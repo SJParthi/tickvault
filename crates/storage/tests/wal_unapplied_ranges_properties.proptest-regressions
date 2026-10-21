@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 30974b213320657dc330ad1f0ade0d620e0d17aada73a389dbf1b66290810f4d # shrinks to seed = 1348121622768296934, start = 0, stuck = false
+cc ecddacab210c54fab81c6114981844a25af525f70ac5cc32237747022745ffe3 # shrinks to seed = 13323464164761636786, start = 1, stuck = false
+cc 0d02788a1e082906ca4669f1c929fe1d8282c1ac0108aac66140340cee3ba01f # shrinks to seed = 8362470527334602142, start = 0, stuck = false
+cc 678a3bf366027b71cfb5b41ff728cf5aa20f3a8c24ef89ddc0125203b76561fb # shrinks to seed = 13013751188033078155, start = 0, stuck = true
+cc 6ff6c51715ae6767a32c2054691fae5f25d1d5ab4441ca749ad503f9b43f2ad8 # shrinks to seed = 16922757407861016088, start = 1, stuck = true, mirror = false, extra = true
+cc 087ad5c9317e050d3407a65355330f9130f0ccd897f63c6e7cf3819d282e4ec6 # shrinks to seed = 13278354003083573788, boots = 40
+cc c50f7f23473af2bd316a52b31b28162e55e80b44c1444c17885dc27ccaf50a94 # shrinks to seed = 2450689520700544884, start = 1, stuck = true, mirror = false, extra = false

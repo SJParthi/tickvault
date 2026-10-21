@@ -51,6 +51,59 @@
 //! and a WAL-suspended table that ACKs silently (that lie advances this
 //! watermark exactly as it advanced the old `confirm_replayed`; the
 //! `wal_suspension_watcher` owns it).
+//!
+//! **⚠ CHANGED 2026-10-20 (plan item PR W):** the bucket table is no longer
+//! the only unapplied record. A bounded set of at most 32 sequence RANGES
+//! (`wal_unapplied_ranges`) holds what the table cannot: the catch-up backlog
+//! guard, the boot tail, an overflow inherited from an earlier process, and
+//! the buckets an earlier process left behind (folded into ranges at boot so
+//! the table starts every session empty). The ranges live in a sidecar file;
+//! this file stays version 1. An overflow now carries a HEIGHT in RAM, and a
+//! reloaded one is bounded at the next boot instead of tainting every later
+//! segment forever.
+//!
+//! **⚠ CORRECTED 2026-10-20 (PR W review, rollback).** The first draft set
+//! this file's overflow bit whenever any range existed. The boot tail exists
+//! on nearly every boot, and an older binary seeds a loaded bit at height
+//! `u64::MAX`, which it can never clear: rolling back would have re-created
+//! the WAL-growth bug on a clean box. Now each range is ALSO written into the
+//! version-1 bucket table as the bucket ids it spans (count
+//! [`UNAPPLIED_BUCKET_RANGE_MARK`]) whenever they fit in free slots, so an
+//! older binary reads exact buckets it can clear. The bit is set only for
+//! state an older binary cannot represent: an overflow in RAM, an overflow
+//! migrated at a boot (the box was already overflowed for an older binary),
+//! or a range whose buckets do not fit. The span between the highest
+//! sequence an earlier process wrote and this boot's `own_floor` holds no
+//! frame of any earlier process and is left out of that encoding
+//! ([`AppliedSnapshot::frameless_gap`]), which is what keeps the overnight
+//! boot tail down to a few buckets.
+//!
+//! **⚠ ADDED 2026-10-20 (PR W review round 4):**
+//!
+//! * A per-frame shed bucket mark carries no reorder slack, so the
+//!   whole-segment check ([`AppliedSnapshot::segment_is_applied`]) now reads
+//!   the bucket table from one slack below the segment's first record, and
+//!   the boot fold gives each folded bucket one slack on its top. The range
+//!   lookup is unchanged.
+//! * **Honest limit, measured by counters, not fixed:** while a QuestDB
+//!   probe is unclean (a suspended table, a latched apply lag, or a blind
+//!   probe) every ack parks, and the whole stretch stays pinned until a
+//!   replay reaches it; on a box whose backlog does not drain that is about
+//!   one session of WAL per lag-latched day. [`WAL_SUSPECT_EPISODES_COUNTER`]
+//!   and [`WAL_SUSPECT_SECONDS_COUNTER`] (local `/metrics` only, registered
+//!   at 0 at boot) show how often and how long. The follow-up, not built:
+//!   confirm parked live acks once a full [`WATERMARK_DURABILITY_LAG_SECS`]
+//!   (60 s) and two clean probes follow them, as `settling/` does for
+//!   replays.
+//!
+//! **⚠ ADDED 2026-10-20 (PR W review round 5), the upper side:** the same
+//! reorder bound lets a segment's last record sit up to one slack ABOVE the
+//! next segment's first record, so above the segment's range end. The
+//! whole-segment check now also reads the bucket table up to one slack above
+//! the range end ([`reorder_reach_hi`]), and the ranges built from per-frame
+//! marks (the boot-folded buckets and the in-session overflow bound) carry
+//! one slack on their bottom as well as their top. Cost: a segment ending
+//! within one second below a marked bucket's start is held too.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -59,6 +112,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tracing::warn;
+
+use crate::wal_unapplied_ranges::{BootFold, UnappliedRanges, UnappliedRangesFile};
 
 /// The watermark file, beside the `*.wal` segments. Not a `.wal`, so the
 /// segment glob and the prune never see it.
@@ -99,6 +154,16 @@ pub const APPLIED_WATERMARK_LEN: usize = HEADER_LEN + BODY_LEN + 4;
 
 const FLAG_DEPTH_UNTRACKED: u8 = 0b01;
 const FLAG_OVERFLOWED: u8 = 0b10;
+
+/// 2026-10-20 (PR W review, rollback): the `mark` written beside a bucket id
+/// that encodes part of a bounded RANGE rather than a shed frame. An older
+/// binary reads the id as an ordinary unapplied bucket (the mark is
+/// informational to it and is never 0, so its `mark_slot` leaves it alone),
+/// and clears it like any other once a drain passes it. This binary drops
+/// such slots when the matching sidecar is trusted (the sidecar holds the
+/// exact ranges) and keeps them as ordinary buckets when it is not. ASCII
+/// `TVURANGE`, a value no shed count reaches.
+pub const UNAPPLIED_BUCKET_RANGE_MARK: u64 = u64::from_le_bytes(*b"TVURANGE");
 
 /// Counter: the sink-side persist could not write the file (loss-shaped name,
 /// so it is paired with a `warn!` at its one emit site).
@@ -166,6 +231,18 @@ pub const RESCUE_FLOOR_SLOTS: usize = 16;
 /// Counter: a rescue hand-off found no free floor slot, so its range was
 /// marked unapplied instead (it is replayed next boot even if it lands).
 pub const RESCUE_FLOOR_FULL_COUNTER: &str = "tv_wal_rescue_floor_full_total";
+/// Counter: QuestDB suspicion episodes the applied watermark entered (a probe
+/// saw a suspended or lagging table, or could not see), once per transition
+/// into suspicion (2026-10-20, PR W review round 4). Local `/metrics` only:
+/// no CloudWatch filter, no EMF name, no alarm. Registered at 0 at boot.
+pub const WAL_SUSPECT_EPISODES_COUNTER: &str = "tv_wal_suspect_episodes_total";
+/// Counter: whole seconds the applied watermark spent suspect, counted at
+/// each probe while suspect and at the clean probe that ends it (the
+/// sub-second remainder is carried, never dropped). While suspect every ack
+/// parks and the session's WAL stays pinned until a replay reaches it, so
+/// this, read beside `tv_wal_unapplied_pinned_bytes`, is what shows whether
+/// pinned bytes grow with lag-latched days. Local `/metrics` only, as above.
+pub const WAL_SUSPECT_SECONDS_COUNTER: &str = "tv_wal_suspect_seconds_total";
 
 /// A queued rescue batch's hold on the persisted watermark (Z7). Returned by
 /// [`AppliedWatermark::hold_rescue_floor`], carried with the batch, and handed
@@ -291,6 +368,38 @@ fn mono_nanos() -> u64 {
     u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The lowest sequence a frame of a WAL segment whose first record is
+/// `first` can carry: one [`REPLAY_REORDER_SLACK_SEQ`] lower, never below 1
+/// (2026-10-20, PR W review round 4). Sixteen sockets race to the writer, so
+/// a record can sit up to the slack below the segment's first. A per-frame
+/// mark (a shed bucket, a deferred-depth mark) carries no slack of its own,
+/// so a whole-segment lookup of such marks starts here. `0` (an unreadable
+/// first record) stays `0`, which every caller reads as "start unknown".
+/// O(1).
+#[must_use]
+pub const fn reorder_reach_lo(first: u64) -> u64 {
+    if first == 0 {
+        0
+    } else {
+        let lo = first.saturating_sub(REPLAY_REORDER_SLACK_SEQ);
+        if lo == 0 { 1 } else { lo }
+    }
+}
+
+/// The highest sequence a frame of a WAL segment whose range ends at `hi`
+/// (the next segment's first record less one) can carry: one
+/// [`REPLAY_REORDER_SLACK_SEQ`] higher, saturating (2026-10-20, PR W review
+/// round 5). The mirror of [`reorder_reach_lo`]: a record is never more than
+/// the slack below one written before it, so a record written into a segment
+/// just before the writer rotated can carry a sequence up to the slack ABOVE
+/// the next segment's first record. A per-frame mark on such a record (a
+/// shed bucket, a deferred-depth mark) can therefore sit in a bucket above
+/// `hi`, and a whole-segment lookup of such marks ends here. O(1).
+#[must_use]
+pub const fn reorder_reach_hi(hi: u64) -> u64 {
+    hi.saturating_add(REPLAY_REORDER_SLACK_SEQ)
+}
+
 /// `hwm` held strictly below `floor` (the lowest sequence of a queued rescue
 /// batch); `u64::MAX` means no floor.
 const fn cap_below_floor(hwm: u64, floor: u64) -> u64 {
@@ -299,6 +408,43 @@ const fn cap_below_floor(hwm: u64, floor: u64) -> u64 {
     } else {
         floor.saturating_sub(1)
     }
+}
+
+/// `seq` rounded DOWN to a frame base (the low
+/// [`crate::ws_frame_spill::PACKET_INDEX_BITS`] cleared), at least 1
+/// (2026-10-20, PR W review round 4). The replay checks each frame by its
+/// BASE, so a range starting inside a frame (`base + k`) would miss the
+/// frame it starts in; every range [`AppliedWatermark::add_unapplied_range`]
+/// adds starts at a base. O(1).
+#[must_use]
+pub(crate) const fn frame_floor(seq: u64) -> u64 {
+    let base = seq & !crate::ws_frame_spill::MAX_PACKET_INDEX;
+    if base == 0 { 1 } else { base }
+}
+
+/// Where a QuestDB suspension range starts, given the watermark it starts
+/// from: TWO [`REPLAY_REORDER_SLACK_SEQ`] lower, at a frame base, at least 1.
+/// O(1). Each slack has its own reason:
+///
+/// * (2026-10-20, PR W review round 4) a frame `f` minted up to one slack
+///   before the frame that set the watermark can be acked after it, so it
+///   can sit in the batch an episode lied about;
+/// * (2026-10-20, PR W review round 4, pass 2) that `f` can be the LAST
+///   record of a segment whose successor's first record `g` sits up to one
+///   more slack below it (`g` minted earlier on another socket, written
+///   after `f`, so `g ≥ f − slack`). The replay skip and the prune judge
+///   that segment by `[first, g − 1]`, which can end almost two slacks below
+///   the watermark; a range starting one slack below missed the segment, so
+///   it read applied and `f` was skipped and could be pruned. A range
+///   derived from an ACK watermark needs both slacks on its bottom; the
+///   range lookup itself is not widened. **⚠ CORRECTED 2026-10-21 (PR W
+///   review round 6):** the rule was applied here only; the plain
+///   whole-segment skip and the boot tail are ack derived too and now carry
+///   the second slack as well ([`AppliedSnapshot::segment_is_applied`],
+///   [`AppliedWatermark::boot_range_floor`]).
+#[must_use]
+pub(crate) const fn suspension_range_lo(watermark: u64) -> u64 {
+    frame_floor(watermark.saturating_sub(2 * REPLAY_REORDER_SLACK_SEQ))
 }
 
 /// Which sink a frame's rows go to; decides which watermark covers it.
@@ -326,6 +472,36 @@ pub struct AppliedSnapshot {
     /// `(bucket_id, mark)` per slot; `(0, _)` is an empty slot, any other id
     /// is an unapplied bucket. `mark` is informational (1 once marked).
     pub buckets: [(u64, u64); UNAPPLIED_BUCKETS],
+    /// 2026-10-20: the highest sequence the bucket table FAILED to record
+    /// while `overflowed`. `u64::MAX` (or `0`, which reads the same) is an
+    /// unknown height: a flag loaded from disk with no matching sidecar.
+    pub overflow_high_seq: u64,
+    /// 2026-10-20: the bounded unapplied ranges (the sidecar's contents).
+    pub ranges: UnappliedRanges,
+    /// The sidecar generation these ranges were read from or written as;
+    /// `0` = none durable. Written into the file's pad bytes.
+    pub ranges_gen: u16,
+    /// The ranges include an overflow migrated at a boot, and some range
+    /// still intersects [`Self::migrated_span`]. While set, the file's
+    /// overflow bit stays set for an older binary (the box was already
+    /// overflowed for it).
+    pub migrated_overflow: bool,
+    /// 2026-10-20 (PR W review round 3): the `[lo, hi]` range the boot fold
+    /// migrated the overflow into (the union, when more than one boot
+    /// migrated). `migrated_overflow` clears once no range intersects it,
+    /// not only once every range is gone. `None` with `migrated_overflow`
+    /// set reads as `(1, u64::MAX)` (unknown: cleared only when no range is
+    /// left).
+    pub migrated_span: Option<(u64, u64)>,
+    /// 2026-10-20 (PR W review): `[highest frame sequence on disk at the boot
+    /// fold + 1, own_floor]`, a span that holds no frame of any process:
+    /// every earlier process's frame is at or below the seeded sequence, and
+    /// the boot fold ratchets the frame counter to `own_floor` so every frame
+    /// this process mints is above it (round 3; `own_floor` itself is never
+    /// minted). Left out when the ranges are encoded into the version-1
+    /// bucket table for an older binary, so an overnight boot tail costs a
+    /// few buckets instead of hundreds. RAM only; never read back from disk.
+    pub frameless_gap: Option<(u64, u64)>,
 }
 
 impl Default for AppliedSnapshot {
@@ -338,6 +514,12 @@ impl Default for AppliedSnapshot {
             persisted_at_nanos: 0,
             dir_tag: 0,
             buckets: [(0, 0); UNAPPLIED_BUCKETS],
+            overflow_high_seq: 0,
+            ranges: UnappliedRanges::new(),
+            ranges_gen: 0,
+            migrated_overflow: false,
+            migrated_span: None,
+            frameless_gap: None,
         }
     }
 }
@@ -366,16 +548,55 @@ impl AppliedSnapshot {
     }
 
     /// `true` when ANY sequence in `[lo, hi]` was recorded as captured-but-
-    /// unapplied, or when the table can no longer answer (overflowed, or the
-    /// range spans more buckets than the table holds). Both fail towards
-    /// "replay it".
+    /// unapplied, or when the record can no longer answer for it. Every
+    /// "cannot answer" fails towards "replay it".
+    ///
+    /// **⚠ CORRECTED 2026-10-20 (plan item PR W).** This read "overflowed →
+    /// everything is unapplied". An overflow now has a HEIGHT
+    /// ([`Self::overflow_high_seq`], the top of what the bucket table failed
+    /// to record), so it taints only a range that STARTS at or below it; a
+    /// range wholly above the height cannot hold a frame the table lost. A
+    /// flag loaded from disk with no trusted sidecar has an unknown height
+    /// (`u64::MAX`) and still taints everything. A range is also unapplied
+    /// when it intersects one of the bounded ranges ([`Self::ranges`]).
     #[must_use]
     pub fn range_has_unapplied(&self, lo: u64, hi: u64) -> bool {
-        if self.overflowed || lo > hi {
+        self.unapplied_in(lo, hi, lo, hi)
+    }
+
+    /// [`Self::range_has_unapplied`] with the bucket-table half (the
+    /// per-frame bucket marks and the in-RAM overflow height) read over
+    /// `[bucket_lo, bucket_hi]` instead of `[lo, hi]`, and the bounded ranges
+    /// still read over `[lo, hi]` exactly (2026-10-20, PR W review round 4;
+    /// `bucket_hi` added in round 5). `bucket_lo` is at or below `lo` and
+    /// `bucket_hi` at or above `hi` (both are clamped to that). O(1) plus at
+    /// most [`UNAPPLIED_BUCKETS`] slot reads.
+    fn unapplied_in(&self, lo: u64, hi: u64, bucket_lo: u64, bucket_hi: u64) -> bool {
+        if lo > hi {
             return true;
         }
-        let first = lo >> UNAPPLIED_BUCKET_SHIFT;
-        let last = hi >> UNAPPLIED_BUCKET_SHIFT;
+        let bucket_lo = bucket_lo.min(lo);
+        let bucket_hi = bucket_hi.max(hi);
+        if self.overflowed {
+            let height = if self.overflow_high_seq == 0 {
+                u64::MAX
+            } else {
+                self.overflow_high_seq
+            };
+            if bucket_lo <= height {
+                return true;
+            }
+        }
+        if self.ranges.intersects(lo, hi) {
+            return true;
+        }
+        // Bucket id 0 is the empty-slot marker, so a widened low end never
+        // reaches it from a range that starts above it.
+        let first = match bucket_lo >> UNAPPLIED_BUCKET_SHIFT {
+            0 if lo >> UNAPPLIED_BUCKET_SHIFT != 0 => 1,
+            id => id,
+        };
+        let last = bucket_hi >> UNAPPLIED_BUCKET_SHIFT;
         if last.saturating_sub(first) >= UNAPPLIED_BUCKETS as u64 {
             return true;
         }
@@ -419,6 +640,103 @@ impl AppliedSnapshot {
         self.range_is_applied(sink, seq, seq)
     }
 
+    /// `true` when a WAL segment whose first record is `first` and whose
+    /// range ends at `hi` (the next segment's first less one) is applied for
+    /// BOTH sinks: a segment mixes main-feed and depth frames, and a
+    /// main-feed frame feeds both. The one decision the boot replay's
+    /// whole-segment skip and the prune share (2026-10-20, PR W review
+    /// round 3). O(1) plus two range lookups.
+    ///
+    /// The ring reorders frames from sixteen sockets, so a segment can hold a
+    /// frame up to one reorder slack BELOW its first record. Two kinds of
+    /// mark cover such a frame differently:
+    ///
+    /// * **Ranges** over particular frames of THIS process carry one slack
+    ///   on their TOP (both suspension-episode marks, the in-session
+    ///   overflow bound, and since round 4 every bucket the boot fold turns
+    ///   into a range), so they reach the first record of any segment such a
+    ///   frame can sit in. The range lookup here stays at `[first, hi]`. A
+    ///   lower margin on the range lookup was tried and rejected on
+    ///   measurement: the lifetime property tests showed it keeps the
+    ///   segment just above EVERY range end (a clean session's first segment
+    ///   after the boot tail read unapplied, check G; one more segment per
+    ///   range stayed pinned on a backlog that never drains, check M3),
+    ///   which is the WAL growth this module closes.
+    /// * **Ranges derived from an ACK watermark** (both suspension-episode
+    ///   marks) need TWO slacks on their bottom, not one (2026-10-20, PR W
+    ///   review round 4, pass 2). A frame `f` acked after the last clean
+    ///   probe can sit up to one slack below that watermark, and be the
+    ///   LAST record of a segment whose successor's first record sits up to
+    ///   one more slack below `f`. This segment's `hi` (that successor's
+    ///   first less one) then ends almost two slacks below the watermark,
+    ///   so a range starting one slack below it missed the segment and `f`
+    ///   was skipped. `suspension_range_lo` gives both marks the second
+    ///   slack; this lookup is unchanged.
+    /// * **Per-frame bucket marks** (`note_unapplied`, bucket = `seq >> 38`)
+    ///   and the in-RAM overflow height carry NO slack: a frame shed just
+    ///   below a bucket boundary marks only the bucket below it.
+    ///   **⚠ CORRECTED 2026-10-20 (PR W review round 4):** this doc said
+    ///   every per-frame mark was covered by the slack on range tops; the
+    ///   bucket marks are not ranges and never were. A frame `s` shed just
+    ///   below a `2^38` boundary, inside a segment whose first record `b` is
+    ///   just above it (`b − s` under one second, reordered across sockets),
+    ///   made that segment read applied: skipped by replay and prunable. The
+    ///   bucket-table half is therefore read from `first −
+    ///   REPLAY_REORDER_SLACK_SEQ` (saturating). It costs at most one extra
+    ///   bucket lookup, and holds a segment only when a marked bucket ends
+    ///   within one second below its first record.
+    /// * **The upper side (2026-10-20, PR W review round 5).** The same
+    ///   reorder bound lets a record of this segment, written just before the
+    ///   writer rotated, carry a sequence up to one slack ABOVE the next
+    ///   segment's first record, so above `hi`. A frame `f` shed just above
+    ///   a `2^38` boundary, written as this segment's last record while the
+    ///   next segment's first record `g` sits just below the boundary
+    ///   (minted earlier on another socket, written later), marked only the
+    ///   bucket above `hi`: this segment read applied, was skipped by replay
+    ///   and could be pruned. The bucket-table half is therefore also read
+    ///   up to `hi + REPLAY_REORDER_SLACK_SEQ` ([`reorder_reach_hi`]), and
+    ///   the ranges built from per-frame marks (the boot-folded buckets and
+    ///   the in-session overflow bound) carry one slack on their BOTTOM as
+    ///   well as their top. Cost: a segment ending within one second below a
+    ///   marked bucket's start is held as well.
+    /// * **The plain ack watermark needs the second slack too (2026-10-21,
+    ///   PR W review round 6).** Round 4, pass 2 gave the second slack only
+    ///   to the suspension ranges; the shape is the same for the watermark
+    ///   itself. Acks follow write order within a sink, so a frame `f` above
+    ///   `skip_below` (the watermark `H` less one slack) can still be
+    ///   unacked when `H` is acked and durable (its flush stuck at a QuestDB
+    ///   stall and the process killed, or acked but not yet durable at a
+    ///   power cut). `f` can be the LAST record of a segment whose
+    ///   successor's first record `g ≥ f − slack` (minted earlier, written
+    ///   after `f`), so that segment's `hi = g − 1` can sit up to almost two
+    ///   slacks below `H`: under `skip_below`, and below the boot tail,
+    ///   which starts at `skip_below + 1`. The segment read applied, the
+    ///   replay archived it unread and the prune could delete it with `f`
+    ///   unconfirmed. A whole segment is therefore applied only when `hi`
+    ///   sits more than one slack below `skip_below` for both sinks
+    ///   ([`Self::below_watermarks_by_a_slack`]). The per-frame check
+    ///   ([`Self::frame_is_applied`]) keeps one slack: for a single frame it
+    ///   is enough. Cost: at most one more segment per session kept or read
+    ///   (the one ending within a slack below `skip_below`).
+    #[must_use]
+    pub fn segment_is_applied(&self, first: u64, hi: u64) -> bool {
+        self.range_is_applied(AppliedSink::Ticks, first, hi)
+            && self.range_is_applied(AppliedSink::Depth, first, hi)
+            && self.below_watermarks_by_a_slack(hi)
+            && !self.unapplied_in(first, hi, reorder_reach_lo(first), reorder_reach_hi(hi))
+    }
+
+    /// `true` when `hi` plus one [`REPLAY_REORDER_SLACK_SEQ`] is strictly
+    /// below [`Self::skip_below`] for both sinks: the second slack a whole
+    /// segment needs below an ack watermark (2026-10-21, PR W review round
+    /// 6; see [`Self::segment_is_applied`]). Strict, because a frame AT
+    /// `skip_below + 1` is unacked by the per-frame rule and its successor's
+    /// first record can then sit at `skip_below + 1 − slack`. O(1).
+    fn below_watermarks_by_a_slack(&self, hi: u64) -> bool {
+        let reach = hi.saturating_add(REPLAY_REORDER_SLACK_SEQ);
+        reach < self.skip_below(AppliedSink::Ticks) && reach < self.skip_below(AppliedSink::Depth)
+    }
+
     fn to_bytes(&self) -> [u8; APPLIED_WATERMARK_LEN] {
         let mut out = [0u8; APPLIED_WATERMARK_LEN];
         out[0..4].copy_from_slice(&APPLIED_MAGIC);
@@ -427,16 +745,28 @@ impl AppliedSnapshot {
         if self.depth_untracked {
             flags |= FLAG_DEPTH_UNTRACKED;
         }
-        if self.overflowed {
+        // 2026-10-20 (PR W review, rollback): the ranges are written into the
+        // bucket table for an older binary when they fit, and the bit is set
+        // only for what that table cannot represent (see `v1_buckets`). The
+        // pad bytes name the sidecar generation that holds the exact ranges;
+        // an in-RAM overflow writes 0 there, which loads as unbounded.
+        let (buckets, overflow_bit) = self.v1_buckets();
+        if overflow_bit {
             flags |= FLAG_OVERFLOWED;
         }
         out[5] = flags;
+        let generation = if !self.overflowed && !self.ranges.is_empty() {
+            self.ranges_gen
+        } else {
+            0
+        };
+        out[6..8].copy_from_slice(&generation.to_le_bytes());
         out[8..16].copy_from_slice(&self.hwm_ticks.to_le_bytes());
         out[16..24].copy_from_slice(&self.hwm_depth.to_le_bytes());
         out[24..32].copy_from_slice(&self.persisted_at_nanos.to_le_bytes());
         out[32..40].copy_from_slice(&self.dir_tag.to_le_bytes());
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, cold persist path
-        for (i, (id, count)) in self.buckets.iter().enumerate() {
+        for (i, (id, count)) in buckets.iter().enumerate() {
             let at = HEADER_LEN + i * 16;
             out[at..at + 8].copy_from_slice(&id.to_le_bytes());
             out[at + 8..at + 16].copy_from_slice(&count.to_le_bytes());
@@ -444,6 +774,76 @@ impl AppliedSnapshot {
         let crc = crc32_ieee(&out[..HEADER_LEN + BODY_LEN]);
         out[HEADER_LEN + BODY_LEN..].copy_from_slice(&crc.to_le_bytes());
         out
+    }
+
+    /// The bucket table as written to disk, and whether the overflow bit is
+    /// set (2026-10-20, PR W review, rollback).
+    ///
+    /// An older binary reads only this table and the bit, and seeds a set
+    /// bit at height `u64::MAX`, which it can never clear. So every range is
+    /// written here as the bucket ids it spans (mark
+    /// [`UNAPPLIED_BUCKET_RANGE_MARK`]) whenever each id lands on a free slot
+    /// or on a slot already holding that id, and the bit is set only when:
+    ///
+    /// * the bucket table itself overflowed in RAM (the old meaning);
+    /// * the ranges include an overflow migrated at a boot (the box was
+    ///   already overflowed for an older binary; nothing narrower is true);
+    /// * a range does not fit (it spans 128 buckets or more, touches bucket
+    ///   id 0, or lands on a slot holding a different id).
+    ///
+    /// **Honest limit (2026-10-20, PR W review round 3):** the table is
+    /// indexed modulo 128, so on a shed-heavy day, when this session's shed
+    /// buckets already fill many slots, a range id is likely to land on a
+    /// slot holding a different id and the bit is then set for that persist.
+    /// Nothing is lost (this binary reads the sidecar; an older binary
+    /// replays everything after a rollback that day), and the bit goes again
+    /// once a drain clears the sheds. A range with no file to start from (no
+    /// or a rejected `applied.tvaw` at the boot, so the tail starts at 1 or
+    /// at the oldest waiting segment) usually spans far more than 128
+    /// buckets and also sets the bit until a trim or a drained reset narrows
+    /// it.
+    ///
+    /// The [`Self::frameless_gap`] is left out of every range first: no
+    /// earlier process wrote a frame there, and an older binary never
+    /// protected it. When the bit is set the real table is written unchanged.
+    /// O(32 ranges × 2 pieces × at most 128 ids), cold: once per persist.
+    ///
+    /// **Honest limit (2026-10-20, PR W review round 4): the ids planted here
+    /// raise an older binary's own odds of overflowing.** It has no boot
+    /// fold and clears an id only on a drained reset. On a box whose backlog
+    /// never drains, ranges from many earlier days stay held and their ids
+    /// sit in slots across those days, so after a rollback the first shed
+    /// of the older binary's session that lands on a slot holding a range id
+    /// (or an island of an earlier day) with a different id overflows its
+    /// table, and it reloads that as the unbounded bit: the original
+    /// next-day collision, made more likely by these ids. Nothing is lost
+    /// (it replays more), but the rollback cost arrives later through a
+    /// shed rather than in this encoding. Leaving old ranges out of the
+    /// encoding and setting the bit for them was considered and not taken:
+    /// it hands the older binary the unbounded bit at once on every such
+    /// box, which is the same cost, earlier and certain.
+    fn v1_buckets(&self) -> ([(u64, u64); UNAPPLIED_BUCKETS], bool) {
+        if self.overflowed {
+            return (self.buckets, true);
+        }
+        if self.ranges.is_empty() {
+            return (self.buckets, false);
+        }
+        if self.migrated_overflow {
+            return (self.buckets, true);
+        }
+        let mut out = self.buckets;
+        // O(1) EXEMPT: bounded by UNAPPLIED_RANGE_SLOTS (32), cold persist
+        for &(lo, hi) in self.ranges.as_slice() {
+            let (left, right) = split_around_gap(lo, hi, self.frameless_gap);
+            // O(1) EXEMPT: at most two pieces per range
+            for (a, b) in [left, right].into_iter().flatten() {
+                if !encode_range_buckets(&mut out, a, b) {
+                    return (self.buckets, true);
+                }
+            }
+        }
+        (out, false)
     }
 
     /// Parses the on-disk form. `None` on any shape or checksum failure —
@@ -461,6 +861,7 @@ impl AppliedSnapshot {
             return None;
         }
         let flags = bytes[5];
+        let ranges_gen = u16::from_le_bytes(bytes[6..8].try_into().ok()?);
         let hwm_ticks = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
         let hwm_depth = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
         let persisted_at_nanos = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
@@ -477,14 +878,23 @@ impl AppliedSnapshot {
             let count = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().ok()?);
             *slot = (id, count);
         }
+        let overflowed = flags & FLAG_OVERFLOWED != 0;
+        // This is exactly what an older binary decodes: the bit, no height.
+        // `load` replaces it with the sidecar's ranges when they match.
         Some(Self {
             hwm_ticks,
             hwm_depth,
             depth_untracked: flags & FLAG_DEPTH_UNTRACKED != 0,
-            overflowed: flags & FLAG_OVERFLOWED != 0,
+            overflowed,
             persisted_at_nanos,
             dir_tag,
             buckets,
+            overflow_high_seq: if overflowed { u64::MAX } else { 0 },
+            ranges: UnappliedRanges::new(),
+            ranges_gen,
+            migrated_overflow: false,
+            migrated_span: None,
+            frameless_gap: None,
         })
     }
 
@@ -538,8 +948,56 @@ impl AppliedSnapshot {
         };
         let expected_tag = dir_tag_of(wal_dir);
         match Self::from_bytes(&bytes, wall_nanos()) {
-            Some(snap) if snap.dir_tag == expected_tag => Ok(Some(snap)),
+            Some(mut snap) if snap.dir_tag == expected_tag => {
+                snap.attach_ranges_sidecar(wal_dir);
+                Ok(Some(snap))
+            }
             _ => Err(bytes.len()),
+        }
+    }
+
+    /// 2026-10-20: reads the ranges sidecar beside `wal_dir` into a snapshot
+    /// just decoded from `applied.tvaw`. The sidecar is TRUSTED only when it
+    /// is valid, belongs to this directory, holds at least one range, and
+    /// carries the generation written into this file's pad bytes. Then its
+    /// ranges replace the range-encoded buckets (they are the same ranges,
+    /// exact rather than bucket-wide) and explain any overflow bit.
+    ///
+    /// Anything else (no sidecar, a corrupt one, a stale one from a crash
+    /// between the two writes, a file written by an older binary with zero
+    /// pad) keeps the bit unbounded and turns every range-encoded bucket into
+    /// an ordinary unapplied bucket, which the boot fold then folds into its
+    /// exact bucket span: coverage never shrinks. A readable but untrusted
+    /// sidecar still adds its ranges (more replay, never less).
+    ///
+    /// **⚠ CHANGED 2026-10-20 (PR W review, rollback):** this read the
+    /// sidecar only when the bit was set. The bit is now set only for what an
+    /// older binary cannot represent, so a non-zero pad alone also asks for
+    /// it. O(`UNAPPLIED_BUCKETS`) plus one small file read, cold.
+    fn attach_ranges_sidecar(&mut self, wal_dir: &Path) {
+        let pad = self.ranges_gen;
+        self.ranges_gen = 0;
+        let side = if pad != 0 || self.overflowed {
+            UnappliedRangesFile::load(wal_dir)
+        } else {
+            None
+        };
+        let trusted = pad != 0 && side.is_some_and(|s| s.generation == pad && !s.ranges.is_empty());
+        if let Some(side) = side {
+            self.ranges = side.ranges;
+            self.migrated_overflow = side.migrated_overflow;
+            self.migrated_span = side.migrated_span;
+        }
+        // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, cold load
+        for slot in &mut self.buckets {
+            if slot.0 != 0 && slot.1 == UNAPPLIED_BUCKET_RANGE_MARK {
+                *slot = if trusted { (0, 0) } else { (slot.0, 1) };
+            }
+        }
+        if trusted {
+            self.overflowed = false;
+            self.overflow_high_seq = 0;
+            self.ranges_gen = pad;
         }
     }
 }
@@ -564,6 +1022,59 @@ const fn slot_of(bucket_id: u64) -> usize {
     (bucket_id % UNAPPLIED_BUCKETS as u64) as usize
 }
 
+/// `[lo, hi]` with the inclusive `gap` removed: up to two pieces, below and
+/// above it. O(1).
+fn split_around_gap(
+    lo: u64,
+    hi: u64,
+    gap: Option<(u64, u64)>,
+) -> (Option<(u64, u64)>, Option<(u64, u64)>) {
+    let Some((g_lo, g_hi)) = gap.filter(|&(g_lo, g_hi)| g_lo <= g_hi) else {
+        return (Some((lo, hi)), None);
+    };
+    if hi < g_lo || lo > g_hi {
+        return (Some((lo, hi)), None);
+    }
+    let left = if lo < g_lo {
+        Some((lo, g_lo - 1))
+    } else {
+        None
+    };
+    let right = if hi > g_hi {
+        Some((g_hi + 1, hi))
+    } else {
+        None
+    };
+    (left, right)
+}
+
+/// Writes every bucket id `[lo, hi]` spans into `table` with the range mark,
+/// leaving a slot that already holds the same id as it is. `false` (and a
+/// partly written `table` the caller discards) when the span is 128 buckets
+/// or wider, touches id 0 (an empty slot), or lands on a slot holding a
+/// different id. O(at most 128), cold: the persist encoding only.
+fn encode_range_buckets(table: &mut [(u64, u64); UNAPPLIED_BUCKETS], lo: u64, hi: u64) -> bool {
+    let first = lo >> UNAPPLIED_BUCKET_SHIFT;
+    let last = hi >> UNAPPLIED_BUCKET_SHIFT;
+    if first == 0 || last < first || last - first >= UNAPPLIED_BUCKETS as u64 {
+        return false;
+    }
+    let mut id = first;
+    // O(1) EXEMPT: bounded by UNAPPLIED_BUCKETS (128), cold persist encoding
+    loop {
+        let slot = &mut table[slot_of(id)];
+        if slot.0 == 0 {
+            *slot = (id, UNAPPLIED_BUCKET_RANGE_MARK);
+        } else if slot.0 != id {
+            return false;
+        }
+        if id == last {
+            return true;
+        }
+        id += 1;
+    }
+}
+
 /// The process-wide watermark. One per process, like `WAL_FRAME_SEQ`.
 pub struct AppliedWatermark {
     hwm_ticks: AtomicU64,
@@ -578,6 +1089,15 @@ pub struct AppliedWatermark {
     /// the set that excludes these. See that function for the loss this
     /// prevents.
     overflow_high_seq: AtomicU64,
+    /// Conservative LOWER bound on the sequences the bucket table failed to
+    /// record (`u64::MAX` = none recorded). 2026-10-20 (PR W review round 4):
+    /// round 3 removed the first version of this field because its only
+    /// reader was the boot fold; its reader is now the persist, which turns
+    /// an in-session overflow of known height into the bounded range
+    /// `[low, height]` instead of writing the bare bit (see
+    /// `bound_known_overflow_locked`). Written only on the two overflow arms
+    /// (`fetch_min`, before the flag is set), never on a shed that fits.
+    overflow_low_seq: AtomicU64,
     bucket_ids: [AtomicU64; UNAPPLIED_BUCKETS],
     bucket_counts: [AtomicU64; UNAPPLIED_BUCKETS],
     ticks_handed_off: AtomicU64,
@@ -601,6 +1121,19 @@ pub struct AppliedWatermark {
     /// none. So while suspect, acks do NOT move the watermark (they park in
     /// `suspect_max_*`), and on recovery the parked range is marked unapplied.
     sink_suspect: AtomicBool,
+    /// Serialises the suspect-flag check with the watermark or parked-ack
+    /// update in [`Self::note_ticks_acked`] / [`Self::note_depth_acked`],
+    /// and the flag flip with the watermark and parked-ack reads at both
+    /// probe transitions (2026-10-21, PR W review round 6). With only the
+    /// atomics, an ack that loaded the flag on one side of a transition and
+    /// wrote on the other was in neither episode range: at the entry it
+    /// raised the watermark after the range read it, at the exit it parked
+    /// into a slot already drained. The bucket table this replaced marked
+    /// whole 4.6-minute buckets, which covered both. Taken once per ack
+    /// BATCH (never per tick) and once per probe transition, held for a
+    /// flag load and one `fetch_max` (or a swap and four loads), never
+    /// across a file write. No allocation.
+    ack_gate: Mutex<()>,
     /// Set while persisting the snapshot keeps failing, so a failing disk is
     /// reported once per episode and not once a second (2026-10-09). The
     /// counter still counts every failure; `durability-sync-failing` pages on it.
@@ -627,6 +1160,11 @@ pub struct AppliedWatermark {
     /// it at an ack and refuses to archive the acked segments if it has moved
     /// since.
     suspect_episodes: AtomicU64,
+    /// Monotonic instant up to which suspect time has been counted on
+    /// [`WAL_SUSPECT_SECONDS_COUNTER`] (2026-10-20, PR W review round 4).
+    suspect_accounted_nanos: AtomicU64,
+    /// Whole seconds counted on [`WAL_SUSPECT_SECONDS_COUNTER`] so far.
+    suspect_seconds: AtomicU64,
     /// Where the LATEST suspicion episode began (audit DA-13b review): its
     /// number (0 while being rewritten), the clean-probe count and the wall
     /// clock at its start. A spill replay round that runs after an episode
@@ -663,6 +1201,92 @@ pub struct AppliedWatermark {
     /// below the oldest floor; the RAM value is unchanged.
     rescue_floors_ticks: [AtomicU64; RESCUE_FLOOR_SLOTS],
     rescue_floors_depth: [AtomicU64; RESCUE_FLOOR_SLOTS],
+    /// 2026-10-20 (plan item PR W): the bounded unapplied ranges, the sidecar
+    /// generation that holds them durably, and the migrated flag. Touched
+    /// only on cold paths (boot, the backlog guard, a trim, the drained reset,
+    /// a QuestDB suspension episode, the settle recovery, the once-a-second
+    /// persist); never by a shed or an ack.
+    ranges: Mutex<RangesState>,
+    /// `(sidecar, its tmp, the directory)`; set by the first [`Self::bind`].
+    ranges_paths: OnceLock<(PathBuf, PathBuf, PathBuf)>,
+    /// The slack-adjusted watermark loaded at the first [`Self::bind`]
+    /// (`0` with no file), frozen there: every frame at or below it was
+    /// applied by an earlier process unless a bucket, a range or an overflow
+    /// says otherwise. Later acks never move it.
+    boot_applied_floor: AtomicU64,
+    /// The `own_floor` of the boot fold (`0` before it runs): every frame an
+    /// earlier process wrote sits at or below it, and (round 3) every frame
+    /// this process mints is above it, because the fold wrapper ratchets the
+    /// frame counter to it first.
+    boot_own_floor: AtomicU64,
+    /// 2026-10-20 (PR W review round 3): the seeded frame sequence at the
+    /// boot fold (`0` before it runs or with nothing on disk). Every frame
+    /// of an earlier process is at or below it.
+    boot_frame_high: AtomicU64,
+    /// The boot fold runs once per process.
+    boot_folded: AtomicBool,
+    /// 2026-10-20 (PR W review): [`AppliedSnapshot::frameless_gap`], set by
+    /// the boot fold; `(0, 0)` = none.
+    boot_gap_lo: AtomicU64,
+    boot_gap_hi: AtomicU64,
+    /// A failing sidecar write is reported once per episode.
+    ranges_failing: AtomicBool,
+}
+
+/// The ranges and how durable they are. One per watermark, under its mutex.
+#[derive(Debug, Clone, Copy)]
+struct RangesState {
+    ranges: UnappliedRanges,
+    /// 2026-10-20 (PR W review round 3): the range an overflow was migrated
+    /// into at a boot (the union when several boots migrated), or `None`.
+    /// Cleared once no range intersects it ([`Self::settle_migrated`]); it
+    /// was a bare flag cleared only when the whole set was empty, so a box
+    /// that never fully drains kept an older binary's overflow bit set for
+    /// ever.
+    migrated_span: Option<(u64, u64)>,
+    /// Generation of the sidecar on disk that holds exactly `ranges`; `0`
+    /// while the RAM ranges are not yet durable (the persist then writes the
+    /// file's pad as `0`, which loads as an unbounded overflow).
+    durable_gen: u16,
+    /// The next generation to write; `0` = derive one from the clock.
+    next_gen: u16,
+}
+
+impl RangesState {
+    const fn new() -> Self {
+        Self {
+            ranges: UnappliedRanges::new(),
+            migrated_span: None,
+            durable_gen: 0,
+            next_gen: 0,
+        }
+    }
+
+    /// Adds `span` to the migrated span (the union of the two). O(1).
+    fn widen_migrated(&mut self, span: (u64, u64)) {
+        self.migrated_span = Some(match self.migrated_span {
+            Some((a, b)) => (a.min(span.0), b.max(span.1)),
+            None => span,
+        });
+    }
+
+    /// Clears the migrated span once no range intersects it. Returns whether
+    /// it changed. O(32).
+    fn settle_migrated(&mut self) -> bool {
+        match self.migrated_span {
+            Some((a, b)) if !self.ranges.intersects(a, b) => {
+                self.migrated_span = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for AppliedWatermark {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 static APPLIED: AppliedWatermark = AppliedWatermark::new();
@@ -747,13 +1371,22 @@ impl AppliedWatermark {
         Self::new()
     }
 
-    const fn new() -> Self {
+    /// A fresh, unbound watermark. Production has exactly one, the
+    /// process-global [`applied_watermark`]; public since 2026-10-20 so the
+    /// integration proptest can model whole process lifetimes on its own
+    /// instances without sharing the global. Hidden from the docs (PR W
+    /// review round 4): public only for
+    /// `tests/wal_unapplied_ranges_properties.rs`.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             hwm_ticks: AtomicU64::new(0),
             hwm_depth: AtomicU64::new(0),
             depth_untracked: AtomicBool::new(false),
             overflowed: AtomicBool::new(false),
             overflow_high_seq: AtomicU64::new(0),
+            overflow_low_seq: AtomicU64::new(u64::MAX),
             bucket_ids: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
             bucket_counts: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
             ticks_handed_off: AtomicU64::new(0),
@@ -763,6 +1396,7 @@ impl AppliedWatermark {
             last_persist_nanos: AtomicU64::new(0),
             paths: OnceLock::new(),
             persist_lock: Mutex::new(DurabilityLag::new()),
+            ack_gate: Mutex::new(()),
             dir_tag: AtomicU64::new(0),
             sink_suspect: AtomicBool::new(false),
             persist_failing: AtomicBool::new(false),
@@ -772,6 +1406,8 @@ impl AppliedWatermark {
             suspect_max_depth: AtomicU64::new(0),
             clean_probes: AtomicU64::new(0),
             suspect_episodes: AtomicU64::new(0),
+            suspect_accounted_nanos: AtomicU64::new(0),
+            suspect_seconds: AtomicU64::new(0),
             episode_start_tag: AtomicU64::new(0),
             episode_start_probes: AtomicU64::new(0),
             episode_start_secs: AtomicU64::new(0),
@@ -779,6 +1415,15 @@ impl AppliedWatermark {
             unlanded: AtomicU64::new(0),
             rescue_floors_ticks: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
             rescue_floors_depth: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
+            ranges: Mutex::new(RangesState::new()),
+            ranges_paths: OnceLock::new(),
+            boot_applied_floor: AtomicU64::new(0),
+            boot_own_floor: AtomicU64::new(0),
+            boot_frame_high: AtomicU64::new(0),
+            boot_folded: AtomicBool::new(false),
+            boot_gap_lo: AtomicU64::new(0),
+            boot_gap_hi: AtomicU64::new(0),
+            ranges_failing: AtomicBool::new(false),
         }
     }
 
@@ -796,14 +1441,78 @@ impl AppliedWatermark {
             .is_ok();
         if set {
             self.dir_tag.store(dir_tag_of(wal_dir), Ordering::Release);
-            if let Some(snap) = AppliedSnapshot::load(wal_dir) {
+            let ranges_paths_set = self
+                .ranges_paths
+                .set((
+                    wal_dir.join(crate::wal_unapplied_ranges::UNAPPLIED_RANGES_FILE),
+                    wal_dir.join(crate::wal_unapplied_ranges::UNAPPLIED_RANGES_TMP),
+                    wal_dir.to_path_buf(),
+                ))
+                .is_ok();
+            let loaded = AppliedSnapshot::load(wal_dir);
+            // 2026-10-20: frozen HERE, from the file, before any sink exists.
+            if ranges_paths_set {
+                self.boot_applied_floor
+                    .store(loaded.as_ref().map_or(0, boot_floor_of), Ordering::Release);
+            }
+            if let Some(snap) = loaded {
                 self.seed(&snap);
             }
         }
     }
 
+    /// Whether [`Self::bind`] bound this watermark to `wal_dir`. Two
+    /// canonicalisations, cold (boot fold, trims).
+    #[must_use]
+    pub(crate) fn is_bound_to(&self, wal_dir: &Path) -> bool {
+        let tag = self.dir_tag.load(Ordering::Acquire);
+        tag != 0 && tag == dir_tag_of(wal_dir)
+    }
+
+    /// The slack-adjusted applied watermark frozen at the first bind (`0`
+    /// with no file): `min(hwm_ticks, hwm_depth)` less the reorder slack,
+    /// whatever the file's `depth_untracked` flag says (round 3, M2). The
+    /// backlog guard never marks below `floor + 1`.
+    #[must_use]
+    pub fn boot_applied_floor(&self) -> u64 {
+        self.boot_applied_floor.load(Ordering::Acquire)
+    }
+
+    /// Where a range over the frames the boot file never vouched for starts
+    /// (the boot tail, the backlog guard): [`Self::boot_applied_floor`] less
+    /// one MORE [`REPLAY_REORDER_SLACK_SEQ`], at a frame base, at least 1
+    /// (2026-10-21, PR W review round 6). The floor is an ACK watermark less
+    /// one slack, and a range derived from an ack watermark needs two (see
+    /// [`suspension_range_lo`]): an unacked frame just above the floor can be
+    /// the LAST record of a segment whose successor's first record sits up
+    /// to one slack below it, so that segment's judged range `[first,
+    /// successor first − 1]` ends below `floor + 1`. A tail starting at
+    /// `floor + 1` missed it; once this session's acks lifted the watermark
+    /// past it, the next replay skipped the segment unread (found by the
+    /// lifetime property test's plain-watermark straddle). Cost: up to one
+    /// more second of frames, so at most one more segment, per boot. O(1).
+    #[must_use]
+    pub(crate) fn boot_range_floor(&self) -> u64 {
+        frame_floor(
+            self.boot_applied_floor()
+                .saturating_sub(REPLAY_REORDER_SLACK_SEQ),
+        )
+    }
+
     /// Loads a snapshot into RAM (monotone on the watermarks, replace on the
-    /// buckets).
+    /// buckets, union on the ranges).
+    ///
+    /// **⚠ CORRECTED 2026-10-20 (plan item PR W).** A seeded overflow flag
+    /// is still stored at height `u64::MAX` (nothing on disk names a
+    /// height), but it is no longer "never clearable by this process": the
+    /// boot fold ([`Self::fold_at_boot_with_spans`]) bounds it as the range
+    /// `[oldest waiting segment − REPLAY_REORDER_SLACK_SEQ, own_floor]` (from
+    /// 1 when the oldest is unknown) before any sink exists, and a drain or a
+    /// trim past that range clears it. Before, it tainted every segment
+    /// written after it, so the prune could never delete anything again.
+    /// The sidecar's ranges are added (a union) and its migrated span is
+    /// widened by the loaded one (round 3, M4: a migrated flag with no span
+    /// reads as `(1, u64::MAX)`).
     pub fn seed(&self, snap: &AppliedSnapshot) {
         self.hwm_ticks.fetch_max(snap.hwm_ticks, Ordering::AcqRel);
         self.hwm_depth.fetch_max(snap.hwm_depth, Ordering::AcqRel);
@@ -825,9 +1534,30 @@ impl AppliedWatermark {
             // previous one failed to record. Seed the height at the maximum
             // so `reset_unapplied_below` can never clear it here, and the
             // boot replays rather than skipping. Fails towards replay, which
-            // costs time; the alternative costs data.
+            // costs time; the alternative costs data. The boot fold then
+            // bounds it (see the 2026-10-20 note above).
             self.overflow_high_seq.store(u64::MAX, Ordering::Release);
             self.overflowed.store(true, Ordering::Release);
+        }
+        if !snap.ranges.is_empty() || snap.migrated_overflow {
+            let mut state = self.lock_ranges();
+            let before = state.ranges;
+            // O(1) EXEMPT: bounded by UNAPPLIED_RANGE_SLOTS (32), boot-time seed
+            for &(lo, hi) in snap.ranges.as_slice() {
+                state.ranges.add_range(lo, hi);
+            }
+            if snap.migrated_overflow {
+                state.widen_migrated(snap.migrated_span.unwrap_or((1, u64::MAX)));
+            }
+            if snap.ranges_gen != 0 {
+                state.next_gen = next_generation(snap.ranges_gen);
+            }
+            // Durable as-is only when the RAM set IS the sidecar it came from.
+            if before.is_empty() && snap.ranges_gen != 0 && state.ranges == snap.ranges {
+                state.durable_gen = snap.ranges_gen;
+            } else if state.ranges != before {
+                state.durable_gen = 0;
+            }
         }
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, boot-time seed
         for (i, (id, count)) in snap.buckets.iter().enumerate() {
@@ -837,7 +1567,9 @@ impl AppliedWatermark {
     }
 
     /// Rows up to `max_seq` landed in QuestDB or were durably rescued.
+    /// The flag check and the update run under [`Self::ack_gate`] (round 6).
     pub fn note_ticks_acked(&self, max_seq: u64) {
+        let _gate = self.lock_ack_gate();
         if self.sink_suspect.load(Ordering::Acquire) {
             self.suspect_max_ticks.fetch_max(max_seq, Ordering::AcqRel);
         } else {
@@ -846,12 +1578,34 @@ impl AppliedWatermark {
     }
 
     /// Depth rows up to `max_seq` landed in QuestDB or were durably rescued.
+    /// The flag check and the update run under [`Self::ack_gate`] (round 6).
     pub fn note_depth_acked(&self, max_seq: u64) {
+        let _gate = self.lock_ack_gate();
         if self.sink_suspect.load(Ordering::Acquire) {
             self.suspect_max_depth.fetch_max(max_seq, Ordering::AcqRel);
         } else {
             self.hwm_depth.fetch_max(max_seq, Ordering::AcqRel);
         }
+    }
+
+    /// `(watermark file, ranges sidecar)`: whether persisting each is in a
+    /// failing episode right now (2026-10-21, PR W review round 6). Read once
+    /// by the boot fold, which runs before the tracing subscriber exists, so
+    /// the episode's one `warn!` was lost and the latch then silenced every
+    /// later failure; the fold records this and the boot log reports it. Two
+    /// atomic loads.
+    pub(crate) fn persist_failing_latched(&self) -> (bool, bool) {
+        (
+            self.persist_failing.load(Ordering::Acquire),
+            self.ranges_failing.load(Ordering::Acquire),
+        )
+    }
+
+    /// The ack gate, recovered from poison (it guards no data of its own).
+    fn lock_ack_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.ack_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The QuestDB WAL-suspension probe reported. `clean` = every table
@@ -862,28 +1616,131 @@ impl AppliedWatermark {
     /// unapplied: the detection window, plus one second of slack for an ack
     /// that raced the flag. Leaving it marks `[watermark, highest parked ack]`
     /// unapplied and re-opens the watermark from where it stopped. Every
-    /// direction is "replay more"; a suspension longer than the bucket table
-    /// covers (~9.8 h) overflows it, which is the old full replay.
+    /// direction is "replay more".
+    ///
+    /// **⚠ CHANGED 2026-10-20 (PR W review):** both marks go to the bounded
+    /// RANGES ([`Self::add_unapplied_range`]), never the bucket table. A
+    /// suspension longer than the table covers (~9.8 h, an episode across an
+    /// overnight gap) used to overflow it into an unbounded bit that tainted
+    /// every later segment; a range is bounded, trimmed as the backlog is read
+    /// and cleared by the drained reset. Cold: one small sidecar write per
+    /// mark, on the watcher task.
+    ///
+    /// **⚠ CHANGED 2026-10-20 (PR W review round 3, L8):** a range add
+    /// writes and fsyncs the sidecar, and this runs on the watcher's tokio
+    /// task, so each add now runs through `off_worker` (`block_in_place` on a
+    /// multi-thread runtime, inline otherwise): the worker's other tasks keep
+    /// running while the file is synced. Only an episode's start and end add
+    /// a range; every other probe touches no file. The watermark is then
+    /// persisted at once, so `applied.tvaw` names the new sidecar generation:
+    /// the property test found that a crash in the up-to-a-second gap before
+    /// the next routine persist left the file naming a generation no longer
+    /// on disk, which loads as an unbounded overflow and makes the next boot
+    /// migrate (replay) every waiting segment.
+    ///
+    /// **⚠ CHANGED 2026-10-20 (PR W review round 4):** both marks now start
+    /// one reorder slack BELOW the watermark they start from, rounded down to
+    /// a frame base ([`suspension_range_lo`]). The ring reorders frames from
+    /// sixteen sockets, so a frame minted just before the one that set the
+    /// last clean watermark can be acked AFTER that probe, inside the window
+    /// the episode may have lied about; a range starting at the watermark
+    /// missed it, and the next boot's per-record filter dropped it as
+    /// applied. The bucket table this replaced marked whole 4.6-minute
+    /// buckets, which almost always covered it.
+    ///
+    /// **⚠ CHANGED 2026-10-20 (PR W review round 4, pass 2):** two slacks
+    /// below, not one. That `f` can be the last record of a segment whose
+    /// successor's first record sits up to one more slack below `f`, so the
+    /// segment's judged range `[first, successor first − 1]` ended below a
+    /// range starting one slack under the watermark: the segment read
+    /// applied, the replay skipped it and the prune could delete it. See
+    /// [`suspension_range_lo`]. Cost: the episode's range keeps up to one
+    /// more second of frames, so at most one more segment.
+    ///
+    /// **⚠ CHANGED 2026-10-21 (PR W review round 6):** both transitions
+    /// flip the flag and read the watermarks (and, at the exit, drain the
+    /// parked acks) under [`Self::ack_gate`], which the ack functions also
+    /// take around their flag check and update. Before, an ack that read
+    /// the flag on one side of a transition and wrote on the other raised
+    /// the watermark after the entry range read it, or parked into a slot
+    /// the exit had already drained; either way it was in no range. The
+    /// file writes run after the gate is released.
+    ///
+    /// **ADDED 2026-10-20 (PR W review round 4):** each transition into
+    /// suspicion counts on [`WAL_SUSPECT_EPISODES_COUNTER`], and the time
+    /// spent suspect on [`WAL_SUSPECT_SECONDS_COUNTER`]. One monotonic clock
+    /// read per probe, a few atomics, cold (once per watcher poll), never
+    /// per frame.
     pub fn note_questdb_probe(&self, clean: bool) {
+        self.note_questdb_probe_at(clean, mono_nanos());
+    }
+
+    /// [`Self::note_questdb_probe`] at monotonic instant `now`.
+    fn note_questdb_probe_at(&self, clean: bool, now: u64) {
         if clean {
             self.clean_probes.fetch_add(1, Ordering::AcqRel);
-            if self.sink_suspect.swap(false, Ordering::AcqRel) {
-                let parked_ticks = self.suspect_max_ticks.swap(0, Ordering::AcqRel);
-                let parked_depth = self.suspect_max_depth.swap(0, Ordering::AcqRel);
-                let hwm_ticks = self.hwm_ticks.load(Ordering::Acquire);
-                let hwm_depth = self.hwm_depth.load(Ordering::Acquire);
-                if parked_ticks > hwm_ticks {
-                    self.note_unapplied_range(hwm_ticks.max(1), parked_ticks);
-                }
-                if parked_depth > hwm_depth {
-                    self.note_unapplied_range(hwm_depth.max(1), parked_depth);
+            // Round 6: the flip and the reads under the ack gate, so an ack
+            // either parked before it (and is read here) or raises the
+            // watermark after it; none can park into the drained slot.
+            let exited = {
+                let _gate = self.lock_ack_gate();
+                self.sink_suspect.swap(false, Ordering::AcqRel).then(|| {
+                    (
+                        self.suspect_max_ticks.swap(0, Ordering::AcqRel),
+                        self.suspect_max_depth.swap(0, Ordering::AcqRel),
+                        self.hwm_ticks.load(Ordering::Acquire),
+                        self.hwm_depth.load(Ordering::Acquire),
+                    )
+                })
+            };
+            if let Some((parked_ticks, parked_depth, hwm_ticks, hwm_depth)) = exited {
+                self.account_suspect_time_at(now);
+                if parked_ticks > hwm_ticks || parked_depth > hwm_depth {
+                    // The top carries one reorder slack too (PR W review
+                    // round 3), mirroring the start-of-episode mark: a frame
+                    // acked under suspicion can sit in a segment whose first
+                    // record is above `parked`, and only a range reaching
+                    // that first record keeps the segment.
+                    crate::off_worker::off_worker(|| {
+                        if parked_ticks > hwm_ticks {
+                            self.add_unapplied_range(
+                                suspension_range_lo(hwm_ticks),
+                                parked_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
+                            );
+                        }
+                        if parked_depth > hwm_depth {
+                            self.add_unapplied_range(
+                                suspension_range_lo(hwm_depth),
+                                parked_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
+                            );
+                        }
+                        self.persist_now();
+                    });
                 }
             }
             self.healthy_ticks
                 .store(self.hwm_ticks.load(Ordering::Acquire), Ordering::Release);
             self.healthy_depth
                 .store(self.hwm_depth.load(Ordering::Acquire), Ordering::Release);
-        } else if !self.sink_suspect.swap(true, Ordering::AcqRel) {
+        } else {
+            // Round 6: the flip and the watermark reads under the ack gate,
+            // so an ack either raised the watermark before it (and is
+            // inside the range below) or parks after it.
+            let entered = {
+                let _gate = self.lock_ack_gate();
+                (!self.sink_suspect.swap(true, Ordering::AcqRel)).then(|| {
+                    (
+                        self.hwm_ticks.load(Ordering::Acquire),
+                        self.hwm_depth.load(Ordering::Acquire),
+                    )
+                })
+            };
+            let Some((hwm_ticks, hwm_depth)) = entered else {
+                self.account_suspect_time_at(now);
+                return;
+            };
+            self.suspect_accounted_nanos.store(now, Ordering::Release);
+            metrics::counter!(WAL_SUSPECT_EPISODES_COUNTER).increment(1);
             // Record where this episode begins BEFORE its number is published
             // (audit DA-13b review): a reader that sees the new number can then
             // also see its start, and a reader mid-rewrite sees the tag change.
@@ -898,17 +1755,34 @@ impl AppliedWatermark {
                 .store(wall_nanos() / 1_000_000_000, Ordering::SeqCst);
             self.episode_start_tag.store(episode, Ordering::SeqCst);
             self.suspect_episodes.fetch_add(1, Ordering::AcqRel);
-            let hwm_ticks = self.hwm_ticks.load(Ordering::Acquire);
-            let hwm_depth = self.hwm_depth.load(Ordering::Acquire);
-            self.note_unapplied_range(
-                self.healthy_ticks.load(Ordering::Acquire).max(1),
-                hwm_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
-            );
-            self.note_unapplied_range(
-                self.healthy_depth.load(Ordering::Acquire).max(1),
-                hwm_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
-            );
+            crate::off_worker::off_worker(|| {
+                self.add_unapplied_range(
+                    suspension_range_lo(self.healthy_ticks.load(Ordering::Acquire)),
+                    hwm_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
+                );
+                self.add_unapplied_range(
+                    suspension_range_lo(self.healthy_depth.load(Ordering::Acquire)),
+                    hwm_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
+                );
+                self.persist_now();
+            });
         }
+    }
+
+    /// Counts the whole seconds since the last counted instant on
+    /// [`WAL_SUSPECT_SECONDS_COUNTER`] and carries the remainder. Only the
+    /// watcher task reports probes, so a load and a store suffice. O(1).
+    fn account_suspect_time_at(&self, now: u64) -> u64 {
+        let since = self.suspect_accounted_nanos.load(Ordering::Acquire);
+        let secs = now.saturating_sub(since) / 1_000_000_000;
+        if secs == 0 {
+            return 0;
+        }
+        self.suspect_accounted_nanos
+            .store(since + secs * 1_000_000_000, Ordering::Release);
+        self.suspect_seconds.fetch_add(secs, Ordering::AcqRel);
+        metrics::counter!(WAL_SUSPECT_SECONDS_COUNTER).increment(secs);
+        secs
     }
 
     /// How many clean probes have reported this process (audit PR41b). `0`
@@ -1015,6 +1889,11 @@ impl AppliedWatermark {
             // seq keeps this an upper bound on every frame the bucket
             // would have held.
             let bucket_top = ((id + 1) << UNAPPLIED_BUCKET_SHIFT).saturating_sub(1);
+            // Low before high (PR W review round 3): a bound that reads this
+            // high (Acquire) then reads this low, so it never pairs the new
+            // high with a stale low.
+            self.overflow_low_seq
+                .fetch_min(id << UNAPPLIED_BUCKET_SHIFT, Ordering::AcqRel);
             self.overflow_high_seq
                 .fetch_max(bucket_top, Ordering::AcqRel);
             self.overflowed.store(true, Ordering::Release);
@@ -1038,6 +1917,11 @@ impl AppliedWatermark {
     /// Every bucket touched by `[lo, hi]` is marked unapplied — a whole batch
     /// whose rescue failed. Bounded by the table size; a range wider than the
     /// table overflows it, which fails towards replaying everything.
+    ///
+    /// 2026-10-20 (PR W review): the cold wide-range callers (the QuestDB
+    /// suspension probe, the settle recovery, the backlog guard) use
+    /// [`Self::add_unapplied_range`] instead; what still comes here is one
+    /// rescue batch at a time, which spans a bucket or two.
     pub fn note_unapplied_range(&self, lo: u64, hi: u64) {
         if lo == 0 || lo > hi {
             return;
@@ -1050,6 +1934,8 @@ impl AppliedWatermark {
             // replay. Without it the flag below is the only trace, and a later
             // confirmed drain would clear that on the strength of a bucket count
             // that never included these frames.
+            // Low before high, as in `note_unapplied`.
+            self.overflow_low_seq.fetch_min(lo, Ordering::AcqRel);
             self.overflow_high_seq.fetch_max(hi, Ordering::AcqRel);
             self.overflowed.store(true, Ordering::Release);
             return;
@@ -1116,7 +2002,355 @@ impl AppliedWatermark {
         // provably passed everything the table failed to record.
         if kept == 0 && self.overflow_high_seq.load(Ordering::Acquire) < ceiling_seq {
             self.overflow_high_seq.store(0, Ordering::Release);
+            self.overflow_low_seq.store(u64::MAX, Ordering::Release);
             self.overflowed.store(false, Ordering::Release);
+        }
+        // 2026-10-20: the bounded ranges below the ceiling go too. The boot
+        // fold, the boot tail and the backlog guard cover frames of EARLIER
+        // processes only, all at or below the boot fold's `boot_frame_high`.
+        // A range over THIS process's frames (a QuestDB suspension episode,
+        // the settle recovery) is cut below the drain ceiling only, exactly
+        // like a bucket. `migrated_overflow` and, with it, the file's overflow
+        // bit clear once no range is left over the migrated span.
+        let range_ceiling = self.range_reset_ceiling(ceiling_seq);
+        let mut state = self.lock_ranges();
+        let changed = if range_ceiling == u64::MAX {
+            let had = !state.ranges.is_empty();
+            state.ranges = UnappliedRanges::new();
+            had
+        } else {
+            state.ranges.trim_below(range_ceiling)
+        };
+        if state.settle_migrated() || changed {
+            self.write_ranges_locked(&mut state);
+        }
+    }
+
+    /// The sequence the drained reset cuts the RANGES below (2026-10-20, PR W
+    /// review round 3, M1). O(1).
+    ///
+    /// The first draft cut below `max(ceiling, own_floor + 1)`, on the
+    /// assumption that this process mints nothing at or below `own_floor`.
+    /// That was assumed, not enforced: the counter stayed at the seeded value
+    /// and minted `max(prev + 1, now)`, so a backward clock step after the
+    /// fold minted frames inside `(boot_frame_high, own_floor)`, and a reset
+    /// could clear a suspension range over them. Now the fold wrapper
+    /// ratchets the counter to `own_floor` first, and this uses the safer
+    /// boundary as well:
+    ///
+    /// * the ceiling at or above `own_floor` (the counter was read after the
+    ///   ratchet): `max(ceiling, own_floor + 1)`. `own_floor` is the
+    ///   ratchet's value and is never minted, so nothing sits at it;
+    /// * a ceiling below `own_floor` (a watermark folded without the ratchet,
+    ///   tests only): `max(ceiling, boot_frame_high + 1)`, which can only
+    ///   leave a frameless remnant of the boot tail, never clear a range over
+    ///   a frame;
+    /// * no fold in this process: the ceiling; `u64::MAX`: everything.
+    fn range_reset_ceiling(&self, ceiling_seq: u64) -> u64 {
+        if ceiling_seq == u64::MAX || !self.boot_folded.load(Ordering::Acquire) {
+            return ceiling_seq;
+        }
+        let own_floor = self.boot_own_floor.load(Ordering::Acquire);
+        if ceiling_seq >= own_floor {
+            ceiling_seq.max(own_floor.saturating_add(1))
+        } else {
+            ceiling_seq.max(
+                self.boot_frame_high
+                    .load(Ordering::Acquire)
+                    .saturating_add(1),
+            )
+        }
+    }
+
+    /// The seeded frame sequence the boot fold recorded (every frame of an
+    /// earlier process is at or below it), or `None` before the fold ran.
+    /// O(1).
+    #[must_use]
+    pub(crate) fn boot_frame_high(&self) -> Option<u64> {
+        self.boot_folded
+            .load(Ordering::Acquire)
+            .then(|| self.boot_frame_high.load(Ordering::Acquire))
+    }
+
+    /// Adds `[lo, hi]` to the bounded ranges and writes the sidecar (when
+    /// bound) before returning. Returns whether coverage changed. The caller
+    /// persists the watermark so the file's pad names the new generation.
+    /// O(32) plus one small file write; cold (the backlog guard).
+    ///
+    /// 2026-10-20 (PR W review round 4): `lo` is rounded down to a frame base
+    /// ([`frame_floor`]) after the `lo > hi` check, so a frame never
+    /// straddles a range's lower edge (the replay checks a frame by its
+    /// base). Only ever widens.
+    pub fn add_unapplied_range(&self, lo: u64, hi: u64) -> bool {
+        if lo > hi {
+            return false;
+        }
+        let mut state = self.lock_ranges();
+        let changed = state.ranges.add_range(frame_floor(lo), hi);
+        if changed {
+            self.write_ranges_locked(&mut state);
+        }
+        changed
+    }
+
+    /// Keeps only the parts of the ranges that fall inside `spans` (sorted,
+    /// disjoint `[lo, hi]` sequence spans of the segments still waiting, the
+    /// newest open-ended) and writes the sidecar when anything changed
+    /// (2026-10-20, PR W review). A range part over no waiting segment
+    /// protects nothing on disk. When the pieces need more than 32 slots, a
+    /// merge prefers a gap that holds no waiting span
+    /// ([`UnappliedRanges::add_range_avoiding`]). Clears `migrated_overflow`
+    /// once no range intersects the migrated span (**⚠ CHANGED 2026-10-20,
+    /// PR W review round 3, M4:** it cleared only when no range at all was
+    /// left, so one later boot tail kept an older binary's overflow bit set
+    /// for ever). O(32 × log spans + spans), cold: after the boot refold and
+    /// each catch-up round.
+    pub fn clip_unapplied_ranges_to(&self, spans: &[(u64, u64)]) -> bool {
+        let mut state = self.lock_ranges();
+        let changed = state.ranges.clip_to(spans);
+        if state.settle_migrated() || changed {
+            self.write_ranges_locked(&mut state);
+        }
+        changed
+    }
+
+    /// `trim_below(seq)` on the ranges, writing the sidecar when anything
+    /// changed (2026-10-20, PR W review round 3, L1): the partial trim used
+    /// when the only waiting segments of unknown span sit in
+    /// `settling/unreadable/`. Returns whether the ranges changed. O(32) plus
+    /// at most one small file write, cold.
+    pub(crate) fn trim_unapplied_ranges_below(&self, seq: u64) -> bool {
+        let mut state = self.lock_ranges();
+        let changed = state.ranges.trim_below(seq);
+        if state.settle_migrated() || changed {
+            self.write_ranges_locked(&mut state);
+        }
+        changed
+    }
+
+    /// The boot fold (2026-10-20, plan item PR W) with no waiting spans: a
+    /// full range set merges its lowest neighbours. See
+    /// [`Self::fold_at_boot_with_spans`]. Test-only since 2026-10-20 (PR W
+    /// review round 4): production folds through
+    /// `wal_unapplied_ranges::fold_at_boot`, which passes the spans.
+    #[cfg(test)]
+    pub(crate) fn fold_at_boot(
+        &self,
+        oldest_waiting: Option<u64>,
+        boot_frame_high: u64,
+        own_floor: u64,
+    ) -> Option<BootFold> {
+        self.fold_at_boot_with_spans(oldest_waiting, boot_frame_high, own_floor, &[])
+    }
+
+    /// The boot fold (2026-10-20, plan item PR W). Once per process, before
+    /// any sink or socket exists. `boot_frame_high` is the seeded frame
+    /// sequence (every frame an earlier process wrote is at or below it),
+    /// `own_floor` is at or above it, and (round 3, M1) the production
+    /// wrapper ratchets the frame counter to `own_floor` before calling
+    /// this, so every frame this process mints is above `own_floor`.
+    /// `oldest_waiting` is the lowest first sequence of a segment a replay
+    /// may still read (`None` when there is none, one is unreadable, or a
+    /// folder could not be listed, which widens the migrated range to start
+    /// at 1). `spans` are the waiting segments' sequence spans
+    /// (`wal_unapplied_ranges::waiting_spans`, empty when unknown): when a
+    /// range set is full, a merge prefers a gap no waiting span intersects.
+    ///
+    /// 1. An overflow present now (inherited at `u64::MAX`, or a known height
+    ///    at or below `own_floor`) becomes the range `[oldest_waiting −
+    ///    REPLAY_REORDER_SLACK_SEQ, own_floor]` (`[that, height]` with a
+    ///    known height) and the flag clears; that range is recorded as the
+    ///    migrated span. Frames below the oldest waiting segment, less the
+    ///    slack, are archived (applied by construction) or gone. **⚠
+    ///    CORRECTED 2026-10-20 (PR W review):** the range started at the
+    ///    oldest segment's FIRST sequence, but sixteen sockets race to the
+    ///    writer, so a later record in that segment can carry a sequence
+    ///    below its first. **⚠ CHANGED (round 3, L5):** the overflow's low
+    ///    end is no longer tracked; it had no production writer before the
+    ///    fold.
+    /// 2. Every bucket whose id is below `own_floor`'s bucket becomes its
+    ///    exact range plus one reorder slack on the top (PR W review round
+    ///    4: a frame of the bucket can sit in a segment whose first record
+    ///    is just above the bucket's end) and one on the bottom, at a frame
+    ///    base, at least 1 (round 5: a frame of the bucket can sit in a
+    ///    segment whose range ends just below the bucket's start), and its
+    ///    slot is emptied, so the
+    ///    table starts the session holding nothing from an earlier day and a
+    ///    next-day shed cannot collide with a stale id.
+    /// 3. The boot tail `[boot_range_floor, own_floor]` (**⚠ CHANGED
+    ///    2026-10-21, PR W review round 6:** was `boot_applied_floor + 1`,
+    ///    one slack too high; see [`Self::boot_range_floor`]) is added: the
+    ///    earlier process's frames the file never vouched for stay unapplied
+    ///    even after this session's acks pass them. **⚠ CHANGED (round 3,
+    ///    L3):** with a known oldest waiting segment it starts no lower than
+    ///    that segment less the slack (what the trim would cut anyway), so a
+    ///    boot with no or a rejected `applied.tvaw` no longer records
+    ///    `[1, own_floor]`.
+    /// 4. `[boot_frame_high + 1, own_floor]` is recorded as the frameless
+    ///    gap (no process wrote or will write a frame there), left out when
+    ///    the ranges are encoded for an older binary.
+    /// 5. The sidecar is written before returning; the caller persists the
+    ///    watermark.
+    ///
+    /// O(UNAPPLIED_BUCKETS + folded × (32 + log spans)), cold, no allocation.
+    pub fn fold_at_boot_with_spans(
+        &self,
+        oldest_waiting: Option<u64>,
+        boot_frame_high: u64,
+        own_floor: u64,
+        spans: &[(u64, u64)],
+    ) -> Option<BootFold> {
+        if self.boot_folded.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        self.boot_own_floor.store(own_floor, Ordering::Release);
+        self.boot_frame_high
+            .store(boot_frame_high, Ordering::Release);
+        let gap_lo = boot_frame_high.saturating_add(1);
+        if gap_lo <= own_floor {
+            self.boot_gap_lo.store(gap_lo, Ordering::Release);
+            self.boot_gap_hi.store(own_floor, Ordering::Release);
+        }
+        let mut out = BootFold {
+            own_floor,
+            boot_frame_high,
+            boot_applied_floor: self.boot_applied_floor(),
+            ..BootFold::default()
+        };
+        let oldest_lo =
+            oldest_waiting.map(|oldest| oldest.saturating_sub(REPLAY_REORDER_SLACK_SEQ).max(1));
+        let mut state = self.lock_ranges();
+        let before = state.ranges;
+        if self.overflowed.load(Ordering::Acquire) {
+            let height = self.overflow_high_seq.load(Ordering::Acquire);
+            if height == u64::MAX || height <= own_floor {
+                let hi = if height == u64::MAX || height == 0 {
+                    own_floor
+                } else {
+                    height
+                };
+                let lo = oldest_lo.unwrap_or(1).clamp(1, hi.max(1));
+                state.ranges.add_range_avoiding(lo, hi, spans);
+                state.widen_migrated((lo, hi));
+                self.overflow_high_seq.store(0, Ordering::Release);
+                self.overflow_low_seq.store(u64::MAX, Ordering::Release);
+                self.overflowed.store(false, Ordering::Release);
+                out.migrated_overflow = true;
+            }
+        }
+        let own_bucket = own_floor >> UNAPPLIED_BUCKET_SHIFT;
+        // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, once per boot
+        for i in 0..UNAPPLIED_BUCKETS {
+            let id = self.bucket_ids[i].load(Ordering::Acquire);
+            if id == 0 || id >= own_bucket {
+                continue;
+            }
+            // One reorder slack on the bottom (PR W review round 5): a frame
+            // shed just above the bucket's start can sit in a segment whose
+            // range ends just below it, and a range is looked up up to that
+            // end, not above it (see `AppliedSnapshot::segment_is_applied`).
+            let lo = frame_floor(
+                (id << UNAPPLIED_BUCKET_SHIFT).saturating_sub(REPLAY_REORDER_SLACK_SEQ),
+            );
+            // One reorder slack on the top (PR W review round 4): a frame
+            // shed just below the bucket's end can sit in a segment whose
+            // first record is just above it, and a range is looked up from
+            // that first record, not below it (see
+            // `AppliedSnapshot::segment_is_applied`).
+            let hi = ((id + 1) << UNAPPLIED_BUCKET_SHIFT)
+                .saturating_sub(1)
+                .saturating_add(REPLAY_REORDER_SLACK_SEQ);
+            state.ranges.add_range_avoiding(lo, hi, spans);
+            self.bucket_ids[i].store(0, Ordering::Release);
+            self.bucket_counts[i].store(0, Ordering::Release);
+            out.folded_buckets = out.folded_buckets.saturating_add(1);
+        }
+        // Round 6: one slack below `boot_applied_floor + 1` (see
+        // `boot_range_floor`).
+        let tail_lo = self.boot_range_floor().max(oldest_lo.unwrap_or(1));
+        if tail_lo <= own_floor {
+            state.ranges.add_range_avoiding(tail_lo, own_floor, spans);
+            out.tail = Some((tail_lo, own_floor));
+        }
+        state.settle_migrated();
+        if state.ranges != before || out.migrated_overflow || state.durable_gen == 0 {
+            self.write_ranges_locked(&mut state);
+        }
+        out.ranges = state.ranges.len();
+        Some(out)
+    }
+
+    /// The ranges lock, recovered from poison (plain integers; every mutation
+    /// builds the new set before storing it, so a panic leaves a whole set).
+    fn lock_ranges(&self) -> std::sync::MutexGuard<'_, RangesState> {
+        self.ranges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Writes `state` to the sidecar under the caller's lock and records the
+    /// generation that now holds it durably. Unbound: nothing to write
+    /// (`durable_gen` stays 0, so the file's pad names no sidecar and the
+    /// ranges load only as their bucket encoding, or as an unbounded bit when
+    /// they do not fit). A failure leaves `durable_gen` at 0 and is counted,
+    /// warned once per episode, and retried by the next persist. Cold: one
+    /// small file, two fsyncs.
+    ///
+    /// **Honest limit (2026-10-20, PR W review round 3, L2), not fixed:** on
+    /// a full disk the tmp file cannot be created, so `durable_gen` stays 0,
+    /// the watermark file names no sidecar, and a range that does not fit
+    /// the bucket table writes the unbounded bit: the prune then refuses
+    /// every segment, which cannot free the disk that blocked the write.
+    /// `applied.tvaw` is written the same tmp + rename way and fails the
+    /// same way, which was already true before this change. An in-place
+    /// rewrite of a pre-created sidecar was considered and NOT taken: the
+    /// sidecar is trusted only when its generation matches the pad bytes of
+    /// `applied.tvaw`, so rewriting one file in place while the other cannot
+    /// be written turns a trusted pair into an untrusted one. Every
+    /// direction stays "replay more"; freeing the disk is the operator's step.
+    fn write_ranges_locked(&self, state: &mut RangesState) {
+        state.durable_gen = 0;
+        let Some((path, tmp, dir)) = self.ranges_paths.get() else {
+            return;
+        };
+        let generation = if state.next_gen == 0 {
+            next_generation(u16::try_from((wall_nanos() >> 20) & 0xFFFF).unwrap_or(1))
+        } else {
+            state.next_gen
+        };
+        let file = UnappliedRangesFile {
+            ranges: state.ranges,
+            migrated_overflow: state.migrated_span.is_some(),
+            migrated_span: state.migrated_span,
+            generation,
+            dir_tag: self.dir_tag.load(Ordering::Acquire),
+        };
+        match file.persist(path, tmp, dir) {
+            Ok(()) => {
+                state.durable_gen = generation;
+                state.next_gen = next_generation(generation);
+                if self.ranges_failing.swap(false, Ordering::AcqRel) {
+                    tracing::info!(
+                        path = %path.display(),
+                        "WAL unapplied ranges are persisting again"
+                    );
+                }
+            }
+            Err(err) => {
+                metrics::counter!(APPLIED_PERSIST_FAILED_COUNTER).increment(1);
+                if !self.ranges_failing.swap(true, Ordering::AcqRel) {
+                    warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                        source = "unapplied_ranges_persist_failed",
+                        path = %path.display(),
+                        error = %err,
+                        "WAL unapplied ranges could not be persisted — the watermark file then \
+                         names no sidecar, so the next boot reads the ranges as whole buckets \
+                         (or, when they do not fit, as an overflow and replays everything); \
+                         nothing is skipped"
+                    );
+                }
+            }
         }
     }
 
@@ -1187,6 +2421,12 @@ impl AppliedWatermark {
     /// Current RAM state.
     #[must_use]
     pub fn snapshot(&self) -> AppliedSnapshot {
+        let state = *self.lock_ranges();
+        self.snapshot_with(&state)
+    }
+
+    /// [`Self::snapshot`] with the ranges the caller already holds.
+    fn snapshot_with(&self, state: &RangesState) -> AppliedSnapshot {
         let mut buckets = [(0u64, 0u64); UNAPPLIED_BUCKETS];
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, cold path
         for (i, slot) in buckets.iter_mut().enumerate() {
@@ -1203,19 +2443,36 @@ impl AppliedWatermark {
             persisted_at_nanos: 0,
             dir_tag: self.dir_tag.load(Ordering::Acquire),
             buckets,
+            overflow_high_seq: self.overflow_high_seq.load(Ordering::Acquire),
+            ranges: state.ranges,
+            ranges_gen: state.durable_gen,
+            migrated_overflow: state.migrated_span.is_some(),
+            migrated_span: state.migrated_span,
+            frameless_gap: {
+                let (lo, hi) = (
+                    self.boot_gap_lo.load(Ordering::Acquire),
+                    self.boot_gap_hi.load(Ordering::Acquire),
+                );
+                (lo != 0 && lo <= hi).then_some((lo, hi))
+            },
         }
     }
 
     /// The snapshot as it is written to disk: the live state with both
     /// high-water marks held back by the durability lag (Z8b) and below every
     /// queued rescue floor (Z7). Cold: once per persist, under the lock.
-    fn durable_view(&self, lag: &mut DurabilityLag, mono_now: u64) -> AppliedSnapshot {
+    fn durable_view(
+        &self,
+        lag: &mut DurabilityLag,
+        mono_now: u64,
+        state: &RangesState,
+    ) -> AppliedSnapshot {
         // The watermarks are read BEFORE the floors. A floor is pushed before
         // its batch is handed off, and every ack that can lift the watermark
         // past that batch happens after; so a watermark value read here that
         // has passed the batch guarantees the floor is visible to the loads
         // below (Acquire on the watermark, Release on the floor store).
-        let mut snap = self.snapshot();
+        let mut snap = self.snapshot_with(state);
         let floor_ticks = self.rescue_floor_min(AppliedSink::Ticks);
         let floor_depth = self.rescue_floor_min(AppliedSink::Depth);
         lag.record(mono_now, snap.hwm_ticks, snap.hwm_depth);
@@ -1231,7 +2488,8 @@ impl AppliedWatermark {
     #[cfg(test)]
     fn durable_view_at(&self, mono_now: u64) -> AppliedSnapshot {
         let mut lag = self.lock_lag();
-        self.durable_view(&mut lag, mono_now)
+        let state = *self.lock_ranges();
+        self.durable_view(&mut lag, mono_now, &state)
     }
 
     /// The persist lock, recovered from poison (the guarded data is a ring of
@@ -1355,8 +2613,13 @@ impl AppliedWatermark {
     }
 
     /// [`Self::persist_now`] at an explicit monotonic instant (tests drive the
-    /// durability lag through this).
-    pub(crate) fn persist_at(&self, mono_now: u64) {
+    /// durability lag through this; public since 2026-10-20 for the
+    /// integration proptest, which models the 60 s lag across lifetimes).
+    /// Hidden from the docs (PR W review round 4): public only for
+    /// `tests/wal_unapplied_ranges_properties.rs`; production calls
+    /// [`Self::persist_now`].
+    #[doc(hidden)]
+    pub fn persist_at(&self, mono_now: u64) {
         let Some((path, tmp)) = self.paths.get() else {
             return;
         };
@@ -1367,9 +2630,23 @@ impl AppliedWatermark {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
+        // 2026-10-20: the ranges are read under their own lock, held through
+        // the write, so the pad written below names the sidecar that holds
+        // exactly these ranges. A range mutation in progress holds it; skip,
+        // the mutating caller persists right after. RAM ranges not yet
+        // durable (a failed sidecar write) are written first.
+        let mut state = match self.ranges.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        let bounded = self.bound_known_overflow_locked(&mut state);
+        if bounded || (state.durable_gen == 0 && !state.ranges.is_empty()) {
+            self.write_ranges_locked(&mut state);
+        }
         // The lock stays held through the write: two persists racing on the
         // same tmp path would refuse each other at `create_new`.
-        let mut snap = self.durable_view(&mut lag, mono_now);
+        let mut snap = self.durable_view(&mut lag, mono_now, &state);
         snap.persisted_at_nanos = wall_nanos();
         let bytes = snap.to_bytes();
         let written = write_fresh(tmp, &bytes).and_then(|()| std::fs::rename(tmp, path));
@@ -1393,6 +2670,106 @@ impl AppliedWatermark {
             );
         }
     }
+
+    /// Turns an in-RAM bucket-table overflow of KNOWN height into the bounded
+    /// range `[overflow_low_seq, overflow_high_seq]` (from 1 when the low end
+    /// is unknown) and clears the flag, under the ranges lock the persist
+    /// holds (2026-10-20, PR W review round 4). Returns whether the ranges
+    /// changed (the caller writes the sidecar).
+    ///
+    /// Before, `to_bytes` wrote any in-RAM overflow as the bare bit with pad
+    /// 0, which loads as height `u64::MAX`: the prune reads the FILE, so from
+    /// the first overflow on, every prune pass of the session refused every
+    /// segment, and the next boot migrated the bit into a range over the
+    /// whole session. A catch-up round that re-appends earlier days' frames
+    /// can overflow the table (a failed rescue marks their original
+    /// `capture_seq`, whose bucket id can share a slot with today's sheds,
+    /// or a batch across a day boundary spans 128 buckets or more). The boot
+    /// fold already bounds an overflow of known height the same way; this
+    /// does it in the session. An unknown height (`u64::MAX`, seeded from a
+    /// file, or `0`) is left as the bit for the boot fold.
+    ///
+    /// After the range is added, the two bounds are reset (high to 0, low to
+    /// `u64::MAX`) by compare-and-swap, so the NEXT overflow of the session
+    /// is bounded on its own (PR W review round 3). Before, the bounds were
+    /// never reset here (only the drained reset and the boot fold did), so a
+    /// second overflow hours later was persisted as one range from the FIRST
+    /// overflow's low end to the second one's top, pinning every acked
+    /// segment written in between.
+    ///
+    /// Races with an overflow arm (which lowers `low`, then raises `high`,
+    /// then sets the flag). The flag is cleared BEFORE the swaps:
+    /// - `high` moved since it was read: the swap fails, the flag is set
+    ///   back and the next pass bounds the new values (low was not reset).
+    /// - `low` moved since it was read: the low swap fails, `high` is put
+    ///   back (`fetch_max`), the flag is set back and the next pass runs.
+    /// - both swaps succeed and `high` is then seen raised while `low` reads
+    ///   `u64::MAX`: a racing overflow lowered `low` before it was read (so
+    ///   its low end is at or above the low just bounded) and the reset
+    ///   wiped it; that low is put back.
+    /// Honest limit: an overflow arm stalled between its two atomic steps
+    /// across this whole reset leaves `low` at `u64::MAX` under a real high;
+    /// the next bound then starts at sequence 1 (keeps more, never less).
+    /// At most four passes, then the flag stays set for the next persist.
+    /// O(1) per pass plus one O(32) range insert, cold: the once-a-second
+    /// persist.
+    fn bound_known_overflow_locked(&self, state: &mut RangesState) -> bool {
+        let mut changed = false;
+        // O(1) EXEMPT: at most four passes, each re-run only when a racing overflow moved a bound
+        for _ in 0..4 {
+            if !self.overflowed.load(Ordering::Acquire) {
+                break;
+            }
+            let high = self.overflow_high_seq.load(Ordering::Acquire);
+            if high == 0 || high == u64::MAX {
+                break;
+            }
+            let low = self.overflow_low_seq.load(Ordering::Acquire);
+            let lo = if low == 0 || low > high { 1 } else { low };
+            // One reorder slack on the top, as on the episode marks: a frame
+            // of the overflowed batch can sit in a segment whose first
+            // record is above `high` (see `AppliedSnapshot::segment_is_applied`).
+            // And one on the bottom (PR W review round 5): a frame at `low`
+            // can sit in a segment whose range ends below it.
+            changed |= state.ranges.add_range(
+                frame_floor(lo.saturating_sub(REPLAY_REORDER_SLACK_SEQ)),
+                high.saturating_add(REPLAY_REORDER_SLACK_SEQ),
+            );
+            self.overflowed.store(false, Ordering::SeqCst);
+            match self.overflow_high_seq.compare_exchange(
+                high,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {}
+                // The drained reset cleared everything meanwhile.
+                Err(0) => break,
+                Err(_) => {
+                    self.overflowed.store(true, Ordering::Release);
+                    continue;
+                }
+            }
+            if self
+                .overflow_low_seq
+                .compare_exchange(low, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                self.overflow_high_seq.fetch_max(high, Ordering::AcqRel);
+                self.overflowed.store(true, Ordering::Release);
+                continue;
+            }
+            if self.overflow_high_seq.load(Ordering::Acquire) != 0
+                && self.overflow_low_seq.load(Ordering::Acquire) == u64::MAX
+                && low != u64::MAX
+            {
+                self.overflow_low_seq.fetch_min(low, Ordering::AcqRel);
+                self.overflowed.store(true, Ordering::Release);
+            }
+            break;
+        }
+        changed
+    }
 }
 
 /// Creates `tmp` fresh (`O_CREAT|O_EXCL`) so a pre-planted symlink at that
@@ -1410,6 +2787,30 @@ pub(crate) fn write_fresh(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // host crash can keep the rename and lose the data, leaving a file that
     // loads as rejected (2026-09-29, item 45a security review).
     file.sync_all()
+}
+
+/// The boot applied floor for a loaded file: `min(hwm_ticks, hwm_depth)` less
+/// the reorder slack, WHATEVER the file's `depth_untracked` flag says.
+///
+/// **⚠ CHANGED 2026-10-20 (PR W review round 3, M2).** This was
+/// `skip_below(Ticks)`, which honours the flag (`hwm_ticks` alone when the
+/// last persist had no depth sink). After an untracked-to-tracked depth
+/// switch, the boot tail and the backlog guard then started above the depth
+/// frames in `(hwm_depth, hwm_ticks]`, which the old guard covered; once the
+/// live depth acks lifted `hwm_depth` past them, the next replay skipped
+/// them. Cost: on a lane with no depth sink `hwm_depth` does not move, so the
+/// tail starts lower and the boot replays more (the production lane always
+/// installs a depth sink). O(1).
+fn boot_floor_of(snap: &AppliedSnapshot) -> u64 {
+    snap.hwm_ticks
+        .min(snap.hwm_depth)
+        .saturating_sub(REPLAY_REORDER_SLACK_SEQ)
+}
+
+/// The generation after `g`, skipping 0 (which means "none").
+const fn next_generation(g: u16) -> u16 {
+    let n = g.wrapping_add(1);
+    if n == 0 { 1 } else { n }
 }
 
 pub(crate) fn wall_nanos() -> u64 {
@@ -1445,6 +2846,53 @@ pub(crate) fn crc32_ieee(bytes: &[u8]) -> u32 {
         c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
+}
+
+// Kept after every production item on purpose: `loss_counter_visibility_guard`
+// stops reading a file at its first column-0 `#[cfg(test)]`, so a test-only
+// item above production code hides that code's emit sites from the guard.
+// Kept before the test module so clippy's `items_after_test_module` holds.
+
+/// Writes a valid watermark file for `wal_dir` holding the two high-water
+/// marks, as a persist would.
+#[cfg(test)]
+// TEST-EXEMPT: test-only helper for the S3 sequence-seed tests
+pub(crate) fn write_file_for_test(wal_dir: &Path, hwm_ticks: u64, hwm_depth: u64) {
+    let bytes = AppliedSnapshot {
+        hwm_ticks,
+        hwm_depth,
+        persisted_at_nanos: wall_nanos(),
+        dir_tag: dir_tag_of(wal_dir),
+        ..AppliedSnapshot::default()
+    }
+    .to_bytes();
+    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
+}
+
+/// Writes `applied.tvaw` as an OLDER binary leaves it after an overflow: the
+/// overflow bit set, the pad bytes zero (no sidecar named), both sinks at
+/// `hwm`, the given bucket table (2026-10-20, PR W review round 4). The new
+/// binary's persist no longer writes this shape for an overflow of known
+/// height, so the tests that start from it build it directly.
+#[cfg(test)]
+// TEST-EXEMPT: test-only helper for the older-binary overflow tests
+pub(crate) fn write_v1_overflow_file_for_test(
+    wal_dir: &Path,
+    hwm: u64,
+    buckets: [(u64, u64); UNAPPLIED_BUCKETS],
+) {
+    let bytes = AppliedSnapshot {
+        hwm_ticks: hwm,
+        hwm_depth: hwm,
+        overflowed: true,
+        overflow_high_seq: u64::MAX,
+        persisted_at_nanos: wall_nanos(),
+        dir_tag: dir_tag_of(wal_dir),
+        buckets,
+        ..AppliedSnapshot::default()
+    }
+    .to_bytes();
+    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
 }
 
 #[cfg(test)]
@@ -1797,6 +3245,40 @@ mod tests {
         assert_eq!(AppliedSnapshot::persisted_high_water(&a), 0, "damaged file");
     }
 
+    /// The test-only writer produces a file `load` accepts in this directory,
+    /// carrying both sinks and no overflow.
+    #[test]
+    fn test_write_file_for_test_writes_a_file_load_accepts() {
+        let dir = scratch("helper_write_file");
+        write_file_for_test(&dir, seq(300), seq(700));
+        let snap = AppliedSnapshot::load(&dir).expect("own valid file");
+        assert_eq!(snap.hwm_ticks, seq(300));
+        assert_eq!(snap.hwm_depth, seq(700));
+        assert!(!snap.overflowed, "no overflow written");
+    }
+
+    /// The older-binary writer produces the shape the boot fold must migrate:
+    /// overflow bit set with no height, both sinks at `hwm`, the given
+    /// bucket table, and no ranges sidecar.
+    #[test]
+    fn test_write_v1_overflow_file_for_test_writes_the_older_binary_shape() {
+        let dir = scratch("helper_write_v1_overflow");
+        let mut buckets = [(0u64, 0u64); UNAPPLIED_BUCKETS];
+        buckets[0] = (7, 1);
+        write_v1_overflow_file_for_test(&dir, seq(400), buckets);
+        let snap = AppliedSnapshot::load(&dir).expect("own valid file");
+        assert!(snap.overflowed, "overflow bit set");
+        assert_eq!(snap.overflow_high_seq, u64::MAX, "no height on disk");
+        assert_eq!(snap.hwm_ticks, seq(400));
+        assert_eq!(snap.hwm_depth, seq(400));
+        assert_eq!(snap.buckets, buckets, "bucket table kept as written");
+        assert!(
+            !dir.join(crate::wal_unapplied_ranges::UNAPPLIED_RANGES_FILE)
+                .exists(),
+            "no sidecar"
+        );
+    }
+
     #[test]
     fn a_suspended_questdb_parks_acks_and_marks_the_window_unapplied() {
         let wm = AppliedWatermark::new_for_tests();
@@ -1997,6 +3479,12 @@ mod tests {
         // The file format carries one BIT, not a height, so a loaded flag
         // must be treated as unbounded: this process cannot know how far the
         // previous one failed to record.
+        //
+        // ⚠ CORRECTED 2026-10-20 (plan item PR W): "never" now means "never
+        // by a reset alone". The boot fold bounds a loaded flag as a range
+        // (`fold_at_boot`), and a drain past that range clears it; that path
+        // is pinned by
+        // `test_regression_reloaded_overflow_clears_after_a_drain_past_its_height`.
         let wm = AppliedWatermark::new_for_tests();
         wm.seed(&AppliedSnapshot {
             overflowed: true,
@@ -2212,6 +3700,333 @@ mod tests {
         wm.note_questdb_probe(true);
         wm.note_ticks_acked(seq(30));
         assert_eq!(wm.snapshot().hwm_ticks, seq(30), "advancing again");
+    }
+
+    /// PR W review round 3: the range written when a suspension episode
+    /// ends had no reorder slack on its top. Two socket read tasks can reach
+    /// the WAL in one order and the ring in the other, so frame `f` can sit
+    /// in segment B below B's first record `b`. If `f` was acked under
+    /// suspicion and the clean probe lands before the ack of anything at or
+    /// above `b`, the range ended at `parked < b`, B's check range `[b, ..]`
+    /// missed it, and once later acks lifted the watermark the next boot
+    /// skipped B unread (and the prune could delete it). The end range now
+    /// reaches `parked + slack`.
+    #[test]
+    fn test_regression_episode_end_range_keeps_a_segment_holding_a_reordered_frame() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(seq(10));
+        wm.note_depth_acked(seq(10));
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(false);
+        // `f`, acked while the table may be lying: parked, not applied.
+        let parked = seq(20);
+        wm.note_ticks_acked(parked);
+        wm.note_depth_acked(parked);
+        wm.note_questdb_probe(true);
+        // B's first record `b`, written to the WAL before `f`.
+        let b = (parked + REPLAY_REORDER_SLACK_SEQ / 2) >> 17 << 17;
+        assert!(b > parked && b - parked < REPLAY_REORDER_SLACK_SEQ);
+        // Later clean acks lift the watermark far past B.
+        wm.note_ticks_acked(seq(60));
+        wm.note_depth_acked(seq(60));
+        let snap = wm.snapshot();
+        assert!(
+            !snap.frame_is_applied(AppliedSink::Ticks, parked),
+            "f is not applied"
+        );
+        assert!(
+            !snap.segment_is_applied(b, seq(40)),
+            "segment B (first record above the parked frame) is kept"
+        );
+        assert!(
+            snap.segment_is_applied(parked + 2 * REPLAY_REORDER_SLACK_SEQ, seq(40)),
+            "a segment starting more than the slack above is not held"
+        );
+    }
+
+    #[test]
+    fn test_reorder_reach_lo_is_one_slack_lower_and_keeps_zero() {
+        assert_eq!(reorder_reach_lo(0), 0, "unknown start stays unknown");
+        assert_eq!(reorder_reach_lo(5), 1, "never below 1");
+        assert_eq!(reorder_reach_lo(REPLAY_REORDER_SLACK_SEQ), 1);
+        assert_eq!(
+            reorder_reach_lo(seq(40)),
+            seq(40) - REPLAY_REORDER_SLACK_SEQ
+        );
+    }
+
+    #[test]
+    fn test_reorder_reach_hi_is_one_slack_higher_and_saturates() {
+        assert_eq!(reorder_reach_hi(0), REPLAY_REORDER_SLACK_SEQ);
+        assert_eq!(
+            reorder_reach_hi(seq(40)),
+            seq(40) + REPLAY_REORDER_SLACK_SEQ
+        );
+        assert_eq!(reorder_reach_hi(u64::MAX - 1), u64::MAX, "saturates");
+    }
+
+    /// PR W review round 4 (C): every transition into suspicion is one
+    /// episode, the time spent suspect is counted in whole seconds at each
+    /// probe while suspect and at the clean probe that ends it (the
+    /// remainder carried), and a clean probe outside suspicion counts
+    /// nothing.
+    #[test]
+    fn test_note_questdb_probe_counts_suspect_episodes_and_seconds() {
+        const SEC_NS: u64 = 1_000_000_000;
+        let wm = AppliedWatermark::new_for_tests();
+        let t0 = 1_000 * SEC_NS;
+        wm.note_questdb_probe_at(true, t0);
+        assert_eq!(wm.suspect_episode_count(), 0);
+        wm.note_questdb_probe_at(false, t0);
+        assert_eq!(wm.suspect_episode_count(), 1);
+        wm.note_questdb_probe_at(false, t0 + 2_500_000_000);
+        assert_eq!(wm.suspect_seconds.load(Ordering::Acquire), 2);
+        wm.note_questdb_probe_at(true, t0 + 4 * SEC_NS);
+        assert_eq!(
+            wm.suspect_seconds.load(Ordering::Acquire),
+            4,
+            "the half second is carried, not dropped"
+        );
+        wm.note_questdb_probe_at(true, t0 + 9 * SEC_NS);
+        assert_eq!(wm.suspect_seconds.load(Ordering::Acquire), 4, "clean time");
+        wm.note_questdb_probe_at(false, t0 + 10 * SEC_NS);
+        wm.note_questdb_probe_at(false, t0 + 13 * SEC_NS);
+        assert_eq!(wm.suspect_episode_count(), 2, "one per transition");
+        assert_eq!(wm.suspect_seconds.load(Ordering::Acquire), 7);
+        // The public probe reads the monotonic clock and counts the same way.
+        wm.note_questdb_probe(true);
+        assert!(!wm.is_sink_suspect());
+    }
+
+    /// PR W review round 4 (A): a per-frame shed BUCKET mark carries no
+    /// reorder slack. A frame `s` shed just below a `2^38` boundary sits in
+    /// segment B whose first record `b` is just above it (`b − s` under one
+    /// second, reordered across sockets). B must read unapplied in RAM (the
+    /// replay skip and the prune), and again after the boot fold turns the
+    /// bucket into a range.
+    #[test]
+    fn test_regression_bucket_mark_holds_a_segment_starting_just_above_the_boundary() {
+        let boundary = ((seq(30) >> UNAPPLIED_BUCKET_SHIFT) + 1) << UNAPPLIED_BUCKET_SHIFT;
+        let s = (boundary - REPLAY_REORDER_SLACK_SEQ / 2) >> 17 << 17;
+        let b = boundary + 1;
+        assert!(s < boundary && b - s < REPLAY_REORDER_SLACK_SEQ);
+        let far = boundary + 2 * REPLAY_REORDER_SLACK_SEQ;
+        let hi = far + (1 << 20);
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_unapplied(s);
+        let top = far + (5u64 << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_ticks_acked(top);
+        wm.note_depth_acked(top);
+        let snap = wm.snapshot();
+        assert!(!snap.frame_is_applied(AppliedSink::Ticks, s), "s is shed");
+        assert!(
+            !snap.range_has_unapplied(b, hi),
+            "the range lookup itself stays at [first, hi]"
+        );
+        assert!(
+            !snap.segment_is_applied(b, hi),
+            "segment B (first record just above the shed bucket) is kept"
+        );
+        assert!(
+            snap.segment_is_applied(far, hi),
+            "a segment starting more than the slack above the bucket is not held"
+        );
+        // The same after the boot fold moves the bucket into a range. The
+        // file vouched for everything up to `top`, so the boot tail starts
+        // above B and only the folded bucket can hold it.
+        wm.boot_applied_floor
+            .store(top - REPLAY_REORDER_SLACK_SEQ, Ordering::Release);
+        let own_floor = top + (10u64 << UNAPPLIED_BUCKET_SHIFT);
+        let fold = wm.fold_at_boot(Some(s), top, own_floor).expect("fold");
+        assert_eq!(fold.folded_buckets, 1);
+        assert!(
+            fold.tail.is_some_and(|(lo, _)| lo > hi),
+            "tail starts above B"
+        );
+        let folded = wm.snapshot();
+        assert!(
+            folded.buckets.iter().all(|&(id, _)| id == 0),
+            "bucket folded"
+        );
+        assert!(
+            !folded.segment_is_applied(b, hi),
+            "the folded range carries the slack on its top"
+        );
+    }
+
+    /// PR W review round 5, the mirror of the round-4 case above: a frame
+    /// `f` shed just ABOVE a `2^38` boundary is written as segment A's last
+    /// record, and the next segment's first record `g` sits just below the
+    /// boundary (minted earlier on another socket, written later; `f − g`
+    /// under one second). A's range `[a, g − 1]` ends in the bucket below
+    /// `f`'s. A must read unapplied in RAM, and again after the boot fold
+    /// turns the bucket into a range.
+    #[test]
+    fn test_regression_bucket_mark_holds_a_segment_ending_just_below_the_boundary() {
+        let slack = REPLAY_REORDER_SLACK_SEQ;
+        let boundary = ((seq(30) >> UNAPPLIED_BUCKET_SHIFT) + 1) << UNAPPLIED_BUCKET_SHIFT;
+        let f = boundary + (1 << 17);
+        let g = (boundary - slack / 2) >> 17 << 17;
+        let a = (boundary - 5 * slack) >> 17 << 17;
+        assert!(g < boundary && f - g < slack);
+        let hi = g - 1;
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_unapplied(f);
+        let top = boundary + (5u64 << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_ticks_acked(top);
+        wm.note_depth_acked(top);
+        let snap = wm.snapshot();
+        assert!(!snap.frame_is_applied(AppliedSink::Ticks, f), "f is shed");
+        assert!(
+            !snap.range_has_unapplied(a, hi),
+            "the range lookup itself stays at [first, hi]"
+        );
+        assert!(
+            !snap.segment_is_applied(a, hi),
+            "segment A (range ending just below the shed bucket) is kept"
+        );
+        assert!(
+            snap.segment_is_applied(a, boundary - 2 * slack),
+            "a segment ending more than the slack below the bucket is not held"
+        );
+        wm.boot_applied_floor.store(top - slack, Ordering::Release);
+        let own_floor = top + (10u64 << UNAPPLIED_BUCKET_SHIFT);
+        let fold = wm.fold_at_boot(Some(a), top, own_floor).expect("fold");
+        assert_eq!(fold.folded_buckets, 1);
+        assert!(
+            fold.tail.is_some_and(|(lo, _)| lo > hi),
+            "tail starts above A"
+        );
+        let folded = wm.snapshot();
+        assert!(
+            folded.ranges.intersects(a, hi),
+            "the folded range carries the slack on its bottom"
+        );
+        assert!(!folded.segment_is_applied(a, hi), "A is still kept");
+        assert!(
+            folded.segment_is_applied(a, boundary - 2 * slack),
+            "and only within one slack of the bucket"
+        );
+    }
+
+    /// PR W review round 5: the in-session overflow bound starts one slack
+    /// below the lowest frame it covers, so a segment whose range ends just
+    /// below that frame (the frame was written into it before the rotation)
+    /// stays unapplied once the bit becomes a range.
+    #[test]
+    fn test_regression_overflow_bound_holds_a_segment_ending_just_below_its_low() {
+        let wm = AppliedWatermark::new_for_tests();
+        let lo = seq(10);
+        let hi = lo + ((UNAPPLIED_BUCKETS as u64 + 1) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied_range(lo, hi);
+        let top = hi + (5u64 << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_ticks_acked(top);
+        wm.note_depth_acked(top);
+        let mut state = *wm.lock_ranges();
+        assert!(wm.bound_known_overflow_locked(&mut state));
+        *wm.lock_ranges() = state;
+        let snap = wm.snapshot();
+        assert!(!snap.overflowed, "bounded");
+        let s = REPLAY_REORDER_SLACK_SEQ;
+        let first = lo - 5 * s;
+        assert!(!snap.segment_is_applied(first, lo - s / 2), "held");
+        assert!(snap.segment_is_applied(first, lo - 2 * s), "not held");
+    }
+
+    /// PR W review round 4 (A): the in-RAM overflow height is the top of a
+    /// bucket the table failed to record, with no slack either; a segment
+    /// whose first record is within one slack above it is held.
+    #[test]
+    fn test_regression_overflow_height_holds_a_segment_starting_just_above_it() {
+        let wm = AppliedWatermark::new_for_tests();
+        let first = seq(30);
+        let colliding = first + ((UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied(first);
+        wm.note_unapplied(colliding);
+        let top = colliding + (5u64 << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_ticks_acked(top);
+        wm.note_depth_acked(top);
+        let snap = wm.snapshot();
+        let height = snap.overflow_high_seq;
+        assert!(snap.overflowed && height > colliding && height < u64::MAX);
+        let b = height + 1;
+        let hi = b + REPLAY_REORDER_SLACK_SEQ * 4;
+        assert!(!snap.range_has_unapplied(b, hi), "range lookup unchanged");
+        assert!(!snap.segment_is_applied(b, hi), "held by the widened read");
+        let far = height + 2 * REPLAY_REORDER_SLACK_SEQ;
+        assert!(
+            snap.segment_is_applied(far, far + 10),
+            "not held further up"
+        );
+    }
+
+    /// PR W review round 3 (low): both overflow arms lower `overflow_low_seq`
+    /// BEFORE they raise `overflow_high_seq`, and the in-session bound reads
+    /// the height first. A bound that sees an overflow's height then also
+    /// sees its low end (release/acquire), so it never pairs the new height
+    /// with a stale, higher low end and writes a range that misses the
+    /// overflowed frame. The order cannot be forced in a single-threaded
+    /// test, so the source is checked.
+    #[test]
+    fn test_overflow_arms_lower_the_low_end_before_raising_the_height() {
+        let src = include_str!("wal_applied_watermark.rs");
+        // O(1) EXEMPT: two fixed function bodies, test only
+        for name in [
+            "    pub fn note_unapplied(&self, seq: u64) {",
+            "    pub fn note_unapplied_range(&self, lo: u64, hi: u64) {",
+        ] {
+            let start = src.find(name).expect("overflow arm present");
+            let body = &src[start..];
+            let body = &body[..body.find("\n    }\n").expect("end of the function")];
+            let low = body.find("overflow_low_seq").expect("low end written");
+            let high = body.find("overflow_high_seq").expect("height written");
+            assert!(low < high, "{name}: the low end must be lowered first");
+        }
+        let bound = &src[src
+            .find("    fn bound_known_overflow_locked(")
+            .expect("bound present")..];
+        let high = bound
+            .find("self.overflow_high_seq.load")
+            .expect("height read");
+        let low = bound.find("self.overflow_low_seq.load").expect("low read");
+        assert!(high < low, "the bound reads the height first");
+    }
+
+    /// PR W review round 3: the shared whole-segment rule is the range check
+    /// on BOTH sinks over `[first, hi]`, and deliberately not below `first`
+    /// (the range producers carry the slack on their tops instead; the doc on
+    /// `segment_is_applied` records why).
+    #[test]
+    fn test_segment_is_applied_is_the_range_check_on_both_sinks() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(seq(100));
+        wm.note_depth_acked(seq(100));
+        let first = seq(50);
+        assert!(wm.snapshot().segment_is_applied(first, seq(60)));
+        wm.add_unapplied_range(first - REPLAY_REORDER_SLACK_SEQ / 2, first - 1);
+        assert!(
+            wm.snapshot().segment_is_applied(first, seq(60)),
+            "a range wholly below the first record does not hold the segment"
+        );
+        wm.add_unapplied_range(seq(55), seq(55));
+        assert!(
+            !wm.snapshot().segment_is_applied(first, seq(60)),
+            "a range inside"
+        );
+        let depth = AppliedWatermark::new_for_tests();
+        depth.note_ticks_acked(seq(100));
+        depth.note_depth_acked(seq(55));
+        assert!(
+            !depth.snapshot().segment_is_applied(first, seq(60)),
+            "the depth watermark has not passed the segment"
+        );
+        let snap = wm.snapshot();
+        assert!(!snap.segment_is_applied(0, seq(60)));
+        assert!(!snap.segment_is_applied(seq(60), seq(50)));
+        assert!(
+            !snap.segment_is_applied(seq(90), seq(200)),
+            "above the watermark"
+        );
     }
 
     #[test]
@@ -2630,24 +4445,296 @@ mod tests {
         let a = mono_nanos();
         assert!(mono_nanos() >= a);
     }
-}
 
-// Kept below the test module on purpose: `loss_counter_visibility_guard`
-// stops reading a file at its first column-0 `#[cfg(test)]`, so a test-only
-// item above production code hides that code's emit sites from the guard.
-
-/// Writes a valid watermark file for `wal_dir` holding the two high-water
-/// marks, as a persist would.
-#[cfg(test)]
-// TEST-EXEMPT: test-only helper for the S3 sequence-seed tests
-pub(crate) fn write_file_for_test(wal_dir: &Path, hwm_ticks: u64, hwm_depth: u64) {
-    let bytes = AppliedSnapshot {
-        hwm_ticks,
-        hwm_depth,
-        persisted_at_nanos: wall_nanos(),
-        dir_tag: dir_tag_of(wal_dir),
-        ..AppliedSnapshot::default()
+    /// PR W review round 4: a range start never falls inside a frame.
+    #[test]
+    fn test_frame_floor_rounds_down_to_a_frame_base_and_never_to_zero() {
+        let base = seq(1_000) & !crate::ws_frame_spill::MAX_PACKET_INDEX;
+        assert_eq!(frame_floor(base), base);
+        assert_eq!(frame_floor(base + 7), base);
+        assert_eq!(
+            frame_floor(base + crate::ws_frame_spill::MAX_PACKET_INDEX),
+            base
+        );
+        assert_eq!(frame_floor(0), 1);
+        assert_eq!(frame_floor(5), 1);
     }
-    .to_bytes();
-    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
+
+    /// PR W review round 4 (pass 2): a suspension range starts TWO reorder
+    /// slacks below the watermark, at a frame base, and never at 0.
+    #[test]
+    fn test_suspension_range_lo_is_two_slacks_lower_at_a_frame_base() {
+        let base = seq(1_000) & !crate::ws_frame_spill::MAX_PACKET_INDEX;
+        let lo = suspension_range_lo(base + 2 * REPLAY_REORDER_SLACK_SEQ + 7);
+        assert_eq!(lo, base);
+        assert!(suspension_range_lo(seq(1_000) | 5) <= seq(1_000) - 2 * REPLAY_REORDER_SLACK_SEQ);
+        assert_eq!(suspension_range_lo(0), 1);
+        assert_eq!(suspension_range_lo(REPLAY_REORDER_SLACK_SEQ), 1);
+        assert_eq!(suspension_range_lo(2 * REPLAY_REORDER_SLACK_SEQ - 1), 1);
+    }
+
+    /// PR W review round 4 (pass 2): a frame `f` acked after the last clean
+    /// probe, a quarter slack below its watermark `H`, is the LAST record of
+    /// segment S, and the next segment's first record `g` sits 1.2 slacks
+    /// below `H` (minted earlier on another socket, written after `f`, so
+    /// `g ≥ f − slack`). The next probe is unclean, and the process restarts
+    /// before a clean drain. S is judged by `[first(S), g − 1]`, which ends
+    /// below a range starting one slack under `H`: S read applied, so the
+    /// replay skipped it and the prune could delete it with `f` unapplied.
+    #[test]
+    fn test_regression_suspension_range_holds_a_segment_whose_last_record_was_acked_late() {
+        let slack = REPLAY_REORDER_SLACK_SEQ;
+        let dir = std::env::temp_dir().join(format!(
+            "tv-wm-susp-two-slacks-{}-{}",
+            std::process::id(),
+            wall_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        let h = seq(1_000);
+        let first_s = seq(900);
+        let g = h - slack - slack / 5;
+        let f = h - slack / 4;
+        assert!(g >= f - slack, "the reorder bound holds for g after f");
+        // `g` and `H` acked, then a clean probe: the last clean watermark is H.
+        wm.note_ticks_acked(g);
+        wm.note_depth_acked(g);
+        wm.note_ticks_acked(h);
+        wm.note_depth_acked(h);
+        wm.note_questdb_probe(true);
+        // `f`, acked after that probe: below H, so it does not move it.
+        wm.note_ticks_acked(f);
+        wm.note_depth_acked(f);
+        wm.note_questdb_probe(false);
+        let snap = wm.snapshot();
+        assert!(!snap.frame_is_applied(AppliedSink::Ticks, f), "f replays");
+        assert!(
+            !snap.segment_is_applied(first_s, g - 1),
+            "S, whose last record is f, is kept (ranges {:?})",
+            snap.ranges.as_slice()
+        );
+        // The restart: what the next boot loads says the same.
+        wm.persist_at(1);
+        wm.persist_at(2 + WATERMARK_DURABILITY_LAG_SECS * 1_000_000_000);
+        let loaded = AppliedSnapshot::load(&dir).expect("file");
+        assert!(
+            !loaded.segment_is_applied(first_s, g - 1),
+            "after a restart"
+        );
+        // A segment ending more than two slacks below H is not held.
+        assert!(loaded.segment_is_applied(seq(800), h - 2 * slack - 2 * (1 << 17)));
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR W review round 6: the same straddle at the PLAIN watermark, with
+    /// no suspicion at all. `g` and `H` are acked and durably persisted; `f`
+    /// (a quarter slack below `H`, the LAST record of segment S) is never
+    /// acked, its flush stuck when the process is killed. The next segment's
+    /// first record is `g` (1.2 slacks below `H`, `g ≥ f − slack`), so S is
+    /// judged by `[first(S), g − 1]`, which sits under `skip_below` (H less
+    /// one slack) and under the boot tail. With one slack S read applied:
+    /// the replay archived it unread and the prune could delete it.
+    #[test]
+    fn test_regression_plain_watermark_straddle_keeps_a_segment_whose_last_record_was_never_acked()
+    {
+        let slack = REPLAY_REORDER_SLACK_SEQ;
+        let dir = std::env::temp_dir().join(format!(
+            "tv-wm-plain-straddle-{}-{}",
+            std::process::id(),
+            wall_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        let h = seq(1_000);
+        let first_s = seq(900);
+        let g = h - slack - slack / 5;
+        let f = h - slack / 4;
+        assert!(g >= f - slack, "the reorder bound holds for g after f");
+        wm.note_ticks_acked(g);
+        wm.note_depth_acked(g);
+        wm.note_ticks_acked(h);
+        wm.note_depth_acked(h);
+        wm.note_questdb_probe(true);
+        wm.persist_at(1);
+        wm.persist_at(2 + WATERMARK_DURABILITY_LAG_SECS * 1_000_000_000);
+        // The kill: `f` was never acked. The next boot loads the file.
+        let loaded = AppliedSnapshot::load(&dir).expect("file");
+        assert!(loaded.ranges.is_empty(), "no suspicion: no range at all");
+        assert!(!loaded.frame_is_applied(AppliedSink::Ticks, f), "f replays");
+        assert!(
+            !loaded.segment_is_applied(first_s, g - 1),
+            "S, whose last record is the unacked f, is kept and read"
+        );
+        // A segment ending more than two slacks below H is still applied.
+        assert!(loaded.segment_is_applied(seq(800), h - 2 * slack - 2 * (1 << 17)));
+        // The boundary is strict: `hi + slack` AT `skip_below` is held.
+        let below = loaded.skip_below(AppliedSink::Ticks);
+        assert!(!loaded.segment_is_applied(seq(800), below - slack));
+        assert!(loaded.segment_is_applied(seq(800), below - slack - 1));
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR W review round 6 (low): the suspect-flag check and the watermark
+    /// or parked-ack update in both ack functions, and the flag flip and its
+    /// reads at both probe transitions, run under the ack gate. With bare
+    /// atomics an ack that loaded the flag on one side of a transition and
+    /// wrote on the other was in neither episode range. The race needs a
+    /// preemption between two adjacent atomics, which a test cannot force,
+    /// so the source is checked (and the stress test below checks the
+    /// outcome).
+    #[test]
+    fn test_ack_gate_serialises_the_flag_check_with_the_update() {
+        let src = include_str!("wal_applied_watermark.rs");
+        // O(1) EXEMPT: two fixed function bodies, test only
+        for name in [
+            "    pub fn note_ticks_acked(&self, max_seq: u64) {",
+            "    pub fn note_depth_acked(&self, max_seq: u64) {",
+        ] {
+            let start = src.find(name).expect("ack fn present");
+            let body = &src[start..];
+            let body = &body[..body.find("\n    }\n").expect("end of the function")];
+            let gate = body.find("self.lock_ack_gate()").expect("gate taken");
+            let flag = body.find("sink_suspect.load").expect("flag read");
+            assert!(gate < flag, "{name}: the gate is taken before the flag");
+        }
+        let start = src
+            .find("    fn note_questdb_probe_at(&self, clean: bool, now: u64) {")
+            .expect("probe present");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("end of the function")];
+        // O(1) EXEMPT: two fixed transitions, test only
+        for flip in ["sink_suspect.swap(false", "sink_suspect.swap(true"] {
+            let at = body.find(flip).expect("transition present");
+            let gate = body[..at].rfind("self.lock_ack_gate()").expect("gate");
+            let between = &body[gate..at];
+            assert!(
+                !between.contains("};"),
+                "{flip}: the flip sits inside the gated block"
+            );
+        }
+        for read in ["suspect_max_ticks.swap(0", "suspect_max_depth.swap(0"] {
+            let at = body.find(read).expect("parked read");
+            let flip = body.find("sink_suspect.swap(false").expect("exit flip");
+            let block_end = flip + body[flip..].find("};").expect("gated block end");
+            assert!(flip < at && at < block_end, "{read} under the exit gate");
+        }
+    }
+
+    /// PR W review round 6 (low): acks racing many probe transitions. Every
+    /// ack that STARTED after a clean probe returned and FINISHED before the
+    /// episode's closing probe began lies in an episode range (it either
+    /// raised the watermark before the entry, which the entry range reaches,
+    /// or parked, which the exit range reaches). Consecutive acks are four
+    /// slacks apart, so a range that missed one cannot reach it through its
+    /// slack.
+    #[test]
+    fn test_acks_racing_probe_transitions_are_always_in_an_episode_range() {
+        use std::sync::Arc;
+        let wm = Arc::new(AppliedWatermark::new_for_tests());
+        let started = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicU64::new(0));
+        let base = seq(10_000);
+        let step = 4 * REPLAY_REORDER_SLACK_SEQ;
+        let total: u64 = 20_000;
+        let acker = {
+            let (wm, started, done) = (Arc::clone(&wm), Arc::clone(&started), Arc::clone(&done));
+            std::thread::spawn(move || {
+                // O(1) EXEMPT: test-only stress loop
+                for i in 1..=total {
+                    started.store(i, Ordering::SeqCst);
+                    wm.note_ticks_acked(base + i * step);
+                    wm.note_depth_acked(base + i * step);
+                    done.store(i, Ordering::SeqCst);
+                }
+            })
+        };
+        let mut windows: Vec<(u64, u64)> = Vec::new();
+        // O(1) EXEMPT: test-only stress loop
+        while done.load(Ordering::SeqCst) < total {
+            wm.note_questdb_probe(true);
+            let after_clean = started.load(Ordering::SeqCst);
+            std::thread::yield_now();
+            wm.note_questdb_probe(false);
+            std::thread::yield_now();
+            let before_close = done.load(Ordering::SeqCst);
+            wm.note_questdb_probe(true);
+            windows.push((after_clean, before_close));
+        }
+        acker.join().expect("acker");
+        let snap = wm.snapshot();
+        let mut checked = 0u64;
+        for (after_clean, before_close) in windows {
+            // O(1) EXEMPT: test-only check
+            for i in (after_clean + 1)..=before_close {
+                let s = base + i * step;
+                checked += 1;
+                assert!(
+                    snap.ranges.intersects(s, s),
+                    "ack {i} ({s}) sat inside an episode and is in no range"
+                );
+            }
+        }
+        assert!(checked > 0, "some acks fell inside an episode");
+    }
+
+    /// PR W review round 4: an in-RAM overflow of known height becomes a
+    /// bounded range at the persist; an unknown height (seeded from a file)
+    /// stays the bit for the boot fold.
+    #[test]
+    fn test_bound_known_overflow_locked_bounds_a_known_height_only() {
+        let wm = AppliedWatermark::new_for_tests();
+        let lo = seq(10);
+        let hi = lo + ((UNAPPLIED_BUCKETS as u64 + 1) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied_range(lo, hi);
+        let mut state = *wm.lock_ranges();
+        assert!(wm.bound_known_overflow_locked(&mut state));
+        assert!(!wm.overflowed.load(Ordering::Acquire));
+        let s = REPLAY_REORDER_SLACK_SEQ;
+        assert_eq!(
+            state.ranges.as_slice(),
+            &[(frame_floor(lo - s), hi + s)],
+            "one reorder slack on the top (round 3) and on the bottom (round 5)"
+        );
+        assert_eq!(
+            wm.overflow_high_seq.load(Ordering::Acquire),
+            0,
+            "round 3: the height is reset after the bound"
+        );
+        assert_eq!(
+            wm.overflow_low_seq.load(Ordering::Acquire),
+            u64::MAX,
+            "round 3: the low end is reset after the bound"
+        );
+        assert!(
+            !wm.bound_known_overflow_locked(&mut state),
+            "nothing left to bound"
+        );
+        // A second overflow far above is bounded on its own.
+        let lo2 = hi + (1_000 << UNAPPLIED_BUCKET_SHIFT);
+        let hi2 = lo2 + ((UNAPPLIED_BUCKETS as u64 + 1) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied_range(lo2, hi2);
+        assert!(wm.bound_known_overflow_locked(&mut state));
+        assert_eq!(
+            state.ranges.as_slice(),
+            &[
+                (frame_floor(lo - s), hi + s),
+                (frame_floor(lo2 - s), hi2 + s)
+            ],
+            "the gap between the two overflows stays unmarked"
+        );
+        let seeded = AppliedWatermark::new_for_tests();
+        seeded.seed(&AppliedSnapshot {
+            overflowed: true,
+            overflow_high_seq: u64::MAX,
+            ..AppliedSnapshot::default()
+        });
+        let mut state = *seeded.lock_ranges();
+        assert!(!seeded.bound_known_overflow_locked(&mut state));
+        assert!(
+            seeded.overflowed.load(Ordering::Acquire),
+            "unknown height: still the bit"
+        );
+    }
 }

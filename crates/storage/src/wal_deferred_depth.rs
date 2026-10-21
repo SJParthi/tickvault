@@ -45,6 +45,26 @@
 //! "delete". `2048 × 4.6 min ≈ 6.5 days` of marks fit before two buckets can
 //! share a slot.
 //!
+//! **⚠ CORRECTED 2026-10-20 (PR W review round 4) — the collision horizon
+//! for marks taken in trading hours is about 13 days, not 6.5.** Two bucket
+//! ids share a slot when they differ by a multiple of 2048, i.e. by a
+//! multiple of `2048 × 2^38 ns = 562,949.95 s = 6 d 12 h 22 min`. One such
+//! step moves the time of day by 12 h 22 min, so a shed in the session
+//! (09:00–15:40 IST, 6 h 40 min wide) cannot land on a mark taken in an
+//! earlier session one step back. Two steps, `1,125,899.91 s = 13 d 0 h
+//! 45 min`, move it by 45 minutes: a shed at 10:00 collides with a mark
+//! taken at 09:15 thirteen days earlier, if that mark is still in the table
+//! (the after-close pass clears marks every evening; a carried or stuck
+//! bucket is what stays). **Honest limit, not changed here:** while
+//! overflowed, [`DeferredDepthSnapshot::kinds_in_range`] returns
+//! [`SHED_DEPTH_ALL`] for EVERY range and ignores `overflow_high_seq`, so a
+//! collision pins every segment written after it until an after-close pass
+//! completes a sweep of every segment at or below the overflow height
+//! (`clear_overflow_through`); a pass that stops or carries a bucket leaves
+//! it set, and the pinned set grows by about one session of segments a day.
+//! The unapplied-ranges change (plan item PR W) does not touch this table. The fix (a range wholly above the overflow height
+//! is not tainted) is plan item W2.
+//!
 //! Persistence mirrors `applied.tvaw`: a CRC-checked file beside the segments,
 //! written tmp + rename at most once a second from the writer threads, bound
 //! to the WAL directory by a path tag so a file copied in from elsewhere is
@@ -167,6 +187,22 @@ impl DeferredDepthSnapshot {
     #[must_use]
     pub fn range_is_deferred(&self, lo: u64, hi: Option<u64>) -> bool {
         self.kinds_in_range(lo, hi) != 0
+    }
+
+    /// Whether a WAL segment whose first record is `first` and whose range
+    /// ends at `hi` (the next segment's first less one; `None` when unknown)
+    /// can hold depth still waiting to be written back. The marks are per
+    /// frame and carry no reorder slack, so the lookup reaches one
+    /// `REPLAY_REORDER_SLACK_SEQ` below `first` (a record can sit up to the
+    /// slack below the segment's first, PR W review round 4) and one above
+    /// `hi` (a record written just before the rotation can sit up to the
+    /// slack above the next segment's first, round 5). `first == 0` (an
+    /// unreadable first record) counts any mark. O(DEFERRED_BUCKETS), cold
+    /// prune path.
+    #[must_use]
+    pub fn segment_is_deferred(&self, first: u64, hi: Option<u64>) -> bool {
+        use crate::wal_applied_watermark::{reorder_reach_hi, reorder_reach_lo};
+        self.range_is_deferred(reorder_reach_lo(first), hi.map(reorder_reach_hi))
     }
 
     /// Every marked bucket, oldest first — the after-close pass's work list.
@@ -979,6 +1015,36 @@ mod tests {
         let snap = d.snapshot();
         assert!(snap.range_is_deferred(seq(9_990), Some(seq(10_010))));
         assert!(!snap.range_is_deferred(seq(1_000), Some(seq(1_100))));
+    }
+
+    /// PR W review rounds 4 and 5: a segment's lookup reaches one reorder
+    /// slack below its first record and one above its range end, because a
+    /// shed depth frame can sit in a segment up to the slack on either side
+    /// of its range, across a bucket boundary. Unknown ends count any mark.
+    #[test]
+    fn test_segment_is_deferred_reaches_one_slack_each_side() {
+        let slack = crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ;
+        let boundary = ((seq(10_000) >> DEFERRED_BUCKET_SHIFT) + 1) << DEFERRED_BUCKET_SHIFT;
+        // Upper side: the mark is just above the boundary, the segment's
+        // range ends just below it.
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(boundary + (1 << 17), ShedDepth::Inline);
+        let snap = d.snapshot();
+        let first = boundary - 5 * slack;
+        assert!(!snap.range_is_deferred(first, Some(boundary - slack / 2)));
+        assert!(snap.segment_is_deferred(first, Some(boundary - slack / 2)));
+        assert!(!snap.segment_is_deferred(first, Some(boundary - 2 * slack)));
+        assert!(snap.segment_is_deferred(first, None), "unknown end");
+        // Lower side: the mark is just below the boundary, the segment's
+        // first record just above it.
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(boundary - slack / 2, ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        let last = boundary + 5 * slack;
+        assert!(!snap.range_is_deferred(boundary + 1, Some(last)));
+        assert!(snap.segment_is_deferred(boundary + 1, Some(last)));
+        assert!(!snap.segment_is_deferred(boundary + 2 * slack, Some(last)));
+        assert!(snap.segment_is_deferred(0, Some(last)), "unknown start");
     }
 
     #[test]

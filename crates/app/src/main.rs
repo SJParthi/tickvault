@@ -1871,6 +1871,26 @@ async fn async_main() -> Result<()> {
         }
     }
     metrics::counter!("tv_wal_lag_tracker_refused_total").increment(0);
+    // PR W review round 4 (C): local `/metrics` only, no filter, no alarm.
+    metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_EPISODES_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_SECONDS_COUNTER)
+        .increment(0);
+    // PR W review round 5: every trim refusal reason exists from boot, so a
+    // trim refused all session is visible. The pinned gauges are NOT set to 0
+    // here on purpose: 0 would read "nothing pinned" while the trim never ran.
+    for reason in [
+        "listing_failed",
+        "unreadable_first_record",
+        "nothing_waiting",
+        "unreadable_set_apart",
+    ] {
+        metrics::counter!(
+            tickvault_storage::wal_unapplied_ranges::WAL_UNAPPLIED_TRIM_REFUSED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
     metrics::counter!("tv_spill_dir_health_check_failed_total").increment(0);
     metrics::counter!("tv_resource_monitor_probe_failed_total").increment(0);
     metrics::counter!("tv_oom_monitor_probe_failed_total").increment(0);
@@ -2293,6 +2313,9 @@ async fn async_main() -> Result<()> {
         .with(category_layers)
         .with(otel_layer)
         .init();
+    // PR W review round 6: the WAL boot fold ran before this subscriber
+    // existed; write what it recorded (and any failed fold persist) now.
+    let _boot_fold_logged = tickvault_storage::wal_unapplied_ranges::log_boot_fold_summary();
 
     // Phase 5: background summary_writer task. Emits a human + Claude
     // readable `data/logs/machine/errors.summary.md` every 60s so `/loop` polling
