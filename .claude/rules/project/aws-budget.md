@@ -9,7 +9,9 @@ paths:
   - "crates/trading/src/strategy/**"
 ---
 
-# AWS Budget Enforcement — r8g.xlarge LOCKED ~₹5,824–7,382/mo
+# AWS Budget Enforcement — r8g.large LOCKED (Quotes 32/33, estimate ~$70–75/mo, not a cap)
+
+> **⚠ TITLE CHANGED 2026-10-21 (operator Quotes 32/33, `daily-universe-scope-expansion-2026-05-27.md` §0).** The lock moves from **r8g.xlarge** (4 vCPU / 32 GiB, ~₹5,824–7,382/mo, Quote 13) to **r8g.large** (2 vCPU / 16 GiB), multi-AZ kept, with a fresh 150 GB root, on the 2026-10-22 rebuild. The owner's estimate is about $70–75 a month; it is an estimate from the 1–13 Oct bill, not a maximum. The only hard maximum is the budget stop (Quotes 36/37 below). The old title is kept in the banner below as history.
 
 > **⚠ TITLE CORRECTED 2026-08-12 (operator Quote 15 — "this is our finalsied
 > instancue dude okay? just sue this evrywhere neitlrey").** This H1 read

@@ -1,12 +1,13 @@
 # =============================================================================
 # tickvault — Docker Compose
 # =============================================================================
-# Same file on Mac dev and AWS prod. Prod host: r8g.xlarge (ARM Graviton4,
-# 4 vCPUs / 32 GiB), multi-AZ, per operator Quote 13 (2026-08-08) in
-# daily-universe-scope-expansion-2026-05-27.md §7.
+# Same file on Mac dev and AWS prod. Prod host: r8g.large (ARM Graviton4,
+# 2 vCPUs / 16 GiB), multi-AZ, per operator Quotes 32/33 (2026-10-21; was
+# r8g.xlarge 4 vCPU / 32 GiB under Quote 13) in daily-universe-scope-expansion-2026-05-27.md §7.
 #
 # QuestDB memory (rewritten 2026-10-12, deep audit QDB-11):
-#   Compose default QDB_MEM_LIMIT=12g. On the box, EVERY deploy derives the
+#   Compose default QDB_MEM_LIMIT=6g (12g until 2026-10-21, on the 32 GiB
+#   box). On the box, EVERY deploy derives the
 #   value (deploy-aws.yml, the questdb-mem step): 40% of the host MemTotal,
 #   clamped to 1..12g, written into the on-box deploy/docker/.env, and
 #   tv-questdb is recreated when it changed. So the 32 GiB box runs 12g and
@@ -124,7 +125,9 @@ services:
     # --qdb-mem 12g --apply-ssm` rewrites it.
     # QuestDB mmaps data files — actual RSS is much lower than limit.
     # Partition manager keeps hot data bounded to ~90 days.
-    mem_limit: ${QDB_MEM_LIMIT:-12g}
+    # 2026-10-21 (Quotes 32/33): default 6g, the deploy formula (4/10) on the
+    # 16 GiB r8g.large. The 12g notes above describe the 32 GiB box.
+    mem_limit: ${QDB_MEM_LIMIT:-6g}
     mem_reservation: 2g
     # HISTORY: this was `cpus: 3.0` with the note "3.0 of the box's 4 vCPU …
     # the remaining core is left for the tickvault app + OS". That reading was

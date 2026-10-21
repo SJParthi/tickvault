@@ -100,6 +100,8 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
+    // 2026-10-21 (Quotes 32/33): the lock is r8g.large, 2 vCPU / 16 GiB, multi-AZ
+    // kept; the text below is the 2026-08-08 record it replaced.
     // Operator-lock 2026-08-08 (daily-universe-scope-expansion-2026-05-27.md §7
     // Quote 13): r8g.xlarge ONLY (Graviton4 memory-optimised, 4 vCPU / 32 GiB).
     // Sized for the 13-timeframe current-day workload WITH raw-tick retention at
@@ -118,11 +120,11 @@ fn test_terraform_instance_type_pinned() {
     // may still appear in SUPERSEDES prose — only the validation condition is
     // forbidden.
     assert!(
-        content.contains("\"r8g.xlarge\""),
-        "variables.tf must pin instance_type to r8g.xlarge (operator lock 2026-08-08, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 13)"
+        content.contains("\"r8g.large\""),
+        "variables.tf must pin instance_type to r8g.large (operator Quotes 32/33, 2026-10-21, see daily-universe-scope-expansion-2026-05-27.md §7)"
     );
     assert!(
-        content.contains("var.instance_type == \"r8g.xlarge\""),
+        content.contains("var.instance_type == \"r8g.large\""),
         "variables.tf must VALIDATE instance_type pinning"
     );
     assert!(
@@ -137,8 +139,8 @@ fn test_terraform_instance_type_pinned() {
     // validated default (r8g.large/m8g.large/t4g.large may still appear in
     // SUPERSEDES comments, so we only forbid them as the validation condition).
     assert!(
-        !content.contains("var.instance_type == \"r8g.large\""),
-        "r8g.large retired as the pinned type (operator downsize lock 2026-07-15)"
+        !content.contains("var.instance_type == \"r8g.xlarge\""),
+        "r8g.xlarge retired as the pinned type (operator Quotes 32/33, 2026-10-21: the half-size server)"
     );
     assert!(
         !content.contains("var.instance_type == \"m8g.large\""),

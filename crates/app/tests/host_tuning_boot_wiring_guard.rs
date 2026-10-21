@@ -232,8 +232,9 @@ fn questdb_memory_cap_matches_the_locked_host_size() {
     let downsize = read(".github/workflows/downsize-instance.yml");
 
     assert!(
-        compose.contains("QDB_MEM_LIMIT:-12g"),
-        "the compose default is no longer 12g — on a 32 GiB host that is the \
+        compose.contains("QDB_MEM_LIMIT:-6g"),
+        "the compose default is no longer 6g — on the 16 GiB r8g.large (Quotes 32/33, \
+         2026-10-21) that is the \
          value a box with no .env override must land on"
     );
 
@@ -252,12 +253,12 @@ fn questdb_memory_cap_matches_the_locked_host_size() {
             }
             assert_eq!(
                 value,
-                "12g",
+                "6g",
                 "downsize-instance.yml:{} writes QDB_MEM_LIMIT={} to the on-box \
-                 .env, but the host is 32 GiB and compose defaults to 12g.\n\n\
+                 .env, but the host is 16 GiB and compose defaults to 6g.\n\n\
                  That override WINS over the compose default, so this one line \
                  caps the database at a fraction of the machine — silently, \
-                 with no error anywhere. This workflow targets r8g.xlarge; the \
+                 with no error anywhere. This workflow targets r8g.large; the \
                  value must match the host it now flips to.",
                 idx + 1,
                 value

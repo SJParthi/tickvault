@@ -1,4 +1,5 @@
-//! Source-scan ratchet pinning the **r8g.xlarge instance type lock** AND the
+//! Source-scan ratchet pinning the **r8g.large instance type lock** (Quotes 32/33,
+//! 2026-10-21; r8g.xlarge before, Quote 13) AND the
 //! **multi-AZ shape** documented in
 //! `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` §7.
 //!
@@ -21,7 +22,7 @@
 //!
 //! Fails the build if:
 //!
-//!  1. The authoritative rule file disappears or stops pinning `r8g.xlarge`.
+//!  1. The authoritative rule file disappears or stops pinning `r8g.large`.
 //!  2. The AZ un-pin is reverted (the rule file must keep recording that the
 //!     zone is NOT pinned, and terraform must keep the per-AZ subnets).
 //!  3. The superseded rule files lose their SUPERSEDED-BY markers (= future
@@ -74,16 +75,16 @@ fn instance_lock_authoritative_rule_file_pins_r8g_xlarge() {
         "daily-universe rule file must pin `r8g.xlarge` as the instance lock (Quote 13, 2026-08-08)"
     );
     assert!(
-        body.contains("**r8g.xlarge**"),
-        "daily-universe rule file must bold-pin `r8g.xlarge` in the §7 instance-spec table"
+        body.contains("**r8g.large**"),
+        "daily-universe rule file must bold-pin `r8g.large` in the §7 instance-spec table (Quotes 32/33, 2026-10-21)"
     );
     assert!(
-        body.contains("32 GiB RAM"),
-        "daily-universe rule file must pin 32 GiB RAM for r8g.xlarge"
+        body.contains("16 GiB RAM"),
+        "daily-universe rule file must pin 16 GiB RAM for r8g.large"
     );
     assert!(
-        body.contains("Instance lock — r8g.xlarge"),
-        "the §7 heading must lock r8g.xlarge as the CURRENT instance type"
+        body.contains("Instance lock — r8g.large"),
+        "the §7 heading must lock r8g.large as the CURRENT instance type (Quotes 32/33)"
     );
     // The capacity outage is the WHY. If a future edit drops it, the next
     // reader loses the reason the box was dark for three days and may
@@ -171,8 +172,8 @@ fn instance_lock_supersession_markers_present_in_aws_budget() {
     // r8g.xlarge lock landed: two instance locks and a ~6x cost change stale,
     // at the top of the file whose whole job is to state the bill.
     assert!(
-        body.contains("# AWS Budget Enforcement — r8g.xlarge LOCKED"),
-        "aws-budget.md H1 must name the CURRENT locked instance type (r8g.xlarge), \
+        body.contains("# AWS Budget Enforcement — r8g.large LOCKED"),
+        "aws-budget.md H1 must name the CURRENT locked instance type (r8g.large), \
          not a superseded one — the dated banners below carry the history"
     );
 }
@@ -194,8 +195,8 @@ fn instance_lock_binds_the_mutating_workflow_not_just_terraform() {
 
     let wf = read(&root.join(".github/workflows/downsize-instance.yml"));
     assert!(
-        wf.contains("TO_TYPE: r8g.xlarge"),
-        "downsize-instance.yml TO_TYPE must be the LOCKED type (r8g.xlarge). \
+        wf.contains("TO_TYPE: r8g.large"),
+        "downsize-instance.yml TO_TYPE must be the LOCKED type (r8g.large). \
          This workflow mutates the instance via ec2 modify-instance-attribute, \
          so terraform's validation never sees it — if TO_TYPE drifts, a single \
          manual dispatch moves the box off the lock with every other gate green."
@@ -203,12 +204,12 @@ fn instance_lock_binds_the_mutating_workflow_not_just_terraform() {
 
     let script = read(&root.join("scripts/aws-upgrade-instance.sh"));
     assert!(
-        script.contains("TO_TYPE=\"${TO_TYPE:-r8g.xlarge}\""),
+        script.contains("TO_TYPE=\"${TO_TYPE:-r8g.large}\""),
         "aws-upgrade-instance.sh --to default must be the LOCKED type \
-         (r8g.xlarge) — it is the manual twin of the workflow above"
+         (r8g.large) — it is the manual twin of the workflow above"
     );
     assert!(
-        script.contains("LOCK is r8g.xlarge everywhere"),
+        script.contains("LOCK is r8g.large everywhere"),
         "aws-upgrade-instance.sh header must name the CURRENT lock; it claimed \
          `LOCK is t4g.medium everywhere` while defaulting --to to r8g.xlarge, \
          which is worse than either alone — the comment and the code disagreed"
@@ -230,6 +231,10 @@ fn instance_lock_supersession_markers_present_in_architecture_doc() {
     assert!(
         body.contains("§5 RE-SUPERSEDED → t4g.medium 2026-07-15"),
         "architecture doc must carry the 2026-07-15 t4g.medium downsize banner (Quote 8)"
+    );
+    assert!(
+        body.contains("§5 RE-SUPERSEDED → r8g.large + MULTI-AZ 2026-10-21"),
+        "architecture doc must carry the 2026-10-21 r8g.large banner (Quotes 32/33)"
     );
 }
 
@@ -293,13 +298,19 @@ fn instance_lock_monthly_bill_pinned_to_current_r8g_xlarge_range() {
     // pinning a SUPERSEDED bill as if it were live. That is exactly the
     // false-OK class this repo bans, and it is why the current figures are
     // asserted first and the superseded ones are explicitly labelled below.
+    // 2026-10-21 (Quotes 32/33): the CURRENT figure is the owner's r8g.large
+    // estimate, and the rule file must keep calling it an estimate, not a cap.
+    assert!(
+        body.contains("about $70–75 a month is an ESTIMATE"),
+        "Quote 32 must keep recording the r8g.large figure as an ESTIMATE, not a maximum"
+    );
     assert!(
         body.contains("~₹5,824/mo"),
-        "rule file must pin the CURRENT r8g.xlarge low-end bill (~₹5,824/mo incl GST at ~210 hrs, 100 GB, EIP kept) — Quote 13, 2026-08-08"
+        "rule file must retain the superseded r8g.xlarge low-end bill (~₹5,824/mo incl GST at ~210 hrs, 100 GB, EIP kept) — Quote 13, 2026-08-08, history since Quote 32"
     );
     assert!(
         body.contains("~₹7,382/mo"),
-        "rule file must pin the CURRENT r8g.xlarge high-end bill (~₹7,382/mo incl GST — the AWS-list-rate end of the derived range)"
+        "rule file must retain the superseded r8g.xlarge high-end bill (~₹7,382/mo incl GST) as history"
     );
     // The breach must stay stated out loud. If a future edit quietly drops it,
     // the next reader could believe this bill meets the sub-1,000 target.
@@ -476,7 +487,7 @@ fn terraform_text_names_no_retired_instance_as_desired() {
     assert!(
         !main_tf.contains("documents the desired t4g.medium"),
         "main.tf says the instance_type validation documents t4g.medium as the \
-         desired type; it pins r8g.xlarge (Quote 13)"
+         desired type; it pins r8g.large (Quotes 32/33)"
     );
     let vars = read(&root.join("deploy/aws/terraform/variables.tf"));
     let start = vars
@@ -485,8 +496,8 @@ fn terraform_text_names_no_retired_instance_as_desired() {
     let block = &vars[start..];
     let block = &block[..block.find("\n}\n").map_or(block.len(), |i| i + 3)];
     assert!(
-        block.contains(r#"var.instance_type == "r8g.xlarge""#),
-        "the instance_type block must still pin r8g.xlarge"
+        block.contains(r#"var.instance_type == "r8g.large""#),
+        "the instance_type block must pin r8g.large (Quotes 32/33, 2026-10-21)"
     );
     assert!(
         !block.contains("13 TF x 128 B"),
