@@ -38,7 +38,17 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
-## OPERATOR RULING 2026-10-13 — AWS at or under ₹15,000 a month: one stop at $170, IOPS 6,000 → 3,000
+## OPERATOR RULING 2026-10-21 — stop at $100 from 1 November; disk speed 500 → 125 MiB/s tonight
+
+Owner, 2026-10-21 (verbatim, typos preserved): "Do everything now dude not Saturday brro do it now okay?", then the decision cards "Cut tonight anyway" (disk speed) and, after a correction that a $100 line in October would stop the box at once ($119.20 spent by 20 Oct), "$100 from 1 November (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 33.
+
+| | Before | After |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the line the hard-stop guard applies in code) | $170 | **$100 from 1 November 2026**; October 2026 stays capped at $170 (`OCTOBER_2026_KILL_USD`) |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 | $170 until 1 November; lowering `limit_amount` to $100 is a follow-up change on or after that date |
+| Disk throughput (live `vol-0c6ab6e593e39d8c8`) | 500 MiB/s | **125 MiB/s**, applied 2026-10-21 17:04 IST by `grow-ebs-volume.yml` run 7; size 600 GB and IOPS 3,000 unchanged |
+
+Honest limits: until the terraform line follows, November's native AWS stop is still at $170 and the $100 stop is the guard Lambda's alone. Depth stays on until the depth-off PR merges, and on 13 Oct the disk was measured at ~149 MiB/s for most of a session, so the 125 MiB/s cap can slow the feed until then.
 
 Owner, 2026-10-13 (verbatim, typos preserved): "bro nto for claude dude im talkign about aws per month shdou leb inr 15 dude okay?", then two decision cards: "Stop at ₹15,000 + trim (Recommended)" and, after a correction naming the 90% early stop, "Stop at ₹15k + cut unused disk (Recommended)". Full record, measurements and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 30.
 

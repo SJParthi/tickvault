@@ -62,9 +62,9 @@ on:
         required: true
         default: '3000'
       target_throughput:
-        description: 'Throughput in MiB/s, 125-1000 (the variables.tf ebs_gp3_throughput range). Default 500 = operator Quote 17, 2026-08-19. Unlike size this CAN go down.'
+        description: 'Throughput in MiB/s, 125-1000 (the variables.tf ebs_gp3_throughput range). Default 125 = operator Quote 33, 2026-10-21 (was 500 per Quote 17). Unlike size this CAN go down.'
         required: true
-        default: '500'
+        default: '125'
 
 concurrency:
   group: grow-ebs-volume-prod
