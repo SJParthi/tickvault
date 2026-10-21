@@ -9497,3 +9497,39 @@ REJECT:
 - Shrinking the disk, lowering disk throughput or changing the instance under
   this quote (each is a separate dated quote in
   `daily-universe-scope-expansion-2026-05-27.md`).
+
+### 2026-10-21 (EVENING) — CANDLES_3S, CANDLES_5S AND TOP_VOLUME ARE REMOVED (supersedes the 2026-09-18 FOURTH, 2026-09-19 and 2026-09-22 sections where they name 3 s, 5 s or `top_volume`)
+
+Owner, 2026-10-21 evening: "dude meanhwiel remvoe candles 3s and 5s and alogn
+with delete and remove the entire top volume tables also dude okay? can yo udo
+all ytehse dud eokay? see in thsic ase what and all we cna save clelary tell me
+dude hwo much memory as well dude okay?", then: "see clealry note to delete and
+permanently remove and drop candles 3 seconds and candles 5 seconds dude and
+even entire top volumes entire tables also dude okay? meanwhiel go ahead with
+eveythgin edude meanwhile see switch off depth 20 and dpeth 200 i eman let th
+eimpelemntations be there but just switch off depth 20 and depth 200 dude
+okay?"
+
+The rule:
+- The fold keeps eight timeframes: `1s 1m 3m 5m 10m 15m 30m 60m`. `S3` and
+  `S5` are removed (`TF_COUNT` 10 → 8); no 3-second or 5-second bar is folded,
+  sealed or written.
+- Nothing writes `top_volume_1s`, `top_volume_3s`, `top_volume_5s` or
+  `top_volume_1m`. The per-cadence ranking, its window-close clock, its sweep,
+  its writer threads, its spill and replay go with them, except any part a
+  live path other than `top_volume` still reads (that part stays, and the PR
+  names it).
+- Depth-20 and depth-200 stay as the same day's earlier section set them:
+  switched off, code kept. This section deletes no depth code.
+- Raw ticks, the WAL and every other candle table are unchanged. Dropping the
+  six tables, and deleting their S3 archives, is governed by Quotes 34 and 35
+  in `daily-universe-scope-expansion-2026-05-27.md`.
+
+REJECT:
+- Removing any other timeframe or any other table under this quote.
+- Re-adding a 3 s or 5 s timeframe, or any `top_volume_*` table or writer,
+  without a fresh dated quote here.
+- Removing a ranking component another live path still reads, without naming
+  that path in the PR.
+- Deleting depth code, or turning depth back on, under this quote.
+- Changing raw tick or WAL capture under this quote.
