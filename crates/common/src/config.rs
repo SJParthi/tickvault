@@ -1168,6 +1168,14 @@ pub struct DhanUniverseConfig {
     #[serde(default = "default_main_feed_backup_top_n")]
     pub backup_top_n: usize,
 
+    /// Whether the depth-20 and depth-200 sockets are attached and dialled at
+    /// all. Default `false`: switched off by the owner on 2026-10-21
+    /// (`websocket-connection-scope-lock.md`, "2026-10-21 — DEPTH-20 AND
+    /// DEPTH-200 ARE SWITCHED OFF"). The main feed and order update are not
+    /// affected; `true` restores depth exactly as before.
+    #[serde(default)]
+    pub depth_sockets_enabled: bool,
+
     /// Whether the evidence-based frame-silence fast paths act, only count,
     /// or are off (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE
     /// THRESHOLDS"). Default `Shadow`: the main-feed (60 s) and depth-20
@@ -1257,6 +1265,7 @@ impl Default for DhanUniverseConfig {
             spot_universe_fno_underlyings_only: false,
             spot_universe_ntm_only: false,
             backup_top_n: default_main_feed_backup_top_n(),
+            depth_sockets_enabled: false,
             frame_silence_fast_path: FrameSilenceFastPath::Shadow,
             depth200_silent_swap_resubscribe_secs: default_depth200_silent_swap_resubscribe_secs(),
         }
@@ -4841,6 +4850,30 @@ mod tests {
             .extract()
             .expect("0 parses");
         assert_eq!(off.dhan_universe.backup_top_n, 0);
+    }
+
+    #[test]
+    fn test_dhan_universe_depth_sockets_enabled_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            dhan_universe: DhanUniverseConfig,
+        }
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nenabled = true\n"))
+            .extract()
+            .expect("absent depth_sockets_enabled must default");
+        assert!(!absent.dhan_universe.depth_sockets_enabled);
+        assert!(!DhanUniverseConfig::default().depth_sockets_enabled);
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[dhan_universe]\ndepth_sockets_enabled = true\n",
+            ))
+            .extract()
+            .expect("true parses");
+        assert!(on.dhan_universe.depth_sockets_enabled);
     }
 
     #[test]

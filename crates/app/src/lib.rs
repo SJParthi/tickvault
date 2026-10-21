@@ -194,6 +194,8 @@ pub mod volume_semantics_probe;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// The depth-20 / depth-200 on-off switch (owner, 2026-10-21).
+pub mod depth_switch;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
 /// up after the close until the day's data is in the database.
 pub mod drain_hold;

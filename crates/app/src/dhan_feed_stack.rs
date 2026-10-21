@@ -14017,8 +14017,8 @@ async fn attach_depth_when_available(
     let mut depth_halted_by_805 = false;
     let mut depth_200_on_wire: std::collections::HashSet<(u64, u8)> =
         std::collections::HashSet::new();
-    let mut depth_ready = false;
-    let mut depth_done = false;
+    let mut depth_ready = !crate::depth_switch::depth_sockets_enabled();
+    let mut depth_done = !crate::depth_switch::depth_sockets_enabled();
     // Depth-20 is a STATIC day set (scope lock 2026-09-24): the F&O spots dial
     // first, and the NIFTY/BANKNIFTY at-the-money legs join once the 09:12
     // pre-open price is final. `depth_20_index_added` is true once every leg
