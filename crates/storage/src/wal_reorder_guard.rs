@@ -67,12 +67,6 @@ impl ReorderWatch {
         }
         true
     }
-
-    /// Records counted as breaking the slack so far.
-    #[cfg(test)]
-    pub(crate) fn exceeded(&self) -> u64 {
-        self.exceeded
-    }
 }
 
 #[cfg(test)]
@@ -91,10 +85,10 @@ mod tests {
         assert!(!w.observe(base + 2 * S));
         // One past the slack: a violation.
         assert!(w.observe(base + 2 * S - 1));
-        assert_eq!(w.exceeded(), 1);
+        assert_eq!(w.exceeded, 1);
         // The highest never falls.
         assert!(w.observe(base + S));
-        assert_eq!(w.exceeded(), 2);
+        assert_eq!(w.exceeded, 2);
     }
 
     #[test]
@@ -124,6 +118,6 @@ mod tests {
         let mut w = ReorderWatch::new();
         w.observe(5 * S);
         assert!(!w.observe(0));
-        assert_eq!(w.exceeded(), 0);
+        assert_eq!(w.exceeded, 0);
     }
 }
