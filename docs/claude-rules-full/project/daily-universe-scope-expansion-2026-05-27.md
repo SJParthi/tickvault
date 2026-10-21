@@ -2890,3 +2890,32 @@ After being shown the October split (~$173 with tax: disk storage ~$73, server h
 - Deletes any SEBI/audit row, or any market data without a verified copy, under cover of this quote.
 - Changes the instance to anything but r8g.large, or to a single-zone shape.
 - Presents the $70–75 estimate as a guaranteed maximum, or changes the kill line under this quote.
+
+#### Quote 33 (2026-10-21, 16:55 IST) — QUOTE 32 STEPS SOONER: DISK SPEED CUT TONIGHT, REBUILD THURSDAY NIGHT (preserve EXACTLY, typos included)
+
+> "Do everything now dude not Saturday brro do it now okay?"
+
+The owner then answered three decision cards. Each answer is given below with the risk the card stated:
+
+| Card | Owner's tap | Risk stated on the card |
+|---|---|---|
+| When should the 150 GB disk + r8g.large rebuild run? | **"Thursday night (Recommended)"** | Sizes come from one measured depth-off day; if the rebuild fails overnight, Friday's capture is at risk |
+| Cut disk speed 500 → 125 right after the first depth-off day? | **"Cut tonight anyway"** | Depth is still on until the PR merges; a slow or lagging feed at tomorrow's open |
+| Lower the AWS spend stop from $170 to $100 now? | **"Lower it to $100"** | The box may be shut off automatically before the downsizing lands |
+
+**What this amends in Quote 32, and nothing else:**
+
+| Quote 32 row | Amended to |
+|---|---|
+| Step 2 precondition (one measured depth-off session) | Waived. Throughput 500 → **125 MiB/s** may run on the evening of 2026-10-21, outside 09:00–15:45 IST, through `grow-ebs-volume.yml` (size 600 and IOPS 3,000 unchanged). `variables.tf` default 125 in the same or the next PR |
+| Steps 3–4 "a non-trading day" | Any weeknight once the box has stopped (after 17:30 IST) and before the 08:30 IST start, first allowed on the night of **Thursday 2026-10-22**. Every other step-3 precondition stands: a reviewed rebuild workflow, S3 copies verified first (Quote 27), WAL backlog drained or copied, old volume kept as a snapshot for 7 days |
+| REJECT "Lowers throughput before a depth-off session is measured" | Lifted for the run on 2026-10-21 only |
+| REJECT "Replaces the disk or the instance on a trading day" | Reads "during market hours (09:00–15:45 IST), or with the app running" |
+
+**Budget stop ($170 → $100):** NOT applied under this quote. October spend was already $119.20 on 1–20 Oct, so a $100 line would trip the native 100% stop at once: the box would stop and the morning start would be disabled for the rest of October. The card stated a milder risk than that, so the change waits for the owner's answer to the corrected question. When it is applied it needs all four lockstep sites and `STANDING_BUDGET_KILL_USD`.
+
+##### What violates Quote 33 (REJECT)
+- A throughput cut inside 09:00–15:45 IST, or a size or IOPS change under cover of this quote.
+- A rebuild inside market hours, with the app running, or before the S3 copies are verified.
+- Lowering the kill line under this quote, or below October's spend to date without a dated answer that names that outcome.
+- Reusing the step-2 waiver after 2026-10-21.
