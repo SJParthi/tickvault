@@ -6918,3 +6918,32 @@ Info lines "drain hold written" / "drain hold released" with what is left; `DRAI
 **Not in this item (honest scope):** the old WAL backlog (1,192 segments waiting on 21 Oct, from 9 Oct onward) is still replayed only at boot, capped at 3,000,000 frames per boot; shrinking it is PR W's work (on this branch, not yet merged) and a post-close replay round is a separate item. Today's data is in the database the same day; old days' false-unapplied segments are not.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 59 — The sealed-candle writer flushes at most once a second (added 2026-10-21, operator: "Fix and resolve everything dude")
+
+**Status:** APPROVED (operator, 2026-10-21, in session).
+
+**Why (MEASURED 2026-10-21, read-only CloudWatch):** `tv_questdb_wal_apply_lag_max` spiked a few minutes after 15-minute marks (10:10 842, 10:50 731, 11:40 673, 11:50 1,351); at 11:50:57 WAL-SUSPEND-01 named `candles_15m` (txn_lag 1,351) and the ingest shed turned on at 11:51:57. The seal writer flushed every 100 ms cycle that held a seal, so the ~4 minutes after a boundary (tick-by-tick seals, then the catch-up sweep at +240 s) sent up to ~2,400 tiny commits into one `ts` group of a DEDUP table.
+
+- [x] 59a — Pace the live flush. `SealWriterRunner::run_one_cycle_with_replay` flushes only when `seal_flush_due(ring_len, last_flush_secs, now_unix_secs)`: `SEAL_FLUSH_MIN_SEALS` (4,096) waiting, or a new cycle second (the loop passes the wall clock), or the first seal; otherwise the queue moves into the ring and nothing is flushed (the replay gate reads the cycle as neutral). `run_one_cycle` (shutdown drain) always flushes. Tests: `seal_flush_due_flushes_on_size_a_new_second_or_the_first_seal`, `test_regression_live_cycle_holds_seals_until_the_next_second`; existing chaos and recovery tests unchanged and green.
+  - Files: crates/storage/src/seal_writer_runner.rs
+
+### Design (Item 59)
+Hold in the ring, not in the ILP buffer: a held seal stays counted unwritten and keeps the rescue → spill → DLQ cascade and the crash marker exactly as before. Judged on the cycle's own second so simulated-time tests and a stepped clock both flush.
+
+### Edge Cases (Item 59)
+A boundary burst (≥ 4,096 waiting) flushes every cycle as before. A single seal after a quiet spell flushes at once. A clock stepped back flushes at once.
+
+### Failure Modes (Item 59)
+A failed flush rescues as before; the next try waits for the next second. A crash loses nothing more than before: held seals are in the ring, counted by the unwritten marker.
+
+### Test Plan (Item 59)
+Storage lib seal tests (181), `seal_drain_recovery`, `dhat_seal_queue_backlog`, `error_level_meta_guard`.
+
+### Rollback (Item 59)
+Revert; the writer flushes every cycle again.
+
+### Observability (Item 59)
+Existing `tv_questdb_wal_apply_lag_max` and WAL-SUSPEND-01 per table; a bar reaches QuestDB at most about a second later (`last_seal_drained_unix_secs` moves up to a second later; the 51d readiness wait tolerates it).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

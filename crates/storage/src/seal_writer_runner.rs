@@ -1065,6 +1065,36 @@ pub struct SealWriterRunner {
     /// writer's own count, which the [`SealOverflow`] that [`Self::overflow`]
     /// builds shares (audit PR40a, Z6).
     escalation_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The cycle second (`now_unix_secs`) of the live cycle's last flush;
+    /// `None` before the first. Paces the live flush ([`seal_flush_due`]).
+    last_live_flush: Option<i64>,
+}
+
+/// Seals waiting in the ring at which the live cycle flushes at once,
+/// whatever the time since its last flush. A quarter of
+/// `SEAL_MAX_DRAIN_PER_CYCLE` (16,384), so a boundary burst still drains at
+/// full speed and the ring (250,000) never backs up behind the hold.
+pub const SEAL_FLUSH_MIN_SEALS: usize = 4_096;
+
+/// The live cycle flushes at most once per cycle second (the loop passes the
+/// wall clock, so at most once a second, a hold under a second), unless
+/// [`SEAL_FLUSH_MIN_SEALS`] are waiting.
+///
+/// MEASURED 2026-10-21: the cycle flushed every 100 ms whatever it held, so
+/// in the ~4 minutes after a 15-minute mark (bars sealing tick by tick, then
+/// the catch-up sweep at +240 s) `candles_15m` took up to ~2,400 tiny
+/// commits into ONE timestamp group (every row of a boundary shares the
+/// bucket-start `ts`). QuestDB fell 1,351 transactions behind on that table
+/// at 11:50 IST and the ingest shed turned on. Holding for a second cuts the
+/// commit count up to tenfold; a bar reaches QuestDB at most a second later
+/// (against a 240 s catch-up margin). Seals wait IN THE RING, so they count
+/// as unwritten and keep the whole rescue, spill and DLQ path. Judged on the
+/// cycle's own second, so a clock step either way flushes at once.
+///
+/// Whether the live cycle should flush now. Pure, O(1).
+#[must_use]
+pub fn seal_flush_due(ring_len: usize, last_flush_secs: Option<i64>, now_unix_secs: i64) -> bool {
+    ring_len >= SEAL_FLUSH_MIN_SEALS || last_flush_secs.is_none_or(|last| last != now_unix_secs)
 }
 
 impl SealWriterRunner {
@@ -1089,6 +1119,7 @@ impl SealWriterRunner {
             dlq_dir: production_dlq_dir(),
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
+            last_live_flush: None,
             spill,
         })
     }
@@ -1143,6 +1174,7 @@ impl SealWriterRunner {
             dlq_dir,
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
+            last_live_flush: None,
             spill,
         }
     }
@@ -1263,6 +1295,13 @@ impl SealWriterRunner {
     /// `try_recv` is a non-blocking sync method. The future tokio
     /// loop in 1.2f.5 wraps this in `tokio::time::interval`.
     pub fn run_one_cycle(&mut self, now_unix_secs: i64) -> CycleOutcome {
+        self.run_one_cycle_paced(now_unix_secs, false)
+    }
+
+    /// [`Self::run_one_cycle`] with the live flush paced when `paced`: if
+    /// [`seal_flush_due`] says no, the queue moves into the ring and nothing
+    /// is flushed.
+    fn run_one_cycle_paced(&mut self, now_unix_secs: i64, paced: bool) -> CycleOutcome {
         let mut outcome = CycleOutcome::default();
 
         // Step 1: drain mpsc → pipeline.submit
@@ -1286,13 +1325,24 @@ impl SealWriterRunner {
             }
         }
 
-        // Step 2: drain pipeline → ILP buffer → flush
-        outcome.drain = drain_once(
-            &mut self.pipeline,
-            &mut self.writer,
-            self.max_drain_per_cycle,
-            now_unix_secs,
-        );
+        // Step 2: drain pipeline → ILP buffer → flush, when due.
+        let due = !paced
+            || seal_flush_due(
+                self.pipeline.ring_len(),
+                self.last_live_flush,
+                now_unix_secs,
+            );
+        if due {
+            outcome.drain = drain_once(
+                &mut self.pipeline,
+                &mut self.writer,
+                self.max_drain_per_cycle,
+                now_unix_secs,
+            );
+            if outcome.drain.ring_seals_popped > 0 {
+                self.last_live_flush = Some(now_unix_secs);
+            }
+        }
 
         // Step 3: sync whatever this cycle (or the escalation thread, or the
         // drain's inline fallback) wrote to the spill or the DLQ. A no-op
@@ -1313,7 +1363,11 @@ impl SealWriterRunner {
         &mut self,
         now_unix_secs: i64,
     ) -> (CycleOutcome, ReplayOutcome) {
-        let cycle = self.run_one_cycle(now_unix_secs);
+        // The live flush is paced ([`seal_flush_due`]); a held cycle takes
+        // the queue into the ring and flushes nothing, which the replay gate
+        // reads as neutral. The shutdown drain calls `run_one_cycle`, which
+        // always flushes.
+        let cycle = self.run_one_cycle_paced(now_unix_secs, true);
         self.replay.observe(&cycle.drain, now_unix_secs);
         // Audit PR41b: the QuestDB watcher's word closes the gate on a
         // suspect table and reopens it without live traffic.
@@ -2728,6 +2782,80 @@ mod tests {
             "the spilled seals stay in the live file"
         );
         assert!(!spill.join("replaying").exists());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn seal_flush_due_flushes_on_size_a_new_second_or_the_first_seal() {
+        let t = 1_800_000_000;
+        assert!(
+            seal_flush_due(1, None, t),
+            "the first seal after start flushes at once"
+        );
+        assert!(!seal_flush_due(1, Some(t), t), "same second: held");
+        assert!(!seal_flush_due(SEAL_FLUSH_MIN_SEALS - 1, Some(t), t));
+        assert!(
+            seal_flush_due(SEAL_FLUSH_MIN_SEALS, Some(t), t),
+            "a burst never waits"
+        );
+        assert!(seal_flush_due(1, Some(t), t + 1), "a new second flushes");
+        assert!(
+            seal_flush_due(1, Some(t), t - 5),
+            "a clock stepped back flushes"
+        );
+    }
+
+    /// Regression (2026-10-21, `candles_15m` 1,351 transactions behind): the
+    /// live cycle flushed every 100 ms. Now seals that arrive in the same
+    /// second as a flush wait in the ring (still counted unwritten) and go
+    /// together in the next second.
+    #[test]
+    fn test_regression_live_cycle_holds_seals_until_the_next_second() {
+        let (spill, dlq) = temp_pair("cycle-paced-hold");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let tx = runner.sender();
+        let t0 = jan1_noon_utc();
+        let send = |n: u32, base: u32| {
+            for i in 0..n {
+                tx.try_send(mk_seal(
+                    13,
+                    0,
+                    TfIndex::M15,
+                    1_716_023_700 + base + i,
+                    100.0,
+                ))
+                .expect("try_send");
+            }
+        };
+        send(2, 0);
+        let (first, _) = runner.run_one_cycle_with_replay(t0);
+        assert_eq!(
+            first.drain.ring_seals_popped, 2,
+            "the first seal flushes at once"
+        );
+        send(2, 10);
+        let (held, _) = runner.run_one_cycle_with_replay(t0);
+        assert_eq!(
+            held.drain.ring_seals_popped, 0,
+            "same second: held, not flushed"
+        );
+        assert_eq!(held.submitted_from_mpsc, 2, "but moved into the ring");
+        assert!(
+            runner.unwritten_seals() >= 2,
+            "held seals still count as unwritten"
+        );
+        let (later, _) = runner.run_one_cycle_with_replay(t0 + 1);
+        assert_eq!(
+            later.drain.ring_seals_popped, 2,
+            "the next second they go together"
+        );
+        // The shutdown drain never holds.
+        send(1, 20);
+        let forced = runner.run_one_cycle(t0 + 1);
+        assert_eq!(
+            forced.drain.ring_seals_popped, 1,
+            "run_one_cycle always flushes"
+        );
         cleanup(&spill, &dlq);
     }
 
