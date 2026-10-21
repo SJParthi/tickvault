@@ -227,14 +227,16 @@ fn rule_files_record_the_current_ceiling() {
 /// Quote 23 (2026-09-23): the September 2026 allowance is ONE month, and the
 /// standing ceiling after it was $150; operator Quote 30 (2026-10-13) set it
 /// to $170 (≈₹15,000); operator Quote 33 (2026-10-21) set it to $100 from
-/// November 2026, with October 2026 capped at $170. Pinned so an allowance can
+/// November 2026, with October 2026 capped at $170; operator Quote 36 (the
+/// same evening) lowered November onward to $85, and operator Quote 37 to $75
+/// (GST included). Pinned so an allowance can
 /// never quietly become the new normal, and so the clamp can never sit ABOVE
 /// the configured ceiling (which would make it a raise, not a clamp).
 #[test]
-fn standing_cap_is_100_from_november_and_each_allowance_is_one_month() {
+fn standing_cap_is_75_from_november_and_each_allowance_is_one_month() {
     assert!(
-        (STANDING_BUDGET_KILL_USD - 100.0).abs() < f64::EPSILON,
-        "the standing ceiling moved off $100 without a dated operator quote"
+        (STANDING_BUDGET_KILL_USD - 75.0).abs() < f64::EPSILON,
+        "the standing ceiling moved off $75 without a dated operator quote"
     );
     // "The clamp never sits above the configured ceiling" is a compile-time
     // assert in hard_stop_guard.rs, next to the two constants.
@@ -243,7 +245,7 @@ fn standing_cap_is_100_from_november_and_each_allowance_is_one_month() {
     assert!((OCTOBER_2026_KILL_USD - 170.0).abs() < f64::EPSILON);
 
     // Every month of the next three years EXCEPT 2026-09 and 2026-10 resolves
-    // to $100.
+    // to $75.
     for year in 2026..=2028 {
         for month in 1..=12 {
             let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, year, month);
@@ -254,7 +256,7 @@ fn standing_cap_is_100_from_november_and_each_allowance_is_one_month() {
             } else {
                 assert!(
                     (effective - STANDING_BUDGET_KILL_USD).abs() < f64::EPSILON,
-                    "{year}-{month:02} resolved to ${effective}, not the standing $100"
+                    "{year}-{month:02} resolved to ${effective}, not the standing $75"
                 );
             }
         }
@@ -271,8 +273,8 @@ fn standing_cap_is_100_from_november_and_each_allowance_is_one_month() {
             body.contains("$150")
                 && body.contains("$225")
                 && body.contains("$170")
-                && body.contains("$100 from 1 November"),
-            "{rel} must record $150, $225, $170 and $100 from 1 November"
+                && body.contains("$75 from 1 November"),
+            "{rel} must record $150, $225, $170 and $75 from 1 November"
         );
     }
 }
