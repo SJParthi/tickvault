@@ -802,6 +802,41 @@ mod tests {
     }
 
     #[test]
+    fn test_first_allowed_and_last_allowed_bound_the_run() {
+        let tz = ist();
+        let first = first_allowed(tz).expect("valid date");
+        let last = last_allowed(tz).expect("valid date");
+        assert_eq!(first.to_rfc3339(), "2026-10-22T17:30:00+05:30");
+        assert_eq!(last.to_rfc3339(), "2026-10-31T08:00:00+05:30");
+        assert!(first < last);
+    }
+
+    #[test]
+    fn test_parse_box_report_reads_the_last_report_line_only() {
+        let (a, line_a) = BoxReport::new(Phase::Copy, Mode::Dry).finish();
+        let mut b = BoxReport::new(Phase::Copy, Mode::Apply);
+        b.problem("disk");
+        let (b, line_b) = b.finish();
+        let text = format!("{line_a}\nsome output\n{line_b}\n");
+        assert_eq!(parse_box_report(&text), Some(b));
+        assert_ne!(parse_box_report(&text), Some(a));
+        assert_eq!(
+            parse_box_report(&format!("{BOX_REPORT_PREFIX}not json")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_clip_cuts_long_lines_on_a_char_boundary() {
+        let short = String::from("ok");
+        assert_eq!(clip(short.clone()), short);
+        let long: String = "é".repeat(REPORT_LINE_MAX_CHARS + 10);
+        let cut = clip(long);
+        assert_eq!(cut.chars().count(), REPORT_LINE_MAX_CHARS);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
     fn test_is_commit_sha_accepts_only_a_lowercase_40_hex_id() {
         assert!(is_commit_sha("f92a6472f0000000000000000000000000000000"));
         assert!(!is_commit_sha("F92A6472F0000000000000000000000000000000"));
