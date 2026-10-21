@@ -761,8 +761,8 @@ running since before 5:30 PM). I have sent the stop command \
 myself. If you WANTED it running this evening, just press \
 'Start instance' on the portal — a box you start manually \
 after 5:30 PM is never auto-stopped. Also investigate why the \
-5:30 PM stop failed: AWS console → Systems Manager → \
-Automation executions for AWS-StopEC2Instance.",
+5:30 PM stop failed: AWS console → CloudWatch → Log groups → \
+/aws/lambda/tv-prod-start-watchdog (the daily_stop run at 5:30 PM).",
             )
             .await?;
         } else {
