@@ -4728,16 +4728,42 @@ mod tests {
     /// slack.
     #[test]
     fn test_acks_racing_probe_transitions_are_always_in_an_episode_range() {
+        // A scheduler that runs the acker to completion before the probe loop
+        // gets the CPU leaves nothing to check (seen once under heavy load);
+        // the acker waits for the first probe and the scenario is retried, so
+        // the non-vacuity assert below is not left to scheduling.
+        // O(1) EXEMPT: test-only retry, at most five scenarios
+        for _attempt in 0..5 {
+            if acks_racing_probe_transitions_scenario() > 0 {
+                return;
+            }
+        }
+        panic!("no ack fell inside an episode in five scenarios");
+    }
+
+    /// One run of the scenario above; asserts every in-episode ack is in a
+    /// range and returns how many were checked.
+    fn acks_racing_probe_transitions_scenario() -> u64 {
         use std::sync::Arc;
         let wm = Arc::new(AppliedWatermark::new_for_tests());
         let started = Arc::new(AtomicU64::new(0));
         let done = Arc::new(AtomicU64::new(0));
+        let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let base = seq(10_000);
         let step = 4 * REPLAY_REORDER_SLACK_SEQ;
         let total: u64 = 20_000;
         let acker = {
-            let (wm, started, done) = (Arc::clone(&wm), Arc::clone(&started), Arc::clone(&done));
+            let (wm, started, done, go) = (
+                Arc::clone(&wm),
+                Arc::clone(&started),
+                Arc::clone(&done),
+                Arc::clone(&go),
+            );
             std::thread::spawn(move || {
+                // O(1) EXEMPT: test-only start barrier
+                while !go.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
                 // O(1) EXEMPT: test-only stress loop
                 for i in 1..=total {
                     started.store(i, Ordering::SeqCst);
@@ -4752,6 +4778,7 @@ mod tests {
         while done.load(Ordering::SeqCst) < total {
             wm.note_questdb_probe(true);
             let after_clean = started.load(Ordering::SeqCst);
+            go.store(true, Ordering::SeqCst);
             std::thread::yield_now();
             wm.note_questdb_probe(false);
             std::thread::yield_now();
@@ -4773,7 +4800,7 @@ mod tests {
                 );
             }
         }
-        assert!(checked > 0, "some acks fell inside an episode");
+        checked
     }
 
     /// PR W review round 4: an in-RAM overflow of known height becomes a
