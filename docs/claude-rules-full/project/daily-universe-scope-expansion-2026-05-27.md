@@ -2912,10 +2912,10 @@ The owner then answered three decision cards. Each answer is given below with th
 | REJECT "Lowers throughput before a depth-off session is measured" | Lifted for the run on 2026-10-21 only |
 | REJECT "Replaces the disk or the instance on a trading day" | Reads "during market hours (09:00–15:45 IST), or with the app running" |
 
-**Budget stop ($170 → $100):** NOT applied under this quote. October spend was already $119.20 on 1–20 Oct, so a $100 line would trip the native 100% stop at once: the box would stop and the morning start would be disabled for the rest of October. The card stated a milder risk than that, so the change waits for the owner's answer to the corrected question. When it is applied it needs all four lockstep sites and `STANDING_BUDGET_KILL_USD`.
+**Budget stop ($170 → $100):** NOT applied in October. October spend was already $119.20 on 1–20 Oct, so a $100 line would trip the native 100% stop at once: the box would stop and the morning start would be disabled for the rest of October. The card stated a milder risk than that, so the change waits for the owner's answer to the corrected question. **Answered the same evening:** "$100 from 1 November (Recommended)". The hard-stop guard applies the $100 line in code from November 2026 (`STANDING_BUDGET_KILL_USD` = 100, October 2026 capped at $170 by `OCTOBER_2026_KILL_USD`); the terraform `limit_amount` (the native stop) moves to $100 on or after 1 November, not before. **Throughput applied:** 2026-10-21 17:04 IST, `grow-ebs-volume.yml` run 7, `vol-0c6ab6e593e39d8c8` now 600 GB / 3,000 IOPS / 125 MiB/s. When it is applied it needs all four lockstep sites and `STANDING_BUDGET_KILL_USD`.
 
 ##### What violates Quote 33 (REJECT)
 - A throughput cut inside 09:00–15:45 IST, or a size or IOPS change under cover of this quote.
 - A rebuild inside market hours, with the app running, or before the S3 copies are verified.
-- Lowering the kill line under this quote, or below October's spend to date without a dated answer that names that outcome.
+- Lowering the native stop (`limit_amount`) below $170 before 1 November 2026, or the October code line below $170.
 - Reusing the step-2 waiver after 2026-10-21.

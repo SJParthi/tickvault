@@ -32,7 +32,8 @@ pub const GST_MULT: f64 = 1.18;
 /// and the guard both read
 /// `hard_stop_guard::effective_budget_kill_usd(BUDGET_USD, year, month)`,
 /// which clamps every month except 2026-09 to
-/// `hard_stop_guard::STANDING_BUDGET_KILL_USD` ($170 since operator Quote 30, 2026-10-13).
+/// `hard_stop_guard::STANDING_BUDGET_KILL_USD` ($170 since operator Quote 30, 2026-10-13; $100 from
+/// November 2026 per operator Quote 33, 2026-10-21, with October 2026 capped at $170).
 ///
 /// History: $55 → $25 (2026-07-19) → $35 (2026-07-31) → $100 (2026-08-08)
 /// → $130 (2026-08-19) → $150 (2026-08-25, Quote 19) → $225 September only
