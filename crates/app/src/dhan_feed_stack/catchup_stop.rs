@@ -47,6 +47,21 @@ pub(super) const fn empty_pass_stop_reason(
     }
 }
 
+/// [`empty_pass_stop_reason`] read from a replay batch's own flags. A helper
+/// so the lane's call fits on one line of `dhan_feed_stack.rs`, which sits at
+/// its size pin.
+#[must_use]
+pub(super) const fn batch_stop_reason(
+    batch: &tickvault_storage::ws_frame_spill::WalReplayBatch,
+) -> Option<&'static str> {
+    empty_pass_stop_reason(
+        batch.stopped_for_frame_cap,
+        batch.stopped_for_memory,
+        batch.stopped_for_disk,
+        batch.deferred_segments,
+    )
+}
+
 /// What the summary reports after the named stops (shutdown, memory, apply
 /// lag, round cap, clock) were ruled out: `"drained"` only when the drain
 /// really emptied the backlog, otherwise the early stop the loop recorded.
@@ -58,6 +73,28 @@ pub(super) const fn residual_stop_reason(drained: bool, early_stop: &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_batch_stop_reason_reads_the_batch_flags() {
+        use tickvault_storage::ws_frame_spill::WalReplayBatch;
+        assert_eq!(batch_stop_reason(&WalReplayBatch::default()), None);
+        let disk = WalReplayBatch {
+            stopped_for_disk: true,
+            ..WalReplayBatch::default()
+        };
+        assert_eq!(batch_stop_reason(&disk), Some("disk"));
+        let deferred = WalReplayBatch {
+            deferred_segments: 2,
+            ..WalReplayBatch::default()
+        };
+        assert_eq!(batch_stop_reason(&deferred), Some("deferred"));
+        let cap = WalReplayBatch {
+            stopped_for_frame_cap: true,
+            stopped_for_disk: true,
+            ..WalReplayBatch::default()
+        };
+        assert_eq!(batch_stop_reason(&cap), Some("frame_cap"));
+    }
 
     #[test]
     fn test_empty_pass_stop_reason_names_every_early_stop() {

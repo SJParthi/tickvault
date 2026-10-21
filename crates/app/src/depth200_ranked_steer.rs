@@ -40,6 +40,21 @@
 //!   there. That dial still selects index at-the-money contracts, which the
 //!   lock bans — recorded as an open item, not silently accepted.
 //!
+//! # The minimum hold (ADDED 2026-10-20)
+//!
+//! Scope lock "DEPTH-200 HOLDS A SWAPPED-IN CONTRACT FOR AT LEAST 10
+//! MINUTES": a contract this planner swapped onto a socket is not swapped off
+//! for [`crate::depth200_min_hold::DEPTH200_MIN_HOLD_SECS`] (600 s). The
+//! planner reads one `Option<u64>` per socket (`min_hold`: the held
+//! contract's underlying when the socket is locked); the swap-in times live in
+//! [`crate::depth200_min_hold::Depth200HoldBook`], owned by the steering loop.
+//! A locked socket keeps its underlying's name: an entry candidate of the
+//! SAME underlying is not placed on another socket (that would put two
+//! sockets on one underlying, against the 2026-09-24 "top 5 distinct
+//! underlyings" rule). The ranking, the band, the per-minute cap and every
+//! other rule above are unchanged. Measured before it (19 Oct): about 1,200
+//! swaps a day, about 2 frames per swap.
+//!
 //! # Complexity
 //!
 //! O(sockets × ranked): sockets is [`DEPTH_200_SOCKET_BUDGET`] (5) and `ranked`
@@ -74,16 +89,26 @@ const _: () = assert!(
 /// `planned` — sent onward to the socket; `capped` — a needed swap refused
 /// this minute by [`MAX_RANKED_SWAPS_PER_MINUTE`] (retried next minute);
 /// `socket_empty` — a ranked contract had no socket to go to because the only
-/// free socket holds nothing (see the module header). A rising `capped` is the
+/// free socket holds nothing (see the module header). Since 2026-10-20 it no
+/// longer counts a contract the minimum hold kept waiting
+/// ([`RankedDecision::held_back`], logged, not published). A rising `capped` is the
 /// measurement the 2026-09-07 rule says decides whether the window needs
 /// lengthening or a hysteresis band — never a reason to revert the key.
+///
+/// `min_hold` (ADDED 2026-10-20, scope lock "DEPTH-200 HOLDS A SWAPPED-IN
+/// CONTRACT FOR AT LEAST 10 MINUTES") — a socket the ranking wanted to change,
+/// with a candidate waiting for it (or an entry candidate of its own
+/// underlying kept off every other socket), left alone because its contract
+/// was swapped in less than [`crate::depth200_min_hold::DEPTH200_MIN_HOLD_SECS`]
+/// ago. Counted once per socket per minute; local `/metrics` only (no EMF
+/// name, no filter, no alarm, as that section's REJECT list requires).
 pub const RANKED_SWAPS_COUNTER: &str = "tv_depth200_ranked_swaps_total";
 
 /// Gauge: sockets whose held contract was ON the ranking this minute (kept).
 pub const RANKED_KEPT_GAUGE: &str = "tv_depth200_ranked_sockets_kept";
 
 /// Every label value [`RANKED_SWAPS_COUNTER`] can carry, for pre-registration.
-pub const RANKED_SWAP_OUTCOMES: [&str; 3] = ["planned", "capped", "socket_empty"];
+pub const RANKED_SWAP_OUTCOMES: [&str; 4] = ["planned", "capped", "socket_empty", "min_hold"];
 
 /// Registers the counter's series at zero so the first swap is a delta the
 /// CloudWatch agent can see, not a dropped first sample (the loss-series
@@ -106,8 +131,25 @@ pub struct RankedDecision {
     /// Needed swaps refused by the per-minute cap. Retried next minute.
     pub capped: usize,
     /// Ranked contracts that had no socket to go to: every non-kept socket was
-    /// either already assigned this minute or holds nothing.
+    /// either already assigned this minute or holds nothing. Published as
+    /// `outcome="socket_empty"`. Since 2026-10-20 it does NOT count a contract
+    /// kept waiting by the minimum hold: those are [`Self::held_back`].
     pub unplaced: usize,
+    /// Sockets the ranking wanted to change, left alone by the 2026-10-20
+    /// minimum hold (their contract was swapped in under
+    /// [`crate::depth200_min_hold::DEPTH200_MIN_HOLD_SECS`] ago). "Wanted"
+    /// means a placeable candidate was waiting when the socket was reached, or
+    /// an entry candidate of the socket's own underlying was kept off the
+    /// board for it. Not a cap refusal: a held socket never spends a slot of
+    /// [`MAX_RANKED_SWAPS_PER_MINUTE`]. Published as `outcome="min_hold"`.
+    pub min_hold: usize,
+    /// Entry candidates the 2026-10-20 minimum hold kept waiting this minute
+    /// (a count of CONTRACTS, where `min_hold` counts sockets): one of the
+    /// same underlying as a locked socket's contract (not placed elsewhere,
+    /// so two sockets never carry one underlying), plus those left over that
+    /// a locked socket would otherwise have taken. Kept out of `unplaced` so
+    /// `socket_empty` stays a true "no socket" signal. Logged, not published.
+    pub held_back: usize,
 }
 
 impl RankedDecision {
@@ -139,10 +181,35 @@ impl RankedDecision {
 /// set; a contract already held is KEPT while it stays anywhere in the list.
 /// So a held contract that slips from fifth to sixth for one window is not
 /// swapped out and back — the churn the 2026-09-07 lock names a band for.
+///
+/// # The minimum hold (2026-10-20)
+///
+/// `min_hold[i]` is `Some(underlying)` when socket `i`'s contract was swapped
+/// in less than [`crate::depth200_min_hold::DEPTH200_MIN_HOLD_SECS`] ago and
+/// is still eligible, carrying that contract's underlying (built by
+/// [`crate::depth200_min_hold::Depth200HoldBook::locked_mask`]). Such a socket
+/// is not swapped off this minute even when its contract has left the
+/// ranking. Two consequences, both counted:
+///
+/// * an entry candidate whose `underlying_id` is a locked socket's underlying
+///   is NOT placed anywhere this minute — the locked socket keeps that name,
+///   so no two sockets carry one underlying (the 2026-09-24 "top 5 distinct
+///   underlyings" rule) — and is counted in `held_back`, with the locked
+///   socket counted in `min_hold`;
+/// * any other candidate stays for the next free socket; one left over that a
+///   locked socket would have taken is counted in `held_back`, never in
+///   `unplaced`.
+///
+/// A missing entry (a shorter or empty slice) reads `None`, and an empty
+/// socket is never locked, so an empty socket, a dial-placed contract and
+/// every caller that passes `&[]` plan exactly as before the hold existed.
+/// One bounds-checked read per socket plus a scan of the entry set per locked
+/// socket: still O(sockets × ranked).
 #[must_use]
 pub fn plan_ranked_minute(
     held: &[Option<SubscribeInstrument>],
     ranked: &[Depth200Candidate],
+    min_hold: &[Option<u64>],
 ) -> RankedDecision {
     let mut decision = RankedDecision::default();
 
@@ -152,12 +219,32 @@ pub fn plan_ranked_minute(
         .flatten()
         .map(|i| (i.security_id, i.segment.binary_code()))
         .collect();
-    // ENTRY candidates NOT held anywhere, best first. The band is never
-    // placed from — it only decides what is kept, below.
-    let mut to_place = crate::depth200_candidates::entry_set(ranked)
+    // The 2026-10-20 minimum hold: the underlyings of the locked sockets
+    // (at most one per socket, five). A locked socket keeps its name.
+    let locked_underlyings: Vec<u64> = held
+        .iter()
+        .zip(min_hold)
+        .filter_map(|(slot, lock)| slot.as_ref().and(*lock))
+        .collect();
+    let entry = crate::depth200_candidates::entry_set(ranked);
+    // An unheld entry candidate of a locked socket's underlying is held back,
+    // never placed on another socket (that would be two sockets on one name).
+    decision.held_back = entry
         .iter()
         .filter(|c| !held_keys.contains(&c.key()))
+        .filter(|c| locked_underlyings.contains(&c.underlying_id))
+        .count();
+    // ENTRY candidates NOT held anywhere and not of a locked socket's
+    // underlying, best first. The band is never placed from — it only
+    // decides what is kept, below.
+    let mut to_place = entry
+        .iter()
+        .filter(|c| !held_keys.contains(&c.key()))
+        .filter(|c| !locked_underlyings.contains(&c.underlying_id))
         .peekable();
+    // Locked sockets reached with a placeable candidate waiting: each would
+    // have taken one, so as many leftovers are the hold's, not "no socket".
+    let mut held_with_candidate_waiting = 0usize;
 
     for (socket_index, slot) in held.iter().enumerate() {
         let Some(old) = slot else {
@@ -209,7 +296,36 @@ pub fn plan_ranked_minute(
         // otherwise inert: the socket is still left alone (no swap is pushed),
         // `to_place` stays empty so no later socket can be funded either, and
         // the terminal `to_place.count()` is unaffected.
+
+        // The 2026-10-20 minimum hold for this socket: `Some(underlying)` when
+        // locked. A locked socket whose own underlying has an entry candidate
+        // held back above was "wanted" even when nothing else waits for it.
+        let lock = min_hold.get(socket_index).copied().flatten();
+        let own_name_held_back = lock.is_some_and(|underlying| {
+            entry
+                .iter()
+                .any(|c| c.underlying_id == underlying && !held_keys.contains(&c.key()))
+        });
         if to_place.peek().is_none() {
+            if own_name_held_back {
+                decision.min_hold = decision.min_hold.saturating_add(1);
+            }
+            continue;
+        }
+        // The hold, AFTER the peek (a socket with nothing waiting for it was
+        // not "wanted", so it is not counted, bar the own-name case above) and
+        // BEFORE the cap (a held socket spends no slot of the cap, and is not
+        // a cap refusal). The candidate is NOT consumed, so it goes to the
+        // next free socket or, left over, is counted in `held_back`.
+        if lock.is_some() {
+            decision.min_hold = decision.min_hold.saturating_add(1);
+            // A socket whose own name is already held back (counted in
+            // `held_back` above) has spent its one slot on that name; counting
+            // it again would move a genuinely unplaced contract out of
+            // `socket_empty` (review round 2, 2026-10-20).
+            if !own_name_held_back {
+                held_with_candidate_waiting = held_with_candidate_waiting.saturating_add(1);
+            }
             continue;
         }
         if decision.swaps.len() >= MAX_RANKED_SWAPS_PER_MINUTE {
@@ -217,8 +333,8 @@ pub fn plan_ranked_minute(
             continue;
         }
         let Some(candidate) = to_place.next() else {
-            // Unreachable: the peek two statements up returned `Some`, and
-            // nothing between there and here advances the iterator. Written as
+            // Unreachable: the peek above returned `Some`, and nothing
+            // between there and here advances the iterator. Written as
             // a `break` rather than an `expect` because `panic = "abort"` on
             // the release profile turns a wrong assumption here into process
             // death mid-session, and because `clippy::expect_used` is denied
@@ -235,8 +351,14 @@ pub fn plan_ranked_minute(
             reason: SwitchReason::VolumeRankChanged,
         });
     }
-    // Whatever is still waiting had no socket to go to this minute.
-    decision.unplaced = to_place.count();
+    // Whatever is still waiting had no socket to go to this minute — except
+    // the leftovers a locked socket would have taken (2026-10-20): each such
+    // socket would have consumed one, so up to that many are the hold's and
+    // go to `held_back`, never to `unplaced` (published as `socket_empty`).
+    let remaining = to_place.count();
+    let held_leftovers = remaining.min(held_with_candidate_waiting);
+    decision.held_back = decision.held_back.saturating_add(held_leftovers);
+    decision.unplaced = remaining.saturating_sub(held_leftovers);
     decision
 }
 
@@ -251,9 +373,16 @@ pub fn record_ranked_decision(decision: &RankedDecision) {
         metrics::counter!(RANKED_SWAPS_COUNTER, "outcome" => "capped")
             .increment(decision.capped as u64);
     }
+    // `unplaced` excludes the contracts the 2026-10-20 minimum hold kept
+    // waiting (`held_back`, logged by the steering loop, deliberately not a
+    // new series), so `socket_empty` means "no socket", never "held".
     if decision.unplaced > 0 {
         metrics::counter!(RANKED_SWAPS_COUNTER, "outcome" => "socket_empty")
             .increment(decision.unplaced as u64);
+    }
+    if decision.min_hold > 0 {
+        metrics::counter!(RANKED_SWAPS_COUNTER, "outcome" => "min_hold")
+            .increment(decision.min_hold as u64);
     }
 }
 
@@ -291,7 +420,7 @@ mod tests {
             candidate(3, 30, 300),
         ];
         let holds = [held(3, FNO), held(1, FNO), held(2, FNO)];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert!(d.is_quiet());
         assert_eq!(d.kept, 3);
         assert_eq!((d.capped, d.unplaced), (0, 0));
@@ -310,7 +439,7 @@ mod tests {
             held(9004, IDX),
             held(77, FNO),
         ];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.swaps.len(), 5);
         assert_eq!(d.kept, 0);
         for (i, swap) in d.swaps.iter().enumerate() {
@@ -331,7 +460,7 @@ mod tests {
     fn a_held_ranked_contract_is_neither_moved_nor_duplicated() {
         let ranked = [candidate(1, 10, 500), candidate(2, 20, 400)];
         let holds = [held(9001, IDX), held(2, FNO)];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.kept, 1);
         assert_eq!(d.swaps.len(), 1);
         assert_eq!(d.swaps[0].socket_index, 0);
@@ -347,7 +476,7 @@ mod tests {
     fn surplus_sockets_keep_their_off_ranking_contract_rather_than_going_empty() {
         let ranked = [candidate(1, 10, 500)];
         let holds = [held(9001, IDX), held(9002, IDX), held(9003, IDX)];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.swaps.len(), 1);
         assert_eq!(d.swaps[0].socket_index, 0);
         assert_eq!(d.unplaced, 0);
@@ -358,7 +487,7 @@ mod tests {
     #[test]
     fn an_empty_ranking_moves_nothing() {
         let holds = [held(9001, IDX), held(9002, IDX)];
-        let d = plan_ranked_minute(&holds, &[]);
+        let d = plan_ranked_minute(&holds, &[], &[]);
         assert!(d.is_quiet());
         assert_eq!(d.kept, 0);
     }
@@ -369,7 +498,7 @@ mod tests {
     fn an_empty_socket_is_skipped_and_the_orphaned_candidate_is_counted() {
         let ranked = [candidate(1, 10, 500), candidate(2, 20, 400)];
         let holds = [None, held(9001, IDX)];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.swaps.len(), 1);
         assert_eq!(d.swaps[0].socket_index, 1);
         assert_eq!(d.unplaced, 1);
@@ -389,7 +518,7 @@ mod tests {
             .map(|i| candidate(100 + i, i, 1000 - i))
             .collect();
         let holds: Vec<_> = (1..=n as u64).map(|i| held(9000 + i, IDX)).collect();
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.swaps.len(), MAX_RANKED_SWAPS_PER_MINUTE);
         assert_eq!(d.capped, 0, "nothing beyond the entry set is ever queued");
         assert_eq!(d.unplaced, 0);
@@ -421,7 +550,7 @@ mod tests {
             held(3, FNO),
             None,
         ];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert!(
             d.is_quiet(),
             "nothing is unheld, so the off-ranking socket keeps what it holds"
@@ -450,7 +579,7 @@ mod tests {
             held(3, FNO),
             held(4, FNO),
         ];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.kept, 5, "rank 6 is inside the band and is kept");
         assert!(
             d.is_quiet(),
@@ -477,7 +606,7 @@ mod tests {
             held(4, FNO),
             held(9001, IDX),
         ];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(d.swaps.len(), 1);
         assert_eq!(
             d.swaps[0].new.security_id, entry,
@@ -493,7 +622,7 @@ mod tests {
             held(5, FNO),
             held(9002, IDX),
         ];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert!(
             d.is_quiet(),
             "band rows are not placed; the socket keeps its contract"
@@ -508,13 +637,112 @@ mod tests {
     fn a_held_id_in_another_segment_does_not_count_as_holding_the_ranked_contract() {
         let ranked = [candidate(13, 10, 500)];
         let holds = [held(13, IDX)];
-        let d = plan_ranked_minute(&holds, &ranked);
+        let d = plan_ranked_minute(&holds, &ranked, &[]);
         assert_eq!(
             d.swaps.len(),
             1,
             "same number, different segment, still a swap"
         );
         assert_eq!(d.kept, 0);
+    }
+
+    /// 2026-10-20 minimum hold: a held off-ranking socket is skipped and
+    /// counted, spends no cap slot, and its candidate goes to the next free
+    /// socket. A held socket with nothing waiting is not counted, and a
+    /// socket holding a ranked contract stays `kept` whatever its hold.
+    #[test]
+    fn plan_ranked_minute_skips_a_min_hold_socket_and_funds_the_next() {
+        let ranked = [candidate(1, 10, 500), candidate(2, 20, 400)];
+        let holds = [held(9001, FNO), held(9002, FNO), held(2, FNO)];
+        let d = plan_ranked_minute(&holds, &ranked, &[Some(901), None, Some(20)]);
+        assert_eq!(d.min_hold, 1);
+        assert_eq!(d.kept, 1);
+        assert_eq!(d.capped, 0);
+        assert_eq!(d.unplaced, 0);
+        assert_eq!(d.held_back, 0, "the candidate found the next free socket");
+        assert_eq!(d.swaps.len(), 1);
+        assert_eq!(d.swaps[0].socket_index, 1);
+        assert_eq!(d.swaps[0].new.security_id, 1);
+
+        // Every socket held: nothing moves, and both waiting candidates are
+        // the HOLD's (held_back), not "no socket" (unplaced / socket_empty).
+        let d = plan_ranked_minute(&holds[..2], &ranked, &[Some(901), Some(902)]);
+        assert!(d.is_quiet());
+        assert_eq!(
+            (d.min_hold, d.held_back, d.unplaced, d.capped),
+            (2, 2, 0, 0)
+        );
+
+        // One held socket, two candidates: one is the hold's, the other had
+        // no socket even without the hold, so it alone is `unplaced`.
+        let d = plan_ranked_minute(&holds[..1], &ranked, &[Some(901)]);
+        assert!(d.is_quiet());
+        assert_eq!(
+            (d.min_hold, d.held_back, d.unplaced, d.capped),
+            (1, 1, 1, 0)
+        );
+
+        // Nothing waiting: a held socket is not "wanted", so not counted.
+        let d = plan_ranked_minute(&[held(9001, FNO)], &[], &[Some(901)]);
+        assert_eq!((d.min_hold, d.held_back, d.unplaced), (0, 0, 0));
+    }
+
+    /// 2026-10-20 minimum hold, reviewer finding (HIGH): socket 0 holds A of
+    /// underlying 10, swapped in under 600 s ago; underlying 10's top contract
+    /// is now B. B must NOT go to socket 1 — that would put two sockets on one
+    /// underlying, against the 2026-09-24 "top 5 distinct underlyings" rule.
+    /// The locked socket keeps the name; B waits (`held_back`), and nothing
+    /// else on the pool changes.
+    #[test]
+    fn a_held_contract_keeps_its_underlying_so_a_same_name_candidate_is_not_placed_elsewhere() {
+        const A: u64 = 500;
+        const B: u64 = 501;
+        let holds = [held(A, FNO), held(9002, FNO)];
+        let mask = [Some(10), None];
+        let d = plan_ranked_minute(&holds, &[candidate(B, 10, 500)], &mask);
+        assert!(d.is_quiet(), "0 swaps: no other socket changes");
+        assert_eq!(
+            (d.min_hold, d.held_back, d.unplaced, d.capped, d.kept),
+            (1, 1, 0, 0, 0)
+        );
+
+        // With another name C waiting too, C takes the free socket and B
+        // still goes nowhere.
+        let d = plan_ranked_minute(
+            &holds,
+            &[candidate(B, 10, 500), candidate(77, 30, 400)],
+            &mask,
+        );
+        assert_eq!(d.swaps.len(), 1);
+        assert_eq!(d.swaps[0].socket_index, 1);
+        assert_eq!(d.swaps[0].new.security_id, 77);
+        assert!(d.swaps.iter().all(|s| s.new.security_id != B));
+        assert_eq!((d.min_hold, d.held_back, d.unplaced), (1, 1, 0));
+
+        // Once the hold expires (mask None) B replaces A on socket 0 itself.
+        let d = plan_ranked_minute(&holds, &[candidate(B, 10, 500)], &[None, None]);
+        assert_eq!(d.swaps.len(), 1);
+        assert_eq!(d.swaps[0].socket_index, 0);
+        assert_eq!(d.swaps[0].new.security_id, B);
+        assert_eq!((d.min_hold, d.held_back), (0, 0));
+    }
+
+    /// Review round 2 (MEDIUM): a locked socket whose own name is already held
+    /// back must not also absorb another leftover, or an empty socket's
+    /// `socket_empty` reading is hidden.
+    #[test]
+    fn plan_ranked_minute_held_back_does_not_double_count_a_locked_slot() {
+        let holds = [held(500, FNO), None];
+        let d = plan_ranked_minute(
+            &holds,
+            &[candidate(501, 10, 500), candidate(77, 30, 400)],
+            &[Some(10), None],
+        );
+        assert_eq!(
+            (d.min_hold, d.held_back, d.unplaced, d.swaps.len()),
+            (1, 1, 1, 0),
+            "B is held back by the hold; C has no socket and is reported"
+        );
     }
 
     /// `is_quiet` is exactly "no swaps": kept, capped and unplaced counts do
@@ -526,9 +754,11 @@ mod tests {
             kept: 3,
             capped: 2,
             unplaced: 1,
+            min_hold: 1,
+            held_back: 1,
         };
         assert!(quiet.is_quiet());
-        let loud = plan_ranked_minute(&[held(9001, IDX)], &[candidate(1, 10, 500)]);
+        let loud = plan_ranked_minute(&[held(9001, IDX)], &[candidate(1, 10, 500)], &[]);
         assert!(!loud.is_quiet());
     }
 
@@ -539,7 +769,7 @@ mod tests {
         record_ranked_decision(&RankedDecision::default());
         // An index option holding against one ranked stock option is exactly
         // one swap and nothing kept; recording that shape must not change it.
-        let decision = plan_ranked_minute(&[held(9001, IDX)], &[candidate(1, 10, 500)]);
+        let decision = plan_ranked_minute(&[held(9001, IDX)], &[candidate(1, 10, 500)], &[]);
         record_ranked_decision(&decision);
         assert_eq!(decision.swaps.len(), 1);
         assert_eq!(decision.kept, 0);
@@ -553,8 +783,10 @@ mod tests {
             kept: 2,
             capped: 1,
             unplaced: 1,
+            min_hold: 1,
+            held_back: 1,
         });
-        assert_eq!(RANKED_SWAP_OUTCOMES.len(), 3);
+        assert_eq!(RANKED_SWAP_OUTCOMES.len(), 4);
     }
 
     /// `plan_ranked_minute` PEEKS, then tests the cap, then consumes — in that

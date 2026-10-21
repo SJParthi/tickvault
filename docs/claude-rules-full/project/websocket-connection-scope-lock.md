@@ -9404,3 +9404,63 @@ REJECT (2026-10-13):
 - Lowering the 900 s depth-200 backstop.
 - Any change to depth-20 or the main feed under this quote.
 - Any new CloudWatch alarm, Telegram page, metric filter or EMF name for it.
+
+### 2026-10-20 note — NO DATA-SILENCE REDIAL ON A NON-TRADING DAY (a fix, not a new quote)
+
+Measured 2026-10-20 (Dussehra, an NSE holiday in `config/base.toml`), read-only
+from the production logs: the box started, every socket dialled, and the
+data-silence redials fired 569 times between 09:15 and 15:30 IST, because the
+2026-10-10 gate checked the time of day only. Owner, the same day: "go ahead
+and fix and resoleev everyhting dude okay?" / "yo utake care of the entiree
+xtreem full end to end automation dude okay?".
+
+The gate now also reads the trading calendar
+(`crates/core/src/websocket/silence_calendar.rs`): on a weekend or NSE holiday
+the 2026-10-10 silence paths (the 300 s fallback, the 60 s / 90 s fast paths,
+the 900 s depth-200 backstop, the depth-200 cross-feed check) and the overflow
+probe window stay shut all day. It only makes those paths fire LESS, so no
+2026-10-10 or 2026-10-13 REJECT row is touched. Unchanged: the ping idle
+watchdog and every close code (an 805 still parks the socket; only the probe
+window that releases it waits for a trading day). It fails open (a normal day) when
+no calendar is installed. One atomic load per 1 s poll; the calendar is asked
+once per IST day. Hostile review the same day: when at least 3 sockets delivered
+data in the last 10 s the market is open whatever the calendar says (a moved
+holiday, a special session, the run-anyway marker), so the gate reads the real
+time of day.
+
+### 2026-10-20 — DEPTH-200 HOLDS A SWAPPED-IN CONTRACT FOR AT LEAST 10 MINUTES
+
+Measured 2026-10-20 from the live logs (read-only), 14, 15, 16 and 19 Oct:
+depth-200 swapped about 1,200 times a day (1,252 "live subscription swapped"
+lines on 19 Oct), each socket held 112–151 different contracts a day, and a
+socket received about 2 frames per swap (pool 0, 10:00–15:00 on 19 Oct: 408
+frames, 203 swaps). The five depth-200 sockets delivered 5,532 frames on 19 Oct
+against 446,187 on depth-20. A held busy contract streams fast (c13 on 19 Oct,
+about 110 frames a minute at 09:15–09:30), so the churn, not the vendor, is why
+depth-200 carried mostly opening snapshots.
+
+Owner, 2026-10-20, asked "Depth-200 sockets switch contract about every 90
+seconds, so each contract gets about 2 snapshots instead of a continuous
+200-level book. How should depth-200 pick its 5 contracts?", tapped **"Hold 10
+min (Recommended)"**: "Keep the top-5-by-1-minute-volume rule, but once a
+contract is on a socket it stays at least 10 minutes. About 6 switches per
+socket per hour instead of about 40, so each held contract streams its full
+book."
+
+The rule: the 2026-09-24 ranking (top 5 distinct stock-option underlyings by
+1-minute volume, re-ranked every minute) and the 2026-10-01 in-place swap
+mechanism stay. A contract swapped onto a depth-200 socket is not swapped off
+for at least 600 s (`DEPTH200_MIN_HOLD_SECS`), counted from its swap-in. The
+per-socket and pool-wide caps, `ROTATION_HALTED`, the 805 handling and the
+silent-swap resubscribe (2026-10-13) are unchanged. A socket that holds no
+contract, or whose contract is gone from the board's eligible set (expired,
+not tradable), is not held by this rule.
+
+REJECT:
+- A minimum hold below 600 s, or a hold longer than 600 s, without a fresh
+  dated quote here.
+- Applying the hold to depth-20 or the main feed.
+- A hold that blocks the first fill of an empty socket, or keeps an expired
+  contract.
+- Raising any swap cap or touching `ROTATION_HALTED` under this quote.
+- Any new alarm, page, metric filter or EMF name for it.

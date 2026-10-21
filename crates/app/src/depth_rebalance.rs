@@ -1543,6 +1543,12 @@ pub async fn run_depth_rebalance(
             crate::depth_unsubscribe_probe::today_ymd_ist(),
         )
     });
+    // Depth-200 swap-in times for the 2026-10-20 minimum hold (scope lock
+    // "DEPTH-200 HOLDS A SWAPPED-IN CONTRACT FOR AT LEAST 10 MINUTES"). Lives
+    // here, beside `sockets`, because this loop is the only writer of what
+    // the depth-200 sockets hold. Starts empty: a dial-placed contract has no
+    // swap-in and is not held.
+    let mut hold_book = crate::depth200_min_hold::Depth200HoldBook::new(sockets.len());
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
     let mut gainer_board_empty_reported = false;
@@ -1656,6 +1662,13 @@ pub async fn run_depth_rebalance(
             // reports a fresh age instead of carrying the block forward.
             heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
         }
+        // The 2026-10-20 minimum hold's COMPARISON reading for this minute,
+        // taken AFTER the probe block (which can hold this loop for minutes):
+        // every swap-in is compared against this instant. The STAMP of a new
+        // swap-in is a separate reading taken after `apply_decision` returns
+        // (below), so a stamp never predates the real send. A contract is
+        // released on the first minute at or past 600 s, never earlier.
+        let steer_now = std::time::Instant::now();
         // ---- "no ranking by 09:20" (2026-09-08) ----
         //
         // Once per session, coded, log-sink only (no CloudWatch filter reads
@@ -1859,22 +1872,47 @@ pub async fn run_depth_rebalance(
                 // `filter_map` above (which collapses gaps) is not used here.
                 let held_slots: Vec<Option<SubscribeInstrument>> =
                     sockets.iter().map(|s| s.held).collect();
-                let ranked_decision =
-                    crate::depth200_ranked_steer::plan_ranked_minute(&held_slots, ranked);
+                // The 2026-10-20 minimum hold: line the book up with the
+                // reconciled holds (a refused swap gets its old contract's
+                // swap-in back), then per socket the held contract's underlying
+                // when it is locked (`None` otherwise), so the planner keeps that
+                // name on that socket and never places a same-underlying contract
+                // elsewhere. O(sockets), one map probe per held socket; not per frame.
+                hold_book.observe(&held_slots);
+                let hold_mask = hold_book.locked_mask(&held_slots, steer_now, |instrument| {
+                    crate::depth200_min_hold::depth200_held_underlying(
+                        crate::contract_underlying_map::global_contract_underlying_map(),
+                        instrument,
+                    )
+                });
+                let ranked_decision = crate::depth200_ranked_steer::plan_ranked_minute(
+                    &held_slots,
+                    ranked,
+                    &hold_mask,
+                );
                 crate::depth200_ranked_steer::record_ranked_decision(&ranked_decision);
                 // Same per-minute read-out as depth-20 above (observability
                 // audit gap 1): every count the counters carry, in one line,
                 // only on a minute that moved or refused something.
                 let planned_200 = ranked_decision.swaps.len();
-                if planned_200 > 0 || ranked_decision.capped > 0 || ranked_decision.unplaced > 0 {
+                if planned_200 > 0
+                    || ranked_decision.capped > 0
+                    || ranked_decision.unplaced > 0
+                    || ranked_decision.min_hold > 0
+                    || ranked_decision.held_back > 0
+                {
                     tracing::info!(
                         planned = planned_200,
                         capped = ranked_decision.capped,
                         unplaced = ranked_decision.unplaced,
                         kept = ranked_decision.kept,
+                        min_hold = ranked_decision.min_hold,
+                        held_back = ranked_decision.held_back,
                         ranked = ranked.len(),
                         "depth-200 ranked steering this minute — planned swaps go to the wire; \
-                         capped and unplaced are retried next minute"
+                         capped and unplaced are retried next minute; min_hold sockets keep a \
+                         contract swapped in under 10 minutes ago, and held_back contracts \
+                         wait for them (never counted as unplaced)"
                     );
                 }
                 (
@@ -1905,6 +1943,17 @@ pub async fn run_depth_rebalance(
             continue;
         }
         let sent = apply_decision(&mut sockets, &decision);
+        // Stamp the swaps that actually queued (their socket now holds the new
+        // contract): each starts its 600 s minimum hold NOW, read after
+        // `apply_decision` returned, so the stamp is never earlier than the
+        // send (a stamp from the top of the minute would release the contract
+        // up to the probe's duration early).
+        let sent_at = std::time::Instant::now();
+        hold_book.note_sent_swaps(
+            &decision.atm_swaps,
+            |index| sockets.get(index).and_then(|s| s.held),
+            sent_at,
+        );
         tracing::info!(
             sent,
             engine,

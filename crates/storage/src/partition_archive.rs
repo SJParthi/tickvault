@@ -1508,33 +1508,109 @@ pub(crate) fn spill_dirs_for_table(table: &str) -> &'static [&'static str] {
 /// pending or the folder is absent. An unreadable folder or entry answers
 /// `Some(0)`, which holds every partition: "I could not check" never reads
 /// as "safe". O(files), one listing, on the archive task (off the worker).
+///
+/// ⚠ CHANGED 2026-10-20 (audit C1): a pending file whose NAME carries no hour
+/// no longer answers `Some(0)`. It used to: one such file held every
+/// top_volume partition and kept the daily archive verdict Incomplete for as
+/// long as the file sat there, and the age set-aside did not move it either
+/// (it cannot age a file it cannot date), so nothing ever cleared it. It is
+/// now skipped and reported in one coded `warn!` per call (one call per
+/// archive run), naming the count and the first such file. Only `.ilp` files
+/// are considered, the same set the replay reads (`list_spill_files`); any
+/// other file is never replayed, so it cannot write into an hour. A file that
+/// vanished between the listing and its `stat` (the replay emptying or
+/// setting it aside) is skipped too. What still fails safe with `Some(0)`: a
+/// folder that exists but cannot be listed, an entry the listing could not
+/// read, and a `stat` that failed for any other reason.
+///
+/// The replay and this hold now agree (C1 review, LOW-2, 2026-10-20): the
+/// top_volume replay round moves every non-empty undated `.ilp` file to
+/// `quarantine/` before it posts anything
+/// (`tick_spill_replay::set_aside_aged_spill_files`), so the replay no longer
+/// posts what this hold skips. The writer never makes such a name
+/// (`<tier>-<feed>-<hour>.ilp`), so one only appears by hand or from a
+/// damaged folder. **Honest limit:** until the next replay round the file
+/// sits in the folder unheld, but nothing posts it in that time, because each
+/// round sets files aside before it posts; only a file placed between a
+/// round's set-aside and that round's own listing is posted, once, unheld.
+/// *(The first version of this note said the replay still posts every
+/// undated file; the set-aside above removed that.)*
 #[must_use]
 pub(crate) fn oldest_pending_spill_hour(dir: &Path) -> Option<u64> {
+    let scan = scan_pending_spill_hours(dir);
+    if scan.unnamed > 0 {
+        warn!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "top_volume_spill_unnamed_file_skipped",
+            dir = %dir.display(),
+            files = scan.unnamed,
+            first = ?scan.first_unnamed,
+            "pending spill file(s) whose name carries no hour were SKIPPED when deciding \
+             which top_volume hours the archive must hold: such a file carries no date, \
+             so it does not hold every partition. The next replay round sets it aside \
+             in quarantine/ before posting anything, so it is not replayed; re-ingest \
+             its rows by hand only after checking the cold archive of their hours."
+        );
+    }
+    scan.oldest
+}
+
+/// What [`oldest_pending_spill_hour`] found in one listing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PendingSpillScan {
+    /// The oldest hour a pending, dated `.ilp` file carries, or `Some(0)` when
+    /// the folder or an entry could not be read (hold every partition).
+    oldest: Option<u64>,
+    /// Pending `.ilp` files whose name carries no hour, skipped.
+    unnamed: u32,
+    /// The first of them, for the coded line.
+    first_unnamed: Option<PathBuf>,
+}
+
+/// One listing of `dir` for [`oldest_pending_spill_hour`]. O(files), cold.
+fn scan_pending_spill_hours(dir: &Path) -> PendingSpillScan {
+    let fail_safe = PendingSpillScan {
+        oldest: Some(0),
+        ..PendingSpillScan::default()
+    };
     let entries = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return Some(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return PendingSpillScan::default();
+        }
+        Err(_) => return fail_safe,
     };
-    let mut oldest: Option<u64> = None;
+    let mut scan = PendingSpillScan::default();
     for entry in entries {
         let Ok(entry) = entry else {
-            return Some(0);
+            return fail_safe;
         };
-        let Ok(meta) = entry.metadata() else {
-            return Some(0);
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            // Gone since the listing: the replay emptied or moved it.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return fail_safe,
         };
         if !meta.is_file() {
             continue;
         }
         let path = entry.path();
-        if !crate::tick_spill_replay::spill_file_pending(&path, meta.len()) {
+        let is_spill_file = path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case(crate::tick_spill_replay::SPILL_FILE_EXTENSION)
+        });
+        if !is_spill_file || !crate::tick_spill_replay::spill_file_pending(&path, meta.len()) {
             continue;
         }
-        // A pending file whose name carries no hour cannot be placed: hold all.
-        let hour = crate::tick_spill_replay::spill_file_hour(&path).unwrap_or(0);
-        oldest = Some(oldest.map_or(hour, |o| o.min(hour)));
+        let Some(hour) = crate::tick_spill_replay::spill_file_hour(&path) else {
+            scan.unnamed = scan.unnamed.saturating_add(1);
+            if scan.first_unnamed.is_none() {
+                scan.first_unnamed = Some(path);
+            }
+            continue;
+        };
+        scan.oldest = Some(scan.oldest.map_or(hour, |o| o.min(hour)));
     }
-    oldest
+    scan
 }
 
 /// Whether the top_volume partition `name` is HELD this run (top_volume
@@ -6547,6 +6623,68 @@ mod hour_granular_eligibility_tests {
             Some(497_746),
             false
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (audit C1, 2026-10-20): a pending spill file whose name
+    /// carries no hour used to answer `Some(0)`, which held EVERY top_volume
+    /// partition and kept the daily verdict Incomplete for as long as the
+    /// file sat there. It is now skipped and counted; a folder that cannot be
+    /// listed still fails safe.
+    #[test]
+    fn test_unparseable_spill_name_does_not_hold_every_partition() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-pa-tv-unnamed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir"); // APPROVED: test
+        let unnamed = dir.join("top_volume-dhan-notanhour.ilp");
+        std::fs::write(&unnamed, b"x\n").expect("write"); // APPROVED: test
+
+        // Alone, it holds nothing: before the fix this was Some(0).
+        let scan = scan_pending_spill_hours(&dir);
+        assert_eq!(scan.oldest, None);
+        assert_eq!(scan.unnamed, 1);
+        assert_eq!(scan.first_unnamed.as_deref(), Some(unnamed.as_path()));
+        assert_eq!(oldest_pending_spill_hour(&dir), None);
+        assert!(
+            !top_volume_partition_held("2026-09-01", oldest_pending_spill_hour(&dir), false),
+            "a month-old partition is archivable again"
+        );
+
+        // Beside a dated file, the dated file alone sets the line.
+        std::fs::write(dir.join("top_volume-dhan-497756.ilp"), b"y\n").expect("write"); // APPROVED: test
+        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_756));
+
+        // Files the replay never reads are ignored, even when their name ends
+        // in digits, and an EMPTY unnamed file is not pending: neither counts.
+        std::fs::write(dir.join("notes-100.txt"), b"z\n").expect("write"); // APPROVED: test
+        std::fs::write(dir.join("top_volume-dhan-empty.ilp"), b"").expect("write"); // APPROVED: test
+        let scan = scan_pending_spill_hours(&dir);
+        assert_eq!(
+            scan.oldest,
+            Some(497_756),
+            "notes-100.txt must not read as hour 100"
+        );
+        assert_eq!(
+            scan.unnamed, 1,
+            "the empty unnamed file holds nothing to replay"
+        );
+
+        // Upper-case extension is still a spill file, as in `list_spill_files`.
+        std::fs::write(dir.join("top_volume-dhan-497700.ILP"), b"w\n").expect("write"); // APPROVED: test
+        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_700));
+
+        // An absent folder holds nothing; a path that exists but cannot be
+        // listed (here a regular file, so `read_dir` fails with something other
+        // than NotFound, also as root) still fails safe and holds everything.
+        assert_eq!(oldest_pending_spill_hour(&dir.join("absent")), None);
+        assert_eq!(oldest_pending_spill_hour(&unnamed), Some(0));
+        assert_eq!(scan_pending_spill_hours(&unnamed).unnamed, 0);
+        assert!(top_volume_partition_held("2026-09-01", Some(0), false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
