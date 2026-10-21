@@ -301,6 +301,8 @@ pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
+// Quote 31 (2026-10-21): seal the WAL writer's open segment on request.
+pub mod wal_idle_seal;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
 // frames whose rows already reached the database. Sibling of `ws_frame_spill`.
 pub mod wal_applied_watermark;

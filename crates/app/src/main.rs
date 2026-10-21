@@ -3183,6 +3183,12 @@ async fn async_main() -> Result<()> {
         tickvault_storage::wal_suspension_watcher::spawn_supervised_wal_suspension_watcher(
             config.questdb.clone(),
         );
+    // Operator Quote 31 (2026-10-21): after the close, hold the scheduled
+    // stops off until the day's data is in the database. No environment
+    // (a dev run without TV_ENVIRONMENT) means no hold to write.
+    let _drain_hold = tickvault_core::auth::secret_manager::resolve_environment()
+        .ok()
+        .map(tickvault_app::drain_hold::spawn_drain_hold_supervisor);
 
     // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
     // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every

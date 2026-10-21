@@ -1718,3 +1718,33 @@ read. The standing ceiling is $150 (Quote 23); the upper bound above is about
 
 **§2.3n's lever rule is NOT met.** No lever is taken. The owner chose the
 change knowing it adds an S3 copy.
+
+## COST NOTE 2026-10-21 — the box stays up after the close until the day's data is in the database (Quote 31, +$0–6/mo, Assumed)
+
+**Authorization:** operator Quote 31 (2026-10-21), recorded in
+`daily-universe-scope-expansion-2026-05-27.md` §0 before any code: *"until or
+unelss movign all tehse dtaa to db never evr shut down"*. The schedule
+08:30–17:30 IST becomes 08:30 until the drain hold is released, never past
+07:30 IST the next morning. Disk throughput is NOT raised (the owner declined
+it: *"why raisign budget limit spee"*).
+
+| Item | Cost |
+|---|---:|
+| Extra r8g.xlarge hours after 17:30 (about $0.19/h, from the 13 Oct record) | $0 on an evening with nothing left; ~$0.40 an evening at 2 h (Assumed) |
+| SSM writes of the hold (Standard parameter, one every 5 min while held) | $0.00 |
+| Lambda invocations (the 17:30 stop now runs through the start watchdog) | $0.00 |
+| Alarms, metrics, filters, EMF names added | 0 |
+| **Total** | **$0 to ~$6/mo (Assumed: 0–3 h on ~22 trading evenings)** |
+
+**Budget position, read live 2026-10-21 (Cost Explorer, Verified):** October
+1–20 is **$119.20** (estimated). Daily cost 13–20 Oct: $6.06, $5.52, $5.49,
+$5.53, $3.27 (Sat), $3.30 (Sun), $5.52, $4.89 (the holiday morning stop).
+Projection at that rate with NO extra hours: 8 more weekdays × ~$5.5 + 3
+weekend days × ~$3.3 ≈ $54, so **October lands near $173, above the $170 stop
+(Assumed; the tax line may be trued up at month end).** The longer evenings add
+about $0.19 per held hour on top. The $170 budget stop is NOT gated by the hold
+(Quote 31), so if October crosses it the box stops for the rest of the month,
+hold or no hold. This is reported to the owner, not acted on: raising the kill
+line needs its own dated quote.
+
+**§2.3n's lever rule is NOT met.** No lever is taken.

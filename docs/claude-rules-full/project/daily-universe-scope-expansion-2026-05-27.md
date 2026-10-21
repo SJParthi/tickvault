@@ -2818,3 +2818,49 @@ REJECT under 29e:
 - Changes disk throughput, the instance type or the EBS size under cover of this quote.
 - Raises IOPS above 3,000 again without a fresh dated quote.
 - Claims the ₹15,000 is a hard cap: it is a stop line, and fixed costs continue after the stop.
+
+**Quote 31 (2026-10-21, in session, after the morning the database fell 4,440 transactions behind at boot):**
+> "go ahead dude make the change but why the fuck every day post market this ddint egt moved see i celalry todl you until or unelss movign all tehse dtaa to db never evr shut down right motherfucekr okay?"
+> "see evryday move shdou lbe finsihed withint that day mtoherfucker why every tiem everyhtign si gettign in one shopt mtoehrfucker why?"
+> "see eevryday i celalry told yo ui wnat evryhtign workign precisleyr igth?"
+
+Earlier the same session, on the option of raising the disk's paid speed: *"bro why raisign budget limit spee ddude whta os the fuckign issue ehre dude?"* — that option is withdrawn and is NOT authorized here.
+
+**Measured 2026-10-21 (read-only CloudWatch, Verified):**
+
+| Fact | Reading |
+|---|---|
+| 20 Oct after-close deferred-depth pass | 15:45–17:01 IST, 406 buckets, **3,067,442,594 rows** (the first full run after the 14–16 Oct latch fault, #2111) |
+| QuestDB apply lag, 20 Oct | 0 at 15:42, 6,758 at 17:00, ~6,000 at the 17:30 stop |
+| QuestDB apply lag at 21 Oct boot | 4,440 at 08:31, caught up (12) at 09:46 |
+| Boot replay, 21 Oct | 18,506,480 inline depth rows + 4,530,491 frames re-appended 08:31–08:36; 1,192 WAL segments still deferred to the next boot (per-boot frame cap 3,000,000) |
+| Disk writes, 21 Oct | 482–500 MiB/s (the volume cap) 08:35–09:55 IST; normal days 250–290 MiB/s for two hours, then ~80 MiB/s |
+| Effect | tick flushes rescued to spill every few seconds 08:33–~10:00; depth shed 09:05–09:08 and 09:20–09:33 |
+| r8g.xlarge hourly cost | about $0.19/h (1–13 Oct: $15.66 for ~81 h, Assumed from the 13 Oct record) |
+
+**The rule (one line):** each trading day's data is fully in the database the SAME day: after the close the box keeps running until every deferred depth bucket is written back, every waiting WAL segment is replayed, every spill folder is drained and QuestDB's apply backlog is back to its idle level (at most 10 transactions, with no suspended table, on two readings a minute apart); only then may the scheduled stops stop it.
+
+**What this authorizes:**
+
+| Item | Change |
+|---|---|
+| Schedule | 08:30–17:30 IST becomes 08:30 until the day's data is in the database, bounded at **07:30 IST the next morning** (the 07:35 curfew check then stops it, and the 08:30 start boots it fresh) |
+| The hold | The app writes `/tickvault/<env>/drain-hold` (a String SSM parameter: an expiry instant and what is left) while work remains, refreshed every few minutes; it lapses on its own if the app stops refreshing it |
+| Stops that honour a fresh hold | the 17:30 daily stop, the 17:45 stop check, the hourly curfew check, the hard-stop guard's out-of-window stop |
+| Evening work | the deferred-depth pass and a post-close WAL catch-up run until done (no 17:15 deadline), paced on QuestDB's absolute apply lag as well as its growth |
+
+**NOT authorized:** gating the budget kill (the hard-stop guard's `>= $170` stop and the native budget stop) on the hold; holding the box past 07:30 IST the next morning; raising disk throughput, IOPS, the instance type, EBS size or the $170 kill line; any new Telegram page.
+
+**Honest limits:**
+- **Read live 2026-10-21 (Cost Explorer):** October 1–20 is $119.20; at the measured daily rate (~$5.5 a weekday, ~$3.3 a weekend day) October lands near **$173, above the $170 stop, before any extra hour** (Assumed; tax may be trued up). Each held evening hour adds about $0.19. The budget stop is not gated by the hold, so if October crosses $170 the box stops for the rest of the month.
+- The box sustains only about 149 MiB/s of disk writes once its EBS burst balance is spent (13 Oct record); an evening drain of a multi-day backlog can take hours.
+- A QuestDB that never catches up holds the box until 07:30; the next boot then replays as before.
+- A hold the app cannot write (SSM failure) lapses and the box stops as before; that is logged as a coded error, not paged.
+
+##### What a PR or action that violates Quote 31 looks like (REJECT)
+- Gates the budget stop on the hold, or lets a hold keep the box running past 07:30 IST the next morning.
+- A hold with no expiry, or one the app does not refresh (a crashed app must not keep the box up).
+- Stops the box on schedule while the app reports work left and its hold is fresh.
+- Re-adds a fixed evening deadline to the deferred-depth pass or the post-close WAL catch-up.
+- Raises disk throughput, IOPS, instance type, EBS size or the kill line under cover of this quote.
+- Adds a Telegram page for the hold.

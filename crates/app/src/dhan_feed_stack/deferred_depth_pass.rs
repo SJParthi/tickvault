@@ -19,15 +19,19 @@
 //! # Why it runs where it runs
 //!
 //! * **After the close, not at the next boot.** The morning boot replay is what
-//!   flooded QuestDB on 2026-09-29. 15:45–17:15 IST is the quietest window the
-//!   box has, and it ends a quarter hour before the 17:30 stop.
+//!   flooded QuestDB on 2026-09-29. It runs from 15:45 IST, the quietest time
+//!   the box has, and since 2026-10-21 (operator Quote 31) it keeps running
+//!   through the night, up to 07:15 IST, until every mark is written back;
+//!   the drain hold (`crate::drain_hold`) keeps the box up until then.
 //! * **On its own thread with its own depth writer.** The live drain's writer
 //!   mixes rows into shared ILP batches; a failed batch marks its whole
 //!   sequence range unapplied, and an hours-old row beside a live one would
 //!   span dozens of buckets. A separate synchronous writer keeps every batch to
 //!   one bucket and gives this pass a direct acknowledgement.
 //! * **Paced.** It pauses while any QuestDB table's WAL apply lag is growing
-//!   and while the applied watermark distrusts the sink. It stops at 17:15,
+//!   and while the applied watermark distrusts the sink, and (Quote 31) while
+//!   QuestDB's apply backlog is above [`AFTER_CLOSE_APPLY_LAG_CEILING`]. It
+//!   stops starting new work at 07:15 IST the next morning,
 //!   and it stops early when free disk on the WAL volume falls below
 //!   [`AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION`].
 //!
@@ -82,9 +86,11 @@
 //!   counted again) on
 //!   `tv_wal_deferred_depth_rows_total{outcome="pre_switch_to_book"}`.
 //!
-//! * A bucket still overlapping the segment the writer holds open is carried
-//!   to the next day (segments rotate by size, so the last bucket of a session
-//!   usually is).
+//! * A bucket still overlapping the segment the writer holds open is carried.
+//!   Segments rotate by size, so the session's last bucket usually is; since
+//!   2026-10-21 each round first asks the writer to seal that segment in a
+//!   lull (`wal_idle_seal::request_idle_seal`), so it is carried one round,
+//!   not one day. A frame arriving in every 200 ms poll would keep it open.
 //! * A frame recorded without a receipt time (a pre-TVW3 record) cannot be
 //!   rewritten onto the row the live drain wrote, so it is counted and left.
 //! * A segment damaged mid-file loses what follows the damage; that is counted
@@ -94,7 +100,7 @@
 //!   bucket in full. Bounded to one bucket by flushing at every bucket edge.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tickvault_common::error_code::ErrorCode;
@@ -118,11 +124,16 @@ use super::{
 
 /// 15:45 IST — the pass may start (five minutes after the 15:40 capture end).
 pub const AFTER_CLOSE_DEPTH_START_SECS_IST: u64 = 15 * 3_600 + 45 * 60;
-/// 17:15 IST — the pass stops starting new work.
-pub const AFTER_CLOSE_DEPTH_STOP_SECS_IST: u64 = 17 * 3_600 + 15 * 60;
-/// 17:30 IST — the scheduled box stop (`main.tf` daily_stop). Stated here only
-/// to prove the window ends in time; the stop itself is terraform's.
-const BOX_STOP_SECS_IST: u64 = 17 * 3_600 + 30 * 60;
+/// 07:15 IST the NEXT morning — the pass stops starting new work. The window
+/// wraps midnight: `[15:45, 24:00) ∪ [00:00, 07:15)`. Operator Quote 31
+/// (2026-10-21): the day's write-back finishes the same day, so the box stays
+/// up until it is done; until then this stopped at 17:15 for a 17:30 stop and
+/// a multi-day backlog arrived in one evening (3,067,442,594 rows on 20 Oct).
+pub const AFTER_CLOSE_DEPTH_STOP_SECS_IST: u64 = 7 * 3_600 + 15 * 60;
+/// 07:30 IST — the latest a drain hold can keep the box up (the 07:35 curfew
+/// check stops it, and the 08:30 start boots it fresh). Stated here only to
+/// prove the window ends in time; the stop itself is the Lambdas'.
+const BOX_HOLD_CEILING_SECS_IST: u64 = 7 * 3_600 + 30 * 60;
 /// Sleep while paused.
 pub const AFTER_CLOSE_PAUSE_SECS: u64 = 10;
 /// [`AFTER_CLOSE_PAUSE_SECS`] as a `Duration`.
@@ -133,17 +144,36 @@ pub const AFTER_CLOSE_PAUSE: Duration = Duration::from_secs(AFTER_CLOSE_PAUSE_SE
 pub const AFTER_CLOSE_SETTLE_SECS: u64 = 65;
 /// [`AFTER_CLOSE_SETTLE_SECS`] as a `Duration`.
 pub const AFTER_CLOSE_SETTLE: Duration = Duration::from_secs(AFTER_CLOSE_SETTLE_SECS);
+/// The pass pauses while QuestDB's largest WAL apply lag (transactions) is
+/// above this, or unknown. MEASURED 2026-10-21: a live session reads 12–350
+/// once caught up; on 20 Oct the pass, pausing only on a GROWING lag, drove
+/// it from 0 to 6,758 and the box stopped with ~6,000 unapplied, which the
+/// next morning's boot then applied on top of the open (Quote 31). The value
+/// is chosen above the live range so a quiet evening never pauses; it is not
+/// a measured optimum.
+pub const AFTER_CLOSE_APPLY_LAG_CEILING: u64 = 500;
 
-// The settle must fit between the stop and the box stop.
-const _: () =
-    assert!(AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_SETTLE.as_secs() < BOX_STOP_SECS_IST);
-const _: () = assert!(AFTER_CLOSE_DEPTH_START_SECS_IST < AFTER_CLOSE_DEPTH_STOP_SECS_IST);
+/// Whether `secs_ist` is inside the wrapping after-close window. O(1).
+#[must_use]
+pub const fn in_after_close_window(secs_ist: u64) -> bool {
+    secs_ist >= AFTER_CLOSE_DEPTH_START_SECS_IST || secs_ist < AFTER_CLOSE_DEPTH_STOP_SECS_IST
+}
+
+// The settle must fit between the stop and the hold ceiling.
+const _: () = assert!(
+    AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_SETTLE.as_secs() < BOX_HOLD_CEILING_SECS_IST
+);
+const _: () = assert!(AFTER_CLOSE_DEPTH_STOP_SECS_IST < AFTER_CLOSE_DEPTH_START_SECS_IST);
 // The pass never runs while live capture writes depth, which is why the
 // ingest shed no longer pauses it: after the capture end the shed gates
 // nothing live. Moving either constant so the two overlap fails the build.
 const _: () = assert!(
     AFTER_CLOSE_DEPTH_START_SECS_IST
         >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+);
+const _: () = assert!(
+    BOX_HOLD_CEILING_SECS_IST
+        <= tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64
 );
 
 /// Free-space fraction of the WAL volume below which the pass stops writing.
@@ -191,9 +221,10 @@ pub const DEFERRED_DEPTH_PASS_COUNTER: &str = "tv_wal_deferred_depth_pass_total"
 /// Why the pass stopped early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassStop {
-    /// Before 15:45 IST — nothing is started.
+    /// Outside the window, in the afternoon (before 15:45 IST) — nothing is
+    /// started.
     BeforeWindow,
-    /// 17:15 IST reached.
+    /// Outside the window, in the morning (07:15 IST reached).
     Deadline,
     /// The lane is shutting down.
     Cancelled,
@@ -216,8 +247,10 @@ pub enum PassStep {
 /// below the floor (`disk_low`) STOPS the pass: nothing the pass does frees
 /// disk before it finishes, so waiting would only run out the window, while
 /// stopping lets the buckets already written be settled and released. The
-/// pass pauses while QuestDB is falling behind (`lag_growing_tables > 0`) or
-/// the applied watermark distrusts the sink.
+/// pass pauses while QuestDB is falling behind (`lag_growing_tables > 0`),
+/// while its apply backlog is above [`AFTER_CLOSE_APPLY_LAG_CEILING`] or
+/// unknown (`apply_lag`, Quote 31), or while the applied watermark distrusts
+/// the sink.
 ///
 /// The ingest shed is deliberately NOT an input (2026-10-13, see the module
 /// header): after the close it gates nothing live, its apply-lag half is
@@ -227,6 +260,7 @@ pub enum PassStep {
 pub const fn after_close_step(
     secs_ist: u64,
     lag_growing_tables: u32,
+    apply_lag: Option<u64>,
     sink_suspect: bool,
     disk_low: bool,
     cancelled: bool,
@@ -234,16 +268,23 @@ pub const fn after_close_step(
     if cancelled {
         return PassStep::Stop(PassStop::Cancelled);
     }
-    if secs_ist < AFTER_CLOSE_DEPTH_START_SECS_IST {
-        return PassStep::Stop(PassStop::BeforeWindow);
-    }
-    if secs_ist >= AFTER_CLOSE_DEPTH_STOP_SECS_IST {
-        return PassStep::Stop(PassStop::Deadline);
+    if !in_after_close_window(secs_ist) {
+        // Out of the window: the morning half means the pass ran out of
+        // night, the afternoon half that it was started too early.
+        return if secs_ist < 12 * 3_600 {
+            PassStep::Stop(PassStop::Deadline)
+        } else {
+            PassStep::Stop(PassStop::BeforeWindow)
+        };
     }
     if disk_low {
         return PassStep::Stop(PassStop::DiskFloor);
     }
-    if lag_growing_tables > 0 || sink_suspect {
+    let lag_high = match apply_lag {
+        Some(lag) => lag > AFTER_CLOSE_APPLY_LAG_CEILING,
+        None => true,
+    };
+    if lag_growing_tables > 0 || lag_high || sink_suspect {
         return PassStep::Pause;
     }
     PassStep::Run
@@ -261,12 +302,10 @@ fn disk_below_pass_floor(free_fraction: Option<f64>) -> bool {
 /// window. O(1).
 #[must_use]
 pub const fn secs_until_window(secs_ist: u64) -> u64 {
-    if secs_ist < AFTER_CLOSE_DEPTH_START_SECS_IST {
-        AFTER_CLOSE_DEPTH_START_SECS_IST - secs_ist
-    } else if secs_ist < AFTER_CLOSE_DEPTH_STOP_SECS_IST {
+    if in_after_close_window(secs_ist) {
         0
     } else {
-        86_400 - secs_ist + AFTER_CLOSE_DEPTH_START_SECS_IST
+        AFTER_CLOSE_DEPTH_START_SECS_IST - secs_ist
     }
 }
 
@@ -274,6 +313,8 @@ pub const fn secs_until_window(secs_ist: u64) -> u64 {
 pub struct PassSignals<'a> {
     pub now_secs_ist: &'a dyn Fn() -> u64,
     pub lag_growing_tables: &'a dyn Fn() -> u32,
+    /// QuestDB's largest WAL apply lag, `None` when unknown (Quote 31).
+    pub apply_lag: &'a dyn Fn() -> Option<u64>,
     pub sink_suspect: &'a dyn Fn() -> bool,
     /// Free-space fraction (0.0..=1.0) of the volume holding the WAL
     /// directory passed in; `None` when it cannot be measured.
@@ -303,6 +344,7 @@ pub fn live_signals() -> PassSignals<'static> {
     PassSignals {
         now_secs_ist: &|| super::now_ist_secs_of_day(),
         lag_growing_tables: &|| tickvault_common::ingest_shed::wal_apply_lag_growing(),
+        apply_lag: &|| tickvault_common::ingest_shed::wal_apply_lag_max(),
         sink_suspect: &|| {
             tickvault_storage::wal_applied_watermark::applied_watermark().is_sink_suspect()
         },
@@ -320,7 +362,59 @@ pub struct PassSummary {
     pub frames_no_receipt: u64,
     pub segments_damaged: u64,
     pub buckets_missing: u64,
+    /// Of `buckets_carried`, those carried ONLY because a neighbouring
+    /// segment is unreadable: a rerun the same night cannot finish them
+    /// (they wait for a restart to repair the file, or for
+    /// `UNCERTAIN_CARRY_MAX_DAYS`), so they do not hold the box (Quote 31).
+    pub buckets_uncertain: u64,
     pub stop: Option<PassStop>,
+}
+
+impl PassSummary {
+    /// Buckets this pass left that another pass tonight could still finish.
+    /// A pass that stopped early (disk floor, deadline, cancel) did not visit
+    /// the rest of its work, so it reports at least one. O(1).
+    #[must_use]
+    pub const fn retryable_left(&self) -> u64 {
+        let left = self.buckets_carried.saturating_sub(self.buckets_uncertain);
+        if self.stop.is_some() && left == 0 {
+            1
+        } else {
+            left
+        }
+    }
+}
+
+/// The last finished pass's [`PassSummary::retryable_left`], or
+/// [`PASS_OUTCOME_UNKNOWN`] until a pass has finished in this process.
+/// Read by the drain hold (`crate::drain_hold`).
+static LAST_PASS_RETRYABLE_LEFT: AtomicU64 = AtomicU64::new(PASS_OUTCOME_UNKNOWN);
+/// "No pass has finished yet."
+pub const PASS_OUTCOME_UNKNOWN: u64 = u64::MAX;
+
+/// Rows every pass in this process has written back, for the drain hold's
+/// progress check: a long pass clears its marks only at its end, so rows are
+/// the evidence it is moving. One relaxed add per frame on the pass's own
+/// thread, never on the frame drain.
+static PASS_ROWS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Total rows written back by the pass in this process. O(1).
+#[must_use]
+pub fn pass_rows_written_total() -> u64 {
+    PASS_ROWS_WRITTEN.load(Ordering::Relaxed)
+}
+
+/// Records a finished pass for the drain hold. O(1).
+pub fn publish_pass_outcome(summary: &PassSummary) {
+    LAST_PASS_RETRYABLE_LEFT.store(summary.retryable_left(), Ordering::Release);
+}
+
+/// Buckets the last finished pass left that a rerun could still finish;
+/// `None` until a pass has finished in this process. O(1).
+#[must_use]
+pub fn last_pass_retryable_left() -> Option<u64> {
+    let v = LAST_PASS_RETRYABLE_LEFT.load(Ordering::Acquire);
+    (v != PASS_OUTCOME_UNKNOWN).then_some(v)
 }
 
 /// The counter set the pass hands to the shared drain helpers. Every drain
@@ -478,6 +572,7 @@ fn wait_for_run(
         match after_close_step(
             (signals.now_secs_ist)(),
             (signals.lag_growing_tables)(),
+            (signals.apply_lag)(),
             (signals.sink_suspect)(),
             disk_below_pass_floor((signals.disk_free_fraction)(wal_dir)),
             cancel.load(Ordering::Acquire),
@@ -605,7 +700,7 @@ pub fn run_after_close_pass(
     // archivers read a hold as "stand aside", never as a failure: the daily
     // leg refunds the attempt and retries, the disk-pressure leg neither
     // counts the pass nor escalates (DA-13d review). The hold ends by the
-    // pass's own deadline (17:15 IST plus the settle), or earlier at its disk
+    // pass's own deadline (07:15 IST plus the settle), or earlier at its disk
     // floor or a cancel.
     let _depth_partitions =
         tickvault_storage::partition_archive::hold_depth_partitions_for_rewrite();
@@ -659,6 +754,9 @@ pub fn run_after_close_pass(
         }
         if bucket.touches_open || bucket.uncertain {
             summary.buckets_carried += 1;
+            if !bucket.touches_open {
+                summary.buckets_uncertain += 1;
+            }
             overflow_complete = false;
             pass_counter("carried");
             continue;
@@ -732,6 +830,7 @@ pub fn run_after_close_pass(
                     pre_switch_to_book.increment(rows);
                 }
                 summary.rows_written = summary.rows_written.saturating_add(rows);
+                PASS_ROWS_WRITTEN.fetch_add(rows, Ordering::Relaxed);
                 // Re-check the disk floor before every late commit (one
                 // `statvfs` per 16 MiB batch): a bucket can hold many
                 // batches, and each commit rewrites an hour partition.
@@ -814,8 +913,11 @@ pub fn run_after_close_pass(
             if (signals.lag_growing_tables)() == 0 && !(signals.sink_suspect)() {
                 break true;
             }
-            if (signals.now_secs_ist)()
-                >= AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_SETTLE.as_secs()
+            // Past the morning stop plus one settle (the window wraps
+            // midnight, so "past" is the daytime gap before 15:45).
+            let now = (signals.now_secs_ist)();
+            if now >= AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_SETTLE.as_secs()
+                && now < AFTER_CLOSE_DEPTH_START_SECS_IST
             {
                 break false;
             }
@@ -872,11 +974,36 @@ fn pass_depth_ingest(
     }
 }
 
-/// Spawns the daily after-close supervisor. It sleeps until 15:45 IST, runs
-/// one pass on its own OS thread with its own synchronous depth writer, then
-/// sleeps until the next window. `cancel` stops it (set by the lane when its
-/// drain ends); it never waits on the lane's shutdown `Notify`, which wakes a
-/// single waiter and would be stolen from the drain.
+/// How long a round waits after asking the WAL writer to seal its open
+/// segment: ten of the writer's 200 ms lull polls.
+pub const AFTER_CLOSE_SEAL_WAIT: Duration = Duration::from_secs(2); // APPROVED: this IS the named constant
+/// Pause between rounds while the last one made progress or left nothing.
+pub const AFTER_CLOSE_ROUND_GAP_SECS: u64 = 60;
+/// Pause after a round that wrote nothing and cleared nothing (a disk floor,
+/// a bucket waiting on an unreadable neighbour): retrying every minute would
+/// only repeat the same log lines.
+pub const AFTER_CLOSE_IDLE_ROUND_GAP_SECS: u64 = 600;
+
+/// The pause before the next round, from the round just finished. Pure, O(1).
+#[must_use]
+pub const fn next_round_gap_secs(summary: &PassSummary) -> u64 {
+    if summary.rows_written == 0 && summary.buckets_cleared == 0 && summary.buckets_carried > 0 {
+        AFTER_CLOSE_IDLE_ROUND_GAP_SECS
+    } else {
+        AFTER_CLOSE_ROUND_GAP_SECS
+    }
+}
+
+/// Spawns the after-close supervisor. Inside the wrapping window
+/// (15:45–07:15 IST) it asks the WAL writer to seal its open segment, runs one
+/// pass on its own OS thread with its own synchronous depth writer, publishes
+/// the outcome for the drain hold, and repeats a minute later (ten when a
+/// round made no progress) until no mark is left. Operator Quote 31
+/// (2026-10-21): the day's write-back finishes the same day; until then this
+/// ran ONE pass a day ending at 17:15, and whatever was left waited a day.
+/// `cancel` stops it (set by the lane when its drain ends); it never waits on
+/// the lane's shutdown `Notify`, which wakes a single waiter and would be
+/// stolen from the drain.
 ///
 /// `book_since` is the lane's array-row start instant (plan item 49e step 3),
 /// passed rather than re-read. `Some` builds a book-only ingest
@@ -898,18 +1025,34 @@ pub fn spawn_after_close_supervisor(
             // promptly without a second shutdown signal.
             let wait = secs_until_window(super::now_ist_secs_of_day()).min(60);
             if wait > 0 {
+                // Between windows: forget the last night's outcome, so a process
+                // that outlives a day never reads yesterday's "nothing left" as
+                // tonight's (hostile review, 2026-10-21).
+                LAST_PASS_RETRYABLE_LEFT.store(PASS_OUTCOME_UNKNOWN, Ordering::Release);
                 tokio::time::sleep(Duration::from_secs(wait)).await;
-                if cancel.load(Ordering::Acquire) {
-                    return;
-                }
                 continue;
             }
+            // Nothing marked: nothing to open a writer for. Report the empty
+            // outcome so the drain hold sees this half done, and look again
+            // in a minute (a crash-recovered mark file can add work).
+            let marks = tickvault_storage::wal_deferred_depth::deferred_depth().snapshot();
+            if marks.is_empty() {
+                publish_pass_outcome(&PassSummary::default());
+                tokio::time::sleep(Duration::from_secs(AFTER_CLOSE_ROUND_GAP_SECS)).await;
+                continue;
+            }
+            // The session's last segment is still open (no frame comes after
+            // the close to fill and rotate it), and a bucket overlapping an
+            // open segment is carried. Ask the writer to seal it in its next
+            // lull, and give it a few of its 200 ms polls to do so.
+            tickvault_storage::wal_idle_seal::request_idle_seal(&wal_dir);
+            tokio::time::sleep(AFTER_CLOSE_SEAL_WAIT).await;
             if cancel.load(Ordering::Acquire) {
                 return;
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
             let questdb = questdb.clone();
-            let wal_dir = wal_dir.clone();
+            let thread_wal_dir = wal_dir.clone();
             let thread_cancel = std::sync::Arc::clone(&cancel);
             let spawned = std::thread::Builder::new()
                 .name("tv-deferred-depth".to_string())
@@ -918,12 +1061,13 @@ pub fn spawn_after_close_supervisor(
                     let summary = run_after_close_pass(
                         &mut sink,
                         tickvault_storage::wal_deferred_depth::deferred_depth(),
-                        &wal_dir,
+                        &thread_wal_dir,
                         &thread_cancel,
                         &live_signals(),
                     );
                     drop(tx.send(summary));
                 });
+            let mut gap = AFTER_CLOSE_ROUND_GAP_SECS;
             if let Err(err) = spawned {
                 error!(
                     code = ErrorCode::WsSpill01WriterRespawn.code_str(),
@@ -932,13 +1076,11 @@ pub fn spawn_after_close_supervisor(
                     "after-close depth pass thread could not start — skipped order-book rows \
                      stay marked and on disk until a later pass"
                 );
-            } else {
-                drop(rx.await);
+            } else if let Ok(summary) = rx.await {
+                publish_pass_outcome(&summary);
+                gap = next_round_gap_secs(&summary);
             }
-            // Sleep past the window so one day runs one pass.
-            let rest = super::now_ist_secs_of_day();
-            let until_close = AFTER_CLOSE_DEPTH_STOP_SECS_IST.saturating_sub(rest);
-            let mut remaining = until_close;
+            let mut remaining = gap;
             while remaining > 0 {
                 let step = remaining.min(60);
                 tokio::time::sleep(Duration::from_secs(step)).await;
@@ -967,27 +1109,74 @@ mod tests {
         use PassStep::{Pause, Run, Stop};
         let before = AFTER_CLOSE_DEPTH_START_SECS_IST - 1;
         let at_stop = AFTER_CLOSE_DEPTH_STOP_SECS_IST;
-        assert_eq!(after_close_step(IN_WINDOW, 0, false, false, false), Run);
-        assert_eq!(after_close_step(IN_WINDOW, 1, false, false, false), Pause);
-        assert_eq!(after_close_step(IN_WINDOW, 0, true, false, false), Pause);
+        let caught_up = Some(0);
+        assert_eq!(
+            after_close_step(IN_WINDOW, 0, caught_up, false, false, false),
+            Run
+        );
+        assert_eq!(
+            after_close_step(IN_WINDOW, 1, caught_up, false, false, false),
+            Pause
+        );
+        assert_eq!(
+            after_close_step(IN_WINDOW, 0, caught_up, true, false, false),
+            Pause
+        );
         // A low disk stops the pass (never a pause), even while QuestDB lags.
         assert_eq!(
-            after_close_step(IN_WINDOW, 3, true, true, false),
+            after_close_step(IN_WINDOW, 3, caught_up, true, true, false),
             Stop(PassStop::DiskFloor)
         );
         assert_eq!(
-            after_close_step(before, 0, false, false, false),
+            after_close_step(before, 0, caught_up, false, false, false),
             Stop(PassStop::BeforeWindow)
         );
         assert_eq!(
-            after_close_step(at_stop, 0, false, false, false),
+            after_close_step(at_stop, 0, caught_up, false, false, false),
             Stop(PassStop::Deadline)
         );
         // Cancellation wins over everything, including a paused state.
         assert_eq!(
-            after_close_step(IN_WINDOW, 5, true, true, true),
+            after_close_step(IN_WINDOW, 5, caught_up, true, true, true),
             Stop(PassStop::Cancelled)
         );
+    }
+
+    /// Regression (Quote 31, 2026-10-21): on 20 Oct the pass paused only on a
+    /// GROWING lag and drove QuestDB from 0 to 6,758 transactions behind; the
+    /// box stopped ~6,000 behind and the next morning applied them on top of
+    /// the open. The pass now pauses on the backlog's SIZE, and on an unknown
+    /// size, and the window runs past midnight instead of ending at 17:15.
+    #[test]
+    fn test_regression_pass_pauses_on_a_large_backlog_and_runs_past_midnight() {
+        use PassStep::{Pause, Run};
+        let ceiling = AFTER_CLOSE_APPLY_LAG_CEILING;
+        assert_eq!(
+            after_close_step(IN_WINDOW, 0, Some(ceiling), false, false, false),
+            Run
+        );
+        assert_eq!(
+            after_close_step(IN_WINDOW, 0, Some(ceiling + 1), false, false, false),
+            Pause,
+            "a non-growing but large backlog must pause the pass"
+        );
+        assert_eq!(
+            after_close_step(IN_WINDOW, 0, Some(6_758), false, false, false),
+            Pause
+        );
+        assert_eq!(
+            after_close_step(IN_WINDOW, 0, None, false, false, false),
+            Pause,
+            "an unmeasured backlog never reads as caught up"
+        );
+        // 17:30, 21:00, 23:59 and 03:00 IST are all inside the window now.
+        for secs in [63_000, 75_600, 86_399, 10_800] {
+            assert_eq!(
+                after_close_step(secs, 0, Some(0), false, false, false),
+                Run,
+                "{secs}s IST must be inside the after-close window"
+            );
+        }
     }
 
     proptest::proptest! {
@@ -997,16 +1186,19 @@ mod tests {
         fn after_close_pass_stops_before_the_stop_time(
             secs in 0u64..86_400,
             lag in 0u32..4,
+            backlog in proptest::option::of(0u64..2_000),
             suspect in proptest::bool::ANY,
             disk_low in proptest::bool::ANY,
         ) {
-            let step = after_close_step(secs, lag, suspect, disk_low, false);
-            let in_window = (AFTER_CLOSE_DEPTH_START_SECS_IST..AFTER_CLOSE_DEPTH_STOP_SECS_IST).contains(&secs);
+            let step = after_close_step(secs, lag, backlog, suspect, disk_low, false);
+            let in_window = secs >= AFTER_CLOSE_DEPTH_START_SECS_IST
+                || secs < AFTER_CLOSE_DEPTH_STOP_SECS_IST;
+            let backlog_high = backlog.is_none_or(|b| b > AFTER_CLOSE_APPLY_LAG_CEILING);
             if !in_window {
                 proptest::prop_assert!(matches!(step, PassStep::Stop(_)));
             } else if disk_low {
                 proptest::prop_assert_eq!(step, PassStep::Stop(PassStop::DiskFloor));
-            } else if lag > 0 || suspect {
+            } else if lag > 0 || suspect || backlog_high {
                 proptest::prop_assert_eq!(step, PassStep::Pause);
             } else {
                 proptest::prop_assert_eq!(step, PassStep::Run);
@@ -1015,15 +1207,82 @@ mod tests {
     }
 
     #[test]
-    fn secs_until_window_is_zero_inside_and_wraps_to_tomorrow() {
+    fn secs_until_window_is_zero_inside_and_counts_to_the_afternoon_start() {
         assert_eq!(secs_until_window(IN_WINDOW), 0);
+        assert_eq!(secs_until_window(0), 0, "midnight is inside the window");
         assert_eq!(
             secs_until_window(AFTER_CLOSE_DEPTH_START_SECS_IST - 100),
             100
         );
         assert_eq!(
             secs_until_window(AFTER_CLOSE_DEPTH_STOP_SECS_IST),
-            86_400 - AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_DEPTH_START_SECS_IST
+            AFTER_CLOSE_DEPTH_START_SECS_IST - AFTER_CLOSE_DEPTH_STOP_SECS_IST
+        );
+    }
+
+    #[test]
+    fn in_after_close_window_wraps_midnight() {
+        assert!(in_after_close_window(AFTER_CLOSE_DEPTH_START_SECS_IST));
+        assert!(in_after_close_window(86_399));
+        assert!(in_after_close_window(0));
+        assert!(in_after_close_window(AFTER_CLOSE_DEPTH_STOP_SECS_IST - 1));
+        assert!(!in_after_close_window(AFTER_CLOSE_DEPTH_STOP_SECS_IST));
+        assert!(!in_after_close_window(AFTER_CLOSE_DEPTH_START_SECS_IST - 1));
+    }
+
+    #[test]
+    fn retryable_left_ignores_uncertain_carries_but_not_an_early_stop() {
+        let mut s = PassSummary {
+            buckets_carried: 3,
+            buckets_uncertain: 3,
+            ..PassSummary::default()
+        };
+        assert_eq!(
+            s.retryable_left(),
+            0,
+            "only unreadable-neighbour carries: done tonight"
+        );
+        s.buckets_uncertain = 1;
+        assert_eq!(s.retryable_left(), 2);
+        let stopped = PassSummary {
+            stop: Some(PassStop::DiskFloor),
+            ..PassSummary::default()
+        };
+        assert_eq!(
+            stopped.retryable_left(),
+            1,
+            "an early stop left unvisited work"
+        );
+        assert_eq!(PassSummary::default().retryable_left(), 0);
+    }
+
+    #[test]
+    fn test_publish_pass_outcome_reads_back_via_last_pass_retryable_left() {
+        publish_pass_outcome(&PassSummary {
+            buckets_carried: 2,
+            ..PassSummary::default()
+        });
+        assert_eq!(last_pass_retryable_left(), Some(2));
+        publish_pass_outcome(&PassSummary::default());
+        assert_eq!(last_pass_retryable_left(), Some(0));
+    }
+
+    #[test]
+    fn next_round_gap_secs_backs_off_only_when_a_round_made_no_progress() {
+        let idle = PassSummary {
+            buckets_carried: 1,
+            ..PassSummary::default()
+        };
+        assert_eq!(next_round_gap_secs(&idle), AFTER_CLOSE_IDLE_ROUND_GAP_SECS);
+        let progress = PassSummary {
+            buckets_carried: 1,
+            rows_written: 10,
+            ..PassSummary::default()
+        };
+        assert_eq!(next_round_gap_secs(&progress), AFTER_CLOSE_ROUND_GAP_SECS);
+        assert_eq!(
+            next_round_gap_secs(&PassSummary::default()),
+            AFTER_CLOSE_ROUND_GAP_SECS
         );
     }
 
@@ -1204,6 +1463,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| IN_WINDOW,
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
@@ -1235,6 +1495,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| IN_WINDOW,
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &|_| {},
@@ -1256,6 +1517,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| AFTER_CLOSE_DEPTH_STOP_SECS_IST,
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &|_| {},
@@ -1313,6 +1575,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| clock.get(),
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
@@ -1355,6 +1618,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| clock.get(),
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
@@ -1388,12 +1652,14 @@ mod tests {
             if d == AFTER_CLOSE_SETTLE {
                 settling.set(true);
             }
-            clock.set(clock.get() + d.as_secs());
+            // Wraps at midnight like the real IST clock: the window does.
+            clock.set((clock.get() + d.as_secs()) % 86_400);
         };
         let signals = PassSignals {
             now_secs_ist: &|| clock.get(),
             // Healthy while writing, lagging from the settle onwards.
             lag_growing_tables: &|| u32::from(settling.get()),
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
@@ -1411,12 +1677,11 @@ mod tests {
             !marks.snapshot().is_empty(),
             "the mark survives an unhealthy settle"
         );
+        let bound = AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_SETTLE.as_secs();
         assert!(
+            (bound..=bound + AFTER_CLOSE_PAUSE.as_secs()).contains(&clock.get()),
+            "the settle wait is bounded by the MORNING deadline: {}",
             clock.get()
-                <= AFTER_CLOSE_DEPTH_STOP_SECS_IST
-                    + AFTER_CLOSE_SETTLE.as_secs()
-                    + AFTER_CLOSE_PAUSE.as_secs(),
-            "the settle wait is bounded by the deadline"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1449,6 +1714,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| clock.get(),
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(DAY_FREE),
             sleep: &sleep,
@@ -1520,6 +1786,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| clock.get(),
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &disk,
             sleep: &sleep,
@@ -1551,6 +1818,7 @@ mod tests {
         let signals = PassSignals {
             now_secs_ist: &|| IN_WINDOW,
             lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| None,
             sleep: &|_| {},
