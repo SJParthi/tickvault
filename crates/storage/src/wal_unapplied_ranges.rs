@@ -2476,6 +2476,11 @@ mod tests {
 
         // The fold starts a migrated overflow at 1, not at the segment seen.
         write_v1_overflow_file(&dir, seq(400));
+        // The fold reads `boot_frame_high` from the process frame counter;
+        // mint one so it stands at the wall clock (far above seq(900)) as in
+        // production. Run alone in a fresh process (CI's nextest) it was 0,
+        // which clamped the guard's top below its floor.
+        let _minted = crate::ws_frame_spill::next_frame_seq();
         let wm = AppliedWatermark::new();
         wm.bind(&dir);
         let fold = fold_at_boot(&wm, &dir).expect("fold");
