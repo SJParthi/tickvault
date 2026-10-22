@@ -61,7 +61,7 @@ const APP_ACTIVE_WAIT_SECS: u64 = 600;
 /// How long `prepare-new` waits for first-boot provisioning to finish.
 const CLOUD_INIT_WAIT_SECS: u64 = 1800;
 /// Written by cloud-init when its last stage ends. Read as files, never by
-/// spawning `cloud-init` (a Python program; the spawn allowlist refuses it).
+/// spawning `cloud-init` (not a Rust binary; the spawn allowlist refuses it).
 const CLOUD_INIT_DONE: &str = "/var/lib/cloud/instance/boot-finished";
 const CLOUD_INIT_RESULT: &str = "/run/cloud-init/result.json";
 /// Poll interval for every wait above.
