@@ -3066,11 +3066,15 @@ mod tests {
         // RE-BLESSED 2026-10-22 (plan item 63) — 47,075 -> 47,076 bytes,
         // comment only, no new lines: the note above `loadAws` names the AWS
         // Budgets call that replaced the Cost Explorer one.
+        //
+        // RE-BLESSED 2026-10-22 (plan item 64, operator Quote 37) — 47,076
+        // bytes, unchanged size: the stopped-box banner reads "auto-stops
+        // 16:30 IST" (was 17:30), the daily stop's new time.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "d1fd595b68f4bc9c6f6e92f879e82c878ed4954681207cef8d9eace819474ef1"
+            "5c9d8633bebce1a8b0ca07ce3a9e8664acb3fd6a353dda2e8a9f23970e1f6203"
         );
         assert_eq!(CONSOLE_HTML.len(), 47_076);
     }
@@ -6113,7 +6117,7 @@ data-pull phase, so the system is never blinded mid-trade";
         // One calm banner replaces the per-shield "unreachable" scatter…
         assert!(CONSOLE_HTML.contains(r#"id="stoppedbanner""#));
         assert!(CONSOLE_HTML.contains(
-        "Box stopped (auto-stops 17:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
+        "Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
     ));
         assert!(CONSOLE_HTML.contains("$('stoppedbanner').hidden=running"));
         // …and the shield greys out as "—" ONLY when the box is not running.

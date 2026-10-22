@@ -6,7 +6,7 @@
 //! this session's frames acked while QuestDB was untrusted) is replayed only
 //! by a boot's catch-up drain, which runs before the sockets dial. So after
 //! the close, once the day's own work is done (and the day's 1-minute
-//! cross-verification has run, or 17:25 IST has passed), the drain-hold
+//! cross-verification has run, or 16:25 IST has passed; 17:25 until 2026-10-22), the drain-hold
 //! supervisor asks this process for a planned restart. systemd's
 //! `Restart=always` starts it again three seconds later and its catch-up
 //! replays the backlog.
@@ -57,9 +57,19 @@ pub const EVENING_DRAIN_SPACING_SECS: i64 = 2_400;
 pub const EVENING_DRAIN_FIRST_SECS_IST: u64 = 15 * 3_600 + 50 * 60;
 /// 05:00 IST: no restart after this.
 pub const EVENING_DRAIN_LAST_RESTART_SECS_IST: u64 = 5 * 3_600;
-/// 17:25 IST: past the day's last 1-minute cross-verification attempt
-/// (17:23), so a restart can no longer cut one short.
-pub const EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST: u64 = 17 * 3_600 + 25 * 60;
+/// 16:25 IST: past the day's last 1-minute cross-verification attempt
+/// (it ends by 16:23), so a restart can no longer cut one short. Derived from
+/// the scheduled-stop window, which the cross-verification end bound is
+/// derived from too (2026-10-22, plan item 64, Quote 37 and §12.15.12: was
+/// 17:25 with the 17:30 stop).
+pub const EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST: u64 =
+    crate::shutdown_class::SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64;
+
+const _: () = assert!(
+    crate::dhan_live_crossverify_boot::XVERIFY_LAST_END_SECS_OF_DAY_IST
+        < EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST,
+    "the evening drain may restart only after the last cross-verification attempt ends"
+);
 /// The restarted boot's catch-up clock, in seconds.
 pub const EVENING_DRAIN_CATCHUP_BUDGET_SECS: u64 = 900;
 /// A pending flag older than this is ignored (a restart that never came).
@@ -199,8 +209,8 @@ impl EveningStep {
 }
 
 /// Whether the day's 1-minute cross-verification can no longer be cut short
-/// by a restart: its day marker exists, or it is past 17:25 IST (its last
-/// attempt ends by 17:23), including the hours after midnight. O(1).
+/// by a restart: its day marker exists, or it is past 16:25 IST (its last
+/// attempt ends by 16:23), including the hours after midnight. O(1).
 #[must_use]
 pub const fn crossverify_settled(marker_written: bool, secs_ist: u64) -> bool {
     marker_written
@@ -518,6 +528,9 @@ mod tests {
     fn crossverify_settled_by_marker_or_clock() {
         assert!(!crossverify_settled(false, 16 * 3_600));
         assert!(crossverify_settled(true, 16 * 3_600));
+        // 2026-10-22 (plan item 64): settled from 16:25, after the 16:23 end bound.
+        assert_eq!(EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST, 16 * 3_600 + 25 * 60);
+        assert!(!crossverify_settled(false, 16 * 3_600 + 25 * 60 - 1));
         assert!(crossverify_settled(
             false,
             EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST

@@ -50,7 +50,8 @@ use crate::dhan_live_crossverify::{
 };
 use crate::option_rank::OptionFamily;
 use crate::shutdown_class::{
-    SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST, SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
+    SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST, SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST,
+    SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
 };
 
 /// Marker task name. The S3 archive gate in `main.rs` reads the same constant,
@@ -313,33 +314,44 @@ pub const TOKEN_WAIT_MAX_POLLS: u32 = 60;
 ///
 /// 2026-10-06 (§12.15.8): 900 → 760 s, so four worst-case attempts still end
 /// by [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (compile-time asserted below).
+///
+/// **⚠ 2026-10-22 (§12.15.12, plan item 64, Quote 37):** kept at 760 s, but
+/// with the stop at 16:30 the end bound is 16:23, so only ONE worst-case
+/// attempt fits (asserted below): 15:57:00 + 760 + 960 s = 16:25:40 is past
+/// 16:23, and [`attempt_is_last`] decides from the latest possible end, so the
+/// 15:41 attempt is decided last and a normal day gets no same-day retry
+/// before the stop. A shrunk or skipped attempt keeps its rules.
 pub const XVERIFY_RETRY_INTERVAL_SECS: u64 = 760;
 
 /// The most attempts one trading day gets, the first one included.
 pub const XVERIFY_MAX_ATTEMPTS_PER_DAY: u32 = 4;
 
-/// 17:30 IST — when the weekday stop cron fires. Kept for documentation and
+/// 16:30 IST — when the weekday stop cron fires (17:30 until 2026-10-22,
+/// §12.15.12). Derived from the one stop constant
+/// ([`SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST`]). Kept for documentation and
 /// the ordering assert only: since 2026-10-06 (§12.15.8) no attempt is bounded
 /// by it, because the scheduled-stop window opens 5 minutes earlier, at
-/// [`SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST`] (17:25), and an attempt
-/// allowed to end at 17:30 could be killed half-way.
-pub const EVENING_STOP_SECS_OF_DAY_IST: u64 = 17 * 3_600 + 30 * 60;
+/// [`SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST`] (16:25), and an attempt
+/// allowed to end at the stop could be killed half-way.
+pub const EVENING_STOP_SECS_OF_DAY_IST: u64 = SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST as u64;
 
-/// 17:45 IST — when the start watchdog's `stop_check` fires on weekdays
+/// 16:45 IST — when the start watchdog's `stop_check` fires on weekdays
 /// (`deploy/aws/terraform/start-watchdog-lambda.tf`,
-/// `cron(15 12 ? * MON-FRI *)`). It stops any box launched before the 17:30
-/// trigger and does NOT read the keep-alive override. Pinned to that cron by
+/// `cron(15 11 ? * MON-FRI *)`; 17:45 until 2026-10-22, §12.15.12): the stop
+/// plus 900 s, the scheduled-stop window's end. It stops any box launched
+/// before the 16:30 trigger and does NOT read the keep-alive override. Pinned to that cron by
 /// `test_evening_start_follows_the_start_watchdog_stop_check_and_curfew`
 /// (§12.15.8, second 51b review).
-pub const START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST: u64 = 17 * 3_600 + 45 * 60;
+pub const START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST: u64 =
+    SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64;
 
 /// Room after the `stop_check` fires for its stop to land (EventBridge
 /// delivery, the Lambda's StopInstances call, the guest shutdown) before the
 /// evening attempt starts. That 300 s is enough is Assumed (§12.15.8).
 pub const XVERIFY_STOP_CHECK_MARGIN_SECS: u64 = 300;
 
-/// 17:50 IST — the earliest an unshrunk attempt starts after the 17:23 end
-/// bound: the evening attempt of a day whose only attempt was skipped for
+/// 16:50 IST (17:50 until 2026-10-22, §12.15.12) — the earliest an unshrunk
+/// attempt starts after the 16:23 end bound: the evening attempt of a day whose only attempt was skipped for
 /// time, and a manual evening boot (§12.15.8). Before the second 51b review
 /// this was 17:45 (`SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST`), the instant
 /// the `stop_check` fires, so the attempt raced the stop. Derived, never a
@@ -353,13 +365,15 @@ pub const XVERIFY_EVENING_START_SECS_OF_DAY_IST: u64 =
 /// stepping back cannot hold the loop.
 const XVERIFY_EVENING_RESLEEP_MAX: u32 = 3;
 
-/// 17:24 IST — one minute before the scheduled-stop window opens. Derived from
+/// 16:24 IST (17:24 until 2026-10-22, §12.15.12) — one minute before the
+/// scheduled-stop window opens. Derived from
 /// the `shutdown_class` constant, never a literal (§12.15.8).
 pub const XVERIFY_DEADLINE_SECS_OF_DAY_IST: u64 =
     SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64 - 60;
 
-/// 17:23 IST — the latest an attempt or the option pass may end, when it
-/// started before the scheduled-stop window (§12.15.8).
+/// 16:23 IST (17:23 until 2026-10-22, §12.15.12) — the latest an attempt or
+/// the option pass may end, when it started before the scheduled-stop window
+/// (§12.15.8).
 pub const XVERIFY_LAST_END_SECS_OF_DAY_IST: u64 = XVERIFY_DEADLINE_SECS_OF_DAY_IST - 60;
 
 /// The smallest run budget a late attempt is shrunk to. Below it the attempt
@@ -371,18 +385,18 @@ pub const XVERIFY_MIN_ATTEMPT_BUDGET_SECS: u64 = 120;
 /// deadline (§12.15.8, [`persist_report_into`]).
 const PERSIST_MARGIN_SECS: u64 = 60;
 
-/// The default `run_budget_secs`, mirrored here so the four-attempt fit can be
+/// The default `run_budget_secs`, mirrored here so the one-attempt fit can be
 /// asserted at compile time. Pinned to `DhanLiveCrossverifyConfig::default()`
 /// by `test_default_run_budget_mirror_matches_the_config_default`.
 const XVERIFY_DEFAULT_RUN_BUDGET_SECS: u64 = 600;
 
+// 2026-10-22 (§12.15.12): with the 16:30 stop the fit is ONE worst-case
+// attempt (56,460 + 960 = 57,420 <= 58,980); §12.15.8's four-attempt fit no
+// longer holds and is not claimed.
 const _: () = assert!(
-    XVERIFY_RUN_AT_SECS_OF_DAY_IST
-        + attempt_max_secs(XVERIFY_DEFAULT_RUN_BUDGET_SECS)
-        + (XVERIFY_MAX_ATTEMPTS_PER_DAY as u64 - 1)
-            * (XVERIFY_RETRY_INTERVAL_SECS + attempt_max_secs(XVERIFY_DEFAULT_RUN_BUDGET_SECS))
+    XVERIFY_RUN_AT_SECS_OF_DAY_IST + attempt_max_secs(XVERIFY_DEFAULT_RUN_BUDGET_SECS)
         <= XVERIFY_LAST_END_SECS_OF_DAY_IST,
-    "four worst-case attempts with the default budget must end by 17:23 IST"
+    "one worst-case attempt with the default budget must end by 16:23 IST"
 );
 
 const _: () = assert!(
@@ -395,7 +409,7 @@ const _: () = assert!(
             <= START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST
         && START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST < XVERIFY_EVENING_START_SECS_OF_DAY_IST
         && XVERIFY_EVENING_START_SECS_OF_DAY_IST < SECS_PER_DAY,
-    "15:41 < 17:23 < 17:24 < 17:25 < 17:30 < 17:45 <= 17:45 < 17:50 < midnight"
+    "15:41 < 16:23 < 16:24 < 16:25 < 16:30 < 16:45 <= 16:45 < 16:50 < midnight"
 );
 
 /// Same-day retries, by the reason the previous attempt failed. Local
@@ -426,8 +440,8 @@ pub enum AttemptFailure {
     /// (2026-10-06, §12.15.7). The day is not recorded on an incomplete audit.
     AuditRowsLost,
     /// No attempt ran in this process: the only one was skipped because too
-    /// little time was left before 17:23 IST, and the one evening attempt at
-    /// 17:50 could not start either (§12.15.8). Pages `xverify_failed` unless
+    /// little time was left before 16:23 IST, and the one evening attempt at
+    /// 16:50 could not start either (§12.15.8). Pages `xverify_failed` unless
     /// today's paged marker shows a page already went out.
     SkippedNoTime,
     /// The live side was not known final before the read: the catch-up floor
@@ -479,8 +493,8 @@ pub const fn attempt_max_secs(run_budget_secs: u64) -> u64 {
 
 /// Seconds to wait before the next same-day attempt, or `None` when there is
 /// no next attempt: the day's attempts are used up, or the next attempt could
-/// still be running at [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (17:23 IST; the
-/// 17:30 bound before 2026-10-06 was a defect, §12.15.8). Pure, O(1).
+/// still be running at [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (16:23 IST since
+/// §12.15.12; the stop-time bound before 2026-10-06 was a defect, §12.15.8). Pure, O(1).
 #[must_use]
 pub const fn retry_delay_secs(
     attempts_made: u32,
@@ -524,8 +538,8 @@ pub const fn attempt_is_last(
 /// The run budget for a full attempt starting at `now_secs_of_day`, or `None`
 /// when it should not start (§12.15.8).
 ///
-/// - At or after [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] (17:50, five minutes
-///   after the 17:45 start-watchdog `stop_check`; a manual evening boot) and
+/// - At or after [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] (16:50, five minutes
+///   after the 16:45 start-watchdog `stop_check`; a manual evening boot) and
 ///   before midnight: the configured budget, unchanged.
 /// - Otherwise the configured budget when the whole attempt (token wait,
 ///   budget, persist margin) ends by [`XVERIFY_LAST_END_SECS_OF_DAY_IST`];
@@ -1389,21 +1403,21 @@ where
 /// A full attempt with too little time left is skipped, never started. When
 /// an earlier attempt in this process did run and fail, the day ends with
 /// THAT failure, so it pages as usual. When nothing ran before it in this
-/// process (a start between about 17:15 and 17:50), the day does not end
+/// process (a start between about 16:15 and 16:50), the day does not end
 /// there (§12.15.8, 51b review): `on_first_skip` reports the day at once,
 /// BEFORE any wait, because the scheduled stop may end the process first
 /// (`run_day` pages it unless today's paged marker shows a page already went
 /// out); then the loop sleeps until
-/// [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] (17:50) and, on the same IST
+/// [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] (16:50) and, on the same IST
 /// day, makes ONE full attempt with the configured budget. The skipped
 /// attempt is not counted, so that attempt is number 1 and the last. Two
-/// scheduled stops act on a weekday box before 17:50: the start watchdog's
-/// 17:45 `stop_check` (any box launched before 17:30, keep-alive ignored) and
-/// its hourly `curfew_check` (17:35: no keep-alive, past the launch grace).
+/// scheduled stops act on a weekday box before 16:50: the start watchdog's
+/// 16:45 `stop_check` (any box launched before 16:30, keep-alive ignored) and
+/// its hourly `curfew_check` (16:35: no keep-alive, past the launch grace).
 /// The attempt therefore starts five minutes after the `stop_check`, never at
-/// the same instant: a weekday box launched before 17:30 is stopped during
+/// the same instant: a weekday box launched before 16:30 is stopped during
 /// the wait and the attempt never starts (the day was already reported); a
-/// box started by hand after 17:30, or a weekend session kept up by
+/// box started by hand after 16:30, or a weekend session kept up by
 /// keep-alive, runs it (second 51b review). The wait happens at most once; a
 /// second skip ends the day [`AttemptFailure::SkippedNoTime`].
 /// O(1) per attempt, at most [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] attempts and
@@ -1483,7 +1497,7 @@ where
                         Err(previous.unwrap_or(AttemptFailure::SkippedNoTime))
                     } else {
                         // Nothing ran here: report the day now, then wait
-                        // for 17:50, after the 17:45 start-watchdog
+                        // for 16:50, after the 16:45 start-watchdog
                         // stop_check, and try once more (§12.15.8, 51b review).
                         on_first_skip();
                         waited_for_evening = true;
@@ -1492,7 +1506,7 @@ where
                             .await;
                         // The sleep runs on the monotonic clock, the gate on
                         // the wall clock: a wall clock stepped back during
-                        // the wait wakes short of 17:50 and would skip the
+                        // the wait wakes short of 16:50 and would skip the
                         // one evening attempt (51b review). Sleep the
                         // shortfall, a bounded number of times.
                         for _ in 0..XVERIFY_EVENING_RESLEEP_MAX {
@@ -1564,7 +1578,7 @@ where
 
 /// Runs today's check, retrying on the same day until it records the day or
 /// the retry window closes, then the option pass. Each attempt is bounded by
-/// its timeout and ends by 17:23 IST when it starts before the scheduled-stop
+/// its timeout and ends by 16:23 IST when it starts before the scheduled-stop
 /// window (§12.15.8); the number of attempts is bounded by
 /// [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] and by that end bound.
 async fn run_day(
@@ -1631,7 +1645,7 @@ async fn run_day(
     }
     // §12.15.6: the depth-held option pass runs ONCE, after the spot check's
     // outcome is final. It never writes the day marker and never pages.
-    // §12.15.8: it runs under its own timeout, so it too ends by 17:23.
+    // §12.15.8: it runs under its own timeout, so it too ends by 16:23.
     // The persist, which the timeout cannot cut, stops itself at the same
     // instant.
     let option_limit_secs = attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS);
@@ -1721,7 +1735,7 @@ fn report_final_failure(
                  started too late to finish before the evening stop. Today's candles are \
                  UNVERIFIED and today's S3 archive stays held. Not paged again: the note at \
                  `path` shows a page already went out today. If the box is still up at \
-                 17:50, one more attempt runs then"
+                 16:50, one more attempt runs then"
             );
         } else {
             warn!(
@@ -1752,7 +1766,7 @@ fn report_final_failure(
             "Dhan 1-minute cross-verification could not run today before the evening \
              stop (the box started or restarted too late) and no alert went out today — \
              today's candles are UNVERIFIED and today's S3 archive stays held. If the box \
-             is still up at 17:50, one more attempt runs then"
+             is still up at 16:50, one more attempt runs then"
         ),
         AttemptFailure::Vacuous => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
@@ -2516,7 +2530,7 @@ where
 }
 
 /// Whether the option pass can still finish by
-/// [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (17:23 IST, §12.15.8), starting now.
+/// [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (16:23 IST, §12.15.8), starting now.
 /// Pure, O(1).
 #[must_use]
 pub const fn option_pass_fits(now_secs_of_day: u64) -> bool {
@@ -3793,11 +3807,12 @@ mod tests {
             None
         );
         assert_eq!(retry_delay_secs(u32::MAX, run, max), None);
-        // §12.15.8: the next attempt must end by 17:23, not 17:30.
+        // §12.15.8: the next attempt must end by the end bound (16:23 since
+        // §12.15.12), not the stop.
         let last_start = XVERIFY_LAST_END_SECS_OF_DAY_IST - XVERIFY_RETRY_INTERVAL_SECS - max;
         assert!(retry_delay_secs(1, last_start, max).is_some());
         assert_eq!(retry_delay_secs(1, last_start + 1, max), None);
-        // The 17:30 bound would still allow this one; it must not.
+        // The stop-time bound would still allow this one; it must not.
         let old_bound_start = EVENING_STOP_SECS_OF_DAY_IST - XVERIFY_RETRY_INTERVAL_SECS - max;
         assert_eq!(retry_delay_secs(1, old_bound_start, max), None);
         // After the stop (a manual evening boot catch-up): no retry, no overflow.
@@ -3813,14 +3828,18 @@ mod tests {
     #[test]
     fn test_deadline_and_last_end_derive_from_the_scheduled_stop_window() {
         let stop = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
-        assert_eq!(stop, 17 * 3_600 + 25 * 60, "the window opens at 17:25");
+        // §12.15.12 (2026-10-22): the stop is 16:30, so the window opens 16:25.
+        assert_eq!(stop, 16 * 3_600 + 25 * 60, "the window opens at 16:25");
         assert_eq!(XVERIFY_DEADLINE_SECS_OF_DAY_IST, stop - 60);
         assert_eq!(
             XVERIFY_LAST_END_SECS_OF_DAY_IST,
             XVERIFY_DEADLINE_SECS_OF_DAY_IST - 60
         );
-        assert_eq!(XVERIFY_DEADLINE_SECS_OF_DAY_IST, 62_640, "17:24");
-        assert_eq!(XVERIFY_LAST_END_SECS_OF_DAY_IST, 62_580, "17:23");
+        assert_eq!(XVERIFY_DEADLINE_SECS_OF_DAY_IST, 59_040, "16:24");
+        assert_eq!(XVERIFY_LAST_END_SECS_OF_DAY_IST, 58_980, "16:23");
+        assert_eq!(EVENING_STOP_SECS_OF_DAY_IST, 59_400, "16:30");
+        assert_eq!(START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST, 60_300, "16:45");
+        assert_eq!(XVERIFY_EVENING_START_SECS_OF_DAY_IST, 60_600, "16:50");
         assert!(XVERIFY_RUN_AT_SECS_OF_DAY_IST < XVERIFY_LAST_END_SECS_OF_DAY_IST);
         assert!(stop < EVENING_STOP_SECS_OF_DAY_IST);
         assert!(
@@ -3830,7 +3849,10 @@ mod tests {
         let prod = prod_src();
         assert!(prod.contains("SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64 - 60;"));
         assert!(prod.contains("XVERIFY_DEADLINE_SECS_OF_DAY_IST - 60;"));
-        assert!(!prod.contains("= 62_580") && !prod.contains("= 62_640"));
+        assert!(!prod.contains("= 58_980") && !prod.contains("= 59_040"));
+        assert!(prod.contains(
+            "pub const EVENING_STOP_SECS_OF_DAY_IST: u64 = SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST as u64;"
+        ));
     }
 
     /// The `schedule_expression` cron fields of one terraform resource block,
@@ -3855,8 +3877,8 @@ mod tests {
     }
 
     /// §12.15.8 (second 51b review): the evening attempt starts after BOTH
-    /// start-watchdog stops that act on a weekday box after 17:30 have had
-    /// their margin. The 17:45 `stop_check` (any box launched before 17:30,
+    /// start-watchdog stops that act on a weekday box after the 16:30 stop have
+    /// had their margin. The 16:45 `stop_check` (any box launched before 16:30,
     /// keep-alive ignored) is pinned to its terraform cron, and the hourly
     /// `curfew_check`'s latest firing at or before the evening start is at
     /// least the same margin earlier. Before this, the attempt started at
@@ -3921,13 +3943,16 @@ mod tests {
         assert_eq!(
             DhanLiveCrossverifyConfig::default().run_budget_secs,
             XVERIFY_DEFAULT_RUN_BUDGET_SECS,
-            "the four-attempt compile-time fit is asserted against this mirror"
+            "the one-attempt compile-time fit is asserted against this mirror"
         );
     }
 
-    /// With the default budget, a 15:41 run whose every attempt takes the
-    /// longest it can gets all its attempts in, the last one ending exactly at
-    /// 17:23 (§12.15.8). The last-attempt decision is the conservative one.
+    /// With the default budget, a 15:41 run whose attempt takes the longest it
+    /// can ends by the 16:23 end bound (§12.15.12, 2026-10-22). Since the stop
+    /// moved to 16:30 that is ONE attempt: the 15:41 attempt is decided last,
+    /// so a normal day gets no same-day retry (Risk, recorded in §12.15.12).
+    /// Before, four attempts fit and the last ended exactly at 17:23
+    /// (§12.15.8). The last-attempt decision is the conservative one.
     #[test]
     fn test_worst_case_day_fits_every_attempt_before_the_last_end() {
         let max = attempt_max_secs(600);
@@ -3947,18 +3972,14 @@ mod tests {
             }
             start = end + XVERIFY_RETRY_INTERVAL_SECS;
         };
-        assert_eq!(attempts, XVERIFY_MAX_ATTEMPTS_PER_DAY);
-        // 15:41:00, 16:09:40, 16:38:20, 17:07:00.
-        assert_eq!(starts, vec![56_460, 58_180, 59_900, 61_620]);
-        assert_eq!(
-            end, XVERIFY_LAST_END_SECS_OF_DAY_IST,
-            "ends exactly at 17:23"
-        );
-        // One more second of interval and the fourth attempt no longer fits.
-        assert!(
-            56_460 + max + 3 * (XVERIFY_RETRY_INTERVAL_SECS + 1 + max)
-                > XVERIFY_LAST_END_SECS_OF_DAY_IST
-        );
+        // §12.15.12: one attempt, 15:41:00 to 15:57:00, 26 minutes before 16:23.
+        assert_eq!(attempts, 1);
+        assert_eq!(starts, vec![56_460]);
+        assert_eq!(end, 57_420, "ends at 15:57:00");
+        assert!(end <= XVERIFY_LAST_END_SECS_OF_DAY_IST);
+        // A second worst-case attempt would end at 16:25:40, past 16:23.
+        assert_eq!(end + XVERIFY_RETRY_INTERVAL_SECS + max, 59_140);
+        assert!(end + XVERIFY_RETRY_INTERVAL_SECS + max > XVERIFY_LAST_END_SECS_OF_DAY_IST);
     }
 
     #[test]
@@ -3997,7 +4018,7 @@ mod tests {
         assert_eq!(attempt_budget_secs(window_start, 600), None);
         assert_eq!(attempt_budget_secs(EVENING_STOP_SECS_OF_DAY_IST, 600), None);
         assert_eq!(attempt_budget_secs(evening_start - 1, 600), None);
-        // §12.15.8 (second 51b review): the 17:45 window end is the instant the
+        // §12.15.8 (second 51b review): the window end (16:45 since §12.15.12) is the instant the
         // start-watchdog stop_check fires, so an unshrunk attempt there would
         // race it. Refused until five minutes later.
         let window_end = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
@@ -4006,7 +4027,7 @@ mod tests {
             attempt_budget_secs(START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST, 600),
             None
         );
-        // A manual evening boot from 17:50 runs the configured budget, as
+        // A manual evening boot from 16:50 runs the configured budget, as
         // before §12.15.8.
         assert_eq!(attempt_budget_secs(evening_start, 600), Some(600));
         assert_eq!(attempt_budget_secs(SECS_PER_DAY - 1, 600), Some(600));
@@ -4019,14 +4040,14 @@ mod tests {
 
     /// Every second of the day, for budgets around every boundary: a granted
     /// budget never exceeds the configured one, an attempt that starts before
-    /// the stop window always ends by 17:23, a budget below the floor is only
+    /// the stop window always ends by 16:23, a budget below the floor is only
     /// ever the configured one, and a refusal happens only when the full
     /// configured attempt does not fit.
     #[test]
     fn test_attempt_budget_secs_every_second_of_the_day() {
         let window_start = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
         // §12.15.8 (second 51b review): unshrunk attempts start only from
-        // 17:50, five minutes after the start-watchdog stop_check.
+        // 16:50, five minutes after the start-watchdog stop_check.
         let window_end = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
         for config in [0_u64, 1, 60, 119, 120, 121, 599, 600, 601, 3_600, u64::MAX] {
             for now in 0..SECS_PER_DAY {
@@ -4041,7 +4062,7 @@ mod tests {
                         } else {
                             assert!(
                                 now >= window_end,
-                                "ran before the 17:50 evening start: {now}"
+                                "ran before the 16:50 evening start: {now}"
                             );
                             assert_eq!(budget, config);
                         }
@@ -4100,7 +4121,7 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4_096))]
         /// Random starts, attempt numbers and budgets: a not-last attempt
-        /// always leaves a full next attempt that ends by 17:23.
+        /// always leaves a full next attempt that ends by 16:23.
         #[test]
         fn proptest_is_last_never_strands_a_retry(
             start in 0_u64..(2 * SECS_PER_DAY),
@@ -4301,13 +4322,13 @@ mod tests {
             previous_end = Some(end);
         }
         // §12.15.8 (51b review): a first attempt with no time is reported at
-        // once, at the skip and before any wait, then retried ONCE at 17:50
+        // once, at the skip and before any wait, then retried ONCE at 16:50
         // with the configured budget, as attempt 1 and the last.
         let skipped_first = attempt_budget_secs(first_start, config).is_none();
         assert_eq!(sim.skip_notices, u32::from(skipped_first));
         if skipped_first {
             assert_eq!(sim.notice_at, Some(first_start), "reported before the wait");
-            let evening = sim.plans.first().copied().expect("the 17:50 attempt ran");
+            let evening = sim.plans.first().copied().expect("the 16:50 attempt ran");
             assert_eq!(
                 evening.start_secs_of_day,
                 XVERIFY_EVENING_START_SECS_OF_DAY_IST
@@ -4335,9 +4356,9 @@ mod tests {
         }
     }
 
-    /// Every start second from 15:41 to 17:23, every failure count 1..=4,
+    /// Every start second from 15:41 to 16:23, every failure count 1..=4,
     /// with attempts that hang to their timeout, fail at once, or alternate:
-    /// no attempt ends after 17:23, `is_last` is decided once and agrees with
+    /// no attempt ends after 16:23, `is_last` is decided once and agrees with
     /// what the loop did, and at most four attempts run.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_every_start_second_ends_by_the_last_end() {
@@ -4366,12 +4387,17 @@ mod tests {
                 }
             }
         }
-        assert_eq!(sims, (62_580 - 56_460 + 1) * 4 * 4);
+        assert_eq!(
+            u64::from(sims),
+            (XVERIFY_LAST_END_SECS_OF_DAY_IST - XVERIFY_RUN_AT_SECS_OF_DAY_IST + 1) * 4 * 4
+        );
+        assert_eq!(sims, (58_980 - 56_460 + 1) * 4 * 4);
     }
 
-    /// The worst case on the paused clock: four attempts that each hang to
-    /// their timeout start at 15:41:00, 16:09:40, 16:38:20 and 17:07:00, and
-    /// the day returns its failure exactly at 17:23.
+    /// The worst case on the paused clock (§12.15.12): the 15:41:00 attempt
+    /// hangs to its timeout, is decided last before it starts, and the day
+    /// returns its failure at 15:57:00. Before the 16:30 stop, four attempts
+    /// ran (15:41:00, 16:09:40, 16:38:20, 17:07:00) and the day ended at 17:23.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_worst_case_hangs_end_exactly_at_the_last_end() {
         let sim = simulate(
@@ -4382,25 +4408,43 @@ mod tests {
         )
         .await;
         let starts: Vec<u64> = sim.plans.iter().map(|p| p.start_secs_of_day).collect();
-        assert_eq!(starts, vec![56_460, 58_180, 59_900, 61_620]);
-        assert_eq!(sim.result.attempts, 4);
+        assert_eq!(starts, vec![56_460]);
+        assert_eq!(sim.result.attempts, 1);
         // A timed-out attempt is incomplete, whatever it would have returned.
         assert_eq!(sim.result.failure, Some(AttemptFailure::Incomplete));
-        assert_eq!(sim.finished, XVERIFY_LAST_END_SECS_OF_DAY_IST);
+        assert_eq!(sim.finished, 57_420);
+        assert!(sim.finished <= XVERIFY_LAST_END_SECS_OF_DAY_IST);
         assert!(sim.ends.is_empty(), "every attempt was cut by its timeout");
         let lasts: Vec<bool> = sim.plans.iter().map(|p| p.is_last).collect();
+        assert_eq!(lasts, vec![true]);
+        // Started early enough (a boot catch-up), four hanging attempts still
+        // fit and the fourth ends exactly at the end bound.
+        let early = XVERIFY_LAST_END_SECS_OF_DAY_IST
+            - 4 * attempt_max_secs(600)
+            - 3 * XVERIFY_RETRY_INTERVAL_SECS;
+        let four = simulate(
+            early,
+            600,
+            |_, _| (None, Err(AttemptFailure::RunFailed)),
+            None,
+        )
+        .await;
+        assert_eq!(four.result.attempts, 4);
+        assert_eq!(four.finished, XVERIFY_LAST_END_SECS_OF_DAY_IST);
+        let lasts: Vec<bool> = four.plans.iter().map(|p| p.is_last).collect();
         assert_eq!(lasts, vec![false, false, false, true]);
     }
 
     /// 51b review: the evening wait sleeps on the monotonic clock but the
     /// attempt is gated on the wall clock. A wall clock stepped back 2 s during
-    /// the wait wakes at 17:49:58; the loop sleeps the shortfall and still
+    /// the wait wakes at 16:49:58; the loop sleeps the shortfall and still
     /// makes the one evening attempt, instead of skipping it a second time
     /// and ending the day `skipped_no_time`.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_evening_attempt_survives_a_wall_clock_stepped_back() {
         let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
-        let first_start = 63_000_u64;
+        // 16:30, the stop instant (a box kept up past it, e.g. a weekend session).
+        let first_start = EVENING_STOP_SECS_OF_DAY_IST;
         let t0 = tokio::time::Instant::now();
         let stepped = std::cell::Cell::new(false);
         let now = || {
@@ -4464,7 +4508,7 @@ mod tests {
     }
 
     /// 51b review: the runbook's operator actions for a skipped day agree
-    /// with §12.15.8 and the code: a start at or after 17:50 runs one full
+    /// with §12.15.8 and the code: a start at or after 16:50 runs one full
     /// attempt (`attempt_budget_secs` returns the configured budget), so the
     /// runbook must never tell the operator today cannot be re-checked by a
     /// restart then, nor that a retry always runs at full budget.
@@ -4481,12 +4525,12 @@ mod tests {
                 .to_string()
         };
         let skipped = row("xverify_attempt_skipped_no_time");
-        assert!(skipped.contains("17:50"), "{skipped}");
+        assert!(skipped.contains("16:50"), "{skipped}");
         let failed = runbook
             .lines()
             .find(|l| l.contains("`reason = \"skipped_no_time\"`") && l.starts_with("| `source"))
             .unwrap_or("");
-        assert!(failed.contains("at or after 17:50"), "{failed}");
+        assert!(failed.contains("at or after 16:50"), "{failed}");
         let timed_out = row("xverify_attempt_timed_out");
         assert!(!timed_out.is_empty());
         for text in [skipped.as_str(), failed, timed_out.as_str()] {
@@ -4508,8 +4552,13 @@ mod tests {
     /// `is_last`, no budget, and its failure is the day's final failure.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_marker_only_attempt_as_the_last() {
+        // §12.15.12: a 15:41 attempt is always the last since the 16:30 stop,
+        // so this starts early enough for four attempts (a boot catch-up).
+        let early = XVERIFY_LAST_END_SECS_OF_DAY_IST
+            - 4 * attempt_max_secs(600)
+            - 3 * XVERIFY_RETRY_INTERVAL_SECS;
         let sim = simulate(
-            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            early,
             600,
             |n, _| match n {
                 1 => (None, Err(AttemptFailure::RunFailed)),
@@ -4534,7 +4583,7 @@ mod tests {
         assert_eq!(sim.result.failure, Some(AttemptFailure::MarkerNotWritten));
         // The same day, the marker-only attempt succeeding records it.
         let ok = simulate(
-            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            early,
             600,
             |n, _| match n {
                 1 => (Some(0), Err(AttemptFailure::MarkerNotWritten)),
@@ -4552,7 +4601,7 @@ mod tests {
     }
 
     /// A late boot catch-up: too little time skips the attempt without
-    /// calling it, reports the day at once and retries once at 17:50; a
+    /// calling it, reports the day at once and retries once at 16:50; a
     /// little more time shrinks the budget and the timeout follows the shrunk
     /// budget; a configured budget below the floor runs.
     #[tokio::test(start_paused = true)]
@@ -4564,7 +4613,7 @@ mod tests {
         let skipped = simulate(skip_at, 600, |_, _| (Some(0), Ok(())), None).await;
         assert_eq!(skipped.skip_notices, 1, "the day is reported at the skip");
         assert_eq!(skipped.notice_at, Some(skip_at));
-        assert_eq!(skipped.plans.len(), 1, "only the 17:50 attempt runs");
+        assert_eq!(skipped.plans.len(), 1, "only the 16:50 attempt runs");
         assert_eq!(
             skipped.plans.first().map(|p| p.start_secs_of_day),
             Some(evening_start)
@@ -4611,23 +4660,23 @@ mod tests {
     }
 
     /// §12.15.8 (51b review): the finding's scenario. A Saturday special
-    /// session, the process restarted at 17:30 with no stop cron. The day is
+    /// session, the process restarted at 16:30 with no stop cron. The day is
     /// reported at once (before the wait, which a weekday stop would cut),
-    /// then verified at 17:50 instead of being given up until the next day.
-    /// Every skip start up to 17:50 behaves the same, the 17:45 instant the
+    /// then verified at 16:50 instead of being given up until the next day.
+    /// Every skip start up to 16:50 behaves the same, the 16:45 instant the
     /// start-watchdog stop_check fires included (second 51b review: the
-    /// attempt used to start at that same instant); the 17:50 attempt's own
+    /// attempt used to start at that same instant); the 16:50 attempt's own
     /// failure is the day's failure.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_skip_reports_at_once_then_retries_once_after_the_stop_check() {
         let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
-        assert_eq!(evening, 17 * 3_600 + 50 * 60, "17:50 IST");
+        assert_eq!(evening, 16 * 3_600 + 50 * 60, "16:50 IST");
         for start in [
             XVERIFY_LAST_END_SECS_OF_DAY_IST - attempt_max_secs(0) - 119,
             XVERIFY_LAST_END_SECS_OF_DAY_IST - 300,
-            62_580,
-            62_645,
-            63_000,
+            XVERIFY_LAST_END_SECS_OF_DAY_IST,
+            XVERIFY_DEADLINE_SECS_OF_DAY_IST + 5,
+            EVENING_STOP_SECS_OF_DAY_IST,
             u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST),
             START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST + 1,
             evening - 1,
@@ -4650,14 +4699,14 @@ mod tests {
             assert_eq!(failed.plans.len(), 1, "one evening attempt, never more");
             assert!(failed.plans.iter().all(|p| p.is_last));
         }
-        // A clock that never reaches 17:50 (nonsense, but bounded): the loop
+        // A clock that never reaches 16:50 (nonsense, but bounded): the loop
         // waits once, skips again and ends `SkippedNoTime`; nothing ran.
         let ran = std::cell::Cell::new(0_u32);
         let notices = std::cell::Cell::new(0_u32);
         let stuck = drive_day(
             day(),
             600,
-            || 62_645,
+            || XVERIFY_DEADLINE_SECS_OF_DAY_IST + 5,
             || true,
             || notices.set(notices.get() + 1),
             |_plan: AttemptPlan| {
@@ -4672,7 +4721,13 @@ mod tests {
         assert_eq!(stuck.failure, Some(AttemptFailure::SkippedNoTime));
         assert!(!stuck.day_changed);
         // The day changes during the evening wait: no attempt, no report.
-        let gone = simulate(62_645, 600, |_, _| (Some(0), Ok(())), Some(0)).await;
+        let gone = simulate(
+            XVERIFY_DEADLINE_SECS_OF_DAY_IST + 5,
+            600,
+            |_, _| (Some(0), Ok(())),
+            Some(0),
+        )
+        .await;
         assert!(gone.result.day_changed);
         assert!(gone.plans.is_empty());
         assert_eq!(gone.skip_notices, 1);
@@ -4682,7 +4737,14 @@ mod tests {
         let readings = std::cell::Cell::new(0_u32);
         let jumping = || {
             readings.set(readings.get() + 1);
-            if readings.get() == 1 { 56_460 } else { 62_500 }
+            // §12.15.12: the first attempt must start early enough to have a
+            // planned retry (a 15:41 attempt is always the last since the
+            // 16:30 stop); the jump lands past the shrink floor.
+            if readings.get() == 1 {
+                52_000
+            } else {
+                XVERIFY_LAST_END_SECS_OF_DAY_IST - 60
+            }
         };
         let after_failure_ran = std::cell::Cell::new(0_u32);
         let after_failure_notices = std::cell::Cell::new(0_u32);
@@ -4784,8 +4846,13 @@ mod tests {
     /// The day changing during a retry sleep stops the loop without a page.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_day_change_stops_retrying() {
+        // §12.15.12: a 15:41 attempt is always the last since the 16:30 stop,
+        // so start early enough for a planned retry (a boot catch-up).
+        let early = XVERIFY_LAST_END_SECS_OF_DAY_IST
+            - 4 * attempt_max_secs(600)
+            - 3 * XVERIFY_RETRY_INTERVAL_SECS;
         let sim = simulate(
-            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            early,
             600,
             |_, _| (Some(0), Err(AttemptFailure::RunFailed)),
             Some(0),
@@ -5288,7 +5355,7 @@ mod tests {
         assert!(option_pass_fits(last - need));
         assert!(!option_pass_fits(last - need + 1));
         assert!(!option_pass_fits(last));
-        // §12.15.8: the old 17:30 bound would still have started this one.
+        // §12.15.8: the stop-time bound would still have started this one.
         assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST - need));
         assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST));
         assert!(!option_pass_fits(u64::MAX), "saturating add never wraps");

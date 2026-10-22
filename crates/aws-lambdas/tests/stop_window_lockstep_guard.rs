@@ -1,7 +1,8 @@
 //! Build-failing ratchet pinning the **evening stop-window lockstep**.
 //!
-//! The operator's 9-hour trading window is 08:30–17:30 IST (operator Quote 14,
-//! 2026-08-08 — the stop moved 16:30 → 17:30; the START is unchanged). FIVE
+//! The operator's trading window is 08:30–16:30 IST (operator Quote 37,
+//! 2026-10-21, plan item 64 — the stop moved back 17:30 → 16:30; it was
+//! 08:30–17:30 from operator Quote 14, 2026-08-08; the START is unchanged). FIVE
 //! places encode the evening edge, and **four of them will actively fight the
 //! schedule if they disagree** — this is not a cosmetic consistency test:
 //!
@@ -31,10 +32,11 @@ use tickvault_aws_lambdas::start_watchdog::{
 
 use chrono::{TimeZone, Utc};
 
-/// The single source of truth for this test: 17:30 IST = 12:00 UTC.
-const STOP_IST_HOUR: u32 = 17;
+/// The single source of truth for this test: 16:30 IST = 11:00 UTC
+/// (2026-10-22, plan item 64; 17:30 IST = 12:00 UTC before).
+const STOP_IST_HOUR: u32 = 16;
 const STOP_IST_MINUTE: u32 = 30;
-const STOP_UTC_HOUR: u32 = 12;
+const STOP_UTC_HOUR: u32 = 11;
 const STOP_UTC_MINUTE: u32 = 0;
 
 fn repo_root() -> PathBuf {
@@ -59,7 +61,7 @@ fn stop_time_utc_and_ist_agree() {
     assert_eq!(
         ist_minutes,
         utc_minutes + 5 * 60 + 30,
-        "17:30 IST must equal 12:00 UTC (+05:30) — this test's own anchors drifted"
+        "16:30 IST must equal 11:00 UTC (+05:30) — this test's own anchors drifted"
     );
 }
 
@@ -79,8 +81,9 @@ fn start_watchdog_stop_trigger_matches_the_cron() {
         "main.tf must schedule daily_stop at `{expected}` (= {STOP_IST_HOUR}:{STOP_IST_MINUTE} IST)"
     );
     assert!(
-        !tf.contains("cron(0 11 ? * MON-FRI *)"),
-        "main.tf still carries the OLD 16:30 IST daily_stop cron — the box would stop an hour early"
+        !tf.contains("cron(0 12 ? * MON-FRI *)"),
+        "main.tf still carries the OLD 17:30 IST daily_stop cron (2026-08-08 to 2026-10-22) — \
+         the box would stop an hour late and the hard-stop guard would force-stop it at 17:05"
     );
 }
 
@@ -165,21 +168,21 @@ fn hard_stop_up_window_covers_the_whole_scheduled_day() {
         in_up_window(at(3, 0)),
         "08:30 IST (the scheduled start) must be inside the up-window"
     );
-    // 11:59 UTC = 17:29 IST — one minute before the stop must be inside.
+    // 10:59 UTC = 16:29 IST — one minute before the stop must be inside.
     assert!(
-        in_up_window(at(11, 59)),
-        "17:29 IST must be inside the up-window — otherwise the hourly guard \
+        in_up_window(at(10, 59)),
+        "16:29 IST must be inside the up-window — otherwise the hourly guard \
          force-stops the box before its scheduled stop"
     );
-    // 12:00 UTC = 17:30 IST — the stop minute itself is inclusive.
+    // 11:00 UTC = 16:30 IST — the stop minute itself is inclusive.
     assert!(
-        in_up_window(at(12, 0)),
-        "17:30 IST (the scheduled stop minute) must be inside the up-window"
+        in_up_window(at(11, 0)),
+        "16:30 IST (the scheduled stop minute) must be inside the up-window"
     );
-    // 12:01 UTC = 17:31 IST — past the stop, the guard SHOULD act.
+    // 11:01 UTC = 16:31 IST — past the stop, the guard SHOULD act.
     assert!(
-        !in_up_window(at(12, 1)),
-        "17:31 IST must be OUTSIDE the up-window — the guard is the backstop for \
+        !in_up_window(at(11, 1)),
+        "16:31 IST must be OUTSIDE the up-window — the guard is the backstop for \
          a failed stop, so it must not stay permissive all evening"
     );
     // Weekends are always out, regardless of clock.
@@ -267,13 +270,15 @@ fn operator_facing_stop_times_are_in_lockstep() {
          hour — commandment 9 requires a precise IST 12-hour time."
     );
 
-    // Inverted pin: the retired 4:30 PM text must never come back. Every
+    // Inverted pin: the retired 5:30 PM text must never come back. Every
     // occurrence would be operator-facing, so one is already too many.
+    // (2026-10-22, plan item 64: this pinned the retired 4:30 PM until the
+    // operator moved the stop back to 4:30 PM IST under Quote 37.)
     assert!(
-        !body.contains("4:30 PM"),
-        "the retired 4:30 PM IST stop time must not reappear in any \
-         operator-facing body (operator widened the window to 5:30 PM IST on \
-         2026-08-08, Quote 14)."
+        !body.contains("5:30 PM"),
+        "the retired 5:30 PM IST stop time must not reappear in any \
+         operator-facing body (operator moved the stop back to 4:30 PM IST on \
+         2026-10-21, Quote 37)."
     );
 
     // EIGHTH site (added 2026-09-23, dhan-rest-only-noise-lock §2.3x): the
@@ -290,8 +295,8 @@ fn operator_facing_stop_times_are_in_lockstep() {
          as `{current}`"
     );
     assert!(
-        !events.contains("4:30 PM"),
-        "the retired 4:30 PM IST stop time must not reappear in \
+        !events.contains("5:30 PM"),
+        "the retired 5:30 PM IST stop time must not reappear in \
          notification/events.rs — it is rendered straight onto the operator's phone"
     );
 }
@@ -358,9 +363,9 @@ fn deploy_workflow_encodes_the_same_evening_edge() {
             continue;
         }
         assert!(
-            !line.contains("1630"),
-            "deploy-aws.yml:{} still carries the retired 16:30 IST edge on a LIVE line. \
-             Operator Quote 14 (2026-08-08) moved the window to 17:30. Line: {}",
+            !line.contains("1730"),
+            "deploy-aws.yml:{} still carries the retired 17:30 IST edge on a LIVE line. \
+             Operator Quote 37 (2026-10-21) moved the window back to 16:30. Line: {}",
             i + 1,
             line.trim()
         );

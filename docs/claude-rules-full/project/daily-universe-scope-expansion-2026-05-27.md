@@ -1451,7 +1451,7 @@ inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08 (Quote 14 → 08:30–17:30).**
 > Trading WEEKDAYS only (Mon–Fri), **08:30–16:30 IST** auto start/stop.
 >
-> **CURRENT LIVE SCHEDULE: 08:30–17:30 IST Mon–Fri** (Quote 14).
+> **CURRENT LIVE SCHEDULE: 08:30–16:30 IST Mon–Fri** (Quote 37, applied 2026-10-22 by plan ITEM 64; it was 08:30–17:30 IST under Quote 14 from 2026-08-08). The Quote 31 drain hold still keeps the box up past 16:30 while the day's data is not saved.
 
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08:** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays

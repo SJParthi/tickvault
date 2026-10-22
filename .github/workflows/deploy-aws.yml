@@ -567,7 +567,7 @@ jobs:
           #
           # AWS does not define an order for Reservations, and this filter
           # deliberately includes stopped instances (the box is stopped
-          # outside its 08:30-17:30 window, which is most of the day). Taking
+          # outside its 08:30-16:30 window, which is most of the day). Taking
           # element zero therefore meant that during any replacement window a
           # STOPPED OLD instance could outrank the RUNNING NEW one, and the
           # deploy would land on the wrong machine — the same class of failure
@@ -655,7 +655,7 @@ jobs:
         # FAIL -> "DLT deploy FAILED" Telegram, on EVERY push. Two distinct
         # cases, two behaviours:
         #
-        #   A. The box SHOULD be up now (08:30-17:30 IST Mon-Fri, OR this run is
+        #   A. The box SHOULD be up now (08:30-16:30 IST Mon-Fri, OR this run is
         #      a manual/after-close workflow_dispatch). If it's stopped, the
         #      08:30 EventBridge start silently failed (see scripts/aws-autopilot.sh
         #      EventBridge diagnostic). SELF-HEAL: start it here + wait for the
@@ -697,15 +697,15 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -uo pipefail
-          # Up-window = 08:30-17:30 IST Mon-Fri (the EventBridge schedule window;
-          # widened 16:30 -> 17:30 on 2026-08-08 per operator Quote 14, recorded in
+          # Up-window = 08:30-16:30 IST Mon-Fri (the EventBridge schedule window;
+          # back to 16:30 on 2026-10-22 per operator Quote 37 (17:30 from Quote 14), recorded in
           # daily-universe-scope-expansion-2026-05-27.md. That quote moved FOUR
           # coupled sites in lockstep; this workflow was a FIFTH nobody listed,
           # and it kept the old 16:30 until 2026-08-27).
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
           UP_WINDOW=no
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1730 ]; then UP_WINDOW=yes; fi
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then UP_WINDOW=yes; fi
           # A manual run or the after-close cron dispatch (workflow_dispatch)
           # always intends the box up — self-start regardless of clock.
           SHOULD_BE_UP=no
@@ -730,7 +730,7 @@ jobs:
 
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
-            echo "::notice::Box is intentionally stopped (outside 08:30-17:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one within ~30 min, ANY day, self-starting the box and stopping it again. If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
+            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one within ~30 min, ANY day, self-starting the box and stopping it again. If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
             # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
             # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
             # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
@@ -769,7 +769,7 @@ jobs:
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
           # Record that THIS run started a stopped box, so the final auto-stop
-          # step below can stop it again if we are now OUTSIDE the 08:30-17:30
+          # step below can stop it again if we are now OUTSIDE the 08:30-16:30
           # IST Mon-Fri up-window (e.g. an after-close workflow_dispatch deploy).
           # Without this, an out-of-window deploy would leave the box billing all
           # night until the next hourly hard-stop guard catches it.
@@ -1699,7 +1699,7 @@ jobs:
         # COST-HARDENING 2026-06-30 (never-cross): when an after-close /
         # workflow_dispatch deploy self-started a STOPPED box (the step above set
         # DEPLOY_STARTED_STOPPED_BOX=yes), leave it running ONLY if we are inside
-        # the 08:30-17:30 IST Mon-Fri up-window. If we are OUTSIDE the window, the
+        # the 08:30-16:30 IST Mon-Fri up-window. If we are OUTSIDE the window, the
         # box would otherwise bill all night until the hourly hard-stop guard
         # catches it — so stop it here, immediately, at the end of the deploy.
         # always() so it runs whether the deploy passed or failed. We NEVER stop a
@@ -1712,14 +1712,14 @@ jobs:
           set -uo pipefail
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1730 ]; then
-            echo "Inside 08:30-17:30 IST Mon-Fri window — leaving the box running."
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then
+            echo "Inside 08:30-16:30 IST Mon-Fri window — leaving the box running."
             exit 0
           fi
           echo "Outside the up-window (dow=$DOW time=$HHMM) and THIS run started the box — stopping it to avoid an out-of-window bill."
           # Announce the stop to the app first (dhan-rest-only-noise-lock
           # §2.3x, 2026-09-23): the SIGTERM this stop delivers lands outside
-          # the 17:25-17:45 quiet window, so without the planned-restart
+          # the 16:25-16:45 quiet window, so without the planned-restart
           # marker the app pages "Unexpected stop" for a stop this workflow
           # chose. Best effort and bounded: if the marker cannot be written,
           # the stop still happens and simply pages — the loud direction.

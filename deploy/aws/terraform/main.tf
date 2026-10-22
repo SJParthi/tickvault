@@ -32,9 +32,10 @@
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
 #     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
 #   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
-#   - EventBridge rules for daily 08:30 IST start / 17:30 IST stop (Mon-Fri;
-#     stop moved 16:30 -> 17:30 on 2026-08-08 per operator Quote 14 — the 9-hour
-#     window. The START is unchanged, which is why no morning schedule moved.)
+#   - EventBridge rules for daily 08:30 IST start / 16:30 IST stop (Mon-Fri;
+#     stop moved 16:30 -> 17:30 on 2026-08-08 per operator Quote 14, and back
+#     17:30 -> 16:30 on 2026-10-22 per operator Quote 37, plan item 64. The
+#     START is unchanged both times, which is why no morning schedule moved.)
 #     trading weekdays only per operator lock 2026-05-29 §7 Quote 5; weekends +
 #     NSE holidays = OFF unless the operator manually starts the instance)
 #   - CloudWatch log group + metric alarms (5 core infrastructure signals)
@@ -504,7 +505,8 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 #
 # IST offset is UTC+5:30, so:
 #   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
-#   Weekday stop  17:30 IST = 12:00 UTC (Mon-Fri)  [2026-08-08 Quote 14]
+#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)  [2026-10-22 Quote 37; was
+#                 17:30 IST = 12:00 UTC from 2026-08-08, Quote 14]
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
@@ -530,12 +532,18 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
 # open, deploy-watchdog) and every one of them stays correct. Only the two
 # stop-side schedules move.
 #
+# 2026-10-22 (operator Quote 37, plan item 64): stop moved back 17:30 -> 16:30
+# IST (11:00 UTC). Start stays 08:30.
+#
 # KEEP IN LOCKSTEP (each force-stops or false-alarms if it disagrees):
-#   - start-watchdog-lambda.tf stop_check cron -> 17:45 IST
-#   - start_watchdog.rs STOP_TRIGGER_UTC_HOUR = 12
-#   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 17*60+30 (curfew)
-#   - hard_stop_guard.rs in_up_window upper bound = 1730
-# Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs.
+#   - start-watchdog-lambda.tf stop_check cron -> 16:45 IST, cron(15 11 ...)
+#   - start_watchdog.rs STOP_TRIGGER_UTC_HOUR = 11
+#   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 16*60+30 (curfew)
+#   - hard_stop_guard.rs in_up_window upper bound = 1630
+#   - shutdown_class.rs SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST = 59,400 (the app's
+#     quiet window and every cross-verification bound derive from it)
+# Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs and
+# shutdown_class::test_scheduled_daily_stop_matches_the_main_tf_daily_stop_cron.
 #
 # Operator Quote 31 (2026-10-21): this rule now fires the start-watchdog
 # Lambda (mode "daily_stop", target in start-watchdog-lambda.tf), which skips
@@ -543,8 +551,8 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
 # the database. The hold can never keep the box past 07:30 IST.
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 17:30 IST on trading weekdays (Mon-Fri)"
-  schedule_expression = "cron(0 12 ? * MON-FRI *)"
+  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 11 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------
@@ -685,7 +693,7 @@ resource "aws_cloudwatch_event_target" "daily_start" {
 }
 
 # The daily_stop TARGET lives in start-watchdog-lambda.tf since operator
-# Quote 31 (2026-10-21): the 17:30 stop now invokes the start-watchdog Lambda
+# Quote 31 (2026-10-21): the daily stop (16:30 since 2026-10-22) now invokes the start-watchdog Lambda
 # (mode "daily_stop"), which honours the app's drain hold, instead of the SSM
 # stop automation, which could not. The rule above is unchanged.
 

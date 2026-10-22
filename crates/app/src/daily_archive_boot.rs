@@ -74,7 +74,8 @@ use tracing::{debug, error, info, warn};
 /// How often the loop asks whether the sweep is due.
 ///
 /// Five minutes, not one: the sweep is a daily housekeeping job with a
-/// two-hour window (15:30 → 17:30 IST box stop), so a five-minute granularity
+/// one-hour window (15:30 → 16:30 IST box stop since 2026-10-22, plan item
+/// 64; two hours to 17:30 before), so a five-minute granularity
 /// costs at most five minutes of latency on a job that had been missing
 /// entire days. It is also comfortably longer than the disk-pressure loop's
 /// 60-second poll, which keeps the two legs from contending on every tick.
@@ -1002,10 +1003,13 @@ mod tests {
     }
 
     /// The poll cadence must leave room for the attempt budget inside the
-    /// window the box is actually alive for (15:30 close → 17:30 stop).
+    /// window the box is actually alive for (15:30 close → the daily stop,
+    /// 16:30 since 2026-10-22, plan item 64).
     #[test]
     fn the_attempt_budget_fits_inside_the_evening_window() {
-        let window_secs = 2 * 3600_u64; // 15:30 → 17:30 IST
+        let window_secs = u64::from(crate::shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST)
+            - (15 * 3600 + 30 * 60);
+        assert_eq!(window_secs, 3600, "15:30 → 16:30 IST");
         let needed = DAILY_ARCHIVE_POLL.as_secs() * u64::from(MAX_DAILY_ARCHIVE_ATTEMPTS);
         assert!(
             needed <= window_secs,

@@ -6,7 +6,7 @@
 //! * Instance already stopped/stopping -> no-op, except the new-month
 //!   release of an expired budget stop (audit PR30,
 //!   `release_expired_budget_stop`): re-enable the daily-start rule once.
-//! * Running OUTSIDE the Mon-Fri 08:30-17:30 IST up-window -> force stop +
+//! * Running OUTSIDE the Mon-Fri 08:30-16:30 IST up-window -> force stop +
 //!   Telegram (the legacy never-cross guard, unchanged).
 //! * Running INSIDE the up-window:
 //!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, write the
@@ -298,7 +298,7 @@ pub trait SsmApi {
     async fn put_parameter(&self, name: &str, value: &str) -> Result<(), String>;
 }
 
-/// Mon-Fri 08:30-**17:30** IST (inclusive both ends).
+/// Mon-Fri 08:30-**16:30** IST (inclusive both ends).
 ///
 /// 2026-08-08 (operator Quote 14): the close moved 16:30 -> 17:30 with the
 /// 9-hour trading window. This constant is LOAD-BEARING, not cosmetic: this
@@ -306,6 +306,12 @@ pub trait SsmApi {
 /// leaving it at 16:30 while EventBridge stops at 17:30 would have had the
 /// guard kill the box at 17:00 every day and page — silently cancelling the
 /// extra hour the operator paid for.
+///
+/// 2026-10-22 (operator Quote 37, plan item 64): the close moved back 17:30 ->
+/// 16:30 with the daily stop, now derived from the start watchdog's stop
+/// trigger ([`UP_WINDOW_CLOSE_IST_HHMM`]) so the two cannot drift. A box held
+/// past 16:30 by the Quote 31 drain hold is left alone by the out-of-window
+/// arm below while the hold is fresh.
 /// The guard NEVER stops the box during the window on schedule grounds —
 /// only a budget breach may stop it in-window.
 pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
@@ -314,8 +320,14 @@ pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
         return false;
     }
     let hhmm = ist_now.hour() * 100 + ist_now.minute();
-    (830..=1730).contains(&hhmm)
+    (830..=UP_WINDOW_CLOSE_IST_HHMM).contains(&hhmm)
 }
+
+/// The up-window's close as IST `hhmm` (1630), derived from the daily stop
+/// trigger (`start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY`).
+pub const UP_WINDOW_CLOSE_IST_HHMM: u32 =
+    ((crate::start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY / 3600) * 100
+        + (crate::start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY % 3600) / 60) as u32;
 
 /// Month-to-date spend for a stop decision against `line_usd`, from the free
 /// AWS Budgets API (plan item 63, operator Quote 37, 2026-10-22; was Cost
@@ -898,7 +910,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
     // 1b. The drain hold (operator Quote 31, 2026-10-21): the app keeps the
     //     box up after the close until the day's data is in the database.
     //     Read HERE only, after the in-window budget path above has returned.
-    //     Never honoured from 07:30 IST to 17:25 IST (`drain_hold`).
+    //     Never honoured from 07:30 IST to 16:25 IST (`drain_hold`).
     //
     //     The budget stop is NEVER gated on the hold (Quote 31 REJECT row):
     //     before honouring a hold, run the SAME budget evaluation the
@@ -943,7 +955,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
         }));
     }
     // 2. Launch grace: a box started minutes ago is a deliberate manual
-    //    start still being used, not a 17:30 stop that failed. The same
+    //    start still being used, not a 16:30 stop that failed. The same
     //    grace the curfew uses, so the two guards cannot disagree on it.
     if let Some(launch_time) = inst.launch_time
         && now_utc.signed_duration_since(launch_time)
@@ -983,7 +995,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
 _instance_: `{}`\n\
 _was_state_: {state}\n\
 Hourly out-of-window guard found the box running OUTSIDE the\n\
-08:30-17:30 IST Mon-Fri window. EventBridge 17:30 stop (or a\n\
+08:30-16:30 IST Mon-Fri window. EventBridge 16:30 stop (or a\n\
 manual start) left it up. Now stopped to protect the budget.\n",
             env.instance_id
         ),
@@ -1174,7 +1186,7 @@ mod tests {
             .expect("valid test timestamp")
     }
 
-    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-17:30).
+    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-16:30).
     fn in_window() -> DateTime<Utc> {
         utc(2026, 7, 7, 4, 30)
     }
@@ -1464,15 +1476,15 @@ mod tests {
     }
 
     #[test]
-    fn test_1730_ist_is_in_and_1731_is_out() {
-        // 12:00 UTC = 17:30 IST; 12:01 UTC = 17:31 IST (Tuesday).
-        assert!(in_up_window(utc(2026, 7, 7, 12, 0)));
-        assert!(!in_up_window(utc(2026, 7, 7, 12, 1)));
-        // 2026-08-08 (Quote 14) regression pin: the OLD close was 16:30 IST
-        // (11:00 UTC). It must now be INSIDE the window — if this flips back,
-        // the hourly guard force-stops the box an hour before its schedule.
+    fn test_1630_ist_is_in_and_1631_is_out() {
+        // 2026-10-22 (Quote 37, plan item 64): the close moved back to 16:30.
+        // 11:00 UTC = 16:30 IST; 11:01 UTC = 16:31 IST (Tuesday).
+        assert_eq!(UP_WINDOW_CLOSE_IST_HHMM, 1630);
         assert!(in_up_window(utc(2026, 7, 7, 11, 0)));
-        assert!(in_up_window(utc(2026, 7, 7, 11, 1)));
+        assert!(!in_up_window(utc(2026, 7, 7, 11, 1)));
+        // 17:30 IST (the close from 2026-08-08 to 2026-10-22) is now OUT, so
+        // the hourly guard is the backstop for a missed 16:30 stop.
+        assert!(!in_up_window(utc(2026, 7, 7, 12, 0)));
     }
 
     // --- MtdUsd (AWS Budgets since 2026-10-22, plan item 63) ---------------
@@ -1895,7 +1907,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     }
 
     /// A box launched inside the grace window is a manual start still in
-    /// use, not a failed 17:30 stop — left alone, exactly as the curfew does.
+    /// use, not a failed 16:30 stop — left alone, exactly as the curfew does.
     /// Saturday 2026-07-04 03:20 UTC (08:50 IST) is out of window; the fake
     /// reports a launch 20 minutes earlier, inside the 45-minute grace.
     #[tokio::test]
@@ -2639,13 +2651,13 @@ aws events enable-rule --name tv-prod-daily-start\n"
         );
     }
 
-    /// The budget stop is NEVER gated on the hold. 17:28 IST is inside the
+    /// The budget stop is NEVER gated on the hold. 16:28 IST is inside the
     /// up-window AND inside the hours a hold counts, so a fresh hold exists
     /// here; the breach still stops, latches, disables and pages, and the
     /// breach path never even reads SSM.
     #[tokio::test]
     async fn test_in_window_breach_ignores_an_active_drain_hold() {
-        let now = utc(2026, 7, 7, 11, 58); // Tue 17:28 IST
+        let now = utc(2026, 7, 7, 10, 58); // Tue 16:28 IST
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),

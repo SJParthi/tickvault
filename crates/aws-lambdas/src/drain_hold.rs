@@ -10,8 +10,8 @@
 //! {"v":1,"state":"holding"|"released","until_unix":<i64>,"written_unix":<i64>,"left":"<text>"}
 //! ```
 //!
-//! **Readers:** the start watchdog's `daily_stop` (17:30 IST), `stop_check`
-//! (17:45 IST) and hourly `curfew_check`, and the hard-stop guard's
+//! **Readers:** the start watchdog's `daily_stop` (16:30 IST), `stop_check`
+//! (16:45 IST) and hourly `curfew_check`, and the hard-stop guard's
 //! out-of-window stop. **Never** the budget stop: the guard's in-window
 //! breach stop and the AWS-Budgets kill-switch do not read this parameter.
 //!
@@ -19,7 +19,8 @@
 //! - a hold counts only while `until_unix` is in the future and at most
 //!   [`MAX_HOLD_AHEAD_SECS`] ahead, so an app that stops refreshing it (a
 //!   crash, a dead SSM write) lets it lapse within the hour;
-//! - a hold is ignored from 07:30 IST to 17:25 IST, so the 07:35 curfew
+//! - a hold is ignored from 07:30 IST to 16:25 IST (17:25 until 2026-10-22,
+//!   plan item 64), so the 07:35 curfew
 //!   check stops a box still held overnight and the 08:30 start boots it
 //!   fresh; the hold can never keep the box past 07:30 IST the next morning.
 //!
@@ -54,9 +55,13 @@ pub const WRITTEN_CLOCK_SKEW_SECS: i64 = 300;
 /// IST seconds of day from which a hold is ignored (07:30 IST).
 pub const HOLD_IGNORED_FROM_IST_SECS: i64 = 7 * 3600 + 30 * 60;
 
-/// IST seconds of day at which a hold counts again (17:25 IST, five minutes
-/// before the 17:30 daily stop).
-pub const HOLD_IGNORED_UNTIL_IST_SECS: i64 = 17 * 3600 + 25 * 60;
+/// IST seconds of day at which a hold counts again (16:25 IST, five minutes
+/// before the 16:30 daily stop). Derived from the start watchdog's stop
+/// trigger, never a literal: 2026-10-22 (operator Quote 37, plan item 64) the
+/// stop moved 17:30 -> 16:30, and a window still opening at 17:25 would have
+/// let the 16:30 daily stop ignore a fresh hold (Quote 31 REJECT row).
+pub const HOLD_IGNORED_UNTIL_IST_SECS: i64 = crate::start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY
+    - crate::start_watchdog::DAILY_STOP_JITTER_LEAD_SECS;
 
 const SECS_PER_DAY: i64 = 86_400;
 
@@ -106,7 +111,7 @@ fn ist_seconds_of_day(now_unix: i64) -> i64 {
         .rem_euclid(SECS_PER_DAY)
 }
 
-/// `true` inside [07:30, 17:25) IST, where no hold is honoured.
+/// `true` inside [07:30, 16:25) IST, where no hold is honoured.
 fn hold_ignored_at(now_unix: i64) -> bool {
     let tod = ist_seconds_of_day(now_unix);
     (HOLD_IGNORED_FROM_IST_SECS..HOLD_IGNORED_UNTIL_IST_SECS).contains(&tod)
@@ -150,7 +155,7 @@ pub fn drain_hold_verdict(raw: Option<&str>, now_unix: i64) -> DrainHold {
         } else if hold_ignored_at(now_unix) {
             info!(
                 until_unix = record.until_unix,
-                "drain hold ignored between 07:30 and 17:25 IST"
+                "drain hold ignored between 07:30 and 16:25 IST"
             );
         } else {
             info!(
@@ -274,14 +279,18 @@ mod tests {
     }
 
     #[test]
-    fn the_ignored_window_boundaries_are_0730_and_1725_ist() {
+    fn the_ignored_window_boundaries_are_0730_and_1625_ist() {
+        // 2026-10-22 (plan item 64): the hold counts from 16:25, five minutes
+        // before the 16:30 daily stop (was 17:25).
+        assert_eq!(HOLD_IGNORED_UNTIL_IST_SECS, 16 * 3600 + 25 * 60);
         let at = |h, m, s| ist_unix(2026, 10, 21, h, m, s);
         for (now, active) in [
             (at(7, 29, 59), true),
             (at(7, 30, 0), false),
             (at(12, 0, 0), false),
-            (at(17, 24, 59), false),
-            (at(17, 25, 0), true),
+            (at(16, 24, 59), false),
+            (at(16, 25, 0), true),
+            (at(16, 30, 0), true),
             (at(23, 59, 59), true),
             (at(0, 0, 0), true),
         ] {
@@ -387,7 +396,7 @@ mod tests {
 
     /// Exhaustive sweep over every minute of one IST day, with holds of
     /// several lengths: the verdict is Active exactly when the hold is in
-    /// (0, 3600] seconds ahead and the minute is outside [07:30, 17:25), and
+    /// (0, 3600] seconds ahead and the minute is outside [07:30, 16:25), and
     /// an Active verdict is never returned from 07:30 IST onward, so no hold
     /// keeps the box past 07:30 the next morning.
     #[test]
@@ -395,7 +404,7 @@ mod tests {
         let midnight = ist_unix(2026, 10, 21, 0, 0, 0);
         for minute in 0..(24 * 60) {
             let now = midnight + minute * 60;
-            let ignored = (7 * 60 + 30..17 * 60 + 25).contains(&minute);
+            let ignored = (7 * 60 + 30..16 * 60 + 25).contains(&minute);
             for ahead in [-60, 0, 1, 600, 3600, 3601, 7200] {
                 let raw = record("holding", now + ahead, now - 120);
                 let verdict = drain_hold_verdict(Some(&raw), now);
