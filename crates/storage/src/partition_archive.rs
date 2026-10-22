@@ -6764,7 +6764,7 @@ mod hour_granular_eligibility_tests {
     // that session.
 
     #[test]
-    fn test_tick_and_depth_gate_unchanged() {
+    fn test_spill_dirs_for_table_is_tick_and_depth_for_every_table() {
         // 2026-10-22 (plan item 62): every table, `top_volume_<tf>` included,
         // now sees only the depth + tick folders.
         for table in [

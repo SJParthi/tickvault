@@ -6211,7 +6211,7 @@ Approved by Parthiban 2026-10-05 ("go woith your recomemndation dude", answering
   - Tests: test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample, the_ws_lag_exclusion_family_is_seeded_on_every_label_set
 - [x] 49c — **Depth spill replay held 08:00–15:40 IST.** The depth directory's drain skips its round inside that window (counted on `tv_depth_spill_replay_held_total`) and drains after the close; the tick directory is unchanged and the quarantine trim still runs. A deferral, never a drop: the spill keeps accepting past its soft cap while the volume has room, and the raw frames are in the WAL.
   - Files: crates/storage/src/tick_spill_replay.rs
-  - Tests: test_depth_replay_held_at_covers_08_00_to_the_close_only, test_depth_replay_held_at_is_applied_to_the_depth_directory_only
+  - Tests: test_depth_replay_held_at_covers_08_00_to_the_close_only, test_replay_policy_for_dir_holds_only_the_depth_directory
 - [x] 49d — **One `market_depth` row per packet with level arrays.** Not started: the scope lock allows array rows only after a QuestDB scratch-table test, and this session has no QuestDB to run one against. *(Ticked 2026-10-11: superseded by that test result and shipped as 49e, PR #2037 and PR #2043.)*
 
 ### Design

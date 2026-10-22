@@ -23191,6 +23191,24 @@ mod tests {
         );
     }
 
+    /// Plan item 62: `note_wall_clock` keeps whole IST seconds and ignores a
+    /// reading that does not fit in `u32` (before the epoch, or past 2106),
+    /// keeping the previous one instead of wrapping.
+    #[test]
+    fn test_note_wall_clock_stores_whole_seconds_and_ignores_out_of_range() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(ingest.drain_wall_secs, 0, "starts with no reading");
+        ingest.note_wall_clock(1_779_355_000 * 1_000_000_000 + 999_999_999);
+        assert_eq!(ingest.drain_wall_secs, 1_779_355_000, "keeps whole seconds");
+        ingest.note_wall_clock(-1);
+        assert_eq!(
+            ingest.drain_wall_secs, 1_779_355_000,
+            "before the epoch is ignored"
+        );
+        ingest.note_wall_clock((i64::from(u32::MAX) + 1) * 1_000_000_000);
+        assert_eq!(ingest.drain_wall_secs, 1_779_355_000, "past u32 is ignored");
+    }
+
     /// Plan ITEM 47, review round 12 (the future-dated question): the
     /// vendor stamp is the candle clock, and only a stamp on a FUTURE DAY is
     /// refused, so one trade stamped 15 minutes ahead on the same day moved

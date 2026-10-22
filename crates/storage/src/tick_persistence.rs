@@ -6827,7 +6827,7 @@ mod tests {
     /// function used, so the tick tier's file name, ceiling, reserves, blind
     /// policy and drain total are unchanged.
     #[test]
-    fn test_tick_spill_spec_reproduces_the_old_file_name_and_reserve() {
+    fn test_spill_failed_ilp_to_with_tick_spill_spec_reproduces_the_old_file_name_and_reserve() {
         let dir = scratch_dir("tick-spec");
         let spec = tick_spill_spec(&dir, Feed::Dhan);
         assert_eq!(spec.dir, dir.as_path());

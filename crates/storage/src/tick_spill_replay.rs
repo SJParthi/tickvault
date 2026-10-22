@@ -3567,7 +3567,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_depth_replay_held_at_is_applied_to_the_depth_directory_only() {
+    fn test_replay_policy_for_dir_holds_only_the_depth_directory() {
         assert!(is_depth_spill_dir(Path::new(
             crate::depth_persistence::DEPTH_SPILL_DIR
         )));
