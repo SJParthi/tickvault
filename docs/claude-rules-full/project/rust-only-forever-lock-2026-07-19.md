@@ -1195,13 +1195,24 @@ second SSM element or any shell line to `rebuild_ssm.rs`; raising either
 ceiling; splicing an unvalidated value into the command; adding a schedule
 or push trigger to the workflow; keeping any of it after 2026-10-31 IST.
 
-## §0.14. 2026-10-22 — ONE-OFF SSM shell for the 2026-10-31 wipe (DRAFT, awaiting owner approval)
+## §0.14. 2026-10-22 — ONE-OFF SSM shell for the 2026-10-31 wipe (APPROVED 2026-10-22)
 
-> **Status: DRAFT, awaiting owner approval.** Written with the plan item 67
-> tooling. It authorizes nothing until the owner approves it in a dated
-> answer recorded here. Until then the workflow
-> `.github/workflows/wipe-2026-10-31.yml` must not be dispatched in `apply`
-> mode (its dry run sends the same element, so the dry run waits too).
+> **Status: APPROVED 2026-10-22, about 19:25 IST.** The owner answered the
+> decision card "The 31 Oct wipe tool is built and tested, but the project's
+> Rust-only rule needs your approval for one small piece of shell on the
+> server: 3 lines that download our own program and start its wipe step, plus
+> 4 lines in the workflow. It is the same kind of one-off approval you gave for
+> tonight's rebuild, and it is deleted after the run or on 1 Nov. Approve it?"
+> with **"Approve, one-off (Recommended)"** ("I record your approval in the
+> rule file. The wipe tool can then do its dry run, then the real delete, on
+> the night of Sat 31 Oct. It still refuses to run outside 31 Oct 18:00 to
+> 1 Nov 08:00 IST and keeps all SEBI/audit records."). Everything below binds
+> as written; the tool's own time window, keep-list and refusals are
+> unchanged by this approval.
+>
+> *(Original status, kept: DRAFT, awaiting owner approval. Written with the
+> plan item 67 tooling. It authorized nothing until the owner approved it in a
+> dated answer recorded here.)*
 
 **Operator words it rests on:** Quote 35 (2026-10-21: "see wipe off the
 entire data fully dude ...", the card "Sat 31 Oct (Recommended)" and "keep it

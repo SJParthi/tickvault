@@ -616,7 +616,7 @@ const REBUILD_SSM_SHELL_SOURCES: &[(&str, usize, usize)] =
 /// one-off 2026-10-31 market-data wipe (plan item 67, operator Quote 35):
 /// `(path, literal lines, bytes)` ceilings, measured exactly 2026-10-22. One
 /// element: fetch the deployed binary, then run its Rust `wipe-box`
-/// subcommand. Rust-only lock §0.14, DRAFT until the owner approves it. The
+/// subcommand. Rust-only lock §0.14, approved by the owner 2026-10-22. The
 /// row goes with the tool in the PR after the run.
 const WIPE_SSM_SHELL_SOURCES: &[(&str, usize, usize)] = &[("crates/app/src/wipe_ssm.rs", 3, 231)];
 
@@ -1397,8 +1397,8 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/secret-scan.yml", 29),
     (".github/workflows/security-audit.yml", 2),
     (".github/workflows/terraform-apply.yml", 287),
-    // 2026-10-22 (plan item 67), rust-only lock §0.14 (Quote 35), DRAFT until
-    // the owner approves it: the one-off 31 Oct wipe only builds and runs its
+    // 2026-10-22 (plan item 67), rust-only lock §0.14 (Quote 35), approved by the
+    // owner 2026-10-22: the one-off 31 Oct wipe only builds and runs its
     // Rust tool, once per job. Removed with the workflow after the run.
     (".github/workflows/wipe-2026-10-31.yml", 4),
     (".github/workflows/wipe-log-streams.yml", 115),

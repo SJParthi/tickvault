@@ -10,8 +10,8 @@
 //! Budgeted by `crates/common/tests/shell_budget_guard.rs`
 //! (`WIPE_SSM_SHELL_SOURCES`, measured exactly) under the dated section §0.14
 //! of `docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md`
-//! (DRAFT until the owner approves it; until then the workflow must not be
-//! dispatched). This file holds no other string literal in its production
+//! (approved by the owner 2026-10-22; the workflow may run only inside the
+//! tool's 31 Oct night window). This file holds no other string literal in its production
 //! half, so the budget measures the shell and nothing else.
 
 use crate::wipe_2026_10_31::{Mode, is_commit_sha};
