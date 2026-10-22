@@ -1222,7 +1222,7 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — r8g.xlarge, MULTI-AZ (LOCKED 2026-08-08 per §0 Quote 13 — the 13-timeframe + tick-retention requirement, and the AZ un-pin that actually ends the capacity outage; supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+## §7. Instance lock — r8g.large, MULTI-AZ (LOCKED 2026-10-21 per §0 Quotes 32/33, applied by the 2026-10-22 rebuild; supersedes the 2026-08-08 r8g.xlarge lock of Quote 13 — the 13-timeframe + tick-retention requirement, and the AZ un-pin that actually ends the capacity outage; supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
 
 > **2026-08-08 (Quote 13) — the AZ pin is REMOVED, and that is the load-bearing
 > change.** Every prior instance lock in this section assumed the box lives in
@@ -1246,13 +1246,13 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 
 | Spec | Value |
 |---|---|
-| Instance | **r8g.xlarge** — ARM Graviton4, **4 vCPU, 32 GiB RAM** (memory-optimised). *(Changed from t4g.large 2026-08-08 per §0 Quote 13 — to serve the 13-timeframe + current-day tick-retention requirement at ~25,000 instruments. `r` = 8 GiB/vCPU because the workload is memory-bound; `m8g` would force buying unused CPU to reach the same RAM, `r8gd`'s local NVMe is wiped on every stop (the box stops daily), and `r8i` would force an x86 rebuild of the whole ARM pipeline. Cost ~₹5,824–₹7,382/mo — the Quote 9 sub-₹1,000 target is BREACHED ~6× and knowingly accepted; see Quote 13 for the derivation.)* |
+| Instance | **r8g.large** — ARM Graviton4, **2 vCPU, 16 GiB RAM** (memory-optimised). *(Changed from r8g.xlarge 2026-10-21 per §0 Quotes 32/33, applied by the 2026-10-22 rebuild with a 150 GB root. Memory is retuned for 16 GiB by `tickvault host-tuning`: QuestDB 4/10 of RAM, the app `MemoryHigh` lowered by a drop-in, QuestDB's cpuset narrowed to the two cores. The 15.5 GiB WAL replay spike came from depth rows and is Assumed not to recur with depth off.)* History: r8g.xlarge — ARM Graviton4, 4 vCPU, 32 GiB (memory-optimised). *(Changed from t4g.large 2026-08-08 per §0 Quote 13 — to serve the 13-timeframe + current-day tick-retention requirement at ~25,000 instruments. `r` = 8 GiB/vCPU because the workload is memory-bound; `m8g` would force buying unused CPU to reach the same RAM, `r8gd`'s local NVMe is wiped on every stop (the box stops daily), and `r8i` would force an x86 rebuild of the whole ARM pipeline. Cost ~₹5,824–₹7,382/mo — the Quote 9 sub-₹1,000 target is BREACHED ~6× and knowingly accepted; see Quote 13 for the derivation.)* |
 | **Availability zone** | **NOT PINNED** — subnets provisioned in `ap-south-1{a,b,c}`, instance zone selected by `var.availability_zone` (default `b`). *(2026-08-08, Quote 13. The old single-AZ pin at `main.tf:77` is what kept the box dark 2026-08-06→08: `describe-instance-type-offerings` confirms all 7 candidate types are offered in all 3 AZs, so the zone — not the type — was the blocker. Re-pinning to one zone is a REJECT.)* |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. **AUTHORIZED 2026-08-19 (Quote 16): 100 → 200 GB.** The terraform default is raised in the same change; the LIVE volume is UNCHANGED until the out-of-band online grow runs (`root_block_device[0].volume_size` is in `lifecycle.ignore_changes`, so `terraform apply` never touches the running root). +$9.12/mo → ~₹915/mo incl GST, narrowing the $100 kill-ceiling margin from $16.40 to $7.28. One-way door: gp3 can never shrink. **APPLIED AND VERIFIED LIVE 2026-08-21** — `describe-volumes` on the running account (post-close, box stopped) returns `vol-0c6ab6e593e39d8c8`: **200 GiB gp3, 6000 IOPS, 500 MiB/s, in-use** on `i-0c3fe906dad5492fc` in ap-south-1b. So the Quote 16 size grow AND the Quote 17 IOPS/throughput raise are BOTH live; `describe-volumes-modifications` records the IOPS step 3000→6000 as `completed`, started 2026-08-20T12:15:58Z. The sentence above — "the LIVE volume is UNCHANGED until the out-of-band online grow runs" — was true when written and is now SUPERSEDED; it is kept per house convention so the sequence stays readable. **The filesystem followed the volume**, which is the half a `describe-volumes` cannot show: `tv_spill_dir_free_bytes` read **200.6 GB free at 09:30 IST on 2026-08-21**, a figure a 100 GB filesystem cannot report. **⚠ The volume id in this row's history is NOT the live one** — `vol-073ccaa417a0f344b` belonged to the retired box; re-describe before any volume operation rather than trusting a recorded id. |
+| EBS | **2026-10-21 (Quotes 32/33): a fresh 150 GB gp3 root (3,000 IOPS, 125 MiB/s) replaces the 600 GB one on the 2026-10-22 rebuild; `variables.tf` default 150, validation ceiling 600 kept while the live root is 600.** The rest of this cell is the record up to then. gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. **AUTHORIZED 2026-08-19 (Quote 16): 100 → 200 GB.** The terraform default is raised in the same change; the LIVE volume is UNCHANGED until the out-of-band online grow runs (`root_block_device[0].volume_size` is in `lifecycle.ignore_changes`, so `terraform apply` never touches the running root). +$9.12/mo → ~₹915/mo incl GST, narrowing the $100 kill-ceiling margin from $16.40 to $7.28. One-way door: gp3 can never shrink. **APPLIED AND VERIFIED LIVE 2026-08-21** — `describe-volumes` on the running account (post-close, box stopped) returns `vol-0c6ab6e593e39d8c8`: **200 GiB gp3, 6000 IOPS, 500 MiB/s, in-use** on `i-0c3fe906dad5492fc` in ap-south-1b. So the Quote 16 size grow AND the Quote 17 IOPS/throughput raise are BOTH live; `describe-volumes-modifications` records the IOPS step 3000→6000 as `completed`, started 2026-08-20T12:15:58Z. The sentence above — "the LIVE volume is UNCHANGED until the out-of-band online grow runs" — was true when written and is now SUPERSEDED; it is kept per house convention so the sequence stays readable. **The filesystem followed the volume**, which is the half a `describe-volumes` cannot show: `tv_spill_dir_free_bytes` read **200.6 GB free at 09:30 IST on 2026-08-21**, a figure a 100 GB filesystem cannot report. **⚠ The volume id in this row's history is NOT the live one** — `vol-073ccaa417a0f344b` belonged to the retired box; re-describe before any volume operation rather than trusting a recorded id. |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan). **2026-07-19 Quote 10 supersession note: release APPROVED for the no-real-orders period — execution ONLY via the bundled erase-window recreate** (a standalone release is VERIFIED-UNSAFE on the live ENI — launch-time attribute, live describe evidence, coordinator session, 2026-07-19; this row's "no public IP after stop/modify/start" claim CONFIRMED). Runbook: `docs/runbooks/eip-release.md`. Re-enable + Dhan setIP ≥7 days before live orders. |
 | Network | ENA enabled by default |
 
@@ -1463,9 +1463,10 @@ inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is r8g.xlarge AND the AZ stays UN-PINNED. PERIOD.** *(2026-08-08,
-   §0 Quote 13 — was t4g.large from 2026-08-07.)* Two things are locked by this rule,
-   not one: the **type** (4 vCPU / 32 GiB Graviton4) and the **multi-AZ shape**
+1. **Instance type is r8g.large AND the AZ stays UN-PINNED. PERIOD.** *(2026-10-21,
+   §0 Quotes 32/33 — was r8g.xlarge from 2026-08-08 (Quote 13), t4g.large from
+   2026-08-07.)* Two things are locked by this rule,
+   not one: the **type** (2 vCPU / 16 GiB Graviton4) and the **multi-AZ shape**
    (subnets in 1a/1b/1c, zone chosen by `var.availability_zone`). Re-pinning the
    subnet to a single AZ is a REJECT on its own, independent of the type — that pin
    is what caused the 2026-08-06→08 outage, and the 2026-08-07 type flip failed
@@ -3035,3 +3036,29 @@ After the squeeze table (plan as decided ~$70–75; free spend lookups, dead ala
 - Deleting the CloudWatch dashboard under this quote.
 - Removing an alarm without the per-alarm review row, or a noise-lock paging family without that file's dated edit first.
 - A daily stop earlier than 16:30 IST, or one that ignores the same-day drain hold.
+
+#### Quote 38 (2026-10-22, ~08:05 IST) — THE r8g.large MEMORY BUDGET IS RE-DERIVED FROM MEASUREMENT; ONE SECURITY UPDATE (decision cards, preserve EXACTLY)
+
+After "Continue dude", the owner answered three decision cards. Two are recorded here; the third (the one-off rebuild shell lines) is `rust-only-forever-lock-2026-07-19.md` §0.13.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "On the half-size server (16 GB), a build check fails: its memory budget assumes the app and OS can use up to 16 GB (sized for the 32 GB server). Measured use is 0.3–3 GB. How should the budget be fixed?" | **"Re-size from measured use (Recommended)"** | "Set the app+OS worst case to 6 GB (2x the highest measured 3 GB) and the per-socket buffer to 64 MB: 6 + 6 (database) + 1 (sockets) = 13 of 16 GB, 3 GB spare." |
+| "PR #2119 is blocked only by one security library update. The project rules ban 'cargo update', so it needs you. Can I run exactly this one command: cargo update -p rustls-webpki --precise 0.103.16?" | **"Yes, you run it (Recommended)"** | "I run that one command only, record your OK in the rules, test, and push to #2119." |
+
+**What this changes, and nothing else:**
+
+| Item | Before | After |
+|---|---|---|
+| `net.core.rmem_max` and the `tcp_rmem` maximum (`deploy/aws/sysctl/99-tickvault-net.conf`, `host_limits::REQUIRED_RMEM_MAX_BYTES`, `host_tuning` expected value) | 128 MiB per socket | **64 MiB per socket** |
+| `kernel_tuning_16ws_guard::NON_QUESTDB_NON_SOCKET_GIB_HIGH` (app + OS + page cache, worst case) | 16 GiB (assumed rows) | **6 GiB** (2 × the highest measured whole-box use, about 3 GB on 2026-10-21 with the app running) |
+| r8g.large budget, 16 sockets | 2.0 + 6.0 + 16 = 24 GiB (does not fit) | 1.0 + 6.0 + 6.0 = **13 GiB of 16**, 3 GiB spare |
+| r8g.large budget, 26 sockets (depth account, still OFF) | — | 1.625 + 6.0 + 6.0 = 13.6 GiB, 2.4 GiB spare |
+| `cargo update -p rustls-webpki --precise 0.103.16` on PR #2119 | banned (CLAUDE.md CARGO) | allowed **once**, for that one package and version only |
+
+**Honest limits, stated:** the 3 GB was measured in the evening, not across a full trading day on the smaller box, so 6 GB is an estimate from a short measurement (Assumed until a depth-off session is measured on r8g.large). A 64 MiB socket buffer absorbs half the burst the 128 MiB one did; with depth off the busiest sockets are the main feed. The `cargo update` permission is for that one command; every other `cargo update` stays banned.
+
+##### What violates Quote 38 (REJECT)
+- Raising `rmem_max` above 64 MiB, or the app+OS worst case below 6 GiB, without a fresh dated quote.
+- Running any other `cargo update`, or this one for another package or version.
+- Switching the depth account on under this quote.

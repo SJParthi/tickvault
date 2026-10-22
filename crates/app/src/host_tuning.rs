@@ -52,7 +52,7 @@ const NET_TUNING_TAG: &str = "tickvault-net-tuning";
 /// `deploy/aws/sysctl/99-tickvault-net.conf` for the arithmetic behind each.
 /// Kept in lockstep with that file by `crates/app/tests/kernel_tuning_16ws_guard.rs`.
 const SCALAR_MINIMUMS: [(&str, u64); 8] = [
-    ("net.core.rmem_max", 134_217_728),
+    ("net.core.rmem_max", 67_108_864),
     ("net.core.rmem_default", 16_777_216),
     ("net.core.wmem_max", 16_777_216),
     ("net.core.netdev_max_backlog", 65_536),
@@ -62,7 +62,7 @@ const SCALAR_MINIMUMS: [(&str, u64); 8] = [
     ("vm.min_free_kbytes", 262_144),
 ];
 /// `net.ipv4.tcp_rmem` is "min default max"; this is the floor for its MAX.
-const TCP_RMEM_MAX_MINIMUM: u64 = 134_217_728;
+const TCP_RMEM_MAX_MINIMUM: u64 = 67_108_864;
 /// Keepalive must fire within this many seconds of idleness …
 const KEEPALIVE_TIME_MAX_SECS: u64 = 60;
 /// … but the whole ladder must outlast Dhan's 40 s ping deadline.
@@ -337,9 +337,165 @@ fn run_apply() -> i32 {
     steer_nic_irqs();
     guard_app_cpus();
     guard_app_memory();
+    emit(&apply_questdb_host_env(false));
     // Never non-zero: a host with default tuning is slower, a host whose boot
     // aborted has no app at all.
     0
+}
+
+/// The on-box compose `.env` (gitignored), read by every `docker compose`
+/// call against `deploy/docker/docker-compose.yml`.
+pub const COMPOSE_ENV_PATH: &str = "/opt/tickvault/repo/deploy/docker/.env";
+
+/// The compose file pins QuestDB to `${TV_QDB_CPUSET:-2,3}`: that default
+/// needs at least this many cores. Docker REFUSES to create a container whose
+/// cpuset names an offline CPU, so on a smaller host QuestDB never starts.
+const QDB_DEFAULT_CPUSET_MIN_CORES: usize = 4;
+
+/// The CPU numbers a cpuset list names (`"2,3"`, `"0-1"`, `"0,2-3"`).
+/// `None` for anything malformed.
+fn cpuset_cpus(list: &str) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        if let Some((a, b)) = part.split_once('-') {
+            let (a, b): (usize, usize) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+            if a > b {
+                return None;
+            }
+            out.extend(a..=b);
+        } else {
+            out.push(part.parse().ok()?);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The value of `key` in a dotenv text (last assignment wins, like compose).
+fn dotenv_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .next_back()
+        .map(str::trim)
+}
+
+/// `text` with `key=value` set: every existing line for `key` replaced by
+/// one, or the line appended.
+fn dotenv_upsert(text: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len() + key.len() + value.len() + 2);
+    let mut done = false;
+    for line in text.lines() {
+        let is_key = line
+            .trim()
+            .strip_prefix(key)
+            .is_some_and(|r| r.starts_with('='));
+        if is_key {
+            if !done {
+                out.push_str(&format!("{key}={value}\n"));
+                done = true;
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !done {
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    out
+}
+
+/// Plan the QuestDB lines of the compose `.env` for a host with `cores` CPUs
+/// and `mem_g` GiB (plan item 66, the r8g.large rebuild: 2 vCPU / 16 GiB).
+///
+/// - On a host with fewer than [`QDB_DEFAULT_CPUSET_MIN_CORES`] cores, a
+///   missing or unsatisfiable `TV_QDB_CPUSET` becomes every online core
+///   (`0-<cores-1>`), and a missing or too-wide `TV_QDB_CPUS` becomes the
+///   core count. A satisfiable operator value is kept. QuestDB then shares
+///   the cores with the app, which `plan_cpu_guard` already runs unconfined
+///   below 3 cores; on a 4-core host nothing changes.
+/// - With `set_mem_if_absent`, a missing `QDB_MEM_LIMIT` becomes the deploy
+///   formula's share ([`questdb_share_g`]); an existing one is left to the
+///   deploy, which owns it. The rebuild sets it before its first QuestDB
+///   start, so the new disk never starts QuestDB at the compose default of
+///   12g on a 16 GiB host.
+///
+/// `None` when nothing needs to change, or when `cores` is unknown (0).
+#[must_use]
+pub fn plan_questdb_host_env(
+    cores: usize,
+    mem_g: u64,
+    env_text: &str,
+    set_mem_if_absent: bool,
+) -> Option<String> {
+    let mut text = env_text.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let mut changed = false;
+    if cores > 0 && cores < QDB_DEFAULT_CPUSET_MIN_CORES {
+        let satisfiable = dotenv_value(&text, "TV_QDB_CPUSET")
+            .and_then(cpuset_cpus)
+            .is_some_and(|cpus| cpus.iter().all(|c| *c < cores));
+        if !satisfiable {
+            let want = if cores == 1 {
+                String::from("0")
+            } else {
+                format!("0-{}", cores - 1)
+            };
+            text = dotenv_upsert(&text, "TV_QDB_CPUSET", &want);
+            changed = true;
+        }
+        let quota_ok = dotenv_value(&text, "TV_QDB_CPUS")
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|q| q > 0.0 && q <= cores as f64);
+        if !quota_ok {
+            text = dotenv_upsert(&text, "TV_QDB_CPUS", &format!("{cores}.0"));
+            changed = true;
+        }
+    }
+    if set_mem_if_absent && mem_g > 0 && dotenv_value(&text, "QDB_MEM_LIMIT").is_none() {
+        text = dotenv_upsert(
+            &text,
+            "QDB_MEM_LIMIT",
+            &format!("{}g", questdb_share_g(mem_g)),
+        );
+        changed = true;
+    }
+    changed.then_some(text)
+}
+
+/// Reads this host's cores and RAM, plans the compose `.env` QuestDB lines
+/// ([`plan_questdb_host_env`]) and writes the file (temp, rename) when they
+/// change. Returns the line to log. Never fails the caller: a host it cannot
+/// read is left as it is and says so.
+// TEST-EXEMPT: host reads and one file write; the decision is plan_questdb_host_env, tested below
+pub fn apply_questdb_host_env(set_mem_if_absent: bool) -> String {
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    let mem_g = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| meminfo_total_kib(&m))
+        .map_or(0, |kib| kib / KIB_PER_GIB);
+    let current = std::fs::read_to_string(COMPOSE_ENV_PATH).unwrap_or_default();
+    let Some(next) = plan_questdb_host_env(cores, mem_g, &current, set_mem_if_absent) else {
+        return format!("host-tuning: {cores} cores, {mem_g}G — QuestDB compose env unchanged");
+    };
+    let tmp = format!("{COMPOSE_ENV_PATH}.tmp");
+    let written = Path::new(COMPOSE_ENV_PATH)
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&tmp, &next))
+        .and_then(|()| std::fs::rename(&tmp, COMPOSE_ENV_PATH));
+    match written {
+        Ok(()) => format!(
+            "host-tuning: WARNING {cores} cores, {mem_g}G — QuestDB compose env set for this host \
+             (TV_QDB_CPUSET / TV_QDB_CPUS / QDB_MEM_LIMIT, see {COMPOSE_ENV_PATH})"
+        ),
+        Err(err) => format!(
+            "host-tuning: WARNING could not write {COMPOSE_ENV_PATH}: {err} — QuestDB may not start \
+             on this {cores}-core host"
+        ),
+    }
 }
 
 fn apply_thp() {
@@ -982,6 +1138,58 @@ mod tests {
             panic!("expected a write");
         };
         assert!(text.ends_with("MemoryHigh=1G\n"));
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_two_core_host_gets_a_satisfiable_cpuset() {
+        // r8g.large: 2 vCPU / ~15 GiB usable. The compose default `2,3` does
+        // not exist there; Docker would refuse to create tv-questdb.
+        let next = plan_questdb_host_env(2, 15, "", true).expect("change");
+        assert!(next.contains("TV_QDB_CPUSET=0-1\n"), "{next}");
+        assert!(next.contains("TV_QDB_CPUS=2.0\n"), "{next}");
+        assert!(next.contains("QDB_MEM_LIMIT=6g\n"), "{next}");
+        // Idempotent: a second pass changes nothing.
+        assert_eq!(plan_questdb_host_env(2, 15, &next, true), None);
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_replaces_an_offline_cpuset_and_keeps_good_values() {
+        let env = "TV_QDB_HTTP_BIND=0.0.0.0\nTV_QDB_CPUSET=2,3\nQDB_MEM_LIMIT=12g\n";
+        let next = plan_questdb_host_env(2, 15, env, true).expect("change");
+        assert!(next.contains("TV_QDB_HTTP_BIND=0.0.0.0\n"));
+        assert!(next.contains("TV_QDB_CPUSET=0-1\n"));
+        assert!(!next.contains("TV_QDB_CPUSET=2,3"));
+        // The deploy owns QDB_MEM_LIMIT: an existing value is left alone.
+        assert!(next.contains("QDB_MEM_LIMIT=12g\n"));
+        // An operator value the host can satisfy is kept.
+        let kept = plan_questdb_host_env(2, 15, "TV_QDB_CPUSET=1\nTV_QDB_CPUS=1.0\n", false);
+        assert_eq!(kept, None);
+        // A quota wider than the host is corrected.
+        let wide = plan_questdb_host_env(2, 15, "TV_QDB_CPUSET=0-1\nTV_QDB_CPUS=3.0\n", false)
+            .expect("change");
+        assert!(wide.contains("TV_QDB_CPUS=2.0\n"));
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_leaves_a_four_core_host_and_unknown_hosts_alone() {
+        assert_eq!(plan_questdb_host_env(4, 30, "", false), None);
+        assert_eq!(plan_questdb_host_env(0, 0, "", true), None);
+        // The every-boot call (set_mem_if_absent = false) never adds the mem line.
+        assert_eq!(plan_questdb_host_env(4, 30, "", false), None);
+        assert_eq!(
+            plan_questdb_host_env(1, 3, "", false).as_deref(),
+            Some("TV_QDB_CPUSET=0\nTV_QDB_CPUS=1.0\n")
+        );
+    }
+
+    #[test]
+    fn test_cpuset_cpus_parses_both_syntaxes() {
+        assert_eq!(cpuset_cpus("2,3"), Some(vec![2, 3]));
+        assert_eq!(cpuset_cpus("0-1"), Some(vec![0, 1]));
+        assert_eq!(cpuset_cpus("0,2-3"), Some(vec![0, 2, 3]));
+        assert_eq!(cpuset_cpus(""), None);
+        assert_eq!(cpuset_cpus("3-1"), None);
+        assert_eq!(cpuset_cpus("x"), None);
     }
 
     #[test]

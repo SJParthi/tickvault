@@ -214,6 +214,11 @@ pub mod s3_cold;
 // Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
 // verified, and marked, before any WAL prune may delete them.
 pub mod raw_frame_upload;
+// Plan item 66 (2026-10-21, operator Quotes 32/33/34): the file-copy and
+// restore primitives of the one-off 2026-10-22 rebuild (150 GB root,
+// r8g.large). Cold path, box-side `tickvault rebuild-box` only; nothing here
+// deletes or overwrites.
+pub mod rebuild_copy;
 // Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).

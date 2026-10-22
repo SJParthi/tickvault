@@ -45,12 +45,13 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-/// Receive buffer the feed sizing targets, in bytes (128 MB).
+/// Receive buffer the feed sizing targets, in bytes (64 MiB; 128 MiB until
+/// 2026-10-22, lowered for the 16 GiB r8g.large under operator Quote 38).
 ///
 /// Must stay in lockstep with `net.core.rmem_max` in
 /// `deploy/aws/sysctl/99-tickvault-net.conf`. Pinned by
 /// `crates/app/tests/host_limits_lockstep_guard.rs`.
-pub const REQUIRED_RMEM_MAX_BYTES: u64 = 134_217_728;
+pub const REQUIRED_RMEM_MAX_BYTES: u64 = 67_108_864;
 
 /// NIC-to-stack queue depth, in packets.
 pub const REQUIRED_NETDEV_MAX_BACKLOG: u64 = 65_536;

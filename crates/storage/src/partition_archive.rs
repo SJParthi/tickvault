@@ -2176,78 +2176,33 @@ impl PartitionArchiver {
         summary
     }
 
-    /// One partition: export → upload → verify → audit-first → drop.
-    async fn process_one(
+    /// Step 2 of [`Self::process_one`], shared with the rebuild copy (plan
+    /// item 66): the never-overwrite placement of an exported gzip at the
+    /// partition's canonical key, or at its content-addressed sidecar key when
+    /// the canonical object holds different bytes. Returns the key the bytes
+    /// now live at and whether THIS call uploaded them; `None` after a
+    /// recorded failure (counter, audit row and coded error already written,
+    /// temp file removed). Moved here verbatim on 2026-10-21; behaviour
+    /// unchanged.
+    async fn place_archive(
         &mut self,
-        table: &'static str,
+        table: &str,
         partition: &str,
+        exported: &ExportedCsv,
         summary: &mut ArchiveRunSummary,
-    ) -> PartitionStep {
-        let Some((start, end)) = partition_range_bounds(partition) else {
-            // Unreachable in practice (names pass the allowlist upstream);
-            // fail-closed anyway.
-            self.record_failure(
-                table,
-                partition,
-                ArchiveOutcome::ExportFailed,
-                "unparseable partition name",
-                summary,
-            );
-            return PartitionStep::Done;
-        };
+    ) -> Option<(String, bool)> {
         let mut s3_key = canonical_archive_key(table, partition);
-        // Did THIS run put the object there, or did it reuse an existing one?
-        // The 4b mismatch arm below needs to tell those apart: deleting an
-        // object we did not write could destroy the only copy of already-
-        // dropped data, which is exactly what the never-overwrite policy
-        // exists to prevent.
         let mut uploaded_this_run = false;
-
-        // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
-        //     probe only refuses SUSPENDED tables. A table that is merely
-        //     BEHIND holds acknowledged rows the export and both recounts
-        //     cannot see, so every count agrees and the drop proceeds. The
-        //     after-close deferred-depth pass (morning `market_depth` hours,
-        //     15:45–17:15) and the spill replay / seal DLQ drain (yesterday's
-        //     partitions) all write into partitions this archiver can select.
-        //     Probed fresh here, per partition, because the run-start snapshot
-        //     can be minutes old by the time a late worklist item is reached.
-        if !self.wal_applied_gate(table, partition, "pre_export").await {
-            return PartitionStep::WalNotApplied;
-        }
-
-        // 1. Export (stream + gzip + count) — one partition on disk at a time.
-        let exported = match self
-            .export_partition_csv(table, partition, &start, &end)
-            .await
-        {
-            Ok(e) => e,
-            Err(err) => {
-                self.record_failure(
-                    table,
-                    partition,
-                    ArchiveOutcome::ExportFailed,
-                    &format!("{err:#}"),
-                    summary,
-                );
-                return PartitionStep::Done;
-            }
-        };
-        summary.csv_bytes_exported = summary
-            .csv_bytes_exported
-            .saturating_add(exported.csv_bytes);
-
-        // 2. Never-overwrite upload (F1): HeadObject FIRST. Reuse requires
-        //    CONTENT IDENTITY (review round 2): equal length (fast
-        //    pre-filter) AND a stored SHA-256 checksum equal to the freshly
-        //    exported gzip's digest — a stale object from a failed prior run
-        //    plus a mutated partition (backfill into a >hot-window
-        //    partition) with a coincidental compressed length can no longer
-        //    slip through to a drop. Length or checksum mismatch, OR an
-        //    object with NO checksum attribute (foreign/legacy) → LOUD
-        //    conflict, keep the partition (the object may be the only copy
-        //    of already-dropped data). Absent → conditional PutObject with
-        //    `If-None-Match: "*"` + `checksum_sha256`.
+        // Reuse requires CONTENT IDENTITY (review round 2): equal length (fast
+        // pre-filter) AND a stored SHA-256 checksum equal to the freshly
+        // exported gzip's digest — a stale object from a failed prior run
+        // plus a mutated partition (backfill into a >hot-window partition)
+        // with a coincidental compressed length can no longer slip through
+        // to a drop. Length or checksum mismatch, OR an object with NO
+        // checksum attribute (foreign/legacy) → sidecar key, never an
+        // overwrite (the object may be the only copy of already-dropped
+        // data). Absent → conditional PutObject with `If-None-Match: "*"` +
+        // `checksum_sha256`.
         match self.head_object_meta(&s3_key).await {
             Some(meta)
                 if meta.len == exported.gzip_bytes
@@ -2354,7 +2309,7 @@ impl PartitionArchiver {
                             summary,
                         );
                         remove_temp_file(&exported.path);
-                        return PartitionStep::Done;
+                        return None;
                     }
                     None => {
                         uploaded_this_run = true;
@@ -2370,7 +2325,7 @@ impl PartitionArchiver {
                                 summary,
                             );
                             remove_temp_file(&exported.path);
-                            return PartitionStep::Done;
+                            return None;
                         }
                         summary.gzip_bytes_uploaded = summary
                             .gzip_bytes_uploaded
@@ -2412,7 +2367,7 @@ impl PartitionArchiver {
                         summary,
                     );
                     remove_temp_file(&exported.path);
-                    return PartitionStep::Done;
+                    return None;
                 }
                 summary.gzip_bytes_uploaded = summary
                     .gzip_bytes_uploaded
@@ -2420,6 +2375,78 @@ impl PartitionArchiver {
                 metrics::counter!("tv_partition_archived_total").increment(1);
             }
         }
+        Some((s3_key, uploaded_this_run))
+    }
+
+    /// One partition: export → upload → verify → audit-first → drop.
+    async fn process_one(
+        &mut self,
+        table: &'static str,
+        partition: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> PartitionStep {
+        let Some((start, end)) = partition_range_bounds(partition) else {
+            // Unreachable in practice (names pass the allowlist upstream);
+            // fail-closed anyway.
+            self.record_failure(
+                table,
+                partition,
+                ArchiveOutcome::ExportFailed,
+                "unparseable partition name",
+                summary,
+            );
+            return PartitionStep::Done;
+        };
+        // Did THIS run put the object there, or did it reuse an existing one?
+        // The 4b mismatch arm below needs to tell those apart: deleting an
+        // object we did not write could destroy the only copy of already-
+        // dropped data, which is exactly what the never-overwrite policy
+        // exists to prevent. `place_archive` (step 2) returns both the key
+        // and that fact.
+
+        // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
+        //     probe only refuses SUSPENDED tables. A table that is merely
+        //     BEHIND holds acknowledged rows the export and both recounts
+        //     cannot see, so every count agrees and the drop proceeds. The
+        //     after-close deferred-depth pass (morning `market_depth` hours,
+        //     15:45–17:15) and the spill replay / seal DLQ drain (yesterday's
+        //     partitions) all write into partitions this archiver can select.
+        //     Probed fresh here, per partition, because the run-start snapshot
+        //     can be minutes old by the time a late worklist item is reached.
+        if !self.wal_applied_gate(table, partition, "pre_export").await {
+            return PartitionStep::WalNotApplied;
+        }
+
+        // 1. Export (stream + gzip + count) — one partition on disk at a time.
+        let exported = match self
+            .export_partition_csv(table, partition, &start, &end)
+            .await
+        {
+            Ok(e) => e,
+            Err(err) => {
+                self.record_failure(
+                    table,
+                    partition,
+                    ArchiveOutcome::ExportFailed,
+                    &format!("{err:#}"),
+                    summary,
+                );
+                return PartitionStep::Done;
+            }
+        };
+        summary.csv_bytes_exported = summary
+            .csv_bytes_exported
+            .saturating_add(exported.csv_bytes);
+
+        // 2. Never-overwrite upload (F1): HeadObject first; reuse only on
+        //    content identity; a different object at the canonical key gets a
+        //    content-addressed sidecar instead. See `place_archive`.
+        let Some((s3_key, uploaded_this_run)) = self
+            .place_archive(table, partition, &exported, summary)
+            .await
+        else {
+            return PartitionStep::Done;
+        };
 
         // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
         // The tally (count AND max(ts)) taken here is what the pre-drop
@@ -2883,15 +2910,23 @@ impl PartitionArchiver {
         start: &str,
         end: &str,
     ) -> Result<ExportedCsv> {
-        crate::off_worker::off_worker(|| std::fs::create_dir_all(&self.temp_dir))
-            .context("create archive temp dir")?;
         let path = self.temp_dir.join(format!("{table}-{partition}.csv.gz"));
         let sql = build_export_sql(table, start, end);
+        self.export_query_csv(&sql, path).await
+    }
+
+    /// Streams the `/exp` CSV of `sql` through gzip into `path`, counting
+    /// records from the RAW byte stream and hashing the compressed bytes.
+    /// Shared by the partition export above and the rebuild's whole-table
+    /// export (plan item 66), so both use one counted, hashed path.
+    async fn export_query_csv(&self, sql: &str, path: PathBuf) -> Result<ExportedCsv> {
+        crate::off_worker::off_worker(|| std::fs::create_dir_all(&self.temp_dir))
+            .context("create archive temp dir")?;
 
         let mut response = self
             .export_client
             .get(&self.exp_url)
-            .query(&[("query", sql.as_str())])
+            .query(&[("query", sql)])
             .send()
             .await
             .context("/exp export request failed")?;
@@ -3206,6 +3241,363 @@ impl PartitionArchiver {
                 remove_temp_file(&path);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild copy (plan item 66, operator Quotes 32/33/34, 2026-10-21)
+// ---------------------------------------------------------------------------
+//
+// The 2026-10-22 rebuild replaces the 600 GB root with a fresh 150 GB one.
+// Quote 27 binds until Quote 35 runs, so EVERY partition still on the box is
+// copied to the cold bucket and verified first, and NOTHING is dropped: the
+// old volume is kept (and snapshotted) untouched. These methods reuse the
+// archiver's own export, never-overwrite placement and verify steps; they
+// never reach `drop_partition`. Cold path: the box-side `rebuild-box copy`
+// subcommand only, with the app stopped.
+
+/// One partition, or one whole table, copied to the cold bucket and verified
+/// for the rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RebuildCopiedObject {
+    /// Table name.
+    pub table: String,
+    /// Partition name; empty for a whole-table export.
+    pub partition: String,
+    /// The key the verified bytes live at.
+    pub s3_key: String,
+    /// Data rows exported, equal to the recount taken after the export.
+    pub rows: u64,
+    /// Compressed bytes, equal to the object's ContentLength.
+    pub gzip_bytes: u64,
+    /// SHA-256 of the compressed bytes, lowercase hex.
+    pub gzip_sha256_hex: String,
+    /// True when this call uploaded the bytes; false when an identical object
+    /// was already there.
+    pub uploaded: bool,
+}
+
+/// One row of `table_partitions()` for the rebuild inventory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RebuildPartitionInfo {
+    /// Partition name (`YYYY-MM-DD` or `YYYY-MM-DDTHH`).
+    pub name: String,
+    /// The partition QuestDB is writing into.
+    pub active: bool,
+    /// Row count QuestDB reports (metadata, no scan).
+    pub num_rows: u64,
+    /// On-disk bytes QuestDB reports.
+    pub disk_bytes: u64,
+}
+
+/// True for a table name the rebuild may interpolate into SQL: 1 to 127 of
+/// `[a-z0-9_]`, starting with a letter. A name from `tables()` is data we did
+/// not author, and QuestDB's HTTP API has no bound parameters, so anything
+/// else is refused (fail closed, the same posture as
+/// [`is_valid_partition_name`]).
+#[must_use]
+pub fn is_rebuild_safe_table_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 127
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// `SELECT name, active, numRows, diskSize FROM table_partitions('<t>')`.
+#[must_use]
+pub fn build_rebuild_partition_list_sql(table: &str) -> String {
+    format!("SELECT name, active, numRows, diskSize FROM table_partitions('{table}')")
+}
+
+/// Parses the rebuild partition listing by column NAME. A row missing a
+/// field, or with a name that fails [`is_valid_partition_name`], is returned
+/// as `Err(name)` so the caller can report it rather than skip it silently.
+#[must_use]
+pub fn parse_rebuild_partitions(json: &str) -> Option<Vec<Result<RebuildPartitionInfo, String>>> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    let columns = parsed.get("columns")?.as_array()?;
+    let idx = |want: &str| {
+        columns
+            .iter()
+            .position(|c| c.get("name").and_then(|n| n.as_str()) == Some(want))
+    };
+    let (n, a, r, d) = (
+        idx("name")?,
+        idx("active")?,
+        idx("numRows")?,
+        idx("diskSize")?,
+    );
+    let dataset = parsed.get("dataset")?.as_array()?;
+    let mut out = Vec::with_capacity(dataset.len());
+    for row in dataset {
+        let Some(cells) = row.as_array() else {
+            out.push(Err(String::from("<row is not an array>")));
+            continue;
+        };
+        let name = cells
+            .get(n)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let active = cells.get(a).and_then(serde_json::Value::as_bool);
+        let num_rows = cells.get(r).and_then(serde_json::Value::as_u64);
+        let disk = cells.get(d).and_then(serde_json::Value::as_u64);
+        match (is_valid_partition_name(&name), active, num_rows, disk) {
+            (true, Some(active), Some(num_rows), Some(disk_bytes)) => {
+                out.push(Ok(RebuildPartitionInfo {
+                    name,
+                    active,
+                    num_rows,
+                    disk_bytes,
+                }));
+            }
+            _ => out.push(Err(name)),
+        }
+    }
+    Some(out)
+}
+
+/// Parses `{"dataset":[[N]]}` (a single `count()` cell). `None` on anything
+/// else, so a missing count can never read as zero.
+#[must_use]
+pub fn parse_single_count(json: &str) -> Option<u64> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    parsed
+        .get("dataset")?
+        .as_array()?
+        .first()?
+        .as_array()?
+        .first()?
+        .as_u64()
+}
+
+/// The content-addressed key a whole-table rebuild export lives at:
+/// `<prefix>/<table>/<sha256 hex>.csv.gz`. A different content is a
+/// different key, so the object is never overwritten and a re-run of an
+/// unchanged table reuses it.
+#[must_use]
+pub fn rebuild_whole_table_key(prefix: &str, table: &str, gzip_sha256_hex: &str) -> String {
+    format!(
+        "{}/{table}/{gzip_sha256_hex}.csv.gz",
+        prefix.trim_end_matches('/')
+    )
+}
+
+impl PartitionArchiver {
+    /// An archiver for the rebuild: explicit bucket (never derived from the
+    /// environment), the given QuestDB, default retention knobs (unused: the
+    /// rebuild never selects by retention window and never drops).
+    ///
+    /// # Errors
+    /// HTTP-client build failure.
+    // TEST-EXEMPT: builds live AWS/HTTP clients; the pure pieces it feeds are tested below
+    pub async fn new_for_rebuild(questdb: &QuestDbConfig, bucket: &str) -> Result<Self> {
+        let cfg = PartitionRetentionConfig {
+            archive_bucket: bucket.to_string(),
+            ..PartitionRetentionConfig::default()
+        };
+        Self::new(questdb, &cfg)
+            .await?
+            .context("rebuild archiver: the explicit bucket did not resolve")
+    }
+
+    /// Every partition of `table` (active included), from QuestDB metadata.
+    ///
+    /// # Errors
+    /// Unsafe table name, request failure, non-2xx, or an unparseable body.
+    // TEST-EXEMPT: one QuestDB round trip; the SQL and the parser are tested below
+    pub async fn rebuild_list_partitions(
+        &self,
+        table: &str,
+    ) -> Result<Vec<Result<RebuildPartitionInfo, String>>> {
+        anyhow::ensure!(
+            is_rebuild_safe_table_name(table),
+            "refusing unsafe table name {table:?}"
+        );
+        let sql = build_rebuild_partition_list_sql(table);
+        let response = self
+            .ddl_client
+            .get(&self.exec_url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await
+            .context("partition list query failed")?;
+        let status = response.status();
+        let body = read_body_capped(response).await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success(),
+            "partition list returned {status}: {}",
+            capture_rest_error_body(&body)
+        );
+        parse_rebuild_partitions(&body).context("partition list body did not parse")
+    }
+
+    /// `true` when QuestDB reports `table` not suspended and fully applied
+    /// (`writerTxn == sequencerTxn`), probed fresh. Same gate the archiver
+    /// runs before every export.
+    // TEST-EXEMPT: delegates to wal_applied_gate, exercised by the stub-server tests
+    pub async fn rebuild_wal_applied(&self, table: &str) -> bool {
+        self.wal_applied_gate(table, "", "rebuild").await
+    }
+
+    /// The canonical archive object's length for `(table, partition)`, when
+    /// one exists (inventory only: presence is reported, never trusted —
+    /// the copy re-exports and compares content).
+    // TEST-EXEMPT: one HeadObject
+    pub async fn rebuild_canonical_len(&self, table: &str, partition: &str) -> Option<u64> {
+        self.head_object_meta(&canonical_archive_key(table, partition))
+            .await
+            .map(|m| m.len)
+    }
+
+    /// Export → never-overwrite placement → verify for ONE partition. NEVER
+    /// drops. `Err` carries a one-line reason (a coded log line and an audit
+    /// row are written by the shared placement step on its failures).
+    // TEST-EXEMPT: live QuestDB + S3; every decision inside is the archiver's own, unit- and stub-tested
+    pub async fn rebuild_copy_partition(
+        &mut self,
+        table: &str,
+        partition: &str,
+    ) -> std::result::Result<RebuildCopiedObject, String> {
+        if !is_rebuild_safe_table_name(table) {
+            return Err(format!("unsafe table name {table:?}"));
+        }
+        let Some((start, end)) = partition_range_bounds(partition) else {
+            return Err(format!("unparseable partition name {partition:?}"));
+        };
+        if !self.wal_applied_gate(table, partition, "rebuild").await {
+            return Err(String::from("WAL not proven applied"));
+        }
+        let exported = self
+            .export_partition_csv(table, partition, &start, &end)
+            .await
+            .map_err(|e| format!("export failed: {e:#}"))?;
+        let mut scratch = ArchiveRunSummary::default();
+        let Some((s3_key, uploaded)) = self
+            .place_archive(table, partition, &exported, &mut scratch)
+            .await
+        else {
+            return Err(String::from(
+                "placement in S3 failed (see the STORAGE-GAP-04 line)",
+            ));
+        };
+        let recount = self.recount_rows(table, &start, &end).await.map(|t| t.rows);
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
+        let verdict = verify_archive(
+            table,
+            partition,
+            exported.rows,
+            exported.csv_bytes,
+            exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
+            recount,
+            s3_len,
+        );
+        remove_temp_file(&exported.path);
+        let proof = verdict.map_err(|f| format!("verify failed: {f:?}"))?;
+        Ok(RebuildCopiedObject {
+            table: table.to_string(),
+            partition: partition.to_string(),
+            s3_key,
+            rows: proof.rows,
+            gzip_bytes: proof.gzip_bytes,
+            gzip_sha256_hex: proof.gzip_sha256_hex,
+            uploaded,
+        })
+    }
+
+    /// Export → content-addressed placement → verify for a WHOLE table, to
+    /// `<key_prefix>/<table>/<sha>.csv.gz`. Used for the tables the rebuild
+    /// restores onto the new disk (the SEBI/audit keep-list) and for tables
+    /// with no time partitions. NEVER drops.
+    // TEST-EXEMPT: live QuestDB + S3; the key builder and the count parser are tested below
+    pub async fn rebuild_copy_whole_table(
+        &mut self,
+        table: &str,
+        key_prefix: &str,
+    ) -> std::result::Result<RebuildCopiedObject, String> {
+        if !is_rebuild_safe_table_name(table) {
+            return Err(format!("unsafe table name {table:?}"));
+        }
+        if !self.wal_applied_gate(table, "", "rebuild").await {
+            return Err(String::from("WAL not proven applied"));
+        }
+        let path = self.temp_dir.join(format!("{table}-whole.csv.gz"));
+        let exported = self
+            .export_query_csv(&format!("SELECT * FROM {table}"), path)
+            .await
+            .map_err(|e| format!("export failed: {e:#}"))?;
+        let s3_key = rebuild_whole_table_key(key_prefix, table, &exported.gzip_sha256_hex);
+        let mut uploaded = false;
+        match crate::s3_cold::classify_existing(
+            self.head_object_meta(&s3_key).await.as_ref(),
+            exported.gzip_bytes,
+            &exported.gzip_sha256_b64,
+        ) {
+            crate::s3_cold::ExistingObject::Identical => {}
+            crate::s3_cold::ExistingObject::Different => {
+                remove_temp_file(&exported.path);
+                return Err(format!(
+                    "{s3_key} holds different bytes under a content-addressed key; not overwritten"
+                ));
+            }
+            crate::s3_cold::ExistingObject::Absent => {
+                if let Err(err) = self
+                    .upload_to_s3(&exported.path, &s3_key, &exported.gzip_sha256_b64)
+                    .await
+                {
+                    remove_temp_file(&exported.path);
+                    return Err(format!("upload failed: {err:#}"));
+                }
+                uploaded = true;
+            }
+        }
+        let recount = self.rebuild_count_rows(table).await;
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
+        let verdict = verify_archive(
+            table,
+            "",
+            exported.rows,
+            exported.csv_bytes,
+            exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
+            recount,
+            s3_len,
+        );
+        remove_temp_file(&exported.path);
+        let proof = verdict.map_err(|f| format!("verify failed: {f:?}"))?;
+        Ok(RebuildCopiedObject {
+            table: table.to_string(),
+            partition: String::new(),
+            s3_key,
+            rows: proof.rows,
+            gzip_bytes: proof.gzip_bytes,
+            gzip_sha256_hex: proof.gzip_sha256_hex,
+            uploaded,
+        })
+    }
+
+    /// `SELECT count() FROM <table>`; `None` when unavailable.
+    // TEST-EXEMPT: one QuestDB round trip; parse_single_count is tested below
+    pub async fn rebuild_count_rows(&self, table: &str) -> Option<u64> {
+        if !is_rebuild_safe_table_name(table) {
+            return None;
+        }
+        let sql = format!("SELECT count() FROM {table}");
+        let response = self
+            .ddl_client
+            .get(&self.exec_url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        parse_single_count(&read_body_capped(response).await.ok()?)
     }
 }
 
