@@ -1194,3 +1194,48 @@ both budget rows are deleted in the first PR after the run (or after
 second SSM element or any shell line to `rebuild_ssm.rs`; raising either
 ceiling; splicing an unvalidated value into the command; adding a schedule
 or push trigger to the workflow; keeping any of it after 2026-10-31 IST.
+
+## §0.14. 2026-10-22 — ONE-OFF SSM shell for the 2026-10-31 wipe (DRAFT, awaiting owner approval)
+
+> **Status: DRAFT, awaiting owner approval.** Written with the plan item 67
+> tooling. It authorizes nothing until the owner approves it in a dated
+> answer recorded here. Until then the workflow
+> `.github/workflows/wipe-2026-10-31.yml` must not be dispatched in `apply`
+> mode (its dry run sends the same element, so the dry run waits too).
+
+**Operator words it rests on:** Quote 35 (2026-10-21: "see wipe off the
+entire data fully dude ...", the card "Sat 31 Oct (Recommended)" and "keep it
+as oct 31 night dude okay?"), recorded verbatim in
+`docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
+with its tool table ("The Quote 35 tool"). Quote 35 says the tool "needs its
+own dated row in `rust-only-forever-lock-2026-07-19.md` if it carries any
+shell". This section is that row, and the question to the owner.
+
+**What it would authorize:** the Rust tool `tv-wipe-2026-10-31`
+(`crates/app/src/bin/wipe_2026_10_31.rs`) sends, for the box phase only, ONE
+SSM `AWS-RunShellScript` element built from the single literal in
+`crates/app/src/wipe_ssm.rs`: download the deployed `tickvault` binary of the
+commit the workflow runs on from `s3://tv-prod-cold/deploys/<sha>/`, mark it
+executable, and `exec` its Rust `wipe-box` subcommand, which does all the
+work (stop the app, delete the old files, drop the old partitions, list
+again). The two values spliced in are validated first (a 40-hex commit id and
+a fixed mode word). Budget rows in `crates/common/tests/shell_budget_guard.rs`:
+`WIPE_SSM_SHELL_SOURCES` (3 literal lines / 231 bytes, measured exactly) and
+the workflow's `WORKFLOW_RUN_LINE_BUDGET` row (4 lines: build the tool and
+run it, in each of its two jobs). §0.13's element is NOT reused.
+
+**Why any shell at all:** SSM's only way to run a program on the box is a
+shell document; the payload is one line that hands over to Rust, the same
+shape as §0.13 and the console's `tickvault-host` calls.
+
+**Removal:** the workflow, the tool, `wipe_box.rs`, `wipe_ssm.rs`,
+`wipe_2026_10_31.rs`, the role and both budget rows are deleted in the first
+PR after the run, or after 2026-11-01 IST, whichever comes first. This
+exception then ends.
+
+**REJECT:** dispatching the workflow before the owner's dated approval is
+recorded here; reusing this exception (or §0.13's element) for another
+workflow or payload; adding a second SSM element or any shell line to
+`wipe_ssm.rs`; raising either ceiling; splicing an unvalidated value into the
+command; adding a schedule or push trigger to the workflow; keeping any of it
+after 2026-11-01 IST.
