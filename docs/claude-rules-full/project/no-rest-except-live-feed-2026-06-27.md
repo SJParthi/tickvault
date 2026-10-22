@@ -2663,3 +2663,29 @@ often such a page would fire before it can be wired. Nothing recorded that.
   read it with the §12.15.9 reader rule.
 
 **What a PR that violates §12.15.11 looks like (REJECT):** putting the column in a DEDUP key; paging, alarming or filtering on it without 51j's own dated noise-lock section; counting an excused or unjudged minute; writing `true` on a run that could not judge missing minutes; letting the shadow change the verdict or the marker.
+
+### §12.15.12 — 2026-10-21: the box stops at 16:30, so every cross-verification bound moves one hour earlier
+
+**The verbatim owner text (2026-10-21, ~18:40 IST, recorded as Quote 37 in `daily-universe-scope-expansion-2026-05-27.md` §0 — preserve EXACTLY, typos included):**
+
+> "bro now we can run our server same time rigth dude startign 8.30 am till 4 pm or 4.30 pm woudl be fine dude tell me dude okay?"
+
+Quote 37 moves the daily stop 17:30 → **16:30 IST** and says "the cross-verification end bound and the stop-check move with the stop" (plan ITEM 64, `.claude/plans/active-plan-feed-hardening.md`). §12.15.8 fixes 17:23 and 17:50 in its REJECT list, so this row is recorded HERE before the code, per the rule-file-first law. It changes only the clock times below. It does not change what the check compares, the readiness barriers (§12.15.10), the verdict rules (§12.15.9), the marker rule (§12.15.7), the timeout and persist-bound mechanism, the page, the alarms or their filters.
+
+| Bound | Before (§12.15.8) | After (this row) | How it is derived |
+|---|---|---|---|
+| Scheduled daily stop | 17:30 (63,000) | **16:30** (59,400) | `shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST`, pinned by test to `main.tf` `daily_stop` `cron(0 11 ? * MON-FRI *)` |
+| Scheduled-stop window | 17:25–17:45 | **16:25–16:45** | stop − 300 s, stop + 900 s |
+| Deadline | 17:24 | **16:24** (59,040) | window start − 60 s (unchanged rule) |
+| End bound | 17:23 (62,580) | **16:23** (58,980) | deadline − 60 s (unchanged rule) |
+| `stop_check` | 17:45, `cron(15 12 …)` | **16:45**, `cron(15 11 ? * MON-FRI *)` | stop + 900 s, pinned to the cron |
+| Evening attempt start | 17:50 | **16:50** (60,600) | `stop_check` + 300 s (unchanged rule) |
+| Curfew check before the evening start | 17:35 | **16:35** | hourly `cron(5 * * * ? *)`, 15 min before 16:50 |
+| Retry interval | 760 s | **760 s (unchanged)** | |
+| First read | ≥ 15:44:05 | **≥ 15:44:05 (unchanged)** | §12.15.10 |
+
+**Worst case that still fits (Verified by arithmetic from the constants):** the run fires 15:41:00; the token and readiness wait (≤ 300 s, the first read no earlier than 15:44:05) ends by 15:46:00; the 600 s run budget by 15:56:00; the 60 s persist margin by **15:57:00**. That is 26 minutes before the 16:23 end bound and 33 minutes before the 16:30 stop. The compile-time fit is now ONE worst-case attempt (56,460 + 960 = 57,420 ≤ 58,980), replacing §12.15.8's four-attempt fit.
+
+**⚠ Honest limit, stated because it is the cost of this change (Risk):** with the retry interval kept at 760 s, a second worst-case attempt cannot fit: 15:57:00 + 760 s + 960 s = 16:25:40, past 16:23. `attempt_is_last` decides from the latest possible end, so **the 15:41 attempt is decided last and a normal day gets no same-day retry before the stop** (it had up to three). A failed day pages `xverify_failed` at its end, as any last failure does. The 16:50 evening attempt still runs only for a day whose only attempt was skipped for time, unchanged. The box is often still up after 16:30 on the Quote 31 drain hold, but no attempt is started between 16:23 and 16:50, by the rules above. Two attempts would fit only with an interval of at most 600 s (zero slack); that is a separate decision and is not taken here.
+
+**What a PR that violates §12.15.12 looks like (REJECT):** every §12.15.8 REJECT row, read with 16:23 for 17:23, 16:25 for 17:25, 16:45 for 17:45 and 16:50 for 17:50; a bound written as a literal instead of derived from the one stop constant; moving the stop cron, the `stop_check` cron or the curfew cron without the pinned constants moving with it; claiming same-day retries that the 16:23 bound no longer leaves room for.
