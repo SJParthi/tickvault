@@ -2035,7 +2035,10 @@ pub struct AwsShell {
     ec2: aws_sdk_ec2::Client,
     ssm: aws_sdk_ssm::Client,
     cloudwatch: aws_sdk_cloudwatch::Client,
-    ce: aws_sdk_costexplorer::Client,
+    /// AWS Budgets (free) for the month-to-date cost, since 2026-10-22
+    /// (plan item 63, Quote 37; was Cost Explorer).
+    budgets: aws_sdk_budgets::Client,
+    budget_coords: Result<crate::budget_spend::BudgetCoordinates, String>,
     /// None when the client build failed (HTTP-CLIENT-01 class — logged
     /// loudly at build; provenance then degrades to "unknown", never a
     /// panic-class `Client::new()` fallback).
@@ -2076,7 +2079,8 @@ impl AwsShell {
             ec2: crate::clients::ec2(&config),
             ssm: crate::clients::ssm(&config),
             cloudwatch: crate::clients::cloudwatch(&config),
-            ce: crate::clients::cost_explorer_us_east_1().await,
+            budgets: crate::clients::budgets_us_east_1().await,
+            budget_coords: crate::budget_spend::budget_coordinates_from_env(),
             http,
             instance_id: std::env::var("TV_INSTANCE_ID").unwrap_or_default(),
             secret_param: std::env::var("OPERATOR_CONTROL_SECRET_PARAM").unwrap_or_default(),
@@ -2326,40 +2330,25 @@ impl OpsShell for AwsShell {
 
     async fn month_to_date_cost(&self) -> String {
         // legacy `_month_to_date_cost` (handler.py:1492-1507) — "" on any
-        // failure. Lambda env clock is UTC (legacy date.today() parity).
-        let today = Utc::now().date_naive();
-        let Some(first) = today.with_day(1) else {
-            return String::new();
+        // failure. 2026-10-22 (plan item 63, operator Quote 37): read from the
+        // free AWS Budgets `DescribeBudget` (was paid Cost Explorer). AWS
+        // refreshes that figure about every 8 to 12 hours and it carries no
+        // month stamp, so on UTC day 1 it may still be last month's total;
+        // the console only shows it, it decides nothing.
+        let coords = match self.budget_coords.as_ref() {
+            Ok(coords) => coords,
+            Err(e) => {
+                tracing::warn!(error = %e, "operator-portal month-to-date cost: budget coordinates missing");
+                return String::new();
+            }
         };
-        let Some(end) = today.succ_opt() else {
-            return String::new();
-        };
-        let Ok(period) = aws_sdk_costexplorer::types::DateInterval::builder()
-            .start(first.format("%Y-%m-%d").to_string())
-            .end(end.format("%Y-%m-%d").to_string())
-            .build()
-        else {
-            return String::new();
-        };
-        let Ok(out) = self
-            .ce
-            .get_cost_and_usage()
-            .time_period(period)
-            .granularity(aws_sdk_costexplorer::types::Granularity::Monthly)
-            .metrics("UnblendedCost")
-            .send()
-            .await
-        else {
-            return String::new();
-        };
-        out.results_by_time()
-            .first()
-            .and_then(|r| r.total())
-            .and_then(|t| t.get("UnblendedCost"))
-            .and_then(|m| m.amount())
-            .and_then(|a| a.parse::<f64>().ok())
-            .map(|f| format!("{f:.2}"))
-            .unwrap_or_default()
+        match crate::budget_spend::describe_actual_spend(&self.budgets, coords).await {
+            Ok(usd) => format!("{usd:.2}"),
+            Err(e) => {
+                tracing::warn!(error = %e, "operator-portal month-to-date cost unavailable");
+                String::new()
+            }
+        }
     }
 
     async fn binary_sha(&self) -> String {
@@ -3073,13 +3062,17 @@ mod tests {
         // now pass the server's strings through `esc()` like every other
         // field. Pinned separately by `console_escapes_both_overview_pills`
         // and `console_never_writes_the_key_to_local_storage`.
+        //
+        // RE-BLESSED 2026-10-22 (plan item 63) — 47,075 -> 47,076 bytes,
+        // comment only, no new lines: the note above `loadAws` names the AWS
+        // Budgets call that replaced the Cost Explorer one.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "f1e6230ff2d6bb545181cb69edf3d75dd7f08921711ba68035dea0d0dadacfe8"
+            "d1fd595b68f4bc9c6f6e92f879e82c878ed4954681207cef8d9eace819474ef1"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_075);
+        assert_eq!(CONSOLE_HTML.len(), 47_076);
     }
 
     // ------------------------------------------------ audit L4 source scans

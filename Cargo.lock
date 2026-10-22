@@ -258,6 +258,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-budgets"
+version = "1.113.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfd8a4d25779eac63684754a77961c55c45f129097229cdb9da3a7a7a3d07f4a"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-cloudwatch"
 version = "1.120.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -283,32 +309,6 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
-name = "aws-sdk-costexplorer"
-version = "1.121.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e54e27f55b09c9b4239f3c568f9df153f991c38c97fbacfa48b7c6956000af9"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-schema",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 0.2.12",
- "http 1.4.0",
  "regex-lite",
  "tracing",
 ]
@@ -4229,8 +4229,8 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-lc-rs",
+ "aws-sdk-budgets",
  "aws-sdk-cloudwatch",
- "aws-sdk-costexplorer",
  "aws-sdk-ec2",
  "aws-sdk-eventbridge",
  "aws-sdk-lambda",

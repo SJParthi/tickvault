@@ -447,7 +447,7 @@ function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
 // AWS strip on Overview (spend $ · alarms firing · disk used %) — sourced from
 // the same aws_status action the old AWS tab used. The <details> expands to
 // the full alarm list + storage shields. Loaded once on first Overview load
-// (NOT on the 8s auto-refresh — aws_status does an SSM probe + Cost Explorer
+// (NOT on the 8s auto-refresh — aws_status does an SSM probe + an AWS Budgets
 // call) and on demand via the 🔄 Refresh AWS button.
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
   const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }

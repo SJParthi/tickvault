@@ -23,7 +23,7 @@
 //!
 //! Parity is the contract: same SNS Subject/Message strings (byte-identical),
 //! same result-dict shapes, same IST math (fixed UTC+5:30), same fail-safe
-//! posture (Cost Explorer errors NEVER stop or disable anything; SSM state
+//! posture (spend-lookup errors NEVER stop or disable anything; SSM state
 //! errors fail OPEN to a ping — one ping beats a silent guard).
 //!
 //! The AWS calls are abstracted behind tiny async traits so the unit tests
@@ -104,8 +104,8 @@ pub const OCTOBER_2026_KILL_USD: f64 = 170.0;
 /// The kill line that actually applies to one billing month.
 ///
 /// **The month is the UTC calendar month, never IST, and that is load-bearing.**
-/// AWS bills and Cost Explorer reports month-to-date in UTC (`mtd_usd` reads
-/// `now_utc.date_naive()`). Between 00:00 and 05:30 IST on 1 October the IST
+/// AWS bills and the Budgets API report month-to-date in UTC (the billing
+/// month the guard keys on is `now_utc`'s UTC month). Between 00:00 and 05:30 IST on 1 October the IST
 /// month is already October while month-to-date still holds September's ~$190;
 /// an IST-keyed clamp would compare September's spend against October's $150
 /// line and stop the box for a month that was allowed. Keying both on UTC keeps
@@ -281,11 +281,14 @@ pub trait EventsApi {
     async fn enable_rule(&self, name: &str) -> Result<(), String>;
 }
 
-/// Cost Explorer surface — the raw `Amount` strings per result period
-/// (the legacy runtime sums `float(d["Total"]["UnblendedCost"]["Amount"])`).
+/// AWS Budgets surface — month-to-date actual spend in USD of the one
+/// tickvault budget (`budgets:DescribeBudget`, free). Replaced the paid Cost
+/// Explorer `GetCostAndUsage` surface on 2026-10-22 (plan item 63, operator
+/// Quote 37). The figure AWS reports is refreshed about every 8 to 12 hours
+/// and carries no month stamp; see `crate::budget_spend` for both limits.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
-pub trait CeApi {
-    async fn unblended_amounts(&self, start: &str, end: &str) -> Result<Vec<String>, String>;
+pub trait BudgetsApi {
+    async fn actual_spend_usd(&self) -> Result<f64, String>;
 }
 
 /// SSM surface for the change-only ping state (get + put).
@@ -314,41 +317,48 @@ pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
     (830..=1730).contains(&hhmm)
 }
 
-/// Legacy `mtd_usd` — best-effort Cost Explorer month-to-date total.
+/// Month-to-date spend for a stop decision against `line_usd`, from the free
+/// AWS Budgets API (plan item 63, operator Quote 37, 2026-10-22; was Cost
+/// Explorer `GetCostAndUsage`).
+///
 /// Returns `None` on ANY error — the caller treats None as fail-safe
-/// ("cost_unknown": page, never stop or disable on missing data).
-/// Deliberate deviation: the legacy runtime read `datetime.now(timezone.utc)` inside;
-/// we take the injected clock so the date window is testable/consistent.
-pub async fn mtd_usd<C: CeApi>(ce: &C, now_utc: DateTime<Utc>) -> Option<f64> {
-    let today = now_utc.date_naive();
-    let Some(start) = today.with_day(1) else {
-        // Day 1 always exists in the current month — unreachable, fail-soft.
-        warn!("MTD lookup failed (non-fatal): month start unrepresentable");
-        return None;
-    };
-    match ce
-        .unblended_amounts(&start.to_string(), &today.to_string())
-        .await
-    {
-        Ok(amounts) => {
-            let mut total = 0.0_f64;
-            for a in amounts {
-                match a.parse::<f64>() {
-                    Ok(v) => total += v,
-                    Err(e) => {
-                        // Legacy float() raise -> caught by the blanket arm.
-                        warn!(error = %e, "MTD lookup failed (non-fatal): bad Amount");
-                        return None;
-                    }
-                }
-            }
-            Some(total)
-        }
-        Err(e) => {
-            warn!(error = %e, "MTD lookup failed (non-fatal)");
+/// ("cost_unknown": page, never stop or disable on missing data), exactly as
+/// the Cost Explorer path did. Also `None`:
+/// - a NaN or infinite reading (coded `LAMBDA-AWS-01`): NaN makes every
+///   `spend >= line` compare false, so it could never stop the box;
+/// - a negative reading;
+/// - during UTC day 1 of a month, a reading at or above `line_usd`, because a
+///   Budgets reply has no month stamp and may still hold last month's total
+///   (`budget_spend::trusted_spend_for_line`). Cost Explorer returned unknown
+///   all of day 1 (empty `[1st, 1st)` interval), so this is no weaker.
+///
+/// Latency: AWS refreshes the figure about every 8 to 12 hours (Assumed, AWS
+/// docs). The budget's native stop action is the second, independent stop.
+pub async fn mtd_usd<B: BudgetsApi>(
+    budgets: &B,
+    line_usd: f64,
+    now_utc: DateTime<Utc>,
+) -> Option<f64> {
+    let reading = match budgets.actual_spend_usd().await {
+        Ok(v) if !v.is_finite() => {
+            error!(
+                code = "LAMBDA-AWS-01",
+                spend = v,
+                "budgets:DescribeBudget gave a non-finite month-to-date spend; treated as unknown"
+            );
             None
         }
-    }
+        Ok(v) if v < 0.0 => {
+            warn!(spend = v, "MTD lookup refused (non-fatal): negative spend");
+            None
+        }
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(error = %e, source = crate::budget_spend::SPEND_SOURCE, "MTD lookup failed (non-fatal)");
+            None
+        }
+    };
+    crate::budget_spend::trusted_spend_for_line(reading, line_usd, now_utc)
 }
 
 /// Legacy `classify_in_window_action` — pure decision for the in-window arm
@@ -436,8 +446,9 @@ pub fn classify_ping_decision(
         return ("ping_bucket_changed", new_state);
     }
     if bucket < prev_bucket {
-        // Hysteresis (hostile-review fix 2026-07-09): Cost Explorer
-        // UnblendedCost estimates are revised BOTH ways, so spend sitting
+        // Hysteresis (hostile-review fix 2026-07-09): month-to-date spend
+        // estimates (Cost Explorer then, the Budgets figure since 2026-10-22)
+        // are revised BOTH ways, so spend sitting
         // on a 10% boundary can flip one bucket down and back up every
         // hour. A 1-bucket dip stays SILENT and RETAINS the stored bucket,
         // so the flip back up is silent too.
@@ -744,12 +755,12 @@ trading day. Nothing to do.\n"
 }
 
 /// Legacy `lambda_handler` — hourly EventBridge cron entry (event unused).
-pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
+pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: SsmApi>(
     env: &GuardEnv,
     ec2: &E,
     sns: &N,
     events: &V,
-    ce: &C,
+    budgets: &B,
     ssm: &P,
     now_utc: DateTime<Utc>,
 ) -> Result<Value, String> {
@@ -805,7 +816,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
             ..env.clone()
         };
         let env = &effective_env;
-        let usd = mtd_usd(ce, now_utc).await;
+        let usd = mtd_usd(budgets, env.budget_kill_usd, now_utc).await;
         let action = classify_in_window_action(usd, env.budget_kill_usd);
         if action == "breach_stop" {
             // breach_stop implies usd is Some; 0.0 fallback is unreachable.
@@ -893,7 +904,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
     //     before honouring a hold, run the SAME budget evaluation the
     //     in-window arm runs, with the same effective ceiling, and on a
     //     breach take the same breach stop (stop, latch, disable the start
-    //     rule, page). A Cost Explorer error keeps the in-window fail-safe
+    //     rule, page). A spend-lookup error keeps the in-window fail-safe
     //     posture: never stop on it, so the hold is then honoured.
     let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now_utc).await;
     if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
@@ -905,7 +916,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
             ),
             ..env.clone()
         };
-        let usd = mtd_usd(ce, now_utc).await;
+        let usd = mtd_usd(budgets, effective_env.budget_kill_usd, now_utc).await;
         let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
         if action == "breach_stop" {
             // breach_stop implies usd is Some; 0.0 fallback is unreachable.
@@ -1070,38 +1081,19 @@ impl EventsApi for SdkEvents {
     }
 }
 
-pub struct SdkCe {
-    client: aws_sdk_costexplorer::Client,
+/// The live AWS Budgets leg (plan item 63, Quote 37): one free
+/// `budgets:DescribeBudget` per hourly invoke on the budget named by
+/// `BUDGET_NAME` in account `BUDGET_ACCOUNT_ID`. Missing coordinates are an
+/// error (unknown spend: page, never stop).
+pub struct SdkBudgets {
+    client: aws_sdk_budgets::Client,
+    coords: Result<crate::budget_spend::BudgetCoordinates, String>,
 }
 
-impl CeApi for SdkCe {
-    async fn unblended_amounts(&self, start: &str, end: &str) -> Result<Vec<String>, String> {
-        let interval = aws_sdk_costexplorer::types::DateInterval::builder()
-            .start(start)
-            .end(end)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let r = self
-            .client
-            .get_cost_and_usage()
-            .time_period(interval)
-            .granularity(aws_sdk_costexplorer::types::Granularity::Monthly)
-            .metrics("UnblendedCost")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::with_capacity(r.results_by_time().len());
-        for period in r.results_by_time() {
-            // Legacy `d["Total"]["UnblendedCost"]["Amount"]` — a missing key
-            // raises inside mtd_usd's blanket catch -> None; Err mirrors it.
-            let amount = period
-                .total()
-                .and_then(|t| t.get("UnblendedCost"))
-                .and_then(|m| m.amount())
-                .ok_or_else(|| "missing Total.UnblendedCost.Amount".to_string())?;
-            out.push(amount.to_string());
-        }
-        Ok(out)
+impl BudgetsApi for SdkBudgets {
+    async fn actual_spend_usd(&self) -> Result<f64, String> {
+        let coords = self.coords.as_ref().map_err(Clone::clone)?;
+        crate::budget_spend::describe_actual_spend(&self.client, coords).await
     }
 }
 
@@ -1153,13 +1145,14 @@ pub async fn handle(_event: Value) -> Result<Value, Error> {
     let events = SdkEvents {
         client: crate::clients::eventbridge(&config),
     };
-    let ce = SdkCe {
-        client: crate::clients::cost_explorer_us_east_1().await,
+    let budgets = SdkBudgets {
+        client: crate::clients::budgets_us_east_1().await,
+        coords: crate::budget_spend::budget_coordinates_from_env(),
     };
     let ssm = SdkSsm {
         client: crate::clients::ssm(&config),
     };
-    run_guard(&env, &ec2, &sns, &events, &ce, &ssm, Utc::now())
+    run_guard(&env, &ec2, &sns, &events, &budgets, &ssm, Utc::now())
         .await
         .map_err(Error::from)
 }
@@ -1309,16 +1302,16 @@ mod tests {
         }
     }
 
-    /// Cost Explorer fake — returns a fixed MTD or raises.
-    struct FakeCe {
+    /// AWS Budgets fake — returns a fixed month-to-date spend or fails.
+    struct FakeBudgets {
         amount: Option<f64>,
     }
 
-    impl CeApi for FakeCe {
-        async fn unblended_amounts(&self, _start: &str, _end: &str) -> Result<Vec<String>, String> {
+    impl BudgetsApi for FakeBudgets {
+        async fn actual_spend_usd(&self) -> Result<f64, String> {
             match self.amount {
-                Some(a) => Ok(vec![format!("{a}")]),
-                None => Err("CE throttled".to_string()),
+                Some(a) => Ok(a),
+                None => Err("budgets:DescribeBudget throttled".to_string()),
             }
         }
     }
@@ -1482,14 +1475,15 @@ mod tests {
         assert!(in_up_window(utc(2026, 7, 7, 11, 1)));
     }
 
-    // --- MtdUsd ------------------------------------------------------------
+    // --- MtdUsd (AWS Budgets since 2026-10-22, plan item 63) ---------------
 
     #[tokio::test]
-    async fn test_returns_sum_from_ce() {
+    async fn test_mtd_usd_returns_the_budgets_spend() {
         let got = mtd_usd(
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
+            170.0,
             in_window(),
         )
         .await;
@@ -1497,12 +1491,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_returns_none_on_ce_error() {
+    async fn test_mtd_usd_returns_none_on_budgets_error() {
         assert!(
-            mtd_usd(&FakeCe { amount: None }, in_window())
+            mtd_usd(&FakeBudgets { amount: None }, 170.0, in_window())
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_mtd_usd_refuses_nan_infinite_and_negative_spend() {
+        // The old Cost Explorer parse accepted "NaN": every `spend >= line`
+        // compare is false with NaN, so it could never stop the box.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5] {
+            assert!(
+                mtd_usd(&FakeBudgets { amount: Some(bad) }, 170.0, in_window())
+                    .await
+                    .is_none(),
+                "{bad} must read as unknown spend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mtd_usd_first_utc_day_reading_at_or_above_the_line_is_unknown() {
+        // 1 Nov 04:30 UTC: a Budgets reply has no month stamp, so $160 may be
+        // October's total. Unknown, never a stop.
+        let day1 = utc(2026, 11, 1, 4, 30);
+        assert!(
+            mtd_usd(
+                &FakeBudgets {
+                    amount: Some(160.0)
+                },
+                75.0,
+                day1
+            )
+            .await
+            .is_none()
+        );
+        // Below the line on day 1 is used as is.
+        let low = mtd_usd(&FakeBudgets { amount: Some(2.0) }, 75.0, day1).await;
+        assert_eq!(low, Some(2.0));
+        // From day 2 the same reading is trusted.
+        let day2 = utc(2026, 11, 2, 4, 30);
+        let high = mtd_usd(
+            &FakeBudgets {
+                amount: Some(160.0),
+            },
+            75.0,
+            day2,
+        )
+        .await;
+        assert_eq!(high, Some(160.0));
+    }
+
+    #[tokio::test]
+    async fn test_first_utc_day_breach_reading_pages_cost_unknown_and_never_stops() {
+        // 1 Dec 2026 is a Tuesday; 04:30 UTC = 10:00 IST, inside the window
+        // (1 Nov 2026 is a Sunday, outside it).
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &test_env(),
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(500.0),
+            },
+            &ssm,
+            utc(2026, 12, 1, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_eq!(out["budget_action"], json!("cost_unknown"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
     }
 
     // --- LambdaHandlerEnvGuards --------------------------------------------
@@ -1518,7 +1586,7 @@ mod tests {
             &FakeEc2::new("running"),
             &FakeSns::default(),
             &FakeEvents::new(),
-            &FakeCe { amount: Some(1.0) },
+            &FakeBudgets { amount: Some(1.0) },
             &FakeSsm::empty(),
             in_window(),
         )
@@ -1539,7 +1607,7 @@ mod tests {
             &FakeEc2::new("running"),
             &FakeSns::default(),
             &FakeEvents::new(),
-            &FakeCe { amount: Some(1.0) },
+            &FakeBudgets { amount: Some(1.0) },
             &FakeSsm::empty(),
             in_window(),
         )
@@ -1560,7 +1628,7 @@ mod tests {
         ec2: &FakeEc2,
         sns: &FakeSns,
         events: &FakeEvents,
-        ce: &FakeCe,
+        ce: &FakeBudgets,
         now: DateTime<Utc>,
         ssm: &FakeSsm,
     ) -> Value {
@@ -1581,7 +1649,7 @@ mod tests {
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             in_window(),
@@ -1649,7 +1717,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(31.20),
             },
             in_window(),
@@ -1675,7 +1743,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(32.50),
             },
             in_window(),
@@ -1703,7 +1771,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: None },
+            &FakeBudgets { amount: None },
             in_window(),
             &ssm,
         )
@@ -1711,7 +1779,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(out["noop"], json!(true));
         assert_eq!(out["budget_action"], json!("cost_unknown"));
         assert_eq!(out["ping_reason"], json!("ping_cost_unknown_edge"));
-        // FAIL-SAFE: no stop, no disable on a Cost Explorer failure.
+        // FAIL-SAFE: no stop, no disable on a spend-lookup failure.
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
         assert_eq!(sns.published.borrow().len(), 1);
@@ -1727,7 +1795,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(60.0) },
+            &FakeBudgets { amount: Some(60.0) },
             in_window(),
             &ssm,
         )
@@ -1752,7 +1820,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             out_of_window(),
@@ -1787,7 +1855,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             out_of_window(),
             &ssm,
         )
@@ -1817,7 +1885,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             out_of_window(),
             &ssm,
         )
@@ -1844,7 +1912,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -1882,7 +1950,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -1942,7 +2010,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             in_window(),
@@ -1955,12 +2023,14 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert!(sns.published.borrow().is_empty());
     }
 
-    fn stopped_with_latch(latch: Option<&str>) -> (FakeEc2, FakeSns, FakeEvents, FakeCe, FakeSsm) {
+    fn stopped_with_latch(
+        latch: Option<&str>,
+    ) -> (FakeEc2, FakeSns, FakeEvents, FakeBudgets, FakeSsm) {
         (
             FakeEc2::new("stopped"),
             FakeSns::default(),
             FakeEvents::new(),
-            FakeCe { amount: Some(0.4) },
+            FakeBudgets { amount: Some(0.4) },
             latch.map_or_else(FakeSsm::empty, |l| {
                 FakeSsm::empty().set(crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM, l)
             }),
@@ -2169,7 +2239,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(33.4) },
+            &FakeBudgets { amount: Some(33.4) },
             in_window(),
             &ssm,
         )
@@ -2192,7 +2262,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(33.4) },
+            &FakeBudgets { amount: Some(33.4) },
             in_window(),
             &ssm,
         )
@@ -2229,7 +2299,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             &ReadExplodesWriteFails,
@@ -2285,7 +2355,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             &ReadFailsWriteExplodes,
             out_of_window(),
         )
@@ -2371,7 +2441,10 @@ aws events enable-rule --name tv-prod-daily-start\n"
 
     #[tokio::test]
     async fn effective_ceiling_october_breach_at_175_stops_even_with_a_225_config() {
-        // 2026-10-01 is a Thursday; 04:30 UTC = 10:00 IST, inside the window.
+        // 2026-10-02 is a Friday; 04:30 UTC = 10:00 IST, inside the window.
+        // Moved from 1 Oct on 2026-10-22 (plan item 63): on UTC day 1 a
+        // Budgets reading at or above the line is unknown (no month stamp),
+        // so a day-1 breach pages and never stops.
         let env = GuardEnv {
             budget_kill_usd: 225.0,
             ..test_env()
@@ -2387,11 +2460,11 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(175.0),
             },
             &ssm,
-            utc(2026, 10, 1, 4, 30),
+            utc(2026, 10, 2, 4, 30),
         )
         .await
         .expect("run_guard ok");
@@ -2425,7 +2498,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(165.0),
             },
             &ssm,
@@ -2456,7 +2529,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(160.0),
             },
             &ssm,
@@ -2496,7 +2569,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -2524,7 +2597,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -2553,7 +2626,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -2598,7 +2671,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(500.0),
             },
             now,
@@ -2657,7 +2730,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(500.0),
             },
             now,
@@ -2691,7 +2764,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -2703,10 +2776,10 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert!(sns.published.borrow().is_empty());
     }
 
-    /// A Cost Explorer error keeps the in-window fail-safe posture: it never
+    /// A spend-lookup error keeps the in-window fail-safe posture: it never
     /// stops the box, so the fresh hold is honoured.
     #[tokio::test]
-    async fn test_out_of_window_active_drain_hold_with_a_cost_explorer_error_is_skipped() {
+    async fn test_out_of_window_active_drain_hold_with_a_spend_lookup_error_is_skipped() {
         let now = utc(2026, 7, 7, 13, 30);
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
@@ -2718,7 +2791,15 @@ aws events enable-rule --name tv-prod-daily-start\n"
             now + Duration::minutes(10),
             now - Duration::minutes(1),
         ));
-        let out = run_scenario(&ec2, &sns, &events, &FakeCe { amount: None }, now, &ssm).await;
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: None },
+            now,
+            &ssm,
+        )
+        .await;
         assert_eq!(out["skipped"], json!("drain_hold"));
         assert_eq!(out["budget_action"], json!("cost_unknown"));
         assert!(ec2.stopped.borrow().is_empty());
@@ -2745,7 +2826,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             now,
             &ssm,
         )
@@ -2779,7 +2860,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
+            &FakeBudgets { amount: Some(10.0) },
             &ssm,
             now,
         )

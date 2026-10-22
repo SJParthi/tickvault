@@ -562,7 +562,8 @@ pub async fn holiday_stop_is_today<S: SsmApi>(
 
 /// `true` when the budget-stop latch names the current UTC billing month.
 /// FAIL-OPEN: an unreadable or missing latch keeps the self-start; the
-/// hourly hard-stop guard still stops a breached box from Cost Explorer.
+/// hourly hard-stop guard still stops a breached box from the month-to-date
+/// spend (AWS Budgets since 2026-10-22, plan item 63).
 pub async fn budget_stop_is_this_month<S: SsmApi>(
     ssm: &S,
     param: &str,

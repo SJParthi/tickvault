@@ -26,7 +26,7 @@ aws-sdk-sns = { workspace = true }
 aws-sdk-ssm = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
-aws-sdk-costexplorer = { workspace = true }
+aws-sdk-budgets = { workspace = true }
 # operator-control (phase 2b-3) extras — all pre-existing workspace pins:
 # aws-lc-rs (HMAC-SHA256 for the qdb console link token — the same crate the
 # workspace already pins for rustls/ed25519), regex (the legacy handler's
