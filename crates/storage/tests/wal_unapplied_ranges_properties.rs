@@ -126,6 +126,18 @@ use tickvault_storage::wal_unapplied_ranges::{
 };
 use tickvault_storage::ws_frame_spill::{PACKET_INDEX_BITS, WalEndpoint, WsType};
 
+/// A per-process serial for each case's temp folder. The folder name was the
+/// process id plus the seed (and the seed's first draw), so two tests in one
+/// binary replaying the same pinned seed on two threads wrote the SAME folder
+/// at once and read each other's segments (2026-10-22: reproduced 5 of 5 runs
+/// under `cargo test`; one thread passes; nextest's one process per test hid
+/// it). The serial makes every case's folder its own.
+static CASE_DIR_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_case_dir_serial() -> u64 {
+    CASE_DIR_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const SEC: u64 = 1_000_000_000;
 const BASE_NS: u64 = 1_780_000_000 * SEC;
 const LAG: u64 = WATERMARK_DURABILITY_LAG_SECS * SEC;
@@ -934,9 +946,10 @@ fn run_case_full(
 ) -> Result<(), TestCaseError> {
     let mut rng = Rng(seed);
     let dir = std::env::temp_dir().join(format!(
-        "tv-ranges-prop-{}-{seed:x}-{}",
+        "tv-ranges-prop-{}-{seed:x}-{}-{}",
         std::process::id(),
-        rng.next()
+        rng.next(),
+        next_case_dir_serial()
     ));
     std::fs::create_dir_all(&dir).expect("case dir");
     let mut world = World {
@@ -1416,9 +1429,10 @@ fn check_older_binary(world: &World) -> Result<(), TestCaseError> {
 fn run_stuck_case(seed: u64, boots: usize) -> Result<(), TestCaseError> {
     let mut rng = Rng(seed);
     let dir = std::env::temp_dir().join(format!(
-        "tv-ranges-stuck-{}-{seed:x}-{}",
+        "tv-ranges-stuck-{}-{seed:x}-{}-{}",
         std::process::id(),
-        rng.next()
+        rng.next(),
+        next_case_dir_serial()
     ));
     std::fs::create_dir_all(&dir).expect("case dir");
     let mut world = World {
@@ -1774,9 +1788,10 @@ fn test_regression_saved_proptest_seeds_replay_as_plain_cases() {
 fn run_repeated_overflow_case(seed: u64) -> Result<(), TestCaseError> {
     let mut rng = Rng(seed);
     let dir = std::env::temp_dir().join(format!(
-        "tv-ranges-prop-overflow-{}-{seed:x}-{}",
+        "tv-ranges-prop-overflow-{}-{seed:x}-{}-{}",
         std::process::id(),
-        rng.next()
+        rng.next(),
+        next_case_dir_serial()
     ));
     std::fs::create_dir_all(&dir).expect("case dir");
     let wm = AppliedWatermark::new();
