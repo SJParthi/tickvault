@@ -814,7 +814,6 @@ jobs:
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_main_feed_backup_dedup.rs
           crates/app/tests/dhat_mark_forward.rs
-          crates/app/tests/dhat_top_volume_sweep.rs
           crates/app/tests/dhat_wal_ring_sink_accept.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/app/tests/dhat_ws_lag_recorder.rs
@@ -1034,7 +1033,6 @@ jobs:
             --test dhat_depth_drain \
             --test dhat_live_ingest_seam \
             --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
-            --test dhat_top_volume_sweep \
             --test dhat_wal_ring_sink_accept \
             --test dhat_ws_lag --test dhat_ws_lag_recorder \
             2>&1 | tee /tmp/dhat-app.log
@@ -1062,11 +1060,11 @@ jobs:
           # real WAL ring sink on the socket read path.
           # 5 since audit M6 (2026-10-05): dhat_ws_lag_recorder runs the lag tap
           # with the production recorder installed.
-          # 4 since audit PR4 (2026-09-26): dhat_top_volume_sweep gates the
-          # sliced top-volume sweep that moved off the drain's timer arms.
+          # 7 since 2026-10-22 (plan item 62): dhat_top_volume_sweep deleted
+          # with the top-volume sweep it gated (operator Quote 34).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 8 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 7 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step."
             exit 1
           fi
 
