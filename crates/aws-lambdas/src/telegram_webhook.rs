@@ -305,10 +305,6 @@ pub const ALARM_PHRASES: [(&str, &str); 126] = [
         "Prices marked as rescued may never have reached the disk file — treat this session's price count as unproven",
     ),
     (
-        "depth-rescue-abandoned",
-        "Order-book levels marked as rescued may never have reached the disk file — treat this session's depth count as unproven",
-    ),
-    (
         "wal-spill-shutdown-incomplete",
         "The app was cut off while still writing captured market data — those frames were never saved and cannot be recovered",
     ),
@@ -395,10 +391,6 @@ pub const ALARM_PHRASES: [(&str, &str); 126] = [
         "🔷 DHAN: the main price connection dropped and took more than 15 seconds to start delivering prices again",
     ),
     (
-        "dhan-depth-new-contract-blank",
-        "🔷 DHAN: most newly added order-book contracts stayed blank for 2 minutes after being added",
-    ),
-    (
         "dhan-wal-dropped",
         "🔷 DHAN: live prices arrived but were never safely stored — that data is gone",
     ),
@@ -409,10 +401,6 @@ pub const ALARM_PHRASES: [(&str, &str); 126] = [
     (
         "live-universe-fallback",
         "🔷 DHAN: fell back to a tiny instrument list — almost nothing is being watched",
-    ),
-    (
-        "depth-steering-stalled",
-        "🔷 DHAN: the order-book tracker has stopped following the market",
     ),
     (
         "preopen-ready-late",
@@ -439,10 +427,6 @@ pub const ALARM_PHRASES: [(&str, &str); 126] = [
     (
         "orders-placed-storm",
         "Far more orders are being placed than expected",
-    ),
-    (
-        "order-fill-lag-high",
-        "Orders are taking too long to be filled",
     ),
     ("order-audit-chain-loss", "Order history rows were lost"),
     (
@@ -637,10 +621,6 @@ pub const ALARM_PHRASES: [(&str, &str); 126] = [
     (
         "errcode-ws-spill-02",
         "Incoming market data hit a capture limit — EITHER a frame was genuinely dropped, OR replay deferred segments to the next start, which loses nothing. The server log line names which — check it before assuming loss",
-    ),
-    (
-        "errcode-ws-gap-02-swap-emptied-socket",
-        "🔷 DHAN: an order-book connection was left carrying nothing after a contract swap",
     ),
     (
         "deploy-provenance-blind",

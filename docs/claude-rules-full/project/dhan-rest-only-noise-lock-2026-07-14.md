@@ -5022,3 +5022,43 @@ check. The fast paths ship in SHADOW mode (count only).
   `alarm_description`, without a further dated row here.
 - Ships any of the four new series to CloudWatch (EMF selector, filter or
   alarm) without a dated row here.
+
+## §2.14 — 2026-10-22: the alarm review under Quote 37 removes five pages and gates one (depth switched off; one alarm that watched nothing)
+
+Owner, 2026-10-21, verbatim (full record and REJECT list:
+`daily-universe-scope-expansion-2026-05-27.md` §0 Quote 37): *"i believe alogn
+with evryhtign these also can be doen right dude ? except clouwatch dashbaord
+dude am i right due tlel me dudeokay?"*, quoting the rows "remove alarms that
+watch switched-off parts, remove metrics for removed features, fewer alarms
+overall 127 → about 60". Quote 37 keeps every paging family in this file
+unless this file records the removal first. This is that record. The per-alarm
+review, one row per alarm, is `docs/audits/2026-10-alarm-review.md` (plan item
+65).
+
+| Alarm | Family / section | What it watched | Why it goes | What still covers the failure |
+|---|---|---|---|---|
+| `tv-<env>-depth-steering-stalled` | (5), §2.3 2026-08-26 | the depth steering loop's heartbeat age (`tv_depth_rebalance_age_secs`, `breaching`, in the market-hours gate) | depth-20 and depth-200 are switched off (`websocket-connection-scope-lock.md` "2026-10-21 — DEPTH-20 AND DEPTH-200 ARE SWITCHED OFF"); the loop never starts, and the app publishes a fake 0 only to keep this alarm quiet | nothing is needed while depth is off; the main feed has `dhan-no-ticks-flowing`, `market-hours-liveness-missing` and `dhan-worst-socket-deaf` |
+| `tv-<env>-depth-rescue-abandoned` | (5), §2.3n | depth rescue rows abandoned at shutdown | no depth row is written while depth is off | `tick-rescue-abandoned`, `offload-writer-shutdown-incomplete`, `wal-spill-shutdown-incomplete` for the live writers |
+| `tv-<env>-dhan-depth-new-contract-blank` | (5), §2.6 | share of new depth subscriptions silent after 2 minutes | no depth contract is subscribed while depth is off | nothing is needed while depth is off |
+| `tv-<env>-errcode-ws-gap-02-swap-emptied-socket` | (5), §2.3m | a depth swap that unsubscribed the old contract and failed to subscribe the new one (`WS-GAP-02`, `source = "swap_emptied_socket"`) | the swap runs only on depth sockets, which are switched off, so the filter cannot match | nothing is needed while depth is off; the main feed's `Resubscribe` has no production sender |
+| `tv-<env>-order-fill-lag-high` | §2a order side | `tv_order_fill_lag_seconds`, which has NO emit site anywhere and ships with `actions_enabled = false` | it could page nobody and measured nothing (recorded dead since 2026-08-25; the deletion recipe was written at the alarm) | `orders-rejected`, `order-path-dropped`, `order-audit-chain-loss`; a fill-lag alarm returns with its emitter at Phase-1 |
+| `tv-<env>-dhan-depth-token-minter-errors` | §10.9 depth account (not a §2 family) | errors of the depth-account token minter | GATED, not deleted: `count = var.dhan_depth_account_enabled ? 1 : 0`, the same switch as its schedule and its not-invoked alarm; the depth account is off, so the function never runs | the alarm comes back with the flag |
+
+Metrics that leave the EMF selector with them (their only reader was a
+removed alarm): `tv_depth_rebalance_age_secs`, `tv_depth_rescue_abandoned_total`,
+`tv_depth_first_packet_arrived_total`, `tv_depth_first_packet_silent_total`
+(about $1.20/mo). The counters stay in the app's local `/metrics`.
+
+**Kept, deliberately:** every alarm on tick loss, feed down, token failure,
+disk filling, the spend stop, and the SEBI/audit loss groups. Turning depth
+back on (`[dhan_universe] depth_sockets_enabled = true`) must restore the four
+depth pages and the four selector names in the same change.
+
+**What a PR that violates §2.14 looks like (REJECT):**
+- Turns depth on without restoring the four depth pages and their four
+  selector names in the same change.
+- Uses this row to remove any alarm not in the table above (each further
+  removal needs its own review row and, for a paging family here, its own
+  dated row).
+- Re-adds `order-fill-lag-high` without a production emitter for its metric.
+- Deletes the depth-account minter's errors alarm instead of gating it.

@@ -63,12 +63,20 @@ const DORMANT_ALARMS: &[(&str, &str, &str)] = &[
     // so no-data is the normal state and "breaching" would page nightly — with
     // the honest limit that this alarm therefore cannot detect an in-session
     // data outage, which is the liveness alarm's job.
-    (
-        "order_fill_lag_high",
-        "tv_order_fill_lag_seconds",
-        "order fill-lag pager",
-    ),
+    //
+    // 2026-10-22 — `order_fill_lag_high` / `tv_order_fill_lag_seconds` REMOVED
+    // from this ledger because the ALARM was deleted, the other exit the
+    // header names: the alarm review under operator Quote 37 (plan item 65,
+    // `dhan-rest-only-noise-lock-2026-07-14.md` §2.14). Its metric never
+    // gained an emitter in fourteen months and the alarm shipped with
+    // `actions_enabled = false`, so it paged nobody and measured nothing.
+    // `the_retired_fill_lag_alarm_does_not_return_without_its_emitter` below
+    // pins the deletion. The ledger stays, empty, for the next dormant alarm.
 ];
+
+/// The alarm deleted on 2026-10-22, and the metric it read.
+const RETIRED_FILL_LAG_ALARM: &str = "order_fill_lag_high";
+const RETIRED_FILL_LAG_METRIC: &str = "tv_order_fill_lag_seconds";
 
 const ORDER_SIDE_TF: &str = "deploy/aws/terraform/order-side-alarms.tf";
 
@@ -311,5 +319,33 @@ fn emit_site_scanner_ignores_comment_only_mentions() {
     assert!(
         kept.contains("counter!(\"tv_fake_real_metric\""),
         "comment stripping removed real code"
+    );
+}
+
+#[test]
+fn the_retired_fill_lag_alarm_does_not_return_without_its_emitter() {
+    // 2026-10-22 (plan item 65, Quote 37 alarm review, noise-lock §2.14): the
+    // fill-lag alarm was deleted because its metric has no emitter. It may come
+    // back only together with one; re-adding it alone would restore an alarm
+    // that reads green over a signal nothing writes.
+    let tf = read(ORDER_SIDE_TF);
+    let marker = format!("resource \"aws_cloudwatch_metric_alarm\" \"{RETIRED_FILL_LAG_ALARM}\"");
+    if has_production_emit_site(RETIRED_FILL_LAG_METRIC) {
+        // The emitter arrived: the alarm may return (arm it, and add it to
+        // DORMANT_ALARMS only if it is dormant again).
+        return;
+    }
+    assert!(
+        !tf.contains(&marker),
+        "{ORDER_SIDE_TF} defines {RETIRED_FILL_LAG_ALARM} again, but \
+         {RETIRED_FILL_LAG_METRIC} still has NO production emit site. Ship the \
+         emitter in the same change, or leave the alarm deleted \
+         (dhan-rest-only-noise-lock-2026-07-14.md §2.14)."
+    );
+    // Non-vacuity: the file is the real order-side file, not an empty read.
+    assert!(
+        tf.contains("resource \"aws_cloudwatch_metric_alarm\" \"daily_loss_breach\""),
+        "{ORDER_SIDE_TF} no longer carries daily_loss_breach; this check would \
+         pass on the wrong file"
     );
 }
