@@ -1148,9 +1148,17 @@ pass at 16:14 IST, then the delete at 16:16 IST (GitHub runs 37919370600 and
 its budget row were deleted in the follow-up PR, so this exception authorizes
 nothing further; any new SSM shell needs its own dated section here.
 
-## §0.13. 2026-10-21 — ONE-OFF SSM shell for the 2026-10-22 rebuild (DRAFT, PENDING OWNER APPROVAL)
+## §0.13. 2026-10-21 — ONE-OFF SSM shell for the 2026-10-22 rebuild (APPROVED 2026-10-22)
 
-> **Status: DRAFT.** Written with the plan item 66 tooling. It authorizes
+> **Status: APPROVED 2026-10-22, about 08:05 IST.** The owner answered the
+> decision card "The rebuild workflow needs a few short server commands (6
+> lines, 280 bytes, plus 2 workflow lines). The Rust-only rule allows that
+> only with your dated OK. Approve this one-off exception for the 22–31 Oct
+> rebuild?" with **"Approve, one-off (Recommended)"** ("Allowed only for this
+> rebuild, removed by the next change, recorded in the Rust-only rule with
+> your words."), after "Continue dude". Everything below binds as written.
+>
+> *(Original draft status, kept:)* Written with the plan item 66 tooling. It authorizes
 > nothing until the owner approves it in a dated answer recorded here. Until
 > then the workflow must not be dispatched in `apply` mode.
 

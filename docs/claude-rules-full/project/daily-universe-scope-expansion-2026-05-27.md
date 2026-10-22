@@ -3036,3 +3036,29 @@ After the squeeze table (plan as decided ~$70–75; free spend lookups, dead ala
 - Deleting the CloudWatch dashboard under this quote.
 - Removing an alarm without the per-alarm review row, or a noise-lock paging family without that file's dated edit first.
 - A daily stop earlier than 16:30 IST, or one that ignores the same-day drain hold.
+
+#### Quote 38 (2026-10-22, ~08:05 IST) — THE r8g.large MEMORY BUDGET IS RE-DERIVED FROM MEASUREMENT; ONE SECURITY UPDATE (decision cards, preserve EXACTLY)
+
+After "Continue dude", the owner answered three decision cards. Two are recorded here; the third (the one-off rebuild shell lines) is `rust-only-forever-lock-2026-07-19.md` §0.13.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "On the half-size server (16 GB), a build check fails: its memory budget assumes the app and OS can use up to 16 GB (sized for the 32 GB server). Measured use is 0.3–3 GB. How should the budget be fixed?" | **"Re-size from measured use (Recommended)"** | "Set the app+OS worst case to 6 GB (2x the highest measured 3 GB) and the per-socket buffer to 64 MB: 6 + 6 (database) + 1 (sockets) = 13 of 16 GB, 3 GB spare." |
+| "PR #2119 is blocked only by one security library update. The project rules ban 'cargo update', so it needs you. Can I run exactly this one command: cargo update -p rustls-webpki --precise 0.103.16?" | **"Yes, you run it (Recommended)"** | "I run that one command only, record your OK in the rules, test, and push to #2119." |
+
+**What this changes, and nothing else:**
+
+| Item | Before | After |
+|---|---|---|
+| `net.core.rmem_max` and the `tcp_rmem` maximum (`deploy/aws/sysctl/99-tickvault-net.conf`, `host_limits::REQUIRED_RMEM_MAX_BYTES`, `host_tuning` expected value) | 128 MiB per socket | **64 MiB per socket** |
+| `kernel_tuning_16ws_guard::NON_QUESTDB_NON_SOCKET_GIB_HIGH` (app + OS + page cache, worst case) | 16 GiB (assumed rows) | **6 GiB** (2 × the highest measured whole-box use, about 3 GB on 2026-10-21 with the app running) |
+| r8g.large budget, 16 sockets | 2.0 + 6.0 + 16 = 24 GiB (does not fit) | 1.0 + 6.0 + 6.0 = **13 GiB of 16**, 3 GiB spare |
+| r8g.large budget, 26 sockets (depth account, still OFF) | — | 1.625 + 6.0 + 6.0 = 13.6 GiB, 2.4 GiB spare |
+| `cargo update -p rustls-webpki --precise 0.103.16` on PR #2119 | banned (CLAUDE.md CARGO) | allowed **once**, for that one package and version only |
+
+**Honest limits, stated:** the 3 GB was measured in the evening, not across a full trading day on the smaller box, so 6 GB is an estimate from a short measurement (Assumed until a depth-off session is measured on r8g.large). A 64 MiB socket buffer absorbs half the burst the 128 MiB one did; with depth off the busiest sockets are the main feed. The `cargo update` permission is for that one command; every other `cargo update` stays banned.
+
+##### What violates Quote 38 (REJECT)
+- Raising `rmem_max` above 64 MiB, or the app+OS worst case below 6 GiB, without a fresh dated quote.
+- Running any other `cargo update`, or this one for another package or version.
+- Switching the depth account on under this quote.
