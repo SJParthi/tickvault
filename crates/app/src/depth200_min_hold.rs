@@ -70,7 +70,7 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 use crate::contract_underlying_map::ContractUnderlyingMap;
 use crate::depth200_atm::PlannedSwap;
-use crate::volume_leaderboard::OptionFamily;
+use crate::option_rank::OptionFamily;
 
 /// The minimum time a contract swapped onto a depth-200 socket stays there.
 ///

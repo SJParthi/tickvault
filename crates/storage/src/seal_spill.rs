@@ -42,9 +42,9 @@
 //! |---|---|---|
 //! | 0    | 4 | **v5+:** `record_crc32: u32`, CRC-32 (IEEE) of bytes 4..128. **v4 and older:** `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
-//! | 5    | 1 | `tf_ordinal: u8` (0..=8 per `TfIndex` — the operator's nine frames since 2026-09-19; the ordinal space has been renumbered twice, so the byte is meaningless without `format_version`) |
+//! | 5    | 1 | `tf_ordinal: u8` (0..=7 per `TfIndex` — eight frames since 2026-10-22, nine on 2026-09-19; the ordinal space has been renumbered twice, so the byte is meaningless without `format_version`) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | `format_version: u8` (=5 since 2026-10-01). Every reader accepts `SEAL_SPILL_OLDEST_READABLE_VERSION..=SEAL_SPILL_FORMAT_VERSION` (4..=5) and REFUSES every other version, older or newer: 3 → 4 renumbered `tf_ordinal`, so an older byte decodes into the wrong frame silently. 4 → 5 renumbered nothing, which is why 4 is still read |
+//! | 7    | 1 | `format_version: u8` (=6 since 2026-10-22, plan item 62; was 5 since 2026-10-01). Every reader accepts `SEAL_SPILL_OLDEST_READABLE_VERSION..=SEAL_SPILL_FORMAT_VERSION` (6..=6 since 2026-10-22; 4..=5 before) and REFUSES every other version, older or newer: 3 → 4 renumbered `tf_ordinal`, so an older byte decodes into the wrong frame silently. 4 → 5 renumbered nothing, which is why 4 is still read |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -251,7 +251,13 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// **Bumped 4 → 5 on 2026-10-01** (audit PR41c): bytes 0..4 carry a CRC-32 of
 /// bytes 4..128 instead of the legacy low-32 id. No ordinal moved, so version
 /// 4 stays readable — see [`SEAL_SPILL_OLDEST_READABLE_VERSION`].
-pub const SEAL_SPILL_FORMAT_VERSION: u8 = 5;
+///
+/// **Bumped 5 → 6 on 2026-10-22** (plan item 62, operator Quote 34): `S3`
+/// and `S5` were removed from `TfIndex`, so `M30` moved 7 → 5, `M60` 8 → 6
+/// and `M10` 9 → 7. A version-5 byte 7 decodes into the WRONG frame, so
+/// [`SEAL_SPILL_OLDEST_READABLE_VERSION`] moved to 6 with it: a v5 record is
+/// refused (its file kept, never deleted), never filed under the wrong table.
+pub const SEAL_SPILL_FORMAT_VERSION: u8 = 6;
 
 /// Oldest format version every reader still accepts.
 ///
@@ -260,7 +266,9 @@ pub const SEAL_SPILL_FORMAT_VERSION: u8 = 5;
 /// in the same change, so the older bytes are refused instead of filed under
 /// the wrong timeframe; a bump that changes only how a record is checked (as
 /// 4 → 5 did) leaves it where it is, so the previous build's spill is read.
-pub const SEAL_SPILL_OLDEST_READABLE_VERSION: u8 = 4;
+///
+/// 2026-10-22 (plan item 62): 4 → 6, because 5 → 6 renumbered `TfIndex`.
+pub const SEAL_SPILL_OLDEST_READABLE_VERSION: u8 = 6;
 
 /// First format version whose bytes 0..4 carry `record_crc32` (2026-10-01).
 pub const SEAL_SPILL_FIRST_CHECKSUM_VERSION: u8 = 5;
@@ -2019,6 +2027,8 @@ impl SealSpillWriter {
                     //
                     // 2026-10-01 (version 4 → 5, audit PR41c): no ordinal moved,
                     // so the gate is the readable RANGE, 4..=5, not one value.
+                    // 2026-10-22 (version 5 → 6, plan item 62): `S3`/`S5` left
+                    // `TfIndex` and later ordinals moved, so the range is 6..=6.
                     // A v5 record whose checksum fails is refused and the read
                     // goes on: the boundary does not depend on the contents.
                     match decode_spill_record(&buf) {
@@ -5189,8 +5199,8 @@ mod c3_tf_ordinal_pins {
         // TF_COUNT so a frame added or retired is actually exercised instead
         // of silently falling outside the range.
         assert_eq!(
-            TF_COUNT, 10,
-            "10 since 2026-09-22: M10 appended at ordinal 9 (a real table, not a view)"
+            TF_COUNT, 8,
+            "8 since 2026-10-22: S3 and S5 removed, M30/M60/M10 renumbered (plan item 62)"
         );
         for ord in 0..TF_COUNT {
             let tf =
@@ -5522,7 +5532,7 @@ mod pr41c_tests {
         let s = seal(4_294_967_301, 1_716_000_900, 101.25);
         let bytes = s.to_bytes();
         assert_eq!(bytes[7], SEAL_SPILL_FORMAT_VERSION);
-        assert_eq!(SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_FIRST_CHECKSUM_VERSION);
+        assert!(SEAL_SPILL_FORMAT_VERSION >= SEAL_SPILL_FIRST_CHECKSUM_VERSION);
         assert_eq!(
             u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             crate::wal_applied_watermark::crc32_ieee(&bytes[4..])
@@ -5548,35 +5558,32 @@ mod pr41c_tests {
                 );
             }
         }
-        // Byte 7 flipped from 5 to 4 reads as the previous format, whose id
-        // check is what refuses it.
+        // Byte 7 rewritten to an older version is refused by the version
+        // gate (2026-10-22, plan item 62: 4 and 5 are no longer readable).
         let mut as_v4 = bytes;
         as_v4[7] = 4;
-        assert_eq!(
-            decode_spill_record(&as_v4),
-            SpillRecordRead::ChecksumMismatch
-        );
+        assert_eq!(decode_spill_record(&as_v4), SpillRecordRead::OtherVersion);
     }
 
     #[test]
-    fn a_v4_record_written_by_the_previous_build_still_decodes() {
+    fn a_v4_or_v5_record_written_by_an_older_build_is_refused_not_misfiled() {
+        // 2026-10-22 (plan item 62): `S3`/`S5` left `TfIndex`, so a v4/v5
+        // ordinal 5 meant `S3` and now means `M30`. Both are refused.
         let s = seal(4_294_967_301, 1_716_000_900, 101.25);
         let old = v4_bytes(&s);
-        assert!(seal_spill_version_is_readable(4));
+        assert!(!seal_spill_version_is_readable(4));
+        assert!(!seal_spill_version_is_readable(5));
+        assert!(seal_spill_version_is_readable(6));
         assert!(seal_spill_version_is_readable(SEAL_SPILL_FORMAT_VERSION));
         assert!(!seal_spill_version_is_readable(3));
         assert!(!seal_spill_version_is_readable(
             SEAL_SPILL_FORMAT_VERSION + 1
         ));
-        assert_eq!(decode_spill_record(&old), SpillRecordRead::Seal(s));
-        // A v4 record from before the id widening (zero full id) has nothing
-        // to compare and decodes from its low-32 id.
-        let mut narrow = old;
-        narrow[120..128].copy_from_slice(&[0; 8]);
-        match decode_spill_record(&narrow) {
-            SpillRecordRead::Seal(read) => assert_eq!(read.security_id, 5),
-            other => panic!("a pre-widening v4 record must decode, got {other:?}"),
-        }
+        assert_eq!(decode_spill_record(&old), SpillRecordRead::OtherVersion);
+        let mut v5 = s.to_bytes();
+        v5[7] = 5;
+        reseal_record_for_test(&mut v5);
+        assert_eq!(decode_spill_record(&v5), SpillRecordRead::OtherVersion);
     }
 
     #[test]

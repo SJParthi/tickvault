@@ -1099,21 +1099,9 @@ rules:
       silently downgrading derivatives. Operator fixes config and
       restarts. Never auto-action.
 
-  - name: volume-mono-01-monotonicity-breach-escalate
-    match:
-      code: VOLUME-MONO-01
-    action: escalate
-    runbook_path: docs/error-runbooks/wave-5-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      VOLUME-MONO-01 = within an IST trading day a tick arrived where
-      `volume[i] < volume[i-1]` for some `(security_id, segment)` —
-      either parser bug or Dhan-side semantic change (cumulative-day
-      assumption violated). Pipeline keeps flowing; guard logs +
-      counts the breach. Operator runs the Mon May 4 09:45 IST
-      monotonicity SELECT in `docs/operator/track-2-monotonicity-select.md`
-      to determine root cause. Severity::High; 10-min cooldown.
+  # The volume-mono-01 escalate rule was removed 2026-10-22 (plan item 62,
+  # operator Quote 34): its `Volume01MonotonicityBreach` variant was retired
+  # with the volume leaderboard, its only emitter.
 
   # -----------------------------------------------------------------------
   # MOVERS-22TF-01/02/03 rules removed 2026-05-02 along with the dead

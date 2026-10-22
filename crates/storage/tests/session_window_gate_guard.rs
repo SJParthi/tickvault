@@ -670,8 +670,9 @@ fn the_session_window_gate_is_wired_into_the_spill_replay_path() {
          deletes late depth rows the writer deliberately kept."
     );
     // The default arm (ticks and any unknown folder) must stay on the strict
-    // exchange clock; only the top_volume folder, whose writer has no session
-    // gate, may skip the filter (PR-C review, 2026-10-13).
+    // exchange clock. Until 2026-10-22 the top_volume folder was the one arm
+    // allowed to skip the filter; it went with the top_volume replay (plan
+    // item 62), so NO arm may skip it now.
     assert!(
         policy_fn.contains("_ => (ReplayWindow::Exchange"),
         "the tick spill must keep the exchange-clock filter; a default arm of \
@@ -679,10 +680,9 @@ fn the_session_window_gate_is_wired_into_the_spill_replay_path() {
     );
     assert_eq!(
         policy_fn.matches("ReplayWindow::None").count(),
-        1,
-        "only the top_volume arm may skip the filter"
+        0,
+        "no replay arm may skip the session filter (the top_volume arm is gone)"
     );
-    assert!(policy_fn.contains("\"top_volume\" => (ReplayWindow::None"));
 
     // And it must gate what is SENT, not merely compute a number. A call whose
     // result is dropped is the same defect wearing a function call.

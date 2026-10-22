@@ -166,6 +166,9 @@ pub mod main_feed_backup;
 /// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
 pub mod market_ram_store_boot;
 pub mod movers;
+/// Option-contract ranking types and pure helpers the depth planners read
+/// (relocated from the deleted `volume_leaderboard`, 2026-10-22, plan item 62).
+pub mod option_rank;
 pub mod prev_close_store;
 /// REST-era multi-TF candle derivation (operator directive 2026-07-16):
 /// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
@@ -179,11 +182,10 @@ pub mod rest_candle_fold;
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
 pub mod spot_price_store;
-/// Projects the in-RAM volume leaderboard into `top_volume_rank` rows —
-/// the pure step between the ranking and the table the operator asked for.
-pub mod top_volume_snapshot;
-pub mod top_volume_sweep;
-pub mod volume_leaderboard;
+// `top_volume_snapshot`, `top_volume_sweep` and `volume_leaderboard` DELETED
+// 2026-10-22 (plan item 62, operator Quote 34): nothing writes `top_volume_*`
+// and the ranking that only fed it is gone. The pieces the depth planners read
+// moved to `option_rank`.
 /// Settles what the Dhan WebSocket `volume` field actually MEANS (running day
 /// total vs per-packet quantity) from data already on disk — the premise the
 /// whole volume-ranked depth steering rests on, which no Dhan document states.

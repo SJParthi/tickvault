@@ -239,10 +239,12 @@ fn waiting_spill_files(dir: &Path) -> usize {
 pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
     use tickvault_storage::audit_spill::AuditSpillTable;
     let marks = tickvault_storage::wal_deferred_depth::deferred_depth().snapshot();
+    // The top_volume spill folder left this list on 2026-10-22 (plan item
+    // 62, operator Quote 34): nothing replays it any more, so a file left in
+    // it would hold the box up all night for work no task will ever do.
     let mut spill_files = [
         tickvault_storage::tick_persistence::TICK_SPILL_DIR,
         tickvault_storage::depth_persistence::DEPTH_SPILL_DIR,
-        tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
     ]
     .iter()
     .map(|d| waiting_spill_files(Path::new(d)))

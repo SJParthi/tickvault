@@ -1032,8 +1032,9 @@ const _: () = assert!(
 );
 
 /// Pre-register every `tier` label value of `tv_spill_free_probe_blind_total`
-/// at 0: `tick`, `depth`, `seal` (since deep audit DA-14) and `top_volume`
-/// (since 2026-10-13, the tier `SpillTier::TopVolume` counts under).
+/// at 0: `tick`, `depth` and `seal` (since deep audit DA-14). The
+/// `top_volume` tier (2026-10-13) went with the top_volume spill on
+/// 2026-10-22 (plan item 62, operator Quote 34).
 ///
 /// That counter records rescues written WITHOUT a free-space answer, because
 /// the `df` probe failed. A per-write floor must NOT fail closed — one broken
@@ -1055,7 +1056,6 @@ pub fn seed_spill_free_probe_blind_counters() {
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(0);
     // Deep audit DA-14: the seal escalation floor's blind writes.
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(0);
-    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "top_volume").increment(0);
 }
 
 // THE CROSS-KIND ASSERT — the one whose absence let the inversion through.
@@ -1407,9 +1407,8 @@ pub(crate) const SPILL_UNSYNCED_ON_DRAIN: Option<SpillSyncFn> = None;
 pub enum SpillTier {
     /// `data/spill/ticks` — decision-critical, refused LAST.
     Tick,
-    /// `data/spill/top_volume` — the busiest-contract boards, derived data,
-    /// refused FIRST (before depth and ticks) as the disk fills.
-    TopVolume,
+    // `TopVolume` (`data/spill/top_volume`) REMOVED 2026-10-22 (plan item 62,
+    // operator Quote 34) with the top_volume writer and spill.
 }
 
 impl SpillTier {
@@ -1419,7 +1418,6 @@ impl SpillTier {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Tick => "tick",
-            Self::TopVolume => "top_volume",
         }
     }
 
@@ -1429,10 +1427,6 @@ impl SpillTier {
         match self {
             Self::Tick => {
                 metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
-            }
-            Self::TopVolume => {
-                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "top_volume")
-                    .increment(1);
             }
         }
     }
@@ -1466,7 +1460,7 @@ pub enum SpillCeilingKind {
 /// the depth twin once did.
 ///
 /// Built by [`tick_spill_spec`] (today's tick constants, byte-identical
-/// behaviour) and `top_volume_rank_persistence::top_volume_spill_spec`.
+/// behaviour) (the top_volume spec went with its tier on 2026-10-22, plan item 62).
 #[derive(Clone, Copy)]
 pub struct IlpSpillSpec<'a> {
     /// The spill folder. Production passes the tier's `*_SPILL_DIR`; tests
@@ -6882,10 +6876,8 @@ mod tests {
         // The labels double as `tv_spill_free_probe_blind_total{tier}` values,
         // which the boot seed pre-registers by the same literals.
         assert_eq!(SpillTier::Tick.label(), "tick");
-        assert_eq!(SpillTier::TopVolume.label(), "top_volume");
         // Counting with no recorder installed must not panic.
         SpillTier::Tick.count_free_probe_blind();
-        SpillTier::TopVolume.count_free_probe_blind();
     }
 
     #[test]
@@ -7608,7 +7600,7 @@ mod tests {
             ))
             .map(|(_, rest)| rest.split_once("\n}").map_or(rest, |(b, _)| b))
             .unwrap_or_default();
-        for tier in ["\"tick\"", "\"depth\"", "\"seal\"", "\"top_volume\""] {
+        for tier in ["\"tick\"", "\"depth\"", "\"seal\""] {
             assert!(
                 body.contains(tier),
                 "the seeding function does not register the {tier} tier — the \
@@ -7618,8 +7610,8 @@ mod tests {
         }
         assert_eq!(
             body.matches("increment(0)").count(),
-            4,
-            "expected exactly four seeded label sets (tick, depth, seal, top_volume)"
+            3,
+            "expected exactly three seeded label sets (tick, depth, seal; top_volume removed 2026-10-22)"
         );
     }
 

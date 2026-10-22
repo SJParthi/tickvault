@@ -4909,6 +4909,18 @@ or EMF name is added. The export is priced in `aws-budget.md` "COST NOTE
   Firehose role a Delete, lifecycle or versioning action, without a dated row
   here.
 
+**2026-10-22 note (plan item 62, operator Quote 34; a removal, not a new page):**
+four loss-group filter rows left `deploy/aws/terraform/loss-group-alarms.tf`
+with the code whose counters they read, because the `top_volume` writer, its
+snapshot projection and the volume leaderboard were deleted:
+`top-volume-rows-discarded`, `top-volume-append-failed`,
+`top-volume-snapshot-refused` (group `market_data_refused`) and
+`volume-leaderboard-refused` (group `bound_or_blind`). Their boot seeds in
+`main.rs` went in the same change, as did the `tier="top_volume"` label of
+`tv_spill_free_probe_blind_total` and the `writer="top_volume"` label of the
+offload-shutdown counter. No page, alarm, group or slice was added or widened;
+the two group descriptions now count six and thirteen counters.
+
 ## §2.11 — 2026-10-06: `RISK-GAP-03` re-arms after each silence episode (no new page)
 
 Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the

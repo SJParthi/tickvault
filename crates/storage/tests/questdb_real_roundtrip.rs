@@ -59,7 +59,6 @@ use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
 use tickvault_storage::shadow_persistence::ensure_shadow_candle_tables;
 use tickvault_storage::shadow_seal_columns::ShadowSealRow;
 use tickvault_storage::tick_persistence::{TickWriter, ensure_ticks_table};
-use tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables;
 
 /// An IST trading day's midnight in IST-epoch seconds.
 const DAY: u32 = 1_779_321_600;
@@ -236,7 +235,6 @@ async fn ensure_all(cfg: &QuestDbConfig) {
     assert!(ensure_shadow_candle_tables(cfg).await, "candle tables");
     assert!(ensure_ticks_table(cfg).await, "ticks");
     assert!(ensure_market_depth_table(cfg).await, "market_depth");
-    assert!(ensure_top_volume_tables(cfg).await, "top_volume tables");
     assert!(ensure_feed_aux_table(cfg).await, "feed_aux");
 }
 
@@ -247,13 +245,7 @@ async fn ddl_creates_every_live_table_idempotently_with_dedup_on() {
     ensure_all(&cfg).await;
     ensure_all(&cfg).await;
 
-    for table in [
-        "ticks",
-        "market_depth",
-        "candles_1m",
-        "candles_5m",
-        "top_volume_1m",
-    ] {
+    for table in ["ticks", "market_depth", "candles_1m", "candles_5m"] {
         let r = rows(
             &cfg,
             &format!("SELECT dedup FROM tables() WHERE table_name = '{table}'"),

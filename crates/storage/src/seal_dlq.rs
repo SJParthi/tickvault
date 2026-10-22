@@ -79,8 +79,8 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 ///
 /// Field-by-field correspondence with `SerializedSeal`:
 /// - `security_id`, `exchange_segment_code` — composite key (I-P1-11).
-/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..`TF_COUNT`; nine frames since
-///   2026-09-19). Its MEANING depends on `format_version` — see that field.
+/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..`TF_COUNT`; eight frames since
+///   2026-10-22, plan item 62; nine from 2026-09-19). Its MEANING depends on `format_version` — see that field.
 /// - `bucket_start_ist_secs`, `tick_count`, `volume`,
 ///   `bucket_start_cumulative`, `oi`, `open`, `high`, `low`, `close`
 ///   — `LiveCandleState` payload.
@@ -1400,7 +1400,7 @@ mod tests {
             let r = SealDlqRecord::from(&mk_serialized_seal(
                 13,
                 0,
-                (i % 9) as u8,
+                (i as usize % tickvault_trading::candles::tf_index::TF_COUNT) as u8,
                 1_716_000_000 + i,
                 100.0 + i as f64,
             ));
@@ -1411,7 +1411,10 @@ mod tests {
         for (i, r) in drained.iter().enumerate() {
             assert_eq!(r.bucket_start_ist_secs, 1_716_000_000 + i as u32);
             assert_eq!(r.close, 100.0 + i as f64);
-            assert_eq!(r.tf_ordinal, (i % 9) as u8);
+            assert_eq!(
+                r.tf_ordinal,
+                (i as usize % tickvault_trading::candles::tf_index::TF_COUNT) as u8
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }

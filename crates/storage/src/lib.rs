@@ -128,10 +128,14 @@ pub mod feed_scoreboard_persistence;
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
 pub mod tf_consistency_audit_persistence;
-/// Top-volume ranking snapshots (operator 2026-09-06): one row per
-/// (snapshot, timeframe, family, contract) recording which option contracts
-/// were the busiest and whether each actually held a depth subscription.
-pub mod top_volume_rank_persistence;
+// Top-volume ranking snapshots: `top_volume_rank_persistence` DELETED
+// 2026-10-22 (plan item 62, operator Quote 34). Nothing writes the four
+// `top_volume_<tf>` tables now; their partitions on the box stay on the
+// retention sweep (archive, then detach) until copied. The delay renderer the
+// candle writer shares moved to `delay_render`.
+/// Human-readable delay strings for the candle delay columns (relocated from
+/// the deleted top-volume writer, 2026-10-22).
+pub mod delay_render;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_audit_persistence` module DELETED — the Rust WRITER
 // only; the `tick_conservation_audit` QuestDB TABLE is RETAINED on disk

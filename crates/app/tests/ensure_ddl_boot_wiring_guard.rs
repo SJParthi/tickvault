@@ -275,13 +275,9 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // depth pools begin silently overwriting each other's levels. Same
         // retry loop as `ticks`, so neither is retried without the other.
         ("ensure_market_depth_table", "src/candle_ddl_boot.rs"),
-        // top_volume_1s / _3s / _5s / _1m — the four DIRECT volume-ranking
-        // tables (2026-09-22; one table viewed four ways before that). Written
-        // every sweep by their offload writer from the first ranking; an
-        // un-ensured table is ILP-auto-created with none of its 6-key DEDUP
-        // (ts, tf, family, feed, security_id, segment). Same retry loop as
-        // `ticks` and `market_depth`.
-        ("ensure_top_volume_tables", "src/candle_ddl_boot.rs"),
+        // (the four `top_volume_<tf>` ensure row retired 2026-10-22, plan item
+        // 62, operator Quote 34: nothing writes those tables, and ensuring them
+        // would re-create them on a fresh volume.)
         // feed_aux_packets (2026-10-02, item 45h) — the OI, previous-close,
         // market-status, disconnect, out-of-window-tick and connect-snapshot
         // rows. They ride the tick writer's buffer from the first frame, so an
@@ -436,7 +432,7 @@ fn the_candle_ddl_is_awaited_before_the_live_table_ddl() {
         sweep_pos < live_pos,
         "`run_candle_ddl_at_boot` (fresh-start reset + legacy view sweep) must \
          be awaited BEFORE `run_live_table_ddl_at_boot` (which ensures ticks, \
-         market_depth and the four top_volume_<tf> tables). Swapped, the reset \
+         market_depth and the feed-aux tables). Swapped, the reset \
          would drop tables the ensure just created. Found the candle DDL at byte \
          {sweep_pos} and the live-table DDL at byte {live_pos}."
     );
@@ -460,7 +456,7 @@ fn the_live_table_loop_creates_no_view_and_requires_every_table() {
         "a view pass is back inside the live-table DDL loop"
     );
     assert!(
-        body.contains("if ticks_ok && depth_ok && volume_ok && feed_aux_ok {"),
+        body.contains("if ticks_ok && depth_ok && feed_aux_ok {"),
         "the boot-complete return must still require every live table"
     );
 }
@@ -497,7 +493,9 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
     // The labels that must be SEEDED, so the CloudWatch agent's
     // dropped-first-sample rule cannot swallow a series on the one day it
     // fires. An unseeded counter publishes NOTHING the first time it moves.
-    for writer in ["tick", "depth", "top_volume"] {
+    // `top_volume` left this list on 2026-10-22 (plan item 62) with its
+    // writer; the remaining offload writers are tick and depth.
+    for writer in ["tick", "depth"] {
         let seed = format!(
             "metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, \"writer\" => \"{writer}\").increment(0)"
         );
@@ -521,12 +519,9 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
     // makes the defect undocumentable, which is a bad trade for a pin that the
     // positive form gives anyway.
     assert!(
-        lane.contains("with_top_volume_writer(producer, handle)"),
-        "the top-volume writer's JoinHandle must be BOUND at the spawn site and \
-         handed to the lane with its producer. Discarding it (`Ok(_handle) =>`) \
-         means the thread can never be joined at shutdown, so its final batches \
-         die with the process and nothing counts them — the state this writer \
-         shipped in for six days while its two siblings had the accounting"
+        !lane.contains("with_top_volume_writer("),
+        "the top-volume writer was removed on 2026-10-22 (plan item 62, Quote 34); \
+         re-adding it needs a fresh dated operator quote"
     );
 
     // All three joins must be present, and against the SAME deadline: `main`
@@ -535,7 +530,6 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
     for join in [
         "ingest.shutdown_offload_writer(offload_deadline)",
         "ingest.shutdown_depth_offload_writer(offload_deadline)",
-        "ingest.shutdown_top_volume_writer(offload_deadline)",
     ] {
         assert!(
             lane.contains(join),
@@ -546,79 +540,24 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
     }
 }
 
-/// The top-volume join is BOUNDED by the deadline, not merely gated on it once.
-///
-/// `JoinHandle::join` has no timeout. Until 2026-09-13 this function tested
-/// `Instant::now() >= deadline` ONCE at entry and then called a bare `join()`,
-/// with a comment that stated the hang hazard verbatim and did it anyway.
-///
-/// A point-in-time check only refuses to START waiting once the budget is
-/// already spent. Enter one millisecond before the deadline with a writer
-/// wedged on a hung socket and it waits forever — and this is the LAST of three
-/// joins against one shared budget, so it routinely enters with almost nothing
-/// left, which is exactly the window where the old test passed and then blocked.
-///
-/// Pinned by ORDER rather than by banning a spelling: the poll loop must come
-/// before the join, so the join only ever runs on a thread that has already
-/// exited. Banning the old spelling would also ban the comment that explains
-/// what was fixed — the lesson the sibling guard above records.
+/// The top-volume writer threads and their bounded join went with
+/// `top_volume` on 2026-10-22 (plan item 62, operator Quote 34). Until then
+/// this test pinned that `shutdown_top_volume_writer` polled `is_finished()`
+/// to the shared deadline before joining. It now pins the removal: the child
+/// module that held the threads is gone and nothing in the lane names it.
 #[test]
-fn the_top_volume_join_is_bounded_by_the_shared_deadline() {
-    // Moved out of `dhan_feed_stack.rs` on 2026-10-13 (top_volume spill PR-B)
-    // to keep that file under its size pin; the same function, the same rule.
-    let lane = production_region(&read_src("src/dhan_feed_stack/top_volume_threads.rs"));
-
-    const FN: &str = "pub fn shutdown_top_volume_writer(&mut self, deadline: std::time::Instant) {";
-    const POLL: &str = "while !handle.is_finished() && std::time::Instant::now() < deadline {";
-    const JOIN: &str = "if handle.join().is_err() {";
-
-    // SLICED to this one function, not searched across the file.
-    //
-    // The first draft counted POLL across the whole production half and
-    // `rfind`-ed it. Both were wrong: the loop legitimately appears THREE times
-    // (here plus two `shutdown_rescue_writer` impls), so the count assertion
-    // failed against correct code, and `rfind` landed on a SIBLING — it would
-    // then have "proved" the ordering of a function this test does not name.
-    // That is the found-the-wrong-occurrence bug this same file already records
-    // once, hit again in the guard written to avoid it.
-    assert_eq!(
-        lane.matches(FN).count(),
-        1,
-        "expected exactly one definition of `shutdown_top_volume_writer` in the \
-         production half — this guard slices on it, so a second definition would \
-         make the slice ambiguous"
-    );
-    let body = {
-        let from = lane.find(FN).expect("counted above");
-        let rest = &lane[from + FN.len()..];
-        // Bounded at the next method, so the slice can never run on into a
-        // sibling's body and borrow its poll loop.
-        let to = rest.find("\n    pub fn ").unwrap_or(rest.len());
-        &rest[..to]
-    };
-
-    let poll_at = body.find(POLL).unwrap_or_else(|| {
-        panic!(
-            "`shutdown_top_volume_writer` must POLL `is_finished()` to the \
-             deadline. A single `Instant::now() >= deadline` test at entry is \
-             NOT a bound — it only refuses to start waiting once the budget is \
-             already spent, and this is the LAST of three joins against one \
-             shared budget"
-        )
-    });
-    let join_at = body
-        .find(JOIN)
-        .expect("the top-volume shutdown must still join the handle");
-
+fn the_top_volume_writer_threads_are_gone() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        poll_at < join_at,
-        "`shutdown_top_volume_writer` must POLL `is_finished()` to the deadline \
-         BEFORE it joins. Joining first — or gating on a single \
-         `Instant::now() >= deadline` test and then joining — leaves an \
-         unbounded wait on a wedged writer, which hangs the box's shutdown \
-         until systemd SIGKILLs it and kills the two sibling writers' final \
-         flushes with it"
+        !manifest
+            .join("src/dhan_feed_stack/top_volume_threads.rs")
+            .exists(),
+        "the top-volume writer threads module was removed with top_volume"
     );
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+    for gone in ["mod top_volume_threads;", "shutdown_top_volume_writer("] {
+        assert!(!lane.contains(gone), "`{gone}` must stay removed");
+    }
 }
 
 /// The ranking daily-reset fires ONLY on a real IST midnight crossing.

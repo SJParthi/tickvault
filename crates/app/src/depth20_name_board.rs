@@ -151,7 +151,7 @@ pub const DEPTH20_RANK_ABSOLUTE_MOVE: bool = true;
 
 /// The largest move this board will rank, in basis points (1,000% = 100,000 bp).
 ///
-/// Deliberately the same magnitude as `volume_leaderboard::MAX_PLAUSIBLE_GAIN_PCT`
+/// Deliberately the same magnitude as `option_rank::MAX_PLAUSIBLE_GAIN_PCT`
 /// (1,000%), expressed in this module's own unit. A move past it is a corrupt
 /// previous close, not a stock — and admitting one would hand it rank 1 for the
 /// session.
@@ -303,7 +303,7 @@ impl NameMove {
 /// Orders names by move, descending, with a total and stable tie-break.
 ///
 /// The tie-break is `(move desc, underlying_id asc, segment asc)` — the same
-/// shape `volume_leaderboard::rank` uses, so the two boards cannot disagree
+/// shape the removed `volume_leaderboard::rank` used (2026-10-22), so the two boards cannot disagree
 /// about what "stable" means.
 ///
 /// **Ties matter more here than on the volume board**, and that is worth

@@ -46,7 +46,9 @@ const BUDGET: &[(&str, usize)] = &[
     // 2026-10-14 (ITEM 57): 90 -> 88; `contract_attach_tests` (3 scans) moved
     // to its own file, one scan added by `test_live_tick_flush_leaves_depth_to_its_own_cadence`,
     // which pairs it with a behaviour half on the same ingest.
-    ("dhan_feed_stack.rs", 88),
+    // 2026-10-22 (plan item 62): 88 -> 81; seven top_volume source scans went
+    // with the code they scanned.
+    ("dhan_feed_stack.rs", 81),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     ("dhan_lifecycle.rs", 2),
@@ -73,8 +75,6 @@ const BUDGET: &[(&str, usize)] = &[
     ("order_runtime.rs", 3),
     ("subsystem_memory.rs", 1),
     ("tf_consistency_boot.rs", 1),
-    ("top_volume_snapshot.rs", 1),
-    ("volume_leaderboard.rs", 2),
     ("ws_audit_consumer.rs", 2),
     ("ws_connection_rollup.rs", 1),
 ];

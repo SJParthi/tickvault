@@ -122,6 +122,11 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     // historical audit per the house banner convention — exactly the
     // WS-GAP-05..09 mechanism.
     "WS-REINJECT-01",
+    // `VOLUME-MONO-01` — variant RETIRED 2026-10-22 (plan item 62, operator
+    // Quote 34): its only emitter, the volume leaderboard's monotonicity
+    // gate, was deleted with `top_volume`. `wave-5-error-codes.md` keeps the
+    // code string as historical audit, the WS-REINJECT-01 mechanism.
+    "VOLUME-MONO-01",
     // GROWW-PUSH-01..04 (Stage 0 stubs, 2026-07-16) were REMOVED from this
     // allowlist when Stage A landed their `GrowwPush0*` ErrorCode variants
     // (the documented Stage-A obligation of the Stage-0 entry).
