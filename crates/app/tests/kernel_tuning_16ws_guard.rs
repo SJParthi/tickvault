@@ -79,7 +79,13 @@ const INSTANCE_RAM_GIB: &[(&str, u64)] = &[
 /// why the total here (30 GiB) is slightly above the 29.3 GiB the conf file
 /// states: the conf shows the real arithmetic, the guard leaves no rounding
 /// slack to hide in.
-const NON_QUESTDB_NON_SOCKET_GIB_HIGH: u64 = 16;
+///
+/// **2026-10-22 (operator Quote 38, "Re-size from measured use"): 16 → 6.**
+/// The 16 above was a sum of ASSUMED rows sized for the 32 GiB box and does not
+/// fit the 16 GiB r8g.large at all. The owner chose to re-derive it from
+/// measurement: 2 × the highest whole-box use measured (about 3 GB, 2026-10-21,
+/// app running). Assumed until a full trading day is measured on r8g.large.
+const NON_QUESTDB_NON_SOCKET_GIB_HIGH: u64 = 6;
 
 const SYSCTL_CONF: &str = "deploy/aws/sysctl/99-tickvault-net.conf";
 const VERIFIER: &str = "crates/app/src/host_tuning.rs";
@@ -268,7 +274,7 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
 fn the_twenty_six_socket_budget_is_recorded_and_gates_the_depth_account() {
     let conf = read(SYSCTL_CONF);
     assert!(
-        conf.contains("26 sockets x 128 MiB ceiling = 3.25 GiB"),
+        conf.contains("26 sockets x 64 MiB ceiling = 1.625 GiB"),
         "99-tickvault-net.conf must record the 26-socket arithmetic for the \
          second, depth-only Dhan account (websocket-connection-scope-lock.md \
          § 2026-09-26)"

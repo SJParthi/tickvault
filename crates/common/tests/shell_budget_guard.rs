@@ -607,7 +607,7 @@ const CONSOLE_SHELL_SOURCES: &[(&str, usize, usize)] = &[
 /// one-off 2026-10-22 rebuild (plan item 66): `(path, literal lines, bytes)`
 /// ceilings, measured exactly 2026-10-21. One element per box phase: fetch
 /// the deployed binary, then run its Rust `rebuild-box` subcommand.
-/// DRAFT, PENDING OWNER APPROVAL: rust-only lock §0.13 (Quotes 32 and 33).
+/// APPROVED by the owner 2026-10-22: rust-only lock §0.13 (Quotes 32 and 33).
 /// The row goes with the tool in the PR after the run.
 const REBUILD_SSM_SHELL_SOURCES: &[(&str, usize, usize)] =
     &[("crates/app/src/rebuild_ssm.rs", 6, 280)];
@@ -1350,7 +1350,7 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/local-branch-sync.yml", 34),
     (".github/workflows/mutation.yml", 79),
     (".github/workflows/postmerge-catchup.yml", 75),
-    // 2026-10-21 (plan item 66), DRAFT, PENDING OWNER APPROVAL under rust-only
+    // 2026-10-21 (plan item 66), APPROVED by the owner 2026-10-22 under rust-only
     // lock §0.13 (Quotes 32/33): the one-off rebuild only builds and runs its
     // Rust tool. Removed with the workflow after the run.
     (".github/workflows/rebuild-2026-10-22.yml", 2),

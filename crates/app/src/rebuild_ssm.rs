@@ -8,9 +8,9 @@
 //! workflow input carries can reach the shell.
 //!
 //! Budgeted by `crates/common/tests/shell_budget_guard.rs`
-//! (`REBUILD_SSM_SHELL_SOURCES`, measured exactly) under the DRAFT dated
+//! (`REBUILD_SSM_SHELL_SOURCES`, measured exactly) under the dated (approved 2026-10-22)
 //! section §0.13 of `docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md`,
-//! which the owner must approve before this ships. This file holds no other
+//! which the owner approved on 2026-10-22. This file holds no other
 //! string literal in its production half, so the budget measures the shell
 //! and nothing else.
 

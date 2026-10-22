@@ -52,7 +52,7 @@ const NET_TUNING_TAG: &str = "tickvault-net-tuning";
 /// `deploy/aws/sysctl/99-tickvault-net.conf` for the arithmetic behind each.
 /// Kept in lockstep with that file by `crates/app/tests/kernel_tuning_16ws_guard.rs`.
 const SCALAR_MINIMUMS: [(&str, u64); 8] = [
-    ("net.core.rmem_max", 134_217_728),
+    ("net.core.rmem_max", 67_108_864),
     ("net.core.rmem_default", 16_777_216),
     ("net.core.wmem_max", 16_777_216),
     ("net.core.netdev_max_backlog", 65_536),
@@ -62,7 +62,7 @@ const SCALAR_MINIMUMS: [(&str, u64); 8] = [
     ("vm.min_free_kbytes", 262_144),
 ];
 /// `net.ipv4.tcp_rmem` is "min default max"; this is the floor for its MAX.
-const TCP_RMEM_MAX_MINIMUM: u64 = 134_217_728;
+const TCP_RMEM_MAX_MINIMUM: u64 = 67_108_864;
 /// Keepalive must fire within this many seconds of idleness …
 const KEEPALIVE_TIME_MAX_SECS: u64 = 60;
 /// … but the whole ladder must outlast Dhan's 40 s ping deadline.
