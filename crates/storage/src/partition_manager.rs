@@ -363,8 +363,11 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
 /// - `contract_name_repair_map` (2026-10-10, plan item 56): the one-day name
 ///   list the after-close contract name repair joins against
 ///   (`contract_name_repair`), created fresh for each day and dropped after it.
+/// - `rebuild_probe_` (2026-10-22, plan item 66): the prefix of the restore
+///   rehearsal's scratch table (`rebuild_copy::REBUILD_PROBE_TABLE_PREFIX`),
+///   created and dropped by one `rebuild-box copy apply` run on the old box.
 #[cfg(test)]
-const SCRATCH_TABLES: &[&str] = &["contract_name_repair_map"];
+const SCRATCH_TABLES: &[&str] = &["contract_name_repair_map", "rebuild_probe_"];
 
 /// Every table the retention system knows about, de-duplicated and sorted —
 /// the measurement set for `table_storage_probe`.

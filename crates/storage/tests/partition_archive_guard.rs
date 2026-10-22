@@ -256,12 +256,21 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
     }
     // Round 2: the reuse decision must compare the STORED checksum against
     // the freshly exported digest (content identity, not just length).
+    // 2026-10-22 (plan item 66): the upload-or-reuse step moved out of
+    // `process_one` into `place_archive`, which the rebuild copy shares, so
+    // the reuse arm is checked there and `process_one` must still reach it.
     assert!(
-        process_one.contains("checksum_sha256_b64"),
+        process_one.contains("self\n            .place_archive(")
+            || process_one.contains("self.place_archive("),
+        "process_one must place the archive through place_archive"
+    );
+    let place_archive = extract_fn_body(&archive_src, "async fn place_archive");
+    assert!(
+        place_archive.contains("checksum_sha256_b64"),
         "the reuse arm must consult the stored sha256 checksum"
     );
     assert!(
-        process_one.contains("gzip_sha256_b64"),
+        place_archive.contains("gzip_sha256_b64"),
         "the reuse arm must compare against the freshly exported gzip sha256"
     );
     // Vacuous-pass tripwires: verify inputs must never be self-satisfied.
