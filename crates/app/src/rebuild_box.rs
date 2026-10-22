@@ -58,6 +58,12 @@ const QUESTDB_READY_WAIT_SECS: u64 = 600;
 const RESTORE_VISIBLE_WAIT_SECS: u64 = 600;
 /// How long the postcheck waits for the app to become active.
 const APP_ACTIVE_WAIT_SECS: u64 = 600;
+/// How long `prepare-new` waits for first-boot provisioning to finish.
+const CLOUD_INIT_WAIT_SECS: u64 = 1800;
+/// Written by cloud-init when its last stage ends. Read as files, never by
+/// spawning `cloud-init` (a Python program; the spawn allowlist refuses it).
+const CLOUD_INIT_DONE: &str = "/var/lib/cloud/instance/boot-finished";
+const CLOUD_INIT_RESULT: &str = "/run/cloud-init/result.json";
 /// Poll interval for every wait above.
 const POLL_SECS: u64 = 5;
 /// Raw-frame upload passes before giving up on a backlog.
@@ -262,6 +268,23 @@ pub fn unapplied_wal_tables(json: &serde_json::Value) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+/// One line from cloud-init's `result.json` (`{"v1":{"errors":[..]}}`):
+/// `done` or `done with N error(s): first`. Reported, never trusted.
+fn cloud_init_summary(body: &[u8]) -> String {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return "done, result.json did not parse".to_string();
+    };
+    match v.pointer("/v1/errors").and_then(|e| e.as_array()) {
+        Some(errs) if errs.is_empty() => "done".to_string(),
+        Some(errs) => format!(
+            "done with {} error(s): {}",
+            errs.len(),
+            errs[0].as_str().unwrap_or("(not text)")
+        ),
+        None => "done, result.json has no v1.errors".to_string(),
+    }
 }
 
 /// `(name, partitionBy, designatedTimestamp)` rows of `tables()`, by column
@@ -896,15 +919,17 @@ async fn prepare_new(manifest_key: &str) -> BoxReport {
     // exit status is reported, not trusted: on a 2-vCPU host its own
     // `docker compose up` can fail on the compose cpuset default, which this
     // phase fixes below.
-    let (_, cloud) = match Command::new("cloud-init")
-        .args(["status", "--wait"])
-        .output()
-    {
-        Ok(o) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        ),
-        Err(e) => (false, format!("cloud-init could not start: {e}")),
+    let deadline = Instant::now() + Duration::from_secs(CLOUD_INIT_WAIT_SECS);
+    while !Path::new(CLOUD_INIT_DONE).exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+    }
+    let cloud = if Path::new(CLOUD_INIT_DONE).exists() {
+        match std::fs::read(CLOUD_INIT_RESULT) {
+            Ok(body) => cloud_init_summary(&body),
+            Err(e) => format!("done, {CLOUD_INIT_RESULT} unreadable: {e}"),
+        }
+    } else {
+        format!("not finished after {CLOUD_INIT_WAIT_SECS} s")
     };
     r.line(format!("first-boot provisioning: {cloud}"));
     if !Path::new("/opt/tickvault/repo/deploy/docker/docker-compose.yml").exists() {
@@ -1271,6 +1296,26 @@ mod tests {
         assert!(!is_wal_segment_name("ws-frames-.wal"));
         assert!(!is_wal_segment_name("ws-frames-12.wal.tmp"));
         assert!(!is_wal_segment_name("applied.tvaw"));
+    }
+
+    #[test]
+    fn test_cloud_init_summary_reads_the_errors_list() {
+        assert_eq!(
+            cloud_init_summary(br#"{"v1":{"datasource":"Ec2","errors":[]}}"#),
+            "done"
+        );
+        assert_eq!(
+            cloud_init_summary(br#"{"v1":{"errors":["a failed","b failed"]}}"#),
+            "done with 2 error(s): a failed"
+        );
+        assert_eq!(
+            cloud_init_summary(br#"{"v2":{}}"#),
+            "done, result.json has no v1.errors"
+        );
+        assert_eq!(
+            cloud_init_summary(b"not json"),
+            "done, result.json did not parse"
+        );
     }
 
     #[test]
