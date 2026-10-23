@@ -3078,3 +3078,18 @@ After "Continue dude", the owner answered three decision cards. Two are recorded
 - Raising `rmem_max` above 64 MiB, or the app+OS worst case below 6 GiB, without a fresh dated quote.
 - Running any other `cargo update`, or this one for another package or version.
 - Switching the depth account on under this quote.
+
+#### Quote 39 (2026-10-23, ~15:18 IST) — ONE MORE SECURITY UPDATE: ctutils 0.4.2 → 0.4.4 (decision card, preserve EXACTLY)
+
+After the Quote 38 update (rustls-webpki 0.103.15 → 0.103.16) cleared RUSTSEC-2026-0382, the Security & Audit check on PR #2120 (head `ca569a5`) failed on a NEW advisory published that day, RUSTSEC-2026-0385 ("Non-constant-time mask generation and `u128` comparisons") in `ctutils` 0.4.2, reached through `digest` 0.11 by the AWS SDK and `totp-rs`. `main` carries the same 0.4.2.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "Today's new security advisory (RUSTSEC-2026-0385) is in 'ctutils' 0.4.2, a cryptography helper used by the AWS libraries. It also affects main. The fix is one more update: cargo update -p ctutils --precise 0.4.4. Your earlier OK covered only rustls-webpki, so this needs a new OK. If you approve, I record it in the rules, remove the deny rule, run only this command on #2119, restore the rule, check and push, then merge both PRs and deploy." | **"Approve, same way (Recommended)"** | "One command only: cargo update -p ctutils --precise 0.4.4, deny rule removed and restored the same way as before." |
+
+**What this changes, and nothing else:** `cargo update -p ctutils --precise 0.4.4` is allowed ONCE, on PR #2119's branch (`claude/nice-bell-yjfwiv`), `Cargo.lock` only. The `.claude/settings.json` deny rule for `cargo update` is lifted only for that one command and restored straight after, never committed lifted.
+
+##### What violates Quote 39 (REJECT)
+- Running any other `cargo update`, or this one for another package or version, or a second time.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Any `Cargo.toml` change, a new dependency, or a version move other than `ctutils` (if the update moves another package, it is reverted and the owner asked again).
