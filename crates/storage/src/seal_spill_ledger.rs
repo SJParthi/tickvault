@@ -463,7 +463,10 @@ struct WrittenBar {
 }
 
 /// Magic + layout version of the boot summary file (S1).
-const BOOT_SUMMARY_MAGIC: [u8; 8] = *b"TVBWSUM1";
+/// `TVBWSUM2` since 2026-10-22 (plan item 62): the timeframe byte is a `TfIndex`
+/// ordinal and `S3`/`S5` were removed, so a `TVBWSUM1` file names frames by
+/// the old ordinals and is refused whole rather than read into the wrong frame.
+const BOOT_SUMMARY_MAGIC: [u8; 8] = *b"TVBWSUM2";
 /// Bytes of one bar in the summary file: security id 8, bucket 4, segment 1,
 /// feed 1, timeframe 1, ticks 4, volume 8.
 const BOOT_SUMMARY_RECORD_SIZE: usize = 27;
@@ -1042,7 +1045,7 @@ mod tests {
 
         let (bytes, dropped) = written.encode_committed(16);
         assert_eq!(dropped, 0);
-        assert_eq!(&bytes[..8], b"TVBWSUM1");
+        assert_eq!(&bytes[..8], b"TVBWSUM2");
         assert_eq!(
             bytes.len(),
             16 + bars.len() * 27 + 4,
@@ -1125,10 +1128,12 @@ mod tests {
         );
         assert_eq!(probe.committed_len(), 0);
         // A wrong layout version is refused on magic, even with a valid CRC
-        // over an otherwise empty summary.
-        let (mut v2, _) = BootWritten::new(16).encode_committed(16);
-        v2[7] = b'2';
-        assert_eq!(probe.seed_from_bytes(&v2), Err(BootSummaryRefused::Magic));
+        // over an otherwise empty summary. Since 2026-10-22 (plan item 62) the
+        // live magic is `TVBWSUM2`, so the previous build's `TVBWSUM1` is
+        // the wrong version: its timeframe bytes are the old ordinals.
+        let (mut v1, _) = BootWritten::new(16).encode_committed(16);
+        v1[7] = b'1';
+        assert_eq!(probe.seed_from_bytes(&v1), Err(BootSummaryRefused::Magic));
     }
 
     #[test]

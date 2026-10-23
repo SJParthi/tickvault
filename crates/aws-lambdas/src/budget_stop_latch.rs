@@ -25,8 +25,10 @@
 //!
 //! **Readers fail OPEN** (an unreadable latch = not latched): a real trading
 //! day must never lose its start to an SSM outage. The hourly guard still
-//! reads Cost Explorer directly and stops a breached box within the hour, so
-//! a failed read costs at most one hour of box time, never the budget.
+//! reads the month-to-date spend directly (AWS Budgets since 2026-10-22, plan
+//! item 63; Cost Explorer before) and stops a breached box within the hour of
+//! that figure reaching the line, so a failed read costs at most one hour of
+//! box time, never the budget.
 
 use chrono::{DateTime, Utc};
 

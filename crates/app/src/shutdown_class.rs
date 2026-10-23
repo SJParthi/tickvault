@@ -2,7 +2,7 @@
 //! coordinator-relayed directive 2026-07-15).
 //!
 //! Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
-//! initiated` page — even the daily EventBridge 17:30 IST auto-stop. This
+//! initiated` page — even the daily EventBridge 16:30 IST auto-stop. This
 //! classifier turns the already-known signal kind + runtime source + IST
 //! clock + trading calendar into a [`ShutdownClass`], so the routine stops
 //! render one quiet Low line while anything unexpected STAYS Medium and
@@ -20,8 +20,8 @@
 //! weekend/holiday runs (§7 Quote 5) killed mid-session by a budget
 //! killswitch or console stop. Now only the holiday-gate self-stop window
 //! (08:25–09:00 IST, non-trading days — the box auto-starts 08:30 and the
-//! gate stops it minutes later) and the weekday 17:25–17:45 stop-cron
-//! window are quiet; everything else stays Medium.
+//! gate stops it minutes later) and the weekday 16:25–16:45 stop-cron
+//! window (17:25–17:45 until 2026-10-22, plan item 64) are quiet; everything else stays Medium.
 //!
 //! Documented residual (plan Edge Cases): a genuine manual/budget stop
 //! DURING one of the two quiet windows renders quiet — bounded (the
@@ -48,10 +48,32 @@ use std::path::Path;
 use tickvault_core::notification::events::ShutdownClass;
 use tracing::warn;
 
-/// Start of the scheduled-stop IST window: 17:25:00 (the EventBridge stop
-/// cron fires 17:30 IST — `cron(0 12 ? * MON-FRI *)`, weekday-only and
-/// deliberately NOT holiday-aware; the wide window absorbs the documented
-/// EventBridge scheduler jitter).
+/// The scheduled daily stop: 16:30:00 IST (59,400 s). The EventBridge
+/// `daily_stop` rule fires `cron(0 11 ? * MON-FRI *)` (11:00 UTC), weekday-only
+/// and deliberately NOT holiday-aware. Pinned to that cron in `main.tf` by
+/// `test_scheduled_daily_stop_matches_the_main_tf_daily_stop_cron`.
+///
+/// **⚠ CHANGED 2026-10-22 (plan item 64, operator Quote 37: "startign 8.30 am
+/// till 4 pm or 4.30 pm woudl be fine"):** 17:30 → 16:30. This is now the ONE
+/// stop constant every app-side evening bound is derived from: the quiet
+/// window below, the cross-verification deadline and end bound, the
+/// start-watchdog `stop_check` instant and the evening attempt
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.15.12), the drain hold's
+/// earliest held stop and the evening-drain cross-verification clear time.
+/// The Quote 31 drain hold still keeps the box up past it while the day's
+/// data is not saved.
+pub const SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST: u32 = 16 * 3_600 + 30 * 60;
+
+/// How long before the stop the quiet window opens (EventBridge jitter).
+pub const SCHEDULED_STOP_WINDOW_LEAD_SECS: u32 = 300;
+
+/// How long after the stop the quiet window stays open: up to the
+/// start-watchdog `stop_check`, which fires `cron(15 11 ? * MON-FRI *)`.
+pub const SCHEDULED_STOP_WINDOW_TRAIL_SECS: u32 = 900;
+
+/// Start of the scheduled-stop IST window: 16:25:00, the stop less
+/// [`SCHEDULED_STOP_WINDOW_LEAD_SECS`] (the wide window absorbs the documented
+/// EventBridge scheduler jitter). Was 17:25:00 (`62_700`) until 2026-10-22.
 ///
 /// MOVED 2026-08-08 with operator Quote 14 ("make it as 8.30 till 5.30 pm").
 /// This window is COUPLED to the stop cron and moving one without the other is
@@ -61,10 +83,14 @@ use tracing::warn;
 /// single trading evening for a completely normal scheduled stop. Same failure
 /// class as the boot-heartbeat/stop-verify coupling recorded in
 /// daily-universe-scope-expansion-2026-05-27.md §7.
-pub const SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 62_700;
+pub const SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 =
+    SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST - SCHEDULED_STOP_WINDOW_LEAD_SECS;
 
-/// End (exclusive) of the scheduled-stop IST window: 17:45:00.
-pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 63_900;
+/// End (exclusive) of the scheduled-stop IST window: 16:45:00, the stop plus
+/// [`SCHEDULED_STOP_WINDOW_TRAIL_SECS`]. Was 17:45:00 (`63_900`) until
+/// 2026-10-22.
+pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
+    SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST + SCHEDULED_STOP_WINDOW_TRAIL_SECS;
 
 /// Start of the holiday-gate self-stop IST window: 08:25:00 (G5, fix
 /// round 2). The box auto-starts 08:30 IST on weekdays; on a non-trading
@@ -110,7 +136,7 @@ pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
 /// |----------|--------|--------------------------------------------|---------------|
 /// | ctrl_c   | any    | any                                        | OperatorStop  |
 /// | sigterm  | false  | any                                        | OperatorStop  |
-/// | sigterm  | true   | weekday ∧ 17:25–17:45 IST (any day)        | ScheduledStop |
+/// | sigterm  | true   | weekday ∧ 16:25–16:45 IST (any day)        | ScheduledStop |
 /// | sigterm  | true   | !is_trading_day ∧ 08:25–09:25 IST          | ScheduledStop |
 /// | sigterm  | true   | otherwise (incl. Muhurat / manual weekend) | ExternalStop  |
 /// | anything else     | —                                          | ExternalStop  |
@@ -130,9 +156,9 @@ pub fn classify_shutdown(
                 // Local `make stop` / container stop.
                 return ShutdownClass::OperatorStop;
             }
-            // The daily EventBridge 17:30 IST stop (weekday-only cron,
+            // The daily EventBridge 16:30 IST stop (weekday-only cron,
             // NOT holiday-aware — it fires on weekday holidays too),
-            // inside the jitter-absorbing 17:25–17:45 window. Applies on
+            // inside the jitter-absorbing 16:25–16:45 window. Applies on
             // trading AND non-trading weekdays alike.
             if is_weekday
                 && (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
@@ -169,7 +195,7 @@ pub fn classify_shutdown(
 /// the app's working directory (`/opt/tickvault` under systemd), so the same
 /// path resolves under `data/` on the box and in a local run.
 ///
-/// Why it exists: every deploy restart sent SIGTERM outside the 17:25–17:45
+/// Why it exists: every deploy restart sent SIGTERM outside the scheduled-stop
 /// quiet window, so [`classify_shutdown`] — correctly, from what it could
 /// see — paged "Unexpected stop" for a change the operator merged himself.
 /// Nothing in-process can tell a deploy SIGTERM from a manual one; the deploy
@@ -257,6 +283,21 @@ pub fn classify_shutdown_with_deploy_marker(
     if planned_deploy_marker && is_aws && signal == "sigterm" {
         return ShutdownClass::PlannedDeployRestart;
     }
+    // Quote 31's evening drain: the app's own planned restart. Only the
+    // process itself produces this signal string.
+    if signal == "self_restart" {
+        return ShutdownClass::PlannedDeployRestart;
+    }
+    // Operator Quote 31 (2026-10-21): a box this process held after the
+    // close is stopped by a scheduled check once the hold ends, at any time
+    // up to 07:35 IST — not only in the 16:25–16:45 window. Without this
+    // every held evening would page "Unexpected stop".
+    if is_aws
+        && signal == "sigterm"
+        && crate::drain_hold::stop_follows_tonights_hold(ist_secs_of_day)
+    {
+        return ShutdownClass::ScheduledStop;
+    }
     classify_shutdown(signal, is_aws, ist_secs_of_day, is_weekday, is_trading_day)
 }
 
@@ -289,6 +330,15 @@ mod tests {
                 MID_SESSION,
                 false,
                 ShutdownClass::ExternalStop,
+            ),
+            // The evening drain's own restart is planned, with or without a
+            // marker.
+            (
+                "self_restart",
+                true,
+                20 * 3600,
+                false,
+                ShutdownClass::PlannedDeployRestart,
             ),
             // Out-of-hours stop of a box the deploy started.
             (
@@ -395,25 +445,55 @@ mod tests {
         assert_eq!(PLANNED_DEPLOY_MARKER_PATH, "data/planned-restart.marker");
     }
 
-    /// 17:30:00 IST — the EventBridge stop cron's nominal fire instant.
-    const STOP_CRON_SECS: u32 = 17 * 3600 + 30 * 60;
+    /// 16:30:00 IST — the EventBridge stop cron's nominal fire instant.
+    const STOP_CRON_SECS: u32 = 16 * 3600 + 30 * 60;
 
     #[test]
-    fn test_classify_shutdown_window_consts_are_1725_and_1745_ist() {
+    fn test_classify_shutdown_window_consts_are_1625_and_1645_ist() {
+        // 2026-10-22 (plan item 64, Quote 37): was 17:25 / 17:45.
+        assert_eq!(SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST, 59_400);
         assert_eq!(
             SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
-            17 * 3600 + 25 * 60
+            16 * 3600 + 25 * 60
         );
         assert_eq!(
             SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST,
-            17 * 3600 + 45 * 60
+            16 * 3600 + 45 * 60
         );
-        // The nominal 17:30 cron instant sits inside the window.
+        // The nominal 16:30 cron instant sits inside the window.
         assert!(
             (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
                 ..SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
                 .contains(&STOP_CRON_SECS)
         );
+    }
+
+    /// The one stop constant must match the `daily_stop` EventBridge cron in
+    /// `main.tf` (IST = UTC + 05:30), and the window's trailing edge must be
+    /// the start-watchdog `stop_check` cron (plan item 64, §12.15.12).
+    #[test]
+    fn test_scheduled_daily_stop_matches_the_main_tf_daily_stop_cron() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let utc = SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST - 19_800;
+        let cron = format!("cron({} {} ? * MON-FRI *)", (utc % 3600) / 60, utc / 3600);
+        let main_tf = std::fs::read_to_string(root.join("deploy/aws/terraform/main.tf"))
+            .expect("main.tf readable");
+        assert!(main_tf.contains(&cron), "main.tf daily_stop must be {cron}");
+        assert_eq!(cron, "cron(0 11 ? * MON-FRI *)");
+        let check_utc = SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST - 19_800;
+        let check_cron = format!(
+            "cron({} {} ? * MON-FRI *)",
+            (check_utc % 3600) / 60,
+            check_utc / 3600
+        );
+        let watchdog_tf =
+            std::fs::read_to_string(root.join("deploy/aws/terraform/start-watchdog-lambda.tf"))
+                .expect("start-watchdog-lambda.tf readable");
+        assert!(
+            watchdog_tf.contains(&check_cron),
+            "the stop_check must be {check_cron}"
+        );
+        assert_eq!(check_cron, "cron(15 11 ? * MON-FRI *)");
     }
 
     #[test]
@@ -451,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_classify_shutdown_window_boundaries() {
-        // Inclusive start: 17:25:00 exactly is scheduled.
+        // Inclusive start: 16:25:00 exactly is scheduled.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -473,7 +553,7 @@ mod tests {
             ),
             ShutdownClass::ExternalStop
         );
-        // Exclusive end: 17:45:00 exactly is already outside — loud.
+        // Exclusive end: 16:45:00 exactly is already outside — loud.
         assert_eq!(
             classify_shutdown(
                 "sigterm",

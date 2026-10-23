@@ -181,7 +181,9 @@ env:
   # NOT a free rider on an instance flip. Left at 1g so this workflow changes
   # exactly one thing.
   FROM_TYPE: t4g.medium
-  TO_TYPE: r8g.xlarge
+  # 2026-10-21 (Quotes 32/33): the lock is r8g.large; the 2026-10-22 rebuild
+  # (rebuild-2026-10-22.yml) is the tool that moves the box there.
+  TO_TYPE: r8g.large
   QDB_MEM: 1g
 
 jobs:

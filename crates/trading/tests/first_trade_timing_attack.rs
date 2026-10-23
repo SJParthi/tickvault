@@ -47,7 +47,7 @@ const PREV_LTT: u32 = DAY - 86_400 + 55_000;
 
 const TFS: [(TfIndex, u32); 4] = [
     (TfIndex::S1, 1),
-    (TfIndex::S5, 5),
+    (TfIndex::M3, 180),
     (TfIndex::M1, 60),
     (TfIndex::M5, 300),
 ];
@@ -142,7 +142,7 @@ fn diff(got: &BTreeMap<(usize, u32), u64>, want: &BTreeMap<(usize, u32), u64>) -
     let mut out = Vec::new();
     for (tf, name) in [
         (TfIndex::S1, "S1"),
-        (TfIndex::S5, "S5"),
+        (TfIndex::M3, "M3"),
         (TfIndex::M1, "M1"),
         (TfIndex::M5, "M5"),
     ] {
@@ -883,7 +883,7 @@ mod randomized {
                 let d = diff(&got, &bars_of(&truth));
                 let first = truth[0];
                 for (name, b, g, w) in &d {
-                    let n = match *name { "S1" => 1, "S5" => 5, "M1" => 60, _ => 300 };
+                    let n = match *name { "S1" => 1, "M3" => 180, "M1" => 60, _ => 300 };
                     let fb = (first.0 - first.0 % n) - DAY;
                     prop_assert!(*b == fb && *g + first.1 == *w,
                         "clean stream but {} {} got {} want {} (first {:?}) all={:?}",

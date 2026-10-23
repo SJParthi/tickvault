@@ -482,20 +482,10 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES above (it is authoritative).
         aws_cloudwatch_metric_alarm.tick_spill_replay_failing.alarm_name,
         aws_cloudwatch_metric_alarm.ticks_spilling.alarm_name,
-        # 2026-08-26: depth_steering_stalled JOINS the gate, for the same
-        # reason as dhan_live_lane_down and dhan_no_ticks_flowing above.
-        #
-        # Its signal is an AGE gauge and it treats missing data as breaching,
-        # because the two ways depth steering dies are a wedged loop (the age
-        # grows) and a dead task tree (the series stops entirely). Only
-        # `breaching` catches the second, and `breaching` is only safe while
-        # something disables the actions overnight — the box publishes nothing
-        # from 17:30 to 08:30 and all weekend, which without this list is a
-        # page every single evening.
-        #
-        # Count: read ALARM_NAMES above. This one and the deaf-socket
-        # sibling added the same day.
-        aws_cloudwatch_metric_alarm.depth_steering_stalled.alarm_name,
+        # 2026-10-22: depth_steering_stalled LEFT the gate with its alarm
+        # (deleted by the alarm review under operator Quote 37, noise-lock
+        # §2.14; depth is switched off). Restore both together if depth
+        # returns.
         # 2026-09-08: aggregator_refusal_rate_high JOINS the gate, because it
         # was firing on windows that lie ENTIRELY BEFORE THE MARKET OPENS.
         #

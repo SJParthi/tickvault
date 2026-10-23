@@ -402,8 +402,6 @@ mod tests {
             (TfIndex::M5, "candles_5m"),
             (TfIndex::M15, "candles_15m"),
             (TfIndex::S1, "candles_1s"),
-            (TfIndex::S3, "candles_3s"),
-            (TfIndex::S5, "candles_5s"),
             (TfIndex::M30, "candles_30m"),
             (TfIndex::M60, "candles_60m"),
             (TfIndex::M10, "candles_10m"),

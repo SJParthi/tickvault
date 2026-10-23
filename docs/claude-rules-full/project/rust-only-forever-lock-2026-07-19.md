@@ -1147,3 +1147,106 @@ pass at 16:14 IST, then the delete at 16:16 IST (GitHub runs 37919370600 and
 37919602693). The root volume went from 98% to 81% used. The workflow file and
 its budget row were deleted in the follow-up PR, so this exception authorizes
 nothing further; any new SSM shell needs its own dated section here.
+
+## §0.13. 2026-10-21 — ONE-OFF SSM shell for the 2026-10-22 rebuild (APPROVED 2026-10-22)
+
+> **Status: APPROVED 2026-10-22, about 08:05 IST.** The owner answered the
+> decision card "The rebuild workflow needs a few short server commands (6
+> lines, 280 bytes, plus 2 workflow lines). The Rust-only rule allows that
+> only with your dated OK. Approve this one-off exception for the 22–31 Oct
+> rebuild?" with **"Approve, one-off (Recommended)"** ("Allowed only for this
+> rebuild, removed by the next change, recorded in the Rust-only rule with
+> your words."), after "Continue dude". Everything below binds as written.
+>
+> *(Original draft status, kept:)* Written with the plan item 66 tooling. It authorizes
+> nothing until the owner approves it in a dated answer recorded here. Until
+> then the workflow must not be dispatched in `apply` mode.
+
+**Operator words it rests on:** Quote 32 (2026-10-21, steps 3 and 4: the
+150 GB root and r8g.large, "a reviewed rebuild plan and workflow") and
+Quote 33 (2026-10-21, 16:55 IST: "Thursday night (Recommended)"), both
+recorded verbatim in
+`docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`.
+Neither quote mentions shell; this section is the question to the owner.
+
+**What it would authorize:** the Rust tool `tv-rebuild-2026-10-22`
+(`crates/app/src/bin/rebuild_2026_10_22.rs`) sends, per box phase, ONE SSM
+`AWS-RunShellScript` element built from the single literal in
+`crates/app/src/rebuild_ssm.rs`: download the deployed `tickvault` binary of
+the commit the workflow runs on from `s3://tv-prod-cold/deploys/<sha>/`,
+mark it executable, and `exec` its Rust `rebuild-box` subcommand, which does
+all the work (inventory, copy without drop, restore, post-check). Every value
+spliced in is validated first (a 40-hex commit id, a fixed phase and mode
+word, a manifest key of one fixed shape). Budget rows in
+`crates/common/tests/shell_budget_guard.rs`: `REBUILD_SSM_SHELL_SOURCES`
+(6 literal lines / 280 bytes, measured exactly) and the workflow's
+`WORKFLOW_RUN_LINE_BUDGET` row (2 lines: build the tool, run it).
+
+**Why any shell at all:** SSM's only way to run a program on the box is a
+shell document; the payload is one line that hands over to Rust, the same
+shape as the console's `tickvault-host` calls.
+
+**Removal:** the workflow, the tool, `rebuild_box.rs`, `rebuild_ssm.rs` and
+both budget rows are deleted in the first PR after the run (or after
+2026-10-31 IST, whichever comes first). This exception then ends.
+
+**REJECT:** reusing this exception for another workflow or payload; adding a
+second SSM element or any shell line to `rebuild_ssm.rs`; raising either
+ceiling; splicing an unvalidated value into the command; adding a schedule
+or push trigger to the workflow; keeping any of it after 2026-10-31 IST.
+
+## §0.14. 2026-10-22 — ONE-OFF SSM shell for the 2026-10-31 wipe (APPROVED 2026-10-22)
+
+> **Status: APPROVED 2026-10-22, about 19:25 IST.** The owner answered the
+> decision card "The 31 Oct wipe tool is built and tested, but the project's
+> Rust-only rule needs your approval for one small piece of shell on the
+> server: 3 lines that download our own program and start its wipe step, plus
+> 4 lines in the workflow. It is the same kind of one-off approval you gave for
+> tonight's rebuild, and it is deleted after the run or on 1 Nov. Approve it?"
+> with **"Approve, one-off (Recommended)"** ("I record your approval in the
+> rule file. The wipe tool can then do its dry run, then the real delete, on
+> the night of Sat 31 Oct. It still refuses to run outside 31 Oct 18:00 to
+> 1 Nov 08:00 IST and keeps all SEBI/audit records."). Everything below binds
+> as written; the tool's own time window, keep-list and refusals are
+> unchanged by this approval.
+>
+> *(Original status, kept: DRAFT, awaiting owner approval. Written with the
+> plan item 67 tooling. It authorized nothing until the owner approved it in a
+> dated answer recorded here.)*
+
+**Operator words it rests on:** Quote 35 (2026-10-21: "see wipe off the
+entire data fully dude ...", the card "Sat 31 Oct (Recommended)" and "keep it
+as oct 31 night dude okay?"), recorded verbatim in
+`docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
+with its tool table ("The Quote 35 tool"). Quote 35 says the tool "needs its
+own dated row in `rust-only-forever-lock-2026-07-19.md` if it carries any
+shell". This section is that row, and the question to the owner.
+
+**What it would authorize:** the Rust tool `tv-wipe-2026-10-31`
+(`crates/app/src/bin/wipe_2026_10_31.rs`) sends, for the box phase only, ONE
+SSM `AWS-RunShellScript` element built from the single literal in
+`crates/app/src/wipe_ssm.rs`: download the deployed `tickvault` binary of the
+commit the workflow runs on from `s3://tv-prod-cold/deploys/<sha>/`, mark it
+executable, and `exec` its Rust `wipe-box` subcommand, which does all the
+work (stop the app, delete the old files, drop the old partitions, list
+again). The two values spliced in are validated first (a 40-hex commit id and
+a fixed mode word). Budget rows in `crates/common/tests/shell_budget_guard.rs`:
+`WIPE_SSM_SHELL_SOURCES` (3 literal lines / 231 bytes, measured exactly) and
+the workflow's `WORKFLOW_RUN_LINE_BUDGET` row (4 lines: build the tool and
+run it, in each of its two jobs). §0.13's element is NOT reused.
+
+**Why any shell at all:** SSM's only way to run a program on the box is a
+shell document; the payload is one line that hands over to Rust, the same
+shape as §0.13 and the console's `tickvault-host` calls.
+
+**Removal:** the workflow, the tool, `wipe_box.rs`, `wipe_ssm.rs`,
+`wipe_2026_10_31.rs`, the role and both budget rows are deleted in the first
+PR after the run, or after 2026-11-01 IST, whichever comes first. This
+exception then ends.
+
+**REJECT:** dispatching the workflow before the owner's dated approval is
+recorded here; reusing this exception (or §0.13's element) for another
+workflow or payload; adding a second SSM element or any shell line to
+`wipe_ssm.rs`; raising either ceiling; splicing an unvalidated value into the
+command; adding a schedule or push trigger to the workflow; keeping any of it
+after 2026-11-01 IST.

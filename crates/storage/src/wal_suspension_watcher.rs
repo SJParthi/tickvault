@@ -1213,6 +1213,9 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // PR W review round 7: the marks a clean reply vouches for are
+            // the ones before the query left, not after it came back.
+            let probe_basis = crate::wal_applied_watermark::applied_watermark().probe_basis();
             match probe_wal_tables(&base_url).await {
                 Ok((rows, skipped)) => {
                     schema_warned = false;
@@ -1263,6 +1266,19 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // mid-incident); the latch below fires only after a sustained
                     // non-falling window and so cannot answer "how far behind now".
                     emit_wal_apply_lag_gauge(&rows);
+                    // Quote 31: the after-close work reads the backlog SIZE.
+                    // Only a complete view is a measurement; a partial poll
+                    // could hide the worst table, so it reads as unknown.
+                    // An empty reply (QuestDB mid-restart) names no table, so it
+                    // is not a reading of zero either.
+                    if skipped == 0 && !rows.is_empty() {
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_max(
+                            max_apply_lag(&rows),
+                            delta.currently_suspended,
+                        );
+                    } else {
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_unknown();
+                    }
                     if lag_tracker.is_suspicious_empty(&rows) {
                         // The lag twin of the suspension check above: an
                         // empty 2xx while tables are latched stuck is a
@@ -1313,11 +1329,13 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // watermark was told the database was clean while the
                     // backlog stood exactly where it was. An ack trusted on
                     // such a poll archives frames that were never applied.
-                    crate::wal_applied_watermark::applied_watermark().note_questdb_probe(
-                        skipped == 0
-                            && delta.currently_suspended == 0
-                            && lag_tracker.untrusted_count() == 0,
-                    );
+                    crate::wal_applied_watermark::applied_watermark()
+                        .note_questdb_probe_with_basis(
+                            skipped == 0
+                                && delta.currently_suspended == 0
+                                && lag_tracker.untrusted_count() == 0,
+                            probe_basis,
+                        );
                     // DA-13c: archive acked replay segments once they are past
                     // the durability lag and two clean probes. A few renames at
                     // most, off the runtime worker; a join error only defers.
@@ -1377,6 +1395,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                         // `ingest_shed` documents zero as "not measured", and
                         // that is exactly what this is.
                         tickvault_common::ingest_shed::publish_wal_apply_lag_growing(0);
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_unknown();
                         error!(
                             code = ErrorCode::WalSuspend01TableSuspended.code_str(),
                             source = "probe_blind",

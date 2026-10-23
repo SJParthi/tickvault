@@ -471,7 +471,8 @@ fn first_trade_at_1529_and_day_close_seal() {
     b.push(&mut a, &trade(40, FNO, at(1, 15, 29, 30), 40, 40));
     let n = b.close(&mut a);
     assert_eq!(b.vol(40, FNO, TfIndex::M1, at(1, 15, 29, 30)), Some(40));
-    assert_eq!(n, 10, "one bar per timeframe, no extra");
+    // 8 timeframes since 2026-10-22 (plan item 62: 3s and 5s removed).
+    assert_eq!(n, 8, "one bar per timeframe, no extra");
 }
 
 #[test]

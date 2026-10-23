@@ -17,8 +17,8 @@
 //! 3. The daily-loss alarm ships ARMED (arm-on-arrival — tv_daily_pnl is
 //!    cluster A's emit) with `ok_actions = []` + `notBreaching` and
 //!    WITHOUT `actions_enabled = false`.
-//! 4. The fill-lag alarm ships DISARMED (`actions_enabled = false`) with
-//!    the verbatim Phase-1 arming contract in its description.
+//! 4. The fill-lag alarm is DELETED (2026-10-22, Quote 37 alarm review) until
+//!    its metric gains an emitter (`tv_order_fill_lag_seconds` has none).
 //!
 //! House precedents: `seal_drop_paging_wiring_guard.rs` (this file's
 //! template — post-install registration ordering, string-aware HCL
@@ -236,33 +236,23 @@ fn test_daily_loss_alarm_is_armed_with_no_ok_actions_and_not_breaching() {
 }
 
 #[test]
-fn test_fill_lag_alarm_ships_disarmed_with_arming_description() {
+fn test_fill_lag_alarm_is_deleted_while_its_metric_has_no_emitter() {
+    // 2026-10-22 (plan item 65, the alarm review under operator Quote 37,
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.14): the disarmed fill-lag
+    // alarm was DELETED. tv_order_fill_lag_seconds has no emit site and the
+    // alarm shipped with actions_enabled = false, so it paged nobody and read
+    // green over nothing. It may return only with its Phase-1 emitter, which
+    // storage's cloudwatch_dormant_alarms_guard checks against crates/*/src.
     let raw = read_repo_file(ORDER_SIDE_TF);
     let stripped = strip_hcl_comments(&raw);
-    let start = stripped
-        .find("resource \"aws_cloudwatch_metric_alarm\" \"order_fill_lag_high\"")
-        .expect("order-side-alarms.tf must define the order_fill_lag_high alarm"); // APPROVED: test
-    let rest = &stripped[start..];
-    let end = rest[1..].find("\nresource ").map_or(rest.len(), |i| i + 1);
-    let block = &rest[..end];
-    let block_compact = compact(block);
     assert!(
-        block_compact.contains("actions_enabled=false"),
-        "order-fill-lag-high must SHIP DISARMED — in dry-run the metric \
-         never publishes and an armed alarm is a permanently-\
-         INSUFFICIENT_DATA dead pager"
+        !stripped.contains("resource \"aws_cloudwatch_metric_alarm\" \"order_fill_lag_high\""),
+        "order-side-alarms.tf defines order_fill_lag_high again; ship its \
+         emitter in the same change (noise-lock §2.14)"
     );
     assert!(
-        block.contains("ARMED at Phase-1 live promotion"),
-        "the fill-lag alarm description must carry the verbatim Phase-1 \
-         arming contract (the arming PR's checklist lives in the \
-         description so it cannot be lost)"
-    );
-    assert!(
-        block_compact.contains("metric_name=\"tv_order_fill_lag_seconds\"")
-            && block_compact.contains("statistic=\"Maximum\"")
-            && block_compact.contains("threshold=10"),
-        "fill-lag alarm shape drifted (tv_order_fill_lag_seconds Maximum > 10s)"
+        stripped.contains("resource \"aws_cloudwatch_metric_alarm\" \"daily_loss_breach\""),
+        "non-vacuity: the stripped file must still carry the daily-loss alarm"
     );
 }
 

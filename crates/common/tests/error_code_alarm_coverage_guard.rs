@@ -340,7 +340,8 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",
-    "VOLUME-MONO-01",
+    // VOLUME-MONO-01 left this list on 2026-10-22: its variant is retired
+    // with the volume leaderboard (plan item 62).
     "WS-GAP-10",
     // WS-SPILL-01 left this list on 2026-08-12 — it is now ALARMED
     // (`deploy/aws/terraform/error-code-alarms.tf`, entry "ws-spill-01").

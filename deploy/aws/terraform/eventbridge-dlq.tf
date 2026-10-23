@@ -2,7 +2,10 @@
 # EventBridge → SSM start/stop dead-letter queue + retry observability
 # =============================================================================
 # The daily_start (08:30 IST) / daily_stop (16:30 IST) EventBridge targets in
-# main.tf fire SSM AWS-StartEC2Instance / AWS-StopEC2Instance. Before this file
+# main.tf fire SSM AWS-StartEC2Instance / AWS-StopEC2Instance. (Since operator
+# Quote 31, 2026-10-21, the daily_stop target is the start-watchdog Lambda in
+# start-watchdog-lambda.tf, at 17:30 IST; it keeps this retry policy and DLQ.)
+# Before this file
 # those targets had NO retry policy and NO dead-letter queue, so a single
 # transient SSM/EC2 throttle silently dropped the invocation with zero retries
 # and nothing to inspect — the recurring "08:30 auto-start FAILED" incidents

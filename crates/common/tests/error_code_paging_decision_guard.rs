@@ -62,6 +62,7 @@ const LOG_ONLY_CODES: &[&str] = &[
     "DH-909",
     "DH-910",
     "DHAN-LIVE-XVERIFY-01",
+    "DRAIN-HOLD-01",
     "EXIT-ORDER-01",
     "EXIT-VERIFY-01",
     "FEED-GAP-01",

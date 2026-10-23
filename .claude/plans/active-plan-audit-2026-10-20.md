@@ -92,6 +92,393 @@ fall count on every flat poll, so it never released from late morning to
     watermark trusting a staircase release: pages now wait an hour inside one
     episode, and the watermark keeps the old two-falls-in-a-row rule.
 
+### PR W — bounded WAL unapplied ranges (stops the shed-overflow WAL growth on sessions that end with clean probes) (storage, app)
+
+Found by the 2026-10-20 live check: the catch-up backlog guard marked a
+3,176-bucket span into the 128-slot unapplied table, which overflowed; the
+overflow was persisted as one bit with no height and reloaded at `u64::MAX`,
+so every later segment read as unapplied and the prune could delete nothing.
+Converged design (three judges).
+
+- [ ] W1. Bounded unapplied ranges: at most 32 disjoint ranges (merge the two
+  closest when full, coverage only grows) in a CRC-checked sidecar beside
+  `applied.tvaw`; `applied.tvaw` stays version 1, keeps its overflow bit set
+  while any range exists and names the sidecar generation in its pad bytes; an
+  overflow carries a height in RAM. Boot fold once per process before the WAL
+  threads spawn: inherited overflow to `[oldest waiting, own_floor]`, earlier
+  buckets to exact ranges, boot tail `[boot_applied_floor + 1, own_floor]`.
+  The backlog guard writes one range; ranges trim below the oldest waiting
+  segment after the boot refold and each catch-up round; the drained reset
+  clears them. The catch-up summary names an early stop (`frame_cap`,
+  `memory`, `disk`, `deferred`, `ack_timeout`, `replay_failed`), never
+  `drained`. NOT changed: the prune gate, deferred-depth pins, the per-frame
+  shed and drain paths, catch-up caps and pacing, alarms, EMF names and
+  filters. **This stops new growth; it does not shrink the backlog already on
+  disk**, which stays protected until a catch-up drain reads it.
+  **⚠ CHANGED 2026-10-20 (review):** the overflow bit is no longer kept set
+  while any range exists (an older binary seeds it at `u64::MAX` for ever, so
+  a rollback would have stopped every prune on a clean box): each range is
+  also written into the version-1 bucket table (less the boot's frameless
+  gap) when it fits, and the bit is set only for an in-RAM overflow, a
+  migrated overflow, or a range that does not fit. The migrated range and the
+  guard start a reorder slack below the oldest waiting segment; a folder that
+  cannot be listed fails closed (fold from 1, guard from the boot floor, trim
+  refuses); the trim clips ranges to the waiting segments' spans instead of
+  only cutting below the oldest; the suspension probe and the settle recovery
+  write ranges, not buckets, and the fold uses the overflow's low end when
+  known.
+  **⚠ CHANGED 2026-10-20 (review round 3):** the fold wrapper rounds
+  `own_floor` up to a frame base and ratchets the frame counter to it, so
+  no frame of this process lands in the span treated as frameless, and the
+  drained reset uses the safer boundary below `own_floor`; the boot floor
+  is `min(hwm_ticks, hwm_depth)` less the slack whatever the depth flag
+  says; a full range set merges across the lowest gap with nothing waiting
+  (else the lowest pair), the fold gets the waiting spans, and the guard
+  is clamped to the boot frame high; the migrated overflow carries its span
+  (sidecar version 2, version 1 still read) and clears once no range
+  meets it; the trim cuts below the lowest readable span when the only
+  unreadable segments sit in `settling/unreadable/`, and counts every
+  refusal (local metric only); the boot tail starts no lower than the
+  oldest waiting segment; the overflow low end is removed; the probe's
+  range writes and an immediate persist run off the runtime worker; the
+  tail probe caps a record read at 4 MiB. A backlog that never drains still
+  keeps one segment per boot until it drains (stated, pinned by a
+  property test over 40 to 55 boots); a full disk and a crash between the
+  two file writes still fail toward replaying more (stated, not fixed).
+  **⚠ CHANGED 2026-10-20 (review round 3, second pass):** the range written
+  when a suspension episode ends, and the in-session overflow bound, carry
+  one reorder slack on their tops, so they reach the first record of any
+  segment a reordered frame of theirs can sit in (a lower margin in the
+  segment check was tried and rejected: the lifetime property tests showed
+  it pins the segment above every range end); the replay skip and the prune
+  share one rule, `AppliedSnapshot::segment_is_applied`; the in-session
+  overflow bound resets the overflow bounds after each bound (compare-and-
+  swap, flag cleared first, at most four passes), so a later overflow of the
+  session is bounded on its own instead of from the first one's low end; the
+  overflow arms lower the low end before raising the height; the tail probe
+  returns an I/O error as an error, so a segment it cannot read is never
+  taken for empty. **Scope of the growth claim:** the WAL stops growing only
+  on sessions that end with clean QuestDB probes. While apply lag keeps a
+  table latched as untrusted, every ack parks, the episode ranges and the
+  next boot's tail cover the whole unconfirmed stretch, the catch-up drain
+  stops on growing lag and the settle step cannot archive, so such a
+  session still adds its WAL to the pinned set (Assumed common on the live
+  box: apply lag measured 11,503 to 27,089 on 2026-09-08). **⚠ CORRECTED
+  2026-10-21 (round 6):** "adds its WAL to the pinned set" understates it.
+  ONE suspicion episode between the catch-up drain's first acked batch and
+  its promotion to `archive/` (the drain's own apply-lag pause starts one:
+  reported tables are a subset of untrusted ones; a failed probe does too)
+  holds the whole process's settled output for the next boot to read again,
+  so that boot's drain progress is undone and the migrated backlog does not
+  shrink at all; pinned bytes stay flat. See (E) in the round-6 section and
+  plan item W3. Verify after
+  deploy over several sessions: the suspicion episodes per session
+  (`AppliedWatermark::suspect_episode_count`, not published as a metric;
+  `tv_questdb_wal_apply_lag_max` is the published proxy; **⚠ CORRECTED
+  2026-10-20 (round 5): superseded by round 4 (C) below, which publishes
+  `tv_wal_suspect_episodes_total` and `tv_wal_suspect_seconds_total`**) and
+  `tv_wal_unapplied_pinned_bytes` / `tv_wal_unapplied_pinned_segments`;
+  pinned bytes rising every day means the live box still grows. The
+  structural fix (confirm parked live acks once a full durability lag and
+  two clean probes follow them, as `settling/` already does for replays) is
+  NOT in this PR and needs its own plan item (see "Follow-up" below).
+  **⚠ CHANGED 2026-10-20 (PR W review round 4).** (A) Per-frame shed
+  BUCKET marks (`note_unapplied`, bucket = `seq >> 38`) carry no reorder
+  slack, so a frame shed just below a `2^38` boundary inside a segment whose
+  first record is just above it made that segment read applied (skipped by
+  replay, prunable). `segment_is_applied` now reads the bucket table and the
+  in-RAM overflow height from `reorder_reach_lo(first)` (one slack lower,
+  never below 1); the range lookup stays at `[first, hi]`, so checks G and
+  M3 are unchanged except that G no longer expects a segment starting
+  within one slack above the boot's shared bucket to read applied (the
+  stated cost). The boot fold gives each folded bucket one slack on its
+  top; the deferred-depth prune lookup and `segments_for_bucket` (the
+  after-close pass) reach one slack below a segment's first record. The
+  lifetime property test starts one new segment in ten just above a bucket
+  boundary with a record half a slack below its first; seed
+  `16702864118144502203` (pinned as a plain test) fails Z on the old rule.
+  Rollback limit: an older binary still reads bucket marks from the first
+  record (check O exempts exactly that shape; **⚠ CORRECTED round 5:** the
+  filter exempted every frame outside the segment's buckets, whatever
+  protected it; now only a shed frame, on either side). (B) Honest limit: WAL growth
+  can also continue through the deferred-depth table, whose overflow is
+  still sticky and height-blind (W2 below). (C) The suspect state is now
+  published, local `/metrics` only, registered at 0 at boot:
+  `tv_wal_suspect_episodes_total` and `tv_wal_suspect_seconds_total` (whole
+  seconds, remainder carried; O(1) once per watcher poll, never per frame).
+  **Post-deploy verify list (replaces the one above):**
+  `tv_wal_unapplied_pinned_bytes` and `tv_wal_unapplied_pinned_segments`,
+  read together with `tv_wal_suspect_seconds_total` and
+  `tv_wal_suspect_episodes_total` per session;
+  `tv_wal_deferred_depth_kept_segments`; and the deferred table's overflow
+  flag (`overflowed` on the after-close pass's start log line, or the
+  overflow flag of `deferred_depth.tvdd`). The claim "growth stopped" is
+  made ONLY after pinned bytes stay flat across several sessions measured
+  together with the suspect time of each; pinned bytes that rise on
+  sessions with suspect time and stay flat on sessions without it mean the
+  follow-up below is what remains.
+  **⚠ CHANGED 2026-10-20 (PR W review round 5).** (A) The upper side of a
+  segment: a segment's last record can sit up to one slack ABOVE the next
+  segment's first record, so a bucket mark on it sat above the segment's
+  range and the segment read applied (replay skip, prune; for shed depth the
+  after-close pass never re-read it). `segment_is_applied` reads the bucket
+  table up to `reorder_reach_hi(hi)`; the boot-folded buckets and the
+  in-session overflow bound get one slack on their bottom too; the
+  deferred-depth prune uses `segment_is_deferred` and `segments_for_bucket`
+  reaches one slack above a range end. Cost: a segment ending within one
+  second below a marked bucket's start is held. The property generator
+  rotates one segment in ten across a boundary the other way when `mirror`
+  is on; four seeds that fail Z under the old rules are pinned. (B) The
+  never-draining bound, corrected: each session keeps its tail, PLUS every
+  segment overlapping one of its per-frame unapplied bucket marks (ring
+  shed, append failure, rescue failure), PLUS, for a session with ANY
+  suspicion episode (closed or open at the stop), the episode's stretch;
+  "everything else prunes" holds only for a session with no shed bucket and
+  no suspicion episode. The tail starts at the depth watermark, which stops
+  at the 15:40 IST depth window, so it covers every segment from the last
+  in-window depth ack to the stop (count per day to be read after deploy).
+  The stuck property test now sheds and closes episodes and checks that
+  bound. (C) `tv_wal_unapplied_trim_refused_total{reason}` is registered
+  at 0 at boot; the pinned gauges deliberately are not (0 would read
+  "nothing pinned" before any trim ran).
+  **Post-deploy verify list (round 5, adds to the round-4 list):** beside
+  pinned bytes and suspect seconds, read the ring-shed counters
+  (`tv_dhan_ws_ring_full_total{endpoint}`, of which
+  `tv_dhan_ws_ring_bytes_full_total` is the byte-budget subset) and the
+  append-failure counters (`tv_ticks_dropped_total{feed}`,
+  `tv_depth_rows_dropped_total`) per session, so a rise in pinned bytes on a day with no suspect
+  time can be put down to shed buckets; an ABSENT
+  `tv_wal_unapplied_pinned_*` gauge means the trim did not run or was
+  refused, read `tv_wal_unapplied_trim_refused_total{reason}` with it.
+  **Limit (round 5), recorded:** during round 4, `git checkout --` on
+  `crates/storage/tests/wal_unapplied_ranges_properties.proptest-regressions`
+  discarded two unstaged seed lines that cannot be recovered. They are
+  PROBABLY the two seeds `test_regression_round4_bucket_boundary_reorder_seeds`
+  pins (Assumed; not confirmed). To regain coverage a one-off sweep of 1,024
+  lifetime cases (start state, stuck and mirror drawn per seed) and 1,024
+  stuck-backlog cases (40 to 55 boots) was run on the round-5 code before
+  merge: 0 failures in 2,048 cases. The four seeds still in the
+  regressions file are now also pinned as plain tests
+  (`test_regression_saved_proptest_seeds_replay_as_plain_cases`). Pinned
+  `run_case` tests, not the regressions file, are the durable form.
+  **⚠ CHANGED 2026-10-20 (PR W review round 4, pass 2).** (A) The pinned
+  gauges are published after the boot fold and after the backlog guard
+  too, whether or not a replayed batch is acknowledged; "nothing waiting"
+  publishes 0. Before, only a trim set them and a trim runs only after an
+  acknowledged batch, so a box under the replay disk floor never set them
+  and read the same as a clean box. **Honest limit (disk floor):** the
+  migrated backlog drains only while the WAL volume stays above the replay
+  disk floor (`wal_replay_disk_floor_bytes`, 40 GiB on the 600 GB box,
+  unchanged), and the drain itself uses QuestDB disk (25–75 GB per
+  session's backlog, measured 2026-09-03). Below the floor every pass is
+  refused, nothing is trimmed, and the backlog plus every later session's
+  leftovers stay pinned until space is freed. (B) Both suspension ranges
+  start two reorder slacks below their watermark: a frame acked after the
+  last clean probe can be the last record of a segment whose successor's
+  first record sits up to one more slack below it, and that segment's
+  judged range ended under a one-slack range (replay skip, prunable).
+  Ranges derived from an ack watermark need two slacks on the bottom.
+  (C) The trim's spans are built in write order (segment names), each
+  starting at the highest first written so far less the slack; in
+  first-sequence order a long segment written after a tiny one, with its
+  first record just below the tiny one's, lost its middle from every span
+  and a frame shed there was skipped uncounted. (D) The orphaned comment
+  block in `ws_frame_spill.rs`'s tests is deleted (16 lines under the pin).
+  The lifetime generator gains `extra` (rotation across `H − slack` at a
+  suspicion, inverted segment pairs); seeds that fail Z under each old rule
+  are pinned (`test_regression_round4_pass2_extra_generator_seeds`).
+  **Post-deploy verify list (pass 2, corrects the round-5 line above):**
+  read `tv_wal_unapplied_pinned_bytes` and `tv_wal_unapplied_pinned_segments`
+  after each boot (they are now set every boot); allow a tolerance of one
+  segment per session when judging "flat across sessions" (the gauge
+  measures with the trim's spans, the prune with `[first, next first − 1]`,
+  so the boundary segment can be counted on one side and not the other).
+  Read with them `tv_wal_replay_disk_floor_stops_total` and the catch-up
+  summary line's `stop_reason` (`disk`, `frame_cap`, `ack_timeout`,
+  `apply_lag`): a rising pinned set with disk-floor stops is the deadlock
+  above, not new growth. An ABSENT gauge now means only that no scan could
+  read the waiting set (a folder that cannot be listed, or an unboundable
+  unreadable first record outside `settling/unreadable/`); read
+  `tv_wal_unapplied_trim_refused_total{reason}` for which. After a drained
+  reset the gauges keep the value published before it until the next boot
+  (reads high, never low).
+  **⚠ CHANGED 2026-10-21 (PR W review round 6).** (A) The whole-segment
+  rule (`AppliedSnapshot::segment_is_applied`) needs the segment's end
+  plus one slack strictly below `skip_below` for both sinks, and the boot
+  tail and the backlog guard start at `AppliedWatermark::boot_range_floor`
+  (`boot_applied_floor` less one more slack, at a frame base): an unacked
+  frame just above `skip_below`, the last record of a segment whose
+  successor starts up to a slack below it, made that segment read applied
+  with no suspicion at all (replay skip, prunable). The lifetime test gains
+  `straddle` (the plain-watermark straddle, then an in-session prune and a
+  crash or a clean stop); three seeds fail Z with either old rule and are
+  pinned; G and M3 allow two slacks. (B) `ack_gate` (a `Mutex<()>`) around
+  the suspect-flag check and the update in both ack functions and around
+  the flip and reads at both probe transitions. (C) The write-order check
+  compares each first with the running maximum
+  (`firsts_within_slack_of_running_max`), in `order_by_name` and
+  `bound_unreadable`. (D) The boot fold's summary and a failed fold
+  persist's warning are written by `log_boot_fold_summary`, called from
+  `main.rs` right after the subscriber's `init`. (E) Honest limit: the
+  migrated backlog (and every per-session leftover behind it) shrinks only
+  on a boot whose catch-up batches are promoted to `archive/`; one episode
+  before the promotion holds the process's whole settled output, so a boot
+  that pauses even once makes zero net progress. (F) `waiting_spans` is
+  documented as the test seam it is. (G) The pinned gauges' staleness
+  limit is corrected: within a session they can read low or high, and a
+  present gauge can be stale.
+  **Post-deploy verify list (round 6, adds to the lists above):** per boot,
+  read `tv_wal_replay_confirmed_segments_total` (must be above 0 for the
+  backlog to shrink), `tv_wal_replay_settle_held_segments_total` and
+  `tv_wal_replay_settle_recovered_segments_total`, with the catch-up
+  summary's `stop_reason=apply_lag` and `tv_wal_catchup_lag_pause_total`.
+  FLAT pinned bytes with held above 0 and confirmed at 0 means the backlog
+  is NOT draining, not that growth stopped. Read the pinned gauges right
+  after a boot, with `tv_wal_unapplied_trim_refused_total`. The boot log
+  now carries the fold's summary line ("WAL unapplied record folded at
+  boot") and, on a failing disk, `source=unapplied_ranges_persist_failed_at_boot`.
+  - Files: crates/storage/src/wal_unapplied_ranges.rs,
+    crates/storage/src/wal_applied_watermark.rs,
+    crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_replay_settle.rs,
+    crates/storage/src/lib.rs, crates/storage/tests/error_level_meta_guard.rs,
+    crates/storage/tests/wal_unapplied_ranges_properties.rs,
+    crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/catchup_stop.rs,
+    crates/storage/src/wal_deferred_depth.rs (doc only in round 4;
+    `segment_is_deferred` in round 5),
+    crates/storage/src/ws_frame_spill/tests/frame_base_tests.rs,
+    crates/app/src/main.rs (counter registration, rounds 4 and 5; the
+    boot fold log call, round 6),
+    CLAUDE.md
+  - Tests: overflow_taints_only_ranges_starting_at_or_below_its_height,
+    test_regression_reloaded_overflow_clears_after_a_drain_past_its_height,
+    test_v1_overflow_bit_migrates_to_range_bounded_by_own_floor,
+    test_migrated_range_covers_replaying_segments,
+    test_rollback_older_binary_decode_keeps_overflow_bit_while_migrated_ranges_exist,
+    test_rollback_old_decoder_on_a_clean_box_sees_buckets_not_overflow,
+    test_range_buckets_without_a_trusted_sidecar_fold_back_into_their_spans,
+    test_migrated_range_keeps_a_record_below_its_segment_s_first_sequence,
+    test_fold_migrates_a_known_overflow_up_to_its_height,
+    test_waiting_segments_fail_closed_when_a_folder_cannot_be_listed,
+    test_waiting_spans_clip_a_gap_to_the_segment_s_last_record,
+    test_trim_to_waiting_clips_a_range_over_a_stretch_with_no_waiting_segment,
+    test_unapplied_ranges_clip_to_splits_keeps_and_drops,
+    test_clip_unapplied_ranges_to_clears_migrated_when_empty,
+    test_suspicion_across_an_overnight_gap_is_a_range_not_an_overflow,
+    test_regression_da13c_boot_rereads_segments_left_settling_by_a_crash,
+    test_sidecar_to_bytes_from_bytes_round_trip,
+    test_sidecar_bad_crc_magic_short_or_malformed_is_refused,
+    test_corrupt_or_missing_sidecar_falls_back_to_buckets_or_an_unbounded_overflow,
+    test_regression_next_day_shed_no_longer_overflows_after_boot_fold,
+    test_unapplied_ranges_full_merges_lowest_pair_and_never_shrinks_coverage,
+    test_trim_below_drops_and_cuts,
+    test_boot_applied_floor_frozen_at_bind_and_ignores_later_acks,
+    test_boot_tail_registered_before_writer_spawn,
+    test_regression_multi_day_backlog_never_overflows_the_bucket_table,
+    test_guard_never_calls_note_unapplied_range,
+    test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it,
+    test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling,
+    test_per_record_skip_honours_ranges_after_live_acks_pass_them,
+    test_prune_never_deletes_a_segment_under_a_range_or_an_unbounded_overflow,
+    test_regression_20_oct_shape,
+    test_catchup_stop_reason_frame_cap_is_not_drained,
+    proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame,
+    test_add_range_avoiding_merges_across_a_gap_no_span_intersects,
+    test_fold_at_boot_with_spans_merges_across_a_free_gap,
+    test_fold_wrapper_ratchets_the_frame_counter_past_own_floor,
+    test_ratchet_frame_seq_to_makes_every_later_mint_greater,
+    test_round_up_to_frame_base_rounds_up_and_saturates,
+    test_drained_reset_keeps_a_suspension_range_above_the_ceiling,
+    test_regression_depth_untracked_file_keeps_depth_frames_between_the_watermarks,
+    test_guard_pending_backlog_is_clamped_to_the_boot_frame_high,
+    test_boot_tail_starts_at_the_oldest_waiting_segment_without_a_file,
+    test_migrated_flag_clears_once_no_range_intersects_the_migrated_span,
+    test_sidecar_from_bytes_reads_a_version_1_file,
+    test_trim_to_waiting_cuts_below_a_segment_set_apart_as_unreadable,
+    test_note_questdb_probe_writes_ranges_off_the_runtime_worker,
+    test_record_at_capped_refuses_a_length_past_the_cap,
+    proptest_stuck_backlog_keeps_later_sessions_prunable,
+    test_regression_episode_end_range_keeps_a_segment_holding_a_reordered_frame,
+    test_segment_is_applied_is_the_range_check_on_both_sinks,
+    test_bound_known_overflow_locked_bounds_a_known_height_only,
+    test_regression_a_second_overflow_after_a_persist_is_bounded_on_its_own,
+    proptest_repeated_in_session_overflows_are_bounded_one_by_one,
+    test_regression_a_segment_that_cannot_be_read_is_never_taken_for_empty,
+    test_overflow_arms_lower_the_low_end_before_raising_the_height,
+    test_regression_bucket_mark_holds_a_segment_starting_just_above_the_boundary,
+    test_regression_overflow_height_holds_a_segment_starting_just_above_it,
+    test_regression_prune_keeps_a_segment_holding_a_frame_shed_below_the_boundary,
+    test_regression_deferred_mark_reaches_a_segment_starting_above_the_boundary,
+    test_regression_round4_bucket_boundary_reorder_seeds,
+    test_reorder_reach_lo_is_one_slack_lower_and_keeps_zero,
+    test_note_questdb_probe_counts_suspect_episodes_and_seconds,
+    test_regression_bucket_mark_holds_a_segment_ending_just_below_the_boundary,
+    test_regression_overflow_bound_holds_a_segment_ending_just_below_its_low,
+    test_reorder_reach_hi_is_one_slack_higher_and_saturates,
+    test_segment_is_deferred_reaches_one_slack_each_side,
+    test_regression_prune_keeps_a_segment_whose_last_record_is_shed_above_the_boundary,
+    test_regression_deferred_mark_reaches_a_segment_ending_below_the_boundary,
+    test_segments_for_bucket_places_an_unreadable_segment_with_the_reach,
+    test_regression_round5_mirror_boundary_rotation_seeds,
+    test_regression_saved_proptest_seeds_replay_as_plain_cases,
+    test_fold_at_boot_and_guard_pending_backlog_publish_pinned_without_an_acked_batch,
+    test_regression_trim_keeps_a_range_over_a_long_segment_written_after_a_tiny_one,
+    test_order_by_name_sorts_by_write_order_and_refuses_an_unknown_order,
+    test_regression_suspension_range_holds_a_segment_whose_last_record_was_acked_late,
+    test_suspension_range_lo_is_two_slacks_lower_at_a_frame_base,
+    test_regression_round4_pass2_extra_generator_seeds,
+    test_regression_plain_watermark_straddle_keeps_a_segment_whose_last_record_was_never_acked,
+    test_regression_round6_plain_watermark_straddle_seeds,
+    test_ack_gate_serialises_the_flag_check_with_the_update,
+    test_acks_racing_probe_transitions_are_always_in_an_episode_range,
+    test_order_by_name_refuses_falls_that_add_up_past_the_slack,
+    test_regression_waiting_spans_cover_every_first_after_falls_that_add_up,
+    test_log_boot_fold_summary_writes_the_recorded_fold_once_after_logging_starts,
+    test_module_header_names_the_drain_progress_counters
+
+- [ ] W2. The deferred-depth table honours its overflow height (found by the
+  PR W review round 4; NOT in PR W). `wal_deferred_depth` has the
+  sticky-overflow shape PR W removed from the unapplied table:
+  `DeferredDepthSnapshot::kinds_in_range` returns `SHED_DEPTH_ALL` for EVERY
+  range while `overflowed`, ignoring `overflow_high_seq`, so one collision
+  pins every later segment until an after-close pass completes a sweep at
+  or below the height. A trading-hours shed collides with a mark about 13
+  days old (2 × 2048 × 2^38 ns = 13 d 0 h 45 min; one step of 6 d 12 h
+  22 min moves the time of day outside the session). Fix: a range whose low
+  end is above `overflow_high_seq` is not tainted by the overflow (an
+  unknown height, `0` or `u64::MAX`, still taints everything); a known
+  height is persisted in the file header that already carries it, and the
+  after-close pass sweeps only up to it. Keeps more, never less: every
+  range at or below the height still reads `SHED_DEPTH_ALL`.
+  - Files: crates/storage/src/wal_deferred_depth.rs,
+    crates/app/src/dhan_feed_stack/deferred_depth_pass.rs (if the sweep
+    bound moves), CLAUDE.md (the `DeferredDepth` row)
+  - Tests (to write): test_overflow_taints_only_ranges_at_or_below_its_height,
+    test_unknown_overflow_height_still_taints_every_range,
+    test_reloaded_overflow_height_round_trips_through_the_file,
+    test_prune_deletes_an_applied_uploaded_segment_above_the_overflow_height,
+    a property test that a collision never lets a prune drop a marked frame
+
+- [ ] W3. The replay settle step promotes batch by batch (found by the PR
+  W review round 6; NOT in PR W). `SettleState` keeps ONE mark for every
+  settled segment of the process, and `promote` holds the whole set (and,
+  once `held`, every later batch) when any suspicion episode began after
+  the mark. The catch-up drain's own apply-lag pause starts such an episode
+  (reported tables are a subset of untrusted ones), so a boot whose drain
+  pauses once makes zero net progress on the migrated backlog: the next
+  boot recovers those segments, reads them first, causes lag, and holds
+  again. Fix: a mark per settled batch (its own ack instant, clean-probe
+  count and episode count), promote each batch whose own durability lag
+  and two clean probes passed before an episode began, and hold only the
+  batches whose ack came before an episode's start; `held` no longer
+  sticks for the rest of the process. Keeps more, never less: a batch acked
+  inside or before an episode is still held for the next boot.
+  - Files: crates/storage/src/wal_replay_settle.rs, crates/storage/src/ws_frame_spill.rs
+    (callers, if the API changes), CLAUDE.md (the settle row)
+  - Tests (to write): test_a_batch_promoted_before_an_episode_stays_archived,
+    test_an_episode_holds_only_batches_acked_before_its_start,
+    test_held_no_longer_sticks_for_the_rest_of_the_process,
+    a property test over interleaved batches, probes and episodes that no
+    batch acked before an episode's start reaches `archive/`
 ### PR H — no data-silence redial on a weekend or NSE holiday (core, app) — live finding
 
 Found by the 2026-10-20 live AWS check (read-only): on the Dussehra holiday the
@@ -174,6 +561,19 @@ CONTRACT FOR AT LEAST 10 MINUTES".
   - Files: CLAUDE.md, deploy/aws/terraform/variables.tf
   - Tests: claude_md_codebase_map_guard
 
+### Follow-up (own plan item, not in this plan)
+
+- PR W growth under latched apply lag: confirm parked live acks once a full
+  durability lag (`WATERMARK_DURABILITY_LAG_SECS`) and two clean probes follow
+  them, as `settling/` does for replays, so a session that ends while a table
+  is latched untrusted stops pinning its whole WAL. Needs its own design (it
+  changes what an ack under suspicion is trusted for) and the live
+  measurement named in W1 first: `tv_wal_unapplied_pinned_bytes` read
+  together with `tv_wal_suspect_seconds_total` and
+  `tv_wal_suspect_episodes_total` over several sessions (2026-10-20, PR W
+  review round 4). While any table is latched, every probe is unclean, acks
+  park, and on a box whose backlog does not drain that is about one session
+  of WAL per lag-latched day.
 ### PR G — holiday gate enabled on deploy, weekday-holiday-only (app, aws-lambdas, common tests, storage tests, deploy workflows, terraform)
 
 Root cause, **Assumed** until `systemctl is-enabled tickvault-holiday-gate` is
@@ -363,6 +763,13 @@ planner then swaps every minute as before.
 No new metric: depth flushes and drops are already counted by the writer and
 `depth_dropped`. The fix shortens a window and adds no failure path.
 
+PR W (2026-10-20, PR W review round 4): local `/metrics` only, no CloudWatch
+filter, no EMF name, no alarm: `tv_wal_unapplied_pinned_segments` and
+`tv_wal_unapplied_pinned_bytes` (after every trim, and since pass 2 after
+the boot fold and the backlog guard), `tv_wal_replay_disk_floor_stops_total`
+(existing, read with them),
+`tv_wal_unapplied_trim_refused_total{reason}`, and, registered at 0 at boot,
+`tv_wal_suspect_episodes_total` and `tv_wal_suspect_seconds_total`.
 PR I: one new label value, `outcome="min_hold"`, on the existing local
 `tv_depth200_ranked_swaps_total` (pre-registered at 0; no EMF name, filter or
 alarm); `held_back` and `min_hold` in the existing per-minute steering `info!`.

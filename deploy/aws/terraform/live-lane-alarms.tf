@@ -804,73 +804,14 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
 }
 
 # ---------------------------------------------------------------------------
-# 13. DEPTH STEERING STOPPED (2026-08-26)
+# 13. DEPTH STEERING STOPPED — REMOVED 2026-10-22
 # ---------------------------------------------------------------------------
-# Both depth pools re-aim once a minute: depth-200 follows the at-the-money
-# strike, and depth-20 now follows its index windows and the day's movers. Five
-# counters describe how much MOVED. Not one of them answered the question an
-# operator actually has at 14:00 — "is depth steering still running at all?" —
-# and until today none of the five reached CloudWatch either.
-#
-# That question has several causes and exactly one symptom. The task panicked;
-# the loop is wedged on a QuestDB query; every command channel closed; the
-# stack never spawned it. In all four the sockets sit on whatever they held at
-# 09:1x for the rest of the session, every other alarm stays green, and the
-# dashboards show a feed delivering ticks normally — because it is. Depth is
-# simply aimed at yesterday's strikes.
-#
-# WHY A GAUGE, NOT ANOTHER COUNTER. A counter that stops incrementing is
-# indistinguishable from a quiet market, and this repository has already paid
-# to learn the second half: the CloudWatch agent's prometheus pipeline is
-# ambiguous about whether a `_total` arrives as a delta or a running
-# cumulative, so an alarm written for the wrong reading is silently blind. A
-# gauge is published verbatim either way — see alarm 11's header, which
-# corrects exactly this mistake on the tick-flow signal.
-#
-# WHY IT IS PUBLISHED BY A SEPARATE TASK. The rebalance loop stamps a shared
-# timestamp; a small ticker publishes `now - stamp` every 30 seconds. Had the
-# loop published its own gauge, a wedged loop would freeze it at zero, and a
-# frozen zero reads as perfectly healthy. Now a stall makes the number GROW,
-# and a total task death stops the series entirely — which `breaching` catches.
-# Both failure shapes are visible; neither was before.
-#
-# WHY THE GATE. `breaching` is what makes process death visible, but a bare
-# flip to breaching pages every evening at 17:30 and all weekend. Membership in
-# the market-hours gate's ALARM_NAMES list is what makes it safe.
-resource "aws_cloudwatch_metric_alarm" "depth_steering_stalled" {
-  alarm_name          = "tv-${var.environment}-depth-steering-stalled"
-  alarm_description   = <<-EOT
-    Depth has stopped re-aiming. The 20-level and 200-level connections are
-    still up and still delivering, but they are pointed at whatever strikes
-    they held when steering stopped — so the deepest book we collect is for
-    contracts the money may have left. Nothing else will report this: every
-    other depth signal describes what moved, and nothing moving is exactly
-    the failure.
-  EOT
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  # 180s against a 60s loop. Two missed minutes is a slow query or a busy
-  # host; three is a stall.
-  threshold          = 180
-  evaluation_periods = 2
-  metric_name        = "tv_depth_rebalance_age_secs"
-  namespace          = local.app_namespace
-  period             = 300
-  # Maximum, not Average: a window holding one fresh reading and four stale
-  # ones is still a window in which steering was stopped, and averaging would
-  # let a single recovered minute erase four dead ones.
-  statistic  = "Maximum"
-  dimensions = local.app_dimensions
-
-  treat_missing_data = "breaching"
-
-  # Actions OFF by default; the market-hours gate Lambda flips them ON.
-  # WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING.
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  # Steering resuming is a real, self-explanatory recovery — the sockets
-  # re-aim on the next minute and the age falls back to near zero.
-  ok_actions = local.app_alarm_ok
-}
+# `depth_steering_stalled` was removed by the alarm review under operator
+# Quote 37 (dhan-rest-only-noise-lock-2026-07-14.md §2.14,
+# docs/audits/2026-10-alarm-review.md): depth-20 and depth-200 are switched off
+# (2026-10-21), the steering loop never starts, and the app published a fake 0
+# heartbeat only to keep this breaching alarm quiet. It also left the
+# market-hours gate's ALARM_NAMES list. Turning depth back on must restore it.
 
 # 14. ONE SOCKET WENT DEAF (2026-08-26) — operator-approved
 # ---------------------------------------------------------------------------
@@ -1222,24 +1163,9 @@ resource "aws_cloudwatch_metric_alarm" "tick_rescue_abandoned" {
   ok_actions    = []
 }
 
-resource "aws_cloudwatch_metric_alarm" "depth_rescue_abandoned" {
-  alarm_name        = "tv-${var.environment}-depth-rescue-abandoned"
-  alarm_description = "The same signal as tv-<env>-tick-rescue-abandoned, on the depth writer — which carries roughly 24 times the tick row volume, so it is the larger exposure of the two. Depth levels counted as rescued may never have reached the depth spill file. Triage: identical — verify the named spill file exists before trusting any depth reconciliation for that session."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 3
-  datapoints_to_alarm = 1
-  metric_name         = "tv_depth_rescue_abandoned_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  ok_actions    = []
-}
+# 2026-10-22: `depth_rescue_abandoned` was REMOVED by the alarm review under
+# operator Quote 37 (noise-lock §2.14): with depth switched off no depth row is
+# written. The three alarms above and below stay.
 
 resource "aws_cloudwatch_metric_alarm" "wal_spill_shutdown_incomplete" {
   alarm_name        = "tv-${var.environment}-wal-spill-shutdown-incomplete"
@@ -1450,70 +1376,8 @@ resource "aws_cloudwatch_metric_alarm" "dhan_main_reconnect_slow" {
   ok_actions         = []
 }
 
-# A contract swapped OUT of a depth socket is forgotten by the first-packet
-# tracker before the new one is stamped (§2.6-iii), so a departing contract
-# can never age into the silent count and inflate this ratio.
-resource "aws_cloudwatch_metric_alarm" "dhan_depth_new_contract_blank" {
-  alarm_name        = "tv-${var.environment}-dhan-depth-new-contract-blank"
-  alarm_description = "Most newly subscribed Dhan depth contracts are delivering nothing. In 30 minutes, at least 5 new subscriptions were measured and at least 80% of them sent no depth packet within 2 minutes. One silent contract is normal (it may simply not have traded); most of them silent means the vendor is not serving new subscriptions. Triage: (1) tv_dhan_ws_alive_connections - are the depth sockets up. (2) tv_dhan_feed_depth_total - is ANY depth arriving. (3) The depth ranked-rotation log lines - which contracts were subscribed."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 80
-  evaluation_periods  = 1
-  treat_missing_data  = "notBreaching"
-
-  metric_query {
-    id = "blank_pct"
-    # 5-sample floor: below it the ratio is noise, so it reads 0. The small
-    # constant keeps the (unused) true branch finite when the total is 0.
-    expression  = "IF(total >= 5, 100 * silent_f / (total + 0.000001), 0)"
-    label       = "New depth contracts silent after 2 minutes (%%)"
-    return_data = true
-  }
-
-  metric_query {
-    id          = "total"
-    expression  = "silent_f + arrived_f"
-    return_data = false
-  }
-
-  metric_query {
-    id          = "silent_f"
-    expression  = "FILL(silent, 0)"
-    return_data = false
-  }
-
-  metric_query {
-    id          = "arrived_f"
-    expression  = "FILL(arrived, 0)"
-    return_data = false
-  }
-
-  metric_query {
-    id          = "silent"
-    return_data = false
-    metric {
-      metric_name = "tv_depth_first_packet_silent_total"
-      namespace   = local.app_namespace
-      period      = 1800
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  metric_query {
-    id          = "arrived"
-    return_data = false
-    metric {
-      metric_name = "tv_depth_first_packet_arrived_total"
-      namespace   = local.app_namespace
-      period      = 1800
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  actions_enabled = true
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = []
-}
+# 2026-10-22: `dhan_depth_new_contract_blank` (§2.6) was REMOVED by the alarm
+# review under operator Quote 37 (dhan-rest-only-noise-lock-2026-07-14.md
+# §2.14, docs/audits/2026-10-alarm-review.md): depth-20 and depth-200 are
+# switched off, so no depth contract is subscribed. Turning depth back on must
+# restore it, with its two selector names, in the same change.

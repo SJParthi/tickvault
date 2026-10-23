@@ -85,10 +85,9 @@ const CEILINGS: &[(&str, &str)] = &[
         "crates/app/src/contract_underlying_map.rs",
         "MAX_TRACKED_CONTRACTS",
     ),
-    (
-        "crates/app/src/volume_leaderboard.rs",
-        "MAX_TRACKED_CONTRACTS",
-    ),
+    // 2026-10-22 (plan item 62): the volume board moved its clamp to
+    // `option_rank` with `volume_leaderboard`'s removal.
+    ("crates/app/src/option_rank.rs", "MAX_TRACKED_CONTRACTS"),
     (
         "crates/trading/src/in_mem/tick_ram_arena.rs",
         "MAX_TICK_ARENA_SLOTS",

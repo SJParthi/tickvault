@@ -908,8 +908,7 @@ mod tests {
         // THREE (1s/3s/5s), so the placeholder heap is 3 × 48 B = 144 B/slot
         // (was 768) and the would-be formula cost falls 80_440 -> 36_800.
         assert_eq!(bars_per_day(TfIndex::S1), 24_000);
-        assert_eq!(bars_per_day(TfIndex::S3), 8_000);
-        assert_eq!(bars_per_day(TfIndex::S5), 4_800);
+        // 2026-10-22 (plan item 62): 3s and 5s removed, ONE second-scale frame.
         let mut gated_formula_total = 0u32;
         let mut gated_frames = 0usize;
         for tf in TfIndex::ALL {
@@ -918,14 +917,15 @@ mod tests {
                 gated_frames += 1;
             }
         }
-        assert_eq!(gated_frames, 3, "second-scale frame count drifted");
+        assert_eq!(gated_frames, 1, "second-scale frame count drifted");
         // 2026-08-07: 75_413 -> 77_422 with the 385-minute session;
         // 2026-08-28: 77_422 -> 80_440 with the 400-minute one;
         // 2026-09-19: 80_440 -> 36_800 with the nine-frame collapse. These
         // are the GDF-gated second-scale frames — capacity-1 placeholders
         // today, so the number is the would-be formula cost, not allocated
         // memory.
-        assert_eq!(gated_formula_total, 36_800, "gated formula sum drifted");
+        // 2026-10-22: 36_800 -> 24_000 with 3s and 5s removed (plan item 62).
+        assert_eq!(gated_formula_total, 24_000, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
         // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13);
         // 2026-09-19: 863 -> 662 as D1 and M2 lost their writers. M30/M60

@@ -751,13 +751,8 @@ socket_close_arm = false
 [depth_storage]
 array_rows = false
 
-# The busiest-contract boards (`top_volume_1s/3s/5s/1m`) save a batch that
-# cannot reach QuestDB to data/spill/top_volume and replay it after 15:40 IST
-# (plan `.claude/plans/active-plan-top-volume-spill.md`, owner approval
-# 2026-10-13). Set false to roll back: such batches are then discarded and
-# counted, as before. The replay still runs for files already on disk.
-[top_volume]
-spill_enabled = true
+# `[top_volume]` (the busiest-contract boards' spill tier) REMOVED 2026-10-22
+# (plan item 62, operator Quote 34): nothing writes `top_volume_*` any more.
 
 [dhan_universe]
 enabled = true
@@ -838,6 +833,12 @@ spot_universe_ntm_only = true
 # free slots. The drain folds and writes ONE copy of each packet; the WAL keeps
 # both. 0 turns it off.
 backup_top_n = 1000
+
+# Depth-20 and depth-200 sockets: switched OFF by the owner on 2026-10-21
+# ("switch off both depth 20 and depth 200 dude okay?"), recorded in
+# `websocket-connection-scope-lock.md` first. Main feed and order update are
+# unaffected. Turning depth back on needs a fresh dated quote there.
+depth_sockets_enabled = false
 
 # Evidence-based frame-silence redials (scope lock 2026-10-10, "PER-KIND
 # FRAME-SILENCE THRESHOLDS (fault redials only)"; owner: "Why idle go ahead

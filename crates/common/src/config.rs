@@ -115,10 +115,9 @@ pub struct ApplicationConfig {
     /// `market_depth`. Turning it on is the operator step (step 4).
     #[serde(default)]
     pub depth_storage: DepthStorageConfig,
-    /// `[top_volume]` — the busiest-contract boards' spill tier (top_volume
-    /// spill plan, 2026-10-13). An absent section keeps the tier ON.
-    #[serde(default)]
-    pub top_volume: TopVolumeConfig,
+    // `[top_volume]` (the boards' spill tier, 2026-10-13) REMOVED 2026-10-22
+    // (plan item 62, operator Quote 34) with the top_volume writer. An old
+    // config file that still carries the section is ignored, never refused.
     /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
     /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
     /// directive 2026-07-13: *"how will you guarantee that all our defined
@@ -1009,34 +1008,6 @@ pub struct DepthStorageConfig {
     pub array_rows: bool,
 }
 
-/// `[top_volume]` — the `top_volume_<tf>` boards' save-to-disk tier
-/// (`.claude/plans/active-plan-top-volume-spill.md`, owner approval
-/// 2026-10-13: "Approve dude don't miss anything dude okay?").
-///
-/// `spill_enabled` defaults to TRUE, also when the section or the key is
-/// absent: a board batch that cannot reach QuestDB is saved to
-/// `data/spill/top_volume` and replayed after the close. `false` is the
-/// rollback: such batches are discarded and counted, as before 2026-10-13.
-/// The replay still runs, so files already on disk are posted and aged.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-pub struct TopVolumeConfig {
-    /// Save board batches that do not land to disk and replay them.
-    #[serde(default = "default_top_volume_spill_enabled")]
-    pub spill_enabled: bool,
-}
-
-impl Default for TopVolumeConfig {
-    fn default() -> Self {
-        Self {
-            spill_enabled: default_top_volume_spill_enabled(),
-        }
-    }
-}
-
-const fn default_top_volume_spill_enabled() -> bool {
-    true
-}
-
 /// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
 ///
 /// Fail-safe shape, the house pattern: `enabled` is `#[serde(default)]` =
@@ -1168,6 +1139,14 @@ pub struct DhanUniverseConfig {
     #[serde(default = "default_main_feed_backup_top_n")]
     pub backup_top_n: usize,
 
+    /// Whether the depth-20 and depth-200 sockets are attached and dialled at
+    /// all. Default `false`: switched off by the owner on 2026-10-21
+    /// (`websocket-connection-scope-lock.md`, "2026-10-21 — DEPTH-20 AND
+    /// DEPTH-200 ARE SWITCHED OFF"). The main feed and order update are not
+    /// affected; `true` restores depth exactly as before.
+    #[serde(default)]
+    pub depth_sockets_enabled: bool,
+
     /// Whether the evidence-based frame-silence fast paths act, only count,
     /// or are off (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE
     /// THRESHOLDS"). Default `Shadow`: the main-feed (60 s) and depth-20
@@ -1257,6 +1236,7 @@ impl Default for DhanUniverseConfig {
             spot_universe_fno_underlyings_only: false,
             spot_universe_ntm_only: false,
             backup_top_n: default_main_feed_backup_top_n(),
+            depth_sockets_enabled: false,
             frame_silence_fast_path: FrameSilenceFastPath::Shadow,
             depth200_silent_swap_resubscribe_secs: default_depth200_silent_swap_resubscribe_secs(),
         }
@@ -3203,20 +3183,14 @@ mod tests {
     }
 
     #[test]
-    fn test_top_volume_spill_is_on_by_default_when_absent_and_can_be_turned_off() {
-        // Top_volume spill plan (2026-10-13): the tier is on unless the
-        // operator writes `spill_enabled = false` (the rollback switch).
-        assert!(TopVolumeConfig::default().spill_enabled);
-        let empty: TopVolumeConfig = toml::from_str("").expect("empty section must parse");
-        assert!(empty.spill_enabled, "an absent key keeps the tier on");
-        let off: TopVolumeConfig = toml::from_str("spill_enabled = false").expect("must parse");
-        assert!(!off.spill_enabled);
+    fn test_top_volume_section_is_gone_from_base_toml() {
+        // 2026-10-22 (plan item 62): the `[top_volume]` section is removed from
+        // base.toml, and AppConfig does not refuse a leftover one.
         let base = include_str!("../../../config/base.toml");
-        let section = base
-            .split_once("\n[top_volume]")
-            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(""))
-            .expect("base.toml must carry a [top_volume] section");
-        assert!(section.contains("spill_enabled = true"), "{section}");
+        assert!(
+            !base.contains("\n[top_volume]"),
+            "base.toml still carries [top_volume]"
+        );
     }
 
     // =======================================================================
@@ -3779,7 +3753,6 @@ mod tests {
             dhan_data_api: DhanDataApiConfig::default(),
             depth_unsubscribe_probe: DepthUnsubscribeProbeConfig::default(),
             depth_storage: DepthStorageConfig::default(),
-            top_volume: TopVolumeConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),
@@ -4841,6 +4814,30 @@ mod tests {
             .extract()
             .expect("0 parses");
         assert_eq!(off.dhan_universe.backup_top_n, 0);
+    }
+
+    #[test]
+    fn test_dhan_universe_depth_sockets_enabled_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            dhan_universe: DhanUniverseConfig,
+        }
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nenabled = true\n"))
+            .extract()
+            .expect("absent depth_sockets_enabled must default");
+        assert!(!absent.dhan_universe.depth_sockets_enabled);
+        assert!(!DhanUniverseConfig::default().depth_sockets_enabled);
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[dhan_universe]\ndepth_sockets_enabled = true\n",
+            ))
+            .extract()
+            .expect("true parses");
+        assert!(on.dhan_universe.depth_sockets_enabled);
     }
 
     #[test]

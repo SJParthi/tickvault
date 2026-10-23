@@ -134,11 +134,6 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/app/src/dhan_feed_stack.rs",
-        "the ilp buffer refused snapshot rows",
-        "derived top_volume table only; ranking runs from RAM; counted and power-of-two logged",
-    ),
-    (
-        "crates/app/src/dhan_feed_stack.rs",
         "the saved main-feed backup set could not be read",
         "replay keeps both copies of a backup packet: a duplicate row, never a lost one",
     ),
@@ -221,11 +216,6 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "a sizing probe; the spill keeps working at its fixed floor",
     ),
     (
-        "crates/storage/src/top_volume_rank_persistence.rs",
-        "so the top_volume spill ceiling falls back",
-        "a sizing probe (2026-10-13, top_volume spill plan item 2); the spill keeps working at its fixed floor, the same shape as its tick and depth twins",
-    ),
-    (
         "crates/storage/src/wal_deferred_depth.rs",
         "deferred-depth marks could not be persisted",
         "coded WS-SPILL-01 and latched once per episode; paged by durability-sync-failing on its counter",
@@ -234,6 +224,16 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "crates/storage/src/wal_applied_watermark.rs",
         "applied-watermark could not be persisted",
         "coded WS-SPILL-01 and latched once per episode; paged by durability-sync-failing; fails toward replaying more",
+    ),
+    (
+        "crates/storage/src/wal_applied_watermark.rs",
+        "unapplied ranges could not be persisted",
+        "2026-10-20 (plan item PR W): coded WS-SPILL-01, latched once per episode, counted on the same persist-failed counter durability-sync-failing pages on; the watermark file then names no sidecar generation, so the next boot reads the ranges as whole buckets or, when they do not fit, as an unbounded overflow (replay more, never less)",
+    ),
+    (
+        "crates/storage/src/wal_unapplied_ranges.rs",
+        "could not be persisted at the boot",
+        "2026-10-21 (PR W review round 6): the boot fold runs before logging starts, so this re-reports, once per process, the same persist failure the two wal_applied_watermark.rs entries above review; it is coded WS-SPILL-01, already counted on the persist-failed counter durability-sync-failing pages on, and fails toward replaying more",
     ),
     (
         "crates/storage/src/resource_monitor.rs",

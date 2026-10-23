@@ -37,12 +37,18 @@ const BUDGET: &[(&str, usize)] = &[
     ("depth_first_packet.rs", 1),
     ("depth_rebalance.rs", 7),
     ("depth_subscription_view.rs", 3),
+    // 2026-10-21 (owner: depth switched off): 2 wiring scans (the attach starts
+    // both depth halves done, main stores the switch); paired behaviour test
+    // `test_set_depth_sockets_enabled_round_trips`.
+    ("depth_switch.rs", 2),
     ("dhan_contract_universe.rs", 1),
     ("dhan_depth_universe.rs", 3),
     // 2026-10-14 (ITEM 57): 90 -> 88; `contract_attach_tests` (3 scans) moved
     // to its own file, one scan added by `test_live_tick_flush_leaves_depth_to_its_own_cadence`,
     // which pairs it with a behaviour half on the same ingest.
-    ("dhan_feed_stack.rs", 88),
+    // 2026-10-22 (plan item 62): 88 -> 81; seven top_volume source scans went
+    // with the code they scanned.
+    ("dhan_feed_stack.rs", 81),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     ("dhan_lifecycle.rs", 2),
@@ -53,6 +59,11 @@ const BUDGET: &[(&str, usize)] = &[
     ("dhan_universe.rs", 3),
     ("disk_pressure_boot.rs", 7),
     ("ensure_questdb.rs", 1),
+    // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
+    // hold supervisor); paired behaviour tests `evening_step_*`,
+    // `test_catchup_budget_for_only_a_fresh_evening_pending_flag`,
+    // `test_request_self_restart_resolves_a_later_self_restart_requested`.
+    ("evening_drain.rs", 3),
     ("feed_scoreboard_boot.rs", 2),
     ("index_constituency_boot.rs", 1),
     ("infra.rs", 3),
@@ -64,8 +75,6 @@ const BUDGET: &[(&str, usize)] = &[
     ("order_runtime.rs", 3),
     ("subsystem_memory.rs", 1),
     ("tf_consistency_boot.rs", 1),
-    ("top_volume_snapshot.rs", 1),
-    ("volume_leaderboard.rs", 2),
     ("ws_audit_consumer.rs", 2),
     ("ws_connection_rollup.rs", 1),
 ];

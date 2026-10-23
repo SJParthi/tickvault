@@ -8,12 +8,19 @@
 //! * mode="check"        @ 08:45 IST — verify the box started; self-heal
 //!   (ec2:StartInstances) + page if not; flag late starts; respect the
 //!   NSE-holiday intentional-stop marker (fail-open).
-//! * mode="stop_check"   @ 17:45 IST — verify the 17:30 stop worked;
-//!   self-stop a box left running since before 17:30; never touch a manual
+//! * mode="daily_stop"   @ 16:30 IST — the scheduled stop (operator Quote 31,
+//!   2026-10-21; was an SSM stop automation): stop the box unless a fresh
+//!   drain hold says the day's data is still going into the database.
+//! * mode="stop_check"   @ 16:45 IST — verify the 16:30 stop worked;
+//!   self-stop a box left running since before 16:30; never touch a manual
 //!   evening session.
 //! * mode="curfew_check" hourly — stop a forgotten out-of-hours box unless
 //!   a keep-alive override / launch grace applies (operator directive
 //!   2026-07-03: "manual human error is not acceptable").
+//!
+//! The three stop modes read the drain hold (`drain_hold`): a fresh hold
+//! skips the stop silently, and a hold that ended tonight turns the stop
+//! into a silent one. The hold is never honoured from 07:30 IST to 16:25 IST.
 //!
 //! Parity is the contract: same mode dispatch, same SNS Subject/Message
 //! strings (byte-identical), same result-dict shapes, same IST math
@@ -35,24 +42,41 @@ use tracing::{error, info, warn};
 /// The daily_start EventBridge rule fires at 03:00 UTC (= 08:30 IST, Mon-Fri).
 pub const START_TRIGGER_UTC_HOUR: u32 = 3;
 pub const START_TRIGGER_UTC_MINUTE: u32 = 0;
-/// The daily_stop EventBridge rule fires at 12:00 UTC (= 17:30 IST, Mon-Fri).
+/// The daily_stop EventBridge rule fires at 11:00 UTC (= 16:30 IST, Mon-Fri).
 /// 2026-08-08 (operator Quote 14): moved from 11:00 UTC / 16:30 IST with the
-/// 9-hour window. KEEP IN LOCKSTEP with main.tf `daily_stop` schedule_expression.
-pub const STOP_TRIGGER_UTC_HOUR: u32 = 12;
+/// 9-hour window. 2026-10-22 (operator Quote 37, plan item 64): moved back to
+/// 11:00 UTC / 16:30 IST. KEEP IN LOCKSTEP with main.tf `daily_stop`
+/// schedule_expression and the app's
+/// `shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST`.
+pub const STOP_TRIGGER_UTC_HOUR: u32 = 11;
 pub const STOP_TRIGGER_UTC_MINUTE: u32 = 0;
 /// EC2 start -> running takes <1 min; anything launched more than this many
 /// minutes after the trigger means the scheduled start did NOT do it.
 pub const LATE_START_GRACE_MINUTES: i64 = 5;
 
-/// Operating hours: 08:00-**17:30** IST, Mon-Fri (curfew guard inactive inside).
+/// Operating hours: 08:00-**16:30** IST, Mon-Fri (curfew guard inactive inside).
 ///
 /// 2026-08-08 (operator Quote 14): close moved 17:00 -> 17:30. LOAD-BEARING:
 /// the curfew guard STOPS a box running outside these hours, so a 17:00 close
 /// against a 17:30 EventBridge stop would have curfew-killed the box 30 min
 /// early every day. The 08:00 open is deliberately UNCHANGED — the start stays
 /// 08:30, so the open already has 30 min of slack and no morning schedule moves.
+///
+/// 2026-10-22 (operator Quote 37, plan item 64): close moved back 17:30 ->
+/// 16:30 with the daily stop. The drain hold still keeps a held box up past it.
 pub const OPERATING_OPEN_IST_MINUTES: u32 = 8 * 60;
-pub const OPERATING_CLOSE_IST_MINUTES: u32 = 17 * 60 + 30;
+pub const OPERATING_CLOSE_IST_MINUTES: u32 = 16 * 60 + 30;
+
+/// The daily stop as IST seconds of day (16:30 IST = 59,400), derived from
+/// [`STOP_TRIGGER_UTC_HOUR`] / [`STOP_TRIGGER_UTC_MINUTE`] plus +05:30. The
+/// drain hold's ignored window ends [`DAILY_STOP_JITTER_LEAD_SECS`] before it.
+pub const STOP_TRIGGER_IST_SECS_OF_DAY: i64 = (STOP_TRIGGER_UTC_HOUR as i64) * 3600
+    + (STOP_TRIGGER_UTC_MINUTE as i64) * 60
+    + crate::time::IST_OFFSET_SECS as i64;
+
+/// How long before the daily stop its EventBridge jitter window opens (the
+/// app's `shutdown_class::SCHEDULED_STOP_WINDOW_LEAD_SECS`, 300 s).
+pub const DAILY_STOP_JITTER_LEAD_SECS: i64 = 300;
 /// Grace: never curfew-stop a box within this many minutes of its launch.
 pub const CURFEW_START_GRACE_MINUTES: i64 = 45;
 
@@ -79,6 +103,11 @@ pub struct WatchdogEnv {
     /// happened in. While it names this UTC month the 08:45 self-start is
     /// skipped, so the watchdog never undoes a budget stop.
     pub budget_stop_param: String,
+    /// The drain hold (`drain_hold`, operator Quote 31, 2026-10-21): while
+    /// the app reports the day's data is not yet in the database, the 16:30
+    /// daily stop, the 16:45 stop check and the hourly curfew leave the box
+    /// running.
+    pub drain_hold_param: String,
 }
 
 impl WatchdogEnv {
@@ -94,6 +123,8 @@ impl WatchdogEnv {
             budget_stop_param: std::env::var("BUDGET_STOP_PARAM").unwrap_or_else(|_| {
                 crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string()
             }),
+            drain_hold_param: std::env::var("DRAIN_HOLD_PARAM")
+                .unwrap_or_else(|_| crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string()),
         }
     }
 }
@@ -548,7 +579,8 @@ pub async fn holiday_stop_is_today<S: SsmApi>(
 
 /// `true` when the budget-stop latch names the current UTC billing month.
 /// FAIL-OPEN: an unreadable or missing latch keeps the self-start; the
-/// hourly hard-stop guard still stops a breached box from Cost Explorer.
+/// hourly hard-stop guard still stops a breached box from the month-to-date
+/// spend (AWS Budgets since 2026-10-22, plan item 63).
 pub async fn budget_stop_is_this_month<S: SsmApi>(
     ssm: &S,
     param: &str,
@@ -562,6 +594,23 @@ pub async fn budget_stop_is_this_month<S: SsmApi>(
         }
     };
     crate::budget_stop_latch::budget_stop_is_latched(raw.as_deref(), now_utc)
+}
+
+/// Read the drain hold (operator Quote 31). A failed read is no hold: the
+/// stop paths then behave exactly as before (the cost-safe direction).
+pub async fn read_drain_hold<S: SsmApi>(
+    ssm: &S,
+    param: &str,
+    now_utc: DateTime<Utc>,
+) -> crate::drain_hold::DrainHold {
+    let raw = match ssm.get_parameter(param).await {
+        Ok(raw) => Some(raw),
+        Err(exc) => {
+            info!(error = %exc, "drain hold unavailable — treating as no hold");
+            None
+        }
+    };
+    crate::drain_hold::drain_hold_verdict(raw.as_deref(), now_utc.timestamp())
 }
 
 /// Legacy `_publish` — skips (with a warning) when the topic ARN is unset.
@@ -619,9 +668,45 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         return Ok(json!({"mode": "ping", "published": true}));
     }
 
+    if mode == "daily_stop" {
+        // @ 16:30 IST (operator Quote 31, 2026-10-21): the scheduled stop.
+        // Until then EventBridge fired the SSM stop automation directly,
+        // which could not see the drain hold. Now: a fresh hold keeps the box
+        // running until the app reports the day's data is in the database;
+        // otherwise stop it, with no page (the old automation sent none). A
+        // failed stop is left to the 16:45 stop_check, which pages. An
+        // unknown state (describe failed) still attempts the stop: a stop is
+        // idempotent, and the old SSM automation retried the same way.
+        let (state, _) = instance_info(ec2, &env.instance_id).await;
+        if state != "running" && state != "unknown" {
+            info!(state = %state, "daily_stop — instance not running; nothing to do");
+            return Ok(json!({"mode": "daily_stop", "state": state, "stopped": false}));
+        }
+        if let crate::drain_hold::DrainHold::Active { until_unix } =
+            read_drain_hold(ssm, &env.drain_hold_param, now).await
+        {
+            info!(
+                until_unix,
+                "daily_stop — drain hold active, box kept running"
+            );
+            return Ok(json!({
+                "mode": "daily_stop", "state": state, "stopped": false,
+                "skipped": "drain_hold"
+            }));
+        }
+        let stopped = try_self_stop(ec2, &env.instance_id).await;
+        if !stopped {
+            error!(
+                code = "LAMBDA-START-02",
+                "daily_stop — stop attempt FAILED; the 16:45 stop_check will retry and page"
+            );
+        }
+        return Ok(json!({"mode": "daily_stop", "state": state, "stopped": stopped}));
+    }
+
     if mode == "stop_check" {
-        // @ 17:45 IST: verify the 17:30 daily_stop actually stopped the box.
-        // Self-heal rule: stop ONLY a box launched BEFORE today's 17:30
+        // @ 16:45 IST: verify the 16:30 daily_stop actually stopped the box.
+        // Self-heal rule: stop ONLY a box launched BEFORE today's 16:30
         // trigger; a box launched AFTER it is a deliberate manual evening
         // session and is NEVER touched.
         let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
@@ -635,17 +720,31 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         {
             info!(
                 launch_time = %lt,
-                "stop_check — running but launched after 17:30 IST: manual evening session, leaving it alone"
+                "stop_check — running but launched after 16:30 IST: manual evening session, leaving it alone"
             );
             return Ok(json!({"mode": "stop_check", "state": state, "alerted": false}));
+        }
+        // Operator Quote 31 (2026-10-21): read the drain hold before any
+        // stop or page. A fresh hold means the 16:30 stop was deliberately
+        // skipped while the day's data drains — silent.
+        let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now).await;
+        if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
+            info!(
+                until_unix,
+                "stop_check — drain hold active; box deliberately still running"
+            );
+            return Ok(json!({
+                "mode": "stop_check", "state": state, "alerted": false,
+                "skipped": "drain_hold"
+            }));
         }
         let Some(_) = launch_time else {
             // Can't prove it isn't a manual session — page, don't stop.
             publish(
                 sns,
                 env,
-                "17:30 auto-stop FAILED — box still running",
-                "🆘 The 5:30 PM IST auto-stop did NOT stop the box and I could \
+                "16:30 auto-stop FAILED — box still running",
+                "🆘 The 4:30 PM IST auto-stop did NOT stop the box and I could \
 not read its launch time, so I won't risk killing a manual \
 session. If you are NOT using it right now, press \
 'Stop instance' on the portal — it bills every hour it runs.",
@@ -660,27 +759,37 @@ session. If you are NOT using it right now, press \
             }));
         };
         let self_stopped = try_self_stop(ec2, &env.instance_id).await;
+        // The box was held tonight, was already running when the hold was
+        // written, and the hold has ended: a SUCCESSFUL stop here is the
+        // expected end of the drain, so no page. A failed stop still pages.
+        if self_stopped && drain_hold.silences_stop_of(launch_time.map(|t| t.timestamp())) {
+            info!("stop_check — drain hold ended; stopped without a page");
+            return Ok(json!({
+                "mode": "stop_check", "state": state, "alerted": false,
+                "self_stopped": true, "drain_hold": "ended"
+            }));
+        }
         if self_stopped {
             publish(
                 sns,
                 env,
-                "17:30 auto-stop FAILED — watchdog stopped the box itself",
-                "🆘 The 5:30 PM IST auto-stop did NOT stop the box (it had been \
-running since before 5:30 PM). I have sent the stop command \
+                "16:30 auto-stop FAILED — watchdog stopped the box itself",
+                "🆘 The 4:30 PM IST auto-stop did NOT stop the box (it had been \
+running since before 4:30 PM). I have sent the stop command \
 myself. If you WANTED it running this evening, just press \
 'Start instance' on the portal — a box you start manually \
-after 5:30 PM is never auto-stopped. Also investigate why the \
-5:30 PM stop failed: AWS console → Systems Manager → \
-Automation executions for AWS-StopEC2Instance.",
+after 4:30 PM is never auto-stopped. Also investigate why the \
+4:30 PM stop failed: AWS console → CloudWatch → Log groups → \
+/aws/lambda/tv-prod-start-watchdog (the daily_stop run at 4:30 PM).",
             )
             .await?;
         } else {
             publish(
                 sns,
                 env,
-                "17:30 auto-stop FAILED — manual stop NEEDED",
+                "16:30 auto-stop FAILED — manual stop NEEDED",
                 &format!(
-                    "🆘 The 5:30 PM IST auto-stop did NOT stop the box — and the \
+                    "🆘 The 4:30 PM IST auto-stop did NOT stop the box — and the \
 watchdog's own stop attempt ALSO failed. Press 'Stop instance' \
 on the portal, or run \
 `aws ec2 stop-instances --instance-ids {} \
@@ -725,6 +834,20 @@ on the portal, or run \
                 "skipped": "keep_alive"
             }));
         }
+        // Operator Quote 31 (2026-10-21): a fresh drain hold keeps the box
+        // running while the day's data drains (never from 07:30 IST, see
+        // `drain_hold`), exactly like the keep-alive above.
+        let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now).await;
+        if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
+            info!(
+                until_unix,
+                "curfew_check — drain hold active; leaving the box alone"
+            );
+            return Ok(json!({
+                "mode": "curfew_check", "state": state, "stopped": false,
+                "skipped": "drain_hold"
+            }));
+        }
         if let Some(lt) = launch_time
             && now.signed_duration_since(lt) < Duration::minutes(CURFEW_START_GRACE_MINUTES)
         {
@@ -763,6 +886,20 @@ it bills every hour it runs."
             }));
         };
         let self_stopped = try_self_stop(ec2, &env.instance_id).await;
+        // The box was held tonight, was already running when the hold was
+        // written, and the hold has ended (or 07:30 IST passed): a SUCCESSFUL
+        // stop here is the expected end of the drain, so no page. A failed
+        // stop still takes the manual-stop page below.
+        if self_stopped && drain_hold.silences_stop_of(launch_time.map(|t| t.timestamp())) {
+            info!(
+                now_ist = %now_ist,
+                "curfew_check — drain hold ended; stopped without a page"
+            );
+            return Ok(json!({
+                "mode": "curfew_check", "state": state, "stopped": true,
+                "alerted": false, "drain_hold": "ended"
+            }));
+        }
         if self_stopped {
             publish(
                 sns,
@@ -1221,32 +1358,55 @@ mod tests {
         }
     }
 
+    /// SSM fake keyed on the parameter NAME (2026-10-21), so the keep-alive,
+    /// holiday, budget-stop and drain-hold parameters are distinct: a value
+    /// set for one is never what another read receives.
     struct FakeSsm {
-        value: Option<String>,
+        values: std::collections::HashMap<String, String>,
         raises: bool,
     }
 
     impl FakeSsm {
-        fn with(value: Option<&str>) -> Self {
+        /// No parameter exists (every read is ParameterNotFound).
+        fn empty() -> Self {
             Self {
-                value: value.map(str::to_string),
+                values: std::collections::HashMap::new(),
                 raises: false,
             }
         }
         fn raising() -> Self {
             Self {
-                value: None,
                 raises: true,
+                ..Self::empty()
             }
+        }
+        fn set(mut self, name: &str, value: &str) -> Self {
+            self.values.insert(name.to_string(), value.to_string());
+            self
+        }
+        fn keep_alive(self, value: &str) -> Self {
+            self.set(DEFAULT_KEEP_ALIVE_PARAM, value)
+        }
+        fn holiday(self, value: &str) -> Self {
+            self.set(DEFAULT_HOLIDAY_STOP_PARAM, value)
+        }
+        fn budget(self, value: &str) -> Self {
+            self.set(crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM, value)
+        }
+        fn drain_hold(self, value: &str) -> Self {
+            self.set(crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM, value)
         }
     }
 
     impl SsmApi for FakeSsm {
-        async fn get_parameter(&self, _name: &str) -> Result<String, String> {
-            if self.raises || self.value.is_none() {
-                return Err("ParameterNotFound".to_string());
+        async fn get_parameter(&self, name: &str) -> Result<String, String> {
+            if self.raises {
+                return Err("AccessDenied".to_string());
             }
-            Ok(self.value.clone().unwrap_or_default())
+            self.values
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "ParameterNotFound".to_string())
         }
     }
 
@@ -1258,6 +1418,7 @@ mod tests {
             keep_alive_param: DEFAULT_KEEP_ALIVE_PARAM.to_string(),
             holiday_stop_param: DEFAULT_HOLIDAY_STOP_PARAM.to_string(),
             budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
+            drain_hold_param: crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string(),
         }
     }
 
@@ -1596,7 +1757,7 @@ mod tests {
         // self-start, no Critical page. in_window_now is 08:45 IST 2026-06-10.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("stopped"));
-        let ssm = FakeSsm::with(Some("2026-06-10"));
+        let ssm = FakeSsm::empty().holiday("2026-06-10");
         let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
         assert_eq!(out["alerted"], json!(false));
         assert_eq!(out["self_started"], json!(false));
@@ -1610,7 +1771,7 @@ mod tests {
         // A previous holiday's marker never matches today -> normal self-heal.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("stopped"));
-        let ssm = FakeSsm::with(Some("2026-06-09")); // yesterday's holiday
+        let ssm = FakeSsm::empty().holiday("2026-06-09"); // yesterday's holiday
         let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
         assert_eq!(out["alerted"], json!(true));
         assert_eq!(out["self_started"], json!(true));
@@ -1627,35 +1788,35 @@ mod tests {
         // 2026-10-20 03:10 UTC = 08:40 IST on the NSE holiday.
         let now = utc(2026, 10, 20, 3, 10);
         for (ssm, blocks) in [
-            (FakeSsm::with(Some("2026-10-20")), true),
-            (FakeSsm::with(Some(" 2026-10-20\n")), true),
-            (FakeSsm::with(Some("2026-10-19")), false),
-            (FakeSsm::with(Some("2026-10-02")), false),
-            (FakeSsm::with(Some("")), false),
-            (FakeSsm::with(None), false),
+            (FakeSsm::empty().holiday("2026-10-20"), true),
+            (FakeSsm::empty().holiday(" 2026-10-20\n"), true),
+            (FakeSsm::empty().holiday("2026-10-19"), false),
+            (FakeSsm::empty().holiday("2026-10-02"), false),
+            (FakeSsm::empty().holiday(""), false),
+            (FakeSsm::empty(), false),
             (FakeSsm::raising(), false),
         ] {
             assert_eq!(
                 holiday_stop_is_today(&ssm, DEFAULT_HOLIDAY_STOP_PARAM, now).await,
                 blocks,
                 "marker {:?} (raises: {})",
-                ssm.value,
+                ssm.values,
                 ssm.raises
             );
         }
     }
 
     // -----------------------------------------------------------------------
-    // Budget-stop latch (audit PR30). FakeSsm answers every name with one
-    // value, so "2026-06" is the latch for June and never today's holiday
-    // marker (a full date).
+    // Budget-stop latch (audit PR30). FakeSsm is keyed on the parameter
+    // name (2026-10-21), so "2026-06" is the latch for June and only the
+    // latch read receives it.
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_budget_stop_is_this_month_latch_skips_the_self_start() {
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("stopped"));
-        let ssm = FakeSsm::with(Some("2026-06"));
+        let ssm = FakeSsm::empty().budget("2026-06");
         let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
         assert_eq!(out["alerted"], json!(true));
         assert_eq!(out["self_started"], json!(false));
@@ -1676,7 +1837,7 @@ mod tests {
     async fn test_budget_stop_is_this_month_last_months_latch_still_self_starts() {
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("stopped"));
-        let ssm = FakeSsm::with(Some("2026-05"));
+        let ssm = FakeSsm::empty().budget("2026-05");
         let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
         assert_eq!(out["self_started"], json!(true));
         assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
@@ -1718,14 +1879,16 @@ mod tests {
     // the old values, 11:46 UTC (17:16 IST) is now BEFORE the stop trigger, so
     // a deliberate manual evening session would have been misread as a box
     // left running since morning and stopped.
+    // 2026-10-22 (Quote 37, plan item 64): back to 11:00 UTC (16:30 IST) and
+    // 11:15 UTC (16:45 IST); the fixtures move with them again.
     fn stop_check_now() -> DateTime<Utc> {
-        utc(2026, 6, 10, 12, 15) // 17:45 IST — the stop_check slot
+        utc(2026, 6, 10, 11, 15) // 16:45 IST — the stop_check slot
     }
     fn morning_launch() -> DateTime<Utc> {
         utc(2026, 6, 10, 3, 13) // 08:43 IST — since morning
     }
     fn evening_launch() -> DateTime<Utc> {
-        utc(2026, 6, 10, 12, 16) // manual 17:46 IST — AFTER the 17:30 stop
+        utc(2026, 6, 10, 11, 16) // manual 16:46 IST — AFTER the 16:30 stop
     }
 
     #[tokio::test]
@@ -1870,7 +2033,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -1888,7 +2051,7 @@ mod tests {
         // Explicit keep-alive in the future -> the operator WANTS it running.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("2026-07-03T06:00:00+05:30")); // tomorrow 6 AM IST
+        let ssm = FakeSsm::empty().keep_alive("2026-07-03T06:00:00+05:30"); // tomorrow 6 AM IST
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -1908,7 +2071,7 @@ mod tests {
         // A keep-alive that already lapsed no longer protects the box.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("2026-07-02T20:00:00+05:30")); // 8 PM IST — past
+        let ssm = FakeSsm::empty().keep_alive("2026-07-02T20:00:00+05:30"); // 8 PM IST — past
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -1926,7 +2089,7 @@ mod tests {
         // Operator pastes a plain IST timestamp with no offset — honored.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("2026-07-03T06:00:00")); // naive -> IST -> future
+        let ssm = FakeSsm::empty().keep_alive("2026-07-03T06:00:00"); // naive -> IST -> future
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -2166,7 +2329,7 @@ mod tests {
         // Garbage in the param must not silently disable budget protection.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("not-a-timestamp"));
+        let ssm = FakeSsm::empty().keep_alive("not-a-timestamp");
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -2186,7 +2349,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2206,7 +2369,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             market_hours_now(),
         )
@@ -2226,7 +2389,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             weekend_now(),
         )
@@ -2242,7 +2405,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2260,7 +2423,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2284,7 +2447,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2298,7 +2461,7 @@ mod tests {
 
     #[test]
     fn test_operating_hours_boundaries() {
-        // Pin the exact window: [08:00, 17:00) IST, Mon-Fri only.
+        // Pin the exact window: [08:00, 16:30) IST, Mon-Fri only.
         let ist_tz = FixedOffset::east_opt(crate::time::IST_OFFSET_SECS).expect("ist offset");
         let at = |y: i32, mo: u32, d: u32, h: u32, mi: u32| {
             ist_tz
@@ -2314,10 +2477,436 @@ mod tests {
         // 17:29 are now INSIDE and only 17:30 is out. The 17:00 assert is kept
         // (inverted) as the regression pin: if the close slips back, the curfew
         // guard stops the box 30 min before its scheduled 17:30 stop.
-        assert!(is_within_operating_hours(at(2026, 7, 1, 17, 0)));
-        assert!(is_within_operating_hours(at(2026, 7, 1, 17, 29)));
-        assert!(!is_within_operating_hours(at(2026, 7, 1, 17, 30)));
+        // 2026-10-22 (Quote 37, plan item 64): close moved back to 16:30, so
+        // 16:29 is the last inside minute and 16:30 and 17:00 are out.
+        assert!(is_within_operating_hours(at(2026, 7, 1, 16, 29)));
+        assert!(!is_within_operating_hours(at(2026, 7, 1, 16, 30)));
+        assert!(!is_within_operating_hours(at(2026, 7, 1, 17, 0)));
         // Sunday midday is never operating hours.
         assert!(!is_within_operating_hours(at(2026, 7, 5, 12, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Drain hold (operator Quote 31, 2026-10-21): the 16:30 daily_stop, the
+    // 16:45 stop_check and the hourly curfew leave the box running while the
+    // app holds it, and stop it WITHOUT a page once a hold has ended.
+    // -----------------------------------------------------------------------
+
+    fn hold(state: &str, until: DateTime<Utc>, written: DateTime<Utc>) -> String {
+        format!(
+            r#"{{"v":1,"state":"{state}","until_unix":{},"written_unix":{},"left":"12 buckets"}}"#,
+            until.timestamp(),
+            written.timestamp()
+        )
+    }
+
+    // Wed 2026-06-10 16:30 IST — the daily_stop slot (17:30 until 2026-10-22).
+    fn daily_stop_now() -> DateTime<Utc> {
+        utc(2026, 6, 10, 11, 0)
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_stopped_box_is_a_silent_noop() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["mode"], json!("daily_stop"));
+        assert_eq!(out["stopped"], json!(false));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_no_hold_stops_silently() {
+        // The old SSM stop automation sent no page; neither does this.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_an_unreadable_hold_still_stops() {
+        // Fail toward stopping: an SSM error is no hold.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::raising(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["stopped"], json!(true));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_an_active_hold_keeps_the_box_running() {
+        let now = daily_stop_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_a_released_hold_stops_silently() {
+        let now = daily_stop_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(1),
+            now - Duration::minutes(1),
+        ));
+        let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_failure_is_left_to_the_stop_check_without_a_page() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"))
+            .launch(morning_launch())
+            .stop_raises();
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["stopped"], json!(false));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_active_hold_is_silent_and_never_stops() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(20),
+            now - Duration::minutes(2),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_active_hold_also_covers_an_unknown_launch_time() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"));
+        let ssm = FakeSsm::empty().drain_hold(&hold("holding", now + Duration::minutes(20), now));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_stops_without_a_page() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        // An expired "holding" record written minutes ago: the hold lapsed.
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now - Duration::minutes(1),
+            now - Duration::minutes(4),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["self_stopped"], json!(true));
+        assert_eq!(out["drain_hold"], json!("ended"));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_with_unknown_launch_still_pages_without_stopping() {
+        // The existing never-kill-a-possible-manual-session rule still wins.
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"));
+        let ssm = FakeSsm::empty().drain_hold(&hold("released", now, now));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert!(ec2.stop_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_stale_hold_keeps_the_existing_page() {
+        // A record from yesterday is no hold: unchanged stop + page.
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::hours(20),
+            now - Duration::hours(20),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_stopped"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("stopped the box itself")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curfew_active_hold_leaves_the_box_alone() {
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(15),
+            now - Duration::minutes(3),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_curfew_ended_hold_stops_without_a_page() {
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(40),
+            now - Duration::minutes(40),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["drain_hold"], json!("ended"));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_curfew_at_0735_ist_stops_a_box_still_held_overnight() {
+        // The hard bound: from 07:30 IST a hold is ignored, so the 07:35
+        // curfew stops the box (silently, it was held tonight) and the 08:30
+        // start boots it fresh.
+        let now = utc(2026, 7, 3, 2, 5); // Fri 07:35 IST
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(30),
+            now - Duration::minutes(5),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_curfew_keep_alive_and_drain_hold_are_distinct_parameters() {
+        // A drain-hold value is never read as the keep-alive, and a stale
+        // drain hold leaves the existing curfew page in place.
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty()
+            .keep_alive("2026-07-02T20:00:00+05:30") // expired
+            .drain_hold(&hold(
+                "released",
+                now - Duration::days(2),
+                now - Duration::days(2),
+            ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("Curfew auto-stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_drain_hold_reads_its_own_parameter_and_fails_toward_no_hold() {
+        use crate::drain_hold::{DEFAULT_DRAIN_HOLD_PARAM, DrainHold};
+        let now = curfew_night_now();
+        let raw = hold("holding", now + Duration::minutes(5), now);
+        let active = FakeSsm::empty().drain_hold(&raw);
+        assert_eq!(
+            read_drain_hold(&active, DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::Active {
+                until_unix: (now + Duration::minutes(5)).timestamp()
+            }
+        );
+        // The same record under ANOTHER name is not the drain hold.
+        let elsewhere = FakeSsm::empty().keep_alive(&raw);
+        assert_eq!(
+            read_drain_hold(&elsewhere, DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+        assert_eq!(
+            read_drain_hold(&FakeSsm::raising(), DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+    }
+
+    // --- Review fixes (2026-10-21): silence only a SUCCESSFUL stop of the box
+    // that was running when the hold was written; daily_stop on an unknown
+    // state still attempts the stop.
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_failed_stop_still_pages_manual() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"))
+            .launch(morning_launch())
+            .stop_raises();
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(2),
+            now - Duration::minutes(2),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_stopped"], json!(false));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("manual stop NEEDED")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_does_not_silence_a_later_session() {
+        // Launched 16:20 IST, after the 16:10 IST hold write: another session.
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 6, 10, 10, 50));
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            utc(2026, 6, 10, 10, 40),
+            utc(2026, 6, 10, 10, 40),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_stopped"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("stopped the box itself")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curfew_ended_hold_failed_stop_still_pages_manual() {
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"))
+            .launch(curfew_old_launch())
+            .stop_raises();
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(40),
+            now - Duration::minutes(40),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert_eq!(out["alerted"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("manual stop NEEDED")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curfew_ended_hold_does_not_silence_a_later_session() {
+        // Box launched 50 min ago (past the 45-min grace), 5 min AFTER the
+        // hold record was written: a different session, so it pages.
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let launch = now - Duration::minutes(50);
+        let ec2 = FakeEc2::new(Some("running")).launch(launch);
+        let written = launch - Duration::minutes(5);
+        let ssm = FakeSsm::empty().drain_hold(&hold("released", written, written));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("Curfew auto-stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_unknown_state_still_attempts_the_stop() {
+        // describe failed: the stop is idempotent, so attempt it.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(None);
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["state"], json!("unknown"));
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_unknown_state_with_an_active_hold_is_skipped() {
+        let now = daily_stop_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(None);
+        let ssm = FakeSsm::empty().drain_hold(&hold("holding", now + Duration::minutes(10), now));
+        let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
     }
 }

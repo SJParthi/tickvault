@@ -280,11 +280,11 @@ fn candle_tables_are_swept_via_single_source() {
     // DROPS them at boot, so there is no table left to sweep. The ledger here
     // is therefore the LIVE set, and the sibling test below is what proves no
     // live name ever drifts into that drop list.
+    // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` left the fold;
+    // they are archive-only (`ARCHIVE_ONLY_CANDLE_TABLES`), pinned below.
     let expected = [
         // Second scale.
         "candles_1s",
-        "candles_3s",
-        "candles_5s",
         // Minute scale.
         "candles_1m",
         "candles_3m",
@@ -396,8 +396,6 @@ fn emitted_and_retired_candle_names_never_intersect() {
     // over candles_1m into a folded table, so it is in the set now.
     let want: BTreeSet<&str> = [
         "candles_1s",
-        "candles_3s",
-        "candles_5s",
         "candles_1m",
         "candles_3m",
         "candles_5m",
@@ -410,7 +408,7 @@ fn emitted_and_retired_candle_names_never_intersect() {
     .collect();
     assert_eq!(
         emitted, want,
-        "the emitted candle tables must be exactly the operator's ten fold frames \
-         (10m has been a folded table since 2026-09-22)"
+        "the emitted candle tables must be exactly the operator's eight fold frames \
+         (10m has been a folded table since 2026-09-22; 3s and 5s left on 2026-10-22)"
     );
 }

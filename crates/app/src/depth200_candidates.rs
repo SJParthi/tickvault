@@ -13,7 +13,7 @@
 //!
 //! The ranking that computes the right answer — one full-population `rank`
 //! on the 1-second cadence, then
-//! [`crate::volume_leaderboard::distinct_underlying_over`] on that slice —
+//! [`crate::option_rank::distinct_underlying_over`] on that slice —
 //! needs `&mut self` on the ingest that lives on the frame-drain task, while
 //! `run_depth_rebalance` is a separate `tokio::spawn` with no handle to it. A
 //! `Mutex` on the drain's state is not available: that is the per-packet hot
@@ -78,7 +78,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use tickvault_common::types::ExchangeSegment;
 
-use crate::volume_leaderboard::RankedContract;
+use crate::option_rank::RankedContract;
 
 /// Gauge: how many contracts the last published ranking held.
 ///
@@ -285,7 +285,7 @@ impl Depth200Candidates {
     /// rank: the ranking rolls per-cadence baselines forward inside the
     /// leaderboard, so a second pass over the same window would measure a
     /// window that has already been consumed. See
-    /// [`crate::volume_leaderboard::distinct_underlying_over`].
+    /// [`crate::option_rank::distinct_underlying_over`].
     pub fn publish(&self, candidates: Vec<Depth200Candidate>) {
         metrics::gauge!(RANKED_CANDIDATES_GAUGE).set(candidates.len() as f64);
         self.ranked.store(Some(Arc::new(candidates)));

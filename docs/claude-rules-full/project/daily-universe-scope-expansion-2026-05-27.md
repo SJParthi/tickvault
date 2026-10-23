@@ -1222,7 +1222,7 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — r8g.xlarge, MULTI-AZ (LOCKED 2026-08-08 per §0 Quote 13 — the 13-timeframe + tick-retention requirement, and the AZ un-pin that actually ends the capacity outage; supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+## §7. Instance lock — r8g.large, MULTI-AZ (LOCKED 2026-10-21 per §0 Quotes 32/33, applied by the 2026-10-22 rebuild; supersedes the 2026-08-08 r8g.xlarge lock of Quote 13 — the 13-timeframe + tick-retention requirement, and the AZ un-pin that actually ends the capacity outage; supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
 
 > **2026-08-08 (Quote 13) — the AZ pin is REMOVED, and that is the load-bearing
 > change.** Every prior instance lock in this section assumed the box lives in
@@ -1246,13 +1246,13 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 
 | Spec | Value |
 |---|---|
-| Instance | **r8g.xlarge** — ARM Graviton4, **4 vCPU, 32 GiB RAM** (memory-optimised). *(Changed from t4g.large 2026-08-08 per §0 Quote 13 — to serve the 13-timeframe + current-day tick-retention requirement at ~25,000 instruments. `r` = 8 GiB/vCPU because the workload is memory-bound; `m8g` would force buying unused CPU to reach the same RAM, `r8gd`'s local NVMe is wiped on every stop (the box stops daily), and `r8i` would force an x86 rebuild of the whole ARM pipeline. Cost ~₹5,824–₹7,382/mo — the Quote 9 sub-₹1,000 target is BREACHED ~6× and knowingly accepted; see Quote 13 for the derivation.)* |
+| Instance | **r8g.large** — ARM Graviton4, **2 vCPU, 16 GiB RAM** (memory-optimised). *(Changed from r8g.xlarge 2026-10-21 per §0 Quotes 32/33, applied by the 2026-10-22 rebuild with a 150 GB root. Memory is retuned for 16 GiB by `tickvault host-tuning`: QuestDB 4/10 of RAM, the app `MemoryHigh` lowered by a drop-in, QuestDB's cpuset narrowed to the two cores. The 15.5 GiB WAL replay spike came from depth rows and is Assumed not to recur with depth off.)* History: r8g.xlarge — ARM Graviton4, 4 vCPU, 32 GiB (memory-optimised). *(Changed from t4g.large 2026-08-08 per §0 Quote 13 — to serve the 13-timeframe + current-day tick-retention requirement at ~25,000 instruments. `r` = 8 GiB/vCPU because the workload is memory-bound; `m8g` would force buying unused CPU to reach the same RAM, `r8gd`'s local NVMe is wiped on every stop (the box stops daily), and `r8i` would force an x86 rebuild of the whole ARM pipeline. Cost ~₹5,824–₹7,382/mo — the Quote 9 sub-₹1,000 target is BREACHED ~6× and knowingly accepted; see Quote 13 for the derivation.)* |
 | **Availability zone** | **NOT PINNED** — subnets provisioned in `ap-south-1{a,b,c}`, instance zone selected by `var.availability_zone` (default `b`). *(2026-08-08, Quote 13. The old single-AZ pin at `main.tf:77` is what kept the box dark 2026-08-06→08: `describe-instance-type-offerings` confirms all 7 candidate types are offered in all 3 AZs, so the zone — not the type — was the blocker. Re-pinning to one zone is a REJECT.)* |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. **AUTHORIZED 2026-08-19 (Quote 16): 100 → 200 GB.** The terraform default is raised in the same change; the LIVE volume is UNCHANGED until the out-of-band online grow runs (`root_block_device[0].volume_size` is in `lifecycle.ignore_changes`, so `terraform apply` never touches the running root). +$9.12/mo → ~₹915/mo incl GST, narrowing the $100 kill-ceiling margin from $16.40 to $7.28. One-way door: gp3 can never shrink. **APPLIED AND VERIFIED LIVE 2026-08-21** — `describe-volumes` on the running account (post-close, box stopped) returns `vol-0c6ab6e593e39d8c8`: **200 GiB gp3, 6000 IOPS, 500 MiB/s, in-use** on `i-0c3fe906dad5492fc` in ap-south-1b. So the Quote 16 size grow AND the Quote 17 IOPS/throughput raise are BOTH live; `describe-volumes-modifications` records the IOPS step 3000→6000 as `completed`, started 2026-08-20T12:15:58Z. The sentence above — "the LIVE volume is UNCHANGED until the out-of-band online grow runs" — was true when written and is now SUPERSEDED; it is kept per house convention so the sequence stays readable. **The filesystem followed the volume**, which is the half a `describe-volumes` cannot show: `tv_spill_dir_free_bytes` read **200.6 GB free at 09:30 IST on 2026-08-21**, a figure a 100 GB filesystem cannot report. **⚠ The volume id in this row's history is NOT the live one** — `vol-073ccaa417a0f344b` belonged to the retired box; re-describe before any volume operation rather than trusting a recorded id. |
+| EBS | **2026-10-21 (Quotes 32/33): a fresh 150 GB gp3 root (3,000 IOPS, 125 MiB/s) replaces the 600 GB one on the 2026-10-22 rebuild; `variables.tf` default 150, validation ceiling 600 kept while the live root is 600.** The rest of this cell is the record up to then. gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. **AUTHORIZED 2026-08-19 (Quote 16): 100 → 200 GB.** The terraform default is raised in the same change; the LIVE volume is UNCHANGED until the out-of-band online grow runs (`root_block_device[0].volume_size` is in `lifecycle.ignore_changes`, so `terraform apply` never touches the running root). +$9.12/mo → ~₹915/mo incl GST, narrowing the $100 kill-ceiling margin from $16.40 to $7.28. One-way door: gp3 can never shrink. **APPLIED AND VERIFIED LIVE 2026-08-21** — `describe-volumes` on the running account (post-close, box stopped) returns `vol-0c6ab6e593e39d8c8`: **200 GiB gp3, 6000 IOPS, 500 MiB/s, in-use** on `i-0c3fe906dad5492fc` in ap-south-1b. So the Quote 16 size grow AND the Quote 17 IOPS/throughput raise are BOTH live; `describe-volumes-modifications` records the IOPS step 3000→6000 as `completed`, started 2026-08-20T12:15:58Z. The sentence above — "the LIVE volume is UNCHANGED until the out-of-band online grow runs" — was true when written and is now SUPERSEDED; it is kept per house convention so the sequence stays readable. **The filesystem followed the volume**, which is the half a `describe-volumes` cannot show: `tv_spill_dir_free_bytes` read **200.6 GB free at 09:30 IST on 2026-08-21**, a figure a 100 GB filesystem cannot report. **⚠ The volume id in this row's history is NOT the live one** — `vol-073ccaa417a0f344b` belonged to the retired box; re-describe before any volume operation rather than trusting a recorded id. |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan). **2026-07-19 Quote 10 supersession note: release APPROVED for the no-real-orders period — execution ONLY via the bundled erase-window recreate** (a standalone release is VERIFIED-UNSAFE on the live ENI — launch-time attribute, live describe evidence, coordinator session, 2026-07-19; this row's "no public IP after stop/modify/start" claim CONFIRMED). Runbook: `docs/runbooks/eip-release.md`. Re-enable + Dhan setIP ≥7 days before live orders. |
 | Network | ENA enabled by default |
 
@@ -1451,7 +1451,7 @@ inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08 (Quote 14 → 08:30–17:30).**
 > Trading WEEKDAYS only (Mon–Fri), **08:30–16:30 IST** auto start/stop.
 >
-> **CURRENT LIVE SCHEDULE: 08:30–17:30 IST Mon–Fri** (Quote 14).
+> **CURRENT LIVE SCHEDULE: 08:30–16:30 IST Mon–Fri** (Quote 37, applied 2026-10-22 by plan ITEM 64; it was 08:30–17:30 IST under Quote 14 from 2026-08-08). The Quote 31 drain hold still keeps the box up past 16:30 while the day's data is not saved.
 
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08:** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
@@ -1463,9 +1463,10 @@ inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is r8g.xlarge AND the AZ stays UN-PINNED. PERIOD.** *(2026-08-08,
-   §0 Quote 13 — was t4g.large from 2026-08-07.)* Two things are locked by this rule,
-   not one: the **type** (4 vCPU / 32 GiB Graviton4) and the **multi-AZ shape**
+1. **Instance type is r8g.large AND the AZ stays UN-PINNED. PERIOD.** *(2026-10-21,
+   §0 Quotes 32/33 — was r8g.xlarge from 2026-08-08 (Quote 13), t4g.large from
+   2026-08-07.)* Two things are locked by this rule,
+   not one: the **type** (2 vCPU / 16 GiB Graviton4) and the **multi-AZ shape**
    (subnets in 1a/1b/1c, zone chosen by `var.availability_zone`). Re-pinning the
    subnet to a single AZ is a REJECT on its own, independent of the type — that pin
    is what caused the 2026-08-06→08 outage, and the 2026-08-07 type flip failed
@@ -2818,3 +2819,292 @@ REJECT under 29e:
 - Changes disk throughput, the instance type or the EBS size under cover of this quote.
 - Raises IOPS above 3,000 again without a fresh dated quote.
 - Claims the ₹15,000 is a hard cap: it is a stop line, and fixed costs continue after the stop.
+
+**Quote 31 (2026-10-21, in session, after the morning the database fell 4,440 transactions behind at boot):**
+> "go ahead dude make the change but why the fuck every day post market this ddint egt moved see i celalry todl you until or unelss movign all tehse dtaa to db never evr shut down right motherfucekr okay?"
+> "see evryday move shdou lbe finsihed withint that day mtoherfucker why every tiem everyhtign si gettign in one shopt mtoehrfucker why?"
+> "see eevryday i celalry told yo ui wnat evryhtign workign precisleyr igth?"
+
+Earlier the same session, on the option of raising the disk's paid speed: *"bro why raisign budget limit spee ddude whta os the fuckign issue ehre dude?"* — that option is withdrawn and is NOT authorized here.
+
+**Measured 2026-10-21 (read-only CloudWatch, Verified):**
+
+| Fact | Reading |
+|---|---|
+| 20 Oct after-close deferred-depth pass | 15:45–17:01 IST, 406 buckets, **3,067,442,594 rows** (the first full run after the 14–16 Oct latch fault, #2111) |
+| QuestDB apply lag, 20 Oct | 0 at 15:42, 6,758 at 17:00, ~6,000 at the 17:30 stop |
+| QuestDB apply lag at 21 Oct boot | 4,440 at 08:31, caught up (12) at 09:46 |
+| Boot replay, 21 Oct | 18,506,480 inline depth rows + 4,530,491 frames re-appended 08:31–08:36; 1,192 WAL segments still deferred to the next boot (per-boot frame cap 3,000,000) |
+| Disk writes, 21 Oct | 482–500 MiB/s (the volume cap) 08:35–09:55 IST; normal days 250–290 MiB/s for two hours, then ~80 MiB/s |
+| Effect | tick flushes rescued to spill every few seconds 08:33–~10:00; depth shed 09:05–09:08 and 09:20–09:33 |
+| r8g.xlarge hourly cost | about $0.19/h (1–13 Oct: $15.66 for ~81 h, Assumed from the 13 Oct record) |
+
+**The rule (one line):** each trading day's data is fully in the database the SAME day: after the close the box keeps running until every deferred depth bucket is written back, every waiting WAL segment is replayed, every spill folder is drained and QuestDB's apply backlog is back to its idle level (at most 10 transactions, with no suspended table, on two readings a minute apart); only then may the scheduled stops stop it.
+
+**What this authorizes:**
+
+| Item | Change |
+|---|---|
+| Schedule | 08:30–17:30 IST becomes 08:30 until the day's data is in the database, bounded at **07:30 IST the next morning** (the 07:35 curfew check then stops it, and the 08:30 start boots it fresh) |
+| The hold | The app writes `/tickvault/<env>/drain-hold` (a String SSM parameter: an expiry instant and what is left) while work remains, refreshed every few minutes; it lapses on its own if the app stops refreshing it |
+| Stops that honour a fresh hold | the 17:30 daily stop, the 17:45 stop check, the hourly curfew check, the hard-stop guard's out-of-window stop |
+| Evening work | the deferred-depth pass and a post-close WAL catch-up run until done (no 17:15 deadline), paced on QuestDB's absolute apply lag as well as its growth |
+
+**NOT authorized:** gating the budget kill (the hard-stop guard's `>= $170` stop and the native budget stop) on the hold; holding the box past 07:30 IST the next morning; raising disk throughput, IOPS, the instance type, EBS size or the $170 kill line; any new Telegram page.
+
+**Honest limits:**
+- **Read live 2026-10-21 (Cost Explorer):** October 1–20 is $119.20; at the measured daily rate (~$5.5 a weekday, ~$3.3 a weekend day) October lands near **$173, above the $170 stop, before any extra hour** (Assumed; tax may be trued up). Each held evening hour adds about $0.19. The budget stop is not gated by the hold, so if October crosses $170 the box stops for the rest of the month.
+- The box sustains only about 149 MiB/s of disk writes once its EBS burst balance is spent (13 Oct record); an evening drain of a multi-day backlog can take hours.
+- A QuestDB that never catches up holds the box until 07:30; the next boot then replays as before.
+- A hold the app cannot write (SSM failure) lapses and the box stops as before; that is logged as a coded error, not paged.
+- **How the post-close WAL catch-up runs (2026-10-21, plan ITEM 60):** only a boot's catch-up (before the sockets dial) replays WAL segments, so once the day's own work is done and the unapplied ranges still pin segments, the app restarts itself (at most 3 an evening, 40 minutes apart, 15:50–05:00 IST, not before the day's cross-verification has finished or 17:25 IST, none after a restart that did not shrink the backlog) and the restarted boot's catch-up runs 15 minutes instead of 5. Every per-boot bound stays (about one session of frames per boot), so a multi-day backlog takes several evenings. The restart sends no shutdown message; the restarted app sends its usual boot message (at most 3 a night).
+
+##### What a PR or action that violates Quote 31 looks like (REJECT)
+- Gates the budget stop on the hold, or lets a hold keep the box running past 07:30 IST the next morning.
+- A hold with no expiry, or one the app does not refresh (a crashed app must not keep the box up).
+- Stops the box on schedule while the app reports work left and its hold is fresh.
+- Re-adds a fixed evening deadline to the deferred-depth pass or the post-close WAL catch-up.
+- Raises disk throughput, IOPS, instance type, EBS size or the kill line under cover of this quote.
+- Adds a Telegram page for the hold.
+
+#### Quote 32 (2026-10-21) — AWS UNDER $100 A MONTH: DEPTH OFF, FREE DISK SPEED, 150 GB DISK, HALF-SIZE SERVER (preserve EXACTLY, typos included)
+
+After being shown the October split (~$173 with tax: disk storage ~$73, server hours ~$45, disk speed ~$22, alarms ~$24, other ~$9) and four steps (depth off; disk speed 500 → 125 MiB/s; 600 GB disk replaced by 150 GB; r8g.xlarge → r8g.large), estimated at about $90–95 a month for the first three and about $70–75 with the fourth:
+
+> "Still I can't understand dude can we get or shrink rhe budget less than 100 usd dude tell me if yes tell me how? Then switch off both depth 20 and depth 200 dude okay?"
+> "Access the direct love Aws dude oaky / Then I believe you can go ahead with allctge steps right dude am icirght bro tellcme dude oaky / So max per month it will be only 75 right dude / Nope bro switch off depth 20 and depth 200 go ahead with all the items which you have listed dude oaky? / What bro doing or not dude see switch off depth 20 and depth 200 and all the steps also implement it dud eoaku"
+
+**What this authorizes, in this order (each step only after the one before it is live and checked):**
+
+| Step | Change | Precondition |
+|---|---|---|
+| 1 | Depth-20 and depth-200 off (`websocket-connection-scope-lock.md`, 2026-10-21) | Merged and deployed |
+| 2 | Disk throughput 500 → **125 MiB/s** (the free gp3 baseline) through `grow-ebs-volume.yml` (size 600 and IOPS 3,000 unchanged); `variables.tf` default 125 | One full session with depth off whose 1-minute write-throughput peak after 09:15 is under 100 MiB/s; outside 09:00–15:45 IST |
+| 3 | Root disk 600 GB → **150 GB**: a new volume on a rebuilt box (gp3 cannot shrink) | A reviewed rebuild plan and workflow; every QuestDB table the new disk does not hold, and every SEBI/audit table, copied to `s3://tv-prod-cold/` and verified first (Quote 27 binds); the WAL backlog drained or copied; a non-trading day; the old volume kept as a snapshot for 7 days |
+| 4 | **r8g.xlarge → r8g.large**, multi-AZ shape kept; memory limits (systemd `MemoryHigh`, QuestDB memory) retuned for 16 GiB; every instance-lock lockstep site in the same change | Done with step 3, on the same rebuild |
+
+**Honest limits, stated to the owner:** about $70–75 a month is an ESTIMATE from the 1–13 Oct bill, not a maximum. The only hard maximum is the budget stop (still $170; lowering it is a separate dated quote). October is already $119.20 on 1–20 Oct, so the saving shows from November. A 150 GB disk holds about two days of trades and candles at today's rate without depth (Assumed until measured after step 1); older partitions move to S3 sooner. A half-size server has half the memory: the WAL replay spike measured 15.5 GiB came from depth rows and should not recur, but this is Assumed until a depth-off replay is measured.
+
+##### What a PR or action that violates Quote 32 looks like (REJECT)
+- Lowers throughput before a depth-off session is measured, or inside 09:00–15:45 IST.
+- Replaces the disk or the instance on a trading day, or before the S3 copies are verified.
+- Deletes any SEBI/audit row, or any market data without a verified copy, under cover of this quote.
+- Changes the instance to anything but r8g.large, or to a single-zone shape.
+- Presents the $70–75 estimate as a guaranteed maximum, or changes the kill line under this quote.
+
+#### Quote 33 (2026-10-21, 16:55 IST) — QUOTE 32 STEPS SOONER: DISK SPEED CUT TONIGHT, REBUILD THURSDAY NIGHT (preserve EXACTLY, typos included)
+
+> "Do everything now dude not Saturday brro do it now okay?"
+
+The owner then answered three decision cards. Each answer is given below with the risk the card stated:
+
+| Card | Owner's tap | Risk stated on the card |
+|---|---|---|
+| When should the 150 GB disk + r8g.large rebuild run? | **"Thursday night (Recommended)"** | Sizes come from one measured depth-off day; if the rebuild fails overnight, Friday's capture is at risk |
+| Cut disk speed 500 → 125 right after the first depth-off day? | **"Cut tonight anyway"** | Depth is still on until the PR merges; a slow or lagging feed at tomorrow's open |
+| Lower the AWS spend stop from $170 to $100 now? | **"Lower it to $100"** | The box may be shut off automatically before the downsizing lands |
+
+**What this amends in Quote 32, and nothing else:**
+
+| Quote 32 row | Amended to |
+|---|---|
+| Step 2 precondition (one measured depth-off session) | Waived. Throughput 500 → **125 MiB/s** may run on the evening of 2026-10-21, outside 09:00–15:45 IST, through `grow-ebs-volume.yml` (size 600 and IOPS 3,000 unchanged). `variables.tf` default 125 in the same or the next PR |
+| Steps 3–4 "a non-trading day" | Any weeknight once the box has stopped (after 17:30 IST) and before the 08:30 IST start, first allowed on the night of **Thursday 2026-10-22**. Every other step-3 precondition stands: a reviewed rebuild workflow, S3 copies verified first (Quote 27), WAL backlog drained or copied, old volume kept as a snapshot for 7 days |
+| REJECT "Lowers throughput before a depth-off session is measured" | Lifted for the run on 2026-10-21 only |
+| REJECT "Replaces the disk or the instance on a trading day" | Reads "during market hours (09:00–15:45 IST), or with the app running" |
+
+**Budget stop ($170 → $100):** NOT applied in October. October spend was already $119.20 on 1–20 Oct, so a $100 line would trip the native 100% stop at once: the box would stop and the morning start would be disabled for the rest of October. The card stated a milder risk than that, so the change waits for the owner's answer to the corrected question. **Answered the same evening:** "$100 from 1 November (Recommended)". The hard-stop guard applies the $100 line in code from November 2026 (`STANDING_BUDGET_KILL_USD` = 100, October 2026 capped at $170 by `OCTOBER_2026_KILL_USD`); the terraform `limit_amount` (the native stop) moves to $100 on or after 1 November, not before. **Throughput applied:** 2026-10-21 17:04 IST, `grow-ebs-volume.yml` run 7, `vol-0c6ab6e593e39d8c8` now 600 GB / 3,000 IOPS / 125 MiB/s. When it is applied it needs all four lockstep sites and `STANDING_BUDGET_KILL_USD`.
+
+##### What violates Quote 33 (REJECT)
+- A throughput cut inside 09:00–15:45 IST, or a size or IOPS change under cover of this quote.
+- A rebuild inside market hours, with the app running, or before the S3 copies are verified.
+- Lowering the native stop (`limit_amount`) below $170 before 1 November 2026, or the October code line below $170.
+- Reusing the step-2 waiver after 2026-10-21.
+
+#### Quote 34 (2026-10-21, evening) — CANDLES_3S, CANDLES_5S AND EVERY TOP_VOLUME TABLE ARE REMOVED (preserve EXACTLY, typos included)
+
+> "dude meanhwiel remvoe candles 3s and 5s and alogn with delete and remove the entire top volume tables also dude okay? can yo udo all ytehse dud eokay? see in thsic ase what and all we cna save clelary tell me dude hwo much memory as well dude okay?"
+> "see clealry note to delete and permanently remove and drop candles 3 seconds and candles 5 seconds dude and even entire top volumes entire tables also dude okay? meanwhiel go ahead with eveythgin edude meanwhile see switch off depth 20 and dpeth 200 i eman let th eimpelemntations be there but just switch off depth 20 and depth 200 dude okay?"
+
+The timeframe and socket half of this quote is recorded in
+`websocket-connection-scope-lock.md` §"2026-10-21 (EVENING) — CANDLES_3S,
+CANDLES_5S AND TOP_VOLUME ARE REMOVED". This file records the data half.
+
+**Measured before the change (2026-10-21, read-only, from the `s3://tv-prod-cold/questdb-partitions/` daily archives of 9–19 Oct; row counts from 16 Oct):**
+
+| Table | Rows a day | Compressed archive a day | On the box (row width × rows, Assumed widths from the DDL) | Days kept on the box |
+|---|---|---|---|---|
+| `candles_3s` | 5,823,334 | ~290 MB | ~1.37 GB | today + yesterday (intraday class) |
+| `candles_5s` | 4,446,655 | ~225 MB | ~1.05 GB | today + yesterday (intraday class) |
+| `top_volume_1s` / `_3s` / `_5s` / `_1m` | 960,322 / 810,976 / 743,757 / 654,718 | ~55 MB together | ~0.29 GB together | 15 days (market-data class) |
+
+**What this authorizes:**
+
+| Surface | Disposition |
+|---|---|
+| Code | The fold stops producing 3 s and 5 s bars; nothing writes `candles_3s`, `candles_5s` or any `top_volume_*` table; the ranking that only fed `top_volume` (and the depth-200 choice, off since the same day) goes with it. |
+| The six tables on the box | **DROPPED**, but only after every partition still on the box is in `s3://tv-prod-cold/questdb-partitions/` and verified (Quote 27 binds until Quote 35 runs). The 2026-10-22 rebuild satisfies this by copying first and creating none of the six on the new disk. |
+| Their S3 archives | Kept until the Quote 35 wipe on 2026-10-31, which deletes them with the rest. |
+
+##### What violates Quote 34 (REJECT)
+- Dropping any of the six tables on the box before its partitions are copied to S3 and verified.
+- Removing any other timeframe (`1s`, `1m`, `3m`, `5m`, `10m`, `15m`, `30m`, `60m`) or table under this quote.
+- Deleting a SEBI or audit row, or any S3 object, under this quote (S3 deletes are Quote 35's, on 2026-10-31 only).
+- Re-adding a 3 s or 5 s candle table or any `top_volume_*` table without a fresh dated quote here.
+
+#### Quote 35 (2026-10-21, evening) — ONE FULL MARKET-DATA WIPE, BOX AND S3, ON THE NIGHT OF SATURDAY 2026-10-31; NOVEMBER STARTS CLEAN (preserve EXACTLY, typos included)
+
+> "see wipe off the entire data fully dude so tomorow run and entire run startign from november also should run as per the precise requriements dude okay?"
+
+**Decision cards, tapped by the owner in this order:**
+1. "Which data should be permanently deleted?" → **"Box clean, keep S3 (Recommended)"**, then, in the owner's next words: "nope bro remvoe evryhtigne ntilrey dude okay?" / "let us condeir it liek thsi startign novemebr month evryhtign eneds to be in place to run evrythign rpoecisleyd dude okay? as per our requirmenet dude okay??"
+2. "Confirm the full wipe: permanently delete ALL market data on the server AND every backup copy in S3 … Nothing from before the wipe can ever be recovered. SEBI/audit tables, order logs, instrument records and deploy files are kept by law. When should it run?" → **"Sat 31 Oct (Recommended)"**.
+3. "With the full wipe on Sat 31 Oct, should the 150 GB disk + smaller server rebuild move from Thursday night to the same Saturday?" → **"Keep Thursday night"**.
+4. Then: "see dod evryhtign nwo ddue okay?" / "make evryhtign as now dude okay?" / "oh okay ya ya keep it as oct 31 night dude okay?" — read as: do all the preparation now, and run the wipe on the night of 31 October. Nothing is deleted before then.
+
+Recorded HERE before anything is deleted, per the rule-file-first law and the
+Quote 27/28 retirement clause. Quote 35 names the data and states that it will
+be lost: **every market-data row and file from before 2026-11-01, on the box and in S3, every version, can never be recovered.**
+
+##### What this authorizes (one run, the night of Saturday 2026-10-31 IST, app stopped)
+
+| Surface | Disposition |
+|---|---|
+| QuestDB market-data tables (`ticks`, `market_depth`, `market_depth_book`, every `candles_<tf>`, any `top_volume_<tf>` still present, `feed_aux_packets` and the other market-data classes Quote 29 named) | Every partition dated before 2026-11-01 IST **DROPPED**. |
+| On-box raw frame log (WAL segments and their `replaying/` and `archive/` folders), tick / depth / seal / top_volume spill, spill-hold, seal DLQ | Every file from before 2026-11-01 **DELETED** (the app is stopped, so no segment is open). |
+| `s3://tv-prod-cold/questdb-partitions/<market-data table>/`, `raw-frames/<date before 2026-11-01>/`, `seal-spill/`, `top-volume-spill/` if present | **DELETED, every version**, by version id, once. |
+| The 7-day snapshot of the old 600 GB volume from the 2026-10-22 rebuild, if it still exists | **DELETED** (it holds the same market data). |
+
+##### What this does NOT touch
+Exactly Quote 29's keep-list: every SEBI and audit table and its S3 archive (`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `partition_archive_audit`, and the rest of the operator-console keep-list), `sebi-preserve/` (box and S3), `deploys/` and `bin/tickvault.backup`, the `logs/` export, config, secrets, the instrument cache, terraform state, and versioning, lifecycle and the public-access block on `tv-prod-cold`.
+
+##### How it runs
+The same shape as Quote 29e: a reviewed, one-off Rust tool and workflow, dry run, then apply, then a verify listing; S3 after the box files; any new delete permission scoped to exactly the prefixes above, refused after 2026-11-01 IST, and deleted with the tool and workflow by the next PR. That tool needs its own dated row in `rust-only-forever-lock-2026-07-19.md` if it carries any shell.
+
+##### The Quote 35 tool (plan item 67, written 2026-10-22, before any delete)
+
+This table records how the shape above is built. It authorizes nothing beyond Quote 35, and the apply waits on the owner's approval of the one SSM shell element (rust-only lock §0.14, DRAFT).
+
+| Item | Locked value |
+|---|---|
+| Tool | `tv-wipe-2026-10-31` (app crate, `src/bin/wipe_2026_10_31.rs`) and `tickvault wipe-box <dry\|apply> <sha>` on the box (`wipe_box.rs`), run by the dispatch-only `.github/workflows/wipe-2026-10-31.yml`. Every delete or keep decision is a pure function in `wipe_2026_10_31.rs`, tested; nothing comes from config. |
+| Market-data tables | Derived from the code's own registry, never restated: every table retention manages, minus the keep-list, plus the retired candle tables (34 tables on 2026-10-22: `ticks`, `market_depth`, `market_depth_book`, `feed_aux_packets`, `top_volume` and `top_volume_{1s,3s,5s,1m}`, every `candles_<tf>` including 3 s, 5 s and the 15 retired frames). |
+| Keep-list (in code) | Every table in `partition_manager::rebuild_keep_tables()` (every DAY-partitioned audit table and every retention-exempt table, the list the 2026-10-22 rebuild carried); `sebi-preserve/`, `deploys/` and `logs/` in S3; on the box `data/spill/audit/**`, any path with `audit` or `sebi-preserve` in it, the WAL's state files (watermark, ranges, owner lock, upload markers), and everything outside `data/ws_wal`, `data/spill`, `data/dlq`. A keep-list table is kept even when it is also market data by name (`top_volume_rank`). |
+| Box (app stopped) | Stops `tickvault` and deletes nothing unless `systemctl is-active` then reads `inactive` or `failed`. Deletes WAL segments (`ws-frames-<n>.wal`), spill and DLQ files last written before 2026-11-01 00:00 IST; truncates a market-data table whose every partition is dated before 2026-11-01, else drops exactly those partitions (after its WAL is applied); deletes market-data `<partition>.detached` directories dated before 2026-11-01; lists again and fails if any is left. The app is left stopped and enabled; the runner stops the box. |
+| S3 | `s3:DeleteObjectVersion` by version id (never a delete marker) for keys dated before 2026-11-01 under `questdb-partitions/<market-data table>/`, `raw-frames/<date>/`, `seal-spill/<date>/` and `top-volume-spill/<date>/`; a key of any other shape is kept and named in the report. `tick-quarantine/`, `depth-quarantine/`, `top-volume-quarantine/` and `rebuild-2026-10-22/` are not named by Quote 35 and are not touched. |
+| Snapshot | Deleted only when it carries both tags the rebuild wrote, `tv-rebuild=2026-10-22` and `Name=tv-prod-root-before-rebuild-2026-10-22`. The old 600 GB root VOLUME (tag `tv-rebuild-old-root`) is not named by Quote 35: reported, kept. |
+| Identity | The box half uses the existing deploy keys over SSM (no new grant). The S3 and snapshot half uses ONE new role, `tv-prod-wipe-2026-10-31`, trusted only by the GitHub environment `wipe-2026-10-31`: list the exact prefixes; `s3:DeleteObjectVersion` on the dated keys above and `ec2:DeleteSnapshot` on a snapshot with both tags, each only from 2026-10-31 18:00 IST; read-only EC2 describes; Deny on `deploys/`, `sebi-preserve/`, `logs/`, November and December keys and every bucket setting; trust and grants expire at the end of 2026-11-01 IST. |
+| When | Dry: any time until the end of 2026-11-01 IST. Apply: only 2026-10-31 18:00 IST to 2026-11-01 08:00 IST, never 09:00–15:45 IST, with the confirm word `WIPE-BEFORE-2026-11-01`, after a successful `dry all` run on the same commit, never while a deploy workflow is queued or running; the S3 and snapshot apply also needs the box stopped. |
+| Afterwards | The first PR after the run deletes the role, the workflow, the tool, the box subcommand and both budget rows, records the run here and marks Quote 35 ENDED. |
+
+##### What violates Quote 35 (REJECT)
+- Deleting anything before the night of 2026-10-31 IST, or anything dated 2026-11-01 or later.
+- Deleting a SEBI or audit row, `sebi-preserve/`, `deploys/` or the `logs/` export.
+- Running with the app running, inside 09:00–15:45 IST, or while `deploy-aws` is running.
+- Suspending versioning, adding an `expiration` or `noncurrent_version_expiration`, or keeping any delete permission after the run.
+- Treating Quote 35 as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
+- Skipping the Quote 32/33 copy-first rule for the 2026-10-22 rebuild because the copies are deleted on 31 Oct anyway: Quote 27 binds until Quote 35 runs.
+
+#### Quote 36 (2026-10-21, ~17:55 IST) — THE SPEND STOP IS $85 FROM 1 NOVEMBER, NOT $100 (amends Quote 33's budget line, preserve EXACTLY, typos included)
+
+Asked whether $75 could be the monthly maximum once every Quote 32 step is done, the owner was told that $70–75 is an estimate of a normal month and the only hard maximum is the spend stop, and was offered: keep $100 for November (recommended), set $85, or set $75. Answer:
+
+> "okay set it with maximum 85 udde but why it even crosses mroe than 85 dude thats my question dude okay?"
+
+**Measured the same evening (live, read-only):** the budget `tv-prod-monthly-budget-v2` counts tax (`IncludeTax = true`), so the line is the bill paid, GST included; October spend $120.31 on 1–21 Oct, AWS forecast $175.68 against the $170 line.
+
+| | Before (Quote 33) | After (Quote 36) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $100 from 1 November | **$85 from 1 November** |
+| October 2026 (`OCTOBER_2026_KILL_USD`) | $170 | $170, unchanged |
+| Terraform `limit_amount` (the native 100% stop) and the other lockstep sites | $170 until 1 November | $170 until 1 November, then **$85** (on or after 1 November, never before) |
+
+**Honest limits, stated to the owner:** $85 leaves about $10–15 a month above the $70–75 estimate. A month that reaches it switches the server off for the rest of that month. The estimate becomes a measurement only once November is billed.
+
+##### What violates Quote 36 (REJECT)
+- A November-or-later line above $85 without a fresh dated quote, or lowering the native `limit_amount` below $170 before 1 November 2026.
+- Moving October's line under this quote.
+- Presenting $70–75 as a maximum.
+
+#### Quote 37 (2026-10-21, ~18:40 IST) — THE SPEND STOP IS $75, GST INCLUDED, FROM 1 NOVEMBER; THE MONITORING SQUEEZE; A 16:30 IST STOP (amends Quote 36, preserve EXACTLY, typos included)
+
+After the squeeze table (plan as decided ~$70–75; free spend lookups, dead alarms, dead metrics, dashboard, 127 → ~60 alarms, 100 GB disk; fully squeezed ~$50–55):
+
+> "i believe alogn with evryhtign these also can be doen right dude ? except clouwatch dashbaord dude am i right due tlel me dudeokay?" (quoting the rows: free spend lookups, remove alarms that watch switched-off parts, remove metrics for removed features, delete the CloudWatch dashboard, fewer alarms overall 127 → about 60)
+> "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?"
+> "bro now we can run our server same time rigth dude startign 8.30 am till 4 pm or 4.30 pm woudl be fine dude tell me dude okay?"
+
+**What this authorizes:**
+
+| Item | Disposition |
+|---|---|
+| `STANDING_BUDGET_KILL_USD` | **$75 from 1 November 2026** (was $85 under Quote 36). The live budget counts tax (`IncludeTax = true`), so $75 is the bill paid, 18% GST included. October stays $170. The native `limit_amount` moves to $75 on or after 1 November, never before. |
+| Spend lookups | The guard, digest and console read month-to-date spend from the free AWS Budgets API instead of paid Cost Explorer calls. |
+| Alarms and metrics for switched-off or removed features (depth, top_volume, 3 s/5 s candles) | Removed, each in the same change as its feature, with the noise-lock row that names it. |
+| Alarm count 127 → about 60 | Allowed after a written per-alarm review; each removal names the alarm, what it watched, and which remaining alarm covers that failure. The paging families in `dhan-rest-only-noise-lock-2026-07-14.md` are kept unless that file records the removal first. |
+| CloudWatch dashboard | **Kept** (the owner excluded it). |
+| Daily stop | 17:30 → **16:30 IST** (the owner allowed 16:00 or 16:30; 16:30 keeps the 15:44 cross-verification inside the run). The Quote 31 same-day drain hold still keeps the box up past the stop while the day's data is not saved; the cross-verification end bound and the stop-check move with the stop. Start stays 08:30 IST. |
+
+**Honest limits, stated to the owner:** the estimate under $75 assumes the squeeze rows above land before 1 November. If they do not, a normal November is about $70–75, so a $75 line could stop the server in the last days of the month. A month that reaches $75 switches the server off for the rest of that month.
+
+##### What violates Quote 37 (REJECT)
+- A November-or-later line above $75 without a fresh dated quote, or a native stop below $170 before 1 November 2026.
+- Deleting the CloudWatch dashboard under this quote.
+- Removing an alarm without the per-alarm review row, or a noise-lock paging family without that file's dated edit first.
+- A daily stop earlier than 16:30 IST, or one that ignores the same-day drain hold.
+
+#### Quote 38 (2026-10-22, ~08:05 IST) — THE r8g.large MEMORY BUDGET IS RE-DERIVED FROM MEASUREMENT; ONE SECURITY UPDATE (decision cards, preserve EXACTLY)
+
+After "Continue dude", the owner answered three decision cards. Two are recorded here; the third (the one-off rebuild shell lines) is `rust-only-forever-lock-2026-07-19.md` §0.13.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "On the half-size server (16 GB), a build check fails: its memory budget assumes the app and OS can use up to 16 GB (sized for the 32 GB server). Measured use is 0.3–3 GB. How should the budget be fixed?" | **"Re-size from measured use (Recommended)"** | "Set the app+OS worst case to 6 GB (2x the highest measured 3 GB) and the per-socket buffer to 64 MB: 6 + 6 (database) + 1 (sockets) = 13 of 16 GB, 3 GB spare." |
+| "PR #2119 is blocked only by one security library update. The project rules ban 'cargo update', so it needs you. Can I run exactly this one command: cargo update -p rustls-webpki --precise 0.103.16?" | **"Yes, you run it (Recommended)"** | "I run that one command only, record your OK in the rules, test, and push to #2119." |
+
+**What this changes, and nothing else:**
+
+| Item | Before | After |
+|---|---|---|
+| `net.core.rmem_max` and the `tcp_rmem` maximum (`deploy/aws/sysctl/99-tickvault-net.conf`, `host_limits::REQUIRED_RMEM_MAX_BYTES`, `host_tuning` expected value) | 128 MiB per socket | **64 MiB per socket** |
+| `kernel_tuning_16ws_guard::NON_QUESTDB_NON_SOCKET_GIB_HIGH` (app + OS + page cache, worst case) | 16 GiB (assumed rows) | **6 GiB** (2 × the highest measured whole-box use, about 3 GB on 2026-10-21 with the app running) |
+| r8g.large budget, 16 sockets | 2.0 + 6.0 + 16 = 24 GiB (does not fit) | 1.0 + 6.0 + 6.0 = **13 GiB of 16**, 3 GiB spare |
+| r8g.large budget, 26 sockets (depth account, still OFF) | — | 1.625 + 6.0 + 6.0 = 13.6 GiB, 2.4 GiB spare |
+| `cargo update -p rustls-webpki --precise 0.103.16` on PR #2119 | banned (CLAUDE.md CARGO) | allowed **once**, for that one package and version only |
+
+**Honest limits, stated:** the 3 GB was measured in the evening, not across a full trading day on the smaller box, so 6 GB is an estimate from a short measurement (Assumed until a depth-off session is measured on r8g.large). A 64 MiB socket buffer absorbs half the burst the 128 MiB one did; with depth off the busiest sockets are the main feed. The `cargo update` permission is for that one command; every other `cargo update` stays banned.
+
+##### What violates Quote 38 (REJECT)
+- Raising `rmem_max` above 64 MiB, or the app+OS worst case below 6 GiB, without a fresh dated quote.
+- Running any other `cargo update`, or this one for another package or version.
+- Switching the depth account on under this quote.
+
+#### Quote 39 (2026-10-23, ~15:18 IST) — ONE MORE SECURITY UPDATE: ctutils 0.4.2 → 0.4.4 (decision card, preserve EXACTLY)
+
+After the Quote 38 update (rustls-webpki 0.103.15 → 0.103.16) cleared RUSTSEC-2026-0382, the Security & Audit check on PR #2120 (head `ca569a5`) failed on a NEW advisory published that day, RUSTSEC-2026-0385 ("Non-constant-time mask generation and `u128` comparisons") in `ctutils` 0.4.2, reached through `digest` 0.11 by the AWS SDK and `totp-rs`. `main` carries the same 0.4.2.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "Today's new security advisory (RUSTSEC-2026-0385) is in 'ctutils' 0.4.2, a cryptography helper used by the AWS libraries. It also affects main. The fix is one more update: cargo update -p ctutils --precise 0.4.4. Your earlier OK covered only rustls-webpki, so this needs a new OK. If you approve, I record it in the rules, remove the deny rule, run only this command on #2119, restore the rule, check and push, then merge both PRs and deploy." | **"Approve, same way (Recommended)"** | "One command only: cargo update -p ctutils --precise 0.4.4, deny rule removed and restored the same way as before." |
+
+**What this changes, and nothing else:** `cargo update -p ctutils --precise 0.4.4` is allowed ONCE, on PR #2119's branch (`claude/nice-bell-yjfwiv`), `Cargo.lock` only. The `.claude/settings.json` deny rule for `cargo update` is lifted only for that one command and restored straight after, never committed lifted.
+
+##### What violates Quote 39 (REJECT)
+- Running any other `cargo update`, or this one for another package or version, or a second time.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Any `Cargo.toml` change, a new dependency, or a version move other than `ctutils` (if the update moves another package, it is reverted and the owner asked again).
+
+#### Quote 40 (2026-10-23, ~15:45 IST) — A THIRD SECURITY UPDATE: webpki-root-certs 1.0.7 → 1.0.11 (decision card, preserve EXACTLY)
+
+With RUSTSEC-2026-0382 and RUSTSEC-2026-0385 fixed (Quotes 38, 39), the Security & Audit check on PR #2119 (head `0b5d216`) and #2120 (head `88ecc72`) passed `cargo deny` and then failed `cargo audit --deny yanked` on RUSTSEC-2026-0383 (dated 2026-10-19, "Bundled root certificates allow trust in distrusted emSign intermediates") in `webpki-root-certs` 1.0.7, fixed from 1.0.10; the latest release is 1.0.11. `main` carries the same 1.0.7. The earlier failures had hidden it because the job stops at its first failing step.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "A third security advisory showed up once the first two were fixed: 'webpki-root-certs' 1.0.7 (the bundled list of trusted website certificates) still trusts a certificate authority that has since been distrusted (RUSTSEC-2026-0383). Fixed from 1.0.10; latest is 1.0.11. This also affects main. Approve one more update the same way (recorded in the rules, deny rule lifted for this one command and restored)?" | **"Approve 1.0.11 (Recommended)"** | "cargo update -p webpki-root-certs --precise 1.0.11: the latest, newest certificate list. Lock file only." |
+
+**What this changes, and nothing else:** `cargo update -p webpki-root-certs --precise 1.0.11` is allowed ONCE, on PR #2119's branch (`claude/nice-bell-yjfwiv`), `Cargo.lock` only. The `.claude/settings.json` deny rule for `cargo update` is lifted only for that one command and restored straight after, never committed lifted.
+
+##### What violates Quote 40 (REJECT)
+- Running any other `cargo update`, or this one for another package or version, or a second time.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Any `Cargo.toml` change, a new dependency, or a version move other than `webpki-root-certs` (if the update moves another package, it is reverted and the owner asked again).

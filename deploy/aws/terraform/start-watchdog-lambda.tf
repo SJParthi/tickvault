@@ -85,6 +85,10 @@ resource "aws_iam_role_policy" "start_watchdog" {
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/holiday-stop-date",
           # Audit PR30: the budget-stop latch (read-only here).
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault-guard/${var.environment}/budget-stop-month",
+          # Operator Quote 31 (2026-10-21): the app's drain hold (read-only
+          # here). The 16:30 daily_stop, 16:45 stop_check and hourly curfew
+          # leave the box up while it is fresh; never past 07:30 IST.
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/drain-hold",
         ]
       },
       {
@@ -146,6 +150,9 @@ resource "aws_lambda_function" "start_watchdog" {
       # Audit PR30: the budget-stop latch — the 08:45 check skips the
       # self-start while it names the current UTC billing month.
       BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
+      # Operator Quote 31 (2026-10-21): the app's drain hold (JSON, written
+      # by the box while the day's data is still going into the database).
+      DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
     }
   }
 
@@ -221,18 +228,52 @@ resource "aws_lambda_permission" "start_watchdog_check" {
   source_arn    = aws_cloudwatch_event_rule.start_watchdog_check.arn
 }
 
+# 16:30 IST daily stop (17:30 until 2026-10-22, operator Quote 37, plan item
+# 64) — operator Quote 31 (2026-10-21). The RULE stays in main.tf
+# (aws_cloudwatch_event_rule.daily_stop, cron(0 11 ? * MON-FRI *));
+# its target moved here from the SSM stop automation, which could not see the
+# app's drain hold. mode "daily_stop" stops the box unless a fresh hold says
+# the day's data is still going into the database (never past 07:30 IST).
+# Same retry ladder and dead-letter queue as before.
+resource "aws_cloudwatch_event_target" "daily_stop" {
+  rule      = aws_cloudwatch_event_rule.daily_stop.name
+  target_id = "stop-instance"
+  arn       = aws_lambda_function.start_watchdog.arn
+  input     = jsonencode({ mode = "daily_stop" })
+
+  retry_policy {
+    maximum_retry_attempts       = 5
+    maximum_event_age_in_seconds = 600
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.eventbridge_dlq.arn
+  }
+}
+
+resource "aws_lambda_permission" "start_watchdog_daily_stop" {
+  statement_id  = "AllowExecutionFromEventBridgeDailyStop"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.start_watchdog.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_stop.arn
+}
+
 # 16:45 IST stop-check — added 2026-06-10 after BOTH schedule directions
 # failed silently the same day (start at 08:30, stop at 16:30). Verifies the
 # 16:30 daily_stop actually stopped the box; self-heals (stop) ONLY when the
-# box has been running since before 17:30 — a manual evening start (launch
-# after 17:30) is the operator's deliberate session and is never touched.
+# box has been running since before 16:30 — a manual evening start (launch
+# after 16:30) is the operator's deliberate session and is never touched.
 resource "aws_cloudwatch_event_rule" "start_watchdog_stop_check" {
   name        = "tv-${var.environment}-start-watchdog-stop-check"
-  description = "17:45 IST (Mon-Fri) verify the box actually stopped; self-heal + page if not"
+  description = "16:45 IST (Mon-Fri) verify the box actually stopped; self-heal + page if not"
   # 2026-08-08 (operator Quote 14): 16:45 -> 17:45 IST, tracking the daily_stop
   # move to 17:30. If this had stayed at 16:45 it would fire 45 min BEFORE the
   # stop and report a false "auto-stop FAILED" every single trading day.
-  schedule_expression = "cron(15 12 ? * MON-FRI *)"
+  # 2026-10-22 (operator Quote 37, plan item 64): back to 16:45 IST with the
+  # daily_stop's move to 16:30, pinned to shutdown_class.rs
+  # SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST (stop + 900 s).
+  schedule_expression = "cron(15 11 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_target" "start_watchdog_stop_check" {
@@ -254,8 +295,9 @@ resource "aws_lambda_permission" "start_watchdog_stop_check" {
 # I started this instance right out of the expected market hours … by mistake
 # if I don't stop manually means it should be auto triggered … manual human
 # error is not acceptable"). Fires every hour; the HANDLER gates itself so it
-# NEVER acts inside 08:00-17:30 IST Mon-Fri (the normal 08:30/17:30 schedule +
-# 17:45 stop_check own that window; widened 2026-08-08 with Quote 14). Outside it a running
+# NEVER acts inside 08:00-16:30 IST Mon-Fri (the normal 08:30/16:30 schedule +
+# 16:45 stop_check own that window; widened 2026-08-08 with Quote 14, narrowed
+# back to 16:30 on 2026-10-22 with Quote 37). Outside it a running
 # box with no keep-alive override (SSM /tickvault/<env>/keep-alive-until) and
 # past the 45-min launch grace is stopped + Telegram-paged. Cost: 24
 # invokes/day — free tier.
@@ -298,7 +340,7 @@ output "start_watchdog_function_name" {
 
 resource "aws_cloudwatch_metric_alarm" "start_watchdog_errors" {
   alarm_name          = "tv-${var.environment}-start-watchdog-errors"
-  alarm_description   = "The START WATCHDOG itself FAILED. This is the Lambda that starts the trading box at 08:30 IST, retries a failed start, and verifies the 17:30 stop - so when it dies silently the box simply does not come up and NOTHING says so: its own not-invoked alarm covers a dropped SCHEDULE, not a throwing run. A failure here means the next trading morning is at risk. Triage: read the Lambda log group; a capacity refusal is a classify_start_failure verdict and pages separately."
+  alarm_description   = "The START WATCHDOG itself FAILED. This is the Lambda that starts the trading box at 08:30 IST, retries a failed start, and verifies the 16:30 stop - so when it dies silently the box simply does not come up and NOTHING says so: its own not-invoked alarm covers a dropped SCHEDULE, not a throwing run. A failure here means the next trading morning is at risk. Triage: read the Lambda log group; a capacity refusal is a classify_start_failure verdict and pages separately."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -331,7 +373,7 @@ resource "aws_cloudwatch_metric_alarm" "start_watchdog_errors" {
 #
 # Why it matters more here than for most Lambdas: this is the component that
 # STARTS the trading box at 08:30 IST, retries the start, and verifies the
-# 17:30 stop. Its Errors alarm is blind to the failure that actually happened
+# 16:30 stop. Its Errors alarm is blind to the failure that actually happened
 # to this repo on 2026-07-02 — EventBridge dropped schedules repo-wide — and
 # a schedule that never fires produces no error to alarm on. The observable
 # symptom of a dropped start schedule is a trading day that silently does not

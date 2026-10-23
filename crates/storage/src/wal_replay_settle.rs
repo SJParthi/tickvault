@@ -394,8 +394,12 @@ impl SettleState {
             return 0;
         }
         wm.bind(wal_dir);
+        // 2026-10-20 (PR W review): bounded ranges, never the bucket table. A
+        // range here spans whole segments (possibly days of them), which the
+        // 128-slot table overflowed into an unbounded bit.
+        // O(1) EXEMPT: one O(32) range insert per leftover segment, boot-time
         for &(lo, hi) in &ranges {
-            wm.note_unapplied_range(lo, hi);
+            wm.add_unapplied_range(lo, hi);
         }
         wm.persist_now();
         let marked_on_disk = AppliedSnapshot::load(wal_dir).is_none_or(|snap| {
@@ -496,7 +500,14 @@ fn state() -> std::sync::MutexGuard<'static, SettleState> {
 /// [`promote_settled_now`] archives them later.
 // TEST-EXEMPT: thin global wrapper; SettleState::settle is covered by the module tests.
 pub fn settle_confirm_replayed<P: AsRef<Path>>(wal_dir: P, start: SettleBatchStart) -> u64 {
-    state().settle(wal_dir.as_ref(), applied_watermark(), Instant::now(), start)
+    let moved = state().settle(wal_dir.as_ref(), applied_watermark(), Instant::now(), start);
+    // 2026-10-20 (plan item PR W): after the boot refold and after each
+    // catch-up round, drop the unapplied ranges below the oldest segment still
+    // waiting (settled ones included), so the record shrinks as the backlog
+    // is read.
+    let _trimmed =
+        crate::wal_unapplied_ranges::trim_to_waiting(applied_watermark(), wal_dir.as_ref());
+    moved
 }
 
 /// Called by the WAL-suspension watcher after each probe.
@@ -705,6 +716,12 @@ mod tests {
         let mut st = SettleState::new();
         assert_eq!(st.recover(&dir, &wm), 2, "both leftovers recovered");
         assert_eq!(names(&settling), 0);
+        // 2026-10-20 (PR W review): the marks are bounded ranges, never the
+        // bucket table, which a recovery spanning days used to overflow.
+        let snap = wm.snapshot();
+        assert!(!snap.overflowed);
+        assert!(snap.buckets.iter().all(|&(id, _)| id == 0));
+        assert_eq!(snap.ranges.len(), 2, "one range per recovered segment");
         assert_eq!(
             replay(&dir),
             10,

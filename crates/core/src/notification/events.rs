@@ -146,14 +146,14 @@ pub enum DispatchPolicy {
 /// coordinator-relayed directive 2026-07-15).
 ///
 /// Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
-/// initiated` page — even the daily scheduled 5:30 PM IST stop. The app-side
+/// initiated` page — even the daily scheduled 4:30 PM IST stop. The app-side
 /// classifier (`classify_shutdown` in the app crate) derives this class from
 /// the signal kind, the runtime source (AWS vs local), the IST clock, and
 /// the trading calendar. Fail-safe direction: ANY classifier doubt lands
 /// [`Self::ExternalStop`] — today's Medium loudness, never quieter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownClass {
-    /// The daily scheduled stop — the 5:30 PM IST weekday auto-stop window,
+    /// The daily scheduled stop — the 4:30 PM IST weekday auto-stop window,
     /// or the holiday-gate self-stop on a non-trading day. Quiet (Low).
     ScheduledStop,
     /// A local operator stop (Ctrl+C / local SIGTERM from `make stop` or a
@@ -2520,7 +2520,7 @@ impl NotificationEvent {
             Self::ShutdownInitiated { class } => match class {
                 // One quiet line each (2026-07-15): a scheduled/operator
                 // stop is routine, never an incident.
-                ShutdownClass::ScheduledStop => "\u{1f6d1} Scheduled stop — daily 5:30 PM IST \
+                ShutdownClass::ScheduledStop => "\u{1f6d1} Scheduled stop — daily 4:30 PM IST \
                                                  window (or holiday). Back at next start."
                     .to_string(),
                 ShutdownClass::OperatorStop => "\u{1f6d1} Stopped by operator.".to_string(),
@@ -2528,7 +2528,7 @@ impl NotificationEvent {
                                                         update — no action needed."
                     .to_string(),
                 ShutdownClass::ExternalStop => "<b>Unexpected stop</b> — outside the daily \
-                                                5:30 PM IST window. If you didn't do this, \
+                                                4:30 PM IST window. If you didn't do this, \
                                                 check the box (deploy / budget stop / manual)."
                     .to_string(),
             },
@@ -4155,7 +4155,7 @@ mod tests {
         };
         let msg = event.to_message();
         assert!(msg.contains("Scheduled stop"), "{msg}");
-        assert!(msg.contains("5:30 PM IST"), "{msg}");
+        assert!(msg.contains("4:30 PM IST"), "{msg}");
         assert!(msg.contains("Back at next start"), "{msg}");
         assert_eq!(msg.lines().count(), 1, "one-line body: {msg}");
         assert!(
@@ -4195,7 +4195,7 @@ mod tests {
         };
         let msg = event.to_message();
         assert!(msg.contains("<b>Unexpected stop</b>"), "{msg}");
-        assert!(msg.contains("5:30 PM IST"), "{msg}");
+        assert!(msg.contains("4:30 PM IST"), "{msg}");
         assert!(
             msg.contains("deploy / budget stop / manual"),
             "the body must name the likely external causes: {msg}"

@@ -4,9 +4,11 @@
 # Two Lambdas that protect the operator's monthly budget:
 #
 # 1. tv-prod-daily-budget-digest (runs 17:30 IST Mon-Fri = 12:00 UTC)
-#    - Queries Cost Explorer for today's spend + month-to-date
+#    - Reads month-to-date spend from the free AWS Budgets API
+#      (budgets:DescribeBudget on aws_budgets_budget.tv_monthly; paid Cost
+#      Explorer until 2026-10-22, plan item 63, operator Quote 37)
 #    - Publishes Telegram-formatted message to SNS tv-prod-alerts
-#    - Operator sees daily message: "Today ₹X | MTD ₹Y / ₹2000 (Z%)"
+#    - Operator sees daily message: "This month ₹Y / stop-budget (Z%)"
 #
 # 2. tv-prod-hard-stop-guard (runs HOURLY, every day)
 #    - Force-stops the EC2 instance if running OUTSIDE the Mon-Fri
@@ -17,7 +19,7 @@
 #      rule, because the native AWS Budget stop-actions fire only ONCE
 #      per month-crossing — without this, the next morning's start cron
 #      restarts the box and it runs daily, unkilled, for the rest of
-#      the month. Cost Explorer errors fail-safe (page, never disable).
+#      the month. Spend-lookup errors fail-safe (page, never disable).
 #    - Source lives in crates/aws-lambdas/src/hard_stop_guard.rs (the
 #      Rust port, rust-only phase 2b-2 wave 2 — the former
 #      deploy/aws/lambda/hard-stop-guard/ handler dir was deleted in the
@@ -33,7 +35,7 @@
 # Rust — crates/aws-lambdas/src/budget_digest.rs (lib logic + unit tests) +
 # src/bin/daily_budget_digest.rs (thin bootstrap bin). Behavior parity:
 # same Cost Explorer queries (us-east-1, DAILY UnblendedCost, exclusive
-# end), same INR_PER_USD=85 / GST_MULT=1.18 / BUDGET_USD constants
+# end; REPLACED 2026-10-22 by one free budgets:DescribeBudget, plan item 63), same INR_PER_USD=85 / GST_MULT=1.18 / BUDGET_USD constants
 # (BUDGET_USD=25 since the 2026-07-19 sub-1K ruling step, was 55)
 # (KEEP IN SYNC with budget.tf limit_amount), same emoji thresholds, same
 # Telegram line format, same '[BUDGET] daily AWS cost' subject, same
@@ -69,9 +71,13 @@ resource "aws_iam_role_policy" "tv_daily_budget_digest" {
     Version = "2012-10-17"
     Statement = [
       {
+        # 2026-10-22 (plan item 63, operator Quote 37): month-to-date spend
+        # from the free AWS Budgets API on the ONE tickvault budget. Replaces
+        # ce:GetCostAndUsage + ce:GetCostForecast (paid per request).
+        Sid      = "ViewTheOneBudget"
         Effect   = "Allow"
-        Action   = ["ce:GetCostAndUsage", "ce:GetCostForecast"]
-        Resource = "*"
+        Action   = ["budgets:ViewBudget"]
+        Resource = aws_budgets_budget.tv_monthly.arn
       },
       {
         Effect   = "Allow"
@@ -100,6 +106,9 @@ resource "aws_lambda_function" "tv_daily_budget_digest" {
   environment {
     variables = {
       ALERTS_TOPIC_ARN = aws_sns_topic.tv_alerts.arn
+      # 2026-10-22 (plan item 63): the budget DescribeBudget reads.
+      BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
+      BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
     }
   }
 }
@@ -180,11 +189,15 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
       },
       {
         # Read-only MTD spend for the hourly cost ping AND the GAP 1
-        # in-window breach check. Fail-safe: a Cost Explorer error never
+        # in-window breach check. Fail-safe: a spend-lookup error never
         # stops the box or disables the start rule (page-only).
+        # 2026-10-22 (plan item 63, operator Quote 37): the free AWS Budgets
+        # DescribeBudget on the ONE tickvault budget, replacing paid
+        # ce:GetCostAndUsage. AWS refreshes that figure about every 8-12 h.
+        Sid      = "ViewTheOneBudget"
         Effect   = "Allow"
-        Action   = ["ce:GetCostAndUsage"]
-        Resource = "*"
+        Action   = ["budgets:ViewBudget"]
+        Resource = aws_budgets_budget.tv_monthly.arn
       },
       {
         # GAP 1 (post-breach morning restart): on MTD >= $55 the Lambda
@@ -234,6 +247,15 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
+      },
+      {
+        # Operator Quote 31 (2026-10-21): the out-of-window stop honours the
+        # app's drain hold, as the start-watchdog's stops do. READ-ONLY, one
+        # ARN. The in-window budget breach stop never reads it.
+        Sid      = "ReadDrainHold"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/drain-hold"
       },
       {
         # Audit PR30 (2026-09-27): the breach stop WRITES the budget-stop
@@ -310,6 +332,14 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
       # Audit PR30: the budget-stop latch the breach stop writes.
       BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
+      # Operator Quote 31 (2026-10-21): the app's drain hold, read by the
+      # out-of-window stop only (same parameter as the start-watchdog's).
+      DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
+      # 2026-10-22 (plan item 63, operator Quote 37): the budget whose free
+      # DescribeBudget gives the month-to-date spend. Missing = unknown spend
+      # (page, never stop).
+      BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
+      BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
     }
   }
 }
@@ -419,12 +449,13 @@ resource "aws_cloudwatch_metric_alarm" "daily_budget_digest_errors" {
 # action and then generalises to "the kill switch", which is wrong: this
 # account has TWO independent switches, and the second one is ours.
 #
-# `tv_hard_stop_guard` above reads month-to-date spend from Cost Explorer every
+# `tv_hard_stop_guard` above reads month-to-date spend (AWS Budgets
+# DescribeBudget since 2026-10-22, plan item 63; Cost Explorer before) every
 # hour, and at `>= BUDGET_KILL_USD` it stops the instance, disables the morning
 # auto-start rule, and pages — see `hard_stop_guard.rs::classify` ("breach_stop"
 # / "cost_unknown" / "below_budget") and `execute_breach_stop`. Its IAM policy
 # carries `ec2:StopInstances` scoped by the `tv-<env>-app` Name tag,
-# `ce:GetCostAndUsage` and `events:DisableRule`. It does not consult the native
+# `budgets:ViewBudget` (was `ce:GetCostAndUsage`) and `events:DisableRule`. It does not consult the native
 # budget action and does not care whether that action works. So the honest
 # statement is "the AWS-NATIVE action is unverifiable", never "the kill switch
 # may not fire" — and whether the native one works is now a nice-to-know rather

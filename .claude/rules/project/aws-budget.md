@@ -9,7 +9,9 @@ paths:
   - "crates/trading/src/strategy/**"
 ---
 
-# AWS Budget Enforcement — r8g.xlarge LOCKED ~₹5,824–7,382/mo
+# AWS Budget Enforcement — r8g.large LOCKED (Quotes 32/33, estimate ~$70–75/mo, not a cap)
+
+> **⚠ TITLE CHANGED 2026-10-21 (operator Quotes 32/33, `daily-universe-scope-expansion-2026-05-27.md` §0).** The lock moves from **r8g.xlarge** (4 vCPU / 32 GiB, ~₹5,824–7,382/mo, Quote 13) to **r8g.large** (2 vCPU / 16 GiB), multi-AZ kept, with a fresh 150 GB root, on the 2026-10-22 rebuild. The owner's estimate is about $70–75 a month; it is an estimate from the 1–13 Oct bill, not a maximum. The only hard maximum is the budget stop (Quotes 36/37 below). The old title is kept in the banner below as history.
 
 > **⚠ TITLE CORRECTED 2026-08-12 (operator Quote 15 — "this is our finalsied
 > instancue dude okay? just sue this evrywhere neitlrey").** This H1 read
@@ -38,7 +40,37 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
-## OPERATOR RULING 2026-10-13 — AWS at or under ₹15,000 a month: one stop at $170, IOPS 6,000 → 3,000
+## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
+
+Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 37 (also: free Budgets API lookups, alarm squeeze, dashboard kept, 16:30 IST stop).
+
+| | Before (Quote 36) | After (Quote 37) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $85 | $170 until 1 November, then **$75** (a follow-up change on or after that date) |
+
+## OPERATOR RULING 2026-10-21 (later) — stop at $85 from 1 November (supersedes the $100 line below)
+
+Owner, 2026-10-21 (verbatim, typos preserved): "okay set it with maximum 85 udde but why it even crosses mroe than 85 dude thats my question dude okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 36.
+
+| | Before (Quote 33) | After (Quote 36) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $100 from 1 November | **$85 from 1 November 2026**; October 2026 stays capped at $170 |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $100 | $170 until 1 November, then **$85** (a follow-up change on or after that date) |
+
+Measured live the same evening: the budget `tv-prod-monthly-budget-v2` has `IncludeTax = true`, so the line is the bill paid, 18% GST included (the "pre-GST" wording in the older notes below and in `budget.tf` is stale). October: $120.31 spent on 1–21 Oct, AWS forecast $175.68 against the $170 line.
+
+## OPERATOR RULING 2026-10-21 — stop at $100 from 1 November; disk speed 500 → 125 MiB/s tonight
+
+Owner, 2026-10-21 (verbatim, typos preserved): "Do everything now dude not Saturday brro do it now okay?", then the decision cards "Cut tonight anyway" (disk speed) and, after a correction that a $100 line in October would stop the box at once ($119.20 spent by 20 Oct), "$100 from 1 November (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 33.
+
+| | Before | After |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the line the hard-stop guard applies in code) | $170 | **$100 from 1 November 2026**; October 2026 stays capped at $170 (`OCTOBER_2026_KILL_USD`) |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 | $170 until 1 November; lowering `limit_amount` to $100 is a follow-up change on or after that date |
+| Disk throughput (live `vol-0c6ab6e593e39d8c8`) | 500 MiB/s | **125 MiB/s**, applied 2026-10-21 17:04 IST by `grow-ebs-volume.yml` run 7; size 600 GB and IOPS 3,000 unchanged |
+
+Honest limits: until the terraform line follows, November's native AWS stop is still at $170 and the $100 stop is the guard Lambda's alone. Depth stays on until the depth-off PR merges, and on 13 Oct the disk was measured at ~149 MiB/s for most of a session, so the 125 MiB/s cap can slow the feed until then.
 
 Owner, 2026-10-13 (verbatim, typos preserved): "bro nto for claude dude im talkign about aws per month shdou leb inr 15 dude okay?", then two decision cards: "Stop at ₹15,000 + trim (Recommended)" and, after a correction naming the 90% early stop, "Stop at ₹15k + cut unused disk (Recommended)". Full record, measurements and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 30.
 
@@ -1718,3 +1750,33 @@ read. The standing ceiling is $150 (Quote 23); the upper bound above is about
 
 **§2.3n's lever rule is NOT met.** No lever is taken. The owner chose the
 change knowing it adds an S3 copy.
+
+## COST NOTE 2026-10-21 — the box stays up after the close until the day's data is in the database (Quote 31, +$0–6/mo, Assumed)
+
+**Authorization:** operator Quote 31 (2026-10-21), recorded in
+`daily-universe-scope-expansion-2026-05-27.md` §0 before any code: *"until or
+unelss movign all tehse dtaa to db never evr shut down"*. The schedule
+08:30–17:30 IST becomes 08:30 until the drain hold is released, never past
+07:30 IST the next morning. Disk throughput is NOT raised (the owner declined
+it: *"why raisign budget limit spee"*).
+
+| Item | Cost |
+|---|---:|
+| Extra r8g.xlarge hours after 17:30 (about $0.19/h, from the 13 Oct record) | $0 on an evening with nothing left; ~$0.40 an evening at 2 h (Assumed) |
+| SSM writes of the hold (Standard parameter, one every 5 min while held) | $0.00 |
+| Lambda invocations (the 17:30 stop now runs through the start watchdog) | $0.00 |
+| Alarms, metrics, filters, EMF names added | 0 |
+| **Total** | **$0 to ~$6/mo (Assumed: 0–3 h on ~22 trading evenings)** |
+
+**Budget position, read live 2026-10-21 (Cost Explorer, Verified):** October
+1–20 is **$119.20** (estimated). Daily cost 13–20 Oct: $6.06, $5.52, $5.49,
+$5.53, $3.27 (Sat), $3.30 (Sun), $5.52, $4.89 (the holiday morning stop).
+Projection at that rate with NO extra hours: 8 more weekdays × ~$5.5 + 3
+weekend days × ~$3.3 ≈ $54, so **October lands near $173, above the $170 stop
+(Assumed; the tax line may be trued up at month end).** The longer evenings add
+about $0.19 per held hour on top. The $170 budget stop is NOT gated by the hold
+(Quote 31), so if October crosses it the box stops for the rest of the month,
+hold or no hold. This is reported to the owner, not acted on: raising the kill
+line needs its own dated quote.
+
+**§2.3n's lever rule is NOT met.** No lever is taken.

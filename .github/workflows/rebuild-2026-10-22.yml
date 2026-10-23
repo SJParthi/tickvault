@@ -1,0 +1,112 @@
+# rebuild-2026-10-22.yml — the one-off production rebuild of the night of
+# Thursday 2026-10-22 (plan item 66).
+#
+# Authorization: operator Quotes 32 and 33 (the rebuild onto a 150 GB root on
+# r8g.large, the old root kept as a snapshot for at least 7 days) and Quote 34
+# (the six removed tables are not re-created). Recorded in
+# docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md.
+#
+# This file only DISPATCHES. Every step, check and rollback is the Rust tool
+# `tv-rebuild-2026-10-22` (crates/app/src/bin/rebuild_2026_10_22.rs); the
+# on-box half is `tickvault rebuild-box`, sent over SSM as one fixed command
+# (crates/app/src/rebuild_ssm.rs).
+#
+# HOW TO RUN IT
+#   1. mode=dry phase=all on main, while the box is up (08:30-17:30 IST), so
+#      the inventory runs. It changes nothing and prints every table,
+#      partition, row count, file and AWS change the apply would make.
+#   2. After 17:30 IST: mode=apply phase=all confirm=REBUILD-2026-10-22.
+#      Apply refuses without a successful dry run on the same commit, outside
+#      17:30-08:00 IST on a weeknight, or while a deploy runs.
+#   3. If it stops part-way, re-run apply with the phase it stopped in (and
+#      manifest=<key> from the report for prepare-new / postcheck); every
+#      phase skips work already done. A failure from `swap` onward rolls back
+#      to the old root and type on its own; phase=rollback with
+#      confirm=ROLLBACK-2026-10-22 does it by hand.
+#
+# SECURITY: dispatch inputs reach the run script only through `env:`. The
+# credentials are the stored keys with EC2 mutation grants (the same pair
+# grow-ebs-volume.yml and downsize-instance.yml use).
+#
+# DELETE THIS FILE, its budget row in shell_budget_guard.rs and the tool in
+# the PR after the run (as the Quote 29e tool was).
+
+name: rebuild-2026-10-22
+run-name: "rebuild-2026-10-22 (${{ inputs.mode }} ${{ inputs.phase }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry (changes nothing; run this first) or apply'
+        required: true
+        type: choice
+        default: dry
+        options: [dry, apply]
+      phase:
+        description: 'all, or one phase (preflight runs first in each case; rollback runs alone)'
+        required: true
+        type: choice
+        default: all
+        options: [all, preflight, copy, snapshot, swap, prepare-new, deploy, postcheck, rollback]
+      confirm:
+        description: 'apply only: REBUILD-2026-10-22 (or ROLLBACK-2026-10-22 for phase=rollback)'
+        required: false
+        default: ''
+      manifest:
+        description: 'prepare-new / postcheck run alone: the manifest key from the copy report'
+        required: false
+        default: ''
+
+concurrency:
+  group: rebuild-2026-10-22
+  cancel-in-progress: false # never interrupt a volume swap
+
+permissions:
+  contents: read
+  actions: write # dispatch deploy-aws and read its runs
+
+jobs:
+  rebuild:
+    name: Rebuild (${{ inputs.mode }} ${{ inputs.phase }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: prod
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned
+        with:
+          toolchain: 1.95.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Build the rebuild tool
+        run: cargo build --locked -p tickvault-app --bin tv-rebuild-2026-10-22
+
+      - name: Run the rebuild tool
+        env:
+          MODE: ${{ inputs.mode }}
+          PHASE: ${{ inputs.phase }}
+          CONFIRM: ${{ inputs.confirm }}
+          MANIFEST: ${{ inputs.manifest }}
+          SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TV_ENVIRONMENT: prod
+        run: ./target/debug/tv-rebuild-2026-10-22 --mode "$MODE" --phase "$PHASE" --sha "$SHA" --confirm "$CONFIRM" --manifest "$MANIFEST" --report rebuild-report.md
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rebuild-report-${{ inputs.mode }}-${{ inputs.phase }}
+          path: rebuild-report.md
+          retention-days: 90

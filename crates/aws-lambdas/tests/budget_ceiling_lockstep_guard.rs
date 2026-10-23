@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 
 use tickvault_aws_lambdas::budget_digest::BUDGET_USD;
 use tickvault_aws_lambdas::hard_stop_guard::{
-    DEFAULT_BUDGET_KILL_USD, SEPTEMBER_2026_ALLOWANCE, STANDING_BUDGET_KILL_USD,
-    effective_budget_kill_usd,
+    DEFAULT_BUDGET_KILL_USD, OCTOBER_2026_ALLOWANCE, OCTOBER_2026_KILL_USD,
+    SEPTEMBER_2026_ALLOWANCE, STANDING_BUDGET_KILL_USD, effective_budget_kill_usd,
 };
 
 fn repo_root() -> PathBuf {
@@ -226,29 +226,37 @@ fn rule_files_record_the_current_ceiling() {
 
 /// Quote 23 (2026-09-23): the September 2026 allowance is ONE month, and the
 /// standing ceiling after it was $150; operator Quote 30 (2026-10-13) set it
-/// to $170 (≈₹15,000). Pinned so the allowance can never quietly become the
-/// new normal, and so the clamp can never sit ABOVE the configured ceiling
-/// (which would make it a raise, not a clamp).
+/// to $170 (≈₹15,000); operator Quote 33 (2026-10-21) set it to $100 from
+/// November 2026, with October 2026 capped at $170; operator Quote 36 (the
+/// same evening) lowered November onward to $85, and operator Quote 37 to $75
+/// (GST included). Pinned so an allowance can
+/// never quietly become the new normal, and so the clamp can never sit ABOVE
+/// the configured ceiling (which would make it a raise, not a clamp).
 #[test]
-fn standing_cap_is_170_and_the_allowance_is_one_month() {
+fn standing_cap_is_75_from_november_and_each_allowance_is_one_month() {
     assert!(
-        (STANDING_BUDGET_KILL_USD - 170.0).abs() < f64::EPSILON,
-        "the standing ceiling moved off $170 without a dated operator quote"
+        (STANDING_BUDGET_KILL_USD - 75.0).abs() < f64::EPSILON,
+        "the standing ceiling moved off $75 without a dated operator quote"
     );
     // "The clamp never sits above the configured ceiling" is a compile-time
     // assert in hard_stop_guard.rs, next to the two constants.
     assert_eq!(SEPTEMBER_2026_ALLOWANCE, (2026, 9));
+    assert_eq!(OCTOBER_2026_ALLOWANCE, (2026, 10));
+    assert!((OCTOBER_2026_KILL_USD - 170.0).abs() < f64::EPSILON);
 
-    // Every month of the next three years EXCEPT 2026-09 resolves to $170.
+    // Every month of the next three years EXCEPT 2026-09 and 2026-10 resolves
+    // to $75.
     for year in 2026..=2028 {
         for month in 1..=12 {
             let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, year, month);
             if (year, month) == SEPTEMBER_2026_ALLOWANCE {
                 assert!((effective - DEFAULT_BUDGET_KILL_USD).abs() < f64::EPSILON);
+            } else if (year, month) == OCTOBER_2026_ALLOWANCE {
+                assert!((effective - OCTOBER_2026_KILL_USD).abs() < f64::EPSILON);
             } else {
                 assert!(
                     (effective - STANDING_BUDGET_KILL_USD).abs() < f64::EPSILON,
-                    "{year}-{month:02} resolved to ${effective}, not the standing $170"
+                    "{year}-{month:02} resolved to ${effective}, not the standing $75"
                 );
             }
         }
@@ -262,8 +270,11 @@ fn standing_cap_is_170_and_the_allowance_is_one_month() {
     ] {
         let body = read(&root.join(rel));
         assert!(
-            body.contains("$150") && body.contains("$225") && body.contains("$170"),
-            "{rel} must record $150, $225 and $170"
+            body.contains("$150")
+                && body.contains("$225")
+                && body.contains("$170")
+                && body.contains("$75 from 1 November"),
+            "{rel} must record $150, $225, $170 and $75 from 1 November"
         );
     }
 }

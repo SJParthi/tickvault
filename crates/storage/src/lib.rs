@@ -128,10 +128,14 @@ pub mod feed_scoreboard_persistence;
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
 pub mod tf_consistency_audit_persistence;
-/// Top-volume ranking snapshots (operator 2026-09-06): one row per
-/// (snapshot, timeframe, family, contract) recording which option contracts
-/// were the busiest and whether each actually held a depth subscription.
-pub mod top_volume_rank_persistence;
+// Top-volume ranking snapshots: `top_volume_rank_persistence` DELETED
+// 2026-10-22 (plan item 62, operator Quote 34). Nothing writes the four
+// `top_volume_<tf>` tables now; their partitions on the box stay on the
+// retention sweep (archive, then detach) until copied. The delay renderer the
+// candle writer shares moved to `delay_render`.
+/// Human-readable delay strings for the candle delay columns (relocated from
+/// the deleted top-volume writer, 2026-10-22).
+pub mod delay_render;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_audit_persistence` module DELETED — the Rust WRITER
 // only; the `tick_conservation_audit` QuestDB TABLE is RETAINED on disk
@@ -214,6 +218,11 @@ pub mod s3_cold;
 // Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
 // verified, and marked, before any WAL prune may delete them.
 pub mod raw_frame_upload;
+// Plan item 66 (2026-10-21, operator Quotes 32/33/34): the file-copy and
+// restore primitives of the one-off 2026-10-22 rebuild (150 GB root,
+// r8g.large). Cold path, box-side `tickvault rebuild-box` only; nothing here
+// deletes or overwrites.
+pub mod rebuild_copy;
 // Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
@@ -301,6 +310,10 @@ pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
+// Quote 31 (2026-10-21): seal the WAL writer's open segment on request.
+pub mod wal_idle_seal;
+// PR W review round 7: count a WAL record written past the reorder slack.
+pub mod wal_reorder_guard;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
 // frames whose rows already reached the database. Sibling of `ws_frame_spill`.
 pub mod wal_applied_watermark;
@@ -313,6 +326,10 @@ pub mod wal_frame_fate;
 // WAL replay settle step (2026-10-13, DA-13c): an acked replay batch is archived
 // only after the durability lag and two clean QuestDB probes.
 pub mod wal_replay_settle;
+// Bounded WAL unapplied ranges (2026-10-20, plan item PR W): the backlog guard,
+// the boot fold and an inherited overflow become at most 32 ranges in a sidecar,
+// so the WAL stops growing behind an unbounded overflow bit.
+pub mod wal_unapplied_ranges;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT

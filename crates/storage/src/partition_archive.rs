@@ -358,7 +358,11 @@ const DEPTH_TABLES: [&str; 2] = [
 /// a minute-or-longer one cannot join by accident. That is worth the O(24)
 /// scan, which runs on the cold retention sweep and never on a tick.
 fn is_intraday_table(table: &str) -> bool {
-    if table == TICKS_TABLE {
+    // 2026-10-22 (plan item 62): the two retired sub-minute tables keep the
+    // intraday window they were archived on while they were written.
+    if table == TICKS_TABLE
+        || crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table)
+    {
         return true;
     }
     (0..tickvault_trading::candles::TF_COUNT).any(|ordinal| {
@@ -599,8 +603,8 @@ pub(crate) fn partition_range_bounds(name: &str) -> Option<(String, String)> {
 }
 
 /// The `[start, end)` of a partition named `name`, as naive date-times.
-/// `None` for anything malformed. Shared by [`partition_range_bounds`] and
-/// [`top_volume_partition_held`].
+/// `None` for anything malformed. Used by [`partition_range_bounds`] (the
+/// top_volume hold that also used it was removed 2026-10-22, plan item 62).
 fn partition_range_naive(name: &str) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
     use chrono::{NaiveDate, NaiveTime, TimeDelta};
 
@@ -1340,11 +1344,8 @@ pub struct ArchiveRunSummary {
     /// rewritten rows are in it. The daily scheduler reads it as
     /// "incomplete, retry".
     pub held_deferred_depth: u32,
-    /// `top_volume_<tf>` partitions HELD this run because a pending top_volume
-    /// spill file could still replay rows into their hour (top_volume spill
-    /// plan item 6, 2026-10-13). Not a failure; the daily scheduler reads it
-    /// as "incomplete" so the day is never latched with them unarchived.
-    pub held_top_volume_spill: u32,
+    // `held_top_volume_spill` REMOVED 2026-10-22 (plan item 62): nothing can
+    // replay rows into a `top_volume_<tf>` hour any more.
 }
 
 /// How one `process_one` call ended, as far as the run loop cares.
@@ -1478,166 +1479,21 @@ pub(crate) fn hour_window_decision(
     }
 }
 
-/// Whether `table` is one of the four `top_volume_<tf>` tables. O(4).
+/// The spill folders whose pending rows a replay could still post into a
+/// swept table: the depth and tick folders.
+///
+/// ⚠ CHANGED 2026-10-22 (plan item 62, operator Quote 34): the top_volume
+/// branch is gone with the top_volume writer, spill and replay. Nothing posts
+/// rows into a `top_volume_<tf>` table any more, so its partitions are no
+/// longer held for a pending spill file (`held_top_volume_spill` is removed);
+/// they are archived like every other table, then detached.
 #[must_use]
-pub(crate) fn is_top_volume_table(table: &str) -> bool {
-    crate::top_volume_rank_persistence::SnapshotCadence::ALL
-        .iter()
-        .any(|c| c.table_name() == table)
-}
-
-/// The spill folders whose pending rows a replay could still post into
-/// `table` (top_volume spill plan item 6, 2026-10-13): the top_volume folder
-/// for a `top_volume_<tf>` table, the depth and tick folders for every other.
-#[must_use]
-pub(crate) fn spill_dirs_for_table(table: &str) -> &'static [&'static str] {
-    const TOP_VOLUME: [&str; 1] = [crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR];
+pub(crate) fn spill_dirs_for_table(_table: &str) -> &'static [&'static str] {
     const TICKS_AND_DEPTH: [&str; 2] = [
         crate::depth_persistence::DEPTH_SPILL_DIR,
         crate::tick_persistence::TICK_SPILL_DIR,
     ];
-    if is_top_volume_table(table) {
-        &TOP_VOLUME
-    } else {
-        &TICKS_AND_DEPTH
-    }
-}
-
-/// The unix hour of the OLDEST spill file in `dir` that still holds rows a
-/// replay will post (top_volume spill plan item 6). `None` when nothing is
-/// pending or the folder is absent. An unreadable folder or entry answers
-/// `Some(0)`, which holds every partition: "I could not check" never reads
-/// as "safe". O(files), one listing, on the archive task (off the worker).
-///
-/// ⚠ CHANGED 2026-10-20 (audit C1): a pending file whose NAME carries no hour
-/// no longer answers `Some(0)`. It used to: one such file held every
-/// top_volume partition and kept the daily archive verdict Incomplete for as
-/// long as the file sat there, and the age set-aside did not move it either
-/// (it cannot age a file it cannot date), so nothing ever cleared it. It is
-/// now skipped and reported in one coded `warn!` per call (one call per
-/// archive run), naming the count and the first such file. Only `.ilp` files
-/// are considered, the same set the replay reads (`list_spill_files`); any
-/// other file is never replayed, so it cannot write into an hour. A file that
-/// vanished between the listing and its `stat` (the replay emptying or
-/// setting it aside) is skipped too. What still fails safe with `Some(0)`: a
-/// folder that exists but cannot be listed, an entry the listing could not
-/// read, and a `stat` that failed for any other reason.
-///
-/// The replay and this hold now agree (C1 review, LOW-2, 2026-10-20): the
-/// top_volume replay round moves every non-empty undated `.ilp` file to
-/// `quarantine/` before it posts anything
-/// (`tick_spill_replay::set_aside_aged_spill_files`), so the replay no longer
-/// posts what this hold skips. The writer never makes such a name
-/// (`<tier>-<feed>-<hour>.ilp`), so one only appears by hand or from a
-/// damaged folder. **Honest limit:** until the next replay round the file
-/// sits in the folder unheld, but nothing posts it in that time, because each
-/// round sets files aside before it posts; only a file placed between a
-/// round's set-aside and that round's own listing is posted, once, unheld.
-/// *(The first version of this note said the replay still posts every
-/// undated file; the set-aside above removed that.)*
-#[must_use]
-pub(crate) fn oldest_pending_spill_hour(dir: &Path) -> Option<u64> {
-    let scan = scan_pending_spill_hours(dir);
-    if scan.unnamed > 0 {
-        warn!(
-            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-            source = "top_volume_spill_unnamed_file_skipped",
-            dir = %dir.display(),
-            files = scan.unnamed,
-            first = ?scan.first_unnamed,
-            "pending spill file(s) whose name carries no hour were SKIPPED when deciding \
-             which top_volume hours the archive must hold: such a file carries no date, \
-             so it does not hold every partition. The next replay round sets it aside \
-             in quarantine/ before posting anything, so it is not replayed; re-ingest \
-             its rows by hand only after checking the cold archive of their hours."
-        );
-    }
-    scan.oldest
-}
-
-/// What [`oldest_pending_spill_hour`] found in one listing.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PendingSpillScan {
-    /// The oldest hour a pending, dated `.ilp` file carries, or `Some(0)` when
-    /// the folder or an entry could not be read (hold every partition).
-    oldest: Option<u64>,
-    /// Pending `.ilp` files whose name carries no hour, skipped.
-    unnamed: u32,
-    /// The first of them, for the coded line.
-    first_unnamed: Option<PathBuf>,
-}
-
-/// One listing of `dir` for [`oldest_pending_spill_hour`]. O(files), cold.
-fn scan_pending_spill_hours(dir: &Path) -> PendingSpillScan {
-    let fail_safe = PendingSpillScan {
-        oldest: Some(0),
-        ..PendingSpillScan::default()
-    };
-    let entries = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return PendingSpillScan::default();
-        }
-        Err(_) => return fail_safe,
-    };
-    let mut scan = PendingSpillScan::default();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return fail_safe;
-        };
-        let meta = match entry.metadata() {
-            Ok(meta) => meta,
-            // Gone since the listing: the replay emptied or moved it.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return fail_safe,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let is_spill_file = path.extension().is_some_and(|ext| {
-            ext.eq_ignore_ascii_case(crate::tick_spill_replay::SPILL_FILE_EXTENSION)
-        });
-        if !is_spill_file || !crate::tick_spill_replay::spill_file_pending(&path, meta.len()) {
-            continue;
-        }
-        let Some(hour) = crate::tick_spill_replay::spill_file_hour(&path) else {
-            scan.unnamed = scan.unnamed.saturating_add(1);
-            if scan.first_unnamed.is_none() {
-                scan.first_unnamed = Some(path);
-            }
-            continue;
-        };
-        scan.oldest = Some(scan.oldest.map_or(hour, |o| o.min(hour)));
-    }
-    scan
-}
-
-/// Whether the top_volume partition `name` is HELD this run (top_volume
-/// spill plan item 6, re-scoped 2026-10-13 after review).
-///
-/// Held only when the disk is not under pressure and the partition ends after
-/// the start of the oldest pending spill file's hour: only those hours can
-/// still receive replayed rows. Older hours go: every pending file younger
-/// than them is younger, and a file too old for the hot window is set aside
-/// in quarantine rather than replayed. The file hour is UTC and the partition
-/// is labelled in IST (5.5 h ahead), so comparing the label directly holds a
-/// superset of the hours a file can reach. An unparseable name is held.
-/// Pure, O(1).
-#[must_use]
-pub(crate) fn top_volume_partition_held(
-    name: &str,
-    oldest_pending_hour: Option<u64>,
-    under_disk_pressure: bool,
-) -> bool {
-    if under_disk_pressure {
-        return false;
-    }
-    let Some(hour) = oldest_pending_hour else {
-        return false;
-    };
-    let pending_from = i64::try_from(hour.saturating_mul(3_600)).unwrap_or(i64::MAX);
-    partition_range_naive(name).is_none_or(|(_, end)| end.and_utc().timestamp() > pending_from)
+    &TICKS_AND_DEPTH
 }
 
 /// What a partition-list query found for one table.
@@ -2015,9 +1871,6 @@ impl PartitionArchiver {
         // table's class hot window, active partition excluded, hostile names
         // rejected — the SAME selection primitives the detach path uses.
         let mut worklist: Vec<(&'static str, String)> = Vec::new();
-        // The oldest pending top_volume spill hour, read once per run, on the
-        // first top_volume partition that needs it.
-        let mut top_volume_pending_hour: Option<Option<u64>> = None;
         for table in swept_tables() {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
@@ -2030,28 +1883,6 @@ impl PartitionArchiver {
             match self.list_eligible_partitions(table, hot_days).await {
                 Ok(PartitionListing::Eligible(names)) => {
                     for name in names {
-                        // Top_volume spill plan item 6 (2026-10-13): a
-                        // top_volume hour a pending spill file can still
-                        // reach is held, counted, and keeps the day open.
-                        if is_top_volume_table(table)
-                            && top_volume_partition_held(
-                                &name,
-                                *top_volume_pending_hour.get_or_insert_with(|| {
-                                    crate::off_worker::off_worker(|| {
-                                        oldest_pending_spill_hour(Path::new(
-                                            crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
-                                        ))
-                                    })
-                                }),
-                                self.cfg.under_disk_pressure,
-                            )
-                        {
-                            summary.held_top_volume_spill =
-                                summary.held_top_volume_spill.saturating_add(1);
-                            metrics::counter!("tv_partition_archive_top_volume_held_total")
-                                .increment(1);
-                            continue;
-                        }
                         worklist.push((table, name));
                     }
                 }
@@ -2137,14 +1968,6 @@ impl PartitionArchiver {
                  archives them with those rows in)"
             );
         }
-        if summary.held_top_volume_spill > 0 {
-            info!(
-                held_top_volume_spill = summary.held_top_volume_spill,
-                "partition archive: top_volume partitions HELD because a pending top_volume \
-                 spill file can still replay rows into their hours (not a failure; the day \
-                 stays open and a later pass archives them once the replay has run)"
-            );
-        }
 
         // Best-effort final audit flush (AUDIT-WS-01 class — never gates).
         if let Err(err) = self.audit.flush() {
@@ -2176,78 +1999,33 @@ impl PartitionArchiver {
         summary
     }
 
-    /// One partition: export → upload → verify → audit-first → drop.
-    async fn process_one(
+    /// Step 2 of [`Self::process_one`], shared with the rebuild copy (plan
+    /// item 66): the never-overwrite placement of an exported gzip at the
+    /// partition's canonical key, or at its content-addressed sidecar key when
+    /// the canonical object holds different bytes. Returns the key the bytes
+    /// now live at and whether THIS call uploaded them; `None` after a
+    /// recorded failure (counter, audit row and coded error already written,
+    /// temp file removed). Moved here verbatim on 2026-10-21; behaviour
+    /// unchanged.
+    async fn place_archive(
         &mut self,
-        table: &'static str,
+        table: &str,
         partition: &str,
+        exported: &ExportedCsv,
         summary: &mut ArchiveRunSummary,
-    ) -> PartitionStep {
-        let Some((start, end)) = partition_range_bounds(partition) else {
-            // Unreachable in practice (names pass the allowlist upstream);
-            // fail-closed anyway.
-            self.record_failure(
-                table,
-                partition,
-                ArchiveOutcome::ExportFailed,
-                "unparseable partition name",
-                summary,
-            );
-            return PartitionStep::Done;
-        };
+    ) -> Option<(String, bool)> {
         let mut s3_key = canonical_archive_key(table, partition);
-        // Did THIS run put the object there, or did it reuse an existing one?
-        // The 4b mismatch arm below needs to tell those apart: deleting an
-        // object we did not write could destroy the only copy of already-
-        // dropped data, which is exactly what the never-overwrite policy
-        // exists to prevent.
         let mut uploaded_this_run = false;
-
-        // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
-        //     probe only refuses SUSPENDED tables. A table that is merely
-        //     BEHIND holds acknowledged rows the export and both recounts
-        //     cannot see, so every count agrees and the drop proceeds. The
-        //     after-close deferred-depth pass (morning `market_depth` hours,
-        //     15:45–17:15) and the spill replay / seal DLQ drain (yesterday's
-        //     partitions) all write into partitions this archiver can select.
-        //     Probed fresh here, per partition, because the run-start snapshot
-        //     can be minutes old by the time a late worklist item is reached.
-        if !self.wal_applied_gate(table, partition, "pre_export").await {
-            return PartitionStep::WalNotApplied;
-        }
-
-        // 1. Export (stream + gzip + count) — one partition on disk at a time.
-        let exported = match self
-            .export_partition_csv(table, partition, &start, &end)
-            .await
-        {
-            Ok(e) => e,
-            Err(err) => {
-                self.record_failure(
-                    table,
-                    partition,
-                    ArchiveOutcome::ExportFailed,
-                    &format!("{err:#}"),
-                    summary,
-                );
-                return PartitionStep::Done;
-            }
-        };
-        summary.csv_bytes_exported = summary
-            .csv_bytes_exported
-            .saturating_add(exported.csv_bytes);
-
-        // 2. Never-overwrite upload (F1): HeadObject FIRST. Reuse requires
-        //    CONTENT IDENTITY (review round 2): equal length (fast
-        //    pre-filter) AND a stored SHA-256 checksum equal to the freshly
-        //    exported gzip's digest — a stale object from a failed prior run
-        //    plus a mutated partition (backfill into a >hot-window
-        //    partition) with a coincidental compressed length can no longer
-        //    slip through to a drop. Length or checksum mismatch, OR an
-        //    object with NO checksum attribute (foreign/legacy) → LOUD
-        //    conflict, keep the partition (the object may be the only copy
-        //    of already-dropped data). Absent → conditional PutObject with
-        //    `If-None-Match: "*"` + `checksum_sha256`.
+        // Reuse requires CONTENT IDENTITY (review round 2): equal length (fast
+        // pre-filter) AND a stored SHA-256 checksum equal to the freshly
+        // exported gzip's digest — a stale object from a failed prior run
+        // plus a mutated partition (backfill into a >hot-window partition)
+        // with a coincidental compressed length can no longer slip through
+        // to a drop. Length or checksum mismatch, OR an object with NO
+        // checksum attribute (foreign/legacy) → sidecar key, never an
+        // overwrite (the object may be the only copy of already-dropped
+        // data). Absent → conditional PutObject with `If-None-Match: "*"` +
+        // `checksum_sha256`.
         match self.head_object_meta(&s3_key).await {
             Some(meta)
                 if meta.len == exported.gzip_bytes
@@ -2354,7 +2132,7 @@ impl PartitionArchiver {
                             summary,
                         );
                         remove_temp_file(&exported.path);
-                        return PartitionStep::Done;
+                        return None;
                     }
                     None => {
                         uploaded_this_run = true;
@@ -2370,7 +2148,7 @@ impl PartitionArchiver {
                                 summary,
                             );
                             remove_temp_file(&exported.path);
-                            return PartitionStep::Done;
+                            return None;
                         }
                         summary.gzip_bytes_uploaded = summary
                             .gzip_bytes_uploaded
@@ -2412,7 +2190,7 @@ impl PartitionArchiver {
                         summary,
                     );
                     remove_temp_file(&exported.path);
-                    return PartitionStep::Done;
+                    return None;
                 }
                 summary.gzip_bytes_uploaded = summary
                     .gzip_bytes_uploaded
@@ -2420,6 +2198,78 @@ impl PartitionArchiver {
                 metrics::counter!("tv_partition_archived_total").increment(1);
             }
         }
+        Some((s3_key, uploaded_this_run))
+    }
+
+    /// One partition: export → upload → verify → audit-first → drop.
+    async fn process_one(
+        &mut self,
+        table: &'static str,
+        partition: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> PartitionStep {
+        let Some((start, end)) = partition_range_bounds(partition) else {
+            // Unreachable in practice (names pass the allowlist upstream);
+            // fail-closed anyway.
+            self.record_failure(
+                table,
+                partition,
+                ArchiveOutcome::ExportFailed,
+                "unparseable partition name",
+                summary,
+            );
+            return PartitionStep::Done;
+        };
+        // Did THIS run put the object there, or did it reuse an existing one?
+        // The 4b mismatch arm below needs to tell those apart: deleting an
+        // object we did not write could destroy the only copy of already-
+        // dropped data, which is exactly what the never-overwrite policy
+        // exists to prevent. `place_archive` (step 2) returns both the key
+        // and that fact.
+
+        // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
+        //     probe only refuses SUSPENDED tables. A table that is merely
+        //     BEHIND holds acknowledged rows the export and both recounts
+        //     cannot see, so every count agrees and the drop proceeds. The
+        //     after-close deferred-depth pass (morning `market_depth` hours,
+        //     15:45–17:15) and the spill replay / seal DLQ drain (yesterday's
+        //     partitions) all write into partitions this archiver can select.
+        //     Probed fresh here, per partition, because the run-start snapshot
+        //     can be minutes old by the time a late worklist item is reached.
+        if !self.wal_applied_gate(table, partition, "pre_export").await {
+            return PartitionStep::WalNotApplied;
+        }
+
+        // 1. Export (stream + gzip + count) — one partition on disk at a time.
+        let exported = match self
+            .export_partition_csv(table, partition, &start, &end)
+            .await
+        {
+            Ok(e) => e,
+            Err(err) => {
+                self.record_failure(
+                    table,
+                    partition,
+                    ArchiveOutcome::ExportFailed,
+                    &format!("{err:#}"),
+                    summary,
+                );
+                return PartitionStep::Done;
+            }
+        };
+        summary.csv_bytes_exported = summary
+            .csv_bytes_exported
+            .saturating_add(exported.csv_bytes);
+
+        // 2. Never-overwrite upload (F1): HeadObject first; reuse only on
+        //    content identity; a different object at the canonical key gets a
+        //    content-addressed sidecar instead. See `place_archive`.
+        let Some((s3_key, uploaded_this_run)) = self
+            .place_archive(table, partition, &exported, summary)
+            .await
+        else {
+            return PartitionStep::Done;
+        };
 
         // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
         // The tally (count AND max(ts)) taken here is what the pre-drop
@@ -2753,6 +2603,10 @@ impl PartitionArchiver {
     /// table. A `top_volume_<tf>` table looks only at its own spill folder;
     /// every other table keeps the depth + tick check, so a top_volume spill
     /// can never defer the hour archive of `market_depth`.
+    ///
+    /// ⚠ CHANGED 2026-10-22 (plan item 62): the top_volume folder is no longer
+    /// read; every table sees the depth + tick folders (see
+    /// [`spill_dirs_for_table`]).
     fn spill_dirs_have_pending_data(table: &str) -> bool {
         spill_dirs_for_table(table)
             .iter()
@@ -2883,15 +2737,23 @@ impl PartitionArchiver {
         start: &str,
         end: &str,
     ) -> Result<ExportedCsv> {
-        crate::off_worker::off_worker(|| std::fs::create_dir_all(&self.temp_dir))
-            .context("create archive temp dir")?;
         let path = self.temp_dir.join(format!("{table}-{partition}.csv.gz"));
         let sql = build_export_sql(table, start, end);
+        self.export_query_csv(&sql, path).await
+    }
+
+    /// Streams the `/exp` CSV of `sql` through gzip into `path`, counting
+    /// records from the RAW byte stream and hashing the compressed bytes.
+    /// Shared by the partition export above and the rebuild's whole-table
+    /// export (plan item 66), so both use one counted, hashed path.
+    async fn export_query_csv(&self, sql: &str, path: PathBuf) -> Result<ExportedCsv> {
+        crate::off_worker::off_worker(|| std::fs::create_dir_all(&self.temp_dir))
+            .context("create archive temp dir")?;
 
         let mut response = self
             .export_client
             .get(&self.exp_url)
-            .query(&[("query", sql.as_str())])
+            .query(&[("query", sql)])
             .send()
             .await
             .context("/exp export request failed")?;
@@ -3209,16 +3071,381 @@ impl PartitionArchiver {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rebuild copy (plan item 66, operator Quotes 32/33/34, 2026-10-21)
+// ---------------------------------------------------------------------------
+//
+// The 2026-10-22 rebuild replaces the 600 GB root with a fresh 150 GB one.
+// Quote 27 binds until Quote 35 runs, so EVERY partition still on the box is
+// copied to the cold bucket and verified first, and NOTHING is dropped: the
+// old volume is kept (and snapshotted) untouched. These methods reuse the
+// archiver's own export, never-overwrite placement and verify steps; they
+// never reach `drop_partition`. Cold path: the box-side `rebuild-box copy`
+// subcommand only, with the app stopped.
+
+/// One partition, or one whole table, copied to the cold bucket and verified
+/// for the rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RebuildCopiedObject {
+    /// Table name.
+    pub table: String,
+    /// Partition name; empty for a whole-table export.
+    pub partition: String,
+    /// The key the verified bytes live at.
+    pub s3_key: String,
+    /// Data rows exported, equal to the recount taken after the export.
+    pub rows: u64,
+    /// Compressed bytes, equal to the object's ContentLength.
+    pub gzip_bytes: u64,
+    /// SHA-256 of the compressed bytes, lowercase hex.
+    pub gzip_sha256_hex: String,
+    /// True when this call uploaded the bytes; false when an identical object
+    /// was already there.
+    pub uploaded: bool,
+}
+
+/// One row of `table_partitions()` for the rebuild inventory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RebuildPartitionInfo {
+    /// Partition name (`YYYY-MM-DD` or `YYYY-MM-DDTHH`).
+    pub name: String,
+    /// The partition QuestDB is writing into.
+    pub active: bool,
+    /// Row count QuestDB reports (metadata, no scan).
+    pub num_rows: u64,
+    /// On-disk bytes QuestDB reports.
+    pub disk_bytes: u64,
+}
+
+/// True for a table name the rebuild may interpolate into SQL: 1 to 127 of
+/// `[a-z0-9_]`, starting with a letter. A name from `tables()` is data we did
+/// not author, and QuestDB's HTTP API has no bound parameters, so anything
+/// else is refused (fail closed, the same posture as
+/// [`is_valid_partition_name`]).
+#[must_use]
+pub fn is_rebuild_safe_table_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 127
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// `SELECT name, active, numRows, diskSize FROM table_partitions('<t>')`.
+#[must_use]
+pub fn build_rebuild_partition_list_sql(table: &str) -> String {
+    format!("SELECT name, active, numRows, diskSize FROM table_partitions('{table}')")
+}
+
+/// Parses the rebuild partition listing by column NAME. A row missing a
+/// field, or with a name that fails [`is_valid_partition_name`], is returned
+/// as `Err(name)` so the caller can report it rather than skip it silently.
+#[must_use]
+pub fn parse_rebuild_partitions(json: &str) -> Option<Vec<Result<RebuildPartitionInfo, String>>> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    let columns = parsed.get("columns")?.as_array()?;
+    let idx = |want: &str| {
+        columns
+            .iter()
+            .position(|c| c.get("name").and_then(|n| n.as_str()) == Some(want))
+    };
+    let (n, a, r, d) = (
+        idx("name")?,
+        idx("active")?,
+        idx("numRows")?,
+        idx("diskSize")?,
+    );
+    let dataset = parsed.get("dataset")?.as_array()?;
+    let mut out = Vec::with_capacity(dataset.len());
+    for row in dataset {
+        let Some(cells) = row.as_array() else {
+            out.push(Err(String::from("<row is not an array>")));
+            continue;
+        };
+        let name = cells
+            .get(n)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let active = cells.get(a).and_then(serde_json::Value::as_bool);
+        let num_rows = cells.get(r).and_then(serde_json::Value::as_u64);
+        let disk = cells.get(d).and_then(serde_json::Value::as_u64);
+        match (is_valid_partition_name(&name), active, num_rows, disk) {
+            (true, Some(active), Some(num_rows), Some(disk_bytes)) => {
+                out.push(Ok(RebuildPartitionInfo {
+                    name,
+                    active,
+                    num_rows,
+                    disk_bytes,
+                }));
+            }
+            _ => out.push(Err(name)),
+        }
+    }
+    Some(out)
+}
+
+/// Parses `{"dataset":[[N]]}` (a single `count()` cell). `None` on anything
+/// else, so a missing count can never read as zero.
+#[must_use]
+pub fn parse_single_count(json: &str) -> Option<u64> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    parsed
+        .get("dataset")?
+        .as_array()?
+        .first()?
+        .as_array()?
+        .first()?
+        .as_u64()
+}
+
+/// The content-addressed key a whole-table rebuild export lives at:
+/// `<prefix>/<table>/<sha256 hex>.csv.gz`. A different content is a
+/// different key, so the object is never overwritten and a re-run of an
+/// unchanged table reuses it.
+#[must_use]
+pub fn rebuild_whole_table_key(prefix: &str, table: &str, gzip_sha256_hex: &str) -> String {
+    format!(
+        "{}/{table}/{gzip_sha256_hex}.csv.gz",
+        prefix.trim_end_matches('/')
+    )
+}
+
+impl PartitionArchiver {
+    /// An archiver for the rebuild: explicit bucket (never derived from the
+    /// environment), the given QuestDB, default retention knobs (unused: the
+    /// rebuild never selects by retention window and never drops).
+    ///
+    /// # Errors
+    /// HTTP-client build failure.
+    // TEST-EXEMPT: builds live AWS/HTTP clients; the pure pieces it feeds are tested below
+    pub async fn new_for_rebuild(questdb: &QuestDbConfig, bucket: &str) -> Result<Self> {
+        let cfg = PartitionRetentionConfig {
+            archive_bucket: bucket.to_string(),
+            ..PartitionRetentionConfig::default()
+        };
+        Self::new(questdb, &cfg)
+            .await?
+            .context("rebuild archiver: the explicit bucket did not resolve")
+    }
+
+    /// Every partition of `table` (active included), from QuestDB metadata.
+    ///
+    /// # Errors
+    /// Unsafe table name, request failure, non-2xx, or an unparseable body.
+    // TEST-EXEMPT: one QuestDB round trip; the SQL and the parser are tested below
+    pub async fn rebuild_list_partitions(
+        &self,
+        table: &str,
+    ) -> Result<Vec<Result<RebuildPartitionInfo, String>>> {
+        anyhow::ensure!(
+            is_rebuild_safe_table_name(table),
+            "refusing unsafe table name {table:?}"
+        );
+        let sql = build_rebuild_partition_list_sql(table);
+        let response = self
+            .ddl_client
+            .get(&self.exec_url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await
+            .context("partition list query failed")?;
+        let status = response.status();
+        let body = read_body_capped(response).await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success(),
+            "partition list returned {status}: {}",
+            capture_rest_error_body(&body)
+        );
+        parse_rebuild_partitions(&body).context("partition list body did not parse")
+    }
+
+    /// `true` when QuestDB reports `table` not suspended and fully applied
+    /// (`writerTxn == sequencerTxn`), probed fresh. Same gate the archiver
+    /// runs before every export.
+    // TEST-EXEMPT: delegates to wal_applied_gate, exercised by the stub-server tests
+    pub async fn rebuild_wal_applied(&self, table: &str) -> bool {
+        self.wal_applied_gate(table, "", "rebuild").await
+    }
+
+    /// The canonical archive object's length for `(table, partition)`, when
+    /// one exists (inventory only: presence is reported, never trusted —
+    /// the copy re-exports and compares content).
+    // TEST-EXEMPT: one HeadObject
+    pub async fn rebuild_canonical_len(&self, table: &str, partition: &str) -> Option<u64> {
+        self.head_object_meta(&canonical_archive_key(table, partition))
+            .await
+            .map(|m| m.len)
+    }
+
+    /// Export → never-overwrite placement → verify for ONE partition. NEVER
+    /// drops. `Err` carries a one-line reason (a coded log line and an audit
+    /// row are written by the shared placement step on its failures).
+    // TEST-EXEMPT: live QuestDB + S3; every decision inside is the archiver's own, unit- and stub-tested
+    pub async fn rebuild_copy_partition(
+        &mut self,
+        table: &str,
+        partition: &str,
+    ) -> std::result::Result<RebuildCopiedObject, String> {
+        if !is_rebuild_safe_table_name(table) {
+            return Err(format!("unsafe table name {table:?}"));
+        }
+        let Some((start, end)) = partition_range_bounds(partition) else {
+            return Err(format!("unparseable partition name {partition:?}"));
+        };
+        if !self.wal_applied_gate(table, partition, "rebuild").await {
+            return Err(String::from("WAL not proven applied"));
+        }
+        let exported = self
+            .export_partition_csv(table, partition, &start, &end)
+            .await
+            .map_err(|e| format!("export failed: {e:#}"))?;
+        let mut scratch = ArchiveRunSummary::default();
+        let Some((s3_key, uploaded)) = self
+            .place_archive(table, partition, &exported, &mut scratch)
+            .await
+        else {
+            return Err(String::from(
+                "placement in S3 failed (see the STORAGE-GAP-04 line)",
+            ));
+        };
+        let recount = self.recount_rows(table, &start, &end).await.map(|t| t.rows);
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
+        let verdict = verify_archive(
+            table,
+            partition,
+            exported.rows,
+            exported.csv_bytes,
+            exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
+            recount,
+            s3_len,
+        );
+        remove_temp_file(&exported.path);
+        let proof = verdict.map_err(|f| format!("verify failed: {f:?}"))?;
+        Ok(RebuildCopiedObject {
+            table: table.to_string(),
+            partition: partition.to_string(),
+            s3_key,
+            rows: proof.rows,
+            gzip_bytes: proof.gzip_bytes,
+            gzip_sha256_hex: proof.gzip_sha256_hex,
+            uploaded,
+        })
+    }
+
+    /// Export → content-addressed placement → verify for a WHOLE table, to
+    /// `<key_prefix>/<table>/<sha>.csv.gz`. Used for the tables the rebuild
+    /// restores onto the new disk (the SEBI/audit keep-list) and for tables
+    /// with no time partitions. NEVER drops.
+    // TEST-EXEMPT: live QuestDB + S3; the key builder and the count parser are tested below
+    pub async fn rebuild_copy_whole_table(
+        &mut self,
+        table: &str,
+        key_prefix: &str,
+    ) -> std::result::Result<RebuildCopiedObject, String> {
+        if !is_rebuild_safe_table_name(table) {
+            return Err(format!("unsafe table name {table:?}"));
+        }
+        if !self.wal_applied_gate(table, "", "rebuild").await {
+            return Err(String::from("WAL not proven applied"));
+        }
+        let path = self.temp_dir.join(format!("{table}-whole.csv.gz"));
+        let exported = self
+            .export_query_csv(&format!("SELECT * FROM {table}"), path)
+            .await
+            .map_err(|e| format!("export failed: {e:#}"))?;
+        let s3_key = rebuild_whole_table_key(key_prefix, table, &exported.gzip_sha256_hex);
+        let mut uploaded = false;
+        match crate::s3_cold::classify_existing(
+            self.head_object_meta(&s3_key).await.as_ref(),
+            exported.gzip_bytes,
+            &exported.gzip_sha256_b64,
+        ) {
+            crate::s3_cold::ExistingObject::Identical => {}
+            crate::s3_cold::ExistingObject::Different => {
+                remove_temp_file(&exported.path);
+                return Err(format!(
+                    "{s3_key} holds different bytes under a content-addressed key; not overwritten"
+                ));
+            }
+            crate::s3_cold::ExistingObject::Absent => {
+                if let Err(err) = self
+                    .upload_to_s3(&exported.path, &s3_key, &exported.gzip_sha256_b64)
+                    .await
+                {
+                    remove_temp_file(&exported.path);
+                    return Err(format!("upload failed: {err:#}"));
+                }
+                uploaded = true;
+            }
+        }
+        let recount = self.rebuild_count_rows(table).await;
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
+        let verdict = verify_archive(
+            table,
+            "",
+            exported.rows,
+            exported.csv_bytes,
+            exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
+            recount,
+            s3_len,
+        );
+        remove_temp_file(&exported.path);
+        let proof = verdict.map_err(|f| format!("verify failed: {f:?}"))?;
+        Ok(RebuildCopiedObject {
+            table: table.to_string(),
+            partition: String::new(),
+            s3_key,
+            rows: proof.rows,
+            gzip_bytes: proof.gzip_bytes,
+            gzip_sha256_hex: proof.gzip_sha256_hex,
+            uploaded,
+        })
+    }
+
+    /// `SELECT count() FROM <table>`; `None` when unavailable.
+    // TEST-EXEMPT: one QuestDB round trip; parse_single_count is tested below
+    pub async fn rebuild_count_rows(&self, table: &str) -> Option<u64> {
+        if !is_rebuild_safe_table_name(table) {
+            return None;
+        }
+        let sql = format!("SELECT count() FROM {table}");
+        let response = self
+            .ddl_client
+            .get(&self.exec_url)
+            .query(&[("query", sql.as_str())])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        parse_single_count(&read_body_capped(response).await.ok()?)
+    }
+}
+
 /// The full swept-table set: HOUR + DAY constants + the 21 live candle
 /// tables from the single source of truth.
 fn swept_tables() -> Vec<&'static str> {
     let candles = crate::shadow_persistence::candle_table_names();
+    // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` are no longer
+    // fold frames, but their partitions on the box are still archived here
+    // until they are copied (operator Quote 34).
+    let archive_only = crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES;
     let mut tables: Vec<&'static str> = Vec::with_capacity(
-        HOUR_PARTITIONED_TABLES.len() + DAY_PARTITIONED_TABLES.len() + candles.len(),
+        HOUR_PARTITIONED_TABLES.len()
+            + DAY_PARTITIONED_TABLES.len()
+            + candles.len()
+            + archive_only.len(),
     );
     tables.extend_from_slice(HOUR_PARTITIONED_TABLES);
     tables.extend_from_slice(DAY_PARTITIONED_TABLES);
     tables.extend_from_slice(&candles);
+    tables.extend_from_slice(&archive_only);
     tables
 }
 
@@ -3971,8 +4198,12 @@ mod tests {
         // instead of leaving the boundary pinned to a ghost.
         let live = crate::shadow_persistence::candle_table_names();
         for table in ["ticks", "candles_1s", "candles_3s", "candles_5s"] {
+            // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` are no
+            // longer written but stay archive-only on the intraday window.
+            let archive_only =
+                crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table);
             assert!(
-                table == "ticks" || live.contains(&table),
+                table == "ticks" || archive_only || live.contains(&table),
                 "{table} is not a live candle table — a frame was retired and \
                  this guard is now pinning the boundary to a name nothing \
                  writes (live: {live:?})"
@@ -4976,6 +5207,10 @@ mod tests {
         let tables = swept_tables();
         assert!(tables.contains(&"ticks"));
         assert!(tables.contains(&"candles_1m"));
+        // 2026-10-22 (plan item 62, Quote 34): archived until copied.
+        assert!(tables.contains(&"candles_3s"));
+        assert!(tables.contains(&"candles_5s"));
+        assert!(tables.contains(&"top_volume_1s"));
         assert!(tables.contains(&"ws_event_audit"));
         assert!(tables.contains(&"partition_archive_audit"));
         // Exempt masters are filtered at run time; they must not be in the
@@ -6529,179 +6764,16 @@ mod hour_granular_eligibility_tests {
     // that session.
 
     #[test]
-    fn test_top_volume_spill_defers_only_top_volume_tables() {
-        // Top_volume spill plan item 6 (2026-10-13; re-scoped after review to
-        // hold only the hours a pending file can still reach).
-        for c in crate::top_volume_rank_persistence::SnapshotCadence::ALL {
-            assert!(is_top_volume_table(c.table_name()));
-            assert_eq!(
-                spill_dirs_for_table(c.table_name()),
-                [crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR]
-            );
-        }
-        assert!(
-            !is_top_volume_table("top_volume"),
-            "the retired shared table has no writer"
-        );
-        // 2026-10-13 10:00 UTC is unix hour 497_746.
-        let pending = Some(497_746_u64);
-        assert!(
-            top_volume_partition_held("2026-10-13T10", pending, false),
-            "the pending file's own hour is held"
-        );
-        assert!(top_volume_partition_held("2026-10-13T15", pending, false));
-        assert!(
-            top_volume_partition_held("2026-10-13", pending, false),
-            "a day partition holding that hour is held"
-        );
-        assert!(
-            !top_volume_partition_held("2026-10-13T09", pending, false),
-            "an hour before every pending file is archived"
-        );
-        assert!(!top_volume_partition_held("2026-09-01", pending, false));
-        assert!(
-            !top_volume_partition_held("2026-10-13T10", None, false),
-            "nothing pending"
-        );
-        assert!(
-            !top_volume_partition_held("2026-10-13T10", pending, true),
-            "pressure archives"
-        );
-        assert!(
-            top_volume_partition_held("garbage", pending, false),
-            "unparseable is held"
-        );
-        // Wired: checked per partition, after the table is listed.
-        let src = include_str!("partition_archive.rs");
-        let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
-        let list = prod
-            .find("match self.list_eligible_partitions(table, hot_days).await")
-            .expect("the table listing");
-        let held = prod
-            .find("&& top_volume_partition_held(")
-            .expect("the per-partition top_volume hold is in the table loop");
-        assert!(list < held, "the hold is per partition, after the listing");
-        assert!(prod[held..].contains("summary.held_top_volume_spill ="));
-    }
-
-    /// Regression (2026-10-13 review, HIGH): the newest top_volume spill file
-    /// is never emptied and the drain offset is in memory only, so a
-    /// table-wide hold skipped every top_volume table on every daily pass
-    /// after the first spill, silently. Now only hours at or after the oldest
-    /// PENDING file are held; older hours are archived; and a drained file
-    /// holds nothing.
-    #[test]
-    fn test_regression_oldest_pending_spill_hour_and_top_volume_partition_held_scope_the_hold() {
-        let dir = std::env::temp_dir().join(format!(
-            "tv-pa-tv-hold-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        assert_eq!(oldest_pending_spill_hour(&dir.join("absent")), None);
-        assert_eq!(oldest_pending_spill_hour(&dir), None, "empty folder");
-        let old = dir.join("top_volume-dhan-497746.ilp");
-        let new = dir.join("top_volume-dhan-497756.ilp");
-        std::fs::write(&old, b"x\n").expect("write");
-        std::fs::write(&new, b"y\n").expect("write");
-        std::fs::write(dir.join("top_volume-dhan-497716.ilp"), b"").expect("write");
-        assert_eq!(
-            oldest_pending_spill_hour(&dir),
-            Some(497_746),
-            "the oldest NON-EMPTY file sets the line; an emptied file holds nothing"
-        );
-        // Drained to its end (the replay records the offset): no longer pending.
-        crate::tick_spill_replay::record_resume_offset(&old, 2);
-        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_756));
-        crate::tick_spill_replay::forget_resume_offset(&old);
-        // A month-old partition is never held by a fresh spill: the pass can
-        // archive it, so the day is not stuck on top_volume.
-        assert!(!top_volume_partition_held(
-            "2026-09-01",
-            Some(497_746),
-            false
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Regression (audit C1, 2026-10-20): a pending spill file whose name
-    /// carries no hour used to answer `Some(0)`, which held EVERY top_volume
-    /// partition and kept the daily verdict Incomplete for as long as the
-    /// file sat there. It is now skipped and counted; a folder that cannot be
-    /// listed still fails safe.
-    #[test]
-    fn test_unparseable_spill_name_does_not_hold_every_partition() {
-        let dir = std::env::temp_dir().join(format!(
-            "tv-pa-tv-unnamed-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir"); // APPROVED: test
-        let unnamed = dir.join("top_volume-dhan-notanhour.ilp");
-        std::fs::write(&unnamed, b"x\n").expect("write"); // APPROVED: test
-
-        // Alone, it holds nothing: before the fix this was Some(0).
-        let scan = scan_pending_spill_hours(&dir);
-        assert_eq!(scan.oldest, None);
-        assert_eq!(scan.unnamed, 1);
-        assert_eq!(scan.first_unnamed.as_deref(), Some(unnamed.as_path()));
-        assert_eq!(oldest_pending_spill_hour(&dir), None);
-        assert!(
-            !top_volume_partition_held("2026-09-01", oldest_pending_spill_hour(&dir), false),
-            "a month-old partition is archivable again"
-        );
-
-        // Beside a dated file, the dated file alone sets the line.
-        std::fs::write(dir.join("top_volume-dhan-497756.ilp"), b"y\n").expect("write"); // APPROVED: test
-        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_756));
-
-        // Files the replay never reads are ignored, even when their name ends
-        // in digits, and an EMPTY unnamed file is not pending: neither counts.
-        std::fs::write(dir.join("notes-100.txt"), b"z\n").expect("write"); // APPROVED: test
-        std::fs::write(dir.join("top_volume-dhan-empty.ilp"), b"").expect("write"); // APPROVED: test
-        let scan = scan_pending_spill_hours(&dir);
-        assert_eq!(
-            scan.oldest,
-            Some(497_756),
-            "notes-100.txt must not read as hour 100"
-        );
-        assert_eq!(
-            scan.unnamed, 1,
-            "the empty unnamed file holds nothing to replay"
-        );
-
-        // Upper-case extension is still a spill file, as in `list_spill_files`.
-        std::fs::write(dir.join("top_volume-dhan-497700.ILP"), b"w\n").expect("write"); // APPROVED: test
-        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_700));
-
-        // An absent folder holds nothing; a path that exists but cannot be
-        // listed (here a regular file, so `read_dir` fails with something other
-        // than NotFound, also as root) still fails safe and holds everything.
-        assert_eq!(oldest_pending_spill_hour(&dir.join("absent")), None);
-        assert_eq!(oldest_pending_spill_hour(&unnamed), Some(0));
-        assert_eq!(scan_pending_spill_hours(&unnamed).unnamed, 0);
-        assert!(top_volume_partition_held("2026-09-01", Some(0), false));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Names the table-side helpers of item 6 together.
-    #[test]
-    fn test_is_top_volume_table_and_spill_dirs_for_table_compose() {
-        let table = crate::top_volume_rank_persistence::SnapshotCadence::OneMinute.table_name();
-        assert!(is_top_volume_table(table));
-        assert_eq!(spill_dirs_for_table(table).len(), 1);
-        assert!(!is_top_volume_table("market_depth"));
-        assert_eq!(spill_dirs_for_table("market_depth").len(), 2);
-    }
-
-    #[test]
-    fn test_tick_and_depth_gate_unchanged() {
-        for table in ["ticks", "market_depth", "candles_1m", "order_audit"] {
-            assert!(!is_top_volume_table(table));
+    fn test_spill_dirs_for_table_is_tick_and_depth_for_every_table() {
+        // 2026-10-22 (plan item 62): every table, `top_volume_<tf>` included,
+        // now sees only the depth + tick folders.
+        for table in [
+            "ticks",
+            "market_depth",
+            "candles_1m",
+            "order_audit",
+            "top_volume_1m",
+        ] {
             assert_eq!(
                 spill_dirs_for_table(table),
                 [
@@ -6711,12 +6783,6 @@ mod hour_granular_eligibility_tests {
                 "{table} keeps the depth + tick check"
             );
         }
-        // A pending top_volume file never defers the depth hour archive: the
-        // hour decision only ever sees the depth + tick folders for it.
-        assert!(
-            !spill_dirs_for_table("market_depth")
-                .contains(&crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR)
-        );
     }
 
     /// Exhaustive truth table for `hour_window_decision`.

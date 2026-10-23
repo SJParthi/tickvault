@@ -132,10 +132,10 @@ fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
 }
 
 /// Weekday-only schedule (trading days). Mon-Fri crons, not Mon-Sun.
-/// IST 08:30 start = 03:00 UTC; IST 17:30 stop = 12:00 UTC (operator widened
-/// the window to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till
-/// 5.30 pm"; supersedes the 2026-06-05 08:30-16:30 narrowing, which itself
-/// superseded the 2026-06-02 08:00-17:00 widening).
+/// IST 08:30 start = 03:00 UTC; IST 16:30 stop = 11:00 UTC (operator Quote 37,
+/// 2026-10-21, plan item 64; the window was 08:30-17:30 from 2026-08-08 under
+/// Quote 14, which superseded the 2026-06-05 08:30-16:30 narrowing, which
+/// itself superseded the 2026-06-02 08:00-17:00 widening).
 #[test]
 fn deploy_schedule_is_weekday_only() {
     let body = read(MAIN_TF);
@@ -144,15 +144,15 @@ fn deploy_schedule_is_weekday_only() {
         "main.tf daily_start must be `cron(0 3 ? * MON-FRI *)` (08:30 IST, Mon-Fri)."
     );
     assert!(
-        body.contains("cron(0 12 ? * MON-FRI *)"),
-        "main.tf daily_stop must be `cron(0 12 ? * MON-FRI *)` (17:30 IST, Mon-Fri)."
+        body.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf daily_stop must be `cron(0 11 ? * MON-FRI *)` (16:30 IST, Mon-Fri)."
     );
-    // Inverted pin: the retired 16:30 IST stop must not return silently — it
-    // would kill the box a full hour before the operator expects it.
+    // Inverted pin: the retired 17:30 IST stop must not return silently — it
+    // would bill an extra hour and the hard-stop guard would stop it at 17:05.
     assert!(
-        !body.contains("cron(0 11 ? * MON-FRI *)"),
-        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, \
-         2026-08-08 Quote 14)."
+        !body.contains("cron(0 12 ? * MON-FRI *)"),
+        "the 17:30 IST stop cron is retired (operator moved the stop back to 16:30 IST, \
+         2026-10-21 Quote 37)."
     );
     assert!(
         !body.contains("MON-SUN") && !body.contains("* * ? * * *"),
@@ -257,22 +257,26 @@ fn deploy_eip_is_enabled_by_default() {
 /// `user/claude-code-agent` cannot perform `ec2:ModifyVolume`. History:
 /// 10 -> 30 -> [50 approved 2026-07-13, never applied; live verified 30 GiB
 /// 2026-07-19] -> 20 target (2026-07-15) -> 100 (2026-08-08) -> 200
-/// (2026-08-19) -> 300 (2026-08-25) -> 500 (2026-09-02) -> 600 (2026-09-05).
+/// (2026-08-19) -> 300 (2026-08-25) -> 500 (2026-09-02) -> 600 (2026-09-05)
+/// -> 150 (2026-10-21, Quotes 32/33: a fresh 150 GB root on the 2026-10-22
+/// rebuild; the 600 ceiling stays while the live root is still 600 GB).
 #[test]
-fn deploy_ebs_default_is_600gb() {
+fn deploy_ebs_default_is_150gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 600"),
-        "ebs_gp3_size_gb must default to 600 GB (operator Quote 22, 2026-09-05 \
+        vars.contains("type = number default = 150 "),
+        "ebs_gp3_size_gb must default to 150 GB (operator Quotes 32/33, 2026-10-21: \
+         the rebuilt root; history: 600 GB, operator Quote 22, 2026-09-05 \
          — the grow that lets the Quote 21 fresh-start wipe be executed at all \
          on a box that booted onto 20 KB free. Raised from the Quote 20 \
          default of 500, which lasted two days)."
     );
-    // 600 is BOTH the default and the validation ceiling, so the next grow
+    // Until 2026-10-21 600 was BOTH the default and the validation ceiling; the
+    // ceiling stays 600 (the live root until the rebuild), so the next grow
     // cannot be a drive-by: it needs a validation edit AND its own dated
     // quote. It also needs a LEVER and not merely a cost note — read live on
     // 2026-09-02, limit_amount is $150, the 90% STOP_EC2_INSTANCES action line
@@ -396,27 +400,29 @@ const DOCKER_COMPOSE: &str = "deploy/docker/docker-compose.yml";
 #[test]
 fn deploy_questdb_mem_limit_tracks_locked_instance_type() {
     // The locked type per `daily-universe-scope-expansion-2026-05-27.md` §7
-    // (operator Quote 13, 2026-08-08). Changing the instance REQUIRES changing
+    // (operator Quotes 32/33, 2026-10-21; was r8g.xlarge / 12g under Quote 13,
+    // 2026-08-08). Changing the instance REQUIRES changing
     // this pair, which is what forces the compose + script sizing to move too.
-    const LOCKED_INSTANCE_TYPE: &str = "r8g.xlarge";
-    const LOCKED_QDB_MEM: &str = "12g";
+    const LOCKED_INSTANCE_TYPE: &str = "r8g.large";
+    const LOCKED_QDB_MEM: &str = "6g";
 
     let compose = read(DOCKER_COMPOSE);
     assert!(
         compose.contains(&format!("${{QDB_MEM_LIMIT:-{LOCKED_QDB_MEM}}}")),
         "docker-compose.yml must default the QuestDB mem_limit to \
          `${{QDB_MEM_LIMIT:-{LOCKED_QDB_MEM}}}` for the locked \
-         {LOCKED_INSTANCE_TYPE} (operator Quote 13, 2026-08-08). §7 Rule 2 \
-         budgets QuestDB at 8-16 GB of the 32 GiB host."
+         {LOCKED_INSTANCE_TYPE} (operator Quotes 32/33, 2026-10-21): the deploy \
+         formula, 4/10 of the 16 GiB host."
     );
     // The stale-ceiling pin: the values sized for the retired 4 GiB / 16 GiB
-    // hosts must not reappear as the DEFAULT on the 32 GiB box.
+    // hosts must not reappear as the DEFAULT (6g is 4/10 of 16 GiB, the deploy
+    // formula; 4g was the 2026-07 r8g.large value, under it).
     for stale in ["${QDB_MEM_LIMIT:-1g}", "${QDB_MEM_LIMIT:-4g}"] {
         assert!(
             !compose.contains(stale),
             "docker-compose.yml still defaults QuestDB to `{stale}` — that is a \
-             retired smaller-host ceiling (t4g.medium 4 GiB / r8g.large 16 GiB). \
-             On the locked {LOCKED_INSTANCE_TYPE} (32 GiB) it caps QuestDB at a \
+             retired smaller-host ceiling (t4g.medium 4 GiB / the 2026-07 r8g.large 4g). \
+             On the locked {LOCKED_INSTANCE_TYPE} (16 GiB) it caps QuestDB at a \
              fraction of the host and makes the upgrade unreachable."
         );
     }

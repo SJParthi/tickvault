@@ -290,6 +290,19 @@ pub fn retired_candle_table_names() -> Vec<&'static str> {
     RETIRED_CANDLE_TABLES.to_vec()
 }
 
+/// Candle tables NO fold frame writes any more but whose partitions on the box
+/// are still copied to S3 by the retention sweep (2026-10-22, plan item 62).
+///
+/// `candles_3s` and `candles_5s` were removed from `TfIndex` by operator
+/// Quote 34 (2026-10-21, `daily-universe-scope-expansion-2026-05-27.md`). That
+/// quote lets the tables be DROPPED only after every partition still on the box
+/// is in `s3://tv-prod-cold/questdb-partitions/` and verified, so they are on
+/// NEITHER the emitted list (nothing creates or writes them) NOR the retired
+/// drop list ([`RETIRED_CANDLE_TABLES`]; nothing drops them). The archive and
+/// the detach sweep keep visiting them on the intraday window, exactly as when
+/// they were written, until the 2026-10-22 rebuild leaves them behind.
+pub const ARCHIVE_ONLY_CANDLE_TABLES: [&str; 2] = ["candles_3s", "candles_5s"];
+
 // ---------------------------------------------------------------------------
 // DDL setup — idempotent CREATE + DEDUP UPSERT.
 //
@@ -1474,7 +1487,8 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 10);
+        // 2026-10-22 (plan item 62): 3s and 5s removed, 10 -> 8.
+        assert_eq!(TF_COUNT, 8);
     }
 
     #[test]
@@ -1827,13 +1841,19 @@ mod tests {
             "candles_5m",
             "candles_15m",
             "candles_1s",
-            "candles_3s",
-            "candles_5s",
             "candles_30m",
             "candles_60m",
             "candles_10m",
         ];
         assert_eq!(names, expected);
+        // 2026-10-22 (plan item 62): archive-only, never emitted, never dropped.
+        for t in ARCHIVE_ONLY_CANDLE_TABLES {
+            assert!(!names.contains(&t), "{t} must not be a fold table");
+            assert!(
+                !retired_candle_table_names().contains(&t),
+                "{t} must not be on the drop list before its S3 copy"
+            );
+        }
     }
 
     /// PR #798 (operator-locked 2026-05-25) — marker constant is set

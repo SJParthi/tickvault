@@ -113,12 +113,13 @@
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
 #   rather than carried forward: 5 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 23 live
+#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 22 live
 #   `error_code_alerts` map entries (was 18 on 2026-09-17; +3 on 2026-09-24,
 #   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
 #   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
 #   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
-#   `hot-path-stall-01`, noise-lock §2.8). Re-count with:
+#   `hot-path-stall-01`, noise-lock §2.8; -1 on 2026-10-22, the depth
+#   swap-emptied entry, Quote 37 alarm review — noise-lock §2.14). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has
@@ -826,33 +827,11 @@ locals {
       desc        = "WS-GAP-03 cross-verify MASS DIVERGENCE: the 15:41 comparison ran and found MORE THAN HALF of the compared open/high/low/close prices disagreeing with Dhan's own 1-minute record. That is not sampling noise - the two records are not describing the same market, so treat the day's candles as untrustworthy until explained. The day counts as measured, so the S3 archive proceeds. Triage from the same log line: minutes_compared is the denominator, cells_diverged the numerator, noise_p95_paise / noise_max_paise say whether it is a small systematic offset or wholesale (wrong instruments, clock fault). Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
     }
 
-    # ADDED 2026-08-28 (noise-lock section 2.3m). A depth-200 socket that
-    # UNSUBSCRIBED its old contract and then failed to subscribe the new one is
-    # carrying NOTHING. It stays transport-healthy - it keeps ponging, the
-    # connection gauge counts it alive, the lane-up gauge reads 1 - and it
-    # delivers no data for the rest of the session. Every existing alarm reads
-    # green through it, including the no-ticks one, because fifteen other
-    # sockets are still flowing and the lane's last tick is always ~1s old.
-    #
-    # Scoped by `$.source`, never by the bare code: WS-GAP-02 is emitted by the
-    # top-up path too, which STOPS at its wire budget without emptying anything
-    # and is an ordinary, non-paging outcome. A bare-code filter would page on
-    # routine ATM top-up budget exhaustion - the RISK-GAP-03 noise trap, on a
-    # path that runs every minute.
-    #
-    # ok_recovery = true: unlike the xverify entries above, this condition
-    # genuinely recovers - the redial the same arm schedules brings the socket
-    # back holding the CURRENT contract (the retained set already names it), so
-    # a return to OK means the remediation worked and is worth telling.
-    "ws-gap-02-swap-emptied-socket" = {
-      pattern     = "{ $.code = \"WS-GAP-02\" && $.level = \"ERROR\" && $.source = \"swap_emptied_socket\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = true
-      desc        = "WS-GAP-02 DEPTH SOCKET EMPTIED: an at-the-money swap unsubscribed the old contract and then failed to subscribe the new one, so this socket is now carrying NO instruments. It stays transport-healthy and keeps ponging, which is why no other alarm sees it: the connection gauge counts it alive and the no-ticks alarm reads the whole lane, where fifteen other sockets are still flowing. A redial is scheduled automatically by the same code path and the retained set already names the NEW contract, so the socket should come back holding the right strike within one backoff - this alarm returning to OK is that remediation working. If it does NOT clear, the socket is failing to re-dial: check tv_dhan_ws_park_total and the endpoint field on this log line. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
-    }
+    # REMOVED 2026-10-22: the depth-socket swap-emptied entry (noise-lock
+    # section 2.3m) was deleted by the alarm review under operator Quote 37
+    # (noise-lock section 2.14, docs/audits/2026-10-alarm-review.md). The swap
+    # runs only on depth sockets, which are switched off since 2026-10-21, so
+    # the filter could not match. Turning depth back on must restore it.
     # SCOREBOARD-01 — 2026-09-02. Authorized by the operator's reaffirmation
     # that day; the dated quote is in
     # dhan-rest-only-noise-lock-2026-07-14.md section 2.3q, recorded BEFORE

@@ -74,7 +74,8 @@ use tracing::{debug, error, info, warn};
 /// How often the loop asks whether the sweep is due.
 ///
 /// Five minutes, not one: the sweep is a daily housekeeping job with a
-/// two-hour window (15:30 → 17:30 IST box stop), so a five-minute granularity
+/// one-hour window (15:30 → 16:30 IST box stop since 2026-10-22, plan item
+/// 64; two hours to 17:30 before), so a five-minute granularity
 /// costs at most five minutes of latency on a job that had been missing
 /// entire days. It is also comfortably longer than the disk-pressure loop's
 /// 60-second poll, which keeps the two legs from contending on every tick.
@@ -243,13 +244,8 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // still past retention at the next day's sweep and go then.
         return PassVerdict::Incomplete("deferred_depth_pass");
     }
-    if summary.held_top_volume_spill > 0 {
-        // Top_volume spill plan item 6 (2026-10-13): a top_volume hour a
-        // pending spill file can still replay into was held. The day stays
-        // open (never latched with it unarchived) and is NOT refunded: the
-        // replay posts after 15:40, so a later attempt finds it drained.
-        return PassVerdict::Incomplete("top_volume_spill_pending");
-    }
+    // The `top_volume_spill_pending` verdict (2026-10-13) went with the
+    // top_volume spill and its archive hold on 2026-10-22 (plan item 62).
     PassVerdict::Complete
 }
 
@@ -271,7 +267,7 @@ pub fn refunds_attempt(outcome: PassOutcome) -> bool {
 
 /// Every `tv_daily_archive_attempts_total{outcome}` value, seeded at 0 when
 /// the loop starts so a first event never lands on a missing series.
-pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 12] = [
+pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
     "complete",
     "contended",
     "did_not_run",
@@ -281,7 +277,6 @@ pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 12] = [
     "partition_failed",
     "budget_exhausted",
     "deferred_depth_pass",
-    "top_volume_spill_pending",
     "skipped",
     "failed",
 ];
@@ -1008,10 +1003,13 @@ mod tests {
     }
 
     /// The poll cadence must leave room for the attempt budget inside the
-    /// window the box is actually alive for (15:30 close → 17:30 stop).
+    /// window the box is actually alive for (15:30 close → the daily stop,
+    /// 16:30 since 2026-10-22, plan item 64).
     #[test]
     fn the_attempt_budget_fits_inside_the_evening_window() {
-        let window_secs = 2 * 3600_u64; // 15:30 → 17:30 IST
+        let window_secs = u64::from(crate::shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST)
+            - (15 * 3600 + 30 * 60);
+        assert_eq!(window_secs, 3600, "15:30 → 16:30 IST");
         let needed = DAILY_ARCHIVE_POLL.as_secs() * u64::from(MAX_DAILY_ARCHIVE_ATTEMPTS);
         assert!(
             needed <= window_secs,
@@ -1170,27 +1168,11 @@ mod pass_ran_tests {
         assert!(!PassOutcome::Ran(pass_verdict(&held, 200)).latches_the_day());
     }
 
-    // Regression: 2026-10-13 (top_volume spill PR-C review, HIGH) — held
-    // top_volume partitions were skipped with no counter, so the pass read
-    // Complete and latched the day with them unarchived.
+    // `test_regression_held_top_volume_partitions_keep_the_day_open` REMOVED
+    // 2026-10-22 (plan item 62): the hold and its verdict are gone.
     #[test]
-    fn test_regression_held_top_volume_partitions_keep_the_day_open() {
-        let held = ArchiveRunSummary {
-            pass_ran: true,
-            held_top_volume_spill: 2,
-            ..ArchiveRunSummary::default()
-        };
-        assert_eq!(
-            pass_verdict(&held, 200),
-            PassVerdict::Incomplete("top_volume_spill_pending")
-        );
-        let outcome = PassOutcome::Ran(pass_verdict(&held, 200));
-        assert!(!outcome.latches_the_day());
-        assert!(
-            !refunds_attempt(outcome),
-            "a held top_volume hour spends its attempt"
-        );
-        assert!(SEEDED_ATTEMPT_OUTCOMES.contains(&"top_volume_spill_pending"));
+    fn test_top_volume_spill_pending_is_no_longer_a_seeded_outcome() {
+        assert!(!SEEDED_ATTEMPT_OUTCOMES.contains(&"top_volume_spill_pending"));
     }
 
     // Regression: 2026-10-13 (DA-13d review) — the after-close depth pass

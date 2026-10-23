@@ -4626,7 +4626,7 @@ mod tests {
             (STOCK, 400, 101.5, 1_040, 400),
             (INDEX, 400, 501.0, 0, 400),
         ];
-        for tf in [TfIndex::S1, TfIndex::S3, TfIndex::S5] {
+        for tf in [TfIndex::S1] {
             let start = tf.bucket_start(OPEN + 40) - OPEN;
             check(
                 "own listening time",
@@ -4982,7 +4982,7 @@ mod tests {
         ];
         p2.extend(index_every_5s(5, 1_000));
         p2.sort_by_key(|p| p.4);
-        for tf in [TfIndex::S1, TfIndex::S3, TfIndex::S5] {
+        for tf in [TfIndex::S1] {
             written_exactly(
                 "a gap packet that traded after the first receipt",
                 &p2,
@@ -5007,7 +5007,7 @@ mod tests {
         ];
         p4.extend(index_every_5s(5, 1_000));
         p4.sort_by_key(|p| p.4);
-        for tf in [TfIndex::S1, TfIndex::S3, TfIndex::S5] {
+        for tf in [TfIndex::S1] {
             absent_or_consistent(
                 "a second late downtime trade",
                 &p4,
@@ -8007,7 +8007,7 @@ mod tests {
         assert!(stale.stale_trading_day);
         let first = push(&mut agg, &first_trade(OPEN + 2, 13.0, 650, OPEN + 2));
         assert!(first.folded());
-        assert_eq!(bar_volume(&agg, TfIndex::S5), 650, "09:15:00 5 s bar");
+        assert_eq!(bar_volume(&agg, TfIndex::M3), 650, "09:15 3 m bar");
         assert_eq!(bar_volume(&agg, TfIndex::M1), 650, "09:15 1 m bar");
         // The next trade still counts only its own quantity.
         let _ = push(&mut agg, &live(OPEN + 3, 13.05, 700, OPEN + 3));
@@ -8299,7 +8299,7 @@ mod tests {
             );
             let at = |tf: TfIndex| got[tf.as_ordinal()];
             assert_eq!(at(TfIndex::M1), want, "the 09:15 minute");
-            assert_eq!(at(TfIndex::S5), want, "the 09:15:00 5 s bar");
+            assert_eq!(at(TfIndex::M3), want, "the 09:15 3 m bar");
             assert_eq!(at(TfIndex::M60), want, "the 09:00 hour");
             // 09:15:02 opens a 1-second bucket of its own, after 09:15:00.
             assert_eq!(at(TfIndex::S1), 0, "a later 1-second bucket seeds");
@@ -8397,7 +8397,7 @@ mod tests {
                 first,
                 "include={include_auction}"
             );
-            assert_eq!(got[TfIndex::S5.as_ordinal()], first);
+            assert_eq!(got[TfIndex::M3.as_ordinal()], first);
             assert_eq!(got[TfIndex::S1.as_ordinal()], 0);
         }
     }
@@ -8422,7 +8422,7 @@ mod tests {
         let _ = push(&mut agg, &live_seg(eq, OPEN + 2, 801.0, 50_400, OPEN + 2));
         let got = volumes_by_tf(&agg, eq);
         assert_eq!(got[TfIndex::M1.as_ordinal()], 0, "seeds, never 50,400");
-        assert_eq!(got[TfIndex::S5.as_ordinal()], 0);
+        assert_eq!(got[TfIndex::M3.as_ordinal()], 0);
     }
 
     #[test]

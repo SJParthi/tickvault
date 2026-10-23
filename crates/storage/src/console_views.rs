@@ -227,7 +227,6 @@ pub async fn drop_retired_views(questdb_config: &QuestDbConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::top_volume_rank_persistence::SnapshotCadence;
 
     #[test]
     fn retired_view_drop_ddl_is_idempotent_one_statement_and_never_a_table() {
@@ -263,11 +262,18 @@ mod tests {
     #[test]
     fn the_sweep_names_no_live_table_except_the_declared_one() {
         let mut live: Vec<&str> = crate::shadow_persistence::candle_table_names().to_vec();
-        for c in SnapshotCadence::ALL {
-            live.push(c.table_name());
-        }
-        live.push(crate::top_volume_rank_persistence::LEGACY_TOP_VOLUME_RANK_TABLE);
-        live.push(crate::top_volume_rank_persistence::LEGACY_TOP_VOLUME_TABLE);
+        // 2026-10-22 (plan item 62): no build writes these, but they are still
+        // TABLES on the box (archive-only until copied, Quote 34), so the view
+        // sweep must never name one. Literal: their writer module is deleted.
+        live.extend(crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES);
+        live.extend([
+            "top_volume_1s",
+            "top_volume_3s",
+            "top_volume_5s",
+            "top_volume_1m",
+            "top_volume_rank",
+            "top_volume",
+        ]);
         live.extend([
             "ticks",
             "market_depth",

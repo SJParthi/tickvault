@@ -40,12 +40,12 @@ use std::path::{Path, PathBuf};
 /// An entry here is a PROMISE that the emitter is coming, not a place to
 /// silence an inconvenient failure. Each carries the reason inline so the
 /// next reader can judge whether the promise is still live.
-const DORMANT_BY_DESIGN: &[(&str, &str)] = &[(
-    "tv_order_fill_lag_seconds",
-    "arm-on-arrival: the emitter ships with the Phase-1 order path; pinned \
-     separately by cloudwatch_dormant_alarms_guard, which requires the alarm \
-     description to carry the DORMANT markers",
-)];
+///
+/// EMPTY since 2026-10-22: its one entry, `tv_order_fill_lag_seconds`, left
+/// with the `order-fill-lag-high` alarm, deleted by the alarm review under
+/// operator Quote 37 (plan item 65, `dhan-rest-only-noise-lock-2026-07-14.md`
+/// §2.14). The promise it recorded was never kept: no emitter arrived.
+const DORMANT_BY_DESIGN: &[(&str, &str)] = &[];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

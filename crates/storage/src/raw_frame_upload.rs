@@ -129,6 +129,12 @@ pub const DEPTH_QUARANTINE_S3_PREFIX: &str = "depth-quarantine";
 /// item 7, 2026-10-13).
 pub const TOP_VOLUME_QUARANTINE_S3_PREFIX: &str = "top-volume-quarantine";
 
+/// The top_volume spill folder, named here since its writer module was deleted
+/// (2026-10-22, plan item 62, operator Quote 34). Nothing writes or replays it
+/// any more; it is kept so files already in its `quarantine/` are still copied
+/// to the cold bucket (and the folder is never deleted by this build).
+pub const LEGACY_TOP_VOLUME_SPILL_DIR: &str = "data/spill/top_volume";
+
 /// Counter: spill / quarantine files uploaded (or found uploaded) and
 /// marked, labelled `set`.
 pub const COLD_FILE_UPLOAD_OK_COUNTER: &str = "tv_cold_file_upload_ok_total";

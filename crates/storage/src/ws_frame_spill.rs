@@ -1127,6 +1127,13 @@ impl WsFrameSpill {
         // The deferred-depth marks (item 45a) sit beside it for the same reason:
         // a shed frame's segment must stay protected across a restart.
         crate::wal_deferred_depth::deferred_depth().bind(&wal_dir);
+        // 2026-10-20 (plan item PR W): fold earlier processes' unapplied marks
+        // into bounded ranges and register the boot tail, BEFORE the writer
+        // thread spawns and before any sink or socket exists.
+        let _fold = crate::wal_unapplied_ranges::fold_at_boot(
+            crate::wal_applied_watermark::applied_watermark(),
+            &wal_dir,
+        );
         if disk_high > 0 {
             tracing::debug!(
                 wal_dir = ?wal_dir,
@@ -2224,6 +2231,7 @@ struct UnflushedTally<'a> {
     untracked: u64,
     /// Highest sequence written since the last good flush.
     high_seq: u64,
+    reorder: crate::wal_reorder_guard::ReorderWatch,
 }
 
 impl<'a> UnflushedTally<'a> {
@@ -2239,6 +2247,7 @@ impl<'a> UnflushedTally<'a> {
             len: 0,
             untracked: 0,
             high_seq: 0,
+            reorder: crate::wal_reorder_guard::ReorderWatch::new(),
         }
     }
 
@@ -2248,6 +2257,7 @@ impl<'a> UnflushedTally<'a> {
         self.persisted.fetch_add(1, Ordering::Relaxed);
         self.segment_bytes = self.segment_bytes.saturating_add(size);
         self.high_seq = self.high_seq.max(seq);
+        self.reorder.observe(seq);
         let i = self.len;
         if let (Some(end), Some(s), Some(t)) = (
             self.ends.get_mut(i),
@@ -2538,6 +2548,16 @@ fn writer_loop(
                 // Nothing arrived for a whole poll and the previous batch was
                 // flushed before this wait began: a pending abort drain is done.
                 abort_drain.ack_if_drained(rx);
+                // Quote 31: seal the open segment on request, in a lull only
+                // (`wal_idle_seal`); the next record opens a fresh one.
+                if crate::wal_idle_seal::take_idle_seal_request(wal_dir) && current.is_some() {
+                    let t = &mut tally;
+                    let to = Some(syncer);
+                    finalise_segment(&mut current, "flush_on_seal", "fsync_on_seal", to, t);
+                    bytes_written = 0;
+                    clear_open_segment_under(wal_dir);
+                    info!("ws-frame-spill-writer: idle segment sealed on request");
+                }
                 // A lull. Before 2026-10-02 only a NEW record could trigger the
                 // rate-limited sync, so the last batch before a quiet spell sat in
                 // the page cache until the next record arrived, leaving the
@@ -2788,13 +2808,9 @@ fn persist_record_resilient(
         // disk that is already full. The failure is detected either way
         // (WS-SPILL-01 has a live metric-filter alarm), so this is not a
         // silence fix — it stops a detected failure from amplifying itself and
-        // starving the very disk the operator has to recover.
-        //
-        // The sleep is the writer thread's own, exactly as in the sibling arms:
-        // this runs on the dedicated WAL writer, never on the hot path. Frames
-        // continue to reach the broadcast and the ring→spill→DLQ while it
-        // backs off — the durable-WAL belt is what is degraded, and it is
-        // already degraded by the full disk.
+        // starving the very disk the operator has to recover. The sleep is the
+        // WAL writer thread's own, never the hot path's; frames still reach the
+        // ring while it backs off (only the WAL belt, already degraded, waits).
         thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
         return 0;
     };
@@ -2956,6 +2972,37 @@ pub fn boot_disk_high_frame_seq() -> Option<u64> {
 #[must_use]
 pub fn current_frame_seq() -> u64 {
     WAL_FRAME_SEQ.load(Ordering::Acquire)
+}
+
+/// Raises [`WAL_FRAME_SEQ`] to at least `seq` rounded DOWN to a frame base
+/// (low [`PACKET_INDEX_BITS`] cleared), so every later [`next_frame_seq`] is
+/// strictly greater than that base whatever the wall clock reads. Returns the
+/// counter's value after the call. Never lowers it (`fetch_max`).
+///
+/// 2026-10-20 (PR W review round 3, M1): the boot fold calls it with its
+/// `own_floor` (rounded UP to a base first) before anything can mint, so the
+/// span the fold treats as frameless, `(boot_frame_high, own_floor]`, really
+/// holds no frame of this process even after a backward clock step. O(1),
+/// one atomic, cold (once per boot).
+pub(crate) fn ratchet_frame_seq_to(seq: u64) -> u64 {
+    let target = (seq >> PACKET_INDEX_BITS) << PACKET_INDEX_BITS;
+    WAL_FRAME_SEQ
+        .fetch_max(target, Ordering::SeqCst)
+        .max(target)
+}
+
+/// `seq` rounded UP to a frame base (low [`PACKET_INDEX_BITS`] zero),
+/// saturating at the highest base. O(1).
+pub(crate) const fn round_up_to_frame_base(seq: u64) -> u64 {
+    let base_ceiling = u64::MAX >> PACKET_INDEX_BITS;
+    let round = if seq & MAX_PACKET_INDEX == 0 { 0 } else { 1 };
+    let base = (seq >> PACKET_INDEX_BITS) + round;
+    let base = if base > base_ceiling {
+        base_ceiling
+    } else {
+        base
+    };
+    base << PACKET_INDEX_BITS
 }
 
 pub fn next_frame_seq() -> u64 {
@@ -4721,18 +4768,16 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     })
 }
 
-/// `true` when the whole `[lo, hi]` range is applied for EVERY sink a frame in
-/// it could feed. A segment mixes main-feed and depth frames, and a
-/// main-feed frame feeds both sinks, so the segment-level decision takes the
-/// stricter of the two.
+/// `true` when the whole segment, from its first record `lo` to `hi`, is
+/// applied for EVERY sink (a main-feed frame feeds both). The shared rule,
+/// with how far past `[lo, hi]` it looks for a reordered frame, is
+/// `AppliedSnapshot::segment_is_applied` (PR W review rounds 3 to 5).
 fn segment_range_is_applied(
     applied: &crate::wal_applied_watermark::AppliedSnapshot,
     lo: u64,
     hi: u64,
 ) -> bool {
-    use crate::wal_applied_watermark::AppliedSink;
-    applied.range_is_applied(AppliedSink::Ticks, lo, hi)
-        && applied.range_is_applied(AppliedSink::Depth, lo, hi)
+    applied.segment_is_applied(lo, hi)
 }
 
 /// Which watermark a replayed frame answers to, from its TVW4 endpoint.
@@ -4765,7 +4810,7 @@ pub(crate) fn first_frame_seq_in_segment(path: &Path) -> u64 {
 
 /// What [`record_at`] found at an offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordProbe {
+pub(crate) enum RecordProbe {
     /// A v2–v4 record whose CRC matches.
     Intact { frame_seq: u64, record_len: u64 },
     /// A record whose header parses with a plausible length but whose CRC
@@ -4784,6 +4829,20 @@ fn record_at(f: &mut File, offset: u64) -> RecordProbe {
     // A frame larger than this is not a record this writer produced; refuse
     // to allocate for it.
     const RECORD_PROBE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+    record_at_capped(f, offset, RECORD_PROBE_MAX_FRAME_BYTES)
+}
+
+/// [`record_at`] that refuses (returns `End`) a header whose frame length
+/// exceeds `max_frame_bytes`, before allocating anything.
+///
+/// 2026-10-20 (PR W review round 3, L9): the tail probe of
+/// `wal_unapplied_ranges` searches backwards for a record magic, and the
+/// bytes `TVW2`..`TVW4` can occur inside a frame's payload. Through
+/// [`record_at`] such a stray magic with a garbage length could allocate up
+/// to 64 MiB; the probe now caps the length at the largest frame the writer
+/// produces (`WAL_RESYNC_MAX_FRAME_BYTES`) and at the bytes left in the
+/// file. Cold; allocates at most `max_frame_bytes` plus the header and CRC.
+pub(crate) fn record_at_capped(f: &mut File, offset: u64, max_frame_bytes: usize) -> RecordProbe {
     if std::io::Seek::seek(f, std::io::SeekFrom::Start(offset)).is_err() {
         return RecordProbe::End;
     }
@@ -4822,7 +4881,7 @@ fn record_at(f: &mut File, offset: u64) -> RecordProbe {
     else {
         return RecordProbe::End;
     };
-    if frame_len > RECORD_PROBE_MAX_FRAME_BYTES {
+    if frame_len > max_frame_bytes {
         return RecordProbe::End;
     }
     let record_len = len_off + 4 + frame_len + 4;
@@ -5107,49 +5166,12 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
     );
 }
 
-/// Protects the WAL backlog a catch-up drain did NOT reach (2026-10-03).
-///
-/// A drain that stops early (clock, round cap, memory, apply lag, a sink that
-/// stops answering) leaves segments as `*.wal` (or staged in `replaying/`)
-/// for the next boot. The live lane then acks frames with HIGHER sequences,
-/// which lifts the applied watermark past the leftover range; with no
-/// unapplied bucket over it, the next boot's replay would read every leftover
-/// segment as applied and archive it UNREAD — its ticks and depth never
-/// reaching the database, with no counter anywhere.
-///
-/// This marks `[lowest first frame_seq still waiting, ceiling_seq − 1]`
-/// unapplied, so the next replay reads those segments instead. Returns the
-/// marked range, or `None` when nothing below `ceiling_seq` is waiting. The
-/// caller persists the watermark. A range wider than the bucket table
-/// overflows it, which fails towards replaying everything.
-///
-/// O(waiting segments) header reads, cold: once per boot, after the drain.
-// TEST-EXEMPT: covered by test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it + test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling
-pub fn guard_pending_backlog(
-    wm: &crate::wal_applied_watermark::AppliedWatermark,
-    wal_dir: &Path,
-    ceiling_seq: u64,
-) -> Option<(u64, u64)> {
-    let mut lowest: Option<u64> = None;
-    for dir in [wal_dir.to_path_buf(), wal_dir.join(REPLAYING_SUBDIR)] {
-        // O(1) EXEMPT: boot-time backlog guard, one header read per waiting segment
-        for seg in wal_segments_in(&dir) {
-            let seq = first_frame_seq_in_segment(&seg);
-            // `0` is an unreadable or v1 first record; such a segment is never
-            // skipped by the replay, so it needs no mark.
-            if seq > 0 {
-                lowest = Some(lowest.map_or(seq, |l| l.min(seq)));
-            }
-        }
-    }
-    let lo = lowest?;
-    let hi = ceiling_seq.checked_sub(1)?;
-    if lo > hi {
-        return None;
-    }
-    wm.note_unapplied_range(lo, hi);
-    Some((lo, hi))
-}
+/// The catch-up backlog guard. **⚠ MOVED 2026-10-20 (plan item PR W)** to
+/// `wal_unapplied_ranges`, where it writes ONE bounded range instead of
+/// marking the 128-bucket table bucket by bucket (a multi-day backlog always
+/// overflowed it into an unbounded bit). Re-exported so every caller keeps
+/// its path.
+pub use crate::wal_unapplied_ranges::guard_pending_backlog;
 
 /// Outcome of one `<wal_dir>/archive/` pruning pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5751,7 +5773,7 @@ fn prune_wal_dir_at(
         // copy of the segment. Unreadable metadata never satisfies it.
         let uploaded = upload.satisfied(&path, meta.as_ref().map(Metadata::len));
         let hi = if first_seq == 0 { None } else { last_seq };
-        if deferred.is_some_and(|d| d.range_is_deferred(first_seq, hi)) {
+        if deferred.is_some_and(|d| d.segment_is_deferred(first_seq, hi)) {
             outcome.kept += 1;
             outcome.deferred_kept += 1;
             let len = meta.as_ref().map_or(0, Metadata::len);
@@ -6565,9 +6587,11 @@ pub struct BucketSegments {
 #[must_use]
 pub fn segments_for_bucket(spans: &[SegmentSpan], bucket_id: u64) -> BucketSegments {
     let shift = crate::wal_deferred_depth::DEFERRED_BUCKET_SHIFT;
+    let reach_hi = |hi: u64| crate::wal_applied_watermark::reorder_reach_hi(hi) >> shift;
     let mut out = BucketSegments::default();
-    // The start of the last readable segment seen, so an unreadable one can be
-    // placed between its neighbours.
+    // The reach (PR W review rounds 4 and 5: one slack below a first record,
+    // one above a range end) of the readable neighbours, so an unreadable one
+    // is placed between them with the same reach.
     let mut prev_lo_id: u64 = 0;
     // O(1) EXEMPT: begin — cold after-close lookup, one pass over the listing
     for (idx, span) in spans.iter().enumerate() {
@@ -6575,15 +6599,15 @@ pub fn segments_for_bucket(spans: &[SegmentSpan], bucket_id: u64) -> BucketSegme
             let next_lo_id = spans
                 .get(idx + 1..)
                 .and_then(|rest| rest.iter().find(|s| s.lo != 0))
-                .map_or(u64::MAX, |s| s.lo >> shift);
+                .map_or(u64::MAX, |s| reach_hi(s.lo));
             if (prev_lo_id..=next_lo_id).contains(&bucket_id) {
                 out.uncertain = true;
             }
             continue;
         }
-        let lo_id = span.lo >> shift;
-        prev_lo_id = lo_id;
-        let covers = lo_id <= bucket_id && span.hi.is_none_or(|hi| bucket_id <= hi >> shift);
+        let reach_id = crate::wal_applied_watermark::reorder_reach_lo(span.lo) >> shift;
+        prev_lo_id = reach_id;
+        let covers = reach_id <= bucket_id && span.hi.is_none_or(|hi| bucket_id <= reach_hi(hi));
         if covers {
             if span.is_open {
                 out.touches_open = true;
@@ -7430,7 +7454,12 @@ mod tests {
         // All three finalisations go through the ONE helper. Naming them
         // individually is what keeps a future fourth arm from quietly
         // hand-rolling a flush: the count below has to move with it.
-        for stage in ["flush_on_stop", "flush_on_close", "flush_on_rotate"] {
+        for stage in [
+            "flush_on_stop",
+            "flush_on_close",
+            "flush_on_rotate",
+            "flush_on_seal",
+        ] {
             let call = format!("finalise_segment(&mut current, \"{stage}\"");
             assert!(
                 production.contains(&call),
@@ -7448,9 +7477,10 @@ mod tests {
         // rather than banning the word.
         assert_eq!(
             production.matches("finalise_segment(&mut current").count(),
-            3,
-            "exactly three arms finalise a segment — stop, close, rotate. A \
-             fourth call site means a new finalisation nobody added to this \
+            4,
+            "exactly four arms finalise a segment — stop, close, rotate, and the idle seal \
+             (Quote 31). A \
+             fifth call site means a new finalisation nobody added to this \
              test; a missing one means an arm went back to flushing alone."
         );
 
@@ -8753,20 +8783,6 @@ mod tests {
             "120 deferring rounds must produce exactly one page"
         );
     }
-
-    /// The silent, permanent tick-loss path an adversarial sweep found on
-    /// 2026-08-28, reproduced end to end.
-    ///
-    /// The sequence needs THREE things to line up, which is why nothing caught
-    /// it: a boot must stage segments and crash before confirming, the next
-    /// boot must hit its RAM budget INSIDE those leftovers, and the refold
-    /// must then succeed so the caller confirms. Each step is individually
-    /// correct; together they archive segments that were never read, and
-    /// archived segments are never re-globbed.
-    ///
-    /// The assertion that actually bites is the last one: the frames must
-    /// still be recoverable. Without the restore loop the deferred leftovers
-    /// stay in `replaying/`, `confirm_replayed` archives all three, and this
 
     /// A corrupt record in the MIDDLE of a segment silently discarded every
     /// frame after it.
@@ -11504,7 +11520,10 @@ mod tests {
         let ceiling = wm_seq(3_000);
         assert_eq!(
             guard_pending_backlog(&wm, &dir, ceiling),
-            Some((wm_seq(0), ceiling - 1))
+            Some((
+                wm_seq(0) - crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ,
+                ceiling - 1
+            ))
         );
         wm.note_ticks_acked(wm_seq(5_000));
         wm.note_depth_acked(wm_seq(5_000));
@@ -11538,8 +11557,11 @@ mod tests {
         write_wm_segment(&replaying, 50, 5, WalEndpoint::MainFeed);
         assert_eq!(
             guard_pending_backlog(&wm, &dir, wm_seq(100)),
-            Some((wm_seq(50), wm_seq(100) - 1)),
-            "a staged segment is the lowest waiting one"
+            Some((
+                wm_seq(50) - crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ,
+                wm_seq(100) - 1
+            )),
+            "a staged segment is the lowest waiting one, less the reorder slack"
         );
         assert!(wm.snapshot().range_has_unapplied(wm_seq(50), wm_seq(54)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -13094,6 +13116,8 @@ mod tests {
         assert_eq!(current_frame_seq(), allocated, "a read allocates nothing");
         assert!(next_frame_seq() > current_frame_seq() - 1);
     }
+
+    mod frame_base_tests;
     // --- Z11a: resync past mid-segment damage (2026-10-02) -----------------
 
     /// A segment of v4 records, sequence `k + 1` and a payload of `fill(k)`;
