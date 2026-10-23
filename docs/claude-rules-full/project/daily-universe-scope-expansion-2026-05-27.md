@@ -3093,3 +3093,18 @@ After the Quote 38 update (rustls-webpki 0.103.15 → 0.103.16) cleared RUSTSEC-
 - Running any other `cargo update`, or this one for another package or version, or a second time.
 - Committing `.claude/settings.json` with the `cargo update` deny rule removed.
 - Any `Cargo.toml` change, a new dependency, or a version move other than `ctutils` (if the update moves another package, it is reverted and the owner asked again).
+
+#### Quote 40 (2026-10-23, ~15:45 IST) — A THIRD SECURITY UPDATE: webpki-root-certs 1.0.7 → 1.0.11 (decision card, preserve EXACTLY)
+
+With RUSTSEC-2026-0382 and RUSTSEC-2026-0385 fixed (Quotes 38, 39), the Security & Audit check on PR #2119 (head `0b5d216`) and #2120 (head `88ecc72`) passed `cargo deny` and then failed `cargo audit --deny yanked` on RUSTSEC-2026-0383 (dated 2026-10-19, "Bundled root certificates allow trust in distrusted emSign intermediates") in `webpki-root-certs` 1.0.7, fixed from 1.0.10; the latest release is 1.0.11. `main` carries the same 1.0.7. The earlier failures had hidden it because the job stops at its first failing step.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "A third security advisory showed up once the first two were fixed: 'webpki-root-certs' 1.0.7 (the bundled list of trusted website certificates) still trusts a certificate authority that has since been distrusted (RUSTSEC-2026-0383). Fixed from 1.0.10; latest is 1.0.11. This also affects main. Approve one more update the same way (recorded in the rules, deny rule lifted for this one command and restored)?" | **"Approve 1.0.11 (Recommended)"** | "cargo update -p webpki-root-certs --precise 1.0.11: the latest, newest certificate list. Lock file only." |
+
+**What this changes, and nothing else:** `cargo update -p webpki-root-certs --precise 1.0.11` is allowed ONCE, on PR #2119's branch (`claude/nice-bell-yjfwiv`), `Cargo.lock` only. The `.claude/settings.json` deny rule for `cargo update` is lifted only for that one command and restored straight after, never committed lifted.
+
+##### What violates Quote 40 (REJECT)
+- Running any other `cargo update`, or this one for another package or version, or a second time.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Any `Cargo.toml` change, a new dependency, or a version move other than `webpki-root-certs` (if the update moves another package, it is reverted and the owner asked again).
