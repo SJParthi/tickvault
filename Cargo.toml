@@ -28,7 +28,7 @@ license = "MIT"
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
 
 # ---- Section 2: Backend Core — Async Runtime ----
-tokio = { version = "=1.53.3", features = ["full"] }
+tokio = { version = "=1.54.1", features = ["full"] }
 
 # ---- Section 2: Backend Core — WebSocket ----
 tokio-tungstenite = { version = "=0.29.0", features = ["rustls-tls-native-roots"] }
@@ -87,7 +87,7 @@ tracing-appender = "=0.2.5"
 # jsonwebtoken removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
-arc-swap = "=1.9.2"
+arc-swap = "=1.9.3"
 totp-rs = { version = "=6.0.0", features = ["otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
@@ -144,7 +144,7 @@ sha2 = "=0.11.1"
 # crates/storage/src/disk_health_watcher.rs replaces a forked `df` process on
 # the spill/rescue free-space probe. Same version, no new package; the edge
 # from tickvault-storage is new and is flagged for the owner in that change.
-libc = "=0.2.190"
+libc = "=0.2.191"
 notify = "=8.2.0"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
@@ -241,7 +241,7 @@ aws-sdk-eventbridge = { version = "=1.110.0", default-features = false, features
 # Lambda runtime for the provided.al2023 bootstrap bins (tokio ^1.46 — the
 # workspace 1.52.3 pin satisfies it). cargo-lambda is a BUILD tool installed
 # in CI, never a dependency.
-lambda_runtime = "=1.4.0"
+lambda_runtime = "=1.5.0"
 
 # ---- Section 11b: Compression (partition archive) ----
 # 2026-07-13: gzip encoder for the streamed QuestDB /exp CSV export before
