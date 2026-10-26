@@ -761,6 +761,42 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   - Files: crates/core/src/auth/types.rs
   - Tests: test_parse_expiry_time_documented_millisecond_string_is_parsed_exactly
 
+### PR K — 2026-10-26 wave-2 audit fixes (storage spill + WAL, app drain hold, core silence spacing)
+
+Approved under the same session quotes as PR J ("go ahead fix everything fully
+parallel dude", "fix and reosleve and implement evrythign dude ... im ggiving you
+all teh permissiosn"). Each item closes a gap the wave-1 slice audits and the
+WebSocket-continuity attack confirmed in source; none changes an operator-locked
+rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they are).
+
+- [ ] K1 (storage, app) Spill replay and spill files: only HTTP 400/413/422 count
+  as a bad payload (other 4xx are retried like a 5xx); a round stops after 3 files
+  in a row are quarantined with the same status; the bisection POST cap follows
+  the 64-line cap; a whole framed depth record that QuestDB refuses increments the
+  paged rejected-lines counter; a spill append first writes a newline when the
+  file's last byte is not one; the shared QuestDB client ignores proxy variables;
+  at shutdown the parked rescue hand-off uses a deadline, then spills inline or
+  counts the rest abandoned; the drain hold also counts depth framed spill files.
+  - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/depth_spill_frame.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/http_client.rs, crates/app/src/drain_hold.rs
+  - Tests: one regression test per change (status classification, quarantine streak stop, POST cap, set-aside counter, newline guard, park deadline, depth folder counted)
+- [ ] K2 (storage) WAL core: a failed segment sync raises the lost mark so the
+  rescue stops deferring to it, logged `error!` with its code; a shutdown that
+  abandons a stuck writer is counted and never logged "complete"; a segment that
+  cannot be read (I/O error) stays in place with a retry cap instead of being
+  archived unread; a failed listing of `replaying/` refuses the pass; staging
+  failures are coded and counted; a discarded segment is synced and cleared from
+  the open registry; the queue byte cap is resolved at construction, not on the
+  first frame; the stale re-capture comment is corrected.
+  - Files: crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_replay_settle.rs
+  - Tests: one regression test per change
+- [ ] K3 (core, app) The 300 s silence fallback redials at most one socket per
+  kind per `CONFIRMED_REDIAL_SPACING_SECS`, so a market-wide silence no longer
+  redials every main-feed socket in the same second; the tick-gap detector's
+  LTT-backward and volume-jump verdicts are counted (pre-resolved counters, local
+  `/metrics` only) instead of discarded.
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/src/pipeline/tick_gap_detector.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: five silent sockets for 1,800 s never redial two inside one spacing; verdict counters move on a crafted backward LTT and volume jump; DHAT on the observe path unchanged
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
@@ -778,6 +814,8 @@ lock, no allocation.
 
 PR J: each fix keeps the existing tiers and only closes a gap: the rescue deferral asks the WAL fate table (one atomic load) before trusting replay; the shutdown drain is a bounded try_recv loop; ensures reuse spawn_ensure_until_keyed; core limits reuse websocket_config; guards are source scans.
 
+PR K: each fix keeps the existing tiers: replay classification and streak stop are pure functions; the WAL sync failure reuses the existing lost mark; the silence spacing reuses the existing per-kind CAS; verdict counters are pre-resolved handles.
+
 ## Edge Cases
 
 - No depth sink: `is_some_and` gives false; nothing changes.
@@ -789,12 +827,16 @@ PR J: each fix keeps the existing tiers and only closes a gap: the rescue deferr
 
 - PR J: a WAL that has not flushed through a batch (disk full) sends the batch to the inline spill instead of trusting replay; a shutdown ring backlog larger than the budget is counted, never silently dropped.
 
+- PR K: a QuestDB that refuses every line (schema drift) stops the round after 3 quarantines instead of emptying the backlog; a 401/403 is retried, never quarantined; all main-feed sockets silent at once are staggered, one redial per spacing.
+
 ## Failure Modes
 
 - Extra flushes under load: at most one per 500 ms from the frame arm.
 - A crash still loses unbacked rows inside the 500 ms window (unchanged, stated).
 
 - PR J: an inline spill that also fails is counted lost (unchanged accounting, now honest).
+
+- PR K: a retried 4xx that never heals keeps the file waiting (counted, not quarantined); a staggered silence redial recovers the pool more slowly (at most 5 × spacing).
 
 ## Test Plan
 
@@ -803,6 +845,8 @@ pin the frame-arm call; the new DHAT test; `cargo test -p tickvault-app --lib`,
 `dhat_live_ingest_seam`, source size and scan budget guards, clippy, fmt.
 
 PR J: per-crate `cargo test -p` for storage, app, core, api, common; new self-test rows for every guard; clippy and fmt.
+
+PR K: per-crate `cargo test -p` for storage, app, core; one regression test per item; clippy and fmt.
 
 ## Rollback
 
@@ -813,6 +857,8 @@ PR I: revert the PR (no runtime switch, per the 2026-10-20 REJECT row); the
 planner then swaps every minute as before.
 
 PR J: revert the merge commit of each sub-branch; no config flag or schema change.
+
+PR K: revert the merge commit of each sub-branch; no config flag or schema change.
 
 ## Observability
 
@@ -831,6 +877,8 @@ PR I: one new label value, `outcome="min_hold"`, on the existing local
 alarm); `held_back` and `min_hold` in the existing per-minute steering `info!`.
 
 PR J: `tv_ticks_lost_total{source="rescue_abandoned"}` and `{source="shutdown_ring_unbacked"}`, registered at 0 at boot, local `/metrics` only (they ride the existing loss-group filter only after a dated noise-lock row).
+
+PR K: tick-gap verdict counters and WAL staging-failure counters, local `/metrics` only, no EMF name, filter or alarm.
 
 ## Guarantee matrix
 
