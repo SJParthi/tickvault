@@ -60,6 +60,7 @@ pub mod feed_scoreboard_boot;
 // compare against the persisted TF tables — Dhan verifies TODAY, Groww
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
 pub mod tf_consistency_boot;
+pub mod tf_consistency_readiness;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_boot` module DELETED — the 15:40 IST WAL-vs-DB daily
 // audit's every input died with the live-WS retirements (Dhan 2026-07-13,
