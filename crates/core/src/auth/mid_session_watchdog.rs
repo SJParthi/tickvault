@@ -658,6 +658,20 @@ fn classify_failure_reason(reason: &str) -> CycleOutcome {
     CycleOutcome::RealAuthFail
 }
 
+/// Pure. True iff a rendered `get_user_profile` error means the broker
+/// REJECTED the token (the watchdog's `RealAuthFail`: HTTP 401/403, or an
+/// unknown shape, fail-safe). A network blip, 429, 5xx, 400 or a parse error
+/// is not evidence the token is dead.
+///
+/// Audit PR L1 (2026-10-26): the boot shared-token probe treated EVERY probe
+/// error as "rejected" and minted. Dhan allows one active token per account,
+/// so a mint after a 5xx on `/v2/profile` killed the scheduled minter's
+/// healthy token over a REST outage. The boot probe now asks this, the same
+/// classifier the watchdog uses before it re-mints.
+pub(crate) fn profile_failure_rejects_token(rendered_error: &str) -> bool {
+    classify_failure_reason(rendered_error) == CycleOutcome::RealAuthFail
+}
+
 /// Pure. Next value of the consecutive REAL-failure counter.
 ///
 /// * `Ok` → 0 (episode over).
@@ -1443,6 +1457,49 @@ mod tests {
             "two novel send-leg failures must stay below the mint threshold \
              (got {consecutive})"
         );
+    }
+
+    /// Regression (2026-10-26, audit PR L1): the boot shared-token probe
+    /// minted on EVERY probe error. Only a real rejection may mint; each
+    /// other error class keeps the shared token.
+    #[test]
+    fn test_regression_profile_failure_rejects_token_only_on_real_auth_failure() {
+        let p = "Dhan authentication failed: ";
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let reason = format!("{p}{HTTP_RESPONSE_WRAPPER}{status} url=u body=b");
+            assert!(
+                profile_failure_rejects_token(&reason),
+                "{status} is a rejection and must mint"
+            );
+        }
+        for status in [
+            "429 Too Many Requests",
+            "500 Internal Server Error",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "400 Bad Request",
+        ] {
+            let reason = format!("{p}{HTTP_RESPONSE_WRAPPER}{status} url=u body=b");
+            assert!(
+                !profile_failure_rejects_token(&reason),
+                "{status} is not a token rejection and must not mint"
+            );
+        }
+        for reason in [
+            format!("{p}{SEND_LEG_WRAPPER} dns error: failed to lookup address information"),
+            format!("{p}{SEND_LEG_WRAPPER} operation timed out"),
+            format!("{p}{SEND_LEG_WRAPPER} unknown transport oddity"),
+            format!("{p}{PARSE_ERROR_WRAPPER}: expected value at line 1 column 1"),
+        ] {
+            assert!(
+                !profile_failure_rejects_token(&reason),
+                "{reason:?} is a network or parse failure and must not mint"
+            );
+        }
+        // An unknown shape stays fail-safe (the watchdog's RealAuthFail).
+        assert!(profile_failure_rejects_token(&format!(
+            "{p}no access token available for profile request"
+        )));
     }
 
     /// The Display prefix (`Dhan authentication failed: `) must not defeat

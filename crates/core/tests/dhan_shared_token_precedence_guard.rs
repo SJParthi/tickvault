@@ -132,3 +132,20 @@ fn guard_self_test_comment_stripping_is_not_vacuous() {
         "code_only must keep real code"
     );
 }
+
+/// Regression (2026-10-26, audit PR L1): the boot probe minted on ANY error
+/// from `/v2/profile`, so a 5xx or a network blip killed the scheduled
+/// minter's healthy token (one active token per account). The rejection arm
+/// must be reached only after the watchdog's classifier says "rejected".
+#[test]
+fn test_regression_boot_probe_mints_only_on_a_real_rejection() {
+    let code = code_only(TOKEN_MANAGER);
+    let probe = index_of(&code, "get_user_profile(");
+    let classify = index_of(&code, "profile_failure_rejects_token(");
+    let flag_set = index_of(&code, "shared_token_rejected_by_broker = true");
+    assert!(
+        probe < classify && classify < flag_set,
+        "the probe error must go through profile_failure_rejects_token before the \
+         rejection arm clears the token and falls through to mint"
+    );
+}
