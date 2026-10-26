@@ -373,8 +373,9 @@ pub const MAIN_FEED_CONFIRMED_MIN_HELD: u32 = 1_000;
 /// Instruments a depth-20 socket must hold for its silence to be confirmed.
 pub const DEPTH20_CONFIRMED_MIN_HELD: u32 = 20;
 
-/// Minimum spacing, pool-wide PER KIND, between two sibling-confirmed
-/// redials, so a vendor-side stall that silences several sockets of one kind
+/// Minimum spacing, pool-wide PER KIND, between two silence redials (sibling-
+/// confirmed, and since plan item K3 the 300 s fallback too, sharing one
+/// slot), so a vendor-side stall that silences several sockets of one kind
 /// redials them one at a time rather than all together.
 pub const CONFIRMED_REDIAL_SPACING_SECS: i64 = 15;
 
@@ -537,7 +538,8 @@ pub struct SilenceInputs<'a> {
 /// Kinds with a confirmed fast path: main feed and depth-20.
 pub const CONFIRMED_SPACING_KINDS: usize = 2;
 
-/// When each kind last took a sibling-confirmed redial, wall ms (0 = never).
+/// When each kind last took a silence redial (sibling-confirmed or, since
+/// plan item K3, the 300 s fallback), wall ms (0 = never).
 static LAST_CONFIRMED_REDIAL_WALL_MS: [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
     [const { std::sync::atomic::AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS];
 
@@ -635,6 +637,33 @@ pub const fn silence_redial_basis(
         }
         DhanEndpointType::OrderUpdate => None,
     }
+}
+
+/// Takes the per-kind spacing slot for a 300 s fallback redial (plan item
+/// K3). `last` is the slot value read earlier in the same poll, `wall_ms` the
+/// wall clock read with it. True when the slot was free (never taken, or
+/// taken at least [`CONFIRMED_REDIAL_SPACING_SECS`] ago) and this call won
+/// the compare-and-swap; false when another socket of the kind holds it or
+/// won the race, so the caller waits for a later poll.
+///
+/// A stamp more than [`SIBLING_FUTURE_SKEW_MS`] AHEAD of `wall_ms` means the
+/// wall clock stepped back after the stamp; it is treated as free, so a
+/// clock step can never hold the time-only fallback off for the size of the
+/// step. Within that skew (two sockets reading the wall a few microseconds
+/// apart) it is held as usual. O(1), one CAS, no allocation.
+fn claim_fallback_spacing(slot: &std::sync::atomic::AtomicI64, last: i64, wall_ms: i64) -> bool {
+    let elapsed = wall_ms.saturating_sub(last);
+    let free = last == 0
+        || elapsed >= CONFIRMED_REDIAL_SPACING_SECS.saturating_mul(1_000)
+        || elapsed < SIBLING_FUTURE_SKEW_MS.saturating_neg();
+    free && slot
+        .compare_exchange(
+            last,
+            wall_ms,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// Counts the OTHER slots of the same kind whose last frame is at most
@@ -5451,8 +5480,10 @@ impl ConnectionSupervisor {
     /// [`Self::poll`] with the process-wide silence inputs injected. `read` is
     /// called ONLY when this socket is already silent past its confirmed
     /// threshold and below the 300 s fallback, on a kind with a confirmed path,
-    /// with evidence and the fast path both on — so a healthy socket never
-    /// reads the register. Tests pass a closure over local data.
+    /// with evidence and the fast path both on — or, for the per-kind spacing
+    /// slot only, when such a socket is silent past the 300 s fallback with
+    /// evidence on (plan item K3) — so a healthy socket never reads the
+    /// register. Tests pass a closure over local data.
     ///
     /// Thresholds (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE THRESHOLDS"):
     /// main feed and depth-20 redial at 300 s on time alone, or earlier at
@@ -5513,13 +5544,21 @@ impl ConnectionSupervisor {
             && kind.is_some()
             && silent_secs >= confirmed_threshold
             && silent_secs < FRAME_SILENCE_REDIAL_SECS;
+        // The 300 s fallback reads the same register for its spacing slot
+        // only (plan item K3): a supervisor opted into the pool register, on
+        // a kind with a spacing slot, already silent past the fallback.
+        // Independent of the fast-path mode, because it spaces the fallback,
+        // which every mode keeps.
+        let read_fallback_spacing = self.silence_evidence == SiblingEvidence::Pool
+            && kind.is_some()
+            && silent_secs >= FRAME_SILENCE_REDIAL_SECS;
         let mut overflow_or_halted = true;
         let mut siblings: u8 = 0;
         let mut spacing_ok = false;
         let mut wall_ms: i64 = 0;
         let mut spacing_slot: Option<&std::sync::atomic::AtomicI64> = None;
         let mut spacing_last: i64 = 0;
-        if read_evidence {
+        if read_evidence || read_fallback_spacing {
             let inputs = read();
             let spacing: &'a [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
                 inputs.spacing;
@@ -5546,6 +5585,25 @@ impl ConnectionSupervisor {
         ) else {
             return SupervisorAction::Continue;
         };
+        // The 300 s fallback takes the SAME per-kind spacing slot as the
+        // confirmed path (plan item K3). Before this, a market-wide stall
+        // that silenced every main-feed socket redialled all of them within
+        // about a second of each other, every five minutes, because only the
+        // confirmed arm below took the slot. Sharing one slot is correct
+        // because the slot bounds SILENCE redials of a kind, whatever their
+        // basis: a confirmed redial and a fallback redial a second apart are
+        // two sockets of one pool torn down together, the burst the spacing
+        // exists to stop. Cost of sharing: either path can delay the other
+        // by at most one spacing (15 s). A socket that loses the slot stays
+        // silent and is offered it again on its next one-second poll; the
+        // 300 s threshold, the escalation, the session gate and the overflow
+        // and 805 refusals are unchanged (the fallback never read them).
+        if basis == SilenceBasis::Unconfirmed
+            && let Some(slot) = spacing_slot
+            && !claim_fallback_spacing(slot, spacing_last, wall_ms)
+        {
+            return SupervisorAction::Continue;
+        }
         if basis == SilenceBasis::SiblingConfirmed {
             match self.fast_path {
                 FrameSilenceFastPath::Off => return SupervisorAction::Continue,
@@ -26312,6 +26370,198 @@ mod frame_silence_evidence_tests {
         assert!(is_redial(poll_at(&mut d, t, 90, &[6, 7], false, &spacing)));
     }
 
+    /// Plan item K3: a market-wide stall silences all five main-feed sockets
+    /// at once. With no live sibling there is no confirmed path, so only the
+    /// 300 s fallback can fire, and before K3 it fired on all five in the
+    /// same second, every five minutes. Now no two redials of the kind land
+    /// inside one spacing, and every socket still redials.
+    #[test]
+    fn five_silent_main_feed_sockets_never_redial_two_inside_one_spacing() {
+        for mode in [
+            FrameSilenceFastPath::Off,
+            FrameSilenceFastPath::Shadow,
+            FrameSilenceFastPath::Act,
+        ] {
+            let t = t0();
+            let spacing = fresh_spacing();
+            let mut sockets: Vec<ConnectionSupervisor> = (0..5_u8)
+                .map(|i| live_sup(DhanEndpointType::MainFeed, i, 5_000, mode, t))
+                .collect();
+            let mut redial_secs: Vec<u64> = Vec::new();
+            let mut per_socket = [0_u32; 5];
+            for secs in 1..=1_800_u64 {
+                for (i, s) in sockets.iter_mut().enumerate() {
+                    // No sibling is live: every socket is silent.
+                    if is_redial(poll_at(s, t, secs, &[], false, &spacing)) {
+                        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+                        redial_secs.push(secs);
+                        per_socket[i] += 1;
+                        // Comes back up, still deaf: the silence clock restarts.
+                        let at = t + Duration::from_secs(secs);
+                        let _ = s.on_event(ConnEvent::BeginDial, at);
+                        let _ = s.on_event(ConnEvent::DialSucceeded, at);
+                        let _ = s.on_event(ConnEvent::SubscribeAcked, at);
+                    }
+                }
+            }
+            let spacing_secs = u64::try_from(CONFIRMED_REDIAL_SPACING_SECS).unwrap_or(u64::MAX);
+            for pair in redial_secs.windows(2) {
+                assert!(
+                    pair[1] - pair[0] >= spacing_secs,
+                    "{mode:?}: redials at {} s and {} s are inside one {spacing_secs} s spacing",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            assert!(
+                per_socket.iter().all(|n| *n >= 1),
+                "{mode:?}: every socket still redials: {per_socket:?}"
+            );
+            // 300, 315, 330, 345, 360 for the first round, not 300 x5.
+            assert_eq!(&redial_secs[..5], &[300, 315, 330, 345, 360], "{mode:?}");
+        }
+    }
+
+    /// The fallback shares the confirmed path's slot: a confirmed redial
+    /// holds the fallback of another socket of the kind for one spacing.
+    #[test]
+    fn a_confirmed_redial_holds_another_sockets_fallback_for_one_spacing() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut a = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        // b holds too few instruments for the confirmed path: fallback only.
+        let mut b = live_sup(
+            DhanEndpointType::MainFeed,
+            1,
+            MAIN_FEED_CONFIRMED_MIN_HELD - 1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        // a delivers every second until +240, so its 60 s confirmed threshold falls at
+        // +300, the same second b's 300 s fallback falls due. a polls first.
+        for secs in 1..300 {
+            if secs <= 240 {
+                let _ = a.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(secs));
+            }
+            assert!(!is_redial(poll_at(
+                &mut a,
+                t,
+                secs,
+                &[2, 3],
+                false,
+                &spacing
+            )));
+            assert!(!is_redial(poll_at(
+                &mut b,
+                t,
+                secs,
+                &[2, 3],
+                false,
+                &spacing
+            )));
+        }
+        assert!(is_redial(poll_at(&mut a, t, 300, &[2, 3], false, &spacing)));
+        assert_eq!(a.last_silence_basis(), SilenceBasis::SiblingConfirmed);
+        for secs in 300..315 {
+            assert_eq!(
+                poll_at(&mut b, t, secs, &[2, 3], false, &spacing),
+                SupervisorAction::Continue,
+                "+{secs}s: the fallback waits out the confirmed redial's spacing"
+            );
+        }
+        assert!(is_redial(poll_at(&mut b, t, 315, &[2, 3], false, &spacing)));
+        assert_eq!(b.last_silence_basis(), SilenceBasis::Unconfirmed);
+        assert_eq!(
+            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
+            WALL0 + 315_000
+        );
+    }
+
+    #[test]
+    fn claim_fallback_spacing_free_held_raced_and_clock_stepped_back() {
+        let slot = AtomicI64::new(0);
+        // Never taken: free.
+        assert!(claim_fallback_spacing(&slot, 0, WALL0));
+        assert_eq!(slot.load(std::sync::atomic::Ordering::Relaxed), WALL0);
+        // Held inside the spacing.
+        assert!(!claim_fallback_spacing(&slot, WALL0, WALL0 + 14_999));
+        // Free exactly at the spacing.
+        assert!(claim_fallback_spacing(&slot, WALL0, WALL0 + 15_000));
+        // A lost race: `last` is stale, the CAS fails, nothing is written.
+        assert!(!claim_fallback_spacing(&slot, WALL0, WALL0 + 60_000));
+        assert_eq!(
+            slot.load(std::sync::atomic::Ordering::Relaxed),
+            WALL0 + 15_000
+        );
+        // A stamp slightly ahead (two wall reads microseconds apart): held.
+        let ahead = WALL0 + 15_000;
+        assert!(!claim_fallback_spacing(&slot, ahead, ahead - 5_000));
+        // A stamp far ahead (the wall clock stepped back an hour): free, so
+        // the fallback is never held off for the size of a clock step.
+        assert!(claim_fallback_spacing(&slot, ahead, ahead - 3_600_000));
+        assert_eq!(
+            slot.load(std::sync::atomic::Ordering::Relaxed),
+            ahead - 3_600_000
+        );
+    }
+
+    /// A supervisor not opted into the pool register (every test default,
+    /// and order update / depth-200 in production) never reads it for the
+    /// fallback either.
+    #[test]
+    fn the_fallback_reads_the_register_only_when_opted_in_on_a_spaced_kind() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let reads = Cell::new(0_u32);
+        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, 0), t);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        let at = t + Duration::from_secs(300);
+        let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+        let action = s.poll_with(at, || {
+            reads.set(reads.get() + 1);
+            SilenceInputs {
+                wall_ms: WALL0,
+                overflow_or_halted: false,
+                stamps: [0; GHOST_REDIAL_SLOTS],
+                spacing: &spacing,
+            }
+        });
+        assert!(
+            is_redial(action),
+            "the unspaced default still redials at 300 s"
+        );
+        assert_eq!(reads.get(), 0);
+        // Depth-200 opted in: its 900 s backstop has no spacing slot.
+        let mut d = live_sup(
+            DhanEndpointType::Depth200,
+            10,
+            1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let at = t + Duration::from_secs(900);
+        let _ = d.on_event(ConnEvent::KeepAliveReceived, at);
+        let action = d.poll_with(at, || {
+            reads.set(reads.get() + 1);
+            SilenceInputs {
+                wall_ms: WALL0,
+                overflow_or_halted: false,
+                stamps: [0; GHOST_REDIAL_SLOTS],
+                spacing: &spacing,
+            }
+        });
+        assert!(is_redial(action));
+        assert_eq!(reads.get(), 0);
+    }
+
     #[test]
     fn below_the_instrument_floor_falls_back_to_300s() {
         let t = t0();
@@ -26366,7 +26616,12 @@ mod frame_silence_evidence_tests {
             &spacing
         )));
         assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
-        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
+        // No fast path fired: the only stamp is the 300 s fallback's own
+        // spacing claim (plan item K3), taken at the fallback instant.
+        assert_eq!(
+            spacing[1].load(std::sync::atomic::Ordering::Relaxed),
+            WALL0 + 300_000
+        );
     }
 
     #[test]
