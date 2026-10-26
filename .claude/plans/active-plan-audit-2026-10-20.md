@@ -821,6 +821,17 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/src/pipeline/tick_gap_detector.rs, crates/app/src/dhan_feed_stack.rs
   - Tests: five silent sockets for 1,800 s never redial two inside one spacing; verdict counters move on a crafted backward LTT and volume jump; DHAT on the observe path unchanged
 
+- [ ] K4 (app, storage) Daily tick conservation and crash gaps: after the
+  session, compare the packets the drain folded today (per feed) with the rows
+  in `ticks` for today minus counted losses and deferrals, and write one
+  `tick_conservation_audit` row (DEDUP `ts, trading_date_ist, feed`); a
+  mismatch logs a coded `error!` (log only: no alarm, filter or page); an
+  unreadable count is `unverified`, never a false mismatch. At boot inside the
+  session window, the downtime since the previous process's last WAL receipt
+  is written as one `feed_gap_audit` row (`kind = process_down`).
+  - Files: crates/app/src/tick_conservation.rs (new), crates/app/src/main.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/ws_frame_spill.rs
+  - Tests: verdict unit tests (match, mismatch, unverified), DDL carries DEDUP with feed, boot gap row only inside the window
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
