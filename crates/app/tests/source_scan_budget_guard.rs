@@ -28,7 +28,12 @@ const BUDGET: &[(&str, usize)] = &[
     ("api_token_rotation.rs", 1),
     ("bin/smoke_test.rs", 1),
     ("boot_helpers.rs", 1),
-    ("candle_ddl_boot.rs", 1),
+    // 2026-10-26 (audit J3): +5 wiring scans, one per audit consumer, pinning
+    // that each starts the audit DDL re-run when its own ensure is refused (a
+    // refusal at the one moment a consumer starts cannot be staged in a unit
+    // test). Paired behaviour tests: `audit_tables_ensure_reads_not_keyed_when_unreachable`,
+    // `test_spawn_audit_ensure_until_keyed_once_starts_once_per_process`.
+    ("candle_ddl_boot.rs", 6),
     ("contract_name_repair_boot.rs", 1),
     ("daily_archive_boot.rs", 1),
     ("daily_task_marker.rs", 2),
@@ -48,7 +53,10 @@ const BUDGET: &[(&str, usize)] = &[
     // which pairs it with a behaviour half on the same ingest.
     // 2026-10-22 (plan item 62): 88 -> 81; seven top_volume source scans went
     // with the code they scanned.
-    ("dhan_feed_stack.rs", 81),
+    // 2026-10-26 (audit K3): +1 wiring scan, the tick-gap verdict counters are
+    // counted at ingest, seeded at 0 and never EMF-shipped. Paired behaviour
+    // test: `tick_verdict_counters_move_on_a_backward_ltt_and_a_volume_jump`.
+    ("dhan_feed_stack.rs", 82),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     ("dhan_lifecycle.rs", 2),
@@ -75,6 +83,11 @@ const BUDGET: &[(&str, usize)] = &[
     ("order_runtime.rs", 3),
     ("subsystem_memory.rs", 1),
     ("tf_consistency_boot.rs", 1),
+    // 2026-10-26 (audit K4): 1 wiring scan, main spawns the daily tick
+    // conservation check and reads the last WAL receipt after claiming the WAL
+    // and before its own writer starts. Paired behaviour tests: the
+    // `test_classify_*` verdict tests and `test_process_down_gap_row_*`.
+    ("tick_conservation.rs", 1),
     ("ws_audit_consumer.rs", 2),
     ("ws_connection_rollup.rs", 1),
 ];

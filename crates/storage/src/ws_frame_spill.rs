@@ -4272,7 +4272,10 @@ pub use replay_retry::{
     WAL_REPLAY_IO_RETRY_CAP, WAL_REPLAY_LISTING_REFUSED_COUNTER, WAL_REPLAY_READ_RETRIED_COUNTER,
     WAL_REPLAY_STAGE_FAILED_COUNTER,
 };
-use replay_retry::{forget_segment_read_failures, note_segment_read_failure, note_stage_failure};
+use replay_retry::{
+    forget_segment_read_failures, note_listing_refused, note_segment_read_failure,
+    note_stage_failure,
+};
 use shutdown_outcome::WalShutdownOutcome;
 
 /// Bad stretches the segment walk skipped by resyncing to the next readable
@@ -4539,15 +4542,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     let (mut segments, mut leftovers) = match listed {
         Ok(pair) => pair,
         Err(err) => {
-            metrics::counter!(WAL_REPLAY_LISTING_REFUSED_COUNTER).increment(1);
-            error!(
-                code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
-                wal_dir = ?wal_dir,
-                error = %err,
-                "WAL replay REFUSED: a segment folder could not be listed, so this pass \
-                 cannot know which segments it would leave behind. Nothing is staged or \
-                 archived; every segment stays where it is for the next pass"
-            );
+            note_listing_refused(wal_dir, &err);
             return Err(anyhow::anyhow!("WAL replay: segment listing failed: {err}"));
         }
     };

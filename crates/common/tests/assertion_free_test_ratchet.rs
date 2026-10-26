@@ -106,7 +106,10 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// `github_workflow_guard.rs` r4 and r5 checked their action pins through a
 /// helper the classifier does not read as an assertion; they now call
 /// `assert_pinned_to_sha_with_tag`, so both left the count.
-const ASSERTION_FREE_BUDGET: usize = 152;
+/// 152 -> 148 on 2026-10-26: measured on the PR J/K assurance-audit fixes
+/// branch (already 148 on its base before J/K landed, found by the K4
+/// session). Nothing was rewritten to reach it.
+const ASSERTION_FREE_BUDGET: usize = 148;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [

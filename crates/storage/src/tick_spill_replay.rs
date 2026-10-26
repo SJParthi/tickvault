@@ -4625,7 +4625,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     /// Audit K1: the POST cap covers the 64-line cap at every chunk size, so
     /// the LINE cap is the one that trips.
     #[test]
-    fn test_isolation_post_cap_follows_the_line_cap() {
+    fn test_replay_max_isolation_posts_follows_the_line_cap() {
         for lines in [1_usize, 2, 7, 100, 4_096, 60_000, 700_000] {
             let depth = (usize::BITS - lines.leading_zeros()) as usize;
             let needed = 2 * (REPLAY_MAX_REJECTED_LINES_PER_CHUNK + 1) * depth;
@@ -4670,7 +4670,10 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
                     assert_eq!(&chunk[range], b"ticks poison\n");
                 }
             }
-            other => panic!("expected the lines isolated, got {other:?}"), // APPROVED: test
+            other => assert!(
+                matches!(other, LineIsolation::Isolated(_)),
+                "expected the lines isolated, got {other:?}"
+            ),
         }
     }
 

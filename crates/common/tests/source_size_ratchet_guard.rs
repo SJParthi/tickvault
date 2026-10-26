@@ -34,7 +34,9 @@ const PINS: &[(&str, usize)] = &[
     // `contract_attach_tests` moved out and ITEM 57 code moved in.
     ("crates/app/src/dhan_feed_stack.rs", 33_752),
     ("crates/app/src/main.rs", 7_002),
-    ("crates/core/src/websocket/pool_supervisor.rs", 26_621),
+    // 2026-10-26 (PR K): lowered 26,621 -> 25,984 after the frame-silence
+    // evidence tests moved to `pool_supervisor/frame_silence_evidence_tests.rs`.
+    ("crates/core/src/websocket/pool_supervisor.rs", 25_984),
     ("crates/storage/src/ws_frame_spill.rs", 13_467),
     ("crates/trading/src/candles/multi_tf_aggregator.rs", 12_755),
 ];
