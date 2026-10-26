@@ -5317,12 +5317,12 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
 
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
 /// Returns an empty Vec for a missing/unreadable dir.
-// TEST-EXEMPT: widened from private to pub(crate) for wal_replay_settle; covered by every replay/prune test that lists segments.
 ///
 /// Lenient form: any listing error reads as "no segments". Use it only where
 /// an empty answer is the safe direction (an archive or settle step then
 /// moves nothing); a step whose correctness needs the FULL set uses
 /// [`try_wal_segments_in`] (K2, 2026-10-26).
+// TEST-EXEMPT: widened from private to pub(crate) for wal_replay_settle; covered by every replay/prune test that lists segments.
 pub(crate) fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
     try_wal_segments_in(dir).unwrap_or_default()
 }
@@ -5334,6 +5334,7 @@ pub(crate) fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
 /// empty, so the replay pass staged this boot's live segments beside the
 /// unlisted leftovers and the confirm later archived those leftovers unread.
 /// O(entries), cold.
+// TEST-EXEMPT: covered by test_regression_k2_unlistable_replaying_folder_refuses_the_pass (missing vs unlistable) + every replay test that lists segments.
 pub(crate) fn try_wal_segments_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     // O(1) EXEMPT: begin — boot replay helper, cold path, bounded segment listing
     let entries = match std::fs::read_dir(dir) {
