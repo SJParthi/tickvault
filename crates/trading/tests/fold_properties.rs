@@ -145,6 +145,27 @@ fn fold_all(ts: &[ParsedTick]) -> Option<LiveCandleState> {
     agg.snapshot(Feed::Dhan, 13, 0, TfIndex::M1)
 }
 
+/// The same ticks with each day cumulative raised to the running maximum, so
+/// none is STALE (audit L3, 2026-10-26).
+///
+/// A stale packet (a cumulative below one already accepted) never moves the
+/// close or OI, so the two properties about which packet OWNS the close and
+/// the OI only hold over packets that are not stale. The arrival order and
+/// the timestamps are untouched; the stale rule is pinned by
+/// `test_regression_stale_packet_never_moves_close_oi_or_book_totals`.
+fn without_stale_packets(ts: &[ParsedTick]) -> Vec<ParsedTick> {
+    let mut high_water = 0u32;
+    ts.iter()
+        .map(|t| {
+            high_water = high_water.max(t.volume);
+            ParsedTick {
+                volume: high_water,
+                ..*t
+            }
+        })
+        .collect()
+}
+
 /// The prices that should actually reach the fold.
 fn sane_prices(ts: &[ParsedTick]) -> Vec<f64> {
     ts.iter()
@@ -270,6 +291,7 @@ proptest! {
     /// the open-bucket path.
     #[test]
     fn the_close_belongs_to_the_latest_timestamp(ts in ticks()) {
+        let ts = without_stale_packets(&ts);
         let Some(got) = fold_all(&ts) else { return Ok(()); };
         let sane: Vec<&ParsedTick> = ts.iter().filter(|t| tick_price_is_sane(t)).collect();
         if sane.is_empty() {
@@ -310,6 +332,7 @@ proptest! {
     /// blank packet must not erase a real reading from earlier in the bucket.
     #[test]
     fn a_blank_open_interest_never_erases_a_real_one(ts in ticks()) {
+        let ts = without_stale_packets(&ts);
         let Some(got) = fold_all(&ts) else { return Ok(()); };
         let any_real_oi = ts
             .iter()

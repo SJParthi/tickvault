@@ -63,7 +63,10 @@ const BUDGET: &[(&str, usize)] = &[
     ("dhan_live_crossverify.rs", 7),
     ("dhan_live_crossverify_boot.rs", 8),
     ("dhan_live_universe.rs", 18),
-    ("dhan_rest_stack.rs", 4),
+    // 2026-10-26 (audit L3): +1, `test_regression_lock_loop_never_parks_for_the_process`
+    // pins that the lock loop leaves only through `Acquired`. Paired behaviour
+    // test: `test_regression_dhan_rest_lock_held_wait_secs_retries_after_patience`.
+    ("dhan_rest_stack.rs", 5),
     ("dhan_universe.rs", 3),
     ("disk_pressure_boot.rs", 7),
     ("ensure_questdb.rs", 1),
