@@ -679,7 +679,7 @@ const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 263),
     ("crates/api/src/handlers/dashboard_page.rs", 235),
     ("crates/api/src/handlers/feeds_page.rs", 226),
-    ("crates/aws-lambdas/src/operator_control_console.html", 339),
+    ("crates/aws-lambdas/src/operator_control_console.html", 319),
 ];
 
 /// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
@@ -762,20 +762,40 @@ fn js_block_span(body: &str) -> JsSpan {
     let mut opener_bytes = 0_usize;
     for line in body.lines() {
         let lower = line.to_ascii_lowercase();
-        if !in_block && lower.contains("<script") {
-            in_block = true;
-            current = JsSpan { lines: 0, bytes: 0 };
-            opener_bytes = line.len() + 1;
-        }
+        let line_span = line.len() + 1;
         if in_block {
             current.lines += 1;
-            current.bytes += line.len() + 1;
+            current.bytes += line_span;
         }
-        if in_block && lower.contains("</script>") {
-            in_block = false;
-            total.lines += current.lines;
-            total.bytes += current.bytes;
-            current = JsSpan { lines: 0, bytes: 0 };
+        // Walk this line's tags IN ORDER (review round 1, 2026-10-26). The
+        // first version asked only "does the line contain an opener / a
+        // closer?", so `<script src=a></script><script>` opened and closed on
+        // that line and the block it left open was counted as nothing until
+        // the next closer: any amount of script could follow uncounted. A
+        // line shared by two blocks is counted in both (errs toward more).
+        let mut pos = 0_usize;
+        loop {
+            if in_block {
+                let Some(at) = lower[pos..].find("</script>") else {
+                    break;
+                };
+                pos += at + "</script>".len();
+                in_block = false;
+                total.lines += current.lines;
+                total.bytes += current.bytes;
+                current = JsSpan { lines: 0, bytes: 0 };
+            } else {
+                let Some(at) = lower[pos..].find("<script") else {
+                    break;
+                };
+                pos += at + "<script".len();
+                in_block = true;
+                current = JsSpan {
+                    lines: 1,
+                    bytes: line_span,
+                };
+                opener_bytes = line_span;
+            }
         }
     }
     if in_block {
@@ -1246,6 +1266,25 @@ fn scope_fix_2026_10_26_scanners_self_test() {
         js_byte_count("let a = 1;\nlet s = \"<script>\";\nlet b = 2;\n"),
         "let s = \"<script>\";".len() + 1
     );
+    // Review round 1: a block opened after a closer on the same line is
+    // counted. Before, the 500 lines below read as 1 line.
+    let reopened = format!(
+        "<script src=a></script><script>\n{}</script>",
+        "x();\n".repeat(500)
+    );
+    assert_eq!(js_line_count(&reopened), 1 + 502);
+    assert_eq!(
+        js_byte_count(&reopened),
+        2 * "<script src=a></script><script>".len() + 2 + 500 * 5 + "</script>".len() + 1
+    );
+    // Three blocks on one line: the line is counted once per block.
+    assert_eq!(
+        js_line_count("<script>a</script><SCRIPT>b</script><script>c</script>"),
+        3
+    );
+    // A closer before an opener on a line, outside a block, opens nothing
+    // until the opener; the opener then runs to the next closer.
+    assert_eq!(js_line_count("x</script> <script>\ny\n</script>"), 3);
     // `javascript:` URLs, case-insensitively.
     assert_eq!(javascript_url_count("<a href=\"javascript:go()\">"), 1);
     assert_eq!(javascript_url_count("<a href=\"JavaScript:go()\">"), 1);
