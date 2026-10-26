@@ -715,6 +715,47 @@ Sunday Muhurat start on 2026-11-08, each with a false "NSE holiday" page.
     after 09:15 IST) a stale binary is not auto-deployed that day; re-run
     `deploy-aws.yml` by hand (a running box deploys).
 
+### PR J — 2026-10-26 assurance-audit fixes (storage, app, core, api, common tests)
+
+Approved by Parthiban, 2026-10-26: "go ahead fix everything fully parallel dude".
+Source: the 2026-10-26 seven-dimension audit plus the WebSocket-continuity
+attack (adversarially verified). Implemented in parallel on sub-branches
+`claude/assurance-fix-g1..g5`, merged into one draft PR.
+
+- [ ] J1 (storage) Tick and depth rescue deferral checks the WAL flushed-through
+  sequence (`wal_frame_fate::flushed_high_seq`) before trusting the WAL; a frame
+  the WAL has not flushed goes to the inline spill instead. Correct the
+  `no_segment` comment in `ws_frame_spill.rs`. Contract labels sanitised once at
+  publish, not per tick row. Hot-path telemetry slots cache-line padded.
+  - Files: crates/storage/src/tick_persistence.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/hot_path_telemetry.rs
+  - Tests: storage unit tests for the deferral decision; dhat_flush_buffer_recycle unchanged
+- [ ] J2 (app) The frame drain's shutdown arm drains the ring and counts the
+  frames still queued (WAL-backed as deferred, unbacked as lost, coded
+  WS-SPILL-02); rescue/offload shutdown abandonment counts ROWS on
+  `tv_ticks_lost_total{source="rescue_abandoned"}`.
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: app unit tests for the shutdown drain count
+- [ ] J3 (app, storage tests) `instrument_lifecycle` is ensured in production
+  beside its audit twin and the write is held when the ensure is refused;
+  order-side audit ensures retry until keyed; AUDIT-WS-01 drop warn carries a
+  code and is latched once per episode; a guard requires DEDUP UPSERT KEYS on
+  every CREATE TABLE literal (dated allowlist for the two scratch tables).
+  - Files: crates/app/src/dhan_lifecycle.rs, crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
+  - Tests: ensure-wiring source guard; create_table_has_dedup guard
+- [ ] J4 (core, api) Order-update WebSocket connects with explicit bounded
+  limits; the connect-config guard scans every `connect_async*` site; the error
+  summary writer streams and bounds its read; the ping/pong counter uses
+  pre-resolved handles; `/api/debug/logs/jsonl/latest` is size-capped.
+  - Files: crates/core/src/websocket/order_update_connection.rs, crates/core/src/websocket/connection.rs, crates/core/src/notification/summary_writer.rs, crates/api/src/handlers/debug.rs
+  - Tests: config limit unit test; guard extension; summary writer bounded-read test; debug cap test
+- [ ] J5 (common tests, scripts, CI) Rust-only guard holes closed: interpreter
+  aliases, case-insensitive `<script`, JS byte ceiling, `javascript:` URLs,
+  banned frontend extensions and SVG script scan, Rust SSM-sender discovery,
+  workflow line-continuation join; `brew install` removed; unversioned
+  `cargo install` / `tool:` rejected and pinned.
+  - Files: crates/common/tests/rust_only_guard.rs, crates/common/tests/shell_budget_guard.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs, scripts/setup-observability.sh, .github/workflows/ci.yml
+  - Tests: a self-test row per new token / extension / discovery rule
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
@@ -730,6 +771,8 @@ passed the frame arm calls `flush_depth` and restarts it. The timer arm keeps it
 own 500 ms check, so whichever arm runs first hands the rows on. No new task, no
 lock, no allocation.
 
+PR J: each fix keeps the existing tiers and only closes a gap: the rescue deferral asks the WAL fate table (one atomic load) before trusting replay; the shutdown drain is a bounded try_recv loop; ensures reuse spawn_ensure_until_keyed; core limits reuse websocket_config; guards are source scans.
+
 ## Edge Cases
 
 - No depth sink: `is_some_and` gives false; nothing changes.
@@ -739,16 +782,22 @@ lock, no allocation.
 - tokio Instant is monotonic; `saturating_duration_since` guards anyway.
 - Ring idle: the timer arm still flushes at 500 ms as before.
 
+- PR J: a WAL that has not flushed through a batch (disk full) sends the batch to the inline spill instead of trusting replay; a shutdown ring backlog larger than the budget is counted, never silently dropped.
+
 ## Failure Modes
 
 - Extra flushes under load: at most one per 500 ms from the frame arm.
 - A crash still loses unbacked rows inside the 500 ms window (unchanged, stated).
+
+- PR J: an inline spill that also fails is counted lost (unchanged accounting, now honest).
 
 ## Test Plan
 
 Unit and property tests on the clock; the existing source assertion extended to
 pin the frame-arm call; the new DHAT test; `cargo test -p tickvault-app --lib`,
 `dhat_live_ingest_seam`, source size and scan budget guards, clippy, fmt.
+
+PR J: per-crate `cargo test -p` for storage, app, core, api, common; new self-test rows for every guard; clippy and fmt.
 
 ## Rollback
 
@@ -757,6 +806,8 @@ still runs whenever it is polled (the pre-PR behaviour).
 
 PR I: revert the PR (no runtime switch, per the 2026-10-20 REJECT row); the
 planner then swaps every minute as before.
+
+PR J: revert the merge commit of each sub-branch; no config flag or schema change.
 
 ## Observability
 
@@ -773,6 +824,8 @@ the boot fold and the backlog guard), `tv_wal_replay_disk_floor_stops_total`
 PR I: one new label value, `outcome="min_hold"`, on the existing local
 `tv_depth200_ranked_swaps_total` (pre-registered at 0; no EMF name, filter or
 alarm); `held_back` and `min_hold` in the existing per-minute steering `info!`.
+
+PR J: `tv_ticks_lost_total{source="rescue_abandoned"}` and `{source="shutdown_ring_unbacked"}`, registered at 0 at boot, local `/metrics` only (they ride the existing loss-group filter only after a dated noise-lock row).
 
 ## Guarantee matrix
 
