@@ -118,8 +118,11 @@ fn the_bucket_and_the_close_ordering_guards_read_the_fold_clock() {
         "`close_ts_ist_secs` must be stamped from the fold clock, or the close \
          is owned by a different packet than the bucket believes is last"
     );
+    // 2026-10-26 (audit L3): a stale packet is never the newest, so the
+    // guard gained a `!stale_packet &&` prefix; the clock comparison is
+    // unchanged.
     assert!(
-        cell.contains("let tick_is_newest = fold_secs >= state.close_ts_ist_secs"),
+        cell.contains("let tick_is_newest = !stale_packet && fold_secs >= state.close_ts_ist_secs"),
         "the close-ordering guard must compare fold clock against fold clock. \
          Comparing an exchange stamp against a receipt-clock `close_ts` makes \
          every late-delivered tick look older than it is, so open interest and \

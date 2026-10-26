@@ -1031,6 +1031,7 @@ impl AggregatorCell {
         extremes: SessionExtremeDelta,
         signed_tick_volume: Option<i64>,
         fold_secs: u32,
+        stale_packet: bool,
     ) -> ConsumeOutcome {
         self.fold(
             tf,
@@ -1042,6 +1043,7 @@ impl AggregatorCell {
             extremes,
             signed_tick_volume,
             fold_secs,
+            stale_packet,
         )
     }
 
@@ -1167,6 +1169,9 @@ impl AggregatorCell {
             // `only_the_extremes_entry_classifies_net_volume`.
             None,
             fold_clock_ist_secs(tick.exchange_timestamp),
+            // This entry point has no previous cumulative to compare with,
+            // so it cannot call a packet stale.
+            false,
         )
     }
 
@@ -1190,6 +1195,12 @@ impl AggregatorCell {
         extremes: SessionExtremeDelta,
         signed_tick_volume: Option<i64>,
         fold_secs: u32,
+        // The aggregator's STALE verdict (a day cumulative below the last
+        // accepted one, `multi_tf_aggregator`, search `is_stale_packet`). A
+        // stale packet may widen high/low, and take the open when it traded
+        // earlier, but never moves the close, the close time, OI or the
+        // pending buy/sell totals (audit L3, 2026-10-26).
+        stale_packet: bool,
     ) -> ConsumeOutcome {
         let ord = tf.as_ordinal();
         // THE bucketing decision. 2026-08-28 it moved to the receipt clock;
@@ -1245,6 +1256,7 @@ impl AggregatorCell {
                         prices,
                         fold_secs,
                         tick.received_at_nanos,
+                        stale_packet,
                     );
                     // SEAL SITE 5 of 6 — and the one that proves the guard
                     // earns its keep. I wrote this change believing there
@@ -1443,6 +1455,7 @@ impl AggregatorCell {
                 cumulative_volume,
                 signed_tick_volume,
                 fold_secs,
+                stale_packet,
             );
             // NO settlement here, deliberately — the in-bucket path leaves the
             // carry standing for the SEAL to settle.
@@ -1620,6 +1633,7 @@ impl AggregatorCell {
                     prices,
                     fold_secs,
                     tick.received_at_nanos,
+                    stale_packet,
                 );
                 // SEAL SITE 4 of 6, and one of the two a careless fix misses: the
                 // late tick just moved `close`, so a percentage stamped at
@@ -2280,6 +2294,7 @@ fn fold_in_bucket(
     cumulative_volume: u64,
     signed_tick_volume: Option<i64>,
     fold_secs: u32,
+    stale_packet: bool,
 ) {
     let price = prices.last_traded_price;
     if price > state.high {
@@ -2315,7 +2330,14 @@ fn fold_in_bucket(
     // Captured BEFORE the close guard mutates `close_ts_ist_secs`, so the OI
     // rule below reads "is this the newest packet we have seen" rather than a
     // value that depends on statement order two lines up.
-    let tick_is_newest = fold_secs >= state.close_ts_ist_secs;
+    // STALE PACKET (audit L3, 2026-10-26). A packet whose day cumulative is
+    // below the last accepted one can still carry the same or a later trade
+    // second (measured live 2026-09-11, security 68407), so the time test
+    // alone took it as the newest and moved close, close time, OI and the
+    // book totals to an older reading while volume and direction ignored
+    // it. It is never the newest, and it carries no OI or book reading this
+    // bar may adopt (`stale_packet` gates the two blocks below).
+    let tick_is_newest = !stale_packet && fold_secs >= state.close_ts_ist_secs;
     if tick_is_newest {
         state.close = price;
         state.close_ts_ist_secs = fold_secs;
@@ -2348,7 +2370,11 @@ fn fold_in_bucket(
     //
     // Last NON-ZERO wins, by EXCHANGE TIMESTAMP — plus "anything beats
     // nothing", which is what the un-nesting adds.
-    if tick.open_interest != 0 {
+    if stale_packet {
+        // Neither "anything beats nothing" nor "newest wins" applies: a
+        // stale packet's readings are older than ones this bar may still
+        // receive, so it adopts none (audit L3).
+    } else if tick.open_interest != 0 {
         // `state.oi == 0` first: with no reading at all, an older real one is
         // strictly better than none.
         if state.oi == 0 || tick_is_newest {
@@ -2373,10 +2399,14 @@ fn fold_in_bucket(
     //
     // NOT executed volume. These are resting orders, and nothing downstream
     // may treat their difference as a buy/sell imbalance of trades.
-    if tick.total_buy_quantity != 0 && (state.total_buy_qty == 0 || tick_is_newest) {
+    if !stale_packet && tick.total_buy_quantity != 0 && (state.total_buy_qty == 0 || tick_is_newest)
+    {
         state.total_buy_qty = tick.total_buy_quantity;
     }
-    if tick.total_sell_quantity != 0 && (state.total_sell_qty == 0 || tick_is_newest) {
+    if !stale_packet
+        && tick.total_sell_quantity != 0
+        && (state.total_sell_qty == 0 || tick_is_newest)
+    {
         state.total_sell_qty = tick.total_sell_quantity;
     }
     // Exchange cumulative volume only ever rises, so a bucket's traded volume
@@ -2490,6 +2520,7 @@ fn fold_late_hlc(
     prices: TickPrices,
     fold_secs: u32,
     received_at_nanos: i64,
+    stale_packet: bool,
 ) {
     let receipt = receipt_ist_nanos(received_at_nanos);
     if receipt > 0 {
@@ -2515,7 +2546,9 @@ fn fold_late_hlc(
         state.open = price;
         state.open_ts_ist_secs = fold_secs;
     }
-    if fold_secs >= state.close_ts_ist_secs {
+    // A stale packet never takes a sealed bar's close (audit L3, the same
+    // rule as `fold_in_bucket`).
+    if !stale_packet && fold_secs >= state.close_ts_ist_secs {
         state.close = price;
         state.close_ts_ist_secs = fold_secs;
     }
@@ -4662,6 +4695,7 @@ mod session_extreme_delta_tests {
             delta,
             None,
             fold_clock_ist_secs(tick.exchange_timestamp),
+            false,
         );
     }
 
@@ -5034,6 +5068,7 @@ mod session_extreme_delta_tests {
                     delta,
                     None,
                     fold_clock_ist_secs(t.exchange_timestamp),
+                    false,
                 );
             }
         }
@@ -5055,6 +5090,7 @@ mod session_extreme_delta_tests {
                 delta,
                 None,
                 fold_clock_ist_secs(spike.exchange_timestamp),
+                false,
             );
         }
 
@@ -5328,6 +5364,7 @@ mod permutation_regression_tests {
             d,
             None,
             fold_clock_ist_secs(a.exchange_timestamp),
+            false,
         );
 
         // 09:16 bucket: a Ticker packet -- no day fields at all.
@@ -5345,6 +5382,7 @@ mod permutation_regression_tests {
             d,
             None,
             fold_clock_ist_secs(silent.exchange_timestamp),
+            false,
         );
 
         // 09:16 again: a Quote with a risen high. The rise could have printed
@@ -5364,6 +5402,7 @@ mod permutation_regression_tests {
             d,
             None,
             fold_clock_ist_secs(c.exchange_timestamp),
+            false,
         );
 
         assert_eq!(

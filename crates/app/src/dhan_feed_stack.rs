@@ -1642,6 +1642,20 @@ struct SealTally {
     rescued: u64,
 }
 
+impl SealTally {
+    /// True when every bar a seal pass produced is accounted for: emitted,
+    /// rescued to disk, or lost. A rescued seal is neither emitted nor
+    /// dropped, so a ledger without it read a rescue as missing and the
+    /// `debug_assert` beside it panicked the drain in a debug build (audit
+    /// L3, 2026-10-26). O(1).
+    fn accounts_for(self, bars: u64) -> bool {
+        bars == self
+            .emitted
+            .saturating_add(self.dropped)
+            .saturating_add(self.rescued)
+    }
+}
+
 /// Routes one sealed bar from a catch-up seal or the replay hand-over to the
 /// seal writer, spilling to disk when the writer is absent or full. O(1).
 /// (Until 2026-10-22, plan item 62, it first handed the volume board its copy
@@ -3473,10 +3487,14 @@ impl LiveIngest {
                     emitted = emitted.saturating_add(1);
                 }
             });
-        debug_assert_eq!(
-            bars as u64,
-            emitted.saturating_add(dropped),
-            "every bar force_seal_all produced must be accounted as emitted or dropped"
+        debug_assert!(
+            SealTally {
+                emitted,
+                dropped,
+                rescued,
+            }
+            .accounts_for(bars as u64),
+            "every bar force_seal_all produced must be accounted as emitted, rescued or dropped"
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
@@ -3783,10 +3801,12 @@ impl LiveIngest {
         // with one number. Outside the session the latch is CLEARED, not held:
         // the pre-open must not carry a verdict into the bell, and a post-close
         // latch would only ever be consulted by the next boot's fresh state.
+        let scan_secs = ist_secs_of_day_from_millis(now_millis);
         if dead_class_verdict_is_due(
-            is_within_market_hours_ist(ist_secs_of_day_from_millis(now_millis)),
+            is_within_market_hours_ist(scan_secs),
             silence_page_allowed_today(),
-        ) {
+        ) || muhurat_silence_check_due_now(scan_secs)
+        {
             self.report_dead_classes(&classes);
         } else {
             self.stand_down_dead_class_report();
@@ -4279,10 +4299,9 @@ impl LiveIngest {
                 );
             },
         );
-        debug_assert_eq!(
-            bars as u64,
-            tally.emitted.saturating_add(tally.dropped),
-            "every bar catch_up_seal_slots produced must be accounted as emitted or dropped"
+        debug_assert!(
+            tally.accounts_for(bars as u64),
+            "every bar catch_up_seal_slots produced must be accounted as emitted, rescued or dropped"
         );
         let (emitted, dropped) = (tally.emitted, tally.dropped);
         self.apply_seal_tally(tally);
@@ -7619,8 +7638,11 @@ async fn run_frame_drain(
                 // (`groww_contract_1m_boot`, `groww_option_chain_1m_boot`,
                 // `brutex_crossverify_boot`, `feed_scoreboard_boot`); the
                 // revived lane was the one regression.
-                if !is_within_market_hours_ist(now_ist_secs_of_day())
-                    || !silence_page_allowed_today()
+                let silence_secs = now_ist_secs_of_day();
+                // Audit L3: on a Muhurat day (an NSE holiday) the check runs
+                // in the Muhurat continuous session too.
+                if (!is_within_market_hours_ist(silence_secs) || !silence_page_allowed_today())
+                    && !muhurat_silence_check_due_now(silence_secs)
                 {
                     silent_scans = 0;
                     silence_reported = false;
@@ -15105,7 +15127,8 @@ fn note_wal_frames_deferred_by_shutdown(
     info!(
         waited_secs,
         staged_frames = frames.len(),
-        "Dhan live feed: shutdown arrived while waiting for authentication — no \
+        "Dhan live feed: shutdown arrived while waiting for authentication or the \
+         dual-instance lock — no \
          socket was dialed, nothing to seal or flush; any staged write-ahead log \
          frames stay staged and are re-offered on the next boot"
     );
@@ -15120,6 +15143,131 @@ fn note_wal_frames_deferred_by_shutdown(
 /// is about to abandon. One atomic load.
 fn shutdown_requested() -> bool {
     tickvault_core::websocket::pool_supervisor::SOCKET_STOP.is_requested()
+}
+
+/// First wait between re-checks of a refused dial precondition (audit L3).
+pub(crate) const LANE_REFUSAL_RETRY_FIRST_SECS: u64 = 5;
+
+/// Largest wait between re-checks of a refused dial precondition (audit L3).
+pub(crate) const LANE_REFUSAL_RETRY_MAX_SECS: u64 = 60;
+
+/// The dial precondition the lane is waiting on (audit L3, 2026-10-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialRefusal {
+    /// No token manager registered: no client id and no JWT to dial with.
+    NoTokenManager,
+    /// A token exists, but this process does not hold the dual-instance lock.
+    LockNotHeld,
+}
+
+/// Wait before re-check `retry` (0-based) of a refused precondition:
+/// 5, 10, 20, 40, then 60 s forever. Pure, O(1).
+#[must_use]
+pub(crate) const fn lane_refusal_retry_secs(retry: u32) -> u64 {
+    let shift = if retry > 4 { 4 } else { retry };
+    let secs = LANE_REFUSAL_RETRY_FIRST_SECS << shift;
+    if secs > LANE_REFUSAL_RETRY_MAX_SECS {
+        LANE_REFUSAL_RETRY_MAX_SECS
+    } else {
+        secs
+    }
+}
+
+/// True while a missing token manager is still the boot's expected
+/// authentication wait (`TOKEN_MANAGER_WAIT_ATTEMPTS` x
+/// `TOKEN_MANAGER_WAIT_INTERVAL_SECS`), which is polled at the flat 5 s
+/// cadence and not reported. A missing lock is never "expected". Pure, O(1).
+const fn in_token_manager_grace(refusal: DialRefusal, waited_secs: u64) -> bool {
+    matches!(refusal, DialRefusal::NoTokenManager)
+        && waited_secs < TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS
+}
+
+/// Waits until the lane may dial: a token manager is registered AND this
+/// process holds the dual-instance lock. Returns the client id, or
+/// `Err(waited_secs)` when a shutdown arrives first.
+///
+/// # Why it never gives up (audit L3, 2026-10-26)
+///
+/// Both refusals used to `return` for the rest of the process: a token
+/// manager that registered after the 300 s wait, or a lock acquired after
+/// the REST stack's patience, left the unit active with zero sockets for the
+/// whole session. Now each refusal re-checks on a capped backoff (5 s
+/// doubling to 60 s) for the life of the process, with ONE coded `error!`
+/// per episode (a new episode starts when the missing precondition changes)
+/// and one `info!` when the lane proceeds. The lock is not weakened: nothing
+/// dials until the flag reads held, and every socket also re-checks it at
+/// its own dial (`dual-instance-lock-2026-07-04.md` §3.6). Staged WAL frames
+/// stay staged while it waits: they are folded once the lane dials, or
+/// deferred to the next boot on shutdown.
+async fn wait_for_dial_preconditions(
+    instance_lock_held: &AtomicBool,
+    shutdown: &tokio::sync::Notify,
+    planned_connections: usize,
+) -> Result<String, u64> {
+    let mut waited_secs: u64 = 0;
+    let mut episode: Option<DialRefusal> = None;
+    let mut retry: u32 = 0;
+    loop {
+        let lock_held = instance_lock_held.load(Ordering::Acquire);
+        let refusal = match global_token_manager().map(|m| m.client_id_string()) {
+            None => DialRefusal::NoTokenManager,
+            Some(id) if lock_held => {
+                if waited_secs > 0 {
+                    info!(
+                        waited_secs,
+                        recovered_from = ?episode,
+                        "Dhan live feed: token manager registered and dual-instance lock \
+                         held — proceeding to dial"
+                    );
+                }
+                return Ok(id);
+            }
+            Some(_) => DialRefusal::LockNotHeld,
+        };
+        let sleep_secs = if in_token_manager_grace(refusal, waited_secs) {
+            TOKEN_MANAGER_WAIT_INTERVAL_SECS
+        } else {
+            if episode != Some(refusal) {
+                episode = Some(refusal);
+                retry = 0;
+                match refusal {
+                    DialRefusal::NoTokenManager => error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "token_manager_missing",
+                        waited_secs,
+                        "Dhan live feed is enabled but no token manager registered within the \
+                         authentication wait, so there is neither a client id nor a JWT to dial \
+                         with — no socket is open. The Dhan REST stack registers the manager \
+                         after authentication (check AUTH-GAP-* and DH-901). Re-checking every \
+                         {LANE_REFUSAL_RETRY_FIRST_SECS}-{LANE_REFUSAL_RETRY_MAX_SECS}s for the \
+                         life of the process."
+                    ),
+                    DialRefusal::LockNotHeld => error!(
+                        code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                        source = "live_lane_dial_refused",
+                        planned_connections,
+                        waited_secs,
+                        "Dhan live feed is enabled and a token exists, but this process does NOT \
+                         hold the dual-instance lock — no socket is open. Another tickvault on \
+                         this account holds it, or the heartbeat lost it; dialing anyway would \
+                         put two boxes on one connection budget. Re-checking every \
+                         {LANE_REFUSAL_RETRY_FIRST_SECS}-{LANE_REFUSAL_RETRY_MAX_SECS}s for the \
+                         life of the process."
+                    ),
+                }
+            }
+            let secs = lane_refusal_retry_secs(retry);
+            retry = retry.saturating_add(1);
+            secs
+        };
+        // SHUTDOWN-AWARE (2026-09-23): a stop arriving during the wait is seen
+        // at once (`notify_one` stores a permit when nobody is waiting).
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+            () = shutdown.notified() => return Err(waited_secs),
+        }
+        waited_secs = waited_secs.saturating_add(sleep_secs);
+    }
 }
 
 /// Closes the lane when a shutdown arrived before the sockets were dialled
@@ -16256,85 +16404,24 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // The refusal was loud, which is the only reason this was recoverable at
     // all. But a lane that logs an error and exits on every single boot is
     // indistinguishable, in effect, from a lane that was never wired.
-    let mut client_id: Option<String> = None;
-    for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS {
-        if let Some(id) = global_token_manager().map(|m| m.client_id_string()) {
-            if attempt > 0 {
-                info!(
-                    waited_secs = attempt * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-                    "Dhan live feed: token manager registered — proceeding to dial"
-                );
-            }
-            client_id = Some(id);
-            break;
-        }
-        // SHUTDOWN-AWARE (2026-09-23). This wait can run for the full
-        // `TOKEN_MANAGER_WAIT_ATTEMPTS × TOKEN_MANAGER_WAIT_INTERVAL_SECS`
-        // (300 s) — for example while the REST stack sits in its dual-instance
-        // lock patience after a restart. It used to be a bare `sleep`, so a
-        // stop arriving here was never seen: `main` waited its whole shutdown
-        // budget and then logged "the shutdown seal+flush did NOT finish" at
-        // ERROR (observed 2026-09-23 05:10 IST, a deploy restart). Nothing was
-        // lost — no socket had been dialed — but the line claimed otherwise.
-        //
-        // `notify_one` stores a permit when nobody is waiting, so a stop sent
-        // before this future is polled is still seen on the next iteration.
-        // Staged WAL frames are NOT reported as refused here: a planned stop
-        // is not a refusal, and `report_unfolded_wal_frames` increments the
-        // alarmed `tv_ws_frame_wal_reinjected_dropped_total` — so routing a
-        // shutdown through it would page on every stop that lands in this
-        // wait. The segments stay unconfirmed in the replay staging area
-        // (boot stopped confirming on the lane's behalf on 2026-08-28) and
-        // the next boot re-offers them — deferred, not lost.
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(
-                TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-            )) => {}
-            () = params.shutdown.notified() => {
-                note_wal_frames_deferred_by_shutdown(
-                    &params.wal_replay_live_feed,
-                    attempt.saturating_mul(TOKEN_MANAGER_WAIT_INTERVAL_SECS),
-                );
+    //
+    // ⚠ CHANGED 2026-10-26 (audit L3): after the authentication wait the lane
+    // used to REFUSE and return for the rest of the process, and so did a
+    // missing dual-instance lock (checked here anyway, because the lock can
+    // be LOST after acquisition and nothing else between the token and the
+    // dial would notice). Both now wait on a capped backoff for as long as
+    // the process lives; see `wait_for_dial_preconditions`. Nothing dials
+    // before both hold.
+    let client_id =
+        match wait_for_dial_preconditions(&params.instance_lock_held, &params.shutdown, plan.len())
+            .await
+        {
+            Ok(client_id) => client_id,
+            Err(waited_secs) => {
+                note_wal_frames_deferred_by_shutdown(&params.wal_replay_live_feed, waited_secs);
                 return;
             }
-        }
-    }
-    let Some(client_id) = client_id else {
-        error!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            waited_secs = TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-            "Dhan live feed is enabled but no token manager registered within the wait budget, \
-             so there is neither a client id nor a JWT to dial with. REFUSING to open any \
-             socket. The Dhan REST stack registers the manager after authentication — this \
-             means authentication did not complete in time (check AUTH-GAP-* and DH-901)."
-        );
-        report_unfolded_wal_frames(&params.wal_replay_live_feed, "token_manager_missing");
-        return;
-    };
-
-    // ---- dual-instance lock ------------------------------------------------
-    // The token manager above is registered by the REST stack only AFTER it
-    // acquired the SSM instance lock, so on a healthy boot this is already
-    // true. It is checked anyway, because the lock can be LOST after
-    // acquisition (heartbeat renewal failure, a peer seizing the parameter)
-    // and nothing else between the token and the dial would notice: two
-    // boxes on one account is exactly the shape the lock exists to prevent,
-    // and Dhan answers the connection past its cap with 805 — "may result in
-    // user being blocked". Refused, counted through the same refusal path as
-    // the other floors, never dialed.
-    if !params.instance_lock_held.load(Ordering::Acquire) {
-        error!(
-            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
-            source = "live_lane_dial_refused",
-            planned_connections = plan.len(),
-            "Dhan live feed is enabled and a token exists, but this process does NOT hold \
-             the dual-instance lock — REFUSING to open any socket. Another tickvault on \
-             this account holds it, or the heartbeat lost it; dialing anyway would put two \
-             boxes on one five-connection budget."
-        );
-        report_unfolded_wal_frames(&params.wal_replay_live_feed, "instance_lock_not_held");
-        return;
-    }
+        };
 
     // ---- the fold ----------------------------------------------------------
     // DISTINCT slots across all three pools — not the sum of their lengths.
@@ -17684,6 +17771,33 @@ const CONTINUOUS_SESSION_START_SECS_OF_DAY_IST: u64 = 9 * 3_600 + 15 * 60;
 pub const fn is_within_market_hours_ist(secs_of_day: u64) -> bool {
     secs_of_day >= CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
         && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+}
+
+/// The Muhurat evening session's continuous part: the Muhurat persist window
+/// with its opening pre-open excluded by the same offset as the regular day
+/// (persist 09:00, continuous 09:15), so [18:15, 19:30) IST.
+const MUHURAT_CONTINUOUS_START_SECS_OF_DAY_IST: u64 =
+    tickvault_common::constants::MUHURAT_PERSIST_START_SECS_OF_DAY_IST as u64
+        + (CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
+            - tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64);
+
+/// True when the connected-but-silent check (RISK-GAP-03) may run at
+/// `secs_of_day` on a Muhurat day (audit L3, 2026-10-26).
+///
+/// A Muhurat date is an NSE holiday, so `silence_page_allowed_today` is false
+/// and the regular gate kept the check off for the whole evening session: a
+/// connection that received nothing read healthy. Pure and total; O(1).
+#[must_use]
+pub(crate) const fn muhurat_silence_check_due(secs_of_day: u64, muhurat_day: bool) -> bool {
+    muhurat_day
+        && secs_of_day >= MUHURAT_CONTINUOUS_START_SECS_OF_DAY_IST
+        && secs_of_day < tickvault_common::constants::MUHURAT_PERSIST_END_SECS_OF_DAY_IST as u64
+}
+
+/// [`muhurat_silence_check_due`] with today's boot-installed Muhurat flag
+/// (one `OnceLock` load, the flag the tick and depth writers read).
+fn muhurat_silence_check_due_now(secs_of_day: u64) -> bool {
+    muhurat_silence_check_due(secs_of_day, tickvault_common::muhurat::current())
 }
 
 /// IST seconds-of-day for a wall-clock instant in unix-epoch MILLISECONDS.
@@ -24964,6 +25078,8 @@ mod tests {
             "ingest.scan_silence(",
             "is_within_market_hours_ist(",
             "SILENCE_SCANS_BEFORE_ALERT",
+            // Audit L3 (2026-10-26): the Muhurat arm of the session gate.
+            "muhurat_silence_check_due_now(",
         ] {
             assert!(
                 body.contains(needle),
@@ -25111,54 +25227,49 @@ mod tests {
     }
     #[test]
     fn test_the_lane_refuses_to_dial_without_a_wal_or_a_token_manager() {
-        // Both refusals are `return`s on the bring-up path, not warnings that
-        // fall through. Capturing without a durable floor, or dialing with a
-        // blank credential, would each look like success while being neither —
-        // so this pins that the code says REFUSING and means it.
+        // A missing WAL is a `return` on the bring-up path, not a warning that
+        // falls through: capturing without a durable floor would look like
+        // success while being neither.
+        //
+        // ⚠ CHANGED 2026-10-26 (audit L3): a missing token manager or lock no
+        // longer RETURNS — that ended the lane for the rest of the process.
+        // The lane now WAITS in `wait_for_dial_preconditions` and dials only
+        // once both hold; pinned here as "never dials before the wait
+        // returns", with the backoff and grace in behaviour tests
+        // (`dhan_feed_stack::l3_audit_tests`).
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production_half = src.split(test_marker).next().unwrap_or(src);
 
-        for needle in [
-            "let Some(spill) = params.spill else",
-            "let Some(client_id) = client_id else",
-        ] {
-            let at = production_half
-                .find(needle)
-                .unwrap_or_else(|| panic!("the bring-up must still guard on `{needle}`"));
-            let tail = &production_half[at..];
-            let block_end = tail.find("};").unwrap_or(tail.len());
-            assert!(
-                tail[..block_end].contains("return;"),
-                "`{needle}` must REFUSE the lane, never warn and continue"
-            );
-        }
-
-        // The token-manager guard must WAIT before it refuses.
-        //
-        // This arm used to pin `let Some(client_id) = global_token_manager()`
-        // — the bare one-shot check — and it passed happily while the lane
-        // lost a race it could not win: the registrar sits behind an SSM +
-        // TOTP + HTTPS auth round-trip, and this lane is spawned with a
-        // single localhost query between them. A guard that is CORRECT
-        // (refusing without a credential is right) can still be WRONG in
-        // timing, and a source pin on the refusal alone cannot tell the
-        // difference. Pin the wait too.
+        let needle = "let Some(spill) = params.spill else";
+        let at = production_half
+            .find(needle)
+            .unwrap_or_else(|| panic!("the bring-up must still guard on `{needle}`"));
+        let tail = &production_half[at..];
+        let block_end = tail.find("};").unwrap_or(tail.len());
         assert!(
-            production_half.contains("for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS"),
-            "the lane must RETRY for the token manager, not one-shot it — the \
-             registrar completes a remote auth handshake first, so a single \
-             check loses on essentially every boot"
+            tail[..block_end].contains("return;"),
+            "`{needle}` must REFUSE the lane, never warn and continue"
         );
+
+        let lane = production_half
+            .split_once("async fn run_dhan_feed_stack(")
+            .expect("the lane function must exist")
+            .1;
+        let wait = lane
+            .find("match wait_for_dial_preconditions(")
+            .expect("the lane must wait for the token manager and the lock before dialing");
+        let dial = lane
+            .find("dial_planned_connections(")
+            .expect("the lane dials");
         assert!(
-            production_half.contains("tokio::time::sleep"),
-            "the token-manager wait must actually yield between attempts"
+            wait < dial,
+            "nothing may dial before the precondition wait returns"
         );
         assert!(
             TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS >= 260,
-            "the wait budget must cover at least two TokenManager::initialize \
-             attempts across its >=130s backoff floor, or one transient auth \
-             failure still costs the whole session"
+            "the quiet authentication wait must cover at least two \
+             TokenManager::initialize attempts across its >=130s backoff floor"
         );
     }
 
@@ -29388,8 +29499,11 @@ mod late_seed_tests {
         );
 
         // Non-vacuous: the scan must actually be looking at real returns.
+        // 2026-10-26 (audit L3): 5 -> 4, the token-manager and lock refusals
+        // became a wait (`wait_for_dial_preconditions`) whose one shutdown
+        // return is the sanctioned one above.
         assert!(
-            before_refold.matches("return;").count() >= 5,
+            before_refold.matches("return;").count() >= 4,
             "the scan window collapsed — it should span every bring-up refusal"
         );
     }
@@ -30176,6 +30290,11 @@ mod connection_delivery_tests {
             "the dead-class gate lost its TRADING-CALENDAR half — on a weekday \
              NSE holiday it will page RISK-GAP-03 for every seeded segment"
         );
+        assert!(
+            gate.contains("muhurat_silence_check_due_now("),
+            "the dead-class gate lost its MUHURAT arm (audit L3) — on a Muhurat \
+             date, an NSE holiday, the evening session is never checked"
+        );
     }
 
     /// A latch carried out of the session is cleared, never held: the next
@@ -30597,6 +30716,9 @@ mod socket_stop_tests {
 // its first `#[cfg(test)]` still see the whole production body.
 #[cfg(test)]
 mod feed_aux_tests;
+
+#[cfg(test)]
+mod l3_audit_tests;
 
 // Depth-200 cross-feed check and frame-silence wiring (scope lock 2026-10-10,
 // plan item 52h).

@@ -125,6 +125,20 @@ boot):
   further SSM polling, so it can structurally never steal the peer's lock
   via the 90s stale-takeover the moment that peer restarts. Restart is the
   only retry; the process keeps running Groww + shared infra.
+  **⚠ CHANGED 2026-10-26 (audit L3):** the park no longer ends the loop.
+  A permanent park left the unit active with zero sockets for the whole
+  session whenever the holder outlived the window. Past the patience the
+  stack now logs ONE RESILIENCE-01 `error!` (`stage = "already_held_parked"`)
+  per episode and re-tries every `DHAN_REST_STACK_PARKED_RETRY_SECS` (60 s)
+  for the life of the process. The lock itself is unchanged: a peer that
+  keeps renewing is never displaced, only a lock its holder released or
+  stopped renewing for the 90 s TTL can be taken, and nothing mints before
+  `Acquired`. The live lane likewise waits (5 s doubling to 60 s) for the
+  token manager and the lock instead of returning, and never dials before
+  both hold (`wait_for_dial_preconditions`). **Risk:** a second box that
+  keeps re-trying takes the lock the moment the owner releases it (a clean
+  stop, CONC-4) or stops renewing, so a deploy restart of the owner can lose
+  the lock to it; the restarted owner then waits in turn.
 - **SSM transport errors** (`stage = "ssm_transport"`, distinct from the
   AlreadyHeld `stage = "already_held"` arms) retry with bounded exponential
   backoff FOREVER in the background — never blocking the Groww feed

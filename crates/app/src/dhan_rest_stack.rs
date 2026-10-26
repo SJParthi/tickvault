@@ -30,6 +30,14 @@
 //!      the machine component is the literal `local` everywhere) — hence
 //!      the bounded window applies to ALL AlreadyHeld holders, same- and
 //!      different-machine alike.
+//!      **⚠ CHANGED 2026-10-26 (audit L3):** the park no longer ends the
+//!      loop. Past the patience the stack re-tries every
+//!      `DHAN_REST_STACK_PARKED_RETRY_SECS` (60 s) for the life of the
+//!      process, with one coded error per episode, because a permanent park
+//!      left the unit up with zero sockets for the whole session. A peer that
+//!      keeps renewing is still never displaced; only a lock its holder
+//!      released, or stopped renewing for the 90 s TTL, can be taken, and
+//!      nothing mints or dials before `Acquired`.
 //!    - **SSM transport errors** (`stage = "ssm_transport"`): bounded
 //!      exponential backoff (cap [`DHAN_REST_STACK_BACKOFF_CAP_SECS`]),
 //!      retried forever in the background — an SSM outage proves nothing
@@ -109,7 +117,7 @@
 //! past the TTL window ([`DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT`]) so a
 //! quick restart never pages against its own stale entry. A holder that
 //! SURVIVES the patience window is a genuine live peer (its heartbeat kept
-//! renewing past the TTL) → one page + permanent park (see module item 1).
+//! renewing past the TTL) → one page, then a 60 s re-try (see module item 1).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -485,9 +493,30 @@ fn held_is_expected_self_stale(attempt: u32) -> bool {
 /// and the stack must stop polling SSM entirely so it can never seize that
 /// peer's lock via the stale-takeover. SSM transport errors do NOT feed
 /// this counter (they prove nothing about peers). Pure — unit-tested.
+///
+/// ⚠ CHANGED 2026-10-26 (audit L3): "park" no longer ends the loop. Once this
+/// is true the loop logs one coded error and re-tries every
+/// [`DHAN_REST_STACK_PARKED_RETRY_SECS`] ([`dhan_rest_lock_held_wait_secs`]).
 #[must_use]
 pub fn dhan_rest_lock_park_due(already_held_wait_secs: u64) -> bool {
     already_held_wait_secs >= DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
+}
+
+/// Re-try interval once the AlreadyHeld patience is spent (audit L3,
+/// 2026-10-26). Shorter than the patience ladder's 300 s cap so a lock freed
+/// mid-session is taken within a minute; one `GetParameter` a minute.
+const DHAN_REST_STACK_PARKED_RETRY_SECS: u64 = 60;
+
+/// Wait before the next AlreadyHeld re-try: the patience ladder
+/// ([`dhan_rest_stack_backoff_secs`]) inside the patience window, then
+/// [`DHAN_REST_STACK_PARKED_RETRY_SECS`] forever. Pure, O(1).
+#[must_use]
+fn dhan_rest_lock_held_wait_secs(held_attempt: u32, held_wait_secs: u64) -> u64 {
+    if dhan_rest_lock_park_due(held_wait_secs) {
+        DHAN_REST_STACK_PARKED_RETRY_SECS
+    } else {
+        dhan_rest_stack_backoff_secs(held_attempt)
+    }
 }
 
 /// Backoff for the `TokenManager::initialize` retry loop — floored at
@@ -617,13 +646,24 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         let mut ssm_attempt: u32 = 0;
         let mut peer_paged = false;
         let mut last_holder = String::new();
+        // One coded error per slow-retry episode (audit L3).
+        let mut slow_retry_reported = false;
         loop {
-            if dhan_rest_lock_park_due(held_wait_secs) {
+            if dhan_rest_lock_park_due(held_wait_secs) && !slow_retry_reported {
                 // Patience exhausted: the holder's heartbeat kept renewing
                 // far past the 90s TTL — a genuine live peer, not our own
-                // stale entry. PARK: no further SSM polling from this
-                // process, so the peer's lock can never be seized via the
-                // stale-takeover the moment the peer restarts.
+                // stale entry.
+                //
+                // ⚠ CHANGED 2026-10-26 (audit L3): this used to PARK for the
+                // rest of the process ("restart is the only retry"), which
+                // left the unit active with zero sockets for a whole session
+                // whenever the holder outlived the window. It now keeps
+                // re-trying every `DHAN_REST_STACK_PARKED_RETRY_SECS` (60 s)
+                // forever, with ONE coded error per episode. The lock is not
+                // weakened: a peer that keeps renewing is never displaced
+                // (only a lock the peer stopped renewing for the 90 s TTL, or
+                // released, can be taken), and nothing mints or dials before
+                // `Acquired`.
                 //
                 // Invariant (round-2 FIX B — the former defensive re-page
                 // here was dead code): the DualInstanceDetected page has
@@ -640,19 +680,14 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     peer = %last_holder,
                     lock_key = %lock_key,
                     waited_secs = held_wait_secs,
-                    "Dhan REST-only stack PARKED: a live peer has held the \
-                     dual-instance lock past the {}s patience window — refusing to \
-                     lurk (a parked stack can never seize the peer's lock via the \
-                     90s stale-takeover); the retained Dhan REST surface stays DOWN \
-                     this process while Groww + shared infra keep running; RESTART \
-                     is the only retry",
-                    DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
+                    "Dhan REST-only stack: a live peer has held the dual-instance \
+                     lock past the {}s patience window — the Dhan REST surface and \
+                     the live feed stay DOWN while it holds it; re-trying every {}s \
+                     (no mint, no dial before the lock)",
+                    DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS,
+                    DHAN_REST_STACK_PARKED_RETRY_SECS
                 );
-                info!(
-                    "Dhan REST-only stack parked — no further SSM lock polling this \
-                     process (restart to re-attempt once the peer is stopped)"
-                );
-                return;
+                slow_retry_reported = true;
             }
             match instance_lock::try_acquire_instance_lock(&ssm_client, &env, &host_id).await {
                 Ok(instance_lock::AcquireOutcome::Acquired) => {
@@ -661,6 +696,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                         env = %env,
                         host_id = %host_id,
                         lock_key = %lock_key,
+                        waited_secs = held_wait_secs,
                         "Dhan REST-only stack: dual-instance lock acquired (pre-mint)"
                     );
                     break;
@@ -688,7 +724,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                              process's entry ages out (90s); retrying, no mint before \
                              the lock"
                         );
-                    } else if dhan_rest_retry_should_log(held_attempt) {
+                    } else if dhan_rest_retry_should_log(held_attempt) && !slow_retry_reported {
                         error!(
                             code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                             severity = ErrorCode::Resilience01DualInstanceDetected
@@ -700,8 +736,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                             attempt = held_attempt,
                             waited_secs = held_wait_secs,
                             "Dhan REST-only stack: another process holds the dual-instance \
-                             lock — bounded patience in progress (parks at {}s; the peer's \
-                             Dhan session is untouched — no mint before the lock)",
+                             lock — bounded patience in progress (slow retry from {}s; the \
+                             peer's Dhan session is untouched — no mint before the lock)",
                             DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
                         );
                     } else {
@@ -723,7 +759,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                         peer_paged = true;
                     }
                     last_holder = holder;
-                    let wait = dhan_rest_stack_backoff_secs(held_attempt);
+                    let wait = dhan_rest_lock_held_wait_secs(held_attempt, held_wait_secs);
                     held_wait_secs = held_wait_secs.saturating_add(wait);
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
@@ -1769,6 +1805,52 @@ mod tests {
             cumulative_through_page_attempt,
             DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
         );
+    }
+
+    // Regression: 2026-10-26 (audit L3) — past the AlreadyHeld patience the
+    // stack PARKED for the rest of the process, leaving the unit up with zero
+    // sockets all session. It now re-tries every 60 s; inside the patience
+    // window the ladder is unchanged.
+    #[test]
+    fn test_regression_dhan_rest_lock_held_wait_secs_retries_after_patience() {
+        let patience = DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS;
+        for attempt in 1..=5 {
+            assert_eq!(
+                dhan_rest_lock_held_wait_secs(attempt, 0),
+                dhan_rest_stack_backoff_secs(attempt),
+                "inside the patience window the ladder is unchanged"
+            );
+        }
+        assert_eq!(dhan_rest_lock_held_wait_secs(6, patience), 60);
+        assert_eq!(dhan_rest_lock_held_wait_secs(u32::MAX, u64::MAX), 60);
+        assert!(
+            DHAN_REST_STACK_PARKED_RETRY_SECS < DHAN_REST_STACK_BACKOFF_CAP_SECS,
+            "a lock freed mid-session is taken within a minute"
+        );
+    }
+
+    // Regression: 2026-10-26 (audit L3) — the park was a `return;` at the top
+    // of the lock loop. The loop may now leave only through `Acquired`.
+    // Paired behaviour test:
+    // `test_regression_dhan_rest_lock_held_wait_secs_retries_after_patience`.
+    #[test]
+    fn test_regression_lock_loop_never_parks_for_the_process() {
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let (prod, _) = own_src
+            .split_once("#[cfg(test)]")
+            .expect("dhan_rest_stack.rs must keep its test module marker");
+        let lock_loop = prod
+            .split_once("let mut slow_retry_reported = false;")
+            .expect("the lock loop must track its slow-retry episode")
+            .1
+            .split_once("Ok(instance_lock::AcquireOutcome::Acquired) =>")
+            .expect("the lock loop must handle Acquired")
+            .0;
+        assert!(
+            !lock_loop.contains("return;"),
+            "the AlreadyHeld patience must lead to a slow retry, never a park"
+        );
+        assert!(lock_loop.contains("slow_retry_reported = true;"));
     }
 
     /// SSM transport errors keep the bounded-backoff retry-FOREVER arm:
