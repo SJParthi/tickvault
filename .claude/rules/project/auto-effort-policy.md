@@ -42,6 +42,29 @@ with the `aws-budget.md` cost discipline).
 | 🔧 **Standard** | a focused change in one crate, a small bug fix, a single-file feature | normal reasoning, scoped tests, no full agent panel |
 | 🚀 **Heavy** | multi-crate or >1,000 LoC changes, hot-path / OMS / risk / auth / persist code, anything "must not break," **every PR before merge** | deep reasoning + adversarial 3-agent review (hot-path + security + hostile) per `operator-charter-forever.md` §E + `wave-4-shared-preamble.md` §3 |
 
+### Reasoning-effort levels per tier (operator 2026-10-26, permanent)
+
+Operator, 2026-10-26: *"based on the tasks difficulties fucntionalisties scneairosx even set the model effrots startign. low till max dude ... set this as the permantn solutions dude okay?"*
+
+Wherever a tool accepts an explicit reasoning effort (today: the Workflow
+tool's `agent(..., {effort})` option), Claude sets it from the task, not a
+single fixed value:
+
+| Effort | Use it for | Examples in this repo |
+|---|---|---|
+| `low` | mechanical, no judgement | listing files, counting lines, running a named test and pasting the result, formatting |
+| `medium` | one-file reading or a narrow check | summarising one module, checking one guard, a doc correction |
+| `high` | normal audit or a single-crate change | per-slice code audit, a fix inside one crate with its tests |
+| `xhigh` | risky or cross-cutting | hot path, WAL/persistence, WebSocket reconnect, auth, OMS, money arithmetic, any change touching >3 crates |
+| `max` | the final word on a claim that will be relied on | adversarial verification of a critical finding, the judge in a panel, a "never loses a tick" proof |
+
+Honest limits (Verified 2026-10-26): the Agent tool and cloud-session
+creation (`create_session`) take no effort parameter, so those inherit the
+session's effort; the session-wide level is the user's `/effort` setting.
+For those, Claude scales effort through the prompt (scope, required proof,
+number of verifiers) instead. Cost guard unchanged: never `xhigh`/`max` on
+`low` work.
+
 **Token-aware guardrail:** never burn Heavy effort on Light work. The 3-agent
 panel is reserved for the Heavy tier (the charter already mandates it there).
 
