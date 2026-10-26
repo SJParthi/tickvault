@@ -24,10 +24,22 @@
 //! The writer runs as a dedicated tokio task with a 60s tick. File I/O
 //! happens OFF the tick pipeline — the summary writer never blocks a
 //! WebSocket frame parse or a QuestDB ILP flush.
+//!
+//! # Memory bound (audit J4, 2026-10-26)
+//!
+//! The hourly `errors.jsonl` files have no byte cap, so an error storm can
+//! make one of them gigabytes long. Each file is read line by line through a
+//! `BufReader`, and only its last [`MAX_TAIL_BYTES_PER_FILE`] (8 MiB): the
+//! reader seeks there and drops the first, partial line. A line is read into
+//! one reused buffer, so a single line is bounded by the same 8 MiB. The
+//! signature map holds at most [`MAX_SIGNATURES`] (4,096) groups; an event of
+//! a new signature past that is counted, not stored, and the count is written
+//! into the summary. Worst case per run: one 8 MiB line buffer plus 4,096
+//! groups of a few hundred bytes, whatever the size of the files.
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +56,16 @@ pub const DEFAULT_LOOKBACK_MINUTES: i64 = 15;
 
 /// Maximum number of signatures rendered in the top-signatures table.
 pub const DEFAULT_TOP_SIGNATURES: usize = 10;
+
+/// Bytes read from the END of each `errors.jsonl*` file per run. Events
+/// earlier in a larger file are not read (the file is named truncated in the
+/// summary). 8 MiB is tens of thousands of error lines, far beyond a
+/// 15-minute window on a healthy box.
+pub const MAX_TAIL_BYTES_PER_FILE: u64 = 8 * 1024 * 1024;
+
+/// Most signature groups held per run. An event of a new signature past this
+/// is counted in the summary's overflow line instead of stored.
+pub const MAX_SIGNATURES: usize = 4096;
 
 /// Output filename. Consumers (Claude loop, operator `make status`) depend
 /// on this — do NOT rename without updating them.
@@ -173,6 +195,7 @@ pub fn regenerate_summary(config: &SummaryWriterConfig) -> Result<usize> {
     let cutoff_epoch = now_epoch.saturating_sub(config.lookback_minutes.saturating_mul(60));
 
     let mut groups: HashMap<String, SignatureGroup> = HashMap::new();
+    let mut stats = ScanStats::default();
 
     for path in files {
         // A file last written before the cutoff holds no event inside the
@@ -182,69 +205,132 @@ pub fn regenerate_summary(config: &SummaryWriterConfig) -> Result<usize> {
         if file_last_written_before(&path, cutoff_epoch) {
             continue;
         }
-        let contents = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(err) => {
-                debug!(
-                    ?err,
-                    path = %path.display(),
-                    "errors.jsonl read failed — skipping this file"
-                );
-                continue;
-            }
-        };
-        for line in contents.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<RawEvent>(line) else {
-                continue;
-            };
-            // Optional timestamp filter. If the timestamp is missing or
-            // unparseable we include the event (conservative — better to
-            // show a suspicious event than hide it).
-            let ts_epoch = event
-                .timestamp
-                .as_ref()
-                .and_then(|s| parse_rfc3339_to_epoch(s));
-            if let Some(ts) = ts_epoch
-                && ts < cutoff_epoch
-            {
-                continue;
-            }
-            let message = event.message.unwrap_or_default();
-            let target = event.target.unwrap_or_default();
-            let signature = signature_hash(&event.code, &target, &message);
-            let timestamp_str = event.timestamp.unwrap_or_else(|| "unknown".to_string());
-            let entry = groups
-                .entry(signature.clone())
-                .or_insert_with(|| SignatureGroup {
-                    signature: signature.clone(),
-                    code: event.code.clone(),
-                    severity: event.severity.clone(),
-                    target: target.clone(),
-                    message_sample: truncate(&message, 160),
-                    count: 0,
-                    first_seen: timestamp_str.clone(),
-                    last_seen: timestamp_str.clone(),
-                });
-            entry.count = entry.count.saturating_add(1);
-            // `first_seen` stays as the earliest string we observed;
-            // `last_seen` tracks the latest. We compare strings
-            // lexicographically which works for RFC3339 timestamps.
-            if timestamp_str < entry.first_seen {
-                entry.first_seen = timestamp_str.clone();
-            }
-            if timestamp_str > entry.last_seen {
-                entry.last_seen = timestamp_str;
-            }
+        if let Err(err) = scan_file_tail(
+            &path,
+            MAX_TAIL_BYTES_PER_FILE,
+            cutoff_epoch,
+            &mut groups,
+            &mut stats,
+        ) {
+            debug!(
+                ?err,
+                path = %path.display(),
+                "errors.jsonl read failed — skipping this file"
+            );
         }
     }
 
-    let markdown = render_markdown(&groups, config, now_epoch);
+    let markdown = render_markdown(&groups, &stats, config, now_epoch);
     let out_path = config.errors_dir.join(SUMMARY_FILENAME);
     atomic_write(&out_path, &markdown)?;
     Ok(groups.len())
+}
+
+/// What one summary run could not show, written into the summary so a capped
+/// run never reads as a complete one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ScanStats {
+    /// Files longer than the tail cap: only their last bytes were read.
+    truncated_files: usize,
+    /// Events of a new signature refused because the map was full.
+    overflow_events: usize,
+}
+
+/// Reads the last `max_tail_bytes` of `path` line by line and folds every
+/// event inside the window into `groups`.
+///
+/// When the file is longer than the cap, the reader seeks to `len - cap` and
+/// drops the first line, which is almost always a partial one. Lines go
+/// through one reused byte buffer, and `take` bounds the total read, so the
+/// memory is at most `max_tail_bytes` whatever the file size. A line that is
+/// not UTF-8 or not JSON is skipped. O(tail bytes) per file.
+fn scan_file_tail(
+    path: &Path,
+    max_tail_bytes: u64,
+    cutoff_epoch: i64,
+    groups: &mut HashMap<String, SignatureGroup>,
+    stats: &mut ScanStats,
+) -> std::io::Result<()> {
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_tail_bytes);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+        stats.truncated_files = stats.truncated_files.saturating_add(1);
+    }
+    let mut reader = BufReader::new(file.take(max_tail_bytes));
+    let mut line: Vec<u8> = Vec::new();
+    if start > 0 {
+        // The seek landed mid-line: the bytes up to the first newline belong
+        // to an event we cannot read whole.
+        reader.read_until(b'\n', &mut line)?;
+    }
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<RawEvent>(text) else {
+            continue;
+        };
+        record_event(event, cutoff_epoch, groups, stats);
+    }
+}
+
+/// Folds one event into its signature group. An event with no parseable
+/// timestamp is kept (better to show a suspicious event than hide it); a new
+/// signature past [`MAX_SIGNATURES`] is counted in `stats`, not stored.
+fn record_event(
+    event: RawEvent,
+    cutoff_epoch: i64,
+    groups: &mut HashMap<String, SignatureGroup>,
+    stats: &mut ScanStats,
+) {
+    let ts_epoch = event
+        .timestamp
+        .as_ref()
+        .and_then(|s| parse_rfc3339_to_epoch(s));
+    if let Some(ts) = ts_epoch
+        && ts < cutoff_epoch
+    {
+        return;
+    }
+    let message = event.message.unwrap_or_default();
+    let target = event.target.unwrap_or_default();
+    let signature = signature_hash(&event.code, &target, &message);
+    let timestamp_str = event.timestamp.unwrap_or_else(|| "unknown".to_string());
+    if !groups.contains_key(&signature) && groups.len() >= MAX_SIGNATURES {
+        stats.overflow_events = stats.overflow_events.saturating_add(1);
+        return;
+    }
+    let entry = groups
+        .entry(signature.clone())
+        .or_insert_with(|| SignatureGroup {
+            signature,
+            code: event.code,
+            severity: event.severity,
+            target,
+            message_sample: truncate(&message, 160),
+            count: 0,
+            first_seen: timestamp_str.clone(),
+            last_seen: timestamp_str.clone(),
+        });
+    entry.count = entry.count.saturating_add(1);
+    // `first_seen` stays as the earliest string we observed; `last_seen`
+    // tracks the latest. RFC3339 strings compare lexicographically.
+    if timestamp_str < entry.first_seen {
+        entry.first_seen = timestamp_str.clone();
+    }
+    if timestamp_str > entry.last_seen {
+        entry.last_seen = timestamp_str;
+    }
 }
 
 /// Returns every `errors.jsonl*` file under `dir`, sorted newest-first
@@ -332,6 +418,7 @@ fn parse_rfc3339_to_epoch(ts: &str) -> Option<i64> {
 /// Renders the groups as Claude-readable markdown.
 fn render_markdown(
     groups: &HashMap<String, SignatureGroup>,
+    stats: &ScanStats,
     config: &SummaryWriterConfig,
     now_epoch: i64,
 ) -> String {
@@ -350,6 +437,23 @@ fn render_markdown(
          Source: `data/logs/machine/errors.jsonl.*`\n\n",
         config.lookback_minutes
     ));
+
+    if stats.truncated_files > 0 {
+        out.push_str(&format!(
+            "**Partial read:** {} file(s) were larger than {} MiB; only their last {} MiB \
+             were read, so earlier events in them are not counted.\n\n",
+            stats.truncated_files,
+            MAX_TAIL_BYTES_PER_FILE / (1024 * 1024),
+            MAX_TAIL_BYTES_PER_FILE / (1024 * 1024),
+        ));
+    }
+    if stats.overflow_events > 0 {
+        out.push_str(&format!(
+            "**Signature cap reached:** {} event(s) of signatures beyond the first {} \
+             were counted but not listed.\n\n",
+            stats.overflow_events, MAX_SIGNATURES,
+        ));
+    }
 
     if sorted.is_empty() {
         out.push_str("**Zero ERROR-level events in the lookback window.**\n");
@@ -787,5 +891,117 @@ mod tests {
         assert_eq!(got, "second");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    fn event_line(code: &str, message: &str) -> String {
+        let ts = chrono::Utc::now().to_rfc3339();
+        format!(
+            r#"{{"timestamp":"{ts}","level":"ERROR","target":"t::j4","code":"{code}","message":"{message}"}}"#
+        )
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tv-summary-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        dir
+    }
+
+    #[test]
+    fn test_scan_file_tail_reads_only_the_tail_and_drops_the_partial_first_line() {
+        // Audit J4: a file larger than the cap is read from `len - cap`; the
+        // events before the tail are not read, and the line the seek cut in
+        // half is dropped rather than parsed as garbage.
+        let dir = scratch_dir("tail");
+        let head = event_line("HEAD-01", "early event");
+        let tail = event_line("TAIL-01", "late event");
+        let body = format!("{head}\n{head}\n{head}\n{tail}\n");
+        let path = dir.join("errors.jsonl.2099-01-01-00");
+        fs::write(&path, &body).unwrap_or_else(|e| panic!("write: {e}"));
+
+        // A cap that lands inside the third head line.
+        let cap = (tail.len() + 1 + head.len() / 2) as u64;
+        let mut groups = HashMap::new();
+        let mut stats = ScanStats::default();
+        scan_file_tail(&path, cap, 0, &mut groups, &mut stats)
+            .unwrap_or_else(|e| panic!("scan: {e}"));
+
+        assert_eq!(stats.truncated_files, 1);
+        assert_eq!(groups.len(), 1, "only the tail event is read: {groups:?}");
+        let only = groups
+            .values()
+            .next()
+            .unwrap_or_else(|| panic!("one group"));
+        assert_eq!(only.code.as_deref(), Some("TAIL-01"));
+        assert_eq!(only.count, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_file_tail_reads_a_small_file_whole_without_marking_it_truncated() {
+        let dir = scratch_dir("whole");
+        let line = event_line("WHOLE-01", "small file");
+        let path = dir.join("errors.jsonl.2099-01-01-00");
+        fs::write(&path, format!("{line}\n{line}\n")).unwrap_or_else(|e| panic!("write: {e}"));
+        let mut groups = HashMap::new();
+        let mut stats = ScanStats::default();
+        scan_file_tail(&path, MAX_TAIL_BYTES_PER_FILE, 0, &mut groups, &mut stats)
+            .unwrap_or_else(|e| panic!("scan: {e}"));
+        assert_eq!(stats, ScanStats::default());
+        assert_eq!(groups.values().map(|g| g.count).sum::<usize>(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_signature_map_is_capped_and_overflow_is_counted_and_rendered() {
+        // Audit J4: the map never grows past MAX_SIGNATURES; an event of a
+        // known signature still counts, a new one is counted as overflow.
+        let mut groups = HashMap::new();
+        let mut stats = ScanStats::default();
+        let make = |code: String| RawEvent {
+            timestamp: None,
+            target: Some("t::cap".to_string()),
+            code: Some(code),
+            severity: None,
+            message: Some("cap".to_string()),
+        };
+        for i in 0..MAX_SIGNATURES + 7 {
+            record_event(make(format!("C-{i}")), 0, &mut groups, &mut stats);
+        }
+        // A repeat of a stored signature is still counted in its group.
+        record_event(make("C-0".to_string()), 0, &mut groups, &mut stats);
+
+        assert_eq!(groups.len(), MAX_SIGNATURES);
+        assert_eq!(stats.overflow_events, 7);
+        let repeat = signature_hash(&Some("C-0".to_string()), "t::cap", "cap");
+        assert_eq!(groups.get(&repeat).map(|g| g.count), Some(2));
+
+        let cfg = SummaryWriterConfig::new("/tmp/unused");
+        let md = render_markdown(&groups, &stats, &cfg, 0);
+        assert!(md.contains("Signature cap reached"), "{md}");
+        assert!(md.contains("7 event(s)"));
+    }
+
+    #[test]
+    fn test_render_markdown_names_a_partial_read() {
+        let stats = ScanStats {
+            truncated_files: 2,
+            overflow_events: 0,
+        };
+        let cfg = SummaryWriterConfig::new("/tmp/unused");
+        let md = render_markdown(&HashMap::new(), &stats, &cfg, 0);
+        assert!(md.contains("Partial read:** 2 file(s)"), "{md}");
+        assert!(md.contains("Zero ERROR-level events"));
+    }
+
+    #[test]
+    fn test_regenerate_summary_has_no_whole_file_read() {
+        // The storm fix, mechanically: the production half reads through
+        // the bounded tail reader, never a whole-file read.
+        let src = include_str!("summary_writer.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        assert!(!production.contains(concat!("read_to_", "string(")));
+        assert!(production.contains("scan_file_tail("));
     }
 }
