@@ -78,7 +78,8 @@ use crate::wal_applied_watermark::{
     AppliedSnapshot, AppliedWatermark, WATERMARK_DURABILITY_LAG_SECS, applied_watermark,
 };
 use crate::ws_frame_spill::{
-    ARCHIVE_SUBDIR, REPLAYING_SUBDIR, WalEndpoint, read_segment_frames_matching, wal_segments_in,
+    ARCHIVE_SUBDIR, REPLAYING_SUBDIR, WalEndpoint, read_segment_frames_matching,
+    try_wal_segments_in, wal_segments_in,
 };
 
 /// Acked-but-not-yet-durable replay segments. Never read by an in-process
@@ -245,9 +246,14 @@ impl SettleState {
     ) -> u64 {
         let settling_dir = wal_dir.join(SETTLING_SUBDIR);
         if !self.settled_any && !self.held {
-            let leftovers = wal_segments_in(&settling_dir).len() as u64;
-            if leftovers > 0 {
-                self.hold(leftovers, "leftovers_not_recovered");
+            // K2 (2026-10-26): a `settling/` that cannot be listed may hold an
+            // earlier process's leftovers, so it holds the set, as leftovers do.
+            match try_wal_segments_in(&settling_dir) {
+                Ok(leftovers) if !leftovers.is_empty() => {
+                    self.hold(leftovers.len() as u64, "leftovers_not_recovered");
+                }
+                Ok(_) => {}
+                Err(_) => self.hold(0, "settling_unlistable"),
             }
         }
         let staged = wal_segments_in(&wal_dir.join(REPLAYING_SUBDIR));
@@ -329,7 +335,13 @@ impl SettleState {
             return 0;
         }
         let settling_dir = wal_dir.join(SETTLING_SUBDIR);
-        let mut leftovers = wal_segments_in(&settling_dir);
+        // K2 (2026-10-26): fail closed. Unlisted leftovers would never be
+        // marked unapplied, and a later promote (once the folder lists again)
+        // would archive them unread, so this process settles nothing.
+        let Ok(mut leftovers) = try_wal_segments_in(&settling_dir) else {
+            self.hold(0, "settling_unlistable");
+            return 0;
+        };
         // Segments an earlier boot could not read are tried again, once per
         // process.
         if !self.unreadable_checked {
@@ -551,6 +563,29 @@ mod tests {
 
     fn lagged(t: Instant) -> Instant {
         t + Duration::from_secs(WATERMARK_DURABILITY_LAG_SECS)
+    }
+
+    // Regression: 2026-10-26 (K2 fix 4) — a `settling/` that could not be
+    // listed read as empty, so an earlier process's leftovers were never
+    // marked unapplied and a later promote could archive them unread.
+    #[test]
+    fn test_regression_k2_unlistable_settling_folder_holds_the_set() {
+        let dir = tmp("k2-unlistable");
+        // A FILE where `settling/` should be: `read_dir` fails with ENOTDIR.
+        std::fs::write(dir.join(SETTLING_SUBDIR), b"not a folder").expect("write"); // APPROVED: test-only
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        assert_eq!(st.recover(&dir, &wm), 0);
+        assert!(st.held, "an unlistable settling/ holds, fail closed");
+        let mut st = SettleState::new();
+        plant(
+            &dir.join(REPLAYING_SUBDIR),
+            "ws-frames-00000000000000000001.wal",
+        );
+        let start = SettleBatchStart { episodes: 0 };
+        let _moved = st.settle(&dir, &wm, Instant::now(), start);
+        assert!(st.held, "the settle step holds the set too");
+        assert_eq!(st.promote(&wm, lagged(Instant::now())), SettleVerdict::Held);
     }
 
     /// c2: an acked batch is not archived until the durability lag has
