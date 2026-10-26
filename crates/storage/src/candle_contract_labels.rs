@@ -14,6 +14,13 @@
 //! own. So the app publishes the day's table ONCE, and the writer reads it
 //! ONCE PER SEALED BAR — never per tick.
 //!
+//! ⚠ CORRECTED 2026-10-26 (plan item J1): "never per tick" is false. The
+//! tick writer (since 2026-09-22) and the depth writer probe this table for
+//! EVERY row they write: one `ArcSwap` load and one hash probe per tick or
+//! depth row, O(1), no allocation. Names are made ILP-safe once, at publish
+//! (`sanitize_labels`), so those per-row probes write the stored name as it
+//! is and never re-scan it.
+//!
 //! `storage` cannot depend on `app`, which owns `ContractUnderlyingMap`, so the
 //! table is re-published here in storage's own key shape at the same moment the
 //! app publishes its own.
@@ -62,6 +69,7 @@ static LABELS: LazyLock<ArcSwap<CandleContractLabels>> =
 /// A replace, never a merge: yesterday's names for expired ids must not
 /// survive into today, and a merge would keep them forever.
 pub fn publish_candle_contract_labels(labels: CandleContractLabels) -> usize {
+    let labels = sanitize_labels(labels);
     let n = labels.len();
     LABELS.store(Arc::new(labels));
     metrics::gauge!("tv_candle_contract_labels_published").set(n as f64);
@@ -77,7 +85,7 @@ pub fn publish_candle_contract_labels(labels: CandleContractLabels) -> usize {
 /// a slow boot racing a fast attach would wipe every option name for the rest
 /// of the session, so the boot publish is a compare-and-swap against empty.
 pub fn publish_candle_contract_labels_if_empty(labels: CandleContractLabels) -> bool {
-    let incoming = Arc::new(labels);
+    let incoming = Arc::new(sanitize_labels(labels));
     let mut stored = false;
     LABELS.rcu(|current| {
         if current.is_empty() {
@@ -92,6 +100,39 @@ pub fn publish_candle_contract_labels_if_empty(labels: CandleContractLabels) -> 
         metrics::gauge!("tv_candle_contract_labels_published").set(incoming.len() as f64);
     }
     stored
+}
+
+/// Makes every name ILP-safe ONCE, at publish (plan item J1, 2026-10-26).
+///
+/// The tick and depth writers probe this table for EVERY row they write, and
+/// until this date each probe re-ran `sanitize_ilp_symbol` on the name: a
+/// `chars()` scan per row, and an allocation for a name that needed
+/// cleaning. Cleaning here moves that to the publish (a few times a day), so
+/// a writer hands the stored `Arc<str>` to the ILP buffer as it is. A name
+/// that is already clean keeps its allocation; only a dirty one is replaced.
+/// O(names), cold.
+fn sanitize_labels(mut labels: CandleContractLabels) -> CandleContractLabels {
+    // O(1) EXEMPT: begin — publish only (boot and contract attach), never per row
+    for name in labels.values_mut() {
+        if let std::borrow::Cow::Owned(clean) =
+            tickvault_common::sanitize::sanitize_ilp_symbol(name)
+        {
+            *name = Arc::from(clean);
+        }
+    }
+    // O(1) EXEMPT: end
+    labels
+}
+
+/// True when `name` is already what `sanitize_ilp_symbol` would write, i.e.
+/// every published name. The writers `debug_assert!` it per row; release
+/// builds skip it.
+#[must_use]
+pub fn label_is_ilp_clean(name: &str) -> bool {
+    matches!(
+        tickvault_common::sanitize::sanitize_ilp_symbol(name),
+        std::borrow::Cow::Borrowed(_)
+    )
 }
 
 /// A snapshot of the current table. Hold it for the length of one row write.
@@ -177,5 +218,56 @@ mod tests {
             t.get(&(9_100_101, "NSE_FNO")).is_none(),
             "an expired name must not survive a republish"
         );
+    }
+
+    /// J1 (2026-10-26): names are made ILP-safe at publish, by both publish
+    /// paths, so the per-row writers can write them as they are.
+    #[test]
+    fn test_publish_sanitizes_every_name_once() {
+        let _g = lock();
+        let mut m = CandleContractLabels::default();
+        m.insert((9_100_301, "NSE_FNO"), Arc::<str>::from("BAD,NAME=X\nCE"));
+        m.insert((9_100_302, "NSE_FNO"), Arc::<str>::from("CLEAN-CE"));
+        publish_candle_contract_labels(m);
+        let t = candle_contract_labels();
+        assert_eq!(
+            t.get(&(9_100_301, "NSE_FNO")).map(|s| &**s),
+            Some("BADNAMEXCE")
+        );
+        assert_eq!(
+            t.get(&(9_100_302, "NSE_FNO")).map(|s| &**s),
+            Some("CLEAN-CE")
+        );
+        assert!(t.values().all(|n| label_is_ilp_clean(n)));
+        drop(t);
+
+        publish_candle_contract_labels(CandleContractLabels::default());
+        let mut boot = CandleContractLabels::default();
+        boot.insert((13, "IDX_I"), Arc::<str>::from("NIF,TY"));
+        assert!(publish_candle_contract_labels_if_empty(boot));
+        assert_eq!(
+            candle_contract_labels().get(&(13, "IDX_I")).map(|s| &**s),
+            Some("NIFTY")
+        );
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+
+    #[test]
+    fn test_label_is_ilp_clean_matches_the_sanitizer() {
+        assert!(label_is_ilp_clean("NIFTY-25Sep2026-24500-CE"));
+        assert!(!label_is_ilp_clean("A,B"));
+        assert!(!label_is_ilp_clean("A=B"));
+        assert!(!label_is_ilp_clean("A\nB"));
+    }
+
+    /// A clean name keeps its allocation; only a dirty one is replaced.
+    #[test]
+    fn test_sanitize_labels_keeps_a_clean_names_allocation() {
+        let clean = Arc::<str>::from("CLEAN-CE");
+        let mut m = CandleContractLabels::default();
+        m.insert((1, "NSE_FNO"), Arc::clone(&clean));
+        let out = sanitize_labels(m);
+        let kept = out.get(&(1, "NSE_FNO")).expect("present");
+        assert!(Arc::ptr_eq(kept, &clean));
     }
 }

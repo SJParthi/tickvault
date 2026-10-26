@@ -1932,11 +1932,11 @@ impl DepthWriter {
             self.contract_label = Some((row.security_id, row.segment, name));
         }
         if let Some((_, _, Some(name))) = &self.contract_label {
+            // Made ILP-safe once at publish (J1, 2026-10-26), so the stored
+            // name is written as it is; no per-row scan.
+            debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
             self.buffer
-                .symbol(
-                    "contract",
-                    tickvault_common::sanitize::sanitize_ilp_symbol(name).as_ref(),
-                )
+                .symbol("contract", &**name)
                 .context("contract")?;
         }
         self.buffer
@@ -2054,11 +2054,11 @@ impl DepthWriter {
             self.contract_label = Some((row.security_id, row.segment, name));
         }
         if let Some((_, _, Some(name))) = &self.contract_label {
+            // Made ILP-safe once at publish (J1, 2026-10-26), so the stored
+            // name is written as it is; no per-row scan.
+            debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
             self.buffer
-                .symbol(
-                    "contract",
-                    tickvault_common::sanitize::sanitize_ilp_symbol(name).as_ref(),
-                )
+                .symbol("contract", &**name)
                 .context("contract")?;
         }
         self.buffer

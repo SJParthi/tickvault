@@ -398,19 +398,18 @@ fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Re
     // SAME table the candle writer reads (operator 2026-09-22: "put either
     // contract or symbol name right in each and every table"). One ArcSwap
     // load + one hash probe per row, zero allocation: the name is borrowed
-    // out of the published snapshot and `sanitize_ilp_symbol` returns it
-    // borrowed unless it needs escaping (the name is master-derived, so it
-    // keeps the sanitiser). Written only when the table knows this exact
+    // out of the published snapshot, already made ILP-safe once at publish
+    // (`candle_contract_labels::sanitize_labels`, J1 2026-10-26; before that
+    // every row re-ran `sanitize_ilp_symbol`, a `chars()` scan per tick).
+    // Debug builds re-check it per row. Written only when the table knows this exact
     // `(security_id, segment)`; otherwise OMITTED, so the cell reads NULL —
     // never a guessed name. It must sit among the symbols: ILP rejects a
     // symbol after the first column.
     let labels = crate::candle_contract_labels::candle_contract_labels();
     if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+        debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
         buffer
-            .symbol(
-                tick_ilp_column("contract"),
-                sanitize_ilp_symbol(name).as_ref(),
-            )
+            .symbol(tick_ilp_column("contract"), &**name)
             .context("contract")?;
     }
     buffer
