@@ -80,10 +80,12 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)** (the
-TICK-CONSERVE-01 entry added here 2026-07-14 by automation-gaps PR-3 left
+`.claude/rules/project/wal-suspension-error-codes.md`**)** (the daily
+tick-conservation entry added here 2026-07-14 by automation-gaps PR-3 left
 this list 2026-07-18 — its emit site was deleted with the retired
-tick-conservation audit; see "Retired paging entries" below), **AUTH-GAP-05
+tick-conservation audit; see "Retired paging entries" below. 2026-10-26, plan
+item K4: the code is live again as a LOG-ONLY daily verdict, so it is no longer
+named in this paragraph, which lists only the codes that page), **AUTH-GAP-05
 (added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
 via `$.cooldown_skip IS FALSE` (the boolean field exists only on that
 emission; IS FALSE additionally excludes the same-day noise-lock H3

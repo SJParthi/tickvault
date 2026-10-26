@@ -3736,7 +3736,7 @@ fn verified_walk_highest_frame_seq(f: &mut File) -> u64 {
 
 /// The header walk itself: the greatest header `frame_seq` and the offset of
 /// the record that carries it. Payloads are seeked past, never read.
-fn header_walk_highest_frame_seq(path: &Path) -> (u64, u64) {
+pub(crate) fn header_walk_highest_frame_seq(path: &Path) -> (u64, u64) {
     let Ok(mut f) = File::open(path) else {
         return (0, 0);
     };
