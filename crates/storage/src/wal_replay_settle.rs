@@ -67,6 +67,7 @@
 //! * The 60 s lag is the watermark's own assumption about kernel writeback;
 //!   it is not an fsync of QuestDB's files.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -244,6 +245,33 @@ impl SettleState {
         now: Instant,
         start: SettleBatchStart,
     ) -> u64 {
+        self.settle_some(wal_dir, wm, now, start, None)
+    }
+
+    /// [`Self::settle`] for the named staged segments only (M2, 2026-10-26):
+    /// a catch-up round settles each segment once ITS rows are acked, so a
+    /// later segment whose rows do not land leaves the earlier ones retired
+    /// instead of holding the whole round back. A name not in `replaying/`
+    /// moves nothing.
+    pub fn settle_named(
+        &mut self,
+        wal_dir: &Path,
+        wm: &AppliedWatermark,
+        now: Instant,
+        start: SettleBatchStart,
+        names: &[&OsStr],
+    ) -> u64 {
+        self.settle_some(wal_dir, wm, now, start, Some(names))
+    }
+
+    fn settle_some(
+        &mut self,
+        wal_dir: &Path,
+        wm: &AppliedWatermark,
+        now: Instant,
+        start: SettleBatchStart,
+        names: Option<&[&OsStr]>,
+    ) -> u64 {
         let settling_dir = wal_dir.join(SETTLING_SUBDIR);
         if !self.settled_any && !self.held {
             // K2 (2026-10-26): a `settling/` that cannot be listed may hold an
@@ -256,7 +284,11 @@ impl SettleState {
                 Err(_) => self.hold(0, "settling_unlistable"),
             }
         }
-        let staged = wal_segments_in(&wal_dir.join(REPLAYING_SUBDIR));
+        let mut staged = wal_segments_in(&wal_dir.join(REPLAYING_SUBDIR));
+        if let Some(names) = names {
+            // O(1) EXEMPT: cold settle step, staged × names (one round's segments)
+            staged.retain(|seg| seg.file_name().is_some_and(|n| names.contains(&n)));
+        }
         let moved = rename_all(&staged, &settling_dir, "replay_settle_rename");
         self.settled_any = true;
         self.dir = Some(wal_dir.to_path_buf());
@@ -520,6 +552,33 @@ pub fn settle_confirm_replayed<P: AsRef<Path>>(wal_dir: P, start: SettleBatchSta
     let _trimmed =
         crate::wal_unapplied_ranges::trim_to_waiting(applied_watermark(), wal_dir.as_ref());
     moved
+}
+
+/// [`settle_confirm_replayed`] for the named staged segments only (M2,
+/// 2026-10-26), WITHOUT the trim: a round settles segment by segment and
+/// trims once at its end ([`trim_after_round`]), since each trim reads every
+/// waiting segment's header.
+// TEST-EXEMPT: thin global wrapper; SettleState::settle_named is covered by the M2 lifetime test.
+pub fn settle_confirm_segments<P: AsRef<Path>>(
+    wal_dir: P,
+    names: &[&OsStr],
+    start: SettleBatchStart,
+) -> u64 {
+    state().settle_named(
+        wal_dir.as_ref(),
+        applied_watermark(),
+        Instant::now(),
+        start,
+        names,
+    )
+}
+
+/// The trim [`settle_confirm_replayed`] runs, once, after a round that
+/// settled segment by segment (M2).
+// TEST-EXEMPT: thin wrapper over wal_unapplied_ranges::trim_to_waiting, covered by its tests.
+pub fn trim_after_round<P: AsRef<Path>>(wal_dir: P) {
+    let _trimmed =
+        crate::wal_unapplied_ranges::trim_to_waiting(applied_watermark(), wal_dir.as_ref());
 }
 
 /// Called by the WAL-suspension watcher after each probe.
@@ -1012,5 +1071,174 @@ mod tests {
         );
         assert_eq!(names(&dir.join(SETTLING_SUBDIR)), 1);
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// Files in each place a segment can be, oldest first by name.
+    fn listed(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut out: Vec<_> = wal_segments_in(dir)
+            .iter()
+            .filter_map(|p| p.file_name().map(ToOwned::to_owned))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Segments still waiting: live, staged or settling (archive is done).
+    fn pinned(dir: &Path) -> usize {
+        names(dir) + names(&dir.join(REPLAYING_SUBDIR)) + names(&dir.join(SETTLING_SUBDIR))
+    }
+
+    /// A deterministic xorshift, so a failing seed can be pinned.
+    struct Rng(u64);
+    impl Rng {
+        fn chance(&mut self, pct: u64) -> bool {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % 100 < pct
+        }
+    }
+
+    /// One process lifetime, as production runs it (M2): recover what an
+    /// earlier process left settling, one budgeted replay pass, then each
+    /// segment in read order settles ONLY once its rows landed (a segment
+    /// whose rows do not land stops the round), then the watcher's promote.
+    /// Returns (segments whose rows landed, segments archived).
+    fn boot_once(
+        dir: &Path,
+        budget_bytes: usize,
+        frames_per_segment: usize,
+        rng: &mut Rng,
+        fail_pct: u64,
+        episode_pct: u64,
+    ) -> (Vec<std::ffi::OsString>, Vec<std::ffi::OsString>) {
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        st.recover(dir, &wm);
+        let waiting = {
+            let mut w = listed(dir);
+            w.extend(listed(&dir.join(REPLAYING_SUBDIR)));
+            w.sort();
+            w
+        };
+        let batch = crate::ws_frame_spill::replay_all_with_report_guarded(
+            dir,
+            budget_bytes,
+            || None,
+            None,
+            crate::ws_frame_spill::WAL_REPLAY_RSS_STOP_PCT,
+        )
+        .expect("replay");
+        // The new map: oldest waiting segments first, each ending where its
+        // frames end in the batch.
+        for (k, (name, end)) in batch.segment_ends.iter().enumerate() {
+            assert_eq!(
+                name.as_ref(),
+                waiting.get(k),
+                "segment {k} is the k-th oldest"
+            );
+            assert_eq!(
+                *end,
+                (k + 1) * frames_per_segment,
+                "segment {k} ends after its own frames"
+            );
+        }
+        assert_eq!(
+            batch.frames.len(),
+            batch.segment_ends.len() * frames_per_segment
+        );
+        let t0 = Instant::now();
+        let mut landed = Vec::new();
+        for (name, _) in &batch.segment_ends {
+            let Some(name) = name else { break };
+            if rng.chance(fail_pct) {
+                break; // its rows did not land: the round stops here
+            }
+            let start = SettleBatchStart::of(&wm);
+            st.settle_named(dir, &wm, t0, start, &[name.as_os_str()]);
+            landed.push(name.clone());
+        }
+        if rng.chance(episode_pct) {
+            wm.note_questdb_probe(false);
+        }
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        let before = listed(&dir.join(ARCHIVE_SUBDIR));
+        let _verdict = st.promote(&wm, lagged(t0));
+        let archived: Vec<_> = listed(&dir.join(ARCHIVE_SUBDIR))
+            .into_iter()
+            .filter(|n| !before.contains(n))
+            .collect();
+        (landed, archived)
+    }
+
+    /// M2 (2026-10-26) lifetime test. Live: 1,696 segments (225 GB) pinned
+    /// and flat while every boot re-read the same 5 and retired none. Across
+    /// N boots, with each segment settled only once its own rows land:
+    /// (1) healthy QuestDB: every boot retires a full replay budget and the
+    ///     pinned set reaches zero in ceil(S / B) boots;
+    /// (2) unhealthy (rows that do not land, suspicion episodes): nothing is
+    ///     ever archived unless its rows landed in that same process with no
+    ///     episode after them, no segment file is lost, and once QuestDB is
+    ///     healthy again the backlog still drains to zero.
+    #[test]
+    fn test_regression_m2_lifetime_backlog_shrinks_to_zero_and_never_retires_unlanded() {
+        const SEGMENTS: usize = 23;
+        const FRAMES: usize = 5;
+        const BUDGET_SEGMENTS: usize = 4;
+        // 32-byte frames: the pass stops after BUDGET_SEGMENTS segments.
+        let budget = BUDGET_SEGMENTS * FRAMES * 32;
+        for seed in 1..=12u64 {
+            let dir = tmp(&format!("m2-life-{seed}"));
+            for k in 0..SEGMENTS as u64 {
+                segment(&dir, k * 1_000, FRAMES as u64);
+            }
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let unhealthy_boots = if seed % 2 == 0 { 0 } else { 15 };
+            let mut boots = 0usize;
+            let mut archived_total = 0usize;
+            while pinned(&dir) > 0 {
+                boots += 1;
+                assert!(
+                    boots <= unhealthy_boots + SEGMENTS,
+                    "seed {seed}: the backlog never drained"
+                );
+                let healthy = boots > unhealthy_boots;
+                let pinned_before = pinned(&dir);
+                let (fail, episode) = if healthy { (0, 0) } else { (30, 30) };
+                let (landed, archived) = boot_once(&dir, budget, FRAMES, &mut rng, fail, episode);
+                // Completeness: only segments whose rows landed in this
+                // process are ever archived.
+                for n in &archived {
+                    assert!(
+                        landed.contains(n),
+                        "seed {seed}: {n:?} archived without landing"
+                    );
+                }
+                // No segment file is ever lost.
+                let everywhere = pinned(&dir)
+                    + names(&dir.join(SETTLING_SUBDIR).join(SETTLING_UNREADABLE_SUBDIR))
+                    + names(&dir.join(ARCHIVE_SUBDIR));
+                assert_eq!(
+                    everywhere, SEGMENTS,
+                    "seed {seed} boot {boots}: a segment vanished"
+                );
+                archived_total += archived.len();
+                if healthy {
+                    // Progress: a healthy boot retires a full budget.
+                    assert_eq!(
+                        archived.len(),
+                        BUDGET_SEGMENTS.min(pinned_before),
+                        "seed {seed} boot {boots}: a healthy boot must retire its whole pass"
+                    );
+                    assert_eq!(pinned(&dir), pinned_before - archived.len());
+                }
+            }
+            assert_eq!(archived_total, SEGMENTS, "seed {seed}");
+            if unhealthy_boots == 0 {
+                assert_eq!(boots, SEGMENTS.div_ceil(BUDGET_SEGMENTS), "seed {seed}");
+            }
+            drop(std::fs::remove_dir_all(&dir));
+        }
     }
 }

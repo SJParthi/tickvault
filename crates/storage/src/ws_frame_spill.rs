@@ -4490,6 +4490,8 @@ pub struct WalReplayBatch {
     /// Plan ITEM 47: `true` when the pass ended on a gap — frames dropped or
     /// lost after the last returned one.
     pub trailing_gap: bool,
+    /// M2: per segment READ, its file name and the `frames` index one past its last frame.
+    pub segment_ends: Vec<(Option<std::ffi::OsString>, usize)>,
 }
 
 /// Should THIS deferral page the operator?
@@ -4623,6 +4625,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     let mut skipped_frames = 0u64;
 
     let mut frames = Vec::new(); // APPROVED: boot-time WAL replay, cold path
+    let mut segment_ends = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut corrupted = 0usize;
     // Bytes of frame payload held so far, and how many segments were actually
     // read. Only the CONSUMED ones are staged below: a segment left as `*.wal`
@@ -4694,6 +4697,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                     real_gap = false;
                 }
                 frames.append(&mut batch);
+                segment_ends.push((path.file_name().map(ToOwned::to_owned), frames.len()));
                 // A walk that stopped on a bad record never returned the
                 // frames after it, and frames dropped as applied after the
                 // last returned one were never replayed: either way the next
@@ -4983,6 +4987,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         stopped_for_frame_cap: false,
         leading_gap: leading_gap.unwrap_or(real_gap),
         trailing_gap: real_gap,
+        segment_ends,
     })
 }
 
