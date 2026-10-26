@@ -89,6 +89,9 @@ mod catchup_stop;
 // walk and depth writers rather than a second copy of either.
 pub(crate) mod deferred_depth_pass;
 mod unbacked_depth;
+// Plan item J2 (2026-10-26): what the drain and its writer threads still
+// held at shutdown, counted rather than dropped silently.
+mod shutdown_residue;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -1542,6 +1545,12 @@ pub struct LiveIngest {
     /// tail batch for a box that never stops, which is the worse failure on a
     /// host whose auto-stop is a cost control.
     writer_done: Option<std::sync::mpsc::Receiver<()>>,
+    /// The tick writer and rescue threads' queues, shared so an abandoned
+    /// thread's batches are counted in ROWS (plan item J2).
+    writer_queue:
+        Option<shutdown_residue::OffloadQueue<tickvault_storage::tick_persistence::FlushBatch>>,
+    rescue_queue:
+        Option<shutdown_residue::OffloadQueue<tickvault_storage::tick_persistence::RescueBatch>>,
     /// Previous closes, one per instrument, fed from the response-code-6
     /// packets this drain used to decode and discard.
     ///
@@ -1845,6 +1854,8 @@ impl LiveIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             prev_close_disagreements: 0,
             // Resolved once here and seeded at zero, so the series exists
@@ -2066,7 +2077,7 @@ impl LiveIngest {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (sink_tx, sink_rx) = std::sync::mpsc::sync_channel::<(
             tickvault_storage::tick_persistence::TickWriterSink,
-            std::sync::mpsc::Receiver<tickvault_storage::tick_persistence::FlushBatch>,
+            shutdown_residue::OffloadQueue<tickvault_storage::tick_persistence::FlushBatch>,
         )>(1);
         let handle = std::thread::Builder::new()
             .name("tv-tick-writer".to_owned())
@@ -2074,14 +2085,14 @@ impl LiveIngest {
                 // Parks until the caller hands over. `Err` means the caller
                 // went away between the spawn and the hand-off, which is not a
                 // failure to report — there is simply nothing to write.
-                let Ok((mut sink, rx)) = sink_rx.recv() else {
+                let Ok((mut sink, queue)) = sink_rx.recv() else {
                     return;
                 };
                 // `recv` ends only when every sender is dropped, i.e. when the
                 // drain itself is gone. There is no other exit, deliberately:
                 // a writer that could stop on its own would leave the producer
                 // handing rows to a closed queue.
-                while let Ok(mut batch) = rx.recv() {
+                while let Some(mut batch) = queue.next() {
                     // `tv_task_busy_seconds{task="tick_writer"}` grows while a
                     // write is stuck on QuestDB; 0 while idle (2026-10-02).
                     tickvault_storage::hot_path_telemetry::busy_begin_at(
@@ -2089,6 +2100,8 @@ impl LiveIngest {
                         std::time::Instant::now(),
                     );
                     let landed = sink.write(&mut batch);
+                    // Landed or rescued: no longer the shutdown's to count.
+                    queue.finished();
                     tickvault_storage::hot_path_telemetry::busy_end_at(
                         tickvault_storage::hot_path_telemetry::HotTask::TickWriter,
                         std::time::Instant::now(),
@@ -2131,7 +2144,10 @@ impl LiveIngest {
         let (producer, sink, rx) = live.split_for_offload();
         self.writer = producer;
         self.writer_offloaded = true;
-        if sink_tx.send((sink, rx)).is_err() {
+        let queue =
+            shutdown_residue::OffloadQueue::new(rx, |b| (b.rows() as u64, b.has_unbacked_rows()));
+        self.writer_queue = Some(queue.clone());
+        if sink_tx.send((sink, queue)).is_err() {
             // Unreachable: the thread parks on this receive as its first act
             // and cannot have exited. Reported rather than ignored, because if
             // it ever happens the writer is split with no thread — the exact
@@ -2160,11 +2176,18 @@ impl LiveIngest {
         // several consecutive flushes, i.e. only when the disk is already
         // wedged. It ran on 2026-08-28 and rescued 308,818 rows.
         let (rescue_sink, rescue_rx) = self.writer.split_rescue_offload();
+        // `RescueBatch::rows` and `has_unbacked_rows` let an abandoned rescue
+        // thread be counted in rows (plan item J2).
+        let rescue_queue = shutdown_residue::OffloadQueue::new(rescue_rx, |b| {
+            (b.rows() as u64, b.has_unbacked_rows())
+        });
+        self.rescue_queue = Some(rescue_queue.clone());
         let rescue_handle = std::thread::Builder::new()
             .name("tv-tick-rescue".to_owned())
             .spawn(move || {
-                while let Ok(batch) = rescue_rx.recv() {
+                while let Some(batch) = rescue_queue.next() {
                     rescue_sink.rescue(&batch);
+                    rescue_queue.finished();
                 }
                 info!("tick rescue thread exiting — the drain closed its queue");
             })?;
@@ -2285,13 +2308,27 @@ impl LiveIngest {
         });
         if !finished {
             metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(1);
+            // Plan item J2: the counter above is one per EVENT. What the thread
+            // still held is counted in rows; its unbacked rows (no WAL record,
+            // so no replay) on `tv_ticks_lost_total{source="writer_abandoned"}`.
+            let residue = self.writer_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::WRITER_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 grace_secs = OFFLOAD_SHUTDOWN_GRACE.as_secs(),
+                batches,
+                rows,
+                unbacked_rows,
                 "the tick writer did not finish within the shutdown grace — the \
                  final batch of the session may not have reached QuestDB. Check \
                  the tick spill directory; the rows are re-ingestable if they \
-                 were rescued."
+                 were rescued. It still held {batches} batch(es) of {rows} row(s); \
+                 {unbacked_rows} had no WAL record and are counted lost, the rest \
+                 replay from the WAL (-1 = the queue could not be read)."
             );
             // Deliberately NOT joined after a timeout: joining here is exactly
             // the unbounded wait the grace exists to avoid. The thread is
@@ -2332,11 +2369,27 @@ impl LiveIngest {
                 "writer" => "tick"
             )
             .increment(1);
+            // Plan item J2: that counter is one per EVENT. The rows still held
+            // are counted here; the unbacked share is a real loss on
+            // `tv_ticks_lost_total{source="rescue_abandoned"}`, and a dropped
+            // batch keeps its watermark floor, so the backed share replays.
+            let residue = self.rescue_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::RESCUE_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                batches,
+                rows,
+                unbacked_rows,
                 "the tick RESCUE thread did not finish within the shutdown budget — a \
                  rescued payload may never have reached the spill file. Those rows were \
-                 counted as rescued and are not in QuestDB either."
+                 counted as rescued and are not in QuestDB either. It still held \
+                 {batches} batch(es) of {rows} row(s); {unbacked_rows} had no WAL record \
+                 and are counted lost, the rest replay from the WAL (-1 = the queue could \
+                 not be read)."
             );
             // Deliberately not joined after the deadline: that is the unbounded
             // wait the budget exists to avoid.
@@ -2348,10 +2401,21 @@ impl LiveIngest {
                 "writer" => "tick"
             )
             .increment(1);
+            // A dead thread wrote nothing still queued: counted in rows (J2).
+            let residue = self.rescue_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::RESCUE_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                batches,
+                rows,
+                unbacked_rows,
                 "the tick rescue thread PANICKED — a rescued payload may never have \
-                 reached the spill file."
+                 reached the spill file. It still held {batches} batch(es) of {rows} \
+                 row(s); {unbacked_rows} had no WAL record and are counted lost."
             );
         }
     }
@@ -4501,6 +4565,9 @@ fn seed_drain_loss_baselines() {
     // same operator action: check the spill directory before the next session.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(0);
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth").increment(0);
+    // Plan item J2: the row-level shutdown loss sources (ring residue, and the
+    // writer and rescue threads' abandoned rows), seeded with their siblings.
+    shutdown_residue::seed_shutdown_loss_baselines();
     // The third label, `writer="top_volume"` (2026-09-13), went with the
     // top-volume writer on 2026-10-22 (plan item 62, operator Quote 34).
     // Rescues written WITHOUT a free-space answer, because the free-space probe
@@ -6603,14 +6670,30 @@ async fn run_frame_drain(
     // invites the symmetric edit. Latch the arm shut instead of relying on
     // that.
     let mut seed_closed = false;
+    // Plan item J2 (2026-10-26): set by the shutdown arm. From then on the
+    // drain keeps folding queued frames until the ring is empty or the tail
+    // budget passes, instead of dropping the receiver with frames still in it.
+    let mut shutting_down = false;
+    // True when the loop ended because every socket sender was dropped,
+    // false when the shutdown signal ended it (the final line says which).
+    let mut ring_closed = false;
+    let ring_tail_deadline = tokio::time::sleep(std::time::Duration::ZERO);
+    tokio::pin!(ring_tail_deadline);
 
     loop {
         tokio::select! {
             // Biased so frames always win a tie: the flush timer firing while
             // frames are queued must not preempt draining them.
             biased;
+            // The ring tail's time limit, ABOVE the frame arm so a socket that
+            // keeps delivering cannot hold the shutdown past it. One bool test
+            // per poll until the shutdown arm sets it.
+            () = &mut ring_tail_deadline, if shutting_down => break,
             maybe_frame = rx.recv() => {
-                let Some(frame) = maybe_frame else { break };
+                let Some(frame) = maybe_frame else {
+                    ring_closed = true;
+                    break;
+                };
                 // The lane is UP the moment a frame actually arrives, and not
                 // one instant sooner (plan Item 7). Raised once per drain, from
                 // the only place in the process that has proof a socket both
@@ -6973,6 +7056,18 @@ async fn run_frame_drain(
                     publish_fold_depth(&ingest);
                 }
             }
+            // The ring tail is done once the frame arm finds the ring EMPTY.
+            // `consume_budget` and not a ready future: when the task's
+            // cooperative budget is spent, `recv` returns Pending with frames
+            // still queued, and so does this, so the select yields and the
+            // frame arm is polled first again with a fresh budget. Ready here
+            // therefore means `recv` saw an empty ring; `is_empty` re-checks
+            // for a frame that landed in between.
+            () = tokio::task::coop::consume_budget(), if shutting_down => {
+                if rx.is_empty() {
+                    break;
+                }
+            }
             // SHUTDOWN (added 2026-08-14). Deliberately placed BELOW the frame
             // arm in this `biased` select, and that ordering is load-bearing:
             // a shutdown signal must not preempt frames already sitting in the
@@ -7024,7 +7119,21 @@ async fn run_frame_drain(
                          persisted"
                     );
                 }
-                break;
+                // Plan item J2: an empty ring ends the loop now, as before. A
+                // ring still holding frames (a socket still open delivered
+                // during the seal and flush above) keeps folding for at most
+                // the tail budget; the two arms around the frame arm end it,
+                // and whatever is left is counted after the loop. A second
+                // signal does not extend it.
+                if rx.is_empty() {
+                    break;
+                }
+                if !shutting_down {
+                    shutting_down = true;
+                    ring_tail_deadline.as_mut().reset(
+                        tokio::time::Instant::now() + shutdown_residue::SHUTDOWN_RING_TAIL_BUDGET,
+                    );
+                }
             }
             // TIME trigger. Without it, the last rows of a thinly-traded
             // instrument sit unflushed below the size threshold waiting for a
@@ -7640,7 +7749,30 @@ async fn run_frame_drain(
         }
     }
 
+    // Plan item J2 (2026-10-26): count what the ring still holds rather than
+    // dropping it with the receiver. WAL-backed frames replay on the next
+    // boot; frames the WAL refused existed only here and are lost, counted and
+    // coded. Bounded by the ring's capacity, so a socket still delivering
+    // cannot hold the shutdown. The receiver is dropped right after, so a
+    // later frame meets a closed ring at its sender, which counts it
+    // (`ring_full`, and marks a backed one unapplied), instead of dying here.
+    let ring_residue = shutdown_residue::drain_ring_residue(
+        || rx.try_recv(),
+        FRAME_RING_CAPACITY,
+        |frame: &CapturedFrame| {
+            match frame.endpoint {
+                DhanEndpointType::MainFeed => main_feed_budget.release(frame.bytes.len()),
+                DhanEndpointType::Depth200 => depth200_budget.release(frame.bytes.len()),
+                _ => depth_budget.release(frame.bytes.len()),
+            }
+            frame.wal_backed
+        },
+    );
+    drop(rx);
+    shutdown_residue::report_ring_residue(ring_residue);
+
     // Every sender was dropped, so no socket is left.
+    // (Or the shutdown signal ended the loop: `ring_closed` says which.)
     //
     // ORDER MATTERS, and it is the reverse of the obvious one. Seal FIRST,
     // flush SECOND. A bucket closes only when a later tick crosses its
@@ -7737,8 +7869,23 @@ async fn run_frame_drain(
         // also the capacity signal for the seal writer.
         seals_rescued = ingest.seals_rescued(),
         seq_refused = ingest.seq_refused(),
-        "Dhan live-feed frame drain ended — every socket sender was dropped, so no further \
-         live ticks will be folded this session"
+        // Plan item J2: this line said "every socket sender was dropped" on
+        // both exits, which was false whenever the shutdown signal ended the
+        // loop. It now names the exit, and what the ring still held.
+        exit = if ring_closed {
+            "senders_dropped"
+        } else {
+            "shutdown_signal"
+        },
+        ring_left_deferred = ring_residue.backed,
+        ring_left_lost = ring_residue.unbacked,
+        "Dhan live-feed frame drain ended ({}) — no further live ticks will be folded \
+         this session",
+        if ring_closed {
+            "every socket sender was dropped"
+        } else {
+            "the shutdown signal stopped it"
+        }
     );
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
     // Returned so the fold is OBSERVABLE (2026-08-11). Previously this took
@@ -23994,6 +24141,68 @@ mod tests {
 
         // The sender is still alive until this line, proving the exit came
         // from the signal and not from the ring closing.
+        drop(tx);
+    }
+
+    /// Plan item J2: frames queued before the shutdown signal all reach the
+    /// fold, at a scale past tokio's per-task cooperative budget (128 polls),
+    /// with half of them unbacked (no WAL record).
+    ///
+    /// Honest scope: this PINS the behaviour and does not bite on the pre-J2
+    /// arm. Measured 2026-10-26 by forcing the shutdown arm to break
+    /// unconditionally: this test still passed, because the frame arm drained
+    /// all 300 before the shutdown arm won a poll. The case J2 actually closes
+    /// is frames arriving while that arm seals and flushes (a socket still
+    /// open past the socket-stop budget), which a single-task test cannot
+    /// time; the counting it relies on is tested in `shutdown_residue`.
+    #[tokio::test]
+    async fn test_shutdown_folds_every_frame_queued_before_the_signal() {
+        const QUEUED: u64 = 300;
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(512);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        for seq in 0..QUEUED {
+            tx.try_send(CapturedFrame {
+                seq: seq + 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
+                // Half the frames have no WAL record: those are the ones a
+                // dropped ring would have lost with no counter.
+                wal_backed: seq % 2 == 0,
+                bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
+                    13,
+                    23_146.45,
+                    todays_in_session_ltt(),
+                )),
+            })
+            .expect("the ring must accept the frame");
+        }
+        shutdown.notify_one();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_frame_drain(
+                rx,
+                ingest,
+                Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::clone(&shutdown),
+                Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
+            ),
+        )
+        .await
+        .expect("the drain must still end on the shutdown signal with a live sender");
+
+        assert_eq!(
+            outcome.frames_seen, QUEUED,
+            "every frame queued before the shutdown must reach the fold, not die in the ring"
+        );
         drop(tx);
     }
 
