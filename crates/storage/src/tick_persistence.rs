@@ -4078,6 +4078,25 @@ impl FlushBatch {
     pub const fn rows(&self) -> usize {
         self.rows
     }
+
+    /// `true` when some row has no WAL record behind it, so the batch cannot
+    /// be replayed if it is lost (plan item J2: the shutdown join counts such
+    /// rows as lost when it abandons the writer thread).
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+}
+
+impl RescueBatch {
+    /// `true` when some row has no WAL record behind it (plan item J2, the
+    /// rescue twin of [`FlushBatch::has_unbacked_rows`]).
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
 }
 
 /// What happened to a batch the producer tried to hand off.
