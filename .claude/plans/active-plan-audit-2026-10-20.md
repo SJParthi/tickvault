@@ -832,6 +832,16 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   - Files: crates/app/src/tick_conservation.rs (new), crates/app/src/main.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/ws_frame_spill.rs
   - Tests: verdict unit tests (match, mismatch, unverified), DDL carries DEDUP with feed, boot gap row only inside the window
 
+- [ ] K5 (storage, app) Real p99 per hot-path stage (audit J7, owner "Always
+  achieve O(1) even with p99 everywhere"): from the existing fixed atomic stage
+  histograms, compute p50/p99/p99.9 once a second on the `tv-telemetry` thread
+  (O(stages x buckets), never on the frame path), publish
+  `tv_hot_path_stage_p99_ns{stage}` (and p50, p999) on local `/metrics` only,
+  and log one coded `warn!` per episode when a stage's p99 passes its budget;
+  plus a Criterion bench reading p99 from samples for the drain stage.
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
+  - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
