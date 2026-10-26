@@ -832,7 +832,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   - Files: crates/app/src/tick_conservation.rs (new), crates/app/src/main.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/ws_frame_spill.rs
   - Tests: verdict unit tests (match, mismatch, unverified), DDL carries DEDUP with feed, boot gap row only inside the window
 
-- [ ] K5 (storage, app) Real p99 per hot-path stage (audit J7, owner "Always
+- [x] K5 (storage, app) Real p99 per hot-path stage (audit J7, owner "Always
   achieve O(1) even with p99 everywhere"): from the existing fixed atomic stage
   histograms, compute p50/p99/p99.9 once a second on the `tv-telemetry` thread
   (O(stages x buckets), never on the frame path), publish
@@ -841,6 +841,20 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   plus a Criterion bench reading p99 from samples for the drain stage.
   - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
   - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
+
+- [ ] K6 (app, storage, quality) Drain p99 tail (owner, 2026-10-26: "Always
+  achieve O(1) even with p99 everywhere"). K5 measured the main-feed drain
+  bench at p50 0.9 us/tick, p99 3.2 us/tick (budget 2.5), p99.9 14.5 us/tick,
+  max 0.48 ms on this container. Find where the tail comes from (profile the
+  bench; Assumed lead: a writer row buffer growing inside a timed frame) and
+  remove it at its source (pre-size or move off the timed path), keeping
+  per-tick O(1) and zero allocation (DHAT gates stay green). Add one
+  hot-path stage for the drain's per-frame work (decode + fold + append),
+  recorded with `record_stage_nanos` (O(1), no allocation) so the live p99
+  covers it; a p99 over budget fails the bench run as well as a median
+  (checked in Rust; shell lines do not grow, rust-only lock).
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/storage/src/hot_path_telemetry.rs, crates/storage/src/tick_persistence.rs, crates/app/benches/feed_drain.rs, quality/benchmark-budgets.toml
+  - Tests: DHAT on the drain unchanged with the new stage; stage recorded once per frame; the p99 check fails on a synthetic over-budget sample (self-test); before/after p99 numbers in the PR body
 
 ### PR L — 2026-10-26 wave-3 audit fixes (core socket, storage seal chain, trading fold, app lane, aws-lambdas, workflows, terraform)
 
