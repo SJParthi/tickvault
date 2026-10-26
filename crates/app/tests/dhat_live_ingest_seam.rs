@@ -40,6 +40,9 @@
 //! bytes -- which would have hidden comfortably inside a byte budget.
 //!
 //! So: **<= 256 blocks across 10,000 folds**, against a measured **11**.
+//! *(2026-10-26, plan item K6: the tick row buffer is now reserved at 2 MiB
+//! before the measured region, so the measured figure is **0 blocks / 0 bytes**;
+//! the 11 were its doublings. The budget is unchanged.)*
 //!
 //! **CORRECTED 2026-08-22, twice over.** This paragraph read "<= 512 blocks
 //! ... ~20x headroom over today's 276" while the constant below said 7_000 --

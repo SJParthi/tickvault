@@ -205,6 +205,9 @@ pub mod depth_switch;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
 /// up after the close until the day's data is in the database.
 pub mod drain_hold;
+/// The p99 tail check the main-feed drain bench runs after Criterion's
+/// median check (plan item K6, 2026-10-26).
+pub mod drain_tail_gate;
 /// `tickvault ensure-questdb`: bring the QuestDB container up (boot self-heal
 /// and the console's restart actions; audit D6d, replaced
 /// `scripts/ensure-questdb.sh`).

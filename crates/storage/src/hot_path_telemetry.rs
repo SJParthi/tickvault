@@ -31,7 +31,7 @@
 //! line, which CloudWatch turns into a Telegram page. The signal re-arms when
 //! it clears; at most one line per [`STALL_LINE_MIN_INTERVAL`], and episodes
 //! that start and end inside that wait are counted into the next line. The
-//! 100 µs / 100 ms / 10 ms stall budgets above stay dashboard-only: they
+//! 100 µs / 100 ms / 10 ms / 1 ms stall budgets above stay dashboard-only: they
 //! count small stalls, which would page all day.
 //!
 //! # Why a hand-rolled histogram and not `metrics::histogram!`
@@ -63,7 +63,7 @@
 //! |---|---|
 //! | [`record_stage_nanos`] | O(1): one `leading_zeros`, four relaxed atomics |
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
-//! | [`publish_once`] | O(stages × buckets + tasks) = O(4 × 28 + 6), once a second, on its own thread; the percentile window adds O(4 × 28) more and keeps the previous read in fixed arrays (no allocation) |
+//! | [`publish_once`] | O(stages × buckets + tasks) = O(5 × 28 + 6), once a second, on its own thread; the percentile window adds O(5 × 28) more and keeps the previous read in fixed arrays (no allocation) |
 //! | [`stage_quantiles`] | O(buckets) = O(28), on the publisher thread only, never on the frame path |
 
 use std::sync::OnceLock;
@@ -99,14 +99,19 @@ pub enum Stage {
     MainRuntimeLag = 2,
     /// How late a 100 ms sleep on the socket READER runtime woke.
     ReaderRuntimeLag = 3,
+    /// The drain's work on ONE main-feed frame: decode every packet, fold
+    /// it into the candles and append its row (plan item K6, 2026-10-26).
+    /// Recorded once per main-feed frame; depth frames are not timed here.
+    DrainMainFrame = 4,
 }
 
 /// Every stage, in index order.
-pub const ALL_STAGES: [Stage; 4] = [
+pub const ALL_STAGES: [Stage; 5] = [
     Stage::SocketToWal,
     Stage::RingDwell,
     Stage::MainRuntimeLag,
     Stage::ReaderRuntimeLag,
+    Stage::DrainMainFrame,
 ];
 
 const STAGE_COUNT: usize = ALL_STAGES.len();
@@ -120,6 +125,7 @@ impl Stage {
             Self::RingDwell => "ring_dwell",
             Self::MainRuntimeLag => "main_runtime_lag",
             Self::ReaderRuntimeLag => "reader_runtime_lag",
+            Self::DrainMainFrame => "drain_main_frame",
         }
     }
 
@@ -130,12 +136,18 @@ impl Stage {
     /// * ring dwell 100 ms: a frame waited a tenth of a second for the drain.
     /// * runtime lag 10 ms: a runtime that could not run a ready task for
     ///   10 ms could not poll a socket for 10 ms either.
+    /// * main-feed frame 1 ms: about 1,100 packets of work at the measured
+    ///   0.9 µs per packet; a frame that holds the drain this long delays
+    ///   every frame queued behind it. A frame stacks at most
+    ///   `MAX_PACKETS_PER_FRAME` packets, so a very large frame can pass this
+    ///   honestly; the stall page (2 s) is far above either.
     #[must_use]
     pub const fn stall_budget_nanos(self) -> u64 {
         match self {
             Self::SocketToWal => 100_000,
             Self::RingDwell => 100_000_000,
             Self::MainRuntimeLag | Self::ReaderRuntimeLag => 10_000_000,
+            Self::DrainMainFrame => 1_000_000,
         }
     }
 }
@@ -1095,6 +1107,29 @@ mod tests {
             "150 µs is over the 100 µs reader budget, 1 µs is not"
         );
         assert_eq!(after.buckets[0] - before.buckets[0], 1);
+    }
+
+    #[test]
+    fn test_drain_main_frame_stage_label_budget_and_index() {
+        // K6 (2026-10-26). `DrainMainFrame` is recorded only by the app
+        // crate's drain, never inside this test binary, so the deltas are
+        // exact.
+        assert_eq!(Stage::DrainMainFrame.as_str(), "drain_main_frame");
+        assert_eq!(Stage::DrainMainFrame.stall_budget_nanos(), 1_000_000);
+        for (i, stage) in ALL_STAGES.iter().enumerate() {
+            assert_eq!(*stage as usize, i, "ALL_STAGES must be in index order");
+        }
+        assert!(ALL_STAGES.contains(&Stage::DrainMainFrame));
+        let before = stage_snapshot(Stage::DrainMainFrame);
+        record_stage_nanos(Stage::DrainMainFrame, 1_000_000);
+        record_stage_nanos(Stage::DrainMainFrame, 1_000_001);
+        let after = stage_snapshot(Stage::DrainMainFrame);
+        assert_eq!(after.count - before.count, 2);
+        assert_eq!(
+            after.over_budget - before.over_budget,
+            1,
+            "exactly the budget is not a stall, one nanosecond over is"
+        );
     }
 
     #[test]
