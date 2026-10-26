@@ -202,8 +202,13 @@ async fn run_order_update_events_consumer(
     order_slot: SharedReceiverSlot<OrderUpdateEventRecord>,
     position_slot: SharedReceiverSlot<PositionUpdateEventRecord>,
 ) {
-    ensure_order_update_events_table(&questdb).await;
-    ensure_position_update_events_table(&questdb).await;
+    // Audit J3 (2026-10-26): a refusal starts the background re-run. Both
+    // ensures always run.
+    let order_keyed = ensure_order_update_events_table(&questdb).await;
+    let position_keyed = ensure_position_update_events_table(&questdb).await;
+    if !(order_keyed && position_keyed) {
+        crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&questdb);
+    }
 
     let mut order_guard = ReceiverGuard::take(&order_slot);
     let mut position_guard = ReceiverGuard::take(&position_slot);

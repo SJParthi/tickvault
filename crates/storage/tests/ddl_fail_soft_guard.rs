@@ -78,9 +78,11 @@ async fn ensure_index_constituency_table_degrades_on_unreachable_questdb() {
 async fn ensure_instrument_lifecycle_tables_degrade_on_unreachable_questdb() {
     let cfg = unreachable_questdb();
     let started = Instant::now();
-    tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(&cfg)
-        .await;
-    tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_audit_table(
+    let _ = tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(
+        &cfg,
+    )
+    .await;
+    let _ = tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_audit_table(
         &cfg,
     )
     .await;

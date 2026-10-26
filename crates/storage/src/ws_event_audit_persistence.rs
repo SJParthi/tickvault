@@ -140,8 +140,13 @@ pub fn ws_event_audit_subscription_alter_ddls() -> Vec<String> {
 /// Create the audit table if absent (idempotent, schema-self-heal pattern).
 /// Failures log at `error!` (Telegram-routable) but do NOT block boot — the WS
 /// events still reach CloudWatch logs + Telegram.
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via ws_event_audit_create_ddl tests)
-pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -157,7 +162,7 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
                 ?err,
                 "ws_event_audit: HTTP client build failed — table not ensured"
             );
-            return;
+            return false;
         }
     };
     let ddl = ws_event_audit_create_ddl();
@@ -245,26 +250,31 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
     let dedup_reenable_ddl = format!(
         "ALTER TABLE {WS_EVENT_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_WS_EVENT_AUDIT})"
     );
-    match client
+    let keyed = match client
         .get(&base_url)
         .query(&[("query", dedup_reenable_ddl.as_str())])
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) if resp.status().is_success() => true,
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: DEDUP ENABLE UPSERT KEYS returned non-2xx");
+            false
         }
-        Err(err) => error!(
-            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-            ?err,
-            "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
-        ),
-    }
+        Err(err) => {
+            error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ?err,
+                "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
+            );
+            false
+        }
+    };
+    keyed
 }
 
 /// Lazy-connect ILP writer for the `ws_event_audit` table. Mirrors

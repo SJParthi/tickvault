@@ -341,6 +341,25 @@ pub enum DdlTables {
     /// `ticks`, `market_depth` and `feed_aux_packets`
     /// ([`run_live_table_ddl_at_boot`]'s ensures).
     Live,
+    /// The order-side and socket audit tables: `order_audit`, `pnl_audit`,
+    /// `order_update_events`, `position_update_events`, `order_leg_pnl` and
+    /// `ws_event_audit`.
+    ///
+    /// Audit J3 (2026-10-26). Each consumer ensured its tables ONCE at start
+    /// and never again, so a DDL QuestDB refused at boot (still replaying its
+    /// WAL, say) left the session writing into tables ILP auto-created with no
+    /// DEDUP key. A consumer whose ensure is refused now starts this re-run
+    /// ([`spawn_audit_ensure_until_keyed_once`]); the spill drains for the
+    /// three spilled tables also refuse to replay until their table is keyed.
+    /// **Honest limit:** a live row written in the gap before the re-run lands
+    /// can still auto-create its table without the key (the gap is small in
+    /// practice: these consumers start at boot and order-side rows arrive
+    /// later, but it is not closed). Whether the re-run's `DEDUP ENABLE` then
+    /// keys such a table depends on the schema ILP gave it, which is Unknown
+    /// here (no QuestDB was reachable to check); until it does, the re-run
+    /// keeps retrying on the doubling delay and each refusal logs its coded
+    /// error. The first re-run is 30 s after the refusal.
+    AuditTables,
 }
 
 async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool {
@@ -362,7 +381,55 @@ async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool 
                 tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
             ticks_ok && depth_ok && feed_aux_ok
         }
+        DdlTables::AuditTables => {
+            use tickvault_storage::{
+                order_audit_persistence, order_leg_pnl_persistence,
+                order_update_events_persistence, pnl_audit_persistence,
+                position_update_events_persistence, ws_event_audit_persistence,
+            };
+            // Every ensure runs on every attempt (no short-circuit), so one
+            // refused table never stops the others from being keyed.
+            let results = [
+                order_audit_persistence::ensure_order_audit_table(questdb).await,
+                pnl_audit_persistence::ensure_pnl_audit_table(questdb).await,
+                order_update_events_persistence::ensure_order_update_events_table(questdb).await,
+                position_update_events_persistence::ensure_position_update_events_table(questdb)
+                    .await,
+                order_leg_pnl_persistence::ensure_order_leg_pnl_table(questdb).await,
+                ws_event_audit_persistence::ensure_ws_event_audit_table(questdb).await,
+            ];
+            results.iter().all(|keyed| *keyed)
+        }
     }
+}
+
+/// Set once the [`DdlTables::AuditTables`] re-run has been started in this
+/// process, so several consumers refused at the same boot start ONE re-run.
+static AUDIT_ENSURE_RETRY_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the [`DdlTables::AuditTables`] background re-run unless one already
+/// runs in this process. Returns `true` when this call started it.
+///
+/// Called by an audit consumer whose own ensure returned `false` (audit J3,
+/// 2026-10-26). O(1): one atomic swap, then at most one spawn per process.
+pub fn spawn_audit_ensure_until_keyed_once(questdb: &QuestDbConfig) -> bool {
+    if AUDIT_ENSURE_RETRY_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    error!(
+        code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        source = "audit_ddl_not_keyed",
+        first_retry_in_secs = DDL_BACKGROUND_RETRY_FIRST_SECS,
+        "audit table DDL refused at consumer start — QuestDB did not confirm the DEDUP key, so a \
+         row written now may auto-create its table without it. Re-running the audit-table DDL in \
+         the background until every table is keyed; the spilled audit tables replay only after."
+    );
+    drop(spawn_ensure_until_keyed(
+        questdb.clone(),
+        DdlTables::AuditTables,
+    ));
+    true
 }
 
 /// Re-runs the ensure for `tables` until every statement is accepted, waiting
@@ -579,6 +646,59 @@ mod tests {
             ensure_until_keyed(&questdb, DdlTables::CandlesWithSkippedSweep, quick, quick).await,
             1
         );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::AuditTables, quick, quick).await,
+            1
+        );
+    }
+
+    /// Audit J3 (2026-10-26): a refused audit ensure must not read as keyed,
+    /// so the re-run keeps going against a database that refuses.
+    #[tokio::test]
+    async fn audit_tables_ensure_reads_not_keyed_when_unreachable() {
+        assert!(!ensure_tables_once(&unreachable_questdb(), DdlTables::AuditTables).await);
+    }
+
+    /// Several consumers refused at one boot start ONE re-run: every call
+    /// after the first returns `false` and spawns nothing.
+    #[tokio::test]
+    async fn the_audit_re_run_starts_once_per_process() {
+        let questdb = unreachable_questdb();
+        let _ = spawn_audit_ensure_until_keyed_once(&questdb);
+        assert!(!spawn_audit_ensure_until_keyed_once(&questdb));
+        assert!(!spawn_audit_ensure_until_keyed_once(&questdb));
+    }
+
+    /// Every audit consumer starts the re-run when its own ensure is refused.
+    /// A source pin, because the refusal needs a QuestDB that refuses at the
+    /// one moment the consumer starts.
+    #[test]
+    fn every_audit_consumer_starts_the_re_run_on_a_refused_ensure() {
+        for (file, src) in [
+            (
+                "order_observability.rs",
+                include_str!("order_observability.rs"),
+            ),
+            (
+                "dhan_order_push_observability.rs",
+                include_str!("dhan_order_push_observability.rs"),
+            ),
+            (
+                "order_leg_pnl_boot.rs",
+                include_str!("order_leg_pnl_boot.rs"),
+            ),
+            (
+                "order_update_events_boot.rs",
+                include_str!("order_update_events_boot.rs"),
+            ),
+            ("ws_audit_consumer.rs", include_str!("ws_audit_consumer.rs")),
+        ] {
+            let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+            assert!(
+                prod.contains("candle_ddl_boot::spawn_audit_ensure_until_keyed_once("),
+                "{file} must start the audit DDL re-run when its ensure is refused"
+            );
+        }
     }
 
     /// The spawned form runs the same loop to completion on its own task.

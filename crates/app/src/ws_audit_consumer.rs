@@ -679,7 +679,10 @@ async fn run_ws_event_audit_consumer(
         WsEventAuditWriter, ensure_ws_event_audit_table,
     };
 
-    ensure_ws_event_audit_table(&questdb_cfg).await;
+    // Audit J3 (2026-10-26): a refused ensure starts the background re-run.
+    if !ensure_ws_event_audit_table(&questdb_cfg).await {
+        crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&questdb_cfg);
+    }
     let mut writer = WsEventAuditWriter::new(&questdb_cfg);
     while let Some(row) = rx.recv().await {
         if let Err(err) = writer.append_row(&row) {

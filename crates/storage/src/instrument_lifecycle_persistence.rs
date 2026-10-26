@@ -419,8 +419,16 @@ pub struct InstrumentLifecycleRow<'a> {
 /// one partition — harmless, and WAL + DEDUP work correctly, which is what lets
 /// the bulk writer ingest via ILP (port 9009). DDL itself goes over `/exec`
 /// (a single small statement, no URL-size issue).
+///
+/// **Returns whether the table is KEYED** (added 2026-10-26, audit J3): `true`
+/// only when the closing `DEDUP ENABLE UPSERT KEYS(...)` step answered 2xx.
+/// A 2xx CREATE alone is not enough: `CREATE TABLE IF NOT EXISTS` succeeds on
+/// a table ILP already auto-created without a DEDUP key. The only production
+/// writer holds its write back on `false`, because a write into an unkeyed
+/// table appends a second copy of every instrument on every daily run.
 // TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
-pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
+#[must_use = "a refused ensure leaves the table without its DEDUP key: hold the write back"]
+pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -446,7 +454,7 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
                 "site" => "lifecycle_ensure"
             )
             .increment(1);
-            return;
+            return false;
         }
     };
 
@@ -523,7 +531,7 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
         QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
         DEDUP_KEY_INSTRUMENT_LIFECYCLE,
     )
-    .await;
+    .await
 }
 
 /// Run the additive, idempotent feed-in-key migration on one lifecycle table:
@@ -531,6 +539,9 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
 /// WHERE feed IS NULL` → `DEDUP ENABLE UPSERT KEYS(<key incl feed>)`. Each
 /// step logs (does not return Err) so a transient hiccup matches the CREATE
 /// DDL's error handling; never drops the table (SEBI retention).
+///
+/// Returns `true` only when the LAST step (the `DEDUP ENABLE`) answered 2xx,
+/// i.e. the table now carries its key whatever created it.
 // TEST-EXEMPT: live-QuestDB DDL runner; the DDL strings are pinned by the
 // feed-in-key ratchet tests + the dedup_segment_meta_guard.
 async fn run_lifecycle_feed_self_heal(
@@ -538,20 +549,26 @@ async fn run_lifecycle_feed_self_heal(
     base_url: &str,
     table: &str,
     dedup_key: &str,
-) {
+) -> bool {
     let steps = [
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;"),
         format!("UPDATE {table} SET feed = '{LIFECYCLE_FEED_DHAN}' WHERE feed IS NULL;"),
         format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({dedup_key});"),
     ];
-    for ddl in &steps {
+    let mut keyed = false;
+    for (step, ddl) in steps.iter().enumerate() {
+        let is_dedup_step = step + 1 == steps.len();
         match client
             .get(base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => {
+                if is_dedup_step {
+                    keyed = true;
+                }
+            }
             Ok(resp) => {
                 warn!(table, status = %resp.status(), ddl = ddl.as_str(), "feed self-heal non-2xx");
             }
@@ -567,6 +584,7 @@ async fn run_lifecycle_feed_self_heal(
             }
         }
     }
+    keyed
 }
 
 /// Coerce a non-finite f64 (NaN / ±inf) to `0.0` before SQL formatting.
@@ -871,7 +889,8 @@ pub struct InstrumentLifecycleAuditRow<'a> {
 /// partitions by day normally (enabling the `partition_manager`
 /// S3-archive-by-date lifecycle for the 5-year SEBI chain).
 // TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
-pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbConfig) {
+#[must_use = "a refused ensure leaves the table without its DEDUP key: hold the write back"]
+pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -897,7 +916,7 @@ pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbCon
                 "site" => "lifecycle_audit_ensure"
             )
             .increment(1);
-            return;
+            return false;
         }
     };
 
@@ -961,7 +980,7 @@ pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbCon
         QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT,
         DEDUP_KEY_INSTRUMENT_LIFECYCLE_AUDIT,
     )
-    .await;
+    .await
 }
 
 /// Formats one audit row as a QuestDB `VALUES (...)` tuple in schema order.
@@ -1941,9 +1960,27 @@ mod tests {
         let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
         let cfg = p2c_cfg(port, 1);
         // Both DDL walks (CREATE + self-heal ALTERs + DEDUP) complete
-        // without panic against a 200-everything QuestDB.
-        ensure_instrument_lifecycle_table(&cfg).await;
-        ensure_instrument_lifecycle_audit_table(&cfg).await;
+        // without panic against a 200-everything QuestDB, and report keyed.
+        assert!(ensure_instrument_lifecycle_table(&cfg).await);
+        assert!(ensure_instrument_lifecycle_audit_table(&cfg).await);
+    }
+
+    // Audit J3 (2026-10-26): a refused DEDUP ENABLE must read as NOT keyed,
+    // so the daily writer holds its rows back instead of appending to an
+    // auto-created table with no key.
+    #[tokio::test]
+    async fn test_ensure_lifecycle_tables_report_not_keyed_on_500() {
+        let port = p2c_spawn_mock_http(P2C_HTTP_500).await;
+        let cfg = p2c_cfg(port, 1);
+        assert!(!ensure_instrument_lifecycle_table(&cfg).await);
+        assert!(!ensure_instrument_lifecycle_audit_table(&cfg).await);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_lifecycle_tables_report_not_keyed_when_unreachable() {
+        let cfg = cfg_unreachable();
+        assert!(!ensure_instrument_lifecycle_table(&cfg).await);
+        assert!(!ensure_instrument_lifecycle_audit_table(&cfg).await);
     }
 
     #[tokio::test]
