@@ -760,6 +760,30 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   now + 24 h.
   - Files: crates/core/src/auth/types.rs
   - Tests: test_parse_expiry_time_documented_millisecond_string_is_parsed_exactly
+- [ ] J8 (aws-lambdas, terraform) Capture the NSE Muhurat session on its date
+  (owner, 2026-10-26: "yes capture muhurat"; 2026: Sunday 2026-11-08). The box
+  runs Mon-Fri only, so on a weekend Muhurat nothing starts it and the hourly
+  curfew and hard-stop guard would stop a manual start. New pure module
+  `muhurat_window` (box up from session start - 60 min to session end + 60
+  min); terraform `var.muhurat_sessions` (dates must equal
+  `[[trading.muhurat_trading_dates]]`, times "HH:MM" IST, EMPTY until the owner
+  fills them from NSE's circular) rendered to `MUHURAT_SESSIONS` on the start
+  watchdog and the hard-stop guard; one DATED EventBridge rule per date
+  (`cron(0/15 0-18 D M ? YYYY)`, never a weekly weekend cron) running the new
+  `muhurat_check` mode: start the box inside the window (budget-stop latch and
+  holiday marker honoured, one page on a failed first attempt), stop the box it
+  started after the window (keep-alive and drain hold honoured), and with empty
+  or unreadable times log `LAMBDA-CONFIG-01` and never start (fail closed). The
+  curfew and the hard-stop guard treat the window as in-hours (the guard still
+  runs its in-window budget check). Budget kill line unchanged.
+  - Files: crates/aws-lambdas/src/muhurat_window.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/aws-lambdas/src/hard_stop_guard.rs, crates/aws-lambdas/src/lib.rs, crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs, crates/aws-lambdas/tests/drain_hold_wiring_guard.rs, deploy/aws/terraform/variables.tf, deploy/aws/terraform/start-watchdog-lambda.tf, deploy/aws/terraform/budget-guards.tf
+  - Tests: muhurat_window::tests (14), start_watchdog test_muhurat_check_* (8) + test_muhurat_after_window_should_stop_table + test_curfew_never_stops_the_box_inside_a_muhurat_window, hard_stop_guard test_muhurat_window_is_in_window_and_never_schedule_stops + test_muhurat_timing_unset_keeps_the_out_of_window_stop, muhurat_window_wiring_guard (5)
+  - Not in J8 (Risk, follow-ups): the candle fold accepts 09:15-15:40 only, so an
+    EVENING session gets ticks and depth rows but no candles (an afternoon
+    session inside that range is folded); the post-merge and catch-up deploys
+    can restart the app on a weekend (deploy-aws.yml blocks Mon-Fri 09:00-15:45
+    only), so no merge should land during the session; the data-silence redial
+    stays off on a non-trading day unless 3+ sockets are streaming.
 
 ### PR K — 2026-10-26 wave-2 audit fixes (storage spill + WAL, app drain hold, core silence spacing)
 

@@ -247,3 +247,41 @@ variable "dhan_depth_account_enabled" {
   type        = bool
   default     = false
 }
+
+variable "muhurat_sessions" {
+  # Plan item J8 (owner 2026-10-26: "yes capture muhurat"). One entry per NSE
+  # Muhurat trading date. Every date must also be a
+  # [[trading.muhurat_trading_dates]] entry in config/base.toml (pinned by
+  # crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs). For each date a
+  # dated EventBridge rule (start-watchdog-lambda.tf) runs the start watchdog's
+  # muhurat_check every 15 minutes that day: the box starts 60 minutes before
+  # session_start_ist and stops 60 minutes after session_end_ist
+  # (crates/aws-lambdas/src/muhurat_window.rs).
+  #
+  # TODO (2026-10-26, owner): fill session_start_ist / session_end_ist
+  # ("HH:MM", IST) for 2026-11-08 from NSE's Muhurat trading circular before
+  # Sunday 2026-11-08, then apply terraform. While they are empty the start
+  # watchdog logs a coded config error and does NOT start the box (fail closed).
+  # Use the FIRST NSE window you want captured (the pre-open or block-deal
+  # order entry, not only the normal market) as session_start_ist.
+  description = "NSE Muhurat trading sessions (IST). Empty times = timing not yet published by NSE: the box is not started."
+  type = list(object({
+    date              = string
+    session_start_ist = string
+    session_end_ist   = string
+  }))
+  default = [
+    { date = "2026-11-08", session_start_ist = "", session_end_ist = "" },
+  ]
+
+  validation {
+    condition = alltrue([
+      for s in var.muhurat_sessions :
+      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", s.date))
+      && (s.session_start_ist == "" || can(regex("^[0-2][0-9]:[0-5][0-9]$", s.session_start_ist)))
+      && (s.session_end_ist == "" || can(regex("^[0-2][0-9]:[0-5][0-9]$", s.session_end_ist)))
+      && ((s.session_start_ist == "") == (s.session_end_ist == ""))
+    ])
+    error_message = "muhurat_sessions: date must be YYYY-MM-DD, times HH:MM (IST), and the two times are either both set or both empty."
+  }
+}
