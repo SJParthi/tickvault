@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use tickvault_app::dhan_feed_stack::{
-    DepthIngest, LiveIngest, counters, drain_depth_frame, drain_main_feed_frame,
+    DepthIngest, DrainCounters, LiveIngest, counters, drain_depth_frame, drain_main_feed_frame,
 };
 use tickvault_common::constants::{DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID};
 use tickvault_common::feed::Feed;
@@ -169,6 +169,62 @@ fn run_timed<I>(
     total
 }
 
+/// How many per-frame samples the percentile report below collects. One
+/// ingest drains the frame pool repeatedly; the pool is rebuilt with the
+/// ingest, as `run_timed` does, so the samples are all steady-state drains.
+const PERCENTILE_SAMPLES: usize = 64 * FRAME_POOL as usize;
+
+/// Prints the main-feed drain's p50 / p99 / p99.9 per frame (plan item K5,
+/// 2026-10-26).
+///
+/// Criterion's own budget check reads the MEDIAN of its sample means, which
+/// says nothing about the tail: a drain that is 2 µs almost always and
+/// 2 ms once in a hundred frames passes it. This reads the tail directly —
+/// one `Instant` pair per frame, into a `Vec` sized before the loop, sorted
+/// after it, so nothing allocates between the two clock reads.
+///
+/// **What it is not:** the clock pair costs tens of nanoseconds per frame
+/// and is inside each sample, so these figures read slightly high; and this
+/// is a synthetic frame pool on the bench host, not the live lane. The live
+/// tail is `tv_hot_path_stage_p99_ns{stage}` on the box.
+fn report_main_feed_drain_percentiles(
+    frames: &[CapturedFrame],
+    drain_counters: &'static DrainCounters,
+) {
+    let mut samples: Vec<u64> = Vec::with_capacity(PERCENTILE_SAMPLES);
+    let mut i = 0u64;
+    while samples.len() < PERCENTILE_SAMPLES {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        for frame in frames {
+            let start = Instant::now();
+            black_box(drain_main_feed_frame(
+                &mut ingest,
+                black_box(frame),
+                SESSION_RECEIPT_NANOS,
+                1_000 + i,
+                drain_counters,
+            ));
+            samples.push(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            i += 1;
+        }
+    }
+    samples.sort_unstable();
+    let at = |num: usize, den: usize| -> u64 {
+        let rank = (samples.len() * num).div_ceil(den).clamp(1, samples.len());
+        samples[rank - 1]
+    };
+    println!(
+        "feed_drain/main_feed_frame_4_quotes percentiles over {} frames: \
+         p50 = {} ns, p99 = {} ns, p99.9 = {} ns, max = {} ns (per FRAME, 4 ticks each; \
+         includes one Instant pair per frame)",
+        samples.len(),
+        at(1, 2),
+        at(99, 100),
+        at(999, 1_000),
+        samples[samples.len() - 1],
+    );
+}
+
 fn bench_feed_drain(c: &mut Criterion) {
     let drain_counters = counters();
 
@@ -191,6 +247,8 @@ fn bench_feed_drain(c: &mut Criterion) {
             )
         });
     });
+
+    report_main_feed_drain_percentiles(&main_frames, drain_counters);
 
     let depth20_frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(depth20_frame).collect();
     c.bench_function("feed_drain/depth20_frame_4x20", |b| {

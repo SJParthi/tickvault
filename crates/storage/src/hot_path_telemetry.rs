@@ -9,6 +9,15 @@
 //! 2. **Stall counters** — every sample above its stage's budget also bumps
 //!    `tv_hot_path_stage_over_budget_total{stage}`, and the worst sample of
 //!    each publish window is `tv_hot_path_stage_max_ns{stage}`.
+//! 2b. **Per-second percentiles** (2026-10-26, plan item K5) — once a
+//!    second the publisher takes each stage's buckets minus the previous
+//!    read (this second's samples only) and publishes p50 / p99 / p99.9 as
+//!    `tv_hot_path_stage_{p50,p99,p999}_ns{stage}`, local `/metrics` only
+//!    (no EMF name, no filter, no alarm). Each figure is the UPPER bound of
+//!    the bucket the quantile falls in, so it reads up to 2× high, never
+//!    low ([`stage_quantiles`]). A p99 over the stage's stall budget, in a
+//!    window of at least [`P99_WARN_MIN_SAMPLES`], writes one coded
+//!    `warn!` per episode (log only, never paged).
 //! 3. **Task heartbeats** — `tv_task_heartbeat_age_seconds{task}` (time since
 //!    the task last made progress) and `tv_task_busy_seconds{task}` (how long
 //!    a writer thread has been inside ONE batch; 0 while idle). A task that
@@ -54,7 +63,8 @@
 //! |---|---|
 //! | [`record_stage_nanos`] | O(1): one `leading_zeros`, four relaxed atomics |
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
-//! | [`publish_once`] | O(stages × buckets + tasks) = O(4 × 28 + 6), once a second, on its own thread |
+//! | [`publish_once`] | O(stages × buckets + tasks) = O(4 × 28 + 6), once a second, on its own thread; the percentile window adds O(4 × 28) more and keeps the previous read in fixed arrays (no allocation) |
+//! | [`stage_quantiles`] | O(buckets) = O(28), on the publisher thread only, never on the frame path |
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -363,6 +373,200 @@ pub fn stage_snapshot(stage: Stage) -> StageSnapshot {
     }
 }
 
+/// The quantiles published per stage, as `(numerator, denominator)` of the
+/// share of samples at or below each: p50, p99, p99.9.
+const QUANTILE_FRACTIONS: [(u64, u64); 3] = [(1, 2), (99, 100), (999, 1_000)];
+
+/// With fewer samples than this in one window the p99 warn stays quiet: the
+/// p99 of under 100 samples is the window's largest sample, which
+/// `tv_hot_path_stage_max_ns` and the stall page already report. The two
+/// runtime-lag stages take 10 samples a second, so their p99 never warns.
+pub const P99_WARN_MIN_SAMPLES: u64 = 100;
+
+/// Where a quantile lies, at bucket resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantileBound {
+    /// At most this many nanoseconds: the UPPER bound of the bucket holding
+    /// the quantile, so the true value is in `(bound / 2, bound]` (or
+    /// `[0, 1,024]` for bucket 0). Conservative: never below the truth, up
+    /// to twice above it.
+    AtMost(u64),
+    /// In the top bucket: above ~68.7 s, with no upper bound.
+    Overflow,
+}
+
+impl QuantileBound {
+    fn of_bucket(k: usize) -> Self {
+        match bucket_upper_bound_nanos(k) {
+            Some(n) => Self::AtMost(n),
+            None => Self::Overflow,
+        }
+    }
+
+    /// The gauge value: the bound in nanoseconds, `+Inf` for the top bucket.
+    fn as_gauge_value(self) -> f64 {
+        match self {
+            Self::Overflow => f64::INFINITY,
+            // Every bound is a power of two (`bucket_upper_bound_nanos`), so
+            // its exponent rebuilds it exactly, with no lossy integer cast.
+            Self::AtMost(n) => 2f64.powi(i32::try_from(n.trailing_zeros()).unwrap_or(i32::MAX)),
+        }
+    }
+
+    /// The log field value: the bound in nanoseconds, `u64::MAX` for the top
+    /// bucket.
+    fn as_log_nanos(self) -> u64 {
+        match self {
+            Self::AtMost(n) => n,
+            Self::Overflow => u64::MAX,
+        }
+    }
+}
+
+/// p50, p99 and p99.9 of one window of samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageQuantiles {
+    /// Samples in the window: the sum of the buckets passed in.
+    pub samples: u64,
+    /// Median.
+    pub p50: QuantileBound,
+    /// 99th percentile.
+    pub p99: QuantileBound,
+    /// 99.9th percentile.
+    pub p999: QuantileBound,
+}
+
+/// `ceil(total × num / den)`, the 1-based rank of the sample at that
+/// quantile; 0 only for an empty window. `num <= den`, so it never passes
+/// `total`. u128 so the product cannot overflow.
+fn quantile_rank(total: u64, num: u64, den: u64) -> u64 {
+    let rank = (u128::from(total) * u128::from(num)).div_ceil(u128::from(den.max(1)));
+    u64::try_from(rank).unwrap_or(total).max(1).min(total)
+}
+
+/// p50, p99 and p99.9 of one window, from per-bucket (NOT cumulative)
+/// counts; `None` when the window holds no sample.
+///
+/// Each quantile is the UPPER bound of the bucket its rank falls in
+/// ([`QuantileBound`]): a log2 histogram cannot say where inside a bucket a
+/// sample was, so the figure is conservative and can read up to twice the
+/// true value; it never reads low.
+///
+/// The total is the sum of `window` itself, never a count read separately:
+/// the publisher reads the buckets one by one while the hot path keeps
+/// recording, so a separately read count can disagree with them by the
+/// samples that raced the read. Summing the buckets keeps every rank inside
+/// the samples actually walked. O(buckets), no allocation.
+#[must_use]
+pub fn stage_quantiles(window: &[u64; STAGE_BUCKETS]) -> Option<StageQuantiles> {
+    let samples = window.iter().fold(0u64, |acc, n| acc.saturating_add(*n));
+    if samples == 0 {
+        return None;
+    }
+    let ranks = QUANTILE_FRACTIONS.map(|(num, den)| quantile_rank(samples, num, den));
+    let mut found: [Option<usize>; 3] = [None; 3];
+    let mut cumulative = 0u64;
+    for (k, count) in window.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*count);
+        for (slot, rank) in found.iter_mut().zip(ranks.iter()) {
+            if slot.is_none() && cumulative >= *rank {
+                *slot = Some(k);
+            }
+        }
+    }
+    // Every rank is at most `samples`, which the walk reaches at its last
+    // non-empty bucket, so every slot is set; the top bucket is the safe
+    // (conservative) reading if that ever failed.
+    let bound = |slot: Option<usize>| QuantileBound::of_bucket(slot.unwrap_or(STAGE_BUCKETS - 1));
+    Some(StageQuantiles {
+        samples,
+        p50: bound(found[0]),
+        p99: bound(found[1]),
+        p999: bound(found[2]),
+    })
+}
+
+/// True when the window's p99 sample is above the stage budget. Exact, not
+/// at bucket resolution: `over_budget` counts every sample above the budget,
+/// so the p99 sample is over it when fewer than its rank are within it.
+fn p99_over_budget(samples: u64, over_budget: u64) -> bool {
+    samples.saturating_sub(over_budget) < quantile_rank(samples, 99, 100)
+}
+
+/// Edge latch for the p99 warn: true on the first over-budget window of an
+/// episode. A window under budget ends the episode; a window with too few
+/// samples to judge (`None`) neither starts nor ends one.
+fn step_p99_latch(latched: &mut bool, over: Option<bool>) -> bool {
+    match over {
+        Some(true) if !*latched => {
+            *latched = true;
+            true
+        }
+        Some(false) => {
+            *latched = false;
+            false
+        }
+        _ => false,
+    }
+}
+
+/// What one stage's window produced.
+struct WindowOutcome {
+    quantiles: Option<StageQuantiles>,
+    over_budget: u64,
+    starts_p99_episode: bool,
+}
+
+/// Per stage, what the quantile publish keeps between windows: the
+/// cumulative buckets and over-budget count it last read, and whether the
+/// p99 is inside an over-budget episode. Fixed arrays, built once; lives on
+/// the publisher thread only.
+struct QuantileWindows {
+    prev_buckets: [[u64; STAGE_BUCKETS]; STAGE_COUNT],
+    prev_over_budget: [u64; STAGE_COUNT],
+    p99_over: [bool; STAGE_COUNT],
+}
+
+impl QuantileWindows {
+    const fn new() -> Self {
+        Self {
+            prev_buckets: [[0; STAGE_BUCKETS]; STAGE_COUNT],
+            prev_over_budget: [0; STAGE_COUNT],
+            p99_over: [false; STAGE_COUNT],
+        }
+    }
+
+    /// Turns the cumulative `snap` into this window's per-bucket counts
+    /// (current minus last read), then computes its quantiles and steps the
+    /// p99 latch. A sample recorded while the buckets were being read lands
+    /// in this window or the next, never in both and never in neither.
+    /// O(buckets), no allocation.
+    fn advance(&mut self, stage: Stage, snap: &StageSnapshot) -> WindowOutcome {
+        let i = stage as usize;
+        let mut window = [0u64; STAGE_BUCKETS];
+        for ((out, now), before) in window
+            .iter_mut()
+            .zip(snap.buckets.iter())
+            .zip(self.prev_buckets[i].iter())
+        {
+            *out = now.saturating_sub(*before);
+        }
+        self.prev_buckets[i] = snap.buckets;
+        let over_budget = snap.over_budget.saturating_sub(self.prev_over_budget[i]);
+        self.prev_over_budget[i] = snap.over_budget;
+        let quantiles = stage_quantiles(&window);
+        let verdict = quantiles
+            .filter(|q| q.samples >= P99_WARN_MIN_SAMPLES)
+            .map(|q| p99_over_budget(q.samples, over_budget));
+        let starts_p99_episode = step_p99_latch(&mut self.p99_over[i], verdict);
+        WindowOutcome {
+            quantiles,
+            over_budget,
+            starts_p99_episode,
+        }
+    }
+}
+
 /// Seconds since `task` last made progress at `now`; `None` if it never has.
 #[must_use]
 pub fn heartbeat_age_at(task: HotTask, now: Instant) -> Option<f64> {
@@ -404,6 +608,9 @@ struct StageHandles {
     sum: metrics::Counter,
     over_budget: metrics::Counter,
     max: metrics::Gauge,
+    p50: metrics::Gauge,
+    p99: metrics::Gauge,
+    p999: metrics::Gauge,
 }
 
 struct TaskHandles {
@@ -416,6 +623,7 @@ struct TaskHandles {
 pub struct TelemetryHandles {
     stages: Vec<StageHandles>,
     tasks: Vec<TaskHandles>,
+    windows: QuantileWindows,
 }
 
 const BUCKET_LABELS: [&str; STAGE_BUCKETS] = [
@@ -475,6 +683,9 @@ impl TelemetryHandles {
                         "stage" => name
                     ),
                     max: metrics::gauge!("tv_hot_path_stage_max_ns", "stage" => name),
+                    p50: metrics::gauge!("tv_hot_path_stage_p50_ns", "stage" => name),
+                    p99: metrics::gauge!("tv_hot_path_stage_p99_ns", "stage" => name),
+                    p999: metrics::gauge!("tv_hot_path_stage_p999_ns", "stage" => name),
                 }
             })
             .collect();
@@ -488,14 +699,25 @@ impl TelemetryHandles {
                 }
             })
             .collect();
-        Self { stages, tasks }
+        Self {
+            stages,
+            tasks,
+            windows: QuantileWindows::new(),
+        }
     }
 }
 
 /// Publishes every series once. Resets each stage's window maximum and
 /// returns what the stall alarm reads: each stage's window maximum and each
 /// watched task's heartbeat age.
-pub fn publish_once(handles: &TelemetryHandles, now: Instant) -> StallReadings {
+///
+/// It also publishes each stage's p50 / p99 / p99.9 over the samples since
+/// the previous call (one second in production; the first call covers
+/// everything since boot) as `tv_hot_path_stage_{p50,p99,p999}_ns{stage}`,
+/// local `/metrics` only. An empty window publishes NaN ("no samples this
+/// second"), never 0, which would read as fast. A p99 above the stage's
+/// [`Stage::stall_budget_nanos`] writes one log-only `warn!` per episode.
+pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadings {
     let mut readings = StallReadings {
         task_age_secs: [None; WATCHED_TASKS.len()],
         stage_max_nanos: [0; STAGE_COUNT],
@@ -516,6 +738,22 @@ pub fn publish_once(handles: &TelemetryHandles, now: Instant) -> StallReadings {
         let max = STAGES[*stage as usize].max_nanos.swap(0, Ordering::Relaxed);
         h.max.set(nanos_to_f64(max));
         readings.stage_max_nanos[*stage as usize] = max;
+        let outcome = handles.windows.advance(*stage, &snap);
+        match outcome.quantiles {
+            Some(q) => {
+                h.p50.set(q.p50.as_gauge_value());
+                h.p99.set(q.p99.as_gauge_value());
+                h.p999.set(q.p999.as_gauge_value());
+                if outcome.starts_p99_episode {
+                    report_p99_over_budget(*stage, &q, outcome.over_budget);
+                }
+            }
+            None => {
+                h.p50.set(f64::NAN);
+                h.p99.set(f64::NAN);
+                h.p999.set(f64::NAN);
+            }
+        }
     }
     for (task, h) in ALL_TASKS.iter().zip(handles.tasks.iter()) {
         // A task that has never beaten publishes nothing: an absent series
@@ -537,14 +775,14 @@ pub fn publish_once(handles: &TelemetryHandles, now: Instant) -> StallReadings {
 pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
     // Fix the anchor before any stamp is taken by a racing task.
     let _ = anchor();
-    let handles = TelemetryHandles::resolve();
+    let mut handles = TelemetryHandles::resolve();
     std::thread::Builder::new()
         .name("tv-telemetry".to_owned())
         .spawn(move || {
             let mut alarm = StallAlarm::new();
             loop {
                 let now = Instant::now();
-                let readings = publish_once(&handles, now);
+                let readings = publish_once(&mut handles, now);
                 let in_session = in_session_now() && !is_shutting_down();
                 if let Some(line) = alarm.observe(now, in_session, &readings) {
                     report_stall(&line);
@@ -757,6 +995,24 @@ fn report_stall(line: &StallLine) {
     );
 }
 
+/// Writes one log-only line when a stage's p99 passes its budget for the
+/// first window of an episode. `warn!`, not `error!`: the
+/// `HOT-PATH-STALL-01` metric filter matches `level = ERROR` only, so this
+/// line never pages (`source` tells it apart in triage).
+fn report_p99_over_budget(stage: Stage, quantiles: &StageQuantiles, over_budget: u64) {
+    tracing::warn!(
+        code = tickvault_common::error_code::ErrorCode::HotPathStall01.code_str(),
+        source = "stage_p99_over_budget",
+        stage = stage.as_str(),
+        p99_at_most_ns = quantiles.p99.as_log_nanos(),
+        budget_ns = stage.stall_budget_nanos(),
+        samples = quantiles.samples,
+        over_budget,
+        "Dhan live feed: more than 1 in 100 samples of one hot step took longer than its \
+         budget in the last second (log only, no page)"
+    );
+}
+
 /// Sleeps [`RUNTIME_PROBE_INTERVAL`] on the current tokio runtime
 /// `iterations` times, recording each wake's lateness under `stage` and
 /// beating `task`. Production passes `u64::MAX`.
@@ -877,14 +1133,200 @@ mod tests {
     #[test]
     fn publish_once_runs_without_a_recorder_and_resets_the_window_max() {
         record_stage_nanos(Stage::RingDwell, 7_777);
-        let handles = TelemetryHandles::resolve();
-        publish_once(&handles, Instant::now());
+        let mut handles = TelemetryHandles::resolve();
+        publish_once(&mut handles, Instant::now());
         assert_eq!(
             STAGES[Stage::RingDwell as usize]
                 .max_nanos
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    fn window_of(samples: &[(usize, u64)]) -> [u64; STAGE_BUCKETS] {
+        let mut w = [0u64; STAGE_BUCKETS];
+        for (k, n) in samples {
+            w[*k] += *n;
+        }
+        w
+    }
+
+    #[test]
+    fn test_stage_quantiles_empty_window_is_none() {
+        assert_eq!(stage_quantiles(&[0; STAGE_BUCKETS]), None);
+    }
+
+    #[test]
+    fn test_stage_quantiles_all_in_one_bucket_reads_that_bucket_upper_bound() {
+        // 500 samples of 3,000 ns: bucket 2, bound 4,096.
+        let mut w = [0u64; STAGE_BUCKETS];
+        w[bucket_index(3_000)] = 500;
+        let q = stage_quantiles(&w).expect("samples");
+        assert_eq!(q.samples, 500);
+        for b in [q.p50, q.p99, q.p999] {
+            assert_eq!(b, QuantileBound::AtMost(4_096));
+        }
+        // A single sample is its own p50, p99 and p99.9.
+        let one = stage_quantiles(&window_of(&[(0, 1)])).expect("one");
+        assert_eq!(one.p50, QuantileBound::AtMost(1_024));
+        assert_eq!(one.p999, QuantileBound::AtMost(1_024));
+    }
+
+    #[test]
+    fn test_stage_quantiles_all_in_top_bucket_reads_overflow() {
+        let w = window_of(&[(STAGE_BUCKETS - 1, 7)]);
+        let q = stage_quantiles(&w).expect("samples");
+        assert_eq!(q.p50, QuantileBound::Overflow);
+        assert_eq!(q.p99, QuantileBound::Overflow);
+        assert!(q.p99.as_gauge_value().is_infinite());
+        assert_eq!(q.p999.as_log_nanos(), u64::MAX);
+    }
+
+    #[test]
+    fn test_stage_quantiles_known_distribution_picks_the_ranked_bucket() {
+        // 10,000 samples: 9,000 in bucket 0, 900 in bucket 5, 90 in bucket
+        // 10, 10 in bucket 20. Ranks: p50 = 5,000 (bucket 0), p99 = 9,900
+        // (cumulative 9,900 reached exactly at bucket 5), p99.9 = 9,990
+        // (cumulative 9,990 at bucket 10).
+        let w = window_of(&[(0, 9_000), (5, 900), (10, 90), (20, 10)]);
+        let q = stage_quantiles(&w).expect("samples");
+        assert_eq!(q.samples, 10_000);
+        assert_eq!(q.p50, QuantileBound::AtMost(1 << 10));
+        assert_eq!(q.p99, QuantileBound::AtMost(1 << 15));
+        assert_eq!(q.p999, QuantileBound::AtMost(1 << 20));
+        // One more slow sample pushes the 9,900th rank past bucket 5.
+        let w2 = window_of(&[(0, 8_999), (5, 900), (10, 91), (20, 10)]);
+        assert_eq!(
+            stage_quantiles(&w2).expect("samples").p99,
+            QuantileBound::AtMost(1 << 20)
+        );
+    }
+
+    #[test]
+    fn test_stage_quantiles_bound_is_never_below_the_true_sample() {
+        // Every recorded value is at or below the bound of its quantile.
+        for nanos in [0u64, 1, 1_024, 1_025, 99_999, 100_001, 1 << 30, u64::MAX] {
+            let mut w = [0u64; STAGE_BUCKETS];
+            w[bucket_index(nanos)] = 3;
+            let q = stage_quantiles(&w).expect("samples");
+            match q.p99 {
+                QuantileBound::AtMost(bound) => {
+                    assert!(nanos <= bound, "{nanos} above its bound {bound}");
+                    assert!(
+                        bound <= nanos.max(512).saturating_mul(2),
+                        "bound {bound} more than 2x {nanos}"
+                    );
+                    assert_eq!(q.p99.as_gauge_value().to_bits(), {
+                        let mut exact = 1f64;
+                        for _ in 0..bound.trailing_zeros() {
+                            exact *= 2.0;
+                        }
+                        exact.to_bits()
+                    });
+                }
+                QuantileBound::Overflow => {
+                    assert!(bucket_upper_bound_nanos(bucket_index(nanos)).is_none())
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_stage_quantiles_uses_the_bucket_sum_not_a_racing_count() {
+        // The snapshot's separately summed count can trail or lead the
+        // buckets the walk reads (samples recorded mid-read). The function
+        // takes only the buckets, so every rank stays inside the samples it
+        // walks: a total of 2 can never ask for a third sample.
+        let w = window_of(&[(3, 1), (9, 1)]);
+        let q = stage_quantiles(&w).expect("samples");
+        assert_eq!(q.samples, 2);
+        assert_eq!(q.p50, QuantileBound::AtMost(1 << 13));
+        assert_eq!(q.p99, QuantileBound::AtMost(1 << 19));
+        // Saturating sums: buckets near u64::MAX do not wrap to a tiny total.
+        let huge = window_of(&[(0, u64::MAX), (1, u64::MAX)]);
+        assert_eq!(stage_quantiles(&huge).expect("samples").samples, u64::MAX);
+    }
+
+    #[test]
+    fn test_quantile_rank_bounds() {
+        assert_eq!(quantile_rank(0, 99, 100), 0);
+        assert_eq!(quantile_rank(1, 1, 2), 1);
+        assert_eq!(quantile_rank(100, 99, 100), 99);
+        assert_eq!(quantile_rank(101, 99, 100), 100);
+        assert_eq!(
+            quantile_rank(u64::MAX, 999, 1_000),
+            u64::MAX - u64::MAX / 1_000
+        );
+    }
+
+    #[test]
+    fn test_p99_over_budget_is_exact_on_the_counter() {
+        // 100 samples: rank 99. Over iff fewer than 99 are within budget.
+        assert!(!p99_over_budget(100, 1));
+        assert!(p99_over_budget(100, 2));
+        assert!(!p99_over_budget(0, 0));
+        // A racing over-budget count larger than the window saturates.
+        assert!(p99_over_budget(100, 500));
+    }
+
+    #[test]
+    fn test_step_p99_latch_fires_once_per_episode_and_re_arms() {
+        let mut latched = false;
+        assert!(step_p99_latch(&mut latched, Some(true)));
+        assert!(!step_p99_latch(&mut latched, Some(true)));
+        // Too few samples: neither ends nor restarts the episode.
+        assert!(!step_p99_latch(&mut latched, None));
+        assert!(!step_p99_latch(&mut latched, Some(true)));
+        assert!(!step_p99_latch(&mut latched, Some(false)));
+        assert!(step_p99_latch(&mut latched, Some(true)));
+    }
+
+    #[test]
+    fn test_quantile_windows_advance_reads_only_this_window_and_latches_once() {
+        let mut windows = QuantileWindows::new();
+        let stage = Stage::SocketToWal;
+        let mut snap = StageSnapshot {
+            buckets: [0; STAGE_BUCKETS],
+            count: 0,
+            sum_nanos: 0,
+            over_budget: 0,
+        };
+        // Window 1: 1,000 fast samples (2 µs). Under budget.
+        snap.buckets[bucket_index(2_000)] += 1_000;
+        let first = windows.advance(stage, &snap);
+        assert_eq!(first.quantiles.expect("w1").samples, 1_000);
+        assert!(!first.starts_p99_episode);
+        // Window 2: 200 slow samples (500 µs, over the 100 µs budget). Only
+        // these 200 are in the window, so p99 is the slow bucket.
+        snap.buckets[bucket_index(500_000)] += 200;
+        snap.over_budget += 200;
+        let second = windows.advance(stage, &snap);
+        let q = second.quantiles.expect("w2");
+        assert_eq!(q.samples, 200);
+        assert_eq!(q.p50, QuantileBound::AtMost(1 << 19));
+        assert_eq!(second.over_budget, 200);
+        assert!(second.starts_p99_episode);
+        // Window 3: same again, still one episode.
+        snap.buckets[bucket_index(500_000)] += 200;
+        snap.over_budget += 200;
+        assert!(!windows.advance(stage, &snap).starts_p99_episode);
+        // Window 4: empty. No quantiles, latch unchanged.
+        let empty = windows.advance(stage, &snap);
+        assert!(empty.quantiles.is_none());
+        assert!(!empty.starts_p99_episode);
+        // Window 5: healthy again re-arms; window 6 slow fires again.
+        snap.buckets[bucket_index(2_000)] += 500;
+        assert!(!windows.advance(stage, &snap).starts_p99_episode);
+        snap.buckets[bucket_index(500_000)] += 150;
+        snap.over_budget += 150;
+        assert!(windows.advance(stage, &snap).starts_p99_episode);
+        // Fewer than P99_WARN_MIN_SAMPLES never fires, even all slow.
+        let mut quiet = QuantileWindows::new();
+        let mut few = snap;
+        few.buckets = [0; STAGE_BUCKETS];
+        few.buckets[bucket_index(500_000)] = P99_WARN_MIN_SAMPLES - 1;
+        few.over_budget = P99_WARN_MIN_SAMPLES - 1;
+        assert!(!quiet.advance(stage, &few).starts_p99_episode);
     }
 
     #[test]
