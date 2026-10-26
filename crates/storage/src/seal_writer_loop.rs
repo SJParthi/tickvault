@@ -602,6 +602,25 @@ pub fn last_seal_drained_unix_secs() -> Option<i64> {
     (last != i64::MIN).then_some(last)
 }
 
+/// Seals the writer itself held (channel plus ring, not the escalation queue,
+/// which main counts on its own) after its latest cycle, normal or shutdown
+/// drain (audit PR L, L2). Read by
+/// [`finish_unwritten_mark_after_writer_timeout`] when main gave up waiting
+/// for the writer, which then cannot report its own residue.
+static WRITER_HELD_SEALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record what the writer held after a cycle. O(1), one Release store.
+fn note_writer_held_seals(held: usize) {
+    WRITER_HELD_SEALS.store(held, std::sync::atomic::Ordering::Release);
+}
+
+/// The seals the writer held (channel plus ring) after its latest cycle
+/// (audit PR L, L2). O(1), one Acquire load.
+#[must_use]
+pub fn last_writer_held_seals() -> usize {
+    WRITER_HELD_SEALS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// What the previous process's marker said, read by `main` before the seal
 /// writer starts and kept for the candle warm-up (audit PR31b-2). The writer
 /// loop overwrites the file with its own samples, so this is the only copy.
@@ -883,6 +902,55 @@ pub fn finish_unwritten_mark_at_shutdown(
     }
 }
 
+/// Finish the marker when main gave up waiting for the seal writer's final
+/// drain (audit PR L, L2). Until 2026-10-26 main called
+/// [`finish_unwritten_mark_at_shutdown`] on that path too, with a residue of
+/// 0 because the writer never returned one, so the marker read clean and the
+/// seals the writer still held were counted nowhere: the not-clean count the
+/// cancel had written was overwritten.
+///
+/// Writes the marker NOT clean, holding `seals_reported_lost` (what main
+/// counted itself, the abandoned escalation queue) plus `writer_held_seals`, the
+/// channel and ring the writer held after its latest cycle (main passes
+/// [`last_writer_held_seals`]). The
+/// next boot reports that as lost. Like the clean finish, it blocks every
+/// later write from the still-running writer, so its own count stands.
+///
+/// **Honest limit:** the writer's count is the one after its latest
+/// finished cycle; a cycle stuck in a flush when main gave up still has its
+/// popped seals in flight and may yet spill them, so the count can read high
+/// by up to one cycle's batch. It never reads low for what the channel and
+/// ring held then.
+///
+/// # Complexity
+/// O(finished markers), one in production, plus one small write and a rename.
+pub fn finish_unwritten_mark_after_writer_timeout(
+    dir: &std::path::Path,
+    seals_reported_lost: usize,
+    writer_held_seals: usize,
+    now_unix_secs: i64,
+) -> bool {
+    let path = dir.join(SEAL_UNWRITTEN_MARK_FILE);
+    let mut finished = lock_finished_marks();
+    if !finished.iter().any(|done| done == &path) {
+        finished.push(path.clone());
+    }
+    let last = LAST_DRAINED_UNIX_SECS.load(std::sync::atomic::Ordering::Acquire);
+    let record = UnwrittenSealRecord {
+        unwritten: seals_reported_lost.saturating_add(writer_held_seals),
+        clean: false,
+        sampled_at_unix_secs: now_unix_secs,
+        drained_at_unix_secs: (last != i64::MIN).then_some(last),
+    };
+    match write_mark_file(&path, &record) {
+        Ok(()) => true,
+        Err(err) => {
+            record_mark_write_failure(&path, &err, true);
+            false
+        }
+    }
+}
+
 /// Report what the previous process's marker says. Called once at boot.
 ///
 /// Returns the seals reported as held unwritten by a process that did not
@@ -1009,10 +1077,15 @@ fn utc_now_secs() -> i64 {
 ///
 /// `SealWriterRunner::run_one_cycle` ultimately calls the writer's blocking
 /// HTTP `flush()` — bounded per attempt by the conf-pinned
-/// `request_timeout=5000` (+ the questdb-rs min-throughput extension, ≤ ~2.5s
-/// at the 1024-seal max batch) with the library's internal retry DISABLED
-/// (`retry_timeout=0`), so a failed cycle against a hung QuestDB blocks at
-/// most ~4 × ~7.5s ≈ 30s (see `shadow_candle_writer::build_ilp_conf_string`).
+/// `request_timeout=5000` plus the questdb-rs min-throughput extension, with
+/// the library's internal retry DISABLED (`retry_timeout=0`). **⚠ CORRECTED
+/// 2026-10-26 (audit PR L, L2):** this said a failed cycle blocks at most
+/// ~30s, which held at 1,024 seals per cycle. At the 16,384 cap and the
+/// library's 100 KiB/s default extension it was about 4.6 minutes. The conf
+/// now pins `request_min_throughput` at 4 MiB/s, so a failed cycle at the cap
+/// blocks about 27 s (4 × ~6.6 s plus backoff; see
+/// `shadow_candle_writer::build_ilp_conf_string`), and the shutdown drain
+/// stops flushing after its first failed cycle.
 /// Even that bounded block must not pin one of the two tokio workers on the
 /// r8g.large prod box, so on a multi-thread runtime the cycle runs under
 /// `tokio::task::block_in_place` — the worker's other tasks migrate while the
@@ -1095,9 +1168,23 @@ fn final_drain_with(
     let deadline = Instant::now() + Duration::from_secs(FINAL_DRAIN_BUDGET_SECS);
     let mut total = CycleOutcome::default();
     let mut cycles: u64 = 0;
+    // Audit PR L, L2 (2026-10-26): once one flush has failed, every later
+    // cycle sends what is held straight to the spill. Flushing again against
+    // a hung database cost up to one failed cycle per `max_drain` seals, and
+    // the deadline below is only checked between cycles, so the drain ran
+    // past main's join budget and its residue was never counted.
+    let mut spill_only = false;
 
     loop {
-        let outcome = run_cycle(runner, utc_now_secs());
+        let outcome = if spill_only {
+            rescue_held_to_spill(runner, utc_now_secs())
+        } else {
+            run_cycle(runner, utc_now_secs())
+        };
+        if outcome.drain.ring_seals_popped > 0 && !outcome.drain.flushed_ok {
+            spill_only = true;
+        }
+        note_writer_held_seals(final_drain_residue(runner));
         let dropped = progress.absorb(&outcome);
         record_cycle_observability(&outcome, dropped);
         total.accumulate(&outcome);
@@ -1183,6 +1270,7 @@ fn run_cycle_with_replay(
         let (outcome, replay) = runner.run_one_cycle_with_replay(now_unix_secs);
         let unwritten = runner.unwritten_seals();
         mark.sample(unwritten, now_unix_secs);
+        note_writer_held_seals(final_drain_residue(runner));
         (outcome, replay, unwritten)
     };
     if tokio::runtime::Handle::current().runtime_flavor()
@@ -1233,6 +1321,19 @@ fn mark_after_final_drain(runner: &SealWriterRunner, mark: &mut UnwrittenSealMar
         tokio::task::block_in_place(write);
     } else {
         write();
+    }
+}
+
+/// [`SealWriterRunner::rescue_held_to_spill`] off the async worker, as
+/// [`run_cycle`] does for a cycle: the spill writes and their sync are file
+/// I/O (audit PR L, L2).
+fn rescue_held_to_spill(runner: &mut SealWriterRunner, now_unix_secs: i64) -> CycleOutcome {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| runner.rescue_held_to_spill(now_unix_secs))
+    } else {
+        runner.rescue_held_to_spill(now_unix_secs)
     }
 }
 
@@ -1983,9 +2084,16 @@ mod tests {
             outcome.submitted_from_mpsc, 12,
             "every queued seal must reach the pipeline, not just one cycle's worth"
         );
+        // Audit PR L, L2 (2026-10-26): the writer is disconnected, so the
+        // first cycle's flush fails and the drain spills the other nine
+        // without flushing again. The ring is still emptied.
         assert_eq!(
-            outcome.drain.ring_seals_popped, 12,
-            "the ring must be drained to EMPTY, across as many cycles as that takes"
+            outcome.drain.ring_seals_popped, 3,
+            "one flush is tried; after it fails the rest go straight to the spill"
+        );
+        assert_eq!(
+            outcome.final_residue, 0,
+            "the ring must be drained to EMPTY"
         );
         assert_eq!(
             outcome.drain.rescued_to_spill, 12,
@@ -2496,6 +2604,86 @@ mod tests {
             }
             other => panic!("expected a marker, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — the shutdown drain kept
+    /// flushing after a failed flush, one failed cycle per `max_drain` seals,
+    /// and checked its deadline only between cycles; against a hung database
+    /// it outlived main's join. It now spills everything held after the
+    /// first failed flush. Bites: without the switch this drain takes five
+    /// flush cycles (10 seals, 2 per cycle), not two.
+    #[tokio::test]
+    async fn test_regression_final_drain_spills_the_rest_after_one_failed_flush() {
+        let (spill, dlq) = temp_pair("final-drain-spill-after-fail");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 64, 64, 2);
+        let tx = runner.sender();
+        for i in 0..10u32 {
+            tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700 + i * 60, 100.0))
+                .expect("queued");
+        }
+        let mut progress = SealWriterProgress::default();
+        let mut cycles = 0_u64;
+        let outcome = final_drain_with(&mut runner, &mut progress, |_, n| cycles = n);
+        assert_eq!(
+            cycles, 2,
+            "one failed flush cycle, then one cycle that spills the rest"
+        );
+        assert_eq!(outcome.final_residue, 0, "nothing is left in memory");
+        assert_eq!(
+            outcome.drain.rescued_to_spill + outcome.drain.rescued_to_dlq,
+            10,
+            "every seal reached the disk"
+        );
+        assert_eq!(
+            outcome.drain.ring_seals_popped, 2,
+            "only one flush was tried"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit PR L, L2: what the writer notes is what main reads. The atomic is
+    /// process-wide and every drain test in this crate stores to it, so the
+    /// test stores a value no drain can hold and retries until it reads it
+    /// back between two of their stores.
+    #[test]
+    fn test_last_writer_held_seals_reads_what_note_writer_held_seals_stored() {
+        const SENTINEL: usize = usize::MAX - 7;
+        let seen = (0..10_000).any(|_| {
+            note_writer_held_seals(SENTINEL);
+            last_writer_held_seals() == SENTINEL
+        });
+        assert!(seen, "the stored count must be the one read");
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — when main's join timed out it
+    /// finished the marker clean with a residue of 0, so the seals the writer
+    /// still held were counted nowhere. Bites: the clean finish writes
+    /// `clean=true, unwritten=3`, and the next boot reports 0.
+    #[test]
+    fn test_regression_finish_unwritten_mark_after_writer_timeout_keeps_it_not_clean() {
+        let dir = temp_dir_for("finish_after_writer_timeout");
+        const NOW: i64 = 7_777_777_003;
+        assert!(finish_unwritten_mark_after_writer_timeout(&dir, 3, 12, NOW));
+        let previous = UnwrittenSealMark::in_dir(&dir).read_previous();
+        match previous {
+            PreviousUnwritten::Read(r) => {
+                assert!(!r.clean, "a writer main gave up on is not a clean shutdown");
+                assert_eq!(
+                    r.unwritten, 15,
+                    "escalation queue plus what the writer held"
+                );
+            }
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        assert_eq!(
+            report_previous_unwritten(previous, NOW + 60),
+            15,
+            "the next boot reports them as lost"
+        );
+        // The still-running writer cannot turn it back to clean.
+        let mut mark = UnwrittenSealMark::in_dir(&dir);
+        assert!(!mark.mark_clean(0, NOW + 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

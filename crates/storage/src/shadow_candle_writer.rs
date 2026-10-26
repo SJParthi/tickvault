@@ -93,11 +93,35 @@ use crate::shadow_seal_columns::ShadowSealRow;
 ///   wraps the cycle in `block_in_place` on the production multi-thread
 ///   runtime (see `seal_writer_loop.rs`) so even that bounded block never
 ///   pins a tokio worker's other tasks.
+///
+/// **⚠ CORRECTED 2026-10-26 (audit PR L, L2) — the "~30s" above was true at
+/// 1,024 seals per cycle and stopped being true at 16,384.** The conf did not
+/// set `request_min_throughput`, so questdb-rs used its 100 KiB/s default and
+/// added `bytes / 102,400` seconds to every attempt: at the 16,384-seal cap
+/// (about 6.5 MB at an Assumed 400 B per row) that is about 64 s more per
+/// attempt, about 69 s per attempt and about 4.6 minutes for the four
+/// attempts of one failed cycle. That outlived the 45 s shutdown drain and
+/// main's 75 s join, so main gave up and the seals still in memory were not
+/// counted. The conf now pins
+/// `request_min_throughput=[`SEAL_FLUSH_REQUEST_MIN_THROUGHPUT_BYTES_PER_SEC`]`
+/// (4 MiB/s): the extension at the cap is about 1.6 s, one attempt about
+/// 6.6 s and one failed cycle about 27 s, inside the 45 s drain budget
+/// (pinned by `test_regression_one_failed_flush_cycle_fits_the_shutdown_drain_budget`).
 fn build_ilp_conf_string(host: &str, http_port: u16) -> String {
     format!(
-        "http::addr={host}:{http_port};protocol_version=1;retry_timeout={SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS};request_timeout={SEAL_FLUSH_REQUEST_TIMEOUT_MS};"
+        "http::addr={host}:{http_port};protocol_version=1;retry_timeout={SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS};request_timeout={SEAL_FLUSH_REQUEST_TIMEOUT_MS};request_min_throughput={SEAL_FLUSH_REQUEST_MIN_THROUGHPUT_BYTES_PER_SEC};"
     )
 }
+
+/// Slowest send rate, in bytes per second, a seal flush accepts before the
+/// attempt times out (audit PR L, L2). questdb-rs adds `bytes / this` seconds
+/// to [`SEAL_FLUSH_REQUEST_TIMEOUT_MS`] for each attempt. 4 MiB/s is far below
+/// what the box's local QuestDB takes (same host), and keeps the extension at
+/// the 16,384-seal cap near 1.6 s instead of about 64 s at the library's
+/// 100 KiB/s default. A slower server makes the attempt fail sooner; the
+/// seals then go to the spill and replay later, so the cost of a false
+/// timeout is a replay, never a loss.
+const SEAL_FLUSH_REQUEST_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 
 /// Per-request HTTP timeout for one seal-flush POST, in milliseconds
 /// (questdb-rs conf-string durations are milliseconds). Bounds a single
@@ -953,7 +977,7 @@ mod tests {
         let conf = build_ilp_conf_string("tv-questdb", 9000);
         assert_eq!(
             conf,
-            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;request_min_throughput=4194304;"
         );
         assert!(
             conf.starts_with("http::addr="),
@@ -978,6 +1002,35 @@ mod tests {
             "per-request HTTP timeout must be pinned (5s), got {conf}"
         );
         assert_eq!(SEAL_FLUSH_REQUEST_TIMEOUT_MS, 5_000);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — with no
+    /// `request_min_throughput` in the conf, questdb-rs added `bytes / 102,400`
+    /// seconds per attempt, so one failed cycle at the 16,384-seal cap took
+    /// about 4.6 minutes, past the 45 s shutdown drain. Bites: with the
+    /// library default (102,400 B/s) the bound below is about 277 s.
+    #[test]
+    fn test_regression_one_failed_flush_cycle_fits_the_shutdown_drain_budget() {
+        const MAX_SEALS_PER_CYCLE: u64 = 16_384; // main.rs SEAL_MAX_DRAIN_PER_CYCLE
+        const ASSUMED_BYTES_PER_ROW: u64 = 400;
+        let conf = build_ilp_conf_string("tv-questdb", 9000);
+        let throughput: u64 = conf
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("request_min_throughput="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(102_400); // questdb-rs 6.1.0 default when unset
+        let batch_bytes = MAX_SEALS_PER_CYCLE * ASSUMED_BYTES_PER_ROW;
+        let attempts = crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES as u64 + 1;
+        let per_attempt_ms = SEAL_FLUSH_REQUEST_TIMEOUT_MS + batch_bytes * 1_000 / throughput;
+        let backoff_ms: u64 = crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_BACKOFF_MS
+            .iter()
+            .sum();
+        let cycle_ms = attempts * per_attempt_ms + backoff_ms;
+        assert!(
+            cycle_ms < crate::seal_writer_loop::FINAL_DRAIN_BUDGET_SECS * 1_000,
+            "one failed flush cycle can block {cycle_ms} ms, past the {} s shutdown drain",
+            crate::seal_writer_loop::FINAL_DRAIN_BUDGET_SECS
+        );
     }
 
     #[test]
