@@ -933,13 +933,14 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs
   - Tests: one regression test per change; a measured bytes-written figure in the PR body
   - Done 2026-10-26 in part: tick spill replay now waits until after 15:40 IST unless the spill volume runs low (no row dropped; the evening drain hold covers it), and every `ticks` row is counted by where its timestamp lands (`tv_ticks_ts_placement_total`). Measured 51 KB of disk writes per tick (116 MiB/s for about 2,390 ticks/s). Main cause found and NOT fixed: `ticks` is partitioned on the exchange trade time and 70-75% of rows are repeat quotes carrying an old trade time, so about 5% land in an already closed hour partition and most commits force QuestDB to rewrite partitions (QuestDB internals Assumed). The fix changes the data-integrity rule for `ts`, so it is listed for the owner below.
-- [ ] M2 (storage) WAL backlog never drains: 1,696 pinned segments (225 GB)
+- [x] M2 (storage) WAL backlog never drains: 1,696 pinned segments (225 GB)
   flat all day, boot catch-up defers 1,759 segments every day on its RAM
   budget. Find why no catch-up makes net progress and make each boot or
   evening drain shrink the backlog (plan item W3 shape: settle per batch),
   bounded and O(1) per frame.
   - Files: crates/storage/src/wal_unapplied_ranges.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_replay_settle.rs, crates/app/src/evening_drain.rs
   - Tests: lifetime property test where the backlog shrinks across boots; regression tests per change
+  - Done (cd658ed): three causes fixed. (1) The replay pacer read a row count `flush_ticks` zeroes even when a full queue gives rows back, so it never waited (`pace_waits = 0` on all 8 boot replays 19-26 Oct); it now reads the writer's retained rows (`replay_rows_held`, O(1)). (2) A catch-up round settled all or nothing; it now folds, acks and settles one segment at a time (`WalReplayBatch::segment_ends`, `SettleState::settle_named`, `dhan_feed_stack/replay_chunks.rs`). (3) `evening_step` gave up at 15:40 and latched; it now waits 12:00-15:50. Tests: `test_regression_m2_replay_pacer_sees_rows_a_full_queue_gave_back`, `test_regression_m2_lifetime_backlog_shrinks_to_zero_and_never_retires_unlanded` (12 seeds; a segment is archived only if its rows landed in that process with no suspicion episode after), `test_regression_evening_step_waits_before_the_window_instead_of_latching_give_up`; each checked to fail without its fix. Except: the boot pass still settles whole (falls back to per-segment at catch-up); the per-boot frame cap (3,000,000) is unchanged, so the 225 GB drains in about 50 trading days with the evening restarts (Assumed), over a year without them; not yet seen on the live box.
 - [x] M3 (app, trading) Data checks failed: find whether the 16.6% 1-minute
   divergence, the 10,186 missing live minutes and the 48,581 timeframe
   mismatches come from rows not yet applied when the check read (writer lag)
