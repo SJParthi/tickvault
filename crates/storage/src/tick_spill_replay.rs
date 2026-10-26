@@ -6428,6 +6428,20 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         assert!(!tick_replay_window_at(17 * 3600));
     }
 
+    #[test]
+    fn test_tick_replay_window_at_edges() {
+        assert!(tick_replay_window_at(
+            TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST
+        ));
+        assert!(!tick_replay_window_at(
+            TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST - 1
+        ));
+        assert!(tick_replay_window_at(
+            TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST - 1
+        ));
+        assert!(!tick_replay_window_at(TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST));
+    }
+
     /// Outside the window the free-space probe is not run at all.
     #[test]
     fn test_replay_held_probes_free_space_only_inside_the_tick_window() {

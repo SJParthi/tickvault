@@ -130,6 +130,14 @@ mod tests {
     }
 
     #[test]
+    fn test_register_baseline_is_idempotent_and_does_not_move_the_high_water_mark() {
+        let before = NEWEST_TS_NANOS.load(Ordering::Relaxed);
+        register_baseline();
+        register_baseline();
+        assert_eq!(NEWEST_TS_NANOS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
     fn test_placement_as_str_labels_are_distinct() {
         let labels = Placement::ALL.map(Placement::as_str);
         assert_eq!(labels, ["in_order", "late_same_hour", "older_partition"]);
