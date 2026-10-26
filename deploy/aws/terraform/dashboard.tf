@@ -420,13 +420,17 @@ resource "aws_cloudwatch_dashboard" "operator" {
           # is the answer to "how many of the 16 are really up?", which until
           # now needed a log grep. `tv_dhan_ws_alive_connections` was already
           # alarmed and simply never charted.
+          #
+          # 2026-10-26 (PR M / M4): the reserved gauge now also moves when the
+          # session widens the main feed after the contract attach (it read 1
+          # all day while five sockets were up), so it is no longer constant.
           title  = "Feed alive? (1 = lane up) + planned vs live sockets"
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_dhan_feed_stack_up", { label = "lane up (1 = yes)", stat = "Minimum" }],
             [local.dash_namespace, "tv_dhan_ws_alive_connections", { label = "sockets LIVE now", stat = "Minimum" }],
-            [local.dash_namespace, "tv_dhan_feed_stack_connections", { label = "sockets PLANNED at boot (constant)", stat = "Maximum" }]
+            [local.dash_namespace, "tv_dhan_feed_stack_connections", { label = "sockets reserved (boot plan + widen)", stat = "Maximum" }]
           ]
           period = 60
         }

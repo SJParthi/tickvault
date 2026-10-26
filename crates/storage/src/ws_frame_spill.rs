@@ -2636,7 +2636,8 @@ fn writer_loop(
     // even when the feed goes quiet right after a batch (2026-10-02).
     let mut unsynced = false;
     loop {
-        // Timed, not blocking, so the thread can notice a shutdown request.
+        // Timed, not blocking, so the thread can notice a shutdown request. Polls
+        // while frames flow (`wal_writer_wait`), so a reader never has to wake it.
         //
         // The clean exit used to be reachable ONLY by every `Sender` being
         // dropped. That can never happen here: the sole sender lives inside
@@ -2645,7 +2646,7 @@ fn writer_loop(
         // parked in `recv()` while the process exited around it. Everything
         // still queued went with it — captured, acknowledged as `Spilled`, and
         // counted by nothing. This arm is what ends that.
-        let first = match rx.recv_timeout(WAL_WRITER_STOP_POLL) {
+        let first = match crate::wal_writer_wait::next_record(rx, WAL_WRITER_STOP_POLL) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 // Empty channel by construction — `recv_timeout` only times out
