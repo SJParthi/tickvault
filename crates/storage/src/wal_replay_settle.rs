@@ -1026,6 +1026,39 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    /// M2: `settle_named` moves only the named staged segments; the rest stay
+    /// in `replaying/` for a later round, and an unknown name moves nothing.
+    #[test]
+    fn test_settle_named_moves_only_the_named_segments() {
+        let dir = tmp("named");
+        let replaying = dir.join(REPLAYING_SUBDIR);
+        let first = plant(&replaying, "ws-frames-00000000000000000001.wal");
+        plant(&replaying, "ws-frames-00000000000000000002.wal");
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        let start = SettleBatchStart::of(&wm);
+        let unknown = std::ffi::OsString::from("ws-frames-00000000000000000009.wal");
+        assert_eq!(
+            st.settle_named(&dir, &wm, t0, start, &[unknown.as_os_str()]),
+            0
+        );
+        assert_eq!(names(&replaying), 2, "an unknown name moves nothing");
+        let first_name = first.file_name().map(std::ffi::OsStr::to_os_string);
+        let first_name = first_name.unwrap_or_default();
+        assert_eq!(
+            st.settle_named(&dir, &wm, t0, start, &[first_name.as_os_str()]),
+            1
+        );
+        assert_eq!(
+            names(&dir.join(SETTLING_SUBDIR)),
+            1,
+            "only the named one settled"
+        );
+        assert_eq!(names(&replaying), 1, "the other waits in replaying/");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     #[test]
     fn test_leftovers_from_an_earlier_process_hold_the_first_settle() {
         let dir = tmp("leftover");
