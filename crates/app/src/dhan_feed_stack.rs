@@ -114,7 +114,8 @@ use tickvault_core::parser::depth::{
 };
 use tickvault_core::parser::dispatcher::dispatch_frame;
 use tickvault_core::pipeline::tick_gap_detector::{
-    DetectorConfig, SilenceVerdict, TickGapDetector, TickObservation,
+    DetectorConfig, LttVerdict, SilenceVerdict, TickAssessment, TickGapDetector, TickObservation,
+    VolumeVerdict,
 };
 use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
@@ -1121,6 +1122,17 @@ pub const INGEST_SEQ_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_seq_refused_to
 /// shed-frame refold also reach, so it counts live AND replayed ticks. The
 /// log line carries `origin` (`live` or `replay`); the counter has no label.
 const TICK_UNKNOWN_SEGMENT_COUNTER: &str = "tv_dhan_feed_tick_unknown_segment_total";
+
+/// Counter: gap-detector verdicts that suggest a missed or reordered packet,
+/// labelled `verdict`: `ltt_backward` (a tick's last-traded time went back,
+/// the strong signal) and `volume_jump` (cumulative volume rose far above the
+/// instrument's learned delta, weak evidence on a conflated feed). ADDED
+/// 2026-10-26 (plan item K3): both were computed per tick by
+/// `TickGapDetector::observe` and thrown away by the drain. Local Prometheus
+/// only: NOT in the CloudWatch EMF selector, no metric filter, no alarm, no
+/// Telegram. Like the unknown-segment counter it runs in `ingest_tick_at`, so
+/// it counts live AND replayed ticks.
+const TICK_VERDICT_COUNTER: &str = "tv_dhan_feed_tick_verdict_total";
 
 /// Counter: live ticks folded end-to-end (gap detector → aggregator → writer).
 pub const INGEST_TICKS_COUNTER: &str = "tv_dhan_feed_ingest_ticks_total";
@@ -2831,7 +2843,11 @@ impl LiveIngest {
         // aggregate, and AGGREGATOR-DROP-01's 30-second delta report is where
         // a systemic refusal rate surfaces today.
         if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
-            let _assessment = self.detector.observe(obs);
+            let assessment = self.detector.observe(obs);
+            // Plan item K3: count the two loss-adjacent verdicts instead of
+            // dropping them. Pre-resolved handles, two matches, no allocation.
+            let c = counters();
+            count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
         }
 
         // Seals go STRAIGHT to the process-wide seal writer — the same
@@ -4376,6 +4392,10 @@ pub struct DrainCounters {
     ingest_seq_refused: metrics::Counter,
     /// See `TICK_UNKNOWN_SEGMENT_COUNTER` (audit INP-1, 2026-10-11).
     tick_unknown_segment: metrics::Counter,
+    /// See `TICK_VERDICT_COUNTER` (plan item K3, 2026-10-26).
+    verdict_ltt_backward: metrics::Counter,
+    /// See `TICK_VERDICT_COUNTER` (plan item K3, 2026-10-26).
+    verdict_volume_jump: metrics::Counter,
     refused_price: metrics::Counter,
     refused_timestamp: metrics::Counter,
     refused_slot: metrics::Counter,
@@ -4459,6 +4479,24 @@ impl DrainCounters {
     }
 }
 
+/// Counts a tick's loss-adjacent gap-detector verdicts (plan item K3): an
+/// LTT that went backward and a volume jump far above the learned delta. The
+/// other verdicts (first sight, repeated, advanced, unchanged, regressed) are
+/// not counted here. Per tick, O(1), two matches on `Copy` enums and at most
+/// two increments on pre-resolved handles, no allocation.
+fn count_tick_verdicts(
+    ltt_backward: &metrics::Counter,
+    volume_jump: &metrics::Counter,
+    assessment: &TickAssessment,
+) {
+    if matches!(assessment.ltt, LttVerdict::Backward { .. }) {
+        ltt_backward.increment(1);
+    }
+    if matches!(assessment.volume, VolumeVerdict::SuspectedGap { .. }) {
+        volume_jump.increment(1);
+    }
+}
+
 /// Process-wide handle set, resolved on first use.
 /// The process-wide cached handle set.
 ///
@@ -4484,6 +4522,8 @@ pub fn counters() -> &'static DrainCounters {
         ingest_ticks: metrics::counter!(INGEST_TICKS_COUNTER),
         ingest_seq_refused: metrics::counter!(INGEST_SEQ_REFUSED_COUNTER),
         tick_unknown_segment: metrics::counter!(TICK_UNKNOWN_SEGMENT_COUNTER),
+        verdict_ltt_backward: metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "ltt_backward"),
+        verdict_volume_jump: metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "volume_jump"),
         refused_price: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "price"),
         refused_timestamp: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "timestamp"),
         refused_slot: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "slot_exhausted"),
@@ -4593,6 +4633,10 @@ fn seed_drain_loss_baselines() {
     c.refused_timestamp.increment(0);
     c.refused_slot.increment(0);
     c.refused_session.increment(0);
+    // Plan item K3 (2026-10-26): the gap detector's two loss-adjacent
+    // verdicts, both label sets, so a session with none reads 0, not absent.
+    c.verdict_ltt_backward.increment(0);
+    c.verdict_volume_jump.increment(0);
     // ADDED 2026-09-10 by the compound-failure permutation sweep. The ghost
     // family is the ONLY instrument that can verify the depth unsubscribe
     // RequestCode live: the scope lock names "a session with `ghost = 0` and
@@ -18725,6 +18769,89 @@ mod tests {
         let reference = lines("ref_lag_ms_");
         assert!(!ours.is_empty(), "no lag lines rendered:\n{rendered}");
         assert_eq!(ours, reference, "rendered:\n{rendered}");
+    }
+
+    /// Plan item K3: a backward LTT and a volume jump, produced by the real
+    /// detector, move the two verdict counters; healthy ticks move neither.
+    #[test]
+    fn tick_verdict_counters_move_on_a_backward_ltt_and_a_volume_jump() {
+        use tickvault_common::types::ExchangeSegment;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let backward = metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "ltt_backward");
+            let jump = metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "volume_jump");
+            backward.increment(0);
+            jump.increment(0);
+            let config = DetectorConfig::default();
+            let warmup = config.baseline_warmup_samples;
+            let mut detector = TickGapDetector::with_capacity(4, config);
+            let key = (52_175_u64, ExchangeSegment::NseFno);
+            let mut ltt: u32 = 1_800_000_000;
+            let mut volume: u32 = 1_000;
+            let mut recv: u64 = 0;
+            let feed = |detector: &mut TickGapDetector, ltt: u32, volume: u32, recv: u64| {
+                let assessment = detector.observe(TickObservation {
+                    key,
+                    ltt_epoch_secs: ltt,
+                    volume,
+                    open_interest: 0,
+                    recv_monotonic_millis: recv,
+                });
+                count_tick_verdicts(&backward, &jump, &assessment);
+                assessment
+            };
+            // Warm up with steady +10 volume, forward LTT: no verdict.
+            for _ in 0..=warmup.saturating_add(2) {
+                ltt += 1;
+                volume += 10;
+                recv += 1_000;
+                let a = feed(&mut detector, ltt, volume, recv);
+                assert!(!a.suspects_loss(), "{a:?}");
+            }
+            // A backward LTT (volume steady, so only the LTT verdict fires).
+            recv += 1_000;
+            let a = feed(&mut detector, ltt - 5, volume, recv);
+            assert!(
+                matches!(a.ltt, LttVerdict::Backward { by_secs: 5 }),
+                "{a:?}"
+            );
+            // A volume jump far above the learned +10 delta.
+            recv += 1_000;
+            let a = feed(&mut detector, ltt + 1, volume + 1_000_000, recv);
+            assert!(
+                matches!(a.volume, VolumeVerdict::SuspectedGap { .. }),
+                "{a:?}"
+            );
+        });
+        let rendered = handle.render();
+        let value = |verdict: &str| -> Option<String> {
+            let prefix = format!("{TICK_VERDICT_COUNTER}{{verdict=\"{verdict}\"}} ");
+            rendered
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_owned))
+        };
+        assert_eq!(value("ltt_backward").as_deref(), Some("1"), "{rendered}");
+        assert_eq!(value("volume_jump").as_deref(), Some("1"), "{rendered}");
+    }
+
+    /// The drain's ingest site counts through the pre-resolved handles, and
+    /// both label sets are seeded with the drain's other loss baselines.
+    #[test]
+    fn tick_verdicts_are_counted_at_ingest_and_seeded_at_zero() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(prod.contains(
+            "count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);"
+        ));
+        assert!(!prod.contains("let _assessment = self.detector.observe(obs);"));
+        assert!(prod.contains("c.verdict_ltt_backward.increment(0);"));
+        assert!(prod.contains("c.verdict_volume_jump.increment(0);"));
+        assert!(prod.contains(r#""verdict" => "ltt_backward""#));
+        assert!(prod.contains(r#""verdict" => "volume_jump""#));
+        // Local only: the EMF selector must never name it.
+        let cw = include_str!("../../../deploy/aws/cloudwatch-agent.json");
+        assert!(!cw.contains(TICK_VERDICT_COUNTER));
     }
 
     #[test]
