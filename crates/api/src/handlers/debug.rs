@@ -731,6 +731,40 @@ mod tests {
     }
 
     #[test]
+    fn read_tail_with_no_newline_in_the_tail_serves_nothing_rather_than_half_a_line() {
+        let tmp = mktemp("tail-noline");
+        let path = tmp.path().join("errors.jsonl.2026-10-26-09");
+        fs::write(&path, "x".repeat(4096)).unwrap();
+        let tail = read_tail(&path, 100).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.file_bytes, 4096);
+        assert!(tail.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn logs_jsonl_latest_answers_404_when_the_newest_entry_cannot_be_read() {
+        // A directory carrying the file prefix is found by `newest_jsonl` but
+        // fails to read; the handler answers 404 naming the path, never 500.
+        let _env = env_guard();
+        let tmp = mktemp("jsonl-unreadable");
+        fs::create_dir(tmp.path().join("errors.jsonl.2026-10-26-09")).unwrap();
+        unsafe {
+            std::env::set_var(LOGS_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let response = logs_jsonl_latest().await;
+        unsafe {
+            std::env::remove_var(LOGS_DIR_ENV);
+        }
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("file not found"), "{text}");
+        assert!(text.contains("errors.jsonl.2026-10-26-09"), "{text}");
+    }
+
+    #[test]
     fn jsonl_response_cap_matches_the_cross_verify_cap() {
         assert_eq!(MAX_JSONL_RESPONSE_BYTES, MAX_CROSS_VERIFY_CSV_BYTES);
         assert_eq!(MAX_JSONL_RESPONSE_BYTES, 10 * 1024 * 1024);

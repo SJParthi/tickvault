@@ -842,7 +842,63 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
   - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
 
+### PR L — 2026-10-26 wave-3 audit fixes (core socket, storage seal chain, trading fold, app lane, aws-lambdas, workflows, terraform)
+
+Approved under the same session quotes as PR J/K ("fix and reosleve and implement
+evrythign dude ... im ggiving you all teh permissiosn", "dude ensure to fox
+reosleve and impelment evryhtign dude okay?"). Each item closes a finding the
+wave-3 slice audits (W2-a socket, W2-b stop/restart/token, W2-c candle chain)
+confirmed in source. No operator-locked rule changes: 805/808 policy, the $75
+line, the frame-silence `act` default and the shell budget stay as they are.
+
+- [ ] L1 (core) Socket read path: a write that fails with no socket decision
+  first takes any owed disconnect code (`pending_close`) and classifies it, and
+  the close drain returns the first disconnect code it reads (lone or stacked)
+  to `classify_disconnect`; a close whose send stalls still drains the frames
+  already readable without waiting; a closed ring is counted under its own
+  reason, not `ring_full`; the main-feed packet-cap check matches the depth walk
+  (`>`); the boot token probe mints only on a real auth failure (network, 429,
+  5xx and parse errors go through `classify_failure_reason`).
+  - Files: crates/core/src/websocket/connection.rs, crates/core/src/websocket/pool_supervisor.rs, crates/core/src/parser/dispatcher.rs, crates/core/src/auth/token_manager.rs
+  - Tests: scripted socket where the write ticket fails while a stacked 805 is owed (805 parks); stalled-close drain keeps buffered frames; closed-ring label; 70,000-packet cap; probe error classes
+- [ ] L2 (storage, app) Seal chain at shutdown and on disk: the candle sender
+  sets `request_min_throughput` so one failed flush cycle fits the shutdown
+  budget; after the first failed flush the final drain spills the rest without
+  flushing again; a shutdown timeout keeps the crash marker not-clean with the
+  real unwritten count; the producer-side escalation honours the 4 GiB seal disk
+  floor (counted refusal); a replayed copy no fuller than the committed one is
+  skipped (`<=`) and a pinned ledger overflow clears; a spill handle closed by
+  staging or a day switch is synced or parked, never dropped unsynced.
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/seal_writer_loop.rs, crates/storage/src/seal_writer_runner.rs, crates/storage/src/seal_spill_ledger.rs, crates/storage/src/seal_spill.rs, crates/app/src/main.rs
+  - Tests: one regression test per change (hung-QuestDB final drain bound, marker not-clean on timeout, floor refusal counted, equal-fullness replay skipped, rotated handle synced)
+- [ ] L3 (trading, app) Candle fold and live lane: a packet the fold calls stale
+  can widen high/low but never moves close, close time, OI or quantities; on a
+  Muhurat day the fold's session gate follows the same Muhurat window the tick
+  writer uses; the seal-accounting `debug_assert` counts rescued seals; the
+  connected-but-silent check (RISK-GAP-03) runs on a Muhurat day; a lane refused
+  for a missing token manager or an unheld instance lock retries on a bounded
+  backoff instead of returning for the rest of the process.
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/src/candles/aggregator_cell.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_rest_stack.rs
+  - Tests: stale packet keeps close; Muhurat-day tick at 18:05 folds into a 1m bar; rescued seal does not trip the assert; lane retries then dials; restart differential unchanged
+- [ ] L4 (aws-lambdas, app, workflows, terraform) Stop paths in the capture
+  window: every workflow market-hours guard uses 09:00–15:40 IST (aws-control,
+  downsize-instance) and is pinned by a test; the deploy failure auto-stop and
+  `terraform apply` re-check IST right before acting; the holiday gate's stop
+  arm ends at 09:00; October's spend is distrusted for the first 48 h of a UTC
+  month; a Muhurat date with unset or malformed times is a Lambda error (the
+  existing Errors alarm fires) and terraform checks the time range and start <
+  end; the daily stop and stop check skip a Muhurat window; the liveness alarm
+  disarms at 15:40 and is armed on a Muhurat date; the stale "recover manually"
+  unit comment is corrected. Workflow shell lines do not grow (shell budget).
+  - Files: .github/workflows/aws-control.yml, .github/workflows/downsize-instance.yml, .github/workflows/deploy-aws.yml, .github/workflows/terraform-apply.yml, crates/app/src/holiday_gate.rs, crates/aws-lambdas/src/budget_spend.rs, crates/aws-lambdas/src/start_watchdog.rs, deploy/aws/terraform/variables.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, deploy/systemd/tickvault.service
+  - Tests: window pins for every guarded workflow; budget day-2 stale reading untrusted; Muhurat config error returns Err; daily stop skips the window; holiday gate at 09:05 starts
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
+
+- Shipping `tv_dhan_token_publish_total` / `tv_dhan_shared_token_adoption_total`
+  to CloudWatch with an alarm: a new page needs a dated noise-lock row first.
+- Skipping the 06:05 Lambda mint while a drain hold is fresh: changes the sole
+  minter's schedule contract (token-minter §10), owner decision.
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
   without a dated measured row (websocket-connection-scope-lock.md 2026-10-10).
@@ -861,6 +917,8 @@ PR J: each fix keeps the existing tiers and only closes a gap: the rescue deferr
 
 PR K: each fix keeps the existing tiers: replay classification and streak stop are pure functions; the WAL sync failure reuses the existing lost mark; the silence spacing reuses the existing per-kind CAS; verdict counters are pre-resolved handles.
 
+PR L: each fix reuses an existing mechanism: the owed close code is already stored in `pending_close`; the seal floor reuses `classify_spill_floor`; the Muhurat gate reuses the writers' Muhurat flag; workflow guards reuse the deploy-aws IST check; budget distrust widens an existing day-1 rule.
+
 ## Edge Cases
 
 - No depth sink: `is_some_and` gives false; nothing changes.
@@ -874,6 +932,8 @@ PR K: each fix keeps the existing tiers: replay classification and streak stop a
 
 - PR K: a QuestDB that refuses every line (schema drift) stops the round after 3 quarantines instead of emptying the backlog; a 401/403 is retried, never quarantined; all main-feed sockets silent at once are staggered, one redial per spacing.
 
+- PR L: a disconnect code stacked behind data at a failed write; a QuestDB that accepts TCP and never answers at exit; a Muhurat session in the evening; Monday 2 November with October's total still showing; a deploy failing at 09:10.
+
 ## Failure Modes
 
 - Extra flushes under load: at most one per 500 ms from the frame arm.
@@ -882,6 +942,8 @@ PR K: each fix keeps the existing tiers: replay classification and streak stop a
 - PR J: an inline spill that also fails is counted lost (unchanged accounting, now honest).
 
 - PR K: a retried 4xx that never heals keeps the file waiting (counted, not quarantined); a staggered silence redial recovers the pool more slowly (at most 5 × spacing).
+
+- PR L: a lane retry that never gets the lock keeps retrying on a capped backoff (logged per episode); a budget reading distrusted on day 2 pages instead of stopping.
 
 ## Test Plan
 
@@ -892,6 +954,8 @@ pin the frame-arm call; the new DHAT test; `cargo test -p tickvault-app --lib`,
 PR J: per-crate `cargo test -p` for storage, app, core, api, common; new self-test rows for every guard; clippy and fmt.
 
 PR K: per-crate `cargo test -p` for storage, app, core; one regression test per item; clippy and fmt.
+
+PR L: per-crate `cargo test -p` for core, storage, trading, app, aws-lambdas; restart differential; workflow window pins; clippy and fmt.
 
 ## Rollback
 
@@ -904,6 +968,8 @@ planner then swaps every minute as before.
 PR J: revert the merge commit of each sub-branch; no config flag or schema change.
 
 PR K: revert the merge commit of each sub-branch; no config flag or schema change.
+
+PR L: revert the merge commit of each sub-branch; no schema change.
 
 ## Observability
 
@@ -924,6 +990,8 @@ alarm); `held_back` and `min_hold` in the existing per-minute steering `info!`.
 PR J: `tv_ticks_lost_total{source="rescue_abandoned"}` and `{source="shutdown_ring_unbacked"}`, registered at 0 at boot, local `/metrics` only (they ride the existing loss-group filter only after a dated noise-lock row).
 
 PR K: tick-gap verdict counters and WAL staging-failure counters, local `/metrics` only, no EMF name, filter or alarm.
+
+PR L: new reason labels and refusal counters only, local `/metrics` only; no new alarm or page (the liveness alarm's schedule moves, the page is unchanged).
 
 ## Guarantee matrix
 
