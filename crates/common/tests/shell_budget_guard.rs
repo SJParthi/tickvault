@@ -703,7 +703,7 @@ const AWK_JQ_BUDGET: &[(&str, usize)] = &[
     ("scripts/notify-telegram.sh", 2),
     ("scripts/questdb-console-gate-matrix.sh", 2),
     ("scripts/register-dhan-ip.sh", 9),
-    ("scripts/setup-observability.sh", 8),
+    ("scripts/setup-observability.sh", 6),
     ("scripts/setup-secrets.sh", 1),
     ("scripts/test-register-dhan-ip.sh", 1),
     ("scripts/triage/verify.sh", 2),
@@ -862,15 +862,18 @@ fn ssm_payloads(text: &str) -> Option<Vec<Vec<String>>> {
         .map(|l| if is_comment_line(l) { "\n" } else { l })
         .collect();
     let c: Vec<char> = cleaned.chars().collect();
-    let needle: Vec<char> = "commands=[".chars().collect();
     let mut payloads = Vec::new();
     let mut i = 0usize;
-    while i + needle.len() <= c.len() {
-        if c[i..i + needle.len()] != needle[..] {
+    while i < c.len() {
+        // SCOPE FIX (2026-10-26, audit plan item J5): the JSON form
+        // `--parameters '{"commands":["…"]}'` is a payload too, not only the
+        // shorthand `commands=[…]`. `payload_open` accepts both, with
+        // whitespace around the `:` or `=`.
+        let Some(open) = payload_open(&c, i) else {
             i += 1;
             continue;
-        }
-        let mut k = i + needle.len();
+        };
+        let mut k = open;
         let mut elems = Vec::new();
         loop {
             match c.get(k) {
@@ -899,11 +902,80 @@ fn ssm_payloads(text: &str) -> Option<Vec<Vec<String>>> {
     Some(payloads)
 }
 
-/// Non-comment lines that run `ssm send-command`.
+/// When `commands` starts at `c[i]` and is followed by an optional closing
+/// `"`, optional whitespace, `=` or `:`, optional whitespace and `[`, the
+/// index just past that `[`. The word must start a token (`subcommands=[` is
+/// not a payload).
+///
+/// HONEST LIMIT: the JSON form escaped inside a double-quoted shell string
+/// (`"{\"commands\":[…]}"`) does not parse; it then counts as a send with no
+/// payload, which fails the budget test (closed, not open).
+fn payload_open(c: &[char], i: usize) -> Option<usize> {
+    let word: Vec<char> = "commands".chars().collect();
+    if *c.get(i..i + word.len())? != word[..] {
+        return None;
+    }
+    if i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_') {
+        return None;
+    }
+    let mut k = i + word.len();
+    if c.get(k) == Some(&'"') {
+        k += 1;
+    }
+    while c.get(k).is_some_and(|ch| *ch == ' ' || *ch == '\t') {
+        k += 1;
+    }
+    if !matches!(c.get(k), Some('=') | Some(':')) {
+        return None;
+    }
+    k += 1;
+    while c.get(k).is_some_and(|ch| ch.is_whitespace()) {
+        k += 1;
+    }
+    (c.get(k) == Some(&'[')).then_some(k + 1)
+}
+
+/// Text with every backslash-continued line joined to the next, comment
+/// lines dropped first.
+///
+/// SCOPE FIX (2026-10-26, audit plan item J5): `aws ssm \` on one line and
+/// `send-command …` on the next is one command, and the per-line scan
+/// counted zero sends for it.
+fn join_continuations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if is_comment_line(line) {
+            out.push('\n');
+            continue;
+        }
+        match line.trim_end().strip_suffix('\\') {
+            Some(head) => {
+                out.push_str(head);
+                out.push(' ');
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// `ssm send-command` invocations on non-comment lines, after joining
+/// continued lines and collapsing whitespace, so `aws ssm \` + `send-command`
+/// and `aws  ssm   send-command` each count once.
 fn count_ssm_send_commands(text: &str) -> usize {
-    text.lines()
-        .filter(|l| !is_comment_line(l) && l.contains("ssm send-command"))
-        .count()
+    join_continuations(text)
+        .lines()
+        .map(|l| {
+            l.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .matches("ssm send-command")
+                .count()
+        })
+        .sum()
 }
 
 /// Whole-word awk/jq occurrences in one line (`--jq` counts; `x.jq`, `jq_x`,
@@ -1098,6 +1170,94 @@ fn wipe_ssm_shell_never_grows() {
     );
 }
 
+/// Production Rust files that may SEND SSM shell, or build it for a sender.
+///
+/// SCOPE FIX (2026-10-26, audit plan item J5). The three ceilings above
+/// bound the shell inside files someone already listed; a NEW production
+/// file calling `send_command` with `AWS-RunShellScript` tripped none of
+/// them. Every production file carrying an [`SSM_SENDER_MARKERS`] marker,
+/// in code or in a comment, must be here. SHRINK-ONLY: a listed file that no
+/// longer carries a marker must leave in the same PR, and adding a file needs
+/// a dated operator quote in the rust-only lock first. Measured 2026-10-26.
+const SSM_SENDER_FILES: &[&str] = &[
+    "crates/app/src/bin/rebuild_2026_10_22.rs",
+    "crates/app/src/bin/wipe_2026_10_31.rs",
+    "crates/app/src/rebuild_ssm.rs",
+    "crates/app/src/wipe_ssm.rs",
+    "crates/aws-lambdas/src/operator_control.rs",
+];
+
+/// What marks a file as an SSM shell sender: the two shell document names,
+/// the SDK call, the CLI verb, and the API action name.
+///
+/// HONEST LIMIT: a document name assembled from pieces, or a call through a
+/// trait with another name, is not seen; `send_command` and `document_name(`
+/// are the SDK spellings every sender in this tree uses.
+const SSM_SENDER_MARKERS: &[&str] = &[
+    "AWS-RunShellScript",
+    "AWS-RunPowerShellScript",
+    "send_command",
+    "send-command",
+    "SendCommand",
+    "document_name(",
+];
+
+fn is_ssm_sender(src: &str) -> bool {
+    SSM_SENDER_MARKERS.iter().any(|m| src.contains(m))
+}
+
+#[test]
+fn ssm_shell_senders_are_enumerated_and_only_shrink() {
+    assert_sorted_unique(SSM_SENDER_FILES, "SSM_SENDER_FILES");
+    let found: Vec<String> = all_files()
+        .into_iter()
+        .filter(|p| is_production_rust(p))
+        .filter(|p| read_text(p).is_some_and(|s| is_ssm_sender(&s)))
+        .collect();
+    assert!(
+        found
+            .iter()
+            .any(|p| p == "crates/aws-lambdas/src/operator_control.rs"),
+        "the SSM sender scan did not find the console Lambda; the scan is broken"
+    );
+    let new: Vec<&String> = found
+        .iter()
+        .filter(|p| !SSM_SENDER_FILES.contains(&p.as_str()))
+        .collect();
+    let stale: Vec<&&str> = SSM_SENDER_FILES
+        .iter()
+        .filter(|p| !found.iter().any(|f| f == **p))
+        .collect();
+    assert!(
+        new.is_empty(),
+        "NEW SSM SHELL SENDER(S): {new:?}. A production Rust file that sends \
+         `AWS-RunShellScript` puts shell on the box outside every budget in this \
+         file. Do the step in a Rust subcommand on the box instead; adding a \
+         sender needs a dated quote in the rust-only lock first."
+    );
+    assert!(
+        stale.is_empty(),
+        "SHRINK THE LIST: {stale:?} no longer send SSM shell; remove them from \
+         SSM_SENDER_FILES in the same PR."
+    );
+}
+
+#[test]
+fn ssm_sender_discovery_self_test() {
+    assert!(is_ssm_sender(".document_name(\"AWS-RunShellScript\")"));
+    assert!(is_ssm_sender("client.send_command().instance_ids(id)"));
+    assert!(is_ssm_sender(
+        "Command::new(\"aws\").args([\"ssm\", \"send-command\"])"
+    ));
+    assert!(is_ssm_sender("\"Action\": \"ssm:SendCommand\""));
+    assert!(is_ssm_sender("doc = \"AWS-RunPowerShellScript\""));
+    assert!(!is_ssm_sender("client.get_parameter().name(path)"));
+    assert!(!is_ssm_sender("let commands = vec![];"));
+    assert!(is_production_rust("crates/app/src/new_sender.rs"));
+    assert!(is_production_rust("crates/app/build.rs"));
+    assert!(!is_production_rust("crates/app/tests/x.rs"));
+}
+
 #[test]
 fn ssm_workflow_shell_never_grows() {
     let names: Vec<&str> = SSM_WORKFLOW_SHELL_BUDGET.iter().map(|r| r.0).collect();
@@ -1290,6 +1450,46 @@ fn embedded_shell_and_awk_jq_self_test() {
         count_ssm_send_commands("echo cannot send-command\n# aws ssm send-command\n"),
         0
     );
+    // SCOPE FIX (2026-10-26, J5): `aws ssm \` + `send-command` on the next
+    // line is one send; extra spaces do not hide it; a commented continuation
+    // does not count.
+    assert_eq!(
+        count_ssm_send_commands("  aws ssm \\\n    send-command --instance-ids i \\\n"),
+        1
+    );
+    assert_eq!(count_ssm_send_commands("aws   ssm\tsend-command x\n"), 1);
+    assert_eq!(
+        count_ssm_send_commands("# aws ssm \\\n# send-command x\n"),
+        0
+    );
+    assert_eq!(
+        count_ssm_send_commands("aws ssm send-command a; aws ssm send-command b\n"),
+        2
+    );
+    // The JSON parameter form parses as a payload, with or without spaces.
+    assert_eq!(
+        ssm_payloads("--parameters '{\"commands\":[\"echo a\",\"echo b\"]}'").expect("json"),
+        vec![vec!["echo a".to_string(), "echo b".to_string()]]
+    );
+    assert_eq!(
+        ssm_payloads("--parameters '{\"commands\" : [ \"x\" ]}'").expect("json spaced"),
+        vec![vec!["x".to_string()]]
+    );
+    assert_eq!(
+        ssm_payloads("--parameters 'commands = [\"y\"]'").expect("spaced shorthand"),
+        vec![vec!["y".to_string()]]
+    );
+    // Not a payload: a longer word ending in `commands`.
+    assert_eq!(
+        ssm_payloads("subcommands=[\"z\"]").expect("terminated"),
+        Vec::<Vec<String>>::new()
+    );
+    // A split send with only a JSON payload: one send, one payload, so the
+    // budget test sees both instead of neither.
+    let split =
+        "  aws ssm \\\n    send-command \\\n    --parameters '{\"commands\":[\"rm -rf /x\"]}'\n";
+    assert_eq!(count_ssm_send_commands(split), 1);
+    assert_eq!(ssm_payloads(split).expect("terminated").len(), 1);
 
     // awk/jq words.
     assert_eq!(count_awk_jq_in_line("x | awk '{print $1}' | jq -r ."), 2);

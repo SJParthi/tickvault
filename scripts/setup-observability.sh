@@ -167,7 +167,7 @@ check_cmd() {
 
 MISSING=0
 check_cmd "docker"         "Install Docker Desktop: https://docker.com/products/docker-desktop" || MISSING=$((MISSING + 1))
-check_cmd "curl"           "apt install curl / brew install curl" || MISSING=$((MISSING + 1))
+check_cmd "curl"           "apt install curl / https://curl.se/download.html" || MISSING=$((MISSING + 1))
 check_cmd "aws"            "bash scripts/ensure-aws-cli.sh" || MISSING=$((MISSING + 1))
 
 # docker compose is a subcommand, not a binary
@@ -180,14 +180,14 @@ else
     MISSING=$((MISSING + 1))
 fi
 
-# jq is optional but useful — auto-install if missing
+# jq is optional but useful — auto-install on Linux; macOS gets a hint
 printf "  %-12s " "jq"
 if command -v jq > /dev/null 2>&1; then
     echo -e "${GREEN}found${NC}"
 else
-    echo -e "${YELLOW}missing${NC} — installing..."
-    if [ "$PLATFORM" = "macOS" ] && command -v brew > /dev/null 2>&1; then
-        brew install jq --quiet 2>/dev/null && echo -e "  ${GREEN}jq installed${NC}" || warn "Could not install jq"
+    echo -e "${YELLOW}missing${NC}"
+    if [ "$PLATFORM" = "macOS" ]; then
+        warn "jq not installed: get the binary from https://jqlang.org/download/ and re-run (not critical)"
     elif [ "$PLATFORM" = "Linux" ]; then
         sudo apt-get install -y jq > /dev/null 2>&1 && echo -e "  ${GREEN}jq installed${NC}" || warn "Could not install jq (not critical)"
     fi

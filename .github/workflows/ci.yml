@@ -307,7 +307,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.148
 
       - name: Start QuestDB for the real round-trip tests (storage only)
         # Audit PROOF-1 (2026-10-11): crates/storage/tests/questdb_real_roundtrip.rs
@@ -400,8 +400,8 @@ jobs:
       - name: Install cargo-audit + cargo-deny (from-source fallback)
         if: steps.install-audit-tools.outcome == 'failure'
         run: |
-          cargo install --locked cargo-audit
-          cargo install --locked cargo-deny
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo install --locked --version 0.19.9 cargo-deny
 
       - name: cargo deny check
         run: cargo deny check
@@ -493,7 +493,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-llvm-cov
-        run: cargo install --locked cargo-llvm-cov
+        run: cargo install --locked --version 0.9.1 cargo-llvm-cov
 
       - name: Run coverage (workspace, JSON output)
         shell: bash
