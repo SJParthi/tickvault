@@ -132,10 +132,10 @@ fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
 }
 
 /// Weekday-only schedule (trading days). Mon-Fri crons, not Mon-Sun.
-/// IST 08:30 start = 03:00 UTC; IST 17:30 stop = 12:00 UTC (operator widened
-/// the window to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till
-/// 5.30 pm"; supersedes the 2026-06-05 08:30-16:30 narrowing, which itself
-/// superseded the 2026-06-02 08:00-17:00 widening).
+/// IST 08:30 start = 03:00 UTC; IST 16:30 stop = 11:00 UTC (operator Quote 37,
+/// 2026-10-21, plan item 64; the window was 08:30-17:30 from 2026-08-08 under
+/// Quote 14, which superseded the 2026-06-05 08:30-16:30 narrowing, which
+/// itself superseded the 2026-06-02 08:00-17:00 widening).
 #[test]
 fn deploy_schedule_is_weekday_only() {
     let body = read(MAIN_TF);
@@ -144,15 +144,15 @@ fn deploy_schedule_is_weekday_only() {
         "main.tf daily_start must be `cron(0 3 ? * MON-FRI *)` (08:30 IST, Mon-Fri)."
     );
     assert!(
-        body.contains("cron(0 12 ? * MON-FRI *)"),
-        "main.tf daily_stop must be `cron(0 12 ? * MON-FRI *)` (17:30 IST, Mon-Fri)."
+        body.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf daily_stop must be `cron(0 11 ? * MON-FRI *)` (16:30 IST, Mon-Fri)."
     );
-    // Inverted pin: the retired 16:30 IST stop must not return silently — it
-    // would kill the box a full hour before the operator expects it.
+    // Inverted pin: the retired 17:30 IST stop must not return silently — it
+    // would bill an extra hour and the hard-stop guard would stop it at 17:05.
     assert!(
-        !body.contains("cron(0 11 ? * MON-FRI *)"),
-        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, \
-         2026-08-08 Quote 14)."
+        !body.contains("cron(0 12 ? * MON-FRI *)"),
+        "the 17:30 IST stop cron is retired (operator moved the stop back to 16:30 IST, \
+         2026-10-21 Quote 37)."
     );
     assert!(
         !body.contains("MON-SUN") && !body.contains("* * ? * * *"),

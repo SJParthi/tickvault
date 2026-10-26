@@ -28,6 +28,7 @@
 pub mod alarm_gate;
 pub mod budget_digest;
 pub mod budget_killswitch;
+pub mod budget_spend;
 pub mod budget_stop_latch;
 pub mod clients;
 pub mod deploy_watchdog;

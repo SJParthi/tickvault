@@ -19,8 +19,8 @@
 //! and a trusted sink. While work is left it writes the SSM String parameter
 //! `/tickvault/<env>/drain-hold`, refreshed every [`DRAIN_HOLD_REFRESH_SECS`]
 //! with an expiry [`DRAIN_HOLD_TTL_SECS`] ahead and never past 07:30 IST. The
-//! 17:30 daily stop, the 17:45 stop check, the hourly curfew check and the
-//! hard-stop guard's out-of-window stop leave the box running while it is
+//! 16:30 daily stop (17:30 until 2026-10-22), the 16:45 stop check, the
+//! hourly curfew check and the hard-stop guard's out-of-window stop leave the box running while it is
 //! fresh (`crates/aws-lambdas/src/drain_hold.rs`). After
 //! [`DRAIN_HOLD_DONE_POLLS`] done readings in a row it writes `released`, and
 //! the next scheduled check stops the box.
@@ -87,14 +87,17 @@ static HELD_TONIGHT: AtomicBool = AtomicBool::new(false);
 /// the 07:35 curfew check plus EC2's delivery of the shutdown (Assumed).
 const HELD_STOP_LAG_SECS: u64 = 600;
 
-/// 17:25 IST: no scheduled stop exists before this (the 17:30 daily stop's
+/// 16:25 IST: no scheduled stop exists before this (the 16:30 daily stop's
 /// jitter window opens here), so a stop between the first hold write and
-/// 17:25 is never the hold's stop and stays loud (hostile review, 2026-10-21).
-const HELD_STOP_EARLIEST_SECS_IST: u64 = 17 * 3_600 + 25 * 60;
+/// 16:25 is never the hold's stop and stays loud (hostile review, 2026-10-21).
+/// Derived from the one stop constant (2026-10-22, plan item 64, Quote 37:
+/// was 17:25 with the 17:30 stop).
+const HELD_STOP_EARLIEST_SECS_IST: u64 =
+    crate::shutdown_class::SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64;
 
 /// Whether a SIGTERM at `secs_ist` is the scheduled stop of a box this
 /// process held after the close (Quote 31): a hold was written tonight, and
-/// it is 17:25 IST or later, overnight, or the minutes after 07:30. O(1).
+/// it is 16:25 IST or later, overnight, or the minutes after 07:30. O(1).
 #[must_use]
 pub fn stop_follows_tonights_hold(secs_ist: u32) -> bool {
     let secs = u64::from(secs_ist);
@@ -239,10 +242,12 @@ fn waiting_spill_files(dir: &Path) -> usize {
 pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
     use tickvault_storage::audit_spill::AuditSpillTable;
     let marks = tickvault_storage::wal_deferred_depth::deferred_depth().snapshot();
+    // The top_volume spill folder left this list on 2026-10-22 (plan item
+    // 62, operator Quote 34): nothing replays it any more, so a file left in
+    // it would hold the box up all night for work no task will ever do.
     let mut spill_files = [
         tickvault_storage::tick_persistence::TICK_SPILL_DIR,
         tickvault_storage::depth_persistence::DEPTH_SPILL_DIR,
-        tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
     ]
     .iter()
     .map(|d| waiting_spill_files(Path::new(d)))
@@ -695,6 +700,19 @@ mod tests {
         assert!(
             !stop_follows_tonights_hold(11 * 3_600),
             "mid-session stays loud"
+        );
+        // 2026-10-22 (plan item 64): the 16:30 stop's window opens at 16:25.
+        assert!(
+            stop_follows_tonights_hold(16 * 3_600 + 25 * 60),
+            "16:25 IST, the stop window"
+        );
+        assert!(
+            stop_follows_tonights_hold(16 * 3_600 + 30 * 60),
+            "the 16:30 daily stop of a held box"
+        );
+        assert!(
+            !stop_follows_tonights_hold(16 * 3_600 + 25 * 60 - 1),
+            "16:24:59 IST stays loud"
         );
         HELD_TONIGHT.store(false, Ordering::Release);
     }

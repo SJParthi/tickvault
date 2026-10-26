@@ -498,16 +498,10 @@ pub enum ErrorCode {
     /// DHAN-LANE-03 class of fail-closed gate). Severity::High.
     OrderReady01GateRefused,
 
-    /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
-    /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
-    /// since session open per Ticket #5525125 (verified via the live Mon
-    /// May 4 monotonicity SELECT — see `docs/operator/track-2-monotonicity-select.md`).
-    /// If a tick arrives with `volume < last_seen_volume` for the same
-    /// `(security_id, exchange_segment)` within a single trading day, that
-    /// breaks cumulative-monotonicity invariant — either Dhan changed the
-    /// semantic mid-session (escalate to Item 26 L3 ticket) or our parser
-    /// regressed on the byte offset. Severity::High.
-    Volume01MonotonicityBreach,
+    // VOLUME-MONO-01 (`Volume01MonotonicityBreach`) RETIRED 2026-10-22 (plan
+    // item 62, operator Quote 34): its only emitter, the volume leaderboard's
+    // monotonicity gate, was deleted with `top_volume`. The runbook keeps the
+    // code string as history (crossref REVERSE_CHECK_ALLOWLIST).
     // PR #5 (2026-05-19): PHASE2-READY-01 variant RETIRED. The 09:13:01 IST
     // pre-flight readiness check is deleted alongside the Phase 2 dispatcher
     // chain under operator-locked 4-IDX_I LOCKED_UNIVERSE.
@@ -1240,8 +1234,6 @@ impl ErrorCode {
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
             Self::PrevClose04CacheEmptyAtBoot => "PREVCLOSE-04",
-            // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
-            Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
             // PR #5 (2026-05-19): PHASE2-READY-01 retired with phase2_readiness_check.
             // Wave 6 — Multi-TF aggregator
             Self::AggregatorDrop01 => "AGGREGATOR-DROP-01",
@@ -1389,7 +1381,6 @@ impl ErrorCode {
             // profile probe. Same class as WS-GAP-10 / DHAN-LANE-03.
             | Self::OrderReady01GateRefused
             | Self::Boot01QuestDbSlow
-            | Self::Volume01MonotonicityBreach
             | Self::AggregatorLate01
             | Self::AggregatorLag01TickLagDropped
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
@@ -1711,8 +1702,7 @@ impl ErrorCode {
             Self::OrderReady01GateRefused => {
                 "docs/error-runbooks/order-readiness-error-codes.md"
             }
-            Self::PrevClose03BootRoutingAssertion
-            | Self::Volume01MonotonicityBreach => "docs/error-runbooks/wave-5-error-codes.md",
+            Self::PrevClose03BootRoutingAssertion => "docs/error-runbooks/wave-5-error-codes.md",
             Self::AggregatorDrop01
             | Self::AggregatorStall01InlineWait
             | Self::AggregatorLate01
@@ -1983,7 +1973,6 @@ impl ErrorCode {
             Self::Selftest01Passed,
             Self::Selftest02Failed,
             Self::PrevClose03BootRoutingAssertion,
-            Self::Volume01MonotonicityBreach,
             // PR #5 (2026-05-19): Phase2Ready01PreflightFailed retired.
             // Wave 6 — Multi-TF aggregator (Sub-PR #1)
             Self::AggregatorDrop01,

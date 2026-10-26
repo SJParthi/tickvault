@@ -313,19 +313,19 @@ fn test_terraform_eventbridge_schedules_match_budget() {
         content.contains("cron(0 3 ? * MON-FRI *)"),
         "main.tf missing weekday start schedule (03:00 UTC Mon-Fri = 08:30 IST)"
     );
-    // Weekday stop: 17:30 IST = 12:00 UTC Mon-Fri (operator widened the window
-    // to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till 5.30 pm";
-    // supersedes the 2026-06-05 08:30-16:30 narrowing).
+    // Weekday stop: 16:30 IST = 11:00 UTC Mon-Fri (operator Quote 37,
+    // 2026-10-21, plan item 64: "startign 8.30 am till 4 pm or 4.30 pm woudl be
+    // fine"; supersedes the 2026-08-08 Quote 14 08:30-17:30 widening).
     assert!(
-        content.contains("cron(0 12 ? * MON-FRI *)"),
-        "main.tf missing weekday stop schedule (12:00 UTC Mon-Fri = 17:30 IST)"
+        content.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf missing weekday stop schedule (11:00 UTC Mon-Fri = 16:30 IST)"
     );
-    // Inverted pin: the retired 16:30 IST stop must NOT come back silently. A
-    // shorter window would stop the box an hour before the operator expects,
-    // mid-session for anything running past 16:30.
+    // Inverted pin: the retired 17:30 IST stop must NOT come back silently. A
+    // longer window bills an extra hour every weekday and the hourly hard-stop
+    // guard (closing at 16:30) would force-stop the box at 17:05 and page.
     assert!(
-        !content.contains("cron(0 11 ? * MON-FRI *)"),
-        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, 2026-08-08 Quote 14)"
+        !content.contains("cron(0 12 ? * MON-FRI *)"),
+        "the 17:30 IST stop cron is retired (operator moved the stop back to 16:30 IST, 2026-10-21 Quote 37)"
     );
     // Negative asserts — the prior 7-day daily crons (every day, no MON-FRI
     // restriction) must NOT return. The weekday-only `? * MON-FRI` form is

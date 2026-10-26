@@ -60,11 +60,9 @@ locals {
     "depth-probe-blind"           = { group = "market_data_refused", counter = "tv_spill_free_probe_blind_total", slice = " && $.tier = \"depth\"" }
     "spill-replay-lines-rejected" = { group = "market_data_refused", counter = "tv_tick_spill_replay_lines_rejected_total", slice = "" }
     "candle-int-heal-refused"     = { group = "market_data_refused", counter = "tv_candle_int_self_heal_refused_total", slice = "" }
-    "top-volume-rows-discarded"   = { group = "market_data_refused", counter = "tv_top_volume_rank_rows_discarded_total", slice = "" }
-    "top-volume-append-failed"    = { group = "market_data_refused", counter = "tv_top_volume_rank_append_failed_total", slice = "" }
-    # 2026-10-11 (§2.10-a). Every reason but label_unavailable drops the row;
-    # label_unavailable keeps it with a blank display name.
-    "top-volume-snapshot-refused" = { group = "market_data_refused", counter = "tv_top_volume_snapshot_refused_total", slice = " && $.reason != \"label_unavailable\"" }
+    # The three top-volume rows (rows discarded, append failed, snapshot
+    # refused) were removed 2026-10-22 (plan item 62, operator Quote 34) with
+    # the top_volume writer whose counters they read.
     # Oversize only: transport is every ordinary socket reset.
     "ws-frame-refused-oversize" = { group = "market_data_refused", counter = "tv_dhan_ws_frame_refused_total", slice = " && $.reason = \"oversize\"" }
 
@@ -134,8 +132,8 @@ locals {
     # ---- 6. a safety bound reached, or a monitor blind ---------------------
     "spot-price-store-refused" = { group = "bound_or_blind", counter = "tv_spot_price_store_refused_total", slice = "" }
     "prev-close-store-refused" = { group = "bound_or_blind", counter = "tv_prev_close_store_refused_total", slice = "" }
-    # zero_lot_window is normal; non_monotonic already logs VOLUME-MONO-01.
-    "volume-leaderboard-refused"    = { group = "bound_or_blind", counter = "tv_volume_leaderboard_refused_total", slice = " && ($.reason = \"capacity\" || $.reason = \"window_bar_missing\")" }
+    # The volume-leaderboard row was removed 2026-10-22 (plan item 62) with
+    # the leaderboard.
     "depth-view-dropped-refused"    = { group = "bound_or_blind", counter = "tv_depth_view_dropped_refused_total", slice = "" }
     "depth-view-held-today-refused" = { group = "bound_or_blind", counter = "tv_depth_view_held_today_refused_total", slice = "" }
     "wal-lag-tracker-refused"       = { group = "bound_or_blind", counter = "tv_wal_lag_tracker_refused_total", slice = "" }
@@ -180,7 +178,7 @@ resource "aws_cloudwatch_log_metric_filter" "loss_group" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_data_refused" {
   alarm_name          = "tv-${var.environment}-market-data-refused"
-  alarm_description   = "RECEIVED MARKET DATA WAS REFUSED, SET ASIDE OR DISCARDED. Sums nine counters: frames drained from a stale socket at reconnect, open-interest/market-status rows refused, depth spill rows refused because the free-space probe was blind, spill replay lines QuestDB refused (kept in quarantine), candles refused on a table still on the old id type, top-volume rows that failed to append, were discarded or were dropped by the snapshot, and socket frames refused as larger than the size cap. DO: (1) grep /tickvault/<env>/app for STORAGE-GAP-01, STORAGE-GAP-03 and TICK-SPILL-01 lines; they name the table and the cause. (2) check QuestDB health and df -h /data. (3) re-ingest data/spill/quarantine/*.rejected-lines once the cause is fixed. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "RECEIVED MARKET DATA WAS REFUSED, SET ASIDE OR DISCARDED. Sums six counters: frames drained from a stale socket at reconnect, open-interest/market-status rows refused, depth spill rows refused because the free-space probe was blind, spill replay lines QuestDB refused (kept in quarantine), candles refused on a table still on the old id type, and socket frames refused as larger than the size cap. DO: (1) grep /tickvault/<env>/app for STORAGE-GAP-01, STORAGE-GAP-03 and TICK-SPILL-01 lines; they name the table and the cause. (2) check QuestDB health and df -h /data. (3) re-ingest data/spill/quarantine/*.rejected-lines once the cause is fixed. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1
@@ -282,7 +280,7 @@ resource "aws_cloudwatch_metric_alarm" "order_path_dropped" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "safety_bound_or_monitor_blind" {
   alarm_name          = "tv-${var.environment}-safety-bound-or-monitor-blind"
-  alarm_description   = "A FIXED-SIZE TABLE IS FULL OR A HEALTH CHECK IS BLIND. Sums fourteen counters: spot-price, previous-close, volume-ranking, day high/low and tick-gap entries refused at their caps (or a ranking window lost), depth-view tracking refused at its cap, the WAL lag tracker full, the spill-disk, memory and OOM probes failing, the order-update activity watchdog panicking, the day high/low reset task dying, and an HTTP client that could not be built. DO: read the log line naming the table or probe in /tickvault/<env>/app. A cap hit means the universe outgrew it; a failing probe means that monitor is not watching. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "A FIXED-SIZE TABLE IS FULL OR A HEALTH CHECK IS BLIND. Sums thirteen counters: spot-price, previous-close, day high/low and tick-gap entries refused at their caps, depth-view tracking refused at its cap, the WAL lag tracker full, the spill-disk, memory and OOM probes failing, the order-update activity watchdog panicking, the day high/low reset task dying, and an HTTP client that could not be built. DO: read the log line naming the table or probe in /tickvault/<env>/app. A cap hit means the universe outgrew it; a failing probe means that monitor is not watching. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1

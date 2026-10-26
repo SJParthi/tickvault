@@ -751,13 +751,8 @@ socket_close_arm = false
 [depth_storage]
 array_rows = false
 
-# The busiest-contract boards (`top_volume_1s/3s/5s/1m`) save a batch that
-# cannot reach QuestDB to data/spill/top_volume and replay it after 15:40 IST
-# (plan `.claude/plans/active-plan-top-volume-spill.md`, owner approval
-# 2026-10-13). Set false to roll back: such batches are then discarded and
-# counted, as before. The replay still runs for files already on disk.
-[top_volume]
-spill_enabled = true
+# `[top_volume]` (the busiest-contract boards' spill tier) REMOVED 2026-10-22
+# (plan item 62, operator Quote 34): nothing writes `top_volume_*` any more.
 
 [dhan_universe]
 enabled = true

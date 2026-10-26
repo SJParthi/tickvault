@@ -2,7 +2,7 @@
 //!
 //! ## The gap this closes
 //!
-//! `volume_leaderboard::eligible_gain_pct(ltp, prev_close)` is the gainer
+//! `option_rank::eligible_gain_pct(ltp, prev_close)` (moved from `volume_leaderboard` on 2026-10-22) is the gainer
 //! ELIGIBILITY filter the 2026-09-06 depth lock specifies. Nothing supplied
 //! its second argument.
 //!
@@ -362,7 +362,7 @@ mod tests {
     fn a_stored_close_produces_a_finite_gain_through_the_leaderboard_filter() {
         // The whole point of the store: `eligible_gain_pct` had no second
         // argument. This is the end-to-end shape it now has.
-        use crate::volume_leaderboard::eligible_gain_pct;
+        use crate::option_rank::eligible_gain_pct;
         let mut s = PrevCloseStore::new();
         s.record(10, FNO, 100.0);
         let prev = s.get(10, FNO).expect("just stored");

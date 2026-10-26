@@ -101,13 +101,13 @@ jobs:
           components: rust-src
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fuzz -> target
           prefix-key: fuzz-${{ env.NIGHTLY_VERSION }}
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # cargo-fuzz
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # cargo-fuzz
         with:
           tool: cargo-fuzz
 

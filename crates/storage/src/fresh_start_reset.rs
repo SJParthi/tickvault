@@ -1184,7 +1184,11 @@ mod tests {
         }
         // Emitted candle set must equal the reset's candle set, so a future
         // tenth fold frame fails here instead of surviving a reset unnoticed.
+        // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` left the fold
+        // and are archive-only now; the one-shot reset (long since run) still
+        // names them, so the comparison adds them back.
         let mut emitted = crate::shadow_persistence::emitted_candle_table_names();
+        emitted.extend(crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES);
         emitted.sort_unstable();
         let mut reset: Vec<&str> = RESET_TABLES
             .iter()
@@ -1202,22 +1206,19 @@ mod tests {
     /// never refused over a dependent view.
     #[test]
     fn the_reset_drops_every_top_volume_name() {
-        use crate::top_volume_rank_persistence::{
-            LEGACY_TOP_VOLUME_RANK_TABLE, LEGACY_TOP_VOLUME_TABLE, SnapshotCadence,
-        };
-        assert!(RESET_TABLES.contains(&LEGACY_TOP_VOLUME_TABLE));
+        // Literal since 2026-10-22 (plan item 62): the top-volume writer
+        // module and its constants are deleted; the reset is one-shot history.
+        const LEGACY_TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
+        assert!(RESET_TABLES.contains(&"top_volume"));
         assert!(RESET_TABLES.contains(&LEGACY_TOP_VOLUME_RANK_TABLE));
-        for c in SnapshotCadence::ALL {
-            assert!(
-                RESET_TABLES.contains(&c.table_name()),
-                "{} table",
-                c.table_name()
-            );
-            assert!(
-                RESET_VIEWS.contains(&c.table_name()),
-                "{} view",
-                c.table_name()
-            );
+        for name in [
+            "top_volume_1s",
+            "top_volume_3s",
+            "top_volume_5s",
+            "top_volume_1m",
+        ] {
+            assert!(RESET_TABLES.contains(&name), "{name} table");
+            assert!(RESET_VIEWS.contains(&name), "{name} view");
         }
         let stmts = drop_statements();
         let legacy_table = stmts

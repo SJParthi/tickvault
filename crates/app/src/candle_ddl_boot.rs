@@ -231,8 +231,9 @@ pub const LIVE_TABLE_DDL_ATTEMPTS: u32 = 6;
 /// Seconds between `ticks` / `market_depth` DDL attempts.
 pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 
-/// Ensure the LIVE-writer tables — `ticks`, `market_depth` and the four
-/// direct `top_volume_<tf>` tables (since 2026-09-22) — with their DEDUP keys, retrying a refusal instead of running the session on
+/// Ensure the LIVE-writer tables — `ticks`, `market_depth` and
+/// `feed_aux_packets` (the four `top_volume_<tf>` tables were dropped from this
+/// list on 2026-10-22, plan item 62) — with their DEDUP keys, retrying a refusal instead of running the session on
 /// whatever ILP auto-creates.
 ///
 /// # Why a retry, when the candle DDL above gets one probe and one shot
@@ -262,13 +263,9 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
             tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
-        // The four direct `top_volume_<tf>` tables (2026-09-22; before that ONE
-        // `top_volume` table viewed four ways). Their offload writer appends
-        // from the first ranking sweep, so an un-ensured table would be
-        // ILP-auto-created with no DEDUP key (`ts, tf, family, feed,
-        // security_id, segment`) and every replayed snapshot would duplicate.
-        let volume_ok =
-            tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb).await;
+        // The four `top_volume_<tf>` tables are no longer ensured (2026-10-22,
+        // plan item 62, operator Quote 34): nothing writes them, and creating
+        // them would undo the Quote 34 removal on a fresh volume.
         // 2026-10-02 (item 45h): `feed_aux_packets` rides the tick writer's
         // buffer, so it must carry its 6-key DEDUP before the first frame too.
         let feed_aux_ok =
@@ -276,11 +273,11 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         // 2026-09-22 (SECOND): no view re-ensure here any more. The app
         // creates NO view; the retired ones are dropped once, before any table
         // DDL, by `run_candle_ddl_at_boot`.
-        if ticks_ok && depth_ok && volume_ok && feed_aux_ok {
+        if ticks_ok && depth_ok && feed_aux_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) + \
+                 (depth_kind DEDUP) + \
                  feed_aux_packets (6-key DEDUP) ensured."
             );
             return true;
@@ -291,7 +288,6 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
                 attempts = LIVE_TABLE_DDL_ATTEMPTS,
                 ticks_ok,
                 depth_ok,
-                volume_ok,
                 feed_aux_ok,
                 backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
                 "live-table DDL refused — retrying so the session does not run on an \
@@ -304,12 +300,11 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
         attempts = LIVE_TABLE_DDL_ATTEMPTS,
         backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
-        "live-table DDL boot EXHAUSTED — ticks, market_depth, feed_aux_packets and/or a top_volume_<tf> table could not be \
+        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or feed_aux_packets could not be \
          ensured. Consequence: the first ILP write may auto-create the table \
          WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
          pools overwrite each other's levels. The ensure keeps re-running in the \
-         background (the boot spawns it), and top_volume rows are refused until it \
-         succeeds. \
+         background (the boot spawns it). \
          Check QuestDB's WAL state (`wal_tables()`) before the next session."
     );
     false
@@ -319,7 +314,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
 ///
 /// Audit PR31a (2026-09-27). Before this, a boot whose ensure was refused
 /// left the tables un-keyed for the whole session: nothing ran the DDL again
-/// until the next boot. The candle and `top_volume_<tf>` writers now REFUSE to
+/// until the next boot. The candle writer (and the `top_volume_<tf>` writer, removed 2026-10-22) REFUSE to
 /// send until their tables are keyed, so without a re-run a transient refusal
 /// at 09:00 would send every candle to the disk spill until the next morning.
 pub const DDL_BACKGROUND_RETRY_FIRST_SECS: u64 = 30;
@@ -343,7 +338,7 @@ pub enum DdlTables {
     /// tables are keyed. The one-shot fresh-start reset is NOT re-run here —
     /// it drops live-writer tables and belongs to the boot only.
     CandlesWithSkippedSweep,
-    /// `ticks`, `market_depth` and the four `top_volume_<tf>` tables
+    /// `ticks`, `market_depth` and `feed_aux_packets`
     /// ([`run_live_table_ddl_at_boot`]'s ensures).
     Live,
 }
@@ -363,12 +358,9 @@ async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool 
             let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
             let depth_ok =
                 tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
-            let volume_ok =
-                tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb)
-                    .await;
             let feed_aux_ok =
                 tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
-            ticks_ok && depth_ok && volume_ok && feed_aux_ok
+            ticks_ok && depth_ok && feed_aux_ok
         }
     }
 }

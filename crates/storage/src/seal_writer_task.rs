@@ -2892,32 +2892,37 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// Audit PR41c: the boot drain reads a version-4 record (the build before
-    /// this one wrote it) and refuses a damaged version-5 record without
-    /// losing the records after it.
+    /// Audit PR41c, re-pinned 2026-10-22 (plan item 62): the boot drain
+    /// REFUSES a version-5 record (the build before this one wrote it, under
+    /// the old timeframe ordinals) and a damaged current record, without
+    /// losing the records after them. Until 2026-10-22 a version-4 record was
+    /// still read; `S3`/`S5` leaving `TfIndex` renumbered the frames after them.
     #[test]
-    fn boot_drain_reads_a_v4_record_and_refuses_a_damaged_one() {
+    fn boot_drain_refuses_an_old_version_record_and_a_damaged_one() {
         let dir = std::env::temp_dir().join(format!("tv-seal-pr41c-boot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("seals_v4-2026-10-01.bin");
 
         let good = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 102.5));
         let after = SerializedSeal::from(&mk_seal(14, 0, TfIndex::M1, 1_716_000_900, 103.5));
-        let mut v4 = good.to_bytes();
-        v4[0..4].copy_from_slice(&13_u32.to_le_bytes());
-        v4[7] = 4;
+        let mut v5 = good.to_bytes();
+        v5[7] = 5;
+        crate::seal_spill::reseal_record_for_test(&mut v5);
         let mut damaged = good.to_bytes();
         damaged[64] ^= 0x40;
 
         let mut bytes = Vec::new();
-        for record in [good.to_bytes(), v4, damaged, after.to_bytes()] {
+        for record in [good.to_bytes(), v5, damaged, after.to_bytes()] {
             bytes.extend_from_slice(&record);
         }
         std::fs::write(&path, &bytes).expect("write spill");
 
         let (records, undecodable) = read_staged_spill(&path).expect("readable");
-        assert_eq!(records, vec![good, good, after]);
-        assert_eq!(undecodable, 1, "the damaged record is refused and counted");
+        assert_eq!(records, vec![good, after]);
+        assert_eq!(
+            undecodable, 2,
+            "the old-version record and the damaged record are refused and counted"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

@@ -114,13 +114,23 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"]
   }
 
-  # AWS tab: read-only CloudWatch alarm states + month-to-date cost. No
-  # resource-level scoping is available for these read APIs (AWS requires "*").
+  # AWS tab: read-only CloudWatch alarm states. No resource-level scoping is
+  # available for DescribeAlarms (AWS requires "*").
   statement {
     sid       = "ReadOnlyObservability"
     effect    = "Allow"
-    actions   = ["cloudwatch:DescribeAlarms", "ce:GetCostAndUsage"]
+    actions   = ["cloudwatch:DescribeAlarms"]
     resources = ["*"]
+  }
+
+  # AWS tab month-to-date cost: the free AWS Budgets DescribeBudget on the ONE
+  # tickvault budget (2026-10-22, plan item 63, operator Quote 37; was paid
+  # ce:GetCostAndUsage on "*").
+  statement {
+    sid       = "ViewTheOneBudget"
+    effect    = "Allow"
+    actions   = ["budgets:ViewBudget"]
+    resources = [aws_budgets_budget.tv_monthly.arn]
   }
 
   # Review finding 7: pin logs to THIS account + this Lambda's log group only.
@@ -201,6 +211,10 @@ resource "aws_lambda_function" "operator_control" {
       # stay in lockstep; a staging env would need the workflow parameterized.
       PORTAL_GIT_SHA   = var.portal_git_sha
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
+      # 2026-10-22 (plan item 63): the budget the AWS tab reads its
+      # month-to-date cost from (free DescribeBudget).
+      BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
+      BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
     }
   }
 }

@@ -612,6 +612,14 @@ const CONSOLE_SHELL_SOURCES: &[(&str, usize, usize)] = &[
 const REBUILD_SSM_SHELL_SOURCES: &[(&str, usize, usize)] =
     &[("crates/app/src/rebuild_ssm.rs", 6, 280)];
 
+/// Rust sources whose production string literals are the SSM shell of the
+/// one-off 2026-10-31 market-data wipe (plan item 67, operator Quote 35):
+/// `(path, literal lines, bytes)` ceilings, measured exactly 2026-10-22. One
+/// element: fetch the deployed binary, then run its Rust `wipe-box`
+/// subcommand. Rust-only lock §0.14, approved by the owner 2026-10-22. The
+/// row goes with the tool in the PR after the run.
+const WIPE_SSM_SHELL_SOURCES: &[(&str, usize, usize)] = &[("crates/app/src/wipe_ssm.rs", 3, 231)];
+
 /// Per workflow file: `(path, SSM command elements, bytes)` ceilings,
 /// measured 2026-10-04. A workflow absent here may send no SSM shell.
 /// 2026-10-20: `deploy-aws.yml` 95 / 11,980 → 94 / 11,907 (measured exactly):
@@ -1060,6 +1068,37 @@ fn rebuild_ssm_shell_never_grows() {
 }
 
 #[test]
+fn wipe_ssm_shell_never_grows() {
+    let names: Vec<&str> = WIPE_SSM_SHELL_SOURCES.iter().map(|r| r.0).collect();
+    assert_sorted_unique(&names, "WIPE_SSM_SHELL_SOURCES");
+    let mut report = Vec::new();
+    let mut over = Vec::new();
+    for (path, max_lines, max_bytes) in WIPE_SSM_SHELL_SOURCES {
+        let src = read_text(path)
+            .unwrap_or_else(|| panic!("wipe shell source `{path}` is gone: remove its row"));
+        let region = production_region(&src);
+        // Anti-vacuity: the file still carries the one command.
+        assert!(
+            region.contains("wipe-box"),
+            "`{path}`: the box command is gone; the row is stale"
+        );
+        let lits = rust_string_literals(region)
+            .unwrap_or_else(|| panic!("`{path}`: unterminated literal or comment"));
+        let (lines, bytes) = literal_lines_and_bytes(&lits);
+        report.push(format!("    (\"{path}\", {lines}, {bytes}),"));
+        if lines > *max_lines || bytes > *max_bytes {
+            over.push((path.to_string(), lines, *max_lines, bytes, *max_bytes));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "the wipe's SSM shell grew (path, lines, ceiling, bytes, ceiling): {over:?}. \
+         Do the step in the Rust `wipe-box` subcommand instead. Measured now:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
 fn ssm_workflow_shell_never_grows() {
     let names: Vec<&str> = SSM_WORKFLOW_SHELL_BUDGET.iter().map(|r| r.0).collect();
     assert_sorted_unique(&names, "SSM_WORKFLOW_SHELL_BUDGET");
@@ -1358,6 +1397,10 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/secret-scan.yml", 29),
     (".github/workflows/security-audit.yml", 2),
     (".github/workflows/terraform-apply.yml", 287),
+    // 2026-10-22 (plan item 67), rust-only lock §0.14 (Quote 35), approved by the
+    // owner 2026-10-22: the one-off 31 Oct wipe only builds and runs its
+    // Rust tool, once per job. Removed with the workflow after the run.
+    (".github/workflows/wipe-2026-10-31.yml", 4),
     (".github/workflows/wipe-log-streams.yml", 115),
 ];
 

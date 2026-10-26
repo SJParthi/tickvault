@@ -688,7 +688,7 @@ async fn copy_body(r: &mut BoxReport) {
             Path::new("data/spill"),
             Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
             Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
-            Path::new(tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR),
+            Path::new(tickvault_storage::raw_frame_upload::LEGACY_TOP_VOLUME_SPILL_DIR),
             &today,
             usize::MAX,
             &always,

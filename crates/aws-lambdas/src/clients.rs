@@ -11,14 +11,15 @@ pub async fn sdk_config() -> SdkConfig {
     aws_config::defaults(BehaviorVersion::latest()).load().await
 }
 
-/// Cost Explorer is a us-east-1-only API — legacy parity:
-/// `boto3.client('ce', region_name='us-east-1')`.
-pub async fn cost_explorer_us_east_1() -> aws_sdk_costexplorer::Client {
+/// AWS Budgets is served from us-east-1 only (`budgets.amazonaws.com`).
+/// 2026-10-22 (plan item 63, Quote 37): replaces the Cost Explorer client
+/// (also us-east-1 only), so the month-to-date spend lookups are free.
+pub async fn budgets_us_east_1() -> aws_sdk_budgets::Client {
     let base = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .load()
         .await;
-    aws_sdk_costexplorer::Client::new(&base)
+    aws_sdk_budgets::Client::new(&base)
 }
 
 pub fn sns(config: &SdkConfig) -> aws_sdk_sns::Client {

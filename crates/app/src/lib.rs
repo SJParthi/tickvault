@@ -166,6 +166,9 @@ pub mod main_feed_backup;
 /// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
 pub mod market_ram_store_boot;
 pub mod movers;
+/// Option-contract ranking types and pure helpers the depth planners read
+/// (relocated from the deleted `volume_leaderboard`, 2026-10-22, plan item 62).
+pub mod option_rank;
 pub mod prev_close_store;
 /// REST-era multi-TF candle derivation (operator directive 2026-07-16):
 /// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
@@ -179,11 +182,10 @@ pub mod rest_candle_fold;
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
 pub mod spot_price_store;
-/// Projects the in-RAM volume leaderboard into `top_volume_rank` rows —
-/// the pure step between the ranking and the table the operator asked for.
-pub mod top_volume_snapshot;
-pub mod top_volume_sweep;
-pub mod volume_leaderboard;
+// `top_volume_snapshot`, `top_volume_sweep` and `volume_leaderboard` DELETED
+// 2026-10-22 (plan item 62, operator Quote 34): nothing writes `top_volume_*`
+// and the ranking that only fed it is gone. The pieces the depth planners read
+// moved to `option_rank`.
 /// Settles what the Dhan WebSocket `volume` field actually MEANS (running day
 /// total vs per-packet quantity) from data already on disk — the premise the
 /// whole volume-ranked depth steering rests on, which no Dhan document states.
@@ -239,6 +241,17 @@ pub mod rebuild_box;
 /// One-off (plan item 66): the one budgeted SSM shell element the rebuild
 /// sends. Removed after the run.
 pub mod rebuild_ssm;
+/// One-off (plan item 67, operator Quote 35, 2026-10-21): the pure half of
+/// the 2026-10-31 market-data wipe (what is deleted and kept, the run
+/// window). Removed with the tool, the box subcommand and the workflow after
+/// the run.
+pub mod wipe_2026_10_31;
+/// One-off (plan item 67): `tickvault wipe-box <mode> <sha>`, the box-side
+/// half of the 2026-10-31 wipe, run over SSM only. Removed after the run.
+pub mod wipe_box;
+/// One-off (plan item 67): the one budgeted SSM shell element the wipe sends
+/// (rust-only lock §0.14). Removed after the run.
+pub mod wipe_ssm;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_pipeline` orchestrator is DELETED. Operator directive:
 // "only ticks and our 9 needed candle timeframes are available".

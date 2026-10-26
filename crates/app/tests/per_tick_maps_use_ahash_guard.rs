@@ -20,11 +20,12 @@
 const AGGREGATOR: &str = include_str!("../../trading/src/candles/multi_tf_aggregator.rs");
 const PREV_CLOSE: &str = include_str!("../src/prev_close_store.rs");
 const SPOT_PRICE: &str = include_str!("../src/spot_price_store.rs");
-const VOLUME_BOARD: &str = include_str!("../src/volume_leaderboard.rs");
 const CONTRACT_MAP: &str = include_str!("../src/contract_underlying_map.rs");
 
 /// (file label, source, declaration that must be present verbatim)
-const PINS: [(&str, &str, &str); 6] = [
+// The volume board's `volumes` map was pinned here until 2026-10-22, when
+// `volume_leaderboard.rs` was deleted with `top_volume` (plan item 62).
+const PINS: [(&str, &str, &str); 5] = [
     (
         "multi_tf_aggregator.rs",
         AGGREGATOR,
@@ -39,11 +40,6 @@ const PINS: [(&str, &str, &str); 6] = [
         "spot_price_store.rs",
         SPOT_PRICE,
         "prices: PapayaHashMap<SpotPriceKey, AtomicU64, ahash::RandomState>,",
-    ),
-    (
-        "volume_leaderboard.rs",
-        VOLUME_BOARD,
-        "volumes: HashMap<ContractKey, Tracked, ahash::RandomState>,",
     ),
     (
         "contract_underlying_map.rs",

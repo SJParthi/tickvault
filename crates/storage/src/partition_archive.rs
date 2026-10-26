@@ -358,7 +358,11 @@ const DEPTH_TABLES: [&str; 2] = [
 /// a minute-or-longer one cannot join by accident. That is worth the O(24)
 /// scan, which runs on the cold retention sweep and never on a tick.
 fn is_intraday_table(table: &str) -> bool {
-    if table == TICKS_TABLE {
+    // 2026-10-22 (plan item 62): the two retired sub-minute tables keep the
+    // intraday window they were archived on while they were written.
+    if table == TICKS_TABLE
+        || crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table)
+    {
         return true;
     }
     (0..tickvault_trading::candles::TF_COUNT).any(|ordinal| {
@@ -599,8 +603,8 @@ pub(crate) fn partition_range_bounds(name: &str) -> Option<(String, String)> {
 }
 
 /// The `[start, end)` of a partition named `name`, as naive date-times.
-/// `None` for anything malformed. Shared by [`partition_range_bounds`] and
-/// [`top_volume_partition_held`].
+/// `None` for anything malformed. Used by [`partition_range_bounds`] (the
+/// top_volume hold that also used it was removed 2026-10-22, plan item 62).
 fn partition_range_naive(name: &str) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
     use chrono::{NaiveDate, NaiveTime, TimeDelta};
 
@@ -1340,11 +1344,8 @@ pub struct ArchiveRunSummary {
     /// rewritten rows are in it. The daily scheduler reads it as
     /// "incomplete, retry".
     pub held_deferred_depth: u32,
-    /// `top_volume_<tf>` partitions HELD this run because a pending top_volume
-    /// spill file could still replay rows into their hour (top_volume spill
-    /// plan item 6, 2026-10-13). Not a failure; the daily scheduler reads it
-    /// as "incomplete" so the day is never latched with them unarchived.
-    pub held_top_volume_spill: u32,
+    // `held_top_volume_spill` REMOVED 2026-10-22 (plan item 62): nothing can
+    // replay rows into a `top_volume_<tf>` hour any more.
 }
 
 /// How one `process_one` call ended, as far as the run loop cares.
@@ -1478,166 +1479,21 @@ pub(crate) fn hour_window_decision(
     }
 }
 
-/// Whether `table` is one of the four `top_volume_<tf>` tables. O(4).
+/// The spill folders whose pending rows a replay could still post into a
+/// swept table: the depth and tick folders.
+///
+/// ⚠ CHANGED 2026-10-22 (plan item 62, operator Quote 34): the top_volume
+/// branch is gone with the top_volume writer, spill and replay. Nothing posts
+/// rows into a `top_volume_<tf>` table any more, so its partitions are no
+/// longer held for a pending spill file (`held_top_volume_spill` is removed);
+/// they are archived like every other table, then detached.
 #[must_use]
-pub(crate) fn is_top_volume_table(table: &str) -> bool {
-    crate::top_volume_rank_persistence::SnapshotCadence::ALL
-        .iter()
-        .any(|c| c.table_name() == table)
-}
-
-/// The spill folders whose pending rows a replay could still post into
-/// `table` (top_volume spill plan item 6, 2026-10-13): the top_volume folder
-/// for a `top_volume_<tf>` table, the depth and tick folders for every other.
-#[must_use]
-pub(crate) fn spill_dirs_for_table(table: &str) -> &'static [&'static str] {
-    const TOP_VOLUME: [&str; 1] = [crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR];
+pub(crate) fn spill_dirs_for_table(_table: &str) -> &'static [&'static str] {
     const TICKS_AND_DEPTH: [&str; 2] = [
         crate::depth_persistence::DEPTH_SPILL_DIR,
         crate::tick_persistence::TICK_SPILL_DIR,
     ];
-    if is_top_volume_table(table) {
-        &TOP_VOLUME
-    } else {
-        &TICKS_AND_DEPTH
-    }
-}
-
-/// The unix hour of the OLDEST spill file in `dir` that still holds rows a
-/// replay will post (top_volume spill plan item 6). `None` when nothing is
-/// pending or the folder is absent. An unreadable folder or entry answers
-/// `Some(0)`, which holds every partition: "I could not check" never reads
-/// as "safe". O(files), one listing, on the archive task (off the worker).
-///
-/// ⚠ CHANGED 2026-10-20 (audit C1): a pending file whose NAME carries no hour
-/// no longer answers `Some(0)`. It used to: one such file held every
-/// top_volume partition and kept the daily archive verdict Incomplete for as
-/// long as the file sat there, and the age set-aside did not move it either
-/// (it cannot age a file it cannot date), so nothing ever cleared it. It is
-/// now skipped and reported in one coded `warn!` per call (one call per
-/// archive run), naming the count and the first such file. Only `.ilp` files
-/// are considered, the same set the replay reads (`list_spill_files`); any
-/// other file is never replayed, so it cannot write into an hour. A file that
-/// vanished between the listing and its `stat` (the replay emptying or
-/// setting it aside) is skipped too. What still fails safe with `Some(0)`: a
-/// folder that exists but cannot be listed, an entry the listing could not
-/// read, and a `stat` that failed for any other reason.
-///
-/// The replay and this hold now agree (C1 review, LOW-2, 2026-10-20): the
-/// top_volume replay round moves every non-empty undated `.ilp` file to
-/// `quarantine/` before it posts anything
-/// (`tick_spill_replay::set_aside_aged_spill_files`), so the replay no longer
-/// posts what this hold skips. The writer never makes such a name
-/// (`<tier>-<feed>-<hour>.ilp`), so one only appears by hand or from a
-/// damaged folder. **Honest limit:** until the next replay round the file
-/// sits in the folder unheld, but nothing posts it in that time, because each
-/// round sets files aside before it posts; only a file placed between a
-/// round's set-aside and that round's own listing is posted, once, unheld.
-/// *(The first version of this note said the replay still posts every
-/// undated file; the set-aside above removed that.)*
-#[must_use]
-pub(crate) fn oldest_pending_spill_hour(dir: &Path) -> Option<u64> {
-    let scan = scan_pending_spill_hours(dir);
-    if scan.unnamed > 0 {
-        warn!(
-            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-            source = "top_volume_spill_unnamed_file_skipped",
-            dir = %dir.display(),
-            files = scan.unnamed,
-            first = ?scan.first_unnamed,
-            "pending spill file(s) whose name carries no hour were SKIPPED when deciding \
-             which top_volume hours the archive must hold: such a file carries no date, \
-             so it does not hold every partition. The next replay round sets it aside \
-             in quarantine/ before posting anything, so it is not replayed; re-ingest \
-             its rows by hand only after checking the cold archive of their hours."
-        );
-    }
-    scan.oldest
-}
-
-/// What [`oldest_pending_spill_hour`] found in one listing.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PendingSpillScan {
-    /// The oldest hour a pending, dated `.ilp` file carries, or `Some(0)` when
-    /// the folder or an entry could not be read (hold every partition).
-    oldest: Option<u64>,
-    /// Pending `.ilp` files whose name carries no hour, skipped.
-    unnamed: u32,
-    /// The first of them, for the coded line.
-    first_unnamed: Option<PathBuf>,
-}
-
-/// One listing of `dir` for [`oldest_pending_spill_hour`]. O(files), cold.
-fn scan_pending_spill_hours(dir: &Path) -> PendingSpillScan {
-    let fail_safe = PendingSpillScan {
-        oldest: Some(0),
-        ..PendingSpillScan::default()
-    };
-    let entries = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return PendingSpillScan::default();
-        }
-        Err(_) => return fail_safe,
-    };
-    let mut scan = PendingSpillScan::default();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return fail_safe;
-        };
-        let meta = match entry.metadata() {
-            Ok(meta) => meta,
-            // Gone since the listing: the replay emptied or moved it.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return fail_safe,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let is_spill_file = path.extension().is_some_and(|ext| {
-            ext.eq_ignore_ascii_case(crate::tick_spill_replay::SPILL_FILE_EXTENSION)
-        });
-        if !is_spill_file || !crate::tick_spill_replay::spill_file_pending(&path, meta.len()) {
-            continue;
-        }
-        let Some(hour) = crate::tick_spill_replay::spill_file_hour(&path) else {
-            scan.unnamed = scan.unnamed.saturating_add(1);
-            if scan.first_unnamed.is_none() {
-                scan.first_unnamed = Some(path);
-            }
-            continue;
-        };
-        scan.oldest = Some(scan.oldest.map_or(hour, |o| o.min(hour)));
-    }
-    scan
-}
-
-/// Whether the top_volume partition `name` is HELD this run (top_volume
-/// spill plan item 6, re-scoped 2026-10-13 after review).
-///
-/// Held only when the disk is not under pressure and the partition ends after
-/// the start of the oldest pending spill file's hour: only those hours can
-/// still receive replayed rows. Older hours go: every pending file younger
-/// than them is younger, and a file too old for the hot window is set aside
-/// in quarantine rather than replayed. The file hour is UTC and the partition
-/// is labelled in IST (5.5 h ahead), so comparing the label directly holds a
-/// superset of the hours a file can reach. An unparseable name is held.
-/// Pure, O(1).
-#[must_use]
-pub(crate) fn top_volume_partition_held(
-    name: &str,
-    oldest_pending_hour: Option<u64>,
-    under_disk_pressure: bool,
-) -> bool {
-    if under_disk_pressure {
-        return false;
-    }
-    let Some(hour) = oldest_pending_hour else {
-        return false;
-    };
-    let pending_from = i64::try_from(hour.saturating_mul(3_600)).unwrap_or(i64::MAX);
-    partition_range_naive(name).is_none_or(|(_, end)| end.and_utc().timestamp() > pending_from)
+    &TICKS_AND_DEPTH
 }
 
 /// What a partition-list query found for one table.
@@ -2015,9 +1871,6 @@ impl PartitionArchiver {
         // table's class hot window, active partition excluded, hostile names
         // rejected — the SAME selection primitives the detach path uses.
         let mut worklist: Vec<(&'static str, String)> = Vec::new();
-        // The oldest pending top_volume spill hour, read once per run, on the
-        // first top_volume partition that needs it.
-        let mut top_volume_pending_hour: Option<Option<u64>> = None;
         for table in swept_tables() {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
@@ -2030,28 +1883,6 @@ impl PartitionArchiver {
             match self.list_eligible_partitions(table, hot_days).await {
                 Ok(PartitionListing::Eligible(names)) => {
                     for name in names {
-                        // Top_volume spill plan item 6 (2026-10-13): a
-                        // top_volume hour a pending spill file can still
-                        // reach is held, counted, and keeps the day open.
-                        if is_top_volume_table(table)
-                            && top_volume_partition_held(
-                                &name,
-                                *top_volume_pending_hour.get_or_insert_with(|| {
-                                    crate::off_worker::off_worker(|| {
-                                        oldest_pending_spill_hour(Path::new(
-                                            crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
-                                        ))
-                                    })
-                                }),
-                                self.cfg.under_disk_pressure,
-                            )
-                        {
-                            summary.held_top_volume_spill =
-                                summary.held_top_volume_spill.saturating_add(1);
-                            metrics::counter!("tv_partition_archive_top_volume_held_total")
-                                .increment(1);
-                            continue;
-                        }
                         worklist.push((table, name));
                     }
                 }
@@ -2135,14 +1966,6 @@ impl PartitionArchiver {
                 "partition archive: depth partitions HELD while the after-close pass writes \
                  back order-book rows skipped under load (not a failure; a later pass \
                  archives them with those rows in)"
-            );
-        }
-        if summary.held_top_volume_spill > 0 {
-            info!(
-                held_top_volume_spill = summary.held_top_volume_spill,
-                "partition archive: top_volume partitions HELD because a pending top_volume \
-                 spill file can still replay rows into their hours (not a failure; the day \
-                 stays open and a later pass archives them once the replay has run)"
             );
         }
 
@@ -2780,6 +2603,10 @@ impl PartitionArchiver {
     /// table. A `top_volume_<tf>` table looks only at its own spill folder;
     /// every other table keeps the depth + tick check, so a top_volume spill
     /// can never defer the hour archive of `market_depth`.
+    ///
+    /// ⚠ CHANGED 2026-10-22 (plan item 62): the top_volume folder is no longer
+    /// read; every table sees the depth + tick folders (see
+    /// [`spill_dirs_for_table`]).
     fn spill_dirs_have_pending_data(table: &str) -> bool {
         spill_dirs_for_table(table)
             .iter()
@@ -3605,12 +3432,20 @@ impl PartitionArchiver {
 /// tables from the single source of truth.
 fn swept_tables() -> Vec<&'static str> {
     let candles = crate::shadow_persistence::candle_table_names();
+    // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` are no longer
+    // fold frames, but their partitions on the box are still archived here
+    // until they are copied (operator Quote 34).
+    let archive_only = crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES;
     let mut tables: Vec<&'static str> = Vec::with_capacity(
-        HOUR_PARTITIONED_TABLES.len() + DAY_PARTITIONED_TABLES.len() + candles.len(),
+        HOUR_PARTITIONED_TABLES.len()
+            + DAY_PARTITIONED_TABLES.len()
+            + candles.len()
+            + archive_only.len(),
     );
     tables.extend_from_slice(HOUR_PARTITIONED_TABLES);
     tables.extend_from_slice(DAY_PARTITIONED_TABLES);
     tables.extend_from_slice(&candles);
+    tables.extend_from_slice(&archive_only);
     tables
 }
 
@@ -4363,8 +4198,12 @@ mod tests {
         // instead of leaving the boundary pinned to a ghost.
         let live = crate::shadow_persistence::candle_table_names();
         for table in ["ticks", "candles_1s", "candles_3s", "candles_5s"] {
+            // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` are no
+            // longer written but stay archive-only on the intraday window.
+            let archive_only =
+                crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table);
             assert!(
-                table == "ticks" || live.contains(&table),
+                table == "ticks" || archive_only || live.contains(&table),
                 "{table} is not a live candle table — a frame was retired and \
                  this guard is now pinning the boundary to a name nothing \
                  writes (live: {live:?})"
@@ -5368,6 +5207,10 @@ mod tests {
         let tables = swept_tables();
         assert!(tables.contains(&"ticks"));
         assert!(tables.contains(&"candles_1m"));
+        // 2026-10-22 (plan item 62, Quote 34): archived until copied.
+        assert!(tables.contains(&"candles_3s"));
+        assert!(tables.contains(&"candles_5s"));
+        assert!(tables.contains(&"top_volume_1s"));
         assert!(tables.contains(&"ws_event_audit"));
         assert!(tables.contains(&"partition_archive_audit"));
         // Exempt masters are filtered at run time; they must not be in the
@@ -6921,179 +6764,16 @@ mod hour_granular_eligibility_tests {
     // that session.
 
     #[test]
-    fn test_top_volume_spill_defers_only_top_volume_tables() {
-        // Top_volume spill plan item 6 (2026-10-13; re-scoped after review to
-        // hold only the hours a pending file can still reach).
-        for c in crate::top_volume_rank_persistence::SnapshotCadence::ALL {
-            assert!(is_top_volume_table(c.table_name()));
-            assert_eq!(
-                spill_dirs_for_table(c.table_name()),
-                [crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR]
-            );
-        }
-        assert!(
-            !is_top_volume_table("top_volume"),
-            "the retired shared table has no writer"
-        );
-        // 2026-10-13 10:00 UTC is unix hour 497_746.
-        let pending = Some(497_746_u64);
-        assert!(
-            top_volume_partition_held("2026-10-13T10", pending, false),
-            "the pending file's own hour is held"
-        );
-        assert!(top_volume_partition_held("2026-10-13T15", pending, false));
-        assert!(
-            top_volume_partition_held("2026-10-13", pending, false),
-            "a day partition holding that hour is held"
-        );
-        assert!(
-            !top_volume_partition_held("2026-10-13T09", pending, false),
-            "an hour before every pending file is archived"
-        );
-        assert!(!top_volume_partition_held("2026-09-01", pending, false));
-        assert!(
-            !top_volume_partition_held("2026-10-13T10", None, false),
-            "nothing pending"
-        );
-        assert!(
-            !top_volume_partition_held("2026-10-13T10", pending, true),
-            "pressure archives"
-        );
-        assert!(
-            top_volume_partition_held("garbage", pending, false),
-            "unparseable is held"
-        );
-        // Wired: checked per partition, after the table is listed.
-        let src = include_str!("partition_archive.rs");
-        let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
-        let list = prod
-            .find("match self.list_eligible_partitions(table, hot_days).await")
-            .expect("the table listing");
-        let held = prod
-            .find("&& top_volume_partition_held(")
-            .expect("the per-partition top_volume hold is in the table loop");
-        assert!(list < held, "the hold is per partition, after the listing");
-        assert!(prod[held..].contains("summary.held_top_volume_spill ="));
-    }
-
-    /// Regression (2026-10-13 review, HIGH): the newest top_volume spill file
-    /// is never emptied and the drain offset is in memory only, so a
-    /// table-wide hold skipped every top_volume table on every daily pass
-    /// after the first spill, silently. Now only hours at or after the oldest
-    /// PENDING file are held; older hours are archived; and a drained file
-    /// holds nothing.
-    #[test]
-    fn test_regression_oldest_pending_spill_hour_and_top_volume_partition_held_scope_the_hold() {
-        let dir = std::env::temp_dir().join(format!(
-            "tv-pa-tv-hold-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        assert_eq!(oldest_pending_spill_hour(&dir.join("absent")), None);
-        assert_eq!(oldest_pending_spill_hour(&dir), None, "empty folder");
-        let old = dir.join("top_volume-dhan-497746.ilp");
-        let new = dir.join("top_volume-dhan-497756.ilp");
-        std::fs::write(&old, b"x\n").expect("write");
-        std::fs::write(&new, b"y\n").expect("write");
-        std::fs::write(dir.join("top_volume-dhan-497716.ilp"), b"").expect("write");
-        assert_eq!(
-            oldest_pending_spill_hour(&dir),
-            Some(497_746),
-            "the oldest NON-EMPTY file sets the line; an emptied file holds nothing"
-        );
-        // Drained to its end (the replay records the offset): no longer pending.
-        crate::tick_spill_replay::record_resume_offset(&old, 2);
-        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_756));
-        crate::tick_spill_replay::forget_resume_offset(&old);
-        // A month-old partition is never held by a fresh spill: the pass can
-        // archive it, so the day is not stuck on top_volume.
-        assert!(!top_volume_partition_held(
-            "2026-09-01",
-            Some(497_746),
-            false
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Regression (audit C1, 2026-10-20): a pending spill file whose name
-    /// carries no hour used to answer `Some(0)`, which held EVERY top_volume
-    /// partition and kept the daily verdict Incomplete for as long as the
-    /// file sat there. It is now skipped and counted; a folder that cannot be
-    /// listed still fails safe.
-    #[test]
-    fn test_unparseable_spill_name_does_not_hold_every_partition() {
-        let dir = std::env::temp_dir().join(format!(
-            "tv-pa-tv-unnamed-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir"); // APPROVED: test
-        let unnamed = dir.join("top_volume-dhan-notanhour.ilp");
-        std::fs::write(&unnamed, b"x\n").expect("write"); // APPROVED: test
-
-        // Alone, it holds nothing: before the fix this was Some(0).
-        let scan = scan_pending_spill_hours(&dir);
-        assert_eq!(scan.oldest, None);
-        assert_eq!(scan.unnamed, 1);
-        assert_eq!(scan.first_unnamed.as_deref(), Some(unnamed.as_path()));
-        assert_eq!(oldest_pending_spill_hour(&dir), None);
-        assert!(
-            !top_volume_partition_held("2026-09-01", oldest_pending_spill_hour(&dir), false),
-            "a month-old partition is archivable again"
-        );
-
-        // Beside a dated file, the dated file alone sets the line.
-        std::fs::write(dir.join("top_volume-dhan-497756.ilp"), b"y\n").expect("write"); // APPROVED: test
-        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_756));
-
-        // Files the replay never reads are ignored, even when their name ends
-        // in digits, and an EMPTY unnamed file is not pending: neither counts.
-        std::fs::write(dir.join("notes-100.txt"), b"z\n").expect("write"); // APPROVED: test
-        std::fs::write(dir.join("top_volume-dhan-empty.ilp"), b"").expect("write"); // APPROVED: test
-        let scan = scan_pending_spill_hours(&dir);
-        assert_eq!(
-            scan.oldest,
-            Some(497_756),
-            "notes-100.txt must not read as hour 100"
-        );
-        assert_eq!(
-            scan.unnamed, 1,
-            "the empty unnamed file holds nothing to replay"
-        );
-
-        // Upper-case extension is still a spill file, as in `list_spill_files`.
-        std::fs::write(dir.join("top_volume-dhan-497700.ILP"), b"w\n").expect("write"); // APPROVED: test
-        assert_eq!(oldest_pending_spill_hour(&dir), Some(497_700));
-
-        // An absent folder holds nothing; a path that exists but cannot be
-        // listed (here a regular file, so `read_dir` fails with something other
-        // than NotFound, also as root) still fails safe and holds everything.
-        assert_eq!(oldest_pending_spill_hour(&dir.join("absent")), None);
-        assert_eq!(oldest_pending_spill_hour(&unnamed), Some(0));
-        assert_eq!(scan_pending_spill_hours(&unnamed).unnamed, 0);
-        assert!(top_volume_partition_held("2026-09-01", Some(0), false));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Names the table-side helpers of item 6 together.
-    #[test]
-    fn test_is_top_volume_table_and_spill_dirs_for_table_compose() {
-        let table = crate::top_volume_rank_persistence::SnapshotCadence::OneMinute.table_name();
-        assert!(is_top_volume_table(table));
-        assert_eq!(spill_dirs_for_table(table).len(), 1);
-        assert!(!is_top_volume_table("market_depth"));
-        assert_eq!(spill_dirs_for_table("market_depth").len(), 2);
-    }
-
-    #[test]
-    fn test_tick_and_depth_gate_unchanged() {
-        for table in ["ticks", "market_depth", "candles_1m", "order_audit"] {
-            assert!(!is_top_volume_table(table));
+    fn test_spill_dirs_for_table_is_tick_and_depth_for_every_table() {
+        // 2026-10-22 (plan item 62): every table, `top_volume_<tf>` included,
+        // now sees only the depth + tick folders.
+        for table in [
+            "ticks",
+            "market_depth",
+            "candles_1m",
+            "order_audit",
+            "top_volume_1m",
+        ] {
             assert_eq!(
                 spill_dirs_for_table(table),
                 [
@@ -7103,12 +6783,6 @@ mod hour_granular_eligibility_tests {
                 "{table} keeps the depth + tick check"
             );
         }
-        // A pending top_volume file never defers the depth hour archive: the
-        // hour decision only ever sees the depth + tick folders for it.
-        assert!(
-            !spill_dirs_for_table("market_depth")
-                .contains(&crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR)
-        );
     }
 
     /// Exhaustive truth table for `hour_window_decision`.

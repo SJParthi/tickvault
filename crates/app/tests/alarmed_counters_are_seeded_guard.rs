@@ -120,11 +120,11 @@ const KNOWN_NO_PRODUCER: &[&str] = &[
     // A DERIVED metric: the alarm reads a log metric filter, not a counter we
     // emit. Nothing to register.
     "tv_orders_placed_delta_total",
-    // The one genuinely producerless name of the original three. Re-verified
-    // 2026-09-01: zero `counter!`/`gauge!`/`histogram!` sites anywhere in
-    // `crates/*/src`. Its alarm is permanently green and always will be, so
-    // this stays a real open finding — add the producer or retire the alarm.
-    "tv_order_fill_lag_seconds",
+    // (2026-10-22: `tv_order_fill_lag_seconds` LEFT this list. It was the one
+    // producerless name of the original three, and the finding recorded here,
+    // "add the producer or retire the alarm", was closed by retiring the
+    // alarm: plan item 65, Quote 37 alarm review, noise-lock §2.14.)
+    //
     // A DERIVED metric, added 2026-09-02: the alarm
     // `tv-<env>-deploy-provenance-blind` reads a log metric filter over the
     // deploy-watchdog Lambda's OWN log group, so no counter in this process
@@ -185,6 +185,9 @@ const KNOWN_GAUGES: &[&str] = &[
     // exemption. Emitted as `metrics::gauge!(REBALANCE_AGE_SECS).set(..)` in
     // `depth_rebalance.rs` — a gauge is published verbatim, with no delta and
     // no dropped first sample, so it has no seeding hazard at all.
+    // (2026-10-22: its alarm, depth-steering-stalled, was deleted by the Quote
+    // 37 alarm review while depth is switched off; the entry stays so the
+    // gauge is classed correctly if the alarm returns with depth.)
     "tv_depth_rebalance_age_secs",
     "tv_dhan_feed_stack_up",
     "tv_dhan_ws_alive_connections",
@@ -235,8 +238,9 @@ const DERIVED_LOSS_GROUP_METRICS: &[&str] = &[
 ];
 
 /// The number of source counters the loss groups read. Moves only with a dated
-/// row in noise lock §2.10 (§2.10-a, 2026-10-11: 55 to 69).
-const LOSS_GROUP_FILTER_COUNT: usize = 69;
+/// row in noise lock §2.10 (§2.10-a, 2026-10-11: 55 to 69; 2026-10-22, plan item 62:
+/// 69 to 65, the four top_volume counters left with their writer).
+const LOSS_GROUP_FILTER_COUNT: usize = 65;
 
 /// Derived metrics that are a LABEL SLICE of one source counter, written by a
 /// log metric filter over the metrics log (noise lock §2.9-i, 2026-10-10):
@@ -773,8 +777,8 @@ fn loss_group_filter_counters() -> Vec<String> {
     out
 }
 
-/// The loss-group pages (2026-10-05, noise lock §2.10) read 69 source counters
-/// (55 until the 2026-10-11 §2.10-a row) through log metric filters. Each source is exposed to the same dropped
+/// The loss-group pages (2026-10-05, noise lock §2.10) read 65 source counters
+/// (55 until the 2026-10-11 §2.10-a row, 69 until plan item 62 on 2026-10-22) through log metric filters. Each source is exposed to the same dropped
 /// first sample as any alarmed counter, so each must be registered at 0 at
 /// boot, either in `main.rs` or beside its owner, or named in
 /// `SEEDED_VIA_HANDLE` with its seeding site.

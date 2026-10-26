@@ -150,7 +150,7 @@
         </details>
       </div>
       <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
-        <div class="banner" id="stoppedbanner" hidden>⏸ Box stopped (auto-stops 17:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start.</div>
+        <div class="banner" id="stoppedbanner" hidden>⏸ Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start.</div>
         <div class="shields" id="shields"></div></div>
       <div class="card"><div class="lbl">feeds — per-broker official-candle pulls (toggle on/off)</div>
         <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadFeeds()">🔄 Load feeds</button></div>
@@ -447,7 +447,7 @@ function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
 // AWS strip on Overview (spend $ · alarms firing · disk used %) — sourced from
 // the same aws_status action the old AWS tab used. The <details> expands to
 // the full alarm list + storage shields. Loaded once on first Overview load
-// (NOT on the 8s auto-refresh — aws_status does an SSM probe + Cost Explorer
+// (NOT on the 8s auto-refresh — aws_status does an SSM probe + an AWS Budgets
 // call) and on demand via the 🔄 Refresh AWS button.
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
   const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }

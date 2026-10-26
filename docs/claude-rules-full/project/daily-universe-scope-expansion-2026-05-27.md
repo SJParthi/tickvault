@@ -1451,7 +1451,7 @@ inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08 (Quote 14 → 08:30–17:30).**
 > Trading WEEKDAYS only (Mon–Fri), **08:30–16:30 IST** auto start/stop.
 >
-> **CURRENT LIVE SCHEDULE: 08:30–17:30 IST Mon–Fri** (Quote 14).
+> **CURRENT LIVE SCHEDULE: 08:30–16:30 IST Mon–Fri** (Quote 37, applied 2026-10-22 by plan ITEM 64; it was 08:30–17:30 IST under Quote 14 from 2026-08-08). The Quote 31 drain hold still keeps the box up past 16:30 while the day's data is not saved.
 
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08:** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
@@ -2981,6 +2981,22 @@ Exactly Quote 29's keep-list: every SEBI and audit table and its S3 archive (`in
 ##### How it runs
 The same shape as Quote 29e: a reviewed, one-off Rust tool and workflow, dry run, then apply, then a verify listing; S3 after the box files; any new delete permission scoped to exactly the prefixes above, refused after 2026-11-01 IST, and deleted with the tool and workflow by the next PR. That tool needs its own dated row in `rust-only-forever-lock-2026-07-19.md` if it carries any shell.
 
+##### The Quote 35 tool (plan item 67, written 2026-10-22, before any delete)
+
+This table records how the shape above is built. It authorizes nothing beyond Quote 35, and the apply waits on the owner's approval of the one SSM shell element (rust-only lock §0.14, DRAFT).
+
+| Item | Locked value |
+|---|---|
+| Tool | `tv-wipe-2026-10-31` (app crate, `src/bin/wipe_2026_10_31.rs`) and `tickvault wipe-box <dry\|apply> <sha>` on the box (`wipe_box.rs`), run by the dispatch-only `.github/workflows/wipe-2026-10-31.yml`. Every delete or keep decision is a pure function in `wipe_2026_10_31.rs`, tested; nothing comes from config. |
+| Market-data tables | Derived from the code's own registry, never restated: every table retention manages, minus the keep-list, plus the retired candle tables (34 tables on 2026-10-22: `ticks`, `market_depth`, `market_depth_book`, `feed_aux_packets`, `top_volume` and `top_volume_{1s,3s,5s,1m}`, every `candles_<tf>` including 3 s, 5 s and the 15 retired frames). |
+| Keep-list (in code) | Every table in `partition_manager::rebuild_keep_tables()` (every DAY-partitioned audit table and every retention-exempt table, the list the 2026-10-22 rebuild carried); `sebi-preserve/`, `deploys/` and `logs/` in S3; on the box `data/spill/audit/**`, any path with `audit` or `sebi-preserve` in it, the WAL's state files (watermark, ranges, owner lock, upload markers), and everything outside `data/ws_wal`, `data/spill`, `data/dlq`. A keep-list table is kept even when it is also market data by name (`top_volume_rank`). |
+| Box (app stopped) | Stops `tickvault` and deletes nothing unless `systemctl is-active` then reads `inactive` or `failed`. Deletes WAL segments (`ws-frames-<n>.wal`), spill and DLQ files last written before 2026-11-01 00:00 IST; truncates a market-data table whose every partition is dated before 2026-11-01, else drops exactly those partitions (after its WAL is applied); deletes market-data `<partition>.detached` directories dated before 2026-11-01; lists again and fails if any is left. The app is left stopped and enabled; the runner stops the box. |
+| S3 | `s3:DeleteObjectVersion` by version id (never a delete marker) for keys dated before 2026-11-01 under `questdb-partitions/<market-data table>/`, `raw-frames/<date>/`, `seal-spill/<date>/` and `top-volume-spill/<date>/`; a key of any other shape is kept and named in the report. `tick-quarantine/`, `depth-quarantine/`, `top-volume-quarantine/` and `rebuild-2026-10-22/` are not named by Quote 35 and are not touched. |
+| Snapshot | Deleted only when it carries both tags the rebuild wrote, `tv-rebuild=2026-10-22` and `Name=tv-prod-root-before-rebuild-2026-10-22`. The old 600 GB root VOLUME (tag `tv-rebuild-old-root`) is not named by Quote 35: reported, kept. |
+| Identity | The box half uses the existing deploy keys over SSM (no new grant). The S3 and snapshot half uses ONE new role, `tv-prod-wipe-2026-10-31`, trusted only by the GitHub environment `wipe-2026-10-31`: list the exact prefixes; `s3:DeleteObjectVersion` on the dated keys above and `ec2:DeleteSnapshot` on a snapshot with both tags, each only from 2026-10-31 18:00 IST; read-only EC2 describes; Deny on `deploys/`, `sebi-preserve/`, `logs/`, November and December keys and every bucket setting; trust and grants expire at the end of 2026-11-01 IST. |
+| When | Dry: any time until the end of 2026-11-01 IST. Apply: only 2026-10-31 18:00 IST to 2026-11-01 08:00 IST, never 09:00–15:45 IST, with the confirm word `WIPE-BEFORE-2026-11-01`, after a successful `dry all` run on the same commit, never while a deploy workflow is queued or running; the S3 and snapshot apply also needs the box stopped. |
+| Afterwards | The first PR after the run deletes the role, the workflow, the tool, the box subcommand and both budget rows, records the run here and marks Quote 35 ENDED. |
+
 ##### What violates Quote 35 (REJECT)
 - Deleting anything before the night of 2026-10-31 IST, or anything dated 2026-11-01 or later.
 - Deleting a SEBI or audit row, `sebi-preserve/`, `deploys/` or the `logs/` export.
@@ -3062,3 +3078,33 @@ After "Continue dude", the owner answered three decision cards. Two are recorded
 - Raising `rmem_max` above 64 MiB, or the app+OS worst case below 6 GiB, without a fresh dated quote.
 - Running any other `cargo update`, or this one for another package or version.
 - Switching the depth account on under this quote.
+
+#### Quote 39 (2026-10-23, ~15:18 IST) — ONE MORE SECURITY UPDATE: ctutils 0.4.2 → 0.4.4 (decision card, preserve EXACTLY)
+
+After the Quote 38 update (rustls-webpki 0.103.15 → 0.103.16) cleared RUSTSEC-2026-0382, the Security & Audit check on PR #2120 (head `ca569a5`) failed on a NEW advisory published that day, RUSTSEC-2026-0385 ("Non-constant-time mask generation and `u128` comparisons") in `ctutils` 0.4.2, reached through `digest` 0.11 by the AWS SDK and `totp-rs`. `main` carries the same 0.4.2.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "Today's new security advisory (RUSTSEC-2026-0385) is in 'ctutils' 0.4.2, a cryptography helper used by the AWS libraries. It also affects main. The fix is one more update: cargo update -p ctutils --precise 0.4.4. Your earlier OK covered only rustls-webpki, so this needs a new OK. If you approve, I record it in the rules, remove the deny rule, run only this command on #2119, restore the rule, check and push, then merge both PRs and deploy." | **"Approve, same way (Recommended)"** | "One command only: cargo update -p ctutils --precise 0.4.4, deny rule removed and restored the same way as before." |
+
+**What this changes, and nothing else:** `cargo update -p ctutils --precise 0.4.4` is allowed ONCE, on PR #2119's branch (`claude/nice-bell-yjfwiv`), `Cargo.lock` only. The `.claude/settings.json` deny rule for `cargo update` is lifted only for that one command and restored straight after, never committed lifted.
+
+##### What violates Quote 39 (REJECT)
+- Running any other `cargo update`, or this one for another package or version, or a second time.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Any `Cargo.toml` change, a new dependency, or a version move other than `ctutils` (if the update moves another package, it is reverted and the owner asked again).
+
+#### Quote 40 (2026-10-23, ~15:45 IST) — A THIRD SECURITY UPDATE: webpki-root-certs 1.0.7 → 1.0.11 (decision card, preserve EXACTLY)
+
+With RUSTSEC-2026-0382 and RUSTSEC-2026-0385 fixed (Quotes 38, 39), the Security & Audit check on PR #2119 (head `0b5d216`) and #2120 (head `88ecc72`) passed `cargo deny` and then failed `cargo audit --deny yanked` on RUSTSEC-2026-0383 (dated 2026-10-19, "Bundled root certificates allow trust in distrusted emSign intermediates") in `webpki-root-certs` 1.0.7, fixed from 1.0.10; the latest release is 1.0.11. `main` carries the same 1.0.7. The earlier failures had hidden it because the job stops at its first failing step.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "A third security advisory showed up once the first two were fixed: 'webpki-root-certs' 1.0.7 (the bundled list of trusted website certificates) still trusts a certificate authority that has since been distrusted (RUSTSEC-2026-0383). Fixed from 1.0.10; latest is 1.0.11. This also affects main. Approve one more update the same way (recorded in the rules, deny rule lifted for this one command and restored)?" | **"Approve 1.0.11 (Recommended)"** | "cargo update -p webpki-root-certs --precise 1.0.11: the latest, newest certificate list. Lock file only." |
+
+**What this changes, and nothing else:** `cargo update -p webpki-root-certs --precise 1.0.11` is allowed ONCE, on PR #2119's branch (`claude/nice-bell-yjfwiv`), `Cargo.lock` only. The `.claude/settings.json` deny rule for `cargo update` is lifted only for that one command and restored straight after, never committed lifted.
+
+##### What violates Quote 40 (REJECT)
+- Running any other `cargo update`, or this one for another package or version, or a second time.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Any `Cargo.toml` change, a new dependency, or a version move other than `webpki-root-certs` (if the update moves another package, it is reverted and the owner asked again).

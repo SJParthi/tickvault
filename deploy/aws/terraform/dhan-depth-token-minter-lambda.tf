@@ -135,9 +135,13 @@ resource "aws_lambda_permission" "dhan_depth_token_minter" {
   source_arn    = aws_cloudwatch_event_rule.dhan_depth_token_minter.arn
 }
 
-# A failed mint pages. With the schedule disabled nothing invokes the function,
-# so this alarm stays quiet (notBreaching) until the account is switched on.
+# A failed mint pages. GATED on the same switch as the schedule since
+# 2026-10-22 (the alarm review under operator Quote 37,
+# dhan-rest-only-noise-lock-2026-07-14.md §2.14): while the depth account is
+# off the function never runs, so the alarm watched nothing; it comes back with
+# the flag, together with the schedule and the not-invoked alarm.
 resource "aws_cloudwatch_metric_alarm" "dhan_depth_token_minter_errors" {
+  count               = var.dhan_depth_account_enabled ? 1 : 0
   alarm_name          = "tv-${var.environment}-dhan-depth-token-minter-errors"
   alarm_description   = "The daily Dhan DEPTH-account token mint FAILED. The extra depth sockets on the second account stay down until the next successful mint; the primary account's feed, depth and orders are unaffected."
   comparison_operator = "GreaterThanOrEqualToThreshold"

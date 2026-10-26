@@ -56,6 +56,9 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // market-status, disconnect, out-of-window-tick and connect-snapshot rows the
 // `ticks` table does not hold. HOUR-partitioned like `ticks`, on the
 // market-data window, archived before any detach like every table here.
+// 2026-10-22 (plan item 62, Quote 34): nothing writes `top_volume*` any more;
+// the five names STAY so their partitions on the box are still archived to S3
+// before any detach, and nothing drops them before that copy.
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "ticks",
     "market_depth",
@@ -385,6 +388,27 @@ pub fn all_managed_table_names() -> Vec<&'static str> {
     // 2026-09-18 — the EMITTED set: a dropped table has no `table_storage()` row,
     // so measuring the retired fifteen would log a probe failure every cycle.
     names.extend_from_slice(&crate::shadow_persistence::emitted_candle_table_names());
+    // 2026-10-22 (plan item 62): still on the box until copied (Quote 34).
+    names.extend_from_slice(&crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES);
+    names.extend_from_slice(RETENTION_EXEMPT_TABLES);
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// The tables the 2026-10-22 rebuild (plan item 66) carries onto the new
+/// disk: every DAY-partitioned audit / daily-data table plus every
+/// retention-EXEMPT table — the same union the operator console's SEBI
+/// preserve exports, and the keep-list Quote 35 names. De-duplicated and
+/// sorted. Derived from the retention lists, never restated, so a table that
+/// joins either list is restored automatically.
+///
+/// Market-data tables (`ticks`, `market_depth*`, `candles_*`, `top_volume*`,
+/// `feed_aux_packets`) are NOT in it: they are copied to S3 and verified, and
+/// start empty on the new disk.
+#[must_use]
+pub fn rebuild_keep_tables() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = DAY_PARTITIONED_TABLES.to_vec();
     names.extend_from_slice(RETENTION_EXEMPT_TABLES);
     names.sort_unstable();
     names.dedup();
@@ -517,7 +541,13 @@ impl PartitionManager {
         // QuestDB about fifteen tables this boot has just dropped, once per retention
         // cycle, forever: each returns an error the loop logs as a warn, which trains
         // an operator to discount a real one.
-        for table in crate::shadow_persistence::emitted_candle_table_names() {
+        // 2026-10-22 (plan item 62): plus the two archive-only tables
+        // (`candles_3s`, `candles_5s`), which nothing writes now but whose
+        // partitions still age out through the same archive-then-detach path.
+        for table in crate::shadow_persistence::emitted_candle_table_names()
+            .into_iter()
+            .chain(crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES)
+        {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
             }
@@ -929,16 +959,10 @@ mod tests {
         assert!(
             HOUR_PARTITIONED_TABLES.contains(&crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE)
         );
-        // Every live per-cadence table is swept — pinned against the
-        // persistence module's own names, so a fifth cadence cannot land
-        // unswept.
-        for c in crate::top_volume_rank_persistence::SnapshotCadence::ALL {
-            assert!(
-                HOUR_PARTITIONED_TABLES.contains(&c.table_name()),
-                "{} is not in the HOUR sweep",
-                c.table_name()
-            );
-        }
+        // 2026-10-22 (plan item 62, Quote 34): nothing writes the four
+        // top_volume tables now, but their partitions on the box must keep
+        // aging out through the archive-then-detach sweep until copied, so
+        // they STAY here (the literal list above pins them).
     }
 
     #[test]

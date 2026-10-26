@@ -3,7 +3,7 @@
 //!
 //! ## Why this exists
 //!
-//! `volume_leaderboard::RankedContract` carries an `underlying_id`, and it is
+//! `option_rank::RankedContract` carries an `underlying_id`, and it is
 //! load-bearing twice: the depth-200 selector requires five DISTINCT
 //! underlyings, and gainer eligibility is judged per underlying. A tick
 //! carries neither — it has the contract's own id and nothing else.
@@ -79,7 +79,7 @@ use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 use crate::dhan_contract_universe::ContractRow;
-use crate::volume_leaderboard::OptionFamily;
+use crate::option_rank::OptionFamily;
 
 /// The I-P1-11 composite identity of a contract. The bare `security_id` is
 /// reused across segments, so keying on it alone would let one segment's

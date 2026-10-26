@@ -1171,10 +1171,19 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // dhan-rest-only-noise-lock-2026-07-14.md §2.9. +$3.00/mo names + 5
     // alarms (~$0.50-1.00, metric math bills per metric), aws-budget.md
     // "COST NOTE 2026-10-04".
+    //
+    // 2026-10-22: 113 -> 109, a REMOVAL (plan item 65, the alarm review under
+    // operator Quote 37, dhan-rest-only-noise-lock-2026-07-14.md §2.14).
+    // tv_depth_rebalance_age_secs, tv_depth_rescue_abandoned_total and the
+    // two tv_depth_first_packet_*_total twins each had ONE reader, a depth
+    // alarm deleted in the same change (depth is switched off since
+    // 2026-10-21). -$1.20/mo. They stay in the app's local /metrics.
     assert_eq!(
         names.len(),
-        113,
-        "Z+ L2 VERIFY ratchet: expected exactly 113 names in the MAIN EMF \
+        109,
+        "Z+ L2 VERIFY ratchet: expected exactly 109 names in the MAIN EMF \
+         (2026-10-22: 113 -> 109, the four depth names whose only reader was a \
+         depth alarm removed by the Quote 37 alarm review, noise-lock §2.14.) \
          (2026-10-04: 103 -> 113, the ten §2.9 data-at-risk counters, see aws-budget.md \
          COST NOTE 2026-10-04.) \
          (2026-10-01: 102 -> 103, tv_order_audit_chain_lost_total, see aws-budget.md \
@@ -2307,11 +2316,12 @@ fn every_alarm_metric_reaches_an_emit_or_a_declared_route() {
     // DORMANT: alarmed on purpose ahead of its producer. Each entry needs a
     // reason, and the anti-drift assertions below delete it the moment the
     // reason stops being true.
-    let dormant: &[(&str, &str)] = &[(
-        "tv_order_fill_lag_seconds",
-        "order fill lag — the order path is paper-mode; declared dormant in \
-         alarm_metric_has_a_route_guard.rs and cloudwatch_dormant_alarms_guard.rs",
-    )];
+    //
+    // EMPTY since 2026-10-22: its one entry, tv_order_fill_lag_seconds, went
+    // with the order-fill-lag-high alarm (plan item 65, Quote 37 alarm
+    // review, noise-lock §2.14). The anti-drift loop below still runs for
+    // any future entry.
+    let dormant: &[(&str, &str)] = &[];
 
     let mut missing = Vec::new();
     for name in &names {

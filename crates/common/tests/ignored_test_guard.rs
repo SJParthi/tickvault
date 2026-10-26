@@ -103,40 +103,8 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/storage/src/off_worker.rs",
         "block_in_place_cost_against_a_bare_call",
     ),
-    // Added 2026-09-19 with the radix A/B it belongs to: the same wall-clock
-    // shape as the other wall-clock harnesses here -- it times the leaderboard's
-    // comparator against a candidate radix sort at four sizes and prints both
-    // numbers, so a shared CI runner would make it a flake, and a flaky gate
-    // teaches people to ignore gates.
-    //
-    // It is NOT the merge condition for anything. The radix was MEASURED and
-    // REJECTED (release: comparator 1.0/7.0/42.0/692.7 us against radix
-    // 4.1/18.7/77.3/1074.3 us at n=100/500/2,000/20,220), so no production
-    // path calls it; the ordering it would have replaced is pinned by the
-    // ordinary tests in the same file.
-    //
-    // Two reasons it is worth keeping rather than deleting: re-running it is
-    // how the rejection stays honest if the row shape or the sizes change,
-    // and it asserts -- each round checks it ordered the `n` rows it claims
-    // and that both paths agree, so it cannot report a figure from an empty
-    // vector the way the withdrawn 900 us sweep number did.
-    (
-        "crates/app/src/volume_leaderboard.rs",
-        "radix_vs_comparator_at_every_measured_shape",
-    ),
-    // Added 2026-09-26 (audit PR4) with the sliced sweep it times: the same
-    // wall-clock shape as the rank harness above. It reports the longest
-    // single step of each phase at the 20,220-contract ceiling, which is the
-    // bound on how long a frame waits behind the sweep. It asserts the board
-    // it timed was full, so it cannot report a figure from an empty board;
-    // the sliced and unsliced rankings are proven equal by the proptest
-    // `begin_sweep_and_sweep_step_rank_identically_to_rank`, which is a gate. Measured 2026-09-26 (release, x86 dev
-    // container): longest step collect 433 us, sort 197 us, gainer walk
-    // 60 us; mean step 11.6 us over 8,316 steps.
-    (
-        "crates/app/src/volume_leaderboard.rs",
-        "sliced_sweep_step_cost_at_the_authorized_ceiling",
-    ),
+    // (a volume_leaderboard wall-clock harness, removed 2026-10-22 with its
+    // module, plan item 62)
     (
         "crates/trading/src/candles/multi_tf_aggregator.rs",
         "catch_up_seal_all_sweep_cost_at_the_authorized_ceiling",
@@ -201,84 +169,8 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/storage/tests/spill_replay_memory_bound.rs",
         "a_multi_gigabyte_spill_file_does_not_grow_the_process",
     ),
-    // Added 2026-09-06 with the volume-leaderboard ranking sweep it measures.
-    //
-    // SAME SHAPE as the three wall-clock harnesses above, and added for the
-    // same reason: it times a full `rank` pass over 20,220 stock-option
-    // contracts -- the measured live count -- and prints the number. A
-    // wall-clock figure on a shared CI runner is a flake, and a flaky gate
-    // teaches people to ignore gates.
-    //
-    // It exists because the number it produces was WRONG in the design notes
-    // before it was written. The cost had been asserted as "~60 us, 0.0012%
-    // duty" by borrowing the 2.8 ns/instrument constant from the
-    // `scan_silence` harness above -- a LINEAR scan -- and applying it to a
-    // `sort_unstable_by`. That is an invalid transfer between two different
-    // complexity classes, and it was the number used to argue a min-heap
-    // design away.
-    //
-    // ⚠ CORRECTED 2026-09-12 -- the figures this paragraph carried were
-    // THEMSELVES wrong, and wrong in the reassuring direction. It read
-    // "Measured here instead: 900.406 us for `rank(top 250)` and 899.543 us
-    // for `rank_distinct_underlying(5)`, a 0.018% duty cycle at the 5-second
-    // cadence -- so the conclusion survived and the evidence for it was
-    // overstated 15x." Both numbers are WITHDRAWN. The harness that produced
-    // them seeded every tracked contract with the SAME volume as its
-    // baseline, so every row had a window delta of zero, every row was
-    // skipped before the comparator, and the sort it timed was a sort of an
-    // EMPTY slice. It also called `rank_distinct_underlying`, which was
-    // DELETED on 2026-09-08 -- so the second figure names a function that no
-    // longer exists.
-    //
-    // Re-measured 2026-09-12 with the harness repaired (contracts actually
-    // trade before the sweep, and the lot lookup is a real hash probe rather
-    // than a constant stub), at the 20,220-contract ceiling:
-    //
-    //   every contract traded  -> 2.95 ms  (0.29% duty at the 1 s cadence)
-    //              2,000 traded -> 123 us  (0.012% duty)
-    //                500 traded ->  29 us
-    //
-    // An independent re-run of the ceiling case reproduced ~3.24 ms, about
-    // 10% higher, so read the ceiling as a ~2.9-3.3 ms BAND rather than a
-    // point -- 2.95 sits at the optimistic edge of what this container
-    // produces.
-    //
-    // So the true ceiling is ~3.3x WORSE than the withdrawn figure, not
-    // better. The design conclusion is unchanged and is now actually
-    // supported: 2.95 ms once per second is a 0.29% duty cycle, and the
-    // every-contract-traded case is not a market that exists.
-    //
-    // It is NOT the merge condition for any behaviour. The ranking, the
-    // family split, the monotonicity gate, the capacity cap and the
-    // non-finite refusal are each pinned by ordinary tests in the same file
-    // that run on every PR. Run this one deliberately:
-    //   cargo test -p tickvault-app --lib -- --ignored --nocapture \
-    //     volume_leaderboard::tests::rank_sweep_cost_at_the_authorized_ceiling
-    (
-        "crates/app/src/volume_leaderboard.rs",
-        "rank_sweep_cost_at_the_authorized_ceiling",
-    ),
-    // Added 2026-09-08 with the per-underlying gainer memo it measures.
-    //
-    // SAME SHAPE as the rank harness directly above, and it exists for the
-    // same reason that one does: the walk it times is the honest worst case
-    // of `gainer_eligible` -- a day on which every stock is falling, so no
-    // gainer is ever collected and the walk runs to the END of the traded
-    // population (up to 20,220 contracts) once per 5-second sweep. Until
-    // 2026-09-08 that walk made TWO store probes per ROW; the memo caps the
-    // probes at the underlying count (~210). The harness prints the cost at
-    // the authorized ceiling so the CLAUDE.md O(1) row carries a MEASURED
-    // figure instead of a projection. A wall-clock number on a shared CI
-    // runner is a flake, so it is never a merge condition; the memo behaviour
-    // (bounded capacity, one verdict per underlying, the walk stopping at the
-    // exit-rank limit) is pinned by the ordinary tests in the same file that
-    // run on every PR. Run deliberately:
-    //   cargo test -p tickvault-app --lib -- --ignored --nocapture \
-    //     volume_leaderboard::tests::gainer_eligible_sweep_cost_at_the_authorized_ceiling
-    (
-        "crates/app/src/volume_leaderboard.rs",
-        "gainer_eligible_sweep_cost_at_the_authorized_ceiling",
-    ),
+    // (a volume_leaderboard wall-clock harness, removed 2026-10-22 with its
+    // module, plan item 62)
     // Added 2026-10-02 with the p99 latency target they measure (owner: "O(1)
     // or single milliseconds or microseconds ... even with p99 latency").
     // Same wall-clock shape as the harnesses above: each times every call of

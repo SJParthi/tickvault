@@ -134,11 +134,6 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/app/src/dhan_feed_stack.rs",
-        "the ilp buffer refused snapshot rows",
-        "derived top_volume table only; ranking runs from RAM; counted and power-of-two logged",
-    ),
-    (
-        "crates/app/src/dhan_feed_stack.rs",
         "the saved main-feed backup set could not be read",
         "replay keeps both copies of a backup packet: a duplicate row, never a lost one",
     ),
@@ -219,11 +214,6 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "crates/storage/src/depth_persistence.rs",
         "so the depth spill ceiling falls back",
         "a sizing probe; the spill keeps working at its fixed floor",
-    ),
-    (
-        "crates/storage/src/top_volume_rank_persistence.rs",
-        "so the top_volume spill ceiling falls back",
-        "a sizing probe (2026-10-13, top_volume spill plan item 2); the spill keeps working at its fixed floor, the same shape as its tick and depth twins",
     ),
     (
         "crates/storage/src/wal_deferred_depth.rs",

@@ -128,3 +128,10 @@ path = "src/bin/tv_guarantees.rs"
 [[bin]]
 name = "tv-rebuild-2026-10-22"
 path = "src/bin/rebuild_2026_10_22.rs"
+
+# One-off tool for the 2026-10-31 market-data wipe (plan item 67, Quote 35).
+# Run only by .github/workflows/wipe-2026-10-31.yml; deleted by the PR after
+# the run, as the Quote 29e tool was.
+[[bin]]
+name = "tv-wipe-2026-10-31"
+path = "src/bin/wipe_2026_10_31.rs"

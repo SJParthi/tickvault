@@ -176,7 +176,7 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
                 contract_security_id: 13 + i,
                 underlying_security_id: 1_000 + i,
                 contract_segment: tickvault_common::types::ExchangeSegment::IdxI,
-                family: tickvault_app::volume_leaderboard::OptionFamily::Stock,
+                family: tickvault_app::option_rank::OptionFamily::Stock,
                 lot_size: 75,
             })
             .collect::<Vec<_>>(),

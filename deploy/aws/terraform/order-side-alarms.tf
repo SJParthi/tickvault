@@ -13,6 +13,13 @@
 #   3. order-fill-lag-high  — SHIPS DISARMED (actions_enabled = false; the
 #      arming contract is in its description).
 #
+# ⚠ CHANGED 2026-10-22: #3 order-fill-lag-high is DELETED (the alarm review
+# under operator Quote 37, dhan-rest-only-noise-lock-2026-07-14.md §2.14,
+# docs/audits/2026-10-alarm-review.md). tv_order_fill_lag_seconds still has no
+# emit site, and the alarm shipped with actions_enabled = false, so it could
+# page nobody and measured nothing. A fill-lag alarm returns with its emitter
+# at Phase-1. The ledger text below is kept as history.
+#
 # COST (see aws-budget.md COST NOTE 2026-07-14): +3 alarms ≈ $0.30/mo;
 # +1 derived custom-metric series (tv_orders_placed_delta_total) ≈ $0.30/mo;
 # of the 2 new EMF allowlist names, tv_daily_pnl went LIVE 2026-08-10 (its
@@ -219,70 +226,12 @@ resource "aws_cloudwatch_metric_alarm" "daily_loss_breach" {
 }
 
 # ---------------------------------------------------------------------------
-# ⚠ 2026-08-25 — DELETION ATTEMPTED, BLOCKED, AND DELIBERATELY NOT FORCED.
-#
-# This alarm was slated for deletion in the 2026-08-25 observability sweep, and
-# the reasoning behind that was right as far as it went: `tv_order_fill_lag_seconds`
-# has ZERO emit sites anywhere in `crates/*/src` (verified again on that date),
-# and this file's own header at line 26 says so. A permanently-green alarm is
-# worse than no alarm — it occupies a row in every "are we green?" sweep and
-# answers a question nobody asked it.
-#
-# It was NOT deleted, because deleting it turns TWO Rust guards red, and both
-# live in crates the terraform sweep does not own:
-#
-#   crates/app/tests/order_side_paging_wiring_guard.rs
-#     ::test_fill_lag_alarm_ships_disarmed_with_arming_description
-#     — `.expect("order-side-alarms.tf must define the order_fill_lag_high alarm")`
-#       panics outright the moment the resource is gone.
-#   crates/storage/tests/cloudwatch_dormant_alarms_guard.rs
-#     — carries ("order_fill_lag_high", "tv_order_fill_lag_seconds") in its
-#       dormancy table and asserts the DORMANT markers stay in the description.
-#
-# Shipping a terraform-only deletion would therefore have traded a green alarm
-# for a red build, which is the worse of the two. It is worth being precise
-# about what this alarm actually costs today, because the two are not the same
-# thing: it carries `actions_enabled = false`, so it can page nobody in any
-# state. What it does is read GREEN in the console while measuring nothing.
-#
-# TO ACTUALLY DELETE IT, one PR must do all three together:
-#   1. remove this resource;
-#   2. delete `test_fill_lag_alarm_ships_disarmed_with_arming_description` and
-#      the fill-lag row from the dormancy table in cloudwatch_dormant_alarms_guard;
-#   3. remove `tv_order_fill_lag_seconds` from `DORMANT_BY_DESIGN` in
-#      crates/common/tests/alarm_metric_has_a_route_guard.rs (it passes today
-#      only because the metric is absent from the EMF selector, so it goes
-#      stale rather than red — a quieter kind of drift, but drift).
-#
-# TO RESTORE IT INSTEAD, the Phase-1 arming PR needs: a production emit site for
-# `tv_order_fill_lag_seconds`, the name restored to BOTH EMF selector copies
-# (`cloudwatch-agent.json` and `user-data.sh.tftpl`, pinned byte-identical, and
-# the user-data template renders at exactly its byte budget with nothing free —
-# see §2.3d-ii), and `actions_enabled = true`. Whoever gets there first wins;
-# what must not happen is a third year of it sitting green.
+# 4. Order fill lag — DELETED 2026-10-22 (see the CHANGED note in the header).
+#    The three steps recorded here on 2026-08-25 were done together: the
+#    resource, test_fill_lag_alarm_ships_disarmed_with_arming_description and
+#    the dormancy rows in cloudwatch_dormant_alarms_guard,
+#    alarm_metric_has_a_route_guard and cloudwatch_app_alarms_wiring.
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# 4. Order fill lag — SHIPS DISARMED (arming contract in the description)
-# ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
-  alarm_name          = "tv-${var.environment}-order-fill-lag-high"
-  alarm_description   = "[DORMANT 2026-08-09 - NO PRODUCTION EMIT SITE: tv_order_fill_lag_seconds is written by ZERO non-test code paths. This alarm additionally ships with actions_enabled=false, so it can page nobody regardless of state.] ARMED at Phase-1 live promotion (phase-0-architecture.md promotion criterion #5) — in dry-run the metric never publishes and an armed alarm would be a permanently-INSUFFICIENT_DATA dead pager. The arming PR must also decide: join the market-hours window gate (12→13 + dated doc corrections) OR make the emitter publish in-session-only (the gauge holds its last value across scrapes)."
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 10
-  evaluation_periods  = 1
-  metric_name         = "tv_order_fill_lag_seconds"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Maximum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-  # DISARMED until Phase-1 (see description — the one-line flip at arming
-  # is `actions_enabled = true`). tv_order_fill_lag_seconds has NO emit
-  # site in this PR (cluster A / Phase-1 ships it).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = []
-}
 
 # ---------------------------------------------------------------------------
 # 5. SEBI FORENSIC CHAIN LOSING ROWS — ONE composite alarm over FIVE counters

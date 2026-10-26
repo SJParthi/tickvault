@@ -115,10 +115,9 @@ pub struct ApplicationConfig {
     /// `market_depth`. Turning it on is the operator step (step 4).
     #[serde(default)]
     pub depth_storage: DepthStorageConfig,
-    /// `[top_volume]` — the busiest-contract boards' spill tier (top_volume
-    /// spill plan, 2026-10-13). An absent section keeps the tier ON.
-    #[serde(default)]
-    pub top_volume: TopVolumeConfig,
+    // `[top_volume]` (the boards' spill tier, 2026-10-13) REMOVED 2026-10-22
+    // (plan item 62, operator Quote 34) with the top_volume writer. An old
+    // config file that still carries the section is ignored, never refused.
     /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
     /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
     /// directive 2026-07-13: *"how will you guarantee that all our defined
@@ -1007,34 +1006,6 @@ pub struct DepthStorageConfig {
     /// Write depth as array rows into `market_depth_book`.
     #[serde(default)]
     pub array_rows: bool,
-}
-
-/// `[top_volume]` — the `top_volume_<tf>` boards' save-to-disk tier
-/// (`.claude/plans/active-plan-top-volume-spill.md`, owner approval
-/// 2026-10-13: "Approve dude don't miss anything dude okay?").
-///
-/// `spill_enabled` defaults to TRUE, also when the section or the key is
-/// absent: a board batch that cannot reach QuestDB is saved to
-/// `data/spill/top_volume` and replayed after the close. `false` is the
-/// rollback: such batches are discarded and counted, as before 2026-10-13.
-/// The replay still runs, so files already on disk are posted and aged.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-pub struct TopVolumeConfig {
-    /// Save board batches that do not land to disk and replay them.
-    #[serde(default = "default_top_volume_spill_enabled")]
-    pub spill_enabled: bool,
-}
-
-impl Default for TopVolumeConfig {
-    fn default() -> Self {
-        Self {
-            spill_enabled: default_top_volume_spill_enabled(),
-        }
-    }
-}
-
-const fn default_top_volume_spill_enabled() -> bool {
-    true
 }
 
 /// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
@@ -3212,20 +3183,14 @@ mod tests {
     }
 
     #[test]
-    fn test_top_volume_spill_is_on_by_default_when_absent_and_can_be_turned_off() {
-        // Top_volume spill plan (2026-10-13): the tier is on unless the
-        // operator writes `spill_enabled = false` (the rollback switch).
-        assert!(TopVolumeConfig::default().spill_enabled);
-        let empty: TopVolumeConfig = toml::from_str("").expect("empty section must parse");
-        assert!(empty.spill_enabled, "an absent key keeps the tier on");
-        let off: TopVolumeConfig = toml::from_str("spill_enabled = false").expect("must parse");
-        assert!(!off.spill_enabled);
+    fn test_top_volume_section_is_gone_from_base_toml() {
+        // 2026-10-22 (plan item 62): the `[top_volume]` section is removed from
+        // base.toml, and AppConfig does not refuse a leftover one.
         let base = include_str!("../../../config/base.toml");
-        let section = base
-            .split_once("\n[top_volume]")
-            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(""))
-            .expect("base.toml must carry a [top_volume] section");
-        assert!(section.contains("spill_enabled = true"), "{section}");
+        assert!(
+            !base.contains("\n[top_volume]"),
+            "base.toml still carries [top_volume]"
+        );
     }
 
     // =======================================================================
@@ -3788,7 +3753,6 @@ mod tests {
             dhan_data_api: DhanDataApiConfig::default(),
             depth_unsubscribe_probe: DepthUnsubscribeProbeConfig::default(),
             depth_storage: DepthStorageConfig::default(),
-            top_volume: TopVolumeConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),

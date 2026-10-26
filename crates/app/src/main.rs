@@ -802,6 +802,11 @@ async fn async_main() -> Result<()> {
         let code = tickvault_app::rebuild_box::run(&cli_args).await;
         std::process::exit(code);
     }
+    // `tickvault wipe-box <mode> <sha>` (plan item 67, one-off, Quote 35): the
+    // box half of the 2026-10-31 wipe, sent over SSM by its workflow only.
+    if tickvault_app::wipe_box::is_invocation(&cli_args) {
+        std::process::exit(tickvault_app::wipe_box::run(&cli_args).await);
+    }
 
     // -----------------------------------------------------------------------
     // Step 0.9: Panic hook (audit CR-3, 2026-10-11)
@@ -1810,7 +1815,6 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_feed_aux_rows_refused_total", "reason" => "security_id_width")
         .increment(0);
     metrics::counter!("tv_candle_int_self_heal_refused_total").increment(0);
-    metrics::counter!("tv_top_volume_rank_append_failed_total").increment(0);
     for (half, stage) in [
         ("main_feed", "spawn_skipped"),
         ("depth", "spawn_skipped"),
@@ -1890,16 +1894,9 @@ async fn async_main() -> Result<()> {
     }
     metrics::counter!("tv_spot_price_store_refused_total").increment(0);
     metrics::counter!("tv_prev_close_store_refused_total").increment(0);
-    for family in ["index", "stock"] {
-        for reason in ["capacity", "window_bar_missing"] {
-            metrics::counter!(
-                "tv_volume_leaderboard_refused_total",
-                "family" => family,
-                "reason" => reason
-            )
-            .increment(0);
-        }
-    }
+    // `tv_volume_leaderboard_refused_total`, `tv_top_volume_rank_append_failed_total`
+    // and `tv_top_volume_snapshot_refused_total` are no longer seeded: their
+    // emitters went with `top_volume` on 2026-10-22 (plan item 62, Quote 34).
     metrics::counter!("tv_wal_lag_tracker_refused_total").increment(0);
     // PR W review round 4 (C): local `/metrics` only, no filter, no alarm.
     metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_EPISODES_COUNTER)
@@ -1928,13 +1925,6 @@ async fn async_main() -> Result<()> {
         .increment(0);
     // The fourteen counters that joined the same six pages on 2026-10-11
     // (noise lock §2.10-a). Same reason, every label value each emit site uses.
-    for reason in tickvault_app::top_volume_snapshot::SnapshotRefusal::ALL {
-        metrics::counter!(
-            tickvault_app::dhan_feed_stack::TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
-            "reason" => reason.as_str()
-        )
-        .increment(0);
-    }
     for endpoint in tickvault_core::websocket::pool_budget::DhanEndpointType::ALL {
         let endpoint = endpoint.as_str();
         for reason in ["oversize", "transport"] {
@@ -2714,7 +2704,7 @@ async fn async_main() -> Result<()> {
                         std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
                         std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
                         std::path::Path::new(
-                            tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
+                            tickvault_storage::raw_frame_upload::LEGACY_TOP_VOLUME_SPILL_DIR,
                         ),
                         &today_spill_file,
                         max_segments,
@@ -3098,18 +3088,10 @@ async fn async_main() -> Result<()> {
             require_raw_upload,
         );
 
-    // The third drain, for the top_volume board spill (2026-10-13, plan item 5):
-    // held until the tables are keyed, then after 15:40 IST; no window filter;
-    // a file older than the hot window less a day is set aside, never replayed.
-    // ALWAYS started: `[top_volume] spill_enabled = false` stops only new spills,
-    // so files already on disk are still replayed and aged (PR-C review).
-    let _top_volume_spill_drain_supervisor =
-        tickvault_storage::tick_spill_replay::spawn_supervised_top_volume_spill_replay(
-            &config.questdb.host,
-            config.questdb.http_port,
-            require_raw_upload,
-            &config.partition_retention,
-        );
+    // The third drain, for the top_volume board spill (2026-10-13), was
+    // removed on 2026-10-22 (plan item 62, operator Quote 34) with the
+    // top_volume writer. Files left in that folder are kept on disk; its
+    // quarantine is still copied cold by the raw upload loop.
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
@@ -3918,7 +3900,6 @@ async fn async_main() -> Result<()> {
             // Frame-silence fast paths (scope lock 2026-10-10): shadow by
             // default, so they count would-redials before anything acts.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
-            top_volume_spill_enabled: config.top_volume.spill_enabled,
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
@@ -4950,9 +4931,8 @@ async fn build_shared_infra(
     // key is a degraded session, a halted boot is a dark one.
     //
     // Audit PR31a (2026-09-27): when the bounded loop gives up, keep
-    // re-running the ensure in the background for this session. The
-    // `top_volume_<tf>` writer refuses to send until its tables are keyed, and
-    // a `DEDUP ENABLE` re-run is what repairs a ticks or depth table ILP
+    // re-running the ensure in the background for this session. A
+    // `DEDUP ENABLE` re-run is what repairs a ticks or depth table ILP
     // auto-created without its key.
     if !tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await {
         drop(tickvault_app::candle_ddl_boot::spawn_ensure_until_keyed(
