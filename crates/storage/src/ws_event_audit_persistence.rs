@@ -250,7 +250,7 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) -> bool
     let dedup_reenable_ddl = format!(
         "ALTER TABLE {WS_EVENT_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_WS_EVENT_AUDIT})"
     );
-    let keyed = match client
+    match client
         .get(&base_url)
         .query(&[("query", dedup_reenable_ddl.as_str())])
         .send()
@@ -273,8 +273,7 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) -> bool
             );
             false
         }
-    };
-    keyed
+    }
 }
 
 /// Lazy-connect ILP writer for the `ws_event_audit` table. Mirrors
