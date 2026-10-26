@@ -99,10 +99,12 @@ fn every_production_dial_disables_nagle() {
         );
 
         // `disable_nagle` is the THIRD positional argument. Assert the two
-        // real shapes rather than parsing Rust: `None` config (order-update)
-        // and a `config` binding (main feed).
-        let ok = src.contains("connect_async_tls_with_config(request, None, true,")
-            || src.contains("connect_async_tls_with_config(request, config, true,");
+        // real shapes rather than parsing Rust: the order-update config helper
+        // (was `None` until audit J4, 2026-10-26; `None` is now refused by
+        // `websocket_connect_config_guard.rs`) and a `config` binding (main feed).
+        let ok = src.contains(
+            "connect_async_tls_with_config( request, Some(order_update_websocket_config()), true,",
+        ) || src.contains("connect_async_tls_with_config(request, config, true,");
 
         assert!(
             ok,
