@@ -865,7 +865,7 @@ wave-3 slice audits (W2-a socket, W2-b stop/restart/token, W2-c candle chain)
 confirmed in source. No operator-locked rule changes: 805/808 policy, the $75
 line, the frame-silence `act` default and the shell budget stay as they are.
 
-- [ ] L1 (core) Socket read path: a write that fails with no socket decision
+- [x] L1 (core) Socket read path: a write that fails with no socket decision
   first takes any owed disconnect code (`pending_close`) and classifies it, and
   the close drain returns the first disconnect code it reads (lone or stacked)
   to `classify_disconnect`; a close whose send stalls still drains the frames
@@ -875,7 +875,7 @@ line, the frame-silence `act` default and the shell budget stay as they are.
   5xx and parse errors go through `classify_failure_reason`).
   - Files: crates/core/src/websocket/connection.rs, crates/core/src/websocket/pool_supervisor.rs, crates/core/src/parser/dispatcher.rs, crates/core/src/auth/token_manager.rs
   - Tests: scripted socket where the write ticket fails while a stacked 805 is owed (805 parks); stalled-close drain keeps buffered frames; closed-ring label; 70,000-packet cap; probe error classes
-- [ ] L2 (storage, app) Seal chain at shutdown and on disk: the candle sender
+- [x] L2 (storage, app) Seal chain at shutdown and on disk: the candle sender
   sets `request_min_throughput` so one failed flush cycle fits the shutdown
   budget; after the first failed flush the final drain spills the rest without
   flushing again; a shutdown timeout keeps the crash marker not-clean with the
@@ -885,7 +885,7 @@ line, the frame-silence `act` default and the shell budget stay as they are.
   staging or a day switch is synced or parked, never dropped unsynced.
   - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/seal_writer_loop.rs, crates/storage/src/seal_writer_runner.rs, crates/storage/src/seal_spill_ledger.rs, crates/storage/src/seal_spill.rs, crates/app/src/main.rs
   - Tests: one regression test per change (hung-QuestDB final drain bound, marker not-clean on timeout, floor refusal counted, equal-fullness replay skipped, rotated handle synced)
-- [ ] L3 (trading, app) Candle fold and live lane: a packet the fold calls stale
+- [x] L3 (trading, app) Candle fold and live lane: a packet the fold calls stale
   can widen high/low but never moves close, close time, OI or quantities; on a
   Muhurat day the fold's session gate follows the same Muhurat window the tick
   writer uses; the seal-accounting `debug_assert` counts rescued seals; the
@@ -894,7 +894,8 @@ line, the frame-silence `act` default and the shell budget stay as they are.
   backoff instead of returning for the rest of the process.
   - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/src/candles/aggregator_cell.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_rest_stack.rs
   - Tests: stale packet keeps close; Muhurat-day tick at 18:05 folds into a 1m bar; rescued seal does not trip the assert; lane retries then dials; restart differential unchanged
-- [ ] L4 (aws-lambdas, app, workflows, terraform) Stop paths in the capture
+  - Done 2026-10-26 except one part: the REST stack still PARKS after its 300 s lock patience. A 60 s re-try was written and reverted, because the dual-instance lock (§3.5) parks on purpose so a second box cannot take the lock when the owner restarts; changing it needs the owner's dated quote in that file first.
+- [x] L4 (aws-lambdas, app, workflows, terraform) Stop paths in the capture
   window: every workflow market-hours guard uses 09:00–15:40 IST (aws-control,
   downsize-instance) and is pinned by a test; the deploy failure auto-stop and
   `terraform apply` re-check IST right before acting; the holiday gate's stop
@@ -906,6 +907,54 @@ line, the frame-silence `act` default and the shell budget stay as they are.
   unit comment is corrected. Workflow shell lines do not grow (shell budget).
   - Files: .github/workflows/aws-control.yml, .github/workflows/downsize-instance.yml, .github/workflows/deploy-aws.yml, .github/workflows/terraform-apply.yml, crates/app/src/holiday_gate.rs, crates/aws-lambdas/src/budget_spend.rs, crates/aws-lambdas/src/start_watchdog.rs, deploy/aws/terraform/variables.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, deploy/systemd/tickvault.service
   - Tests: window pins for every guarded workflow; budget day-2 stale reading untrusted; Muhurat config error returns Err; daily stop skips the window; holiday gate at 09:05 starts
+  - Done 2026-10-26 except arming the liveness alarm on the Muhurat date: before the first tick its no-ticks alarm reads the app's uptime, so arming at the configured session start (13:30, before the reported 14:05 pre-open) would page at once; needs NSE's official times and a start offset. `terraform fmt` not run (not installed).
+
+### PR M — 2026-10-26 live-session findings (storage, app, core, trading, terraform)
+
+From a read-only check of the live AWS account for the 2026-10-26 session
+(CloudWatch metrics scrapes, app logs, EBS and EC2 metrics). Approved under
+the same session quotes as PR J/K/L plus "do the slonwess test directl yfrom
+liv e aws" and "do a live aws check ... live access evryhtign" (2026-10-26).
+Measured: 0 ticks lost and 0 socket disconnects all day; every hot-path stage
+inside its budget at p99; but the root disk sat at its 125 MiB/s ceiling from
+09:30 to 15:40 IST (CPU about 5%), the tick writer fell behind for about 6 h
+(9.2M rows rescued to spill, all replayed, 0 failed), the WAL backlog held
+225 GB flat, the 1-minute cross-check read `diverged` (16.6% of price
+fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
+48,581 mismatches and 27,680 missing rows.
+
+- [ ] M1 (storage, app) Disk write amplification: the box writes about
+  110-190 MiB/s in session (500 MiB/s days) against about 1 MB/s of tick
+  rows. Measure which writer it is (QuestDB out-of-order merges from spill
+  replay or WAL catch-up, the frame WAL, candle tables, uploads) from the
+  live metrics, and remove the amplification at its source so a session
+  fits well under 125 MiB/s. Report before/after bytes per tick.
+  - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: one regression test per change; a measured bytes-written figure in the PR body
+- [ ] M2 (storage) WAL backlog never drains: 1,696 pinned segments (225 GB)
+  flat all day, boot catch-up defers 1,759 segments every day on its RAM
+  budget. Find why no catch-up makes net progress and make each boot or
+  evening drain shrink the backlog (plan item W3 shape: settle per batch),
+  bounded and O(1) per frame.
+  - Files: crates/storage/src/wal_unapplied_ranges.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_replay_settle.rs, crates/app/src/evening_drain.rs
+  - Tests: lifetime property test where the backlog shrinks across boots; regression tests per change
+- [ ] M3 (app, trading) Data checks failed: find whether the 16.6% 1-minute
+  divergence, the 10,186 missing live minutes and the 48,581 timeframe
+  mismatches come from rows not yet applied when the check read (writer lag)
+  or from the fold, and fix the cause (the check must not read before the
+  rows it judges are applied; a fold bug gets its regression test).
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_crossverify.rs, crates/app/src/tf_consistency_boot.rs, crates/trading/src/candles/multi_tf_aggregator.rs
+  - Tests: regression test per cause found; readiness barrier covers the spill/replay backlog
+- [ ] M4 (core, app, terraform) Smaller live findings: the socket hand-off
+  stage went over its 100 us budget 8,843 times (p99.9 262 us at the open)
+  — find and remove the tail at its source, O(1), zero allocation; the
+  planned-connections gauge stays at 1 after five sockets come up; the
+  contract-to-underlying map refuses 60,988 of 85,988 legs at its 25,000 cap
+  every attempt until 09:30 (find whether any subscribed or ranked contract
+  loses its underlying, fix if so); two QuestDB console Lambda log groups
+  keep logs forever (set retention).
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform
+  - Tests: DHAT on the socket path unchanged; regression test per change
 
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
@@ -913,6 +962,11 @@ line, the frame-silence `act` default and the shell budget stay as they are.
   to CloudWatch with an alarm: a new page needs a dated noise-lock row first.
 - Skipping the 06:05 Lambda mint while a drain hold is fresh: changes the sole
   minter's schedule contract (token-minter §10), owner decision.
+- Raising the root disk throughput back above 125 MiB/s: Quote 31 REJECTs it
+  without a fresh dated quote (live: disk at the 125 MiB/s ceiling all
+  session since the 21 Oct cut; Quote 32 step 2's "after one depth-off session
+  peaks under 100 MiB/s" was not met: 21 Oct averaged 191 MiB/s).
+- The REST stack re-trying after its lock patience (L3 5b, reverted).
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
   without a dated measured row (websocket-connection-scope-lock.md 2026-10-10).
@@ -931,6 +985,8 @@ PR J: each fix keeps the existing tiers and only closes a gap: the rescue deferr
 
 PR K: each fix keeps the existing tiers: replay classification and streak stop are pure functions; the WAL sync failure reuses the existing lost mark; the silence spacing reuses the existing per-kind CAS; verdict counters are pre-resolved handles.
 
+PR M: every item starts from a live measurement and ends with a before/after number; fixes reuse existing tiers.
+
 PR L: each fix reuses an existing mechanism: the owed close code is already stored in `pending_close`; the seal floor reuses `classify_spill_floor`; the Muhurat gate reuses the writers' Muhurat flag; workflow guards reuse the deploy-aws IST check; budget distrust widens an existing day-1 rule.
 
 ## Edge Cases
@@ -946,6 +1002,8 @@ PR L: each fix reuses an existing mechanism: the owed close code is already stor
 
 - PR K: a QuestDB that refuses every line (schema drift) stops the round after 3 quarantines instead of emptying the backlog; a 401/403 is retried, never quarantined; all main-feed sockets silent at once are staggered, one redial per spacing.
 
+- PR M: a session that saturates the disk; a backlog larger than one boot's replay budget; a check that reads rows still in spill.
+
 - PR L: a disconnect code stacked behind data at a failed write; a QuestDB that accepts TCP and never answers at exit; a Muhurat session in the evening; Monday 2 November with October's total still showing; a deploy failing at 09:10.
 
 ## Failure Modes
@@ -956,6 +1014,8 @@ PR L: each fix reuses an existing mechanism: the owed close code is already stor
 - PR J: an inline spill that also fails is counted lost (unchanged accounting, now honest).
 
 - PR K: a retried 4xx that never heals keeps the file waiting (counted, not quarantined); a staggered silence redial recovers the pool more slowly (at most 5 × spacing).
+
+- PR M: a fix that moves writes rather than removing them shows up in the next session's EBS bytes.
 
 - PR L: a lane retry that never gets the lock keeps retrying on a capped backoff (logged per episode); a budget reading distrusted on day 2 pages instead of stopping.
 
@@ -968,6 +1028,8 @@ pin the frame-arm call; the new DHAT test; `cargo test -p tickvault-app --lib`,
 PR J: per-crate `cargo test -p` for storage, app, core, api, common; new self-test rows for every guard; clippy and fmt.
 
 PR K: per-crate `cargo test -p` for storage, app, core; one regression test per item; clippy and fmt.
+
+PR M: per-crate tests plus the next live session's EBS throughput, spill count and cross-check verdict read back read-only.
 
 PR L: per-crate `cargo test -p` for core, storage, trading, app, aws-lambdas; restart differential; workflow window pins; clippy and fmt.
 
@@ -982,6 +1044,8 @@ planner then swaps every minute as before.
 PR J: revert the merge commit of each sub-branch; no config flag or schema change.
 
 PR K: revert the merge commit of each sub-branch; no config flag or schema change.
+
+PR M: revert the merge commit of each sub-branch.
 
 PR L: revert the merge commit of each sub-branch; no schema change.
 
@@ -1004,6 +1068,8 @@ alarm); `held_back` and `min_hold` in the existing per-minute steering `info!`.
 PR J: `tv_ticks_lost_total{source="rescue_abandoned"}` and `{source="shutdown_ring_unbacked"}`, registered at 0 at boot, local `/metrics` only (they ride the existing loss-group filter only after a dated noise-lock row).
 
 PR K: tick-gap verdict counters and WAL staging-failure counters, local `/metrics` only, no EMF name, filter or alarm.
+
+PR M: no new alarm or page; local `/metrics` only for any new counter.
 
 PR L: new reason labels and refusal counters only, local `/metrics` only; no new alarm or page (the liveness alarm's schedule moves, the page is unchanged).
 

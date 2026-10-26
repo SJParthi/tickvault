@@ -345,8 +345,9 @@ pub const UP_WINDOW_CLOSE_IST_HHMM: u32 =
 /// - a NaN or infinite reading (coded `LAMBDA-AWS-01`): NaN makes every
 ///   `spend >= line` compare false, so it could never stop the box;
 /// - a negative reading;
-/// - during UTC day 1 of a month, a reading at or above `line_usd`, because a
-///   Budgets reply has no month stamp and may still hold last month's total
+/// - during UTC days 1 and 2 of a month (day 1 only until 2026-10-26, audit
+///   PR L4), a reading at or above `line_usd`, because a Budgets reply has no
+///   month stamp and may still hold last month's total
 ///   (`budget_spend::trusted_spend_for_line`). Cost Explorer returned unknown
 ///   all of day 1 (empty `[1st, 1st)` interval), so this is no weaker.
 ///
@@ -1556,14 +1557,26 @@ mod tests {
         // Below the line on day 1 is used as is.
         let low = mtd_usd(&FakeBudgets { amount: Some(2.0) }, 75.0, day1).await;
         assert_eq!(low, Some(2.0));
-        // From day 2 the same reading is trusted.
+        // 2026-10-26 (audit PR L4): day 2 is distrusted too (Monday 2 Nov
+        // could still show October's total); this asserted day 2 trusted.
         let day2 = utc(2026, 11, 2, 4, 30);
-        let high = mtd_usd(
+        let day2_high = mtd_usd(
             &FakeBudgets {
                 amount: Some(160.0),
             },
             75.0,
             day2,
+        )
+        .await;
+        assert_eq!(day2_high, None);
+        // From day 3 the same reading is trusted.
+        let day3 = utc(2026, 11, 3, 4, 30);
+        let high = mtd_usd(
+            &FakeBudgets {
+                amount: Some(160.0),
+            },
+            75.0,
+            day3,
         )
         .await;
         assert_eq!(high, Some(160.0));
@@ -2465,10 +2478,12 @@ aws events enable-rule --name tv-prod-daily-start\n"
 
     #[tokio::test]
     async fn effective_ceiling_october_breach_at_175_stops_even_with_a_225_config() {
-        // 2026-10-02 is a Friday; 04:30 UTC = 10:00 IST, inside the window.
+        // 2026-10-05 is a Monday; 04:30 UTC = 10:00 IST, inside the window.
         // Moved from 1 Oct on 2026-10-22 (plan item 63): on UTC day 1 a
         // Budgets reading at or above the line is unknown (no month stamp),
         // so a day-1 breach pages and never stops.
+        // 2026-10-26 (audit PR L4): moved again, to Monday 5 Oct, because UTC
+        // day 2 is now distrusted the same way (first 48 h of the month).
         let env = GuardEnv {
             budget_kill_usd: 225.0,
             ..test_env()
@@ -2488,7 +2503,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
                 amount: Some(175.0),
             },
             &ssm,
-            utc(2026, 10, 2, 4, 30),
+            utc(2026, 10, 5, 4, 30),
         )
         .await
         .expect("run_guard ok");

@@ -166,6 +166,26 @@ fn curfew_and_hard_stop_guard_treat_the_window_as_in_hours() {
         ),
         "the curfew must skip a box inside a Muhurat window"
     );
+    // 2026-10-26 (audit PR L4): the 16:30 daily_stop and the 16:45
+    // stop_check skip the window too, each before it reads the instance.
+    for mode in ["daily_stop", "stop_check"] {
+        let arm = watchdog
+            .find(&format!("if mode == \"{mode}\" {{"))
+            .unwrap_or_else(|| panic!("start_watchdog.rs has no `{mode}` arm"));
+        let rest = &watchdog[arm..];
+        let skip = rest
+            .find(
+                "if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {",
+            )
+            .unwrap_or_else(|| panic!("the `{mode}` arm must skip a Muhurat window"));
+        let describe = rest
+            .find("instance_info(ec2, &env.instance_id)")
+            .unwrap_or_else(|| panic!("the `{mode}` arm reads the instance"));
+        assert!(
+            skip < describe,
+            "the `{mode}` arm must check the Muhurat window before it acts on the box"
+        );
+    }
     let guard = code_only(&read("crates/aws-lambdas/src/hard_stop_guard.rs"));
     assert!(
         guard.contains(

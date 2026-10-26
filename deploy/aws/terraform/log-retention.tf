@@ -80,7 +80,7 @@ resource "aws_cloudwatch_metric_alarm" "logs_ingestion_runaway" {
 # guaranteed false-pager while the box is intentionally stopped (nightly /
 # weekend / weekday-NSE-holiday self-stop via the holiday gate), so actions are
 # OFF by default and window-gated: the market-hours gate Lambda
-# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri —
+# (market-hours-liveness-alarm.tf) enables them 09:20-15:40 IST Mon-Fri —
 # and, per the 2026-07-07 review fix, ONLY after verifying the tv-app
 # instance is actually up (the open cron is holiday-blind; the box is OFF on
 # weekday NSE holidays, so a blind enable would false-page ~09:35 IST every
@@ -108,7 +108,7 @@ resource "aws_cloudwatch_metric_alarm" "app_log_ingestion_silent" {
   }
 
   # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri — only when the box is actually up — so the
+  # 09:20-15:40 IST Mon-Fri — only when the box is actually up — so the
   # intentional nightly/weekend/NSE-holiday stop (box down => zero ingestion
   # => missing datapoints) can never false-page.
   actions_enabled = false

@@ -245,7 +245,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   treat_missing_data = "breaching"
   dimensions         = local.app_dimensions
 
-  # Actions OFF by default; the window Lambda flips them ON 09:20–15:35 IST Mon-Fri
+  # Actions OFF by default; the window Lambda flips them ON 09:20–15:40 IST Mon-Fri
   # so the intentional nightly/weekend stop (metric absent) can never false-page.
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions
@@ -279,7 +279,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 #         DescribeInstances error — a real trading day must never lose the
 #         liveness page), then reset each alarm to OK with the exact
 #         'market-hours window opened (09:20 IST)' reason.
-#   mode="close" (15:35 IST) → disable them again so the intentional
+#   mode="close" (15:40 IST since 2026-10-26) → disable them again so the intentional
 #     off-hours state never pages.
 # The weekday-NSE-holiday safety chain (2026-07-07 rounds 1+3) lives on in
 # the Rust port and is ratcheted by
@@ -704,12 +704,20 @@ resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   state = "ENABLED"
 }
 
-# Close the window at 15:35 IST (10:05 UTC) Mon-Fri — 5 min after the 15:30 IST
-# market close, so post-close idle (and the 16:30 IST nightly stop) never pages.
+# Close the window at 15:40 IST (10:10 UTC) Mon-Fri, so post-close idle (and the
+# 16:30 IST nightly stop) never pages.
+#
+# 2026-10-26 (audit PR L4): was 15:35 IST (10:05 UTC), "5 min after the 15:30
+# IST market close". Since the NSE closing-auction change of 2026-08-03 the
+# session and the app's capture both end at 15:40 IST
+# (TICK_PERSIST_END_SECS_OF_DAY_IST), so the last five minutes of capture had
+# no app-death page. The feed still delivers equity packets in the closing
+# auction, so the tick-age alarms in ALARM_NAMES stay fed until 15:40
+# (Assumed from the session change; not measured on the box).
 resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_close" {
   name                = "tv-${var.environment}-market-hours-liveness-close"
-  description         = "Disable market-hours liveness alarm actions at 15:35 IST (Mon-Fri)"
-  schedule_expression = "cron(5 10 ? * MON-FRI *)"
+  description         = "Disable market-hours liveness alarm actions at 15:40 IST (Mon-Fri)"
+  schedule_expression = "cron(10 10 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_open" {
@@ -743,7 +751,7 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:35 IST window). Signal: the tv_dhan_feed_last_tick_age_secs gauge MISSING (treat_missing_data=breaching) — published every 30s by the live lane's silence timer, in the CW-agent EMF selector (deploy/aws/cloudwatch-agent.json). Signal moved off tv_rest_1m_fire_heartbeat on 2026-09-16 (the per-minute REST legs were removed under the operator's sockets-only directive, taking all three of that gauge's producers with them; re-pointed rather than retired because at 60s x 5 this is the only ~5-minute detector in the gated set), off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entries."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:40 IST window). Signal: the tv_dhan_feed_last_tick_age_secs gauge MISSING (treat_missing_data=breaching) — published every 30s by the live lane's silence timer, in the CW-agent EMF selector (deploy/aws/cloudwatch-agent.json). Signal moved off tv_rest_1m_fire_heartbeat on 2026-09-16 (the per-minute REST legs were removed under the operator's sockets-only directive, taking all three of that gauge's producers with them; re-pointed rather than retired because at 60s x 5 this is the only ~5-minute detector in the gated set), off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entries."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }
 

@@ -664,6 +664,82 @@ fn test_deploy_aws_workflow_has_market_hours_guard() {
     );
 }
 
+// Regression: 2026-10-26 (audit PR L4) — aws-control refused its sensitive
+// actions only 09:15-15:30 IST and downsize-instance only 09:00-15:35, while
+// capture runs 09:00-15:40 IST (TICK_PERSIST_START/END). A stop at 09:05 or
+// 15:38 cut the live session.
+#[test]
+fn test_regression_workflow_stop_guards_cover_the_capture_window() {
+    let read = |rel: &str| {
+        std::fs::read_to_string(workspace_root().join(rel))
+            .unwrap_or_else(|e| panic!("{rel} must be readable: {e}")) // APPROVED: test
+    };
+    // 09:00 IST = 03:30 UTC = minute 210; 15:40 IST = 10:10 UTC = minute 610.
+    let control = read(".github/workflows/aws-control.yml");
+    assert!(
+        control.contains(r#"[ "$mins" -ge 210 ] && [ "$mins" -le 610 ]"#),
+        "aws-control.yml must refuse stop/reboot/restart-app/stop-app/rotate-ip \
+         for UTC minutes 210-610 (09:00-15:40 IST)"
+    );
+    assert!(
+        !control.contains("-ge 225") && !control.contains("-le 600"),
+        "aws-control.yml still carries the old 09:15-15:30 IST window"
+    );
+    let downsize = read(".github/workflows/downsize-instance.yml");
+    assert!(
+        downsize.contains(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]"#),
+        "downsize-instance.yml must refuse 09:00-15:40 IST"
+    );
+    assert!(
+        !downsize.contains("-le 1535"),
+        "downsize-instance.yml still ends its window at 15:35 IST"
+    );
+    // The deploy failure auto-stop skips the capture window before it stops.
+    let deploy = read(".github/workflows/deploy-aws.yml");
+    let check = deploy
+        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; then echo "::warning::Deploy failed inside"#)
+        .expect("deploy-aws.yml auto-stop must skip 09:00-15:40 IST"); // APPROVED: test
+    let stop = deploy
+        .find("tickvault auto-stop on deploy failure")
+        .expect("deploy-aws.yml auto-stop dispatch"); // APPROVED: test
+    assert!(
+        check < stop,
+        "the IST check must run before the auto-stop dispatch"
+    );
+    // terraform-apply re-checks the band in the apply step itself.
+    let tf = read(".github/workflows/terraform-apply.yml");
+    let recheck = tf
+        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ] && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]"#)
+        .expect("terraform-apply.yml must re-check IST at apply time"); // APPROVED: test
+    let apply = tf
+        .find("apply -auto-approve -no-color")
+        .expect("terraform apply line"); // APPROVED: test
+    assert!(
+        recheck < apply,
+        "the IST re-check must sit right before terraform apply"
+    );
+}
+
+// Regression: 2026-10-26 (audit PR L4) — the market-hours gate disarmed the
+// app-death alarms at 15:35 IST while capture (and, since the 2026-08-03 NSE
+// closing auction, the session) runs to 15:40 IST.
+#[test]
+fn test_regression_liveness_gate_closes_at_1540_ist() {
+    let tf = std::fs::read_to_string(
+        workspace_root().join("deploy/aws/terraform/market-hours-liveness-alarm.tf"),
+    )
+    .expect("market-hours-liveness-alarm.tf must be readable"); // APPROVED: test
+    // 15:40 IST = 10:10 UTC.
+    assert!(
+        tf.contains(r#"schedule_expression = "cron(10 10 ? * MON-FRI *)""#),
+        "the liveness close rule must fire at 10:10 UTC (15:40 IST)"
+    );
+    assert!(
+        !tf.contains("cron(5 10 ? * MON-FRI *)"),
+        "the liveness close rule still fires at 15:35 IST"
+    );
+}
+
 #[test]
 fn test_deploy_aws_workflow_green_defer_gate() {
     // Green-defer contract (2026-07-17, PR #1618): an in-window MAIN-BRANCH

@@ -29,6 +29,15 @@
 //! can only under-state the new month by at most last month's tail, and it can
 //! never stop the box.
 //!
+//! **⚠ CHANGED 2026-10-26 (audit PR L4) — the distrust now covers the first
+//! 48 hours (UTC days 1 AND 2), not day 1 only.** AWS refreshes the figure
+//! about every 8 to 12 hours and has been seen to lag longer, so on day 2 a
+//! reading at or above the line may still be the month that just ended (on
+//! Monday 2 November October's total could stop the box). A distrusted reading
+//! is unknown exactly as on day 1: it pages and never stops. The native budget
+//! stop is unaffected. Cost: a genuine breach on day 2 pages instead of
+//! stopping, and the next run (day 3) stops it.
+//!
 //! # Refusals
 //!
 //! A reply with no budget, no calculated spend or no actual spend, an amount
@@ -55,9 +64,11 @@ pub const BUDGET_ACCOUNT_ID_ENV: &str = "BUDGET_ACCOUNT_ID";
 pub const SPEND_UNIT_USD: &str = "USD";
 /// The spend source named in logs and return values.
 pub const SPEND_SOURCE: &str = "budgets";
-/// The UTC day of a billing month on which a Budgets figure may still be the
-/// previous month's (see the module header).
+/// The first UTC day of a billing month on which a Budgets figure may still be
+/// the previous month's (see the module header).
 pub const UNSTAMPED_FIRST_DAY_OF_MONTH: u32 = 1;
+/// The last UTC day of that window (2026-10-26, audit PR L4: was day 1 only).
+pub const UNSTAMPED_LAST_DAY_OF_MONTH: u32 = 2;
 
 /// Which budget to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,13 +155,13 @@ pub fn actual_spend_of(
     parse_spend_amount(actual.amount(), actual.unit())
 }
 
-/// True during the first 24 hours (UTC) of a billing month, when a Budgets
-/// figure may still be the previous month's.
-pub fn in_unstamped_first_day(now_utc: DateTime<Utc>) -> bool {
-    now_utc.day() == UNSTAMPED_FIRST_DAY_OF_MONTH
+/// True during the first 48 hours (UTC days 1 and 2) of a billing month, when
+/// a Budgets figure may still be the previous month's.
+pub fn in_unstamped_month_start(now_utc: DateTime<Utc>) -> bool {
+    (UNSTAMPED_FIRST_DAY_OF_MONTH..=UNSTAMPED_LAST_DAY_OF_MONTH).contains(&now_utc.day())
 }
 
-/// The spend a stop decision may use. During UTC day 1 a reading at or above
+/// The spend a stop decision may use. During UTC days 1 and 2 a reading at or above
 /// `line_usd` is treated as unknown (`None`: page, never stop), because it may
 /// be last month's total. Every other reading passes through unchanged.
 pub fn trusted_spend_for_line(
@@ -159,12 +170,12 @@ pub fn trusted_spend_for_line(
     now_utc: DateTime<Utc>,
 ) -> Option<f64> {
     match spend {
-        Some(v) if in_unstamped_first_day(now_utc) && v >= line_usd => {
+        Some(v) if in_unstamped_month_start(now_utc) && v >= line_usd => {
             warn!(
                 spend_usd = v,
                 line_usd,
                 source = SPEND_SOURCE,
-                "first UTC day of the month: a Budgets reading at or above the line may be last month's; treated as unknown"
+                "first 48 h (UTC) of the month: a Budgets reading at or above the line may be last month's; treated as unknown"
             );
             None
         }
@@ -312,11 +323,13 @@ mod tests {
     }
 
     #[test]
-    fn test_in_unstamped_first_day_is_utc_day_one_only() {
-        assert!(in_unstamped_first_day(utc(2026, 11, 1, 0)));
-        assert!(in_unstamped_first_day(utc(2026, 11, 1, 23)));
-        assert!(!in_unstamped_first_day(utc(2026, 11, 2, 0)));
-        assert!(!in_unstamped_first_day(utc(2026, 10, 31, 23)));
+    fn test_in_unstamped_month_start_is_utc_days_one_and_two() {
+        assert!(in_unstamped_month_start(utc(2026, 11, 1, 0)));
+        assert!(in_unstamped_month_start(utc(2026, 11, 1, 23)));
+        assert!(in_unstamped_month_start(utc(2026, 11, 2, 0)));
+        assert!(in_unstamped_month_start(utc(2026, 11, 2, 23)));
+        assert!(!in_unstamped_month_start(utc(2026, 11, 3, 0)));
+        assert!(!in_unstamped_month_start(utc(2026, 10, 31, 23)));
     }
 
     #[test]
@@ -327,8 +340,19 @@ mod tests {
         // Below the line on day 1 passes through: it can never stop the box.
         assert_eq!(trusted_spend_for_line(Some(3.0), 75.0, day1), Some(3.0));
         assert_eq!(trusted_spend_for_line(None, 75.0, day1), None);
-        // From day 2 a breach reading is trusted.
-        let day2 = utc(2026, 11, 2, 0);
-        assert_eq!(trusted_spend_for_line(Some(80.0), 75.0, day2), Some(80.0));
+        // From day 3 a breach reading is trusted.
+        let day3 = utc(2026, 11, 3, 0);
+        assert_eq!(trusted_spend_for_line(Some(80.0), 75.0, day3), Some(80.0));
+    }
+
+    // Regression: 2026-10-26 (audit PR L4) — only UTC day 1 was distrusted, so
+    // on Monday 2 November a Budgets figure still showing October's total at
+    // or above the line could stop the box.
+    #[test]
+    fn test_regression_day_two_reading_at_or_above_line_is_unknown() {
+        let day2 = utc(2026, 11, 2, 4);
+        assert_eq!(trusted_spend_for_line(Some(160.0), 75.0, day2), None);
+        assert_eq!(trusted_spend_for_line(Some(75.0), 75.0, day2), None);
+        assert_eq!(trusted_spend_for_line(Some(3.0), 75.0, day2), Some(3.0));
     }
 }

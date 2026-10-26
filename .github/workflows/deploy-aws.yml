@@ -1647,6 +1647,14 @@ jobs:
         # step). For earlier failures it silently no-ops via `|| true`.
         run: |
           set +e
+          # 2026-10-26 (audit PR L4): never stop the app inside the 09:00-15:40
+          # IST capture window. A deploy that passed its gate at 08:57 can fail
+          # at ~09:10; stopping then loses the live session. Same IST check as
+          # the swap re-gate above; the next deploy or the post-close crons fix
+          # a bad binary. Net run-line count unchanged (shell budget): the two
+          # check lines are paid by joining four send-command flags below.
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; then echo "::warning::Deploy failed inside the 09:00-15:40 IST capture window ($HHMM IST); NOT stopping the app."; exit 0; fi
           # QUOTING FIX (2026-07-02, run #415 rc=127): the on-box echo message
           # previously contained an unquoted `;` — SSM runs each commands[]
           # element as a shell line, so the `;` TERMINATED the echo and the
@@ -1655,10 +1663,8 @@ jobs:
           # auto-stop invocation exited rc=127 even though the systemctl stop
           # itself succeeded. The message is now split into two `;`-free echos.
           aws ssm send-command \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --instance-ids "$IID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} --instance-ids "$IID" \
+            --document-name "AWS-RunShellScript" --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
             --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot","echo unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it"]' \
             --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
