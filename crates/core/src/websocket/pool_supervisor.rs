@@ -1272,6 +1272,16 @@ pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
 /// indistinguishable. Label: `endpoint`.
 pub const RING_BYTES_FULL_METRIC: &str = "tv_dhan_ws_ring_bytes_full_total";
 
+/// Counter: the ring refused a frame because its RECEIVER is gone (the frame
+/// drain exited, or the lane is shutting down), not because it was full.
+///
+/// Added 2026-10-26 (audit PR L1). This refusal was counted on
+/// `RING_FULL_METRIC` and logged as "the fold cannot keep up", which sends a
+/// reader after a slow fold that does not exist. The frame is still queued for
+/// the WAL and marked unapplied, so replay re-offers it; only the label was
+/// wrong. Local `/metrics` only (no EMF name, no alarm). Label: `endpoint`.
+pub const RING_CLOSED_METRIC: &str = "tv_dhan_ws_ring_closed_total";
+
 /// Counter: the WAL itself refused a frame. This is the only genuine capture
 /// loss path. Label: `endpoint`.
 pub const WAL_DROP_METRIC: &str = "tv_dhan_ws_wal_dropped_total";
@@ -7434,6 +7444,14 @@ pub enum FrameSinkOutcome {
     /// doc claiming permanence would now send a reader looking for a data
     /// loss that the watermark already prevents.
     RingFull,
+    /// Queued for durable write; the ring refused it because its RECEIVER is
+    /// gone (the frame drain exited or the lane is shutting down), not because
+    /// it was full. Marked unapplied like `RingFull`, so replay re-offers it.
+    ///
+    /// Added 2026-10-26 (audit PR L1): this case returned `RingFull` and was
+    /// logged as "the fold cannot keep up", which points a reader at a slow
+    /// fold when the fold is not running at all.
+    RingClosed,
     /// The WAL refused it AND the ring refused it. The frame reached neither
     /// disk nor the fold: genuine, immediate capture loss, recoverable by
     /// nothing.
@@ -8283,6 +8301,8 @@ pub struct WalRingSink {
     wal_dropped: metrics::Counter,
     ring_full: metrics::Counter,
     ring_bytes_full: metrics::Counter,
+    /// The ring refused because its receiver is gone (audit PR L1).
+    ring_closed: metrics::Counter,
     /// Optional forensic side-channel for socket lifecycle events.
     ///
     /// `None` by default and set only by [`WalRingSink::with_audit`], so a
@@ -8344,6 +8364,7 @@ impl WalRingSink {
             wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+            ring_closed: metrics::counter!(RING_CLOSED_METRIC, "endpoint" => endpoint_label),
             audit_tx: None,
             dial_permit: None,
             socket_stop: None,
@@ -8416,6 +8437,7 @@ impl WalRingSink {
         self.wal_dropped.increment(0);
         self.ring_full.increment(0);
         self.ring_bytes_full.increment(0);
+        self.ring_closed.increment(0);
         tickvault_storage::wal_frame_fate::pre_register();
     }
 
@@ -8576,32 +8598,45 @@ impl FrameSink for WalRingSink {
         }
         // Step 3 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
-        if self
-            .ring
-            .try_send(CapturedFrame {
-                seq,
-                endpoint: self.endpoint,
-                connection_index: self.connection_index,
-                received_at,
-                received_at_nanos,
-                wal_backed: !wal_refused,
-                bytes: frame,
-            })
-            .is_err()
-        {
+        if let Err(refused) = self.ring.try_send(CapturedFrame {
+            seq,
+            endpoint: self.endpoint,
+            connection_index: self.connection_index,
+            received_at,
+            received_at_nanos,
+            wal_backed: !wal_refused,
+            bytes: frame,
+        }) {
             // The frame never entered the ring, so nothing downstream will ever
             // release its reservation. Give it back here or the budget ratchets
             // down on every count-full frame until it refuses everything —
             // a slow strangulation that would look like the feed dying for no
             // reason.
             self.budget.release(len);
-            self.ring_full.increment(1);
+            // Audit PR L1 (2026-10-26): a CLOSED ring (the drain is gone) is
+            // not a full one. It was counted on `ring_full` and logged as "the
+            // fold cannot keep up"; it now has its own counter and outcome.
+            // The WAL handling is identical: the frame is queued for the WAL,
+            // marked unapplied, and replay re-offers it.
+            let closed = matches!(
+                refused,
+                crate::websocket::frame_ring::FrameRingTrySendError::Closed(_)
+            );
+            if closed {
+                self.ring_closed.increment(1);
+            } else {
+                self.ring_full.increment(1);
+            }
             if wal_refused {
                 return FrameSinkOutcome::WalDropped;
             }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
             self.note_ring_shed(seq);
-            return FrameSinkOutcome::RingFull;
+            return if closed {
+                FrameSinkOutcome::RingClosed
+            } else {
+                FrameSinkOutcome::RingFull
+            };
         }
         // Reaching here with the class slot caps summing to the channel's
         // capacity means the `try_send` above can only fail on a CLOSED
@@ -9025,9 +9060,25 @@ pub trait DhanFeedSocket: Send {
     /// handed to `on_frame` (2026-10-02). The supervisor passes its sink, so a
     /// frame Dhan delivers between our Close and its reply reaches the
     /// write-ahead log like any other instead of being discarded uncounted.
-    fn close<F>(&mut self, on_frame: F) -> impl std::future::Future<Output = ()> + Send
+    ///
+    /// Returns the Dhan disconnect code this socket still owed, or else the
+    /// first one read during the close, lone or stacked (audit PR L1,
+    /// 2026-10-26), so the caller can classify a code that arrived as the
+    /// socket was being torn down.
+    fn close<F>(
+        &mut self,
+        on_frame: F,
+    ) -> impl std::future::Future<Output = Option<DisconnectCode>> + Send
     where
         F: FnMut(Bytes) + Send;
+    /// Takes the disconnect code an earlier `recv` saw stacked behind data and
+    /// still owes (it would be the next `recv`'s `Closed`), without reading.
+    ///
+    /// Audit PR L1 (2026-10-26): a write that failed while such a code was
+    /// owed went straight to the subscribe-failed redial, and the close then
+    /// erased the code, so an 805 never parked. Required, like the methods
+    /// above: a transport with no such state returns `None`.
+    fn take_owed_close(&mut self) -> Option<DisconnectCode>;
 }
 
 /// A transport-level failure. Opaque on purpose: policy lives in the
@@ -9151,6 +9202,8 @@ struct DrainThrottle {
     ring_full_seen: u64,
     wal_dropped_seen: u64,
     captured_live_only_seen: u64,
+    /// Audit PR L1 (2026-10-26): the ring refused because its receiver is gone.
+    ring_closed_seen: u64,
 }
 
 /// Whether an answer can be trusted to describe THIS connection's wire.
@@ -9211,18 +9264,28 @@ where
                     );
                     return WireWait {
                         outcome: Ok(Err(SocketFailure)),
-                        socket_decision: None,
+                        socket_decision: owed_close_decision(socket, supervisor),
                     };
                 }
+                // Audit PR L1 (2026-10-26): a failed write first hands any
+                // disconnect code the socket still owes to the supervisor. The
+                // biased select answers the ticket before the read that would
+                // have delivered it, and the close would then erase it, so an
+                // owed 805 never parked and an owed 807 never refreshed.
+                let socket_decision = if answer.is_err() {
+                    owed_close_decision(socket, supervisor)
+                } else {
+                    None
+                };
                 return WireWait {
                     outcome: Ok(answer),
-                    socket_decision: None,
+                    socket_decision,
                 };
             }
             () = &mut budget, if deadline.is_some() => {
                 return WireWait {
                     outcome: Err(WireElapsed),
-                    socket_decision: None,
+                    socket_decision: owed_close_decision(socket, supervisor),
                 };
             }
             event = socket.recv() => {
@@ -9859,7 +9922,10 @@ where
 /// close given a do-nothing callback would compile and silently restore the
 /// discard this replaced, so every close goes through here and a source pin
 /// (`every_production_close_passes_its_frames_to_the_sink`) holds it.
-async fn close_capturing<S, K>(socket: &mut S, sink: &K)
+///
+/// Returns the disconnect code the close found (owed, or read during the
+/// handshake), audit PR L1.
+async fn close_capturing<S, K>(socket: &mut S, sink: &K) -> Option<DisconnectCode>
 where
     S: DhanFeedSocket,
     K: FrameSink + ?Sized,
@@ -9869,7 +9935,43 @@ where
             // The sink counts and reports its own refusals.
             let _outcome = sink.accept(frame);
         })
-        .await;
+        .await
+}
+
+/// A disconnect code the close found AFTER the supervisor had already chosen
+/// a redial (audit PR L1, 2026-10-26).
+///
+/// A transient code changes nothing (the redial already chosen is right), so
+/// it is not fed in: that would count the reconnect twice. Every other class
+/// (805 park, 806/810 park, 807/809 token refresh, 808, 804) changes what the
+/// socket must do next, so the supervisor classifies it and its answer
+/// replaces the redial. `already_refreshing` (the token-refresh arm) also
+/// skips 807/809, which would only schedule the same refresh again. O(1).
+fn late_close_decision(
+    supervisor: &mut ConnectionSupervisor,
+    code: Option<DisconnectCode>,
+    already_refreshing: bool,
+) -> Option<SupervisorAction> {
+    let code = code?;
+    match classify_disconnect(Some(code)) {
+        DisconnectClass::Transient => return None,
+        DisconnectClass::TokenStale if already_refreshing => return None,
+        _ => {}
+    }
+    let action = supervisor.on_event(ConnEvent::Disconnected { code: Some(code) }, Instant::now());
+    (action != SupervisorAction::Continue).then_some(action)
+}
+
+/// The decision an OWED disconnect code makes after a failed write (audit
+/// PR L1, 2026-10-26). `None` when nothing is owed or the supervisor keeps
+/// going. O(1), no read, no wait.
+fn owed_close_decision<S: DhanFeedSocket>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+) -> Option<SupervisorAction> {
+    let code = socket.take_owed_close()?;
+    let action = supervisor.on_event(ConnEvent::Disconnected { code: Some(code) }, Instant::now());
+    (action != SupervisorAction::Continue).then_some(action)
 }
 
 /// [`run_connection`] plus a channel that can change the LIVE subscription
@@ -9998,7 +10100,14 @@ where
             }
 
             SupervisorAction::SleepThenDial { delay_ms } => {
-                close_capturing(&mut socket, &*sink).await;
+                let late = close_capturing(&mut socket, &*sink).await;
+                // Audit PR L1 (2026-10-26): a disconnect code the close found
+                // (an 805 read during the handshake after a failed write) is
+                // classified, and its decision replaces this redial.
+                if let Some(decided) = late_close_decision(&mut supervisor, late, false) {
+                    action = decided;
+                    continue;
+                }
                 guard.mark_lost();
                 // Review 2026-10-10: the socket holds nothing during the
                 // backoff, so the depth-200 cross-feed check must not judge it
@@ -10020,7 +10129,13 @@ where
             }
 
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
-                close_capturing(&mut socket, &*sink).await;
+                let late = close_capturing(&mut socket, &*sink).await;
+                // Audit PR L1: as in the arm above; a late 807/809 is not fed
+                // in, since this arm already refreshes.
+                if let Some(decided) = late_close_decision(&mut supervisor, late, true) {
+                    action = decided;
+                    continue;
+                }
                 guard.mark_lost();
                 // Review 2026-10-10: the socket holds nothing during the
                 // backoff, so the depth-200 cross-feed check must not judge it
@@ -11806,6 +11921,7 @@ where
         ring_full_seen,
         wal_dropped_seen,
         captured_live_only_seen,
+        ring_closed_seen,
     } = throttle;
     let action;
     match event {
@@ -11925,6 +12041,25 @@ where
                          CANDLE contribution, because by then the tick is outside \
                          the aggregating session and only the row is written. Treat \
                          this as lost candles, not lost ticks. Logged at \
+                         1, 2, 4, 8 ... occurrences per socket to bound the noise."
+                    );
+                }
+            }
+            if outcome == FrameSinkOutcome::RingClosed {
+                // Audit PR L1 (2026-10-26): the drain is gone, not slow. The
+                // frame is queued for the WAL and marked unapplied, so replay
+                // re-offers it; the line says that instead of blaming the fold.
+                // Same power-of-two throttle as the arms above.
+                *ring_closed_seen = ring_closed_seen.saturating_add(1);
+                if ring_closed_seen.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        endpoint = supervisor.slot().endpoint.as_str(),
+                        pool_index = supervisor.slot().pool_index,
+                        refused_on_this_socket = *ring_closed_seen,
+                        "the frame ring is CLOSED — the frame drain has stopped, so \
+                         this frame is not folded now. It IS queued for the \
+                         write-ahead log and marked for replay. Logged at \
                          1, 2, 4, 8 ... occurrences per socket to bound the noise."
                     );
                 }
@@ -15945,10 +16080,14 @@ mod tests {
             async fn recv(&mut self) -> SocketEvent {
                 SocketEvent::Closed { code: None }
             }
-            async fn close<F>(&mut self, _on_frame: F)
+            async fn close<F>(&mut self, _on_frame: F) -> Option<DisconnectCode>
             where
                 F: FnMut(Bytes) + Send,
             {
+                None
+            }
+            fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+                None
             }
         }
         assert_eq!(Silent.last_dial_failure_reason(), "unknown");
@@ -16189,6 +16328,38 @@ mod tests {
             FrameSinkOutcome::RingFull,
             "a full ring is a lag signal, never silent capture loss"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_closed_ring_is_not_reported_as_full() {
+        // Audit PR L1: a ring whose receiver is gone was reported as FULL
+        // ("the fold cannot keep up"). It now has its own outcome.
+        let dir = wal_dir("ringclosed");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
+        drop(rx);
+        let budget = std::sync::Arc::new(RingByteBudget::new(16));
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::RingClosed,
+                "a closed ring is not a full one"
+            );
+        }
+        // The reservation was given back each time (3 x 10 bytes > 16).
+        assert_eq!(budget.try_reserve_detailed(16), RingReserve::Granted);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16580,6 +16751,11 @@ mod tests {
         close_frames: Vec<Bytes>,
         /// Every security id handed to `send_unsubscribe`, in order.
         unsubscribed_ids: Vec<u64>,
+        /// A disconnect code a previous read saw stacked behind data and
+        /// still owes (the production `pending_close`), audit PR L1.
+        owed_close: Option<DisconnectCode>,
+        /// A disconnect code the next `close` reads during its handshake.
+        close_code: Option<DisconnectCode>,
         /// `(kind, instruments)` per (un)subscribe message, in order — what
         /// the in-place tests read to prove the 100-per-message split.
         batch_sizes: Vec<(&'static str, usize)>,
@@ -16728,24 +16904,33 @@ mod tests {
             }
         }
 
-        fn close<F>(&mut self, mut on_frame: F) -> impl std::future::Future<Output = ()> + Send
+        fn close<F>(
+            &mut self,
+            mut on_frame: F,
+        ) -> impl std::future::Future<Output = Option<DisconnectCode>> + Send
         where
             F: FnMut(Bytes) + Send,
         {
             let state = std::sync::Arc::clone(&self.state);
             async move {
-                let drained = match state.lock() {
+                let (drained, code) = match state.lock() {
                     Ok(mut s) => {
                         s.closes += 1;
                         s.batch_sizes.push(("close", 0));
-                        std::mem::take(&mut s.close_frames)
+                        let code = s.owed_close.take().or(s.close_code.take());
+                        (std::mem::take(&mut s.close_frames), code)
                     }
-                    Err(_) => Vec::new(),
+                    Err(_) => (Vec::new(), None),
                 };
                 for frame in drained {
                     on_frame(frame);
                 }
+                code
             }
+        }
+
+        fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+            self.state.lock().ok().and_then(|mut s| s.owed_close.take())
         }
     }
 
@@ -17737,10 +17922,14 @@ mod tests {
                     }
                 }
             }
-            async fn close<F>(&mut self, _on_frame: F)
+            async fn close<F>(&mut self, _on_frame: F) -> Option<DisconnectCode>
             where
                 F: FnMut(Bytes) + Send,
             {
+                None
+            }
+            fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+                None
             }
         }
 
@@ -19742,6 +19931,11 @@ mod tests {
             (
                 "FrameSinkOutcome::RingFull",
                 "ring_full_seen",
+                "FrameSinkOutcome::RingClosed",
+            ),
+            (
+                "FrameSinkOutcome::RingClosed",
+                "ring_closed_seen",
                 "\n        }",
             ),
         ];
@@ -19782,6 +19976,7 @@ mod tests {
             "ring_full_seen",
             "wal_dropped_seen",
             "captured_live_only_seen",
+            "ring_closed_seen",
         ] {
             assert!(
                 throttle_struct.contains(&format!("{counter}: u64,")),
@@ -25725,6 +25920,9 @@ mod tests {
         assert!(arm.contains("Some(ParkReason::PoolOverflow)"));
         assert!(arm.contains("OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()"));
     }
+
+    #[path = "owed_close_tests.rs"]
+    mod owed_close_tests;
 }
 
 /// Audit M8 (2026-10-04): the four subscription-change audit rows.
