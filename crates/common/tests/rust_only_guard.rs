@@ -106,15 +106,46 @@ const INVOCATION_SITE_ALLOWLIST: &[&str] = &[];
 /// ZERO tracked matches for all seven, so both allowlists stay at their
 /// hard-zero floor and the ratchet cannot be re-grown by this widening.
 const BANNED_FILE_EXTENSIONS: &[&str] = &[
-    "py", "pyw", "pyi", "pyx", "js", "jsx", "mjs", "cjs", "es6", "coffee", "ts", "tsx", "mts",
-    "cts", "rb", "pl", "php", "lua", "tcl", "groovy", "jl",
+    "py",
+    "pyw",
+    "pyi",
+    "pyx",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "es6",
+    "coffee",
+    "ts",
+    "tsx",
+    "mts",
+    "cts",
+    "rb",
+    "pl",
+    "php",
+    "lua",
+    "tcl",
+    "groovy",
+    "jl",
     "ipynb", // SCOPE FIX #6 — shell variants (all zero tracked; `.sh` + bash only)
-    "bash", "zsh", "ksh", "ps1", "bat", "fish", "nu",
+    "bash",
+    "zsh",
+    "ksh",
+    "ps1",
+    "bat",
+    "fish",
+    "nu",
     // SCOPE FIX #17 (2026-09-02) — COMPILED-or-VM runtimes. The ban listed
     // scripting languages only; a tracked `.java` / `.go` / `.swift` source
     // file is a second toolchain in the product path just as surely, and the
     // lock says "one language" not "no scripting".
-    "java", "kt", "kts", "scala", "go", "cs", "swift",
+    "java",
+    "kt",
+    "kts",
+    "scala",
+    "go",
+    "cs",
+    "swift",
     "r", // was `*.R`/`*.r` — the case dimension is gone, so ONE entry now
     // SCOPE FIX #21 (2026-09-18) — hole 11d, found by the same sweep as 11a.
     // SCOPE FIX #17 enumerated "COMPILED-or-VM runtimes" and stopped at the
@@ -125,8 +156,26 @@ const BANNED_FILE_EXTENSIONS: &[&str] = &[
     // with ZERO new dependency signal — the lockfile check cannot see it and
     // the token scan has nothing to match. Verified at fix time: zero tracked
     // matches for all twenty, case-insensitively.
-    "c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "zig", "nim", "hs", "ex", "exs", "clj", "cljs",
-    "erl", "dart", "ml", "mli", "f90", "pas",
+    "c",
+    "cc",
+    "cpp",
+    "cxx",
+    "h",
+    "hpp",
+    "hxx",
+    "zig",
+    "nim",
+    "hs",
+    "ex",
+    "exs",
+    "clj",
+    "cljs",
+    "erl",
+    "dart",
+    "ml",
+    "mli",
+    "f90",
+    "pas",
     // SCOPE FIX #23 (2026-10-26, audit plan item J5) — frontend and markup
     // forms the browser-surface guard never sees, because it budgets `.html`
     // and `.rs` page handlers only: single-file components (`.vue`,
@@ -135,7 +184,22 @@ const BANNED_FILE_EXTENSIONS: &[&str] = &[
     // EVERYWHERE, docs included, which is stricter than the audit asked
     // ("outside docs/"): verified at fix time, `git ls-files` returns zero
     // matches for all six, case-insensitively, so nothing needs a carve-out.
-    "vue", "svelte", "astro", "htm", "xhtml", "wasm",
+    "vue",
+    "svelte",
+    "astro",
+    "htm",
+    "xhtml",
+    "wasm",
+    // Same change, review round 1: the script files of runtimes banned as
+    // commands above (Expect `.exp`, AppleScript `.applescript` / `.scpt`,
+    // PowerShell modules `.psm1` / `.psd1`) and WebAssembly text (`.wat`).
+    // Zero tracked matches for all six, case-insensitively.
+    "exp",
+    "applescript",
+    "scpt",
+    "psm1",
+    "psd1",
+    "wat",
 ];
 
 // ============================ PURE CORE ============================
@@ -4608,6 +4672,12 @@ fn scope_fix_2026_10_26_alias_self_test() {
         "legacy/index.htm",
         "legacy/page.XHTML",
         "pkg/engine.wasm",
+        "tools/login.EXP",
+        "mac/run.applescript",
+        "mac/run.scpt",
+        "ps/Mod.psm1",
+        "ps/Mod.psd1",
+        "web/x.wat",
         "docs/demo.vue",
     ]
     .iter()
