@@ -59,6 +59,11 @@ const BUDGET: &[(&str, usize)] = &[
     ("dhan_feed_stack.rs", 82),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
+    // 2026-10-26 (audit PR M / M4): 1 wiring scan, every dial batch republishes
+    // the reserved-connections gauge (the widen dials long after bring-up and
+    // cannot be staged in a unit test). Paired behaviour test:
+    // `test_regression_reserved_connections_gauge_follows_the_widen`.
+    ("dhan_feed_stack/reserved_connections_tests.rs", 1),
     ("dhan_lifecycle.rs", 2),
     ("dhan_live_crossverify.rs", 7),
     ("dhan_live_crossverify_boot.rs", 8),

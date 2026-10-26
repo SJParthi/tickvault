@@ -211,12 +211,24 @@ pub const FEED_STACK_UP_GAUGE: &str = "tv_dhan_feed_stack_up";
 /// until then it is honestly unwatched rather than dishonestly absent.
 pub const DEPTH_OFFLOAD_DEGRADED_GAUGE: &str = "tv_dhan_depth_offload_degraded";
 
-/// Gauge: connections the plan reserved, by endpoint type.
+/// Gauge: connections the pool has reserved, by endpoint type.
 ///
-/// PLANNED, not alive. It is written once at bring-up and never moves again, so
-/// it answers "what did we intend?" and cannot answer "what is still running?".
-/// Use [`ALIVE_CONNECTIONS_GAUGE`] for the latter.
+/// RESERVED, not alive. Set at bring-up and again after every dial (a widen
+/// adds main-feed sockets after the contract attach), so it answers "what did
+/// we intend?" and cannot answer "what is still running?". Use
+/// [`ALIVE_CONNECTIONS_GAUGE`] for the latter. ⚠ CHANGED 2026-10-26 (PR M /
+/// M4): it was written ONCE from the boot plan and read 1 main-feed socket all
+/// session on 2026-10-26 while the widen brought up five.
 pub const FEED_STACK_CONNECTIONS_GAUGE: &str = "tv_dhan_feed_stack_connections";
+
+/// Publishes [`FEED_STACK_CONNECTIONS_GAUGE`] from the pool's reservations.
+/// O(endpoint kinds), cold: bring-up and once per dial batch, never per frame.
+fn publish_reserved_connections(pool: &PoolSupervisor) {
+    for endpoint in DhanEndpointType::ALL {
+        metrics::gauge!(FEED_STACK_CONNECTIONS_GAUGE, "endpoint" => endpoint.as_str())
+            .set(f64::from(pool.open_count(endpoint)));
+    }
+}
 
 /// Gauge: sockets whose supervisor task is still running, right now.
 ///
@@ -14807,6 +14819,8 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         });
         dialed = dialed.saturating_add(1);
     }
+    // A widen admits more main-feed slots after boot; follow it (PR M / M4).
+    publish_reserved_connections(pool);
     dialed
 }
 
@@ -16304,14 +16318,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         }
     };
 
-    for endpoint in DhanEndpointType::ALL {
-        let planned = plan.count_for(endpoint);
-        // `u32::try_from` then `f64::from`: lossless by construction (the count
-        // is bounded by 16), and no lossy `as` cast to justify to clippy.
-        let planned_f64 = f64::from(u32::try_from(planned).unwrap_or(u32::MAX));
-        metrics::gauge!(FEED_STACK_CONNECTIONS_GAUGE, "endpoint" => endpoint.as_str())
-            .set(planned_f64);
-    }
+    // The plan admitted its slots into `pool`, so this is the plan's count.
+    publish_reserved_connections(&pool);
 
     // Captured before the plan is moved into the dial below, so the dial can be
     // checked against what it was ASKED for rather than only reporting itself.
@@ -30719,6 +30727,8 @@ mod feed_aux_tests;
 
 #[cfg(test)]
 mod l3_audit_tests;
+#[cfg(test)]
+mod reserved_connections_tests;
 
 // Depth-200 cross-feed check and frame-silence wiring (scope lock 2026-10-10,
 // plan item 52h).
