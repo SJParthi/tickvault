@@ -93,7 +93,12 @@ fn order_leg_pnl_alter_ddls() -> Vec<String> {
 // TEST-EXEMPT: thin HTTP wrapper over the DDL builders, which are unit-tested;
 // exercising it needs a live QuestDB (covered by the boot integration path).
 /// Ensure the table + columns + DEDUP keys exist (best-effort, never fatal).
-pub async fn ensure_order_leg_pnl_table(questdb_config: &QuestDbConfig) {
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
+pub async fn ensure_order_leg_pnl_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -112,19 +117,21 @@ pub async fn ensure_order_leg_pnl_table(questdb_config: &QuestDbConfig) {
                 error = %err,
                 "order_leg_pnl: DDL client build failed — table ensure skipped this boot"
             );
-            return;
+            return false;
         }
     };
     let mut ddls = vec![order_leg_pnl_create_ddl()];
     ddls.extend(order_leg_pnl_alter_ddls());
-    for ddl in &ddls {
+    let dedup_index = ddls.len().saturating_sub(1);
+    let mut keyed = false;
+    for (index, ddl) in ddls.iter().enumerate() {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {}
+            Ok(response) if response.status().is_success() => keyed |= index == dedup_index,
             Ok(response) => {
                 metrics::counter!("tv_order_leg_pnl_persist_errors_total", "stage" => "ensure_ddl")
                     .increment(1);
@@ -147,6 +154,7 @@ pub async fn ensure_order_leg_pnl_table(questdb_config: &QuestDbConfig) {
             }
         }
     }
+    keyed
 }
 
 /// ILP-over-HTTP sender conf — HTTP port (9000), never the TCP ILP port.

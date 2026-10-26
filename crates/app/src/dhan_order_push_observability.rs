@@ -298,7 +298,10 @@ async fn run_dhan_order_push_consumer(
     mut rx: broadcast::Receiver<OrderUpdate>,
     events_tx: Option<mpsc::Sender<OrderUpdateEventRecord>>,
 ) {
-    ensure_order_audit_table(&questdb).await;
+    // Audit J3 (2026-10-26): a refused ensure starts the background re-run.
+    if !ensure_order_audit_table(&questdb).await {
+        crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&questdb);
+    }
     // Audit PR42b: after the ensure (no-op if the order consumer started it).
     spawn_audit_spill_drain_once(AuditSpillTable::OrderAudit, &questdb);
     let mut writer = OrderAuditWriter::new(&questdb);
