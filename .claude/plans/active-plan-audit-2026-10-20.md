@@ -755,6 +755,11 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   `cargo install` / `tool:` rejected and pinned.
   - Files: crates/common/tests/rust_only_guard.rs, crates/common/tests/shell_budget_guard.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs, scripts/setup-observability.sh, .github/workflows/ci.yml
   - Tests: a self-test row per new token / extension / discovery rule
+- [ ] J6 (core) Dhan's documented `expiryTime` shape with milliseconds
+  ("2026-01-01T00:00:00.000") is parsed instead of silently falling back to
+  now + 24 h.
+  - Files: crates/core/src/auth/types.rs
+  - Tests: test_parse_expiry_time_documented_millisecond_string_is_parsed_exactly
 
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
