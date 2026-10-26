@@ -97,7 +97,9 @@ fn handles() -> &'static [Counter; 3] {
 /// Registers every series at 0. Called when a tick writer is built, so the
 /// series exist before the first row.
 pub fn register_baseline() {
-    let _ = handles();
+    for handle in handles() {
+        handle.increment(0);
+    }
 }
 
 /// Notes one appended `ticks` row and returns its placement. One `fetch_max`
