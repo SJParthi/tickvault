@@ -153,6 +153,9 @@ resource "aws_lambda_function" "start_watchdog" {
       # Operator Quote 31 (2026-10-21): the app's drain hold (JSON, written
       # by the box while the day's data is still going into the database).
       DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
+      # Plan item J8: the NSE Muhurat sessions (var.muhurat_sessions), read by
+      # the muhurat_check mode and the curfew.
+      MUHURAT_SESSIONS = local.muhurat_sessions_env
     }
   }
 
@@ -320,6 +323,52 @@ resource "aws_lambda_permission" "start_watchdog_curfew_check" {
   function_name = aws_lambda_function.start_watchdog.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.start_watchdog_curfew_check.arn
+}
+
+# NSE Muhurat sessions — plan item J8 (owner 2026-10-26: "yes capture
+# muhurat"). The weekday 08:30 start and 16:30 stop never run on a weekend
+# Muhurat date (2026: Sunday 2026-11-08), so each configured date gets ONE
+# dated rule (day, month and year in the cron, never a weekly weekend cron):
+# every 15 minutes from 00:00 to 18:45 UTC (05:30 IST to 00:15 IST the next
+# day). The handler starts the box 60 minutes before the session, stops the
+# box it started 60 minutes after it, and does nothing outside that window.
+# While the session times are empty it logs a coded config error and does not
+# start the box. Cost: 76 invokes per Muhurat date, free tier.
+locals {
+  muhurat_sessions_env = join(";", [
+    for s in var.muhurat_sessions : "${s.date}@${s.session_start_ist}-${s.session_end_ist}"
+  ])
+  muhurat_dates = { for s in var.muhurat_sessions : s.date => s }
+}
+
+resource "aws_cloudwatch_event_rule" "start_watchdog_muhurat_check" {
+  for_each    = local.muhurat_dates
+  name        = "tv-${var.environment}-start-watchdog-muhurat-${each.key}"
+  description = "NSE Muhurat ${each.key}: start the box before the session and stop it after (every 15 min that day)"
+  schedule_expression = format(
+    "cron(0/15 0-18 %d %d ? %s)",
+    tonumber(split("-", each.key)[2]),
+    tonumber(split("-", each.key)[1]),
+    split("-", each.key)[0],
+  )
+  state = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_target" "start_watchdog_muhurat_check" {
+  for_each  = local.muhurat_dates
+  rule      = aws_cloudwatch_event_rule.start_watchdog_muhurat_check[each.key].name
+  target_id = "start-watchdog-muhurat-check"
+  arn       = aws_lambda_function.start_watchdog.arn
+  input     = jsonencode({ mode = "muhurat_check" })
+}
+
+resource "aws_lambda_permission" "start_watchdog_muhurat_check" {
+  for_each      = local.muhurat_dates
+  statement_id  = "AllowExecutionFromEventBridgeMuhurat${replace(each.key, "-", "")}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.start_watchdog.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.start_watchdog_muhurat_check[each.key].arn
 }
 
 output "start_watchdog_function_name" {

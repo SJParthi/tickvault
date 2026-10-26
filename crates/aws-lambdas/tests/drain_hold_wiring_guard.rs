@@ -178,7 +178,9 @@ fn the_budget_breach_stop_precedes_any_drain_hold_read() {
             .find("pub struct SdkEc2")
             .expect("SdkEc2 follows run_guard");
     let run = &rs[run_start..run_end];
-    let in_window = position(run, "if in_up_window(now_utc) {", "in-window branch");
+    // Plan item J8: the in-window test also admits a Muhurat session window
+    // (`muhurat_window::in_muhurat_up_window_raw`) on the next line.
+    let in_window = position(run, "if in_up_window(now_utc)\n||", "in-window branch");
     let breach = position(run, "return execute_breach_stop(", "breach stop");
     let hold = position(
         run,
