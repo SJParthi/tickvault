@@ -2213,7 +2213,7 @@ mod subscribed_refusal_tests {
     }
 
     #[test]
-    fn test_subscribed_leg_refusal_is_still_counted() {
+    fn test_publish_from_legs_selected_first_still_counts_a_subscribed_refusal() {
         let legs = vec![leg(1, 0), leg(2, 75), leg(3, 0)];
         let map = ContractUnderlyingMap::new();
         let (build, counted) = map.publish_from_legs_selected_first(&legs, 2);

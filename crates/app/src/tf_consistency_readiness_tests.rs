@@ -273,7 +273,7 @@ fn wal(name: &str, writer: i64, seq: i64, suspended: bool) -> WalTableRow {
 }
 
 #[test]
-fn test_snapshot_and_tables_applied() {
+fn test_snapshot_sequencer_txns_and_tables_applied() {
     let rows = [
         wal("candles_1m", 5, 9, false),
         wal("candles_5m", 3, 3, false),
