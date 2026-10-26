@@ -149,7 +149,7 @@ fn test_regression_muhurat_tick_folds_into_candles_on_a_muhurat_day() {
 /// The same tick on an ordinary day is still refused, and a Muhurat day does
 /// not open the gap between the regular close and 18:00.
 #[test]
-fn test_muhurat_widening_is_gated_on_the_flag_and_the_window() {
+fn test_set_muhurat_session_gates_the_widening_on_the_flag_and_the_window() {
     let mut ordinary = MultiTfAggregator::new(FeedStrategy::DEFAULT);
     ordinary.set_muhurat_session(false);
     let refused = ordinary.consume_tick(
