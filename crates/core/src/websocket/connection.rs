@@ -425,6 +425,51 @@ pub const PING_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 /// raw). Labels: `endpoint`, `kind`.
 pub const CONTROL_FRAME_METRIC: &str = "tv_dhan_ws_control_frames_total";
 
+/// The `kind` label values of [`CONTROL_FRAME_METRIC`], in handle-table order.
+const CONTROL_FRAME_KINDS: [&str; 4] = ["ping", "pong", "text", "raw"];
+
+/// Index of `endpoint` in [`DhanEndpointType::ALL`] order. O(1).
+const fn endpoint_index(endpoint: DhanEndpointType) -> usize {
+    match endpoint {
+        DhanEndpointType::MainFeed => 0,
+        DhanEndpointType::Depth20 => 1,
+        DhanEndpointType::Depth200 => 2,
+        DhanEndpointType::OrderUpdate => 3,
+    }
+}
+
+/// Pre-resolved [`CONTROL_FRAME_METRIC`] handles, endpoint x kind (audit J4,
+/// 2026-10-26). `metrics::counter!` with non-literal labels builds a label
+/// `Vec` and looks the key up in the recorder on every call, and Dhan pings
+/// every socket every 10 s, so the read task allocated per ping. The sixteen
+/// handles are built once, on the first control frame; every later frame is
+/// one `OnceLock` load, two array indexes and one relaxed add, no allocation.
+/// Same shape as `parser::dispatcher`'s counter table.
+static CONTROL_FRAME_COUNTERS: std::sync::OnceLock<[[metrics::Counter; 4]; 4]> =
+    std::sync::OnceLock::new();
+
+/// The handle for `endpoint` x `kind_index` ([`CONTROL_FRAME_KINDS`]). An
+/// out-of-range kind clamps to `raw`, never panics.
+#[inline]
+fn control_frame_counter(
+    endpoint: DhanEndpointType,
+    kind_index: usize,
+) -> &'static metrics::Counter {
+    let table = CONTROL_FRAME_COUNTERS.get_or_init(|| {
+        std::array::from_fn(|e| {
+            std::array::from_fn(|k| {
+                metrics::counter!(
+                    CONTROL_FRAME_METRIC,
+                    "endpoint" => DhanEndpointType::ALL[e].as_str(),
+                    "kind" => CONTROL_FRAME_KINDS[k],
+                )
+            })
+        })
+    });
+    let kind = kind_index.min(CONTROL_FRAME_KINDS.len() - 1);
+    &table[endpoint_index(endpoint)][kind]
+}
+
 /// Client-originated keepalive pings, by endpoint and outcome.
 ///
 /// Local-exporter only — deliberately NOT added to the EMF selector, because
@@ -507,13 +552,7 @@ fn report_oversize_refusal(
     endpoint: DhanEndpointType,
     err: &tokio_tungstenite::tungstenite::Error,
 ) {
-    let idx = match endpoint {
-        DhanEndpointType::MainFeed => 0,
-        DhanEndpointType::Depth20 => 1,
-        DhanEndpointType::Depth200 => 2,
-        DhanEndpointType::OrderUpdate => 3,
-    };
-    let seen = OVERSIZE_REFUSALS[idx]
+    let seen = OVERSIZE_REFUSALS[endpoint_index(endpoint)]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1);
     if seen.is_power_of_two() {
@@ -2127,18 +2166,15 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                     SocketEvent::Closed { code: None }
                 }
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
-                    let kind = match message {
-                        Message::Ping(_) => "ping",
-                        Message::Pong(_) => "pong",
-                        Message::Text(_) => "text",
-                        _ => "raw",
+                    // Index into CONTROL_FRAME_KINDS; a pre-resolved handle, so
+                    // a ping costs no allocation on the read task (audit J4).
+                    let kind_index = match message {
+                        Message::Ping(_) => 0,
+                        Message::Pong(_) => 1,
+                        Message::Text(_) => 2,
+                        _ => 3,
                     };
-                    metrics::counter!(
-                        CONTROL_FRAME_METRIC,
-                        "endpoint" => endpoint.as_str(),
-                        "kind" => kind,
-                    )
-                    .increment(1);
+                    control_frame_counter(endpoint, kind_index).increment(1);
                     // RETURN, do not loop (2026-08-19).
                     //
                     // This arm used to increment the counter and fall through
@@ -3865,9 +3901,51 @@ mod tests {
     // -- structural proofs --------------------------------------------------
 
     #[test]
+    fn test_control_frame_counter_returns_one_pre_resolved_handle_per_endpoint_and_kind() {
+        // Audit J4: the ping/pong arm must reuse a handle built once, never
+        // build a label set per frame. The same (endpoint, kind) always maps
+        // to the same static handle; distinct pairs map to distinct ones.
+        let mut seen: Vec<*const metrics::Counter> = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            assert_eq!(DhanEndpointType::ALL[endpoint_index(endpoint)], endpoint);
+            for kind in 0..CONTROL_FRAME_KINDS.len() {
+                let first = control_frame_counter(endpoint, kind) as *const metrics::Counter;
+                let again = control_frame_counter(endpoint, kind) as *const metrics::Counter;
+                assert_eq!(first, again, "{endpoint:?} kind {kind} re-resolved");
+                assert!(
+                    !seen.contains(&first),
+                    "{endpoint:?} kind {kind} shares a slot"
+                );
+                seen.push(first);
+            }
+        }
+        assert_eq!(seen.len(), 16);
+        // An out-of-range kind clamps to `raw` instead of panicking.
+        assert_eq!(
+            control_frame_counter(DhanEndpointType::MainFeed, 99) as *const metrics::Counter,
+            control_frame_counter(DhanEndpointType::MainFeed, 3) as *const metrics::Counter,
+        );
+        assert_eq!(CONTROL_FRAME_KINDS, ["ping", "pong", "text", "raw"]);
+    }
+
+    #[test]
+    fn test_the_control_frame_arm_uses_the_pre_resolved_handles() {
+        let src = include_str!("connection.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(production.contains("control_frame_counter(endpoint, kind_index).increment(1);"));
+        // The metric name is passed to `counter!` exactly once: inside the
+        // one-time table build.
+        assert_eq!(production.matches("CONTROL_FRAME_METRIC,").count(), 1);
+    }
+
+    #[test]
     fn test_the_production_half_never_dials_without_an_explicit_config() {
         // The security property this module exists for: `None` as the config
         // argument inherits tungstenite's 64 MiB message ceiling.
+        // This scans connection.rs only; `crates/core/tests/
+        // websocket_connect_config_guard.rs` scans every `connect_async*` call
+        // in crates/*/src (audit J4, 2026-10-26).
         let src = include_str!("connection.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);

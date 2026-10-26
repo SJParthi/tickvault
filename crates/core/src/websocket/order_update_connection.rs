@@ -21,6 +21,7 @@ use tokio::time;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, error, info, warn};
 
 use chrono::{NaiveTime, Utc};
@@ -57,6 +58,44 @@ const ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD: u32 = 3;
 /// far beyond the observed die-after-login window (~10ms, 2026-07-06 incident)
 /// and far below `WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS`.
 const ORDER_UPDATE_RECONNECT_STABILITY_SECS: u64 = 60;
+
+/// Largest message (and frame) the order-update socket accepts (audit J4,
+/// 2026-10-26). A Dhan order update is one JSON object; the documented sample
+/// in `docs/dhan-ref/10-live-order-update-websocket.md` is 1,448 bytes, so
+/// 64 KiB is about 45x headroom. tungstenite's default is a 64 MiB message
+/// and a 16 MiB frame, which let a hostile or MITM'd endpoint make us buffer
+/// 64 MiB before the JSON parser ran. Over-cap input is refused by the
+/// library as a read error, which ends this connection and takes the normal
+/// reconnect path.
+const ORDER_UPDATE_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Read buffer of the order-update socket: one typical message fits many
+/// times over.
+const ORDER_UPDATE_READ_BUFFER_BYTES: usize = 16 * 1024;
+
+/// Write buffer: the login message and pongs are a few hundred bytes.
+const ORDER_UPDATE_WRITE_BUFFER_BYTES: usize = 4 * 1024;
+
+/// Bound on queued outgoing bytes (tungstenite's default is unbounded). Must
+/// exceed [`ORDER_UPDATE_WRITE_BUFFER_BYTES`] by at least one message.
+const ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+// The library requires the write ceiling to sit above the write buffer.
+const _: () = assert!(ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES > ORDER_UPDATE_WRITE_BUFFER_BYTES);
+
+/// The explicit WebSocket configuration of the order-update socket. Every
+/// field this product cares about is set, never inherited; message and frame
+/// caps are equal so fragments cannot add up past the frame cap. Cold path,
+/// once per connect.
+fn order_update_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(ORDER_UPDATE_READ_BUFFER_BYTES)
+        .write_buffer_size(ORDER_UPDATE_WRITE_BUFFER_BYTES)
+        .max_write_buffer_size(ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES)
+        .max_message_size(Some(ORDER_UPDATE_MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(ORDER_UPDATE_MAX_MESSAGE_BYTES))
+        .accept_unmasked_frames(false)
+}
 use crate::websocket::activity_watchdog::{
     ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
     spawn_with_panic_notify,
@@ -668,10 +707,14 @@ async fn connect_and_listen(
     // standard practice for trading sockets. Receive-only paper mode today,
     // so the present blast radius is small — but this is the socket the live
     // order path re-uses, and the disconnect it prevents is the expensive one.
-    let (ws_stream, _response) =
-        connect_async_tls_with_config(request, None, true, Some(tls_connector))
-            .await
-            .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
+    let (ws_stream, _response) = connect_async_tls_with_config(
+        request,
+        Some(order_update_websocket_config()),
+        true,
+        Some(tls_connector),
+    )
+    .await
+    .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
     // O(1) EXEMPT: end
 
     info!("order update WebSocket connected");
@@ -1542,6 +1585,50 @@ enum OrderUpdateConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_order_update_websocket_config_sets_every_bound_explicitly() {
+        // Audit J4: the order-update dial used tungstenite's defaults (64 MiB
+        // message, 16 MiB frame, unbounded write buffer).
+        let config = order_update_websocket_config();
+        assert_eq!(
+            config.max_message_size,
+            Some(ORDER_UPDATE_MAX_MESSAGE_BYTES)
+        );
+        assert_eq!(config.max_frame_size, Some(ORDER_UPDATE_MAX_MESSAGE_BYTES));
+        assert_eq!(config.max_message_size, config.max_frame_size);
+        assert_eq!(config.read_buffer_size, ORDER_UPDATE_READ_BUFFER_BYTES);
+        assert_eq!(config.write_buffer_size, ORDER_UPDATE_WRITE_BUFFER_BYTES);
+        assert_eq!(
+            config.max_write_buffer_size,
+            ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES
+        );
+        assert!(config.max_write_buffer_size > config.write_buffer_size);
+        assert!(!config.accept_unmasked_frames);
+        // Tens of KiB, never the library's megabyte-scale defaults.
+        let defaults = WebSocketConfig::default();
+        assert!(ORDER_UPDATE_MAX_MESSAGE_BYTES <= 64 * 1024);
+        assert!(config.max_message_size < defaults.max_message_size);
+        assert!(config.max_frame_size < defaults.max_frame_size);
+        assert!(config.max_write_buffer_size < defaults.max_write_buffer_size);
+    }
+
+    #[test]
+    fn test_order_update_cap_holds_a_documented_order_update_with_headroom() {
+        // The documented sample is 1,448 bytes; a real update must never hit
+        // the cap and force a reconnect.
+        let sample = r#"{"Data":{"Exchange":"NSE","Segment":"E","Source":"P","SecurityId":"14366","ClientId":"1000000001","ExchOrderNo":"1100000000000000","OrderNo":"1124091136546","Product":"C","TxnType":"B","OrderType":"LMT","Validity":"DAY","DiscQuantity":0,"DiscQtyRem":0,"RemainingQuantity":1,"Quantity":1,"TradedQty":0,"Price":13,"TriggerPrice":0,"TradedPrice":0,"AvgTradedPrice":0,"AlgoOrdNo":"","OffMktFlag":"0","OrderDateTime":"2024-09-11 14:39:29","ExchOrderTime":"2024-09-11 14:39:29","LastUpdatedTime":"2024-09-11 14:39:29","Remarks":"NA","MktType":"NL","ReasonDescription":"CONFIRMED","LegNo":1,"Instrument":"EQUITY","Symbol":"IDEA","ProductName":"CNC","Status":"Pending","LotSize":1,"StrikePrice":0,"ExpiryDate":"0001-01-01 00:00:00","OptType":"XX","DisplayName":"Vodafone Idea","Isin":"INE669E01016","Series":"EQ","GoodTillDaysDate":"2024-09-11","RefLtp":13.1,"TickSize":0.01,"AlgoId":"0","Multiplier":1,"CorrelationId":"00000000-0000-0000-0000-000000000000"},"Type":"order_alert"}"#;
+        assert!(sample.len().saturating_mul(30) < ORDER_UPDATE_MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn test_order_update_dial_passes_the_explicit_config() {
+        let src = include_str!("order_update_connection.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        assert!(production.contains("Some(order_update_websocket_config())"));
+        assert!(!production.contains(concat!("request, ", "None, true")));
+    }
 
     // R4 (2026-10-01, reality check): an order frame the typed parse cannot
     // read is flagged, not filed as a harmless non-order message.
