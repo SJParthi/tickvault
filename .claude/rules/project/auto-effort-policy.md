@@ -65,6 +65,23 @@ For those, Claude scales effort through the prompt (scope, required proof,
 number of verifiers) instead. Cost guard unchanged: never `xhigh`/`max` on
 `low` work.
 
+### Usage guard: model tier and concurrency (operator 2026-10-26, permanent)
+
+Operator, 2026-10-26: *"bro why the usage is becoming massive dude ... take care of this effort models starting low till max dude always"*.
+Measured that day: 35 Opus cloud sessions at once, each fanning out 4-6
+sub-agents plus 2 verifiers per finding, took the 5-hour plan limit from
+40% to 69% in about three minutes. Every agent also starts with about
+250,000 tokens of auto-loaded rules (`first_request_input_tokens: 251,905`
+in a cloud session log), so agent COUNT is the main cost multiplier.
+
+| Lever | Rule |
+|---|---|
+| Model tier (settable on `create_session`, the Agent tool and Workflow `agent()`) | Haiku: running tests, collecting results, listing, formatting. Sonnet: normal audits and single-crate fixes. Opus: hot path, WAL/persistence, reconnect, auth, OMS, and final adversarial verification only. |
+| Effort (Workflow `agent()` only) | low / medium / high / xhigh / max per the table above |
+| Concurrency | At most 5 cloud sessions running at once; fan-out inside a session at most 4 sub-agents |
+| Budget check | Before any fan-out larger than 5 agents, ask for or check the plan usage. Above 60% of the 5-hour limit: pause new fan-out and resume after the reset. |
+| Prompt size | Name the exact files and lines in each brief so agents do not re-read whole crates |
+
 **Token-aware guardrail:** never burn Heavy effort on Light work. The 3-agent
 panel is reserved for the Heavy tier (the charter already mandates it there).
 
