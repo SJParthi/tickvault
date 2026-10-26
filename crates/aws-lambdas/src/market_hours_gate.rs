@@ -6,7 +6,8 @@
 //!                            (a) the holiday-stop marker is NOT today and
 //!                            (b) the tv-app box is actually up; then reset
 //!                            each alarm to OK.
-//! mode="close" (15:35 IST) → disable them again.
+//! mode="close" (15:40 IST since 2026-10-26, audit PR L4; 15:35 before) →
+//! disable them again.
 //!
 //! Environment variables (unchanged): `ALARM_NAMES` (comma-separated),
 //! `EC2_INSTANCE_ID`, `HOLIDAY_STOP_PARAM`.

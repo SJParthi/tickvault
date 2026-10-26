@@ -1596,7 +1596,10 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/safety.yml", 410),
     (".github/workflows/secret-scan.yml", 29),
     (".github/workflows/security-audit.yml", 2),
-    (".github/workflows/terraform-apply.yml", 287),
+    // 2026-10-26 (audit PR L4): 287 → 286. The apply step re-checks IST
+    // right before `terraform apply` (+2), paid by joining the guard job's
+    // four clock reads into one line (−3).
+    (".github/workflows/terraform-apply.yml", 286),
     // 2026-10-22 (plan item 67), rust-only lock §0.14 (Quote 35), approved by the
     // owner 2026-10-22: the one-off 31 Oct wipe only builds and runs its
     // Rust tool, once per job. Removed with the workflow after the run.
