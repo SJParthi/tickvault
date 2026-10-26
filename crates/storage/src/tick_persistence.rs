@@ -2642,6 +2642,7 @@ impl TickWriter {
     // append/flush path is covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
         register_drop_baseline(feed);
+        crate::tick_ts_placement::register_baseline();
         match Sender::from_conf(ticks_ilp_http_conf(config)) {
             Ok(s) => {
                 let b = s.new_buffer();
@@ -2911,6 +2912,9 @@ impl TickWriter {
                 // side. One relaxed add per accepted Dhan row, O(1), no alloc.
                 if appended.is_ok() && self.feed == Feed::Dhan {
                     crate::tick_conservation_ledger::ledger().note_row_appended(row.ts_ist_nanos);
+                    // M1 (2026-10-26): append, late in its hour, or older
+                    // partition. One `fetch_max`, one counter add, O(1).
+                    let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos);
                 }
                 appended
             }

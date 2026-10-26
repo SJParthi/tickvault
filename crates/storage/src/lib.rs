@@ -307,6 +307,9 @@ pub mod hot_path_telemetry;
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
 pub mod tick_persistence;
+// Plan item M1 (2026-10-26): counts where each `ticks` row lands against the
+// newest row written (append, late in its hour, older hour partition).
+pub mod tick_ts_placement;
 // Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
 // ILP bodies back to QuestDB's /write endpoint and truncates on success, so
 // the ITEM 24 rescue recovers without a human running curl. Reinstates the
