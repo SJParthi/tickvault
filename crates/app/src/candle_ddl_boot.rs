@@ -662,7 +662,7 @@ mod tests {
     /// Several consumers refused at one boot start ONE re-run: every call
     /// after the first returns `false` and spawns nothing.
     #[tokio::test]
-    async fn the_audit_re_run_starts_once_per_process() {
+    async fn test_spawn_audit_ensure_until_keyed_once_starts_once_per_process() {
         let questdb = unreachable_questdb();
         let _ = spawn_audit_ensure_until_keyed_once(&questdb);
         assert!(!spawn_audit_ensure_until_keyed_once(&questdb));
