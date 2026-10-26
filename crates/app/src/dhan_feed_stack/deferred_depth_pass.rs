@@ -436,6 +436,8 @@ pub(crate) fn pass_counters() -> &'static DrainCounters {
             ingest_ticks: noop(),
             ingest_seq_refused: noop(),
             tick_unknown_segment: noop(),
+            verdict_ltt_backward: noop(),
+            verdict_volume_jump: noop(),
             refused_price: noop(),
             refused_timestamp: noop(),
             refused_slot: noop(),
