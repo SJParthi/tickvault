@@ -225,6 +225,84 @@ pub fn flushed_high_seq() -> u64 {
     FLUSHED_HIGH_SEQ.load(Ordering::Relaxed)
 }
 
+/// The highest frame sequence the WAL writer has reported LOST (a record it
+/// could not write, or one written but dropped with a failed segment). Raised
+/// by every [`FrameFate::note_lost`] and by [`note_lost_high`]; never lowered.
+static LOST_HIGH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Raises the lost high-water mark to `seq`. One `fetch_max`. Called for
+/// records whose individual sequences the writer did not keep (written past
+/// its tally's capacity), with the highest sequence written in that buffer,
+/// so the mark never sits below a lost record.
+pub fn note_lost_high(seq: u64) {
+    LOST_HIGH_SEQ.fetch_max(seq, Ordering::Relaxed);
+}
+
+/// The value the WAL writer's loss arms last raised.
+#[must_use]
+pub fn lost_high_seq() -> u64 {
+    LOST_HIGH_SEQ.load(Ordering::Relaxed)
+}
+
+/// May a failed flush's rows be handed to the WAL instead of a spill file
+/// (the "deferred to WAL" arm of `discard_pending`, ticks and depth)?
+///
+/// Before 2026-10-26 (plan item J1) that arm trusted the WAL whenever the
+/// rows carried a capture sequence. But a frame is "WAL-backed" from the
+/// moment its record is QUEUED, not written: if the writer then had no
+/// segment or failed `write_record`, [`FrameFate::note_lost`] found no shed
+/// bit and reported `NotShed`, the rescue had already cleared the buffer, and
+/// the rows were gone while every counter said "replayable".
+///
+/// So the arm now defers only when the WAL has provably got the frames:
+/// - the rows carry capture sequences and the WAL refused none of them
+///   (`min_seq != 0 && !unbacked`, as before);
+/// - the writer has flushed to the kernel through the batch's newest frame
+///   (`flushed_high_seq` at or past `max_seq`);
+/// - no record at or above the batch's oldest frame has been lost
+///   (`lost_high_seq` below `min_seq`; a loss above the batch also blocks it,
+///   which errs toward the inline spill).
+///
+/// Otherwise the caller writes the inline spill (slower, nothing lost).
+/// A flushed mark of 0 means nothing reached the kernel yet (refuse); a lost
+/// mark of 0 means nothing was ever lost (no block).
+/// Compares frame BASES (the packet index dropped), as
+/// `rescue_failure_fate_at` does. O(1): two relaxed loads, no allocation.
+///
+/// Honest limit (the same as [`FrameFate::count_unflushed_sheds`]): a frame
+/// minted below the flushed mark but queued after it (two sockets racing for a
+/// few microseconds) and then lost is not seen by this check.
+#[must_use]
+// WIRING-EXEMPT: wired as a fn pointer (`wal_defer_check:` in the tick and depth writer constructors), never called by name.
+pub fn rescue_may_defer_to_wal(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+    rescue_may_defer_to_wal_at(
+        min_seq,
+        max_seq,
+        unbacked,
+        flushed_high_seq(),
+        lost_high_seq(),
+    )
+}
+
+/// [`rescue_may_defer_to_wal`] against given marks. Pure.
+#[must_use]
+pub const fn rescue_may_defer_to_wal_at(
+    min_seq: u64,
+    max_seq: u64,
+    unbacked: bool,
+    wal_flushed_high_seq: u64,
+    wal_lost_high_seq: u64,
+) -> bool {
+    if min_seq == 0 || unbacked {
+        return false;
+    }
+    let min_base = min_seq >> PACKET_INDEX_BITS;
+    let max_base = max_seq >> PACKET_INDEX_BITS;
+    wal_flushed_high_seq != 0
+        && max_base <= (wal_flushed_high_seq >> PACKET_INDEX_BITS)
+        && (wal_lost_high_seq == 0 || (wal_lost_high_seq >> PACKET_INDEX_BITS) < min_base)
+}
+
 /// The direct-mapped fate table. `N` must be a power of two.
 pub struct FrameFate<const N: usize> {
     slots: [AtomicU64; N],
@@ -299,6 +377,9 @@ impl<const N: usize> FrameFate<N> {
             counters().unknown.increment(1);
             return LostFate::Unknown;
         };
+        // J1: the rescue deferral reads this mark, so it is raised for every
+        // lost record, shed or not.
+        note_lost_high(seq);
         let slot = self.slot(base);
         let mut cur = slot.load(Ordering::Acquire);
         loop {
@@ -620,5 +701,44 @@ mod tests {
                 "round {round}: lost={lost:?} shed={shed:?} must count exactly once"
             );
         }
+    }
+
+    /// J1: the deferral needs a capture sequence, a backed batch, the WAL
+    /// flushed through the newest frame, and no loss at or above the oldest.
+    #[test]
+    fn test_rescue_may_defer_to_wal_at_needs_flushed_and_nothing_lost() {
+        let (lo, hi) = (seq(10), seq(12) + 5);
+        // Flushed through the batch, nothing lost: defer.
+        assert!(rescue_may_defer_to_wal_at(lo, hi, false, seq(12), 0));
+        assert!(rescue_may_defer_to_wal_at(lo, hi, false, seq(99), seq(9)));
+        // Nothing ever lost (mark 0) defers even a base-0 test sequence.
+        assert!(rescue_may_defer_to_wal_at(1, 1, false, u64::MAX, 0));
+        // No capture sequence, or a WAL-refused frame: never.
+        assert!(!rescue_may_defer_to_wal_at(0, hi, false, u64::MAX, 0));
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, true, u64::MAX, 0));
+        // The WAL has not flushed the newest frame yet.
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, false, seq(11), 0));
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, false, 0, 0));
+        assert!(
+            !rescue_may_defer_to_wal_at(1, 1, false, 0, 0),
+            "nothing flushed yet"
+        );
+        // A record lost inside the batch, at its edges, or above it.
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, false, seq(99), seq(11)));
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, false, seq(99), seq(10)));
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, false, seq(99), seq(12)));
+        assert!(!rescue_may_defer_to_wal_at(lo, hi, false, seq(99), seq(50)));
+    }
+
+    /// J1: every `note_lost` raises the lost mark, a `NotShed` loss included
+    /// (the case the rescue deferral missed), and the mark never goes down.
+    #[test]
+    fn test_note_lost_high_and_lost_high_seq_rise_for_an_unshed_record() {
+        let t: FrameFate<64> = FrameFate::new();
+        let s = seq(1 << 40);
+        assert_eq!(t.note_lost(s, WsType::LiveFeed), LostFate::NotShed);
+        assert!(lost_high_seq() >= s, "a NotShed loss still raises the mark");
+        note_lost_high(seq(3));
+        assert!(lost_high_seq() >= s, "the mark is never lowered");
     }
 }

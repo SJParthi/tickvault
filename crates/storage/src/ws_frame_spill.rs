@@ -2340,6 +2340,10 @@ impl<'a> UnflushedTally<'a> {
             // tracked one, so they are lost only when the file ends short.
             if self.untracked > 0 {
                 crate::wal_frame_fate::note_lost_untracked(self.untracked);
+                // J1: their sequences are not kept, but none is above the
+                // highest written in this buffer, so the lost mark is raised
+                // to that (errs toward the inline spill).
+                crate::wal_frame_fate::note_lost_high(self.high_seq);
                 unknown = unknown.saturating_add(self.untracked);
             }
         }
@@ -2787,9 +2791,17 @@ fn persist_record_resilient(
         *current = open_segment_tracked(wal_dir, syncer);
     }
     let Some(w) = current.as_mut() else {
-        // No segment available (disk full / unwritable). The frame still
-        // reaches the in-memory broadcast + the persist-side ring→spill→DLQ;
-        // only the WAL belt is missing for this frame, which we count + alarm.
+        // No segment available (disk full / unwritable). The frame's
+        // in-memory copy still goes on to the ring and the drain, so it is
+        // normally written to QuestDB; only the WAL copy is missing, counted
+        // and alarmed here. ⚠ CORRECTED 2026-10-26 (J1): this said the frame
+        // was still covered by a "persist-side ring→spill→DLQ". Ticks have
+        // NO DLQ, and the persist side's own fallback, the rescue "deferred
+        // to WAL" arm, relied on THIS record, which is circular. A frame the
+        // ring shed, or rows a failed flush would have deferred, have no
+        // other copy: the shed case is counted by `wal_frame_fate` below,
+        // and the rescue now refuses to defer past a lost record
+        // (`wal_frame_fate::rescue_may_defer_to_wal`) and spills inline.
         metrics::counter!(
             "tv_ws_frame_spill_write_errors_total",
             "stage" => "no_segment"
