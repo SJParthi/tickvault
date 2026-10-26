@@ -59,10 +59,10 @@ pub const BUDGET_USD: f64 = 170.0;
 /// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
 
-/// The caveat line shown on UTC day 1, when a Budgets figure may still be
-/// last month's (a `DescribeBudget` reply carries no month stamp).
-pub const FIRST_DAY_CAVEAT: &str =
-    "_Note_: on the 1st this figure may still be last month's (AWS refreshes it every 8-12 h)";
+/// The caveat line shown on UTC days 1 and 2 (day 1 only until 2026-10-26),
+/// when a Budgets figure may still be last month's (a `DescribeBudget` reply
+/// carries no month stamp).
+pub const FIRST_DAY_CAVEAT: &str = "_Note_: on the 1st and 2nd this figure may still be last month's (AWS refreshes it every 8-12 h)";
 
 /// USD → display rupees (incl GST).
 pub fn inr(usd: f64) -> f64 {
@@ -148,7 +148,11 @@ pub fn render_digest(today_utc: NaiveDate, mtd_usd: f64) -> (String, f64) {
         ),
         format!("_Days left_:   {}", m.days_remaining),
     ];
-    if today_utc.day() == crate::budget_spend::UNSTAMPED_FIRST_DAY_OF_MONTH {
+    // 2026-10-26 (audit PR L4): days 1 and 2, the same window the guard distrusts.
+    if (crate::budget_spend::UNSTAMPED_FIRST_DAY_OF_MONTH
+        ..=crate::budget_spend::UNSTAMPED_LAST_DAY_OF_MONTH)
+        .contains(&today_utc.day())
+    {
         lines.push(FIRST_DAY_CAVEAT.to_string());
     }
     (lines.join("\n"), pct)
@@ -312,6 +316,9 @@ mod tests {
         assert!(msg.contains(FIRST_DAY_CAVEAT), "{msg}");
         let day2 = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
         let (msg, _) = render_digest(day2, 3.0);
+        assert!(msg.contains(FIRST_DAY_CAVEAT), "{msg}");
+        let day3 = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
+        let (msg, _) = render_digest(day3, 3.0);
         assert!(!msg.contains(FIRST_DAY_CAVEAT), "{msg}");
     }
 

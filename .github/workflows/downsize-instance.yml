@@ -400,7 +400,7 @@ jobs:
           # non-fatal by design.
 
       # ── STEP 1: post-market guard (aws-upgrade-instance.sh style, IST math from deploy-aws.yml) ──
-      - name: Post-market guard — refuse 09:00-15:35 IST Mon-Fri
+      - name: Post-market guard — refuse 09:00-15:40 IST Mon-Fri
         env:
           FORCE_MARKET_HOURS: ${{ github.event.inputs.force_market_hours }}
         run: |
@@ -408,8 +408,8 @@ jobs:
             echo "operator force override — proceeding despite market hours"; exit 0
           fi
           DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1535 ]; then
-            echo "::error::Refusing: within 09:00-15:35 IST Mon-Fri (a stop interrupts the live session). Re-run post-market or set force_market_hours=yes."
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; then
+            echo "::error::Refusing: within 09:00-15:40 IST Mon-Fri (a stop interrupts the live session). Re-run post-market or set force_market_hours=yes."
             exit 1
           fi
           echo "outside the market window (dow=$DOW $HHMM IST) — safe"

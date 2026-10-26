@@ -279,10 +279,26 @@ variable "muhurat_sessions" {
     condition = alltrue([
       for s in var.muhurat_sessions :
       can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", s.date))
-      && (s.session_start_ist == "" || can(regex("^[0-2][0-9]:[0-5][0-9]$", s.session_start_ist)))
-      && (s.session_end_ist == "" || can(regex("^[0-2][0-9]:[0-5][0-9]$", s.session_end_ist)))
+      && (s.session_start_ist == "" || can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", s.session_start_ist)))
+      && (s.session_end_ist == "" || can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", s.session_end_ist)))
       && ((s.session_start_ist == "") == (s.session_end_ist == ""))
     ])
-    error_message = "muhurat_sessions: date must be YYYY-MM-DD, times HH:MM (IST), and the two times are either both set or both empty."
+    error_message = "muhurat_sessions: date must be YYYY-MM-DD, times HH:MM (IST, 00:00-23:59), and the two times are either both set or both empty."
+  }
+
+  # 2026-10-26 (audit PR L4): the hour was [0-2][0-9], which accepted 24:00 to
+  # 29:59, and nothing checked start < end; either shape reaches the start
+  # watchdog as an unreadable session. HCL's || does not short-circuit before
+  # Terraform 1.12, so the compare sits inside try() and an empty pair passes
+  # on its own arm.
+  validation {
+    condition = alltrue([
+      for s in var.muhurat_sessions :
+      s.session_start_ist == "" || try(
+        tonumber(replace(s.session_start_ist, ":", "")) < tonumber(replace(s.session_end_ist, ":", "")),
+        false
+      )
+    ])
+    error_message = "muhurat_sessions: session_start_ist must be earlier than session_end_ist."
   }
 }

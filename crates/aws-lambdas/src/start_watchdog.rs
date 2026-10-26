@@ -663,6 +663,12 @@ pub fn muhurat_after_window_should_stop(
 /// and fails closed (coded error, no start) when the session times are not
 /// set. Honours the budget-stop latch, the holiday-stop marker, the
 /// keep-alive override and the drain hold.
+///
+/// **⚠ CHANGED 2026-10-26 (audit PR L4):** a Muhurat date whose times are unset
+/// or malformed now returns `Err` after its coded `LAMBDA-CONFIG-01` line, so
+/// the invocation fails and the Lambda's existing Errors alarm fires. Before,
+/// it returned `Ok`, the box was not started, and nothing paged: a missed
+/// Muhurat session was silent. The box is still never started on that path.
 async fn run_muhurat_check<E: Ec2Api, S: SsmApi, N: SnsApi>(
     env: &WatchdogEnv,
     ec2: &E,
@@ -685,7 +691,9 @@ async fn run_muhurat_check<E: Ec2Api, S: SsmApi, N: SnsApi>(
                  not set (terraform var muhurat_sessions); the box is NOT started. Fill \
                  the times from NSE's Muhurat circular and apply terraform."
             );
-            Ok(json!({"mode": "muhurat_check", "phase": "timing_unset", "started": false}))
+            Err(format!(
+                "muhurat_check phase=timing_unset date={date}: Muhurat session times not set; box NOT started"
+            ))
         }
         MuhuratPhase::Malformed { entries } => {
             error!(
@@ -694,7 +702,9 @@ async fn run_muhurat_check<E: Ec2Api, S: SsmApi, N: SnsApi>(
                 "muhurat_check — MUHURAT_SESSIONS has unreadable entries and none names \
                  today with valid times; the box is NOT started."
             );
-            Ok(json!({"mode": "muhurat_check", "phase": "malformed", "started": false}))
+            Err(format!(
+                "muhurat_check phase=malformed entries={entries:?}: no valid Muhurat session for today; box NOT started"
+            ))
         }
         MuhuratPhase::BeforeWindow { box_start } => {
             info!(%box_start, "muhurat_check — before today's Muhurat box window");
@@ -845,6 +855,13 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         // failed stop is left to the 16:45 stop_check, which pages. An
         // unknown state (describe failed) still attempts the stop: a stop is
         // idempotent, and the old SSM automation retried the same way.
+        // 2026-10-26 (audit PR L4): a configured Muhurat window that covers
+        // 16:30 IST keeps the box up, as the curfew and the hard-stop guard
+        // already do; before, the scheduled stop ended a weekday session.
+        if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {
+            info!("daily_stop — inside a Muhurat session window; box kept running");
+            return Ok(json!({"mode": "daily_stop", "stopped": false, "skipped": "muhurat"}));
+        }
         let (state, _) = instance_info(ec2, &env.instance_id).await;
         if state != "running" && state != "unknown" {
             info!(state = %state, "daily_stop — instance not running; nothing to do");
@@ -877,6 +894,12 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         // Self-heal rule: stop ONLY a box launched BEFORE today's 16:30
         // trigger; a box launched AFTER it is a deliberate manual evening
         // session and is NEVER touched.
+        // 2026-10-26 (audit PR L4): inside a Muhurat window the box is up on
+        // purpose (daily_stop skipped it); never stop or page.
+        if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {
+            info!("stop_check — inside a Muhurat session window; box deliberately running");
+            return Ok(json!({"mode": "stop_check", "alerted": false, "skipped": "muhurat"}));
+        }
         let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
         if state != "running" {
             info!(state = %state, "stop_check OK — instance not running; staying silent");
@@ -2696,6 +2719,48 @@ mod tests {
         assert!(sns.published.borrow().is_empty());
     }
 
+    // Regression: 2026-10-26 (audit PR L4) — the 16:30 daily_stop and the
+    // 16:45 stop_check did not skip a Muhurat window (only the curfew and the
+    // hard-stop guard did), so a weekday Muhurat session was stopped mid-run.
+    #[tokio::test]
+    async fn test_regression_daily_stop_and_stop_check_skip_a_muhurat_window() {
+        // Monday 9 Nov 2026, session 15:00-16:30 IST: box window 14:00-17:30.
+        let raw = "2026-11-09@15:00-16:30";
+        for (mode, now) in [
+            ("daily_stop", utc(2026, 11, 9, 11, 0)),  // 16:30 IST
+            ("stop_check", utc(2026, 11, 9, 11, 15)), // 16:45 IST
+        ] {
+            let sns = FakeSns::default();
+            let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 9, 8, 30));
+            let out = run_watchdog(
+                &json!({ "mode": mode }),
+                &muhurat_env(raw),
+                &ec2,
+                &FakeSsm::empty(),
+                &sns,
+                now,
+            )
+            .await
+            .expect("run_watchdog");
+            assert_eq!(out["skipped"], json!("muhurat"), "{mode}");
+            assert!(ec2.stop_calls.borrow().is_empty(), "{mode} must not stop");
+            assert!(sns.published.borrow().is_empty(), "{mode} must not page");
+        }
+        // Outside the window (a later date) the same daily_stop stops.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 10, 3, 0));
+        let out = run_watchdog(
+            &json!({"mode": "daily_stop"}),
+            &muhurat_env(raw),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 10, 11, 0),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["stopped"], json!(true));
+    }
+
     #[tokio::test]
     async fn test_daily_stop_with_no_hold_stops_silently() {
         // The old SSM stop automation sent no page; neither does this.
@@ -3161,23 +3226,27 @@ mod tests {
         }
     }
 
+    // Regression: 2026-10-26 (audit PR L4) — an unset or malformed Muhurat
+    // session returned Ok, so the box stayed off and no alarm fired. It now
+    // returns Err (the Lambda Errors alarm pages) and still never starts.
     #[tokio::test]
-    async fn test_muhurat_check_fails_closed_when_timing_unset_or_malformed() {
+    async fn test_regression_muhurat_config_error_returns_err_and_never_starts() {
         for (raw, phase) in [
             ("2026-11-08@-", "timing_unset"),
             ("2026-11-08@15:30-14:05", "malformed"),
         ] {
             let ec2 = FakeEc2::new(Some("stopped"));
-            let out = run_muhurat(
-                raw,
+            let out = run_watchdog(
+                &json!({"mode": "muhurat_check"}),
+                &muhurat_env(raw),
                 &ec2,
                 &FakeSsm::empty(),
                 &FakeSns::default(),
                 utc(2026, 11, 8, 8, 0),
             )
             .await;
-            assert_eq!(out["phase"], json!(phase), "{raw}");
-            assert_eq!(out["started"], json!(false), "{raw}");
+            let err = out.expect_err("a Muhurat config error must fail the invocation");
+            assert!(err.contains(phase), "{raw}: {err}");
             assert!(ec2.start_calls.borrow().is_empty(), "{raw}");
         }
     }

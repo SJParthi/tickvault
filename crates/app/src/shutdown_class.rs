@@ -42,6 +42,9 @@
 //! window now runs 10 minutes past 09:15, so "both windows sit outside the
 //! trading session" above holds only because this arm needs a NON-trading
 //! day, on which no session runs.
+//! **⚠ CHANGED 2026-10-26 (audit PR L4):** the gate's window now ends at
+//! 09:00 (the capture start), so this quiet window ends at 09:10 (09:00 plus
+//! the 600 s lag); the residual above shrinks to 08:25 to 09:10 IST.
 
 use std::path::Path;
 
@@ -106,7 +109,9 @@ pub const HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 30_300;
 /// **Assumed** (EC2 normally signals the guest within seconds); not measured.
 pub const HOLIDAY_GATE_STOP_LAG_SECS: u32 = 600;
 
-/// End (exclusive) of the holiday-gate self-stop IST window: 09:25:00.
+/// End (exclusive) of the holiday-gate self-stop IST window: 09:10:00
+/// (09:25:00 from 2026-10-20 until the gate's window end moved from 09:15 to
+/// 09:00 on 2026-10-26, audit PR L4).
 ///
 /// **⚠ CHANGED 2026-10-20** — was 09:00:00 (`32_400`). It is now the holiday
 /// gate's own window end (09:15, see
@@ -137,7 +142,7 @@ pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
 /// | ctrl_c   | any    | any                                        | OperatorStop  |
 /// | sigterm  | false  | any                                        | OperatorStop  |
 /// | sigterm  | true   | weekday ∧ 16:25–16:45 IST (any day)        | ScheduledStop |
-/// | sigterm  | true   | !is_trading_day ∧ 08:25–09:25 IST          | ScheduledStop |
+/// | sigterm  | true   | !is_trading_day ∧ 08:25–09:10 IST          | ScheduledStop |
 /// | sigterm  | true   | otherwise (incl. Muhurat / manual weekend) | ExternalStop  |
 /// | anything else     | —                                          | ExternalStop  |
 #[must_use]
@@ -580,7 +585,8 @@ mod tests {
     #[test]
     fn test_classify_shutdown_holiday_gate_self_stop_window_only() {
         // G5 (fix round 2): the non-trading-day quiet arm is the EXPLICIT
-        // holiday-gate self-stop window (08:25–09:25 IST since 2026-10-20,
+        // holiday-gate self-stop window (08:25–09:10 IST since 2026-10-26,
+        // 08:25–09:25 from 2026-10-20,
         // 08:25–09:00 before) — never any-hour.
         // Inside the window (weekday holiday auto-start morning): quiet.
         for secs in [
@@ -594,7 +600,7 @@ mod tests {
                 "secs={secs}"
             );
         }
-        // Boundaries: one second before 08:25 / at 09:25 exactly → loud.
+        // Boundaries: one second before 08:25 / at 09:10 exactly → loud.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -624,16 +630,17 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0925_ist() {
+    fn test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0910_ist() {
         assert_eq!(
             HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST,
             8 * 3600 + 25 * 60
         );
-        // 2026-10-20: was 09:00; now the gate's 09:15 end plus the 600 s lag.
+        // 2026-10-20: was 09:00; then the gate's 09:15 end plus the 600 s lag.
+        // 2026-10-26 (audit PR L4): the gate ends at 09:00, so 09:10.
         assert_eq!(HOLIDAY_GATE_STOP_LAG_SECS, 600);
         assert_eq!(
             HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST,
-            9 * 3600 + 25 * 60
+            9 * 3600 + 10 * 60
         );
     }
 
