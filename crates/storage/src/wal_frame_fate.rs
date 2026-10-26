@@ -273,6 +273,7 @@ pub fn lost_high_seq() -> u64 {
 /// minted below the flushed mark but queued after it (two sockets racing for a
 /// few microseconds) and then lost is not seen by this check.
 #[must_use]
+// WIRING-EXEMPT: wired as a fn pointer (`wal_defer_check:` in the tick and depth writer constructors), never called by name.
 pub fn rescue_may_defer_to_wal(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
     rescue_may_defer_to_wal_at(
         min_seq,
@@ -705,7 +706,7 @@ mod tests {
     /// J1: the deferral needs a capture sequence, a backed batch, the WAL
     /// flushed through the newest frame, and no loss at or above the oldest.
     #[test]
-    fn rescue_may_defer_to_wal_needs_flushed_and_nothing_lost() {
+    fn test_rescue_may_defer_to_wal_at_needs_flushed_and_nothing_lost() {
         let (lo, hi) = (seq(10), seq(12) + 5);
         // Flushed through the batch, nothing lost: defer.
         assert!(rescue_may_defer_to_wal_at(lo, hi, false, seq(12), 0));
@@ -732,7 +733,7 @@ mod tests {
     /// J1: every `note_lost` raises the lost mark, a `NotShed` loss included
     /// (the case the rescue deferral missed), and the mark never goes down.
     #[test]
-    fn note_lost_raises_the_lost_high_water_for_an_unshed_record() {
+    fn test_note_lost_high_and_lost_high_seq_rise_for_an_unshed_record() {
         let t: FrameFate<64> = FrameFate::new();
         let s = seq(1 << 40);
         assert_eq!(t.note_lost(s, WsType::LiveFeed), LostFate::NotShed);
