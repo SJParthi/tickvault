@@ -175,6 +175,15 @@ impl HotTask {
     }
 }
 
+/// One cache line per stage, and per task below (plan item J1, 2026-10-26).
+/// The socket readers and the frame drain write their own entries on every
+/// frame; packed side by side, two entries shared one 64-byte line, so each
+/// write invalidated the other core's copy (false sharing). `align(64)`
+/// gives every entry its own line (64 bytes is the line size on the
+/// Graviton host and on x86). SPACE: `TaskBeat` grows 16 -> 64 bytes,
+/// `StageStats` rounds up to a multiple of 64; both are fixed `static`
+/// arrays, a few KiB in all.
+#[repr(align(64))]
 struct StageStats {
     buckets: [AtomicU64; STAGE_BUCKETS],
     sum_nanos: AtomicU64,
@@ -193,6 +202,7 @@ impl StageStats {
     }
 }
 
+#[repr(align(64))]
 struct TaskBeat {
     /// Nanoseconds since [`anchor`] of the last progress, plus one; 0 means
     /// the task has never beaten.
@@ -767,6 +777,21 @@ pub async fn run_runtime_probe(task: HotTask, stage: Stage, iterations: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// J1 (2026-10-26): every stage and task entry owns its own cache line,
+    /// so per-frame writes from different cores never share one.
+    #[test]
+    fn test_telemetry_entries_are_cache_line_aligned() {
+        assert_eq!(std::mem::align_of::<TaskBeat>(), 64);
+        assert_eq!(std::mem::align_of::<StageStats>(), 64);
+        assert_eq!(std::mem::size_of::<TaskBeat>() % 64, 0);
+        assert_eq!(std::mem::size_of::<StageStats>() % 64, 0);
+        // Neighbouring statics start on different lines.
+        let a = std::ptr::addr_of!(TASKS[0]) as usize;
+        let b = std::ptr::addr_of!(TASKS[1]) as usize;
+        assert!(b - a >= 64);
+        assert_eq!(a % 64, 0);
+    }
 
     #[test]
     fn bucket_index_puts_each_sample_under_its_upper_bound() {
