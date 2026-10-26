@@ -76,7 +76,7 @@ in a cloud session log), so agent COUNT is the main cost multiplier.
 
 | Lever | Rule |
 |---|---|
-| Model tier (settable on `create_session`, the Agent tool and Workflow `agent()`) | Haiku: running tests, collecting results, listing, formatting. Sonnet: normal audits and single-crate fixes. Opus: hot path, WAL/persistence, reconnect, auth, OMS, and final adversarial verification only. |
+| Model | **Opus 5.5 only, always** (operator 2026-10-26: *"never evr use haiku dude always sue opus 5.5 alpne only"*). Never Haiku or Sonnet, for any task, session, sub-agent or workflow agent. Cost is controlled by effort level and agent count, never by a cheaper model. |
 | Effort (Workflow `agent()` only) | low / medium / high / xhigh / max per the table above |
 | Concurrency | At most 5 cloud sessions running at once; fan-out inside a session at most 4 sub-agents |
 | Budget check | Before any fan-out larger than 5 agents, ask for or check the plan usage. Above 60% of the 5-hour limit: pause new fan-out and resume after the reset. |
