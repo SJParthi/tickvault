@@ -355,32 +355,41 @@ fn test_live_lane_refuses_to_dial_without_the_shared_instance_lock() {
     );
     let feed_src = strip_line_comments(&read("crates/app/src/dhan_feed_stack.rs"));
     let prod = feed_src.split("#[cfg(test)]").next().unwrap_or(&feed_src);
+    // ⚠ CHANGED 2026-10-26 (audit L3): the lock refusal no longer RETURNS for
+    // the rest of the process; the lane waits in `wait_for_dial_preconditions`
+    // (capped backoff, one RESILIENCE-01 line per episode) and dials only once
+    // the flag reads held. The staged WAL frames are no longer reported as
+    // refused there: they are folded when the lane dials, or deferred on
+    // shutdown.
+    let wait_fn = prod
+        .split_once("async fn wait_for_dial_preconditions(")
+        .expect("the precondition wait must exist") // APPROVED: test
+        .1;
+    let wait_fn = wait_fn
+        .split_once("\n}\n")
+        .map_or(wait_fn, |(body, _)| body);
     assert!(
-        prod.contains("if !params.instance_lock_held.load(Ordering::Acquire)"),
-        "run_dhan_feed_stack must check the lock flag before dialing"
+        wait_fn.contains("instance_lock_held.load(Ordering::Acquire)"),
+        "the precondition wait must check the lock flag before the lane dials"
     );
     assert!(
-        prod.contains(
-            "report_unfolded_wal_frames(&params.wal_replay_live_feed, \"instance_lock_not_held\")"
-        ),
-        "the lock refusal must account for the replayed WAL frames like every other refusal"
+        wait_fn.contains("Some(id) if lock_held =>"),
+        "the client id is returned only while the lock is held"
     );
     assert!(
-        prod.contains("code = ErrorCode::Resilience01DualInstanceDetected.code_str(),\n            source = \"live_lane_dial_refused\","),
+        wait_fn.contains("code = ErrorCode::Resilience01DualInstanceDetected.code_str(),")
+            && wait_fn.contains("source = \"live_lane_dial_refused\","),
         "the refusal must carry RESILIENCE-01 with its own source label"
     );
-    // The gate must sit AFTER the token wait and BEFORE the fold/dial.
+    // The wait must sit BEFORE the fold/dial.
     let gate = prod
-        .find("if !params.instance_lock_held.load(Ordering::Acquire)")
-        .expect("gate present (asserted above)"); // APPROVED: test
-    let token_wait = prod
-        .find("\"token_manager_missing\"")
-        .expect("token wait present"); // APPROVED: test
+        .find("match wait_for_dial_preconditions(")
+        .expect("the lane must call the precondition wait"); // APPROVED: test
     let fold = prod
         .find("let capacity = distinct_fold_slots(")
         .expect("fold present"); // APPROVED: test
     assert!(
-        token_wait < gate && gate < fold,
-        "lock gate must follow the token wait ({token_wait}) and precede the fold ({fold}); gate at {gate}"
+        gate < fold,
+        "the lock wait must precede the fold ({fold}); wait at {gate}"
     );
 }

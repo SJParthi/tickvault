@@ -63,7 +63,8 @@ use std::collections::HashMap;
 
 use tickvault_common::constants::{
     EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_NSE_EQ,
-    EXCHANGE_SEGMENT_NSE_FNO, MAX_PLAUSIBLE_LTP,
+    EXCHANGE_SEGMENT_NSE_FNO, MAX_PLAUSIBLE_LTP, MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
 };
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
@@ -806,6 +807,11 @@ pub struct MultiTfAggregator {
     /// to recognise a tick that live may have seen only AFTER that seal
     /// (review round 7). Defaults to [`DEFAULT_CATCH_UP_MARGIN_SECS`].
     catch_up_margin_secs: u32,
+    /// Muhurat session flag override. `None` (production) reads the
+    /// boot-installed `tickvault_common::muhurat::current()`; tests fix it
+    /// through [`Self::set_muhurat_session`] so the process-wide `OnceLock`
+    /// never couples two tests (audit L3, 2026-10-26).
+    muhurat_override: Option<bool>,
     /// Test-only slot-ceiling override so the fail-closed exhaustion path can
     /// be exercised without allocating 25,000 cells (~135 MB).
     #[cfg(test)]
@@ -1002,6 +1008,14 @@ impl MultiTfAggregator {
         Self::with_capacity(strategy, AGGREGATOR_DEFAULT_SLOTS)
     }
 
+    /// Fixes the Muhurat session flag instead of reading the boot-installed
+    /// global, so a test can fold a Muhurat tick without setting the
+    /// process-wide `OnceLock`.
+    #[cfg(test)]
+    pub(crate) fn set_muhurat_session(&mut self, active: bool) {
+        self.muhurat_override = Some(active);
+    }
+
     /// Empty aggregator pre-sized for `cap` instruments, so the boot path can
     /// avoid re-hashing / re-allocating mid-session. `cap` is clamped to
     /// [`AGGREGATOR_MAX_SLOTS`].
@@ -1023,6 +1037,7 @@ impl MultiTfAggregator {
             replay_last_frame_secs: 0,
             capture_start_provisional: false,
             catch_up_margin_secs: DEFAULT_CATCH_UP_MARGIN_SECS,
+            muhurat_override: None,
             #[cfg(test)]
             test_capacity_override: None,
         }
@@ -2023,8 +2038,19 @@ impl MultiTfAggregator {
         // earlier into the 09:15 bucket; the grid now has real buckets to put
         // those ticks in, so admitting them forms pre-open candles instead of
         // corrupting anything.
-        let out_of_session = secs_of_day < CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
-            || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
+        let out_of_session = (secs_of_day < CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
+            || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST)
+            // MUHURAT (audit L3, 2026-10-26): on a Muhurat day the fold admits
+            // the same [18:00, 19:30) IST evening window the tick and depth
+            // writers widen to (`session_window::nanos_in_muhurat_window`), so
+            // a Muhurat tick folds into candles instead of being refused. The
+            // flag is read only after the regular window refused the tick:
+            // one `OnceLock` load, O(1), no allocation.
+            && !(secs_of_day >= MUHURAT_PERSIST_START_SECS_OF_DAY_IST
+                && secs_of_day < MUHURAT_PERSIST_END_SECS_OF_DAY_IST
+                && self
+                    .muhurat_override
+                    .unwrap_or_else(tickvault_common::muhurat::current));
         if out_of_session {
             // An equity's pre-open trade packet carries the auction volume
             // (2026-10-09). Kept only when the first bar excludes it.
@@ -2634,6 +2660,9 @@ impl MultiTfAggregator {
                 // down rather than recomputing it saves 48 conversions per
                 // tick (24 timeframes × the bucket site and one fold arm).
                 fold_secs,
+                // Audit L3: the fold widens high/low on a stale packet but
+                // never moves close, close time, OI or the book totals.
+                is_stale_packet,
             ) {
                 ConsumeOutcome::Updated => {}
                 ConsumeOutcome::Sealed { sealed_state } => {
@@ -3855,6 +3884,10 @@ impl MultiTfAggregator {
         slot.last_ltp.is_finite().then_some(slot.last_ltp)
     }
 }
+
+#[cfg(test)]
+#[path = "multi_tf_aggregator_l3_tests.rs"]
+mod l3_tests;
 
 #[cfg(test)]
 mod tests {
