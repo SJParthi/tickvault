@@ -37,9 +37,14 @@ fn parse_expiry_time(value: &serde_json::Value) -> Option<DateTime<FixedOffset>>
             if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
                 return Some(dt.with_timezone(&ist));
             }
-            // Try common date-time formats
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-                return dt.and_local_timezone(ist).single();
+            // Try common date-time formats. Dhan's documented generateAccessToken
+            // `expiryTime` carries milliseconds ("2026-01-01T00:00:00.000", IST,
+            // docs/dhan-ref/02-authentication.md); `%S` alone rejects the
+            // fraction, which made the documented shape fall back to now + 24 h.
+            for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, format) {
+                    return dt.and_local_timezone(ist).single();
+                }
             }
             // Try epoch millis as string
             if let Ok(epoch) = s.parse::<i64>() {
@@ -1106,6 +1111,24 @@ mod tests {
         let val = serde_json::json!("2026-02-27T13:45:00");
         let result = parse_expiry_time(&val);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_expiry_time_documented_millisecond_string_is_parsed_exactly() {
+        // The shape docs/dhan-ref/02-authentication.md documents for
+        // generateAccessToken. Before 2026-10-26 this returned None and the
+        // caller silently assumed now + 24 h.
+        let val = serde_json::json!("2026-01-01T09:30:15.000");
+        let parsed = parse_expiry_time(&val);
+        assert_eq!(
+            parsed.map(|dt| dt.to_rfc3339()),
+            Some("2026-01-01T09:30:15+05:30".to_string())
+        );
+        let with_millis = serde_json::json!("2026-01-01T09:30:15.250");
+        assert_eq!(
+            parse_expiry_time(&with_millis).map(|dt| dt.timestamp_subsec_millis()),
+            Some(250)
+        );
     }
 
     #[test]
