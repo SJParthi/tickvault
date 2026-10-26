@@ -57,6 +57,13 @@ pub const EVENING_DRAIN_SPACING_SECS: i64 = 2_400;
 pub const EVENING_DRAIN_FIRST_SECS_IST: u64 = 15 * 3_600 + 50 * 60;
 /// 05:00 IST: no restart after this.
 pub const EVENING_DRAIN_LAST_RESTART_SECS_IST: u64 = 5 * 3_600;
+/// 12:00 IST: from here to [`EVENING_DRAIN_FIRST_SECS_IST`] the evening's
+/// restarts are still ahead (wait); from 05:00 to here they are over.
+pub const EVENING_DRAIN_AFTERNOON_SECS_IST: u64 = 12 * 3_600;
+const _: () = assert!(
+    EVENING_DRAIN_LAST_RESTART_SECS_IST < EVENING_DRAIN_AFTERNOON_SECS_IST
+        && EVENING_DRAIN_AFTERNOON_SECS_IST < EVENING_DRAIN_FIRST_SECS_IST
+);
 /// 16:25 IST: past the day's last 1-minute cross-verification attempt
 /// (it ends by 16:23), so a restart can no longer cut one short. Derived from
 /// the scheduled-stop window, which the cross-verification end bound is
@@ -255,7 +262,17 @@ pub fn evening_step(
     if restarts > 0 && backlog >= state.backlog_before {
         return EveningStep::GaveUp;
     }
-    if restarts >= EVENING_DRAIN_RESTARTS_MAX || !in_restart_window(secs_ist) {
+    if restarts >= EVENING_DRAIN_RESTARTS_MAX {
+        return EveningStep::GaveUp;
+    }
+    if !in_restart_window(secs_ist) {
+        // M2 (2026-10-26): the supervisor starts at 15:40, before the 15:50
+        // window. Giving up there latched the verdict for the whole evening,
+        // so 26 Oct made no restart at all (15:40:57, restarts=0). Before the
+        // window on the same afternoon the restart is still to come.
+        if secs_ist >= EVENING_DRAIN_AFTERNOON_SECS_IST {
+            return EveningStep::Wait;
+        }
         return EveningStep::GaveUp;
     }
     if !other_done || !xverify_settled {
@@ -474,7 +491,8 @@ mod tests {
     fn evening_step_stops_outside_the_window_and_after_giving_up() {
         let fresh = EveningState::default();
         assert_eq!(step(&fresh, Some(5), NOW, 6 * 3_600), EveningStep::GaveUp);
-        assert_eq!(step(&fresh, Some(5), NOW, 15 * 3_600), EveningStep::GaveUp);
+        // 15:00 is before tonight's window: wait, never give up (M2).
+        assert_eq!(step(&fresh, Some(5), NOW, 15 * 3_600), EveningStep::Wait);
         assert_eq!(step(&fresh, Some(5), NOW, 2 * 3_600), EveningStep::Restart);
         // A latched give-up does not flip back when the count moves.
         let gave_up = state_for_give_up(&tonight(1, NOW, 100), DAY);
@@ -491,6 +509,37 @@ mod tests {
             step(&yesterday, Some(5), NOW, EVENING),
             EveningStep::Restart
         );
+    }
+
+    /// M2 (2026-10-26, live): the drain-hold supervisor's first look is at
+    /// 15:40, ten minutes before the window. It returned GaveUp there, the
+    /// caller latched it for the day, and the evening made no restart
+    /// ("no more restarts tonight", restarts=0, 15:40:57 IST).
+    #[test]
+    fn test_regression_evening_step_waits_before_the_window_instead_of_latching_give_up() {
+        let fresh = EveningState::default();
+        let at_1540 = 15 * 3_600 + 40 * 60;
+        assert_eq!(step(&fresh, Some(1_696), NOW, at_1540), EveningStep::Wait);
+        assert!(step(&fresh, Some(1_696), NOW, at_1540).holds());
+        // Ten minutes later the same evening restarts.
+        let at_1550 = EVENING_DRAIN_FIRST_SECS_IST;
+        assert_eq!(
+            step(&fresh, Some(1_696), NOW + 600, at_1550),
+            EveningStep::Restart
+        );
+        // After 05:00 the night is over: give up, as before.
+        assert_eq!(
+            step(
+                &fresh,
+                Some(1_696),
+                NOW,
+                EVENING_DRAIN_LAST_RESTART_SECS_IST
+            ),
+            EveningStep::GaveUp
+        );
+        // A real cap still gives up before the window too.
+        let capped = tonight(EVENING_DRAIN_RESTARTS_MAX, NOW - 2 * SPACING, 100);
+        assert_eq!(step(&capped, Some(50), NOW, at_1540), EveningStep::GaveUp);
     }
 
     #[test]

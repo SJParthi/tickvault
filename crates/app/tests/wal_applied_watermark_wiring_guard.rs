@@ -58,9 +58,17 @@ fn both_lane_confirms_wait_for_the_writer_ack() {
                 "replay_rows_landed(&mut ingest, {stage}, unlanded_before)"
             ))
             .unwrap_or_else(|| panic!("the {stage} confirm must wait on replay_rows_landed"));
-        let confirm = src[wait..]
-            .find("confirm_replayed(")
-            .expect("a confirm must follow the ack wait");
+        // M2 (2026-10-26): the catch-up settles segment by segment
+        // (`settle_confirm_segments`), still only after the ack wait.
+        let after = &src[wait..];
+        let confirm = [
+            after.find("confirm_replayed("),
+            after.find("settle_confirm_segments("),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect("a confirm must follow the ack wait");
         // The confirm is inside the `if` the wait guards: no more than a few
         // lines away, and never before it.
         assert!(
