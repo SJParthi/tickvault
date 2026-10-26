@@ -127,6 +127,15 @@ const BANNED_FILE_EXTENSIONS: &[&str] = &[
     // matches for all twenty, case-insensitively.
     "c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "zig", "nim", "hs", "ex", "exs", "clj", "cljs",
     "erl", "dart", "ml", "mli", "f90", "pas",
+    // SCOPE FIX #23 (2026-10-26, audit plan item J5) — frontend and markup
+    // forms the browser-surface guard never sees, because it budgets `.html`
+    // and `.rs` page handlers only: single-file components (`.vue`,
+    // `.svelte`, `.astro`), the other HTML spellings (`.htm`, `.xhtml`) and
+    // compiled WebAssembly (`.wasm`), which a page loads and runs. Banned
+    // EVERYWHERE, docs included, which is stricter than the audit asked
+    // ("outside docs/"): verified at fix time, `git ls-files` returns zero
+    // matches for all six, case-insensitively, so nothing needs a carve-out.
+    "vue", "svelte", "astro", "htm", "xhtml", "wasm",
 ];
 
 // ============================ PURE CORE ============================
@@ -996,9 +1005,63 @@ const NODE_RUNTIME_BUDGET: &[(&str, usize)] = &[(".mcp.json", 2)];
 /// first version of this fix counted "swift recovery is expected after a
 /// reconnect" in a real comment. They therefore additionally require a
 /// toolchain-shaped NEXT token; see [`PROSE_AMBIGUOUS_RUNTIMES`].
+///
+/// # SCOPE FIX #23 (2026-10-26, audit plan item J5) — interpreter ALIASES
+///
+/// The list named each runtime by its canonical binary and stopped there, so
+/// the same runtime under another name passed: `nodejs` (Debian's node),
+/// `bunx`, `ts-node` / `tsx` / `corepack` (node launchers), `pypy` / `pypy3`
+/// / `ipython` / `jupyter` / `micropython` (the banned interpreter under
+/// another binary name; the token scan's word boundary does not see the
+/// banned name inside `ipython`), `pwsh` / `powershell`, `tclsh` / `wish` /
+/// `expect` (Tcl), `osascript`, `elixir` / `erl` (BEAM), `runghc` / `ghc`
+/// (Haskell). Verified before adding: zero command-position uses in the
+/// tree. `expect` and `wish` are English words and `expect` is a shell
+/// function name in `scripts/bench-gate.selftest.sh`, so both are
+/// [`PROSE_AMBIGUOUS_RUNTIMES`] with the stricter rule there.
 const NODE_FAMILY: &[&str] = &[
-    "node", "npx", "npm", "yarn", "pnpm", "deno", "bun", "ruby", "gem", "php", "lua", "java",
-    "kotlin", "kotlinc", "scala", "groovy", "go", "dotnet", "julia", "Rscript", "swift",
+    "node",
+    "npx",
+    "npm",
+    "yarn",
+    "pnpm",
+    "deno",
+    "bun",
+    "ruby",
+    "gem",
+    "php",
+    "lua",
+    "java",
+    "kotlin",
+    "kotlinc",
+    "scala",
+    "groovy",
+    "go",
+    "dotnet",
+    "julia",
+    "Rscript",
+    "swift",
+    // SCOPE FIX #23 (2026-10-26) — aliases of runtimes already banned.
+    "nodejs",
+    "bunx",
+    "ts-node",
+    "tsx",
+    "corepack",
+    "pypy",
+    "pypy3",
+    "ipython",
+    "jupyter",
+    "micropython",
+    "pwsh",
+    "powershell",
+    "tclsh",
+    "wish",
+    "expect",
+    "osascript",
+    "elixir",
+    "erl",
+    "runghc",
+    "ghc",
 ];
 
 /// Runtimes whose names are ordinary English words, so command position alone
@@ -1011,16 +1074,37 @@ const NODE_FAMILY: &[&str] = &[
 /// counts 0, while the same line with `node` counts 1. Accepting the bare
 /// form would count the sentence, and the sentence is what appears in real
 /// files.
-const PROSE_AMBIGUOUS_RUNTIMES: &[&str] = &["go", "swift"];
+///
+/// SCOPE FIX #23 (2026-10-26): `expect` and `wish` (English words) and `ghc`
+/// joined. `ghc` is not a word, but CI deletes the directory `/opt/ghc` on a
+/// backslash-continued `rm -rf` line, where the path alone sits in command
+/// position; a real compiler run carries a flag or a source file after it.
+const PROSE_AMBIGUOUS_RUNTIMES: &[&str] = &["go", "swift", "expect", "wish", "ghc"];
+
+/// SCOPE FIX #23 (2026-10-26): the [`PROSE_AMBIGUOUS_RUNTIMES`] members that
+/// need MORE than a toolchain-shaped next token. `expect "8/8 regressing"` is
+/// a call to the shell FUNCTION `expect` in `scripts/bench-gate.selftest.sh`,
+/// and its quoted label contains a `/`, which the general rule reads as a
+/// path. For these two the name must be followed by whitespace (not `:` or
+/// `(`), and the next token must not open a quote. Residual, stated: a real
+/// `expect "$SCRIPT"` is therefore uncounted (a false negative, never a false
+/// positive).
+const QUOTE_REFUSING_RUNTIMES: &[&str] = &["expect", "wish"];
 
 /// Does the text after a [`PROSE_AMBIGUOUS_RUNTIMES`] token look like a
 /// toolchain invocation rather than prose? True when the next token is a
 /// flag (`-o`, `--version`), a path or source file (`./cmd`, `main.go`,
 /// `Package.swift`), or one of the compiler's own subcommands.
 fn next_token_is_toolchain_use(runtime: &str, after: &str) -> bool {
+    if QUOTE_REFUSING_RUNTIMES.contains(&runtime) && !after.starts_with([' ', '\t']) {
+        return false;
+    }
     let Some(next) = after.split_whitespace().next() else {
         return false;
     };
+    if QUOTE_REFUSING_RUNTIMES.contains(&runtime) && next.starts_with(['"', '\'']) {
+        return false;
+    }
     let next = next.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ']');
     if next.is_empty() {
         return false;
@@ -4443,4 +4527,219 @@ fn banned_word_scan_self_test() {
     ));
     assert!(!contains_ascii_case_insensitive(b"pyth on", &needle));
     assert!(!contains_ascii_case_insensitive(b"", &needle));
+}
+
+/// SCOPE FIX #23 (2026-10-26, audit plan item J5) — the interpreter aliases
+/// count in command position, and the words they share with prose do not.
+#[test]
+fn scope_fix_2026_10_26_alias_self_test() {
+    // One must-count row per alias added to NODE_FAMILY.
+    for shape in [
+        "nodejs server.js",
+        "bunx some-pkg",
+        "ts-node app.ts",
+        "tsx watch src/main.ts",
+        "corepack enable",
+        "pypy script.py",
+        "pypy3 -m http.server",
+        "ipython -c 'x'",
+        "jupyter nbconvert --execute x.ipynb",
+        "micropython main.py",
+        "pwsh -File x.ps1",
+        "powershell -Command Get-Item",
+        "tclsh build.tcl",
+        "wish gui.tcl",
+        "expect -f login.exp",
+        "expect login.exp",
+        "osascript -e 'beep'",
+        "elixir run.exs",
+        "erl -noshell -s app start",
+        "runghc Main.hs",
+        "ghc -O2 Main.hs",
+        "RUN pwsh -c x",
+        "ExecStart=/usr/bin/nodejs /opt/app.js",
+        "\"command\": \"tsx\"",
+        "if true; then pypy3 x; fi",
+    ] {
+        assert!(
+            count_node_invocations(shape) > 0,
+            "self-test: {shape:?} invokes an interpreter alias in command position and MUST count"
+        );
+    }
+    // A `ts-node` / `nodejs` / `pypy3` call is ONE invocation, not two: the
+    // canonical name inside the alias is not a separate word.
+    for single in ["ts-node app.ts", "nodejs app.js", "pypy3 x.py", "bunx pkg"] {
+        assert_eq!(count_node_invocations(single), 1, "self-test: {single:?}");
+    }
+
+    // Must NOT count: prose, Rust, and the real lines in this tree that carry
+    // `expect` / `ghc` as words.
+    for prose in [
+        // scripts/bench-gate.selftest.sh: a shell FUNCTION named `expect`.
+        "expect() {",
+        "expect \"31/31 uniform +24..30% drift, all budgets OK -> PASS (was false RED)\" 0 \"$A\"",
+        "expect \"8/8 regressing but spread ~74 pts -> still FAILS (not uniform)\" 2 \"$C\"",
+        // downsize-instance.yml: `expect` after a `;` inside an echo.
+        "echo \"::warning::busy; expect a red deploy-aws run and ignore it.\"",
+        // ci.yml: `/opt/ghc` is a path being deleted, not a compiler run.
+        "          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \\",
+        "                      /opt/ghc \\",
+        // Rust `.expect(` and prose uses.
+        "let v = r.expect(\"boot config\");",
+        "expect: 200",
+        "expect a clean run",
+        "wish list for the next release",
+        "wish: none",
+        "# pwsh -File x.ps1 (commented out)",
+        "the tsx extension is banned",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: {prose:?} is prose or a non-invocation and must not count"
+        );
+    }
+
+    // The banned frontend/markup extensions, case-insensitively.
+    let planted: Vec<String> = [
+        "web/App.vue",
+        "web/Page.SVELTE",
+        "site/index.astro",
+        "legacy/index.htm",
+        "legacy/page.XHTML",
+        "pkg/engine.wasm",
+        "docs/demo.vue",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    assert_eq!(
+        banned_extension_files(&planted).len(),
+        planted.len(),
+        "self-test: every planted frontend/markup file must be caught"
+    );
+    for kept in ["web/index.html", "assets/logo.svg", "src/vue_notes.rs"] {
+        assert!(
+            banned_extension_files(&[kept.to_string()]).is_empty(),
+            "self-test: {kept:?} is not a banned extension"
+        );
+    }
+}
+
+// ---- SCOPE FIX #23 (2026-10-26, audit plan item J5): `brew` -----------------
+//
+// CLAUDE.md's BANNED list names `brew`, and `scripts/setup-observability.sh`
+// ran `brew install jq` anyway: nothing enforced the line. Homebrew is not a
+// language runtime, so it is not in NODE_FAMILY; it is a package manager that
+// pulls unpinned binaries onto the machine, which the "every version pinned"
+// principle forbids. Counted in COMMAND POSITION with the same parser as the
+// runtimes, so `"install it from brew"` in a message is prose.
+//
+// Shrink-only budget, measured 2026-10-26 after the setup-observability fix.
+// Each remaining row says what it is:
+//   - `.claude/hooks/post-compact-recovery.sh`: the BANNED list itself,
+//     `| brew |`, where the `|` reads as a pipe (prose, pinned).
+//   - `.claude/settings.json`: the `Bash(brew *)` permission entry, where the
+//     `(` reads as a subshell (config, pinned).
+//   - `Makefile`: an error message `(brew install jq)`, same `(` shape.
+//   - `scripts/questdb-tunnel.sh` (2): two `fail` messages, `(macOS: brew
+//     install awscli)` and `macOS: brew install --cask …`, where the `(` and
+//     the `macOS:` key shape read as command position (prose, pinned).
+//   - `scripts/tv-tunnel/install-mac.sh`: a REAL `brew install --cask
+//     tailscale` on the operator's Mac. Outside this change's scope; the
+//     budget pins it so it cannot grow and forces the row down when it goes.
+const BREW_BUDGET: &[(&str, usize)] = &[
+    (".claude/hooks/post-compact-recovery.sh", 1),
+    (".claude/settings.json", 1),
+    ("Makefile", 1),
+    ("scripts/questdb-tunnel.sh", 2),
+    ("scripts/tv-tunnel/install-mac.sh", 1),
+];
+
+/// `brew` in command position on non-comment lines.
+fn count_brew_invocations(content: &str) -> usize {
+    let mut hits = 0usize;
+    for line in content.lines() {
+        if is_comment_line(line) {
+            continue;
+        }
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find("brew") {
+            let at = from + rel;
+            let end = at + "brew".len();
+            let before_ok = line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-');
+            let after_ok = line[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-');
+            if before_ok && after_ok && is_command_position(line, at) {
+                hits += 1;
+            }
+            from = end;
+        }
+    }
+    hits
+}
+
+#[test]
+fn brew_invocations_only_shrink() {
+    assert_sorted_unique(
+        &BREW_BUDGET.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        "BREW_BUDGET",
+    );
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    for (path, content) in load_invocation_scan_files() {
+        let n = count_brew_invocations(&content);
+        if n > 0 || BREW_BUDGET.iter().any(|(p, _)| *p == path) {
+            counted.push((path, n));
+        }
+    }
+    let (over, under) = github_script_budget_drift(&counted, BREW_BUDGET);
+    assert!(
+        over.is_empty(),
+        "BANNED: `brew` in command position {over:?} (path, actual, budget). CLAUDE.md \
+         bans brew: it installs unpinned binaries. Print an install hint instead, or \
+         pin a release download. Do NOT raise BREW_BUDGET."
+    );
+    assert!(
+        under.is_empty(),
+        "SHRINK THE RATCHET: fewer `brew` invocations than budgeted {under:?}; lower \
+         BREW_BUDGET in the same PR."
+    );
+}
+
+#[test]
+fn brew_scan_self_test() {
+    for shape in [
+        "brew install jq",
+        "    brew install jq --quiet 2>/dev/null && echo ok",
+        "if x; then brew install gh; fi",
+        "sudo brew upgrade",
+        "RUN brew install x",
+        "  - run: brew install jq",
+        "/opt/homebrew/bin/brew install jq",
+    ] {
+        assert!(
+            count_brew_invocations(shape) > 0,
+            "self-test: {shape:?} runs brew and MUST count"
+        );
+    }
+    for prose in [
+        "warn \"get the binary from https://jqlang.org/download/\"",
+        "require_cli gh \"brew install gh\"",
+        "fail \"Tailscale app not installed and brew not available\"",
+        "# brew install jq (commented)",
+        "homebrew-core is a tap",
+        "brewery",
+        "check_cmd \"curl\" \"apt install curl\"",
+    ] {
+        assert_eq!(
+            count_brew_invocations(prose),
+            0,
+            "self-test: {prose:?} is not a brew invocation"
+        );
+    }
 }

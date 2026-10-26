@@ -173,7 +173,10 @@ fn browser_code_in_rust_is_pinned_to_the_enumerated_surfaces() {
         if path.ends_with("browser_surface_and_toolchain_guard.rs") {
             continue;
         }
-        let body = read_scan_text(&root, &path);
+        // SCOPE FIX #23 (2026-10-26, audit plan item J5): counted on the
+        // LOWERCASED text. HTML tag names are case-insensitive, so
+        // `<SCRIPT>` runs exactly like `<script>` and was invisible here.
+        let body = read_scan_text(&root, &path).to_ascii_lowercase();
         let count = body.matches("<script").count();
         if count > 0 {
             actual.insert(path, count);
@@ -726,25 +729,59 @@ const HANDLER_ATTRS: &[&str] = &[
 /// raises it out of irritation rather than intent. A guard people re-baseline
 /// to silence it is not a guard.
 fn js_line_count(body: &str) -> usize {
-    let mut total = 0_usize;
+    js_block_span(body).lines
+}
+
+/// Bytes inside `<script>…</script>` blocks, over the same span
+/// [`js_line_count`] counts (each counted line's bytes plus its newline).
+///
+/// SCOPE FIX #23 (2026-10-26, audit plan item J5). The line budget alone let
+/// one line hold any amount of script: a minified bundle pasted on a single
+/// line counts as one line. The line budget stays the review signal; this is
+/// a CEILING beside it, set to the bytes measured on the fix date, so growth
+/// fails and a formatting-only shrink passes (lower the ceiling to keep the
+/// gain).
+fn js_byte_count(body: &str) -> usize {
+    js_block_span(body).bytes
+}
+
+/// Lines and bytes of the script blocks in `body`.
+struct JsSpan {
+    lines: usize,
+    bytes: usize,
+}
+
+/// One pass shared by [`js_line_count`] and [`js_byte_count`], so the two
+/// budgets measure the same span. Tags are matched CASE-INSENSITIVELY
+/// (SCOPE FIX #23, 2026-10-26): `<SCRIPT>` opens a block in every browser,
+/// and the case-sensitive version counted none of it.
+fn js_block_span(body: &str) -> JsSpan {
+    let mut total = JsSpan { lines: 0, bytes: 0 };
     let mut in_block = false;
-    let mut current = 0_usize;
+    let mut current = JsSpan { lines: 0, bytes: 0 };
+    let mut opener_bytes = 0_usize;
     for line in body.lines() {
-        if !in_block && line.contains("<script") {
+        let lower = line.to_ascii_lowercase();
+        if !in_block && lower.contains("<script") {
             in_block = true;
-            current = 0;
+            current = JsSpan { lines: 0, bytes: 0 };
+            opener_bytes = line.len() + 1;
         }
         if in_block {
-            current += 1;
+            current.lines += 1;
+            current.bytes += line.len() + 1;
         }
-        if in_block && line.contains("</script>") {
+        if in_block && lower.contains("</script>") {
             in_block = false;
-            total += current;
-            current = 0;
+            total.lines += current.lines;
+            total.bytes += current.bytes;
+            current = JsSpan { lines: 0, bytes: 0 };
         }
     }
     if in_block {
-        total += 1;
+        // An unterminated opener contributes its own line and nothing more.
+        total.lines += 1;
+        total.bytes += opener_bytes;
     }
     total
 }
@@ -1043,4 +1080,184 @@ fn js_scanners_self_test() {
     assert_eq!(inline_handler_count("let onloaded = 1;"), 0);
     assert_eq!(inline_handler_count("fn on_click_handler() {}"), 0);
     assert_eq!(inline_handler_count("// discusses onclick in prose"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// SCOPE FIX #23 (2026-10-26, audit plan item J5) — three more ways the
+// frontend carve-out could grow unseen: script bytes on few lines, a
+// `javascript:` URL (script with no tag and no handler attribute), and an SVG
+// (markup that runs scripts, never opened by any scan before).
+// ---------------------------------------------------------------------------
+
+/// Bytes of JavaScript inside script blocks, per surface: the same surfaces
+/// and span as [`JS_VOLUME_BUDGET`]. A CEILING, measured on 2026-10-26: a
+/// value above it fails; a value below it passes and the ceiling should be
+/// lowered in the same PR. Growing a number needs the same dated operator note
+/// as `JS_VOLUME_BUDGET`.
+const JS_BYTE_BUDGET: &[(&str, usize)] = &[
+    ("crates/api/src/handlers/board_page.rs", 10_838),
+    ("crates/api/src/handlers/dashboard_page.rs", 8_781),
+    ("crates/api/src/handlers/feeds_page.rs", 9_720),
+    (
+        "crates/aws-lambdas/src/operator_control_console.html",
+        26_601,
+    ),
+];
+
+#[test]
+fn javascript_bytes_inside_script_tags_stay_under_the_ceiling() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = JS_BYTE_BUDGET.iter().copied().collect();
+    let mut scan: Vec<String> = JS_BYTE_BUDGET
+        .iter()
+        .map(|(p, _)| (*p).to_string())
+        .collect();
+    for path in scan_paths("*.html") {
+        if !scan.contains(&path) {
+            scan.push(path);
+        }
+    }
+    let mut problems = Vec::new();
+    for path in &scan {
+        let bytes = js_byte_count(&read_scan_text(&root, path));
+        match budget.get(path.as_str()) {
+            None if bytes > 0 => problems.push(format!(
+                "  UNBUDGETED: {path} holds {bytes} byte(s) of JavaScript and is not in \
+                 JS_BYTE_BUDGET"
+            )),
+            Some(&allowed) if bytes > allowed => problems.push(format!(
+                "  GREW: {path} holds {bytes} byte(s) of JavaScript, ceiling {allowed}"
+            )),
+            Some(_) if bytes == 0 => problems.push(format!(
+                "  STALE: {path} holds no JavaScript; remove it from JS_BYTE_BUDGET"
+            )),
+            _ => {}
+        }
+    }
+    let volume: Vec<&str> = JS_VOLUME_BUDGET.iter().map(|(p, _)| *p).collect();
+    let bytes_paths: Vec<&str> = JS_BYTE_BUDGET.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        volume, bytes_paths,
+        "JS_BYTE_BUDGET and JS_VOLUME_BUDGET must name the same surfaces in the same order"
+    );
+    assert!(
+        problems.is_empty(),
+        "FRONTEND CARVE-OUT GREW (bytes):\n{}\n\n\
+         The line budget cannot see a long line. Growth needs a dated note in \
+         `.claude/rules/project/rust-only-forever-lock-2026-07-19.md` FIRST.",
+        problems.join("\n")
+    );
+}
+
+/// `javascript:` URLs per file, across `*.rs`, `*.html` and `*.svg`. Zero
+/// anywhere on 2026-10-26, so the budget is EMPTY: any occurrence fails.
+/// Shrink-only, like every table in this file.
+const JAVASCRIPT_URL_BUDGET: &[(&str, usize)] = &[];
+
+/// Case-insensitive count of `javascript:` (URL schemes are case-insensitive,
+/// and browsers also ignore whitespace inside the scheme, which this does not
+/// model: a stated limit, not a covered case).
+fn javascript_url_count(body: &str) -> usize {
+    body.to_ascii_lowercase().matches("javascript:").count()
+}
+
+#[test]
+fn javascript_urls_only_shrink() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = JAVASCRIPT_URL_BUDGET.iter().copied().collect();
+    let mut problems = Vec::new();
+    let mut scanned = 0_usize;
+    for pathspec in ["*.rs", "*.html", "*.svg", "*.SVG"] {
+        for path in scan_paths(pathspec) {
+            if is_the_scanner_itself(&path) {
+                continue;
+            }
+            scanned += 1;
+            let n = javascript_url_count(&read_scan_text(&root, &path));
+            let allowed = budget.get(path.as_str()).copied().unwrap_or(0);
+            if n > allowed {
+                problems.push(format!(
+                    "  {path}: {n} `javascript:` URL(s), budget {allowed}"
+                ));
+            } else if n < allowed {
+                problems.push(format!(
+                    "  SHRANK: {path}: {n} against a budget of {allowed}; lower the budget"
+                ));
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "javascript-URL scan read almost nothing — it would pass vacuously"
+    );
+    assert!(
+        problems.is_empty(),
+        "`javascript:` URL OUTSIDE THE BUDGET:\n{}\n\n\
+         A `javascript:` URL runs script with no `<script` tag and no handler \
+         attribute, so neither budget above sees it. Growing this needs a dated \
+         note in `rust-only-forever-lock-2026-07-19.md` first.",
+        problems.join("\n")
+    );
+}
+
+/// Does an SVG carry a script element or a `javascript:` URL?
+fn svg_carries_script(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<script") || lower.contains("javascript:")
+}
+
+/// An SVG is markup a browser runs scripts from. None is tracked today; any
+/// tracked or untracked one must carry no script element, no `javascript:`
+/// URL and no inline handler attribute.
+#[test]
+fn svg_files_carry_no_script() {
+    let root = repo_root();
+    let mut svgs = scan_paths("*.svg");
+    svgs.extend(scan_paths("*.SVG"));
+    let offenders: Vec<String> = svgs
+        .iter()
+        .filter(|p| {
+            let body = read_scan_text(&root, p);
+            svg_carries_script(&body) || inline_handler_count(&body) > 0
+        })
+        .cloned()
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "SVG FILE(S) CARRYING SCRIPT: {offenders:?}. A script inside an image is \
+         JavaScript outside the budgeted frontend set; remove it."
+    );
+}
+
+#[test]
+fn scope_fix_2026_10_26_scanners_self_test() {
+    // Case: `<SCRIPT>` opens a block like `<script>`.
+    assert_eq!(js_line_count("<SCRIPT>\nlet a=1;\n</SCRIPT>"), 3);
+    assert_eq!(js_line_count("<Script>\nx\n</script>"), 3);
+    // Bytes: the span's lines plus their newlines.
+    assert_eq!(js_byte_count("<script>\nab\n</script>"), 9 + 3 + 10);
+    assert_eq!(js_byte_count("<p>no script</p>"), 0);
+    // One line, many bytes: the line count stays 1, the bytes do not.
+    let minified = format!("<script>{}</script>", "x();".repeat(1000));
+    assert_eq!(js_line_count(&minified), 1);
+    assert_eq!(js_byte_count(&minified), minified.len() + 1);
+    // An unterminated opener contributes its own line's bytes and no more.
+    assert_eq!(
+        js_byte_count("let a = 1;\nlet s = \"<script>\";\nlet b = 2;\n"),
+        "let s = \"<script>\";".len() + 1
+    );
+    // `javascript:` URLs, case-insensitively.
+    assert_eq!(javascript_url_count("<a href=\"javascript:go()\">"), 1);
+    assert_eq!(javascript_url_count("<a href=\"JavaScript:go()\">"), 1);
+    assert_eq!(javascript_url_count("the javascript language"), 0);
+    // SVG scan.
+    assert!(svg_carries_script("<svg><script>alert(1)</script></svg>"));
+    assert!(svg_carries_script("<svg><SCRIPT href='x.js'/></svg>"));
+    assert!(svg_carries_script(
+        "<svg><a href=\"JavaScript:alert(1)\">x</a></svg>"
+    ));
+    assert!(!svg_carries_script(
+        "<svg><rect width='1' height='1'/></svg>"
+    ));
+    assert!(inline_handler_count("<svg onload=\"alert(1)\"></svg>") > 0);
 }
