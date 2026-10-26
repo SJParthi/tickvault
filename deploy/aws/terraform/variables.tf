@@ -258,12 +258,13 @@ variable "muhurat_sessions" {
   # session_start_ist and stops 60 minutes after session_end_ist
   # (crates/aws-lambdas/src/muhurat_window.rs).
   #
-  # TODO (2026-10-26, owner): fill session_start_ist / session_end_ist
-  # ("HH:MM", IST) for 2026-11-08 from NSE's Muhurat trading circular before
-  # Sunday 2026-11-08, then apply terraform. While they are empty the start
-  # watchdog logs a coded config error and does NOT start the box (fail closed).
-  # Use the FIRST NSE window you want captured (the pre-open or block-deal
-  # order entry, not only the normal market) as session_start_ist.
+  # 2026-11-08 times (set 2026-10-26, Assumed, not read from the NSE circular,
+  # which could not be fetched from the build environment): press reports of
+  # NSE's 19 Oct 2026 circular give pre-open from 14:05 and normal trading
+  # 14:20-15:30; 2025 was 13:45-14:45. The window below covers every reported
+  # variant: 13:30-15:40 IST (15:40 is the app's own tick save end), so the box
+  # runs 12:30-16:40 IST. Narrow it to the circular's exact times if desired;
+  # empty times make the start watchdog refuse to start the box (fail closed).
   description = "NSE Muhurat trading sessions (IST). Empty times = timing not yet published by NSE: the box is not started."
   type = list(object({
     date              = string
@@ -271,7 +272,7 @@ variable "muhurat_sessions" {
     session_end_ist   = string
   }))
   default = [
-    { date = "2026-11-08", session_start_ist = "", session_end_ist = "" },
+    { date = "2026-11-08", session_start_ist = "13:30", session_end_ist = "15:40" },
   ]
 
   validation {

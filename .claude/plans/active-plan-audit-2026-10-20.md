@@ -760,7 +760,7 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   now + 24 h.
   - Files: crates/core/src/auth/types.rs
   - Tests: test_parse_expiry_time_documented_millisecond_string_is_parsed_exactly
-- [ ] J8 (aws-lambdas, terraform) Capture the NSE Muhurat session on its date
+- [x] J8 (aws-lambdas, terraform) Capture the NSE Muhurat session on its date
   (owner, 2026-10-26: "yes capture muhurat"; 2026: Sunday 2026-11-08). The box
   runs Mon-Fri only, so on a weekend Muhurat nothing starts it and the hourly
   curfew and hard-stop guard would stop a manual start. New pure module
