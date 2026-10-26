@@ -2644,7 +2644,9 @@ impl TickWriter {
         register_drop_baseline(feed);
         match Sender::from_conf(ticks_ilp_http_conf(config)) {
             Ok(s) => {
-                let b = s.new_buffer();
+                let mut b = s.new_buffer();
+                // K6: reserved up front, so no batch regrows on the drain.
+                b.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
                 Self {
                     sender: Some(s),
                     buffer: b,
@@ -2676,7 +2678,7 @@ impl TickWriter {
                 );
                 Self {
                     sender: None,
-                    buffer: Buffer::new(ProtocolVersion::V1),
+                    buffer: presized_row_buffer(ProtocolVersion::V1),
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
@@ -2732,7 +2734,7 @@ impl TickWriter {
         register_drop_baseline(feed);
         Self {
             sender: None,
-            buffer: Buffer::new(ProtocolVersion::V1),
+            buffer: presized_row_buffer(ProtocolVersion::V1),
             pending: 0,
             pending_min_seq: 0,
             pending_max_seq: 0,
@@ -3597,16 +3599,25 @@ impl TickWriter {
     /// several reallocations per flush on the drain task. A spare of another
     /// protocol version is dropped rather than used, because the next batch
     /// must speak the protocol the sender negotiated. `try_recv`, never
-    /// `recv`: no spare simply means the next append allocates as before.
+    /// `recv`. With no spare (or one under [`TICK_ROW_BUFFER_PRESIZE_BYTES`])
+    /// the buffer is reserved to that size here, on the flush arm (K6), so
+    /// the next batch does not regrow inside the frames that append it.
     fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
-        let Some(spares) = self.spare_buffers.as_ref() else {
-            return;
-        };
-        if let Ok(mut spare) = spares.try_recv()
+        if let Some(spares) = self.spare_buffers.as_ref()
+            && let Ok(mut spare) = spares.try_recv()
             && spare.protocol_version() == protocol
         {
             spare.clear();
             self.buffer = spare;
+        }
+        // K6 (2026-10-26): no spare (or a smaller one) means the next batch
+        // would regrow from zero inside the frames that append it. Reserve
+        // the pre-size here instead: one allocation on this flush arm, none
+        // per tick. A spare at least that big costs nothing.
+        if self.buffer.capacity() < TICK_ROW_BUFFER_PRESIZE_BYTES {
+            let have = self.buffer.len();
+            self.buffer
+                .reserve(TICK_ROW_BUFFER_PRESIZE_BYTES.saturating_sub(have));
         }
     }
 
@@ -4155,6 +4166,40 @@ pub const FLUSH_QUEUE_DEPTH: usize = 4;
 /// already in flight toward a client whose buffer wedges permanently at
 /// 100 MiB, a 64 MiB producer ceiling leaves no real headroom.
 pub const MAX_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes every tick row buffer is reserved with up front (plan item K6,
+/// 2026-10-26).
+///
+/// A row buffer used to start at zero capacity: the first batch of the
+/// process, and every batch whose flush found no spare waiting, regrew it by
+/// doubling, one reallocation each time the rows crossed a power of two. Each
+/// of those landed inside the frame whose append crossed it, so on the frame
+/// drain. MEASURED 2026-10-26 (`feed_drain` bench, 1,024 four-tick frames per
+/// buffer, this container): 11 reallocations per buffer, the last one a 1 MiB
+/// copy that took 0.27 to 0.35 ms inside one frame; 3 to 26 % of the frames at
+/// or above the p99 were one of them.
+///
+/// 2 MiB holds about 15,000 rows at the measured ~133 bytes a row, so a
+/// 500 ms flush at up to about 30,000 ticks a second never regrows. A busier
+/// batch still grows past it, by doubling, as before, and is then recycled
+/// at its larger size (`install_spare_buffer`). SPACE: one buffer in the
+/// producer, at most [`FLUSH_QUEUE_DEPTH`] queued and as many spares, so at
+/// most 9 × 2 MiB reserved; pages are committed only as rows are written.
+pub const TICK_ROW_BUFFER_PRESIZE_BYTES: usize = 2 * 1024 * 1024;
+
+const _: () = assert!(
+    TICK_ROW_BUFFER_PRESIZE_BYTES <= MAX_PRODUCER_BUFFER_BYTES,
+    "a pre-sized buffer must be one the spare lane will take back"
+);
+
+/// An empty row buffer of `protocol`, with [`TICK_ROW_BUFFER_PRESIZE_BYTES`]
+/// reserved. One allocation, at construction or on a flush arm; never per
+/// tick.
+fn presized_row_buffer(protocol: ProtocolVersion) -> Buffer {
+    let mut buffer = Buffer::new(protocol);
+    buffer.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
+    buffer
+}
 
 /// The questdb-rs client buffer ceiling. Past it EVERY flush fails, permanently
 /// — a wedge, not a degrade, which is why the producer must cut well below it.
@@ -6690,6 +6735,9 @@ mod tests {
 
         let mut batch = rx.try_recv().expect("batch queued");
         let spent_capacity = batch.buffer.capacity();
+        // The allocation itself, not its size: since K6 a fresh buffer is
+        // pre-sized too, so equal capacity alone would not prove reuse.
+        let spent_ptr = batch.buffer.as_bytes().as_ptr();
         assert!(spent_capacity > 0, "a batch that held a row has capacity");
         // `write` rescues (no sender in for_test) and then returns the buffer.
         let _landed = sink.write(&mut batch);
@@ -6702,6 +6750,11 @@ mod tests {
             producer.buffer.capacity(),
             spent_capacity,
             "the next batch must reuse the spent buffer, not regrow from zero"
+        );
+        assert_eq!(
+            producer.buffer.as_bytes().as_ptr(),
+            spent_ptr,
+            "the next batch must reuse the spent buffer's allocation"
         );
         assert!(
             producer.buffer.as_bytes().is_empty(),
@@ -6770,6 +6823,37 @@ mod tests {
         }
     }
 
+    // Regression: 2026-10-26 (K6) — the row buffer started at zero capacity
+    // and regrew by doubling inside the frames that appended to it (up to a
+    // 1 MiB copy, 0.27–0.35 ms in one frame on the feed_drain bench).
+    #[test]
+    fn test_regression_tick_row_buffer_is_presized_and_never_regrows_on_append() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert!(
+            w.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES,
+            "a new writer's row buffer is reserved up front"
+        );
+        let ptr = w.buffer.as_bytes().as_ptr();
+        let cap = w.buffer.capacity();
+        // Well under the pre-size: 2,000 rows of a few hundred bytes.
+        for seq in 1..=2_000_i64 {
+            w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        }
+        assert!(!w.buffer.is_empty());
+        assert_eq!(w.buffer.capacity(), cap, "no regrowth below the pre-size");
+        assert_eq!(w.buffer.as_bytes().as_ptr(), ptr, "no reallocation");
+
+        // A hand-off that finds no spare waiting reserves the pre-size for
+        // the next batch on the flush arm, never leaving a zero buffer.
+        let (mut producer, _sink, _rx) = w.split_for_offload();
+        producer.flush().expect("hand off");
+        assert!(producer.buffer.as_bytes().is_empty());
+        assert!(
+            producer.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES,
+            "the batch after a spare-less hand-off starts pre-sized"
+        );
+    }
+
     #[test]
     fn a_spare_of_another_protocol_is_never_installed() {
         let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
@@ -6791,9 +6875,11 @@ mod tests {
             ProtocolVersion::V1,
             "the next batch must speak the protocol the sender negotiated"
         );
+        // The foreign spare (4,096 bytes) was dropped; the buffer in its
+        // place is the K6 pre-size, reserved on the flush arm.
         assert_eq!(
             producer.buffer.capacity(),
-            0,
+            TICK_ROW_BUFFER_PRESIZE_BYTES,
             "the foreign spare was dropped"
         );
     }

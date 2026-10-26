@@ -26,6 +26,7 @@ in session (09:00–15:40 IST), seven signals:
 | `socket_to_wal` | stage | one socket read's WAL + ring hand-off took 2 s |
 | `ring_dwell` | stage | one frame waited 2 s in the ring before the drain took it |
 | `main_runtime_lag` / `reader_runtime_lag` | stage | a probe woke 2 s late |
+| `drain_main_frame` | stage | the drain took 2 s to decode, fold and append ONE main-feed frame (added 2026-10-26, plan item K6; its 1 ms stall budget is dashboard-only) |
 
 A signal that becomes stalled starts an episode; the first line names the
 worst newly stalled signal. The signal is silent until it clears, then

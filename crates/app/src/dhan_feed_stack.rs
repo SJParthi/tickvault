@@ -6811,8 +6811,13 @@ async fn run_frame_drain(
                     tickvault_storage::hot_path_telemetry::Stage::RingDwell,
                     u64::try_from(queued_nanos).unwrap_or(0),
                 );
-                tickvault_storage::hot_path_telemetry::beat(
+                // K6 (2026-10-26): the beat's clock reading also starts the
+                // main-feed frame timer below, so the stage costs one more
+                // `Instant` read per frame, not two.
+                let frame_work_start = std::time::Instant::now();
+                tickvault_storage::hot_path_telemetry::beat_at(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
+                    frame_work_start,
                 );
                 // The receipt the WAL record carries, read off the frame
                 // rather than re-derived as `now() - queued` (audit PR31).
@@ -6857,6 +6862,14 @@ async fn run_frame_drain(
                     DhanEndpointType::MainFeed => {
                         let outcome = drain_main_feed_frame(
                             &mut ingest, &frame, received_at_nanos, recv_millis, c,
+                        );
+                        // K6: decode + fold + row append for this frame, as a
+                        // hot-path stage, so the live p99 covers the drain's
+                        // own work. One clock read and four relaxed atomics,
+                        // no allocation.
+                        tickvault_storage::hot_path_telemetry::record_stage(
+                            tickvault_storage::hot_path_telemetry::Stage::DrainMainFrame,
+                            frame_work_start.elapsed(),
                         );
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
@@ -24191,6 +24204,65 @@ mod tests {
         // (see `test_drain_exits_on_shutdown_signal_with_the_ring_still_open`
         // for the other exit path — the one that did not exist until
         // 2026-08-14.)
+    }
+
+    /// K6 (2026-10-26): every main-feed frame the drain folds is timed as the
+    /// `drain_main_frame` hot-path stage, so the live p99 covers the drain's
+    /// own decode + fold + append, not only the ring wait before it.
+    ///
+    /// The stage is a process-wide static and other tests in this binary may
+    /// run a drain at the same time, so the delta is checked as AT LEAST one
+    /// sample per frame; the code records it at one site, after
+    /// `drain_main_feed_frame`.
+    #[tokio::test]
+    async fn test_regression_drain_records_the_main_frame_stage_per_frame() {
+        use tickvault_storage::hot_path_telemetry::{Stage, stage_snapshot};
+        const FRAMES: u64 = 3;
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
+        let ltt = todays_in_session_ltt();
+        for k in 0..FRAMES {
+            tx.try_send(CapturedFrame {
+                seq: 500 + k,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
+                wal_backed: true,
+                bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
+                    13,
+                    23_146.45,
+                    ltt.saturating_add(u32::try_from(k).unwrap_or(0)),
+                )),
+            })
+            .expect("the ring must accept a frame");
+        }
+        drop(tx);
+        let before = stage_snapshot(Stage::DrainMainFrame).count;
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_frame_drain(
+                rx,
+                ingest,
+                Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
+            ),
+        )
+        .await
+        .expect("the drain must end when the ring closes");
+        let after = stage_snapshot(Stage::DrainMainFrame).count;
+        assert_eq!(drained.folded, FRAMES, "every frame folded");
+        assert!(
+            after.saturating_sub(before) >= FRAMES,
+            "each main-feed frame must record one drain_main_frame sample: \
+             {before} -> {after} for {FRAMES} frames"
+        );
     }
 
     /// The drain must exit on the shutdown signal **while the ring is still
