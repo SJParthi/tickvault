@@ -38,7 +38,8 @@
 //! * A live commit fuller than the copy on disk is appended to the spill
 //!   ([`SpillLedger::on_live_commit`] returns `Mirror`), so the boot drain,
 //!   which keeps the fullest copy per bar across every file, ends on it.
-//! * The mid-session replay skips a copy less full than the committed one
+//! * The mid-session replay skips a copy less full than the committed one,
+//!   or equal to it while that commit is trusted (audit PR L, L2)
 //!   ([`SpillLedger::replay_is_older`]) and records what it commits
 //!   ([`SpillLedger::on_replay_commit`]), so a parked file resumed late
 //!   cannot write an older copy over one a later file already replayed.
@@ -117,6 +118,12 @@ struct BarEntry {
     /// Escalation progress that must be reached before the entry may be
     /// forgotten: everything queued before its last update has been written.
     queue_mark: u64,
+    /// The ledger's trust generation when the committed copy was last
+    /// recorded (audit PR L, L2). A replayed copy EQUAL to the committed one
+    /// is skipped only while this matches the current generation; a QuestDB
+    /// suspicion bumps it, so an ack that may have been false never hides
+    /// the copy that would repair it.
+    committed_trust: u32,
 }
 
 impl BarEntry {
@@ -128,6 +135,7 @@ impl BarEntry {
         disk_volume: 0,
         committed_volume: 0,
         queue_mark: 0,
+        committed_trust: 0,
     };
 
     fn disk(&self) -> Option<Fullness> {
@@ -150,10 +158,15 @@ impl BarEntry {
         }
     }
 
-    fn note_committed(&mut self, copy: Fullness) {
-        if self.committed().is_none_or(|held| copy > held) {
-            self.committed_ticks = copy.0;
-            self.committed_volume = copy.1;
+    fn note_committed(&mut self, copy: Fullness, trust: u32) {
+        match self.committed() {
+            Some(held) if copy < held => {}
+            Some(held) if copy == held => self.committed_trust = trust,
+            _ => {
+                self.committed_ticks = copy.0;
+                self.committed_volume = copy.1;
+                self.committed_trust = trust;
+            }
         }
         self.flags |= HAS_COMMITTED;
     }
@@ -173,8 +186,14 @@ impl BarEntry {
 struct Overflow {
     active: bool,
     disk_epoch: u32,
-    dead_lettered: bool,
     queue_mark: u64,
+    /// Latest bucket of any untracked copy written to the dead-letter file
+    /// (audit PR L, L2). Only the boot drain reads that file, so such a copy
+    /// stays on disk for the whole process; a live commit of a bar whose
+    /// bucket is at or before this is mirrored even after the rest of the
+    /// overflow has cleared. A bar with a later bucket cannot have a
+    /// dead-letter copy among them.
+    dead_letter_max_bucket: Option<u32>,
 }
 
 /// What the spill should do with a copy it is about to append.
@@ -225,6 +244,8 @@ pub(crate) struct SpillLedger {
     bars: HashMap<BarKey, BarEntry>,
     capacity: usize,
     overflow: Overflow,
+    /// Bumped on every QuestDB suspicion transition ([`Self::distrust_commits`]).
+    trust_generation: u32,
 }
 
 impl SpillLedger {
@@ -237,12 +258,15 @@ impl SpillLedger {
             bars: HashMap::with_capacity(capacity),
             capacity,
             overflow: Overflow::default(),
+            trust_generation: 0,
         }
     }
 
     /// `true` while the ledger holds anything or has overflowed.
     pub(crate) fn is_active(&self) -> bool {
-        !self.bars.is_empty() || self.overflow.active
+        !self.bars.is_empty()
+            || self.overflow.active
+            || self.overflow.dead_letter_max_bucket.is_some()
     }
 
     /// `true` while an untracked copy may be on disk.
@@ -260,11 +284,14 @@ impl SpillLedger {
         self.bars.get_mut(&key)
     }
 
-    fn note_untracked(&mut self, epoch: u32, dead_lettered: bool, queue_mark: u64) {
+    fn note_untracked(&mut self, bucket: u32, epoch: u32, dead_lettered: bool, queue_mark: u64) {
         let o = &mut self.overflow;
         o.active = true;
+        if dead_lettered {
+            o.dead_letter_max_bucket =
+                Some(o.dead_letter_max_bucket.map_or(bucket, |b| b.max(bucket)));
+        }
         o.disk_epoch = o.disk_epoch.max(epoch);
-        o.dead_lettered |= dead_lettered;
         o.queue_mark = o.queue_mark.max(queue_mark);
     }
 
@@ -304,17 +331,18 @@ impl SpillLedger {
         queue_mark: u64,
     ) -> bool {
         let copy = fullness_of(seal);
+        let trust = self.trust_generation;
         match self.entry(BarKey::of(seal)) {
             Some(entry) => {
                 entry.note_disk(copy, epoch, dead_lettered);
                 if also_committed {
-                    entry.note_committed(copy);
+                    entry.note_committed(copy, trust);
                 }
                 entry.queue_mark = entry.queue_mark.max(queue_mark);
                 true
             }
             None => {
-                self.note_untracked(epoch, dead_lettered, queue_mark);
+                self.note_untracked(seal.bucket_start_ist_secs, epoch, dead_lettered, queue_mark);
                 false
             }
         }
@@ -338,9 +366,10 @@ impl SpillLedger {
     ) -> LiveCommit {
         let key = BarKey::of(seal);
         let copy = fullness_of(seal);
+        let trust = self.trust_generation;
         if let Some(entry) = self.bars.get_mut(&key) {
             let mirror = entry.disk().is_some_and(|held| copy > held);
-            entry.note_committed(copy);
+            entry.note_committed(copy, trust);
             entry.queue_mark = entry.queue_mark.max(queue_mark);
             return if mirror {
                 LiveCommit::Mirror
@@ -348,20 +377,26 @@ impl SpillLedger {
                 LiveCommit::Nothing
             };
         }
-        if !self.overflow.active && !queue_busy {
+        // Audit PR L, L2: a bar an untracked dead-letter copy may hold is
+        // still mirrored after the rest of the overflow cleared.
+        let dead_letter_covers = self
+            .overflow
+            .dead_letter_max_bucket
+            .is_some_and(|max| key.bucket_start_ist_secs <= max);
+        if !self.overflow.active && !queue_busy && !dead_letter_covers {
             // No copy of this bar is on disk this process (or every one has
             // been replayed and forgotten), and none can be in the queue.
             return LiveCommit::Nothing;
         }
         match self.entry(key) {
             Some(entry) => {
-                entry.note_committed(copy);
+                entry.note_committed(copy, trust);
                 entry.queue_mark = entry.queue_mark.max(queue_mark);
             }
             // Full: the queued original, if any, may be written untracked.
-            None => self.note_untracked(epoch, false, queue_mark),
+            None => self.note_untracked(key.bucket_start_ist_secs, epoch, false, queue_mark),
         }
-        if self.overflow.active {
+        if self.overflow.active || dead_letter_covers {
             LiveCommit::MirrorOverflow
         } else {
             LiveCommit::Nothing
@@ -374,21 +409,43 @@ impl SpillLedger {
     /// # Complexity
     /// O(1), one hash probe.
     pub(crate) fn on_replay_commit(&mut self, seal: &SerializedSeal) {
+        let trust = self.trust_generation;
         if let Some(entry) = self.bars.get_mut(&BarKey::of(seal)) {
-            entry.note_committed(fullness_of(seal));
+            entry.note_committed(fullness_of(seal), trust);
         }
     }
 
-    /// `true` when `replayed` is less full than a copy already committed.
+    /// `true` when `replayed` is no fuller than a copy already committed.
     /// The replay drops it.
+    ///
+    /// Audit PR L, L2 (2026-10-26): an EQUAL copy is dropped too, was
+    /// written. It is the same bar, and re-writing it replaced the committed
+    /// live row with one whose three receipt delays read unknown (a replayed
+    /// seal carries no receipt times), for nothing. Only while the committed
+    /// copy is trusted: after a QuestDB suspicion ([`Self::distrust_commits`])
+    /// the equal copy is written again, since its ack may have been false.
     ///
     /// # Complexity
     /// O(1), one hash probe.
     pub(crate) fn replay_is_older(&self, replayed: &SerializedSeal) -> bool {
-        self.bars
-            .get(&BarKey::of(replayed))
-            .and_then(BarEntry::committed)
-            .is_some_and(|held| fullness_of(replayed) < held)
+        let copy = fullness_of(replayed);
+        self.bars.get(&BarKey::of(replayed)).is_some_and(|entry| {
+            entry.committed().is_some_and(|held| {
+                copy < held || (copy == held && entry.committed_trust == self.trust_generation)
+            })
+        })
+    }
+
+    /// Stop trusting every committed copy recorded so far (audit PR L, L2):
+    /// a replayed copy equal to one of them is written again, as before
+    /// 2026-10-26. Called on every QuestDB suspicion transition, when an ack
+    /// may have been false and the replay re-reads its files to repair it.
+    /// A strictly older copy is still skipped.
+    ///
+    /// # Complexity
+    /// O(1): one add.
+    pub(crate) fn distrust_commits(&mut self) {
+        self.trust_generation = self.trust_generation.wrapping_add(1);
     }
 
     /// Forget every bar whose copies can no longer be written: every disk
@@ -412,12 +469,16 @@ impl SpillLedger {
         });
         // O(1) EXEMPT: end
         let o = self.overflow;
-        if o.active
-            && !o.dead_lettered
-            && o.disk_epoch <= consumed_through
-            && queue.has_passed(o.queue_mark)
-        {
-            self.overflow = Overflow::default();
+        // Audit PR L, L2 (2026-10-26): a dead-lettered untracked copy used to
+        // pin the whole overflow for the process, so every later live commit
+        // was mirrored to the spill for the rest of the session. It now
+        // clears like any other, keeping only the dead-letter bucket bound,
+        // which mirrors just the bars such a copy could be.
+        if o.active && o.disk_epoch <= consumed_through && queue.has_passed(o.queue_mark) {
+            self.overflow = Overflow {
+                dead_letter_max_bucket: o.dead_letter_max_bucket,
+                ..Overflow::default()
+            };
         }
         before - self.bars.len()
     }
@@ -820,7 +881,8 @@ mod tests {
         // Once the replay commits c2 (a later file first), c1 is dropped.
         ledger.on_replay_commit(&c2);
         assert!(ledger.replay_is_older(&c1));
-        assert!(!ledger.replay_is_older(&c2));
+        // Audit PR L, L2: c2 itself, equal to the committed copy, is skipped too.
+        assert!(ledger.replay_is_older(&c2));
     }
 
     #[test]
@@ -862,6 +924,80 @@ mod tests {
         ledger.forget_replayed(1, IDLE);
         assert!(!ledger.overflowed());
         assert_eq!(ledger.len(), 0);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — the replay re-wrote a copy
+    /// equal to the committed one, replacing the live row with one whose
+    /// receipt delays read unknown. Bites with `<`.
+    #[test]
+    fn test_regression_replay_is_older_skips_a_copy_equal_to_the_committed_one() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let copy = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        ledger.record_on_disk(&copy, 1, false, true, 0);
+        assert!(
+            ledger.replay_is_older(&copy),
+            "the committed bar itself is not replayed"
+        );
+        assert!(
+            !ledger.replay_is_older(&copy_of(13, 2, TfIndex::M1, 600, 6, 40)),
+            "a fuller copy still is"
+        );
+    }
+
+    /// Audit PR L, L2: after a QuestDB suspicion the committed copies are not
+    /// trusted, so an equal copy the replay re-reads is written again; a
+    /// commit recorded after that is trusted again. Bites: without the trust
+    /// check the equal copy stays skipped after the suspicion.
+    #[test]
+    fn test_regression_distrust_commits_lets_an_equal_copy_replay_after_a_suspicion() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let copy = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        ledger.record_on_disk(&copy, 1, false, true, 0);
+        assert!(ledger.replay_is_older(&copy));
+        ledger.distrust_commits();
+        assert!(
+            !ledger.replay_is_older(&copy),
+            "its ack may have been false"
+        );
+        assert!(
+            ledger.replay_is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)),
+            "a strictly older copy is still skipped"
+        );
+        ledger.on_replay_commit(&copy);
+        assert!(
+            ledger.replay_is_older(&copy),
+            "trusted again once re-committed"
+        );
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — one untracked dead-letter
+    /// copy pinned the overflow for the process, so every later live commit
+    /// was mirrored to the spill. Now the overflow clears and only bars at or
+    /// before the dead-letter bucket are still mirrored. Bites: the old code
+    /// stays overflowed and mirrors the later bar.
+    #[test]
+    fn test_regression_forget_replayed_clears_an_overflow_a_dead_letter_copy_pinned() {
+        let mut ledger = SpillLedger::with_capacity(1);
+        ledger.record_on_disk(&copy_of(1, 2, TfIndex::M1, 600, 1, 1), 1, false, false, 0);
+        let dead_lettered = copy_of(2, 2, TfIndex::M1, 600, 1, 1);
+        assert!(!ledger.record_on_disk(&dead_lettered, 1, true, false, 0));
+        assert!(ledger.overflowed());
+        ledger.forget_replayed(1, IDLE);
+        assert!(
+            !ledger.overflowed(),
+            "the overflow clears once its spill copies are consumed"
+        );
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(3, 2, TfIndex::M1, 660, 2, 1), false, 2, 0),
+            LiveCommit::Nothing,
+            "a bar after the dead-letter bucket cannot be in that file"
+        );
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(2, 2, TfIndex::M1, 600, 2, 1), false, 2, 0),
+            LiveCommit::MirrorOverflow,
+            "the dead-lettered bar is still mirrored, so the boot drain ends on the fuller copy"
+        );
+        assert!(ledger.is_active());
     }
 
     #[test]

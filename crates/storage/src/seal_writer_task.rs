@@ -308,6 +308,21 @@ fn rescue_one(
     }
 }
 
+/// Send every seal the ring holds down the rescue cascade (spill, then DLQ,
+/// then a counted drop), oldest first, with no flush (audit PR L, L2). The
+/// shutdown drain uses it once a flush has failed, so a dead database costs
+/// one failed cycle, not one per `max_drain` seals.
+///
+/// `ring_seals_popped` stays 0 and `flushed_ok` false: nothing was handed to
+/// the writer. Cold path. O(ring), no allocation beyond the spill's own.
+pub fn rescue_ring(pipeline: &mut SealAbsorptionPipeline, now_unix_secs: i64) -> DrainOutcome {
+    let mut outcome = DrainOutcome::default();
+    while let Some(seal) = pipeline.pop_oldest() {
+        rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
+    }
+    outcome
+}
+
 // ---------------------------------------------------------------------------
 // Boot-time recovery drain (2026-08-11 — closes the silent-loss gap)
 // ---------------------------------------------------------------------------
@@ -1914,6 +1929,10 @@ pub struct MidSessionReplay {
     live_ok_flushes: u64,
     /// The watcher's view as of the last [`Self::observe_probe`].
     probe: ReplayProbe,
+    /// A suspicion began or ended since the last step (audit PR L, L2): the
+    /// next step tells the spill ledger to stop trusting the commits it
+    /// recorded, so an equal copy re-read after a false ack is written again.
+    distrust_pending: bool,
     /// Wall-clock second of the last directory scan.
     last_scan: Option<i64>,
     cursor: Option<ReplayCursor>,
@@ -2003,6 +2022,9 @@ impl MidSessionReplay {
     /// otherwise.
     pub fn observe_probe(&mut self, probe: ReplayProbe, now_unix_secs: i64) -> usize {
         let entering = probe.suspect && !self.probe.suspect;
+        if probe.suspect != self.probe.suspect {
+            self.distrust_pending = true;
+        }
         self.probe = probe;
         if !probe.suspect {
             return 0;
@@ -2116,6 +2138,9 @@ impl MidSessionReplay {
         ring_is_empty: bool,
         now_unix_secs: i64,
     ) -> ReplayOutcome {
+        if std::mem::take(&mut self.distrust_pending) {
+            spill.distrust_commits();
+        }
         let mut outcome = ReplayOutcome::default();
         self.archive_confirmed(&mut outcome);
         if !ring_is_empty || !self.is_healthy(now_unix_secs) {
@@ -4600,12 +4625,15 @@ mod tests {
             t0 + SEAL_REPLAY_HEALTHY_SECS,
         );
         assert_eq!(out.files_archived, 1);
-        assert_eq!(out.seals_reingested, 1);
+        // Audit PR L, L2 (2026-10-26): the amended copy mirrored behind the
+        // original equals the live commit, so it is not written again either
+        // (re-writing it only replaced the live row's receipt delays with
+        // unknown ones). Until then this read `seals_reingested == 1`.
+        assert_eq!(out.seals_reingested, 0);
         assert_eq!(out.records_skipped, 0, "a superseded copy is not a loss");
-        assert_eq!(
-            sink.committed,
-            vec![(600, 5)],
-            "the original is never written"
+        assert!(
+            sink.committed.is_empty(),
+            "the original is never written, and the committed amend is not re-written"
         );
         cleanup(&spill, &dlq);
     }

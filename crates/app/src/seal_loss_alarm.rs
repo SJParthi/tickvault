@@ -70,7 +70,13 @@ impl SealLossReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoDurableTier => "no durable tier installed (seal writer failed to boot)",
-            Self::BothDiskTiersFailed => "spill and DLQ both refused the write",
+            // Audit PR L, L2 (2026-10-26): the escalator now also refuses
+            // below the seal disk floor without writing; that refusal is
+            // reported through this reason too (its own coded line,
+            // `source = "seal_floor_refused"`, says which).
+            Self::BothDiskTiersFailed => {
+                "spill and DLQ both refused the write, or free space is below the seal floor"
+            }
         }
     }
 
