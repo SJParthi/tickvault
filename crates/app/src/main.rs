@@ -1336,6 +1336,10 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     };
+    // K4 (2026-10-26): the previous process's last receipt, read after the
+    // claim and before this process can append (boot crash-gap row).
+    let previous_process_last_receipt =
+        tickvault_storage::wal_last_receipt::newest_receipt_nanos_on_disk(&ws_wal_path);
 
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
@@ -3241,7 +3245,7 @@ async fn async_main() -> Result<()> {
     // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
     // conservation audit spawn was DELETED — its inputs (live WAL frames,
     // processor counters, `ticks` writes) all died with the live-WS
-    // retirements; the `tick_conservation_audit` table stays (SEBI).
+    // retirements. RESTORED in a new shape by K4 (2026-10-26), next to the cross-check.
 
     // Daily 15:25 IST orphan-position watchdog — PROCESS-GLOBAL
     // (2026-07-14 re-home; the tick-conservation hoist precedent directly
@@ -4000,6 +4004,16 @@ async fn async_main() -> Result<()> {
                 calendar: std::sync::Arc::clone(&trading_calendar),
             },
             &main_feed_instruments,
+        )
+    });
+    // K4 (2026-10-26): daily ticks conservation check (15:45 IST) and the
+    // boot downtime row. Own task; only with the Dhan lane, the one writer.
+    let _tick_conservation = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::tick_conservation::spawn_tick_conservation(
+            config.questdb.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            process_start_ist_nanos,
+            previous_process_last_receipt,
         )
     });
 

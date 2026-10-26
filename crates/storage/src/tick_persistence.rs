@@ -2878,7 +2878,13 @@ impl TickWriter {
                     self.persist_refused_tick(tick, capture_seq);
                     return Ok(());
                 }
-                self.append_row(&row)
+                let appended = self.append_row(&row);
+                // K4 (2026-10-26): the daily conservation check's process
+                // side. One relaxed add per accepted Dhan row, O(1), no alloc.
+                if appended.is_ok() && self.feed == Feed::Dhan {
+                    crate::tick_conservation_ledger::ledger().note_row_appended(row.ts_ist_nanos);
+                }
+                appended
             }
             Err(err) => Err(err.into()),
         };
@@ -3684,6 +3690,7 @@ impl TickWriter {
         // otherwise the rows take the inline spill below.
         if rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked) {
             note_rescue_outcome_ticks(false, range, false);
+            note_ticks_not_landed(self.feed, dropped);
             self.flush_counters.append_dropped.increment(dropped as u64);
             self.flush_counters
                 .rescue_deferred_to_wal
@@ -3713,6 +3720,15 @@ impl TickWriter {
         self.buffer.clear();
         self.pending = 0;
         dropped
+    }
+}
+
+/// K4 (2026-10-26): reports `rows` that left the tick buffer without reaching
+/// QuestDB to the conservation ledger, at the same sites that increment
+/// `tv_ticks_dropped_total`. Only the Dhan writer reports. O(1).
+fn note_ticks_not_landed(feed: Feed, rows: usize) {
+    if feed == Feed::Dhan {
+        crate::tick_conservation_ledger::ledger().note_rows_not_landed(rows as u64);
     }
 }
 
@@ -3776,6 +3792,7 @@ fn perform_tick_rescue(
             // not have it. `spilled` is the strictly narrower fact "and it is
             // recoverable", which is why it is a second increment rather than a
             // replacement.
+            note_ticks_not_landed(feed, dropped);
             metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
                 .increment(dropped as u64);
             metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str())
@@ -3801,6 +3818,7 @@ fn perform_tick_rescue(
             // The rescue itself failed (disk full, cap reached, no
             // permission). Fall back to the counted drop — a spill that
             // cannot be written must never mask the loss.
+            note_ticks_not_landed(feed, dropped);
             metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
                 .increment(dropped as u64);
             error!(
@@ -4381,6 +4399,7 @@ impl TickWriterSink {
         ) {
             Ok(path) => {
                 note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
+                note_ticks_not_landed(self.feed, rows);
                 self.counters.dropped.increment(rows as u64);
                 self.counters.spilled.increment(rows as u64);
                 error!(
@@ -4400,6 +4419,7 @@ impl TickWriterSink {
             }
             Err(err) => {
                 note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
+                note_ticks_not_landed(self.feed, rows);
                 self.counters.dropped.increment(rows as u64);
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
@@ -4922,6 +4942,46 @@ mod tests {
         w.append_tick_with_seq(&sample_tick(), 5).expect("append");
         assert_eq!(w.aux_rows_appended(), 0);
         assert_eq!(w.pending(), 1);
+    }
+
+    /// K4 (2026-10-26): an accepted Dhan `ticks` row is counted in the
+    /// conservation ledger under its IST day; a non-Dhan row and a refused row
+    /// are not. Each case uses its own day so parallel tests cannot interfere.
+    #[test]
+    fn test_k4_accepted_dhan_row_is_counted_in_the_conservation_ledger() {
+        use crate::tick_conservation_ledger::{TickConservationLedger, ledger};
+        let shifted = |days: u32| {
+            let mut t = sample_tick();
+            t.exchange_timestamp += days * 86_400;
+            t.received_at_nanos += i64::from(days) * 86_400 * 1_000_000_000;
+            t
+        };
+        let day_of = |t: &ParsedTick| {
+            let row = TickRow::from_parsed_tick(t, 7).expect("row"); // APPROVED: test
+            TickConservationLedger::ist_day_of(row.ts_ist_nanos)
+        };
+
+        let dhan_tick = shifted(1_001);
+        let mut dhan = TickWriter::for_test(Feed::Dhan);
+        dhan.append_tick_with_seq(&dhan_tick, 7).expect("append");
+        assert_eq!(ledger().accepted_rows_on(day_of(&dhan_tick)), 1);
+
+        let other_tick = shifted(1_002); // a non-Dhan feed is not counted
+        let mut other = TickWriter::for_test(Feed::Truedata);
+        other.append_tick_with_seq(&other_tick, 7).expect("append");
+        assert_eq!(ledger().accepted_rows_on(day_of(&other_tick)), 0);
+
+        let mut refused = sample_tick();
+        refused.exchange_timestamp = 2_600_000_000; // year 2052, refused by the band
+        refused.received_at_nanos = 0;
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&refused, 7).expect("refusal is Ok");
+        assert_eq!(
+            ledger().accepted_rows_on(TickConservationLedger::ist_day_of(
+                2_600_000_000_i64 * 1_000_000_000
+            )),
+            0
+        );
     }
 
     /// Item 45h (a): the Full packet's day-high / day-low OI reach `ticks`;
