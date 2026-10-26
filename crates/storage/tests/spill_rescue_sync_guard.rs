@@ -125,7 +125,7 @@ fn off_drain_paths_sync_and_the_drain_inline_path_does_not() {
 
 /// H4 (2026-10-03): the drain PARKS a rescue it cannot hand off instead of
 /// writing it to disk, and never WAITS to hand a parked batch on. Only the
-/// shutdown close may block on the send.
+/// shutdown close may wait, and only up to its deadline (audit K1).
 #[test]
 fn the_drain_parks_a_refused_rescue_and_never_waits_to_retry_it() {
     for (file, max) in [
@@ -165,9 +165,15 @@ fn the_drain_parks_a_refused_rescue_and_never_waits_to_retry_it() {
             "{file}: every flush retries the park"
         );
         let close = body_of(&src, "pub fn close_rescue_offload(");
+        // Audit K1 (2026-10-26): the shutdown hand-off has a deadline; a
+        // blocking `send` with none held the shutdown behind a stuck thread.
         assert!(
-            close.contains("tx.send(batch)"),
-            "{file}: shutdown hands every parked batch to the rescue thread"
+            close.contains("hand_off_before(&tx, batch, deadline)"),
+            "{file}: shutdown hands every parked batch to the rescue thread, with a deadline"
+        );
+        assert!(
+            !close.contains("tx.send(batch)"),
+            "{file}: the shutdown hand-off must never block without a deadline"
         );
     }
 }

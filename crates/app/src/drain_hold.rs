@@ -228,10 +228,14 @@ pub fn hold_value(holding: bool, until_unix: i64, written_unix: i64, left: &str)
 }
 
 /// Non-empty spill files waiting in `dir` (quarantine excluded). A drained
-/// file can be left behind empty, which is not work. O(files).
+/// file can be left behind empty, which is not work. Counts the ILP text
+/// files AND the framed depth files (`.dspl`, audit K1): the depth folder
+/// holds both, and before K1 a night with only framed depth left released the
+/// hold with that work undone. Two O(files) listings.
 fn waiting_spill_files(dir: &Path) -> usize {
     tickvault_storage::tick_spill_replay::list_spill_files(dir)
-        .iter()
+        .into_iter()
+        .chain(tickvault_storage::depth_spill_frame::list_framed_spill_files(dir))
         .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
         .count()
 }
@@ -1034,6 +1038,27 @@ mod tests {
         assert_eq!(waiting_spill_files(&dir), 0, "an emptied file is not work");
         std::fs::write(dir.join("ticks-dhan-2.ilp"), b"row\n").unwrap();
         assert_eq!(waiting_spill_files(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit K1: a non-empty framed depth spill file is work; an empty one
+    /// is not. Bite: drop the `list_framed_spill_files` chain and the count
+    /// reads 0.
+    #[test]
+    fn test_regression_k1_waiting_spill_files_counts_framed_depth_files() {
+        let dir = std::env::temp_dir().join(format!("tv-drain-hold-dspl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("depth-dhan-1.dspl"), b"").unwrap();
+        assert_eq!(
+            waiting_spill_files(&dir),
+            0,
+            "an emptied framed file is not work"
+        );
+        std::fs::write(dir.join("depth-dhan-2.dspl"), b"framed").unwrap();
+        assert_eq!(waiting_spill_files(&dir), 1, "a framed depth file is work");
+        std::fs::write(dir.join("depth-dhan-3.ilp"), b"row\n").unwrap();
+        assert_eq!(waiting_spill_files(&dir), 2, "both kinds in one folder");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
