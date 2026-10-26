@@ -173,6 +173,10 @@ pub struct GuardEnv {
     /// the OUT-OF-WINDOW stop only. The in-window budget breach stop never
     /// reads it.
     pub drain_hold_param: String,
+    /// The rendered Muhurat sessions (`muhurat_window`, plan item J8): a box
+    /// running inside a session window is in-window (budget check, no
+    /// schedule stop).
+    pub muhurat_sessions: String,
 }
 
 /// Grace: never out-of-window-stop a box within this many minutes of its
@@ -228,6 +232,8 @@ impl GuardEnv {
             }),
             drain_hold_param: std::env::var("DRAIN_HOLD_PARAM")
                 .unwrap_or_else(|_| crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string()),
+            muhurat_sessions: std::env::var(crate::muhurat_window::MUHURAT_SESSIONS_ENV)
+                .unwrap_or_default(),
         }
     }
 }
@@ -808,7 +814,12 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: Ssm
         return Ok(json!({"ok": true, "noop": true, "state": state, "released": released}));
     }
 
-    if in_up_window(now_utc) {
+    // Plan item J8: a configured Muhurat session window (a weekend or evening
+    // session) counts as in-window, so the guard runs the same budget check
+    // and never schedule-stops the box during the session.
+    if in_up_window(now_utc)
+        || crate::muhurat_window::in_muhurat_up_window_raw(now_utc, &env.muhurat_sessions)
+    {
         // Running DURING the trading window — expected. GAP 1 check first:
         // even in-window, a breached budget stops the box + kills the
         // morning restart. The breach stop is evaluated BEFORE any ping
@@ -1417,6 +1428,7 @@ mod tests {
             keep_alive_param: crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string(),
             budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
             drain_hold_param: crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string(),
+            muhurat_sessions: String::new(),
         }
     }
 
@@ -2879,5 +2891,53 @@ aws events enable-rule --name tv-prod-daily-start\n"
         .await;
         assert!(out.is_err(), "a failed stop must surface, not read as done");
         assert!(sns.published.borrow().is_empty());
+    }
+
+    // ---- plan item J8: a Muhurat session window is in-window -------------
+
+    #[tokio::test]
+    async fn test_muhurat_window_is_in_window_and_never_schedule_stops() {
+        // Sunday 2026-11-08 14:30 IST (09:00 UTC), launched 13:06 IST: past
+        // the grace, outside the weekday window, inside the Muhurat window.
+        let env = GuardEnv {
+            muhurat_sessions: "2026-11-08@14:05-15:30".to_string(),
+            ..test_env()
+        };
+        let ec2 = FakeEc2::launched_at("running", utc(2026, 11, 8, 7, 36));
+        let out = run_guard(
+            &env,
+            &ec2,
+            &FakeSns::default(),
+            &FakeEvents::new(),
+            &FakeBudgets { amount: Some(10.0) },
+            &FakeSsm::empty(),
+            utc(2026, 11, 8, 9, 0),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out["in_window"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_timing_unset_keeps_the_out_of_window_stop() {
+        let env = GuardEnv {
+            muhurat_sessions: "2026-11-08@-".to_string(),
+            ..test_env()
+        };
+        let ec2 = FakeEc2::launched_at("running", utc(2026, 11, 8, 7, 36));
+        let out = run_guard(
+            &env,
+            &ec2,
+            &FakeSns::default(),
+            &FakeEvents::new(),
+            &FakeBudgets { amount: Some(10.0) },
+            &FakeSsm::empty(),
+            utc(2026, 11, 8, 9, 0),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(ec2.stopped.borrow().len(), 1);
     }
 }
