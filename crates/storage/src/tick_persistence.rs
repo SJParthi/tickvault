@@ -2250,6 +2250,11 @@ pub struct TickWriter {
     /// Cleared only when `discard_pending` consumes it — a stale `true` is
     /// conservative (inline spill, the old behaviour), never a loss.
     pending_unbacked: bool,
+    /// Decides whether a failed flush the rescue thread cannot take may be
+    /// handed to the WAL (`(min_seq, max_seq, unbacked)`). Production is
+    /// always [`crate::wal_frame_fate::rescue_may_defer_to_wal`]; tests swap
+    /// it so they do not depend on the process-global WAL marks (J1).
+    wal_defer_check: fn(u64, u64, bool) -> bool,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
     /// Pre-resolved session-window refusal counters -- see
@@ -2620,6 +2625,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
                     out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
@@ -2648,6 +2654,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
                     out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
@@ -2685,6 +2692,15 @@ impl TickWriter {
         self
     }
 
+    /// Test-only: replaces the WAL-deferral decision (J1) so a test does not
+    /// depend on the process-global WAL flushed / lost marks.
+    #[cfg(test)]
+    #[must_use]
+    fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
+        self.wal_defer_check = check;
+        self
+    }
+
     pub fn for_test(feed: Feed) -> Self {
         register_drop_baseline(feed);
         Self {
@@ -2694,6 +2710,7 @@ impl TickWriter {
             pending_min_seq: 0,
             pending_max_seq: 0,
             pending_unbacked: false,
+            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
             feed,
             out_of_window: tick_out_of_window_counters(feed),
             last_capture_seq: 0,
@@ -3657,7 +3674,16 @@ impl TickWriter {
         // QuestDB — reporting less would be a false-OK. Rows WITHOUT a capture
         // sequence (`range.0 == 0`) exist nowhere else, so they keep the
         // inline spill: a slow drain is bad, a lost tick is worse.
-        if rescue_unavailable && range.0 != 0 && !unbacked {
+        //
+        // J1 (2026-10-26): "already in the WAL" was assumed, not checked. A
+        // record is queued for the WAL writer before it is written, and a
+        // writer with no segment or a failed `write_record` loses it with no
+        // shed bit set, so the rows were gone while the counters said
+        // "replayable". The deferral now needs the WAL to have flushed through
+        // `max_seq` and to have lost nothing at or above `min_seq`
+        // (`wal_frame_fate::rescue_may_defer_to_wal`, two relaxed loads);
+        // otherwise the rows take the inline spill below.
+        if rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked) {
             note_rescue_outcome_ticks(false, range, false);
             self.flush_counters.append_dropped.increment(dropped as u64);
             self.flush_counters
@@ -4392,6 +4418,94 @@ impl TickWriterSink {
 
 #[cfg(test)]
 mod tests {
+    // ---- J1 (2026-10-26): the deferral needs the WAL to have the frames ----
+
+    /// The WAL flushed everything and lost nothing: deferral as before.
+    fn wal_has_it(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, u64::MAX, 0)
+    }
+
+    /// The WAL writer has flushed nothing yet.
+    fn wal_not_flushed(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, 0, 0)
+    }
+
+    /// The WAL writer lost a record at the batch's oldest frame.
+    fn wal_lost_one(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(
+            min_seq,
+            max_seq,
+            unbacked,
+            u64::MAX,
+            min_seq,
+        )
+    }
+
+    #[test]
+    fn j1_rescue_spills_inline_when_the_wal_has_not_flushed_the_rows() {
+        let dir = scratch_dir("j1-not-flushed");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_not_flushed);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // thread gone -> the fallback arms
+        w.append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let files = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            files, 1,
+            "unflushed WAL frames -> inline spill, not a deferral"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j1_rescue_spills_inline_when_the_wal_lost_a_record_in_the_batch() {
+        let dir = scratch_dir("j1-lost");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_lost_one);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx);
+        w.append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let files = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            files, 1,
+            "a lost WAL record -> inline spill, never a deferral"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production wiring: every constructor uses the real WAL check.
+    #[test]
+    fn j1_every_tick_constructor_wires_the_real_wal_defer_check() {
+        let source = include_str!("tick_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert_eq!(
+            prod.matches("wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,")
+                .count(),
+            prod.matches("pending_unbacked: false,").count(),
+            "each constructor sets the real check"
+        );
+        assert!(
+            prod.contains(
+                "rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked)"
+            )
+        );
+    }
+
     // ---- Audit DB-8 (2026-10-11): a failed rescue names its real fate ----
 
     /// A row's sequence: frame base `b`, packet index `i`.
@@ -6724,7 +6838,9 @@ mod tests {
     #[test]
     fn test_regression_h4_wal_backed_rows_are_deferred_not_parked() {
         let dir = scratch_dir("h4-park-backed");
-        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (sink, rx) = w.split_rescue_offload();
         for k in 0..RESCUE_QUEUE_DEPTH as i64 + 1 {
             w.append_tick_with_seq(&sample_tick(), (1 << 20) + k)
@@ -7121,7 +7237,9 @@ mod tests {
     #[test]
     fn full_rescue_queue_defers_to_wal_without_file_io() {
         let dir = scratch_dir("defer-wal");
-        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut writer = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (_sink, rx) = writer.split_rescue_offload();
         drop(rx); // thread gone -> Disconnected on try_send
         writer
@@ -7791,7 +7909,9 @@ mod tests {
     #[test]
     fn test_regression_tick_refused_rescue_hand_off_retracts_its_floor() {
         let dir = scratch_dir("z7-refused");
-        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (_sink, rx) = w.split_rescue_offload();
         drop(rx); // Disconnected
         let seq = z7_seq(2);

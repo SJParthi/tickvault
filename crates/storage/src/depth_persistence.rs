@@ -1289,6 +1289,11 @@ pub struct DepthWriter {
     /// Cleared only when `discard_pending` consumes it — a stale `true` is
     /// conservative (inline spill, the old behaviour), never a loss.
     pending_unbacked: bool,
+    /// Decides whether a failed flush the rescue thread cannot take may be
+    /// handed to the WAL (`(min_seq, max_seq, unbacked)`). Production is
+    /// always [`crate::wal_frame_fate::rescue_may_defer_to_wal`]; tests swap
+    /// it so they do not depend on the process-global WAL marks (J1).
+    wal_defer_check: fn(u64, u64, bool) -> bool,
     feed: Feed,
     /// Pre-resolved session-window refusal counters. See
     /// [`DEPTH_OUT_OF_WINDOW_REASONS`] for why depth speaks a different
@@ -1542,6 +1547,7 @@ impl DepthWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
                     out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
@@ -1573,6 +1579,7 @@ impl DepthWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
                     out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
@@ -1611,6 +1618,7 @@ impl DepthWriter {
             pending_min_seq: 0,
             pending_max_seq: 0,
             pending_unbacked: false,
+            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
             feed,
             out_of_window: depth_out_of_window_counters(feed),
             dropped: 0,
@@ -1668,6 +1676,15 @@ impl DepthWriter {
     #[must_use]
     fn with_spill_dir_for_test(mut self, dir: PathBuf) -> Self {
         self.spill_dir = dir;
+        self
+    }
+
+    /// Test-only: replaces the WAL-deferral decision (J1) so a test does not
+    /// depend on the process-global WAL flushed / lost marks.
+    #[cfg(test)]
+    #[must_use]
+    fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
+        self.wal_defer_check = check;
         self
     }
 
@@ -2263,7 +2280,11 @@ impl DepthWriter {
         // unapplied, replayed, never archived unread) instead of a `df` fork
         // and a large file write on the frame-drain task. Rows without a
         // capture sequence keep the inline spill.
-        if rescue_unavailable && range.0 != 0 && !unbacked {
+        // J1 (2026-10-26): and only once the WAL has flushed through the
+        // batch's newest frame and lost nothing at or above its oldest
+        // (`wal_frame_fate::rescue_may_defer_to_wal`); a record queued but
+        // never written was otherwise gone while counted as replayable.
+        if rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked) {
             note_rescue_outcome_depth(false, range, false);
             self.flush_counters.rows_dropped.increment(rows as u64);
             self.flush_counters
@@ -3551,6 +3572,81 @@ impl DepthWriterSink {
 }
 #[cfg(test)]
 mod tests {
+    // ---- J1 (2026-10-26): the deferral needs the WAL to have the frames ----
+
+    /// The WAL flushed everything and lost nothing: deferral as before.
+    fn wal_has_it(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, u64::MAX, 0)
+    }
+
+    /// The WAL writer has flushed nothing yet.
+    fn wal_not_flushed(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, 0, 0)
+    }
+
+    /// The WAL writer lost a record at the batch's oldest frame.
+    fn wal_lost_one(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(
+            min_seq,
+            max_seq,
+            unbacked,
+            u64::MAX,
+            min_seq,
+        )
+    }
+
+    fn j1_assert_inline_spill(check: fn(u64, u64, bool) -> bool, tag: &str) {
+        let dir = spill_tmp(tag);
+        let mut w = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(check);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // thread gone -> the fallback arms
+        // A real frame base (row() carries base 0).
+        let r = DepthRow {
+            capture_seq: 1 << 30,
+            ..row()
+        };
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "{tag}: rows the WAL may not hold must be spilled inline, never deferred"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j1_depth_rescue_spills_inline_when_the_wal_has_not_flushed_the_rows() {
+        j1_assert_inline_spill(wal_not_flushed, "j1-depth-not-flushed");
+    }
+
+    #[test]
+    fn j1_depth_rescue_spills_inline_when_the_wal_lost_a_record_in_the_batch() {
+        j1_assert_inline_spill(wal_lost_one, "j1-depth-lost");
+    }
+
+    /// Production wiring: every constructor uses the real WAL check.
+    #[test]
+    fn j1_every_depth_constructor_wires_the_real_wal_defer_check() {
+        let source = include_str!("depth_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert_eq!(
+            prod.matches("wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,")
+                .count(),
+            prod.matches("pending_unbacked: false,").count(),
+            "each constructor sets the real check"
+        );
+        assert!(
+            prod.contains(
+                "rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked)"
+            )
+        );
+    }
+
     // ---- Audit DB-8 (2026-10-11): a failed depth rescue names its fate ----
 
     #[test]
@@ -4175,7 +4271,9 @@ mod tests {
     #[test]
     fn a_full_depth_rescue_queue_defers_wal_backed_rows_without_file_io() {
         let dir = spill_tmp("depth-rescue-defer");
-        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut w = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (_sink, _rx) = w.split_rescue_offload();
 
         for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
@@ -5572,7 +5670,9 @@ mod tests {
     #[test]
     fn test_regression_depth_refused_rescue_hand_off_retracts_its_floor() {
         let dir = spill_tmp("z7-depth-refused");
-        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut w = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (sink, rx) = w.split_rescue_offload();
         let wm = crate::wal_applied_watermark::applied_watermark();
         let kind = crate::wal_applied_watermark::AppliedSink::Depth;
