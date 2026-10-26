@@ -842,7 +842,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
   - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
 
-- [ ] K6 (app, storage, quality) Drain p99 tail (owner, 2026-10-26: "Always
+- [x] K6 (app, storage, quality) Drain p99 tail (owner, 2026-10-26: "Always
   achieve O(1) even with p99 everywhere"). K5 measured the main-feed drain
   bench at p50 0.9 us/tick, p99 3.2 us/tick (budget 2.5), p99.9 14.5 us/tick,
   max 0.48 ms on this container. Find where the tail comes from (profile the
@@ -855,6 +855,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   (checked in Rust; shell lines do not grow, rust-only lock).
   - Files: crates/app/src/dhan_feed_stack.rs, crates/storage/src/hot_path_telemetry.rs, crates/storage/src/tick_persistence.rs, crates/app/benches/feed_drain.rs, quality/benchmark-budgets.toml
   - Tests: DHAT on the drain unchanged with the new stage; stage recorded once per frame; the p99 check fails on a synthetic over-budget sample (self-test); before/after p99 numbers in the PR body
+  - Done 2026-10-26: the tick writer's row buffer is pre-sized (2 MiB), a `drain_main_frame` stage (1 ms budget) times decode + fold + append, and the feed_drain bench fails on a p99 over budget (self-tested). Bench p99 per frame 9,035 -> 6,940 ns (-23%), p99.9 35,095 -> 28,448 ns; drain-seam DHAT 11 blocks -> 0. Most of the remaining tail is the test VM's scheduling noise (a no-op loop shows the same p99/p50 ratio). The CI runner's p99 is not measured yet (Assumed headroom 6,250 ns/tick).
 
 ### PR L — 2026-10-26 wave-3 audit fixes (core socket, storage seal chain, trading fold, app lane, aws-lambdas, workflows, terraform)
 
@@ -923,7 +924,7 @@ inside its budget at p99; but the root disk sat at its 125 MiB/s ceiling from
 fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
 48,581 mismatches and 27,680 missing rows.
 
-- [ ] M1 (storage, app) Disk write amplification: the box writes about
+- [x] M1 (storage, app) Disk write amplification: the box writes about
   110-190 MiB/s in session (500 MiB/s days) against about 1 MB/s of tick
   rows. Measure which writer it is (QuestDB out-of-order merges from spill
   replay or WAL catch-up, the frame WAL, candle tables, uploads) from the
@@ -931,6 +932,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   fits well under 125 MiB/s. Report before/after bytes per tick.
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs
   - Tests: one regression test per change; a measured bytes-written figure in the PR body
+  - Done 2026-10-26 in part: tick spill replay now waits until after 15:40 IST unless the spill volume runs low (no row dropped; the evening drain hold covers it), and every `ticks` row is counted by where its timestamp lands (`tv_ticks_ts_placement_total`). Measured 51 KB of disk writes per tick (116 MiB/s for about 2,390 ticks/s). Main cause found and NOT fixed: `ticks` is partitioned on the exchange trade time and 70-75% of rows are repeat quotes carrying an old trade time, so about 5% land in an already closed hour partition and most commits force QuestDB to rewrite partitions (QuestDB internals Assumed). The fix changes the data-integrity rule for `ts`, so it is listed for the owner below.
 - [ ] M2 (storage) WAL backlog never drains: 1,696 pinned segments (225 GB)
   flat all day, boot catch-up defers 1,759 segments every day on its RAM
   budget. Find why no catch-up makes net progress and make each boot or
@@ -938,14 +940,15 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   bounded and O(1) per frame.
   - Files: crates/storage/src/wal_unapplied_ranges.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_replay_settle.rs, crates/app/src/evening_drain.rs
   - Tests: lifetime property test where the backlog shrinks across boots; regression tests per change
-- [ ] M3 (app, trading) Data checks failed: find whether the 16.6% 1-minute
+- [x] M3 (app, trading) Data checks failed: find whether the 16.6% 1-minute
   divergence, the 10,186 missing live minutes and the 48,581 timeframe
   mismatches come from rows not yet applied when the check read (writer lag)
   or from the fold, and fix the cause (the check must not read before the
   rows it judges are applied; a fold bug gets its regression test).
   - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_crossverify.rs, crates/app/src/tf_consistency_boot.rs, crates/trading/src/candles/multi_tf_aggregator.rs
   - Tests: regression test per cause found; readiness barrier covers the spill/replay backlog
-- [ ] M4 (core, app, terraform) Smaller live findings: the socket hand-off
+  - Done 2026-10-26: the timeframe check waits (until 15:55 IST at most) for sealed, saved and applied candles and counts a bar still unsealed as `unsealed_at_read`, not missing; the two shapes the fold makes by design (a day extreme moving across a minute boundary, the 09:15 bar's first volume) are counted apart and no longer logged as TF-VERIFY-01 (the code was never paged). The 1-minute check's 15-17% divergence is the vendor's full trade tape against our sampled feed (same every day, 13-26 Oct); its summary now logs the split per field. No paging threshold changed.
+- [x] M4 (core, app, terraform) Smaller live findings: the socket hand-off
   stage went over its 100 us budget 8,843 times (p99.9 262 us at the open)
   — find and remove the tail at its source, O(1), zero allocation; the
   planned-connections gauge stays at 1 after five sockets come up; the
@@ -955,6 +958,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   keep logs forever (set retention).
   - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform
   - Tests: DHAT on the socket path unchanged; regression test per change
+  - Done 2026-10-26: the WAL writer polls for 50 ms after its last record (1 ms sleep) before its blocking wait, so the reader no longer pays a futex wake per frame (harness: WAL hand-off max 4.0 ms -> 22 us, 0 over budget; frames reach the WAL file up to about 1 ms later); the reserved-connections gauge follows the widen; contract-map refusals are counted only for subscribed contracts (none lose their underlying); the two QuestDB console log groups get 14-day retention in terraform (not applied, not validated locally). Live confirmation waits for the next session.
 
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
@@ -967,6 +971,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   session since the 21 Oct cut; Quote 32 step 2's "after one depth-off session
   peaks under 100 MiB/s" was not met: 21 Oct averaged 191 MiB/s).
 - The REST stack re-trying after its lock patience (L3 5b, reverted).
+- The `ticks` designated timestamp (M1 root cause): repeat quotes keep their old trade time, so most commits insert behind newer rows and QuestDB rewrites partitions (about 51 KB written per tick). Stamping repeat quotes with their receipt time, or moving them to a receipt-stamped table, changes the data-integrity rule for `ts` and needs the owner's dated quote first.
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
   without a dated measured row (websocket-connection-scope-lock.md 2026-10-10).

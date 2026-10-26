@@ -49,6 +49,19 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-26 with audit M4: a wall-clock timing harness for the
+    // socket hand-off stage (frames 400 us apart so the WAL writer and the
+    // drain are parked). It prints percentiles and gates nothing, the same
+    // as the other `#[ignore]`d cost harnesses (a wall-clock number must not
+    // become a flaky CI gate); the behaviour is pinned by the ordinary tests
+    // in `crates/storage/src/wal_writer_wait.rs`. Re-run it when that wait
+    // changes:
+    //
+    //   cargo test --release -p tickvault-core --test socket_to_wal_tail_harness -- --ignored --nocapture
+    (
+        "crates/core/tests/socket_to_wal_tail_harness.rs",
+        "socket_to_wal_stage_cost_with_parked_consumers",
+    ),
     // Added 2026-10-11 with the real-SIGKILL chaos test (audit TEST-1): these
     // two are the CHILD halves of `chaos_wal_real_sigkill.rs`. Each parent
     // test re-runs its own test binary with `--ignored --exact <child>`,
