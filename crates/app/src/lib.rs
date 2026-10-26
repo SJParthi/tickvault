@@ -67,6 +67,10 @@ pub mod tf_consistency_boot;
 // `ws_wal_dir()` helper relocated to `boot_helpers`, `parse_questdb_count`
 // to `feed_scoreboard_boot`. The `tick_conservation_audit` QuestDB table
 // is RETAINED (SEBI, forensic).
+// RESTORED in a new shape 2026-10-26 (plan item K4): the Dhan live lane writes
+// `ticks` again. Daily rows-accepted-vs-rows-stored check after 15:40 IST, and
+// the boot `feed_gap_audit` row for the downtime before a mid-session start.
+pub mod tick_conservation;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
 // operator-locked pre-open equilibrium open-price gap.

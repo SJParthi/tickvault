@@ -1974,6 +1974,24 @@ rules:
       compares against prior days (trend, not absolute) before deciding
       which store is wrong. Nothing is safe to auto-fix.
 
+  # TICK-CONSERVE-01 (plan item K4, 2026-10-26) = the daily 15:45 IST check
+  # found today's `ticks` rows do not reconcile with the rows the process
+  # accepted, after every counted spill, failure and WAL deferral. A data
+  # verdict (is_auto_triage_safe = false, the TF-VERIFY-01 precedent): apply
+  # lag, a second writer or a real loss each need a human to tell apart.
+  - name: tick-conserve-01-daily-mismatch-escalate
+    match:
+      code: TICK-CONSERVE-01
+    action: escalate
+    runbook_path: docs/error-runbooks/tick-conservation-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      TICK-CONSERVE-01 = the day's ticks rows do not match the rows accepted
+      for persistence. The tick_conservation_audit row carries the numbers;
+      the operator checks QuestDB apply lag and the loss counters named in
+      the runbook before deciding. Nothing is safe to auto-fix.
+
   # TF-VERIFY-02 = the verifier run itself degraded (client build /
   # discovery / per-SID query / truncation / flush / budget). Best-effort
   # forensic cold-path task: a lost run loses one day's verification

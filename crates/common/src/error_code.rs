@@ -789,6 +789,14 @@ pub enum ErrorCode {
     /// waits for its verdict. A degraded or blind run never renders as a
     /// pass. Severity::High, auto-triage-safe.
     DhanLiveXverify01RunDegraded,
+    /// TICK-CONSERVE-01 — the daily tick conservation check (plan item K4,
+    /// 2026-10-26) found that the `ticks` rows QuestDB holds for today do not
+    /// match the rows this process accepted for persistence, after the rows
+    /// already counted as dropped, spilled or deferred to the WAL replay.
+    /// Restored (retired 2026-07-18, when nothing wrote `ticks`): the Dhan
+    /// live lane writes `ticks` again. Log only (no filter, alarm or page).
+    /// Severity::High; never auto-triaged (a data verdict the operator judges).
+    TickConserve01DailyMismatch,
     // SPOT1M-01 RETIRED 2026-09-16 with the per-minute spot-1m REST fetch.
     // SPOT1M-02 below SURVIVES — its remaining emitter is the per-contract
     // 1m leg, not the spot leg.
@@ -1272,6 +1280,7 @@ impl ErrorCode {
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
             Self::DhanLiveXverify01RunDegraded => "DHAN-LIVE-XVERIFY-01",
+            Self::TickConserve01DailyMismatch => "TICK-CONSERVE-01",
             // Per-minute REST pipeline (operator grant 2026-07-12).
             Self::Spot1m02PersistFailed => "SPOT1M-02",
             // Daily timeframe-consistency verifier (operator 2026-07-13)
@@ -1543,6 +1552,9 @@ impl ErrorCode {
             // DHAN-LIVE-XVERIFY-01 — the only external check on the captured
             // candles ran degraded or blind. Loud (High), never a halt.
             Self::DhanLiveXverify01RunDegraded => Severity::High,
+            // TICK-CONSERVE-01 (K4, 2026-10-26): today's `ticks` rows do not
+            // reconcile with the rows accepted for persistence. High, log only.
+            Self::TickConserve01DailyMismatch => Severity::High,
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
@@ -1783,6 +1795,9 @@ impl ErrorCode {
             Self::DhanLiveXverify01RunDegraded => {
                 "docs/error-runbooks/dhan-live-crossverify-error-codes.md"
             }
+            Self::TickConserve01DailyMismatch => {
+                "docs/error-runbooks/tick-conservation-error-codes.md"
+            }
             // Per-minute REST pipeline (operator grant 2026-07-12). Only the
             // contract-1m leg still emits in this family; see SPOT1M-02.
             Self::Spot1m02PersistFailed => {
@@ -1856,6 +1871,10 @@ impl ErrorCode {
                 // would re-stamp rows and could mask the evidence (the
                 // Futidx02 precedent).
                 | Self::TfVerify01MismatchFound
+                // TICK-CONSERVE-01 (K4, 2026-10-26): a row-count verdict the
+                // operator judges (restart, apply lag or a real loss); the
+                // TF-VERIFY-01 precedent.
+                | Self::TickConserve01DailyMismatch
                 // ORDER-READY-01 (Cluster F, 2026-07-14): restoring
                 // dataPlan/segment/token is an operator/broker ACCOUNT decision
                 // (CHAIN-01 precedent); no auto-triage action may ever touch the
@@ -2013,6 +2032,7 @@ impl ErrorCode {
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded,
             Self::DhanLiveXverify01RunDegraded,
+            Self::TickConserve01DailyMismatch,
             // Per-minute REST pipeline (operator grant 2026-07-12). SPOT1M-02
             // is the sole survivor — see its docblock.
             Self::Spot1m02PersistFailed,
@@ -2432,6 +2452,9 @@ mod tests {
                 // TICK-CONSERVE- prefix was likewise REMOVED with its only
                 // variant (`TickConserve01DailyResidual` — every audit
                 // input died with the dead tick chain, stage-2 sweep).
+                // 2026-10-26 (K4): re-added for `TickConserve01DailyMismatch`
+                // (the Dhan live lane writes `ticks` again).
+                || s.starts_with("TICK-CONSERVE-")
                 // PR-A 2026-06-28: Groww shared-master persist
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
                 // PR-R1 (2026-07-04): Groww native-Rust shadow client
