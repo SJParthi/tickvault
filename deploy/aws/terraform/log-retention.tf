@@ -39,6 +39,36 @@ resource "aws_cloudwatch_log_group" "tv_metrics" {
   retention_in_days = 14
 }
 
+# 2026-10-26 (audit PR M / M4): two more auto-created groups with NO retention,
+# read live: the QuestDB console front and proxy Lambdas never declared a log
+# group, so the runtime created both on first invoke with "never expire".
+# Adopted with the same 14 days as operator-control above. Gated on the same
+# flag as the Lambdas (`for_each` on the import, Terraform >= 1.7), so a stack
+# with the console off neither imports nor creates them.
+import {
+  for_each = var.enable_questdb_console ? toset(["front"]) : toset([])
+  to       = aws_cloudwatch_log_group.questdb_console_front[0]
+  id       = "/aws/lambda/tv-${var.environment}-questdb-console-front"
+}
+
+resource "aws_cloudwatch_log_group" "questdb_console_front" {
+  count             = var.enable_questdb_console ? 1 : 0
+  name              = "/aws/lambda/tv-${var.environment}-questdb-console-front"
+  retention_in_days = 14
+}
+
+import {
+  for_each = var.enable_questdb_console ? toset(["proxy"]) : toset([])
+  to       = aws_cloudwatch_log_group.questdb_console_proxy[0]
+  id       = "/aws/lambda/tv-${var.environment}-questdb-console-proxy"
+}
+
+resource "aws_cloudwatch_log_group" "questdb_console_proxy" {
+  count             = var.enable_questdb_console ? 1 : 0
+  name              = "/aws/lambda/tv-${var.environment}-questdb-console-proxy"
+  retention_in_days = 14
+}
+
 # ---------------------------------------------------------------------------
 # Account-level CloudWatch Logs ingestion alarm — catches ANY log runaway
 # (a debug-loop Lambda, a chatty agent scrape, a new unretained group)

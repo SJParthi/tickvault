@@ -2361,6 +2361,12 @@ pub async fn load_contract_universe(
         // artifact -- while saying nothing about why, so the top-volume board
         // ranked nothing for two sessions and the cause had to be found by
         // reading source. See `count_artifact_refusals` for the full record.
+        // Only SUBSCRIBED contracts' refusals are counted (PR M / M4): the
+        // rest are other expiries and BSE, refused on every attach attempt.
+        let artifact_refusals = crate::contract_underlying_map::subscribed_refusals(
+            &artifact_refusals,
+            &selection.instruments,
+        );
         let artifact_refusal_reasons =
             crate::contract_underlying_map::count_artifact_refusals(&artifact_refusals);
         let (legs, selected_first) =
@@ -2418,15 +2424,17 @@ pub async fn load_contract_universe(
             "candle contract names published — option candles now carry their contract name"
         );
         crate::contract_underlying_map::global_contract_underlying_map().publish_labels(labels);
-        let build = crate::contract_underlying_map::global_contract_underlying_map()
-            .publish_from_legs(&legs);
+        let (build, refused_subscribed_in_build) =
+            crate::contract_underlying_map::global_contract_underlying_map()
+                .publish_from_legs_selected_first(&legs, selected_first);
         tracing::info!(
             mapped_contracts = build.accepted,
             subscribed_option_legs_ordered_first = selected_first,
             subscribed_instruments = selection.instruments.len(),
             option_legs_in_artifact = legs.len(),
             refused_in_build = build.refusals.len(),
-            refused_in_artifact_scan = artifact_refusals.len(),
+            refused_subscribed_in_build,
+            refused_subscribed_in_artifact_scan = artifact_refusals.len(),
             artifact_refusal_reasons = %artifact_refusal_reasons,
             "contract-to-underlying map published — this is what the top-volume ranking \
              can see; every subscribed option leg was offered a slot before any \

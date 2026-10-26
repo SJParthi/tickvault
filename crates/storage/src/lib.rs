@@ -319,6 +319,9 @@ pub mod ws_frame_spill;
 pub mod wal_last_receipt;
 // Quote 31 (2026-10-21): seal the WAL writer's open segment on request.
 pub mod wal_idle_seal;
+// PR M / M4 (2026-10-26): the WAL writer polls while frames flow, so the
+// socket read task never pays a futex wake to hand it a frame.
+pub mod wal_writer_wait;
 // PR W review round 7: count a WAL record written past the reorder slack.
 pub mod wal_reorder_guard;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
