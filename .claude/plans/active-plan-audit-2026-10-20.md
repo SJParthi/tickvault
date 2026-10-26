@@ -793,7 +793,7 @@ all teh permissiosn"). Each item closes a gap the wave-1 slice audits and the
 WebSocket-continuity attack confirmed in source; none changes an operator-locked
 rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they are).
 
-- [ ] K1 (storage, app) Spill replay and spill files: only HTTP 400/413/422 count
+- [x] K1 (storage, app) Spill replay and spill files: only HTTP 400/413/422 count
   as a bad payload (other 4xx are retried like a 5xx); a round stops after 3 files
   in a row are quarantined with the same status; the bisection POST cap follows
   the 64-line cap; a whole framed depth record that QuestDB refuses increments the
@@ -803,7 +803,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   counts the rest abandoned; the drain hold also counts depth framed spill files.
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/depth_spill_frame.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/http_client.rs, crates/app/src/drain_hold.rs
   - Tests: one regression test per change (status classification, quarantine streak stop, POST cap, set-aside counter, newline guard, park deadline, depth folder counted)
-- [ ] K2 (storage) WAL core: a failed segment sync raises the lost mark so the
+- [x] K2 (storage) WAL core: a failed segment sync raises the lost mark so the
   rescue stops deferring to it, logged `error!` with its code; a shutdown that
   abandons a stuck writer is counted and never logged "complete"; a segment that
   cannot be read (I/O error) stays in place with a retry cap instead of being
@@ -813,7 +813,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   first frame; the stale re-capture comment is corrected.
   - Files: crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_replay_settle.rs
   - Tests: one regression test per change
-- [ ] K3 (core, app) The 300 s silence fallback redials at most one socket per
+- [x] K3 (core, app) The 300 s silence fallback redials at most one socket per
   kind per `CONFIRMED_REDIAL_SPACING_SECS`, so a market-wide silence no longer
   redials every main-feed socket in the same second; the tick-gap detector's
   LTT-backward and volume-jump verdicts are counted (pre-resolved counters, local
@@ -821,7 +821,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/src/pipeline/tick_gap_detector.rs, crates/app/src/dhan_feed_stack.rs
   - Tests: five silent sockets for 1,800 s never redial two inside one spacing; verdict counters move on a crafted backward LTT and volume jump; DHAT on the observe path unchanged
 
-- [ ] K4 (app, storage) Daily tick conservation and crash gaps: after the
+- [x] K4 (app, storage) Daily tick conservation and crash gaps: after the
   session, compare the packets the drain folded today (per feed) with the rows
   in `ticks` for today minus counted losses and deferrals, and write one
   `tick_conservation_audit` row (DEDUP `ts, trading_date_ist, feed`); a

@@ -96,3 +96,19 @@ pub(super) fn note_stage_failure(source: &'static str, path: &Path, err: &std::i
          and is read again by the next pass"
     );
 }
+
+/// Counts and logs one replay pass refused because a segment folder could not
+/// be listed (K2). Nothing is staged or archived; every segment stays where it
+/// is for the next pass.
+// TEST-EXEMPT: covered by test_regression_k2_unlistable_replaying_folder_refuses_the_pass (asserts the counter moves).
+pub(super) fn note_listing_refused(wal_dir: &Path, err: &std::io::Error) {
+    metrics::counter!(WAL_REPLAY_LISTING_REFUSED_COUNTER).increment(1);
+    error!(
+        code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
+        wal_dir = ?wal_dir,
+        error = %err,
+        "WAL replay REFUSED: a segment folder could not be listed, so this pass \
+         cannot know which segments it would leave behind. Nothing is staged or \
+         archived; every segment stays where it is for the next pass"
+    );
+}

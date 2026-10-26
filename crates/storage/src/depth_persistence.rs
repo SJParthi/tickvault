@@ -2398,20 +2398,31 @@ impl DepthWriter {
     /// levels still reach the spill tier.
     ///
     /// H4 (2026-10-03): every parked batch is handed to the rescue thread
-    /// first, with a BLOCKING send — shutdown only; see
-    /// `TickPersistenceWriter::close_rescue_offload` for why.
+    /// first. Audit K1 (2026-10-26): with a deadline, not a blocking `send`
+    /// (see `TickPersistenceWriter::close_rescue_offload`); past it a batch
+    /// is written inline, and if that fails too its unbacked rows are counted
+    /// on [`DEPTH_RESCUE_ABANDONED_COUNTER`] with a coded `error!`.
     pub fn close_rescue_offload(&mut self) {
+        use crate::tick_persistence::{
+            RESCUE_SHUTDOWN_HANDOFF_BUDGET, ShutdownHandOff, hand_off_before,
+        };
         if let Some(tx) = self.rescue.take() {
+            let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
             while let Some(batch) = self.parked_rescue.pop_front() {
                 self.parked_rescue_bytes = self
                     .parked_rescue_bytes
                     .saturating_sub(batch.buffer.as_bytes().len());
                 let rows = batch.rows;
-                match tx.send(batch) {
-                    Ok(()) => self.flush_counters.rescue_queued.increment(rows as u64),
-                    Err(std::sync::mpsc::SendError(batch)) => {
+                match hand_off_before(&tx, batch, deadline) {
+                    ShutdownHandOff::Sent => {
+                        self.flush_counters.rescue_queued.increment(rows as u64);
+                    }
+                    ShutdownHandOff::Gone(batch) => {
                         self.flush_counters.rescue_fallback_thread_gone.increment(1);
-                        self.spill_parked_on_drain(batch);
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                    ShutdownHandOff::TimedOut(batch) => {
+                        self.spill_parked_at_shutdown(batch);
                     }
                 }
             }
@@ -2419,7 +2430,7 @@ impl DepthWriter {
         // Unreachable with batches still parked (only a split writer parks),
         // and written inline rather than dropped if it ever is.
         while let Some(batch) = self.parked_rescue.pop_front() {
-            self.spill_parked_on_drain(batch);
+            self.spill_parked_at_shutdown(batch);
         }
         self.parked_rescue_bytes = 0;
         self.flush_counters.rescue_parked_bytes.set(0.0);
@@ -2505,6 +2516,43 @@ impl DepthWriter {
             wm.release_rescue_floor(floor);
         }
         wm.note_depth_completed();
+    }
+
+    /// [`Self::spill_parked_on_drain`] at shutdown (audit K1): a batch whose
+    /// inline write also fails and whose rows the WAL does not hold is counted
+    /// on [`DEPTH_RESCUE_ABANDONED_COUNTER`], with a coded line.
+    fn spill_parked_at_shutdown(&self, batch: DepthRescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let rows = batch.rows;
+        let landed = self.spill_on_drain(
+            batch.buffer.as_bytes(),
+            spill_version_of(batch.buffer.protocol_version()),
+            batch.rows,
+            fate,
+        );
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_depth_completed();
+        if !landed && fate == crate::wal_applied_watermark::RESCUE_FATE_LOST {
+            metrics::counter!(DEPTH_RESCUE_ABANDONED_COUNTER, "writer" => "depth")
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                rows,
+                source = crate::tick_persistence::SHUTDOWN_RESCUE_ABANDONED_SOURCE,
+                "shutdown: a parked depth rescue batch could not be handed to the rescue \
+                 thread in time AND could not be written to the spill file, and the WAL does \
+                 not hold its rows. These depth rows are LOST."
+            );
+        }
     }
 
     /// The drain's only depth spill write, NOT synced (see

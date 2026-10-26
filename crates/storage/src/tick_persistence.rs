@@ -1747,9 +1747,11 @@ pub(crate) fn spill_failed_ilp_to(
         spec.file_prefix,
         spec.feed.as_str()
     ));
+    // `read` too, so the newline guard below can look at the last byte.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(&path)?;
     // The length before this append, taken only by a tier that serialises
     // its appends (see `IlpSpillSpec::truncate_failed_append`).
@@ -1758,8 +1760,19 @@ pub(crate) fn spill_failed_ilp_to(
     } else {
         None
     };
-    let append = || -> std::io::Result<()> {
+    let mut separator_bytes: u64 = 0;
+    let mut append = || -> std::io::Result<()> {
         let mut writer = &file;
+        // Audit K1: a failed partial write (a full disk, a crash of the other
+        // appender) can leave a fragment with no newline at the end of the
+        // file, and this append would join onto it, so the replay sees ONE
+        // malformed line and refuses a good row with the torn one. End the
+        // fragment first. Two appenders racing here can both add one, which
+        // leaves an empty line: harmless to ILP, never a joined row.
+        if file_ends_mid_line(&file)? {
+            writer.write_all(b"\n")?;
+            separator_bytes = 1;
+        }
         writer.write_all(payload)?;
         writer.flush()?;
         if let Some(sync) = sync {
@@ -1782,10 +1795,25 @@ pub(crate) fn spill_failed_ilp_to(
         return Err(err);
     }
     if on_drain && let Some(cache) = spec.drain_held {
-        cache.note_written(dir, payload.len() as u64);
+        cache.note_written(dir, (payload.len() as u64).saturating_add(separator_bytes));
     }
     Ok(path)
     // O(1) EXEMPT: end
+}
+
+/// `true` when `file` is non-empty and its last byte is not `\n`: a torn
+/// fragment a failed append left behind (audit K1). One `fstat` and one
+/// one-byte positioned read; cold path (spill appends only).
+// O(1) EXEMPT: cold path, runs only on a spill append after a failed flush.
+fn file_ends_mid_line(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt as _;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut last = [0_u8; 1];
+    file.read_exact_at(&mut last, len - 1)?;
+    Ok(last[0] != b'\n')
 }
 /// Total bytes of the spill directory, INCLUDING the quarantine subtree.
 ///
@@ -3299,22 +3327,31 @@ impl TickWriter {
     /// refused, so the end-of-session rows still reach the spill tier.
     ///
     /// H4 (2026-10-03): every parked batch is handed to the rescue thread
-    /// first, with a BLOCKING send. Shutdown only: waiting for the thread to
-    /// take one batch costs no more than the inline write it replaces, and the
-    /// thread syncs the file where an inline write would not. A thread that is
-    /// already gone gets the batch written inline instead, never dropped.
+    /// first. Audit K1 (2026-10-26): the hand-off has a DEADLINE
+    /// ([`RESCUE_SHUTDOWN_HANDOFF_BUDGET`] for all parked batches together),
+    /// where it used to be a blocking `send` with none, so a rescue thread
+    /// stuck on a wedged disk held the whole shutdown. A batch the thread does
+    /// not take in time, or a thread already gone, is written inline instead;
+    /// if that write fails too, its unbacked rows are counted lost on
+    /// `tv_ticks_lost_total{source="rescue_abandoned"}` with a coded `error!`.
     pub fn close_rescue_offload(&mut self) {
         if let Some(tx) = self.rescue.take() {
+            let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
             while let Some(batch) = self.parked_rescue.pop_front() {
                 self.parked_rescue_bytes = self
                     .parked_rescue_bytes
                     .saturating_sub(batch.buffer.as_bytes().len());
                 let rows = batch.rows;
-                match tx.send(batch) {
-                    Ok(()) => self.flush_counters.rescue_queued.increment(rows as u64),
-                    Err(std::sync::mpsc::SendError(batch)) => {
+                match hand_off_before(&tx, batch, deadline) {
+                    ShutdownHandOff::Sent => {
+                        self.flush_counters.rescue_queued.increment(rows as u64);
+                    }
+                    ShutdownHandOff::Gone(batch) => {
                         self.flush_counters.rescue_fallback_thread_gone.increment(1);
-                        self.spill_parked_on_drain(batch);
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                    ShutdownHandOff::TimedOut(batch) => {
+                        self.spill_parked_at_shutdown(batch);
                     }
                 }
             }
@@ -3322,7 +3359,7 @@ impl TickWriter {
         // Unreachable with batches still parked (only a split writer parks),
         // and written inline rather than dropped if it ever is.
         while let Some(batch) = self.parked_rescue.pop_front() {
-            self.spill_parked_on_drain(batch);
+            self.spill_parked_at_shutdown(batch);
         }
         self.parked_rescue_bytes = 0;
         self.flush_counters.rescue_parked_bytes.set(0.0);
@@ -3407,6 +3444,40 @@ impl TickWriter {
             wm.release_rescue_floor(floor);
         }
         wm.note_ticks_completed();
+    }
+
+    /// [`Self::spill_parked_on_drain`] at shutdown (audit K1): a batch whose
+    /// inline write also fails and whose rows the WAL does not hold is counted
+    /// lost on `tv_ticks_lost_total{source="rescue_abandoned"}`, with a coded
+    /// line. Rows the WAL holds are left to the next boot's replay (the fate
+    /// line from the failed write already says so).
+    fn spill_parked_at_shutdown(&self, batch: RescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let rows = batch.rows;
+        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows, fate);
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_ticks_completed();
+        if !landed && fate == crate::wal_applied_watermark::RESCUE_FATE_LOST {
+            metrics::counter!("tv_ticks_lost_total", "source" => SHUTDOWN_RESCUE_ABANDONED_SOURCE)
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                rows,
+                source = SHUTDOWN_RESCUE_ABANDONED_SOURCE,
+                "shutdown: a parked tick rescue batch could not be handed to the rescue thread \
+                 in time AND could not be written to the spill file, and the WAL does not hold \
+                 its rows. These ticks are LOST."
+            );
+        }
     }
 
     /// The drain's only spill write, NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
@@ -3912,6 +3983,64 @@ pub const TICK_RESCUE_DEFERRED_TO_WAL_COUNTER: &str = "tv_tick_rescue_deferred_t
 /// rescued-to-spill source the pager excludes: the rows are not on disk in
 /// any re-ingestable file until the WAL replays them.
 pub const RESCUE_DEFERRED_TO_WAL_SOURCE: &str = "rescue_deferred_to_wal";
+
+/// `tv_ticks_lost_total` source for parked rescue rows the shutdown could
+/// neither hand over nor write (audit K1). The same value the app's
+/// shutdown residue uses for the rescue thread's own abandoned rows.
+pub const SHUTDOWN_RESCUE_ABANDONED_SOURCE: &str = "rescue_abandoned";
+
+/// Total seconds the shutdown waits for the rescue thread to take the parked
+/// batches (audit K1). Fits inside the shutdown's offload grace (12 s) with
+/// room; past it the batches are written inline.
+pub const RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS: u64 = 2;
+
+/// [`RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS`] as a `Duration`.
+pub const RESCUE_SHUTDOWN_HANDOFF_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS);
+
+/// Milliseconds between hand-off attempts while the rescue queue is full.
+const RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS: u64 = 10;
+
+/// [`RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS`] as a `Duration`.
+const RESCUE_SHUTDOWN_HANDOFF_POLL: std::time::Duration =
+    std::time::Duration::from_millis(RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS);
+
+/// What [`hand_off_before`] did with one item.
+#[derive(Debug)]
+pub(crate) enum ShutdownHandOff<T> {
+    /// The thread's queue took it.
+    Sent,
+    /// The thread is gone; the item comes back.
+    Gone(T),
+    /// The queue stayed full until the deadline; the item comes back.
+    TimedOut(T),
+}
+
+/// Hands `item` to a bounded `std` channel, retrying while it is full, and
+/// gives it back at `deadline` (audit K1). Shutdown only: the wait is at most
+/// the time left to `deadline` plus one poll, never unbounded like `send`.
+pub(crate) fn hand_off_before<T>(
+    tx: &std::sync::mpsc::SyncSender<T>,
+    mut item: T,
+    deadline: std::time::Instant,
+) -> ShutdownHandOff<T> {
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return ShutdownHandOff::Sent,
+            Err(std::sync::mpsc::TrySendError::Disconnected(back)) => {
+                return ShutdownHandOff::Gone(back);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                if std::time::Instant::now() >= deadline {
+                    return ShutdownHandOff::TimedOut(back);
+                }
+                item = back;
+                // O(1) EXEMPT: shutdown only, bounded by `deadline`; never on the drain.
+                std::thread::sleep(RESCUE_SHUTDOWN_HANDOFF_POLL);
+            }
+        }
+    }
+}
 
 /// Rescue payloads abandoned because the rescue thread did not finish.
 ///
@@ -6912,6 +7041,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Audit K1: the shutdown hand-off never waits past its deadline.
+    #[test]
+    fn test_hand_off_before_sends_gives_back_on_gone_and_times_out_on_full() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(matches!(
+            hand_off_before(&tx, 1, far),
+            ShutdownHandOff::Sent
+        ));
+        // Full, receiver alive, never drained: the deadline gives it back.
+        let started = std::time::Instant::now();
+        let soon = started + std::time::Duration::from_millis(50);
+        match hand_off_before(&tx, 2, soon) {
+            ShutdownHandOff::TimedOut(back) => assert_eq!(back, 2),
+            other => panic!("expected a timeout, got {other:?}"), // APPROVED: test
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "bounded by the deadline plus one poll"
+        );
+        drop(rx);
+        match hand_off_before(&tx, 3, far) {
+            ShutdownHandOff::Gone(back) => assert_eq!(back, 3),
+            other => panic!("expected gone, got {other:?}"), // APPROVED: test
+        }
+    }
+
+    /// Audit K1: a rescue thread that is alive but never takes a batch (a
+    /// wedged disk) no longer holds the shutdown: the parked batches are
+    /// written inline once the budget passes. Before K1 this test hung on
+    /// the blocking `send`.
+    #[test]
+    fn test_regression_k1_shutdown_hand_off_has_a_deadline() {
+        let dir = scratch_dir("k1-park-deadline");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 2 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2, "two batches parked");
+        // `rx` stays alive and is never drained: the queue stays full.
+        let started = std::time::Instant::now();
+        w.close_rescue_offload();
+        let took = started.elapsed();
+        assert!(
+            took < RESCUE_SHUTDOWN_HANDOFF_BUDGET + std::time::Duration::from_secs(3),
+            "the close returned in {took:?}, within the budget"
+        );
+        assert!(w.parked_rescue.is_empty());
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "the parked rows were written inline, not dropped"
+        );
+        drop(rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// H4: WAL-backed rows are never parked; the WAL defers them as before.
     #[test]
     fn test_regression_h4_wal_backed_rows_are_deferred_not_parked() {
@@ -7122,6 +7309,44 @@ mod tests {
         let mut expected = first.to_vec();
         expected.extend_from_slice(second);
         assert_eq!(written, expected, "both episodes survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit K1: a torn fragment (no final newline) left by a failed append
+    /// is ended before the next append, so the next row is not joined onto
+    /// it. Bite: drop the `file_ends_mid_line` guard and the file reads
+    /// `...torntrue second=...` on one line.
+    #[test]
+    fn test_regression_spill_append_ends_a_torn_fragment_first() {
+        let dir = scratch_dir("torn-fragment");
+        let first = b"ticks first=1i 1700000000000000000\n";
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("first spill");
+        // A failed partial write: a fragment with no newline.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&p1)
+                .expect("open"); // APPROVED: test
+            f.write_all(b"ticks torn").expect("fragment"); // APPROVED: test
+        }
+        let second = b"ticks second=2i 1700000000000000001\n";
+        let p2 = spill_failed_ilp(
+            &dir,
+            second,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("second spill");
+        assert_eq!(p1, p2);
+        let written = std::fs::read(&p1).expect("readable");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(b"ticks torn\n");
+        expected.extend_from_slice(second);
+        assert_eq!(written, expected, "the second row stays on its own line");
+        // A file that already ends in a newline gets no extra byte.
+        assert!(!file_ends_mid_line(&std::fs::File::open(&p1).expect("open")).expect("probe"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
