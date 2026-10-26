@@ -660,12 +660,26 @@ fn the_handle_seeded_exemptions_still_have_their_seeding_sites() {
          loss counters are exempted from the seeding guard because it seeds \
          them; if it is gone, those alarms are dead on their first episode."
     );
+    // 2026-10-26 (audit L1): a fourth seed, `ring_closed`
+    // (tv_dhan_ws_ring_closed_total, local /metrics only, not alarmed), joined
+    // the three alarmed ones; the three exemptions still need all three.
+    for seeded in [
+        "wal_dropped.increment(0)",
+        "ring_full.increment(0)",
+        "ring_bytes_full.increment(0)",
+    ] {
+        assert!(
+            pre_register.contains(seeded),
+            "pre_register no longer seeds `{seeded}` — the exemptions for \
+             tv_dhan_ws_wal_dropped_total / _ring_full_total / \
+             _ring_bytes_full_total assume it seeds all three:\n{pre_register}"
+        );
+    }
     assert_eq!(
         pre_register.matches("increment(0)").count(),
-        3,
-        "pre_register no longer seeds exactly three counters — the exemptions \
-         for tv_dhan_ws_wal_dropped_total / _ring_full_total / \
-         _ring_bytes_full_total assume it seeds all three:\n{pre_register}"
+        4,
+        "pre_register no longer seeds exactly four counters (three alarmed plus \
+         the local ring_closed):\n{pre_register}"
     );
 
     // A function that seeds is worth nothing if nobody calls it. Adversarial
