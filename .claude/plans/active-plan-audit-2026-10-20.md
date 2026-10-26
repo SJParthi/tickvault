@@ -722,40 +722,40 @@ Source: the 2026-10-26 seven-dimension audit plus the WebSocket-continuity
 attack (adversarially verified). Implemented in parallel on sub-branches
 `claude/assurance-fix-g1..g5`, merged into one draft PR.
 
-- [ ] J1 (storage) Tick and depth rescue deferral checks the WAL flushed-through
+- [x] J1 (storage) Tick and depth rescue deferral checks the WAL flushed-through
   sequence (`wal_frame_fate::flushed_high_seq`) before trusting the WAL; a frame
   the WAL has not flushed goes to the inline spill instead. Correct the
   `no_segment` comment in `ws_frame_spill.rs`. Contract labels sanitised once at
   publish, not per tick row. Hot-path telemetry slots cache-line padded.
   - Files: crates/storage/src/tick_persistence.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/hot_path_telemetry.rs
   - Tests: storage unit tests for the deferral decision; dhat_flush_buffer_recycle unchanged
-- [ ] J2 (app) The frame drain's shutdown arm drains the ring and counts the
+- [x] J2 (app) The frame drain's shutdown arm drains the ring and counts the
   frames still queued (WAL-backed as deferred, unbacked as lost, coded
   WS-SPILL-02); rescue/offload shutdown abandonment counts ROWS on
   `tv_ticks_lost_total{source="rescue_abandoned"}`.
   - Files: crates/app/src/dhan_feed_stack.rs
   - Tests: app unit tests for the shutdown drain count
-- [ ] J3 (app, storage tests) `instrument_lifecycle` is ensured in production
+- [x] J3 (app, storage tests) `instrument_lifecycle` is ensured in production
   beside its audit twin and the write is held when the ensure is refused;
   order-side audit ensures retry until keyed; AUDIT-WS-01 drop warn carries a
   code and is latched once per episode; a guard requires DEDUP UPSERT KEYS on
   every CREATE TABLE literal (dated allowlist for the two scratch tables).
   - Files: crates/app/src/dhan_lifecycle.rs, crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
   - Tests: ensure-wiring source guard; create_table_has_dedup guard
-- [ ] J4 (core, api) Order-update WebSocket connects with explicit bounded
+- [x] J4 (core, api) Order-update WebSocket connects with explicit bounded
   limits; the connect-config guard scans every `connect_async*` site; the error
   summary writer streams and bounds its read; the ping/pong counter uses
   pre-resolved handles; `/api/debug/logs/jsonl/latest` is size-capped.
   - Files: crates/core/src/websocket/order_update_connection.rs, crates/core/src/websocket/connection.rs, crates/core/src/notification/summary_writer.rs, crates/api/src/handlers/debug.rs
   - Tests: config limit unit test; guard extension; summary writer bounded-read test; debug cap test
-- [ ] J5 (common tests, scripts, CI) Rust-only guard holes closed: interpreter
+- [x] J5 (common tests, scripts, CI) Rust-only guard holes closed: interpreter
   aliases, case-insensitive `<script`, JS byte ceiling, `javascript:` URLs,
   banned frontend extensions and SVG script scan, Rust SSM-sender discovery,
   workflow line-continuation join; `brew install` removed; unversioned
   `cargo install` / `tool:` rejected and pinned.
   - Files: crates/common/tests/rust_only_guard.rs, crates/common/tests/shell_budget_guard.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs, scripts/setup-observability.sh, .github/workflows/ci.yml
   - Tests: a self-test row per new token / extension / discovery rule
-- [ ] J6 (core) Dhan's documented `expiryTime` shape with milliseconds
+- [x] J6 (core) Dhan's documented `expiryTime` shape with milliseconds
   ("2026-01-01T00:00:00.000") is parsed instead of silently falling back to
   now + 24 h.
   - Files: crates/core/src/auth/types.rs
