@@ -1060,6 +1060,75 @@ pub struct DayComparison {
     /// that actually happened. The price side reports `max` for exactly
     /// the same reason — volume's bad direction is simply down.
     pub volume_capture_min_pct: i64,
+    /// Where the diverged cells sit (plan item M3, 2026-10-26). A
+    /// measurement only: it feeds neither `cells_diverged` nor the outcome.
+    pub divergence_profile: DivergenceProfile,
+}
+
+/// Which price field each diverged cell is, and which side of the vendor's
+/// range our high or low sits on (plan item M3, 2026-10-26).
+///
+/// # Why
+///
+/// From 13 to 26 October every run read `diverged` with 185,566 to 208,732
+/// of about 1.24 million price cells over the paise-exact tolerance (15 to
+/// 17%), and the day's log line could not say why: no field split, and no
+/// way to tell "we saw less of the tape" from "we wrote a price the tape
+/// never printed". The two point opposite ways:
+///
+/// * our high BELOW theirs, or our low ABOVE theirs (`extremes_live_inside`)
+///   is what a sampled stream does against a full tape: a trade printed
+///   between two of our packets. Vendor side, not a capture fault.
+/// * our high ABOVE theirs, or our low BELOW theirs (`extremes_live_outside`)
+///   is a price their tape does not hold for that minute: worth a look.
+///
+/// Open and close differ either way under sampling, so they are counted by
+/// field only. `missing_live_index` was computed for the verdict and never
+/// reported. O(1) per diverged cell; no allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DivergenceProfile {
+    /// Diverged `open` cells.
+    pub open: i64,
+    /// Diverged `high` cells.
+    pub high: i64,
+    /// Diverged `low` cells.
+    pub low: i64,
+    /// Diverged `close` cells.
+    pub close: i64,
+    /// Diverged high/low cells where our value is inside the vendor's range.
+    pub extremes_live_inside: i64,
+    /// Diverged high/low cells where our value is outside the vendor's range.
+    pub extremes_live_outside: i64,
+    /// Missing-live minutes on an index (each one is real, see the verdict).
+    pub missing_live_index: i64,
+}
+
+impl DivergenceProfile {
+    /// Counts one diverged cell. `live_paise` and `rest_paise` are the two
+    /// sides of `field`. Pure, O(1).
+    pub fn record(&mut self, field: &str, live_paise: i64, rest_paise: i64) {
+        match field {
+            "open" => self.open = self.open.saturating_add(1),
+            "high" => {
+                self.high = self.high.saturating_add(1);
+                self.record_extreme(live_paise < rest_paise);
+            }
+            "low" => {
+                self.low = self.low.saturating_add(1);
+                self.record_extreme(live_paise > rest_paise);
+            }
+            "close" => self.close = self.close.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn record_extreme(&mut self, inside: bool) {
+        if inside {
+            self.extremes_live_inside = self.extremes_live_inside.saturating_add(1);
+        } else {
+            self.extremes_live_outside = self.extremes_live_outside.saturating_add(1);
+        }
+    }
 }
 
 impl DayComparison {
@@ -1198,6 +1267,7 @@ pub fn compare_day_in_scope(
     let mut missing_live_unjudged: i64 = 0;
     // Missing minutes on an index — always real (see the missing arm).
     let mut missing_live_index: i64 = 0;
+    let mut divergence_profile = DivergenceProfile::default();
     // §12.15.11 shadow: the current run of consecutive real missing index
     // minutes on which Dhan's bar moved, as (security_id, last minute, length),
     // and the longest such run of the day. Keys iterate per instrument in
@@ -1235,6 +1305,7 @@ pub fn compare_day_in_scope(
                     }
                     if diff > tolerance_paise {
                         cells_diverged = cells_diverged.saturating_add(1);
+                        divergence_profile.record(field, *l_paise, *r_paise);
                         findings.push(DhanLiveXverifyCellFinding {
                             run_ts_ist_nanos,
                             trading_date_ist_nanos: day_start_ist_nanos,
@@ -1498,6 +1569,10 @@ pub fn compare_day_in_scope(
         volume_capture_p50_pct,
         volume_capture_p05_pct,
         volume_capture_min_pct,
+        divergence_profile: DivergenceProfile {
+            missing_live_index,
+            ..divergence_profile
+        },
     }
 }
 
@@ -3158,6 +3233,56 @@ mod tests {
         // tolerance 4 → still diverged.
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 4, false);
         assert_eq!(cmp.cells_diverged, 1);
+    }
+
+    /// Plan item M3 (2026-10-26): every run 13 to 26 October read
+    /// `diverged` at 15 to 17% of price cells and its log could not say which
+    /// field or which direction. The profile splits diverged cells by field,
+    /// and a high/low by whether our value sits inside the vendor's range
+    /// (sampling: we missed a print) or outside it (a price their tape does
+    /// not hold). It must never move the verdict.
+    #[test]
+    fn test_regression_divergence_profile_splits_fields_and_extreme_direction() {
+        // Minute 1: our high below theirs, our low above theirs (inside).
+        // Minute 2: our high above theirs (outside), open and close differ.
+        // Minute 3: identical.
+        let live = vec![
+            side(13, OPEN, bar(100.0, 101.00, 99.10, 100.5)),
+            side(13, OPEN + 60, bar(100.6, 102.00, 99.50, 101.0)),
+            side(13, OPEN + 120, bar(101.0, 101.5, 100.5, 101.2)),
+        ];
+        let rest = vec![
+            side(13, OPEN, bar(100.0, 101.20, 99.00, 100.5)),
+            side(13, OPEN + 60, bar(100.5, 101.90, 99.50, 100.9)),
+            side(13, OPEN + 120, bar(101.0, 101.5, 100.5, 101.2)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.cells_diverged, 5);
+        let p = cmp.divergence_profile;
+        assert_eq!((p.open, p.high, p.low, p.close), (1, 2, 1, 1));
+        assert_eq!(p.extremes_live_inside, 2, "high below + low above theirs");
+        assert_eq!(p.extremes_live_outside, 1, "high above theirs");
+        assert_eq!(
+            p.open + p.high + p.low + p.close,
+            cmp.cells_diverged,
+            "every diverged cell is counted under exactly one field"
+        );
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+
+        // Inside the tolerance nothing is counted, so the profile never
+        // disagrees with `cells_diverged`.
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 1_000, false);
+        assert_eq!(cmp.cells_diverged, 0);
+        assert_eq!(cmp.divergence_profile, DivergenceProfile::default());
+    }
+
+    #[test]
+    fn test_divergence_profile_record_ignores_unknown_fields() {
+        let mut p = DivergenceProfile::default();
+        p.record("volume", 1, 2);
+        assert_eq!(p, DivergenceProfile::default());
+        p.record("low", 5, 3);
+        assert_eq!((p.low, p.extremes_live_inside), (1, 1));
     }
 
     #[test]
