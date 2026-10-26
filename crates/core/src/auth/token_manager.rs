@@ -583,6 +583,35 @@ impl TokenManager {
                                         notifier.notify(NotificationEvent::AuthenticationSuccess);
                                         return Ok(manager);
                                     }
+                                    // Audit PR L1 (2026-10-26): only a REAL
+                                    // rejection (401/403) mints. A probe that
+                                    // could not reach a verdict (network, 429,
+                                    // 5xx, 400, parse) keeps the shared token:
+                                    // minting here would kill the scheduled
+                                    // minter's token over a REST outage, and
+                                    // the mid-session watchdog re-checks it.
+                                    Err(e)
+                                        if !crate::auth::mid_session_watchdog::profile_failure_rejects_token(
+                                            &e.to_string(),
+                                        ) =>
+                                    {
+                                        warn!(
+                                            error = %e,
+                                            expires_at = %manager.current_expiry_display(),
+                                            "adopted the SHARED Dhan token from SSM WITHOUT a \
+                                             verdict: /v2/profile failed for a reason that is not \
+                                             a token rejection (network, rate limit, server error \
+                                             or parse), so this box does not mint. The \
+                                             mid-session profile watchdog re-checks it"
+                                        );
+                                        metrics::counter!(
+                                            "tv_dhan_shared_token_adoption_total",
+                                            "outcome" => "adopted_unverified"
+                                        )
+                                        .increment(1);
+                                        notifier.notify(NotificationEvent::AuthenticationSuccess);
+                                        return Ok(manager);
+                                    }
                                     Err(e) => {
                                         manager.token.store(Arc::new(None));
                                         shared_token_rejected_by_broker = true;

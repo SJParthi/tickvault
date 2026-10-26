@@ -76,7 +76,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tickvault_common::constants::{
     DEEP_DEPTH_HEADER_OFFSET_FEED_CODE, DEEP_DEPTH_HEADER_SIZE, DISCONNECT_PACKET_SIZE,
     MAX_PACKETS_PER_FRAME, RESPONSE_CODE_DISCONNECT,
@@ -280,51 +280,125 @@ impl CloseHandshake {
 /// frame read here was DISCARDED with no count, so each redial (depth-200
 /// rotation, ghost redial, idle teardown, park) lost whatever Dhan delivered
 /// between our Close and its reply, for up to [`CLOSE_HANDSHAKE_WAIT`].
+///
+/// Also returns the FIRST Dhan disconnect code read here, lone or stacked
+/// behind data (audit PR L1, 2026-10-26). Until then a lone disconnect packet
+/// was skipped and a stacked one was handed up as data only, so a code that
+/// arrived during the close (an 805 after a failed write, for one) was never
+/// classified: an 805 did not park, an 807 redialled without a refresh.
 async fn await_close_handshake<S, F>(
     stream: &mut S,
     last_read_ended_by_reset: bool,
     endpoint: DhanEndpointType,
     mut on_frame: F,
-) -> CloseHandshake
+) -> (CloseHandshake, Option<DisconnectCode>)
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
     F: FnMut(Bytes),
 {
     if last_read_ended_by_reset {
-        return CloseHandshake::Skipped;
+        return (CloseHandshake::Skipped, None);
     }
+    let mut first_code = None;
     let drain = async {
         loop {
             match stream.next().await {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(Message::Binary(payload))) => {
-                    if close_drain_frame_carries_data(endpoint, &payload) {
-                        metrics::counter!(
-                            "tv_dhan_ws_close_drain_frames_total",
-                            "endpoint" => endpoint.as_str()
-                        )
-                        .increment(1);
-                        on_frame(ws_bytes_to_bytes(payload));
-                    }
+                    note_close_drain_frame(endpoint, payload, &mut on_frame, &mut first_code);
                 }
                 Some(Ok(_)) => {}
             }
         }
     };
-    match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, drain).await {
+    let verdict = match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, drain).await {
         Ok(()) => CloseHandshake::Completed,
         Err(_elapsed) => CloseHandshake::TimedOut,
+    };
+    (verdict, first_code)
+}
+
+/// Upper bound on frames [`drain_ready_frames`] reads in one close.
+///
+/// A socket that is never pending would otherwise hold the connection task
+/// here. 4,096 frames is far more than one receive buffer holds at the
+/// measured frame sizes; anything past it is dropped with the socket, as
+/// every frame was before this drain existed.
+const CLOSE_READY_DRAIN_MAX_FRAMES: usize = 4_096;
+
+/// Reads, WITHOUT waiting, every frame already readable on `stream`, handing
+/// data to `on_frame` and recording the first disconnect code.
+///
+/// Audit PR L1 (2026-10-26): when our Close frame could not be sent inside
+/// [`CLOSE_HANDSHAKE_WAIT`], `close` returned at once and every frame already
+/// in the receive buffer was dropped uncounted. Waiting a second bound would
+/// delay the redial (the peer is not draining our writes), but frames that are
+/// already here cost nothing to read. Stops at the first poll that is not
+/// ready, at the peer's Close, at stream end or an error, or at
+/// [`CLOSE_READY_DRAIN_MAX_FRAMES`]. Returns the number of messages read.
+fn drain_ready_frames<S, F>(
+    stream: &mut S,
+    endpoint: DhanEndpointType,
+    on_frame: &mut F,
+    first_code: &mut Option<DisconnectCode>,
+) -> usize
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    F: FnMut(Bytes),
+{
+    let mut read = 0usize;
+    while read < CLOSE_READY_DRAIN_MAX_FRAMES {
+        let Some(Some(Ok(message))) = stream.next().now_or_never() else {
+            break;
+        };
+        read = read.saturating_add(1);
+        match message {
+            Message::Close(_) => break,
+            Message::Binary(payload) => {
+                note_close_drain_frame(endpoint, payload, on_frame, first_code);
+            }
+            _ => {}
+        }
+    }
+    read
+}
+
+/// One binary frame read while closing: data goes to `on_frame` (and is
+/// counted), and the first disconnect code is kept.
+fn note_close_drain_frame<F>(
+    endpoint: DhanEndpointType,
+    payload: WsBytes,
+    on_frame: &mut F,
+    first_code: &mut Option<DisconnectCode>,
+) where
+    F: FnMut(Bytes),
+{
+    let (carries_data, code) = close_drain_frame_verdict(endpoint, &payload);
+    if first_code.is_none() {
+        *first_code = code;
+    }
+    if carries_data {
+        metrics::counter!(
+            "tv_dhan_ws_close_drain_frames_total",
+            "endpoint" => endpoint.as_str()
+        )
+        .increment(1);
+        on_frame(ws_bytes_to_bytes(payload));
     }
 }
 
 /// Whether a binary frame read during the close handshake carries market
-/// data: the same verdict `recv` reaches (a data frame, or a disconnect
-/// stacked behind data). A lone disconnect packet carries none. O(packets)
+/// data, and the disconnect code it carries if any: the same verdict `recv`
+/// reaches (a data frame, or a disconnect stacked behind data). A lone
+/// disconnect packet carries no data but still carries its code. O(packets)
 /// through [`classify_frame`], on the close path only.
-fn close_drain_frame_carries_data(endpoint: DhanEndpointType, frame: &[u8]) -> bool {
+fn close_drain_frame_verdict(
+    endpoint: DhanEndpointType,
+    frame: &[u8],
+) -> (bool, Option<DisconnectCode>) {
     match classify_frame(endpoint, frame) {
-        FrameClass::Data => true,
-        FrameClass::Disconnect(_) => {
+        FrameClass::Data => (true, None),
+        FrameClass::Disconnect(found) => {
             let control = match endpoint {
                 DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
                     crate::parser::depth::DEPTH_DISCONNECT_PACKET_SIZE
@@ -333,7 +407,7 @@ fn close_drain_frame_carries_data(endpoint: DhanEndpointType, frame: &[u8]) -> b
                     DISCONNECT_PACKET_SIZE
                 }
             };
-            frame.len() > control
+            (frame.len() > control, Some(found))
         }
     }
 }
@@ -2197,17 +2271,23 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         }
     }
 
-    async fn close<F>(&mut self, on_frame: F)
+    fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+        self.pending_close.take()
+    }
+
+    async fn close<F>(&mut self, mut on_frame: F) -> Option<DisconnectCode>
     where
         F: FnMut(Bytes) + Send,
     {
-        // A close owed by this connection dies with it (audit PR21).
-        self.pending_close = None;
+        // A close owed by this connection is handed back, not wiped (audit
+        // PR L1, 2026-10-26): the caller classifies it. Until then a stacked
+        // 805 owed here was erased when a failed write closed the socket first.
+        let owed = self.pending_close.take();
         let writer = self.writer.take();
         let Some(reader) = self.stream.take() else {
             // No read half: dropping the writer (if any) stops its task.
             drop(writer);
-            return;
+            return owed;
         };
         // Stop the writer and take its write half back, so the Close below
         // goes out on the same connection exactly as it did before the split.
@@ -2220,14 +2300,14 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                 "Dhan feed socket writer did not hand its write half back — the socket is \
                  dropped without a close frame, which still releases the connection"
             );
-            return;
+            return owed;
         };
         let Ok(mut stream) = reader.reunite(sink) else {
             debug!(
                 endpoint = self.params.endpoint.as_str(),
                 "Dhan feed socket halves did not belong together — dropped without a close frame"
             );
-            return;
+            return owed;
         };
         // Best effort, and BOUNDED. A close that fails means the peer is already
         // gone, which is exactly the state we are trying to reach. A close that
@@ -2246,14 +2326,29 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         if sent == CloseFrameSend::TimedOut {
             // The peer is not draining our writes, so it will not send a Close
             // reply either: waiting a second bound would only delay the redial.
-            return;
+            // Frames ALREADY readable are still read, without waiting (audit
+            // PR L1): they used to be dropped with the socket, uncounted.
+            let mut first_code = None;
+            let read = drain_ready_frames(
+                &mut stream,
+                self.params.endpoint,
+                &mut on_frame,
+                &mut first_code,
+            );
+            debug!(
+                endpoint = self.params.endpoint.as_str(),
+                frames_read = read,
+                "Dhan feed close frame stalled — read the frames already buffered, then dropped \
+                 the socket"
+            );
+            return owed.or(first_code);
         }
         // Give the peer its half of the close handshake, bounded — see
         // `CLOSE_HANDSHAKE_WAIT` for why an instant redial on top of a
         // half-open socket can get a HEALTHY sibling killed (Assumed: that
         // Dhan counts the half-open socket against its per-endpoint cap).
         // Skipped when the last read was a reset: nothing is left to answer.
-        let verdict = await_close_handshake(
+        let (verdict, first_code) = await_close_handshake(
             &mut stream,
             self.last_read_ended_by_reset,
             self.params.endpoint,
@@ -2266,6 +2361,7 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
             wait_bound_ms = CLOSE_HANDSHAKE_WAIT.as_millis(),
             "Dhan feed socket closed"
         );
+        owed.or(first_code)
     }
 }
 
@@ -2685,7 +2781,9 @@ mod tests {
         let mut silent = stream::pending::<Item>();
         let started = tokio::time::Instant::now();
         assert_eq!(
-            await_close_handshake(&mut silent, false, DhanEndpointType::MainFeed, |_| {}).await,
+            await_close_handshake(&mut silent, false, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
             CloseHandshake::TimedOut
         );
         assert_eq!(
@@ -2697,7 +2795,9 @@ mod tests {
         // A bare TCP reset: there is no peer to wait for, and no time passes.
         let started = tokio::time::Instant::now();
         assert_eq!(
-            await_close_handshake(&mut silent, true, DhanEndpointType::MainFeed, |_| {}).await,
+            await_close_handshake(&mut silent, true, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
             CloseHandshake::Skipped
         );
         assert_eq!(
@@ -2714,7 +2814,9 @@ mod tests {
         ]);
         let started = tokio::time::Instant::now();
         assert_eq!(
-            await_close_handshake(&mut replying, false, DhanEndpointType::MainFeed, |_| {}).await,
+            await_close_handshake(&mut replying, false, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
             CloseHandshake::Completed
         );
         assert_eq!(started.elapsed(), Duration::ZERO);
@@ -2722,7 +2824,9 @@ mod tests {
         // A stream that has already ended completes at once as well.
         let mut ended = stream::iter(Vec::<Item>::new());
         assert_eq!(
-            await_close_handshake(&mut ended, false, DhanEndpointType::MainFeed, |_| {}).await,
+            await_close_handshake(&mut ended, false, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
             CloseHandshake::Completed
         );
         assert_eq!(CloseHandshake::TimedOut.as_str(), "timed_out");
@@ -3461,16 +3565,99 @@ mod tests {
             Ok(Message::Binary(WsBytes::from(data.clone()))),
         ]);
         let mut handed: Vec<Bytes> = Vec::new();
-        let verdict = await_close_handshake(&mut peer, false, DhanEndpointType::MainFeed, |f| {
-            handed.push(f)
-        })
-        .await;
+        let (verdict, first_code) =
+            await_close_handshake(&mut peer, false, DhanEndpointType::MainFeed, |f| {
+                handed.push(f)
+            })
+            .await;
         assert_eq!(verdict, CloseHandshake::Completed);
         assert_eq!(
             handed,
             vec![Bytes::from(data), Bytes::from(stacked)],
             "data and stacked-disconnect frames are kept; nothing after the Close is read"
         );
+        // Audit PR L1: the lone 805 carried no data but its code is reported.
+        assert_eq!(first_code, Some(DisconnectCode::ExceededActiveConnections));
+    }
+
+    /// Regression (2026-10-26, audit PR L1): a disconnect stacked behind data
+    /// during the close was handed up as data only and its code was never
+    /// classified. The close now reports it.
+    #[tokio::test]
+    async fn test_regression_close_drain_reports_a_stacked_disconnect_code() {
+        use futures_util::stream;
+        let mut stacked = main_feed_packet(RESPONSE_CODE_FULL);
+        stacked.extend_from_slice(&main_feed_disconnect(807));
+        let mut peer = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(WsBytes::from(
+                stacked.clone(),
+            ))),
+            Ok(Message::Close(None)),
+        ]);
+        let mut handed: Vec<Bytes> = Vec::new();
+        let (_, first_code) =
+            await_close_handshake(&mut peer, false, DhanEndpointType::MainFeed, |f| {
+                handed.push(f)
+            })
+            .await;
+        assert_eq!(
+            handed,
+            vec![Bytes::from(stacked)],
+            "the data still reaches the sink"
+        );
+        assert_eq!(first_code, Some(DisconnectCode::AccessTokenExpired));
+    }
+
+    /// Regression (2026-10-26, audit PR L1): when our Close frame could not
+    /// be sent, `close` returned without reading, so frames already in the
+    /// receive buffer were dropped uncounted. `drain_ready_frames` reads them
+    /// without waiting and stops at the first pending poll.
+    #[test]
+    fn test_regression_stalled_close_drains_buffered_frames_without_waiting() {
+        use futures_util::stream::{self, StreamExt as _};
+        let data = main_feed_packet(RESPONSE_CODE_FULL);
+        let lone = main_feed_disconnect(805);
+        let ready = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(WsBytes::from(
+                data.clone(),
+            ))),
+            Ok(Message::Ping(WsBytes::new())),
+            Ok(Message::Binary(WsBytes::from(lone))),
+            Ok(Message::Binary(WsBytes::from(data.clone()))),
+        ]);
+        // Then nothing more is readable: the drain must stop, not wait.
+        let mut peer = ready.chain(stream::pending());
+        let mut handed: Vec<Bytes> = Vec::new();
+        let mut first_code = None;
+        let read = drain_ready_frames(
+            &mut peer,
+            DhanEndpointType::MainFeed,
+            &mut |f| handed.push(f),
+            &mut first_code,
+        );
+        assert_eq!(read, 4);
+        assert_eq!(handed, vec![Bytes::from(data.clone()), Bytes::from(data)]);
+        assert_eq!(first_code, Some(DisconnectCode::ExceededActiveConnections));
+
+        // A peer's Close ends it; nothing after the Close is read.
+        let mut closing = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Close(None)),
+            Ok(Message::Binary(WsBytes::from(main_feed_packet(
+                RESPONSE_CODE_FULL,
+            )))),
+        ]);
+        let mut none: Vec<Bytes> = Vec::new();
+        let mut code = None;
+        assert_eq!(
+            drain_ready_frames(
+                &mut closing,
+                DhanEndpointType::MainFeed,
+                &mut |f| none.push(f),
+                &mut code
+            ),
+            1
+        );
+        assert!(none.is_empty() && code.is_none());
     }
 
     #[test]

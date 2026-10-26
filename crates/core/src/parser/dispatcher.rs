@@ -345,6 +345,15 @@ pub fn stacked_disconnect_reason(frame: &[u8], max_packets: u32) -> Option<u16> 
     let mut packets = 0u32;
     let mut found: Option<u16> = None;
     while offset < frame.len() {
+        // Count the packet BEFORE reading it, as the depth walk does
+        // (`stacked_depth_disconnect_reason`): a frame of exactly
+        // `max_packets` packets is walked whole. The old `>=` after the read
+        // gave up on the last packet of such a frame, so a disconnect stacked
+        // last in a 70,000-packet frame was never seen.
+        packets = packets.saturating_add(1);
+        if packets > max_packets {
+            return None;
+        }
         let rest = frame.get(offset..)?;
         let len = main_feed_packet_len(rest)?;
         let end = offset.checked_add(len)?;
@@ -362,10 +371,6 @@ pub fn stacked_disconnect_reason(frame: &[u8], max_packets: u32) -> Option<u16> 
             found = Some(u16::from_le_bytes(raw));
         }
         offset = end;
-        packets = packets.saturating_add(1);
-        if packets >= max_packets {
-            return None;
-        }
     }
     // The WHOLE frame must walk cleanly before a disconnect inside it counts.
     //
@@ -1047,6 +1052,35 @@ mod stacked_disconnect_tests {
         // Within the cap it is found; below it the walk stops first.
         assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(804));
         assert_eq!(stacked_disconnect_reason(&frame, 3), None);
+    }
+
+    #[test]
+    fn test_regression_packet_cap_walks_a_frame_of_exactly_the_cap() {
+        // A frame of exactly `max_packets` packets with the disconnect last:
+        // the old `>=` gave up on that last packet and lost the code.
+        let mut frame = Vec::new();
+        for _ in 0..3 {
+            frame.extend_from_slice(&packet(RESPONSE_CODE_TICKER));
+        }
+        frame.extend_from_slice(&disc(805));
+        assert_eq!(stacked_disconnect_reason(&frame, 4), Some(805));
+        assert_eq!(stacked_disconnect_reason(&frame, 3), None);
+    }
+
+    #[test]
+    fn test_regression_packet_cap_at_the_production_ceiling() {
+        // 69,999 tickers then an 805: exactly `MAX_PACKETS_PER_FRAME` packets.
+        let cap = tickvault_common::constants::MAX_PACKETS_PER_FRAME;
+        let one = packet(RESPONSE_CODE_TICKER);
+        let mut frame = Vec::with_capacity(one.len() * cap as usize + 10);
+        for _ in 1..cap {
+            frame.extend_from_slice(&one);
+        }
+        frame.extend_from_slice(&disc(805));
+        assert_eq!(stacked_disconnect_reason(&frame, cap), Some(805));
+        // One packet past the cap is refused, as the depth walk refuses it.
+        frame.extend_from_slice(&one);
+        assert_eq!(stacked_disconnect_reason(&frame, cap), None);
     }
 
     #[test]
