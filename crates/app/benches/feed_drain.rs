@@ -22,16 +22,28 @@
 //! Companion zero-allocation evidence: `tests/dhat_live_ingest_seam.rs` and
 //! `tests/dhat_depth_drain.rs`.
 //!
+//! # The p99 gate (plan item K6, 2026-10-26)
+//!
+//! After Criterion, the main-feed drain's per-frame p99 is measured over
+//! 65,536 frames and divided by the four ticks in a frame; above the same
+//! `feed_drain_main_feed` per-tick budget the median is held to (times
+//! `BENCH_BUDGET_MULTIPLIER`, as the median arm), the run exits 1 and the
+//! bench job fails. The check lives in `tickvault_app::drain_tail_gate`,
+//! whose self-test (an over-budget sample must fail) runs first. Only under
+//! `cargo bench` (`--bench`): a test-mode run of this binary is debug code
+//! and its timings mean nothing.
+//!
 //! Run: `cargo bench --bench feed_drain -p tickvault-app`
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 
 use tickvault_app::dhan_feed_stack::{
     DepthIngest, DrainCounters, LiveIngest, counters, drain_depth_frame, drain_main_feed_frame,
 };
+use tickvault_app::drain_tail_gate;
 use tickvault_common::constants::{DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID};
 use tickvault_common::feed::Feed;
 use tickvault_core::parser::depth::DepthFeedKind;
@@ -174,8 +186,11 @@ fn run_timed<I>(
 /// ingest, as `run_timed` does, so the samples are all steady-state drains.
 const PERCENTILE_SAMPLES: usize = 64 * FRAME_POOL as usize;
 
-/// Prints the main-feed drain's p50 / p99 / p99.9 per frame (plan item K5,
-/// 2026-10-26).
+/// Ticks in one `main_feed_frame` (four stacked Quote packets).
+const TICKS_PER_MAIN_FRAME: u64 = 4;
+
+/// Measures the main-feed drain per frame and returns the samples sorted
+/// (plan item K5, 2026-10-26; gated since K6).
 ///
 /// Criterion's own budget check reads the MEDIAN of its sample means, which
 /// says nothing about the tail: a drain that is 2 µs almost always and
@@ -186,11 +201,11 @@ const PERCENTILE_SAMPLES: usize = 64 * FRAME_POOL as usize;
 /// **What it is not:** the clock pair costs tens of nanoseconds per frame
 /// and is inside each sample, so these figures read slightly high; and this
 /// is a synthetic frame pool on the bench host, not the live lane. The live
-/// tail is `tv_hot_path_stage_p99_ns{stage}` on the box.
-fn report_main_feed_drain_percentiles(
+/// tail is `tv_hot_path_stage_p99_ns{stage="drain_main_frame"}` on the box.
+fn main_feed_drain_samples(
     frames: &[CapturedFrame],
     drain_counters: &'static DrainCounters,
-) {
+) -> Vec<u64> {
     let mut samples: Vec<u64> = Vec::with_capacity(PERCENTILE_SAMPLES);
     let mut i = 0u64;
     while samples.len() < PERCENTILE_SAMPLES {
@@ -210,8 +225,7 @@ fn report_main_feed_drain_percentiles(
     }
     samples.sort_unstable();
     let at = |num: usize, den: usize| -> u64 {
-        let rank = (samples.len() * num).div_ceil(den).clamp(1, samples.len());
-        samples[rank - 1]
+        drain_tail_gate::quantile_of_sorted(&samples, num, den).unwrap_or(0)
     };
     println!(
         "feed_drain/main_feed_frame_4_quotes percentiles over {} frames: \
@@ -221,8 +235,57 @@ fn report_main_feed_drain_percentiles(
         at(1, 2),
         at(99, 100),
         at(999, 1_000),
-        samples[samples.len() - 1],
+        samples.last().copied().unwrap_or(0),
     );
+    samples
+}
+
+/// The p99 gate (plan item K6). `Err` fails the bench run.
+fn main_feed_drain_tail_gate() -> Result<(), String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../quality/benchmark-budgets.toml"
+    );
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let budget =
+        drain_tail_gate::budget_from_toml(&text, drain_tail_gate::MAIN_FEED_DRAIN_BUDGET_KEY)
+            .ok_or_else(|| {
+                format!(
+                    "no positive `{}` in [budgets] of {path}",
+                    drain_tail_gate::MAIN_FEED_DRAIN_BUDGET_KEY
+                )
+            })?;
+    let env_value = std::env::var(drain_tail_gate::BUDGET_MULTIPLIER_ENV).ok();
+    let multiplier = drain_tail_gate::budget_multiplier(env_value.as_deref()).ok_or_else(|| {
+        format!(
+            "{} = {env_value:?} is not a number in [1, {}]",
+            drain_tail_gate::BUDGET_MULTIPLIER_ENV,
+            drain_tail_gate::MAX_BUDGET_MULTIPLIER
+        )
+    })?;
+    // A gate that can not fail proves nothing: check it fails first.
+    drain_tail_gate::self_test(budget, TICKS_PER_MAIN_FRAME)?;
+
+    let frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(main_feed_frame).collect();
+    let samples = main_feed_drain_samples(&frames, counters());
+    let verdict = drain_tail_gate::tail_verdict(&samples, TICKS_PER_MAIN_FRAME, budget, multiplier)
+        .ok_or_else(|| "no samples".to_string())?;
+    println!(
+        "feed_drain p99 gate: p99 = {} ns per frame = {:.0} ns per tick, ceiling {:.0} ns \
+         per tick (budget {budget} x {multiplier}): {}",
+        verdict.p99_ns_per_frame,
+        verdict.p99_ns_per_tick,
+        verdict.ceiling_ns_per_tick,
+        if verdict.within { "PASS" } else { "FAIL" },
+    );
+    if verdict.within {
+        Ok(())
+    } else {
+        Err(format!(
+            "main-feed drain p99 {:.0} ns per tick is over the {:.0} ns ceiling",
+            verdict.p99_ns_per_tick, verdict.ceiling_ns_per_tick
+        ))
+    }
 }
 
 fn bench_feed_drain(c: &mut Criterion) {
@@ -247,8 +310,6 @@ fn bench_feed_drain(c: &mut Criterion) {
             )
         });
     });
-
-    report_main_feed_drain_percentiles(&main_frames, drain_counters);
 
     let depth20_frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(depth20_frame).collect();
     c.bench_function("feed_drain/depth20_frame_4x20", |b| {
@@ -292,4 +353,17 @@ fn bench_feed_drain(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_feed_drain);
-criterion_main!(benches);
+
+/// `criterion_main!` plus the p99 gate. The gate runs only under
+/// `cargo bench` (Criterion's `--bench` flag); a test-mode run of this
+/// binary is unoptimised and its timings mean nothing.
+fn main() {
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    if std::env::args().any(|a| a == "--bench")
+        && let Err(why) = main_feed_drain_tail_gate()
+    {
+        eprintln!("feed_drain p99 gate FAILED: {why}");
+        std::process::exit(1);
+    }
+}

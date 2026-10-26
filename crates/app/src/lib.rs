@@ -60,6 +60,7 @@ pub mod feed_scoreboard_boot;
 // compare against the persisted TF tables — Dhan verifies TODAY, Groww
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
 pub mod tf_consistency_boot;
+pub mod tf_consistency_readiness;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_boot` module DELETED — the 15:40 IST WAL-vs-DB daily
 // audit's every input died with the live-WS retirements (Dhan 2026-07-13,
@@ -205,6 +206,9 @@ pub mod depth_switch;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
 /// up after the close until the day's data is in the database.
 pub mod drain_hold;
+/// The p99 tail check the main-feed drain bench runs after Criterion's
+/// median check (plan item K6, 2026-10-26).
+pub mod drain_tail_gate;
 /// `tickvault ensure-questdb`: bring the QuestDB container up (boot self-heal
 /// and the console's restart actions; audit D6d, replaced
 /// `scripts/ensure-questdb.sh`).
