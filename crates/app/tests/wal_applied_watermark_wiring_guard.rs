@@ -107,10 +107,20 @@ fn the_segment_listing_excludes_the_open_segment() {
     let listing = src
         .find("fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {")
         .expect("wal_segments_in must exist");
-    let body = &src[listing..listing + 900];
+    // K2 (2026-10-26): the lenient form delegates to the fail-closed
+    // `try_wal_segments_in`, which holds the filter, so both are checked.
+    let body = &src[listing..listing + 200];
     assert!(
-        body.contains("is_open_segment(p)"),
-        "wal_segments_in must filter the writer's open segment, or a catch-up round can stage the file being appended to"
+        body.contains("try_wal_segments_in(dir)"),
+        "wal_segments_in must delegate to try_wal_segments_in, the one listing that filters"
+    );
+    let strict = src
+        .find("fn try_wal_segments_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {")
+        .expect("try_wal_segments_in must exist");
+    let strict_body = &src[strict..strict + 1_200];
+    assert!(
+        strict_body.contains("!is_open_segment(&path)"),
+        "the segment listing must filter the writer's open segment, or a catch-up round can stage the file being appended to"
     );
     assert!(
         src.contains("set_open_segment(path);"),
