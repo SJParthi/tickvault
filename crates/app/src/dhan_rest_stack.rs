@@ -1092,6 +1092,9 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             let health_for_audit = params.health.clone();
             tokio::spawn(async move {
                 use tickvault_common::ws_event_types::WsEventKind;
+                // One drop episode = one log line (audit J3, 2026-10-26); the
+                // counter below still counts every dropped row.
+                let drop_latch = tickvault_core::websocket::audit_drop_latch::DropLatch::new();
                 while let Some(row) = tee_rx.recv().await {
                     let connected = match row.event_kind {
                         WsEventKind::Connected
@@ -1120,6 +1123,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     // Health first: it is the operator-facing verdict and
                     // must not depend on the forensic write succeeding.
                     health_for_audit.set_order_update_connected(connected);
+                    let row_kind = row.event_kind.as_str();
                     if persist_tx.try_send(row).is_err() {
                         metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(1);
                         // Counted AND said out loud. Until 2026-08-12 this arm
@@ -1138,11 +1142,32 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                         // forensic depth, not liveness. Paper-mode order-update
                         // capture today; this becomes materially more serious
                         // when live order events flow through it.
-                        warn!(
-                            "order-update audit row DROPPED — the persist channel \
-                             was full. The WebSocket health verdict is unaffected, \
-                             but this lifecycle transition will be missing from \
-                             ws_event_audit and cannot be reconstructed later."
+                        //
+                        // ⚠ CHANGED 2026-10-26 (audit J3): this logged one
+                        // uncoded line per dropped row, so a full channel
+                        // wrote a line per transition and coded-error triage
+                        // never found it. It now carries AUDIT-WS-01 and logs
+                        // once per drop EPISODE (the `DropLatch` shape the
+                        // live-feed forwarder uses); the counter above still
+                        // counts every row.
+                        if drop_latch.on_drop() {
+                            warn!(
+                                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                                source = "order_update_ws_audit_row_dropped",
+                                event_kind = row_kind,
+                                "order-update audit row DROPPED — the persist channel \
+                                 was full. The WebSocket health verdict is unaffected, \
+                                 but this lifecycle transition will be missing from \
+                                 ws_event_audit and cannot be reconstructed later. \
+                                 Logged once per drop episode; every dropped row is \
+                                 counted on tv_order_update_ws_audit_dropped_total."
+                            );
+                        }
+                    } else if drop_latch.on_ok() {
+                        info!(
+                            "order-update audit rows reach the persist channel again — \
+                             the drop episode is over (rows dropped during it are gone; \
+                             the count is on tv_order_update_ws_audit_dropped_total)"
                         );
                     }
                 }

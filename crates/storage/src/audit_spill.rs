@@ -634,17 +634,17 @@ fn audit_write_url(questdb: &QuestDbConfig) -> String {
 }
 
 /// Runs the table's own idempotent `ensure_*_table` (create, add missing
-/// columns, enable the DEDUP key).
-async fn ensure_table(table: AuditSpillTable, questdb: &QuestDbConfig) {
+/// columns, enable the DEDUP key). Returns whether the table is keyed.
+async fn ensure_table(table: AuditSpillTable, questdb: &QuestDbConfig) -> bool {
     match table {
         AuditSpillTable::OrderAudit => {
-            crate::order_audit_persistence::ensure_order_audit_table(questdb).await;
+            crate::order_audit_persistence::ensure_order_audit_table(questdb).await
         }
         AuditSpillTable::PnlAudit => {
-            crate::pnl_audit_persistence::ensure_pnl_audit_table(questdb).await;
+            crate::pnl_audit_persistence::ensure_pnl_audit_table(questdb).await
         }
         AuditSpillTable::OrderLegPnl => {
-            crate::order_leg_pnl_persistence::ensure_order_leg_pnl_table(questdb).await;
+            crate::order_leg_pnl_persistence::ensure_order_leg_pnl_table(questdb).await
         }
     }
 }
@@ -710,10 +710,21 @@ async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String, quest
             crate::off_worker::off_worker(|| quarantine_stale_tmp_files(&dir, table));
         } else {
             if !ensured {
-                ensure_table(table, &questdb).await;
-                ensured = true;
+                ensured = ensure_table(table, &questdb).await;
             }
-            let outcome = drain_audit_spill_dir(&dir, table, &url, &client).await;
+            // Audit J3 (2026-10-26): a table QuestDB has not confirmed keyed is
+            // never replayed into, because a replay into an ILP-auto-created
+            // table would land with no DEDUP key. The rows stay on disk and the
+            // round counts as failed, so the ensure runs again next round and
+            // the backlog page still fires if it never clears.
+            let outcome = if ensured {
+                drain_audit_spill_dir(&dir, table, &url, &client).await
+            } else {
+                AuditDrainOutcome {
+                    failed: true,
+                    ..AuditDrainOutcome::default()
+                }
+            };
             if outcome.failed {
                 // The rows stay on disk; this counts rounds that could not finish.
                 metrics::counter!("tv_audit_spill_replay_failed_total", "table" => name)
