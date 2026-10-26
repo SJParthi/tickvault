@@ -913,8 +913,19 @@ pub struct WsFrameSpill {
     /// See [`wal_queue_max_bytes`] for why a byte bound exists at all when the
     /// channel is already record-bounded.
     queued_bytes: Arc<AtomicU64>,
+    /// The byte budget [`wal_queue_max_bytes`] resolved ONCE at construction
+    /// (K2, 2026-10-26). Before, the first `append` resolved it, on a socket
+    /// read task: a cgroup and `/proc/meminfo` read plus an `info!` on the
+    /// first frame of the session.
+    queue_budget_bytes: u64,
     drop_critical: Arc<AtomicU64>,
     persisted_total: Arc<AtomicU64>,
+    /// Records the writer has seen reach the kernel (a good flush, or the
+    /// part of a failed segment the file really holds). `persisted_total −
+    /// flushed_total` is what is still in the open segment's buffer, which a
+    /// writer abandoned at shutdown never writes (plan item K2, 2026-10-26).
+    /// Moved once per flush, never per record.
+    flushed_total: Arc<AtomicU64>,
     /// Pre-resolved per-`WsType` loss counters — see [`SpillDropCounters`].
     drop_counters: SpillDropCounters,
     /// SP5.1: optional per-feed health registry. When `Some`, a dropped
@@ -1145,8 +1156,12 @@ impl WsFrameSpill {
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         let drop_critical = Arc::new(AtomicU64::new(0));
         let persisted_total = Arc::new(AtomicU64::new(0));
+        let flushed_total = Arc::new(AtomicU64::new(0));
+        let flushed_for_thread = Arc::clone(&flushed_total); // APPROVED: Arc clone in the one-shot constructor
         let queued_bytes = Arc::new(AtomicU64::new(0));
         let queued_bytes_for_thread = Arc::clone(&queued_bytes); // APPROVED: Arc clone in the one-shot constructor
+        // K2: resolved here, on the constructing thread, never on a socket read.
+        let queue_budget_bytes = wal_queue_max_bytes();
 
         let persisted_for_thread = persisted_total.clone(); // APPROVED: Arc clone in the one-shot constructor
         let wal_dir_for_thread = wal_dir.clone(); // APPROVED: one-shot constructor, not per-frame
@@ -1203,7 +1218,10 @@ impl WsFrameSpill {
                         writer_loop(
                             &rx,
                             &wal_dir_for_thread,
-                            &persisted_for_thread,
+                            RecordCounts {
+                                persisted: &persisted_for_thread,
+                                flushed: &flushed_for_thread,
+                            },
                             &stop_for_thread,
                             &queued_bytes_for_thread,
                             &abort_drain_for_thread,
@@ -1256,8 +1274,10 @@ impl WsFrameSpill {
         Ok(Self {
             spill_tx: tx,
             queued_bytes,
+            queue_budget_bytes,
             drop_critical,
             persisted_total,
+            flushed_total,
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
             stop,
@@ -1307,8 +1327,10 @@ impl WsFrameSpill {
         Self {
             spill_tx: tx,
             queued_bytes: Arc::new(AtomicU64::new(0)),
+            queue_budget_bytes: wal_queue_max_bytes(),
             drop_critical: Arc::new(AtomicU64::new(0)),
             persisted_total: Arc::new(AtomicU64::new(0)),
+            flushed_total: Arc::new(AtomicU64::new(0)),
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -1408,7 +1430,7 @@ impl WsFrameSpill {
         // need a lock on the hot path to buy a tighter version of an already
         // round number.
         let frame_bytes = record.frame.len() as u64;
-        let budget = wal_queue_max_bytes();
+        let budget = self.queue_budget_bytes;
         let prev_bytes = self.queued_bytes.fetch_add(frame_bytes, Ordering::Relaxed);
         if prev_bytes.saturating_add(frame_bytes) > budget {
             self.queued_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
@@ -1605,12 +1627,13 @@ impl WsFrameSpill {
     ///
     /// # What it does not promise
     ///
-    /// Returns the number of records still queued when the budget expired —
-    /// `0` for a clean drain. A non-zero return is a real, permanent loss and
-    /// says so, at `error!` and on
-    /// [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`]; it is reported rather than
-    /// waited out because systemd's `TimeoutStopSec` escalates to SIGKILL, and
-    /// a SIGKILL loses strictly more.
+    /// Returns the records lost when the budget expired — `0` for a clean
+    /// drain: those still queued PLUS (⚠ CORRECTED 2026-10-26, K2; it returned
+    /// `0` and logged "complete" for a writer stuck with an empty queue) what an
+    /// ABANDONED writer still held in its buffer (`persisted − flushed`; errs
+    /// toward loss, the detached writer may still flush). A non-zero return is
+    /// a real loss, at `error!` and on [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`];
+    /// reported, not waited out, since `TimeoutStopSec` escalates to SIGKILL.
     ///
     /// A `0` return means every queued record reached the kernel. The device
     /// sync is separate (CORRECTED 2026-10-02 — this paragraph said "there is
@@ -1622,6 +1645,11 @@ impl WsFrameSpill {
     /// in the page cache, so it survives the process exit and is exposed only
     /// to a power loss before the kernel's own writeback.
     pub fn shutdown(&self, budget: Duration) -> usize {
+        self.shutdown_outcome(budget).lost_records()
+    }
+
+    /// [`Self::shutdown`], returning how it ended (K2).
+    fn shutdown_outcome(&self, budget: Duration) -> WalShutdownOutcome {
         self.stop.store(true, Ordering::Release);
         // Last chance to record what this session applied. The sink threads
         // persist at most once a second; a clean stop must not lose the last
@@ -1637,6 +1665,9 @@ impl WsFrameSpill {
             thread::sleep(WAL_SHUTDOWN_POLL);
         }
         let queued = self.spill_tx.len();
+        // Records an abandoned writer still held in its segment buffer (K2).
+        let mut unflushed: u64 = 0;
+        let mut writer_abandoned = false;
 
         // Phase 2: wait for the thread to notice, flush, and exit. Polled
         // rather than joined outright: a writer parked in
@@ -1664,9 +1695,16 @@ impl WsFrameSpill {
                 // Deliberately abandoned. Put nothing back in the slot — the
                 // handle is dropped, the thread is detached, and the process is
                 // about to exit anyway.
+                writer_abandoned = true;
+                // K2: counted into the buffer, never flushed to the kernel.
+                unflushed = self
+                    .persisted_total
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.flushed_total.load(Ordering::Relaxed));
                 warn!(
                     budget_secs = budget.as_secs(),
                     queued,
+                    unflushed,
                     "WAL spill writer did not exit within the shutdown budget — abandoning it"
                 );
                 // Audit M1: what it still held never reaches the disk. A frame the
@@ -1727,14 +1765,26 @@ impl WsFrameSpill {
                 "WAL spill: the final drain was ABANDONED with records still queued — these \
                  frames were captured and acknowledged but never written; they are gone"
             );
-        } else {
-            info!(
-                persisted = self.persisted_count(),
-                "WAL spill: final drain complete on shutdown; queue empty"
+        }
+        if unflushed > 0 {
+            metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(unflushed);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                unflushed,
+                budget_secs = budget.as_secs(),
+                "WAL spill: the writer was ABANDONED at shutdown holding records in its \
+                 segment buffer — these frames were captured and counted but never \
+                 reached the file; they are gone"
             );
         }
-
-        queued
+        if writer_abandoned || queued > 0 {
+            return WalShutdownOutcome::Abandoned { queued, unflushed };
+        }
+        info!(
+            persisted = self.persisted_count(),
+            "WAL spill: final drain complete on shutdown; queue empty"
+        );
+        WalShutdownOutcome::Drained
     }
 }
 
@@ -2020,6 +2070,14 @@ fn spawn_wal_syncer(syncer: Arc<WalSyncer>) -> std::io::Result<thread::JoinHandl
         .spawn(move || syncer_loop(&syncer))
 }
 
+/// After a failed segment sync (plan item K2, 2026-10-26): raises the WAL's
+/// lost high-water mark through the highest sequence flushed to the kernel,
+/// so no rescue batch at or below it is deferred to the WAL. Two relaxed
+/// atomics, no allocation.
+fn sync_failure_raises_lost_mark() {
+    crate::wal_frame_fate::note_lost_high(crate::wal_frame_fate::flushed_high_seq());
+}
+
 /// Counts and reports one sync. Shared by the syncer and the inline arms so a
 /// failure is reported identically wherever it happens. Returns `true` on Ok.
 fn record_sync_result(result: std::io::Result<()>, started: Instant, stage: &'static str) -> bool {
@@ -2034,38 +2092,42 @@ fn record_sync_result(result: std::io::Result<()>, started: Instant, stage: &'st
             true
         }
         Err(err) => {
-            // Deliberately NOT `report_io_error`. That helper says "reopening
-            // segment; thread stays alive", which is true of a WRITE failure
-            // and false of this one: a failed sync reopens nothing, loses
-            // nothing that was already written, and does not endanger the
-            // thread. Its consequence is narrower and worth naming exactly —
-            // the records are still in the page cache and still survive a
-            // process death; what is gone is the BOUND on the power-loss
-            // window, which silently reverts to the kernel's writeback policy.
-            // Routing it through the write-error helper would also have
-            // inflated `tv_ws_frame_spill_write_errors_total` with events that
-            // are not write errors.
+            // Deliberately NOT `report_io_error`: a failed sync reopens nothing
+            // and is not a write error.
+            //
+            // ⚠ CORRECTED 2026-10-26 (K2): this arm said the records "still
+            // survive a process kill" and logged a `warn!`. On Linux a failed
+            // fsync can mark the dirty pages CLEAN, so a later sync SUCCEEDS
+            // while those bytes never reached the device. So every record
+            // flushed so far is treated as possibly lost: the lost mark is
+            // raised through the flushed high-water (an upper bound on this
+            // segment's highest sequence, erring toward spilling more), and the
+            // rescues stop deferring to the WAL for any batch at or below it
+            // (`wal_frame_fate::rescue_may_defer_to_wal`). Honest limit: rows
+            // deferred to this segment BEFORE the failure are not re-spilled.
+            sync_failure_raises_lost_mark();
             metrics::counter!("tv_wal_fsync_errors_total").increment(1);
             if stage == WAL_PERIODIC_FSYNC_STAGE {
-                warn!(
+                error!(
                     code = ErrorCode::WsSpill01WriterRespawn.code_str(),
                     stage,
                     error = %err,
-                    "WAL segment sync FAILED — records already written are still \
-                     in the page cache and still survive a process kill, but the \
-                     power-loss window is no longer bounded by the sync interval"
+                    "WAL segment sync FAILED — records flushed so far may not be on \
+                     the device (a failed sync can drop the dirty pages); rescues \
+                     now spill to disk instead of trusting the WAL for them"
                 );
             } else {
                 // Sharper: NOTHING will sync this segment again. At shutdown
                 // it is the process's last sync; at a rotation the periodic
                 // sync has already moved on to the new segment.
-                warn!(
+                error!(
                     code = ErrorCode::WsSpill01WriterRespawn.code_str(),
                     stage,
                     error = %err,
-                    "WAL sync FAILED while finalising a segment — its last records \
-                     are flushed to the kernel but not forced to the device, and \
-                     nothing will sync this segment again"
+                    "WAL sync FAILED while finalising a segment — its records may \
+                     not be on the device and nothing will sync this segment \
+                     again; rescues now spill to disk instead of trusting the WAL \
+                     for them"
                 );
             }
             false
@@ -2221,6 +2283,9 @@ pub const WAL_UNFLUSHED_LOST_COUNTER: &str = "tv_ws_frame_spill_unflushed_lost_t
 /// good flush reports the highest sequence it covered.
 struct UnflushedTally<'a> {
     persisted: &'a AtomicU64,
+    /// Where records that reached the kernel are counted (K2); `None` in
+    /// unit tests that build a tally by hand.
+    flushed_sink: Option<&'a AtomicU64>,
     /// Bytes of counted records written to the current segment so far.
     segment_bytes: u64,
     ends: [u64; UNFLUSHED_TALLY_CAPACITY],
@@ -2240,6 +2305,7 @@ impl<'a> UnflushedTally<'a> {
         metrics::counter!(WAL_UNFLUSHED_LOST_COUNTER).increment(0);
         Self {
             persisted,
+            flushed_sink: None,
             segment_bytes: 0,
             ends: [0; UNFLUSHED_TALLY_CAPACITY],
             seqs: [0; UNFLUSHED_TALLY_CAPACITY],
@@ -2248,6 +2314,27 @@ impl<'a> UnflushedTally<'a> {
             untracked: 0,
             high_seq: 0,
             reorder: crate::wal_reorder_guard::ReorderWatch::new(),
+        }
+    }
+
+    /// Also counts every record that reaches the kernel into `flushed`, so
+    /// `persisted − flushed` is what the open buffer still holds (K2).
+    fn counting_flushed_into(mut self, flushed: &'a AtomicU64) -> Self {
+        self.flushed_sink = Some(flushed);
+        self
+    }
+
+    /// Records noted since the last flush or forget.
+    fn pending(&self) -> u64 {
+        (self.len as u64).saturating_add(self.untracked)
+    }
+
+    /// Adds `n` records to the flushed count. One relaxed add, per flush.
+    fn add_flushed(&self, n: u64) {
+        if n != 0
+            && let Some(sink) = self.flushed_sink
+        {
+            sink.fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -2275,6 +2362,7 @@ impl<'a> UnflushedTally<'a> {
 
     /// The buffer reached the kernel: nothing written so far can be lost to it.
     fn flushed(&mut self) {
+        self.add_flushed(self.pending());
         if self.high_seq != 0 {
             crate::wal_frame_fate::note_flushed_through(self.high_seq);
         }
@@ -2358,13 +2446,27 @@ impl<'a> UnflushedTally<'a> {
 /// writer is taken apart instead. The file's real length decides which counted
 /// records reached it; a length that cannot be read counts every record since
 /// the last good flush as lost, the safe direction for a loss counter.
+///
+/// K2 (2026-10-26): every caller also clears the open-segment registration
+/// (`clear_open_segment_under`), so a replay running before the next open is
+/// not told this closed file is still being written and skips it.
 fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, stage: &'static str) {
     let (file, _unwritten) = w.into_parts();
+    // K2 (2026-10-26): best-effort sync of what DID reach the kernel. Nothing
+    // syncs this file again (the writer reopens a fresh segment and the
+    // periodic sync follows it), so without this its kept records were exposed
+    // to a power cut for the kernel's whole writeback window. A failed sync
+    // raises the lost mark like any other (`record_sync_result`).
+    if resolve_wal_fsync_interval().is_some() {
+        record_sync_result(file.sync_data(), Instant::now(), "fsync_on_discard");
+    }
     let on_disk = file.metadata().map_or(0, |m| m.len());
     let lost = tally.lost_beyond(on_disk);
     // Audit M1: a lost record the reader or the drain had shed is a lost
     // frame; `wal_frame_fate` counts it on the tick-loss counter.
     let (shed_ring, shed_drain, fate_unknown) = tally.report_lost_fates(on_disk);
+    // K2: the records the file really holds reached the kernel.
+    tally.add_flushed(tally.pending().saturating_sub(lost));
     tally.new_segment();
     if lost == 0 {
         return;
@@ -2427,10 +2529,18 @@ fn count_records_left_at_writer_exit(rx: &Receiver<WalRecord>) -> usize {
     left
 }
 
+/// The two record counts the writer moves and `shutdown` reads (K2): records
+/// written into the segment buffer, and records that reached the kernel.
+#[derive(Clone, Copy)]
+struct RecordCounts<'a> {
+    persisted: &'a AtomicU64,
+    flushed: &'a AtomicU64,
+}
+
 fn writer_loop(
     rx: &Receiver<WalRecord>,
     wal_dir: &Path,
-    persisted: &AtomicU64,
+    counts: RecordCounts<'_>,
     stop: &AtomicBool,
     queued_bytes: &AtomicU64,
     abort_drain: &AbortDrain,
@@ -2486,7 +2596,7 @@ fn writer_loop(
     // draining the channel so `append()` never observes `Disconnected` and the
     // durable WAL floor survives. The ONLY clean exit is the channel closing.
     // What `persisted` counted but the buffer may still hold (2026-10-02).
-    let mut tally = UnflushedTally::new(persisted);
+    let mut tally = UnflushedTally::new(counts.persisted).counting_flushed_into(counts.flushed);
     let mut current: Option<BufWriter<File>> = open_segment_tracked(wal_dir, syncer);
     let mut bytes_written: u64 = 0;
 
@@ -2636,11 +2746,18 @@ fn writer_loop(
                 // reopens a segment.
                 if let Some(w) = current.take() {
                     discard_segment_writer(w, &mut tally, "flush");
+                    clear_open_segment_under(wal_dir);
+                    // K2: the next segment starts its rotation count at zero.
+                    bytes_written = 0;
                 }
                 thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
             }
             None => {}
         }
+        // K2: a segment discarded on a `write_record` failure mid-batch reset
+        // the tally's byte count; the rotation count follows it, so the next
+        // segment is not rotated early by bytes that went to the old one.
+        bytes_written = bytes_written.min(tally.segment_bytes);
         // Everything taken off the channel so far has now been flushed (or its
         // failure reported): serve a pending abort drain if the channel is
         // empty too. Once per batch, never per record.
@@ -2737,6 +2854,8 @@ fn open_segment_resilient(wal_dir: &Path) -> Option<BufWriter<File>> {
             error = %err,
             "WAL spill writer could not create the WAL directory — will retry; thread stays alive"
         );
+        // K2: no segment is open, so none may stay registered as open.
+        clear_open_segment_under(wal_dir);
         metrics::counter!(
             "tv_ws_frame_spill_write_errors_total",
             "stage" => "create_dir"
@@ -2753,6 +2872,7 @@ fn open_segment_resilient(wal_dir: &Path) -> Option<BufWriter<File>> {
                 error = %err,
                 "WAL spill writer could not open a segment — will retry; thread stays alive"
             );
+            clear_open_segment_under(wal_dir);
             metrics::counter!(
                 "tv_ws_frame_spill_write_errors_total",
                 "stage" => "open_segment"
@@ -2842,6 +2962,7 @@ fn persist_record_resilient(
             // record.
             if let Some(w) = current.take() {
                 discard_segment_writer(w, tally, "write_record");
+                clear_open_segment_under(wal_dir);
             }
             thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
             0
@@ -4002,16 +4123,22 @@ pub(crate) fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
 //
 // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): a replayed segment is moved
 // to the IN-PROGRESS staging dir `<wal_dir>/replaying/` — NOT straight to
-// `archive/`. The caller re-injects the returned frames into the live pipeline
-// (ring → spill → WAL → DB), which durably RE-captures them into a fresh
-// segment; ONLY THEN does the caller call `confirm_replayed`, which moves
-// `replaying/` → `archive/`. Until confirmed, the segment stays in `replaying/`
-// and `replay_all` re-globs it on the next boot, so a SECOND crash between
-// replay and persist no longer strands frames in `archive/` (which is never
-// re-globbed). `archive/` holds ONLY confirmed segments → it is never
-// re-replayed, so the confirmed-history never re-injects (no whole-archive
-// re-replay regression). Re-replay is idempotent via the replay-stable
-// `capture_seq` DEDUP key.
+// `archive/`.
+//
+// ⚠ CORRECTED 2026-10-26 (plan item K2): this block said the caller
+// re-injects the frames "(ring → spill → WAL → DB), which durably RE-captures
+// them into a fresh segment". It does not: replayed frames are folded and
+// their rows written to QuestDB directly; they are NEVER written to the WAL a
+// second time. What keeps a staged segment safe is ACK-BEFORE-CONFIRM: it
+// stays in `replaying/` (re-globbed every boot) until QuestDB acknowledged the
+// rows written from it. An acked batch then moves to `settling/`
+// (`wal_replay_settle`), not straight to `archive/`, and is archived only
+// after the watermark durability lag and two clean QuestDB probes;
+// `confirm_replayed` archives only a batch that wrote nothing. A crash at any
+// point before that leaves the segment where the next boot reads it again.
+// `archive/` holds ONLY confirmed segments → it is never re-replayed (no
+// whole-archive re-replay regression). Re-replay is idempotent via the
+// replay-stable `capture_seq` DEDUP key.
 // ---------------------------------------------------------------------------
 
 /// In-progress staging directory: holds segments that have been replayed but
@@ -4020,8 +4147,9 @@ pub(crate) fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
 /// moves them to `archive/`.
 pub(crate) const REPLAYING_SUBDIR: &str = "replaying";
 
-/// Confirmed-history directory: holds segments whose frames have been durably
-/// re-captured into the live pipeline. NEVER re-globbed by `replay_all`.
+/// Confirmed-history directory: holds segments whose replayed rows QuestDB
+/// acknowledged and, for an acked batch, held past the durability lag and two
+/// clean probes (`wal_replay_settle`). NEVER re-globbed by `replay_all`.
 pub(crate) const ARCHIVE_SUBDIR: &str = "archive";
 
 /// Largest total frame payload `replay_all` will hold in RAM at once.
@@ -4137,6 +4265,15 @@ pub const WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER: &str = "tv_wal_replay_truncated
 /// an estimate inside a counter whose purpose is to stop estimates is worse
 /// than no number at all.
 pub const WAL_REPLAY_ABANDONED_BYTES_COUNTER: &str = "tv_wal_replay_abandoned_bytes_total";
+
+mod replay_retry;
+mod shutdown_outcome;
+pub use replay_retry::{
+    WAL_REPLAY_IO_RETRY_CAP, WAL_REPLAY_LISTING_REFUSED_COUNTER, WAL_REPLAY_READ_RETRIED_COUNTER,
+    WAL_REPLAY_STAGE_FAILED_COUNTER,
+};
+use replay_retry::{forget_segment_read_failures, note_segment_read_failure, note_stage_failure};
+use shutdown_outcome::WalShutdownOutcome;
 
 /// Bad stretches the segment walk skipped by resyncing to the next readable
 /// record (Z11a). Prometheus only: the coded WS-SPILL-02 line and the two
@@ -4394,9 +4531,27 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // crashed boot was draining) AND the live `*.wal` segments (this crash's
     // fresh segments). NOT `archive/` — confirmed segments are never replayed.
     let replaying_dir = wal_dir.join(REPLAYING_SUBDIR);
-    let mut segments: Vec<PathBuf> = wal_segments_in(wal_dir);
+    // K2 (2026-10-26): fail CLOSED on a listing error. A `replaying/` that
+    // read as empty let this pass stage live segments beside leftovers it
+    // never saw, and the confirm then archived those leftovers unread.
+    let listed = try_wal_segments_in(wal_dir)
+        .and_then(|live| try_wal_segments_in(&replaying_dir).map(|staged| (live, staged)));
+    let (mut segments, mut leftovers) = match listed {
+        Ok(pair) => pair,
+        Err(err) => {
+            metrics::counter!(WAL_REPLAY_LISTING_REFUSED_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
+                wal_dir = ?wal_dir,
+                error = %err,
+                "WAL replay REFUSED: a segment folder could not be listed, so this pass \
+                 cannot know which segments it would leave behind. Nothing is staged or \
+                 archived; every segment stays where it is for the next pass"
+            );
+            return Err(anyhow::anyhow!("WAL replay: segment listing failed: {err}"));
+        }
+    };
     let leftover_count = {
-        let mut leftovers = wal_segments_in(&replaying_dir);
         let n = leftovers.len();
         segments.append(&mut leftovers);
         n
@@ -4479,6 +4634,10 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // crash-safety invariant rather than by anything new.
     let mut bytes_held = 0usize;
     let mut consumed = 0usize;
+    // K2: segments in the walked prefix whose open or read failed (I/O); never
+    // staged, so the confirm cannot archive them unread (see `replay_retry`).
+    let mut read_failed: Vec<bool> = vec![false; segments.len()]; // APPROVED: boot-time WAL replay, cold path
+    let mut read_retried = 0u64;
 
     let mut stopped_for_memory = false;
     // Plan ITEM 47: the first frame of a pass always follows a gap (what came
@@ -4515,6 +4674,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         }
         match replay_segment_core(path, applied.as_ref(), &|_, _| true, true) {
             Ok(read) => {
+                forget_segment_read_failures(path);
                 let SegmentRead {
                     frames: mut batch,
                     dropped_as_applied: dropped,
@@ -4548,20 +4708,45 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 }
             }
             Err(err) => {
-                corrupted += 1;
+                // Only an open or read I/O error reaches here: damage INSIDE a
+                // readable file is handled by the walk (resync, `damaged`).
                 gap_pending = true;
                 real_gap = true;
-                // WS-SPILL-04, not WS-SPILL-02 (audit M3, 2026-10-06): the
-                // corrupted-segment counter below already pages through the
-                // existing durable-floor-breach alarm, and WS-SPILL-02 pages
-                // on any line, so it would page the same event twice. The
-                // next segment is marked as following a gap.
-                error!(
-                    code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
-                    segment = ?path,
-                    error = %err,
-                    "WAL segment corrupted; skipping"
-                );
+                let attempts = note_segment_read_failure(path);
+                if attempts < WAL_REPLAY_IO_RETRY_CAP {
+                    // K2 (2026-10-26): before this, the segment was counted
+                    // consumed, STAGED and archived by `confirm_replayed`
+                    // without one frame read, so a transient EIO lost it for
+                    // good. It is now kept for the next pass.
+                    if let Some(slot) = read_failed.get_mut(seg_idx) {
+                        *slot = true;
+                    }
+                    read_retried = read_retried.saturating_add(1);
+                    error!(
+                        code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
+                        segment = ?path,
+                        error = %err,
+                        attempts,
+                        retry_cap = WAL_REPLAY_IO_RETRY_CAP,
+                        "WAL segment could not be read (I/O error); kept unread for the \
+                         next replay pass, not archived"
+                    );
+                } else {
+                    corrupted += 1;
+                    // WS-SPILL-04, not WS-SPILL-02 (audit M3, 2026-10-06): the
+                    // corrupted-segment counter below already pages through the
+                    // existing durable-floor-breach alarm, and WS-SPILL-02 pages
+                    // on any line, so it would page the same event twice. The
+                    // next segment is marked as following a gap.
+                    error!(
+                        code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
+                        segment = ?path,
+                        error = %err,
+                        attempts,
+                        "WAL segment still unreadable (I/O error) after the retry cap; \
+                         skipping it, its frames are not replayed"
+                    );
+                }
             }
         }
         consumed += 1;
@@ -4653,7 +4838,15 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // and it gets a coded error plus a counter rather than a shrug. Both
     // renames are within one filesystem between sibling directories, so a
     // failure here means the staging renames below are failing too.
-    for path in segments.iter().skip(consumed) {
+    // K2: a leftover this pass could not READ goes back the same way, so the
+    // confirm cannot archive it unread.
+    // O(1) EXEMPT: begin — boot replay restore, cold path, one pass over the segment list
+    let unread = segments
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx >= consumed || read_failed.get(*idx).copied().unwrap_or(false));
+    // O(1) EXEMPT: end
+    for (_, path) in unread {
         if path.parent() != Some(replaying_dir.as_path()) {
             continue; // never staged; a live `*.wal` is already re-globbable
         }
@@ -4705,6 +4898,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         );
     }
 
+    // K2: unconditional, so the series exists before its first episode.
+    metrics::counter!(WAL_REPLAY_READ_RETRIED_COUNTER).increment(read_retried);
     metrics::counter!(WAL_REPLAY_SKIPPED_SEGMENTS_COUNTER).increment(skipped_segments);
     metrics::counter!(WAL_REPLAY_SKIPPED_FRAMES_COUNTER).increment(skipped_frames);
     metrics::counter!(WAL_REPLAY_SKIPPED_BYTES_COUNTER).increment(skipped_bytes);
@@ -4715,6 +4910,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         replaying_leftovers = leftover_count,
         frames_replayed = frames.len(),
         corrupted_segments = corrupted,
+        read_retried_segments = read_retried,
         skipped_segments,
         skipped_frames,
         skipped_bytes,
@@ -4747,18 +4943,32 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // They remain re-globbable next boot until `confirm_replayed` is called.
     // Best-effort, like the prior archive move: a failed move leaves the
     // segment as `*.wal`, which is STILL re-globbed next boot — never worse.
-    drop(std::fs::create_dir_all(&replaying_dir)); // O(1) EXEMPT: boot replay staging move, cold path
+    //
+    // K2 (2026-10-26): both steps were `drop(..)`ed. A failure still leaves
+    // the segment a `*.wal` (re-read next pass, so never a loss), but it is
+    // now coded and counted, so a staging folder that keeps failing shows up.
+    let staging_dir = std::fs::create_dir_all(&replaying_dir); // O(1) EXEMPT: boot replay staging move, cold path
+    if let Err(err) = staging_dir {
+        note_stage_failure("replay_stage_mkdir", &replaying_dir, &err);
+    }
     // ONLY the segments actually read. Staging one that was never replayed
     // would hand it to `confirm_replayed`, which archives it — and an archived
     // segment is NEVER re-globbed, so its frames would be lost for good. This
     // slice is the whole safety of the budget above.
-    for seg in segments.iter().take(consumed) {
+    for (idx, seg) in segments.iter().enumerate().take(consumed) {
+        // K2: never stage a segment whose read failed (kept for retry).
+        if read_failed.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
         if let Some(name) = seg.file_name() {
             let dst = replaying_dir.join(name);
             // A leftover that was re-read from `replaying/` renames onto
             // itself / is overwritten by identical bytes — safe.
             if seg != &dst {
-                drop(std::fs::rename(seg, dst)); // O(1) EXEMPT: boot replay staging move, cold path
+                let staged = std::fs::rename(seg, &dst); // O(1) EXEMPT: boot replay staging move, cold path
+                if let Err(err) = staged {
+                    note_stage_failure("replay_stage_rename", seg, &err);
+                }
             }
         }
     }
@@ -5108,25 +5318,47 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
 /// Returns an empty Vec for a missing/unreadable dir.
 // TEST-EXEMPT: widened from private to pub(crate) for wal_replay_settle; covered by every replay/prune test that lists segments.
+///
+/// Lenient form: any listing error reads as "no segments". Use it only where
+/// an empty answer is the safe direction (an archive or settle step then
+/// moves nothing); a step whose correctness needs the FULL set uses
+/// [`try_wal_segments_in`] (K2, 2026-10-26).
 pub(crate) fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
-    // O(1) EXEMPT: boot replay helper — cold path, bounded segment listing
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new(); // APPROVED: boot replay helper, cold path
+    try_wal_segments_in(dir).unwrap_or_default()
+}
+
+/// [`wal_segments_in`], failing CLOSED: a missing directory is no segments,
+/// and any other `read_dir` or entry error is returned (K2, 2026-10-26).
+///
+/// Before this, a `replaying/` that could not be listed (EIO, EACCES) read as
+/// empty, so the replay pass staged this boot's live segments beside the
+/// unlisted leftovers and the confirm later archived those leftovers unread.
+/// O(entries), cold.
+pub(crate) fn try_wal_segments_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // O(1) EXEMPT: begin — boot replay helper, cold path, bounded segment listing
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()), // APPROVED: boot replay helper, cold path
+        Err(err) => return Err(err),
     };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+    let mut out = Vec::new(); // APPROVED: boot replay helper, cold path
+    for entry in entries {
+        let path = entry?.path();
         // Never the segment the writer thread is appending to — see
         // `OPEN_SEGMENT` for the loss this prevents.
-        .filter(|p| !is_open_segment(p))
-        .collect() // APPROVED: boot replay helper, cold path
+        if path.extension().and_then(|s| s.to_str()) == Some("wal") && !is_open_segment(&path) {
+            out.push(path);
+        }
+    }
+    // O(1) EXEMPT: end
+    Ok(out)
 }
 
 /// CRASH-SAFETY confirm step: move every segment in `<wal_dir>/replaying/` to
 /// `<wal_dir>/archive/`. Call this ONLY after the frames returned by
-/// `replay_all` have been durably re-captured into the live pipeline (i.e. the
-/// boot re-injection succeeded). Until this runs, the staged segments are
+/// `replay_all` were handled and nothing from them still needs QuestDB (K2,
+/// 2026-10-26: replayed frames are NOT re-captured into the WAL; an acked batch
+/// goes through `wal_replay_settle` instead). Until this runs, the staged segments are
 /// re-replayed on the next boot — so a crash between `replay_all` and this call
 /// can never strand frames. Idempotent and best-effort: a missing `replaying/`
 /// is a no-op; a rename failure leaves the segment in `replaying/` for a
@@ -7139,126 +7371,7 @@ fn resync_from(buf: &[u8], start: usize) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod wal_queue_byte_budget_tests {
-    use super::*;
-
-    /// The whole point: the queue is bounded in BYTES, not only in records.
-    ///
-    /// The old bound was 524,288 records with no length check, so the same
-    /// queue was worth 12 MiB of ticker packets or ~256 GiB of depth-200
-    /// frames. This pins the arithmetic that makes the second case impossible.
-    #[test]
-    fn the_budget_is_a_fraction_of_the_host_clamped_at_both_ends() {
-        // Production: r8g.xlarge, 32 GiB. 1/16 = 2 GiB, exactly the ceiling.
-        let prod = 32 * 1024 * 1024 * 1024;
-        assert_eq!(
-            wal_queue_budget_from_ceiling(Some(prod)),
-            WAL_QUEUE_MAX_BYTES_CEILING,
-            "32 GiB host must resolve to the 2 GiB ceiling"
-        );
-
-        // A 4 GiB dev container: 1/16 = 256 MiB, exactly the floor.
-        let dev = 4 * 1024 * 1024 * 1024;
-        assert_eq!(
-            wal_queue_budget_from_ceiling(Some(dev)),
-            WAL_QUEUE_MIN_BYTES,
-            "4 GiB host must resolve to the 256 MiB floor"
-        );
-
-        // A tiny host must NOT resolve below the floor.
-        assert_eq!(
-            wal_queue_budget_from_ceiling(Some(64 * 1024 * 1024)),
-            WAL_QUEUE_MIN_BYTES,
-            "a host smaller than the floor still gets the floor"
-        );
-
-        // A host between the two scales with it rather than clamping.
-        let mid = 16 * 1024 * 1024 * 1024;
-        assert_eq!(
-            wal_queue_budget_from_ceiling(Some(mid)),
-            mid / WAL_QUEUE_RAM_FRACTION_DIVISOR,
-            "a host between floor and ceiling scales with the host"
-        );
-    }
-
-    /// An unreadable host takes the FLOOR, never the ceiling.
-    ///
-    /// Guessing large on an unknown host guesses toward the OOM this budget
-    /// exists to prevent, so the direction of the fallback is load-bearing.
-    #[test]
-    fn an_unknown_host_falls_back_to_the_floor_not_the_ceiling() {
-        assert_eq!(wal_queue_budget_from_ceiling(None), WAL_QUEUE_MIN_BYTES);
-        assert!(
-            wal_queue_budget_from_ceiling(None) < WAL_QUEUE_MAX_BYTES_CEILING,
-            "the unknown-host fallback must be the SMALL end"
-        );
-    }
-
-    /// The bound must never be so tight that the ORDINARY tick mix hits it.
-    ///
-    /// A Full packet is 162 bytes. The record bound (524,288) must still be
-    /// what binds for that mix, or this change would convert a working feed
-    /// into a dropping one — the exact regression a byte bound could cause.
-    #[test]
-    fn the_record_bound_still_binds_first_for_the_ordinary_tick_mix() {
-        let full_packet_bytes = 162_u64;
-        let bytes_at_record_capacity = full_packet_bytes * SPILL_CHANNEL_CAPACITY as u64;
-        assert!(
-            bytes_at_record_capacity < WAL_QUEUE_MIN_BYTES,
-            "a full channel of 162-byte packets is {bytes_at_record_capacity} bytes, which must \
-             stay under even the FLOOR ({WAL_QUEUE_MIN_BYTES}) — otherwise the byte bound would \
-             start refusing ordinary ticks"
-        );
-    }
-
-    /// And it must be tight enough that the pathological mix CANNOT reach the
-    /// host's memory. This is the failure the change exists to prevent.
-    #[test]
-    fn a_full_channel_of_max_frames_cannot_exceed_the_budget() {
-        // The largest frame the depth-200 socket accepts.
-        let depth_200_max = 512_u64 * 1024;
-        let unbounded_worst_case = depth_200_max * SPILL_CHANNEL_CAPACITY as u64;
-        let host = 32_u64 * 1024 * 1024 * 1024;
-        assert!(
-            unbounded_worst_case > host,
-            "sanity: the record-only bound really does exceed a 32 GiB host \
-             ({unbounded_worst_case} bytes) — this is the defect being fixed"
-        );
-        let budget = wal_queue_budget_from_ceiling(Some(host));
-        assert!(
-            budget < host,
-            "the byte budget must sit strictly under the host it protects"
-        );
-        // The budget is what now bounds the pathological mix, not the record count.
-        assert!(
-            budget < unbounded_worst_case,
-            "the byte budget must be the binding limit for max-size frames"
-        );
-    }
-
-    /// A refused frame must RELEASE its reservation, or the budget ratchets
-    /// down to zero and a permanently-empty queue refuses everything.
-    ///
-    /// `new_with_dead_writer_for_test` drops the receiver, so every send takes the
-    /// `Disconnected` arm — which is one of the two arms that must release.
-    #[test]
-    fn a_refused_frame_releases_its_byte_reservation() {
-        let spill = WsFrameSpill::new_with_dead_writer_for_test();
-        for _ in 0..64 {
-            assert_eq!(
-                spill.append(WsType::LiveFeed, vec![0_u8; 4096]),
-                AppendOutcome::Dropped,
-                "no writer exists, so every append must be refused"
-            );
-        }
-        assert_eq!(
-            spill.queued_bytes.load(Ordering::Relaxed),
-            0,
-            "every refused frame must have released its reservation; a leak here \
-             would make the budget shrink monotonically until nothing is accepted"
-        );
-    }
-}
+mod wal_queue_byte_budget_tests;
 
 #[cfg(test)]
 mod tests {
@@ -13130,6 +13243,7 @@ mod tests {
     }
 
     mod frame_base_tests;
+    mod k2_tests;
     // --- Z11a: resync past mid-segment damage (2026-10-02) -----------------
 
     /// A segment of v4 records, sequence `k + 1` and a payload of `fill(k)`;
@@ -13547,132 +13661,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod queue_depth_visibility_tests {
-    /// The writer loop must publish the queue depth AND its session high-water.
-    ///
-    /// Source-scanned rather than behavioural because the loop is a thread with
-    /// no return value and the gauges are process-global; a behavioural test
-    /// would have to install a recorder and race the thread. What can go wrong
-    /// here is a refactor deleting the lines, and a scan catches exactly that.
-    /// The writer loop body, bounded by the next top-level fn.
-    ///
-    /// NOT split on `#[cfg(test)]` like the other guards in this repo: that
-    /// marker appears INSIDE `writer_loop` itself (the `maybe_test_panic`
-    /// hook), so the usual split truncates the production text mid-function
-    /// and the scan silently sees nothing. Caught by these tests failing on
-    /// their first run against code that was already correct.
-    fn writer_loop_src() -> &'static str {
-        let src = include_str!("ws_frame_spill.rs");
-        let from = src.find("fn writer_loop").expect("writer_loop must exist");
-        let len = src[from..]
-            .find("fn open_segment_resilient")
-            .expect("the next top-level fn must still follow writer_loop");
-        &src[from..from + len]
-    }
-
-    #[test]
-    fn the_writer_publishes_its_queue_depth_and_high_water() {
-        let production = writer_loop_src();
-
-        assert!(
-            production.contains("tv_ws_frame_spill_queue_depth"),
-            "the queued-but-unwritten window must be observable — it is the \
-             frames an abort loses, and nothing else counts them"
-        );
-        assert!(
-            production.contains("tv_ws_frame_spill_queue_high_water"),
-            "the PEAK is the load-bearing half: a 30s scrape of a decaying \
-             gauge misses the burst that matters"
-        );
-        assert!(
-            production.contains("let queued = rx.len();"),
-            "depth must be read from the channel itself, not inferred"
-        );
-    }
-
-    /// The gauges must be resolved OUTSIDE the loop and read at the BATCH
-    /// boundary, never per frame.
-    ///
-    /// This is the `record_ws_lag` lesson, which allocated twice per tick —
-    /// ~36M allocations/hour — on a path its own docs called allocation-free.
-    /// Three correct comments did not stop it shipping; a test does.
-    #[test]
-    fn the_depth_gauge_is_not_read_on_the_per_frame_path() {
-        let loop_body = writer_loop_src();
-
-        // The handles are resolved before the `loop {`; the reads happen after
-        // the inner drain. If either moved into the 0..256 drain, the gauge
-        // write would land once per FRAME instead of once per batch.
-        let resolve_at = loop_body
-            .find("metrics::gauge!(\"tv_ws_frame_spill_queue_depth\")")
-            .expect("depth gauge must be resolved in writer_loop");
-        let loop_at = loop_body.find("\n    loop {").expect("the drain loop");
-        assert!(
-            resolve_at < loop_at,
-            "the gauge handle is resolved INSIDE the loop — re-resolving a \
-             handle per iteration is how a metric write becomes a cost"
-        );
-
-        let drain_at = loop_at
-            + loop_body[loop_at..]
-                .find("for _ in 0..256")
-                .expect("the batch drain");
-        let read_at = loop_at
-            + loop_body[loop_at..]
-                .find("let queued = rx.len();")
-                .expect("the depth read");
-        assert!(
-            read_at > drain_at,
-            "the depth is read BEFORE the batch drain — it must sit at the \
-             batch boundary so it costs one write per ~257 records, not one \
-             per frame"
-        );
-    }
-
-    #[test]
-    fn refusal_line_due_logs_the_first_and_every_power_of_two() {
-        use super::refusal_line_due;
-        // The first refusal MUST log (it is what pages); the flood must not.
-        assert!(refusal_line_due(1));
-        assert!(refusal_line_due(2));
-        assert!(!refusal_line_due(3));
-        assert!(refusal_line_due(4));
-        assert!(!refusal_line_due(1_000));
-        assert!(refusal_line_due(1 << 20));
-        // 2026-09-04: 2,000,238 refusals in one session would have produced
-        // 21 lines instead of two million.
-        let lines = (1..=2_000_238u64).filter(|n| refusal_line_due(*n)).count();
-        assert_eq!(lines, 21);
-        assert!(!refusal_line_due(0), "a zero count is not a refusal");
-    }
-
-    #[test]
-    fn refusal_line_due_stops_doubling_at_the_stride_so_a_long_storm_is_never_silent() {
-        use super::{REFUSAL_LINE_STRIDE, refusal_line_due};
-        // Past the ladder the line repeats at a FIXED stride. Under the pure
-        // power-of-two rule the counter is never reset, so after a 2M-refusal
-        // episode the next line was 2^21 and the one after that 2^22 - a
-        // 2.1-MILLION-frame silence inside an outage that is still losing
-        // frames.
-        assert!(refusal_line_due(REFUSAL_LINE_STRIDE));
-        assert!(refusal_line_due(REFUSAL_LINE_STRIDE * 3));
-        assert!(refusal_line_due(REFUSAL_LINE_STRIDE * 7));
-        assert!(!refusal_line_due(REFUSAL_LINE_STRIDE * 3 + 1));
-        // 3 x stride is NOT a power of two: this case logged nothing before.
-        assert!(!(REFUSAL_LINE_STRIDE * 3).is_power_of_two());
-
-        // The worst-case silent gap anywhere past the ladder is one stride.
-        let start = REFUSAL_LINE_STRIDE * 5 + 1;
-        let mut silent = 0u64;
-        for n in start..=(start + REFUSAL_LINE_STRIDE) {
-            if refusal_line_due(n) {
-                break;
-            }
-            silent += 1;
-        }
-        assert!(
-            silent < REFUSAL_LINE_STRIDE,
-            "silent run of {silent} frames exceeds the stride"
-        );
-    }
-}
+mod queue_depth_visibility_tests;
