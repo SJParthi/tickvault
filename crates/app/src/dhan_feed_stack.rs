@@ -84,6 +84,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 mod catchup_stop;
+// M2 (2026-10-26): a catch-up round settled segment by segment.
+mod replay_chunks;
 // Item 45a (2026-09-29): the after-close pass that writes back order-book rows
 // the ingest shed skipped. A child module so it reuses the drain's own packet
 // walk and depth writers rather than a second copy of either.
@@ -15490,6 +15492,18 @@ pub fn pace_after_replay_flush(
     waits
 }
 
+/// Rows the last replay flush could not hand to the writer threads (M2,
+/// 2026-10-26). Reads the WRITER's retained count: `LiveIngest::pending_rows`
+/// is zeroed by every `flush_ticks`, also when a full queue gave the rows
+/// back, so the pacer read "nothing held" and never waited (`pace_waits` = 0
+/// on all eight boot replays from 19 to 26 Oct). The third full-queue flush
+/// then rescued the rows, the busy rescue thread handed them back to the WAL,
+/// and the ack check refused the batch: the same 5 segments were re-read on
+/// every boot from 21 Oct. O(1).
+fn replay_rows_held(ingest: &LiveIngest, with_depth: bool) -> bool {
+    ingest.writer.pending() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
+}
+
 /// [`pace_after_replay_flush`] on the real writers (audit R1).
 ///
 /// `with_depth` says whether the flush it follows included the depth sink.
@@ -15520,8 +15534,7 @@ fn replay_pace_after_flush(
             if shutdown_requested() {
                 return false;
             }
-            let ingest = ingest.borrow();
-            ingest.pending_rows() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
+            replay_rows_held(&ingest.borrow(), with_depth)
         },
         |step| {
             // A fresh snapshot each step: a rescue elsewhere should end this
@@ -17132,7 +17145,19 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let mut gap_carry = false;
             // O(1) EXEMPT: begin — one pass over a catch-up batch on the boot drain, cold path
             let mut segment_boundary = false;
-            for f in batch.frames {
+            // M2: where each segment's frames end in `staged`.
+            let segment_ends = std::mem::take(&mut batch.segment_ends);
+            let mut chunk_ends: Vec<replay_chunks::SegmentChunkEnd> =
+                Vec::with_capacity(segment_ends.len());
+            let mut segment_cursor = 0usize;
+            for (batch_idx, f) in batch.frames.into_iter().enumerate() {
+                replay_chunks::close_segments_before(
+                    &segment_ends,
+                    &mut segment_cursor,
+                    batch_idx,
+                    staged.len(),
+                    &mut chunk_ends,
+                );
                 gap_carry |= f.after_gap;
                 segment_boundary |= f.first_in_segment;
                 if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
@@ -17169,6 +17194,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     bytes::Bytes::from(f.frame),
                 ));
             }
+            replay_chunks::close_segments_before(
+                &segment_ends,
+                &mut segment_cursor,
+                usize::MAX,
+                staged.len(),
+                &mut chunk_ends,
+            );
+            let chunk_ends = replay_chunks::checked_chunks(chunk_ends, staged.len());
             // O(1) EXEMPT: end
             // A gap flagged on a frame after the last live-feed one (an
             // order-update or TrueData frame) is still a gap at this round's
@@ -17195,44 +17228,96 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 rounds = rounds.saturating_add(1);
                 continue;
             }
-            let unlanded_before =
-                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            // DA-13c review: the suspicion count BEFORE this round's first ack.
-            let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
             // Audit R1: paced like the boot pass, and never past this
             // drain's own deadline.
             let round_pace_until = wal_replay_pace_until(now_ist_secs_of_day(), Instant::now())
                 .map(|until| until.min(catchup_deadline.into_std()));
-            let outcome = refold_wal_frames(&mut ingest, &staged, &staged_gaps, round_pace_until);
-            let flushed = blocking_flush(|| ingest.flush());
-            // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
-            // the drain rather than re-offering the same batch to a sink that
-            // is not answering: the segments stay staged for the next boot.
-            if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
+            // M2 (2026-10-26): fold, ack and settle ONE SEGMENT at a time, so
+            // a segment whose rows do not land stops the round there and
+            // every segment before it is already retired (see
+            // `replay_chunks`). Before, one rescue handed back to the WAL
+            // refused the whole round, and the next boot re-read the same
+            // segments: zero progress from 21 to 26 Oct.
+            let mut round_landed = true;
+            let mut round_frames = 0usize;
+            let mut round_ticks = 0u64;
+            let mut round_lost = 0u64;
+            let mut flushed = 0u64;
+            let mut pace_waits = 0u64;
+            let mut chunk_start = 0usize;
+            let mut gaps_in_chunk: Vec<usize> = Vec::new();
+            for (segment, chunk_end) in &chunk_ends {
+                let chunk = staged.get(chunk_start..*chunk_end).unwrap_or(&[]);
+                replay_chunks::chunk_gaps(
+                    &staged_gaps,
+                    chunk_start,
+                    *chunk_end,
+                    &mut gaps_in_chunk,
+                );
+                chunk_start = *chunk_end;
+                // DA-13c review: the suspicion count BEFORE this chunk's first ack.
+                let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
+                if !chunk.is_empty() {
+                    use tickvault_storage::wal_applied_watermark::applied_watermark;
+                    let unlanded_before = applied_watermark().unlanded_total();
+                    let outcome =
+                        refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
+                    flushed = flushed.saturating_add(blocking_flush(|| ingest.flush()));
+                    round_frames = round_frames.saturating_add(chunk.len());
+                    round_ticks = round_ticks.saturating_add(outcome.refolded as u64);
+                    round_lost = round_lost.saturating_add(outcome.lost);
+                    pace_waits = pace_waits.saturating_add(outcome.pace_waits);
+                    // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A
+                    // timeout ends the drain rather than re-offering the
+                    // segment to a sink that is not answering.
+                    if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
+                        round_landed = false;
+                        break;
+                    }
+                }
+                match segment {
+                    Some(name) => {
+                        tickvault_storage::wal_replay_settle::settle_confirm_segments(
+                            &wal_dir,
+                            &[name.as_os_str()],
+                            settle_start,
+                        );
+                    }
+                    // No segment map: the whole round was one chunk.
+                    None => {
+                        tickvault_storage::wal_replay_settle::settle_confirm_replayed(
+                            &wal_dir,
+                            settle_start,
+                        );
+                    }
+                }
+            }
+            tickvault_storage::wal_replay_settle::trim_after_round(&wal_dir);
+            catchup_frames = catchup_frames.saturating_add(round_frames);
+            catchup_ticks = catchup_ticks.saturating_add(round_ticks);
+            if !round_landed {
                 catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
                 break;
             }
-            tickvault_storage::wal_replay_settle::settle_confirm_replayed(&wal_dir, settle_start);
-            catchup_frames = catchup_frames.saturating_add(staged.len());
-            catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
             rounds = rounds.saturating_add(1);
-            if outcome.lost > 0 {
+            if round_lost > 0 {
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "wal_catchup_unfolded",
                     round = rounds,
                     frames = staged.len(),
-                    lost = outcome.lost,
+                    lost = round_lost,
                     "the WAL catch-up drain could not fold {} tick(s) in this round",
-                    outcome.lost
+                    round_lost
                 );
             }
             tracing::debug!(
                 round = rounds,
                 frames = staged.len(),
-                ticks = outcome.refolded,
+                segments = chunk_ends.len(),
+                ticks = round_ticks,
                 rows_flushed = flushed,
-                pace_waits = outcome.pace_waits,
+                pace_waits,
                 "WAL catch-up drain round complete"
             );
         }
@@ -26113,7 +26198,7 @@ mod wal_refold_tests {
         assert_eq!(prod.matches(call).count(), 1, "exactly one hand-over");
         let finish = prod.find(call).expect("hand-over present");
         let catch_up = prod
-            .find("refold_wal_frames(&mut ingest, &staged, &staged_gaps, round_pace_until)")
+            .find("refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until)")
             .expect("catch-up refold present");
         let spawn = prod
             .find("tokio::spawn(run_frame_drain(")
