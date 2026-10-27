@@ -2860,7 +2860,8 @@ impl TickWriter {
         self.append_tick_into(tick, capture_seq, false)
     }
 
-    /// Appends a main-feed packet that carries NO new trade to `tick_quotes`
+    /// Appends a main-feed packet whose trade time is stale against its WAL
+    /// receipt (routed by the drain, owner Quote 43) to `tick_quotes`
     /// (plan item M5, owner Quote 41, 2026-10-27), with the same replay-stable
     /// `capture_seq`.
     ///
@@ -2984,7 +2985,7 @@ impl TickWriter {
                     self.persist_refused_tick(tick, capture_seq);
                     return Ok(());
                 }
-                // M5 (2026-10-27): a repeat quote with a receipt time goes to
+                // M5 (2026-10-27): a packet routed to quotes with a receipt goes to
                 // `tick_quotes`, stamped at arrival (`received_at`, the same
                 // value as that column); every other row goes to `ticks`.
                 if let (true, Some(arrival)) = (to_quotes, row.received_at_ist_nanos) {
@@ -4415,6 +4416,14 @@ impl FlushBatch {
     // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
     pub const fn has_unbacked_rows(&self) -> bool {
         self.unbacked
+    }
+
+    /// The batch's ILP text, exactly as it will be sent. Read-only; lets a
+    /// caller compare the rows two paths produced (plan item M5: a packet's
+    /// `tick_quotes` row must be byte-identical live and on replay).
+    #[must_use]
+    pub fn ilp_bytes(&self) -> &[u8] {
+        self.buffer.as_bytes()
     }
 }
 

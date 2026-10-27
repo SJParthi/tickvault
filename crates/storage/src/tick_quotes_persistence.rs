@@ -1,6 +1,7 @@
-//! `tick_quotes` — main-feed packets that carry no new trade (plan item M5,
-//! owner Quote 41, 2026-10-27; `websocket-connection-scope-lock.md`
-//! §"2026-10-27 — REPEAT QUOTES GET THEIR OWN TABLE").
+//! `tick_quotes` — main-feed packets whose trade time is stale against their
+//! arrival (plan item M5; owner Quotes 41 and 43, 2026-10-27;
+//! `websocket-connection-scope-lock.md` §"2026-10-27" and §"2026-10-27
+//! (SECOND) — `tick_quotes` ROUTES ON THE PACKET ALONE").
 //!
 //! Measured on the live box on 2026-10-26 (depth already off): about 70-75%
 //! of `ticks` rows were quotes with no new trade, each carrying its last trade
@@ -9,16 +10,19 @@
 //! partition (about 51 KB written per tick, the root disk at 125 MiB/s all
 //! session). `tick_ts_placement` (plan item M1) counts that shape.
 //!
-//! The drain now routes such a packet here instead. The row has every `ticks`
-//! column plus `exchange_timestamp`, the vendor's last trade time, kept
-//! unchanged. Its designated `ts` is the ARRIVAL time in IST, built exactly
-//! like `received_at` (UTC receipt + the IST offset), so the table only ever
-//! appends. `ticks.ts` is untouched: exchange time, never + 5:30.
+//! The drain now routes a packet here when its exchange trade time is more
+//! than 2 s before its WAL receipt (`app::tick_quote_route`, packet and WAL
+//! record only). The row has every `ticks` column plus `exchange_timestamp`,
+//! the vendor's trade time, kept unchanged. Its designated `ts` is the ARRIVAL
+//! time in IST: the frame's WAL receipt stamp plus the IST offset (the
+//! `received_at` value), which a replay reads back unchanged, so a replayed
+//! packet produces a byte-identical row and the DEDUP key collapses it. The
+//! table only ever appends. `ticks.ts` is untouched: exchange time, never
+//! + 5:30.
 //!
 //! The rows ride the SAME tick writer and ILP buffer as `ticks`: the WAL,
-//! ring, rescue, spill, park, replay and the offload thread carry both, and a
-//! WAL replay decides the table from the same data in the same order. Nothing
-//! is dropped, sampled or coalesced.
+//! ring, rescue, spill, park, replay and the offload thread carry both.
+//! Nothing is dropped, sampled or coalesced.
 //!
 //! ## Schema
 //!
@@ -333,5 +337,26 @@ mod tests {
             tick_quotes_ensure_statements(TICKS_COLUMNS).len(),
             1 + TICKS_COLUMNS.len() + 1 + 1
         );
+    }
+
+    /// The hand-off batch exposes the exact ILP text the sink will send, so a
+    /// caller can compare the rows two paths produced (plan item M5).
+    #[test]
+    fn test_flush_batch_ilp_bytes_carry_the_tick_quotes_row() {
+        let tick = repeat_quote();
+        let (mut producer, _sink, rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        producer
+            .append_tick_quote_with_seq(&tick, 45)
+            .expect("append"); // APPROVED: test
+        producer.flush().expect("hand-off"); // APPROVED: test
+        let batch = rx.try_recv().expect("queued"); // APPROVED: test
+        let text = String::from_utf8_lossy(batch.ilp_bytes()).into_owned();
+        assert!(text.starts_with("tick_quotes,"), "{text}");
+        assert!(
+            text.trim_end()
+                .ends_with(&format!(" {}", arrival_ist_nanos(&tick))),
+            "{text}"
+        );
+        assert_eq!(batch.rows(), 1);
     }
 }
