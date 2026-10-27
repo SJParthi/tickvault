@@ -9583,6 +9583,7 @@ REJECT:
 Owner's tap, recorded with the card text in `daily-universe-scope-expansion-2026-05-27.md` Quote 43: **"Packet-only rule (Recommended)"**. The rule above ("same last trade time and cumulative volume as the last one seen for its key") could, after a mid-session restart whose replay starts part-way through a contract's stream, send one packet to both tables. It is replaced:
 
 - A main-feed packet goes to **`tick_quotes`** when its exchange trade time (`exchange_timestamp`, whole IST seconds) is more than **2 seconds** before the frame's receipt time (the WAL record's receipt stamp, whole IST seconds); otherwise it goes to `ticks`. Inputs are the packet and its own WAL record only, so live and replay always agree and no packet can reach both tables.
-- Everything else in the section above stands (columns, `ts` = arrival time, DEDUP key, retention, S3 copy, readers).
+- `tick_quotes.ts` is the frame's receipt time from its WAL record (UTC to IST), never `Utc::now()` at processing time, so a replayed packet produces the identical row and the DEDUP key collapses it.
+- Everything else in the section above stands (columns, DEDUP key, retention, S3 copy, readers).
 
 REJECT (adds to the section above): any per-contract, per-socket or order-dependent input to the routing decision; a threshold other than 2 s without a fresh dated quote.
