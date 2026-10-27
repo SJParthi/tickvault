@@ -674,6 +674,16 @@ mod tests {
         assert_eq!(Mode::parse("APPLY"), None);
     }
 
+    /// The ec2:CreateTags permission probe sends this tag; EC2 refuses an
+    /// empty key or value as InvalidParameterValue before it checks the
+    /// permission, which made the probe report a missing permission
+    /// (2026-10-27).
+    #[test]
+    fn test_regression_permission_probe_tag_is_not_empty() {
+        assert!(!REBUILD_TAG_KEY.trim().is_empty());
+        assert!(!REBUILD_TAG_VALUE.trim().is_empty());
+    }
+
     #[test]
     fn test_keep_alive_value_is_twelve_hours_ahead_in_ist() {
         let now = at_ist(2026, 10, 22, 18, 0);
