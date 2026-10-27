@@ -3169,3 +3169,24 @@ Measured first (read-only, 2026-10-27 ~08:10 IST): instance `i-0c3fe906dad5492fc
 - Deleting a keep-list table, `sebi-preserve/`, `deploys/` or `logs/`.
 - Skipping the rebuild's copy-first verification.
 - Reusing Quote 42 after this one run: Quote 27 binds again, and the first PR after the run deletes the role, workflow, tool and budget rows and marks Quotes 35 and 42 ENDED.
+
+#### Quote 43 (2026-10-27, ~10:45 IST) — `tick_quotes` ROUTES ON THE PACKET ALONE; TONIGHT'S WIPE ALSO DELETES THE REBUILD'S SPILL-FILE COPIES (decision cards, preserve EXACTLY)
+
+> "i dont need any alowness or any missign ticks or any msisign clalcuations or any msisign or wrong candles or wrong ro dupciates dude oaky? espeiclaly dude ?"
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "The repeat-quote table (the fix for disk slowness) has one rare gap: if the server restarts mid-day and re-reads saved data, a quote could be written to BOTH tables once (a duplicate, never a loss). To make duplicates impossible, the rule can use only facts inside each packet: 'trade time more than 2 seconds older than arrival time → quotes table'. This gives the same answer live and on any re-read, always. Which rule?" | **"Packet-only rule (Recommended)"** | "Zero duplicates possible, O(1), no memory per contract. A real trade that reaches us more than 2 s late (rare) is stored in the quotes table instead of ticks, still with its exchange time, nothing lost. Candles are unaffected." |
+| "The rebuild also copies raw spill FILES to S3 (under rebuild-2026-10-22/files/). They are old market data too, but your recorded approval named only tables. Delete them tonight as part of 'entire wipe including S3'?" | **"Delete them too (Recommended)"** | "Truly fresh: no old market data left in S3. SEBI/audit and deploy files still kept." |
+
+**What this changes, and nothing else:**
+
+| Item | Change |
+|---|---|
+| `tick_quotes` routing (scope lock §"2026-10-27") | A main-feed packet goes to `tick_quotes` when its exchange trade time is more than **2 seconds** older than the frame's receipt time (both read from the packet and its WAL record); otherwise to `ticks`. No per-contract state; a WAL replay always routes a packet exactly as live did. Supersedes the "no new trade" definition. |
+| Quote 42 wipe scope | Adds the market-data spill-file copies under `rebuild-2026-10-22/files/` (dated before 2026-10-28 by last-modified time). Anything under `files/` whose path names `audit`, `sebi`, `deploys` or `logs`, and `rebuild-2026-10-22/keep/` and `manifests/`, stay KEPT. |
+
+##### What violates Quote 43 (REJECT)
+- Any per-contract or order-dependent input to the `tick_quotes` routing decision.
+- Dropping, sampling or coalescing a packet instead of routing it.
+- Deleting a keep-list, audit, SEBI, deploy or log file under cover of this quote.
