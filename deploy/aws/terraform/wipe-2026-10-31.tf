@@ -15,14 +15,15 @@
 #     .github/workflows/wipe-2026-10-31.yml, job `cloud`);
 #   * s3:ListBucketVersions on tv-prod-cold, only for the exact prefixes the
 #     tool lists (one per market-data table, plus raw-frames/, seal-spill/,
-#     top-volume-spill/, the three quarantine roots and
-#     rebuild-2026-10-22/tables/);
+#     top-volume-spill/, the three quarantine roots,
+#     rebuild-2026-10-22/tables/ and rebuild-2026-10-22/files/);
 #   * s3:DeleteObjectVersion (never s3:DeleteObject, so it cannot even add a
 #     delete marker) on 2026-dated keys under questdb-partitions/<one of the
 #     market-data tables>/ and the six dated roots, and on the rebuild's
 #     whole-table copies of the market-data tables
-#     (rebuild-2026-10-22/tables/<table>/), only from 18:00 IST on
-#     2026-10-27 (Quote 42);
+#     (rebuild-2026-10-22/tables/<table>/), and on the rebuild's copies of
+#     the spill files (rebuild-2026-10-22/files/spill/, files/dlq/; Quote
+#     43), only from 18:00 IST on 2026-10-27 (Quote 42);
 #   * an explicit Deny on every key dated 2026-10-28 or later, anywhere in
 #     the bucket (Quote 42's cutoff). One Allow pattern per table plus this
 #     Deny, rather than one Allow per allowed date, keeps the policy under
@@ -117,6 +118,14 @@ locals {
     "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/tables/${t}/*"
   ]
 
+  # The rebuild's copies of the market-data spill files, data/spill/** and
+  # data/dlq/** (rebuild-2026-10-22/files/<path>.sha-<sha256>, Quote 43).
+  # Paths naming audit, sebi, deploys or logs are denied below.
+  wipe_rebuild_spill_file_arns = [
+    "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/files/spill/*",
+    "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/files/dlq/*",
+  ]
+
   # <root>/<IST date>/<file>. The quarantine roots are Quote 42's.
   wipe_dated_roots = [
     "raw-frames",
@@ -134,7 +143,7 @@ locals {
   wipe_list_prefixes = concat(
     [for t in local.wipe_tables : "questdb-partitions/${t}/"],
     [for r in local.wipe_dated_roots : "${r}/"],
-    ["rebuild-2026-10-22/tables/"],
+    ["rebuild-2026-10-22/tables/", "rebuild-2026-10-22/files/"],
   )
 }
 
@@ -200,6 +209,7 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
         Resource = concat(
           local.wipe_partition_arns,
           local.wipe_rebuild_table_arns,
+          local.wipe_rebuild_spill_file_arns,
           [for r in local.wipe_dated_roots : "${aws_s3_bucket.tv_cold.arn}/${r}/2026-??-??/*"],
         )
       },
@@ -251,6 +261,10 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
           "${aws_s3_bucket.tv_cold.arn}/sebi-preserve/*",
           "${aws_s3_bucket.tv_cold.arn}/logs/*",
           "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/keep/*",
+          "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/files/*audit*",
+          "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/files/*sebi*",
+          "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/files/*deploys*",
+          "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/files/*logs*",
         ]
       },
       {
