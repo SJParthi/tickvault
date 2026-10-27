@@ -249,6 +249,33 @@ pub fn plan_table(name: &str, partition_by: &str, designated: &str, keep: &[&str
     }
 }
 
+/// The listed parent of a QuestDB split piece `bad`, when it is one and its
+/// parent is a parseable partition in the same `listing`. The parent is
+/// copied by its whole `[start, end)` time range and recounted, so the
+/// piece's rows are in that copy (2026-10-27: 28 split pieces of the day's
+/// candle and tick partitions stopped the copy as "cannot be copied safely"
+/// although every row was copied and verified). A piece whose parent is not
+/// listed stays a problem (fail closed). O(listing) per piece, cold.
+fn split_parent_listed<'a>(
+    bad: &str,
+    listing: &'a [Result<tickvault_storage::partition_archive::RebuildPartitionInfo, String>],
+) -> Option<&'a str> {
+    let candidates = tickvault_storage::partition_archive::split_partition_parents(bad);
+    listing.iter().find_map(|p| match p {
+        Ok(info) if candidates.contains(&info.name.as_str()) => Some(info.name.as_str()),
+        _ => None,
+    })
+}
+
+/// `false` for a table QuestDB cannot put on its write-ahead log: one with
+/// no partitioning (`PARTITION BY NONE`, or no value). Its writes apply when
+/// acknowledged and it never appears in `wal_tables()`, so the copy skips
+/// the WAL-applied gate for it only.
+#[must_use]
+pub fn is_wal_capable(partition_by: &str) -> bool {
+    !(partition_by.is_empty() || partition_by.eq_ignore_ascii_case("NONE"))
+}
+
 /// `true` for a WAL segment file name (`ws-frames-<digits>.wal`).
 #[must_use]
 pub fn is_wal_segment_name(name: &str) -> bool {
@@ -564,9 +591,14 @@ async fn inventory() -> BoxReport {
                                     )
                                 ));
                             }
-                            Err(bad) => r.problem(format!(
-                                "{name}: partition {bad:?} cannot be copied safely"
-                            )),
+                            Err(bad) => match split_parent_listed(bad, &listing) {
+                                Some(parent) => r.line(format!(
+                                    "{name}: split piece {bad} is inside {parent}, copied with it by time range"
+                                )),
+                                None => r.problem(format!(
+                                    "{name}: partition {bad:?} cannot be copied safely"
+                                )),
+                            },
                         }
                     }
                     parts_total += n;
@@ -770,11 +802,23 @@ async fn copy_body(r: &mut BoxReport) {
                     }
                 };
                 let (mut ok, mut rows) = (0u64, 0u64);
-                for p in listing {
+                let split_parents: Vec<Option<String>> = listing
+                    .iter()
+                    .map(|p| match p {
+                        Err(bad) => split_parent_listed(bad, &listing).map(str::to_string),
+                        Ok(_) => None,
+                    })
+                    .collect();
+                for (p, split_parent) in listing.into_iter().zip(split_parents) {
                     match p {
-                        Err(bad) => {
-                            r.problem(format!("{name}: partition {bad:?} cannot be copied safely"))
-                        }
+                        Err(bad) => match split_parent {
+                            Some(parent) => r.line(format!(
+                                "{name}: split piece {bad} is inside {parent}, copied with it by time range"
+                            )),
+                            None => r.problem(format!(
+                                "{name}: partition {bad:?} cannot be copied safely"
+                            )),
+                        },
                         Ok(p) => match arch.rebuild_copy_partition(name, &p.name).await {
                             Ok(c) => {
                                 ok += 1;
@@ -789,7 +833,10 @@ async fn copy_body(r: &mut BoxReport) {
                     "copied {name}: {ok} partitions, {rows} rows, verified"
                 ));
             }
-            TablePlan::Whole => match arch.rebuild_copy_whole_table(name, &tables_prefix).await {
+            TablePlan::Whole => match arch
+                .rebuild_copy_whole_table(name, &tables_prefix, is_wal_capable(partition_by))
+                .await
+            {
                 Ok(c) => {
                     r.line(format!("copied {name} whole: {} rows, verified", c.rows));
                     manifest.whole_tables.push(c);
@@ -804,7 +851,10 @@ async fn copy_body(r: &mut BoxReport) {
                         continue;
                     }
                 };
-                match arch.rebuild_copy_whole_table(name, &keep_prefix).await {
+                match arch
+                    .rebuild_copy_whole_table(name, &keep_prefix, is_wal_capable(partition_by))
+                    .await
+                {
                     Ok(c) => {
                         r.line(format!(
                             "copied keep {name}: {} rows with DDL, verified",
@@ -1276,6 +1326,58 @@ mod tests {
 
     const SHA: &str = "f92a6472f0000000000000000000000000000000";
     const KEY: &str = "rebuild-2026-10-22/manifests/copy-20261022T133500Z.json";
+
+    fn part(
+        name: &str,
+    ) -> Result<tickvault_storage::partition_archive::RebuildPartitionInfo, String> {
+        Ok(tickvault_storage::partition_archive::RebuildPartitionInfo {
+            name: name.to_string(),
+            active: false,
+            num_rows: 1,
+            disk_bytes: 1,
+        })
+    }
+
+    /// 2026-10-27 apply: a split piece is covered only when its parent is in
+    /// the same listing; a piece whose parent is missing stays a problem.
+    #[test]
+    fn test_regression_split_parent_listed_needs_the_parent_in_the_listing() {
+        let day = vec![
+            part("2026-10-26"),
+            part("2026-10-27"),
+            Err(String::from("2026-10-27T102600-000001")),
+        ];
+        assert_eq!(
+            split_parent_listed("2026-10-27T102600-000001", &day),
+            Some("2026-10-27")
+        );
+        let hour = vec![
+            part("2026-10-27T14"),
+            part("2026-10-27T15"),
+            Err(String::from("2026-10-27T152808-982120")),
+        ];
+        assert_eq!(
+            split_parent_listed("2026-10-27T152808-982120", &hour),
+            Some("2026-10-27T15")
+        );
+        let orphan = vec![part("2026-10-26")];
+        assert_eq!(
+            split_parent_listed("2026-10-27T102600-000001", &orphan),
+            None
+        );
+        assert_eq!(split_parent_listed("x';DROP", &day), None);
+    }
+
+    /// `schema_reset_log` (no partitioning) never appears in `wal_tables()`.
+    #[test]
+    fn test_regression_is_wal_capable_is_false_only_without_partitioning() {
+        assert!(!is_wal_capable("NONE"));
+        assert!(!is_wal_capable("none"));
+        assert!(!is_wal_capable(""));
+        for by in ["DAY", "HOUR", "MONTH", "YEAR", "WEEK"] {
+            assert!(is_wal_capable(by), "{by}");
+        }
+    }
 
     #[test]
     fn test_is_invocation_matches_only_the_subcommand_word() {

@@ -3142,6 +3142,42 @@ pub fn build_rebuild_partition_list_sql(table: &str) -> String {
     format!("SELECT name, active, numRows, diskSize FROM table_partitions('{table}')")
 }
 
+/// The possible parent partitions of a QuestDB SPLIT piece (empty when
+/// `name` is not one). Out-of-order writes into an existing partition make
+/// QuestDB split it: the piece is named after its parent plus the split
+/// instant and a transaction number, `2026-10-27T102600-000001` for the DAY
+/// partition `2026-10-27` (`THHMMSS`) and `2026-10-27T152808-982120` for the
+/// HOUR partition `2026-10-27T15` (`MMSS`). The two shapes have the same
+/// length, so a name can read either way; the caller takes the candidate
+/// that is in the same listing (a table is partitioned one way). Every row of
+/// a piece lies inside its parent's time range, so a copy of the parent by
+/// `[start, end)` on `ts` (what the rebuild exports and recounts) already
+/// holds them. Only these exact shapes match; anything else yields no
+/// candidate (fail closed). Pure, O(name length).
+#[must_use]
+pub fn split_partition_parents(name: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let Some((head, txn)) = name.rsplit_once('-') else {
+        return out;
+    };
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    if txn.is_empty() || !txn.bytes().all(|b| b.is_ascii_digit()) || head.len() != 17 {
+        return out;
+    }
+    // DAY parent: "YYYY-MM-DD" + "T" + HHMMSS.
+    let (day, rest) = head.split_at(10);
+    if rest.strip_prefix('T').is_some_and(|c| digits(c, 6)) && partition_range_bounds(day).is_some()
+    {
+        out.push(day);
+    }
+    // HOUR parent: "YYYY-MM-DDTHH" + MMSS.
+    let (hour, clock) = head.split_at(13);
+    if digits(clock, 4) && partition_range_bounds(hour).is_some() {
+        out.push(hour);
+    }
+    out
+}
+
 /// Parses the rebuild partition listing by column NAME. A row missing a
 /// field, or with a name that fails [`is_valid_partition_name`], is returned
 /// as `Err(name)` so the caller can report it rather than skip it silently.
@@ -3343,16 +3379,25 @@ impl PartitionArchiver {
     /// `<key_prefix>/<table>/<sha>.csv.gz`. Used for the tables the rebuild
     /// restores onto the new disk (the SEBI/audit keep-list) and for tables
     /// with no time partitions. NEVER drops.
+    ///
+    /// `wal_table` is false for a table with no partitioning (`PARTITION BY
+    /// NONE`): QuestDB cannot put such a table on its write-ahead log, so it
+    /// is never in `wal_tables()` and its writes are applied when they are
+    /// acknowledged. The WAL gate is skipped for it only; every other table
+    /// still must prove its WAL applied (2026-10-27: `schema_reset_log`, a
+    /// keep-list table with no partitioning, failed the gate forever and
+    /// stopped the rebuild copy).
     // TEST-EXEMPT: live QuestDB + S3; the key builder and the count parser are tested below
     pub async fn rebuild_copy_whole_table(
         &mut self,
         table: &str,
         key_prefix: &str,
+        wal_table: bool,
     ) -> std::result::Result<RebuildCopiedObject, String> {
         if !is_rebuild_safe_table_name(table) {
             return Err(format!("unsafe table name {table:?}"));
         }
-        if !self.wal_applied_gate(table, "", "rebuild").await {
+        if wal_table && !self.wal_applied_gate(table, "", "rebuild").await {
             return Err(String::from("WAL not proven applied"));
         }
         let path = self.temp_dir.join(format!("{table}-whole.csv.gz"));
@@ -3815,7 +3860,34 @@ mod fair_share_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartitionListing, is_table_absent_response};
+    use super::{PartitionListing, is_table_absent_response, split_partition_parents};
+
+    /// 2026-10-27 rebuild: the split pieces QuestDB listed that night name
+    /// their DAY or HOUR parent; anything else yields no parent.
+    #[test]
+    fn test_split_partition_parents_reads_day_and_hour_splits() {
+        assert_eq!(
+            split_partition_parents("2026-10-27T102600-000001"),
+            vec!["2026-10-27", "2026-10-27T10"]
+        );
+        assert!(split_partition_parents("2026-10-27T152808-982120").contains(&"2026-10-27T15"));
+        for not_a_split in [
+            "2026-10-27",
+            "2026-10-27T15",
+            "2026-10-27T102600",
+            "2026-10-27T102600-",
+            "2026-10-27T1026-000001",
+            "2026-10-27X102600-000001",
+            "2026-13-27T102600-000001",
+            "2026-10-27T10260a-000001",
+            "x';DROP-1",
+        ] {
+            assert!(
+                split_partition_parents(not_a_split).is_empty(),
+                "{not_a_split} is not a split piece"
+            );
+        }
+    }
 
     /// The exact envelope QuestDB returns for a missing table is absence,
     /// not failure — the 2026-09-23 shape that kept the day unlatched.
