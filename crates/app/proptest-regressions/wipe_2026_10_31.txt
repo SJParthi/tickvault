@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc b503bc1ec72b09dc608d0145cce6389cedae7acfedc59500515abec036d42340 # shrinks to year = 2025, month = 1, day = 1, hour = None, table_pick = 0, root_pick = 0, written_offset = 0
 cc 3b6de576b040d55a9fc17a22fa5ddcccd6f51330e0b77c0502e599d49fd8b787 # shrinks to year = 2025, month = 1, day = 1, hour = None, table_pick = 1547, root_pick = 4, written_offset = -1
+cc 73ca73a920c77ad7453717c7b9d6806729f398759a8b617dc10f0e989a53e27a # shrinks to year = 2025, month = 1, day = 1, hour = None, table_pick = 0, root_pick = 12, written_offset = -1, files_dir = 0, word_pick = 8

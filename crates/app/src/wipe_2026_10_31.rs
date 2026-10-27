@@ -10,7 +10,10 @@
 //! Wednesday's fresh box writes can be touched), the S3 scope adds the
 //! market-data tables the rebuild copied under `rebuild-2026-10-22/tables/`
 //! and the three quarantine prefixes, and the old-root snapshot is kept until
-//! 2026-10-28 16:30 IST. Quote 29's keep-list is kept: every SEBI and audit
+//! 2026-10-28 16:30 IST. Quote 43 (same day) adds the rebuild's copies of
+//! the market-data spill files under `rebuild-2026-10-22/files/` and keeps
+//! every key naming `audit`, `sebi`, `deploys` or `logs`. Quote 29's
+//! keep-list is kept: every SEBI and audit
 //! table (the rebuild's keep-list, [`is_keep_table`]), `sebi-preserve/`,
 //! `deploys/`, `logs/`, versioning, lifecycle, and anything dated 2026-10-28
 //! or later. The tool's name, workflow, environment, role and confirm word
@@ -102,6 +105,20 @@ const DATED_ROOTS: [&str; 6] = [
 pub const REBUILD_TABLES_ROOT: &str = "rebuild-2026-10-22/tables/";
 /// The rebuild's keep-list copies (`rebuild-2026-10-22/keep/`): never touched.
 const REBUILD_KEEP_ROOT: &str = "rebuild-2026-10-22/keep/";
+/// Where the rebuild copied the files under `data/`:
+/// `rebuild-2026-10-22/files/<path under data/>.sha-<sha256 hex>`
+/// (`rebuild_copy::rebuild_file_key`). Quote 43 adds the market-data spill
+/// files here: only copies of `data/spill/**` and `data/dlq/**` (the folders
+/// the box phase wipes), dated by the version's last-modified time. Any path
+/// naming `audit`, `sebi`, `deploys` or `logs` is kept, as is every other
+/// file the rebuild copied (instrument cache, state markers, ...).
+pub const REBUILD_FILES_ROOT: &str = "rebuild-2026-10-22/files/";
+/// The `data/` folders whose copies under [`REBUILD_FILES_ROOT`] are spill
+/// files (Quote 43).
+const REBUILD_SPILL_DIRS: [&str; 2] = ["spill", "dlq"];
+/// Path words that keep a key whatever its root (Quote 43; checked
+/// case-insensitively).
+const PROTECTED_WORDS: [&str; 4] = ["audit", "sebi", "deploys", "logs"];
 /// S3 roots that are never touched, whatever follows.
 const PROTECTED_ROOTS: [&str; 3] = ["deploys/", "sebi-preserve/", "logs/"];
 /// The only year the IAM grant covers (`2026-0?-??*`, `2026-10-??*`).
@@ -253,6 +270,7 @@ pub fn s3_list_prefixes() -> Vec<String> {
         .collect();
     out.extend(DATED_ROOTS.iter().map(|r| (*r).to_string()));
     out.push(REBUILD_TABLES_ROOT.to_string());
+    out.push(REBUILD_FILES_ROOT.to_string());
     out
 }
 
@@ -279,11 +297,60 @@ fn rebuild_table_verdict(rest: &str, last_modified_unix_secs: Option<i64>) -> Ve
     if !market_data_tables().contains(&table) || !is_rebuild_whole_table_file(file) {
         return Verdict::KeepUnparsed;
     }
+    written_before_cutoff(last_modified_unix_secs)
+}
+
+/// Dates an undated rebuild copy by its version's last-modified time:
+/// [`Verdict::Delete`] only when it was written before the cutoff instant;
+/// an unknown time keeps it.
+fn written_before_cutoff(last_modified_unix_secs: Option<i64>) -> Verdict {
     match (last_modified_unix_secs, cutoff_unix_secs()) {
         (Some(t), Some(c)) if t < c => Verdict::Delete,
         (Some(_), Some(_)) => Verdict::KeepNotOld,
         _ => Verdict::KeepUnparsed,
     }
+}
+
+/// One object under [`REBUILD_FILES_ROOT`] (`<path under data/>.sha-<hex>`):
+/// deleted only when the path is a copy of a market-data spill file (first
+/// folder in [`REBUILD_SPILL_DIRS`], at least one file below it, no empty,
+/// `.` or `..` component), the name ends in the rebuild's
+/// `.sha-<64 lowercase hex>`, and the version was written before the cutoff
+/// instant. The caller has already kept every path naming a
+/// [`PROTECTED_WORDS`] word. Anything else is kept and reported.
+fn rebuild_file_verdict(rest: &str, last_modified_unix_secs: Option<i64>) -> Verdict {
+    let Some((rel, hex)) = rest.rsplit_once(".sha-") else {
+        return Verdict::KeepUnparsed;
+    };
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Verdict::KeepUnparsed;
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts.len() < 2
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || *p == "." || *p == "..")
+        || !REBUILD_SPILL_DIRS.contains(&parts[0])
+    {
+        return Verdict::KeepUnparsed;
+    }
+    // A folder or file named for a date on or after the cutoff is kept, as
+    // the IAM Deny on `*/2026-10-28*` and later would refuse it anyway.
+    let cutoff = cutoff_date();
+    if parts
+        .iter()
+        .filter_map(|p| leading_date(p))
+        .any(|d| cutoff.is_none_or(|c| d >= c))
+    {
+        return Verdict::KeepNotOld;
+    }
+    written_before_cutoff(last_modified_unix_secs)
+}
+
+/// `true` when the key names a [`PROTECTED_WORDS`] word, in any case.
+fn names_a_protected_word(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    PROTECTED_WORDS.iter().any(|w| lower.contains(w))
 }
 
 /// A real `YYYY-MM-DD` date at the start of `s`.
@@ -342,19 +409,22 @@ pub fn partition_verdict(table: &str, name: &str) -> Verdict {
 /// Classifies one object version of the cold bucket by its key and, for the
 /// undated rebuild keys only, its last-modified time (Unix seconds).
 ///
-/// Any key naming `audit` or `sebi` anywhere is kept, whatever its root
-/// (defence in depth: the box classifier keeps such paths the same way).
+/// Any key naming `audit`, `sebi`, `deploys` or `logs` anywhere, in any
+/// case, is kept, whatever its root (Quote 43; the box classifier keeps
+/// audit and sebi paths the same way).
 #[must_use]
 pub fn classify_s3_key(key: &str, last_modified_unix_secs: Option<i64>) -> Verdict {
     if PROTECTED_ROOTS.iter().any(|r| key.starts_with(r))
         || key.starts_with(REBUILD_KEEP_ROOT)
-        || key.contains("audit")
-        || key.contains("sebi")
+        || names_a_protected_word(key)
     {
         return Verdict::KeepProtected;
     }
     if let Some(rest) = key.strip_prefix(REBUILD_TABLES_ROOT) {
         return rebuild_table_verdict(rest, last_modified_unix_secs);
+    }
+    if let Some(rest) = key.strip_prefix(REBUILD_FILES_ROOT) {
+        return rebuild_file_verdict(rest, last_modified_unix_secs);
     }
     if let Some(rest) = key.strip_prefix(PARTITIONS_ROOT) {
         let Some((table, name)) = rest.split_once('/') else {
@@ -647,7 +717,7 @@ pub struct S3Plan {
 }
 
 fn group_of(key: &str) -> String {
-    for root in [PARTITIONS_ROOT, REBUILD_TABLES_ROOT] {
+    for root in [PARTITIONS_ROOT, REBUILD_TABLES_ROOT, REBUILD_FILES_ROOT] {
         if let Some(rest) = key.strip_prefix(root) {
             let table = rest.split('/').next().unwrap_or_default();
             return format!("{root}{table}");
@@ -918,7 +988,7 @@ mod tests {
     #[test]
     fn test_s3_list_prefixes_are_exact_and_never_protected() {
         let p = s3_list_prefixes();
-        assert_eq!(p.len(), market_data_tables().len() + DATED_ROOTS.len() + 1);
+        assert_eq!(p.len(), market_data_tables().len() + DATED_ROOTS.len() + 2);
         assert!(p.iter().all(|x| x.ends_with('/')));
         for want in [
             "questdb-partitions/ticks/",
@@ -929,6 +999,7 @@ mod tests {
             "depth-quarantine/",
             "top-volume-quarantine/",
             "rebuild-2026-10-22/tables/",
+            "rebuild-2026-10-22/files/",
         ] {
             assert!(p.contains(&want.to_string()), "{want}");
         }
@@ -1327,7 +1398,8 @@ mod tests {
         for key in [
             format!("rebuild-2026-10-22/keep/order_audit/{hex}.csv.gz"),
             format!("rebuild-2026-10-22/keep/ticks/{hex}.csv.gz"),
-            format!("rebuild-2026-10-22/files/spill/ticks/a.ilp.sha-{hex}"),
+            format!("rebuild-2026-10-22/files/spill/audit/order_audit/a.ilp.sha-{hex}"),
+            format!("rebuild-2026-10-22/files/instrument-cache/x.rkyv.sha-{hex}"),
             "rebuild-2026-10-22/manifests/copy-20261027T133500Z.json".to_string(),
         ] {
             assert_ne!(classify_s3_key(&key, tonight), Delete, "{key}");
@@ -1343,6 +1415,116 @@ mod tests {
             assert_eq!(classify_s3_key(&key, tonight), KeepUnparsed, "{key}");
         }
         assert!(s3_list_prefixes().contains(&REBUILD_TABLES_ROOT.to_string()));
+    }
+
+    #[test]
+    fn test_regression_rebuild_spill_files_are_deleted_before_cutoff() {
+        use Verdict::*;
+        // Quote 43: the rebuild's copies of the market-data spill files go,
+        // keyed exactly as the rebuild writes them.
+        let hex = "0123456789abcdef".repeat(4);
+        let key_of = |rel: &str| tickvault_storage::rebuild_copy::rebuild_file_key(rel, &hex);
+        let tonight = Some(secs("2026-10-27 20:00"));
+        for rel in [
+            "spill/ticks/ticks-1.ilp",
+            "spill/depth/depth-2.ilp",
+            "spill/seals_v6-2026-10-27.bin",
+            "spill/replaying/seals_v6-2026-10-26.bin",
+            "spill/ticks/quarantine/ticks-3.ilp",
+            "spill/top_volume/tv-1.ilp",
+            "dlq/seals-2026-10-26.ndjson",
+        ] {
+            let key = key_of(rel);
+            assert!(key.starts_with(REBUILD_FILES_ROOT), "{key}");
+            assert_eq!(classify_s3_key(&key, tonight), Delete, "{key}");
+            // Written at or after the cutoff instant, or at an unknown time: kept.
+            assert_eq!(
+                classify_s3_key(&key, Some(secs("2026-10-28 00:00"))),
+                KeepNotOld,
+                "{key}"
+            );
+            assert_eq!(classify_s3_key(&key, None), KeepUnparsed, "{key}");
+        }
+        // A folder named for Wednesday or later is kept whatever its write time.
+        for rel in ["spill/2026-10-28/x.ilp", "dlq/2026-11-01/y.ndjson"] {
+            assert_eq!(classify_s3_key(&key_of(rel), tonight), KeepNotOld, "{rel}");
+        }
+        // Not a spill file, not the rebuild's name shape, or an odd path: kept.
+        for key in [
+            key_of("instrument-cache/universe.rkyv"),
+            key_of("state/daily/x.marker"),
+            key_of("spill"),
+            key_of("spill-hold/depth-1.ilp"),
+            format!("{REBUILD_FILES_ROOT}spill/ticks/ticks-1.ilp"),
+            format!("{REBUILD_FILES_ROOT}spill/ticks/ticks-1.ilp.sha-ABC"),
+            format!("{REBUILD_FILES_ROOT}spill//x.ilp.sha-{hex}"),
+            format!("{REBUILD_FILES_ROOT}spill/../state/x.sha-{hex}"),
+        ] {
+            assert_eq!(classify_s3_key(&key, tonight), KeepUnparsed, "{key}");
+        }
+        assert!(s3_list_prefixes().contains(&REBUILD_FILES_ROOT.to_string()));
+        let plan = S3Plan::from_entries(vec![VersionEntry {
+            key: key_of("spill/ticks/ticks-1.ilp"),
+            version_id: "v".to_string(),
+            bytes: 10,
+            is_delete_marker: false,
+            last_modified_unix_secs: tonight,
+        }]);
+        assert_eq!(plan.groups["rebuild-2026-10-22/files/spill"].versions, 1);
+    }
+
+    #[test]
+    fn test_rebuild_files_keep_audit_sebi_deploy_log_paths() {
+        let hex = "a".repeat(64);
+        let tonight = Some(secs("2026-10-27 20:00"));
+        for rel in [
+            "spill/audit/order_audit/a.ilp",
+            "spill/audit/pnl_audit/b.ilp",
+            "spill/order_audit_x.ilp",
+            "spill/AUDIT/x.ilp",
+            "dlq/Sebi-preserve/x.csv",
+            "spill/sebi/x",
+            "spill/deploys/x",
+            "spill/DEPLOYS/x",
+            "spill/logs/x.log",
+            "dlq/Logs/x",
+            "sebi-preserve/2026-10-01/x.csv",
+            "logs/machine/app.log",
+        ] {
+            let key = tickvault_storage::rebuild_copy::rebuild_file_key(rel, &hex);
+            assert_eq!(
+                classify_s3_key(&key, tonight),
+                Verdict::KeepProtected,
+                "{key}"
+            );
+        }
+        // The same words keep a key under every other root, in any case.
+        for key in [
+            "raw-frames/2026-10-01/AUDIT.gz",
+            "tick-quarantine/2026-10-01/logs.gz",
+            "seal-spill/2026-10-01/Deploys.gz",
+        ] {
+            assert_eq!(
+                classify_s3_key(key, tonight),
+                Verdict::KeepProtected,
+                "{key}"
+            );
+        }
+        // The rebuild's keep copies and manifests are never deleted.
+        assert_eq!(
+            classify_s3_key(
+                &format!("rebuild-2026-10-22/keep/ticks/{hex}.csv.gz"),
+                tonight
+            ),
+            Verdict::KeepProtected
+        );
+        assert_ne!(
+            classify_s3_key(
+                "rebuild-2026-10-22/manifests/copy-20261027T133500Z.json",
+                tonight
+            ),
+            Verdict::Delete
+        );
     }
 
     /// IAM's ARN wildcard match: `*` any run (including `/`), `?` one char.
@@ -1365,6 +1547,9 @@ mod tests {
             out.push(format!("questdb-partitions/{t}/2026-??-??*"));
             out.push(format!("{REBUILD_TABLES_ROOT}{t}/*"));
         }
+        for d in REBUILD_SPILL_DIRS {
+            out.push(format!("{REBUILD_FILES_ROOT}{d}/*"));
+        }
         for r in DATED_ROOTS {
             out.push(format!("{r}2026-??-??/*"));
         }
@@ -1385,6 +1570,9 @@ mod tests {
             out.push(format!("{r}*"));
         }
         out.push(format!("{REBUILD_KEEP_ROOT}*"));
+        for w in PROTECTED_WORDS {
+            out.push(format!("{REBUILD_FILES_ROOT}*{w}*"));
+        }
         out
     }
 
@@ -1407,7 +1595,13 @@ mod tests {
             "/${r}/2026-??-??/*\"",
             "/*/${d}*\"",
             "/rebuild-2026-10-22/keep/*\"",
-            "[\"rebuild-2026-10-22/tables/\"]",
+            "[\"rebuild-2026-10-22/tables/\", \"rebuild-2026-10-22/files/\"]",
+            "/rebuild-2026-10-22/files/spill/*\"",
+            "/rebuild-2026-10-22/files/dlq/*\"",
+            "/rebuild-2026-10-22/files/*audit*\"",
+            "/rebuild-2026-10-22/files/*sebi*\"",
+            "/rebuild-2026-10-22/files/*deploys*\"",
+            "/rebuild-2026-10-22/files/*logs*\"",
         ] {
             assert!(tf.contains(want), "{want}");
         }
@@ -1439,6 +1633,18 @@ mod tests {
             }
             keys.push(format!("{REBUILD_TABLES_ROOT}{t}/{hex}.csv.gz"));
         }
+        for rel in [
+            "spill/ticks/ticks-1.ilp",
+            "spill/seals_v6-2026-10-27.bin",
+            "spill/depth/quarantine/d.ilp",
+            "dlq/seals-2026-10-26.ndjson",
+            "spill/2026-10-28/x.ilp",
+            "spill/audit/order_audit/a.ilp",
+            "spill/Logs/x.ilp",
+            "instruments/cache.rkyv",
+        ] {
+            keys.push(format!("{REBUILD_FILES_ROOT}{rel}.sha-{hex}"));
+        }
         for r in DATED_ROOTS {
             for d in ["2026-09-30", "2026-10-27", "2026-10-28", "2026-10-31"] {
                 keys.push(format!("{r}{d}/x.gz"));
@@ -1453,7 +1659,9 @@ mod tests {
                 assert!(granted && !denied, "{k}: granted {granted} denied {denied}");
             } else {
                 assert!(
-                    !granted || denied || k.starts_with(REBUILD_TABLES_ROOT),
+                    // Undated rebuild copies are dated, and mixed-case
+                    // protected words kept, by the tool alone.
+                    !granted || denied || k.starts_with("rebuild-2026-10-22/"),
                     "{k}"
                 );
             }
@@ -1488,6 +1696,8 @@ mod tests {
         let fixed = tf[start..end]
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
+            // Object ARN lines are counted once, in `rendered`.
+            .filter(|l| !l.contains("tv_cold.arn}/"))
             .flat_map(str::chars)
             .filter(|c| !c.is_whitespace())
             .count();
@@ -1497,7 +1707,10 @@ mod tests {
             .map(|p| BUCKET_ARN.len() + p.len() + 3)
             .chain(s3_list_prefixes().iter().map(|p| p.len() + 3))
             .sum();
-        let total = fixed + rendered;
+        // jsonencode quotes every HCL key (`Sid =` becomes `"Sid":`): about
+        // 70 keys, two characters each, rounded up.
+        const JSON_KEY_QUOTES: usize = 300;
+        let total = fixed + rendered + JSON_KEY_QUOTES;
         assert!(
             total < IAM_ROLE_INLINE_LIMIT - 1_000,
             "estimated inline policy {total} chars (fixed {fixed}, rendered {rendered})"
@@ -1515,8 +1728,10 @@ mod tests {
             day in 1u32..=31,
             hour in proptest::option::of(0u32..=23),
             table_pick in 0usize..10_000,
-            root_pick in 0usize..12,
+            root_pick in 0usize..16,
             written_offset in -900_000i64..900_000,
+            files_dir in 0usize..5,
+            word_pick in 0usize..12,
         ) {
             use Verdict::*;
             let date = format!("{year:04}-{month:02}-{day:02}");
@@ -1532,6 +1747,13 @@ mod tests {
                 0..=3 => format!("questdb-partitions/{table}/{date}{hour}.csv.gz"),
                 4 => format!("{REBUILD_TABLES_ROOT}{table}/{}.csv.gz", "b".repeat(64)),
                 5 => format!("rebuild-2026-10-22/keep/{table}/{}.csv.gz", "c".repeat(64)),
+                12..=15 => {
+                    let dir = ["spill", "dlq", "spill/ticks", "instrument-cache", "state"][files_dir];
+                    let word = ["audit", "SEBI", "Deploys", "logs", "Audit", "sebi", "DEPLOYS", "LOGS"]
+                        .get(word_pick)
+                        .map_or(String::new(), |w| format!("{w}/"));
+                    format!("{REBUILD_FILES_ROOT}{dir}/{word}{date}{hour}.ilp.sha-{}", "d".repeat(64))
+                }
                 r => format!("{}{date}/f.gz", DATED_ROOTS[(r - 6) % DATED_ROOTS.len()]),
             };
             let v = classify_s3_key(&key, Some(written));
@@ -1541,8 +1763,23 @@ mod tests {
             if root_pick == 4 && written >= secs("2026-10-28 00:00") {
                 proptest::prop_assert_ne!(v, Delete, "{}", key);
             }
-            if root_pick != 4 && dated_new {
+            if root_pick != 4 && root_pick < 12 && dated_new {
                 proptest::prop_assert_ne!(v, Delete, "{}", key);
+            }
+            if root_pick >= 12 {
+                let lower = key.to_ascii_lowercase();
+                let worded = ["audit", "sebi", "deploys", "logs"].iter().any(|w| lower.contains(w));
+                let spill = files_dir <= 2;
+                if worded {
+                    proptest::prop_assert_eq!(v, KeepProtected, "{}", key);
+                }
+                if written >= secs("2026-10-28 00:00") || dated_new || !spill {
+                    proptest::prop_assert_ne!(v, Delete, "{}", key);
+                }
+                let old_name = NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_or(true, |d| d < cutoff);
+                if !worded && spill && old_name && written < secs("2026-10-28 00:00") {
+                    proptest::prop_assert_eq!(v, Delete, "{}", key);
+                }
             }
             if root_pick <= 3 {
                 let p = format!("{date}{hour}");
