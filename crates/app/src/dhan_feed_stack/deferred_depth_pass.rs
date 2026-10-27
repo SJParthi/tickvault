@@ -109,6 +109,7 @@ use tickvault_core::parser::depth::DepthFeedKind;
 use tickvault_core::parser::dispatcher::{dispatch_frame, main_feed_packet_len};
 use tickvault_core::websocket::pool_budget::DhanEndpointType;
 use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+use tickvault_storage::wal_applied_watermark::reorder_reach_lo;
 use tickvault_storage::wal_deferred_depth::{
     DEFERRED_BUCKET_SHIFT, DeferredDepth, SHED_DEPTH_ALL, ShedDepth,
 };
@@ -643,7 +644,18 @@ pub fn run_after_close_pass(
     // segment at or below the overflow height is swept for both kinds.
     let mut overflow_complete = snap.overflowed;
     if snap.overflowed {
+        // Plan item W2 (2026-10-27): every lost mark is at or below the
+        // height, so a segment whose reach (one reorder slack below its first
+        // record, as the prune reads it) starts above the height holds none
+        // of them and is skipped BEFORE the open and unbounded checks. Until
+        // this change the newest segment, which never has an upper bound,
+        // marked every sweep incomplete and the overflow never cleared. An
+        // unknown height reaches every segment, as before.
+        let sweep_height = snap.overflow_height().unwrap_or(u64::MAX);
         for span in &spans {
+            if span.lo != 0 && reorder_reach_lo(span.lo) > sweep_height {
+                continue;
+            }
             if span.lo == 0 || span.is_open {
                 overflow_complete = false;
                 continue;
@@ -653,9 +665,6 @@ pub fn run_after_close_pass(
                 overflow_complete = false;
                 continue;
             };
-            if span.lo > snap.overflow_high_seq {
-                continue;
-            }
             let (lo_id, hi_id) = (
                 span.lo >> DEFERRED_BUCKET_SHIFT,
                 hi >> DEFERRED_BUCKET_SHIFT,
@@ -1605,6 +1614,76 @@ mod tests {
             clock.get() >= IN_WINDOW + AFTER_CLOSE_SETTLE.as_secs(),
             "it waited to settle"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two segments, A holding a frame at `seq` and B (the newest, so with
+    /// no upper bound) holding one three buckets later, each written by its
+    /// own WAL so B is a separate file. Both frames are outside the session
+    /// (01:56 IST), so the pass writes nothing and its flush succeeds.
+    fn wal_with_two_segments(tag: &str) -> (std::path::PathBuf, u64, u64) {
+        let (dir, seq) = wal_with_one_refused_frame(tag);
+        let later = seq + (3u64 << DEFERRED_BUCKET_SHIFT);
+        let rx: i64 = 1_780_000_000 * 1_000_000_000;
+        {
+            let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                later,
+                rx,
+                WalEndpoint::MainFeed,
+            );
+            wal.shutdown(Duration::from_secs(5));
+        }
+        (dir, seq, later)
+    }
+
+    /// Plan item W2 (2026-10-27): an overflow whose height is below the
+    /// newest segment is cleared once every segment reaching the height is
+    /// swept. Before, the newest segment (no upper bound) marked every sweep
+    /// incomplete, so the overflow never cleared and pinned every later
+    /// segment for good. An unknown height still reaches the newest segment
+    /// and stays set.
+    #[test]
+    fn test_regression_pass_clears_an_overflow_below_the_newest_segment() {
+        use tickvault_storage::wal_deferred_depth::DeferredDepthSnapshot;
+        let (dir, seq, later) = wal_with_two_segments("w2-overflow");
+        let spans = deferred_segment_spans(&dir).expect("listable");
+        assert_eq!(spans.len(), 2, "two segments: {spans:?}");
+        assert!(spans[1].hi.is_none(), "the newest has no upper bound");
+        let height = (((seq >> DEFERRED_BUCKET_SHIFT) + 1) << DEFERRED_BUCKET_SHIFT) - 1;
+        assert!(height < later);
+        let run = |overflow_high_seq: u64| {
+            let marks = DeferredDepth::new_for_tests();
+            marks.seed(&DeferredDepthSnapshot {
+                overflowed: true,
+                overflow_high_seq,
+                ..Default::default()
+            });
+            let clock = Cell::new(IN_WINDOW);
+            let sleep = |d: Duration| clock.set(clock.get() + d.as_secs());
+            let signals = PassSignals {
+                now_secs_ist: &|| clock.get(),
+                lag_growing_tables: &|| 0,
+                apply_lag: &|| Some(0),
+                sink_suspect: &|| false,
+                disk_free_fraction: &|_| Some(HEALTHY_FREE),
+                sleep: &sleep,
+            };
+            let summary = run_after_close_pass(
+                &mut DepthIngest::for_test(),
+                &marks,
+                &dir,
+                &AtomicBool::new(false),
+                &signals,
+            );
+            assert!(summary.stop.is_none(), "{summary:?}");
+            marks.snapshot().overflowed
+        };
+        assert!(!run(height), "a known height below B: swept and cleared");
+        assert!(run(u64::MAX), "an unknown height reaches B: kept");
+        assert!(run(later), "a height reaching B: kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
