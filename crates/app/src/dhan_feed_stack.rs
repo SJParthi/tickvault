@@ -1645,6 +1645,12 @@ pub struct LiveIngest {
     /// the volume ranking, whose monotonicity gate a stale cumulative would
     /// re-latch; that ranking is removed with `top_volume`.
     replaying_wal: bool,
+    /// `false` while the frame being drained carries no WAL receipt stamp
+    /// (the live drain substituted a wall-clock reading, which a replay
+    /// cannot reproduce), so its packets stay in `ticks` (plan item M5,
+    /// Quote 43). Set once per frame by the live drain and the replay; one
+    /// `bool` store.
+    frame_receipt_is_wal_stamp: bool,
 }
 
 /// Seals routed by [`route_catch_up_seal`], in the three outcomes a seal can
@@ -1918,6 +1924,7 @@ impl LiveIngest {
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
+            frame_receipt_is_wal_stamp: true,
         }
     }
 
@@ -2877,6 +2884,15 @@ impl LiveIngest {
             let c = counters();
             count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
         }
+        // M5 (2026-10-27, owner Quotes 41 + 43): a packet whose trade time is
+        // more than 2 s before its WAL receipt goes to `tick_quotes`. Packet
+        // and WAL record only, so a replay routes it the same way
+        // (`tick_quote_route`). O(1), no lookup.
+        let to_tick_quotes = crate::tick_quote_route::routes_to_tick_quotes(
+            tick.exchange_timestamp,
+            tick.received_at_nanos,
+            self.frame_receipt_is_wal_stamp,
+        );
 
         // Seals go STRAIGHT to the process-wide seal writer — the same
         // `global_seal_sender` the REST fold uses, landing in the same
@@ -3167,7 +3183,12 @@ impl LiveIngest {
         }
 
         // `append_tick_with_seq`, never `append_tick` — the single-source rule.
-        if self.writer.append_tick_with_seq(tick, capture_seq).is_err() {
+        let appended = if to_tick_quotes {
+            self.writer.append_tick_quote_with_seq(tick, capture_seq)
+        } else {
+            self.writer.append_tick_with_seq(tick, capture_seq)
+        };
+        if appended.is_err() {
             // No log here since 2026-09-01: `append_tick_with_seq` now emits
             // the coded ERROR itself (with `feed`, `source` and the failure
             // text) AND increments the ALARMED `tv_ticks_dropped_total`. The
@@ -8109,6 +8130,10 @@ pub fn drain_main_feed_frame(
     c: &DrainCounters,
 ) -> FrameOutcome {
     let mut out = FrameOutcome::default();
+    // M5 (Quote 43): `tick_quotes` routes on the WAL receipt stamp; a frame
+    // the WAL recorded as receipt-unknown keeps its packets in `ticks`.
+    ingest.frame_receipt_is_wal_stamp =
+        crate::tick_quote_route::receipt_is_wal_stamp(frame.received_at_nanos);
     // A single WebSocket message may carry SEVERAL stacked packets — the
     // frame cap is `MAX_PACKETS_PER_FRAME` (70,000) of them. Walking the frame
     // packet by packet is what stops packets 2..N being silently discarded.
@@ -15778,6 +15803,11 @@ pub fn refold_wal_frames(
     for (frame_idx, (frame_seq, wal_received_at_nanos, endpoint, bytes)) in
         frames.iter().enumerate()
     {
+        // M5 (Quote 43): the same receipt test as the live drain, on the
+        // stamp the WAL record carries (an unknown one reads as 0 and stays
+        // in `ticks` either way).
+        ingest.frame_receipt_is_wal_stamp =
+            crate::tick_quote_route::receipt_is_wal_stamp(*wal_received_at_nanos);
         // Plan ITEM 47: frames before this one were not replayed, so no
         // instrument's volume baseline may carry across. `while`, not `if`,
         // so a duplicate index is consumed rather than stalling the cursor.
@@ -27672,6 +27702,9 @@ mod silence_latch_tests {
 
 #[cfg(test)]
 mod contract_attach_tests;
+
+#[cfg(test)]
+mod tick_quotes_route_tests;
 
 #[cfg(test)]
 mod alive_connection_guard_tests {
