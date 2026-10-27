@@ -1291,7 +1291,7 @@ fn has_unconfirmed_ack_at(path: &Path, view: &SpillSinkView) -> bool {
 /// offset on both sides of the ack catches both, because the ack read then
 /// lies between two offset reads. O(1): two map probes and one ack probe.
 #[must_use]
-pub(crate) fn spill_file_pending(path: &Path, len: u64) -> bool {
+pub fn spill_file_pending(path: &Path, len: u64) -> bool {
     if len > resume_offset_for(path) {
         return true;
     }
@@ -5962,7 +5962,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             "offset lowered before the acks are cleared"
         );
         let helper = src
-            .split("pub(crate) fn spill_file_pending(")
+            .split("pub fn spill_file_pending(")
             .nth(1)
             .expect("spill_file_pending");
         let helper = &helper[..helper.find("\n\u{7d}\n").unwrap_or(helper.len())];

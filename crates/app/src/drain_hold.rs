@@ -232,11 +232,22 @@ pub fn hold_value(holding: bool, until_unix: i64, written_unix: i64, left: &str)
 /// files AND the framed depth files (`.dspl`, audit K1): the depth folder
 /// holds both, and before K1 a night with only framed depth left released the
 /// hold with that work undone. Two O(files) listings.
+///
+/// A file this process already drained to its end is not work either: the
+/// replay never empties the newest file in a folder (its writer may still
+/// append), so on 2026-10-27 three fully loaded files held the box an hour
+/// for nothing and gave up as `stalled`. A file counts only while it has
+/// bytes past the drained offset or loaded rows the database has not yet
+/// confirmed (`spill_file_pending`, O(1) per file). After a restart the
+/// offset is forgotten, so a file counts until the first round re-sends it.
 fn waiting_spill_files(dir: &Path) -> usize {
     tickvault_storage::tick_spill_replay::list_spill_files(dir)
         .into_iter()
         .chain(tickvault_storage::depth_spill_frame::list_framed_spill_files(dir))
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+        .filter(|p| {
+            std::fs::metadata(p)
+                .is_ok_and(|m| tickvault_storage::tick_spill_replay::spill_file_pending(p, m.len()))
+        })
         .count()
 }
 
