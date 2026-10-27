@@ -253,6 +253,14 @@ pub fn market_data_tables() -> Vec<&'static str> {
         tickvault_storage::partition_manager::all_managed_table_names();
     out.extend(tickvault_storage::shadow_persistence::retired_candle_table_names());
     out.retain(|t| !is_keep_table(t));
+    // 2026-10-27 (plan item M5): `tick_quotes` is created by this change and
+    // can hold no row before the 2026-10-28 cutoff (the router refuses any
+    // frame received earlier, live or replayed:
+    // `tick_quote_route::TICK_QUOTES_FIRST_RECEIPT_IST_SECS`, pinned equal to
+    // this tool's cutoff by a test), so it is not part of the
+    // wipe and not in the role's grant (`wipe_tables`); listing its prefix
+    // would only be refused.
+    out.retain(|t| *t != tickvault_storage::tick_quotes_persistence::TICK_QUOTES_TABLE);
     out.sort_unstable();
     out.dedup();
     out
@@ -960,6 +968,29 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Regression (2026-10-27, plan item M5): `tick_quotes` joined the
+    /// retention registry, which this list derives from; the one-off role has
+    /// no grant for it and it holds nothing before the cutoff.
+    #[test]
+    fn test_regression_tick_quotes_is_not_in_the_wipe_set() {
+        assert!(!market_data_tables().contains(&"tick_quotes"));
+        assert!(market_data_tables().contains(&"ticks"));
+    }
+
+    /// Review finding (2026-10-27): excluding `tick_quotes` is safe only while
+    /// the router writes nothing received before this tool's cutoff. The
+    /// router's first receipt (IST epoch seconds) must be the cutoff day's
+    /// IST midnight.
+    #[test]
+    fn test_regression_tick_quotes_router_cutoff_is_the_wipe_cutoff() {
+        let cutoff_utc = cutoff_unix_secs().unwrap_or(0);
+        assert_eq!(
+            crate::tick_quote_route::TICK_QUOTES_FIRST_RECEIPT_IST_SECS,
+            cutoff_utc + 19_800,
+            "router cutoff (IST epoch) must equal the wipe cutoff (UTC) + 5:30"
+        );
     }
 
     #[test]

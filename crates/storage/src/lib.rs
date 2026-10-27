@@ -307,6 +307,9 @@ pub mod hot_path_telemetry;
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
 pub mod tick_persistence;
+// Plan item M5 (2026-10-27, owner Quote 41): repeat quotes (no new trade) go
+// to `tick_quotes`, stamped at arrival; same tick writer and buffer.
+pub mod tick_quotes_persistence;
 // Plan item M1 (2026-10-26): counts where each `ticks` row lands against the
 // newest row written (append, late in its hour, older hour partition).
 pub mod tick_ts_placement;

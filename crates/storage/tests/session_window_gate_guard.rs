@@ -63,15 +63,39 @@ fn tick_persistence_src() -> String {
     strip_rust_comments(&raw)
 }
 
-/// The body of `append_tick_with_seq`, comments stripped.
+/// The body that gates both tick appends, comments stripped.
+///
+/// 2026-10-27 (plan item M5): `append_tick_with_seq` and
+/// `append_tick_quote_with_seq` are one-line wrappers over `append_tick_into`,
+/// which holds the gate for both tables, so this reads that body (up to the
+/// next method, `append_row`). Both wrappers must still delegate to it.
 fn append_fn_body(src: &str) -> String {
+    for (wrapper, call) in [
+        (
+            "pub fn append_tick_with_seq(",
+            "self.append_tick_into(tick, capture_seq, false)",
+        ),
+        (
+            "pub fn append_tick_quote_with_seq(",
+            "self.append_tick_into(tick, capture_seq, true)",
+        ),
+    ] {
+        let at = src
+            .find(wrapper)
+            .unwrap_or_else(|| panic!("{wrapper} is gone"));
+        let head: String = src[at..].chars().take(300).collect();
+        assert!(
+            head.contains(call),
+            "{wrapper} no longer goes through the gated body"
+        );
+    }
     let start = src
-        .find("pub fn append_tick_with_seq")
-        .expect("append_tick_with_seq is gone from tick_persistence.rs");
+        .find("fn append_tick_into(")
+        .expect("append_tick_into is gone from tick_persistence.rs");
     let rest = &src[start..];
     let end = rest
-        .find("\n    pub fn append_row")
-        .unwrap_or(rest.len().min(6000));
+        .find("\n    pub(crate) fn append_row")
+        .expect("append_row must follow append_tick_into");
     rest[..end].to_string()
 }
 

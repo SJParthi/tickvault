@@ -1569,6 +1569,14 @@ fn line_is_positively_out_of_window(line: &[u8], is_arrival_clock: bool) -> bool
     if is_feed_aux_line(trimmed) {
         return false;
     }
+    // A `tick_quotes` row (plan item M5) also shares the tick buffer, and its
+    // `ts` is the ARRIVAL time, not the exchange time this window judges. The
+    // writer accepted it (it gates on the exchange time), so the replay must
+    // never drop it: a repeat quote that arrived after 15:40 was lost here
+    // before (review finding, 2026-10-27).
+    if is_tick_quotes_line(trimmed) {
+        return false;
+    }
     let Some(last) = trimmed.rsplit(|b| *b == b' ').next() else {
         return false;
     };
@@ -1610,6 +1618,13 @@ fn line_is_positively_out_of_window(line: &[u8], is_arrival_clock: bool) -> bool
 /// is the text before the first unescaped `,` or space. One prefix compare.
 fn is_feed_aux_line(line: &[u8]) -> bool {
     let table = crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE.as_bytes();
+    line.strip_prefix(table)
+        .is_some_and(|rest| matches!(rest.first(), Some(b',' | b' ')))
+}
+
+/// True when an ILP line names the `tick_quotes` table. One prefix compare.
+fn is_tick_quotes_line(line: &[u8]) -> bool {
+    let table = crate::tick_quotes_persistence::TICK_QUOTES_TABLE.as_bytes();
     line.strip_prefix(table)
         .is_some_and(|rest| matches!(rest.first(), Some(b',' | b' ')))
 }
@@ -3211,6 +3226,25 @@ pub(crate) mod tests {
         // A table that merely STARTS with the name is not the aux table.
         assert!(!is_feed_aux_line(b"feed_aux_packets_old,x=1 1"));
         assert!(is_feed_aux_line(b"feed_aux_packets x=1 1"));
+    }
+
+    /// Review finding (2026-10-27): a `tick_quotes` row carries its ARRIVAL
+    /// time; one that arrived after 15:40 was accepted by the writer and must
+    /// survive a spill replay. The same stamp on a `ticks` line is dropped.
+    #[test]
+    fn test_regression_spill_replay_keeps_a_late_arriving_tick_quotes_line() {
+        let late = ist_at(15 * 3600 + 40 * 60 + 10);
+        let quote = format!("tick_quotes,segment=NSE_FNO,feed=dhan ltp=1.0 {late}\n");
+        assert!(!line_is_positively_out_of_window(quote.as_bytes(), false));
+        let tick = format!("ticks,segment=NSE_FNO,feed=dhan ltp=1.0 {late}\n");
+        assert!(line_is_positively_out_of_window(tick.as_bytes(), false));
+        let (kept, dropped) =
+            retain_lines_in_open_window(format!("{quote}{tick}").as_bytes(), false);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept, quote.as_bytes());
+        assert!(!is_tick_quotes_line(b"tick_quotes_old,x=1 1"));
+        assert!(is_tick_quotes_line(b"tick_quotes x=1 1"));
+        assert!(!is_tick_quotes_line(b"ticks,x=1 1"));
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //! ## What it counts
 //!
 //! - **Accepted rows, per IST day.** One increment per `ticks` row the Dhan
-//!   writer appended to its ILP buffer, keyed by the IST day of the row's
+//!   writer appended to its ILP buffer (or, since plan item M5 on
+//!   2026-10-27, per `tick_quotes` row, keyed by its own arrival `ts`), keyed by the IST day of the row's
 //!   designated `ts` (the same day the database count filters on). A row the
 //!   session-window gate refused, or one that failed to append, is never
 //!   counted, because it was never offered to QuestDB.
