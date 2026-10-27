@@ -454,6 +454,10 @@ pub(crate) fn pass_counters() -> &'static DrainCounters {
             shed_dedicated_depth: noop(),
             depth_rows: metrics::counter!(DEFERRED_DEPTH_ROWS_COUNTER, "outcome" => "written"),
             depth_refused: metrics::counter!(DEFERRED_DEPTH_ROWS_COUNTER, "outcome" => "refused"),
+            depth_implausible_kept: metrics::counter!(
+                DEFERRED_DEPTH_ROWS_COUNTER,
+                "outcome" => "implausible_kept"
+            ),
             depth_dropped: noop(),
             depth_disconnects: noop(),
             depth_length_mismatch: noop(),
