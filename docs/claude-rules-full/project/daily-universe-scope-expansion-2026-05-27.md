@@ -3136,3 +3136,36 @@ Measured before the fourth card (Verified, 2026-10-26 11:00 IST scrape): every d
 - Any throughput, IOPS or size change under cover of this quote.
 - The 15,000,000-frame slice on any boot that is not an evening drain restart, or removing the replay disk floor or the restart spacing.
 - Raising or lowering a budget line under cover of this quote.
+
+#### Quote 42 (2026-10-27, ~08:20 IST) — THE QUOTE 35 WIPE AND THE QUOTE 32/33 REBUILD RUN TONIGHT, 27 OCTOBER; FRESH START WEDNESDAY 28 OCTOBER (preserve EXACTLY, typos included)
+
+> "bro see as of nowonly oru amx 25k isnturments alognw ith its market depth level 5 alone will be saved rigth dude ... did yo udowngrade the lowered the isnatcne evrythign yo udid dude can youc ehck evrythign dude whetehr is evrythign i npalce in our lkvie aws isnatcne and srever dude okay? see cna yo udo one entire full fresh extreme entire delet and entire wipe off afetr post market and cna yo ugo ahea dwith all of our funcinotlities scenairos entirley by tonight itself dude okay?"
+> "so that start evrythign by tomorrow mronign very fresjhly from the scratch and go ahea ddude okay?"
+> "see by tonoght tiself do evryhtign dude netire downgrade and whatevr else is evryhtign needed also dd it dude okay? entiree wipe off inclduign s3 dude i mean the entire isntacne needs to be enw very fresh scratch dud eokay?"
+
+Measured first (read-only, 2026-10-27 ~08:10 IST): instance `i-0c3fe906dad5492fc` is still **r8g.xlarge**, root volume 600 GB / 3,000 IOPS / 125 MiB/s; the 2026-10-22 rebuild never ran. Budget `tv-prod-monthly-budget-v2`: $151.36 actual, $186.70 forecast, $170 line.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "How do you want the fresh start for tomorrow morning?" | **"Rebuild + S3 wipe tonight"** | "Same, plus deleting all old S3 market-data archives tonight instead of 31 Oct. Needs a rushed rule + code + AWS-permission change today; permanent, no undo. Riskier." (the "Same" being: "After 17:30 IST: SEBI/audit tables copied to S3 and verified first, then a new 150 GB disk + smaller r8g.large, empty market-data database. Old disk kept as a 7-day snapshot (undo possible). Wed 08:30 starts fresh.") |
+| "Merge [PR #2127] today so tomorrow's fresh server runs them?" | **"Merge today (Recommended)"** | "I mark it ready; it merges itself only after All Green and deploys after 15:45 IST (never in market hours)." |
+
+**What Quote 42 changes, and nothing else:**
+
+| Item | Quote 32/33/35 | Quote 42 |
+|---|---|---|
+| Rebuild (Quote 32 steps 3–4, Quote 33 dates) | Weeknight after 17:30 IST from 2026-10-22, before 31 Oct 08:00 | **Runs the night of Tuesday 2026-10-27**, unchanged in every other respect: copy-first and verify, old root kept as a snapshot. |
+| Wipe night | 2026-10-31 18:00 → 2026-11-01 08:00 IST | Apply allowed from **2026-10-27 18:00 IST** (end of window unchanged, 2026-11-01 08:00 IST); runs tonight after the rebuild. |
+| Wipe cutoff | Data dated before 2026-11-01 | Data dated before **2026-10-28** (so nothing Wednesday's fresh box writes can be touched). |
+| S3 scope | `questdb-partitions/<market-data table>/`, `raw-frames/`, `seal-spill/`, `top-volume-spill/` | Plus the market-data tables the rebuild copies under `rebuild-2026-10-22/`, and `tick-quarantine/`, `depth-quarantine/`, `top-volume-quarantine/` (market data the owner named in "entire wipe off inclduign s3"). Keep-list tables under `rebuild-2026-10-22/` are KEPT. |
+| Old-root snapshot | Deleted the same night | Deleted **no earlier than 2026-10-28 16:30 IST**, after Wednesday's first session on the new box ends, so a failed rebuild can still be undone overnight. The S3 delete permission's end stays at the end of 2026-11-01 IST. |
+| Keep-list | Quote 29/35 keep-list | **Unchanged**: every SEBI and audit table and its S3 archive, `sebi-preserve/`, `deploys/`, `logs/`, config, secrets, terraform state, versioning, lifecycle, public-access block. The law keeps these whatever the owner's "entire". |
+
+**Risks stated plainly:** permanent loss of every market-data row and file before 2026-10-28 (box and S3, every version), including today's 27 Oct session; a rebuild failure overnight risks Wednesday's capture (rollback: the old-root snapshot); the October spend is $151.36 of $170 with a $186.70 forecast, so the native stop may switch the box off before 31 October whatever runs tonight.
+
+##### What violates Quote 42 (REJECT)
+- Any delete before 2026-10-27 18:00 IST, inside 09:00–15:45 IST, with the app running, or of anything dated 2026-10-28 or later.
+- Deleting the old-root snapshot before 2026-10-28 16:30 IST.
+- Deleting a keep-list table, `sebi-preserve/`, `deploys/` or `logs/`.
+- Skipping the rebuild's copy-first verification.
+- Reusing Quote 42 after this one run: Quote 27 binds again, and the first PR after the run deletes the role, workflow, tool and budget rows and marks Quotes 35 and 42 ENDED.
