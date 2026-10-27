@@ -983,6 +983,34 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   - Tests: DHAT on the socket path unchanged; regression test per change
   - Done 2026-10-26: the WAL writer polls for 50 ms after its last record (1 ms sleep) before its blocking wait, so the reader no longer pays a futex wake per frame (harness: WAL hand-off max 4.0 ms -> 22 us, 0 over budget; frames reach the WAL file up to about 1 ms later); the reserved-connections gauge follows the widen; contract-map refusals are counted only for subscribed contracts (none lose their underlying); the two QuestDB console log groups get 14-day retention in terraform (not applied, not validated locally). Live confirmation waits for the next session.
 
+- [ ] M5 (storage, app) Repeat quotes to `tick_quotes` (owner Quote 41,
+  2026-10-27; scope-lock section "2026-10-27 — REPEAT QUOTES GET THEIR OWN
+  TABLE"). Route a main-feed packet with no new trade to a new `tick_quotes`
+  table stamped with arrival time (IST), keeping the vendor trade time in
+  `exchange_timestamp`; `ticks` unchanged for every other packet. Same writer,
+  WAL, rescue, spill, replay (a replayed packet reaches the same table), DEDUP
+  `(ts, security_id, segment, capture_seq, feed)`, self-heal ensure, retention,
+  partition archive and S3 copy; readers of `ticks` that need quotes (quote
+  endpoint, tick conservation K4, cross-checks) read both or are named. O(1)
+  per packet (the no-new-trade test reuses the fold's existing per-key state;
+  no extra lookup), zero allocation (DHAT). `tv_ticks_ts_placement_total`
+  should show the late share of `ticks` rows fall to near 0.
+  - Files: crates/storage/src/tick_persistence.rs, crates/app/src/dhan_feed_stack.rs,
+    crates/storage/src/partition_manager.rs / partition_archive.rs (retention),
+    crates/storage/src/tick_conservation_ledger.rs, crates/app/src/tick_conservation.rs,
+    crates/api/src/handlers/quote.rs, CLAUDE.md, docs (table list)
+  - Tests (to write): test_regression_repeat_quote_goes_to_tick_quotes_with_arrival_ts,
+    test_new_trade_stays_in_ticks_with_exchange_ts, test_replay_routes_like_live,
+    test_tick_quotes_dedup_key_includes_feed_and_segment, DHAT on the drain unchanged
+- [ ] M6 (app) Evening drain restarts replay up to 5 × `WAL_REPLAY_MAX_FRAMES_PER_BOOT`
+  (owner Quote 41): only a boot `evening_drain` recorded as its own planned
+  restart; morning and every other boot keep 3,000,000; disk floor, 15-minute
+  clock, 3 restarts and 40-minute spacing unchanged.
+  - Files: crates/app/src/evening_drain.rs, crates/app/src/main.rs or the
+    catch-up budget site, crates/storage/src/ws_frame_spill.rs (if the cap is a const there)
+  - Tests (to write): test_regression_evening_restart_gets_five_times_the_frame_cap,
+    test_morning_boot_keeps_the_frame_cap, test_unreadable_state_keeps_the_frame_cap
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Shipping `tv_dhan_token_publish_total` / `tv_dhan_shared_token_adoption_total`
