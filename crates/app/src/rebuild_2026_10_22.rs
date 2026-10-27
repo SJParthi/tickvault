@@ -283,6 +283,41 @@ pub fn apply_window(now: DateTime<Utc>) -> Result<(), String> {
     }
 }
 
+/// The latest IST time of the night the disk swap may START: it needs about
+/// three hours (swap, first-boot provisioning, restore, deploy, checks)
+/// before the 08:00 IST end of the window and the 08:30 boot (owner, 2026-10-27:
+/// "only swap if at least 3 hours remain").
+pub const SWAP_LATEST_START_IST: (u32, u32) = (5, 0);
+
+/// Minutes of one workflow job after which a multi-phase run does not start
+/// the swap: the job is killed at 360 minutes (the cargo build takes part of
+/// it) and a kill after the swap starts skips the rollback, so the swap,
+/// prepare-new and deploy need the rest of the job.
+pub const SWAP_LATEST_JOB_MINUTES: i64 = 180;
+
+/// `Ok` when the disk swap may start now: inside the apply window and before
+/// [`SWAP_LATEST_START_IST`] on a morning (a swap started in the evening has
+/// the whole night). Pure, O(1).
+///
+/// # Errors
+/// The reason, in one line.
+pub fn swap_start_ok(now: DateTime<Utc>) -> Result<(), String> {
+    apply_window(now)?;
+    let local = now.with_timezone(&ist());
+    let latest = NaiveTime::from_hms_opt(SWAP_LATEST_START_IST.0, SWAP_LATEST_START_IST.1, 0)
+        .unwrap_or(NaiveTime::MIN);
+    let morning_end = NaiveTime::from_hms_opt(8, 0, 0).unwrap_or(NaiveTime::MIN);
+    let t = local.time();
+    if t >= latest && t < morning_end {
+        return Err(format!(
+            "{} IST is too close to 08:00 to swap disks safely; the copy and snapshot stay, \
+             run phase=swap the next night",
+            local.format("%H:%M")
+        ));
+    }
+    Ok(())
+}
+
 /// The keep-alive value: `now + KEEP_ALIVE_HOURS`, in IST with an explicit
 /// offset (a shape both guard Lambdas accept).
 #[must_use]
@@ -672,6 +707,17 @@ mod tests {
         assert!(Phase::Copy.runs_on_box() && !Phase::Swap.runs_on_box());
         assert_eq!(Mode::parse("apply"), Some(Mode::Apply));
         assert_eq!(Mode::parse("APPLY"), None);
+    }
+
+    #[test]
+    fn test_swap_start_ok_refuses_from_0500_ist_until_the_window_closes() {
+        assert!(swap_start_ok(at_ist(2026, 10, 27, 18, 0)).is_ok());
+        assert!(swap_start_ok(at_ist(2026, 10, 27, 23, 59)).is_ok());
+        assert!(swap_start_ok(at_ist(2026, 10, 28, 4, 59)).is_ok());
+        assert!(swap_start_ok(at_ist(2026, 10, 28, 5, 0)).is_err());
+        assert!(swap_start_ok(at_ist(2026, 10, 28, 7, 59)).is_err());
+        // Outside the apply window altogether.
+        assert!(swap_start_ok(at_ist(2026, 10, 28, 12, 0)).is_err());
     }
 
     /// The ec2:CreateTags permission probe sends this tag; EC2 refuses an

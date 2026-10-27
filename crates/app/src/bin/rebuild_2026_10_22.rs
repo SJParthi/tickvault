@@ -36,9 +36,9 @@ use tickvault_app::rebuild_2026_10_22::{
     APPLY_CONFIRM, BOX_PHASE_TIMEOUT_SECS, DEPLOY_WORKFLOWS, DRAIN_HOLD_PARAM, INSTANCE_NAME_TAG,
     InstanceFacts, KEEP_ALIVE_PARAM, Mode, NEW_INSTANCE_TYPE, NEW_ROOT_IOPS, NEW_ROOT_SIZE_GB,
     NEW_ROOT_THROUGHPUT_MIBPS, OLD_INSTANCE_TYPE, Phase, REBUILD_TAG_KEY, REBUILD_TAG_VALUE,
-    ROLLBACK_CONFIRM, SNAPSHOT_KEEP_UNTIL, Stage, VolumeFacts, apply_window, classify_stage,
-    drain_hold_active, is_commit_sha, is_manifest_key, keep_alive_value, parse_box_report,
-    phases_for, preflight_problems,
+    ROLLBACK_CONFIRM, SNAPSHOT_KEEP_UNTIL, SWAP_LATEST_JOB_MINUTES, Stage, VolumeFacts,
+    apply_window, classify_stage, drain_hold_active, is_commit_sha, is_manifest_key,
+    keep_alive_value, parse_box_report, phases_for, preflight_problems, swap_start_ok,
 };
 
 const REGION: &str = "ap-south-1";
@@ -1341,7 +1341,30 @@ async fn real_main() -> Result<Vec<String>, (String, Vec<String>)> {
             Err(e) => return Err((format!("could not check for a dry run: {e}"), run.log)),
         }
     }
+    let started = std::time::Instant::now();
+    let multi_phase = phases.len() > 1;
     for p in phases {
+        // 2026-10-27 pre-run review: a swap is started only with time left
+        // for everything after it, in the night and in this job (a job killed
+        // after the swap starts never reaches the rollback below).
+        if mode == Mode::Apply && p == Phase::Swap {
+            let job_minutes = i64::try_from(started.elapsed().as_secs() / 60).unwrap_or(i64::MAX);
+            let refusal = swap_start_ok(Utc::now()).err().or_else(|| {
+                (multi_phase && job_minutes >= SWAP_LATEST_JOB_MINUTES).then(|| {
+                    format!(
+                        "{job_minutes} minutes into this job; run phase=swap, then prepare-new, \
+                         deploy and postcheck as their own runs"
+                    )
+                })
+            });
+            if let Some(why) = refusal {
+                run.say(format!(
+                    "STOPPED before the swap (nothing swapped; the old root is untouched): {why}"
+                ));
+                run.keep_alive_off().await;
+                return Err((why, run.log));
+            }
+        }
         if let Err(e) = run.phase(p).await {
             run.say(format!("FAILED in {}: {e}", p.as_str()));
             let after_swap_started = matches!(
