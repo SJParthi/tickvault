@@ -138,6 +138,13 @@ pub fn parse_args(args: &[String]) -> Result<BoxArgs, String> {
     })
 }
 
+/// `true` for the one phase that runs on a fresh root, where the box folder
+/// appears only once first-boot provisioning has run. Pure, O(1).
+#[must_use]
+pub fn waits_for_first_boot_before_entering(phase: Phase, mode: Mode) -> bool {
+    phase == Phase::PrepareNew && mode == Mode::Apply
+}
+
 /// Runs the subcommand; the process exit code (0 only when the report is ok).
 // TEST-EXEMPT: process entry point on the box; the decisions are the tested pure functions it calls
 pub async fn run(args: &[String]) -> i32 {
@@ -154,6 +161,16 @@ pub async fn run(args: &[String]) -> i32 {
                 parsed.mode.as_str(),
                 parsed.sha
             ));
+            // A fresh root creates BOX_ROOT only when first-boot
+            // provisioning reaches it, minutes after the SSM agent is
+            // online, so prepare-new waits for provisioning BEFORE it
+            // enters the folder (2026-10-27 pre-run review).
+            if waits_for_first_boot_before_entering(parsed.phase, parsed.mode) {
+                let deadline = Instant::now() + Duration::from_secs(CLOUD_INIT_WAIT_SECS);
+                while !Path::new(CLOUD_INIT_DONE).exists() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+                }
+            }
             if let Err(err) = std::env::set_current_dir(BOX_ROOT) {
                 let mut r = BoxReport::new(parsed.phase, parsed.mode);
                 r.problem(format!("cannot enter {BOX_ROOT}: {err}"));
@@ -611,36 +628,43 @@ async fn copy_apply() -> BoxReport {
         r.problem(format!("refused: {why}"));
         return r;
     }
-    let (was_enabled, _) = systemctl(&["is-enabled", "--quiet", "tickvault"]);
     let (stopped, out) = systemctl(&["stop", "tickvault"]);
     if !stopped {
         r.problem(format!("could not stop tickvault.service: {out}"));
         return r;
     }
-    // Disabled for the copy so nothing restarts it; enabled again (never
-    // started) on every path out, so the old disk still boots the app if
-    // the rebuild is rolled back.
-    let (disabled, out) = systemctl(&["disable", "tickvault"]);
-    if disabled {
-        r.line("app stopped and disabled for the copy");
+    // Masked for the copy, at RUNTIME only (a link under /run), so nothing
+    // starts it while the copy runs. A runtime mask ends at the next boot,
+    // so if this process is killed (the SSM time limit) or aborts, the old
+    // disk still starts the app at the next boot; the unit is never
+    // disabled (2026-10-27 pre-run review: a disable left behind by a kill
+    // would have booted the old disk without the app).
+    let (masked, out) = systemctl(&RUNTIME_MASK_ARGS);
+    if masked {
+        r.line("app stopped and masked until the copy ends or the next boot");
     } else {
-        // The copy still runs (the app is stopped); a reboot in the middle
-        // could restart it, which the WAL check would then catch.
-        r.line(format!(
-            "app stopped; disable failed ({out}), so a reboot would restart it"
-        ));
+        // The copy still runs (the app is stopped); a restart in the middle
+        // would be caught by the WAL check.
+        r.line(format!("app stopped; runtime mask failed ({out})"));
     }
     copy_body(&mut r).await;
-    if was_enabled {
-        let (ok, out) = systemctl(&["enable", "tickvault"]);
+    if masked {
+        let (ok, out) = systemctl(&RUNTIME_UNMASK_ARGS);
         if ok {
-            r.line("app unit enabled again (not started)");
+            r.line("app unit unmasked (not started)");
         } else {
-            r.problem(format!("could not re-enable tickvault.service: {out}"));
+            r.problem(format!(
+                "could not unmask tickvault.service: {out} (the next boot clears it)"
+            ));
         }
     }
     r
 }
+
+/// `systemctl mask --runtime tickvault`: lasts until the next boot only.
+pub const RUNTIME_MASK_ARGS: [&str; 3] = ["mask", "--runtime", "tickvault"];
+/// The matching `systemctl unmask --runtime tickvault`.
+pub const RUNTIME_UNMASK_ARGS: [&str; 3] = ["unmask", "--runtime", "tickvault"];
 
 async fn copy_body(r: &mut BoxReport) {
     let q = match questdb() {
@@ -1211,6 +1235,39 @@ async fn postcheck(mode: Mode, manifest_key: Option<&str>) -> BoxReport {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pre-run review 2026-10-27: prepare-new must wait for first-boot
+    /// provisioning before it enters /opt/tickvault on a fresh root; no other
+    /// phase waits.
+    #[test]
+    fn test_regression_waits_for_first_boot_before_entering_only_on_prepare_new_apply() {
+        assert!(waits_for_first_boot_before_entering(
+            Phase::PrepareNew,
+            Mode::Apply
+        ));
+        assert!(!waits_for_first_boot_before_entering(
+            Phase::PrepareNew,
+            Mode::Dry
+        ));
+        assert!(!waits_for_first_boot_before_entering(
+            Phase::Copy,
+            Mode::Apply
+        ));
+        assert!(!waits_for_first_boot_before_entering(
+            Phase::Postcheck,
+            Mode::Apply
+        ));
+    }
+
+    /// Pre-run review 2026-10-27: the copy masks the app at RUNTIME (cleared
+    /// by the next boot), never disables it, so a killed copy cannot leave
+    /// the old disk booting without the app.
+    #[test]
+    fn test_regression_copy_masks_at_runtime_and_never_disables() {
+        assert_eq!(RUNTIME_MASK_ARGS, ["mask", "--runtime", "tickvault"]);
+        assert_eq!(RUNTIME_UNMASK_ARGS, ["unmask", "--runtime", "tickvault"]);
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {
