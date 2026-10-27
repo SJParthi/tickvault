@@ -100,7 +100,7 @@ overflow was persisted as one bit with no height and reloaded at `u64::MAX`,
 so every later segment read as unapplied and the prune could delete nothing.
 Converged design (three judges).
 
-- [ ] W1. Bounded unapplied ranges: at most 32 disjoint ranges (merge the two
+- [x] W1. Bounded unapplied ranges: at most 32 disjoint ranges (merge the two
   closest when full, coverage only grows) in a CRC-checked sidecar beside
   `applied.tvaw`; `applied.tvaw` stays version 1, keeps its overflow bit set
   while any range exists and names the sidecar generation in its pad bytes; an
@@ -557,9 +557,31 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 - [x] D2. Coded error on the tick-gap tracker emit; the code guard flags every production `error!` without `code =` (frozen §28 files allowlisted until their own approval).
   - Files: crates/trading/src/risk/tick_gap_tracker.rs, crates/common/tests/error_code_tag_guard.rs
   - Tests: every_production_error_carries_a_code
-- [ ] D3. CLAUDE.md: O(1) table rows for the frame ring backlog and the silent-swap register; stale benchmark rows; `variables.tf` IOPS text.
+- [x] D3. CLAUDE.md: O(1) table rows for the frame ring backlog and the silent-swap register; stale benchmark rows; `variables.tf` IOPS text.
   - Files: CLAUDE.md, deploy/aws/terraform/variables.tf
   - Tests: claude_md_codebase_map_guard
+  - Done: merged to main in #2117 (frame ring and silent-swap rows, IOPS text, struck bench rows); ticked 2026-10-27.
+
+### PR W4 — confirm parked live acks once they are durable (storage, app) — 2026-10-27 wave
+
+- [ ] W4. Parked live acks under latched apply lag (the "Follow-up" below,
+  now its own item, owner: "go ahead with next wave ... fix and resolve and
+  implement everything", 2026-10-27). While any table is latched untrusted,
+  every QuestDB probe is unclean, live acks park, and a session pins its whole
+  stretch of WAL until a later replay reaches it. Fix, keep-more only: a
+  parked live ack is confirmed (its range trimmed from the unapplied ranges)
+  only after a full `WATERMARK_DURABILITY_LAG_SECS` AND two clean probes
+  follow it with no suspicion episode beginning in between, the same rule
+  `settling/` uses for replays; an episode that begins first keeps the range.
+  First measure live (read-only, the `/tickvault/prod/metrics` scrapes):
+  `tv_wal_unapplied_pinned_bytes`, `tv_wal_suspect_seconds_total`,
+  `tv_wal_suspect_episodes_total` per session, and state whether any session
+  had clean probes at all; if none did, say so and confirm only what the rule
+  allows (no relaxation of the probe rule).
+  - Files: crates/storage/src/wal_applied_watermark.rs, crates/storage/src/wal_unapplied_ranges.rs, CLAUDE.md (the unapplied-ranges row)
+  - Tests (to write): test_parked_ack_is_confirmed_after_lag_and_two_clean_probes,
+    test_episode_before_confirmation_keeps_the_range,
+    a property test that no frame acked inside or before an episode is ever trimmed
 
 ### Follow-up (own plan item, not in this plan)
 
@@ -586,7 +608,7 @@ exit 75 = weekend or holiday): the post-merge catch-up deploy (every 30 minutes,
 all seven days), a console start, filesystem recovery, downsize, and a manual
 Sunday Muhurat start on 2026-11-08, each with a false "NSE holiday" page.
 
-- [ ] G1. The deploy enables all three units in one `systemctl enable` element
+- [x] G1. The deploy enables all three units in one `systemctl enable` element
   after `systemctl daemon-reload`; the gate unit's copy is unconditional, so a
   missing file fails the deploy instead of silently failing the combined enable.
   The guard helper counts a later `systemctl disable|mask` as removing a unit.
@@ -603,7 +625,7 @@ Sunday Muhurat start on 2026-11-08, each with a false "NSE holiday" page.
     bytes) was measured exactly with no slack, so any echo grows it, and the
     budget only shrinks. The enabled state stays unverified by the deploy; read
     it on the box (the root-cause check above).
-- [ ] G2. The gate stops the box ONLY on a Monday-to-Friday NSE holiday with no
+- [x] G2. The gate stops the box ONLY on a Monday-to-Friday NSE holiday with no
   Muhurat or mock session, at a boot inside 08:25 to 09:15 IST (the 08:30 IST
   EventBridge start); every other boot (weekend, Muhurat, trading day, outside
   the window, unreadable config) starts the app with one log line saying why.
@@ -666,7 +688,7 @@ Sunday Muhurat start on 2026-11-08, each with a false "NSE holiday" page.
     seconds before 08:25 whose gate runs after 08:25 is stopped but read by the
     readiness Lambda as launched before its floor, so it pages "box not
     running".
-- [ ] G3. The deploy chain never restarts a box the gate stopped. The
+- [x] G3. The deploy chain never restarts a box the gate stopped. The
   deploy-watchdog Lambda (instance-start event, 08:50 / 15:51 IST crons) reads
   `/tickvault/<env>/holiday-stop-date` through the start-watchdog's
   `holiday_stop_is_today` (same parameter, IST date, fail-open) after a stale
