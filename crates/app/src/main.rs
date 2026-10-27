@@ -1907,6 +1907,7 @@ async fn async_main() -> Result<()> {
         .increment(0);
     metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_SECONDS_COUNTER)
         .increment(0);
+    tickvault_storage::wal_parked_confirm::register_counters(); // PR W4, local only
     // PR W review round 5: every trim refusal reason exists from boot, so a
     // trim refused all session is visible. The pinned gauges are NOT set to 0
     // here on purpose: 0 would read "nothing pinned" while the trim never ran.

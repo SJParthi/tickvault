@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6d12bdf8e6faac6f91de8c37acc084036c641d40396089c78420efc83222e065 # shrinks to ops = [Ack(1), Probe(5, 1), Probe(0, 1), Probe(0, 49), Ack(3), Probe(0, 11), Probe(5, 1)]
+cc c70ea81b1b8d5607bcdaa666eef6e2635620b696c1f8397f3e266c84242fbda8 # shrinks to ops = [Probe(5, 1), Foreign(1), Probe(0, 1), Probe(0, 1), Probe(0, 59)]
+cc 10bab95583ad5629104e53c415eb0ca0a36769ff6720f04396f4962a7578736c # shrinks to ops = [Ack(1), Probe(5, 1), Probe(0, 1), Probe(0, 1), Ack(1), Probe(0, 1)]
+cc 6d4078d7b3c3e01e6d735356469896c775c92309d62cf52fc385aa3bf60bbec4 # shrinks to ops = [Ack(1), Probe(9, 1), Probe(0, 1), Probe(0, 33), Probe(0, 27), Ack(1)]
