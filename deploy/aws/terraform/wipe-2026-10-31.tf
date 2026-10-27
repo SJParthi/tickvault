@@ -1,10 +1,13 @@
 # wipe-2026-10-31.tf - ONE-OFF permission for the S3 and snapshot half of the
-# 2026-10-31 market-data wipe (operator Quote 35, plan item 67).
+# market-data wipe (operator Quote 35, plan item 67), brought forward to the
+# night of Tuesday 2026-10-27 by Quote 42 (plan item X1). Names unchanged.
 #
 # Authorization (recorded BEFORE this file was written):
 #   docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md
 #   "Quote 35 (2026-10-21, evening) - ONE FULL MARKET-DATA WIPE, BOX AND S3,
-#   ON THE NIGHT OF SATURDAY 2026-10-31" and its "The Quote 35 tool" table.
+#   ON THE NIGHT OF SATURDAY 2026-10-31", its "The Quote 35 tool" table, and
+#   "Quote 42 (2026-10-27, ~08:20 IST) - THE QUOTE 35 WIPE AND THE QUOTE
+#   32/33 REBUILD RUN TONIGHT, 27 OCTOBER".
 #
 # What this grants, and only this:
 #   * a NEW role, trusted ONLY by the GitHub Actions environment
@@ -12,19 +15,29 @@
 #     .github/workflows/wipe-2026-10-31.yml, job `cloud`);
 #   * s3:ListBucketVersions on tv-prod-cold, only for the exact prefixes the
 #     tool lists (one per market-data table, plus raw-frames/, seal-spill/,
-#     top-volume-spill/);
+#     top-volume-spill/, the three quarantine roots and
+#     rebuild-2026-10-22/tables/);
 #   * s3:DeleteObjectVersion (never s3:DeleteObject, so it cannot even add a
-#     delete marker) on keys dated before 2026-11-01 under
-#     questdb-partitions/<one of the market-data tables>/, raw-frames/<date>/,
-#     seal-spill/<date>/ and top-volume-spill/<date>/, and only from 18:00 IST
-#     on 2026-10-31;
+#     delete marker) on 2026-dated keys under questdb-partitions/<one of the
+#     market-data tables>/ and the six dated roots, and on the rebuild's
+#     whole-table copies of the market-data tables
+#     (rebuild-2026-10-22/tables/<table>/), only from 18:00 IST on
+#     2026-10-27 (Quote 42);
+#   * an explicit Deny on every key dated 2026-10-28 or later, anywhere in
+#     the bucket (Quote 42's cutoff). One Allow pattern per table plus this
+#     Deny, rather than one Allow per allowed date, keeps the policy under
+#     IAM's 10,240-character inline limit. The rebuild copies carry no date
+#     in the key: the tool deletes only a version last written before
+#     2026-10-28 00:00 IST, and the new box never writes under that prefix;
 #   * ec2:DeleteSnapshot only on a snapshot tagged BOTH
 #     tv-rebuild=2026-10-22 and Name=tv-prod-root-before-rebuild-2026-10-22
-#     (the old-root snapshot the 2026-10-22 rebuild made), same window;
+#     (the old-root snapshot the 2026-10-22 rebuild made), only from 16:30
+#     IST on 2026-10-28 (Quote 42: after Wednesday's first session);
 #   * read-only ec2:Describe{Instances,Snapshots,Volumes} (the cloud deletes
 #     run only with the box stopped);
-#   * an explicit Deny on deploys/, sebi-preserve/, logs/, every key dated
-#     2026-11 and every bucket setting;
+#   * an explicit Deny on deploys/, sebi-preserve/, logs/,
+#     rebuild-2026-10-22/keep/ (the SEBI and audit copies) and every bucket
+#     setting;
 #   * the trust policy and every Allow stop working at the end of 2026-11-01
 #     IST (aws:CurrentTime), even if the removal PR is late.
 # No existing role, user or bucket policy gains anything. The box half runs
@@ -36,8 +49,12 @@
 locals {
   wipe_github_environment = "wipe-2026-10-31"
 
-  # Deletes are refused before 18:00 IST on Saturday 2026-10-31.
-  wipe_deletes_from = "2026-10-31T12:30:00Z"
+  # Deletes are refused before 18:00 IST on Tuesday 2026-10-27 (Quote 42;
+  # was 18:00 IST on Saturday 2026-10-31 under Quote 35).
+  wipe_deletes_from = "2026-10-27T12:30:00Z"
+  # The old-root snapshot may be deleted only from 16:30 IST on Wednesday
+  # 2026-10-28, after the new box's first session (Quote 42).
+  wipe_snapshot_delete_from = "2026-10-28T11:00:00Z"
   # IAM stops honouring the role at the end of 2026-11-01 IST.
   wipe_expires_at = "2026-11-01T18:30:00Z"
 
@@ -83,28 +100,47 @@ locals {
   ]
 
   # Partition object names start with the partition date (IST wall time):
-  # 2026-10-01.csv.gz, 2026-10-01T09.csv.gz, 2026-10-01T09.sha-<hex>.csv.gz.
-  # "2026-0?-??" is January to September; "2026-1?-??" would be October to
-  # December; only "2026-10-??" is granted, and the Deny below also refuses
-  # November and December outright.
-  wipe_partition_arns = flatten([
-    for t in local.wipe_tables : [
-      "${aws_s3_bucket.tv_cold.arn}/questdb-partitions/${t}/2026-0?-??*",
-      "${aws_s3_bucket.tv_cold.arn}/questdb-partitions/${t}/2026-10-??*",
-    ]
-  ])
+  # 2026-10-01.csv.gz, 2026-10-27T09.csv.gz, 2026-10-27T09.sha-<hex>.csv.gz.
+  # One 2026-dated pattern per table is granted; wipe_deny_dates below
+  # refuses every key dated 2026-10-28 or later, so the grant that is left is
+  # exactly "dated before 2026-10-28" (Quote 42).
+  wipe_partition_arns = [
+    for t in local.wipe_tables :
+    "${aws_s3_bucket.tv_cold.arn}/questdb-partitions/${t}/2026-??-??*"
+  ]
 
-  wipe_dated_roots = ["raw-frames", "seal-spill", "top-volume-spill"]
+  # The rebuild's whole-table copies of the market-data tables
+  # (rebuild-2026-10-22/tables/<table>/<sha256>.csv.gz, Quote 42). Keep-list
+  # tables copied there (top_volume_rank) are not in wipe_tables.
+  wipe_rebuild_table_arns = [
+    for t in local.wipe_tables :
+    "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/tables/${t}/*"
+  ]
+
+  # <root>/<IST date>/<file>. The quarantine roots are Quote 42's.
+  wipe_dated_roots = [
+    "raw-frames",
+    "seal-spill",
+    "top-volume-spill",
+    "tick-quarantine",
+    "depth-quarantine",
+    "top-volume-quarantine",
+  ]
+
+  # Every key whose path has a "/<date>" segment dated 2026-10-28 or later
+  # (partition names, dated folders) is refused, whatever the root.
+  wipe_deny_dates = ["2026-10-28", "2026-10-29", "2026-10-3?", "2026-11-", "2026-12-"]
 
   wipe_list_prefixes = concat(
     [for t in local.wipe_tables : "questdb-partitions/${t}/"],
     [for r in local.wipe_dated_roots : "${r}/"],
+    ["rebuild-2026-10-22/tables/"],
   )
 }
 
 resource "aws_iam_role" "wipe_2026_10_31" {
   name                 = "tv-${var.environment}-wipe-2026-10-31"
-  description          = "One-off Quote 35: delete pre-2026-11-01 market-data copies and the old-root snapshot. Remove after the run."
+  description          = "One-off Quotes 35 and 42: delete pre-2026-10-28 market-data copies and the old-root snapshot. Remove after the run."
   max_session_duration = 3600
 
   assume_role_policy = jsonencode({
@@ -150,7 +186,7 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
         }
       },
       {
-        Sid    = "DeleteVersionsDatedBeforeNovember"
+        Sid    = "DeleteVersionsDatedBefore28October"
         Effect = "Allow"
         Action = ["s3:DeleteObjectVersion"]
         Condition = {
@@ -163,12 +199,8 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
         }
         Resource = concat(
           local.wipe_partition_arns,
-          flatten([
-            for r in local.wipe_dated_roots : [
-              "${aws_s3_bucket.tv_cold.arn}/${r}/2026-0?-??/*",
-              "${aws_s3_bucket.tv_cold.arn}/${r}/2026-10-??/*",
-            ]
-          ]),
+          local.wipe_rebuild_table_arns,
+          [for r in local.wipe_dated_roots : "${aws_s3_bucket.tv_cold.arn}/${r}/2026-??-??/*"],
         )
       },
       {
@@ -197,7 +229,7 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
             "aws:ResourceTag/Name"       = "tv-prod-root-before-rebuild-2026-10-22"
           }
           DateGreaterThan = {
-            "aws:CurrentTime" = local.wipe_deletes_from
+            "aws:CurrentTime" = local.wipe_snapshot_delete_from
           }
           DateLessThan = {
             "aws:CurrentTime" = local.wipe_expires_at
@@ -205,21 +237,20 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
         }
       },
       {
-        Sid    = "NeverNovemberDeploysLogsOrSebi"
+        Sid      = "NeverAnythingDated28OctoberOrLater"
+        Effect   = "Deny"
+        Action   = ["s3:*"]
+        Resource = [for d in local.wipe_deny_dates : "${aws_s3_bucket.tv_cold.arn}/*/${d}*"]
+      },
+      {
+        Sid    = "NeverDeploysLogsSebiOrKeepCopies"
         Effect = "Deny"
         Action = ["s3:*"]
         Resource = [
-          "${aws_s3_bucket.tv_cold.arn}/questdb-partitions/*/2026-11-*",
-          "${aws_s3_bucket.tv_cold.arn}/questdb-partitions/*/2026-12-*",
-          "${aws_s3_bucket.tv_cold.arn}/raw-frames/2026-11-*",
-          "${aws_s3_bucket.tv_cold.arn}/raw-frames/2026-12-*",
-          "${aws_s3_bucket.tv_cold.arn}/seal-spill/2026-11-*",
-          "${aws_s3_bucket.tv_cold.arn}/seal-spill/2026-12-*",
-          "${aws_s3_bucket.tv_cold.arn}/top-volume-spill/2026-11-*",
-          "${aws_s3_bucket.tv_cold.arn}/top-volume-spill/2026-12-*",
           "${aws_s3_bucket.tv_cold.arn}/deploys/*",
           "${aws_s3_bucket.tv_cold.arn}/sebi-preserve/*",
           "${aws_s3_bucket.tv_cold.arn}/logs/*",
+          "${aws_s3_bucket.tv_cold.arn}/rebuild-2026-10-22/keep/*",
         ]
       },
       {
@@ -240,6 +271,6 @@ resource "aws_iam_role_policy" "wipe_2026_10_31" {
 }
 
 output "wipe_2026_10_31_role_arn" {
-  description = "One-off Quote 35 wipe role; removed after the run"
+  description = "One-off Quotes 35 and 42 wipe role; removed after the run"
   value       = aws_iam_role.wipe_2026_10_31.arn
 }
