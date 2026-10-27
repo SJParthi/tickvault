@@ -33,6 +33,16 @@ use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 /// owner quote in the scope lock.
 pub const TICK_QUOTES_STALE_TRADE_SECS: i64 = 2;
 
+/// The first receipt instant routed by this rule: 2026-10-28 00:00:00 IST, as
+/// IST epoch seconds. A frame received earlier was written to `ticks` by the
+/// binary that captured it, so a replay of a pre-deploy WAL segment must send
+/// it to `ticks` again; routing it to `tick_quotes` would leave the packet in
+/// BOTH tables (the `ticks` DEDUP key cannot collapse a row in another table).
+/// It also keeps the Quote 42 wipe's premise true: `tick_quotes` holds no row
+/// dated before 2026-10-28. Still a pure function of the packet and its WAL
+/// record (the receipt stamp), so live and replay agree.
+pub const TICK_QUOTES_FIRST_RECEIPT_IST_SECS: i64 = 1_793_145_600;
+
 /// Nanoseconds in one second.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -55,7 +65,8 @@ pub fn routes_to_tick_quotes(
     let receipt_ist_secs = received_at_utc_nanos
         .saturating_add(IST_UTC_OFFSET_NANOS)
         .div_euclid(NANOS_PER_SEC);
-    receipt_ist_secs.saturating_sub(i64::from(ltt_ist_secs)) > TICK_QUOTES_STALE_TRADE_SECS
+    receipt_ist_secs >= TICK_QUOTES_FIRST_RECEIPT_IST_SECS
+        && receipt_ist_secs.saturating_sub(i64::from(ltt_ist_secs)) > TICK_QUOTES_STALE_TRADE_SECS
 }
 
 /// `true` when `received_at_utc_nanos`, as recorded for a frame, is a real
@@ -73,8 +84,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// 2026-10-27 10:00:00 IST, IST epoch seconds.
-    const TEN_AM_IST: u32 = 1_793_095_200;
+    /// 2026-10-28 10:00:00 IST, IST epoch seconds (the first day the rule
+    /// routes; see `TICK_QUOTES_FIRST_RECEIPT_IST_SECS`).
+    const TEN_AM_IST: u32 = 1_793_181_600;
 
     /// UTC nanos of an IST receipt `secs` after 10:00:00 IST, plus `sub` nanos.
     fn receipt(secs: u32, sub: i64) -> i64 {
@@ -109,6 +121,28 @@ mod tests {
         assert!(!routes_to_tick_quotes(TEN_AM_IST + 60, at, true));
     }
 
+    /// Review finding (2026-10-27): a frame captured before the deploy was
+    /// written to `ticks` live; its replay must not add a `tick_quotes` copy.
+    #[test]
+    fn test_regression_frames_received_before_2026_10_28_stay_in_ticks() {
+        // 2026-10-28 00:00:00 IST is the day boundary.
+        assert_eq!(TICK_QUOTES_FIRST_RECEIPT_IST_SECS % 86_400, 0);
+        assert_eq!(
+            TICK_QUOTES_FIRST_RECEIPT_IST_SECS,
+            i64::from(TEN_AM_IST) - 36_000
+        );
+        let day_start = TEN_AM_IST - 36_000;
+        // An hour-old trade received one second before the cutoff: `ticks`.
+        let before = receipt(0, 0) - 36_001 * NANOS_PER_SEC;
+        assert!(!routes_to_tick_quotes(day_start - 3_601, before, true));
+        // The same age received exactly at the cutoff: `tick_quotes`.
+        let at = receipt(0, 0) - 36_000 * NANOS_PER_SEC;
+        assert!(routes_to_tick_quotes(day_start - 3_600, at, true));
+        // 2026-10-27 10:00:10 IST receipt, 10 s old trade: `ticks`.
+        let yesterday = receipt(10, 0) - 86_400 * NANOS_PER_SEC;
+        assert!(!routes_to_tick_quotes(TEN_AM_IST - 86_400, yesterday, true));
+    }
+
     #[test]
     fn test_routes_to_tick_quotes_unknown_receipt_stays_in_ticks() {
         assert!(!routes_to_tick_quotes(TEN_AM_IST - 3_600, 0, true));
@@ -137,7 +171,8 @@ mod tests {
     proptest! {
         /// The route is a function of (trade second, receipt second) alone:
         /// any two receipts in the same IST second give the same table, and
-        /// the answer is exactly "more than 2 s older".
+        /// the answer is exactly "received on or after 2026-10-28 IST and
+        /// more than 2 s older".
         #[test]
         fn proptest_routes_to_tick_quotes_is_a_pure_function_of_the_two_seconds(
             ltt in 1_700_000_000_u32..1_900_000_000,
@@ -148,7 +183,11 @@ mod tests {
             let utc = |sub: i64| receipt_secs * NANOS_PER_SEC - IST_UTC_OFFSET_NANOS + sub;
             let a = routes_to_tick_quotes(ltt, utc(sub_a), true);
             prop_assert_eq!(a, routes_to_tick_quotes(ltt, utc(sub_b), true));
-            prop_assert_eq!(a, receipt_secs - i64::from(ltt) > TICK_QUOTES_STALE_TRADE_SECS);
+            prop_assert_eq!(
+                a,
+                receipt_secs >= TICK_QUOTES_FIRST_RECEIPT_IST_SECS
+                    && receipt_secs - i64::from(ltt) > TICK_QUOTES_STALE_TRADE_SECS
+            );
         }
     }
 }

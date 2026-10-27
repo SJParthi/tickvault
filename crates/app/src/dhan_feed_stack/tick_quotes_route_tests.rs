@@ -10,8 +10,8 @@ use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, QUOTE_PACKET_SIZE, RES
 use tickvault_common::feed::Feed;
 use tickvault_storage::tick_persistence::FlushBatch;
 
-/// 2026-10-27 10:00:00 IST, IST epoch seconds.
-const TEN_AM_IST: u32 = 1_793_095_200;
+/// 2026-10-28 10:00:00 IST, IST epoch seconds (the first routed day).
+const TEN_AM_IST: u32 = 1_793_181_600;
 
 /// One Quote-mode (code 4) packet on NSE_FNO.
 fn quote_packet(security_id: u32, ltt_ist_secs: u32, volume: u32) -> Vec<u8> {
@@ -207,7 +207,12 @@ fn test_unknown_wal_receipt_stays_in_ticks_live_and_on_replay() {
     p.receipt_utc_nanos = 0;
     let live = route_live(&[p]);
     let replay = route_replay(&[p]);
-    assert!(matches!(live[0], Some((false, _))), "{live:?}");
+    // Live substitutes the WALL clock for the unknown receipt, so whether the
+    // writer's session gate keeps the row depends on the real date the test
+    // runs on (a trade dated 2026-10-28 against a 2026-10-27 wall clock is a
+    // future trade and is refused). The property under test is the TABLE:
+    // whatever is written, live or on replay, is never a `tick_quotes` row.
+    assert!(!matches!(live[0], Some((true, _))), "{live:?}");
     assert!(matches!(replay[0], Some((false, _))), "{replay:?}");
 }
 
