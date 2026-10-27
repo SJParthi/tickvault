@@ -1210,6 +1210,8 @@ or push trigger to the workflow; keeping any of it after 2026-10-31 IST.
 > as written; the tool's own time window, keep-list and refusals are
 > unchanged by this approval.
 >
+> **Amended 2026-10-27 (owner Quote 42, `daily-universe-scope-expansion-2026-05-27.md`):** the owner moved the run to tonight ("Rebuild + S3 wipe tonight"). The apply window now opens **2026-10-27 18:00 IST** (end unchanged, 2026-11-01 08:00 IST). The SSM element, its 3 lines / 231 bytes, the workflow ceilings and the removal date are unchanged.
+>
 > *(Original status, kept: DRAFT, awaiting owner approval. Written with the
 > plan item 67 tooling. It authorized nothing until the owner approved it in a
 > dated answer recorded here.)*

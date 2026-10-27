@@ -1011,6 +1011,22 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   - Tests (to write): test_regression_evening_restart_gets_five_times_the_frame_cap,
     test_morning_boot_keeps_the_frame_cap, test_unreadable_state_keeps_the_frame_cap
 
+- [ ] X1 (app, terraform) Quote 42: the wipe runs tonight. `wipe_2026_10_31`:
+  apply window opens 2026-10-27 18:00 IST (end unchanged), data cutoff
+  2026-10-28, S3 scope adds the market-data tables under
+  `rebuild-2026-10-22/` (keep-list tables there kept) and the three
+  quarantine prefixes, old-root snapshot delete refused before 2026-10-28
+  16:30 IST. Terraform role `tv-prod-wipe-2026-10-31`: deletes from
+  2026-10-27T12:30Z, dated-key conditions before 2026-10-28, the new
+  prefixes, snapshot delete from 2026-10-28T11:00Z, expiry unchanged.
+  - Files: crates/app/src/wipe_2026_10_31.rs, crates/app/src/bin/wipe_2026_10_31.rs,
+    crates/app/src/wipe_box.rs (cutoff), deploy/aws/terraform/wipe-2026-10-31.tf,
+    .github/workflows/wipe-2026-10-31.yml (text only, budgets unchanged)
+  - Tests: the tool's date and verdict tests moved to the new dates, plus
+    test_regression_wipe_never_touches_data_dated_2026_10_28_or_later,
+    test_snapshot_delete_refused_before_wednesday_close,
+    test_rebuild_prefix_keeps_keep_list_tables, and the terraform cross-check
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Shipping `tv_dhan_token_publish_total` / `tv_dhan_shared_token_adoption_total`
