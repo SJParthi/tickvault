@@ -435,7 +435,7 @@ Converged design (three judges).
     test_log_boot_fold_summary_writes_the_recorded_fold_once_after_logging_starts,
     test_module_header_names_the_drain_progress_counters
 
-- [ ] W2. The deferred-depth table honours its overflow height (found by the
+- [x] W2. (done: `wal_deferred_depth.rs` `kinds_in_range` + `deferred_depth_pass.rs`, branch claude/assurance-fix-w2) The deferred-depth table honours its overflow height (found by the
   PR W review round 4; NOT in PR W). `wal_deferred_depth` has the
   sticky-overflow shape PR W removed from the unapplied table:
   `DeferredDepthSnapshot::kinds_in_range` returns `SHED_DEPTH_ALL` for EVERY
@@ -458,7 +458,7 @@ Converged design (three judges).
     test_prune_deletes_an_applied_uploaded_segment_above_the_overflow_height,
     a property test that a collision never lets a prune drop a marked frame
 
-- [ ] W3. The replay settle step promotes batch by batch (found by the PR
+- [x] W3. (done: `wal_replay_settle.rs` `SettleBatch`, branch claude/assurance-fix-w3) The replay settle step promotes batch by batch (found by the PR
   W review round 6; NOT in PR W). `SettleState` keeps ONE mark for every
   settled segment of the process, and `promote` holds the whole set (and,
   once `held`, every later batch) when any suspicion episode began after
@@ -983,7 +983,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   - Tests: DHAT on the socket path unchanged; regression test per change
   - Done 2026-10-26: the WAL writer polls for 50 ms after its last record (1 ms sleep) before its blocking wait, so the reader no longer pays a futex wake per frame (harness: WAL hand-off max 4.0 ms -> 22 us, 0 over budget; frames reach the WAL file up to about 1 ms later); the reserved-connections gauge follows the widen; contract-map refusals are counted only for subscribed contracts (none lose their underlying); the two QuestDB console log groups get 14-day retention in terraform (not applied, not validated locally). Live confirmation waits for the next session.
 
-- [ ] M5 (storage, app) Repeat quotes to `tick_quotes` (owner Quote 41,
+- [x] M5 (done: `tick_quote_route.rs`, `tick_quotes_persistence.rs`, branch claude/assurance-fix-m5) (storage, app) Repeat quotes to `tick_quotes` (owner Quote 41,
   2026-10-27; scope-lock section "2026-10-27 — REPEAT QUOTES GET THEIR OWN
   TABLE"). Route a main-feed packet with no new trade to a new `tick_quotes`
   table stamped with arrival time (IST), keeping the vendor trade time in
@@ -1011,7 +1011,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   - Tests (to write): test_regression_evening_restart_gets_five_times_the_frame_cap,
     test_morning_boot_keeps_the_frame_cap, test_unreadable_state_keeps_the_frame_cap
 
-- [ ] X1 (app, terraform) Quote 42: the wipe runs tonight. `wipe_2026_10_31`:
+- [x] X1 (done: `wipe_2026_10_31.rs`, `wipe-2026-10-31.tf`, PR #2128 + branch claude/assurance-fix-x1b) (app, terraform) Quote 42: the wipe runs tonight. `wipe_2026_10_31`:
   apply window opens 2026-10-27 18:00 IST (end unchanged), data cutoff
   2026-10-28, S3 scope adds the market-data tables under
   `rebuild-2026-10-22/` (keep-list tables there kept) and the three

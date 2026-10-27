@@ -34,9 +34,15 @@
 //!   rows are acked all through a refold, so the count is read where the
 //!   batch begins, [`replay_batch_start`], and the oldest waiting start wins).
 //!
-//! The watcher calls [`promote_settled_now`] after each probe. If a
-//! suspicion episode began, the settled segments are HELD in `settling/` for
-//! the rest of the process and counted; nothing is archived unread.
+//! The watcher calls [`promote_settled_now`] after each probe. Each settled
+//! batch carries its OWN mark (W3, 2026-10-27): its ack instant, the clean
+//! probe count at its ack and the episode count at its start, and the names
+//! of the segments it moved. A batch whose own lag and probes have passed is
+//! archived by itself (only its own named segments move); a batch an episode
+//! began after is HELD in `settling/` for the next boot and counted. Only
+//! that batch: batches started after the episode still archive, so one
+//! apply-lag pause of the catch-up drain no longer holds everything the
+//! process settled. Nothing is archived unread.
 //!
 //! At boot, before the first replay pass reads the watermark, segments left
 //! in `settling/` by an earlier process have their sequence ranges marked
@@ -51,23 +57,28 @@
 //! # Cost
 //!
 //! Cold path only, never the frame drain. Settle: one directory listing and
-//! one rename per staged segment, once per replayed batch. Promote: one lock
-//! and three atomic loads per watcher probe (60 s) while nothing is settling;
-//! one listing and one rename per settled segment when promoting. Boot
+//! one rename per staged segment, once per replayed batch, plus one tracked
+//! batch (a `Vec` of its segment names) in a list pre-sized to
+//! [`SETTLE_BATCH_CAPACITY`]. Promote: one lock and three atomic loads per
+//! watcher probe (60 s), then O(tracked batches) compares and one rename per
+//! segment of each promotable batch (no listing). Boot
 //! recovery: one full CRC-checked read of each segment in `settling/` (O(bytes),
 //! one segment in memory at a time, no frame kept), once per process.
 //!
 //! # Honest limits
 //!
-//! * One mark covers every settled segment: a newer batch restarts the clock
-//!   for older ones, so a long catch-up drain promotes everything only after
-//!   its last batch has settled. A crash before then re-reads all of it.
+//! * A batch past [`SETTLE_BATCH_CAPACITY`] in one process is not tracked:
+//!   its segments stay in `settling/` and the next boot re-reads them (keep
+//!   more), counted on the held counter. A batch whose archive rename fails
+//!   is dropped from tracking the same way.
+//! * Leftovers from an earlier process, or a `settling/` that cannot be
+//!   listed, still hold every batch of the process (unchanged).
 //! * Held segments are re-read only at the next boot, so rows QuestDB dropped
 //!   during a suspension reach it a session late, not never.
 //! * The 60 s lag is the watermark's own assumption about kernel writeback;
 //!   it is not an fsync of QuestDB's files.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -172,12 +183,26 @@ pub const WAL_REPLAY_SETTLE_UNREADABLE_BYTES_GAUGE: &str = "tv_wal_replay_settle
 /// confirmed when it reaches `archive/`.
 const CONFIRMED_COUNTER: &str = "tv_wal_replay_confirmed_segments_total";
 
-/// What the watermark looked like when the newest batch was acked.
+/// Settled batches one process tracks at most (W3). Pre-sized once; a batch
+/// past it is not tracked, so its segments stay in `settling/` for the next
+/// boot (keep more). A process settles one batch per boot refold and one per
+/// catch-up segment, bounded by the per-boot frame cap (about 5 to 8
+/// segments), so this is far above any real count.
+pub const SETTLE_BATCH_CAPACITY: usize = 256;
+
+/// What the watermark looked like for ONE settled batch (W3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SettleMark {
     acked_at: Instant,
     clean_probes_at: u64,
     episodes_at: u64,
+}
+
+/// One settled batch: its mark and the segments it moved to `settling/`.
+#[derive(Debug)]
+struct SettleBatch {
+    mark: SettleMark,
+    names: Vec<OsString>,
 }
 
 /// What [`SettleState::promote`] decided.
@@ -198,7 +223,12 @@ pub enum SettleVerdict {
 #[derive(Debug)]
 pub struct SettleState {
     dir: Option<PathBuf>,
-    mark: Option<SettleMark>,
+    /// One entry per settled batch still waiting (W3), at most
+    /// [`SETTLE_BATCH_CAPACITY`].
+    batches: Vec<SettleBatch>,
+    /// Process-wide hold: leftovers of an earlier process, or a `settling/`
+    /// that could not be listed or recovered. Sticky, as before W3. An
+    /// episode no longer sets it; it holds only the batches it touched.
     held: bool,
     settled_any: bool,
     /// `settling/unreadable/` was tried this process (DA-13c review): once
@@ -219,7 +249,7 @@ impl SettleState {
     pub const fn new() -> Self {
         Self {
             dir: None,
-            mark: None,
+            batches: Vec::new(),
             held: false,
             settled_any: false,
             unreadable_checked: false,
@@ -231,8 +261,9 @@ impl SettleState {
     ///
     /// `start` is the episode count read when the batch STARTED writing: an
     /// episode that began after it, even one already over, holds the batch.
-    /// A newer batch keeps the oldest start still waiting, so it can never
-    /// hide an episode that touched an older one.
+    /// Each batch keeps its OWN start (W3), so a newer batch can never hide
+    /// an episode that touched an older one, and an episode that touched an
+    /// older batch never holds a newer one.
     ///
     /// Settled leftovers from an EARLIER process found here (the boot
     /// recovery did not run, for example a pass refused on the disk floor)
@@ -289,18 +320,32 @@ impl SettleState {
             // O(1) EXEMPT: cold settle step, staged × names (one round's segments)
             staged.retain(|seg| seg.file_name().is_some_and(|n| names.contains(&n)));
         }
-        let moved = rename_all(&staged, &settling_dir, "replay_settle_rename");
+        let moved_names = rename_each(&staged, &settling_dir, "replay_settle_rename");
+        let moved = moved_names.len() as u64;
         self.settled_any = true;
         self.dir = Some(wal_dir.to_path_buf());
-        self.mark = Some(SettleMark {
-            acked_at: now,
-            clean_probes_at: wm.clean_probe_count(),
-            episodes_at: self
-                .mark
-                .map_or(start.episodes, |m| m.episodes_at.min(start.episodes)),
-        });
-        if self.held && moved > 0 {
-            metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(moved);
+        if self.held {
+            // Process-wide hold: nothing of this process is archived.
+            if moved > 0 {
+                metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(moved);
+            }
+        } else if !moved_names.is_empty() {
+            if self.batches.capacity() == 0 {
+                self.batches.reserve_exact(SETTLE_BATCH_CAPACITY); // O(1) EXEMPT: once per process, cold
+            }
+            if self.batches.len() >= SETTLE_BATCH_CAPACITY {
+                // Untracked: stays in settling/, the next boot re-reads it.
+                hold_batches(moved, "settle_batch_capacity");
+            } else {
+                self.batches.push(SettleBatch {
+                    mark: SettleMark {
+                        acked_at: now,
+                        clean_probes_at: wm.clean_probe_count(),
+                        episodes_at: start.episodes,
+                    },
+                    names: moved_names,
+                });
+            }
         }
         info!(
             wal_dir = ?wal_dir,
@@ -312,44 +357,83 @@ impl SettleState {
         moved
     }
 
-    /// Archives the settled segments once the lag has passed, two clean
-    /// probes ran after the ack and no suspicion episode began since.
+    /// Archives each settled batch, by itself, once ITS lag has passed, two
+    /// clean probes ran after ITS ack and no suspicion episode began after
+    /// ITS start (W3). A batch an episode began after is held for the next
+    /// boot; every other batch is judged on its own. Only a batch's own
+    /// named segments move, never a listing of `settling/`.
     pub fn promote(&mut self, wm: &AppliedWatermark, now: Instant) -> SettleVerdict {
-        let (Some(dir), Some(mark)) = (self.dir.clone(), self.mark) else {
+        if self.held {
+            return if self.dir.is_some() {
+                SettleVerdict::Held
+            } else {
+                SettleVerdict::Idle
+            };
+        }
+        let Some(dir) = self.dir.clone() else {
             return SettleVerdict::Idle;
         };
-        if self.held {
-            return SettleVerdict::Held;
+        if self.batches.is_empty() {
+            return SettleVerdict::Idle;
         }
         let settling_dir = dir.join(SETTLING_SUBDIR);
-        if wm.suspect_episode_count() != mark.episodes_at {
-            let held = wal_segments_in(&settling_dir).len() as u64;
-            self.hold(held, "questdb_suspect_after_ack");
-            return SettleVerdict::Held;
-        }
+        let archive_dir = dir.join(ARCHIVE_SUBDIR);
+        // Read once: the count BEFORE the flag (as `SettleBatchStart::of`),
+        // so an episode opening between the loads is still seen by the flag.
+        let episodes_now = wm.suspect_episode_count();
+        let suspect_now = wm.is_sink_suspect();
+        let clean_now = wm.clean_probe_count();
         let lag = Duration::from_secs(WATERMARK_DURABILITY_LAG_SECS);
-        if now.saturating_duration_since(mark.acked_at) < lag
-            || wm.clean_probe_count()
-                < mark
-                    .clean_probes_at
-                    .saturating_add(WAL_REPLAY_SETTLE_CLEAN_PROBES)
-            || wm.is_sink_suspect()
-        {
-            return SettleVerdict::Waiting;
+        let mut promoted = 0u64;
+        let mut held_now = 0u64;
+        let mut waiting = 0usize;
+        // O(1) EXEMPT: cold, O(tracked batches ≤ SETTLE_BATCH_CAPACITY) per probe
+        self.batches.retain(|batch| {
+            let mark = batch.mark;
+            if episodes_now != mark.episodes_at {
+                // An episode began after this batch started: its acks may
+                // not be applied. Kept in settling/ for the next boot.
+                held_now = held_now.saturating_add(batch.names.len() as u64);
+                return false;
+            }
+            if suspect_now
+                || now.saturating_duration_since(mark.acked_at) < lag
+                || clean_now
+                    < mark
+                        .clean_probes_at
+                        .saturating_add(WAL_REPLAY_SETTLE_CLEAN_PROBES)
+            {
+                waiting = waiting.saturating_add(1);
+                return true;
+            }
+            let paths: Vec<PathBuf> = batch.names.iter().map(|n| settling_dir.join(n)).collect(); // APPROVED: cold settle step
+            // A failed rename leaves the segment in settling/, untracked:
+            // the next boot recovers and re-reads it.
+            promoted =
+                promoted.saturating_add(rename_all(&paths, &archive_dir, "replay_settle_archive"));
+            false
+        });
+        if held_now > 0 {
+            hold_batches(held_now, "questdb_suspect_after_batch_start");
         }
-        let settled = wal_segments_in(&settling_dir);
-        let promoted = rename_all(&settled, &dir.join(ARCHIVE_SUBDIR), "replay_settle_archive");
         if promoted > 0 {
             metrics::counter!(CONFIRMED_COUNTER).increment(promoted);
+            info!(
+                promoted_segments = promoted,
+                held_segments = held_now,
+                waiting_batches = waiting,
+                "WAL replay settled: the acked rows are past the durability lag and two clean \
+                 QuestDB probes, so their segments are archived"
+            );
+            return SettleVerdict::Promoted(promoted);
         }
-        self.mark = None;
-        info!(
-            promoted_segments = promoted,
-            settled = settled.len(),
-            "WAL replay settled: the acked rows are past the durability lag and two clean \
-             QuestDB probes, so their segments are archived"
-        );
-        SettleVerdict::Promoted(promoted)
+        if held_now > 0 {
+            return SettleVerdict::Held;
+        }
+        if waiting > 0 {
+            return SettleVerdict::Waiting;
+        }
+        SettleVerdict::Promoted(0)
     }
 
     /// Boot step, before the first replay pass loads the watermark: every
@@ -501,21 +585,45 @@ fn segment_bytes(dir: &Path) -> u64 {
     })
 }
 
+/// Counts and reports segments held for the next boot by ONE batch decision
+/// (W3): an episode after a batch's start, or a batch past
+/// [`SETTLE_BATCH_CAPACITY`]. Unlike `SettleState::hold`, it does not hold
+/// the rest of the process. At most one line per watcher probe or per
+/// untracked batch, cold.
+fn hold_batches(segments: u64, reason: &'static str) {
+    warn!(
+        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+        source = "replay_settle_batch_held",
+        reason,
+        segments,
+        "WAL replay: settled segments of one batch are kept in settling/ for the next boot, \
+         which marks them unapplied and reads them again. Later batches still archive. \
+         Nothing is archived unread."
+    );
+    metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(segments);
+}
+
 /// Renames each file into `dst_dir` (created if missing). A failed rename
 /// leaves the file where it was, coded; returns how many moved.
 fn rename_all(files: &[PathBuf], dst_dir: &Path, source: &'static str) -> u64 {
+    rename_each(files, dst_dir, source).len() as u64
+}
+
+/// [`rename_all`], returning the names of the files that moved (W3: a batch
+/// tracks only what it really put in `settling/`).
+fn rename_each(files: &[PathBuf], dst_dir: &Path, source: &'static str) -> Vec<OsString> {
     if files.is_empty() {
-        return 0;
+        return Vec::new();
     }
     drop(std::fs::create_dir_all(dst_dir)); // O(1) EXEMPT: cold settle step
-    let mut moved = 0u64;
+    let mut moved: Vec<OsString> = Vec::with_capacity(files.len()); // APPROVED: cold settle step
     for seg in files {
         let Some(name) = seg.file_name() else {
             continue;
         };
         // O(1) EXEMPT: cold settle step, one rename per segment
         match std::fs::rename(seg, dst_dir.join(name)) {
-            Ok(()) => moved = moved.saturating_add(1),
+            Ok(()) => moved.push(name.to_os_string()),
             Err(err) => error!(
                 code = ErrorCode::HotPath01SyncFsFailed.code_str(),
                 source,
@@ -717,14 +825,28 @@ mod tests {
             "nothing archived unread"
         );
         assert_eq!(names(&dir.join(SETTLING_SUBDIR)), 1);
-        // A later batch in the same process is held too.
+        // W3 (2026-10-27): a later batch STARTED after the episode is judged
+        // on its own; it no longer inherits the hold.
         plant(
             &dir.join(REPLAYING_SUBDIR),
             "ws-frames-00000000000000000003.wal",
         );
         st.settle(&dir, &wm, t0, SettleBatchStart::of(&wm));
-        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
-        assert_eq!(names(&dir.join(SETTLING_SUBDIR)), 2);
+        assert_eq!(
+            st.promote(&wm, lagged(t0)),
+            SettleVerdict::Waiting,
+            "the later batch waits for its own clean probes"
+        );
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Promoted(1));
+        assert_eq!(
+            listed(&dir.join(SETTLING_SUBDIR)),
+            vec![std::ffi::OsString::from(
+                "ws-frames-00000000000000000002.wal"
+            )],
+            "the batch the episode touched stays settling"
+        );
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -944,8 +1066,21 @@ mod tests {
         st.settle(&dir, &wm, t0, second);
         wm.note_questdb_probe(true);
         wm.note_questdb_probe(true);
-        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
-        assert_eq!(names(&dir.join(ARCHIVE_SUBDIR)), 0);
+        // W3: the older batch is held; the newer one, started after the
+        // episode, archives by itself and never lifts the older one's hold.
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Promoted(1));
+        assert_eq!(
+            listed(&dir.join(ARCHIVE_SUBDIR)),
+            vec![std::ffi::OsString::from(
+                "ws-frames-00000000000000000011.wal"
+            )]
+        );
+        assert_eq!(
+            listed(&dir.join(SETTLING_SUBDIR)),
+            vec![std::ffi::OsString::from(
+                "ws-frames-00000000000000000010.wal"
+            )]
+        );
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -1018,10 +1153,8 @@ mod tests {
         );
         wm.note_questdb_probe(true);
         wm.note_questdb_probe(true);
-        assert_eq!(
-            st.promote(&wm, lagged(Instant::now())),
-            SettleVerdict::Promoted(0)
-        );
+        // W3: an empty settle tracks no batch, so there is nothing to promote.
+        assert_eq!(st.promote(&wm, lagged(Instant::now())), SettleVerdict::Idle);
         assert_eq!(st.promote(&wm, Instant::now()), SettleVerdict::Idle);
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -1130,13 +1263,22 @@ mod tests {
             self.0 ^= self.0 << 17;
             self.0 % 100 < pct
         }
+        /// A value in `0..n` (`n` > 0).
+        fn below(&mut self, n: usize) -> usize {
+            self.chance(0);
+            (self.0 % n as u64) as usize
+        }
     }
 
     /// One process lifetime, as production runs it (M2): recover what an
     /// earlier process left settling, one budgeted replay pass, then each
     /// segment in read order settles ONLY once its rows landed (a segment
     /// whose rows do not land stops the round), then the watcher's promote.
-    /// Returns (segments whose rows landed, segments archived).
+    /// `pause_after` (W3): after that many segments landed, the drain pauses
+    /// on apply lag, which opens and closes one suspicion episode before the
+    /// next segment starts. Returns (segments whose rows landed, segments
+    /// archived, the index into `landed` from which a batch started after
+    /// every episode of this process, so may be archived).
     fn boot_once(
         dir: &Path,
         budget_bytes: usize,
@@ -1144,7 +1286,8 @@ mod tests {
         rng: &mut Rng,
         fail_pct: u64,
         episode_pct: u64,
-    ) -> (Vec<std::ffi::OsString>, Vec<std::ffi::OsString>) {
+        pause_after: Option<usize>,
+    ) -> (Vec<std::ffi::OsString>, Vec<std::ffi::OsString>, usize) {
         let wm = AppliedWatermark::new_for_tests();
         let mut st = SettleState::new();
         st.recover(dir, &wm);
@@ -1182,8 +1325,17 @@ mod tests {
         );
         let t0 = Instant::now();
         let mut landed = Vec::new();
+        let mut eligible_from = 0usize;
+        let pause = |wm: &AppliedWatermark| {
+            wm.note_questdb_probe(false);
+            wm.note_questdb_probe(true);
+        };
         for (name, _) in &batch.segment_ends {
             let Some(name) = name else { break };
+            if pause_after == Some(landed.len()) {
+                pause(&wm);
+                eligible_from = landed.len();
+            }
             if rng.chance(fail_pct) {
                 break; // its rows did not land: the round stops here
             }
@@ -1191,8 +1343,14 @@ mod tests {
             st.settle_named(dir, &wm, t0, start, &[name.as_os_str()]);
             landed.push(name.clone());
         }
+        if pause_after.is_some_and(|p| p >= landed.len()) {
+            // The pause came after the last batch: it touched every one.
+            pause(&wm);
+            eligible_from = landed.len();
+        }
         if rng.chance(episode_pct) {
             wm.note_questdb_probe(false);
+            eligible_from = landed.len();
         }
         wm.note_questdb_probe(true);
         wm.note_questdb_probe(true);
@@ -1202,7 +1360,31 @@ mod tests {
             .into_iter()
             .filter(|n| !before.contains(n))
             .collect();
-        (landed, archived)
+        (landed, archived, eligible_from)
+    }
+
+    /// Checks one boot: exactly the batches started after every episode of
+    /// the process were archived (W3), and no segment file was lost.
+    fn assert_boot_settled_exactly(
+        dir: &Path,
+        segments: usize,
+        landed: &[std::ffi::OsString],
+        archived: &[std::ffi::OsString],
+        eligible_from: usize,
+        ctx: &str,
+    ) {
+        let mut want: Vec<_> = landed.get(eligible_from..).unwrap_or(&[]).to_vec();
+        want.sort();
+        let mut got = archived.to_vec();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "{ctx}: archived must be exactly the batches no episode touched"
+        );
+        let everywhere = pinned(dir)
+            + names(&dir.join(SETTLING_SUBDIR).join(SETTLING_UNREADABLE_SUBDIR))
+            + names(&dir.join(ARCHIVE_SUBDIR));
+        assert_eq!(everywhere, segments, "{ctx}: a segment vanished");
     }
 
     /// M2 (2026-10-26) lifetime test. Live: 1,696 segments (225 GB) pinned
@@ -1239,22 +1421,21 @@ mod tests {
                 let healthy = boots > unhealthy_boots;
                 let pinned_before = pinned(&dir);
                 let (fail, episode) = if healthy { (0, 0) } else { (30, 30) };
-                let (landed, archived) = boot_once(&dir, budget, FRAMES, &mut rng, fail, episode);
+                // W3 (2026-10-27): an unhealthy boot's drain may also pause
+                // on apply lag part way through (one closed episode).
+                let pause = (!healthy && rng.chance(50)).then(|| rng.below(BUDGET_SEGMENTS + 1));
+                let (landed, archived, eligible_from) =
+                    boot_once(&dir, budget, FRAMES, &mut rng, fail, episode, pause);
                 // Completeness: only segments whose rows landed in this
-                // process are ever archived.
-                for n in &archived {
-                    assert!(
-                        landed.contains(n),
-                        "seed {seed}: {n:?} archived without landing"
-                    );
-                }
-                // No segment file is ever lost.
-                let everywhere = pinned(&dir)
-                    + names(&dir.join(SETTLING_SUBDIR).join(SETTLING_UNREADABLE_SUBDIR))
-                    + names(&dir.join(ARCHIVE_SUBDIR));
-                assert_eq!(
-                    everywhere, SEGMENTS,
-                    "seed {seed} boot {boots}: a segment vanished"
+                // process, in a batch no episode touched, are ever archived,
+                // and every such batch is; no segment file is ever lost.
+                assert_boot_settled_exactly(
+                    &dir,
+                    SEGMENTS,
+                    &landed,
+                    &archived,
+                    eligible_from,
+                    &format!("seed {seed} boot {boots}"),
                 );
                 archived_total += archived.len();
                 if healthy {
@@ -1270,6 +1451,319 @@ mod tests {
             assert_eq!(archived_total, SEGMENTS, "seed {seed}");
             if unhealthy_boots == 0 {
                 assert_eq!(boots, SEGMENTS.div_ceil(BUDGET_SEGMENTS), "seed {seed}");
+            }
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    /// Settles one planted segment as its own batch: start read, then
+    /// (optionally) an episode inside the batch, then the ack at `at`.
+    fn settle_one(
+        st: &mut SettleState,
+        dir: &Path,
+        wm: &AppliedWatermark,
+        name: &str,
+        at: Instant,
+    ) {
+        let start = SettleBatchStart::of(wm);
+        plant(&dir.join(REPLAYING_SUBDIR), name);
+        st.settle_named(dir, wm, at, start, &[OsStr::new(name)]);
+    }
+
+    fn episode(wm: &AppliedWatermark) {
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+    }
+
+    const SEG_A: &str = "ws-frames-00000000000000000021.wal";
+    const SEG_B: &str = "ws-frames-00000000000000000022.wal";
+    const SEG_C: &str = "ws-frames-00000000000000000023.wal";
+
+    /// W3: a batch archived before an episode stays archived; the episode
+    /// holds only the batch it touched.
+    #[test]
+    fn test_a_batch_promoted_before_an_episode_stays_archived() {
+        let dir = tmp("w3-before");
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        settle_one(&mut st, &dir, &wm, SEG_A, t0);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Promoted(1));
+        settle_one(&mut st, &dir, &wm, SEG_B, t0);
+        episode(&wm);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
+        assert_eq!(
+            listed(&dir.join(ARCHIVE_SUBDIR)),
+            vec![OsString::from(SEG_A)]
+        );
+        assert_eq!(
+            listed(&dir.join(SETTLING_SUBDIR)),
+            vec![OsString::from(SEG_B)]
+        );
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Idle);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// W3: one episode holds the batches that started before it and only
+    /// those; a batch started after it archives in the same promote.
+    #[test]
+    fn test_an_episode_holds_only_batches_acked_before_its_start() {
+        let dir = tmp("w3-only");
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        settle_one(&mut st, &dir, &wm, SEG_A, t0);
+        settle_one(&mut st, &dir, &wm, SEG_B, t0);
+        episode(&wm); // the catch-up drain's apply-lag pause
+        settle_one(&mut st, &dir, &wm, SEG_C, t0);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Promoted(1));
+        assert_eq!(
+            listed(&dir.join(ARCHIVE_SUBDIR)),
+            vec![OsString::from(SEG_C)]
+        );
+        assert_eq!(
+            listed(&dir.join(SETTLING_SUBDIR)),
+            vec![OsString::from(SEG_A), OsString::from(SEG_B)],
+            "the batches acked before the episode stay for the next boot"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// W3: after an episode held a batch, every later batch of the process
+    /// is still judged on its own and archives.
+    #[test]
+    fn test_held_no_longer_sticks_for_the_rest_of_the_process() {
+        let dir = tmp("w3-sticky");
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        settle_one(&mut st, &dir, &wm, SEG_A, t0);
+        episode(&wm);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
+        assert!(!st.held, "an episode is not a process-wide hold");
+        for k in 0..5u64 {
+            let name = format!("ws-frames-{:020}.wal", 100 + k);
+            settle_one(&mut st, &dir, &wm, &name, t0);
+            wm.note_questdb_probe(true);
+            wm.note_questdb_probe(true);
+            assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Promoted(1));
+        }
+        assert_eq!(names(&dir.join(ARCHIVE_SUBDIR)), 5);
+        assert_eq!(
+            listed(&dir.join(SETTLING_SUBDIR)),
+            vec![OsString::from(SEG_A)]
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// W3: past `SETTLE_BATCH_CAPACITY` a batch is not tracked, so it stays
+    /// in settling/ for the next boot (keep more); the tracked ones archive.
+    #[test]
+    fn test_batch_past_settle_batch_capacity_stays_settling() {
+        let dir = tmp("w3-cap");
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        for k in 0..=SETTLE_BATCH_CAPACITY as u64 {
+            settle_one(
+                &mut st,
+                &dir,
+                &wm,
+                &format!("ws-frames-{:020}.wal", 1_000 + k),
+                t0,
+            );
+        }
+        assert_eq!(st.batches.len(), SETTLE_BATCH_CAPACITY);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(
+            st.promote(&wm, lagged(t0)),
+            SettleVerdict::Promoted(SETTLE_BATCH_CAPACITY as u64)
+        );
+        let last = format!("ws-frames-{:020}.wal", 1_000 + SETTLE_BATCH_CAPACITY as u64);
+        assert_eq!(
+            listed(&dir.join(SETTLING_SUBDIR)),
+            vec![OsString::from(last)]
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// W3 lifetime: the catch-up drain pauses on apply lag part way through
+    /// EVERY boot (one closed suspicion episode, as live on 21-26 Oct). Before
+    /// W3 one pause held every segment the process had settled, so pinned
+    /// stayed flat; now each boot archives the segments that settled after
+    /// its pause, and the backlog drains.
+    #[test]
+    fn test_regression_w3_lifetime_backlog_shrinks_with_a_pause_every_boot() {
+        use std::io::Write as _;
+        const SEGMENTS: usize = 23;
+        const FRAMES: usize = 5;
+        const BUDGET_SEGMENTS: usize = 4;
+        let budget = BUDGET_SEGMENTS * FRAMES * 32;
+        for seed in 1..=8u64 {
+            let dir = tmp(&format!("w3-life-{seed}"));
+            for k in 0..SEGMENTS as u64 {
+                segment(&dir, k * 1_000, FRAMES as u64);
+            }
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut boots = 0usize;
+            let mut paused_boots = 0usize;
+            let mut archived_in_paused_boots = 0usize;
+            while pinned(&dir) > 0 {
+                boots += 1;
+                assert!(
+                    boots <= 2 * SEGMENTS,
+                    "seed {seed}: the backlog never drained"
+                );
+                let pinned_before = pinned(&dir);
+                // Pause after 1..BUDGET segments while a later one exists;
+                // the last few segments drain on a quiet boot.
+                let pause =
+                    (pinned_before > BUDGET_SEGMENTS).then(|| 1 + rng.below(BUDGET_SEGMENTS - 1));
+                let (landed, archived, eligible_from) =
+                    boot_once(&dir, budget, FRAMES, &mut rng, 0, 0, pause);
+                assert_boot_settled_exactly(
+                    &dir,
+                    SEGMENTS,
+                    &landed,
+                    &archived,
+                    eligible_from,
+                    &format!("seed {seed} boot {boots}"),
+                );
+                if let Some(p) = pause {
+                    paused_boots += 1;
+                    archived_in_paused_boots += archived.len();
+                    assert_eq!(
+                        archived.len(),
+                        BUDGET_SEGMENTS - p,
+                        "seed {seed} boot {boots}"
+                    );
+                    assert!(
+                        pinned(&dir) < pinned_before,
+                        "seed {seed} boot {boots}: a boot with one pause must still shrink the backlog"
+                    );
+                }
+            }
+            assert!(paused_boots > 0, "seed {seed}");
+            assert!(archived_in_paused_boots > 0, "seed {seed}");
+            // Shown with `--nocapture`: the numbers the W3 report quotes.
+            drop(writeln!(
+                std::io::stderr(),
+                "seed {seed}: {SEGMENTS} segments drained in {boots} boots, {paused_boots} paused, \
+                 {archived_in_paused_boots} archived by paused boots"
+            ));
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+        /// W3 property: over interleaved batch starts, settles, probes,
+        /// episodes, time and promotes, no batch an episode began after
+        /// (or one that started inside an open episode) ever reaches
+        /// `archive/`, nothing is archived before its own lag and two clean
+        /// probes, no file is lost, and at the end every untouched batch is
+        /// archived.
+        #[test]
+        fn proptest_w3_no_batch_touched_by_an_episode_reaches_archive(
+            ops in proptest::collection::vec(0u8..6, 1..48)
+        ) {
+            let dir = tmp("w3-prop");
+            let wm = AppliedWatermark::new_for_tests();
+            let mut st = SettleState::new();
+            let t0 = Instant::now();
+            let half = Duration::from_secs(WATERMARK_DURABILITY_LAG_SECS / 2 + 1);
+            let mut now = t0;
+            let mut suspect = false;
+            let mut clean = 0u64;
+            // (name, touched by an episode, acked_at, clean probes at ack, archived)
+            let mut model: Vec<(String, bool, Instant, u64, bool)> = Vec::new();
+            let mut next = 0u64;
+            for op in ops {
+                match op {
+                    // A batch: start, maybe an episode inside it, then ack.
+                    0 | 1 => {
+                        let start = SettleBatchStart::of(&wm);
+                        let mut tainted = suspect;
+                        if op == 1 {
+                            if !suspect {
+                                // An episode begins: every batch started so
+                                // far is touched too.
+                                for m in &mut model {
+                                    m.1 |= !m.4;
+                                }
+                            }
+                            wm.note_questdb_probe(false);
+                            wm.note_questdb_probe(true);
+                            clean += 1;
+                            suspect = false;
+                            tainted = true;
+                        }
+                        let name = format!("ws-frames-{:020}.wal", 500 + next);
+                        next += 1;
+                        plant(&dir.join(REPLAYING_SUBDIR), &name);
+                        st.settle_named(&dir, &wm, now, start, &[OsStr::new(&name)]);
+                        model.push((name, tainted, now, clean, false));
+                    }
+                    2 => {
+                        wm.note_questdb_probe(true);
+                        clean += 1;
+                        suspect = false;
+                    }
+                    3 => {
+                        if !suspect {
+                            // An episode begins: every batch started so far
+                            // is touched.
+                            for m in &mut model {
+                                m.1 |= !m.4;
+                            }
+                        }
+                        wm.note_questdb_probe(false);
+                        suspect = true;
+                    }
+                    4 => now += half,
+                    _ => {
+                        let _verdict = st.promote(&wm, now);
+                    }
+                }
+                for n in listed(&dir.join(ARCHIVE_SUBDIR)) {
+                    let m = model.iter_mut().find(|m| OsStr::new(&m.0) == n.as_os_str());
+                    let Some((name, tainted, acked, clean_at, archived)) = m else {
+                        return Err(proptest::test_runner::TestCaseError::fail(format!(
+                            "unknown archived {n:?}"
+                        )));
+                    };
+                    if *archived {
+                        continue;
+                    }
+                    // Newly archived by this op: judged at this instant.
+                    proptest::prop_assert!(!*tainted, "{} archived after an episode touched it", name);
+                    proptest::prop_assert!(*clean_at + WAL_REPLAY_SETTLE_CLEAN_PROBES <= clean);
+                    proptest::prop_assert!(lagged(*acked) <= now);
+                    *archived = true;
+                }
+                proptest::prop_assert_eq!(
+                    names(&dir.join(ARCHIVE_SUBDIR)) + names(&dir.join(SETTLING_SUBDIR)),
+                    model.len(),
+                    "a segment vanished"
+                );
+            }
+            // Quiet end: the lag and two clean probes pass, then a promote.
+            wm.note_questdb_probe(true);
+            wm.note_questdb_probe(true);
+            let _verdict = st.promote(&wm, lagged(now));
+            let archived = listed(&dir.join(ARCHIVE_SUBDIR));
+            for (name, tainted, _, _, _) in &model {
+                let is_archived = archived.iter().any(|n| n.as_os_str() == OsStr::new(name));
+                proptest::prop_assert_eq!(is_archived, !tainted, "{} final placement", name);
             }
             drop(std::fs::remove_dir_all(&dir));
         }

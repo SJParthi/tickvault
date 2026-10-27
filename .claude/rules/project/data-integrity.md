@@ -162,11 +162,14 @@ Adding +5:30 to WebSocket timestamps corrupts:
 
 ### 2026-10-27 — `tick_quotes` (repeat quotes, owner Quote 41)
 
-A main-feed packet with no new trade is written to `tick_quotes`, not `ticks`
-(`websocket-connection-scope-lock.md` §"2026-10-27"). Its `ts` is the ARRIVAL
-time, built exactly like `received_at` (UTC now + IST offset), because the
-vendor's last trade time on such a packet is old and placed it behind the
-table's newest row. The vendor time is kept unchanged in `exchange_timestamp`.
+A main-feed packet whose exchange trade time is more than 2 s older than its
+receipt time is written to `tick_quotes`, not `ticks`
+(`websocket-connection-scope-lock.md` §"2026-10-27" and §"2026-10-27 (SECOND)", Quote 43). Its `ts` is the ARRIVAL
+time taken from the frame's receipt stamp in its WAL record (UTC to IST, the
+same instant replay reads back), NEVER `Utc::now()` at processing time: a
+replayed packet must produce the identical `ts` so the DEDUP key collapses it.
+The vendor's last trade time on such a packet is old and would have placed it
+behind the table's newest row. The vendor time is kept unchanged in `exchange_timestamp`.
 `ticks.ts` is unchanged: exchange time, never + 5:30. DEDUP key
 `(ts, security_id, segment, capture_seq, feed)`.
 

@@ -61,6 +61,10 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // before any detach, and nothing drops them before that copy.
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "ticks",
+    // 2026-10-27 (plan item M5, owner Quote 41): repeat quotes, stamped at
+    // arrival. Same partitioning, retention class, archive and S3 copy as
+    // `ticks` (`partition_archive::is_intraday_table`).
+    "tick_quotes",
     "market_depth",
     // 2026-10-09 (plan item 49e step 3): the array-row depth table, swept on
     // the same depth window as `market_depth` (see `partition_archive`).
@@ -922,6 +926,7 @@ mod tests {
             HOUR_PARTITIONED_TABLES,
             &[
                 "ticks",
+                "tick_quotes",
                 "market_depth",
                 "market_depth_book",
                 "top_volume",

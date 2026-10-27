@@ -360,7 +360,10 @@ const DEPTH_TABLES: [&str; 2] = [
 fn is_intraday_table(table: &str) -> bool {
     // 2026-10-22 (plan item 62): the two retired sub-minute tables keep the
     // intraday window they were archived on while they were written.
+    // 2026-10-27 (plan item M5): `tick_quotes` holds rows `ticks` held before
+    // the split, so it keeps the same window.
     if table == TICKS_TABLE
+        || table == crate::tick_quotes_persistence::TICK_QUOTES_TABLE
         || crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table)
     {
         return true;
