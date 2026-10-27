@@ -1,5 +1,5 @@
-//! `tickvault wipe-box <dry|apply> <sha>`: the box-side half of the 2026-10-31
-//! market-data wipe (plan item 67, operator Quote 35; see `wipe_2026_10_31`).
+//! `tickvault wipe-box <dry|apply> <sha>`: the box-side half of the one-off
+//! market-data wipe (plan item 67, operator Quotes 35 and 42; see `wipe_2026_10_31`).
 //!
 //! Sent over SSM by the runner as the one budgeted shell element in
 //! `wipe_ssm`: a copy of the deployed binary for the workflow's commit is
@@ -25,9 +25,9 @@ use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::wipe_2026_10_31::{
-    BoxReport, Mode, TableAction, Verdict, app_state_permits_delete, box_file_verdict,
-    cutoff_unix_secs, detached_dir_verdict, is_commit_sha, is_keep_table, market_data_tables,
-    partition_verdict, table_action,
+    BoxReport, CUTOFF_IST_DATE, Mode, TableAction, Verdict, app_state_permits_delete,
+    box_file_verdict, cutoff_unix_secs, detached_dir_verdict, is_commit_sha, is_keep_table,
+    market_data_tables, partition_verdict, table_action,
 };
 
 /// The CLI word.
@@ -232,7 +232,7 @@ struct FilePlan {
 impl FilePlan {
     fn summary(&self, what: &str) -> String {
         format!(
-            "{what}: delete {} ({}); kept {} dated 2026-11-01 or later, {} on the keep-list, {} other",
+            "{what}: delete {} ({}); kept {} dated {CUTOFF_IST_DATE} or later, {} on the keep-list, {} other",
             self.delete.len(),
             gib(self.delete.iter().map(|d| d.1).sum()),
             self.kept_not_old,
@@ -546,9 +546,11 @@ async fn questdb_step(q: &QuestDb, mode: Mode, r: &mut BoxReport) {
         };
         let action = table_action(table, &parts);
         let summary = match &action {
-            TableAction::Truncate(n) => format!("truncate ({n} partitions, all before 2026-11-01)"),
+            TableAction::Truncate(n) => {
+                format!("truncate ({n} partitions, all before {CUTOFF_IST_DATE})")
+            }
             TableAction::DropList(v) => format!(
-                "drop {} of {} partitions (the rest are 2026-11-01 or later, or unrecognised)",
+                "drop {} of {} partitions (the rest are {CUTOFF_IST_DATE} or later, or unrecognised)",
                 v.len(),
                 parts.len()
             ),
@@ -583,7 +585,9 @@ async fn questdb_step(q: &QuestDb, mode: Mode, r: &mut BoxReport) {
                 {
                     still.push(table.clone());
                 }
-                Ok(_) => r.line(format!("{table}: verified, no partition before 2026-11-01")),
+                Ok(_) => r.line(format!(
+                    "{table}: verified, no partition before {CUTOFF_IST_DATE}"
+                )),
                 Err(e) => {
                     r.problem(e);
                 }
@@ -659,7 +663,8 @@ mod tests {
     }
 
     const OLD: u64 = 1_793_000_000; // 2026-10-26, before the cutoff
-    const NEW: u64 = 1_793_500_000; // 2026-11-01, after the cutoff
+    // 2026-10-28 00:00 IST exactly: the cutoff instant itself is kept.
+    const NEW: u64 = 1_793_125_800;
 
     fn seed(base: &Path) {
         for rel in [
@@ -727,7 +732,7 @@ mod tests {
         let base = temp_tree();
         for d in [
             "ticks~3/2026-10-01T09.detached",
-            "ticks~3/2026-11-01T09.detached",
+            "ticks~3/2026-10-28T09.detached",
             "ticks~3/2026-10-01T09",
             "order_audit~4/2026-10-01.detached",
         ] {
