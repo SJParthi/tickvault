@@ -4482,6 +4482,10 @@ pub struct DrainCounters {
     depth_unbacked_not_shed: metrics::Counter,
     depth_rows: metrics::Counter,
     depth_refused: metrics::Counter,
+    /// Inline 5-level slots whose price failed the plausibility check but was
+    /// finite, and so was KEPT as sent (2026-10-27, owner: never skip level-5
+    /// data). Not a loss.
+    depth_implausible_kept: metrics::Counter,
     depth_dropped: metrics::Counter,
     depth_disconnects: metrics::Counter,
     depth_length_mismatch: metrics::Counter,
@@ -4595,6 +4599,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_unbacked_not_shed: metrics::counter!(DEPTH_COUNTER, "outcome" => "unbacked_not_shed"),
         depth_rows: metrics::counter!(DEPTH_COUNTER, "outcome" => "rows"),
         depth_refused: metrics::counter!(DEPTH_COUNTER, "outcome" => "refused"),
+        depth_implausible_kept: metrics::counter!(DEPTH_COUNTER, "outcome" => "implausible_kept"),
         depth_dropped: metrics::counter!(DEPTH_COUNTER, "outcome" => "dropped"),
         depth_disconnects: metrics::counter!(DEPTH_COUNTER, "outcome" => "disconnects"),
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
@@ -4712,6 +4717,7 @@ fn seed_drain_loss_baselines() {
     // on the first depth packet, so seeding it would publish a confident zero
     // for a depth lane that has not dialed yet.
     c.depth_refused.increment(0);
+    c.depth_implausible_kept.increment(0);
     c.depth_dropped.increment(0);
     c.depth_length_mismatch.increment(0);
     // ADDED 2026-09-23. The ws-lag EXCLUSION family: ticks we deliberately
@@ -9546,7 +9552,13 @@ fn append_inline_depth(
             let p = f64::from(p);
             p.is_finite() && p >= 0.0 && p <= f64::from(MAX_PLAUSIBLE_LTP)
         };
-        if plausible(level.bid_price) {
+        // 2026-10-27: a finite price the plausibility check rejects is KEPT
+        // (counted `implausible_kept`), never dropped; see
+        // `append_inline_depth_book`.
+        if level.bid_price.is_finite() {
+            if !plausible(level.bid_price) {
+                c.depth_implausible_kept.increment(1);
+            }
             let row = DepthRow {
                 security_id,
                 segment,
@@ -9570,7 +9582,13 @@ fn append_inline_depth(
         } else {
             c.depth_refused.increment(1);
         }
-        if plausible(level.ask_price) {
+        // 2026-10-27: a finite price the plausibility check rejects is KEPT
+        // (counted `implausible_kept`), never dropped; see
+        // `append_inline_depth_book`.
+        if level.ask_price.is_finite() {
+            if !plausible(level.ask_price) {
+                c.depth_implausible_kept.increment(1);
+            }
             let row = DepthRow {
                 security_id,
                 segment,
@@ -9625,13 +9643,26 @@ fn append_inline_depth_book(
             } else {
                 (level.ask_price, level.ask_quantity, level.ask_orders)
             };
+            // 2026-10-27 (owner: "never ever skip any level 5 data"): every
+            // slot keeps its quantity and orders, and any FINITE price is kept
+            // as sent, even one the plausibility check rejects. Measured live
+            // 27 Oct: in the 09:00-09:10 pre-open NSE_EQ packets carry a 5th
+            // level the check rejected (about 420,000 slots), and the old arm
+            // blanked the whole slot. A kept implausible price is counted on
+            // `implausible_kept`; only a non-finite price (NaN or infinity,
+            // which QuestDB cannot hold as a value) is stored as NaN, with its
+            // quantity and orders still kept, and counted `refused`.
+            b.quantity[slot] = f64::from(quantity);
+            b.orders[slot] = f64::from(orders);
             if plausible(price) {
                 b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
-                b.quantity[slot] = f64::from(quantity);
-                b.orders[slot] = f64::from(orders);
                 stored = stored.saturating_add(1);
+            } else if price.is_finite() {
+                b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
+                stored = stored.saturating_add(1);
+                c.depth_implausible_kept.increment(1);
             } else {
-                b.mark_refused(slot);
+                b.price[slot] = f64::NAN;
                 c.depth_refused.increment(1);
             }
         }
@@ -27881,8 +27912,8 @@ mod inline_depth_tests {
             bid_price: 10.2,
             ask_price: 10.35,
         }; 5];
-        // Slot 2's ask is refused.
-        levels[2].ask_price = -3.0;
+        // Slot 2's ask is not a number: the only price still refused.
+        levels[2].ask_price = f32::NAN;
         let rows = append_inline_depth(
             &mut sink,
             &tick,
@@ -27907,6 +27938,70 @@ mod inline_depth_tests {
         let bid: Vec<u8> = [10.2_f64; 5].iter().flat_map(|p| p.to_le_bytes()).collect();
         assert!(bytes.windows(bid.len()).any(|w| w == bid.as_slice()));
         let ask: Vec<u8> = [10.35, 10.35, f64::NAN, 10.35, 10.35]
+            .iter()
+            .flat_map(|p: &f64| p.to_le_bytes())
+            .collect();
+        assert!(bytes.windows(ask.len()).any(|w| w == ask.as_slice()));
+        // The NaN slot keeps its quantity: only the price is unknown.
+        let ask_qty: Vec<u8> = [20.0_f64; 5].iter().flat_map(|p| p.to_le_bytes()).collect();
+        assert!(
+            bytes
+                .windows(ask_qty.len())
+                .any(|w| w == ask_qty.as_slice())
+        );
+    }
+
+    /// Owner 2026-10-27: "never ever skip any level 5 data". Measured live the
+    /// same day: pre-open NSE_EQ packets carry a 5th level whose price the
+    /// plausibility check rejects, and the old arm blanked the whole slot
+    /// (about 420,000 slots between 09:00 and 09:10). A finite price is now
+    /// kept as sent, with its quantity and orders.
+    #[test]
+    fn test_regression_inline_depth_book_keeps_an_implausible_fifth_level() {
+        let mut sink = DepthIngest::for_test_book(RECEIPT_UTC_NANOS);
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 1,
+            ..Default::default()
+        };
+        let mut levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 52.0,
+            ask_price: 52.5,
+        }; 5];
+        levels[4].bid_price = -1.0;
+        levels[4].bid_quantity = 777;
+        levels[4].ask_price = 3.0e9;
+        let rows = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            RECEIPT_UTC_NANOS,
+            0,
+            0,
+            false,
+            counters(),
+        );
+        assert_eq!(rows, 10, "every level is stored, none skipped");
+        let bytes = sink.pending_book_bytes();
+        let bid: Vec<u8> = [52.0, 52.0, 52.0, 52.0, -1.0_f64]
+            .iter()
+            .flat_map(|p: &f64| p.to_le_bytes())
+            .collect();
+        assert!(bytes.windows(bid.len()).any(|w| w == bid.as_slice()));
+        let bid_qty: Vec<u8> = [10.0, 10.0, 10.0, 10.0, 777.0_f64]
+            .iter()
+            .flat_map(|p: &f64| p.to_le_bytes())
+            .collect();
+        assert!(
+            bytes
+                .windows(bid_qty.len())
+                .any(|w| w == bid_qty.as_slice())
+        );
+        let ask: Vec<u8> = [52.5, 52.5, 52.5, 52.5, 3.0e9_f64]
             .iter()
             .flat_map(|p: &f64| p.to_le_bytes())
             .collect();
@@ -28028,12 +28123,21 @@ mod inline_depth_tests {
             "zero-priced levels are the absent sentinel and MUST be written"
         );
 
+        // 2026-10-27 (owner: never skip level-5 data): a negative price is
+        // kept as sent; only a non-finite price is refused.
         let mut neg = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         neg[0].bid_price = -1.0;
         assert_eq!(
             append_inline_depth(&mut sink, &tick, &neg, 1, 0, 0, false, counters()),
+            10,
+            "a finite price is kept even when implausible"
+        );
+        let mut nan = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
+        nan[0].bid_price = f32::NAN;
+        assert_eq!(
+            append_inline_depth(&mut sink, &tick, &nan, 1, 0, 0, false, counters()),
             9,
-            "a negative price is impossible and must be refused"
+            "a non-finite price cannot be stored as a value"
         );
     }
 
