@@ -383,9 +383,23 @@ fn append_within_marker(
 /// Writes one `ticks` line. Only [`TickWriter::append_row`] calls it, inside
 /// a marker.
 fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Result<()> {
+    write_tick_line_into(buffer, TICKS_TABLE, feed, row, None)
+}
+
+/// Writes one line of the `ticks` columns into `table`. `exchange_ts_ist_nanos`
+/// is written as `exchange_timestamp` (the `tick_quotes` column, plan item M5);
+/// `ticks` passes `None` and has no such column. Only the two append paths
+/// call it, each inside a marker. O(1), no allocation.
+fn write_tick_line_into(
+    buffer: &mut Buffer,
+    table: &'static str,
+    feed: &'static str,
+    row: &TickRow,
+    exchange_ts_ist_nanos: Option<i64>,
+) -> Result<()> {
     debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
     buffer
-        .table(questdb::ingress::TableName::new_unchecked(TICKS_TABLE))
+        .table(questdb::ingress::TableName::new_unchecked(table))
         .context("table")?
         .symbol(
             tick_ilp_column("segment"),
@@ -484,6 +498,14 @@ fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Re
         buffer
             .column_i64(tick_ilp_column("payload_hash"), v)
             .context("payload_hash")?;
+    }
+    if let Some(v) = exchange_ts_ist_nanos {
+        buffer
+            .column_ts(
+                tick_ilp_column("exchange_timestamp"),
+                TimestampNanos::new(v),
+            )
+            .context("exchange_timestamp")?;
     }
 
     // capture_seq is the LAST column before the designated timestamp.
@@ -725,7 +747,7 @@ pub fn ticks_create_ddl() -> String {
 }
 
 /// Every `ticks` column with its type, for the per-column self-heal ALTERs.
-const TICKS_COLUMNS: &[(&str, &str)] = &[
+pub(crate) const TICKS_COLUMNS: &[(&str, &str)] = &[
     ("received_at", "TIMESTAMP"),
     ("contract", "SYMBOL"),
     ("feed", "SYMBOL"),
@@ -810,7 +832,10 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
         }
     };
     let mut every_statement_accepted = true;
-    for ddl in &ticks_ensure_statements() {
+    // M5 (2026-10-27): `tick_quotes` is written by the same writer, so it is
+    // ensured here with `ticks`, under the same verdict and retry.
+    let quotes = crate::tick_quotes_persistence::tick_quotes_ensure_statements(TICKS_COLUMNS);
+    for ddl in ticks_ensure_statements().iter().chain(quotes.iter()) {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -2346,6 +2371,9 @@ pub struct TickWriter {
     /// buffer carries `ticks` and `feed_aux_packets` rows together, so
     /// `pending` alone cannot say which table a pending row is for.
     aux_rows_appended: u64,
+    /// `tick_quotes` rows appended by this writer over its life (plan item
+    /// M5). The buffer carries both tables, as it does `feed_aux_packets`.
+    quote_rows_appended: u64,
 }
 
 /// Pre-resolves the per-kind `tv_feed_aux_rows_total` handles (plan item 45h).
@@ -2596,6 +2624,8 @@ fn tick_out_of_window_counters(feed: Feed) -> OutOfWindowCounters {
 /// [`TickWriter::for_test`] for why that is not merely tidiness. Idempotent:
 /// `increment(0)` on an already-registered series is a no-op.
 fn register_drop_baseline(feed: Feed) {
+    // M5 (2026-10-27): the `tick_quotes` row counter exists from boot.
+    crate::tick_quotes_persistence::register_baseline();
     metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str()).increment(0);
     // The rescue counter needs the SAME treatment for the same reason: a
     // spill episode is rare, so its first increment would otherwise be
@@ -2669,6 +2699,7 @@ impl TickWriter {
                     spare_buffers: None,
                     aux_counters: aux_row_counters(),
                     aux_rows_appended: 0,
+                    quote_rows_appended: 0,
                 }
             }
             Err(err) => {
@@ -2698,6 +2729,7 @@ impl TickWriter {
                     spare_buffers: None,
                     aux_counters: aux_row_counters(),
                     aux_rows_appended: 0,
+                    quote_rows_appended: 0,
                 }
             }
         }
@@ -2754,6 +2786,7 @@ impl TickWriter {
             spare_buffers: None,
             aux_counters: aux_row_counters(),
             aux_rows_appended: 0,
+            quote_rows_appended: 0,
         }
     }
 
@@ -2775,7 +2808,7 @@ impl TickWriter {
 
     /// Test-only view of the raw ILP buffer bytes (wire-shape assertions).
     #[cfg(test)]
-    fn buffer_utf8(&self) -> String {
+    pub(crate) fn buffer_utf8(&self) -> String {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 
@@ -2824,6 +2857,48 @@ impl TickWriter {
     /// # Errors
     /// [`TickRow::from_parsed_tick`] refusals and ILP buffer errors.
     pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
+        self.append_tick_into(tick, capture_seq, false)
+    }
+
+    /// Appends a main-feed packet that carries NO new trade to `tick_quotes`
+    /// (plan item M5, owner Quote 41, 2026-10-27), with the same replay-stable
+    /// `capture_seq`.
+    ///
+    /// Every gate is the one [`Self::append_tick_with_seq`] applies, judged on
+    /// the same `ticks` row: a packet that `ticks` would refuse to
+    /// `feed_aux_packets` is refused there exactly as before, so `ticks` plus
+    /// `tick_quotes` holds exactly the rows `ticks` held before the split. The
+    /// row then takes the ARRIVAL time as its designated `ts` (the `received_at`
+    /// value, already UTC + the IST offset) and keeps the vendor's last trade
+    /// time unchanged in `exchange_timestamp`. A packet with no receipt time
+    /// cannot be stamped at arrival and is written to `ticks` instead.
+    ///
+    /// O(1), allocation-free apart from the buffer's amortised growth.
+    ///
+    /// # Errors
+    /// As [`Self::append_tick_with_seq`].
+    pub fn append_tick_quote_with_seq(
+        &mut self,
+        tick: &ParsedTick,
+        capture_seq: i64,
+    ) -> Result<()> {
+        self.append_tick_into(tick, capture_seq, true)
+    }
+
+    /// `tick_quotes` rows this writer has appended over its life.
+    #[must_use]
+    pub const fn quote_rows_appended(&self) -> u64 {
+        self.quote_rows_appended
+    }
+
+    /// The shared body of the two tick appends: `to_quotes` picks the table
+    /// AFTER every gate, so both tables see the same refusals.
+    fn append_tick_into(
+        &mut self,
+        tick: &ParsedTick,
+        capture_seq: i64,
+        to_quotes: bool,
+    ) -> Result<()> {
         let outcome = match TickRow::from_parsed_tick(tick, capture_seq) {
             Ok(row) => {
                 // THE SESSION-WINDOW GATE (operator requirement, 2026-09-05).
@@ -2909,16 +2984,34 @@ impl TickWriter {
                     self.persist_refused_tick(tick, capture_seq);
                     return Ok(());
                 }
-                let appended = self.append_row(&row);
-                // K4 (2026-10-26): the daily conservation check's process
-                // side. One relaxed add per accepted Dhan row, O(1), no alloc.
-                if appended.is_ok() && self.feed == Feed::Dhan {
-                    crate::tick_conservation_ledger::ledger().note_row_appended(row.ts_ist_nanos);
-                    // M1 (2026-10-26): append, late in its hour, or older
-                    // partition. One `fetch_max`, one counter add, O(1).
-                    let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos);
+                // M5 (2026-10-27): a repeat quote with a receipt time goes to
+                // `tick_quotes`, stamped at arrival (`received_at`, the same
+                // value as that column); every other row goes to `ticks`.
+                if let (true, Some(arrival)) = (to_quotes, row.received_at_ist_nanos) {
+                    let appended = self.append_quote_row(&row, arrival, tick.exchange_timestamp);
+                    if appended.is_ok() {
+                        self.quote_rows_appended = self.quote_rows_appended.saturating_add(1);
+                        crate::tick_quotes_persistence::note_row();
+                        // K4: `tick_quotes` rows are counted too, under their
+                        // own designated `ts`; the daily check counts both.
+                        if self.feed == Feed::Dhan {
+                            crate::tick_conservation_ledger::ledger().note_row_appended(arrival);
+                        }
+                    }
+                    appended
+                } else {
+                    let appended = self.append_row(&row);
+                    // K4 (2026-10-26): the daily conservation check's process
+                    // side. One relaxed add per accepted Dhan row, O(1), no alloc.
+                    if appended.is_ok() && self.feed == Feed::Dhan {
+                        crate::tick_conservation_ledger::ledger()
+                            .note_row_appended(row.ts_ist_nanos);
+                        // M1 (2026-10-26): append, late in its hour, or older
+                        // partition. One `fetch_max`, one counter add, O(1).
+                        let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos);
+                    }
+                    appended
                 }
-                appended
             }
             Err(err) => Err(err.into()),
         };
@@ -3017,6 +3110,46 @@ impl TickWriter {
         let feed = self.feed.as_str();
         append_within_marker(&mut self.buffer, |buffer| {
             write_tick_line(buffer, feed, row)
+        })?;
+        self.pending = self.pending.saturating_add(1);
+        self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
+    /// Appends one `tick_quotes` row (plan item M5): the `ticks` columns with
+    /// the designated `ts` replaced by `arrival_ist_nanos`, plus the vendor's
+    /// last trade time `ltt_ist_secs` (IST epoch seconds, written unchanged;
+    /// the never-traded `0` is omitted, so the cell is NULL). Same buffer,
+    /// same pending range as a `ticks` row. O(1), no allocation.
+    ///
+    /// # Errors
+    /// ILP buffer errors; the buffer is then exactly as before the call.
+    fn append_quote_row(
+        &mut self,
+        row: &TickRow,
+        arrival_ist_nanos: i64,
+        ltt_ist_secs: u32,
+    ) -> Result<()> {
+        let nonfinite = count_nonfinite_tick_floats(row);
+        if nonfinite > 0 {
+            metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
+        }
+        let quote = TickRow {
+            ts_ist_nanos: arrival_ist_nanos,
+            ..*row
+        };
+        // Dhan's LTT is already IST epoch seconds: no offset is added.
+        let exchange_ts = (ltt_ist_secs != 0).then(|| i64::from(ltt_ist_secs) * 1_000_000_000);
+        let feed = self.feed.as_str();
+        append_within_marker(&mut self.buffer, |buffer| {
+            write_tick_line_into(
+                buffer,
+                crate::tick_quotes_persistence::TICK_QUOTES_TABLE,
+                feed,
+                &quote,
+                exchange_ts,
+            )
         })?;
         self.pending = self.pending.saturating_add(1);
         self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);

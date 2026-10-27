@@ -11,7 +11,8 @@
 //!   in-process ledger (`tickvault_storage::tick_conservation_ledger`, one
 //!   relaxed add per accepted row);
 //! - **database**: `select count() from ticks where ts in '<today>' and
-//!   feed = 'dhan'`, through the shared QuestDB client builder with a
+//!   feed = 'dhan'`, plus the same count over `tick_quotes` (plan item M5:
+//!   repeat quotes moved there and the ledger counts them too), through the shared QuestDB client builder with a
 //!   timeout;
 //! - **not landed**: rows already counted as spilled, failed or handed to the
 //!   WAL replay (the same sites that increment `tv_ticks_dropped_total`).
@@ -198,11 +199,19 @@ pub const fn secs_until_check(now_secs_of_day_ist: u32) -> Option<u64> {
     }
 }
 
-/// The count query for `day` (IST date). Pure.
+/// The tables the daily count reads. The writer counts a row of either in the
+/// ledger (plan item M5, 2026-10-27: repeat quotes moved to `tick_quotes`),
+/// so the database side sums both.
+pub const TICK_COUNT_TABLES: [&str; 2] = [
+    tickvault_storage::tick_persistence::TICKS_TABLE,
+    tickvault_storage::tick_quotes_persistence::TICK_QUOTES_TABLE,
+];
+
+/// The count query for `table` on `day` (IST date). Pure.
 #[must_use]
-pub fn tick_count_sql(day: NaiveDate) -> String {
+pub fn tick_count_sql(table: &str, day: NaiveDate) -> String {
     format!(
-        "select count() from ticks where ts in '{}' and feed = '{}'",
+        "select count() from {table} where ts in '{}' and feed = '{}'",
         day.format("%Y-%m-%d"),
         Feed::Dhan.as_str()
     )
@@ -334,11 +343,21 @@ async fn run_daily_checks(
     }
 }
 
+/// The day's rows across [`TICK_COUNT_TABLES`]. `None` when any one count
+/// cannot be read: a sum missing a table would read as a shortfall.
 async fn read_tick_count(day: NaiveDate, questdb: &QuestDbConfig) -> Option<u64> {
+    let mut total = 0_u64;
+    for table in TICK_COUNT_TABLES {
+        total = total.checked_add(read_table_count(table, day, questdb).await?)?;
+    }
+    Some(total)
+}
+
+async fn read_table_count(table: &str, day: NaiveDate, questdb: &QuestDbConfig) -> Option<u64> {
     let client =
         tickvault_storage::http_client::build_probe_client(TICK_COUNT_QUERY_TIMEOUT_SECS).ok()?;
     let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
-    let sql = tick_count_sql(day);
+    let sql = tick_count_sql(table, day);
     let resp = tokio::time::timeout(
         Duration::from_secs(TICK_COUNT_QUERY_TIMEOUT_SECS),
         client.get(&url).query(&[("query", sql.as_str())]).send(),
@@ -592,8 +611,21 @@ mod tests {
     fn test_tick_count_sql_filters_day_and_feed() {
         let day = NaiveDate::from_ymd_opt(2026, 10, 26).expect("date");
         assert_eq!(
-            tick_count_sql(day),
+            tick_count_sql("ticks", day),
             "select count() from ticks where ts in '2026-10-26' and feed = 'dhan'"
+        );
+    }
+
+    /// Regression (2026-10-27, plan item M5): the writer's ledger counts
+    /// `tick_quotes` rows too, so the database side must count both tables or
+    /// every quote row reads as a shortfall.
+    #[test]
+    fn test_regression_tick_count_reads_ticks_and_tick_quotes() {
+        assert_eq!(TICK_COUNT_TABLES, ["ticks", "tick_quotes"]);
+        let day = NaiveDate::from_ymd_opt(2026, 10, 27).expect("date");
+        assert_eq!(
+            tick_count_sql("tick_quotes", day),
+            "select count() from tick_quotes where ts in '2026-10-27' and feed = 'dhan'"
         );
     }
 

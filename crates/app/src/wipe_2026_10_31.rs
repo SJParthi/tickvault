@@ -204,6 +204,11 @@ pub fn market_data_tables() -> Vec<&'static str> {
         tickvault_storage::partition_manager::all_managed_table_names();
     out.extend(tickvault_storage::shadow_persistence::retired_candle_table_names());
     out.retain(|t| !is_keep_table(t));
+    // 2026-10-27 (plan item M5): `tick_quotes` is created by this change and
+    // can hold no row before the 2026-10-28 cutoff, so it is not part of the
+    // wipe and not in the role's grant (`wipe_tables`); listing its prefix
+    // would only be refused.
+    out.retain(|t| *t != tickvault_storage::tick_quotes_persistence::TICK_QUOTES_TABLE);
     out.sort_unstable();
     out.dedup();
     out
@@ -792,6 +797,15 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Regression (2026-10-27, plan item M5): `tick_quotes` joined the
+    /// retention registry, which this list derives from; the one-off role has
+    /// no grant for it and it holds nothing before the cutoff.
+    #[test]
+    fn test_regression_tick_quotes_is_not_in_the_wipe_set() {
+        assert!(!market_data_tables().contains(&"tick_quotes"));
+        assert!(market_data_tables().contains(&"ticks"));
     }
 
     #[test]

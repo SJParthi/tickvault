@@ -2870,13 +2870,24 @@ impl LiveIngest {
         // `refused_timestamp`, `refused_slot_exhausted`) already carry the
         // aggregate, and AGGREGATOR-DROP-01's 30-second delta report is where
         // a systemic refusal rate surfaces today.
-        if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
-            let assessment = self.detector.observe(obs);
-            // Plan item K3: count the two loss-adjacent verdicts instead of
-            // dropping them. Pre-resolved handles, two matches, no allocation.
-            let c = counters();
-            count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
-        }
+        let assessment =
+            TickObservation::from_parsed_tick(tick, recv_monotonic_millis).map(|obs| {
+                let assessment = self.detector.observe(obs);
+                // Plan item K3: count the two loss-adjacent verdicts instead of
+                // dropping them. Pre-resolved handles, two matches, no allocation.
+                let c = counters();
+                count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
+                assessment
+            });
+        // M5 (2026-10-27, owner Quote 41): a packet with no new trade goes to
+        // `tick_quotes`, stamped at arrival. Decided from the detector verdict
+        // just computed (no extra lookup) and the WAL-carried receipt, so a
+        // replay routes it the same way (`tick_quote_route`).
+        let to_tick_quotes = crate::tick_quote_route::routes_to_tick_quotes(
+            assessment,
+            tick.exchange_timestamp,
+            tick.received_at_nanos,
+        );
 
         // Seals go STRAIGHT to the process-wide seal writer — the same
         // `global_seal_sender` the REST fold uses, landing in the same
@@ -3167,7 +3178,12 @@ impl LiveIngest {
         }
 
         // `append_tick_with_seq`, never `append_tick` — the single-source rule.
-        if self.writer.append_tick_with_seq(tick, capture_seq).is_err() {
+        let appended = if to_tick_quotes {
+            self.writer.append_tick_quote_with_seq(tick, capture_seq)
+        } else {
+            self.writer.append_tick_with_seq(tick, capture_seq)
+        };
+        if appended.is_err() {
             // No log here since 2026-09-01: `append_tick_with_seq` now emits
             // the coded ERROR itself (with `feed`, `source` and the failure
             // text) AND increments the ALARMED `tv_ticks_dropped_total`. The
@@ -27672,6 +27688,9 @@ mod silence_latch_tests {
 
 #[cfg(test)]
 mod contract_attach_tests;
+
+#[cfg(test)]
+mod tick_quotes_route_tests;
 
 #[cfg(test)]
 mod alive_connection_guard_tests {
