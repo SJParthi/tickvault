@@ -25,7 +25,8 @@
 #      09:00-15:45 IST): mode=apply phase=all confirm=WIPE-BEFORE-2026-11-01.
 #      The box job stops the app, deletes the files and partitions dated
 #      before 2026-10-28, stops the box; then the cloud job deletes the old
-#      S3 versions and lists again. Before 16:30 IST on 2026-10-28 the
+#      S3 versions (with Quote 43, the rebuild's copies of the spill files
+#      too) and lists again. Before 16:30 IST on 2026-10-28 the
 #      old-root snapshot is KEPT and the job says so. Apply refuses without a
 #      successful dry run on the same commit, outside the window, or while a
 #      deploy is queued or running.
