@@ -309,3 +309,57 @@ fn test_segments_for_bucket_places_an_unreadable_segment_with_the_reach() {
         "the unreadable segment can hold the bucket"
     );
 }
+
+/// Plan item W2 (2026-10-27): a collision lost the shed frame in segment A.
+/// The overflow height is the top of that frame's bucket, so A is kept,
+/// while B and C (applied, aged, with a verified copy, and wholly above the
+/// height) age out. Before W2 every range read as deferred while the table
+/// was overflowed, and B and C were pinned until an after-close pass cleared
+/// the flag.
+#[test]
+fn test_prune_deletes_an_applied_uploaded_segment_above_the_overflow_height() {
+    use crate::wal_deferred_depth::{
+        DEFERRED_BUCKET_SHIFT, DEFERRED_BUCKETS, DeferredDepth, ShedDepth,
+    };
+    let dir = tmp_dir("deferred-overflow-height");
+    let now = SystemTime::now();
+    let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+    let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+    let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+    let d = write_wm_segment(&dir, 3_000, 3, WalEndpoint::MainFeed);
+    for p in [&a, &b, &c] {
+        backdate(p, now, 400_000);
+        mark_uploaded(&dir, p, len_of(p));
+    }
+    // An older bucket holds the slot, so the shed in A cannot be recorded.
+    let lost = wm_seq(1);
+    let marks = DeferredDepth::new_for_tests();
+    marks.note_shed(
+        lost - ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT),
+        ShedDepth::Inline,
+    );
+    marks.note_shed(lost, ShedDepth::Inline);
+    let deferred = marks.snapshot();
+    let height = deferred.overflow_height().expect("a known height");
+    assert!(height < wm_seq(1_000), "B starts above the height");
+    let markers = crate::raw_frame_upload::markers_dir(&dir);
+    let out = prune_active_segments_deferred_at(
+        &dir,
+        172_800,
+        u64::MAX,
+        now,
+        Some(&all_applied_through(wm_seq(5_000))),
+        Some(&deferred),
+        false,
+        UploadGate::Required {
+            markers_dir: &markers,
+        },
+    );
+    assert!(a.exists(), "A holds the frame the overflow lost: kept");
+    assert!(!b.exists(), "B is above the height: it ages out");
+    assert!(!c.exists(), "C is above the height: it ages out");
+    assert!(d.exists(), "D is the newest: kept");
+    assert_eq!(out.deleted, 2);
+    assert_eq!(out.deferred_kept, 1, "only A");
+    let _ = std::fs::remove_dir_all(&dir);
+}
