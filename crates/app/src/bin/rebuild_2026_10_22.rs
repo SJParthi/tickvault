@@ -407,10 +407,20 @@ impl Run {
         if !Self::dry_ok(&r) {
             missing.push("ec2:AttachVolume");
         }
+        // A tag is required: with none, EC2 answers InvalidParameterValue
+        // before it checks the permission, so the probe read "missing" even
+        // for a key that holds ec2:CreateTags (live, 2026-10-27). DryRun, so
+        // nothing is written.
         let r = self
             .ec2
             .create_tags()
             .resources(root)
+            .tags(
+                Tag::builder()
+                    .key(REBUILD_TAG_KEY)
+                    .value(REBUILD_TAG_VALUE)
+                    .build(),
+            )
             .dry_run(true)
             .send()
             .await;
