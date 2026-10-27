@@ -144,7 +144,7 @@ jobs:
           echo "id=$IID" >> "$GITHUB_OUTPUT"
           echo "Instance: $IID"
 
-      - name: Market-hours guard (IST 09:15-15:30 Mon-Fri)
+      - name: Market-hours guard (IST 09:00-15:40 Mon-Fri)
         id: guard
         # 2026-08-10 (security review): both inputs come in through `env:`,
         # never spliced into the script text. `force` is a free-form string,
@@ -167,11 +167,11 @@ jobs:
             *) sensitive=0 ;;
           esac
           if [ "$sensitive" = "1" ] && [ "$force" != "yes" ]; then
-            # IST = UTC+5:30. Market window UTC 03:45-10:00, Mon-Fri.
+            # IST = UTC+5:30. Capture window UTC 03:30-10:10 (09:00-15:40 IST), Mon-Fri.
             mins=$(( ( $(date -u +%H) * 60 + $(date -u +%M) ) ))
             dow=$(date -u +%u)  # 1=Mon..7=Sun
-            if [ "$dow" -le 5 ] && [ "$mins" -ge 225 ] && [ "$mins" -le 600 ]; then
-              echo "::error::'$action' blocked during market hours (09:15-15:30 IST Mon-Fri). Re-run with force=yes if truly needed."
+            if [ "$dow" -le 5 ] && [ "$mins" -ge 210 ] && [ "$mins" -le 610 ]; then
+              echo "::error::'$action' blocked during the capture window (09:00-15:40 IST Mon-Fri). Re-run with force=yes if truly needed."
               exit 1
             fi
           fi

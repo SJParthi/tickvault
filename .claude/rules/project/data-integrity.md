@@ -160,6 +160,16 @@ Adding +5:30 to WebSocket timestamps corrupts:
 
 **If any test with "CRITICAL" in its name fails on tick timestamps: REVERT IMMEDIATELY.**
 
+### 2026-10-27 — `tick_quotes` (repeat quotes, owner Quote 41)
+
+A main-feed packet with no new trade is written to `tick_quotes`, not `ticks`
+(`websocket-connection-scope-lock.md` §"2026-10-27"). Its `ts` is the ARRIVAL
+time, built exactly like `received_at` (UTC now + IST offset), because the
+vendor's last trade time on such a packet is old and placed it behind the
+table's newest row. The vendor time is kept unchanged in `exchange_timestamp`.
+`ticks.ts` is unchanged: exchange time, never + 5:30. DEDUP key
+`(ts, security_id, segment, capture_seq, feed)`.
+
 ## Greeks Pipeline Timestamp Rule — ALWAYS ADD +5:30 TO ts
 
 **THIS IS A CRITICAL DATA INTEGRITY RULE FOR GREEKS TABLES.**

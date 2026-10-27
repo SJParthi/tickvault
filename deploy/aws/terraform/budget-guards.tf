@@ -335,6 +335,9 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # Operator Quote 31 (2026-10-21): the app's drain hold, read by the
       # out-of-window stop only (same parameter as the start-watchdog's).
       DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
+      # Plan item J8: the NSE Muhurat sessions (same value as the start
+      # watchdog's); a box inside a session window is in-window here.
+      MUHURAT_SESSIONS = local.muhurat_sessions_env
       # 2026-10-22 (plan item 63, operator Quote 37): the budget whose free
       # DescribeBudget gives the month-to-date spend. Missing = unknown spend
       # (page, never stop).

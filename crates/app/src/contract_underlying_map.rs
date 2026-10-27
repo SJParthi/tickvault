@@ -501,6 +501,43 @@ pub fn count_artifact_refusals(refusals: &[(i64, LegRefusal)]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+/// The artifact-scan refusals of contracts the main feed SUBSCRIBED.
+///
+/// Audit PR M / M4 (2026-10-26): every attach attempt counted each failing
+/// option leg of every expiry and exchange (42,510 `unsupported_segment` BSE
+/// legs and 1,518 `unresolved_underlying_symbol` per attempt), none of them
+/// subscribed, so the counter measured the artifact's shape. A refusal of a
+/// subscribed contract still counts, so the 2026-09-09 class (every leg
+/// refused) still shows. A refusal with no usable id (`0`) is kept: it cannot
+/// be attributed, and it means a broken artifact. O(selected + refusals), cold.
+#[must_use]
+pub fn subscribed_refusals(
+    refusals: &[(i64, LegRefusal)],
+    selected: &[SubscribeInstrument],
+) -> Vec<(i64, LegRefusal)> {
+    let picked: HashSet<ContractKey> = selected
+        .iter()
+        .map(|instrument| (instrument.security_id, instrument.segment))
+        .collect();
+    refusals
+        .iter()
+        .copied()
+        .filter(|(id, _)| refusal_is_subscribed(*id, &picked))
+        .collect()
+}
+
+/// Whether a refused leg's contract is in `picked`. A refusal carries the bare
+/// id, so both derivative segments are probed on the I-P1-11 composite key; an
+/// unusable id is kept (unattributable, see [`subscribed_refusals`]).
+fn refusal_is_subscribed(id: i64, picked: &HashSet<ContractKey>) -> bool {
+    match u64::try_from(id) {
+        Ok(0) | Err(_) => true,
+        Ok(id) => [ExchangeSegment::NseFno, ExchangeSegment::BseFno]
+            .iter()
+            .any(|segment| picked.contains(&(id, *segment))),
+    }
+}
+
 /// Puts the legs the main feed will actually SUBSCRIBE ahead of the rest, so
 /// they are the ones that fit inside [`MAX_TRACKED_CONTRACTS`].
 ///
@@ -612,22 +649,64 @@ impl ContractUnderlyingMap {
     /// Refusals are counted here rather than in `build_snapshot`, which stays
     /// pure so the decision rule is testable without a metrics recorder.
     pub fn publish_from_legs(&self, legs: &[LegIds]) -> SnapshotBuild {
+        self.publish_counting(legs, &|_| true).0
+    }
+
+    /// [`Self::publish_from_legs`] for legs ordered by [`order_selected_first`]:
+    /// the first `selected_first` legs are the subscribed ones. The map is
+    /// built from ALL the legs, as before; only a refusal of a SUBSCRIBED
+    /// contract is counted and logged. Returns the build and that count.
+    ///
+    /// Audit PR M / M4 (2026-10-26): the attach retries every few seconds
+    /// until the pricing quorum holds, and each attempt counted 60,988
+    /// `at_capacity` refusals, every one a leg of a contract nobody subscribed
+    /// (other expiries), so the counter and the warn line measured the
+    /// artifact's size, not a defect.
+    pub fn publish_from_legs_selected_first(
+        &self,
+        legs: &[LegIds],
+        selected_first: usize,
+    ) -> (SnapshotBuild, usize) {
+        let picked: HashSet<ContractKey> = legs[..selected_first.min(legs.len())]
+            .iter()
+            .filter_map(|l| {
+                u64::try_from(l.contract_security_id)
+                    .ok()
+                    .map(|id| (id, l.contract_segment))
+            })
+            .collect();
+        self.publish_counting(legs, &|id| refusal_is_subscribed(id, &picked))
+    }
+
+    /// Builds, publishes, and counts the refusals `counts` keeps. O(legs),
+    /// once per attach attempt, cold.
+    fn publish_counting(
+        &self,
+        legs: &[LegIds],
+        counts: &dyn Fn(i64) -> bool,
+    ) -> (SnapshotBuild, usize) {
         let (map, build) = build_snapshot(legs);
+        let counted: Vec<(i64, LegRefusal)> = build
+            .refusals
+            .iter()
+            .copied()
+            .filter(|(id, _)| counts(*id))
+            .collect();
         // A refusal means a contract cannot be RANKED at all — the ranking is
         // narrower than the subscription, silently, and a counter alone would
         // leave that reaching nobody. One SUMMARY line per publish, not per leg.
         // per leg: this runs ONCE PER DAY at attach over a bounded leg count, so
         // whole picture fits in a single line and a per-leg line would be
         // thousands of them for one event.
-        for (_, reason) in &build.refusals {
+        for (_, reason) in &counted {
             metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(1);
         }
-        if !build.refusals.is_empty() {
+        if let Some((_, first)) = counted.first() {
             tracing::warn!(
-                refused = build.refusals.len(),
+                refused = counted.len(),
                 accepted = build.accepted,
                 legs = legs.len(),
-                first_reason = build.refusals[0].1.as_str(),
+                first_reason = first.as_str(),
                 "contract-to-underlying mapping refused chain legs — those \
                  contracts cannot be ranked or depth-steered today \
                  (one line per publish; per-reason counts are on the counter)"
@@ -658,7 +737,8 @@ impl ContractUnderlyingMap {
             );
         }
         self.publish(map);
-        build
+        let counted = counted.len();
+        (build, counted)
     }
 
     /// Who this contract belongs to and which board it ranks on, or `None`.
@@ -2066,5 +2146,122 @@ mod label_cap_tests {
             );
             assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
         }
+    }
+}
+
+/// Audit PR M / M4 (2026-10-26): only refusals of SUBSCRIBED contracts count.
+#[cfg(test)]
+mod subscribed_refusal_tests {
+    use super::*;
+
+    const FNO: ExchangeSegment = ExchangeSegment::NseFno;
+
+    fn leg(contract: i64, lot_size: u32) -> LegIds {
+        LegIds {
+            contract_security_id: contract,
+            underlying_security_id: 13,
+            contract_segment: FNO,
+            lot_size,
+            family: OptionFamily::Stock,
+        }
+    }
+
+    fn picked(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment,
+        }
+    }
+
+    fn at_capacity_count(handle: &metrics_exporter_prometheus::PrometheusHandle) -> String {
+        handle
+            .render()
+            .lines()
+            .find(|l| l.starts_with(REFUSED_COUNTER) && l.contains(LegRefusal::AtCapacity.as_str()))
+            .and_then(|l| l.rsplit(' ').next())
+            .unwrap_or("absent")
+            .to_owned()
+    }
+
+    // Regression: 2026-10-26 — each attach attempt counted 60,988 `at_capacity`
+    // refusals of legs nobody subscribed. The map still holds every leg that
+    // fits (unchanged); only a subscribed contract's refusal is counted.
+    #[test]
+    fn test_regression_unsubscribed_at_capacity_legs_are_not_counted() {
+        // Two subscribed legs first, then one past the cap of unsubscribed.
+        let mut legs = vec![leg(1, 75), leg(2, 75)];
+        legs.extend((10..10 + MAX_TRACKED_CONTRACTS as i64 + 1).map(|id| leg(id, 75)));
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let map = ContractUnderlyingMap::new();
+        let (build, counted) = metrics::with_local_recorder(&recorder, || {
+            pre_register_contract_underlying_counters();
+            map.publish_from_legs_selected_first(&legs, 2)
+        });
+        assert_eq!(
+            build.accepted, MAX_TRACKED_CONTRACTS,
+            "the map is full, as before"
+        );
+        assert_eq!(
+            build.refusals.len(),
+            3,
+            "three unsubscribed legs past the cap"
+        );
+        assert_eq!(counted, 0, "none of them is a subscribed contract");
+        assert_eq!(at_capacity_count(&handle), "0");
+        assert!(map.owner_of(1, FNO).is_some() && map.owner_of(2, FNO).is_some());
+    }
+
+    #[test]
+    fn test_publish_from_legs_selected_first_still_counts_a_subscribed_refusal() {
+        let legs = vec![leg(1, 0), leg(2, 75), leg(3, 0)];
+        let map = ContractUnderlyingMap::new();
+        let (build, counted) = map.publish_from_legs_selected_first(&legs, 2);
+        assert_eq!(build.refusals.len(), 2, "both zero-lot legs are refused");
+        assert_eq!(counted, 1, "only the subscribed one (id 1) counts");
+    }
+
+    #[test]
+    fn test_publish_from_legs_still_counts_every_refusal() {
+        let map = ContractUnderlyingMap::new();
+        let build = map.publish_from_legs(&[leg(1, 0), leg(2, 0)]);
+        assert_eq!(build.refusals.len(), 2);
+    }
+
+    #[test]
+    fn test_subscribed_refusals_keeps_subscribed_and_unattributable_ones() {
+        let refusals = vec![
+            (100, LegRefusal::MissingLotSize),
+            (200, LegRefusal::UnsupportedSegment),
+            (300, LegRefusal::UnresolvedUnderlyingSymbol),
+            (0, LegRefusal::ZeroOrNegativeContractId),
+        ];
+        let selected = vec![
+            picked(100, FNO),
+            picked(300, ExchangeSegment::BseFno),
+            // Same bare id as 200 but a SPOT: must not adopt the derivative's refusal.
+            picked(200, ExchangeSegment::NseEquity),
+        ];
+        let kept = subscribed_refusals(&refusals, &selected);
+        assert_eq!(
+            kept,
+            vec![
+                (100, LegRefusal::MissingLotSize),
+                (300, LegRefusal::UnresolvedUnderlyingSymbol),
+                (0, LegRefusal::ZeroOrNegativeContractId),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_subscribed_refusals_of_nothing_subscribed_is_empty_but_for_zero_ids() {
+        let refusals = vec![
+            (5, LegRefusal::AtCapacity),
+            (-1, LegRefusal::MissingLotSize),
+        ];
+        assert_eq!(
+            subscribed_refusals(&refusals, &[]),
+            vec![(-1, LegRefusal::MissingLotSize)]
+        );
     }
 }

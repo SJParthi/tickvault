@@ -125,11 +125,18 @@ ExecStartPre=-/opt/tickvault/bin/tickvault-host ensure-questdb
 TimeoutStartSec=infinity
 
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
-# Bounded by StartLimitIntervalSec/StartLimitBurst in [Unit]: after > 8
-# restarts in 10 min the unit goes to `failed` and stops restarting (so a true
-# crash-loop becomes an observable hard failure instead of an infinite silent
-# churn under a re-emitted stale gauge). Recover a `failed` unit manually with
-# `systemctl reset-failed tickvault && systemctl start tickvault`.
+# Bounded by StartLimitIntervalSec/StartLimitBurst in [Unit]: after more than
+# StartLimitBurst restarts inside StartLimitIntervalSec (5 in 3600 s since
+# 2026-09-03; it read "> 8 in 10 min" until then) the unit goes to `failed`
+# and stops restarting, so a true crash-loop becomes an observable hard failure
+# instead of an infinite silent churn under a re-emitted stale gauge.
+# CORRECTED 2026-10-26 (audit PR L4): this said to recover a `failed` unit
+# manually. No human step is needed while the unit is enabled:
+# scripts/aws-autopilot.sh runs `systemctl reset-failed tickvault` then
+# `systemctl start tickvault` on any pass that finds the enabled unit not
+# active (passes run every 15 minutes, 08:30-16:30 IST
+# Mon-Fri, .github/workflows/aws-autopilot.yml). A DISABLED unit is read as an
+# intentional kill switch and is left alone.
 Restart=always
 RestartSec=3
 

@@ -65,6 +65,20 @@
 //! session does not open an incident over a value that converged to zero the
 //! day before.
 //!
+//! **⚠ CHANGED 2026-10-26 (plan item M3).** Both readings above are now
+//! measured and handled, in `tf_consistency_readiness`. (1) The run still
+//! fires at 15:40 but waits, at most until 15:55 IST, until the live side
+//! has sealed past 15:45 (the last 3/5/10/15/30-minute bucket ends), the
+//! seal writer drained after that sweep, no seal spill file is staged and
+//! every candle table it reads applied its WAL; a bucket whose natural end
+//! is past the sealed floor at the read is skipped (`unsealed_at_read`),
+//! never missing. Evidence: every later same-day run read
+//! `missing_tf_rows = 0` (13, 14, 21, 22, 23 Oct). (2) The mismatches were
+//! the fold crediting a longer bar with what it can prove happened inside
+//! it: 38,850 of 38,850 on 2026-10-23 (S3 archive) were a wider high/low
+//! (81.0%) or the day's first volume and open in the 09:15 bar (19.0%).
+//! Those two exact shapes are counted (`attributed_wider`) and do not page.
+//!
 //! The bucket grid is REIMPLEMENTED here independently (windows
 //! `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
 //! against `TfIndex::bucket_start` by a hand-literal TRIPWIRE test below —
@@ -658,18 +672,35 @@ pub struct TfCompareCounts {
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
     pub volume_overflows: u64,
+    /// Buckets whose natural end was past the live side's sealed floor at the
+    /// read: skipped, never judged missing (plan item M3).
+    pub unsealed_at_read: u64,
+    /// Mismatching buckets of the `ExtremeStraddle` shape (plan item M3).
+    pub attributed_extreme: u64,
+    /// Mismatching buckets of the `FirstTrade` shape (plan item M3).
+    pub attributed_first_trade: u64,
 }
 
 /// Compare ONE instrument's stored rows of ONE higher TF against the
 /// recompute over its (sorted, de-duplicated) 1m rows. Pure — O(rows) with
 /// a single sweep over the grid.
+///
+/// `sealed_through_secs_of_day` (plan item M3, 2026-10-26): when `Some`, a
+/// bucket whose NATURAL end (start plus the frame, not cut at the close) is
+/// past it had not sealed when the run read, so it is skipped and counted
+/// in `unsealed_at_read`, never reported missing. A mismatching bucket of a
+/// shape the fold produces by design
+/// ([`crate::tf_consistency_readiness::attributed_wider_shape`]) is counted
+/// on its own and is not a finding.
 #[must_use]
 pub fn compare_tf(
     tf: TfIndex,
     rows_1m_sorted: &[CandleRow],
     stored_rows: &[CandleRow],
     day_start_ist_nanos: i64,
+    sealed_through_secs_of_day: Option<i64>,
 ) -> (Vec<FindingDraft>, TfCompareCounts) {
+    use crate::tf_consistency_readiness::{AttributedShape, attributed_wider_shape};
     let tf_secs = tf.seconds_per_bucket();
     let tf_label = tf.display_name();
     let windows = bucket_grid(tf_secs);
@@ -713,6 +744,10 @@ pub fn compare_tf(
         stored_by_sod.insert(sod, *r);
     }
 
+    let first_1m_secs_of_day = rows_1m_sorted
+        .first()
+        .map(|r| secs_of_day_from_nanos(r.ts_nanos, day_start_ist_nanos));
+
     // Single sweep: assign sorted 1m rows to windows via a moving cursor.
     let mut cursor = 0usize;
     for w in &windows {
@@ -735,6 +770,14 @@ pub fn compare_tf(
         let one_m_rows = members.len() as i64;
         let stored = stored_by_sod.remove(&start);
 
+        let natural_end = start.saturating_add(i64::from(tf_secs));
+        if sealed_through_secs_of_day.is_some_and(|floor| natural_end > floor) {
+            if stored.is_some() || !members.is_empty() {
+                counts.unsealed_at_read = counts.unsealed_at_read.saturating_add(1);
+            }
+            continue;
+        }
+
         let recomputed = match recompute_window(members) {
             Ok(r) => r,
             Err(VolumeOverflow) => {
@@ -746,7 +789,23 @@ pub fn compare_tf(
         match (stored, recomputed) {
             (Some(s), Some(rec)) => {
                 counts.buckets_compared = counts.buckets_compared.saturating_add(1);
-                for field in diff_strict_fields(&s, &rec) {
+                let fields = diff_strict_fields(&s, &rec);
+                let shape = if fields.is_empty() {
+                    None
+                } else {
+                    attributed_wider_shape(&s, &rec, start, first_1m_secs_of_day)
+                };
+                match shape {
+                    Some(AttributedShape::ExtremeStraddle) => {
+                        counts.attributed_extreme = counts.attributed_extreme.saturating_add(1);
+                    }
+                    Some(AttributedShape::FirstTrade) => {
+                        counts.attributed_first_trade =
+                            counts.attributed_first_trade.saturating_add(1);
+                    }
+                    None => {}
+                }
+                for field in fields.into_iter().filter(|_| shape.is_none()) {
                     let (sv, rv) = match field {
                         DiffField::Open => (s.open, rec.open),
                         DiffField::High => (s.high, rec.high),
@@ -1171,6 +1230,12 @@ pub struct PassStats {
     pub query_failures: u64,
     pub rows_seen: bool,
     pub degraded: bool,
+    /// Buckets not yet sealed when the run read (plan item M3). Never pages.
+    pub unsealed_at_read: u64,
+    /// Mismatches of the `ExtremeStraddle` shape (plan item M3). Never pages.
+    pub attributed_extreme: u64,
+    /// Mismatches of the `FirstTrade` shape (plan item M3). Never pages.
+    pub attributed_first_trade: u64,
 }
 
 impl PassStats {
@@ -1366,6 +1431,8 @@ struct PassParams<'a> {
     date: NaiveDate,
     always_on: &'a HashSet<(i64, String)>,
     run_started: std::time::Instant,
+    /// The live side's sealed floor at the read (plan item M3).
+    sealed_through_secs_of_day: Option<i64>,
 }
 
 /// Shared mutable run state across the two passes.
@@ -1711,13 +1778,28 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             if stored.is_empty() && rows_1m_sorted.is_empty() {
                 continue;
             }
-            let (tf_drafts, counts) = compare_tf(tf, &rows_1m_sorted, &stored, day_start_nanos);
+            let (tf_drafts, counts) = compare_tf(
+                tf,
+                &rows_1m_sorted,
+                &stored,
+                day_start_nanos,
+                p.sealed_through_secs_of_day,
+            );
             drafts.extend(tf_drafts);
             stats.buckets_compared = stats
                 .buckets_compared
                 .saturating_add(counts.buckets_compared);
             stats.bucket_gaps = stats.bucket_gaps.saturating_add(counts.bucket_gaps);
             stats.soft_tick_count = stats.soft_tick_count.saturating_add(counts.soft_tick_count);
+            stats.unsealed_at_read = stats
+                .unsealed_at_read
+                .saturating_add(counts.unsealed_at_read);
+            stats.attributed_extreme = stats
+                .attributed_extreme
+                .saturating_add(counts.attributed_extreme);
+            stats.attributed_first_trade = stats
+                .attributed_first_trade
+                .saturating_add(counts.attributed_first_trade);
             if counts.volume_overflows > 0 {
                 // Corrupt data — Σ(volume) overflowed i64. Degrades the run
                 // under the query_failed stage (the data was unusable).
@@ -1796,6 +1878,13 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
     // Soft tick_count divergence is a counter, never a page.
     metrics::counter!("tv_tf_verify_soft_divergence_total", "field" => "tick_count")
         .increment(stats.soft_tick_count);
+    // Plan item M3: by-design differences and buckets read before they
+    // sealed. Counted, never paged.
+    metrics::counter!("tv_tf_verify_attributed_wider_total", "shape" => "extreme_straddle")
+        .increment(stats.attributed_extreme);
+    metrics::counter!("tv_tf_verify_attributed_wider_total", "shape" => "first_trade")
+        .increment(stats.attributed_first_trade);
+    metrics::counter!("tv_tf_verify_unsealed_at_read_total").increment(stats.unsealed_at_read);
 
     // Refuter round 2 (H2 self-disarm visibility): ONE coalesced warn per
     // pass naming instruments excluded by the DATA-derived out-of-session
@@ -1843,6 +1932,9 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             off_grid = stats.off_grid,
             duplicates = stats.duplicates,
             buckets_compared = stats.buckets_compared,
+            attributed_extreme = stats.attributed_extreme,
+            attributed_first_trade = stats.attributed_first_trade,
+            unsealed_at_read = stats.unsealed_at_read,
             samples = %pass_samples.join(" | "),
             "TF-VERIFY-01: higher-timeframe candles diverge from their \
              1-minute recompute — operator judgment required over the \
@@ -1923,6 +2015,16 @@ pub async fn run_tf_consistency(
         }
     };
 
+    // Plan item M3: read only once the candles are final (bounded wait), and
+    // skip any bucket still unsealed at the read.
+    let readiness = crate::tf_consistency_readiness::wait_for_sealed_candles(
+        &client,
+        &exec_url,
+        dhan_date,
+        ist_day_start_nanos(dhan_date),
+    )
+    .await;
+
     let always_on = always_on_string_set(&tickvault_common::always_on::current());
     let run_started = std::time::Instant::now();
     let mut state = RunState {
@@ -1941,6 +2043,7 @@ pub async fn run_tf_consistency(
             date: dhan_date,
             always_on: &always_on,
             run_started,
+            sealed_through_secs_of_day: readiness.sealed_through_secs_of_day,
         },
         &mut state,
     )
@@ -2000,6 +2103,11 @@ pub async fn run_tf_consistency(
         no_coverage = summary.no_coverage,
         off_grid = summary.off_grid,
         duplicates = summary.duplicates,
+        attributed_extreme = dhan_stats.attributed_extreme,
+        attributed_first_trade = dhan_stats.attributed_first_trade,
+        unsealed_at_read = dhan_stats.unsealed_at_read,
+        sealed_through_secs_of_day = readiness.sealed_through_secs_of_day.unwrap_or(-1),
+        read_final = readiness.verdict.is_ok(),
         "tf_consistency: daily timeframe-consistency verification complete"
     );
     summary
@@ -2036,6 +2144,11 @@ pub fn spawn_tf_consistency_tasks(
         // The other boot path already spawned it this process.
         return;
     }
+    // Plan item M3: seeded at 0 so the first run's increment is a delta.
+    for shape in ["extreme_straddle", "first_trade"] {
+        metrics::counter!("tv_tf_verify_attributed_wider_total", "shape" => shape).increment(0);
+    }
+    metrics::counter!("tv_tf_verify_unsealed_at_read_total").increment(0);
     let qcfg = config.questdb.clone();
     let calendar = std::sync::Arc::clone(trading_calendar);
     let inner: tokio::task::JoinHandle<Result<Option<(TfConsistencySummaryData, bool)>, String>> =
@@ -2978,7 +3091,7 @@ mod tests {
             row(33_420, 101.5, 101.75, 98.0, 99.0, 30, 5),
         ];
         let stored = vec![row(33_300, 100.0, 102.0, 98.0, 99.0, 60, 12)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, None);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
         assert_eq!(counts.bucket_gaps, 1, "3 of 5 minutes present");
@@ -2990,7 +3103,7 @@ mod tests {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
         // Stored high + volume wrong.
         let stored = vec![row(33_300, 100.0, 105.0, 99.0, 100.5, 11, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, None);
         assert_eq!(counts.buckets_compared, 1);
         let cats: Vec<_> = findings.iter().map(|f| (f.category, f.field)).collect();
         assert!(cats.contains(&(FindingCategory::Mismatch, "high")));
@@ -3008,7 +3121,7 @@ mod tests {
     #[test]
     fn test_compare_tf_missing_tf_row_pages_when_1m_present() {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, None);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
@@ -3019,7 +3132,7 @@ mod tests {
     #[test]
     fn test_compare_tf_no_1m_coverage_when_stored_over_nothing() {
         let stored = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, None);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::No1mCoverage);
@@ -3029,7 +3142,7 @@ mod tests {
     fn test_compare_tf_off_grid_stored_ts_detected() {
         // A 09:16:00 "5m" row is off the 09:15-anchored grid.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
+        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::OffGridTs);
         assert_eq!(findings[0].bucket_secs_of_day, 33_360);
@@ -3041,7 +3154,7 @@ mod tests {
         let first = row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3);
         let mut second = first;
         second.close = 999.0;
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START, None);
         // The duplicate is flagged; the compare ran on the FIRST row and
         // matched, so no mismatch rows.
         assert_eq!(counts.buckets_compared, 1);
@@ -3060,7 +3173,7 @@ mod tests {
             row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1),
             row(33_600, 2.0, 2.0, 2.0, 2.0, 2, 1),
         ];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, None);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 2);
     }
@@ -3074,7 +3187,7 @@ mod tests {
             row(55_740, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:29
         ];
         let stored = vec![row(54_900, 10.0, 12.0, 9.0, 11.0, 10, 4)];
-        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START, None);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
     }
@@ -3083,7 +3196,7 @@ mod tests {
     fn test_compare_tf_tick_count_divergence_is_soft() {
         let ones = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 5)];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 6)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, None);
         assert!(findings.is_empty(), "soft signal must not page");
         assert_eq!(counts.soft_tick_count, 1);
     }
@@ -3095,7 +3208,7 @@ mod tests {
             row(33_360, 1.0, 1.0, 1.0, 1.0, 1, 1),
         ];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, None);
         assert_eq!(counts.volume_overflows, 1);
         assert_eq!(counts.buckets_compared, 0, "corrupt window not compared");
         assert!(findings.is_empty());
@@ -3574,7 +3687,7 @@ mod tests {
         // still a paging finding (the exclusion never swallows off_grid
         // for normal instruments), carve-out flag irrelevant.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, None);
         assert!(
             findings
                 .iter()

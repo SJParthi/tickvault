@@ -142,7 +142,12 @@ pub mod delay_render;
 // per SEBI 5y retention (no DDL drop anywhere). The 15:40 IST audit's
 // inputs all died with the live-WS retirements + the stage-2 tick-chain
 // deletion (#1631).
+// RESTORED 2026-10-26 (plan item K4): the Dhan live lane writes `ticks`
+// again, so the daily conservation check writes new rows into the retained
+// table. `tick_conservation_ledger` is the process-side count it reads.
 pub mod table_storage_probe;
+pub mod tick_conservation_audit_persistence;
+pub mod tick_conservation_ledger;
 pub mod ws_connection_daily_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
@@ -302,6 +307,9 @@ pub mod hot_path_telemetry;
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
 pub mod tick_persistence;
+// Plan item M1 (2026-10-26): counts where each `ticks` row lands against the
+// newest row written (append, late in its hour, older hour partition).
+pub mod tick_ts_placement;
 // Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
 // ILP bodies back to QuestDB's /write endpoint and truncates on success, so
 // the ITEM 24 rescue recovers without a human running curl. Reinstates the
@@ -310,8 +318,13 @@ pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
+// K4 (2026-10-26): the previous process's last WAL receipt, read at boot.
+pub mod wal_last_receipt;
 // Quote 31 (2026-10-21): seal the WAL writer's open segment on request.
 pub mod wal_idle_seal;
+// PR M / M4 (2026-10-26): the WAL writer polls while frames flow, so the
+// socket read task never pays a futex wake to hand it a frame.
+pub mod wal_writer_wait;
 // PR W review round 7: count a WAL record written past the reorder slack.
 pub mod wal_reorder_guard;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay

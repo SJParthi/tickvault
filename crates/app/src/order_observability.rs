@@ -665,8 +665,13 @@ pub(crate) async fn run_order_side_consumer(
     stats: Arc<OrderSideDayStats>,
 ) {
     // Subsystem-owned lazy ensure (idempotent; coded failure arms inside).
-    ensure_order_audit_table(&wiring.questdb).await;
-    ensure_pnl_audit_table(&wiring.questdb).await;
+    // Audit J3 (2026-10-26): a refusal starts the background re-run instead
+    // of leaving the tables unkeyed for the session. Both always run.
+    let order_keyed = ensure_order_audit_table(&wiring.questdb).await;
+    let pnl_keyed = ensure_pnl_audit_table(&wiring.questdb).await;
+    if !(order_keyed && pnl_keyed) {
+        crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&wiring.questdb);
+    }
     // Audit PR42b: the disk-tier drains start only after both tables are
     // ensured, so a replay never auto-creates a table without its DEDUP key.
     spawn_audit_spill_drain_once(AuditSpillTable::OrderAudit, &wiring.questdb);

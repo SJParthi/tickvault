@@ -57,16 +57,101 @@ pub async fn logs_summary() -> impl IntoResponse {
 /// file as application/x-ndjson. Lexical sort is sufficient because the
 /// filenames embed ISO-8601 YYYY-MM-DD-HH suffixes.
 /// Returns 404 if no errors.jsonl.* file exists yet.
-pub async fn logs_jsonl_latest() -> impl IntoResponse {
+///
+/// Bounded read (audit J4, 2026-10-26): the hourly file has no byte cap, so
+/// an error storm can make it gigabytes long. A file larger than
+/// [`MAX_JSONL_RESPONSE_BYTES`] is served as its last 10 MiB, starting at a
+/// line boundary, with the header [`TRUNCATED_HEADER`] set to `true` and a
+/// first NDJSON line `{"truncated":true,"file_bytes":N,"served_bytes":M}`.
+pub async fn logs_jsonl_latest() -> axum::response::Response {
     let dir = resolve_logs_dir();
-    match on_blocking_pool(move || newest_jsonl(&dir)).await.flatten() {
-        Some(path) => read_text_file(&path, "application/x-ndjson; charset=utf-8").await,
-        None => (
+    let Some(path) = on_blocking_pool(move || newest_jsonl(&dir)).await.flatten() else {
+        return (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "application/json")],
             "{\"error\":\"no errors.jsonl file present\"}".to_string(),
-        ),
+        )
+            .into_response();
+    };
+    let read_path = path.clone();
+    match on_blocking_pool(move || read_tail(&read_path, MAX_JSONL_RESPONSE_BYTES)).await {
+        Some(Ok(tail)) => {
+            let truncated = if tail.truncated { "true" } else { "false" };
+            let body = if tail.truncated {
+                format!(
+                    "{{\"truncated\":true,\"file_bytes\":{},\"served_bytes\":{}}}\n{}",
+                    tail.file_bytes,
+                    tail.body.len(),
+                    tail.body
+                )
+            } else {
+                tail.body
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
+                    (header::HeaderName::from_static(TRUNCATED_HEADER), truncated),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":\"file not found\",\"path\":\"{}\"}}",
+                json_escape(&path.display().to_string())
+            ),
+        )
+            .into_response(),
     }
+}
+
+/// Largest JSONL body the debug endpoint serves (the same 10 MiB as
+/// [`MAX_CROSS_VERIFY_CSV_BYTES`]).
+const MAX_JSONL_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Response header naming whether the JSONL body is a tail of a larger file.
+const TRUNCATED_HEADER: &str = "x-tickvault-truncated";
+
+/// The last bytes of a file, as read by [`read_tail`].
+#[derive(Debug)]
+struct FileTail {
+    body: String,
+    file_bytes: u64,
+    truncated: bool,
+}
+
+/// Reads at most `cap` bytes from the end of `path`. When the file is larger,
+/// the reader seeks to `len - cap` and drops everything up to the first
+/// newline, so the body starts on a whole line. Invalid UTF-8 is replaced,
+/// never refused. Blocking: run it on the blocking pool. Memory is at most
+/// `cap` bytes whatever the file size.
+fn read_tail(path: &Path, cap: u64) -> std::io::Result<FileTail> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let file_bytes = file.metadata()?.len();
+    let start = file_bytes.saturating_sub(cap);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut raw = Vec::with_capacity(usize::try_from(file_bytes - start).unwrap_or(0));
+    file.take(cap).read_to_end(&mut raw)?;
+    let truncated = start > 0;
+    let from = if truncated {
+        raw.iter()
+            .position(|b| *b == b'\n')
+            .map_or(raw.len(), |i| i + 1)
+    } else {
+        0
+    };
+    Ok(FileTail {
+        body: String::from_utf8_lossy(&raw[from..]).into_owned(),
+        file_bytes,
+        truncated,
+    })
 }
 
 fn resolve_spill_dir() -> PathBuf {
@@ -608,6 +693,139 @@ mod tests {
         unsafe {
             std::env::remove_var(LOGS_DIR_ENV);
         }
+    }
+
+    #[test]
+    fn read_tail_serves_a_small_file_whole() {
+        let tmp = mktemp("tail-whole");
+        let path = tmp.path().join("errors.jsonl.2026-10-26-09");
+        fs::write(&path, "{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let tail = read_tail(&path, MAX_JSONL_RESPONSE_BYTES).unwrap();
+        assert!(!tail.truncated);
+        assert_eq!(tail.file_bytes, 16);
+        assert_eq!(tail.body, "{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn read_tail_caps_a_large_file_at_a_line_boundary() {
+        // Audit J4: a file over the cap is served as its tail, never read
+        // whole, and the cut line is dropped.
+        let tmp = mktemp("tail-cut");
+        let path = tmp.path().join("errors.jsonl.2026-10-26-09");
+        let line = "{\"message\":\"storm\"}\n";
+        let body = line.repeat(100);
+        fs::write(&path, &body).unwrap();
+        // A cap that lands mid-line: 10 whole lines plus half of one.
+        let cap = (line.len() * 10 + line.len() / 2) as u64;
+        let tail = read_tail(&path, cap).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.file_bytes, body.len() as u64);
+        assert_eq!(tail.body, line.repeat(10));
+        assert!(tail.body.len() as u64 <= cap);
+    }
+
+    #[test]
+    fn read_tail_errors_on_a_missing_file() {
+        let tmp = mktemp("tail-missing");
+        assert!(read_tail(&tmp.path().join("nope"), 1024).is_err());
+    }
+
+    #[test]
+    fn read_tail_with_no_newline_in_the_tail_serves_nothing_rather_than_half_a_line() {
+        let tmp = mktemp("tail-noline");
+        let path = tmp.path().join("errors.jsonl.2026-10-26-09");
+        fs::write(&path, "x".repeat(4096)).unwrap();
+        let tail = read_tail(&path, 100).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.file_bytes, 4096);
+        assert!(tail.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn logs_jsonl_latest_answers_404_when_the_newest_entry_cannot_be_read() {
+        // A directory carrying the file prefix is found by `newest_jsonl` but
+        // fails to read; the handler answers 404 naming the path, never 500.
+        let _env = env_guard();
+        let tmp = mktemp("jsonl-unreadable");
+        fs::create_dir(tmp.path().join("errors.jsonl.2026-10-26-09")).unwrap();
+        unsafe {
+            std::env::set_var(LOGS_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let response = logs_jsonl_latest().await;
+        unsafe {
+            std::env::remove_var(LOGS_DIR_ENV);
+        }
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("file not found"), "{text}");
+        assert!(text.contains("errors.jsonl.2026-10-26-09"), "{text}");
+    }
+
+    #[test]
+    fn jsonl_response_cap_matches_the_cross_verify_cap() {
+        assert_eq!(MAX_JSONL_RESPONSE_BYTES, MAX_CROSS_VERIFY_CSV_BYTES);
+        assert_eq!(MAX_JSONL_RESPONSE_BYTES, 10 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn logs_jsonl_latest_serves_a_small_file_untruncated() {
+        let _env = env_guard();
+        let tmp = mktemp("jsonl-small");
+        fs::write(
+            tmp.path().join("errors.jsonl.2026-10-26-09"),
+            "{\"m\":\"x\"}\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var(LOGS_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let response = logs_jsonl_latest().await;
+        unsafe {
+            std::env::remove_var(LOGS_DIR_ENV);
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(TRUNCATED_HEADER).unwrap(), "false");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"{\"m\":\"x\"}\n");
+    }
+
+    #[tokio::test]
+    async fn logs_jsonl_latest_marks_a_file_over_the_cap_as_truncated() {
+        let _env = env_guard();
+        let tmp = mktemp("jsonl-big");
+        let line = format!("{{\"message\":\"{}\"}}\n", "e".repeat(1000));
+        let lines = (MAX_JSONL_RESPONSE_BYTES as usize / line.len()) + 50;
+        fs::write(
+            tmp.path().join("errors.jsonl.2026-10-26-09"),
+            line.repeat(lines),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var(LOGS_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let response = logs_jsonl_latest().await;
+        unsafe {
+            std::env::remove_var(LOGS_DIR_ENV);
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(TRUNCATED_HEADER).unwrap(), "true");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.starts_with("{\"truncated\":true,\"file_bytes\":"),
+            "{first}"
+        );
+        // Marker line plus at most the cap.
+        assert!(body.len() as u64 <= MAX_JSONL_RESPONSE_BYTES + 128);
+        assert!(text.lines().skip(1).all(|l| l == line.trim_end()));
     }
 
     #[test]

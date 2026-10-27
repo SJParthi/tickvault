@@ -253,12 +253,60 @@ pub const REPLAY_QUARANTINED_COUNTER: &str = "tv_tick_spill_replay_quarantined_t
 /// file kept a 512 MB file holding 1,662,318 intact ticks from ever being
 /// attempted, for hours.
 ///
-/// 408 and 429 are 4xx by number and TRANSIENT by meaning — request timeout
-/// and rate limit both succeed on a later try — so they are deliberately
-/// excluded and take the retry path.
+/// Only 400 (bad request), 413 (payload too large) and 422 (unprocessable)
+/// describe the PAYLOAD (audit K1, 2026-10-26). Every other 4xx describes the
+/// request or the server's state, not the bytes: 401/403 (auth on the HTTP
+/// endpoint), 404 (wrong path or a proxy in the way), 408 (timeout), 429
+/// (rate limit). Before K1 every 4xx except 408/429 quarantined the file, so a
+/// misconfigured endpoint answering 401 or 404 set the whole backlog aside
+/// one file at a time. Those now take the retry path like a 5xx: the file
+/// stays waiting and the round stops.
 #[must_use]
 pub fn is_permanent_refusal(status: u16) -> bool {
-    (400..500).contains(&status) && status != 408 && status != 429
+    matches!(status, 400 | 413 | 422)
+}
+
+/// Files quarantined IN A ROW with the same HTTP status after which a replay
+/// round stops (audit K1). One poison file is a torn write; three in a row
+/// refused the same way is the server refusing everything (schema drift, a
+/// table QuestDB will no longer accept), and carrying on would set the whole
+/// backlog aside in one round. Stopping keeps the rest waiting for a fix.
+pub const REPLAY_QUARANTINE_STREAK_STOP: u32 = 3;
+
+/// Tracks consecutive whole-file quarantines that carried the same HTTP status
+/// (audit K1). O(1), no allocation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineStreak {
+    status: Option<u16>,
+    count: u32,
+}
+
+impl QuarantineStreak {
+    /// Records one file quarantined for `status`. Returns `true` when the
+    /// streak reached [`REPLAY_QUARANTINE_STREAK_STOP`] and the round must
+    /// stop.
+    #[must_use]
+    pub fn record(&mut self, status: u16) -> bool {
+        if self.status == Some(status) {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.status = Some(status);
+            self.count = 1;
+        }
+        self.count >= REPLAY_QUARANTINE_STREAK_STOP
+    }
+
+    /// A file that was not quarantined for a status (replayed, skipped as
+    /// corrupt for another reason) breaks the streak.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Files in the current streak.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.count
+    }
 }
 
 /// Moves a permanently-refused spill file into the quarantine directory.
@@ -381,10 +429,18 @@ pub enum ReplayWindow {
 /// When a spill directory's replay waits instead of posting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayHold {
-    /// Never held (ticks): the rescue tier must drain as soon as it can.
+    /// Never held (an unknown folder).
+    ///
+    /// ⚠ CHANGED 2026-10-26 (plan item M1): this was the ticks policy too,
+    /// "the rescue tier must drain as soon as it can". Ticks now use
+    /// [`ReplayHold::InSessionUnlessLowDisk`].
     Never,
     /// Held 08:00–15:40 IST ([`depth_replay_held_at`]); depth.
     InSession,
+    /// Held 09:00–15:40 IST ([`tick_replay_held_at`]) unless the spill
+    /// volume's free space is below [`TICK_REPLAY_IN_SESSION_FREE_FLOOR_BYTES`]
+    /// or cannot be read; ticks (plan item M1, 2026-10-26).
+    InSessionUnlessLowDisk,
     // `KeyedThenInSession` (the top_volume folder's hold) REMOVED 2026-10-22
     // (plan item 62, operator Quote 34) with the top_volume writer and replay.
 }
@@ -414,6 +470,11 @@ pub fn replay_policy_for_dir(dir: &Path) -> ReplayPolicy {
     let label = dir_label(dir);
     let (window, hold, framed_depth) = match label {
         "depth" => (ReplayWindow::Arrival, ReplayHold::InSession, true),
+        "ticks" => (
+            ReplayWindow::Exchange,
+            ReplayHold::InSessionUnlessLowDisk,
+            false,
+        ),
         _ => (ReplayWindow::Exchange, ReplayHold::Never, false),
     };
     ReplayPolicy {
@@ -429,11 +490,86 @@ pub fn replay_policy_for_dir(dir: &Path) -> ReplayPolicy {
 ///
 /// ⚠ CHANGED 2026-10-22 (plan item 62): the `top_volume_keyed` argument went
 /// with the top_volume replay, the only policy that read it.
+///
+/// ⚠ CHANGED 2026-10-26 (plan item M1): `free_bytes` is called only for
+/// [`ReplayHold::InSessionUnlessLowDisk`] inside its window, so the other
+/// policies pay no disk probe.
 #[must_use]
-pub fn replay_held(hold: ReplayHold, secs_of_day_ist: u32) -> bool {
+pub fn replay_held(
+    hold: ReplayHold,
+    secs_of_day_ist: u32,
+    free_bytes: impl FnOnce() -> Option<u64>,
+) -> bool {
     match hold {
         ReplayHold::Never => false,
         ReplayHold::InSession => depth_replay_held_at(secs_of_day_ist),
+        ReplayHold::InSessionUnlessLowDisk => {
+            tick_replay_window_at(secs_of_day_ist) && tick_replay_held_at(free_bytes())
+        }
+    }
+}
+
+/// Start of the daily window in which the TICK spill is not replayed: 09:00
+/// IST, when tick capture starts. A boot at 08:30 still drains yesterday's
+/// leftover spill before the first live row.
+pub const TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
+
+/// End of that window: 15:40 IST, the same instant the depth hold ends.
+pub const TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+
+/// Free bytes below which the tick spill replays in session anyway.
+///
+/// Twice [`crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`]
+/// (16 GiB), so a held spill can never be what pushes the volume to the
+/// reserve at which a rescue is refused: replaying moves the rows into the
+/// database and empties the files, which frees space. A worst-case session
+/// spills about 16 GiB (`TICK_SPILL_SESSION_WORST_CASE_BYTES`); on 2026-10-26
+/// it spilled 9.2M rows, 3.06 GB, with 175 GB free.
+pub const TICK_REPLAY_IN_SESSION_FREE_FLOOR_BYTES: u64 =
+    2 * crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
+
+/// Whether `secs_of_day_ist` is inside the tick replay hold window. Pure. O(1).
+#[must_use]
+pub fn tick_replay_window_at(secs_of_day_ist: u32) -> bool {
+    (TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST..TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST)
+        .contains(&secs_of_day_ist)
+}
+
+/// Whether a tick replay round inside the window waits, given the spill
+/// volume's free bytes. Pure. O(1).
+///
+/// # Why (plan item M1, 2026-10-26, measured on the live box)
+///
+/// The root disk sat at its 125 MiB/s ceiling from 09:30 to 13:30 IST on
+/// 2026-10-22, 10-23 and 10-26 while the app wrote about 1 MB/s of tick rows.
+/// `ticks` is partitioned by HOUR on the exchange trade time, so a row older
+/// than the newest one already applied is an out-of-order insert that makes
+/// QuestDB rewrite the partition from that point. A replayed spill row is
+/// minutes to hours old by construction. On 2026-10-26 this loop re-posted
+/// 2.8 GB of such rows in session (50 to 420 MiB per half hour, every
+/// 5-minute round from 09:46 to 15:41), on its own connection, interleaved
+/// with the live writer's commits, while the live writer itself fell behind
+/// and spilled 9.2M rows: a loop where the replay adds rewrite work to the
+/// disk whose slowness made the spill.
+///
+/// Holding to the close is a deferral, never a drop, exactly as for depth:
+/// the files stay on disk, the spill keeps accepting past its soft cap while
+/// the volume has room, the raw frames are in the WAL, and the evening drain
+/// hold keeps the box up until the spill is empty. Free space unknown (probe
+/// failed) or below the floor replays as before.
+#[must_use]
+pub fn tick_replay_held_at(free_bytes: Option<u64>) -> bool {
+    free_bytes.is_some_and(|free| free >= TICK_REPLAY_IN_SESSION_FREE_FLOOR_BYTES)
+}
+
+/// Free bytes of the volume holding `dir`, or `None` when the probe fails.
+/// One `statvfs`; called from the blocking pool once per held-window round.
+fn spill_volume_free_bytes(dir: &Path) -> Option<u64> {
+    match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => Some(free_bytes),
+        _ => None,
     }
 }
 
@@ -1499,11 +1635,26 @@ pub const REJECTED_LINES_SUFFIX: &str = ".rejected-lines";
 /// disk; dozens mean the refusal is about the table, not a line.
 pub const REPLAY_MAX_REJECTED_LINES_PER_CHUNK: usize = 64;
 
-/// Most POSTs one refused chunk may spend finding its bad lines. Bisection
-/// finds one bad line in about log2(lines) POSTs (~17 for a full 8 MiB
-/// chunk), so this allows the line cap above with room, and bounds the load
-/// on a QuestDB that has just refused us.
-pub const REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK: usize = 1_024;
+/// Most POSTs one refused chunk may spend finding its bad lines, for a chunk
+/// of `lines` lines (audit K1, 2026-10-26).
+///
+/// Bisection POSTs both halves at every level, so one bad line costs about
+/// 2 × log2(lines) POSTs (about 32 for a full 8 MiB chunk of ~60,000 lines,
+/// not the ~17 this comment used to say). The cap allows that for one more
+/// line than [`REPLAY_MAX_REJECTED_LINES_PER_CHUNK`], so the LINE cap is the
+/// one that trips. Before K1 a fixed 1,024 POSTs cut isolation off at about
+/// 32 bad lines in a full chunk, half the documented 64. Still bounded:
+/// 2 × 65 × 17 = 2,210 POSTs for a full chunk, on a cold path, only after a
+/// permanent refusal. O(1).
+#[must_use]
+pub fn replay_max_isolation_posts(lines: usize) -> usize {
+    // floor(log2(lines)) + 1 for lines >= 1, i.e. the bisection depth.
+    let depth = (usize::BITS - lines.max(1).leading_zeros()) as usize;
+    REPLAY_MAX_REJECTED_LINES_PER_CHUNK
+        .saturating_add(1)
+        .saturating_mul(2)
+        .saturating_mul(depth)
+}
 
 /// What line isolation made of a chunk QuestDB permanently refused.
 #[derive(Debug, PartialEq, Eq)]
@@ -1561,7 +1712,7 @@ pub fn split_at_line_boundary(bytes: &[u8], range: std::ops::Range<usize>) -> Op
 /// still refused are returned to be set aside. QuestDB stays the judge, so
 /// nothing here parses ILP.
 ///
-/// Bounded: at most [`REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK`] POSTs and
+/// Bounded: at most [`replay_max_isolation_posts`] POSTs and
 /// [`REPLAY_MAX_REJECTED_LINES_PER_CHUNK`] refused lines, past either the
 /// whole file is quarantined as before. A chunk with no accepted line is also
 /// `WholeFile` (the refusal may be about the table, not a line), unless
@@ -1591,9 +1742,12 @@ pub(crate) async fn isolate_refused_lines(
     let mut stack = vec![first_split..chunk.len(), 0..first_split]; // APPROVED: cold path, after a permanent refusal
     let mut rejected: Vec<std::ops::Range<usize>> = Vec::new(); // APPROVED: cold path, at most REPLAY_MAX_REJECTED_LINES_PER_CHUNK
     let mut posts = 0_usize;
+    // O(chunk) newline count, once, cold path (audit K1).
+    let lines = chunk.iter().filter(|byte| **byte == b'\n').count().max(1);
+    let post_cap = replay_max_isolation_posts(lines);
     let mut accepted_any = false;
     while let Some(range) = stack.pop() {
-        if posts >= REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK {
+        if posts >= post_cap {
             return LineIsolation::WholeFile;
         }
         posts = posts.saturating_add(1);
@@ -1716,6 +1870,8 @@ pub async fn replay_spill_dir(
     let label = dir_label(dir);
     let files = list_spill_files(dir);
     let last_index = files.len().saturating_sub(1);
+    // Audit K1: consecutive whole-file quarantines with the same status.
+    let mut streak = QuarantineStreak::default();
     for (file_index, path) in files.into_iter().enumerate() {
         // Size from METADATA, never from a materialised read. This is the
         // 2026-09-03 fix: `std::fs::read` here held a 21 GB file in RAM.
@@ -1809,6 +1965,8 @@ pub async fn replay_spill_dir(
         let mut refused_bytes: u64 = 0;
         let mut failed = false;
         let mut quarantined = false;
+        // The HTTP status a whole-file quarantine carried (audit K1).
+        let mut quarantined_status: Option<u16> = None;
         let mut over_long_line = false;
         // At least one chunk of this file got a 2xx this round (audit
         // DA-13b): the ack is stamped so the empty-out can wait for it to be
@@ -2192,6 +2350,7 @@ pub async fn replay_spill_dir(
                                     // is dealt with, and the whole point is that
                                     // the queue keeps moving.
                                     quarantined = true;
+                                    quarantined_status = Some(status);
                                     break 'file;
                                 }
                                 Err(err) => {
@@ -2279,6 +2438,7 @@ pub async fn replay_spill_dir(
                          from confirmed_through, which is safe to repeat because the ticks \
                          dedup key carries capture_seq."
                     );
+                    streak.reset();
                     continue;
                 }
                 Err(err) => {
@@ -2297,11 +2457,36 @@ pub async fn replay_spill_dir(
         }
 
         if quarantined {
+            // Audit K1: three files in a row refused with the same status is
+            // the server refusing everything, not a poison file. Stop the
+            // round so the rest of the backlog stays waiting for a fix
+            // instead of being set aside one file at a time.
+            if let Some(status) = quarantined_status
+                && streak.record(status)
+            {
+                error!(
+                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                    dir = %dir.display(),
+                    status,
+                    files_in_a_row = streak.count(),
+                    "spill replay STOPPED: consecutive files were all refused by QuestDB with the \
+                     same status, which means QuestDB is refusing every file (for example a \
+                     schema change), not that each file is bad. The remaining files are kept \
+                     waiting and retried next round; fix the table or the endpoint."
+                );
+                // Counted as a failed round, like any other stop, so the
+                // caller does not read the round as drained (the framed depth
+                // pass, for one, runs only after a round with no failure).
+                outcome.files_failed = outcome.files_failed.saturating_add(1);
+                metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
+                return outcome;
+            }
             // Moved aside, not drained. Continue to the NEXT file — the whole
             // reason this branch exists is that the backlog behind a poison
             // file is usually intact and just needs to be attempted.
             continue;
         }
+        streak.reset();
 
         // Audit DA-13b: stamp the acks of this file so its empty-out waits
         // until they are confirmed, and so a suspicion episode after them
@@ -2570,6 +2755,8 @@ pub fn register_replay_baseline() {
     for dir in ["ticks", "depth"] {
         metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => dir, "reason" => "sink_suspect")
             .increment(0);
+        metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => dir, "reason" => "in_session")
+            .increment(0);
         metrics::counter!(SPILL_REPLAY_REWOUND_COUNTER, "dir" => dir).increment(0);
         metrics::counter!(SPILL_REPLAY_NONLAST_LIVE_COUNTER, "dir" => dir).increment(0);
         metrics::counter!(SPILL_REPLAY_TORN_TAIL_COUNTER, "dir" => dir).increment(0);
@@ -2670,14 +2857,34 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool, policy
         let round_url = url.clone();
         let round_client = client.clone();
         let runtime = tokio::runtime::Handle::current();
-        // The depth directory waits for the close (see `depth_replay_held_at`).
-        // The quarantine trim below still runs every round.
-        let held = replay_held(
-            policy.hold,
-            tickvault_common::market_hours::now_ist_secs_of_day(),
-        );
+        // The depth directory waits for the close (see `depth_replay_held_at`);
+        // the tick directory too unless its volume runs low (plan item M1,
+        // `tick_replay_held_at`). The quarantine trim below still runs every
+        // round. The free-space probe is one `statvfs`, on the blocking pool,
+        // and only for the tick policy inside its window.
+        let secs_of_day_ist = tickvault_common::market_hours::now_ist_secs_of_day();
+        let free_bytes = if policy.hold == ReplayHold::InSessionUnlessLowDisk
+            && tick_replay_window_at(secs_of_day_ist)
+        {
+            let probe_dir = dir.clone();
+            tokio::task::spawn_blocking(move || spill_volume_free_bytes(&probe_dir))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let held = replay_held(policy.hold, secs_of_day_ist, || free_bytes);
         if held && holds_in_session {
             metrics::counter!("tv_depth_spill_replay_held_total").increment(1);
+        }
+        if held {
+            metrics::counter!(
+                SPILL_REPLAY_HELD_COUNTER,
+                "dir" => dir_label(&dir),
+                "reason" => "in_session"
+            )
+            .increment(1);
         }
         // Audit DA-13b: while a QuestDB table is suspended (or its apply lag
         // grows, or the probe is blind), a 2xx is not proof the rows were
@@ -3585,13 +3792,14 @@ pub(crate) mod tests {
             replay_policy_for_dir(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR)).hold,
             ReplayHold::InSession
         );
+        // ⚠ CHANGED 2026-10-26 (plan item M1): ticks are held too, unless
+        // their volume runs low.
         assert_eq!(
             replay_policy_for_dir(Path::new(crate::tick_persistence::TICK_SPILL_DIR)).hold,
-            ReplayHold::Never,
-            "the hold must be scoped to the depth directory, never the tick one"
+            ReplayHold::InSessionUnlessLowDisk,
         );
         assert!(
-            body.contains("let held = replay_held(\n            policy.hold,"),
+            body.contains("let held = replay_held(policy.hold, secs_of_day_ist, || free_bytes);"),
             "a held round must consult the policy and the IST window"
         );
         assert!(
@@ -3967,6 +4175,91 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Audit K1: the streak counts only the SAME status, and resets.
+    #[test]
+    fn test_quarantine_streak_stops_at_three_of_the_same_status() {
+        let mut streak = QuarantineStreak::default();
+        assert!(!streak.record(400));
+        assert!(!streak.record(400));
+        assert!(streak.record(400), "the third 400 in a row stops the round");
+
+        let mut mixed = QuarantineStreak::default();
+        assert!(!mixed.record(400));
+        assert!(!mixed.record(422), "a different status starts a new streak");
+        assert!(!mixed.record(422));
+        assert_eq!(mixed.count(), 2);
+        mixed.reset();
+        assert_eq!(mixed.count(), 0);
+        assert!(!mixed.record(422), "a replayed file between them breaks it");
+    }
+
+    /// Audit K1: a QuestDB that refuses every file stops the round after
+    /// three quarantines; the fourth file is never attempted and stays.
+    #[tokio::test]
+    async fn test_regression_three_quarantines_in_a_row_stop_the_round() {
+        let dir = temp_dir("streak");
+        for n in 1..=4 {
+            std::fs::write(
+                dir.join(format!("ticks-dhan-{n}.ilp")),
+                b"ticks value=1i 1\n",
+            )
+            .expect("write");
+        }
+        // Ready to serve FOUR, so a fourth POST would be answered and counted:
+        // `served == 3` proves the fourth file was never attempted (a server
+        // that stopped at three would make an attempt read as a refused
+        // connect, which looks the same in the outcome).
+        let (url, server) = tiny_server_with_deadline(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            4,
+            Duration::from_secs(3),
+        );
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let outcome = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
+        let served = server.join().expect("server thread");
+
+        assert_eq!(
+            served, 3,
+            "exactly three refusals, the fourth file never sent"
+        );
+        assert_eq!(outcome.files_quarantined, 3);
+        assert_eq!(
+            outcome.files_failed, 1,
+            "the stop is reported as a failed round"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("ticks-dhan-4.ilp")).expect("read"),
+            b"ticks value=1i 1\n",
+            "the fourth file must be left waiting, byte for byte"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit K1: a 401 is retried like a 5xx, never quarantined.
+    #[tokio::test]
+    async fn test_regression_a_401_keeps_the_file_waiting() {
+        let dir = temp_dir("unauth");
+        let path = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&path, b"ticks value=1i 1\n").expect("write");
+        let (url, server) = tiny_server(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            1,
+        );
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let outcome = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
+        let served = server.join().expect("server thread");
+
+        assert_eq!(served, 1);
+        assert_eq!(
+            outcome.files_quarantined, 0,
+            "a 401 is not a payload refusal"
+        );
+        assert_eq!(outcome.files_failed, 1, "the round stops as on a 5xx");
+        assert_eq!(std::fs::read(&path).expect("read"), b"ticks value=1i 1\n");
+        assert!(!dir.join(QUARANTINE_DIR).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_failing_file_stops_the_whole_round() {
         // The spill exists because the database was already too slow. Pushing
@@ -4085,11 +4378,19 @@ pub(crate) mod tests {
     /// becomes an outage); a 4xx must not, because retrying a malformed byte
     /// can never succeed.
     #[test]
-    fn permanent_refusal_is_4xx_except_the_two_that_mean_try_again() {
-        for s in [400, 401, 403, 404, 413, 422] {
+    fn permanent_refusal_is_only_the_three_payload_statuses() {
+        for s in [400, 413, 422] {
             assert!(
                 is_permanent_refusal(s),
                 "{s} is a payload-level refusal — retrying it forever blocks the queue"
+            );
+        }
+        // Audit K1: auth, path and proxy refusals say nothing about the bytes.
+        // Quarantining on them set a healthy backlog aside one file at a time.
+        for s in [401, 403, 404, 405, 409, 410, 411, 415, 451] {
+            assert!(
+                !is_permanent_refusal(s),
+                "{s} is about the request or the endpoint, not the payload — it retries"
             );
         }
         // Transient by meaning despite being 4xx by number.
@@ -4430,6 +4731,61 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             }
         });
         (format!("http://{addr}/write"), handle)
+    }
+
+    /// Audit K1: the POST cap covers the 64-line cap at every chunk size, so
+    /// the LINE cap is the one that trips.
+    #[test]
+    fn test_replay_max_isolation_posts_follows_the_line_cap() {
+        for lines in [1_usize, 2, 7, 100, 4_096, 60_000, 700_000] {
+            let depth = (usize::BITS - lines.leading_zeros()) as usize;
+            let needed = 2 * (REPLAY_MAX_REJECTED_LINES_PER_CHUNK + 1) * depth;
+            assert!(
+                replay_max_isolation_posts(lines) >= needed,
+                "{lines} lines: 2 x 65 x depth POSTs must fit"
+            );
+        }
+        assert!(
+            replay_max_isolation_posts(60_000) > 1_024,
+            "a full chunk needs more than the old fixed 1,024"
+        );
+        assert_eq!(
+            replay_max_isolation_posts(0),
+            replay_max_isolation_posts(1),
+            "an empty chunk is treated as one line"
+        );
+    }
+
+    /// Audit K1: sixty bad lines spread through a 60,000-line chunk need
+    /// more than the old fixed 1,024 POSTs; with the cap following the line
+    /// cap they are all isolated instead of the whole file being quarantined.
+    #[tokio::test]
+    async fn test_regression_sixty_bad_lines_in_a_full_chunk_are_isolated() {
+        let mut chunk: Vec<u8> = Vec::with_capacity(60_000 * 16);
+        for n in 0..60_000_usize {
+            if n % 1_000 == 500 {
+                chunk.extend_from_slice(b"ticks poison\n");
+            } else {
+                chunk.extend_from_slice(b"ticks v=1i 1\n");
+            }
+        }
+        let chunk = bytes::Bytes::from(chunk);
+        let (url, server) = spawn_full_body_server(false).await;
+        let client = crate::http_client::build_probe_client(10).expect("client"); // APPROVED: test
+        let verdict = isolate_refused_lines(&client, &url, &chunk, false).await;
+        server.abort();
+        match verdict {
+            LineIsolation::Isolated(ranges) => {
+                assert_eq!(ranges.len(), 60, "every bad line, and only those");
+                for range in ranges {
+                    assert_eq!(&chunk[range], b"ticks poison\n");
+                }
+            }
+            other => assert!(
+                matches!(other, LineIsolation::Isolated(_)),
+                "expected the lines isolated, got {other:?}"
+            ),
+        }
     }
 
     /// Audit N1 (2026-10-04): a transient failure LATER in a file used to
@@ -5960,7 +6316,8 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let ticks = replay_policy_for_dir(Path::new(crate::tick_persistence::TICK_SPILL_DIR));
         assert_eq!(ticks.label, "ticks");
         assert_eq!(ticks.window, ReplayWindow::Exchange);
-        assert_eq!(ticks.hold, ReplayHold::Never);
+        // ⚠ CHANGED 2026-10-26 (plan item M1).
+        assert_eq!(ticks.hold, ReplayHold::InSessionUnlessLowDisk);
         assert!(!ticks.framed_depth);
         assert_eq!(ticks.max_file_age_secs, None);
         let depth = replay_policy_for_dir(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR));
@@ -5993,13 +6350,117 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     fn test_replay_held_truth_table() {
         let noon = 12 * 3600;
         let evening = 17 * 3600;
+        let roomy = || Some(u64::MAX);
         assert!(
-            !replay_held(ReplayHold::Never, noon),
-            "ticks are never held"
+            !replay_held(ReplayHold::Never, noon, roomy),
+            "an unknown folder is never held"
         );
-        assert!(!replay_held(ReplayHold::Never, evening));
-        assert!(replay_held(ReplayHold::InSession, noon));
-        assert!(!replay_held(ReplayHold::InSession, evening));
+        assert!(!replay_held(ReplayHold::Never, evening, roomy));
+        assert!(replay_held(ReplayHold::InSession, noon, roomy));
+        assert!(!replay_held(ReplayHold::InSession, evening, roomy));
+        assert!(replay_held(ReplayHold::InSessionUnlessLowDisk, noon, roomy));
+        assert!(!replay_held(
+            ReplayHold::InSessionUnlessLowDisk,
+            evening,
+            roomy
+        ));
+    }
+
+    /// Regression (2026-10-26, plan item M1): on 2026-10-26 the tick spill was
+    /// re-posted every 5 minutes from 09:46 to 15:41 IST (2.8 GB of
+    /// minutes-old rows, each an out-of-order rewrite of an hour partition)
+    /// while the disk sat at its 125 MiB/s ceiling. A tick round inside the
+    /// session now waits for the close while the volume has room. Bites: on
+    /// the old policy (`ReplayHold::Never` for ticks) the first assert fails.
+    #[test]
+    fn test_regression_tick_spill_replay_waits_for_the_close_in_session() {
+        let ticks = replay_policy_for_dir(Path::new(crate::tick_persistence::TICK_SPILL_DIR));
+        let noon = 12 * 3600;
+        let free = || Some(175 * 1024 * 1024 * 1024_u64); // 10-26 free space
+        assert!(
+            replay_held(ticks.hold, noon, free),
+            "a tick replay round at noon must wait for the close"
+        );
+        // Window edges: 09:00 held, 08:59:59 and 15:40 replay.
+        assert!(replay_held(
+            ticks.hold,
+            TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST,
+            free
+        ));
+        assert!(!replay_held(
+            ticks.hold,
+            TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST - 1,
+            free
+        ));
+        assert!(!replay_held(
+            ticks.hold,
+            TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST,
+            free
+        ));
+        assert!(replay_held(
+            ticks.hold,
+            TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST - 1,
+            free
+        ));
+    }
+
+    /// The hold never stands between a rescue and a full disk: below the floor
+    /// or with the free space unreadable, the tick round replays in session.
+    #[test]
+    fn test_regression_tick_replay_held_at_replays_when_the_volume_runs_low() {
+        let noon = 12 * 3600;
+        let ticks = ReplayHold::InSessionUnlessLowDisk;
+        assert!(tick_replay_held_at(Some(
+            TICK_REPLAY_IN_SESSION_FREE_FLOOR_BYTES
+        )));
+        assert!(!tick_replay_held_at(Some(
+            TICK_REPLAY_IN_SESSION_FREE_FLOOR_BYTES - 1
+        )));
+        assert!(!tick_replay_held_at(None), "a blind probe replays");
+        assert!(!replay_held(ticks, noon, || Some(1024)));
+        assert!(!replay_held(ticks, noon, || None));
+        // The floor sits above the reserve at which a rescue is refused.
+        assert!(
+            TICK_REPLAY_IN_SESSION_FREE_FLOOR_BYTES
+                > crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+        );
+        assert!(tick_replay_window_at(noon));
+        assert!(!tick_replay_window_at(17 * 3600));
+    }
+
+    #[test]
+    fn test_tick_replay_window_at_edges() {
+        assert!(tick_replay_window_at(
+            TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST
+        ));
+        assert!(!tick_replay_window_at(
+            TICK_REPLAY_HOLD_START_SECS_OF_DAY_IST - 1
+        ));
+        assert!(tick_replay_window_at(
+            TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST - 1
+        ));
+        assert!(!tick_replay_window_at(TICK_REPLAY_HOLD_END_SECS_OF_DAY_IST));
+    }
+
+    /// Outside the window the free-space probe is not run at all.
+    #[test]
+    fn test_replay_held_probes_free_space_only_inside_the_tick_window() {
+        let probed = std::cell::Cell::new(false);
+        let probe = || {
+            probed.set(true);
+            Some(u64::MAX)
+        };
+        assert!(!replay_held(
+            ReplayHold::InSessionUnlessLowDisk,
+            17 * 3600,
+            probe
+        ));
+        assert!(!probed.get());
+        assert!(replay_held(ReplayHold::InSession, 12 * 3600, || {
+            probed.set(true);
+            None
+        }));
+        assert!(!probed.get(), "the depth hold never probes the disk");
     }
 
     #[test]

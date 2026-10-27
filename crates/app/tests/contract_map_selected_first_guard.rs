@@ -27,7 +27,7 @@ fn the_map_is_published_after_the_selection_with_selected_legs_first() {
         .find("crate::contract_underlying_map::order_selected_first(")
         .expect("the attach path must order the selected legs first");
     let publish = UNIVERSE
-        .find(".publish_from_legs(&legs)")
+        .find(".publish_from_legs_selected_first(&legs, selected_first)")
         .expect("the attach path must publish the map");
 
     assert!(

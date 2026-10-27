@@ -108,6 +108,10 @@ pub struct WatchdogEnv {
     /// daily stop, the 16:45 stop check and the hourly curfew leave the box
     /// running.
     pub drain_hold_param: String,
+    /// The rendered Muhurat sessions (`muhurat_window`, plan item J8): the
+    /// `muhurat_check` mode starts and stops the box around each session,
+    /// and the curfew leaves the box alone inside a session window.
+    pub muhurat_sessions: String,
 }
 
 impl WatchdogEnv {
@@ -125,6 +129,8 @@ impl WatchdogEnv {
             }),
             drain_hold_param: std::env::var("DRAIN_HOLD_PARAM")
                 .unwrap_or_else(|_| crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string()),
+            muhurat_sessions: std::env::var(crate::muhurat_window::MUHURAT_SESSIONS_ENV)
+                .unwrap_or_default(),
         }
     }
 }
@@ -627,6 +633,174 @@ async fn publish<N: SnsApi>(
     sns.publish(&env.alerts_topic_arn, subject, message).await
 }
 
+/// A box launched this long before the Muhurat box window opened is not one
+/// `muhurat_check` started, so `muhurat_check` never stops it (the curfew's
+/// own rules then apply).
+pub const MUHURAT_OWN_START_SLACK_MINUTES: i64 = 15;
+
+/// What `muhurat_check` does with a box after the Muhurat window, given what
+/// it read. Pure, so every branch is tested without fakes.
+#[must_use]
+pub fn muhurat_after_window_should_stop(
+    state: &str,
+    launch_time: Option<DateTime<Utc>>,
+    box_start: DateTime<Utc>,
+    keep_alive_active: bool,
+    drain_hold_active: bool,
+) -> bool {
+    if state != "running" || keep_alive_active || drain_hold_active {
+        return false;
+    }
+    // Only a box launched inside (or just before) this window, i.e. the one
+    // this mode started. Unknown launch time: leave it to the curfew.
+    launch_time
+        .is_some_and(|lt| lt >= box_start - Duration::minutes(MUHURAT_OWN_START_SLACK_MINUTES))
+}
+
+/// `mode = "muhurat_check"` (plan item J8): fired every 15 minutes on each
+/// configured Muhurat date by a dated EventBridge rule. Starts the box inside
+/// the session window, stops the box it started once the window has passed,
+/// and fails closed (coded error, no start) when the session times are not
+/// set. Honours the budget-stop latch, the holiday-stop marker, the
+/// keep-alive override and the drain hold.
+///
+/// **⚠ CHANGED 2026-10-26 (audit PR L4):** a Muhurat date whose times are unset
+/// or malformed now returns `Err` after its coded `LAMBDA-CONFIG-01` line, so
+/// the invocation fails and the Lambda's existing Errors alarm fires. Before,
+/// it returned `Ok`, the box was not started, and nothing paged: a missed
+/// Muhurat session was silent. The box is still never started on that path.
+async fn run_muhurat_check<E: Ec2Api, S: SsmApi, N: SnsApi>(
+    env: &WatchdogEnv,
+    ec2: &E,
+    ssm: &S,
+    sns: &N,
+    now: DateTime<Utc>,
+) -> Result<Value, String> {
+    use crate::muhurat_window::{MuhuratPhase, muhurat_phase, parse_muhurat_sessions};
+    let schedule = parse_muhurat_sessions(&env.muhurat_sessions);
+    match muhurat_phase(now, &schedule) {
+        MuhuratPhase::NotToday => {
+            info!("muhurat_check — no Muhurat session today; nothing to do");
+            Ok(json!({"mode": "muhurat_check", "phase": "not_today", "started": false}))
+        }
+        MuhuratPhase::TimingUnset { date } => {
+            error!(
+                code = "LAMBDA-CONFIG-01",
+                %date,
+                "muhurat_check — today is a Muhurat date but its NSE session times are \
+                 not set (terraform var muhurat_sessions); the box is NOT started. Fill \
+                 the times from NSE's Muhurat circular and apply terraform."
+            );
+            Err(format!(
+                "muhurat_check phase=timing_unset date={date}: Muhurat session times not set; box NOT started"
+            ))
+        }
+        MuhuratPhase::Malformed { entries } => {
+            error!(
+                code = "LAMBDA-CONFIG-01",
+                ?entries,
+                "muhurat_check — MUHURAT_SESSIONS has unreadable entries and none names \
+                 today with valid times; the box is NOT started."
+            );
+            Err(format!(
+                "muhurat_check phase=malformed entries={entries:?}: no valid Muhurat session for today; box NOT started"
+            ))
+        }
+        MuhuratPhase::BeforeWindow { box_start } => {
+            info!(%box_start, "muhurat_check — before today's Muhurat box window");
+            Ok(json!({"mode": "muhurat_check", "phase": "before", "started": false}))
+        }
+        MuhuratPhase::InWindow { box_start, .. } => {
+            let (state, _) = instance_info(ec2, &env.instance_id).await;
+            if matches!(state.as_str(), "running" | "pending" | "stopping") {
+                info!(state = %state, "muhurat_check — box already up (or stopping); nothing to do");
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "in_window", "state": state,
+                    "started": false
+                }));
+            }
+            if budget_stop_is_this_month(ssm, &env.budget_stop_param, now).await {
+                info!("muhurat_check — budget-stop latch names this month; not starting");
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "in_window", "state": state,
+                    "started": false, "skipped": "budget_stop"
+                }));
+            }
+            if holiday_stop_is_today(ssm, &env.holiday_stop_param, now).await {
+                info!("muhurat_check — holiday-stop marker is today; not starting");
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "in_window", "state": state,
+                    "started": false, "skipped": "holiday_stop"
+                }));
+            }
+            let attempt = try_self_start(ec2, &env.instance_id).await;
+            let started = attempt.started();
+            if started {
+                info!(%box_start, "muhurat_check — box start issued for today's Muhurat session");
+            } else if now - box_start < Duration::minutes(15) {
+                // One page, at the first attempt only: later 15-minute
+                // retries log (LAMBDA-START-02) without paging again.
+                publish(
+                    sns,
+                    env,
+                    "Muhurat auto-start FAILED — box did not start",
+                    "🆘 Today is an NSE Muhurat trading day and the box did NOT start \
+for the special session. I will retry every 15 minutes until the session \
+ends. If it keeps failing, press 'Start instance' on the portal.",
+                )
+                .await?;
+            }
+            Ok(json!({
+                "mode": "muhurat_check", "phase": "in_window", "state": state,
+                "started": started
+            }))
+        }
+        MuhuratPhase::AfterWindow { box_start, .. } => {
+            let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
+            if state != "running" {
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "after", "state": state,
+                    "stopped": false
+                }));
+            }
+            let keep_alive_active = read_keep_alive_until(ssm, &env.keep_alive_param)
+                .await
+                .is_some_and(|until| now < until);
+            let drain_hold_active = matches!(
+                read_drain_hold(ssm, &env.drain_hold_param, now).await,
+                crate::drain_hold::DrainHold::Active { .. }
+            );
+            if !muhurat_after_window_should_stop(
+                &state,
+                launch_time,
+                box_start,
+                keep_alive_active,
+                drain_hold_active,
+            ) {
+                info!(
+                    keep_alive_active,
+                    drain_hold_active,
+                    "muhurat_check — after the window; box left running (held, kept alive, \
+                     or not started by this mode)"
+                );
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "after", "state": state,
+                    "stopped": false
+                }));
+            }
+            let stopped = try_self_stop(ec2, &env.instance_id).await;
+            info!(
+                stopped,
+                "muhurat_check — Muhurat window over; box stop issued"
+            );
+            Ok(json!({
+                "mode": "muhurat_check", "phase": "after", "state": state,
+                "stopped": stopped
+            }))
+        }
+    }
+}
+
 /// Legacy `lambda_handler` — the full mode dispatch, driven through the
 /// injectable AWS surfaces so tests exercise the exact flow.
 pub async fn run_watchdog<E: Ec2Api, S: SsmApi, N: SnsApi>(
@@ -641,6 +815,10 @@ pub async fn run_watchdog<E: Ec2Api, S: SsmApi, N: SnsApi>(
     // mode falls through to the default "check" branch.
     let mode = event.get("mode").and_then(Value::as_str).unwrap_or("check");
     info!(mode, instance = %env.instance_id, "start-watchdog invoked");
+
+    if mode == "muhurat_check" {
+        return run_muhurat_check(env, ec2, ssm, sns, now).await;
+    }
 
     if mode == "ping" {
         let mut message = "🟢 8:30 AM IST instance start triggered (Mon-Fri). \
@@ -677,6 +855,13 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         // failed stop is left to the 16:45 stop_check, which pages. An
         // unknown state (describe failed) still attempts the stop: a stop is
         // idempotent, and the old SSM automation retried the same way.
+        // 2026-10-26 (audit PR L4): a configured Muhurat window that covers
+        // 16:30 IST keeps the box up, as the curfew and the hard-stop guard
+        // already do; before, the scheduled stop ended a weekday session.
+        if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {
+            info!("daily_stop — inside a Muhurat session window; box kept running");
+            return Ok(json!({"mode": "daily_stop", "stopped": false, "skipped": "muhurat"}));
+        }
         let (state, _) = instance_info(ec2, &env.instance_id).await;
         if state != "running" && state != "unknown" {
             info!(state = %state, "daily_stop — instance not running; nothing to do");
@@ -709,6 +894,12 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         // Self-heal rule: stop ONLY a box launched BEFORE today's 16:30
         // trigger; a box launched AFTER it is a deliberate manual evening
         // session and is NEVER touched.
+        // 2026-10-26 (audit PR L4): inside a Muhurat window the box is up on
+        // purpose (daily_stop skipped it); never stop or page.
+        if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {
+            info!("stop_check — inside a Muhurat session window; box deliberately running");
+            return Ok(json!({"mode": "stop_check", "alerted": false, "skipped": "muhurat"}));
+        }
         let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
         if state != "running" {
             info!(state = %state, "stop_check OK — instance not running; staying silent");
@@ -810,7 +1001,11 @@ on the portal, or run \
 
     if mode == "curfew_check" {
         // Hourly, active OUTSIDE 08:00-17:00 IST Mon-Fri (and all weekend).
-        if is_within_operating_hours(now) {
+        // Plan item J8: a configured Muhurat session window counts as
+        // operating hours, so the curfew never stops the box mid-session.
+        if is_within_operating_hours(now)
+            || crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions)
+        {
             info!("curfew_check — inside operating hours; guard inactive");
             return Ok(json!({
                 "mode": "curfew_check", "skipped": "operating_hours", "stopped": false
@@ -1419,6 +1614,7 @@ mod tests {
             holiday_stop_param: DEFAULT_HOLIDAY_STOP_PARAM.to_string(),
             budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
             drain_hold_param: crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string(),
+            muhurat_sessions: String::new(),
         }
     }
 
@@ -2523,6 +2719,48 @@ mod tests {
         assert!(sns.published.borrow().is_empty());
     }
 
+    // Regression: 2026-10-26 (audit PR L4) — the 16:30 daily_stop and the
+    // 16:45 stop_check did not skip a Muhurat window (only the curfew and the
+    // hard-stop guard did), so a weekday Muhurat session was stopped mid-run.
+    #[tokio::test]
+    async fn test_regression_daily_stop_and_stop_check_skip_a_muhurat_window() {
+        // Monday 9 Nov 2026, session 15:00-16:30 IST: box window 14:00-17:30.
+        let raw = "2026-11-09@15:00-16:30";
+        for (mode, now) in [
+            ("daily_stop", utc(2026, 11, 9, 11, 0)),  // 16:30 IST
+            ("stop_check", utc(2026, 11, 9, 11, 15)), // 16:45 IST
+        ] {
+            let sns = FakeSns::default();
+            let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 9, 8, 30));
+            let out = run_watchdog(
+                &json!({ "mode": mode }),
+                &muhurat_env(raw),
+                &ec2,
+                &FakeSsm::empty(),
+                &sns,
+                now,
+            )
+            .await
+            .expect("run_watchdog");
+            assert_eq!(out["skipped"], json!("muhurat"), "{mode}");
+            assert!(ec2.stop_calls.borrow().is_empty(), "{mode} must not stop");
+            assert!(sns.published.borrow().is_empty(), "{mode} must not page");
+        }
+        // Outside the window (a later date) the same daily_stop stops.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 10, 3, 0));
+        let out = run_watchdog(
+            &json!({"mode": "daily_stop"}),
+            &muhurat_env(raw),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 10, 11, 0),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["stopped"], json!(true));
+    }
+
     #[tokio::test]
     async fn test_daily_stop_with_no_hold_stops_silently() {
         // The old SSM stop automation sent no page; neither does this.
@@ -2908,5 +3146,252 @@ mod tests {
         let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
         assert_eq!(out["skipped"], json!("drain_hold"));
         assert!(ec2.stop_calls.borrow().is_empty());
+    }
+
+    // ---- plan item J8: Muhurat session start/stop (muhurat_check) --------
+
+    /// 2026-11-08 (Sunday) 14:05-15:30 IST: box window 13:05-16:30 IST =
+    /// 07:35-11:00 UTC.
+    const MUHURAT: &str = "2026-11-08@14:05-15:30";
+
+    fn muhurat_env(raw: &str) -> WatchdogEnv {
+        WatchdogEnv {
+            muhurat_sessions: raw.to_string(),
+            ..test_env()
+        }
+    }
+
+    async fn run_muhurat(
+        raw: &str,
+        ec2: &FakeEc2,
+        ssm: &FakeSsm,
+        sns: &FakeSns,
+        now: DateTime<Utc>,
+    ) -> Value {
+        run_watchdog(
+            &json!({"mode": "muhurat_check"}),
+            &muhurat_env(raw),
+            ec2,
+            ssm,
+            sns,
+            now,
+        )
+        .await
+        .expect("run_watchdog")
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_starts_a_stopped_box_inside_the_window() {
+        let (ec2, sns) = (FakeEc2::new(Some("stopped")), FakeSns::default());
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 7, 45),
+        )
+        .await;
+        assert_eq!(out["phase"], json!("in_window"));
+        assert_eq!(out["started"], json!(true));
+        assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_leaves_a_running_box_alone() {
+        let ec2 = FakeEc2::new(Some("running"));
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 8, 8, 0),
+        )
+        .await;
+        assert_eq!(out["started"], json!(false));
+        assert!(ec2.start_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_before_window_and_other_day_never_start() {
+        for (raw, now, phase) in [
+            (MUHURAT, utc(2026, 11, 8, 7, 30), "before"), // 13:00 IST
+            (MUHURAT, utc(2026, 11, 9, 8, 0), "not_today"),
+            ("", utc(2026, 11, 8, 8, 0), "not_today"),
+        ] {
+            let ec2 = FakeEc2::new(Some("stopped"));
+            let out = run_muhurat(raw, &ec2, &FakeSsm::empty(), &FakeSns::default(), now).await;
+            assert_eq!(out["phase"], json!(phase), "{raw} {now}");
+            assert!(ec2.start_calls.borrow().is_empty(), "{raw} {now}");
+        }
+    }
+
+    // Regression: 2026-10-26 (audit PR L4) — an unset or malformed Muhurat
+    // session returned Ok, so the box stayed off and no alarm fired. It now
+    // returns Err (the Lambda Errors alarm pages) and still never starts.
+    #[tokio::test]
+    async fn test_regression_muhurat_config_error_returns_err_and_never_starts() {
+        for (raw, phase) in [
+            ("2026-11-08@-", "timing_unset"),
+            ("2026-11-08@15:30-14:05", "malformed"),
+        ] {
+            let ec2 = FakeEc2::new(Some("stopped"));
+            let out = run_watchdog(
+                &json!({"mode": "muhurat_check"}),
+                &muhurat_env(raw),
+                &ec2,
+                &FakeSsm::empty(),
+                &FakeSns::default(),
+                utc(2026, 11, 8, 8, 0),
+            )
+            .await;
+            let err = out.expect_err("a Muhurat config error must fail the invocation");
+            assert!(err.contains(phase), "{raw}: {err}");
+            assert!(ec2.start_calls.borrow().is_empty(), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_respects_the_budget_stop_and_holiday_marker() {
+        let now = utc(2026, 11, 8, 8, 0);
+        let budget = FakeSsm::empty().budget("2026-11");
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let out = run_muhurat(MUHURAT, &ec2, &budget, &FakeSns::default(), now).await;
+        assert_eq!(out["skipped"], json!("budget_stop"));
+        assert!(ec2.start_calls.borrow().is_empty());
+
+        let holiday = FakeSsm::empty().holiday("2026-11-08");
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let out = run_muhurat(MUHURAT, &ec2, &holiday, &FakeSns::default(), now).await;
+        assert_eq!(out["skipped"], json!("holiday_stop"));
+        assert!(ec2.start_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_failed_start_pages_once_at_the_first_attempt() {
+        let ec2 = FakeEc2::new(Some("stopped")).start_raises();
+        let sns = FakeSns::default();
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 7, 35),
+        )
+        .await;
+        assert_eq!(out["started"], json!(false));
+        assert_eq!(sns.published.borrow().len(), 1);
+        assert!(sns.published.borrow()[0].subject.contains("Muhurat"));
+        // A later retry logs, no second page.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped")).start_raises();
+        run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 8, 5),
+        )
+        .await;
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_stops_its_own_box_after_the_window() {
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 8, 7, 36));
+        let sns = FakeSns::default();
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 11, 15),
+        )
+        .await;
+        assert_eq!(out["phase"], json!("after"));
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(
+            sns.published.borrow().is_empty(),
+            "the planned stop pages nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_after_window_honours_hold_and_keep_alive() {
+        let now = utc(2026, 11, 8, 11, 15); // 16:45 IST, the hold counts again
+        let launched = utc(2026, 11, 8, 7, 36);
+        let held = FakeSsm::empty().drain_hold(&hold("holding", now + Duration::minutes(10), now));
+        let ec2 = FakeEc2::new(Some("running")).launch(launched);
+        let out = run_muhurat(MUHURAT, &ec2, &held, &FakeSns::default(), now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert!(ec2.stop_calls.borrow().is_empty());
+
+        let kept = FakeSsm::empty().keep_alive("2026-11-08T23:00:00+05:30");
+        let ec2 = FakeEc2::new(Some("running")).launch(launched);
+        let out = run_muhurat(MUHURAT, &ec2, &kept, &FakeSns::default(), now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert!(ec2.stop_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_muhurat_after_window_should_stop_table() {
+        let box_start = utc(2026, 11, 8, 7, 35);
+        let ours = Some(box_start + Duration::minutes(1));
+        let slack_edge = Some(box_start - Duration::minutes(MUHURAT_OWN_START_SLACK_MINUTES));
+        let earlier = Some(box_start - Duration::minutes(MUHURAT_OWN_START_SLACK_MINUTES + 1));
+        assert!(muhurat_after_window_should_stop(
+            "running", ours, box_start, false, false
+        ));
+        assert!(muhurat_after_window_should_stop(
+            "running", slack_edge, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", earlier, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", None, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "stopped", ours, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", ours, box_start, true, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", ours, box_start, false, true
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_curfew_never_stops_the_box_inside_a_muhurat_window() {
+        // Sunday 2026-11-08 14:35 IST, launched 13:06 IST: outside the weekday
+        // operating hours and past the 45-minute grace, but inside the window.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 8, 7, 36));
+        let out = run_watchdog(
+            &json!({"mode": "curfew_check"}),
+            &muhurat_env(MUHURAT),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 8, 9, 5),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["skipped"], json!("operating_hours"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        // Without the session configured the same box is curfew-stopped.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 8, 7, 36));
+        let out = run_watchdog(
+            &json!({"mode": "curfew_check"}),
+            &muhurat_env("2026-11-08@-"),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 8, 9, 5),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["stopped"], json!(true));
     }
 }

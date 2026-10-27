@@ -337,6 +337,14 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // story — the flush that failed in the first place — already pages via
     // HOT-PATH-02 and the dhan_ticks_dropped alarm.
     "TICK-SPILL-01",
+    // ADDED 2026-10-26 (plan item K4), an addition to a shrink-only list, so
+    // the reason: TICK-CONSERVE-01 is the daily ticks conservation verdict,
+    // written once a day after 15:40 IST into `tick_conservation_audit`. The
+    // task brief and `dhan-rest-only-noise-lock-2026-07-14.md` §3 make it log
+    // only: a new Dhan-scoped page needs a dated quote in that file first.
+    // The losses it can expose already page on their own counters
+    // (`dhan_ticks_dropped`, HOT-PATH-02, WS-SPILL-01/-02).
+    "TICK-CONSERVE-01",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",

@@ -276,16 +276,6 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "not a loss: the writer syncs that segment inline instead",
     ),
     (
-        "crates/storage/src/ws_frame_spill.rs",
-        "wal segment sync failed",
-        "paged by durability-sync-failing on tv_wal_fsync_errors_total; warn level is a documented decision at the site",
-    ),
-    (
-        "crates/storage/src/ws_frame_spill.rs",
-        "wal sync failed while finalising a segment",
-        "paged by durability-sync-failing on tv_wal_fsync_errors_total; the records reached the kernel",
-    ),
-    (
         "crates/storage/src/shadow_persistence.rs",
         "failed to write legacy-drop marker",
         "a one-time cleanup marker; the cleanup repeats next boot",

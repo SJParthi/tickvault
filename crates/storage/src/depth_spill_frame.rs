@@ -780,6 +780,11 @@ async fn set_aside_refused(
         match set_aside(dir, path, REJECTED_RECORDS_SUFFIX, &framed) {
             Ok(()) => {
                 metrics::counter!(FRAMED_SET_ASIDE_COUNTER, "reason" => "refused").increment(1);
+                // Audit K1: also on the PAGED rejected-lines counter, one per
+                // record, like the torn-region branch above. Before, a whole
+                // refused record moved only the local framed counter, so its
+                // rows left the database with no page.
+                metrics::counter!(REPLAY_LINES_REJECTED_COUNTER, "dir" => "depth").increment(1);
                 outcome.files_quarantined = outcome.files_quarantined.saturating_add(1);
                 error!(
                     code = ErrorCode::TickSpill01FileQuarantined.code_str(),
@@ -1564,6 +1569,34 @@ mod tests {
         );
         assert_eq!(out.files_failed, 0);
         assert_eq!(paged, 1, "the torn record is on the paged counter");
+        forget_resume_offset(&closed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit K1: a whole framed record QuestDB refuses moves the PAGED
+    /// rejected-lines counter, like the torn-region branch.
+    ///
+    /// Bite: drop the `REPLAY_LINES_REJECTED_COUNTER` increment in
+    /// `set_aside_refused`'s whole-record arm and the count reads 0.
+    #[test]
+    fn test_regression_k1_a_whole_refused_depth_record_is_paged() {
+        let dir = temp_dir("k1-whole-record");
+        let closed = dir.join("depth-dhan-1.dspl");
+        let v2_poison: &[u8] = b"bin poison \n\x00";
+        write_records(&closed, &[(v2_poison, 2)]);
+        std::fs::write(dir.join("depth-dhan-2.dspl"), b"").expect("w"); // APPROVED: test
+        let rt = crate::tick_spill_replay::tests::counter_test_runtime();
+        let (url, _bodies, server) = rt.block_on(spawn_recording_server());
+        let rec =
+            crate::tick_spill_replay::tests::OneCounterRecorder::new(REPLAY_LINES_REJECTED_COUNTER);
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let client = client();
+        let (out, paged) =
+            rec.count_during(&rt, replay_framed_spill_dir(&dir, &url, &client, &view));
+        server.abort();
+        assert_eq!(out.files_failed, 0);
+        assert_eq!(out.files_quarantined, 1, "the record was set aside whole");
+        assert_eq!(paged, 1, "the refused record is on the paged counter");
         forget_resume_offset(&closed);
         let _ = std::fs::remove_dir_all(&dir);
     }

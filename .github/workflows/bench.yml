@@ -146,8 +146,12 @@ jobs:
       # with the EC2 SDK override in Cargo.toml's [profile.bench.package] this
       # keeps the build inside the runner's memory; from 2026-10-03 the runner
       # was killed (exit 143) in the middle of the bench build on every run.
+      # K6 (2026-10-26): feed_drain's p99 gate reads the same multiplier the
+      # median arm below uses, so a slower runner moves both ceilings alike.
       - name: Run benchmarks (workspace)
         id: bench
+        env:
+          BENCH_BUDGET_MULTIPLIER: '2.5'
         run: |
           set -o pipefail
           cargo bench --workspace --bench '*' 2>&1 | tee bench-output.log

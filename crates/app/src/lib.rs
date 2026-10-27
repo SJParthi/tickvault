@@ -60,6 +60,7 @@ pub mod feed_scoreboard_boot;
 // compare against the persisted TF tables — Dhan verifies TODAY, Groww
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
 pub mod tf_consistency_boot;
+pub mod tf_consistency_readiness;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_boot` module DELETED — the 15:40 IST WAL-vs-DB daily
 // audit's every input died with the live-WS retirements (Dhan 2026-07-13,
@@ -67,6 +68,10 @@ pub mod tf_consistency_boot;
 // `ws_wal_dir()` helper relocated to `boot_helpers`, `parse_questdb_count`
 // to `feed_scoreboard_boot`. The `tick_conservation_audit` QuestDB table
 // is RETAINED (SEBI, forensic).
+// RESTORED in a new shape 2026-10-26 (plan item K4): the Dhan live lane writes
+// `ticks` again. Daily rows-accepted-vs-rows-stored check after 15:40 IST, and
+// the boot `feed_gap_audit` row for the downtime before a mid-session start.
+pub mod tick_conservation;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
 // operator-locked pre-open equilibrium open-price gap.
@@ -201,6 +206,9 @@ pub mod depth_switch;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
 /// up after the close until the day's data is in the database.
 pub mod drain_hold;
+/// The p99 tail check the main-feed drain bench runs after Criterion's
+/// median check (plan item K6, 2026-10-26).
+pub mod drain_tail_gate;
 /// `tickvault ensure-questdb`: bring the QuestDB container up (boot self-heal
 /// and the console's restart actions; audit D6d, replaced
 /// `scripts/ensure-questdb.sh`).

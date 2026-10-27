@@ -29,8 +29,8 @@
 //! Monday-to-Friday date in the NSE holiday list with no Muhurat or mock
 //! session ([`classify_calendar_day`]), AND the boot falls inside
 //! [`SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST`] ..
-//! [`SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST`] (08:25 to 09:15 IST, around
-//! the 08:30 IST weekday start). Every other boot starts the app and logs one
+//! [`SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST`] (08:25 to 09:00 IST, around
+//! the 08:30 IST weekday start; the end was 09:15 until 2026-10-26). Every other boot starts the app and logs one
 //! line saying why. The `--check-trading-day` CLI contract (0 / 75 / 70) is
 //! unchanged; the gate no longer reads it.
 //!
@@ -66,12 +66,12 @@
 //! restart (a console start, or a start an operator ran on purpose) and the
 //! gate lets the app start with one line saying so
 //! ([`decide_second_start`]). Until this date a restart inside 08:25 to 09:15
-//! IST was stopped again and paged again. A missing parameter (the gate has
+//! IST (09:00 since 2026-10-26) was stopped again and paged again. A missing parameter (the gate has
 //! never stopped a box) is a first boot and stops. A FAILED read (timeout,
 //! access denied, throttling) also stops, as before: the read cannot tell a
 //! first boot from a second, the first boot of a holiday is the common case
 //! and the one that saves the bill, and a restart stopped that way is undone
-//! by `ALLOW_HOLIDAY_RUN` or by starting again after 09:15 IST.
+//! by `ALLOW_HOLIDAY_RUN` or by starting again after 09:00 IST.
 //! **Honest limits:** (a) a same-day reboot of a box whose stop CALL failed
 //! now starts the app instead of trying the stop again; (b) after a second
 //! start the marker still reads today, so the start-watchdog, the
@@ -123,11 +123,18 @@ const OVERRIDE_MARKER_PATH: &str = "/opt/tickvault/ALLOW_HOLIDAY_RUN";
 pub const SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST: u32 =
     crate::shutdown_class::HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST;
 
-/// End (exclusive) of the scheduled-start IST window: 09:15:00, the market
-/// open, 45 minutes after the scheduled start so a slow boot is still
-/// stopped. Pinned with the start by
-/// `test_scheduled_start_window_is_0825_to_0915_ist_around_the_0830_start`.
-pub const SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+/// End (exclusive) of the scheduled-start IST window: 09:00:00, the start of
+/// the capture window (`TICK_PERSIST_START_SECS_OF_DAY_IST`), 30 minutes
+/// after the scheduled start so a slow boot is still stopped. Pinned with the
+/// start by `test_scheduled_start_window_is_0825_to_0900_ist_around_the_0830_start`.
+///
+/// **⚠ CHANGED 2026-10-26 (audit PR L4):** was 09:15, the market open. Capture
+/// starts at 09:00, so a holiday verdict between 09:00 and 09:15 (a wrong
+/// holiday list, or a slow boot on a day that is trading after all) stopped
+/// the box inside the capture window. The stop arm now ends where capture
+/// begins; a boot at or after 09:00 always starts the app.
+pub const SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
 
 // Every stop this gate issues must classify quiet in `shutdown_class`: the
 // gate's window must sit INSIDE that quiet window, with the same start (the
@@ -651,15 +658,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduled_start_window_is_0825_to_0915_ist_around_the_0830_start() {
+    fn test_scheduled_start_window_is_0825_to_0900_ist_around_the_0830_start() {
         assert_eq!(
             SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST,
             8 * 3600 + 25 * 60
         );
-        assert_eq!(
-            SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST,
-            9 * 3600 + 15 * 60
-        );
+        assert_eq!(SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST, 9 * 3600);
         // The EventBridge start, 03:00 UTC = 08:30 IST, sits inside it.
         assert!(in_scheduled_start_window(8 * 3600 + 30 * 60));
         assert!(in_scheduled_start_window(
@@ -687,7 +691,7 @@ mod tests {
                 <= crate::shutdown_class::HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST
         );
         assert_eq!(hh_mm(SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST), "08:25");
-        assert_eq!(hh_mm(SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST), "09:15");
+        assert_eq!(hh_mm(SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST), "09:00");
     }
 
     #[test]
@@ -726,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_weekday_holiday_inside_the_scheduled_start_window_stops() {
-        for (h, m) in [(8, 25), (8, 30), (8, 31), (9, 14)] {
+        for (h, m) in [(8, 25), (8, 30), (8, 31), (8, 59)] {
             assert_eq!(
                 decide(false, at(date(2026, 10, 20), h, m), calendar),
                 Verdict::Stop,
@@ -737,15 +741,44 @@ mod tests {
 
     #[test]
     fn test_weekday_holiday_outside_the_window_starts() {
-        for (h, m) in [(10, 0), (8, 0), (8, 24), (9, 15), (13, 0), (17, 50), (0, 5)] {
+        for (h, m) in [
+            (10, 0),
+            (8, 0),
+            (8, 24),
+            (9, 0),
+            (9, 15),
+            (13, 0),
+            (17, 50),
+            (0, 5),
+        ] {
             assert!(
                 matches!(
                     decide(false, at(date(2026, 10, 20), h, m), calendar),
-                    Verdict::Start(ref r) if r.contains("outside the scheduled start window (08:25 to 09:15 IST)")
+                    Verdict::Start(ref r) if r.contains("outside the scheduled start window (08:25 to 09:00 IST)")
                 ),
                 "{h:02}:{m:02} IST on a weekday holiday is a deploy or manual start"
             );
         }
+    }
+
+    // Regression: 2026-10-26 (audit PR L4) — the stop arm ran until 09:15, so
+    // a holiday verdict at 09:05 stopped the box inside the 09:00-15:40 IST
+    // capture window.
+    #[test]
+    fn test_regression_holiday_verdict_at_0905_does_not_stop() {
+        for (h, m) in [(9, 0), (9, 5), (9, 14)] {
+            assert!(
+                matches!(
+                    decide(false, at(date(2026, 10, 20), h, m), calendar),
+                    Verdict::Start(_)
+                ),
+                "{h:02}:{m:02} IST is inside the capture window; the gate must not stop"
+            );
+        }
+        assert_eq!(
+            SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST,
+            tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
+        );
     }
 
     #[test]

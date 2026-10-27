@@ -137,10 +137,22 @@ fn the_append_reserves_bytes_before_it_sends() {
     let src = spill_source();
     let region = happy_path_region(&src);
 
+    // K2 (2026-10-26): the budget is resolved ONCE at construction and the
+    // append reads the stored value, so the first frame never pays the
+    // cgroup / meminfo read on a socket read task.
     assert!(
-        region.contains("wal_queue_max_bytes()"),
+        region.contains("self.queue_budget_bytes"),
         "the append no longer consults the queue's BYTE budget. The channel's \
          record bound is not a memory bound — see `wal_queue_max_bytes`."
+    );
+    assert!(
+        !region.contains("wal_queue_max_bytes()"),
+        "the append resolves the byte budget itself again; it must read the \
+         value resolved at construction (`queue_budget_bytes`)."
+    );
+    assert!(
+        src.contains("let queue_budget_bytes = wal_queue_max_bytes();"),
+        "the constructor no longer resolves the WAL queue byte budget."
     );
     assert!(
         region.contains("queued_bytes.fetch_add"),

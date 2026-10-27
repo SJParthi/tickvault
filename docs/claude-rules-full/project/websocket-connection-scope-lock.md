@@ -9533,3 +9533,47 @@ REJECT:
   that path in the PR.
 - Deleting depth code, or turning depth back on, under this quote.
 - Changing raw tick or WAL capture under this quote.
+
+### 2026-10-27 — REPEAT QUOTES GET THEIR OWN TABLE (`tick_quotes`); `ticks` KEEPS EXCHANGE TIME
+
+Owner's tap on 2026-10-27 (~07:50 IST), recorded with the card text in
+`daily-universe-scope-expansion-2026-05-27.md` Quote 41: **"Separate table
+(Recommended)"** — "Repeat quotes (no new trade) go to their own table stamped
+with arrival time; the ticks table keeps exchange time exactly as today. Nothing
+is dropped."
+
+Why (Verified on the live box, 2026-10-26, depth already off): about 70–75% of
+`ticks` rows were quotes with no new trade, carrying their last trade time
+(minutes to hours old). `ts` is that trade time, so each such row landed behind
+the table's newest `ts` and made QuestDB rewrite (out-of-order merge) an older
+part of the partition: about 51 KB written per tick, the root disk at its
+125 MiB/s ceiling 09:30–15:40 IST, and the tick writer about 6 hours behind.
+
+The rule:
+- A main-feed packet with **no new trade** (its last trade time and cumulative
+  volume equal the last ones this process saw for that `(security_id,
+  segment)`, or it is the instrument's first packet of the session and its last
+  trade time is before that session's open) is written to a new table
+  **`tick_quotes`**, not to `ticks`. Every other packet is written to `ticks`
+  exactly as today.
+- `tick_quotes` has the same columns as `ticks`; its designated `ts` is the
+  frame's ARRIVAL time in IST (the `received_at` rule, so the IST offset is added
+  as for `received_at`), and the vendor's last trade time is kept unchanged in
+  its `exchange_timestamp` column. DEDUP UPSERT KEYS `(ts, security_id, segment,
+  capture_seq, feed)`; `PARTITION BY HOUR` or `DAY` as `ticks`; same retention
+  class, archive and S3 copy as `ticks`.
+- Nothing is dropped: the split is a routing choice inside the same writer, so
+  the WAL, ring, rescue, spill and replay paths carry both, and a WAL replay
+  routes a packet to the same table it went to live.
+- The candle fold, the WAL and the raw frame capture are unchanged.
+- Every reader of `ticks` that needs quotes (the quote endpoint, the daily tick
+  conservation count, cross-checks) reads both tables or is named in the PR as
+  reading `ticks` only on purpose.
+
+REJECT:
+- Dropping, sampling or coalescing a repeat quote instead of routing it.
+- Changing `ticks.ts` away from the exchange time, or adding the IST offset to
+  it (data-integrity rule unchanged for `ticks`).
+- A `tick_quotes` row without `feed` in its DEDUP key, or a per-feed table.
+- A live/replay routing difference (the same packet must reach the same table
+  both ways).

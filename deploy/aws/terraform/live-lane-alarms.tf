@@ -97,7 +97,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_live_lane_down" {
   # deliberately stopped outside 08:30-17:30 IST. An apply at any hour outside
   # the session — and terraform-apply runs path-filtered on push and via the
   # post-merge catch-up dispatcher, so that is most hours — armed a breaching
-  # alarm against a stopped box until the gate's next close run at 15:35 IST.
+  # alarm against a stopped box until the gate's next close run at 15:40 IST (15:35 until 2026-10-26).
   #
   # Found by the generalised `breaching_alarms_are_gated_guard`, which was
   # widened in the same change to derive the breaching set from this file
@@ -634,6 +634,8 @@ resource "aws_cloudwatch_metric_alarm" "dhan_no_ticks_flowing" {
   # edges - the gate opens 09:20, five minutes after the 09:15 open, and closes
   # 15:35, five minutes after the 15:30 close. Ten consecutive minutes without
   # a persisted tick INSIDE the session is not an edge effect.
+  # 2026-10-26 (audit PR L4): the gate now closes at 15:40, the end of the
+  # NSE closing auction (session end since 2026-08-03) and of capture.
   evaluation_periods = 2
   metric_name        = "tv_dhan_feed_last_tick_age_secs"
   namespace          = local.app_namespace
@@ -649,7 +651,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_no_ticks_flowing" {
   treat_missing_data = "breaching"
 
   # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING.
+  # 09:20-15:40 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING.
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions
   # Ticks resuming IS a real, self-explanatory recovery - unlike the loss
@@ -872,7 +874,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_worst_socket_deaf" {
   treat_missing_data = "notBreaching"
 
   # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING
+  # 09:20-15:40 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING
   # AT ~15:40, when every socket legitimately stops delivering.
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions

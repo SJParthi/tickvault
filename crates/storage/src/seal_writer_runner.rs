@@ -170,6 +170,11 @@ pub fn global_seal_sender() -> Option<&'static SealSender> {
 pub struct SealOverflow {
     spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
     dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
+    /// The seal disk floor (audit PR L, L2): checked before the inline
+    /// cascade writes, and shared with the escalation thread, which checks
+    /// it once per batch. Until 2026-10-26 neither checked it, so below
+    /// 4 GiB free the drain's refused seals still went to disk.
+    floor: std::sync::Arc<crate::seal_absorption::SealDiskFloor>,
     /// Bounded hand-off to the dedicated escalation thread.
     ///
     /// `None` until [`Self::split_escalation_offload`] runs, and `None` is the
@@ -415,6 +420,9 @@ pub struct SealEscalationItem {
 /// `tv-seal-escalate` OS thread.
 pub struct SealEscalationSink {
     rx: std::sync::mpsc::Receiver<SealEscalationItem>,
+    /// The escalator's seal disk floor, checked once per IST-day run (audit
+    /// PR L, L2).
+    floor: std::sync::Arc<crate::seal_absorption::SealDiskFloor>,
     spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
     dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -472,6 +480,23 @@ impl SealEscalationSink {
                 end += 1;
             }
             let run = &batch[start..end];
+            // Audit PR L, L2 (2026-10-26): the seal disk floor, once per run, as
+            // the writer pipeline checks it per seal. Below it nothing in the
+            // run is written: each seal is counted on the floor counter and
+            // reported lost through `on_lost`, the AGGREGATOR-DROP-01 page.
+            let run_bytes = (run.len() * crate::seal_spill::SEAL_SPILL_RECORD_SIZE) as u64;
+            if !self.floor.has_room(run_bytes, run[0].now_unix_secs) {
+                for item in run {
+                    self.floor
+                        .note_refusal(item.seal.security_id, item.seal.exchange_segment_code);
+                    metrics::counter!(SEAL_ESCALATION_LOST_COUNTER).increment(1);
+                    on_lost(&item.seal);
+                }
+                self.spill.note_escalation_finished(run.len());
+                start = end;
+                continue;
+            }
+            self.floor.note_cleared();
             spill_writes += 1;
             let written = self.spill.append_seals(
                 run.iter().map(|item| &item.seal),
@@ -657,7 +682,11 @@ impl SealOverflow {
         dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
     ) -> Self {
         let pending = spill.escalation_pending();
+        let floor = std::sync::Arc::new(crate::seal_absorption::SealDiskFloor::new(
+            spill.spill_dir().to_path_buf(),
+        ));
         Self {
+            floor,
             spill,
             dlq,
             offload: None,
@@ -701,6 +730,7 @@ impl SealOverflow {
         register_escalation_baseline();
         SealEscalationSink {
             rx,
+            floor: std::sync::Arc::clone(&self.floor),
             spill: std::sync::Arc::clone(&self.spill),
             dlq: std::sync::Arc::clone(&self.dlq),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -713,12 +743,26 @@ impl SealOverflow {
     ///
     /// Shared verbatim by the caller's fallback arm and the escalation thread
     /// so the two can never drift into different durability semantics.
+    ///
+    /// Audit PR L, L2 (2026-10-26): the seal disk floor first, as the writer
+    /// pipeline does. Below it nothing is written and the seal is `Lost`,
+    /// counted on `tv_seal_floor_refused_total` with one coded line per
+    /// episode, so the caller's AGGREGATOR-DROP-01 page has its reason.
     fn escalate_inline(
+        floor: &crate::seal_absorption::SealDiskFloor,
         spill: &crate::seal_spill::SealSpillWriter,
         dlq: &crate::seal_dlq::SealDlqWriter,
         serialised: &crate::seal_spill::SerializedSeal,
         now_unix_secs: i64,
     ) -> OverflowOutcome {
+        if !floor.has_room(
+            crate::seal_spill::SEAL_SPILL_RECORD_SIZE as u64,
+            now_unix_secs,
+        ) {
+            floor.note_refusal(serialised.security_id, serialised.exchange_segment_code);
+            return OverflowOutcome::Lost;
+        }
+        floor.note_cleared();
         if spill.append_seal(serialised, now_unix_secs).is_ok() {
             return OverflowOutcome::Spilled;
         }
@@ -863,6 +907,7 @@ impl SealOverflow {
                     // other tasks on its worker do not.
                     let outcome = crate::off_worker::off_worker(|| {
                         Self::escalate_inline(
+                            &self.floor,
                             &self.spill,
                             &self.dlq,
                             &item.seal,
@@ -875,7 +920,13 @@ impl SealOverflow {
             }
         }
         crate::off_worker::off_worker(|| {
-            Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
+            Self::escalate_inline(
+                &self.floor,
+                &self.spill,
+                &self.dlq,
+                &serialised,
+                now_unix_secs,
+            )
         })
     }
 }
@@ -1305,25 +1356,7 @@ impl SealWriterRunner {
         let mut outcome = CycleOutcome::default();
 
         // Step 1: drain mpsc → pipeline.submit
-        loop {
-            match self.receiver.try_recv() {
-                Ok(seal) => {
-                    outcome.submitted_from_mpsc += 1;
-                    match self.pipeline.submit(seal, now_unix_secs) {
-                        SubmitOutcome::Buffered => outcome.mpsc_submit_buffered += 1,
-                        SubmitOutcome::Spilled => outcome.mpsc_submit_spilled += 1,
-                        SubmitOutcome::DlqWritten => outcome.mpsc_submit_dlq += 1,
-                        SubmitOutcome::Dropped(_) => outcome.mpsc_submit_dropped += 1,
-                        SubmitOutcome::DroppedBelowFloor(_) => {
-                            outcome.mpsc_submit_dropped += 1;
-                            outcome.mpsc_submit_dropped_below_floor += 1;
-                        }
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
+        self.take_channel(&mut outcome, now_unix_secs);
 
         // Step 2: drain pipeline → ILP buffer → flush, when due.
         let due = !paced
@@ -1349,6 +1382,47 @@ impl SealWriterRunner {
         // without a write since the last sync.
         self.pipeline.sync_escalated();
 
+        outcome
+    }
+
+    /// Step 1 of a cycle: every seal waiting in the channel goes to
+    /// `pipeline.submit`, counted by tier. O(queued), no allocation.
+    fn take_channel(&mut self, outcome: &mut CycleOutcome, now_unix_secs: i64) {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(seal) => {
+                    outcome.submitted_from_mpsc += 1;
+                    match self.pipeline.submit(seal, now_unix_secs) {
+                        SubmitOutcome::Buffered => outcome.mpsc_submit_buffered += 1,
+                        SubmitOutcome::Spilled => outcome.mpsc_submit_spilled += 1,
+                        SubmitOutcome::DlqWritten => outcome.mpsc_submit_dlq += 1,
+                        SubmitOutcome::Dropped(_) => outcome.mpsc_submit_dropped += 1,
+                        SubmitOutcome::DroppedBelowFloor(_) => {
+                            outcome.mpsc_submit_dropped += 1;
+                            outcome.mpsc_submit_dropped_below_floor += 1;
+                        }
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// The shutdown drain after a failed flush (audit PR L, L2): take the
+    /// channel into the ring as a cycle does, then send every seal the ring
+    /// holds straight to the spill (DLQ, then a counted drop, as any rescue),
+    /// without another flush. A database that just failed one flush would
+    /// cost up to one more failed cycle (about 27 s) per `max_drain` seals,
+    /// and the drain has 45 s for all of them.
+    ///
+    /// # Complexity
+    /// O(seals held), one spill append each, then one sync. No flush.
+    pub fn rescue_held_to_spill(&mut self, now_unix_secs: i64) -> CycleOutcome {
+        let mut outcome = CycleOutcome::default();
+        self.take_channel(&mut outcome, now_unix_secs);
+        outcome.drain = crate::seal_writer_task::rescue_ring(&mut self.pipeline, now_unix_secs);
+        self.pipeline.sync_escalated();
         outcome
     }
 
@@ -3256,6 +3330,120 @@ mod tests {
         let on_disk = runner.spill.read_all(now).expect("read spill");
         assert_eq!(on_disk.len(), 1);
         assert_eq!(on_disk[0].tick_count, 5);
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit PR L, L2: the shutdown drain's spill path takes the channel and
+    /// the ring to disk through `rescue_ring`, and never flushes.
+    #[test]
+    fn test_rescue_held_to_spill_uses_rescue_ring_and_never_flushes() {
+        let (spill, dlq) = temp_pair("rescue-held");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 2);
+        let tx = runner.sender();
+        for i in 0..5u32 {
+            tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_767_225_600 + i * 60, 100.0))
+                .expect("queued");
+        }
+        let outcome = runner.rescue_held_to_spill(jan1_noon_utc());
+        assert_eq!(outcome.submitted_from_mpsc, 5);
+        assert_eq!(
+            outcome.drain.ring_seals_popped, 0,
+            "nothing went to the writer"
+        );
+        assert!(!outcome.drain.flushed_ok);
+        assert_eq!(
+            outcome.drain.rescued_to_spill, 5,
+            "all five spilled, not two"
+        );
+        assert_eq!(runner.unwritten_seals(), 0);
+        assert_eq!(
+            runner
+                .spill
+                .read_all(jan1_noon_utc())
+                .expect("read spill")
+                .len(),
+            5
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// A fixed 1 GiB free-space answer for an unshared escalator's floor,
+    /// below the 4 GiB seal floor (audit PR L, L2).
+    fn below_the_seal_floor(overflow: &mut SealOverflow) {
+        std::sync::Arc::get_mut(&mut overflow.floor)
+            .expect("the floor is not shared before split_escalation_offload")
+            .set_free_probe_for_test(|_| Some(1024 * 1024 * 1024));
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — the producer-side
+    /// escalator's inline cascade wrote the spill with no disk floor, unlike
+    /// the writer pipeline. Bites: without the check this escalation returns
+    /// `Spilled` and the spill holds the seal.
+    #[test]
+    fn test_regression_inline_escalation_refuses_below_the_seal_floor() {
+        let (spill, dlq) = temp_pair("pr-l-inline-floor");
+        let mut overflow = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill.clone(),
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+        below_the_seal_floor(&mut overflow);
+        let now = jan1_noon_utc();
+        assert_eq!(
+            overflow.escalate(&mk_seal(21, 0, TfIndex::M1, 34_380, 12.0), now),
+            OverflowOutcome::Lost,
+            "below the floor nothing is written and the seal is reported lost"
+        );
+        assert!(
+            overflow.spill.read_all(now).expect("read spill").is_empty(),
+            "the floor refuses before the spill"
+        );
+        assert!(
+            std::fs::read_dir(&dlq).map_or(0, |d| d.count()) == 0,
+            "and before the DLQ"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — the escalation thread wrote
+    /// each batch with no disk floor. Bites: without the check the batch is
+    /// in the spill and `on_lost` is never called.
+    #[test]
+    fn test_regression_escalation_thread_refuses_below_the_seal_floor() {
+        let (spill, dlq) = temp_pair("pr-l-thread-floor");
+        let mut overflow = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill.clone(),
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+        below_the_seal_floor(&mut overflow);
+        let sink = overflow.split_escalation_offload();
+        let pending = sink.pending_count();
+        let now = jan1_noon_utc();
+        for i in 0..3u32 {
+            assert_eq!(
+                overflow.escalate(&mk_seal(21, 0, TfIndex::M1, 34_380 + i * 60, 12.0), now),
+                OverflowOutcome::Queued
+            );
+        }
+        let spill_writer = std::sync::Arc::clone(&overflow.spill);
+        drop(overflow);
+        let lost = std::sync::atomic::AtomicUsize::new(0);
+        let _ = sink.run(|_| {
+            lost.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(lost.into_inner(), 3, "each refused seal is reported lost");
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            spill_writer.read_all(now).expect("read spill").is_empty(),
+            "nothing was written below the floor"
+        );
         cleanup(&spill, &dlq);
     }
 }

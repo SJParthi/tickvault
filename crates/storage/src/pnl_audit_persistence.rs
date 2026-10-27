@@ -182,9 +182,14 @@ pub fn pnl_audit_create_ddl() -> String {
 /// HTTP-CLIENT-01-class consequence: a failed ensure leaves the table to
 /// be auto-created by the first ILP write WITHOUT dedup (a duplicate-row
 /// window until a later ensure succeeds).
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested; the 200/500/unreachable arms exercised via the mock-HTTP tokio tests below)
 // FINANCIAL-TEST-EXEMPT: idempotent DDL runner — no financial arithmetic ("pnl" is the table name)
-pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -205,7 +210,7 @@ pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) {
                  ensured (first ILP write may auto-create it WITHOUT dedup — \
                  duplicate-row window until the next successful boot)"
             );
-            return;
+            return false;
         }
     };
     let mut statements = vec![pnl_audit_create_ddl()];
@@ -231,14 +236,16 @@ pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) {
     statements.push(format!(
         "ALTER TABLE {PNL_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_PNL_AUDIT});"
     ));
-    for ddl in &statements {
+    let dedup_index = statements.len().saturating_sub(1);
+    let mut keyed = false;
+    for (index, ddl) in statements.iter().enumerate() {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => keyed |= index == dedup_index,
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -268,6 +275,7 @@ pub async fn ensure_pnl_audit_table(questdb_config: &QuestDbConfig) {
             }
         }
     }
+    keyed
 }
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
@@ -815,18 +823,27 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_pnl_audit_table_mock_200_completes() {
         let port = spawn_mock_http(MOCK_HTTP_200).await;
-        ensure_pnl_audit_table(&mock_cfg(port)).await;
+        assert!(
+            ensure_pnl_audit_table(&mock_cfg(port)).await,
+            "200 everywhere reads keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_pnl_audit_table_mock_500_degrades_without_panic() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_pnl_audit_table(&mock_cfg(port)).await;
+        assert!(
+            !ensure_pnl_audit_table(&mock_cfg(port)).await,
+            "a refused DDL must not read keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_pnl_audit_table_unreachable_degrades_without_panic() {
-        ensure_pnl_audit_table(&unreachable_cfg()).await;
+        assert!(
+            !ensure_pnl_audit_table(&unreachable_cfg()).await,
+            "unreachable must not read keyed"
+        );
     }
 
     #[tokio::test]

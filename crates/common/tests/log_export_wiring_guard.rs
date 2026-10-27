@@ -37,6 +37,14 @@ const NOT_EXPORTED: &[(&str, &str)] = &[
         "log_export_firehose",
         "Firehose's own delivery-error log; exporting it into the stream that writes it would loop",
     ),
+    (
+        "questdb_console_front",
+        "QuestDB console web front (operator UI access log, no trading data); adopted 2026-10-26 (audit M4) only to bound its retention at 14 days, never exported before",
+    ),
+    (
+        "questdb_console_proxy",
+        "QuestDB console proxy (operator UI access log, no trading data); adopted 2026-10-26 (audit M4) only to bound its retention at 14 days, never exported before",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {

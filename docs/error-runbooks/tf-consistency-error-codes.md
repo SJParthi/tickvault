@@ -162,6 +162,30 @@ exchange — that is the 15:31 cross-verify's job (Dhan REST vs `candles_1m`)
 invisible to it by construction. `oi` and the `*_pct_from_prev_day` columns
 are not compared (OI arrives on a separate packet; pct columns are derived).
 
+### 2026-10-26 update (plan item M3) — what TF-VERIFY-01 no longer counts
+
+Two findings that were never fold bugs no longer reach TF-VERIFY-01:
+
+- **Rows read before they sealed.** The run waits (until 15:55 IST at most)
+  for the live side to seal past 15:45, the seal writer to drain, no seal
+  spill file to be staged and the candle tables to apply their WAL. A bucket
+  still unsealed at the read is skipped and counted in `unsealed_at_read`
+  (`tv_tf_verify_unsealed_at_read_total`); the hourly 15:15 bar is always
+  among them (it seals about 16:19). Before this, 27,680 "missing" rows on
+  2026-10-26 were the write tail; later same-day runs read 0.
+- **A longer bar that knows more.** A wider high/low with open, close and
+  volume exact (`extreme_straddle`), or the 09:15 bar of a contract whose
+  first packet came after 09:16 holding the day's first volume and open
+  (`first_trade`). Counted in `tv_tf_verify_attributed_wider_total{shape}`
+  and on the run's log line. On 2026-10-23 they were 38,850 of 38,850
+  mismatches.
+
+What still pages: any other difference (a narrower longer bar, a close or
+volume disagreement outside the 09:15 first-trade case), a missing row for
+a bucket that had sealed, no coverage, off-grid, duplicates. A sudden rise in
+`attributed_wider` with no rise in trading is worth a look: a fold bug of
+exactly those shapes would be counted there instead of paging.
+
 ## §2. TF-VERIFY-02 — verifier run degraded
 
 **Severity:** High. **Auto-triage safe:** Yes (the degrade already

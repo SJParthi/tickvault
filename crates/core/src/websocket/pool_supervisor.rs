@@ -373,8 +373,9 @@ pub const MAIN_FEED_CONFIRMED_MIN_HELD: u32 = 1_000;
 /// Instruments a depth-20 socket must hold for its silence to be confirmed.
 pub const DEPTH20_CONFIRMED_MIN_HELD: u32 = 20;
 
-/// Minimum spacing, pool-wide PER KIND, between two sibling-confirmed
-/// redials, so a vendor-side stall that silences several sockets of one kind
+/// Minimum spacing, pool-wide PER KIND, between two silence redials (sibling-
+/// confirmed, and since plan item K3 the 300 s fallback too, sharing one
+/// slot), so a vendor-side stall that silences several sockets of one kind
 /// redials them one at a time rather than all together.
 pub const CONFIRMED_REDIAL_SPACING_SECS: i64 = 15;
 
@@ -537,7 +538,8 @@ pub struct SilenceInputs<'a> {
 /// Kinds with a confirmed fast path: main feed and depth-20.
 pub const CONFIRMED_SPACING_KINDS: usize = 2;
 
-/// When each kind last took a sibling-confirmed redial, wall ms (0 = never).
+/// When each kind last took a silence redial (sibling-confirmed or, since
+/// plan item K3, the 300 s fallback), wall ms (0 = never).
 static LAST_CONFIRMED_REDIAL_WALL_MS: [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
     [const { std::sync::atomic::AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS];
 
@@ -635,6 +637,33 @@ pub const fn silence_redial_basis(
         }
         DhanEndpointType::OrderUpdate => None,
     }
+}
+
+/// Takes the per-kind spacing slot for a 300 s fallback redial (plan item
+/// K3). `last` is the slot value read earlier in the same poll, `wall_ms` the
+/// wall clock read with it. True when the slot was free (never taken, or
+/// taken at least [`CONFIRMED_REDIAL_SPACING_SECS`] ago) and this call won
+/// the compare-and-swap; false when another socket of the kind holds it or
+/// won the race, so the caller waits for a later poll.
+///
+/// A stamp more than [`SIBLING_FUTURE_SKEW_MS`] AHEAD of `wall_ms` means the
+/// wall clock stepped back after the stamp; it is treated as free, so a
+/// clock step can never hold the time-only fallback off for the size of the
+/// step. Within that skew (two sockets reading the wall a few microseconds
+/// apart) it is held as usual. O(1), one CAS, no allocation.
+fn claim_fallback_spacing(slot: &std::sync::atomic::AtomicI64, last: i64, wall_ms: i64) -> bool {
+    let elapsed = wall_ms.saturating_sub(last);
+    let free = last == 0
+        || elapsed >= CONFIRMED_REDIAL_SPACING_SECS.saturating_mul(1_000)
+        || elapsed < SIBLING_FUTURE_SKEW_MS.saturating_neg();
+    free && slot
+        .compare_exchange(
+            last,
+            wall_ms,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// Counts the OTHER slots of the same kind whose last frame is at most
@@ -1242,6 +1271,16 @@ pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
 /// oversized or hostile peer) and, at the count bound alone, are
 /// indistinguishable. Label: `endpoint`.
 pub const RING_BYTES_FULL_METRIC: &str = "tv_dhan_ws_ring_bytes_full_total";
+
+/// Counter: the ring refused a frame because its RECEIVER is gone (the frame
+/// drain exited, or the lane is shutting down), not because it was full.
+///
+/// Added 2026-10-26 (audit PR L1). This refusal was counted on
+/// `RING_FULL_METRIC` and logged as "the fold cannot keep up", which sends a
+/// reader after a slow fold that does not exist. The frame is still queued for
+/// the WAL and marked unapplied, so replay re-offers it; only the label was
+/// wrong. Local `/metrics` only (no EMF name, no alarm). Label: `endpoint`.
+pub const RING_CLOSED_METRIC: &str = "tv_dhan_ws_ring_closed_total";
 
 /// Counter: the WAL itself refused a frame. This is the only genuine capture
 /// loss path. Label: `endpoint`.
@@ -5451,8 +5490,10 @@ impl ConnectionSupervisor {
     /// [`Self::poll`] with the process-wide silence inputs injected. `read` is
     /// called ONLY when this socket is already silent past its confirmed
     /// threshold and below the 300 s fallback, on a kind with a confirmed path,
-    /// with evidence and the fast path both on — so a healthy socket never
-    /// reads the register. Tests pass a closure over local data.
+    /// with evidence and the fast path both on — or, for the per-kind spacing
+    /// slot only, when such a socket is silent past the 300 s fallback with
+    /// evidence on (plan item K3) — so a healthy socket never reads the
+    /// register. Tests pass a closure over local data.
     ///
     /// Thresholds (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE THRESHOLDS"):
     /// main feed and depth-20 redial at 300 s on time alone, or earlier at
@@ -5513,13 +5554,21 @@ impl ConnectionSupervisor {
             && kind.is_some()
             && silent_secs >= confirmed_threshold
             && silent_secs < FRAME_SILENCE_REDIAL_SECS;
+        // The 300 s fallback reads the same register for its spacing slot
+        // only (plan item K3): a supervisor opted into the pool register, on
+        // a kind with a spacing slot, already silent past the fallback.
+        // Independent of the fast-path mode, because it spaces the fallback,
+        // which every mode keeps.
+        let read_fallback_spacing = self.silence_evidence == SiblingEvidence::Pool
+            && kind.is_some()
+            && silent_secs >= FRAME_SILENCE_REDIAL_SECS;
         let mut overflow_or_halted = true;
         let mut siblings: u8 = 0;
         let mut spacing_ok = false;
         let mut wall_ms: i64 = 0;
         let mut spacing_slot: Option<&std::sync::atomic::AtomicI64> = None;
         let mut spacing_last: i64 = 0;
-        if read_evidence {
+        if read_evidence || read_fallback_spacing {
             let inputs = read();
             let spacing: &'a [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
                 inputs.spacing;
@@ -5546,6 +5595,25 @@ impl ConnectionSupervisor {
         ) else {
             return SupervisorAction::Continue;
         };
+        // The 300 s fallback takes the SAME per-kind spacing slot as the
+        // confirmed path (plan item K3). Before this, a market-wide stall
+        // that silenced every main-feed socket redialled all of them within
+        // about a second of each other, every five minutes, because only the
+        // confirmed arm below took the slot. Sharing one slot is correct
+        // because the slot bounds SILENCE redials of a kind, whatever their
+        // basis: a confirmed redial and a fallback redial a second apart are
+        // two sockets of one pool torn down together, the burst the spacing
+        // exists to stop. Cost of sharing: either path can delay the other
+        // by at most one spacing (15 s). A socket that loses the slot stays
+        // silent and is offered it again on its next one-second poll; the
+        // 300 s threshold, the escalation, the session gate and the overflow
+        // and 805 refusals are unchanged (the fallback never read them).
+        if basis == SilenceBasis::Unconfirmed
+            && let Some(slot) = spacing_slot
+            && !claim_fallback_spacing(slot, spacing_last, wall_ms)
+        {
+            return SupervisorAction::Continue;
+        }
         if basis == SilenceBasis::SiblingConfirmed {
             match self.fast_path {
                 FrameSilenceFastPath::Off => return SupervisorAction::Continue,
@@ -7376,6 +7444,14 @@ pub enum FrameSinkOutcome {
     /// doc claiming permanence would now send a reader looking for a data
     /// loss that the watermark already prevents.
     RingFull,
+    /// Queued for durable write; the ring refused it because its RECEIVER is
+    /// gone (the frame drain exited or the lane is shutting down), not because
+    /// it was full. Marked unapplied like `RingFull`, so replay re-offers it.
+    ///
+    /// Added 2026-10-26 (audit PR L1): this case returned `RingFull` and was
+    /// logged as "the fold cannot keep up", which points a reader at a slow
+    /// fold when the fold is not running at all.
+    RingClosed,
     /// The WAL refused it AND the ring refused it. The frame reached neither
     /// disk nor the fold: genuine, immediate capture loss, recoverable by
     /// nothing.
@@ -8225,6 +8301,8 @@ pub struct WalRingSink {
     wal_dropped: metrics::Counter,
     ring_full: metrics::Counter,
     ring_bytes_full: metrics::Counter,
+    /// The ring refused because its receiver is gone (audit PR L1).
+    ring_closed: metrics::Counter,
     /// Optional forensic side-channel for socket lifecycle events.
     ///
     /// `None` by default and set only by [`WalRingSink::with_audit`], so a
@@ -8286,6 +8364,7 @@ impl WalRingSink {
             wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+            ring_closed: metrics::counter!(RING_CLOSED_METRIC, "endpoint" => endpoint_label),
             audit_tx: None,
             dial_permit: None,
             socket_stop: None,
@@ -8358,6 +8437,7 @@ impl WalRingSink {
         self.wal_dropped.increment(0);
         self.ring_full.increment(0);
         self.ring_bytes_full.increment(0);
+        self.ring_closed.increment(0);
         tickvault_storage::wal_frame_fate::pre_register();
     }
 
@@ -8518,32 +8598,45 @@ impl FrameSink for WalRingSink {
         }
         // Step 3 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
-        if self
-            .ring
-            .try_send(CapturedFrame {
-                seq,
-                endpoint: self.endpoint,
-                connection_index: self.connection_index,
-                received_at,
-                received_at_nanos,
-                wal_backed: !wal_refused,
-                bytes: frame,
-            })
-            .is_err()
-        {
+        if let Err(refused) = self.ring.try_send(CapturedFrame {
+            seq,
+            endpoint: self.endpoint,
+            connection_index: self.connection_index,
+            received_at,
+            received_at_nanos,
+            wal_backed: !wal_refused,
+            bytes: frame,
+        }) {
             // The frame never entered the ring, so nothing downstream will ever
             // release its reservation. Give it back here or the budget ratchets
             // down on every count-full frame until it refuses everything —
             // a slow strangulation that would look like the feed dying for no
             // reason.
             self.budget.release(len);
-            self.ring_full.increment(1);
+            // Audit PR L1 (2026-10-26): a CLOSED ring (the drain is gone) is
+            // not a full one. It was counted on `ring_full` and logged as "the
+            // fold cannot keep up"; it now has its own counter and outcome.
+            // The WAL handling is identical: the frame is queued for the WAL,
+            // marked unapplied, and replay re-offers it.
+            let closed = matches!(
+                refused,
+                crate::websocket::frame_ring::FrameRingTrySendError::Closed(_)
+            );
+            if closed {
+                self.ring_closed.increment(1);
+            } else {
+                self.ring_full.increment(1);
+            }
             if wal_refused {
                 return FrameSinkOutcome::WalDropped;
             }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
             self.note_ring_shed(seq);
-            return FrameSinkOutcome::RingFull;
+            return if closed {
+                FrameSinkOutcome::RingClosed
+            } else {
+                FrameSinkOutcome::RingFull
+            };
         }
         // Reaching here with the class slot caps summing to the channel's
         // capacity means the `try_send` above can only fail on a CLOSED
@@ -8967,9 +9060,25 @@ pub trait DhanFeedSocket: Send {
     /// handed to `on_frame` (2026-10-02). The supervisor passes its sink, so a
     /// frame Dhan delivers between our Close and its reply reaches the
     /// write-ahead log like any other instead of being discarded uncounted.
-    fn close<F>(&mut self, on_frame: F) -> impl std::future::Future<Output = ()> + Send
+    ///
+    /// Returns the Dhan disconnect code this socket still owed, or else the
+    /// first one read during the close, lone or stacked (audit PR L1,
+    /// 2026-10-26), so the caller can classify a code that arrived as the
+    /// socket was being torn down.
+    fn close<F>(
+        &mut self,
+        on_frame: F,
+    ) -> impl std::future::Future<Output = Option<DisconnectCode>> + Send
     where
         F: FnMut(Bytes) + Send;
+    /// Takes the disconnect code an earlier `recv` saw stacked behind data and
+    /// still owes (it would be the next `recv`'s `Closed`), without reading.
+    ///
+    /// Audit PR L1 (2026-10-26): a write that failed while such a code was
+    /// owed went straight to the subscribe-failed redial, and the close then
+    /// erased the code, so an 805 never parked. Required, like the methods
+    /// above: a transport with no such state returns `None`.
+    fn take_owed_close(&mut self) -> Option<DisconnectCode>;
 }
 
 /// A transport-level failure. Opaque on purpose: policy lives in the
@@ -9093,6 +9202,8 @@ struct DrainThrottle {
     ring_full_seen: u64,
     wal_dropped_seen: u64,
     captured_live_only_seen: u64,
+    /// Audit PR L1 (2026-10-26): the ring refused because its receiver is gone.
+    ring_closed_seen: u64,
 }
 
 /// Whether an answer can be trusted to describe THIS connection's wire.
@@ -9153,18 +9264,28 @@ where
                     );
                     return WireWait {
                         outcome: Ok(Err(SocketFailure)),
-                        socket_decision: None,
+                        socket_decision: owed_close_decision(socket, supervisor),
                     };
                 }
+                // Audit PR L1 (2026-10-26): a failed write first hands any
+                // disconnect code the socket still owes to the supervisor. The
+                // biased select answers the ticket before the read that would
+                // have delivered it, and the close would then erase it, so an
+                // owed 805 never parked and an owed 807 never refreshed.
+                let socket_decision = if answer.is_err() {
+                    owed_close_decision(socket, supervisor)
+                } else {
+                    None
+                };
                 return WireWait {
                     outcome: Ok(answer),
-                    socket_decision: None,
+                    socket_decision,
                 };
             }
             () = &mut budget, if deadline.is_some() => {
                 return WireWait {
                     outcome: Err(WireElapsed),
-                    socket_decision: None,
+                    socket_decision: owed_close_decision(socket, supervisor),
                 };
             }
             event = socket.recv() => {
@@ -9801,7 +9922,10 @@ where
 /// close given a do-nothing callback would compile and silently restore the
 /// discard this replaced, so every close goes through here and a source pin
 /// (`every_production_close_passes_its_frames_to_the_sink`) holds it.
-async fn close_capturing<S, K>(socket: &mut S, sink: &K)
+///
+/// Returns the disconnect code the close found (owed, or read during the
+/// handshake), audit PR L1.
+async fn close_capturing<S, K>(socket: &mut S, sink: &K) -> Option<DisconnectCode>
 where
     S: DhanFeedSocket,
     K: FrameSink + ?Sized,
@@ -9811,7 +9935,43 @@ where
             // The sink counts and reports its own refusals.
             let _outcome = sink.accept(frame);
         })
-        .await;
+        .await
+}
+
+/// A disconnect code the close found AFTER the supervisor had already chosen
+/// a redial (audit PR L1, 2026-10-26).
+///
+/// A transient code changes nothing (the redial already chosen is right), so
+/// it is not fed in: that would count the reconnect twice. Every other class
+/// (805 park, 806/810 park, 807/809 token refresh, 808, 804) changes what the
+/// socket must do next, so the supervisor classifies it and its answer
+/// replaces the redial. `already_refreshing` (the token-refresh arm) also
+/// skips 807/809, which would only schedule the same refresh again. O(1).
+fn late_close_decision(
+    supervisor: &mut ConnectionSupervisor,
+    code: Option<DisconnectCode>,
+    already_refreshing: bool,
+) -> Option<SupervisorAction> {
+    let code = code?;
+    match classify_disconnect(Some(code)) {
+        DisconnectClass::Transient => return None,
+        DisconnectClass::TokenStale if already_refreshing => return None,
+        _ => {}
+    }
+    let action = supervisor.on_event(ConnEvent::Disconnected { code: Some(code) }, Instant::now());
+    (action != SupervisorAction::Continue).then_some(action)
+}
+
+/// The decision an OWED disconnect code makes after a failed write (audit
+/// PR L1, 2026-10-26). `None` when nothing is owed or the supervisor keeps
+/// going. O(1), no read, no wait.
+fn owed_close_decision<S: DhanFeedSocket>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+) -> Option<SupervisorAction> {
+    let code = socket.take_owed_close()?;
+    let action = supervisor.on_event(ConnEvent::Disconnected { code: Some(code) }, Instant::now());
+    (action != SupervisorAction::Continue).then_some(action)
 }
 
 /// [`run_connection`] plus a channel that can change the LIVE subscription
@@ -9940,7 +10100,14 @@ where
             }
 
             SupervisorAction::SleepThenDial { delay_ms } => {
-                close_capturing(&mut socket, &*sink).await;
+                let late = close_capturing(&mut socket, &*sink).await;
+                // Audit PR L1 (2026-10-26): a disconnect code the close found
+                // (an 805 read during the handshake after a failed write) is
+                // classified, and its decision replaces this redial.
+                if let Some(decided) = late_close_decision(&mut supervisor, late, false) {
+                    action = decided;
+                    continue;
+                }
                 guard.mark_lost();
                 // Review 2026-10-10: the socket holds nothing during the
                 // backoff, so the depth-200 cross-feed check must not judge it
@@ -9962,7 +10129,13 @@ where
             }
 
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
-                close_capturing(&mut socket, &*sink).await;
+                let late = close_capturing(&mut socket, &*sink).await;
+                // Audit PR L1: as in the arm above; a late 807/809 is not fed
+                // in, since this arm already refreshes.
+                if let Some(decided) = late_close_decision(&mut supervisor, late, true) {
+                    action = decided;
+                    continue;
+                }
                 guard.mark_lost();
                 // Review 2026-10-10: the socket holds nothing during the
                 // backoff, so the depth-200 cross-feed check must not judge it
@@ -11748,6 +11921,7 @@ where
         ring_full_seen,
         wal_dropped_seen,
         captured_live_only_seen,
+        ring_closed_seen,
     } = throttle;
     let action;
     match event {
@@ -11867,6 +12041,25 @@ where
                          CANDLE contribution, because by then the tick is outside \
                          the aggregating session and only the row is written. Treat \
                          this as lost candles, not lost ticks. Logged at \
+                         1, 2, 4, 8 ... occurrences per socket to bound the noise."
+                    );
+                }
+            }
+            if outcome == FrameSinkOutcome::RingClosed {
+                // Audit PR L1 (2026-10-26): the drain is gone, not slow. The
+                // frame is queued for the WAL and marked unapplied, so replay
+                // re-offers it; the line says that instead of blaming the fold.
+                // Same power-of-two throttle as the arms above.
+                *ring_closed_seen = ring_closed_seen.saturating_add(1);
+                if ring_closed_seen.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        endpoint = supervisor.slot().endpoint.as_str(),
+                        pool_index = supervisor.slot().pool_index,
+                        refused_on_this_socket = *ring_closed_seen,
+                        "the frame ring is CLOSED — the frame drain has stopped, so \
+                         this frame is not folded now. It IS queued for the \
+                         write-ahead log and marked for replay. Logged at \
                          1, 2, 4, 8 ... occurrences per socket to bound the noise."
                     );
                 }
@@ -15887,10 +16080,14 @@ mod tests {
             async fn recv(&mut self) -> SocketEvent {
                 SocketEvent::Closed { code: None }
             }
-            async fn close<F>(&mut self, _on_frame: F)
+            async fn close<F>(&mut self, _on_frame: F) -> Option<DisconnectCode>
             where
                 F: FnMut(Bytes) + Send,
             {
+                None
+            }
+            fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+                None
             }
         }
         assert_eq!(Silent.last_dial_failure_reason(), "unknown");
@@ -16131,6 +16328,38 @@ mod tests {
             FrameSinkOutcome::RingFull,
             "a full ring is a lag signal, never silent capture loss"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_closed_ring_is_not_reported_as_full() {
+        // Audit PR L1: a ring whose receiver is gone was reported as FULL
+        // ("the fold cannot keep up"). It now has its own outcome.
+        let dir = wal_dir("ringclosed");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
+        drop(rx);
+        let budget = std::sync::Arc::new(RingByteBudget::new(16));
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::RingClosed,
+                "a closed ring is not a full one"
+            );
+        }
+        // The reservation was given back each time (3 x 10 bytes > 16).
+        assert_eq!(budget.try_reserve_detailed(16), RingReserve::Granted);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16522,6 +16751,11 @@ mod tests {
         close_frames: Vec<Bytes>,
         /// Every security id handed to `send_unsubscribe`, in order.
         unsubscribed_ids: Vec<u64>,
+        /// A disconnect code a previous read saw stacked behind data and
+        /// still owes (the production `pending_close`), audit PR L1.
+        owed_close: Option<DisconnectCode>,
+        /// A disconnect code the next `close` reads during its handshake.
+        close_code: Option<DisconnectCode>,
         /// `(kind, instruments)` per (un)subscribe message, in order — what
         /// the in-place tests read to prove the 100-per-message split.
         batch_sizes: Vec<(&'static str, usize)>,
@@ -16670,24 +16904,33 @@ mod tests {
             }
         }
 
-        fn close<F>(&mut self, mut on_frame: F) -> impl std::future::Future<Output = ()> + Send
+        fn close<F>(
+            &mut self,
+            mut on_frame: F,
+        ) -> impl std::future::Future<Output = Option<DisconnectCode>> + Send
         where
             F: FnMut(Bytes) + Send,
         {
             let state = std::sync::Arc::clone(&self.state);
             async move {
-                let drained = match state.lock() {
+                let (drained, code) = match state.lock() {
                     Ok(mut s) => {
                         s.closes += 1;
                         s.batch_sizes.push(("close", 0));
-                        std::mem::take(&mut s.close_frames)
+                        let code = s.owed_close.take().or(s.close_code.take());
+                        (std::mem::take(&mut s.close_frames), code)
                     }
-                    Err(_) => Vec::new(),
+                    Err(_) => (Vec::new(), None),
                 };
                 for frame in drained {
                     on_frame(frame);
                 }
+                code
             }
+        }
+
+        fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+            self.state.lock().ok().and_then(|mut s| s.owed_close.take())
         }
     }
 
@@ -17679,10 +17922,14 @@ mod tests {
                     }
                 }
             }
-            async fn close<F>(&mut self, _on_frame: F)
+            async fn close<F>(&mut self, _on_frame: F) -> Option<DisconnectCode>
             where
                 F: FnMut(Bytes) + Send,
             {
+                None
+            }
+            fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+                None
             }
         }
 
@@ -19684,6 +19931,11 @@ mod tests {
             (
                 "FrameSinkOutcome::RingFull",
                 "ring_full_seen",
+                "FrameSinkOutcome::RingClosed",
+            ),
+            (
+                "FrameSinkOutcome::RingClosed",
+                "ring_closed_seen",
                 "\n        }",
             ),
         ];
@@ -19724,6 +19976,7 @@ mod tests {
             "ring_full_seen",
             "wal_dropped_seen",
             "captured_live_only_seen",
+            "ring_closed_seen",
         ] {
             assert!(
                 throttle_struct.contains(&format!("{counter}: u64,")),
@@ -25667,6 +25920,9 @@ mod tests {
         assert!(arm.contains("Some(ParkReason::PoolOverflow)"));
         assert!(arm.contains("OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()"));
     }
+
+    #[path = "owed_close_tests.rs"]
+    mod owed_close_tests;
 }
 
 /// Audit M8 (2026-10-04): the four subscription-change audit rows.
@@ -25922,898 +26178,5 @@ mod subscription_audit_tests {
 // spacing tables, so none of them reads or writes another test's sockets.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-mod frame_silence_evidence_tests {
-    use super::*;
-    use proptest::prelude::*;
-    use std::cell::Cell;
-    use std::sync::atomic::AtomicI64;
-
-    const WALL0: i64 = 1_800_000_000_000;
-
-    fn t0() -> Instant {
-        Instant::now()
-    }
-
-    fn slot_at(endpoint: DhanEndpointType, global_index: u8) -> ConnectionSlot {
-        ConnectionSlot {
-            account: crate::websocket::pool_budget::DhanAccount::Primary,
-            endpoint,
-            pool_index: 0,
-            global_index,
-        }
-    }
-
-    /// A live supervisor on `global_index`, opted into evidence, with `held`
-    /// instruments and fast path `mode`.
-    fn live_sup(
-        endpoint: DhanEndpointType,
-        global_index: u8,
-        held: u32,
-        mode: FrameSilenceFastPath,
-        t: Instant,
-    ) -> ConnectionSupervisor {
-        let mut s = ConnectionSupervisor::new(slot_at(endpoint, global_index), t);
-        s.set_silence_evidence(SiblingEvidence::Pool);
-        s.set_fast_path(mode);
-        s.set_held_instruments(held);
-        let _ = s.on_event(ConnEvent::BeginDial, t);
-        let _ = s.on_event(ConnEvent::DialSucceeded, t);
-        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
-        assert_eq!(s.phase(), ConnPhase::Live);
-        s
-    }
-
-    /// Stamps with the given slots live at `wall`.
-    fn stamps_live(slots: &[u8], wall: i64) -> [i64; GHOST_REDIAL_SLOTS] {
-        let mut out = [0_i64; GHOST_REDIAL_SLOTS];
-        for s in slots {
-            if let Some(v) = out.get_mut(usize::from(*s)) {
-                *v = wall;
-            }
-        }
-        out
-    }
-
-    /// Polls at `t + secs` after a pong (so the IDLE watchdog stays quiet),
-    /// with the given siblings live at that instant.
-    fn poll_at(
-        s: &mut ConnectionSupervisor,
-        t: Instant,
-        secs: u64,
-        siblings: &[u8],
-        overflow_or_halted: bool,
-        spacing: &[AtomicI64; CONFIRMED_SPACING_KINDS],
-    ) -> SupervisorAction {
-        let at = t + Duration::from_secs(secs);
-        let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
-        let wall = WALL0 + i64::try_from(secs).unwrap_or(0) * 1_000;
-        s.poll_with(at, || SilenceInputs {
-            wall_ms: wall,
-            overflow_or_halted,
-            stamps: stamps_live(siblings, wall),
-            spacing,
-        })
-    }
-
-    fn fresh_spacing() -> [AtomicI64; CONFIRMED_SPACING_KINDS] {
-        [const { AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS]
-    }
-
-    fn is_redial(a: SupervisorAction) -> bool {
-        matches!(a, SupervisorAction::SleepThenDial { .. })
-    }
-
-    #[test]
-    fn silence_redial_basis_truth_table() {
-        use DhanEndpointType::{Depth20, Depth200, MainFeed, OrderUpdate};
-        let all = |e, silent, held| silence_redial_basis(e, silent, 60, true, false, 2, held, true);
-        // Main feed: confirmed at its threshold with every condition.
-        assert_eq!(all(MainFeed, 59, 1_000), None);
-        assert_eq!(
-            all(MainFeed, 60, 1_000),
-            Some(SilenceBasis::SiblingConfirmed)
-        );
-        assert_eq!(
-            all(MainFeed, 299, 1_000),
-            Some(SilenceBasis::SiblingConfirmed)
-        );
-        assert_eq!(all(MainFeed, 300, 1_000), Some(SilenceBasis::Unconfirmed));
-        // Each condition alone blocks the confirmed path but never the fallback.
-        for (window, overflow, siblings, held, spacing) in [
-            (false, false, 2, 1_000, true),
-            (true, true, 2, 1_000, true),
-            (true, false, 1, 1_000, true),
-            (true, false, 2, 999, true),
-            (true, false, 2, 1_000, false),
-        ] {
-            assert_eq!(
-                silence_redial_basis(MainFeed, 120, 60, window, overflow, siblings, held, spacing),
-                None
-            );
-            assert_eq!(
-                silence_redial_basis(MainFeed, 300, 60, window, overflow, siblings, held, spacing),
-                Some(SilenceBasis::Unconfirmed)
-            );
-        }
-        // Depth-20: its own floor.
-        assert_eq!(
-            silence_redial_basis(Depth20, 90, 90, true, false, 2, 20, true),
-            Some(SilenceBasis::SiblingConfirmed)
-        );
-        assert_eq!(
-            silence_redial_basis(Depth20, 90, 90, true, false, 2, 19, true),
-            None
-        );
-        // Depth-200: time alone, only at the backstop.
-        assert_eq!(all(Depth200, 300, 1), None);
-        assert_eq!(all(Depth200, 899, 1), None);
-        assert_eq!(all(Depth200, 900, 1), Some(SilenceBasis::Backstop));
-        // Order update: never.
-        assert_eq!(all(OrderUpdate, 100_000, 1), None);
-        // Labels are distinct and stable.
-        let labels: Vec<&str> = SilenceBasis::ALL.iter().map(|b| b.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["unconfirmed", "sibling_confirmed", "cross_feed", "backstop"]
-        );
-    }
-
-    #[test]
-    fn live_siblings_counts_same_kind_other_slots_within_10s_only() {
-        let now = WALL0;
-        let mut stamps = [0_i64; GHOST_REDIAL_SLOTS];
-        // Main-feed slots 0..5. Self is 0.
-        stamps[0] = now; // self: never counted
-        stamps[1] = now - 10_000; // exactly 10 s old: counted
-        stamps[2] = now - 10_001; // just past: not counted
-        stamps[3] = now + 5_000; // 5 s ahead: counted (skew allowance)
-        stamps[4] = now + 5_001; // further ahead: not counted
-        stamps[5] = now; // depth-20 slot: other kind
-        stamps[10] = now; // depth-200 slot: other kind
-        assert_eq!(
-            live_siblings(0, DhanEndpointType::MainFeed, now, &stamps),
-            2
-        );
-        // Depth-20 seen from slot 6: slot 5 is live, the depth account's
-        // depth-20 slots (16..21) count as the same kind.
-        stamps[16] = now - 1;
-        assert_eq!(live_siblings(6, DhanEndpointType::Depth20, now, &stamps), 2);
-        // Never-delivered (0) and negative stamps never count.
-        let empty = [0_i64; GHOST_REDIAL_SLOTS];
-        assert_eq!(live_siblings(0, DhanEndpointType::MainFeed, now, &empty), 0);
-        // A short slice is handled.
-        assert_eq!(
-            live_siblings(0, DhanEndpointType::MainFeed, now, &[now, now]),
-            1
-        );
-    }
-
-    proptest! {
-        /// Random inter-frame gaps, every one below the kind's confirmed
-        /// threshold, with two siblings live and a poll every second inside
-        /// each gap: no fast-path mode ever produces a redial.
-        #[test]
-        fn proptest_gaps_below_the_confirmed_threshold_never_redial(
-            depth20 in any::<bool>(),
-            mode_pick in 0_u8..3,
-            gaps in proptest::collection::vec(1_u64..1_000, 1..40),
-        ) {
-            let endpoint = if depth20 {
-                DhanEndpointType::Depth20
-            } else {
-                DhanEndpointType::MainFeed
-            };
-            let mode = match mode_pick {
-                0 => FrameSilenceFastPath::Off,
-                1 => FrameSilenceFastPath::Shadow,
-                _ => FrameSilenceFastPath::Act,
-            };
-            let t = t0();
-            let spacing = fresh_spacing();
-            let mut s = live_sup(endpoint, 3, 5_000, mode, t);
-            let threshold = s.confirmed_threshold_secs();
-            prop_assert!(threshold >= MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS);
-            let mut now_secs = 0_u64;
-            let _ = s.on_event(ConnEvent::FrameReceived, t);
-            for raw in gaps {
-                // Map onto [1, threshold - 1]: always below the threshold.
-                let gap = 1 + raw % (threshold - 1);
-                for step in 1..=gap {
-                    let action = poll_at(&mut s, t, now_secs + step, &[0, 1], false, &spacing);
-                    prop_assert!(
-                        !is_redial(action),
-                        "redial after {step} s of a {gap} s gap (threshold {threshold} s, {mode:?})"
-                    );
-                }
-                now_secs += gap;
-                let _ = s.on_event(
-                    ConnEvent::FrameReceived,
-                    t + Duration::from_secs(now_secs),
-                );
-            }
-            prop_assert_eq!(s.silence_strikes(), 0);
-        }
-    }
-
-    #[test]
-    fn main_feed_confirmed_redial_at_60s_with_two_live_siblings_in_act_mode() {
-        let t = t0();
-        let spacing = fresh_spacing();
-        let mut s = live_sup(
-            DhanEndpointType::MainFeed,
-            0,
-            5_000,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        assert_eq!(s.confirmed_threshold_secs(), 60);
-        assert_eq!(
-            poll_at(&mut s, t, 59, &[1, 2], false, &spacing),
-            SupervisorAction::Continue
-        );
-        assert!(is_redial(poll_at(&mut s, t, 60, &[1, 2], false, &spacing)));
-        assert_eq!(s.last_silence_basis(), SilenceBasis::SiblingConfirmed);
-        assert_eq!(s.last_redial_reason(), ReconnectReason::IdleSilence);
-        assert_eq!(s.silence_strikes(), 1);
-        assert_eq!(
-            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
-            WALL0 + 60_000,
-            "the act path stamps the pool-wide spacing"
-        );
-        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn shadow_mode_counts_once_per_episode_and_never_redials() {
-        let t = t0();
-        let spacing = fresh_spacing();
-        let mut s = live_sup(
-            DhanEndpointType::MainFeed,
-            1,
-            5_000,
-            FrameSilenceFastPath::Shadow,
-            t,
-        );
-        for secs in [60, 61, 120, 299] {
-            assert_eq!(
-                poll_at(&mut s, t, secs, &[0, 2], false, &spacing),
-                SupervisorAction::Continue
-            );
-        }
-        assert_eq!(s.shadow_would_redials(), 1, "once per episode");
-        assert_eq!(
-            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "shadow never stamps the spacing"
-        );
-        // A frame ends the episode; a new silence counts again.
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(299));
-        assert_eq!(
-            poll_at(&mut s, t, 299 + 60, &[0, 2], false, &spacing),
-            SupervisorAction::Continue
-        );
-        assert_eq!(s.shadow_would_redials(), 2);
-        // The fallback still governs.
-        assert!(is_redial(poll_at(
-            &mut s,
-            t,
-            299 + 300,
-            &[0, 2],
-            false,
-            &spacing
-        )));
-        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
-        // Off never even reads the evidence.
-        let reads = Cell::new(0_u32);
-        let mut off = live_sup(
-            DhanEndpointType::MainFeed,
-            2,
-            5_000,
-            FrameSilenceFastPath::Off,
-            t,
-        );
-        let at = t + Duration::from_secs(120);
-        let _ = off.on_event(ConnEvent::KeepAliveReceived, at);
-        let action = off.poll_with(at, || {
-            reads.set(reads.get() + 1);
-            SilenceInputs {
-                wall_ms: WALL0,
-                overflow_or_halted: false,
-                stamps: [WALL0; GHOST_REDIAL_SLOTS],
-                spacing: &spacing,
-            }
-        });
-        assert_eq!(action, SupervisorAction::Continue);
-        assert_eq!(reads.get(), 0);
-        assert_eq!(off.shadow_would_redials(), 0);
-    }
-
-    /// A socket that is deaf on every connection: confirmed redials escalate
-    /// 60 → 120 → 240 → 300 and then stay at the fallback, so confirmed
-    /// redials alone can never outpace the flap ceiling.
-    #[test]
-    fn escalation_bounds_snapshot_then_deaf_loop() {
-        let t = t0();
-        let mut s = live_sup(
-            DhanEndpointType::MainFeed,
-            3,
-            5_000,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        let mut elapsed: u64 = 0;
-        let mut gaps = Vec::new();
-        for _ in 0..6 {
-            let start = elapsed;
-            let spacing = fresh_spacing();
-            loop {
-                elapsed += 1;
-                if is_redial(poll_at(&mut s, t, elapsed, &[0, 1], false, &spacing)) {
-                    break;
-                }
-                assert!(elapsed - start <= 300, "never past the fallback");
-            }
-            gaps.push(elapsed - start);
-            // Redial and come back up, still deaf.
-            let at = t + Duration::from_secs(elapsed);
-            let _ = s.on_event(ConnEvent::BeginDial, at);
-            let _ = s.on_event(ConnEvent::DialSucceeded, at);
-            let _ = s.on_event(ConnEvent::SubscribeAcked, at);
-        }
-        assert_eq!(gaps, [60, 120, 240, 300, 300, 300]);
-        assert_eq!(s.silence_strikes(), 6);
-        // Strikes reset after SILENCE_STRIKE_RESET with no silence redial.
-        let mut quiet = elapsed;
-        while quiet < elapsed + SILENCE_STRIKE_RESET_SECS {
-            quiet += 30;
-            let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(quiet));
-            let _ = poll_at(&mut s, t, quiet, &[0, 1], false, &fresh_spacing());
-        }
-        assert_eq!(s.silence_strikes(), 0);
-        assert_eq!(s.confirmed_threshold_secs(), 60);
-    }
-
-    #[test]
-    fn confirmed_redial_spacing_is_pool_wide_per_kind() {
-        let t = t0();
-        let spacing = fresh_spacing();
-        let mut a = live_sup(
-            DhanEndpointType::MainFeed,
-            0,
-            5_000,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        let mut b = live_sup(
-            DhanEndpointType::MainFeed,
-            1,
-            5_000,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        let mut d = live_sup(
-            DhanEndpointType::Depth20,
-            5,
-            50,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        assert!(is_redial(poll_at(&mut a, t, 60, &[2, 3], false, &spacing)));
-        // The second main-feed socket waits out the spacing.
-        for secs in 60..75 {
-            assert_eq!(
-                poll_at(&mut b, t, secs, &[2, 3], false, &spacing),
-                SupervisorAction::Continue,
-                "+{secs}s"
-            );
-        }
-        assert!(is_redial(poll_at(&mut b, t, 75, &[2, 3], false, &spacing)));
-        // Depth-20 has its own spacing slot.
-        assert!(is_redial(poll_at(&mut d, t, 90, &[6, 7], false, &spacing)));
-    }
-
-    #[test]
-    fn below_the_instrument_floor_falls_back_to_300s() {
-        let t = t0();
-        let spacing = fresh_spacing();
-        let mut s = live_sup(
-            DhanEndpointType::MainFeed,
-            0,
-            MAIN_FEED_CONFIRMED_MIN_HELD - 1,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        for secs in [60, 120, 299] {
-            assert_eq!(
-                poll_at(&mut s, t, secs, &[1, 2, 3], false, &spacing),
-                SupervisorAction::Continue
-            );
-        }
-        assert!(is_redial(poll_at(
-            &mut s,
-            t,
-            300,
-            &[1, 2, 3],
-            false,
-            &spacing
-        )));
-        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
-    }
-
-    #[test]
-    fn an_engaged_overflow_episode_or_a_halted_rotation_suppresses_every_fast_path() {
-        let t = t0();
-        let spacing = fresh_spacing();
-        let mut s = live_sup(
-            DhanEndpointType::Depth20,
-            5,
-            50,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        for secs in [90, 200, 299] {
-            assert_eq!(
-                poll_at(&mut s, t, secs, &[6, 7, 8], true, &spacing),
-                SupervisorAction::Continue
-            );
-        }
-        assert!(is_redial(poll_at(
-            &mut s,
-            t,
-            300,
-            &[6, 7, 8],
-            true,
-            &spacing
-        )));
-        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
-        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn confirmed_window_open_at_boundaries() {
-        let gate = FrameSilenceGate::ContinuousSessionIst;
-        let open = CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST;
-        let close = CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST;
-        assert_eq!(close, 15 * 3600 + 15 * 60, "15:15 IST");
-        assert!(!gate.confirmed_window_open_at(open - 1));
-        assert!(gate.confirmed_window_open_at(open));
-        assert!(gate.confirmed_window_open_at(close - 1));
-        assert!(!gate.confirmed_window_open_at(close));
-        // The closing auction is inside the session gate but outside the
-        // confirmed window: the 300 s fallback governs there.
-        assert!(gate.is_open_at(close));
-        assert!(FrameSilenceGate::AlwaysOn.confirmed_window_open_at(0));
-        assert!(!FrameSilenceGate::Off.confirmed_window_open_at(open));
-    }
-
-    #[test]
-    fn depth200_is_not_redialled_by_time_before_the_900s_backstop() {
-        let t = t0();
-        let spacing = fresh_spacing();
-        let reads = Cell::new(0_u32);
-        let mut s = live_sup(
-            DhanEndpointType::Depth200,
-            10,
-            1,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        let poll = |s: &mut ConnectionSupervisor, secs: u64| {
-            let at = t + Duration::from_secs(secs);
-            let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
-            s.poll_with(at, || {
-                reads.set(reads.get() + 1);
-                SilenceInputs {
-                    wall_ms: WALL0,
-                    overflow_or_halted: false,
-                    stamps: [WALL0; GHOST_REDIAL_SLOTS],
-                    spacing: &spacing,
-                }
-            })
-        };
-        for secs in [60, 300, 600, 899] {
-            assert_eq!(poll(&mut s, secs), SupervisorAction::Continue, "+{secs}s");
-        }
-        assert!(is_redial(poll(&mut s, 900)));
-        assert_eq!(s.last_silence_basis(), SilenceBasis::Backstop);
-        assert_eq!(reads.get(), 0, "depth-200 never reads sibling evidence");
-
-        // The order-update socket is never redialled for frame silence.
-        let mut ou = live_sup(
-            DhanEndpointType::OrderUpdate,
-            15,
-            0,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        assert_eq!(poll(&mut ou, 3_600), SupervisorAction::Continue);
-        assert_eq!(ou.phase(), ConnPhase::Live);
-
-        // A cross-feed request redials a live depth-200 socket on its basis.
-        let mut x = live_sup(
-            DhanEndpointType::Depth200,
-            11,
-            1,
-            FrameSilenceFastPath::Act,
-            t,
-        );
-        x.note_silence_basis(SilenceBasis::CrossFeed);
-        assert!(is_redial(x.on_event(
-            ConnEvent::FrameSilenceElapsed,
-            t + Duration::from_secs(95)
-        )));
-        assert_eq!(x.last_silence_basis(), SilenceBasis::CrossFeed);
-        assert_eq!(x.silence_strikes(), 1);
-        // A basis noted while not live is consumed, never carried to a later
-        // redial.
-        let mut y = ConnectionSupervisor::new(slot_at(DhanEndpointType::Depth200, 12), t);
-        y.note_silence_basis(SilenceBasis::CrossFeed);
-        assert_eq!(
-            y.on_event(ConnEvent::FrameSilenceElapsed, t),
-            SupervisorAction::Continue
-        );
-        let _ = y.on_event(ConnEvent::BeginDial, t);
-        let _ = y.on_event(ConnEvent::DialSucceeded, t);
-        let _ = y.on_event(ConnEvent::SubscribeAcked, t);
-        assert!(is_redial(y.on_event(
-            ConnEvent::FrameSilenceElapsed,
-            t + Duration::from_secs(1)
-        )));
-        assert_eq!(y.last_silence_basis(), SilenceBasis::Unconfirmed);
-    }
-
-    #[test]
-    fn data_silence_request_is_dropped_when_the_dial_generation_moved() {
-        let pending = [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
-        let last = [const { AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
-        let cooldown_ms = DATA_SILENCE_REQUEST_COOLDOWN_SECS * 1_000;
-        assert_eq!(
-            request_data_silence_redial_in(&pending, &last, 3, WALL0, false, 7),
-            Ok(())
-        );
-        assert_eq!(
-            request_data_silence_redial_in(&pending, &last, 3, WALL0, false, 7),
-            Err(DataSilenceRefusal::StillPending)
-        );
-        assert_eq!(
-            take_data_silence_redial_in(&pending, 3, 7),
-            DataSilenceTake::Take
-        );
-        assert_eq!(
-            take_data_silence_redial_in(&pending, 3, 7),
-            DataSilenceTake::Nothing
-        );
-        assert_eq!(
-            request_data_silence_redial_in(&pending, &last, 3, WALL0 + cooldown_ms - 1, false, 7),
-            Err(DataSilenceRefusal::CoolingDown)
-        );
-        assert_eq!(
-            request_data_silence_redial_in(&pending, &last, 3, WALL0 + cooldown_ms, false, 7),
-            Ok(())
-        );
-        // The socket redialled since the request: the request names an
-        // earlier connection and is dropped.
-        assert_eq!(
-            take_data_silence_redial_in(&pending, 3, 8),
-            DataSilenceTake::Stale
-        );
-        assert_eq!(
-            take_data_silence_redial_in(&pending, 3, 8),
-            DataSilenceTake::Nothing
-        );
-        // After an 805 nothing is recorded.
-        assert_eq!(
-            request_data_silence_redial_in(&pending, &last, 4, WALL0, true, 1),
-            Err(DataSilenceRefusal::Halted)
-        );
-        assert_eq!(
-            take_data_silence_redial_in(&pending, 4, 1),
-            DataSilenceTake::Nothing
-        );
-        // Out of range never panics.
-        assert_eq!(
-            request_data_silence_redial_in(&pending, &last, 200, WALL0, false, 1),
-            Err(DataSilenceRefusal::OutOfRange)
-        );
-        assert_eq!(
-            take_data_silence_redial_in(&pending, 200, 1),
-            DataSilenceTake::Nothing
-        );
-        assert_eq!(DataSilenceRefusal::Halted.as_str(), "halted");
-    }
-
-    #[test]
-    fn a_taken_data_silence_request_after_805_is_refused_with_path_data_silence() {
-        let src = include_str!("pool_supervisor.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("production half");
-        let take = prod
-            .find("&& take_data_silence_redial(supervisor.slot().global_index)")
-            .expect("the connection task takes cross-feed requests");
-        let rest = &prod[take..];
-        let halted = rest.find("if rotation_halted() {").expect("805 check");
-        let refused = rest
-            .find("refuse_voluntary_redial_after_805(supervisor.slot(), \"data_silence\")")
-            .expect("refused with its own path label");
-        let basis = rest
-            .find("supervisor.note_silence_basis(SilenceBasis::CrossFeed)")
-            .expect("labelled cross-feed");
-        let redial = rest
-            .find("supervisor.on_event(ConnEvent::FrameSilenceElapsed")
-            .expect("redials as a fault");
-        assert!(halted < refused && refused < basis && basis < redial);
-        // The request side refuses after an 805 too.
-        assert!(
-            prod.contains("        rotation_halted(),\n        dial_generation(connection_index),")
-        );
-    }
-
-    #[test]
-    fn depth200_held_round_trips_and_never_returns_a_torn_id() {
-        let idx = 31;
-        let a = SubscribeInstrument {
-            security_id: 72_271,
-            segment: ExchangeSegment::NseFno,
-        };
-        let b = SubscribeInstrument {
-            security_id: 72_272,
-            segment: ExchangeSegment::NseFno,
-        };
-        publish_depth200_held(idx, None, 0);
-        assert_eq!(depth200_held(idx), None);
-        publish_depth200_held(idx, Some(a), 1_000);
-        assert_eq!(
-            depth200_held(idx),
-            Some((72_271, ExchangeSegment::NseFno, 1_000))
-        );
-        // The same contract again keeps its original start.
-        publish_depth200_held(idx, Some(a), 5_000);
-        assert_eq!(
-            depth200_held(idx),
-            Some((72_271, ExchangeSegment::NseFno, 1_000))
-        );
-        publish_depth200_held(idx, Some(b), 6_000);
-        assert_eq!(
-            depth200_held(idx),
-            Some((72_272, ExchangeSegment::NseFno, 6_000))
-        );
-        // An id that cannot be packed clears the slot rather than lying.
-        publish_depth200_held(
-            idx,
-            Some(SubscribeInstrument {
-                security_id: u64::MAX,
-                segment: ExchangeSegment::NseFno,
-            }),
-            7_000,
-        );
-        assert_eq!(depth200_held(idx), None);
-        publish_depth200_held(idx, None, 0);
-        assert_eq!(depth200_held(idx), None);
-        // Out of range never panics.
-        publish_depth200_held(200, Some(a), 1);
-        assert_eq!(depth200_held(200), None);
-    }
-
-    #[test]
-    fn publish_depth200_held_is_called_at_every_held_set_change() {
-        let src = include_str!("pool_supervisor.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("production half");
-        let lines: Vec<&str> = prod.lines().map(str::trim_start).collect();
-        let mut sized = 0;
-        let mut zeroed = 0;
-        for (i, line) in lines.iter().enumerate() {
-            let next = lines.get(i + 1).copied().unwrap_or("");
-            if line.starts_with("publish_connection_instruments(&supervisor.slot(), guard.len())") {
-                sized += 1;
-                assert!(next.starts_with("note_held_set("), "line {i}: {next}");
-            }
-            if line.starts_with("publish_connection_instruments(&supervisor.slot(), 0)") {
-                zeroed += 1;
-                assert!(next.starts_with("note_held_cleared("), "line {i}: {next}");
-            }
-        }
-        assert_eq!((sized, zeroed), (5, 2));
-        // The swap arm (which can change the depth-200 contract) and its
-        // emptied path are covered too.
-        assert!(prod.contains("                    note_held_set(supervisor, guard);\n                }\n                Ok(LiveSubscriptionCommand::ProbeUnsubscribe {"));
-        let emptied = prod
-            .find("metrics::counter!(SWAP_EMPTIED_SOCKET_METRIC).increment(1);")
-            .expect("emptied path");
-        let cleared = prod[emptied..]
-            .find("note_held_cleared(supervisor);")
-            .expect("emptied socket clears the register");
-        let failed = prod[emptied..]
-            .find(".on_event(ConnEvent::SubscribeFailed, Instant::now())")
-            .expect("emptied socket redials");
-        assert!(cleared < failed);
-        // Both backoff arms clear the register before they sleep.
-        for arm in [
-            "SupervisorAction::SleepThenDial { delay_ms } => {",
-            "SupervisorAction::RefreshTokenThenDial { delay_ms } => {",
-        ] {
-            let start = prod.find(arm).expect("backoff arm");
-            let body = &prod[start..];
-            let cleared = body
-                .find("note_held_cleared(&mut supervisor);")
-                .expect("backoff clears the register");
-            let slept = body.find("sleep_unless_stopped(").expect("backoff sleeps");
-            assert!(cleared < slept, "{arm}");
-        }
-        let set_fn = prod
-            .find("fn note_held_set(")
-            .expect("note_held_set exists");
-        let set_body = &prod[set_fn..];
-        let set_body = &set_body[..set_body.find("\n}\n").expect("end of note_held_set")];
-        let squashed: String = set_body.split_whitespace().collect();
-        assert!(
-            squashed.contains(
-                "publish_depth200_held(supervisor.slot().global_index,guard.first(),wall_clock_ms(),);"
-            ),
-            "note_held_set publishes the depth-200 contract: {set_body}"
-        );
-    }
-
-    #[test]
-    fn frame_activity_published_at_most_once_per_second() {
-        let idx = 30;
-        let t = t0();
-        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, idx), t);
-        let _ = s.on_event(ConnEvent::BeginDial, t);
-        let _ = s.on_event(ConnEvent::DialSucceeded, t);
-        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
-        let _ = s.on_event(ConnEvent::FrameReceived, t);
-        let first = last_frame_wall_ms(idx).expect("published on the first frame");
-        assert!(first > 0);
-        // Overwrite with a sentinel: a frame inside the second must not
-        // republish.
-        SLOT_LAST_FRAME_WALL_MS[usize::from(idx)]
-            .0
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(500));
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(999));
-        assert_eq!(last_frame_wall_ms(idx), Some(1));
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(1_000));
-        assert!(last_frame_wall_ms(idx).unwrap_or(0) >= first);
-        assert_eq!(last_frame_wall_ms(200), None);
-        assert_eq!(snapshot_frame_activity().len(), GHOST_REDIAL_SLOTS);
-    }
-
-    #[test]
-    fn test_subscribed_wall_ms_is_stamped_at_the_subscribe_ack() {
-        // PR54: the deaf-socket gauge ages a never-delivering socket from its
-        // subscribe. The stamp is taken at the ack, before any frame.
-        let idx = 28;
-        let t = t0();
-        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::Depth20, idx), t);
-        let _ = s.on_event(ConnEvent::BeginDial, t);
-        let _ = s.on_event(ConnEvent::DialSucceeded, t);
-        let before = wall_clock_ms();
-        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
-        let stamp = subscribed_wall_ms(idx).expect("stamped at the subscribe ack");
-        assert!(stamp >= before, "the stamp is the ack's wall time");
-        assert_eq!(subscribed_wall_ms(200), None, "out of range reads None");
-    }
-
-    #[test]
-    fn frame_gap_peak_is_the_largest_gap_inside_the_window() {
-        let idx = 29;
-        let t = t0();
-        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, idx), t);
-        let _ = s.on_event(ConnEvent::BeginDial, t);
-        let _ = s.on_event(ConnEvent::DialSucceeded, t);
-        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
-        // The first poll opens the window (AlwaysOn) and resets the peak.
-        assert_eq!(s.poll(t), SupervisorAction::Continue);
-        // The first frame's gap is the dial, not a gap between frames.
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(20));
-        assert_eq!(frame_gap_peak_secs(idx), Some(0));
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(25));
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(32));
-        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(33));
-        assert_eq!(frame_gap_peak_secs(idx), Some(7));
-        assert_eq!(frame_gap_peak_secs(200), None);
-        publish_frame_gap_peaks();
-        seed_frame_silence_counters();
-    }
-
-    /// Slot 27 is written by no other test in this module.
-    const REGISTER_TEST_SLOT: u8 = 27;
-
-    #[test]
-    fn test_last_frame_wall_ms_and_snapshot_frame_activity_read_the_register() {
-        let idx = usize::from(REGISTER_TEST_SLOT);
-        SLOT_LAST_FRAME_WALL_MS[idx]
-            .0
-            .store(WALL0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), Some(WALL0));
-        assert_eq!(snapshot_frame_activity()[idx], WALL0);
-        // 0 means never delivered: no stamp.
-        SLOT_LAST_FRAME_WALL_MS[idx]
-            .0
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), None);
-        assert_eq!(snapshot_frame_activity()[idx], 0);
-        assert_eq!(last_frame_wall_ms(u8::MAX), None);
-    }
-
-    #[test]
-    fn test_frame_gap_peak_secs_rounds_down_and_publish_frame_gap_peaks_reads_it() {
-        let idx = usize::from(REGISTER_TEST_SLOT);
-        SLOT_FRAME_GAP_PEAK_MS[idx].store(7_999, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(7));
-        SLOT_FRAME_GAP_PEAK_MS[idx].store(999, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(0));
-        assert_eq!(frame_gap_peak_secs(u8::MAX), None);
-        // Publishing reads the register and never panics without a recorder.
-        publish_frame_gap_peaks();
-        SLOT_FRAME_GAP_PEAK_MS[idx].store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[test]
-    fn test_seed_frame_silence_counters_is_idempotent() {
-        // Seeding adds zero, so running it twice (two lane starts) is safe.
-        seed_frame_silence_counters();
-        seed_frame_silence_counters();
-        assert_eq!(
-            DATA_SILENCE_STALE_METRIC,
-            "tv_dhan_ws_data_silence_request_stale_total"
-        );
-    }
-
-    #[test]
-    fn test_overflow_episode_engaged_reads_the_never_cleared_flag() {
-        assert_eq!(
-            overflow_episode_engaged(),
-            OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
-        );
-    }
-
-    #[test]
-    fn test_confirmed_threshold_secs_doubles_per_strike_and_caps_at_300() {
-        let t = t0();
-        for (endpoint, expected) in [
-            (DhanEndpointType::MainFeed, [60, 120, 240, 300, 300]),
-            (DhanEndpointType::Depth20, [90, 180, 300, 300, 300]),
-            (DhanEndpointType::Depth200, [300, 300, 300, 300, 300]),
-        ] {
-            let mut s = ConnectionSupervisor::new(slot_at(endpoint, REGISTER_TEST_SLOT), t);
-            for (strikes, want) in expected.into_iter().enumerate() {
-                s.silence_strikes = u8::try_from(strikes).expect("small");
-                assert_eq!(s.confirmed_threshold_secs(), want, "{endpoint:?} {strikes}");
-            }
-            s.silence_strikes = u8::MAX;
-            assert_eq!(s.confirmed_threshold_secs(), FRAME_SILENCE_REDIAL_SECS);
-        }
-    }
-
-    proptest! {
-        /// Frames that never leave a gap as long as the shortest confirmed
-        /// threshold never earn a silence redial, whatever the evidence says.
-        #[test]
-        fn gaps_below_the_threshold_never_redial(
-            gaps in proptest::collection::vec(1_u64..60, 1..20),
-            endpoint_pick in 0_u8..2,
-        ) {
-            let endpoint = if endpoint_pick == 0 {
-                DhanEndpointType::MainFeed
-            } else {
-                DhanEndpointType::Depth20
-            };
-            let base = endpoint.jitter_base();
-            let t = t0();
-            let spacing = fresh_spacing();
-            let mut s = live_sup(endpoint, base, 5_000, FrameSilenceFastPath::Act, t);
-            let siblings = [base + 1, base + 2, base + 3];
-            let mut at: u64 = 0;
-            for gap in gaps {
-                for _ in 0..gap {
-                    at += 1;
-                    let action = poll_at(&mut s, t, at, &siblings, false, &spacing);
-                    prop_assert_eq!(action, SupervisorAction::Continue);
-                }
-                let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(at));
-            }
-            prop_assert_eq!(s.silence_strikes(), 0);
-            prop_assert_eq!(s.reconnects(), 0);
-        }
-    }
-}
+#[path = "pool_supervisor/frame_silence_evidence_tests.rs"]
+mod frame_silence_evidence_tests;

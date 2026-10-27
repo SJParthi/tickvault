@@ -40,7 +40,7 @@ use tickvault_core::instrument::master_csv::{InstrumentClass, MasterRow, OptionL
 use tickvault_storage::instrument_lifecycle_persistence::{
     InstrumentLifecycleAuditRow, InstrumentLifecycleRow, LIFECYCLE_FEED_DHAN, LifecycleState,
     TransitionKind, append_instrument_lifecycle_audit_rows, append_instrument_lifecycle_rows,
-    ensure_instrument_lifecycle_audit_table,
+    ensure_instrument_lifecycle_audit_table, ensure_instrument_lifecycle_table,
 };
 
 /// Seconds a QuestDB `/exec` read of the known-instrument set may take.
@@ -719,6 +719,45 @@ pub async fn write_dhan_lifecycle(
 ) -> anyhow::Result<LifecycleTally> {
     // The audit failure counter is seeded at boot (main.rs), after the
     // metrics recorder is installed, so a scrape sees 0 before any failure.
+
+    // --- Both SEBI tables must carry their DEDUP key before any row goes in ---
+    //
+    // The DDL is ensured here rather than at boot because this is the only
+    // writer: ILP would otherwise auto-create the table without its DEDUP
+    // key. For `instrument_lifecycle` that is the whole design: its
+    // designated `ts` is a constant, so the key is the only thing that keeps
+    // ONE row per instrument, and an unkeyed table gains a second copy of
+    // all ~150,000 instruments on every daily run. For the audit table a
+    // re-run would append a second, contradictory history for the same day.
+    //
+    // **⚠ CHANGED 2026-10-26 (audit J3):** until this date only the AUDIT
+    // table was ensured here, and `instrument_lifecycle` had no production
+    // ensure at all, so a fresh or restored QuestDB got it auto-created with
+    // no key. Both are ensured now, and when either cannot be confirmed keyed
+    // (QuestDB refused, still replaying its WAL, or unreachable) the whole
+    // write is held back: the table keeps yesterday's state, nothing is
+    // deleted, and the next run (the next boot, or tomorrow) writes it.
+    // Pinned by `ensure_ddl_boot_wiring_guard::the_lifecycle_write_is_held_back_when_a_sebi_table_is_not_keyed`.
+    let lifecycle_keyed = ensure_instrument_lifecycle_table(questdb).await;
+    let audit_keyed = ensure_instrument_lifecycle_audit_table(questdb).await;
+    if !(lifecycle_keyed && audit_keyed) {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+            source = "lifecycle_ddl_not_keyed",
+            lifecycle_keyed,
+            audit_keyed,
+            "instrument lifecycle write held back: QuestDB did not confirm the DEDUP key on \
+             the SEBI lifecycle tables, and writing into a table without it would append a \
+             duplicate copy of every instrument. Nothing was written or deleted; the tables \
+             keep yesterday's state and the next run writes today's."
+        );
+        return Err(anyhow::anyhow!(
+            "instrument lifecycle write held back: DEDUP key not confirmed \
+             (instrument_lifecycle keyed = {lifecycle_keyed}, \
+             instrument_lifecycle_audit keyed = {audit_keyed})"
+        ));
+    }
+
     let known = fetch_known_instruments(questdb).await;
     let (rows, tally) =
         build_lifecycle_rows(master, &known, today_ymd, today_ist_nanos, source_sha256);
@@ -735,13 +774,7 @@ pub async fn write_dhan_lifecycle(
     // table keeps yesterday's state for it, and the next run records the
     // transition. Rows with no transition today are never held back, so
     // one refused audit row costs one instrument's state update, not the
-    // day's.
-    //
-    // The DDL is ensured here rather than at boot because this is the only
-    // writer: ILP would otherwise auto-create the table without its DEDUP
-    // key, and a re-run would then append a second, contradictory history for
-    // the same day instead of upserting onto the first.
-    ensure_instrument_lifecycle_audit_table(questdb).await;
+    // day's. (Both tables' DDL is ensured at the top of this function.)
     let audit_rows = build_lifecycle_audit_rows(&rows, &known, today_ist_nanos, source_sha256);
     let report = write_audit_then_lifecycle(
         &rows,

@@ -476,10 +476,9 @@ jobs:
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03 — kept consistent with deploy-aws.yml: no prod mutation,
           # app OR infra, during 09:00 till 3.45 pm IST).
-          UTC_HOUR=$(date -u +%H)
-          UTC_MINUTE=$(date -u +%M)
-          UTC_DOW=$(date -u +%u)  # 1=Mon, 7=Sun
-          UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
+          # 1=Mon, 7=Sun. One line since 2026-10-26 (audit PR L4): the lines
+          # saved pay for the same check re-run right before `terraform apply`.
+          UTC_HOUR=$(date -u +%H); UTC_MINUTE=$(date -u +%M); UTC_DOW=$(date -u +%u); UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
 
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
@@ -651,7 +650,17 @@ jobs:
         # the zips locally. archive_file is deterministic, and apply only runs
         # after the plan job already passed + the market-hours guard, so a
         # same-commit re-plan is safe and idempotent.
-        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color
+        #
+        # 2026-10-26 (audit PR L4): the guard job ran before the Lambda build,
+        # which can take many minutes; an apply that passed the guard at 08:55
+        # could reach this step inside the 09:00-15:45 IST band. The same
+        # check (same override input) runs again immediately before applying.
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
+        run: |
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ] && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]; then echo "::error::BLOCK: it is $HHMM IST, inside the 09:00-15:45 IST no-deploy band, at apply time. Re-run after 15:45 IST or with confirm_market_hours=yes."; exit 1; fi
+          terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color
 
       - name: Capture outputs
         id: outputs

@@ -39,6 +39,36 @@ resource "aws_cloudwatch_log_group" "tv_metrics" {
   retention_in_days = 14
 }
 
+# 2026-10-26 (audit PR M / M4): two more auto-created groups with NO retention,
+# read live: the QuestDB console front and proxy Lambdas never declared a log
+# group, so the runtime created both on first invoke with "never expire".
+# Adopted with the same 14 days as operator-control above. Gated on the same
+# flag as the Lambdas (`for_each` on the import, Terraform >= 1.7), so a stack
+# with the console off neither imports nor creates them.
+import {
+  for_each = var.enable_questdb_console ? toset(["front"]) : toset([])
+  to       = aws_cloudwatch_log_group.questdb_console_front[0]
+  id       = "/aws/lambda/tv-${var.environment}-questdb-console-front"
+}
+
+resource "aws_cloudwatch_log_group" "questdb_console_front" {
+  count             = var.enable_questdb_console ? 1 : 0
+  name              = "/aws/lambda/tv-${var.environment}-questdb-console-front"
+  retention_in_days = 14
+}
+
+import {
+  for_each = var.enable_questdb_console ? toset(["proxy"]) : toset([])
+  to       = aws_cloudwatch_log_group.questdb_console_proxy[0]
+  id       = "/aws/lambda/tv-${var.environment}-questdb-console-proxy"
+}
+
+resource "aws_cloudwatch_log_group" "questdb_console_proxy" {
+  count             = var.enable_questdb_console ? 1 : 0
+  name              = "/aws/lambda/tv-${var.environment}-questdb-console-proxy"
+  retention_in_days = 14
+}
+
 # ---------------------------------------------------------------------------
 # Account-level CloudWatch Logs ingestion alarm — catches ANY log runaway
 # (a debug-loop Lambda, a chatty agent scrape, a new unretained group)
@@ -80,7 +110,7 @@ resource "aws_cloudwatch_metric_alarm" "logs_ingestion_runaway" {
 # guaranteed false-pager while the box is intentionally stopped (nightly /
 # weekend / weekday-NSE-holiday self-stop via the holiday gate), so actions are
 # OFF by default and window-gated: the market-hours gate Lambda
-# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri —
+# (market-hours-liveness-alarm.tf) enables them 09:20-15:40 IST Mon-Fri —
 # and, per the 2026-07-07 review fix, ONLY after verifying the tv-app
 # instance is actually up (the open cron is holiday-blind; the box is OFF on
 # weekday NSE holidays, so a blind enable would false-page ~09:35 IST every
@@ -108,7 +138,7 @@ resource "aws_cloudwatch_metric_alarm" "app_log_ingestion_silent" {
   }
 
   # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri — only when the box is actually up — so the
+  # 09:20-15:40 IST Mon-Fri — only when the box is actually up — so the
   # intentional nightly/weekend/NSE-holiday stop (box down => zero ingestion
   # => missing datapoints) can never false-page.
   actions_enabled = false

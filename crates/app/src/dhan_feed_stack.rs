@@ -84,11 +84,16 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 mod catchup_stop;
+// M2 (2026-10-26): a catch-up round settled segment by segment.
+mod replay_chunks;
 // Item 45a (2026-09-29): the after-close pass that writes back order-book rows
 // the ingest shed skipped. A child module so it reuses the drain's own packet
 // walk and depth writers rather than a second copy of either.
 pub(crate) mod deferred_depth_pass;
 mod unbacked_depth;
+// Plan item J2 (2026-10-26): what the drain and its writer threads still
+// held at shutdown, counted rather than dropped silently.
+mod shutdown_residue;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -111,7 +116,8 @@ use tickvault_core::parser::depth::{
 };
 use tickvault_core::parser::dispatcher::dispatch_frame;
 use tickvault_core::pipeline::tick_gap_detector::{
-    DetectorConfig, SilenceVerdict, TickGapDetector, TickObservation,
+    DetectorConfig, LttVerdict, SilenceVerdict, TickAssessment, TickGapDetector, TickObservation,
+    VolumeVerdict,
 };
 use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
@@ -207,12 +213,24 @@ pub const FEED_STACK_UP_GAUGE: &str = "tv_dhan_feed_stack_up";
 /// until then it is honestly unwatched rather than dishonestly absent.
 pub const DEPTH_OFFLOAD_DEGRADED_GAUGE: &str = "tv_dhan_depth_offload_degraded";
 
-/// Gauge: connections the plan reserved, by endpoint type.
+/// Gauge: connections the pool has reserved, by endpoint type.
 ///
-/// PLANNED, not alive. It is written once at bring-up and never moves again, so
-/// it answers "what did we intend?" and cannot answer "what is still running?".
-/// Use [`ALIVE_CONNECTIONS_GAUGE`] for the latter.
+/// RESERVED, not alive. Set at bring-up and again after every dial (a widen
+/// adds main-feed sockets after the contract attach), so it answers "what did
+/// we intend?" and cannot answer "what is still running?". Use
+/// [`ALIVE_CONNECTIONS_GAUGE`] for the latter. ⚠ CHANGED 2026-10-26 (PR M /
+/// M4): it was written ONCE from the boot plan and read 1 main-feed socket all
+/// session on 2026-10-26 while the widen brought up five.
 pub const FEED_STACK_CONNECTIONS_GAUGE: &str = "tv_dhan_feed_stack_connections";
+
+/// Publishes [`FEED_STACK_CONNECTIONS_GAUGE`] from the pool's reservations.
+/// O(endpoint kinds), cold: bring-up and once per dial batch, never per frame.
+fn publish_reserved_connections(pool: &PoolSupervisor) {
+    for endpoint in DhanEndpointType::ALL {
+        metrics::gauge!(FEED_STACK_CONNECTIONS_GAUGE, "endpoint" => endpoint.as_str())
+            .set(f64::from(pool.open_count(endpoint)));
+    }
+}
 
 /// Gauge: sockets whose supervisor task is still running, right now.
 ///
@@ -1119,6 +1137,17 @@ pub const INGEST_SEQ_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_seq_refused_to
 /// log line carries `origin` (`live` or `replay`); the counter has no label.
 const TICK_UNKNOWN_SEGMENT_COUNTER: &str = "tv_dhan_feed_tick_unknown_segment_total";
 
+/// Counter: gap-detector verdicts that suggest a missed or reordered packet,
+/// labelled `verdict`: `ltt_backward` (a tick's last-traded time went back,
+/// the strong signal) and `volume_jump` (cumulative volume rose far above the
+/// instrument's learned delta, weak evidence on a conflated feed). ADDED
+/// 2026-10-26 (plan item K3): both were computed per tick by
+/// `TickGapDetector::observe` and thrown away by the drain. Local Prometheus
+/// only: NOT in the CloudWatch EMF selector, no metric filter, no alarm, no
+/// Telegram. Like the unknown-segment counter it runs in `ingest_tick_at`, so
+/// it counts live AND replayed ticks.
+const TICK_VERDICT_COUNTER: &str = "tv_dhan_feed_tick_verdict_total";
+
 /// Counter: live ticks folded end-to-end (gap detector → aggregator → writer).
 pub const INGEST_TICKS_COUNTER: &str = "tv_dhan_feed_ingest_ticks_total";
 
@@ -1542,6 +1571,12 @@ pub struct LiveIngest {
     /// tail batch for a box that never stops, which is the worse failure on a
     /// host whose auto-stop is a cost control.
     writer_done: Option<std::sync::mpsc::Receiver<()>>,
+    /// The tick writer and rescue threads' queues, shared so an abandoned
+    /// thread's batches are counted in ROWS (plan item J2).
+    writer_queue:
+        Option<shutdown_residue::OffloadQueue<tickvault_storage::tick_persistence::FlushBatch>>,
+    rescue_queue:
+        Option<shutdown_residue::OffloadQueue<tickvault_storage::tick_persistence::RescueBatch>>,
     /// Previous closes, one per instrument, fed from the response-code-6
     /// packets this drain used to decode and discard.
     ///
@@ -1619,6 +1654,20 @@ struct SealTally {
     emitted: u64,
     dropped: u64,
     rescued: u64,
+}
+
+impl SealTally {
+    /// True when every bar a seal pass produced is accounted for: emitted,
+    /// rescued to disk, or lost. A rescued seal is neither emitted nor
+    /// dropped, so a ledger without it read a rescue as missing and the
+    /// `debug_assert` beside it panicked the drain in a debug build (audit
+    /// L3, 2026-10-26). O(1).
+    fn accounts_for(self, bars: u64) -> bool {
+        bars == self
+            .emitted
+            .saturating_add(self.dropped)
+            .saturating_add(self.rescued)
+    }
 }
 
 /// Routes one sealed bar from a catch-up seal or the replay hand-over to the
@@ -1845,6 +1894,8 @@ impl LiveIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             prev_close_disagreements: 0,
             // Resolved once here and seeded at zero, so the series exists
@@ -2066,7 +2117,7 @@ impl LiveIngest {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (sink_tx, sink_rx) = std::sync::mpsc::sync_channel::<(
             tickvault_storage::tick_persistence::TickWriterSink,
-            std::sync::mpsc::Receiver<tickvault_storage::tick_persistence::FlushBatch>,
+            shutdown_residue::OffloadQueue<tickvault_storage::tick_persistence::FlushBatch>,
         )>(1);
         let handle = std::thread::Builder::new()
             .name("tv-tick-writer".to_owned())
@@ -2074,14 +2125,14 @@ impl LiveIngest {
                 // Parks until the caller hands over. `Err` means the caller
                 // went away between the spawn and the hand-off, which is not a
                 // failure to report — there is simply nothing to write.
-                let Ok((mut sink, rx)) = sink_rx.recv() else {
+                let Ok((mut sink, queue)) = sink_rx.recv() else {
                     return;
                 };
                 // `recv` ends only when every sender is dropped, i.e. when the
                 // drain itself is gone. There is no other exit, deliberately:
                 // a writer that could stop on its own would leave the producer
                 // handing rows to a closed queue.
-                while let Ok(mut batch) = rx.recv() {
+                while let Some(mut batch) = queue.next() {
                     // `tv_task_busy_seconds{task="tick_writer"}` grows while a
                     // write is stuck on QuestDB; 0 while idle (2026-10-02).
                     tickvault_storage::hot_path_telemetry::busy_begin_at(
@@ -2089,6 +2140,8 @@ impl LiveIngest {
                         std::time::Instant::now(),
                     );
                     let landed = sink.write(&mut batch);
+                    // Landed or rescued: no longer the shutdown's to count.
+                    queue.finished();
                     tickvault_storage::hot_path_telemetry::busy_end_at(
                         tickvault_storage::hot_path_telemetry::HotTask::TickWriter,
                         std::time::Instant::now(),
@@ -2131,7 +2184,10 @@ impl LiveIngest {
         let (producer, sink, rx) = live.split_for_offload();
         self.writer = producer;
         self.writer_offloaded = true;
-        if sink_tx.send((sink, rx)).is_err() {
+        let queue =
+            shutdown_residue::OffloadQueue::new(rx, |b| (b.rows() as u64, b.has_unbacked_rows()));
+        self.writer_queue = Some(queue.clone());
+        if sink_tx.send((sink, queue)).is_err() {
             // Unreachable: the thread parks on this receive as its first act
             // and cannot have exited. Reported rather than ignored, because if
             // it ever happens the writer is split with no thread — the exact
@@ -2160,11 +2216,18 @@ impl LiveIngest {
         // several consecutive flushes, i.e. only when the disk is already
         // wedged. It ran on 2026-08-28 and rescued 308,818 rows.
         let (rescue_sink, rescue_rx) = self.writer.split_rescue_offload();
+        // `RescueBatch::rows` and `has_unbacked_rows` let an abandoned rescue
+        // thread be counted in rows (plan item J2).
+        let rescue_queue = shutdown_residue::OffloadQueue::new(rescue_rx, |b| {
+            (b.rows() as u64, b.has_unbacked_rows())
+        });
+        self.rescue_queue = Some(rescue_queue.clone());
         let rescue_handle = std::thread::Builder::new()
             .name("tv-tick-rescue".to_owned())
             .spawn(move || {
-                while let Ok(batch) = rescue_rx.recv() {
+                while let Some(batch) = rescue_queue.next() {
                     rescue_sink.rescue(&batch);
+                    rescue_queue.finished();
                 }
                 info!("tick rescue thread exiting — the drain closed its queue");
             })?;
@@ -2285,13 +2348,27 @@ impl LiveIngest {
         });
         if !finished {
             metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(1);
+            // Plan item J2: the counter above is one per EVENT. What the thread
+            // still held is counted in rows; its unbacked rows (no WAL record,
+            // so no replay) on `tv_ticks_lost_total{source="writer_abandoned"}`.
+            let residue = self.writer_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::WRITER_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 grace_secs = OFFLOAD_SHUTDOWN_GRACE.as_secs(),
+                batches,
+                rows,
+                unbacked_rows,
                 "the tick writer did not finish within the shutdown grace — the \
                  final batch of the session may not have reached QuestDB. Check \
                  the tick spill directory; the rows are re-ingestable if they \
-                 were rescued."
+                 were rescued. It still held {batches} batch(es) of {rows} row(s); \
+                 {unbacked_rows} had no WAL record and are counted lost, the rest \
+                 replay from the WAL (-1 = the queue could not be read)."
             );
             // Deliberately NOT joined after a timeout: joining here is exactly
             // the unbounded wait the grace exists to avoid. The thread is
@@ -2332,11 +2409,27 @@ impl LiveIngest {
                 "writer" => "tick"
             )
             .increment(1);
+            // Plan item J2: that counter is one per EVENT. The rows still held
+            // are counted here; the unbacked share is a real loss on
+            // `tv_ticks_lost_total{source="rescue_abandoned"}`, and a dropped
+            // batch keeps its watermark floor, so the backed share replays.
+            let residue = self.rescue_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::RESCUE_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                batches,
+                rows,
+                unbacked_rows,
                 "the tick RESCUE thread did not finish within the shutdown budget — a \
                  rescued payload may never have reached the spill file. Those rows were \
-                 counted as rescued and are not in QuestDB either."
+                 counted as rescued and are not in QuestDB either. It still held \
+                 {batches} batch(es) of {rows} row(s); {unbacked_rows} had no WAL record \
+                 and are counted lost, the rest replay from the WAL (-1 = the queue could \
+                 not be read)."
             );
             // Deliberately not joined after the deadline: that is the unbounded
             // wait the budget exists to avoid.
@@ -2348,10 +2441,21 @@ impl LiveIngest {
                 "writer" => "tick"
             )
             .increment(1);
+            // A dead thread wrote nothing still queued: counted in rows (J2).
+            let residue = self.rescue_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::RESCUE_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                batches,
+                rows,
+                unbacked_rows,
                 "the tick rescue thread PANICKED — a rescued payload may never have \
-                 reached the spill file."
+                 reached the spill file. It still held {batches} batch(es) of {rows} \
+                 row(s); {unbacked_rows} had no WAL record and are counted lost."
             );
         }
     }
@@ -2767,7 +2871,11 @@ impl LiveIngest {
         // aggregate, and AGGREGATOR-DROP-01's 30-second delta report is where
         // a systemic refusal rate surfaces today.
         if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
-            let _assessment = self.detector.observe(obs);
+            let assessment = self.detector.observe(obs);
+            // Plan item K3: count the two loss-adjacent verdicts instead of
+            // dropping them. Pre-resolved handles, two matches, no allocation.
+            let c = counters();
+            count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
         }
 
         // Seals go STRAIGHT to the process-wide seal writer — the same
@@ -3393,10 +3501,14 @@ impl LiveIngest {
                     emitted = emitted.saturating_add(1);
                 }
             });
-        debug_assert_eq!(
-            bars as u64,
-            emitted.saturating_add(dropped),
-            "every bar force_seal_all produced must be accounted as emitted or dropped"
+        debug_assert!(
+            SealTally {
+                emitted,
+                dropped,
+                rescued,
+            }
+            .accounts_for(bars as u64),
+            "every bar force_seal_all produced must be accounted as emitted, rescued or dropped"
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
@@ -3703,10 +3815,12 @@ impl LiveIngest {
         // with one number. Outside the session the latch is CLEARED, not held:
         // the pre-open must not carry a verdict into the bell, and a post-close
         // latch would only ever be consulted by the next boot's fresh state.
+        let scan_secs = ist_secs_of_day_from_millis(now_millis);
         if dead_class_verdict_is_due(
-            is_within_market_hours_ist(ist_secs_of_day_from_millis(now_millis)),
+            is_within_market_hours_ist(scan_secs),
             silence_page_allowed_today(),
-        ) {
+        ) || muhurat_silence_check_due_now(scan_secs)
+        {
             self.report_dead_classes(&classes);
         } else {
             self.stand_down_dead_class_report();
@@ -4199,10 +4313,9 @@ impl LiveIngest {
                 );
             },
         );
-        debug_assert_eq!(
-            bars as u64,
-            tally.emitted.saturating_add(tally.dropped),
-            "every bar catch_up_seal_slots produced must be accounted as emitted or dropped"
+        debug_assert!(
+            tally.accounts_for(bars as u64),
+            "every bar catch_up_seal_slots produced must be accounted as emitted, rescued or dropped"
         );
         let (emitted, dropped) = (tally.emitted, tally.dropped);
         self.apply_seal_tally(tally);
@@ -4312,6 +4425,10 @@ pub struct DrainCounters {
     ingest_seq_refused: metrics::Counter,
     /// See `TICK_UNKNOWN_SEGMENT_COUNTER` (audit INP-1, 2026-10-11).
     tick_unknown_segment: metrics::Counter,
+    /// See `TICK_VERDICT_COUNTER` (plan item K3, 2026-10-26).
+    verdict_ltt_backward: metrics::Counter,
+    /// See `TICK_VERDICT_COUNTER` (plan item K3, 2026-10-26).
+    verdict_volume_jump: metrics::Counter,
     refused_price: metrics::Counter,
     refused_timestamp: metrics::Counter,
     refused_slot: metrics::Counter,
@@ -4395,6 +4512,24 @@ impl DrainCounters {
     }
 }
 
+/// Counts a tick's loss-adjacent gap-detector verdicts (plan item K3): an
+/// LTT that went backward and a volume jump far above the learned delta. The
+/// other verdicts (first sight, repeated, advanced, unchanged, regressed) are
+/// not counted here. Per tick, O(1), two matches on `Copy` enums and at most
+/// two increments on pre-resolved handles, no allocation.
+fn count_tick_verdicts(
+    ltt_backward: &metrics::Counter,
+    volume_jump: &metrics::Counter,
+    assessment: &TickAssessment,
+) {
+    if matches!(assessment.ltt, LttVerdict::Backward { .. }) {
+        ltt_backward.increment(1);
+    }
+    if matches!(assessment.volume, VolumeVerdict::SuspectedGap { .. }) {
+        volume_jump.increment(1);
+    }
+}
+
 /// Process-wide handle set, resolved on first use.
 /// The process-wide cached handle set.
 ///
@@ -4420,6 +4555,8 @@ pub fn counters() -> &'static DrainCounters {
         ingest_ticks: metrics::counter!(INGEST_TICKS_COUNTER),
         ingest_seq_refused: metrics::counter!(INGEST_SEQ_REFUSED_COUNTER),
         tick_unknown_segment: metrics::counter!(TICK_UNKNOWN_SEGMENT_COUNTER),
+        verdict_ltt_backward: metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "ltt_backward"),
+        verdict_volume_jump: metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "volume_jump"),
         refused_price: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "price"),
         refused_timestamp: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "timestamp"),
         refused_slot: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "slot_exhausted"),
@@ -4501,6 +4638,9 @@ fn seed_drain_loss_baselines() {
     // same operator action: check the spill directory before the next session.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(0);
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth").increment(0);
+    // Plan item J2: the row-level shutdown loss sources (ring residue, and the
+    // writer and rescue threads' abandoned rows), seeded with their siblings.
+    shutdown_residue::seed_shutdown_loss_baselines();
     // The third label, `writer="top_volume"` (2026-09-13), went with the
     // top-volume writer on 2026-10-22 (plan item 62, operator Quote 34).
     // Rescues written WITHOUT a free-space answer, because the free-space probe
@@ -4526,6 +4666,10 @@ fn seed_drain_loss_baselines() {
     c.refused_timestamp.increment(0);
     c.refused_slot.increment(0);
     c.refused_session.increment(0);
+    // Plan item K3 (2026-10-26): the gap detector's two loss-adjacent
+    // verdicts, both label sets, so a session with none reads 0, not absent.
+    c.verdict_ltt_backward.increment(0);
+    c.verdict_volume_jump.increment(0);
     // ADDED 2026-09-10 by the compound-failure permutation sweep. The ghost
     // family is the ONLY instrument that can verify the depth unsubscribe
     // RequestCode live: the scope lock names "a session with `ghost = 0` and
@@ -6603,14 +6747,30 @@ async fn run_frame_drain(
     // invites the symmetric edit. Latch the arm shut instead of relying on
     // that.
     let mut seed_closed = false;
+    // Plan item J2 (2026-10-26): set by the shutdown arm. From then on the
+    // drain keeps folding queued frames until the ring is empty or the tail
+    // budget passes, instead of dropping the receiver with frames still in it.
+    let mut shutting_down = false;
+    // True when the loop ended because every socket sender was dropped,
+    // false when the shutdown signal ended it (the final line says which).
+    let mut ring_closed = false;
+    let ring_tail_deadline = tokio::time::sleep(std::time::Duration::ZERO);
+    tokio::pin!(ring_tail_deadline);
 
     loop {
         tokio::select! {
             // Biased so frames always win a tie: the flush timer firing while
             // frames are queued must not preempt draining them.
             biased;
+            // The ring tail's time limit, ABOVE the frame arm so a socket that
+            // keeps delivering cannot hold the shutdown past it. One bool test
+            // per poll until the shutdown arm sets it.
+            () = &mut ring_tail_deadline, if shutting_down => break,
             maybe_frame = rx.recv() => {
-                let Some(frame) = maybe_frame else { break };
+                let Some(frame) = maybe_frame else {
+                    ring_closed = true;
+                    break;
+                };
                 // The lane is UP the moment a frame actually arrives, and not
                 // one instant sooner (plan Item 7). Raised once per drain, from
                 // the only place in the process that has proof a socket both
@@ -6684,8 +6844,13 @@ async fn run_frame_drain(
                     tickvault_storage::hot_path_telemetry::Stage::RingDwell,
                     u64::try_from(queued_nanos).unwrap_or(0),
                 );
-                tickvault_storage::hot_path_telemetry::beat(
+                // K6 (2026-10-26): the beat's clock reading also starts the
+                // main-feed frame timer below, so the stage costs one more
+                // `Instant` read per frame, not two.
+                let frame_work_start = std::time::Instant::now();
+                tickvault_storage::hot_path_telemetry::beat_at(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
+                    frame_work_start,
                 );
                 // The receipt the WAL record carries, read off the frame
                 // rather than re-derived as `now() - queued` (audit PR31).
@@ -6730,6 +6895,14 @@ async fn run_frame_drain(
                     DhanEndpointType::MainFeed => {
                         let outcome = drain_main_feed_frame(
                             &mut ingest, &frame, received_at_nanos, recv_millis, c,
+                        );
+                        // K6: decode + fold + row append for this frame, as a
+                        // hot-path stage, so the live p99 covers the drain's
+                        // own work. One clock read and four relaxed atomics,
+                        // no allocation.
+                        tickvault_storage::hot_path_telemetry::record_stage(
+                            tickvault_storage::hot_path_telemetry::Stage::DrainMainFrame,
+                            frame_work_start.elapsed(),
                         );
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
@@ -6973,6 +7146,18 @@ async fn run_frame_drain(
                     publish_fold_depth(&ingest);
                 }
             }
+            // The ring tail is done once the frame arm finds the ring EMPTY.
+            // `consume_budget` and not a ready future: when the task's
+            // cooperative budget is spent, `recv` returns Pending with frames
+            // still queued, and so does this, so the select yields and the
+            // frame arm is polled first again with a fresh budget. Ready here
+            // therefore means `recv` saw an empty ring; `is_empty` re-checks
+            // for a frame that landed in between.
+            () = tokio::task::coop::consume_budget(), if shutting_down => {
+                if rx.is_empty() {
+                    break;
+                }
+            }
             // SHUTDOWN (added 2026-08-14). Deliberately placed BELOW the frame
             // arm in this `biased` select, and that ordering is load-bearing:
             // a shutdown signal must not preempt frames already sitting in the
@@ -7024,7 +7209,21 @@ async fn run_frame_drain(
                          persisted"
                     );
                 }
-                break;
+                // Plan item J2: an empty ring ends the loop now, as before. A
+                // ring still holding frames (a socket still open delivered
+                // during the seal and flush above) keeps folding for at most
+                // the tail budget; the two arms around the frame arm end it,
+                // and whatever is left is counted after the loop. A second
+                // signal does not extend it.
+                if rx.is_empty() {
+                    break;
+                }
+                if !shutting_down {
+                    shutting_down = true;
+                    ring_tail_deadline.as_mut().reset(
+                        tokio::time::Instant::now() + shutdown_residue::SHUTDOWN_RING_TAIL_BUDGET,
+                    );
+                }
             }
             // TIME trigger. Without it, the last rows of a thinly-traded
             // instrument sit unflushed below the size threshold waiting for a
@@ -7466,8 +7665,11 @@ async fn run_frame_drain(
                 // (`groww_contract_1m_boot`, `groww_option_chain_1m_boot`,
                 // `brutex_crossverify_boot`, `feed_scoreboard_boot`); the
                 // revived lane was the one regression.
-                if !is_within_market_hours_ist(now_ist_secs_of_day())
-                    || !silence_page_allowed_today()
+                let silence_secs = now_ist_secs_of_day();
+                // Audit L3: on a Muhurat day (an NSE holiday) the check runs
+                // in the Muhurat continuous session too.
+                if (!is_within_market_hours_ist(silence_secs) || !silence_page_allowed_today())
+                    && !muhurat_silence_check_due_now(silence_secs)
                 {
                     silent_scans = 0;
                     silence_reported = false;
@@ -7640,7 +7842,30 @@ async fn run_frame_drain(
         }
     }
 
+    // Plan item J2 (2026-10-26): count what the ring still holds rather than
+    // dropping it with the receiver. WAL-backed frames replay on the next
+    // boot; frames the WAL refused existed only here and are lost, counted and
+    // coded. Bounded by the ring's capacity, so a socket still delivering
+    // cannot hold the shutdown. The receiver is dropped right after, so a
+    // later frame meets a closed ring at its sender, which counts it
+    // (`ring_full`, and marks a backed one unapplied), instead of dying here.
+    let ring_residue = shutdown_residue::drain_ring_residue(
+        || rx.try_recv(),
+        FRAME_RING_CAPACITY,
+        |frame: &CapturedFrame| {
+            match frame.endpoint {
+                DhanEndpointType::MainFeed => main_feed_budget.release(frame.bytes.len()),
+                DhanEndpointType::Depth200 => depth200_budget.release(frame.bytes.len()),
+                _ => depth_budget.release(frame.bytes.len()),
+            }
+            frame.wal_backed
+        },
+    );
+    drop(rx);
+    shutdown_residue::report_ring_residue(ring_residue);
+
     // Every sender was dropped, so no socket is left.
+    // (Or the shutdown signal ended the loop: `ring_closed` says which.)
     //
     // ORDER MATTERS, and it is the reverse of the obvious one. Seal FIRST,
     // flush SECOND. A bucket closes only when a later tick crosses its
@@ -7737,8 +7962,23 @@ async fn run_frame_drain(
         // also the capacity signal for the seal writer.
         seals_rescued = ingest.seals_rescued(),
         seq_refused = ingest.seq_refused(),
-        "Dhan live-feed frame drain ended — every socket sender was dropped, so no further \
-         live ticks will be folded this session"
+        // Plan item J2: this line said "every socket sender was dropped" on
+        // both exits, which was false whenever the shutdown signal ended the
+        // loop. It now names the exit, and what the ring still held.
+        exit = if ring_closed {
+            "senders_dropped"
+        } else {
+            "shutdown_signal"
+        },
+        ring_left_deferred = ring_residue.backed,
+        ring_left_lost = ring_residue.unbacked,
+        "Dhan live-feed frame drain ended ({}) — no further live ticks will be folded \
+         this session",
+        if ring_closed {
+            "every socket sender was dropped"
+        } else {
+            "the shutdown signal stopped it"
+        }
     );
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
     // Returned so the fold is OBSERVABLE (2026-08-11). Previously this took
@@ -14594,6 +14834,8 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         });
         dialed = dialed.saturating_add(1);
     }
+    // A widen admits more main-feed slots after boot; follow it (PR M / M4).
+    publish_reserved_connections(pool);
     dialed
 }
 
@@ -14914,7 +15156,8 @@ fn note_wal_frames_deferred_by_shutdown(
     info!(
         waited_secs,
         staged_frames = frames.len(),
-        "Dhan live feed: shutdown arrived while waiting for authentication — no \
+        "Dhan live feed: shutdown arrived while waiting for authentication or the \
+         dual-instance lock — no \
          socket was dialed, nothing to seal or flush; any staged write-ahead log \
          frames stay staged and are re-offered on the next boot"
     );
@@ -14929,6 +15172,131 @@ fn note_wal_frames_deferred_by_shutdown(
 /// is about to abandon. One atomic load.
 fn shutdown_requested() -> bool {
     tickvault_core::websocket::pool_supervisor::SOCKET_STOP.is_requested()
+}
+
+/// First wait between re-checks of a refused dial precondition (audit L3).
+pub(crate) const LANE_REFUSAL_RETRY_FIRST_SECS: u64 = 5;
+
+/// Largest wait between re-checks of a refused dial precondition (audit L3).
+pub(crate) const LANE_REFUSAL_RETRY_MAX_SECS: u64 = 60;
+
+/// The dial precondition the lane is waiting on (audit L3, 2026-10-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialRefusal {
+    /// No token manager registered: no client id and no JWT to dial with.
+    NoTokenManager,
+    /// A token exists, but this process does not hold the dual-instance lock.
+    LockNotHeld,
+}
+
+/// Wait before re-check `retry` (0-based) of a refused precondition:
+/// 5, 10, 20, 40, then 60 s forever. Pure, O(1).
+#[must_use]
+pub(crate) const fn lane_refusal_retry_secs(retry: u32) -> u64 {
+    let shift = if retry > 4 { 4 } else { retry };
+    let secs = LANE_REFUSAL_RETRY_FIRST_SECS << shift;
+    if secs > LANE_REFUSAL_RETRY_MAX_SECS {
+        LANE_REFUSAL_RETRY_MAX_SECS
+    } else {
+        secs
+    }
+}
+
+/// True while a missing token manager is still the boot's expected
+/// authentication wait (`TOKEN_MANAGER_WAIT_ATTEMPTS` x
+/// `TOKEN_MANAGER_WAIT_INTERVAL_SECS`), which is polled at the flat 5 s
+/// cadence and not reported. A missing lock is never "expected". Pure, O(1).
+const fn in_token_manager_grace(refusal: DialRefusal, waited_secs: u64) -> bool {
+    matches!(refusal, DialRefusal::NoTokenManager)
+        && waited_secs < TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS
+}
+
+/// Waits until the lane may dial: a token manager is registered AND this
+/// process holds the dual-instance lock. Returns the client id, or
+/// `Err(waited_secs)` when a shutdown arrives first.
+///
+/// # Why it never gives up (audit L3, 2026-10-26)
+///
+/// Both refusals used to `return` for the rest of the process: a token
+/// manager that registered after the 300 s wait, or a lock acquired after
+/// the REST stack's patience, left the unit active with zero sockets for the
+/// whole session. Now each refusal re-checks on a capped backoff (5 s
+/// doubling to 60 s) for the life of the process, with ONE coded `error!`
+/// per episode (a new episode starts when the missing precondition changes)
+/// and one `info!` when the lane proceeds. The lock is not weakened: nothing
+/// dials until the flag reads held, and every socket also re-checks it at
+/// its own dial (`dual-instance-lock-2026-07-04.md` §3.6). Staged WAL frames
+/// stay staged while it waits: they are folded once the lane dials, or
+/// deferred to the next boot on shutdown.
+async fn wait_for_dial_preconditions(
+    instance_lock_held: &AtomicBool,
+    shutdown: &tokio::sync::Notify,
+    planned_connections: usize,
+) -> Result<String, u64> {
+    let mut waited_secs: u64 = 0;
+    let mut episode: Option<DialRefusal> = None;
+    let mut retry: u32 = 0;
+    loop {
+        let lock_held = instance_lock_held.load(Ordering::Acquire);
+        let refusal = match global_token_manager().map(|m| m.client_id_string()) {
+            None => DialRefusal::NoTokenManager,
+            Some(id) if lock_held => {
+                if waited_secs > 0 {
+                    info!(
+                        waited_secs,
+                        recovered_from = ?episode,
+                        "Dhan live feed: token manager registered and dual-instance lock \
+                         held — proceeding to dial"
+                    );
+                }
+                return Ok(id);
+            }
+            Some(_) => DialRefusal::LockNotHeld,
+        };
+        let sleep_secs = if in_token_manager_grace(refusal, waited_secs) {
+            TOKEN_MANAGER_WAIT_INTERVAL_SECS
+        } else {
+            if episode != Some(refusal) {
+                episode = Some(refusal);
+                retry = 0;
+                match refusal {
+                    DialRefusal::NoTokenManager => error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "token_manager_missing",
+                        waited_secs,
+                        "Dhan live feed is enabled but no token manager registered within the \
+                         authentication wait, so there is neither a client id nor a JWT to dial \
+                         with — no socket is open. The Dhan REST stack registers the manager \
+                         after authentication (check AUTH-GAP-* and DH-901). Re-checking every \
+                         {LANE_REFUSAL_RETRY_FIRST_SECS}-{LANE_REFUSAL_RETRY_MAX_SECS}s for the \
+                         life of the process."
+                    ),
+                    DialRefusal::LockNotHeld => error!(
+                        code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                        source = "live_lane_dial_refused",
+                        planned_connections,
+                        waited_secs,
+                        "Dhan live feed is enabled and a token exists, but this process does NOT \
+                         hold the dual-instance lock — no socket is open. Another tickvault on \
+                         this account holds it, or the heartbeat lost it; dialing anyway would \
+                         put two boxes on one connection budget. Re-checking every \
+                         {LANE_REFUSAL_RETRY_FIRST_SECS}-{LANE_REFUSAL_RETRY_MAX_SECS}s for the \
+                         life of the process."
+                    ),
+                }
+            }
+            let secs = lane_refusal_retry_secs(retry);
+            retry = retry.saturating_add(1);
+            secs
+        };
+        // SHUTDOWN-AWARE (2026-09-23): a stop arriving during the wait is seen
+        // at once (`notify_one` stores a permit when nobody is waiting).
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+            () = shutdown.notified() => return Err(waited_secs),
+        }
+        waited_secs = waited_secs.saturating_add(sleep_secs);
+    }
 }
 
 /// Closes the lane when a shutdown arrived before the sockets were dialled
@@ -15137,6 +15505,18 @@ pub fn pace_after_replay_flush(
     waits
 }
 
+/// Rows the last replay flush could not hand to the writer threads (M2,
+/// 2026-10-26). Reads the WRITER's retained count: `LiveIngest::pending_rows`
+/// is zeroed by every `flush_ticks`, also when a full queue gave the rows
+/// back, so the pacer read "nothing held" and never waited (`pace_waits` = 0
+/// on all eight boot replays from 19 to 26 Oct). The third full-queue flush
+/// then rescued the rows, the busy rescue thread handed them back to the WAL,
+/// and the ack check refused the batch: the same 5 segments were re-read on
+/// every boot from 21 Oct. O(1).
+fn replay_rows_held(ingest: &LiveIngest, with_depth: bool) -> bool {
+    ingest.writer.pending() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
+}
+
 /// [`pace_after_replay_flush`] on the real writers (audit R1).
 ///
 /// `with_depth` says whether the flush it follows included the depth sink.
@@ -15167,8 +15547,7 @@ fn replay_pace_after_flush(
             if shutdown_requested() {
                 return false;
             }
-            let ingest = ingest.borrow();
-            ingest.pending_rows() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
+            replay_rows_held(&ingest.borrow(), with_depth)
         },
         |step| {
             // A fresh snapshot each step: a rescue elsewhere should end this
@@ -15965,14 +16344,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         }
     };
 
-    for endpoint in DhanEndpointType::ALL {
-        let planned = plan.count_for(endpoint);
-        // `u32::try_from` then `f64::from`: lossless by construction (the count
-        // is bounded by 16), and no lossy `as` cast to justify to clippy.
-        let planned_f64 = f64::from(u32::try_from(planned).unwrap_or(u32::MAX));
-        metrics::gauge!(FEED_STACK_CONNECTIONS_GAUGE, "endpoint" => endpoint.as_str())
-            .set(planned_f64);
-    }
+    // The plan admitted its slots into `pool`, so this is the plan's count.
+    publish_reserved_connections(&pool);
 
     // Captured before the plan is moved into the dial below, so the dial can be
     // checked against what it was ASKED for rather than only reporting itself.
@@ -16065,85 +16438,24 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // The refusal was loud, which is the only reason this was recoverable at
     // all. But a lane that logs an error and exits on every single boot is
     // indistinguishable, in effect, from a lane that was never wired.
-    let mut client_id: Option<String> = None;
-    for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS {
-        if let Some(id) = global_token_manager().map(|m| m.client_id_string()) {
-            if attempt > 0 {
-                info!(
-                    waited_secs = attempt * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-                    "Dhan live feed: token manager registered — proceeding to dial"
-                );
-            }
-            client_id = Some(id);
-            break;
-        }
-        // SHUTDOWN-AWARE (2026-09-23). This wait can run for the full
-        // `TOKEN_MANAGER_WAIT_ATTEMPTS × TOKEN_MANAGER_WAIT_INTERVAL_SECS`
-        // (300 s) — for example while the REST stack sits in its dual-instance
-        // lock patience after a restart. It used to be a bare `sleep`, so a
-        // stop arriving here was never seen: `main` waited its whole shutdown
-        // budget and then logged "the shutdown seal+flush did NOT finish" at
-        // ERROR (observed 2026-09-23 05:10 IST, a deploy restart). Nothing was
-        // lost — no socket had been dialed — but the line claimed otherwise.
-        //
-        // `notify_one` stores a permit when nobody is waiting, so a stop sent
-        // before this future is polled is still seen on the next iteration.
-        // Staged WAL frames are NOT reported as refused here: a planned stop
-        // is not a refusal, and `report_unfolded_wal_frames` increments the
-        // alarmed `tv_ws_frame_wal_reinjected_dropped_total` — so routing a
-        // shutdown through it would page on every stop that lands in this
-        // wait. The segments stay unconfirmed in the replay staging area
-        // (boot stopped confirming on the lane's behalf on 2026-08-28) and
-        // the next boot re-offers them — deferred, not lost.
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(
-                TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-            )) => {}
-            () = params.shutdown.notified() => {
-                note_wal_frames_deferred_by_shutdown(
-                    &params.wal_replay_live_feed,
-                    attempt.saturating_mul(TOKEN_MANAGER_WAIT_INTERVAL_SECS),
-                );
+    //
+    // ⚠ CHANGED 2026-10-26 (audit L3): after the authentication wait the lane
+    // used to REFUSE and return for the rest of the process, and so did a
+    // missing dual-instance lock (checked here anyway, because the lock can
+    // be LOST after acquisition and nothing else between the token and the
+    // dial would notice). Both now wait on a capped backoff for as long as
+    // the process lives; see `wait_for_dial_preconditions`. Nothing dials
+    // before both hold.
+    let client_id =
+        match wait_for_dial_preconditions(&params.instance_lock_held, &params.shutdown, plan.len())
+            .await
+        {
+            Ok(client_id) => client_id,
+            Err(waited_secs) => {
+                note_wal_frames_deferred_by_shutdown(&params.wal_replay_live_feed, waited_secs);
                 return;
             }
-        }
-    }
-    let Some(client_id) = client_id else {
-        error!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            waited_secs = TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-            "Dhan live feed is enabled but no token manager registered within the wait budget, \
-             so there is neither a client id nor a JWT to dial with. REFUSING to open any \
-             socket. The Dhan REST stack registers the manager after authentication — this \
-             means authentication did not complete in time (check AUTH-GAP-* and DH-901)."
-        );
-        report_unfolded_wal_frames(&params.wal_replay_live_feed, "token_manager_missing");
-        return;
-    };
-
-    // ---- dual-instance lock ------------------------------------------------
-    // The token manager above is registered by the REST stack only AFTER it
-    // acquired the SSM instance lock, so on a healthy boot this is already
-    // true. It is checked anyway, because the lock can be LOST after
-    // acquisition (heartbeat renewal failure, a peer seizing the parameter)
-    // and nothing else between the token and the dial would notice: two
-    // boxes on one account is exactly the shape the lock exists to prevent,
-    // and Dhan answers the connection past its cap with 805 — "may result in
-    // user being blocked". Refused, counted through the same refusal path as
-    // the other floors, never dialed.
-    if !params.instance_lock_held.load(Ordering::Acquire) {
-        error!(
-            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
-            source = "live_lane_dial_refused",
-            planned_connections = plan.len(),
-            "Dhan live feed is enabled and a token exists, but this process does NOT hold \
-             the dual-instance lock — REFUSING to open any socket. Another tickvault on \
-             this account holds it, or the heartbeat lost it; dialing anyway would put two \
-             boxes on one five-connection budget."
-        );
-        report_unfolded_wal_frames(&params.wal_replay_live_feed, "instance_lock_not_held");
-        return;
-    }
+        };
 
     // ---- the fold ----------------------------------------------------------
     // DISTINCT slots across all three pools — not the sum of their lengths.
@@ -16846,7 +17158,19 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let mut gap_carry = false;
             // O(1) EXEMPT: begin — one pass over a catch-up batch on the boot drain, cold path
             let mut segment_boundary = false;
-            for f in batch.frames {
+            // M2: where each segment's frames end in `staged`.
+            let segment_ends = std::mem::take(&mut batch.segment_ends);
+            let mut chunk_ends: Vec<replay_chunks::SegmentChunkEnd> =
+                Vec::with_capacity(segment_ends.len());
+            let mut segment_cursor = 0usize;
+            for (batch_idx, f) in batch.frames.into_iter().enumerate() {
+                replay_chunks::close_segments_before(
+                    &segment_ends,
+                    &mut segment_cursor,
+                    batch_idx,
+                    staged.len(),
+                    &mut chunk_ends,
+                );
                 gap_carry |= f.after_gap;
                 segment_boundary |= f.first_in_segment;
                 if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
@@ -16883,6 +17207,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     bytes::Bytes::from(f.frame),
                 ));
             }
+            replay_chunks::close_segments_before(
+                &segment_ends,
+                &mut segment_cursor,
+                usize::MAX,
+                staged.len(),
+                &mut chunk_ends,
+            );
+            let chunk_ends = replay_chunks::checked_chunks(chunk_ends, staged.len());
             // O(1) EXEMPT: end
             // A gap flagged on a frame after the last live-feed one (an
             // order-update or TrueData frame) is still a gap at this round's
@@ -16909,44 +17241,96 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 rounds = rounds.saturating_add(1);
                 continue;
             }
-            let unlanded_before =
-                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            // DA-13c review: the suspicion count BEFORE this round's first ack.
-            let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
             // Audit R1: paced like the boot pass, and never past this
             // drain's own deadline.
             let round_pace_until = wal_replay_pace_until(now_ist_secs_of_day(), Instant::now())
                 .map(|until| until.min(catchup_deadline.into_std()));
-            let outcome = refold_wal_frames(&mut ingest, &staged, &staged_gaps, round_pace_until);
-            let flushed = blocking_flush(|| ingest.flush());
-            // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
-            // the drain rather than re-offering the same batch to a sink that
-            // is not answering: the segments stay staged for the next boot.
-            if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
+            // M2 (2026-10-26): fold, ack and settle ONE SEGMENT at a time, so
+            // a segment whose rows do not land stops the round there and
+            // every segment before it is already retired (see
+            // `replay_chunks`). Before, one rescue handed back to the WAL
+            // refused the whole round, and the next boot re-read the same
+            // segments: zero progress from 21 to 26 Oct.
+            let mut round_landed = true;
+            let mut round_frames = 0usize;
+            let mut round_ticks = 0u64;
+            let mut round_lost = 0u64;
+            let mut flushed = 0u64;
+            let mut pace_waits = 0u64;
+            let mut chunk_start = 0usize;
+            let mut gaps_in_chunk: Vec<usize> = Vec::new();
+            for (segment, chunk_end) in &chunk_ends {
+                let chunk = staged.get(chunk_start..*chunk_end).unwrap_or(&[]);
+                replay_chunks::chunk_gaps(
+                    &staged_gaps,
+                    chunk_start,
+                    *chunk_end,
+                    &mut gaps_in_chunk,
+                );
+                chunk_start = *chunk_end;
+                // DA-13c review: the suspicion count BEFORE this chunk's first ack.
+                let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
+                if !chunk.is_empty() {
+                    use tickvault_storage::wal_applied_watermark::applied_watermark;
+                    let unlanded_before = applied_watermark().unlanded_total();
+                    let outcome =
+                        refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
+                    flushed = flushed.saturating_add(blocking_flush(|| ingest.flush()));
+                    round_frames = round_frames.saturating_add(chunk.len());
+                    round_ticks = round_ticks.saturating_add(outcome.refolded as u64);
+                    round_lost = round_lost.saturating_add(outcome.lost);
+                    pace_waits = pace_waits.saturating_add(outcome.pace_waits);
+                    // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A
+                    // timeout ends the drain rather than re-offering the
+                    // segment to a sink that is not answering.
+                    if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
+                        round_landed = false;
+                        break;
+                    }
+                }
+                match segment {
+                    Some(name) => {
+                        tickvault_storage::wal_replay_settle::settle_confirm_segments(
+                            &wal_dir,
+                            &[name.as_os_str()],
+                            settle_start,
+                        );
+                    }
+                    // No segment map: the whole round was one chunk.
+                    None => {
+                        tickvault_storage::wal_replay_settle::settle_confirm_replayed(
+                            &wal_dir,
+                            settle_start,
+                        );
+                    }
+                }
+            }
+            tickvault_storage::wal_replay_settle::trim_after_round(&wal_dir);
+            catchup_frames = catchup_frames.saturating_add(round_frames);
+            catchup_ticks = catchup_ticks.saturating_add(round_ticks);
+            if !round_landed {
                 catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
                 break;
             }
-            tickvault_storage::wal_replay_settle::settle_confirm_replayed(&wal_dir, settle_start);
-            catchup_frames = catchup_frames.saturating_add(staged.len());
-            catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
             rounds = rounds.saturating_add(1);
-            if outcome.lost > 0 {
+            if round_lost > 0 {
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "wal_catchup_unfolded",
                     round = rounds,
                     frames = staged.len(),
-                    lost = outcome.lost,
+                    lost = round_lost,
                     "the WAL catch-up drain could not fold {} tick(s) in this round",
-                    outcome.lost
+                    round_lost
                 );
             }
             tracing::debug!(
                 round = rounds,
                 frames = staged.len(),
-                ticks = outcome.refolded,
+                segments = chunk_ends.len(),
+                ticks = round_ticks,
                 rows_flushed = flushed,
-                pace_waits = outcome.pace_waits,
+                pace_waits,
                 "WAL catch-up drain round complete"
             );
         }
@@ -17493,6 +17877,33 @@ const CONTINUOUS_SESSION_START_SECS_OF_DAY_IST: u64 = 9 * 3_600 + 15 * 60;
 pub const fn is_within_market_hours_ist(secs_of_day: u64) -> bool {
     secs_of_day >= CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
         && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+}
+
+/// The Muhurat evening session's continuous part: the Muhurat persist window
+/// with its opening pre-open excluded by the same offset as the regular day
+/// (persist 09:00, continuous 09:15), so [18:15, 19:30) IST.
+const MUHURAT_CONTINUOUS_START_SECS_OF_DAY_IST: u64 =
+    tickvault_common::constants::MUHURAT_PERSIST_START_SECS_OF_DAY_IST as u64
+        + (CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
+            - tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64);
+
+/// True when the connected-but-silent check (RISK-GAP-03) may run at
+/// `secs_of_day` on a Muhurat day (audit L3, 2026-10-26).
+///
+/// A Muhurat date is an NSE holiday, so `silence_page_allowed_today` is false
+/// and the regular gate kept the check off for the whole evening session: a
+/// connection that received nothing read healthy. Pure and total; O(1).
+#[must_use]
+pub(crate) const fn muhurat_silence_check_due(secs_of_day: u64, muhurat_day: bool) -> bool {
+    muhurat_day
+        && secs_of_day >= MUHURAT_CONTINUOUS_START_SECS_OF_DAY_IST
+        && secs_of_day < tickvault_common::constants::MUHURAT_PERSIST_END_SECS_OF_DAY_IST as u64
+}
+
+/// [`muhurat_silence_check_due`] with today's boot-installed Muhurat flag
+/// (one `OnceLock` load, the flag the tick and depth writers read).
+fn muhurat_silence_check_due_now(secs_of_day: u64) -> bool {
+    muhurat_silence_check_due(secs_of_day, tickvault_common::muhurat::current())
 }
 
 /// IST seconds-of-day for a wall-clock instant in unix-epoch MILLISECONDS.
@@ -18578,6 +18989,89 @@ mod tests {
         let reference = lines("ref_lag_ms_");
         assert!(!ours.is_empty(), "no lag lines rendered:\n{rendered}");
         assert_eq!(ours, reference, "rendered:\n{rendered}");
+    }
+
+    /// Plan item K3: a backward LTT and a volume jump, produced by the real
+    /// detector, move the two verdict counters; healthy ticks move neither.
+    #[test]
+    fn tick_verdict_counters_move_on_a_backward_ltt_and_a_volume_jump() {
+        use tickvault_common::types::ExchangeSegment;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let backward = metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "ltt_backward");
+            let jump = metrics::counter!(TICK_VERDICT_COUNTER, "verdict" => "volume_jump");
+            backward.increment(0);
+            jump.increment(0);
+            let config = DetectorConfig::default();
+            let warmup = config.baseline_warmup_samples;
+            let mut detector = TickGapDetector::with_capacity(4, config);
+            let key = (52_175_u64, ExchangeSegment::NseFno);
+            let mut ltt: u32 = 1_800_000_000;
+            let mut volume: u32 = 1_000;
+            let mut recv: u64 = 0;
+            let feed = |detector: &mut TickGapDetector, ltt: u32, volume: u32, recv: u64| {
+                let assessment = detector.observe(TickObservation {
+                    key,
+                    ltt_epoch_secs: ltt,
+                    volume,
+                    open_interest: 0,
+                    recv_monotonic_millis: recv,
+                });
+                count_tick_verdicts(&backward, &jump, &assessment);
+                assessment
+            };
+            // Warm up with steady +10 volume, forward LTT: no verdict.
+            for _ in 0..=warmup.saturating_add(2) {
+                ltt += 1;
+                volume += 10;
+                recv += 1_000;
+                let a = feed(&mut detector, ltt, volume, recv);
+                assert!(!a.suspects_loss(), "{a:?}");
+            }
+            // A backward LTT (volume steady, so only the LTT verdict fires).
+            recv += 1_000;
+            let a = feed(&mut detector, ltt - 5, volume, recv);
+            assert!(
+                matches!(a.ltt, LttVerdict::Backward { by_secs: 5 }),
+                "{a:?}"
+            );
+            // A volume jump far above the learned +10 delta.
+            recv += 1_000;
+            let a = feed(&mut detector, ltt + 1, volume + 1_000_000, recv);
+            assert!(
+                matches!(a.volume, VolumeVerdict::SuspectedGap { .. }),
+                "{a:?}"
+            );
+        });
+        let rendered = handle.render();
+        let value = |verdict: &str| -> Option<String> {
+            let prefix = format!("{TICK_VERDICT_COUNTER}{{verdict=\"{verdict}\"}} ");
+            rendered
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_owned))
+        };
+        assert_eq!(value("ltt_backward").as_deref(), Some("1"), "{rendered}");
+        assert_eq!(value("volume_jump").as_deref(), Some("1"), "{rendered}");
+    }
+
+    /// The drain's ingest site counts through the pre-resolved handles, and
+    /// both label sets are seeded with the drain's other loss baselines.
+    #[test]
+    fn tick_verdicts_are_counted_at_ingest_and_seeded_at_zero() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(prod.contains(
+            "count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);"
+        ));
+        assert!(!prod.contains("let _assessment = self.detector.observe(obs);"));
+        assert!(prod.contains("c.verdict_ltt_backward.increment(0);"));
+        assert!(prod.contains("c.verdict_volume_jump.increment(0);"));
+        assert!(prod.contains(r#""verdict" => "ltt_backward""#));
+        assert!(prod.contains(r#""verdict" => "volume_jump""#));
+        // Local only: the EMF selector must never name it.
+        let cw = include_str!("../../../deploy/aws/cloudwatch-agent.json");
+        assert!(!cw.contains(TICK_VERDICT_COUNTER));
     }
 
     #[test]
@@ -23919,6 +24413,65 @@ mod tests {
         // 2026-08-14.)
     }
 
+    /// K6 (2026-10-26): every main-feed frame the drain folds is timed as the
+    /// `drain_main_frame` hot-path stage, so the live p99 covers the drain's
+    /// own decode + fold + append, not only the ring wait before it.
+    ///
+    /// The stage is a process-wide static and other tests in this binary may
+    /// run a drain at the same time, so the delta is checked as AT LEAST one
+    /// sample per frame; the code records it at one site, after
+    /// `drain_main_feed_frame`.
+    #[tokio::test]
+    async fn test_regression_drain_records_the_main_frame_stage_per_frame() {
+        use tickvault_storage::hot_path_telemetry::{Stage, stage_snapshot};
+        const FRAMES: u64 = 3;
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
+        let ltt = todays_in_session_ltt();
+        for k in 0..FRAMES {
+            tx.try_send(CapturedFrame {
+                seq: 500 + k,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
+                wal_backed: true,
+                bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
+                    13,
+                    23_146.45,
+                    ltt.saturating_add(u32::try_from(k).unwrap_or(0)),
+                )),
+            })
+            .expect("the ring must accept a frame");
+        }
+        drop(tx);
+        let before = stage_snapshot(Stage::DrainMainFrame).count;
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_frame_drain(
+                rx,
+                ingest,
+                Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
+            ),
+        )
+        .await
+        .expect("the drain must end when the ring closes");
+        let after = stage_snapshot(Stage::DrainMainFrame).count;
+        assert_eq!(drained.folded, FRAMES, "every frame folded");
+        assert!(
+            after.saturating_sub(before) >= FRAMES,
+            "each main-feed frame must record one drain_main_frame sample: \
+             {before} -> {after} for {FRAMES} frames"
+        );
+    }
+
     /// The drain must exit on the shutdown signal **while the ring is still
     /// open** — the exit path that did not exist until 2026-08-14.
     ///
@@ -23994,6 +24547,68 @@ mod tests {
 
         // The sender is still alive until this line, proving the exit came
         // from the signal and not from the ring closing.
+        drop(tx);
+    }
+
+    /// Plan item J2: frames queued before the shutdown signal all reach the
+    /// fold, at a scale past tokio's per-task cooperative budget (128 polls),
+    /// with half of them unbacked (no WAL record).
+    ///
+    /// Honest scope: this PINS the behaviour and does not bite on the pre-J2
+    /// arm. Measured 2026-10-26 by forcing the shutdown arm to break
+    /// unconditionally: this test still passed, because the frame arm drained
+    /// all 300 before the shutdown arm won a poll. The case J2 actually closes
+    /// is frames arriving while that arm seals and flushes (a socket still
+    /// open past the socket-stop budget), which a single-task test cannot
+    /// time; the counting it relies on is tested in `shutdown_residue`.
+    #[tokio::test]
+    async fn test_shutdown_folds_every_frame_queued_before_the_signal() {
+        const QUEUED: u64 = 300;
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(512);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        for seq in 0..QUEUED {
+            tx.try_send(CapturedFrame {
+                seq: seq + 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
+                // Half the frames have no WAL record: those are the ones a
+                // dropped ring would have lost with no counter.
+                wal_backed: seq % 2 == 0,
+                bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
+                    13,
+                    23_146.45,
+                    todays_in_session_ltt(),
+                )),
+            })
+            .expect("the ring must accept the frame");
+        }
+        shutdown.notify_one();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_frame_drain(
+                rx,
+                ingest,
+                Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::clone(&shutdown),
+                Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
+            ),
+        )
+        .await
+        .expect("the drain must still end on the shutdown signal with a live sender");
+
+        assert_eq!(
+            outcome.frames_seen, QUEUED,
+            "every frame queued before the shutdown must reach the fold, not die in the ring"
+        );
         drop(tx);
     }
 
@@ -24628,6 +25243,8 @@ mod tests {
             "ingest.scan_silence(",
             "is_within_market_hours_ist(",
             "SILENCE_SCANS_BEFORE_ALERT",
+            // Audit L3 (2026-10-26): the Muhurat arm of the session gate.
+            "muhurat_silence_check_due_now(",
         ] {
             assert!(
                 body.contains(needle),
@@ -24775,54 +25392,49 @@ mod tests {
     }
     #[test]
     fn test_the_lane_refuses_to_dial_without_a_wal_or_a_token_manager() {
-        // Both refusals are `return`s on the bring-up path, not warnings that
-        // fall through. Capturing without a durable floor, or dialing with a
-        // blank credential, would each look like success while being neither —
-        // so this pins that the code says REFUSING and means it.
+        // A missing WAL is a `return` on the bring-up path, not a warning that
+        // falls through: capturing without a durable floor would look like
+        // success while being neither.
+        //
+        // ⚠ CHANGED 2026-10-26 (audit L3): a missing token manager or lock no
+        // longer RETURNS — that ended the lane for the rest of the process.
+        // The lane now WAITS in `wait_for_dial_preconditions` and dials only
+        // once both hold; pinned here as "never dials before the wait
+        // returns", with the backoff and grace in behaviour tests
+        // (`dhan_feed_stack::l3_audit_tests`).
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production_half = src.split(test_marker).next().unwrap_or(src);
 
-        for needle in [
-            "let Some(spill) = params.spill else",
-            "let Some(client_id) = client_id else",
-        ] {
-            let at = production_half
-                .find(needle)
-                .unwrap_or_else(|| panic!("the bring-up must still guard on `{needle}`"));
-            let tail = &production_half[at..];
-            let block_end = tail.find("};").unwrap_or(tail.len());
-            assert!(
-                tail[..block_end].contains("return;"),
-                "`{needle}` must REFUSE the lane, never warn and continue"
-            );
-        }
-
-        // The token-manager guard must WAIT before it refuses.
-        //
-        // This arm used to pin `let Some(client_id) = global_token_manager()`
-        // — the bare one-shot check — and it passed happily while the lane
-        // lost a race it could not win: the registrar sits behind an SSM +
-        // TOTP + HTTPS auth round-trip, and this lane is spawned with a
-        // single localhost query between them. A guard that is CORRECT
-        // (refusing without a credential is right) can still be WRONG in
-        // timing, and a source pin on the refusal alone cannot tell the
-        // difference. Pin the wait too.
+        let needle = "let Some(spill) = params.spill else";
+        let at = production_half
+            .find(needle)
+            .unwrap_or_else(|| panic!("the bring-up must still guard on `{needle}`"));
+        let tail = &production_half[at..];
+        let block_end = tail.find("};").unwrap_or(tail.len());
         assert!(
-            production_half.contains("for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS"),
-            "the lane must RETRY for the token manager, not one-shot it — the \
-             registrar completes a remote auth handshake first, so a single \
-             check loses on essentially every boot"
+            tail[..block_end].contains("return;"),
+            "`{needle}` must REFUSE the lane, never warn and continue"
         );
+
+        let lane = production_half
+            .split_once("async fn run_dhan_feed_stack(")
+            .expect("the lane function must exist")
+            .1;
+        let wait = lane
+            .find("match wait_for_dial_preconditions(")
+            .expect("the lane must wait for the token manager and the lock before dialing");
+        let dial = lane
+            .find("dial_planned_connections(")
+            .expect("the lane dials");
         assert!(
-            production_half.contains("tokio::time::sleep"),
-            "the token-manager wait must actually yield between attempts"
+            wait < dial,
+            "nothing may dial before the precondition wait returns"
         );
         assert!(
             TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS >= 260,
-            "the wait budget must cover at least two TokenManager::initialize \
-             attempts across its >=130s backoff floor, or one transient auth \
-             failure still costs the whole session"
+            "the quiet authentication wait must cover at least two \
+             TokenManager::initialize attempts across its >=130s backoff floor"
         );
     }
 
@@ -25658,7 +26270,7 @@ mod wal_refold_tests {
         assert_eq!(prod.matches(call).count(), 1, "exactly one hand-over");
         let finish = prod.find(call).expect("hand-over present");
         let catch_up = prod
-            .find("refold_wal_frames(&mut ingest, &staged, &staged_gaps, round_pace_until)")
+            .find("refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until)")
             .expect("catch-up refold present");
         let spawn = prod
             .find("tokio::spawn(run_frame_drain(")
@@ -29052,8 +29664,11 @@ mod late_seed_tests {
         );
 
         // Non-vacuous: the scan must actually be looking at real returns.
+        // 2026-10-26 (audit L3): 5 -> 4, the token-manager and lock refusals
+        // became a wait (`wait_for_dial_preconditions`) whose one shutdown
+        // return is the sanctioned one above.
         assert!(
-            before_refold.matches("return;").count() >= 5,
+            before_refold.matches("return;").count() >= 4,
             "the scan window collapsed — it should span every bring-up refusal"
         );
     }
@@ -29840,6 +30455,11 @@ mod connection_delivery_tests {
             "the dead-class gate lost its TRADING-CALENDAR half — on a weekday \
              NSE holiday it will page RISK-GAP-03 for every seeded segment"
         );
+        assert!(
+            gate.contains("muhurat_silence_check_due_now("),
+            "the dead-class gate lost its MUHURAT arm (audit L3) — on a Muhurat \
+             date, an NSE holiday, the evening session is never checked"
+        );
     }
 
     /// A latch carried out of the session is cleared, never held: the next
@@ -30261,6 +30881,11 @@ mod socket_stop_tests {
 // its first `#[cfg(test)]` still see the whole production body.
 #[cfg(test)]
 mod feed_aux_tests;
+
+#[cfg(test)]
+mod l3_audit_tests;
+#[cfg(test)]
+mod reserved_connections_tests;
 
 // Depth-200 cross-feed check and frame-silence wiring (scope lock 2026-10-10,
 // plan item 52h).

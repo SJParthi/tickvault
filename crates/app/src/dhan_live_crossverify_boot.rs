@@ -1947,6 +1947,14 @@ async fn run_once(
                 noise_max_paise = c.noise_max_paise,
                 volume_cells = c.volume_cells,
                 volume_exact = c.volume_exact,
+                diverged_open = c.divergence_profile.open,
+                diverged_high = c.divergence_profile.high,
+                diverged_low = c.divergence_profile.low,
+                diverged_close = c.divergence_profile.close,
+                extremes_live_inside = c.divergence_profile.extremes_live_inside,
+                extremes_live_outside = c.divergence_profile.extremes_live_outside,
+                missing_live_zero_volume = c.missing_live_zero_volume,
+                missing_live_index = c.divergence_profile.missing_live_index,
                 findings = c.findings.len(),
                 rest_failures = report.rest_failures,
                 rest_failure_reasons = %report.rest_failure_breakdown.summary(),
@@ -3009,6 +3017,7 @@ mod tests {
             volume_capture_p50_pct: 0,
             volume_capture_p05_pct: 0,
             volume_capture_min_pct: 0,
+            divergence_profile: crate::dhan_live_crossverify::DivergenceProfile::default(),
         }
     }
 

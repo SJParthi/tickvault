@@ -801,9 +801,11 @@ struct SpillState {
     /// The previous IST day's handle, closed by a rotation and not yet
     /// synced. The rotation only moves it here (the append path never waits
     /// for the device); the escalation thread syncs and drops it in
-    /// [`SealSpillWriter::sync_open_file`]. At most one: a second rotation
-    /// before any sync closes the older one unsynced, which is the same
-    /// exposure the open file has until its own first sync.
+    /// [`SealSpillWriter::sync_open_file`]. At most one. **⚠ CORRECTED
+    /// 2026-10-26 (audit PR L, L2):** a second rotation before any sync used to
+    /// close the older one unsynced; it is now parked in `failed_unsynced` or
+    /// dropped only when the newly open handle is the same file (see
+    /// `park_closing_handle`).
     rotated: Option<File>,
     /// A handle dropped after a failed write, not yet synced (deep audit DA-14
     /// review). It still holds the bytes written since the last sync: every
@@ -833,7 +835,9 @@ struct SpillState {
 /// forgotten once the mid-session replay has consumed their copies; past this
 /// bound the ledger fails toward writing data (see the ledger's module docs).
 /// About 30 MiB of address space, allocated once per writer; only the control
-/// bytes (~512 KiB) are touched until a seal is spilled.
+/// bytes (~512 KiB) are touched until a seal is spilled. (Audit PR L, L2,
+/// 2026-10-26: each entry grew 40 -> 48 bytes for its commit trust
+/// generation, about 2 MiB more at the cap; not re-measured.)
 pub const SEAL_SPILL_LEDGER_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 
 /// Bars the boot drain records at most (Z6). Grown on demand, once per boot,
@@ -1200,6 +1204,57 @@ impl SealSpillWriter {
     /// they share a file (a sync of either covers both); a parked handle of a
     /// DIFFERENT file (one set aside since) is kept, and this one is closed
     /// unsynced and counted as a failed sync, with the episode's coded line.
+    /// Keep a handle being closed (a day rotation, or staging) until the next
+    /// [`Self::sync_open_file`] has synced it (audit PR L, L2). No syscall
+    /// but `fstat`s, never a sync, so it is safe under the append lock.
+    ///
+    /// A parked handle on the same file as `now_open` is dropped first: the
+    /// open handle's sync covers the same inode, and the slot is needed when
+    /// two day files alternate near midnight. Then `closing` takes the first
+    /// free slot (`rotated`, then `failed`), or is dropped when a parked
+    /// handle already covers its file. Only with both slots holding two
+    /// other files is it closed unsynced, counted on the sync-failure
+    /// counter and logged once per episode, as [`Self::park_failed_handle`]
+    /// does.
+    ///
+    /// # Complexity
+    /// O(1): at most four `fstat` pairs.
+    fn park_closing_handle(
+        &self,
+        rotated: &mut Option<File>,
+        failed: &mut Option<File>,
+        closing: File,
+        now_open: Option<&File>,
+    ) {
+        if let (Some(parked), Some(open)) = (rotated.as_ref(), now_open)
+            && same_file(parked, open)
+        {
+            *rotated = None;
+        }
+        for slot in [&mut *rotated, &mut *failed] {
+            match slot.as_ref() {
+                None => {
+                    *slot = Some(closing);
+                    return;
+                }
+                Some(parked) if same_file(parked, &closing) => return,
+                Some(_) => {}
+            }
+        }
+        if now_open.is_some_and(|open| same_file(open, &closing)) {
+            return;
+        }
+        self.err_sync.increment(1);
+        if !self.sync_failing.swap(true, Ordering::Relaxed) {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                spill_dir = ?self.spill_dir,
+                "seal spill: a day file was closed with two other files still waiting \
+                 for their sync; its seals reported written may be lost on a power cut"
+            );
+        }
+    }
+
     fn park_failed_handle(&self, open: &mut Option<OpenSpillFile>, failed: &mut Option<File>) {
         let Some(previous) = open.take() else {
             return;
@@ -1321,7 +1376,7 @@ impl SealSpillWriter {
         // Rotate only when the IST day actually changed (or nothing is open
         // yet, incl. after a write error dropped the handle). The check is an
         // integer compare — no filename is built on the steady-state path.
-        let current = self.current_file(open, rotated, now_unix_secs)?;
+        let current = self.current_file(open, rotated, failed_unsynced, now_unix_secs)?;
 
         // ONE `write(2)`. The file is unbuffered by design: the previous
         // implementation's `BufWriter::flush()` bought exactly this syscall
@@ -1374,6 +1429,7 @@ impl SealSpillWriter {
         &self,
         open: &'s mut Option<OpenSpillFile>,
         rotated: &mut Option<File>,
+        failed: &mut Option<File>,
         now_unix_secs: i64,
     ) -> Result<&'s mut OpenSpillFile> {
         let day = ist_day_number(now_unix_secs);
@@ -1384,11 +1440,20 @@ impl SealSpillWriter {
             // moved to `rotated` (no syscall) and the escalation thread syncs
             // and closes it off the lock in `sync_open_file`. Until then the
             // rotation holds two descriptors.
-            if let Some(previous) = open.take() {
-                *rotated = Some(previous.file);
-            }
+            //
+            // Audit PR L, L2 (2026-10-26): a second rotation before any sync
+            // used to overwrite `rotated`, closing the older handle unsynced.
+            // Near IST midnight the producer (bucket day) and the writer (wall
+            // clock) switch day files back and forth, so that was routine. The
+            // handle is now parked by `park_closing_handle`, never dropped
+            // while it may hold unsynced bytes no other handle covers.
+            let closing = open.take().map(|previous| previous.file);
             let path = self.spill_path(now_unix_secs);
-            let mut file = self.open_append_handle(&path)?;
+            let opened = self.open_append_handle(&path);
+            if let Some(closing) = closing {
+                self.park_closing_handle(rotated, failed, closing, opened.as_ref().ok());
+            }
+            let mut file = opened?;
             // Audit PR41c: a file left with a torn tail (a crash mid-write,
             // or the third failure in a row on the write paths) would put
             // every record appended now off its 128-byte boundary, and every
@@ -1623,7 +1688,7 @@ impl SealSpillWriter {
             return Ok(());
         }
         let current = self
-            .current_file(open, rotated, now_unix_secs)
+            .current_file(open, rotated, failed_unsynced, now_unix_secs)
             .map_err(BatchSpillFailure::nothing_kept)?;
         let before = match current.file.metadata() {
             // Audit PR41c: the batch starts on a record boundary. The day
@@ -1829,7 +1894,7 @@ impl SealSpillWriter {
             return 0;
         }
         let written = self
-            .current_file(open, rotated, now_unix_secs)
+            .current_file(open, rotated, failed_unsynced, now_unix_secs)
             .and_then(|current| {
                 current
                     .file
@@ -1908,6 +1973,15 @@ impl SealSpillWriter {
         }
     }
 
+    /// Audit PR L, L2: a QuestDB suspicion began or ended, so an ack may have
+    /// been false. Every committed copy recorded so far stops counting as
+    /// trusted, and a replayed copy equal to one is written again (see
+    /// [`SpillLedger::distrust_commits`]). O(1) under the append lock;
+    /// seal writer task, once per suspicion transition.
+    pub(crate) fn distrust_commits(&self) {
+        self.lock_state().ledger.distrust_commits();
+    }
+
     /// Z6: the mid-session replay has consumed every spill file staged up to
     /// the last clean staging. Forget every bar whose copies can no longer be
     /// written (see [`SpillLedger::forget_replayed`]). Returns how many bars
@@ -1953,7 +2027,19 @@ impl SealSpillWriter {
     /// `f` must be short: a directory listing and a few renames.
     pub fn with_appends_paused<R>(&self, f: impl FnOnce() -> (R, bool)) -> R {
         let mut state = self.lock_state();
-        state.open = None;
+        // Audit PR L, L2 (2026-10-26): the handle is parked for the next sync,
+        // not dropped. Dropping it left `sync_open_file` with no handle, so it
+        // cleared the pending flag and synced nothing, and the bytes written
+        // since the last sync reached the staged file with no sync at all.
+        let SpillState {
+            open,
+            rotated,
+            failed_unsynced,
+            ..
+        } = &mut *state;
+        if let Some(previous) = open.take() {
+            self.park_closing_handle(rotated, failed_unsynced, previous.file, None);
+        }
         let (result, moved_every_live_file) = f();
         let closed = state.epoch;
         state.epoch = closed.saturating_add(1);
@@ -3328,6 +3414,95 @@ mod tests {
         assert!(writer.sync_open_file());
         assert!(!writer.has_unsynced_writes());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — a second day switch before
+    /// any sync overwrote `rotated` and closed the older handle unsynced.
+    /// Bites: the old code leaves `failed_unsynced` empty and day one's
+    /// handle is gone.
+    #[test]
+    fn test_regression_a_second_day_switch_before_a_sync_parks_both_handles() {
+        let dir = temp_spill_dir("sync-two-rotations");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let day_one = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        for (i, now) in [day_one, day_one + 86_400, day_one + 2 * 86_400]
+            .into_iter()
+            .enumerate()
+        {
+            let seal = mk_seal(13 + i as u64, 0, 0, 1_716_000_900, 100.0);
+            writer
+                .append_seal(&seal, now)
+                .unwrap_or_else(|err| panic!("append: {err}"));
+        }
+        {
+            let state = writer.lock_state();
+            assert!(
+                state.rotated.is_some(),
+                "day one's handle waits for the sync"
+            );
+            assert!(
+                state.failed_unsynced.is_some(),
+                "day two's handle is parked, not closed unsynced"
+            );
+        }
+        assert!(writer.sync_open_file(), "every parked handle syncs");
+        let state = writer.lock_state();
+        assert!(state.rotated.is_none() && state.failed_unsynced.is_none());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit PR L, L2: two day files alternating (the midnight shape) keep
+    /// one parked handle, since the newly open one covers the same file.
+    #[test]
+    fn test_park_closing_handle_drops_a_parked_handle_the_open_one_covers() {
+        let dir = temp_spill_dir("sync-alternating-days");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let day_one = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        for now in [day_one, day_one + 86_400, day_one, day_one + 86_400] {
+            writer
+                .append_seal(&mk_seal(13, 0, 0, 1_716_000_900, 100.0), now)
+                .unwrap_or_else(|err| panic!("append: {err}"));
+        }
+        let state = writer.lock_state();
+        assert!(state.rotated.is_some(), "the other day's handle is parked");
+        assert!(state.failed_unsynced.is_none(), "no second slot is needed");
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — staging dropped the open
+    /// handle, so the next sync found no handle, cleared the pending flag and
+    /// synced nothing. Bites: the old code leaves nothing parked.
+    #[test]
+    fn test_regression_with_appends_paused_parks_the_open_handle_for_the_sync() {
+        let dir = temp_spill_dir("sync-staging");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        writer
+            .append_seal(&mk_seal(13, 0, 0, 1_716_000_900, 100.0), now)
+            .unwrap_or_else(|err| panic!("append: {err}"));
+        writer.with_appends_paused(|| ((), true));
+        {
+            let state = writer.lock_state();
+            assert!(state.open.is_none(), "staging closes the append handle");
+            assert!(state.rotated.is_some(), "and parks it for the sync");
+        }
+        assert!(writer.sync_open_file());
+        assert!(writer.lock_state().rotated.is_none(), "the sync closed it");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5393,7 +5568,9 @@ mod pr41a_tests {
             1
         );
         assert!(writer.replay_is_superseded(&pr41a_buffered(&original)));
-        assert!(!writer.replay_is_superseded(&pr41a_buffered(&amended)));
+        // Audit PR L, L2: an equal copy is the committed bar itself; the
+        // replay skips it rather than re-write the row with unknown delays.
+        assert!(writer.replay_is_superseded(&pr41a_buffered(&amended)));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5436,7 +5613,9 @@ mod pr41a_tests {
         writer.append_seal(&original, now).expect("spill original");
         writer.note_replay_commits(&[pr41a_buffered(&amended)]);
         assert!(writer.replay_is_superseded(&pr41a_buffered(&original)));
-        assert!(!writer.replay_is_superseded(&pr41a_buffered(&amended)));
+        // Audit PR L, L2: an equal copy is the committed bar itself; the
+        // replay skips it rather than re-write the row with unknown delays.
+        assert!(writer.replay_is_superseded(&pr41a_buffered(&amended)));
         let _ = std::fs::remove_dir_all(dir);
     }
 

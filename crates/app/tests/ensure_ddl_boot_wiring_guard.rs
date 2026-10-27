@@ -318,6 +318,37 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
             "ensure_index_constituency_table",
             "src/index_constituency_boot.rs",
         ),
+        // instrument_lifecycle + instrument_lifecycle_audit — the SEBI
+        // never-delete master and its 5-year transition chain (audit J3,
+        // 2026-10-26). The master had NO production ensure until this date:
+        // its only writer ensured the audit table alone, so a fresh or
+        // restored QuestDB auto-created the master with no DEDUP key and its
+        // constant designated `ts` then took a second copy of all ~150,000
+        // instruments every day. Needles are CALL-shaped, because both names
+        // also appear on the `use` line, which a bare-name needle would
+        // accept on its own.
+        (
+            "ensure_instrument_lifecycle_table(questdb).await",
+            "src/dhan_lifecycle.rs",
+        ),
+        (
+            "ensure_instrument_lifecycle_audit_table(questdb).await",
+            "src/dhan_lifecycle.rs",
+        ),
+        // order_update_events / position_update_events / order_leg_pnl —
+        // order-side capture tables, each ensured by its own consumer.
+        (
+            "ensure_order_update_events_table(&questdb).await",
+            "src/order_update_events_boot.rs",
+        ),
+        (
+            "ensure_position_update_events_table(&questdb).await",
+            "src/order_update_events_boot.rs",
+        ),
+        (
+            "ensure_order_leg_pnl_table(&questdb).await",
+            "src/order_leg_pnl_boot.rs",
+        ),
     ];
 
     for (needle, rel) in coverage {
@@ -644,5 +675,51 @@ fn the_day_roll_seals_the_fold_before_resetting_the_ranking() {
     assert!(
         seal_at < reset_at,
         "`roll_trading_day` must seal the fold before resetting the ranking"
+    );
+}
+
+/// Audit J3 (2026-10-26): the SEBI lifecycle writer must hold its write back
+/// when either table's DEDUP key is not confirmed. Calling the ensure is not
+/// enough on its own: an ensure whose verdict is dropped lets the write go
+/// ahead into an ILP-auto-created table with no key, which is the duplicate
+/// class the call exists to prevent.
+#[test]
+fn the_lifecycle_write_is_held_back_when_a_sebi_table_is_not_keyed() {
+    let src = production_region(&read_src("src/dhan_lifecycle.rs"));
+    let body = src
+        .split(concat!("pub async ", "fn write_dhan_lifecycle("))
+        .nth(1)
+        .expect("write_dhan_lifecycle must exist");
+    let ensure_master = body
+        .find("let lifecycle_keyed = ensure_instrument_lifecycle_table(questdb).await;")
+        .expect("the master ensure's verdict must be kept");
+    let ensure_audit = body
+        .find("let audit_keyed = ensure_instrument_lifecycle_audit_table(questdb).await;")
+        .expect("the audit ensure's verdict must be kept");
+    let gate = body
+        .find("if !(lifecycle_keyed && audit_keyed) {")
+        .expect("both verdicts must gate the write");
+    let first_write = body
+        .find("write_audit_then_lifecycle(")
+        .expect("the write must exist");
+    let first_read = body
+        .find("fetch_known_instruments(questdb)")
+        .expect("the known-instruments read must exist");
+    assert!(
+        ensure_master < gate && ensure_audit < gate,
+        "both ensures must run before the gate"
+    );
+    assert!(
+        gate < first_read && gate < first_write,
+        "the gate must come before any read or write of the SEBI tables"
+    );
+    let held_back = &body[gate..first_read];
+    assert!(
+        held_back.contains("return Err("),
+        "a refused ensure must stop the write, not log and carry on"
+    );
+    assert!(
+        held_back.contains("ErrorCode::StorageGap03AuditWriteFailed"),
+        "the hold-back must log a coded error"
     );
 }

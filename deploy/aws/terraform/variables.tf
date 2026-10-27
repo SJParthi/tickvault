@@ -247,3 +247,58 @@ variable "dhan_depth_account_enabled" {
   type        = bool
   default     = false
 }
+
+variable "muhurat_sessions" {
+  # Plan item J8 (owner 2026-10-26: "yes capture muhurat"). One entry per NSE
+  # Muhurat trading date. Every date must also be a
+  # [[trading.muhurat_trading_dates]] entry in config/base.toml (pinned by
+  # crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs). For each date a
+  # dated EventBridge rule (start-watchdog-lambda.tf) runs the start watchdog's
+  # muhurat_check every 15 minutes that day: the box starts 60 minutes before
+  # session_start_ist and stops 60 minutes after session_end_ist
+  # (crates/aws-lambdas/src/muhurat_window.rs).
+  #
+  # 2026-11-08 times (set 2026-10-26, Assumed, not read from the NSE circular,
+  # which could not be fetched from the build environment): press reports of
+  # NSE's 19 Oct 2026 circular give pre-open from 14:05 and normal trading
+  # 14:20-15:30; 2025 was 13:45-14:45. The window below covers every reported
+  # variant: 13:30-15:40 IST (15:40 is the app's own tick save end), so the box
+  # runs 12:30-16:40 IST. Narrow it to the circular's exact times if desired;
+  # empty times make the start watchdog refuse to start the box (fail closed).
+  description = "NSE Muhurat trading sessions (IST). Empty times = timing not yet published by NSE: the box is not started."
+  type = list(object({
+    date              = string
+    session_start_ist = string
+    session_end_ist   = string
+  }))
+  default = [
+    { date = "2026-11-08", session_start_ist = "13:30", session_end_ist = "15:40" },
+  ]
+
+  validation {
+    condition = alltrue([
+      for s in var.muhurat_sessions :
+      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", s.date))
+      && (s.session_start_ist == "" || can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", s.session_start_ist)))
+      && (s.session_end_ist == "" || can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", s.session_end_ist)))
+      && ((s.session_start_ist == "") == (s.session_end_ist == ""))
+    ])
+    error_message = "muhurat_sessions: date must be YYYY-MM-DD, times HH:MM (IST, 00:00-23:59), and the two times are either both set or both empty."
+  }
+
+  # 2026-10-26 (audit PR L4): the hour was [0-2][0-9], which accepted 24:00 to
+  # 29:59, and nothing checked start < end; either shape reaches the start
+  # watchdog as an unreadable session. HCL's || does not short-circuit before
+  # Terraform 1.12, so the compare sits inside try() and an empty pair passes
+  # on its own arm.
+  validation {
+    condition = alltrue([
+      for s in var.muhurat_sessions :
+      s.session_start_ist == "" || try(
+        tonumber(replace(s.session_start_ist, ":", "")) < tonumber(replace(s.session_end_ist, ":", "")),
+        false
+      )
+    ])
+    error_message = "muhurat_sessions: session_start_ist must be earlier than session_end_ist."
+  }
+}

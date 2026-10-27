@@ -398,19 +398,18 @@ fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Re
     // SAME table the candle writer reads (operator 2026-09-22: "put either
     // contract or symbol name right in each and every table"). One ArcSwap
     // load + one hash probe per row, zero allocation: the name is borrowed
-    // out of the published snapshot and `sanitize_ilp_symbol` returns it
-    // borrowed unless it needs escaping (the name is master-derived, so it
-    // keeps the sanitiser). Written only when the table knows this exact
+    // out of the published snapshot, already made ILP-safe once at publish
+    // (`candle_contract_labels::sanitize_labels`, J1 2026-10-26; before that
+    // every row re-ran `sanitize_ilp_symbol`, a `chars()` scan per tick).
+    // Debug builds re-check it per row. Written only when the table knows this exact
     // `(security_id, segment)`; otherwise OMITTED, so the cell reads NULL —
     // never a guessed name. It must sit among the symbols: ILP rejects a
     // symbol after the first column.
     let labels = crate::candle_contract_labels::candle_contract_labels();
     if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+        debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
         buffer
-            .symbol(
-                tick_ilp_column("contract"),
-                sanitize_ilp_symbol(name).as_ref(),
-            )
+            .symbol(tick_ilp_column("contract"), &**name)
             .context("contract")?;
     }
     buffer
@@ -1748,9 +1747,11 @@ pub(crate) fn spill_failed_ilp_to(
         spec.file_prefix,
         spec.feed.as_str()
     ));
+    // `read` too, so the newline guard below can look at the last byte.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(&path)?;
     // The length before this append, taken only by a tier that serialises
     // its appends (see `IlpSpillSpec::truncate_failed_append`).
@@ -1759,8 +1760,19 @@ pub(crate) fn spill_failed_ilp_to(
     } else {
         None
     };
-    let append = || -> std::io::Result<()> {
+    let mut separator_bytes: u64 = 0;
+    let mut append = || -> std::io::Result<()> {
         let mut writer = &file;
+        // Audit K1: a failed partial write (a full disk, a crash of the other
+        // appender) can leave a fragment with no newline at the end of the
+        // file, and this append would join onto it, so the replay sees ONE
+        // malformed line and refuses a good row with the torn one. End the
+        // fragment first. Two appenders racing here can both add one, which
+        // leaves an empty line: harmless to ILP, never a joined row.
+        if file_ends_mid_line(&file)? {
+            writer.write_all(b"\n")?;
+            separator_bytes = 1;
+        }
         writer.write_all(payload)?;
         writer.flush()?;
         if let Some(sync) = sync {
@@ -1783,10 +1795,25 @@ pub(crate) fn spill_failed_ilp_to(
         return Err(err);
     }
     if on_drain && let Some(cache) = spec.drain_held {
-        cache.note_written(dir, payload.len() as u64);
+        cache.note_written(dir, (payload.len() as u64).saturating_add(separator_bytes));
     }
     Ok(path)
     // O(1) EXEMPT: end
+}
+
+/// `true` when `file` is non-empty and its last byte is not `\n`: a torn
+/// fragment a failed append left behind (audit K1). One `fstat` and one
+/// one-byte positioned read; cold path (spill appends only).
+// O(1) EXEMPT: cold path, runs only on a spill append after a failed flush.
+fn file_ends_mid_line(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt as _;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut last = [0_u8; 1];
+    file.read_exact_at(&mut last, len - 1)?;
+    Ok(last[0] != b'\n')
 }
 /// Total bytes of the spill directory, INCLUDING the quarantine subtree.
 ///
@@ -2250,6 +2277,11 @@ pub struct TickWriter {
     /// Cleared only when `discard_pending` consumes it — a stale `true` is
     /// conservative (inline spill, the old behaviour), never a loss.
     pending_unbacked: bool,
+    /// Decides whether a failed flush the rescue thread cannot take may be
+    /// handed to the WAL (`(min_seq, max_seq, unbacked)`). Production is
+    /// always [`crate::wal_frame_fate::rescue_may_defer_to_wal`]; tests swap
+    /// it so they do not depend on the process-global WAL marks (J1).
+    wal_defer_check: fn(u64, u64, bool) -> bool,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
     /// Pre-resolved session-window refusal counters -- see
@@ -2610,9 +2642,12 @@ impl TickWriter {
     // append/flush path is covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
         register_drop_baseline(feed);
+        crate::tick_ts_placement::register_baseline();
         match Sender::from_conf(ticks_ilp_http_conf(config)) {
             Ok(s) => {
-                let b = s.new_buffer();
+                let mut b = s.new_buffer();
+                // K6: reserved up front, so no batch regrows on the drain.
+                b.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
                 Self {
                     sender: Some(s),
                     buffer: b,
@@ -2620,6 +2655,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
                     out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
@@ -2643,11 +2679,12 @@ impl TickWriter {
                 );
                 Self {
                     sender: None,
-                    buffer: Buffer::new(ProtocolVersion::V1),
+                    buffer: presized_row_buffer(ProtocolVersion::V1),
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
                     out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
@@ -2685,15 +2722,25 @@ impl TickWriter {
         self
     }
 
+    /// Test-only: replaces the WAL-deferral decision (J1) so a test does not
+    /// depend on the process-global WAL flushed / lost marks.
+    #[cfg(test)]
+    #[must_use]
+    fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
+        self.wal_defer_check = check;
+        self
+    }
+
     pub fn for_test(feed: Feed) -> Self {
         register_drop_baseline(feed);
         Self {
             sender: None,
-            buffer: Buffer::new(ProtocolVersion::V1),
+            buffer: presized_row_buffer(ProtocolVersion::V1),
             pending: 0,
             pending_min_seq: 0,
             pending_max_seq: 0,
             pending_unbacked: false,
+            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
             feed,
             out_of_window: tick_out_of_window_counters(feed),
             last_capture_seq: 0,
@@ -2862,7 +2909,16 @@ impl TickWriter {
                     self.persist_refused_tick(tick, capture_seq);
                     return Ok(());
                 }
-                self.append_row(&row)
+                let appended = self.append_row(&row);
+                // K4 (2026-10-26): the daily conservation check's process
+                // side. One relaxed add per accepted Dhan row, O(1), no alloc.
+                if appended.is_ok() && self.feed == Feed::Dhan {
+                    crate::tick_conservation_ledger::ledger().note_row_appended(row.ts_ist_nanos);
+                    // M1 (2026-10-26): append, late in its hour, or older
+                    // partition. One `fetch_max`, one counter add, O(1).
+                    let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos);
+                }
+                appended
             }
             Err(err) => Err(err.into()),
         };
@@ -3277,22 +3333,31 @@ impl TickWriter {
     /// refused, so the end-of-session rows still reach the spill tier.
     ///
     /// H4 (2026-10-03): every parked batch is handed to the rescue thread
-    /// first, with a BLOCKING send. Shutdown only: waiting for the thread to
-    /// take one batch costs no more than the inline write it replaces, and the
-    /// thread syncs the file where an inline write would not. A thread that is
-    /// already gone gets the batch written inline instead, never dropped.
+    /// first. Audit K1 (2026-10-26): the hand-off has a DEADLINE
+    /// ([`RESCUE_SHUTDOWN_HANDOFF_BUDGET`] for all parked batches together),
+    /// where it used to be a blocking `send` with none, so a rescue thread
+    /// stuck on a wedged disk held the whole shutdown. A batch the thread does
+    /// not take in time, or a thread already gone, is written inline instead;
+    /// if that write fails too, its unbacked rows are counted lost on
+    /// `tv_ticks_lost_total{source="rescue_abandoned"}` with a coded `error!`.
     pub fn close_rescue_offload(&mut self) {
         if let Some(tx) = self.rescue.take() {
+            let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
             while let Some(batch) = self.parked_rescue.pop_front() {
                 self.parked_rescue_bytes = self
                     .parked_rescue_bytes
                     .saturating_sub(batch.buffer.as_bytes().len());
                 let rows = batch.rows;
-                match tx.send(batch) {
-                    Ok(()) => self.flush_counters.rescue_queued.increment(rows as u64),
-                    Err(std::sync::mpsc::SendError(batch)) => {
+                match hand_off_before(&tx, batch, deadline) {
+                    ShutdownHandOff::Sent => {
+                        self.flush_counters.rescue_queued.increment(rows as u64);
+                    }
+                    ShutdownHandOff::Gone(batch) => {
                         self.flush_counters.rescue_fallback_thread_gone.increment(1);
-                        self.spill_parked_on_drain(batch);
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                    ShutdownHandOff::TimedOut(batch) => {
+                        self.spill_parked_at_shutdown(batch);
                     }
                 }
             }
@@ -3300,7 +3365,7 @@ impl TickWriter {
         // Unreachable with batches still parked (only a split writer parks),
         // and written inline rather than dropped if it ever is.
         while let Some(batch) = self.parked_rescue.pop_front() {
-            self.spill_parked_on_drain(batch);
+            self.spill_parked_at_shutdown(batch);
         }
         self.parked_rescue_bytes = 0;
         self.flush_counters.rescue_parked_bytes.set(0.0);
@@ -3385,6 +3450,40 @@ impl TickWriter {
             wm.release_rescue_floor(floor);
         }
         wm.note_ticks_completed();
+    }
+
+    /// [`Self::spill_parked_on_drain`] at shutdown (audit K1): a batch whose
+    /// inline write also fails and whose rows the WAL does not hold is counted
+    /// lost on `tv_ticks_lost_total{source="rescue_abandoned"}`, with a coded
+    /// line. Rows the WAL holds are left to the next boot's replay (the fate
+    /// line from the failed write already says so).
+    fn spill_parked_at_shutdown(&self, batch: RescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let rows = batch.rows;
+        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows, fate);
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_ticks_completed();
+        if !landed && fate == crate::wal_applied_watermark::RESCUE_FATE_LOST {
+            metrics::counter!("tv_ticks_lost_total", "source" => SHUTDOWN_RESCUE_ABANDONED_SOURCE)
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                rows,
+                source = SHUTDOWN_RESCUE_ABANDONED_SOURCE,
+                "shutdown: a parked tick rescue batch could not be handed to the rescue thread \
+                 in time AND could not be written to the spill file, and the WAL does not hold \
+                 its rows. These ticks are LOST."
+            );
+        }
     }
 
     /// The drain's only spill write, NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
@@ -3504,16 +3603,25 @@ impl TickWriter {
     /// several reallocations per flush on the drain task. A spare of another
     /// protocol version is dropped rather than used, because the next batch
     /// must speak the protocol the sender negotiated. `try_recv`, never
-    /// `recv`: no spare simply means the next append allocates as before.
+    /// `recv`. With no spare (or one under [`TICK_ROW_BUFFER_PRESIZE_BYTES`])
+    /// the buffer is reserved to that size here, on the flush arm (K6), so
+    /// the next batch does not regrow inside the frames that append it.
     fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
-        let Some(spares) = self.spare_buffers.as_ref() else {
-            return;
-        };
-        if let Ok(mut spare) = spares.try_recv()
+        if let Some(spares) = self.spare_buffers.as_ref()
+            && let Ok(mut spare) = spares.try_recv()
             && spare.protocol_version() == protocol
         {
             spare.clear();
             self.buffer = spare;
+        }
+        // K6 (2026-10-26): no spare (or a smaller one) means the next batch
+        // would regrow from zero inside the frames that append it. Reserve
+        // the pre-size here instead: one allocation on this flush arm, none
+        // per tick. A spare at least that big costs nothing.
+        if self.buffer.capacity() < TICK_ROW_BUFFER_PRESIZE_BYTES {
+            let have = self.buffer.len();
+            self.buffer
+                .reserve(TICK_ROW_BUFFER_PRESIZE_BYTES.saturating_sub(have));
         }
     }
 
@@ -3657,8 +3765,18 @@ impl TickWriter {
         // QuestDB — reporting less would be a false-OK. Rows WITHOUT a capture
         // sequence (`range.0 == 0`) exist nowhere else, so they keep the
         // inline spill: a slow drain is bad, a lost tick is worse.
-        if rescue_unavailable && range.0 != 0 && !unbacked {
+        //
+        // J1 (2026-10-26): "already in the WAL" was assumed, not checked. A
+        // record is queued for the WAL writer before it is written, and a
+        // writer with no segment or a failed `write_record` loses it with no
+        // shed bit set, so the rows were gone while the counters said
+        // "replayable". The deferral now needs the WAL to have flushed through
+        // `max_seq` and to have lost nothing at or above `min_seq`
+        // (`wal_frame_fate::rescue_may_defer_to_wal`, two relaxed loads);
+        // otherwise the rows take the inline spill below.
+        if rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked) {
             note_rescue_outcome_ticks(false, range, false);
+            note_ticks_not_landed(self.feed, dropped);
             self.flush_counters.append_dropped.increment(dropped as u64);
             self.flush_counters
                 .rescue_deferred_to_wal
@@ -3688,6 +3806,15 @@ impl TickWriter {
         self.buffer.clear();
         self.pending = 0;
         dropped
+    }
+}
+
+/// K4 (2026-10-26): reports `rows` that left the tick buffer without reaching
+/// QuestDB to the conservation ledger, at the same sites that increment
+/// `tv_ticks_dropped_total`. Only the Dhan writer reports. O(1).
+fn note_ticks_not_landed(feed: Feed, rows: usize) {
+    if feed == Feed::Dhan {
+        crate::tick_conservation_ledger::ledger().note_rows_not_landed(rows as u64);
     }
 }
 
@@ -3751,6 +3878,7 @@ fn perform_tick_rescue(
             // not have it. `spilled` is the strictly narrower fact "and it is
             // recoverable", which is why it is a second increment rather than a
             // replacement.
+            note_ticks_not_landed(feed, dropped);
             metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
                 .increment(dropped as u64);
             metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str())
@@ -3776,6 +3904,7 @@ fn perform_tick_rescue(
             // The rescue itself failed (disk full, cap reached, no
             // permission). Fall back to the counted drop — a spill that
             // cannot be written must never mask the loss.
+            note_ticks_not_landed(feed, dropped);
             metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
                 .increment(dropped as u64);
             error!(
@@ -3869,6 +3998,64 @@ pub const TICK_RESCUE_DEFERRED_TO_WAL_COUNTER: &str = "tv_tick_rescue_deferred_t
 /// rescued-to-spill source the pager excludes: the rows are not on disk in
 /// any re-ingestable file until the WAL replays them.
 pub const RESCUE_DEFERRED_TO_WAL_SOURCE: &str = "rescue_deferred_to_wal";
+
+/// `tv_ticks_lost_total` source for parked rescue rows the shutdown could
+/// neither hand over nor write (audit K1). The same value the app's
+/// shutdown residue uses for the rescue thread's own abandoned rows.
+pub const SHUTDOWN_RESCUE_ABANDONED_SOURCE: &str = "rescue_abandoned";
+
+/// Total seconds the shutdown waits for the rescue thread to take the parked
+/// batches (audit K1). Fits inside the shutdown's offload grace (12 s) with
+/// room; past it the batches are written inline.
+pub const RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS: u64 = 2;
+
+/// [`RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS`] as a `Duration`.
+pub const RESCUE_SHUTDOWN_HANDOFF_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS);
+
+/// Milliseconds between hand-off attempts while the rescue queue is full.
+const RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS: u64 = 10;
+
+/// [`RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS`] as a `Duration`.
+const RESCUE_SHUTDOWN_HANDOFF_POLL: std::time::Duration =
+    std::time::Duration::from_millis(RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS);
+
+/// What [`hand_off_before`] did with one item.
+#[derive(Debug)]
+pub(crate) enum ShutdownHandOff<T> {
+    /// The thread's queue took it.
+    Sent,
+    /// The thread is gone; the item comes back.
+    Gone(T),
+    /// The queue stayed full until the deadline; the item comes back.
+    TimedOut(T),
+}
+
+/// Hands `item` to a bounded `std` channel, retrying while it is full, and
+/// gives it back at `deadline` (audit K1). Shutdown only: the wait is at most
+/// the time left to `deadline` plus one poll, never unbounded like `send`.
+pub(crate) fn hand_off_before<T>(
+    tx: &std::sync::mpsc::SyncSender<T>,
+    mut item: T,
+    deadline: std::time::Instant,
+) -> ShutdownHandOff<T> {
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return ShutdownHandOff::Sent,
+            Err(std::sync::mpsc::TrySendError::Disconnected(back)) => {
+                return ShutdownHandOff::Gone(back);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                if std::time::Instant::now() >= deadline {
+                    return ShutdownHandOff::TimedOut(back);
+                }
+                item = back;
+                // O(1) EXEMPT: shutdown only, bounded by `deadline`; never on the drain.
+                std::thread::sleep(RESCUE_SHUTDOWN_HANDOFF_POLL);
+            }
+        }
+    }
+}
 
 /// Rescue payloads abandoned because the rescue thread did not finish.
 ///
@@ -3984,6 +4171,40 @@ pub const FLUSH_QUEUE_DEPTH: usize = 4;
 /// 100 MiB, a 64 MiB producer ceiling leaves no real headroom.
 pub const MAX_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
+/// Bytes every tick row buffer is reserved with up front (plan item K6,
+/// 2026-10-26).
+///
+/// A row buffer used to start at zero capacity: the first batch of the
+/// process, and every batch whose flush found no spare waiting, regrew it by
+/// doubling, one reallocation each time the rows crossed a power of two. Each
+/// of those landed inside the frame whose append crossed it, so on the frame
+/// drain. MEASURED 2026-10-26 (`feed_drain` bench, 1,024 four-tick frames per
+/// buffer, this container): 11 reallocations per buffer, the last one a 1 MiB
+/// copy that took 0.27 to 0.35 ms inside one frame; 3 to 26 % of the frames at
+/// or above the p99 were one of them.
+///
+/// 2 MiB holds about 15,000 rows at the measured ~133 bytes a row, so a
+/// 500 ms flush at up to about 30,000 ticks a second never regrows. A busier
+/// batch still grows past it, by doubling, as before, and is then recycled
+/// at its larger size (`install_spare_buffer`). SPACE: one buffer in the
+/// producer, at most [`FLUSH_QUEUE_DEPTH`] queued and as many spares, so at
+/// most 9 × 2 MiB reserved; pages are committed only as rows are written.
+pub const TICK_ROW_BUFFER_PRESIZE_BYTES: usize = 2 * 1024 * 1024;
+
+const _: () = assert!(
+    TICK_ROW_BUFFER_PRESIZE_BYTES <= MAX_PRODUCER_BUFFER_BYTES,
+    "a pre-sized buffer must be one the spare lane will take back"
+);
+
+/// An empty row buffer of `protocol`, with [`TICK_ROW_BUFFER_PRESIZE_BYTES`]
+/// reserved. One allocation, at construction or on a flush arm; never per
+/// tick.
+fn presized_row_buffer(protocol: ProtocolVersion) -> Buffer {
+    let mut buffer = Buffer::new(protocol);
+    buffer.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
+    buffer
+}
+
 /// The questdb-rs client buffer ceiling. Past it EVERY flush fails, permanently
 /// — a wedge, not a degrade, which is why the producer must cut well below it.
 ///
@@ -4052,6 +4273,25 @@ impl FlushBatch {
     // TEST-EXEMPT: accessor, exercised by the offload tests below.
     pub const fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// `true` when some row has no WAL record behind it, so the batch cannot
+    /// be replayed if it is lost (plan item J2: the shutdown join counts such
+    /// rows as lost when it abandons the writer thread).
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+}
+
+impl RescueBatch {
+    /// `true` when some row has no WAL record behind it (plan item J2, the
+    /// rescue twin of [`FlushBatch::has_unbacked_rows`]).
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
     }
 }
 
@@ -4337,6 +4577,7 @@ impl TickWriterSink {
         ) {
             Ok(path) => {
                 note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
+                note_ticks_not_landed(self.feed, rows);
                 self.counters.dropped.increment(rows as u64);
                 self.counters.spilled.increment(rows as u64);
                 error!(
@@ -4356,6 +4597,7 @@ impl TickWriterSink {
             }
             Err(err) => {
                 note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
+                note_ticks_not_landed(self.feed, rows);
                 self.counters.dropped.increment(rows as u64);
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
@@ -4392,6 +4634,94 @@ impl TickWriterSink {
 
 #[cfg(test)]
 mod tests {
+    // ---- J1 (2026-10-26): the deferral needs the WAL to have the frames ----
+
+    /// The WAL flushed everything and lost nothing: deferral as before.
+    fn wal_has_it(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, u64::MAX, 0)
+    }
+
+    /// The WAL writer has flushed nothing yet.
+    fn wal_not_flushed(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, 0, 0)
+    }
+
+    /// The WAL writer lost a record at the batch's oldest frame.
+    fn wal_lost_one(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(
+            min_seq,
+            max_seq,
+            unbacked,
+            u64::MAX,
+            min_seq,
+        )
+    }
+
+    #[test]
+    fn j1_rescue_spills_inline_when_the_wal_has_not_flushed_the_rows() {
+        let dir = scratch_dir("j1-not-flushed");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_not_flushed);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // thread gone -> the fallback arms
+        w.append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let files = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            files, 1,
+            "unflushed WAL frames -> inline spill, not a deferral"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j1_rescue_spills_inline_when_the_wal_lost_a_record_in_the_batch() {
+        let dir = scratch_dir("j1-lost");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_lost_one);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx);
+        w.append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let files = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            files, 1,
+            "a lost WAL record -> inline spill, never a deferral"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production wiring: every constructor uses the real WAL check.
+    #[test]
+    fn j1_every_tick_constructor_wires_the_real_wal_defer_check() {
+        let source = include_str!("tick_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert_eq!(
+            prod.matches("wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,")
+                .count(),
+            prod.matches("pending_unbacked: false,").count(),
+            "each constructor sets the real check"
+        );
+        assert!(
+            prod.contains(
+                "rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked)"
+            )
+        );
+    }
+
     // ---- Audit DB-8 (2026-10-11): a failed rescue names its real fate ----
 
     /// A row's sequence: frame base `b`, packet index `i`.
@@ -4790,6 +5120,46 @@ mod tests {
         w.append_tick_with_seq(&sample_tick(), 5).expect("append");
         assert_eq!(w.aux_rows_appended(), 0);
         assert_eq!(w.pending(), 1);
+    }
+
+    /// K4 (2026-10-26): an accepted Dhan `ticks` row is counted in the
+    /// conservation ledger under its IST day; a non-Dhan row and a refused row
+    /// are not. Each case uses its own day so parallel tests cannot interfere.
+    #[test]
+    fn test_k4_accepted_dhan_row_is_counted_in_the_conservation_ledger() {
+        use crate::tick_conservation_ledger::{TickConservationLedger, ledger};
+        let shifted = |days: u32| {
+            let mut t = sample_tick();
+            t.exchange_timestamp += days * 86_400;
+            t.received_at_nanos += i64::from(days) * 86_400 * 1_000_000_000;
+            t
+        };
+        let day_of = |t: &ParsedTick| {
+            let row = TickRow::from_parsed_tick(t, 7).expect("row"); // APPROVED: test
+            TickConservationLedger::ist_day_of(row.ts_ist_nanos)
+        };
+
+        let dhan_tick = shifted(1_001);
+        let mut dhan = TickWriter::for_test(Feed::Dhan);
+        dhan.append_tick_with_seq(&dhan_tick, 7).expect("append");
+        assert_eq!(ledger().accepted_rows_on(day_of(&dhan_tick)), 1);
+
+        let other_tick = shifted(1_002); // a non-Dhan feed is not counted
+        let mut other = TickWriter::for_test(Feed::Truedata);
+        other.append_tick_with_seq(&other_tick, 7).expect("append");
+        assert_eq!(ledger().accepted_rows_on(day_of(&other_tick)), 0);
+
+        let mut refused = sample_tick();
+        refused.exchange_timestamp = 2_600_000_000; // year 2052, refused by the band
+        refused.received_at_nanos = 0;
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&refused, 7).expect("refusal is Ok");
+        assert_eq!(
+            ledger().accepted_rows_on(TickConservationLedger::ist_day_of(
+                2_600_000_000_i64 * 1_000_000_000
+            )),
+            0
+        );
     }
 
     /// Item 45h (a): the Full packet's day-high / day-low OI reach `ticks`;
@@ -6369,6 +6739,9 @@ mod tests {
 
         let mut batch = rx.try_recv().expect("batch queued");
         let spent_capacity = batch.buffer.capacity();
+        // The allocation itself, not its size: since K6 a fresh buffer is
+        // pre-sized too, so equal capacity alone would not prove reuse.
+        let spent_ptr = batch.buffer.as_bytes().as_ptr();
         assert!(spent_capacity > 0, "a batch that held a row has capacity");
         // `write` rescues (no sender in for_test) and then returns the buffer.
         let _landed = sink.write(&mut batch);
@@ -6381,6 +6754,11 @@ mod tests {
             producer.buffer.capacity(),
             spent_capacity,
             "the next batch must reuse the spent buffer, not regrow from zero"
+        );
+        assert_eq!(
+            producer.buffer.as_bytes().as_ptr(),
+            spent_ptr,
+            "the next batch must reuse the spent buffer's allocation"
         );
         assert!(
             producer.buffer.as_bytes().is_empty(),
@@ -6449,6 +6827,37 @@ mod tests {
         }
     }
 
+    // Regression: 2026-10-26 (K6) — the row buffer started at zero capacity
+    // and regrew by doubling inside the frames that appended to it (up to a
+    // 1 MiB copy, 0.27–0.35 ms in one frame on the feed_drain bench).
+    #[test]
+    fn test_regression_tick_row_buffer_is_presized_and_never_regrows_on_append() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert!(
+            w.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES,
+            "a new writer's row buffer is reserved up front"
+        );
+        let ptr = w.buffer.as_bytes().as_ptr();
+        let cap = w.buffer.capacity();
+        // Well under the pre-size: 2,000 rows of a few hundred bytes.
+        for seq in 1..=2_000_i64 {
+            w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        }
+        assert!(!w.buffer.is_empty());
+        assert_eq!(w.buffer.capacity(), cap, "no regrowth below the pre-size");
+        assert_eq!(w.buffer.as_bytes().as_ptr(), ptr, "no reallocation");
+
+        // A hand-off that finds no spare waiting reserves the pre-size for
+        // the next batch on the flush arm, never leaving a zero buffer.
+        let (mut producer, _sink, _rx) = w.split_for_offload();
+        producer.flush().expect("hand off");
+        assert!(producer.buffer.as_bytes().is_empty());
+        assert!(
+            producer.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES,
+            "the batch after a spare-less hand-off starts pre-sized"
+        );
+    }
+
     #[test]
     fn a_spare_of_another_protocol_is_never_installed() {
         let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
@@ -6470,9 +6879,11 @@ mod tests {
             ProtocolVersion::V1,
             "the next batch must speak the protocol the sender negotiated"
         );
+        // The foreign spare (4,096 bytes) was dropped; the buffer in its
+        // place is the K6 pre-size, reserved on the flush arm.
         assert_eq!(
             producer.buffer.capacity(),
-            0,
+            TICK_ROW_BUFFER_PRESIZE_BYTES,
             "the foreign spare was dropped"
         );
     }
@@ -6720,11 +7131,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Audit K1: the shutdown hand-off never waits past its deadline.
+    #[test]
+    fn test_hand_off_before_sends_gives_back_on_gone_and_times_out_on_full() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(matches!(
+            hand_off_before(&tx, 1, far),
+            ShutdownHandOff::Sent
+        ));
+        // Full, receiver alive, never drained: the deadline gives it back.
+        let started = std::time::Instant::now();
+        let soon = started + std::time::Duration::from_millis(50);
+        match hand_off_before(&tx, 2, soon) {
+            ShutdownHandOff::TimedOut(back) => assert_eq!(back, 2),
+            other => panic!("expected a timeout, got {other:?}"), // APPROVED: test
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "bounded by the deadline plus one poll"
+        );
+        drop(rx);
+        match hand_off_before(&tx, 3, far) {
+            ShutdownHandOff::Gone(back) => assert_eq!(back, 3),
+            other => panic!("expected gone, got {other:?}"), // APPROVED: test
+        }
+    }
+
+    /// Audit K1: a rescue thread that is alive but never takes a batch (a
+    /// wedged disk) no longer holds the shutdown: the parked batches are
+    /// written inline once the budget passes. Before K1 this test hung on
+    /// the blocking `send`.
+    #[test]
+    fn test_regression_k1_shutdown_hand_off_has_a_deadline() {
+        let dir = scratch_dir("k1-park-deadline");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 2 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2, "two batches parked");
+        // `rx` stays alive and is never drained: the queue stays full.
+        let started = std::time::Instant::now();
+        w.close_rescue_offload();
+        let took = started.elapsed();
+        assert!(
+            took < RESCUE_SHUTDOWN_HANDOFF_BUDGET + std::time::Duration::from_secs(3),
+            "the close returned in {took:?}, within the budget"
+        );
+        assert!(w.parked_rescue.is_empty());
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "the parked rows were written inline, not dropped"
+        );
+        drop(rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// H4: WAL-backed rows are never parked; the WAL defers them as before.
     #[test]
     fn test_regression_h4_wal_backed_rows_are_deferred_not_parked() {
         let dir = scratch_dir("h4-park-backed");
-        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (sink, rx) = w.split_rescue_offload();
         for k in 0..RESCUE_QUEUE_DEPTH as i64 + 1 {
             w.append_tick_with_seq(&sample_tick(), (1 << 20) + k)
@@ -6931,6 +7402,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Audit K1: a torn fragment (no final newline) left by a failed append
+    /// is ended before the next append, so the next row is not joined onto
+    /// it. Bite: drop the `file_ends_mid_line` guard and the file reads
+    /// `...torntrue second=...` on one line.
+    #[test]
+    fn test_regression_spill_append_ends_a_torn_fragment_first() {
+        let dir = scratch_dir("torn-fragment");
+        let first = b"ticks first=1i 1700000000000000000\n";
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("first spill");
+        // A failed partial write: a fragment with no newline.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&p1)
+                .expect("open"); // APPROVED: test
+            f.write_all(b"ticks torn").expect("fragment"); // APPROVED: test
+        }
+        let second = b"ticks second=2i 1700000000000000001\n";
+        let p2 = spill_failed_ilp(
+            &dir,
+            second,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("second spill");
+        assert_eq!(p1, p2);
+        let written = std::fs::read(&p1).expect("readable");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(b"ticks torn\n");
+        expected.extend_from_slice(second);
+        assert_eq!(written, expected, "the second row stays on its own line");
+        // A file that already ends in a newline gets no extra byte.
+        assert!(!file_ends_mid_line(&std::fs::File::open(&p1).expect("open")).expect("probe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn spill_failed_ilp_separates_feeds_and_hours() {
         // Bounded file count with a replayable granularity: an operator
@@ -7121,7 +7630,9 @@ mod tests {
     #[test]
     fn full_rescue_queue_defers_to_wal_without_file_io() {
         let dir = scratch_dir("defer-wal");
-        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut writer = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (_sink, rx) = writer.split_rescue_offload();
         drop(rx); // thread gone -> Disconnected on try_send
         writer
@@ -7791,7 +8302,9 @@ mod tests {
     #[test]
     fn test_regression_tick_refused_rescue_hand_off_retracts_its_floor() {
         let dir = scratch_dir("z7-refused");
-        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
         let (_sink, rx) = w.split_rescue_offload();
         drop(rx); // Disconnected
         let seq = z7_seq(2);

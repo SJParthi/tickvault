@@ -3108,3 +3108,64 @@ With RUSTSEC-2026-0382 and RUSTSEC-2026-0385 fixed (Quotes 38, 39), the Security
 - Running any other `cargo update`, or this one for another package or version, or a second time.
 - Committing `.claude/settings.json` with the `cargo update` deny rule removed.
 - Any `Cargo.toml` change, a new dependency, or a version move other than `webpki-root-certs` (if the update moves another package, it is reverted and the owner asked again).
+
+#### Quote 41 (2026-10-27, ~07:50 IST) — A BIGGER REPLAY SLICE FOR EVENING DRAIN RESTARTS; REPEAT QUOTES TO THEIR OWN TABLE; DISK SPEED STAYS 125 (decision cards, preserve EXACTLY)
+
+> "go ahead with next wave dude meanwhiel ensure to fix and reoslev and implement evryhtign dude okay?"
+
+The owner answered three decision cards, then asked about the third ("bro i cant udnerstand about this 70 to 75 percnetage tcik rows and increasign ofg 250 mib s dude see anywhoe startign novemebr our plan is to switch off depth 20 and ddpeht 200 itself then our bigger backpressure is completel ystopped right dude then why bro issues why ?") and answered a fourth card that replaced it:
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "About 70–75% of tick rows are repeat quotes carrying an old trade time, which forces the database to rewrite old data and puts the tick writer about 6 hours behind. How should repeat quotes be stored?" | **"Separate table (Recommended)"** | "Repeat quotes (no new trade) go to their own table stamped with arrival time; the ticks table keeps exchange time exactly as today. Nothing is dropped. Needs a dated rule edit I'll record from your answer." |
+| "The old 225 GB backlog clears about 3 million frames per restart (~50 trading days). Should the evening clean-up restarts (after 17:25, never in market hours) be allowed a bigger slice?" | **"5x for evenings (Recommended)"** | "15 million frames per evening restart only; morning boot unchanged. Clears in about 2–3 weeks. Stops itself if free disk falls under the 40 GiB floor." |
+| "The disk sat at its 125 MiB/s speed limit all market day (it was 500 until 21 Oct). Raising it is a live AWS change I can't make (my AWS access is read-only). What should happen?" | "Raise to 250 (Recommended)" — **REPLACED by the next row** | "About $5/month more. I record your dated approval and give you the one AWS command to run (online, no stop)." |
+| "Plain version: depth has been OFF since 21 Oct, but the disk was still full-speed busy yesterday. The cause is the ticks table ... So should I skip the disk-speed raise for now and only raise it if the fix is not enough?" | **"Skip raise, fix cause (Recommended)"** | "Keep disk at 125 (no extra cost, safer for the $75 November limit). Build the repeat-quote table now; re-measure one market day; raise only if still at the limit." |
+
+Measured before the fourth card (Verified, 2026-10-26 11:00 IST scrape): every depth-20 and depth-200 connection reported 0 frames, so the 2026-10-26 disk ceiling was reached with depth already off.
+
+**What this changes, and nothing else:**
+
+| Area | Change |
+|---|---|
+| Root disk throughput | **Unchanged at 125 MiB/s.** Quote 31's "Disk throughput is NOT raised" stands. A raise needs a fresh dated quote after one market day measured with the repeat-quote table live. |
+| Evening drain restarts (Quote 31, plan ITEM 60) | A boot that `evening_drain` marked as its own planned restart may replay up to **5×** `WAL_REPLAY_MAX_FRAMES_PER_BOOT` (15,000,000 frames). The morning boot and every other boot keep the 3,000,000 cap. The 40 GiB replay disk floor, the 15-minute catch-up clock, the at-most-3-restarts and 40-minute spacing, and "none before the day's cross-verification marker or 17:25 IST" are unchanged. |
+| Repeat quotes | Recorded in `websocket-connection-scope-lock.md` §"2026-10-27 — REPEAT QUOTES GET THEIR OWN TABLE" (the `ticks` schema lock lives there). |
+
+##### What violates Quote 41 (REJECT)
+- Any throughput, IOPS or size change under cover of this quote.
+- The 15,000,000-frame slice on any boot that is not an evening drain restart, or removing the replay disk floor or the restart spacing.
+- Raising or lowering a budget line under cover of this quote.
+
+#### Quote 42 (2026-10-27, ~08:20 IST) — THE QUOTE 35 WIPE AND THE QUOTE 32/33 REBUILD RUN TONIGHT, 27 OCTOBER; FRESH START WEDNESDAY 28 OCTOBER (preserve EXACTLY, typos included)
+
+> "bro see as of nowonly oru amx 25k isnturments alognw ith its market depth level 5 alone will be saved rigth dude ... did yo udowngrade the lowered the isnatcne evrythign yo udid dude can youc ehck evrythign dude whetehr is evrythign i npalce in our lkvie aws isnatcne and srever dude okay? see cna yo udo one entire full fresh extreme entire delet and entire wipe off afetr post market and cna yo ugo ahea dwith all of our funcinotlities scenairos entirley by tonight itself dude okay?"
+> "so that start evrythign by tomorrow mronign very fresjhly from the scratch and go ahea ddude okay?"
+> "see by tonoght tiself do evryhtign dude netire downgrade and whatevr else is evryhtign needed also dd it dude okay? entiree wipe off inclduign s3 dude i mean the entire isntacne needs to be enw very fresh scratch dud eokay?"
+
+Measured first (read-only, 2026-10-27 ~08:10 IST): instance `i-0c3fe906dad5492fc` is still **r8g.xlarge**, root volume 600 GB / 3,000 IOPS / 125 MiB/s; the 2026-10-22 rebuild never ran. Budget `tv-prod-monthly-budget-v2`: $151.36 actual, $186.70 forecast, $170 line.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "How do you want the fresh start for tomorrow morning?" | **"Rebuild + S3 wipe tonight"** | "Same, plus deleting all old S3 market-data archives tonight instead of 31 Oct. Needs a rushed rule + code + AWS-permission change today; permanent, no undo. Riskier." (the "Same" being: "After 17:30 IST: SEBI/audit tables copied to S3 and verified first, then a new 150 GB disk + smaller r8g.large, empty market-data database. Old disk kept as a 7-day snapshot (undo possible). Wed 08:30 starts fresh.") |
+| "Merge [PR #2127] today so tomorrow's fresh server runs them?" | **"Merge today (Recommended)"** | "I mark it ready; it merges itself only after All Green and deploys after 15:45 IST (never in market hours)." |
+
+**What Quote 42 changes, and nothing else:**
+
+| Item | Quote 32/33/35 | Quote 42 |
+|---|---|---|
+| Rebuild (Quote 32 steps 3–4, Quote 33 dates) | Weeknight after 17:30 IST from 2026-10-22, before 31 Oct 08:00 | **Runs the night of Tuesday 2026-10-27**, unchanged in every other respect: copy-first and verify, old root kept as a snapshot. |
+| Wipe night | 2026-10-31 18:00 → 2026-11-01 08:00 IST | Apply allowed from **2026-10-27 18:00 IST** (end of window unchanged, 2026-11-01 08:00 IST); runs tonight after the rebuild. |
+| Wipe cutoff | Data dated before 2026-11-01 | Data dated before **2026-10-28** (so nothing Wednesday's fresh box writes can be touched). |
+| S3 scope | `questdb-partitions/<market-data table>/`, `raw-frames/`, `seal-spill/`, `top-volume-spill/` | Plus the market-data tables the rebuild copies under `rebuild-2026-10-22/`, and `tick-quarantine/`, `depth-quarantine/`, `top-volume-quarantine/` (market data the owner named in "entire wipe off inclduign s3"). Keep-list tables under `rebuild-2026-10-22/` are KEPT. |
+| Old-root snapshot | Deleted the same night | Deleted **no earlier than 2026-10-28 16:30 IST**, after Wednesday's first session on the new box ends, so a failed rebuild can still be undone overnight. The S3 delete permission's end stays at the end of 2026-11-01 IST. |
+| Keep-list | Quote 29/35 keep-list | **Unchanged**: every SEBI and audit table and its S3 archive, `sebi-preserve/`, `deploys/`, `logs/`, config, secrets, terraform state, versioning, lifecycle, public-access block. The law keeps these whatever the owner's "entire". |
+
+**Risks stated plainly:** permanent loss of every market-data row and file before 2026-10-28 (box and S3, every version), including today's 27 Oct session; a rebuild failure overnight risks Wednesday's capture (rollback: the old-root snapshot); the October spend is $151.36 of $170 with a $186.70 forecast, so the native stop may switch the box off before 31 October whatever runs tonight.
+
+##### What violates Quote 42 (REJECT)
+- Any delete before 2026-10-27 18:00 IST, inside 09:00–15:45 IST, with the app running, or of anything dated 2026-10-28 or later.
+- Deleting the old-root snapshot before 2026-10-28 16:30 IST.
+- Deleting a keep-list table, `sebi-preserve/`, `deploys/` or `logs/`.
+- Skipping the rebuild's copy-first verification.
+- Reusing Quote 42 after this one run: Quote 27 binds again, and the first PR after the run deletes the role, workflow, tool and budget rows and marks Quotes 35 and 42 ENDED.

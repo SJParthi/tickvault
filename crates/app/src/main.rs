@@ -1336,6 +1336,10 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     };
+    // K4 (2026-10-26): the previous process's last receipt, read after the
+    // claim and before this process can append (boot crash-gap row).
+    let previous_process_last_receipt =
+        tickvault_storage::wal_last_receipt::newest_receipt_nanos_on_disk(&ws_wal_path);
 
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
@@ -3241,7 +3245,7 @@ async fn async_main() -> Result<()> {
     // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
     // conservation audit spawn was DELETED — its inputs (live WAL frames,
     // processor counters, `ticks` writes) all died with the live-WS
-    // retirements; the `tick_conservation_audit` table stays (SEBI).
+    // retirements. RESTORED in a new shape by K4 (2026-10-26), next to the cross-check.
 
     // Daily 15:25 IST orphan-position watchdog — PROCESS-GLOBAL
     // (2026-07-14 re-home; the tick-conservation hoist precedent directly
@@ -4000,6 +4004,16 @@ async fn async_main() -> Result<()> {
                 calendar: std::sync::Arc::clone(&trading_calendar),
             },
             &main_feed_instruments,
+        )
+    });
+    // K4 (2026-10-26): daily ticks conservation check (15:45 IST) and the
+    // boot downtime row. Own task; only with the Dhan lane, the one writer.
+    let _tick_conservation = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::tick_conservation::spawn_tick_conservation(
+            config.questdb.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            process_start_ist_nanos,
+            previous_process_last_receipt,
         )
     });
 
@@ -5775,6 +5789,8 @@ async fn run_process_runloop(
     // Seals the writer's final drain left in memory (audit CONC-2), counted
     // as lost in the crash marker at 5b-2c.
     let mut seal_final_residue = 0_usize;
+    // Audit PR L, L2: main gave up on the writer, so the marker stays not clean.
+    let mut seal_writer_timed_out = false;
     let seal_handle = SEAL_WRITER_HANDLE.lock().ok().and_then(|mut s| s.take());
     if let Some(handle) = seal_handle {
         match tokio::time::timeout(SEAL_WRITER_SHUTDOWN_BUDGET, handle).await {
@@ -5820,9 +5836,12 @@ async fn run_process_runloop(
             }
             Err(_) => {
                 seal_tail_complete = false;
+                seal_writer_timed_out = true;
                 error!(
                     code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                     budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
+                    writer_held_seals =
+                        tickvault_storage::seal_writer_loop::last_writer_held_seals(),
                     "seal writer: the final drain did NOT finish within budget — exiting anyway \
                      so systemd does not SIGKILL us, but the day's tail is incomplete"
                 );
@@ -5908,9 +5927,10 @@ async fn run_process_runloop(
     // writer (5b-2) and the escalation queue (5b-2b) are drained, or have been
     // given up on and paged. The writer left the marker NOT clean while the
     // escalation queue held seals, so a kill during 5b-2b is reported at the
-    // next boot. Marking it clean here, whatever the outcome above, stops the
-    // next boot paging a loss this shutdown already paged, including a writer
-    // that overran its budget.
+    // next boot. Marking it clean here stops the next boot paging a loss this
+    // shutdown already paged; a writer that overran its budget is the one
+    // exception (audit PR L, L2): its count is kept NOT clean, since nothing
+    // else counted what it still held.
     //
     // Bounded like every other wait on this path: the finish is a file write
     // and a rename, and on a stalled disk an overrun writer can hold the
@@ -5924,6 +5944,15 @@ async fn run_process_runloop(
             // The writer's residue is lost as surely as the abandoned
             // escalation queue, and an incomplete tail names the last real
             // drain instant rather than `now` (audit CONC-2, 2026-10-11).
+            if seal_writer_timed_out {
+                // Not clean, with what the writer still held (audit PR L, L2).
+                return tickvault_storage::seal_writer_loop::finish_unwritten_mark_after_writer_timeout(
+                    &dir,
+                    seals_escalation_abandoned,
+                    tickvault_storage::seal_writer_loop::last_writer_held_seals(),
+                    now,
+                );
+            }
             tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
                 &dir,
                 seals_escalation_abandoned.saturating_add(seal_final_residue),

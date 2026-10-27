@@ -125,6 +125,15 @@ boot):
   further SSM polling, so it can structurally never steal the peer's lock
   via the 90s stale-takeover the moment that peer restarts. Restart is the
   only retry; the process keeps running Groww + shared infra.
+  **2026-10-26 (audit L3):** the park above is UNCHANGED. A fix that made
+  the stack re-try every 60 s after the patience was written and NOT
+  applied: it would let a second box take the lock the moment the owner
+  restarts, which is what this park prevents, and changing it needs the
+  owner's dated quote here first. What did change: the live lane no longer
+  returns for the rest of the process when the token manager is missing or
+  the lock flag reads not held; it waits (5 s doubling to 60 s, one
+  RESILIENCE-01 line per episode, `wait_for_dial_preconditions`) and never
+  dials before both hold.
 - **SSM transport errors** (`stage = "ssm_transport"`, distinct from the
   AlreadyHeld `stage = "already_held"` arms) retry with bounded exponential
   backoff FOREVER in the background — never blocking the Groww feed
