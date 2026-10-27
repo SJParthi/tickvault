@@ -617,6 +617,47 @@ impl UnappliedRanges {
         changed
     }
 
+    /// Removes every sequence in `[lo, hi]` (2026-10-27, plan item PR W4): a
+    /// range inside it goes, one straddling an edge is cut, one around it is
+    /// split in two. When a split would need more than
+    /// [`UNAPPLIED_RANGE_SLOTS`] ranges, the lowest two neighbours merge, as in
+    /// [`Self::add_range`], which only covers MORE (it may re-cover part of the
+    /// hole). Returns whether coverage changed. O(32), no allocation. Its one
+    /// production caller is the parked-ack confirmation, which removes only
+    /// sequences an episode itself added.
+    pub fn remove_range(&mut self, lo: u64, hi: u64) -> bool {
+        if lo > hi || !self.intersects(lo, hi) {
+            return false;
+        }
+        let mut out = [(0u64, 0u64); UNAPPLIED_RANGE_SLOTS + 1];
+        let mut n = 0usize;
+        // O(1) EXEMPT: bounded by UNAPPLIED_RANGE_SLOTS (32), cold path
+        for &(a, b) in self.as_slice() {
+            if b < lo || hi < a {
+                out[n] = (a, b);
+                n += 1;
+                continue;
+            }
+            if a < lo {
+                out[n] = (a, lo - 1);
+                n += 1;
+            }
+            if hi < b {
+                out[n] = (hi + 1, b);
+                n += 1;
+            }
+        }
+        if n > UNAPPLIED_RANGE_SLOTS {
+            out[0].1 = out[1].1;
+            out.copy_within(2..n, 1);
+            n -= 1;
+        }
+        self.slots = [(0, 0); UNAPPLIED_RANGE_SLOTS];
+        self.slots[..n].copy_from_slice(&out[..n]);
+        self.len = n;
+        true
+    }
+
     /// `true` when every sequence covered by `other` is covered by `self`.
     /// O(32 × 32). Tests and the integration proptest only; no production
     /// caller (2026-10-20, PR W review round 3: this said "and the boot
@@ -2033,6 +2074,33 @@ mod tests {
         for w in r.as_slice().windows(2) {
             assert!(w[0].1.saturating_add(1) < w[1].0);
         }
+    }
+
+    #[test]
+    fn test_remove_range_cuts_splits_and_merges_when_full() {
+        let mut r = UnappliedRanges::new();
+        r.add_range(10, 20);
+        r.add_range(30, 40);
+        assert!(!r.remove_range(21, 29), "a gap: nothing to remove");
+        assert!(!r.remove_range(5, 1), "an empty range removes nothing");
+        assert!(r.remove_range(15, 32));
+        assert_eq!(r.as_slice(), &[(10, 14), (33, 40)]);
+        assert!(r.remove_range(35, 36), "a split");
+        assert_eq!(r.as_slice(), &[(10, 14), (33, 34), (37, 40)]);
+        assert!(r.remove_range(1, 100));
+        assert!(r.is_empty());
+        // Full: a split merges the lowest pair, so coverage only grows
+        // outside the hole.
+        let mut full = UnappliedRanges::new();
+        // O(1) EXEMPT: test loop
+        for k in 0..UNAPPLIED_RANGE_SLOTS as u64 {
+            full.add_range(k * 100 + 1, k * 100 + 50);
+        }
+        assert!(full.remove_range(3_120, 3_130));
+        assert_eq!(full.len(), UNAPPLIED_RANGE_SLOTS);
+        assert_eq!(full.as_slice()[0], (1, 150), "the lowest pair merged");
+        assert!(!full.intersects(3_120, 3_130), "the hole stays open");
+        assert!(full.intersects(3_101, 3_119) && full.intersects(3_131, 3_150));
     }
 
     #[test]

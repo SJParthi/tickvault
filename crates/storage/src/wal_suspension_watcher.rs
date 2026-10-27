@@ -1329,11 +1329,15 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // watermark was told the database was clean while the
                     // backlog stood exactly where it was. An ack trusted on
                     // such a poll archives frames that were never applied.
+                    // PR W4: the full verdict, so an episode made only of
+                    // lag-only probes can later have its parked acks confirmed.
                     crate::wal_applied_watermark::applied_watermark()
-                        .note_questdb_probe_with_basis(
-                            skipped == 0
-                                && delta.currently_suspended == 0
-                                && lag_tracker.untrusted_count() == 0,
+                        .note_questdb_probe_verdict_with_basis(
+                            crate::wal_parked_confirm::ProbeVerdict::from_readings(
+                                skipped == 0,
+                                delta.currently_suspended,
+                                lag_tracker.untrusted_count(),
+                            ),
                             probe_basis,
                         );
                     // DA-13c: archive acked replay segments once they are past

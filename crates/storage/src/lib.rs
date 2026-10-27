@@ -343,6 +343,9 @@ pub mod wal_replay_settle;
 // the boot fold and an inherited overflow become at most 32 ranges in a sidecar,
 // so the WAL stops growing behind an unbounded overflow bit.
 pub mod wal_unapplied_ranges;
+// Parked live acks (2026-10-27, plan item PR W4): a lag-only suspicion episode's
+// ranges are cut back out once it is past the durability lag and two clean probes.
+pub mod wal_parked_confirm;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT

@@ -95,6 +95,13 @@
 //!   confirm parked live acks once a full [`WATERMARK_DURABILITY_LAG_SECS`]
 //!   (60 s) and two clean probes follow them, as `settling/` does for
 //!   replays.
+//!   **⚠ BUILT 2026-10-27 (plan item PR W4), for lag-only episodes:** see
+//!   `wal_parked_confirm`. An episode whose every unclean probe was a
+//!   complete view with no suspended table (only apply lag latched) has its
+//!   own ranges cut back out, and the watermark raised to its parked acks,
+//!   once the durability lag and two clean probes follow its end with no
+//!   episode in between and no other range over its spans. A suspended,
+//!   partial or blind episode keeps its ranges as before.
 //!
 //! **⚠ ADDED 2026-10-20 (PR W review round 5), the upper side:** the same
 //! reorder bound lets a segment's last record sit up to one slack ABOVE the
@@ -111,8 +118,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::wal_parked_confirm::{
+    Decision, ExitMark, ParkedConfirm, ProbeVerdict, Sink, WAL_PARKED_ACKS_CONFIRMED_COUNTER,
+    WAL_PARKED_ACKS_KEPT_COUNTER, own_union,
+};
 use crate::wal_unapplied_ranges::{BootFold, UnappliedRanges, UnappliedRangesFile};
 
 /// The watermark file, beside the `*.wal` segments. Not a `.wal`, so the
@@ -1250,6 +1261,11 @@ struct RangesState {
     durable_gen: u16,
     /// The next generation to write; `0` = derive one from the clock.
     next_gen: u16,
+    /// 2026-10-27 (plan item PR W4): the current suspicion episode's own
+    /// ranges and whether its parked acks may be confirmed. Every range add
+    /// goes through [`Self::add_foreign`] or [`Self::add_own`], so an add from
+    /// any other source over the episode's spans is seen.
+    confirm: ParkedConfirm,
 }
 
 impl RangesState {
@@ -1259,7 +1275,45 @@ impl RangesState {
             migrated_span: None,
             durable_gen: 0,
             next_gen: 0,
+            confirm: ParkedConfirm::new(),
         }
+    }
+
+    /// Adds `[lo, hi]` from any source other than the current suspicion
+    /// episode, telling the episode first (PR W4). O(32).
+    fn add_foreign(&mut self, lo: u64, hi: u64) -> bool {
+        self.confirm.note_foreign_add(lo, hi);
+        self.ranges.add_range(lo, hi)
+    }
+
+    /// [`Self::add_foreign`] with the waiting spans (boot fold). O(32 × log
+    /// spans).
+    fn add_foreign_avoiding(&mut self, lo: u64, hi: u64, spans: &[(u64, u64)]) -> bool {
+        self.confirm.note_foreign_add(lo, hi);
+        self.ranges.add_range_avoiding(lo, hi, spans)
+    }
+
+    /// Adds `[lo, hi]` as the current episode's own range for `sink` (PR
+    /// W4). Coverage already present over a part of it the episode does not
+    /// own came from another source, so the episode can no longer be cut
+    /// back out. O(32).
+    fn add_own(&mut self, sink: Sink, lo: u64, hi: u64) -> bool {
+        let lo = lo.max(1);
+        if lo > hi {
+            return false;
+        }
+        let own = own_union(self.confirm.spans());
+        let inside = |a: u64, b: u64| own.iter().flatten().any(|&(x, y)| x <= a && b <= y);
+        // O(1) EXEMPT: bounded by UNAPPLIED_RANGE_SLOTS (32), cold path
+        let foreign = self.ranges.as_slice().iter().any(|&(a, b)| {
+            let (x, y) = (a.max(lo), b.min(hi));
+            x <= y && !inside(x, y)
+        });
+        if foreign {
+            self.confirm.note_foreign_present();
+        }
+        self.confirm.own(sink, lo, hi);
+        self.ranges.add_range(lo, hi)
     }
 
     /// Adds `span` to the migrated span (the union of the two). O(1).
@@ -1544,7 +1598,7 @@ impl AppliedWatermark {
             let before = state.ranges;
             // O(1) EXEMPT: bounded by UNAPPLIED_RANGE_SLOTS (32), boot-time seed
             for &(lo, hi) in snap.ranges.as_slice() {
-                state.ranges.add_range(lo, hi);
+                state.add_foreign(lo, hi);
             }
             if snap.migrated_overflow {
                 state.widen_migrated(snap.migrated_span.unwrap_or((1, u64::MAX)));
@@ -1694,19 +1748,39 @@ impl AppliedWatermark {
     /// vouched for by it, and recording them as healthy put them in no
     /// episode range when the next probe failed.
     pub fn note_questdb_probe_with_basis(&self, clean: bool, basis: (u64, u64)) {
-        self.note_questdb_probe_full(clean, Some(basis), mono_nanos());
+        self.note_questdb_probe_full(verdict_of(clean), Some(basis), mono_nanos());
+    }
+
+    /// [`Self::note_questdb_probe_with_basis`] with the probe's full verdict
+    /// (2026-10-27, plan item PR W4): a [`ProbeVerdict::LagOnly`] probe is
+    /// unclean exactly like [`ProbeVerdict::Untrusted`], but an episode made
+    /// only of lag-only probes may later have its parked acks confirmed (see
+    /// `wal_parked_confirm`). The watcher calls this; O(1) plus the cold
+    /// range work of an episode transition.
+    pub fn note_questdb_probe_verdict_with_basis(&self, verdict: ProbeVerdict, basis: (u64, u64)) {
+        self.note_questdb_probe_full(verdict, Some(basis), mono_nanos());
     }
 
     /// [`Self::note_questdb_probe`] at monotonic instant `now`.
     fn note_questdb_probe_at(&self, clean: bool, now: u64) {
-        self.note_questdb_probe_full(clean, None, now);
+        self.note_questdb_probe_full(verdict_of(clean), None, now);
+    }
+
+    /// [`Self::note_questdb_probe_verdict_with_basis`] at monotonic instant
+    /// `now`, with the marks now as the basis (tests drive time with it).
+    #[cfg(test)]
+    pub(crate) fn note_questdb_probe_verdict_at(&self, verdict: ProbeVerdict, now: u64) {
+        self.note_questdb_probe_full(verdict, None, now);
     }
 
     /// The probe report: `basis` = the marks when the query was sent, or
     /// `None` for the marks now.
-    fn note_questdb_probe_full(&self, clean: bool, basis: Option<(u64, u64)>, now: u64) {
-        if clean {
-            self.clean_probes.fetch_add(1, Ordering::AcqRel);
+    fn note_questdb_probe_full(&self, verdict: ProbeVerdict, basis: Option<(u64, u64)>, now: u64) {
+        if verdict.is_clean() {
+            let clean_probes = self
+                .clean_probes
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
             // Round 6: the flip and the reads under the ack gate, so an ack
             // either parked before it (and is read here) or raises the
             // watermark after it; none can park into the drained slot.
@@ -1731,13 +1805,15 @@ impl AppliedWatermark {
                     // that first record keeps the segment.
                     crate::off_worker::off_worker(|| {
                         if parked_ticks > hwm_ticks {
-                            self.add_unapplied_range(
+                            self.episode_add_unapplied_range(
+                                Sink::Ticks,
                                 suspension_range_lo(hwm_ticks),
                                 parked_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
                             );
                         }
                         if parked_depth > hwm_depth {
-                            self.add_unapplied_range(
+                            self.episode_add_unapplied_range(
+                                Sink::Depth,
                                 suspension_range_lo(hwm_depth),
                                 parked_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
                             );
@@ -1745,6 +1821,14 @@ impl AppliedWatermark {
                         self.persist_now();
                     });
                 }
+                // PR W4: the exit mark, after the episode's last range is in.
+                self.lock_ranges().confirm.exit(ExitMark {
+                    at_mono: now,
+                    clean_probes,
+                    episodes: self.suspect_episodes.load(Ordering::Acquire),
+                    parked_ticks,
+                    parked_depth,
+                });
             }
             // The marks the reply vouches for: those when the query was sent
             // (never above the marks now, which only rise).
@@ -1754,6 +1838,7 @@ impl AppliedWatermark {
             });
             self.healthy_ticks.store(healthy_ticks, Ordering::Release);
             self.healthy_depth.store(healthy_depth, Ordering::Release);
+            self.confirm_parked_acks(now, clean_probes);
         } else {
             // Round 6: the flip and the watermark reads under the ack gate,
             // so an ack either raised the watermark before it (and is
@@ -1769,10 +1854,17 @@ impl AppliedWatermark {
             };
             let Some((hwm_ticks, hwm_depth)) = entered else {
                 self.account_suspect_time_at(now);
+                self.lock_ranges().confirm.observe_unclean(verdict);
                 return;
             };
             self.suspect_accounted_nanos.store(now, Ordering::Release);
             metrics::counter!(WAL_SUSPECT_EPISODES_COUNTER).increment(1);
+            // PR W4: an episode still waiting for confirmation is dropped
+            // (its ranges stay); the new one starts tracking before its
+            // first range is added.
+            if let Some(reason) = self.lock_ranges().confirm.begin(verdict, false) {
+                metrics::counter!(WAL_PARKED_ACKS_KEPT_COUNTER, "reason" => reason).increment(1);
+            }
             // Record where this episode begins BEFORE its number is published
             // (audit DA-13b review): a reader that sees the new number can then
             // also see its start, and a reader mid-rewrite sees the tag change.
@@ -1788,16 +1880,86 @@ impl AppliedWatermark {
             self.episode_start_tag.store(episode, Ordering::SeqCst);
             self.suspect_episodes.fetch_add(1, Ordering::AcqRel);
             crate::off_worker::off_worker(|| {
-                self.add_unapplied_range(
+                self.episode_add_unapplied_range(
+                    Sink::Ticks,
                     suspension_range_lo(self.healthy_ticks.load(Ordering::Acquire)),
                     hwm_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
                 );
-                self.add_unapplied_range(
+                self.episode_add_unapplied_range(
+                    Sink::Depth,
                     suspension_range_lo(self.healthy_depth.load(Ordering::Acquire)),
                     hwm_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
                 );
                 self.persist_now();
             });
+        }
+    }
+
+    /// The parked-ack confirmation (2026-10-27, plan item PR W4), run at
+    /// every clean probe. While no episode is tracked: one lock, nothing
+    /// else. When one is due (durability lag and two clean probes after its
+    /// end, no episode since, lag-only, no other range over its spans): its
+    /// own ranges are cut out under the same lock that decided, the sidecar
+    /// and the watermark file are written off the runtime worker, then the
+    /// watermarks are raised to the parked acks under the ack gate. Cold:
+    /// once per watcher poll (60 s). Every refusal keeps the ranges.
+    fn confirm_parked_acks(&self, now: u64, clean_probes: u64) {
+        if !self.lock_ranges().confirm.is_tracking() {
+            return;
+        }
+        let decision = crate::off_worker::off_worker(|| {
+            let mut state = self.lock_ranges();
+            let decision = state.confirm.decide(
+                now,
+                clean_probes,
+                self.suspect_episodes.load(Ordering::Acquire),
+                self.sink_suspect.load(Ordering::Acquire),
+            );
+            if let Decision::Confirm { ticks, depth, .. } = decision {
+                let mut changed = false;
+                // O(1) EXEMPT: at most two spans, each an O(32) removal
+                for (lo, hi) in [ticks, depth].into_iter().flatten() {
+                    changed |= state.ranges.remove_range(lo, hi);
+                }
+                if state.settle_migrated() || changed {
+                    self.write_ranges_locked(&mut state);
+                }
+                drop(state);
+                self.persist_now();
+            }
+            decision
+        });
+        match decision {
+            Decision::Idle | Decision::Wait => {}
+            Decision::Keep(reason) => {
+                metrics::counter!(WAL_PARKED_ACKS_KEPT_COUNTER, "reason" => reason).increment(1);
+                info!(
+                    reason,
+                    "WAL parked acks kept: the suspicion episode's ranges stay until a \
+                     replay reads them"
+                );
+            }
+            Decision::Confirm {
+                ticks,
+                depth,
+                parked_ticks,
+                parked_depth,
+            } => {
+                {
+                    let _gate = self.lock_ack_gate();
+                    self.hwm_ticks.fetch_max(parked_ticks, Ordering::AcqRel);
+                    self.hwm_depth.fetch_max(parked_depth, Ordering::AcqRel);
+                }
+                metrics::counter!(WAL_PARKED_ACKS_CONFIRMED_COUNTER).increment(1);
+                info!(
+                    ?ticks,
+                    ?depth,
+                    parked_ticks,
+                    parked_depth,
+                    "WAL parked acks confirmed: a lag-only suspicion episode is past the \
+                     durability lag and two clean QuestDB probes, so its ranges are cut"
+                );
+            }
         }
     }
 
@@ -2118,7 +2280,23 @@ impl AppliedWatermark {
             return false;
         }
         let mut state = self.lock_ranges();
-        let changed = state.ranges.add_range(frame_floor(lo), hi);
+        let changed = state.add_foreign(frame_floor(lo), hi);
+        if changed {
+            self.write_ranges_locked(&mut state);
+        }
+        changed
+    }
+
+    /// [`Self::add_unapplied_range`] for the current suspicion episode's own
+    /// range on `sink` (2026-10-27, plan item PR W4): the confirmation may
+    /// later cut exactly these sequences back out. O(32) plus one small file
+    /// write; cold (an episode's start and end only).
+    fn episode_add_unapplied_range(&self, sink: Sink, lo: u64, hi: u64) -> bool {
+        if lo > hi {
+            return false;
+        }
+        let mut state = self.lock_ranges();
+        let changed = state.add_own(sink, frame_floor(lo), hi);
         if changed {
             self.write_ranges_locked(&mut state);
         }
@@ -2263,7 +2441,7 @@ impl AppliedWatermark {
                     height
                 };
                 let lo = oldest_lo.unwrap_or(1).clamp(1, hi.max(1));
-                state.ranges.add_range_avoiding(lo, hi, spans);
+                state.add_foreign_avoiding(lo, hi, spans);
                 state.widen_migrated((lo, hi));
                 self.overflow_high_seq.store(0, Ordering::Release);
                 self.overflow_low_seq.store(u64::MAX, Ordering::Release);
@@ -2293,7 +2471,7 @@ impl AppliedWatermark {
             let hi = ((id + 1) << UNAPPLIED_BUCKET_SHIFT)
                 .saturating_sub(1)
                 .saturating_add(REPLAY_REORDER_SLACK_SEQ);
-            state.ranges.add_range_avoiding(lo, hi, spans);
+            state.add_foreign_avoiding(lo, hi, spans);
             self.bucket_ids[i].store(0, Ordering::Release);
             self.bucket_counts[i].store(0, Ordering::Release);
             out.folded_buckets = out.folded_buckets.saturating_add(1);
@@ -2302,7 +2480,7 @@ impl AppliedWatermark {
         // `boot_range_floor`).
         let tail_lo = self.boot_range_floor().max(oldest_lo.unwrap_or(1));
         if tail_lo <= own_floor {
-            state.ranges.add_range_avoiding(tail_lo, own_floor, spans);
+            state.add_foreign_avoiding(tail_lo, own_floor, spans);
             out.tail = Some((tail_lo, own_floor));
         }
         state.settle_migrated();
@@ -2764,7 +2942,7 @@ impl AppliedWatermark {
             // record is above `high` (see `AppliedSnapshot::segment_is_applied`).
             // And one on the bottom (PR W review round 5): a frame at `low`
             // can sit in a segment whose range ends below it.
-            changed |= state.ranges.add_range(
+            changed |= state.add_foreign(
                 frame_floor(lo.saturating_sub(REPLAY_REORDER_SLACK_SEQ)),
                 high.saturating_add(REPLAY_REORDER_SLACK_SEQ),
             );
@@ -2802,6 +2980,16 @@ impl AppliedWatermark {
             break;
         }
         changed
+    }
+}
+
+/// The probe verdict a bare `clean` flag stands for: an unclean probe with no
+/// detail is [`ProbeVerdict::Untrusted`], so its episode is never confirmed.
+const fn verdict_of(clean: bool) -> ProbeVerdict {
+    if clean {
+        ProbeVerdict::Clean
+    } else {
+        ProbeVerdict::Untrusted
     }
 }
 
@@ -4697,7 +4885,7 @@ mod tests {
             assert!(gate < flag, "{name}: the gate is taken before the flag");
         }
         let start = src
-            .find("    fn note_questdb_probe_full(&self, clean: bool, basis: Option<(u64, u64)>, now: u64) {")
+            .find("    fn note_questdb_probe_full(&self, verdict: ProbeVerdict, basis: Option<(u64, u64)>, now: u64) {")
             .expect("probe present");
         let body = &src[start..];
         let body = &body[..body.find("\n    }\n").expect("end of the function")];
