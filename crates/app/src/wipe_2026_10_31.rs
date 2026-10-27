@@ -1,14 +1,20 @@
-//! The one-off full market-data wipe of the night of Saturday 2026-10-31
-//! (plan item 67; operator Quote 35 in
+//! The one-off full market-data wipe (plan item 67; operator Quote 35,
+//! brought forward by Quote 42, both in
 //! `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`).
 //!
-//! Quote 35 names the data and states the loss: every market-data partition
-//! and file dated before 2026-11-01 IST, on the box and in `s3://tv-prod-cold`,
-//! every version, plus the snapshot of the old 600 GB root from the
-//! 2026-10-22 rebuild. Quote 29's keep-list is kept: every SEBI and audit
+//! Quote 35 named the data and stated the loss: every market-data partition
+//! and file on the box and in `s3://tv-prod-cold`, every version, plus the
+//! snapshot of the old 600 GB root from the 2026-10-22 rebuild. Quote 42
+//! (2026-10-27) moved it to the night of Tuesday 2026-10-27: the apply window
+//! opens 2026-10-27 18:00 IST, the cutoff is **2026-10-28** (nothing
+//! Wednesday's fresh box writes can be touched), the S3 scope adds the
+//! market-data tables the rebuild copied under `rebuild-2026-10-22/tables/`
+//! and the three quarantine prefixes, and the old-root snapshot is kept until
+//! 2026-10-28 16:30 IST. Quote 29's keep-list is kept: every SEBI and audit
 //! table (the rebuild's keep-list, [`is_keep_table`]), `sebi-preserve/`,
-//! `deploys/`, `logs/`, versioning, lifecycle, and anything dated 2026-11-01
-//! or later.
+//! `deploys/`, `logs/`, versioning, lifecycle, and anything dated 2026-10-28
+//! or later. The tool's name, workflow, environment, role and confirm word
+//! keep their 2026-10-31 names (renaming them the same day is not possible).
 //!
 //! This module is the pure half shared by the two programs that run it:
 //!
@@ -34,14 +40,22 @@ use serde::{Deserialize, Serialize};
 
 /// The only bucket this tool may touch.
 pub const COLD_BUCKET: &str = "tv-prod-cold";
-/// Data dated strictly before this IST date is in scope.
-pub const CUTOFF_IST_DATE: &str = "2026-11-01";
+/// Data dated strictly before this IST date is in scope (Quote 42: "Data
+/// dated before 2026-10-28", so nothing Wednesday's fresh box writes can be
+/// touched). Was 2026-11-01 under Quote 35.
+pub const CUTOFF_IST_DATE: &str = "2026-10-28";
 /// Every run is refused after this IST date (Quote 35: refused after
-/// 2026-11-01 IST). The IAM role expires at the same instant.
+/// 2026-11-01 IST; Quote 42 keeps the end). The IAM role expires at the same
+/// instant.
 pub const LAST_RUN_IST_DATE: &str = "2026-11-01";
-/// An apply may start no earlier than this IST instant ("the night of
-/// Saturday 2026-10-31").
-pub const APPLY_FROM_IST: &str = "2026-10-31 18:00";
+/// An apply may start no earlier than this IST instant (Quote 42: "Apply
+/// allowed from 2026-10-27 18:00 IST"; was 2026-10-31 18:00 under Quote 35).
+pub const APPLY_FROM_IST: &str = "2026-10-27 18:00";
+/// The old-root snapshot may be deleted no earlier than this IST instant
+/// (Quote 42: "no earlier than 2026-10-28 16:30 IST, after Wednesday's first
+/// session on the new box ends, so a failed rebuild can still be undone
+/// overnight"). Checked by [`snapshot_delete_refusal`].
+pub const SNAPSHOT_DELETE_FROM_IST: &str = "2026-10-28 16:30";
 /// An apply may start no later than this IST instant (before Sunday
 /// morning; nowhere near 09:00–15:45 IST).
 pub const APPLY_UNTIL_IST: &str = "2026-11-01 08:00";
@@ -68,8 +82,26 @@ const REPORT_MAX_LINES: usize = 80;
 const REPORT_LINE_MAX_CHARS: usize = 160;
 
 const PARTITIONS_ROOT: &str = "questdb-partitions/";
-/// Dated S3 roots Quote 35 names: `<root><IST date>/<file>`.
-const DATED_ROOTS: [&str; 3] = ["raw-frames/", "seal-spill/", "top-volume-spill/"];
+/// Dated S3 roots: `<root><IST date>/<file>`. The first three are Quote 35's;
+/// the three quarantine roots are Quote 42's ("market data the owner named
+/// in 'entire wipe off inclduign s3'"), written by `raw_frame_upload` with
+/// the same `<prefix>/<IST date>/<name>.gz` key shape.
+const DATED_ROOTS: [&str; 6] = [
+    "raw-frames/",
+    "seal-spill/",
+    "top-volume-spill/",
+    "tick-quarantine/",
+    "depth-quarantine/",
+    "top-volume-quarantine/",
+];
+/// Where the 2026-10-22 rebuild put the tables it copied WHOLE:
+/// `rebuild-2026-10-22/tables/<table>/<sha256 hex>.csv.gz`
+/// (`partition_archive::rebuild_whole_table_key`). Quote 42 adds the
+/// market-data tables here; keep-list tables here are kept. The key has no
+/// date, so its object's last-modified time dates it.
+pub const REBUILD_TABLES_ROOT: &str = "rebuild-2026-10-22/tables/";
+/// The rebuild's keep-list copies (`rebuild-2026-10-22/keep/`): never touched.
+const REBUILD_KEEP_ROOT: &str = "rebuild-2026-10-22/keep/";
 /// S3 roots that are never touched, whatever follows.
 const PROTECTED_ROOTS: [&str; 3] = ["deploys/", "sebi-preserve/", "logs/"];
 /// The only year the IAM grant covers (`2026-0?-??*`, `2026-10-??*`).
@@ -154,7 +186,7 @@ impl Phase {
 pub enum Verdict {
     /// In scope and dated before the cutoff: deleted.
     Delete,
-    /// In scope but dated 2026-11-01 or later: kept.
+    /// In scope but dated 2026-10-28 or later: kept.
     KeepNotOld,
     /// On the keep-list (SEBI / audit / deploys / logs / sebi-preserve /
     /// state files): kept, whatever its date.
@@ -172,7 +204,7 @@ fn cutoff_date() -> Option<NaiveDate> {
     NaiveDate::parse_from_str(CUTOFF_IST_DATE, "%Y-%m-%d").ok()
 }
 
-/// The cutoff instant: 2026-11-01 00:00 IST, i.e. 2026-10-31 18:30 UTC, as
+/// The cutoff instant: 2026-10-28 00:00 IST, i.e. 2026-10-27 18:30 UTC, as
 /// Unix seconds. `None` only if the constant does not parse (tested).
 #[must_use]
 pub fn cutoff_unix_secs() -> Option<i64> {
@@ -209,8 +241,10 @@ pub fn market_data_tables() -> Vec<&'static str> {
     out
 }
 
-/// The exact prefixes the S3 phase lists, one per market-data table plus the
-/// dated roots. The IAM `s3:prefix` condition allows these and no others.
+/// The exact prefixes the S3 phase lists, one per market-data table, the
+/// dated roots, and the rebuild's whole-table root (listed once; every key
+/// under it is classified by table, so a keep-list or unknown table there is
+/// kept). The IAM `s3:prefix` condition allows these and no others.
 #[must_use]
 pub fn s3_list_prefixes() -> Vec<String> {
     let mut out: Vec<String> = market_data_tables()
@@ -218,7 +252,38 @@ pub fn s3_list_prefixes() -> Vec<String> {
         .map(|t| format!("{PARTITIONS_ROOT}{t}/"))
         .collect();
     out.extend(DATED_ROOTS.iter().map(|r| (*r).to_string()));
+    out.push(REBUILD_TABLES_ROOT.to_string());
     out
+}
+
+/// `true` for `<64 lowercase hex>.csv.gz`, the only file name
+/// `partition_archive::rebuild_whole_table_key` writes.
+fn is_rebuild_whole_table_file(file: &str) -> bool {
+    file.strip_suffix(".csv.gz").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// One object under [`REBUILD_TABLES_ROOT`]: deleted only when its table is
+/// market data (never a keep-list table, e.g. `top_volume_rank`), its file
+/// name is the rebuild's content-addressed shape, and the version was last
+/// written before the cutoff instant. The key carries no date, so the
+/// version's own last-modified time dates it; an unknown time keeps it.
+fn rebuild_table_verdict(rest: &str, last_modified_unix_secs: Option<i64>) -> Verdict {
+    let Some((table, file)) = rest.split_once('/') else {
+        return Verdict::KeepUnparsed;
+    };
+    if is_keep_table(table) {
+        return Verdict::KeepProtected;
+    }
+    if !market_data_tables().contains(&table) || !is_rebuild_whole_table_file(file) {
+        return Verdict::KeepUnparsed;
+    }
+    match (last_modified_unix_secs, cutoff_unix_secs()) {
+        (Some(t), Some(c)) if t < c => Verdict::Delete,
+        (Some(_), Some(_)) => Verdict::KeepNotOld,
+        _ => Verdict::KeepUnparsed,
+    }
 }
 
 /// A real `YYYY-MM-DD` date at the start of `s`.
@@ -274,11 +339,22 @@ pub fn partition_verdict(table: &str, name: &str) -> Verdict {
     date_verdict(date)
 }
 
-/// Classifies one object key of the cold bucket.
+/// Classifies one object version of the cold bucket by its key and, for the
+/// undated rebuild keys only, its last-modified time (Unix seconds).
+///
+/// Any key naming `audit` or `sebi` anywhere is kept, whatever its root
+/// (defence in depth: the box classifier keeps such paths the same way).
 #[must_use]
-pub fn classify_s3_key(key: &str) -> Verdict {
-    if PROTECTED_ROOTS.iter().any(|r| key.starts_with(r)) {
+pub fn classify_s3_key(key: &str, last_modified_unix_secs: Option<i64>) -> Verdict {
+    if PROTECTED_ROOTS.iter().any(|r| key.starts_with(r))
+        || key.starts_with(REBUILD_KEEP_ROOT)
+        || key.contains("audit")
+        || key.contains("sebi")
+    {
         return Verdict::KeepProtected;
+    }
+    if let Some(rest) = key.strip_prefix(REBUILD_TABLES_ROOT) {
+        return rebuild_table_verdict(rest, last_modified_unix_secs);
     }
     if let Some(rest) = key.strip_prefix(PARTITIONS_ROOT) {
         let Some((table, name)) = rest.split_once('/') else {
@@ -324,7 +400,7 @@ fn is_wal_segment_name(name: &str) -> bool {
 /// | any other file under `data/spill/` or `data/dlq/` | by date (tick, depth, seal, top_volume spill, seal DLQ) |
 /// | anything with an `audit` or `sebi-preserve` component, `..`, or elsewhere | kept |
 ///
-/// "By date": deleted when last written before 2026-11-01 00:00 IST.
+/// "By date": deleted when last written before 2026-10-28 00:00 IST.
 #[must_use]
 pub fn box_file_verdict(rel: &str, mtime_unix_secs: i64) -> Verdict {
     let parts: Vec<&str> = rel.split('/').collect();
@@ -434,7 +510,7 @@ pub fn run_refusal(
     };
     if now_ist.date() > last {
         return Some(format!(
-            "Quote 35 is one run; this tool expired after {LAST_RUN_IST_DATE} IST"
+            "Quotes 35 and 42 are one run; this tool expired after {LAST_RUN_IST_DATE} IST"
         ));
     }
     if mode == Mode::Dry || phase == Phase::Preflight {
@@ -449,7 +525,24 @@ pub fn run_refusal(
     }
     if now_ist < from || now_ist > until {
         return Some(format!(
-            "apply runs only from {APPLY_FROM_IST} to {APPLY_UNTIL_IST} IST (the night of Saturday 2026-10-31)"
+            "apply runs only from {APPLY_FROM_IST} to {APPLY_UNTIL_IST} IST (Quote 42)"
+        ));
+    }
+    None
+}
+
+/// Why the old-root snapshot must not be deleted yet, or `None` when it may.
+/// Quote 42: no earlier than [`SNAPSHOT_DELETE_FROM_IST`], after Wednesday's
+/// first session on the new box ends, so a failed rebuild can still be undone
+/// overnight. Checked on top of [`run_refusal`] for every snapshot delete.
+#[must_use]
+pub fn snapshot_delete_refusal(now_ist: NaiveDateTime) -> Option<String> {
+    let Some(from) = ist_naive(SNAPSHOT_DELETE_FROM_IST) else {
+        return Some("internal: the snapshot delete time cannot be evaluated".to_string());
+    };
+    if now_ist < from {
+        return Some(format!(
+            "the old-root snapshot is kept until {SNAPSHOT_DELETE_FROM_IST} IST (Quote 42: after Wednesday's first session on the new box, so a failed rebuild can still be undone); re-run phase=cloud mode=apply after that"
         ));
     }
     None
@@ -523,6 +616,8 @@ pub struct VersionEntry {
     pub bytes: i64,
     /// A delete marker rather than a version.
     pub is_delete_marker: bool,
+    /// Last-modified time (Unix seconds); dates the undated rebuild keys.
+    pub last_modified_unix_secs: Option<i64>,
 }
 
 /// Totals for one group in the S3 report.
@@ -543,7 +638,7 @@ pub struct S3Plan {
     pub delete: Vec<VersionEntry>,
     /// Per group (`questdb-partitions/<table>`, `raw-frames`, ...).
     pub groups: std::collections::BTreeMap<String, GroupTotals>,
-    /// Kept: dated 2026-11-01 or later.
+    /// Kept: dated 2026-10-28 or later.
     pub kept_not_old: usize,
     /// Kept: on the keep-list.
     pub kept_protected: usize,
@@ -552,9 +647,11 @@ pub struct S3Plan {
 }
 
 fn group_of(key: &str) -> String {
-    if let Some(rest) = key.strip_prefix(PARTITIONS_ROOT) {
-        let table = rest.split('/').next().unwrap_or_default();
-        return format!("{PARTITIONS_ROOT}{table}");
+    for root in [PARTITIONS_ROOT, REBUILD_TABLES_ROOT] {
+        if let Some(rest) = key.strip_prefix(root) {
+            let table = rest.split('/').next().unwrap_or_default();
+            return format!("{root}{table}");
+        }
     }
     key.split('/').next().unwrap_or_default().to_string()
 }
@@ -565,7 +662,7 @@ impl S3Plan {
     pub fn from_entries(entries: Vec<VersionEntry>) -> Self {
         let mut plan = Self::default();
         for e in entries {
-            match classify_s3_key(&e.key) {
+            match classify_s3_key(&e.key, e.last_modified_unix_secs) {
                 Verdict::Delete => {
                     let g = plan.groups.entry(group_of(&e.key)).or_default();
                     if e.is_delete_marker {
@@ -720,14 +817,15 @@ mod tests {
             version_id: "v".to_string(),
             bytes,
             is_delete_marker: marker,
+            last_modified_unix_secs: Some(secs("2026-10-27 20:00")),
         }
     }
 
     #[test]
-    fn test_cutoff_unix_secs_is_midnight_ist_on_the_first_of_november() {
-        // 2026-10-31T18:30:00Z.
-        assert_eq!(cutoff_unix_secs(), Some(1_793_471_400));
-        assert_eq!(cutoff_unix_secs(), Some(secs("2026-11-01 00:00")));
+    fn test_cutoff_unix_secs_is_midnight_ist_on_the_twenty_eighth_of_october() {
+        // 2026-10-27T18:30:00Z (Quote 42; was 2026-11-01 under Quote 35).
+        assert_eq!(cutoff_unix_secs(), Some(1_793_125_800));
+        assert_eq!(cutoff_unix_secs(), Some(secs("2026-10-28 00:00")));
     }
 
     #[test]
@@ -820,13 +918,17 @@ mod tests {
     #[test]
     fn test_s3_list_prefixes_are_exact_and_never_protected() {
         let p = s3_list_prefixes();
-        assert_eq!(p.len(), market_data_tables().len() + 3);
+        assert_eq!(p.len(), market_data_tables().len() + DATED_ROOTS.len() + 1);
         assert!(p.iter().all(|x| x.ends_with('/')));
         for want in [
             "questdb-partitions/ticks/",
             "raw-frames/",
             "seal-spill/",
             "top-volume-spill/",
+            "tick-quarantine/",
+            "depth-quarantine/",
+            "top-volume-quarantine/",
+            "rebuild-2026-10-22/tables/",
         ] {
             assert!(p.contains(&want.to_string()), "{want}");
         }
@@ -842,7 +944,7 @@ mod tests {
     fn test_classify_s3_key_refuses_every_keep_table_and_protected_root() {
         for t in tickvault_storage::partition_manager::rebuild_keep_tables() {
             let key = format!("questdb-partitions/{t}/2026-10-01.csv.gz");
-            assert_eq!(classify_s3_key(&key), Verdict::KeepProtected, "{key}");
+            assert_eq!(classify_s3_key(&key, None), Verdict::KeepProtected, "{key}");
         }
         for k in [
             "deploys/abc/tickvault",
@@ -851,7 +953,7 @@ mod tests {
             "logs/2026/10/01/app.gz",
             "logs/raw-frames/2026-10-01/x",
         ] {
-            assert_eq!(classify_s3_key(k), Verdict::KeepProtected, "{k}");
+            assert_eq!(classify_s3_key(k, None), Verdict::KeepProtected, "{k}");
         }
     }
 
@@ -859,8 +961,8 @@ mod tests {
     fn test_classify_s3_key_date_fence_and_shapes() {
         use Verdict::*;
         let cases = [
-            ("questdb-partitions/ticks/2026-10-31T23.csv.gz", Delete),
-            ("questdb-partitions/ticks/2026-10-31.csv.gz", Delete),
+            ("questdb-partitions/ticks/2026-10-27T23.csv.gz", Delete),
+            ("questdb-partitions/ticks/2026-10-27.csv.gz", Delete),
             (
                 "questdb-partitions/ticks/2026-10-01T09.sha-ab12.csv.gz",
                 Delete,
@@ -870,8 +972,8 @@ mod tests {
                 "questdb-partitions/top_volume_1m/2026-10-02T10.csv.gz",
                 Delete,
             ),
-            ("questdb-partitions/ticks/2026-11-01.csv.gz", KeepNotOld),
-            ("questdb-partitions/ticks/2026-11-01T00.csv.gz", KeepNotOld),
+            ("questdb-partitions/ticks/2026-10-28.csv.gz", KeepNotOld),
+            ("questdb-partitions/ticks/2026-10-28T00.csv.gz", KeepNotOld),
             ("questdb-partitions/ticks/2027-01-02.csv.gz", KeepUnparsed),
             ("questdb-partitions/ticks/2025-12-31.csv.gz", KeepUnparsed),
             ("questdb-partitions/ticks/2026-02-30.csv.gz", KeepUnparsed),
@@ -884,33 +986,33 @@ mod tests {
             ("questdb-partitions/ticks_x/2026-10-01.csv.gz", KeepUnparsed),
             ("questdb-partitions/ticks/", KeepUnparsed),
             ("questdb-partitions/ticks", KeepUnparsed),
-            ("raw-frames/2026-10-31/ws-frames-1.wal.gz", Delete),
+            ("raw-frames/2026-10-27/ws-frames-1.wal.gz", Delete),
             ("seal-spill/2026-10-01/seals_v6-x.bin.gz", Delete),
             ("top-volume-spill/2026-10-01/x.gz", Delete),
-            ("raw-frames/2026-11-01/ws-frames-1.wal.gz", KeepNotOld),
-            ("seal-spill/2026-11-02/x", KeepNotOld),
+            ("raw-frames/2026-10-28/ws-frames-1.wal.gz", KeepNotOld),
+            ("seal-spill/2026-10-29/x", KeepNotOld),
             ("raw-frames/2026-10-08/", KeepUnparsed),
             ("raw-frames/2026-10-8/x", KeepUnparsed),
             ("raw-frames/latest/x", KeepUnparsed),
             ("seal-spill/x.bin", KeepUnparsed),
-            ("tick-quarantine/2026-10-01/x.gz", KeepUnparsed),
+            ("tick-quarantine/2026-10-01/x.gz", Delete),
             ("rebuild-2026-10-22/files/data/x", KeepUnparsed),
             ("", KeepUnparsed),
         ];
         for (k, want) in cases {
-            assert_eq!(classify_s3_key(k), want, "{k}");
+            assert_eq!(classify_s3_key(k, None), want, "{k}");
         }
     }
 
     #[test]
     fn test_partition_verdict_names_and_tables() {
         use Verdict::*;
-        assert_eq!(partition_verdict("ticks", "2026-10-31T23"), Delete);
-        assert_eq!(partition_verdict("ticks", "2026-10-31"), Delete);
-        assert_eq!(partition_verdict("ticks", "2026-10-31T23.12"), Delete);
-        assert_eq!(partition_verdict("ticks", "2026-11-01T00"), KeepNotOld);
+        assert_eq!(partition_verdict("ticks", "2026-10-27T23"), Delete);
+        assert_eq!(partition_verdict("ticks", "2026-10-27"), Delete);
+        assert_eq!(partition_verdict("ticks", "2026-10-27T23.12"), Delete);
+        assert_eq!(partition_verdict("ticks", "2026-10-28T00"), KeepNotOld);
         assert_eq!(partition_verdict("ticks", "2026-11-05"), KeepNotOld);
-        assert_eq!(partition_verdict("ticks", "2026-10-31X"), KeepUnparsed);
+        assert_eq!(partition_verdict("ticks", "2026-10-27X"), KeepUnparsed);
         assert_eq!(partition_verdict("ticks", "garbage"), KeepUnparsed);
         assert_eq!(
             partition_verdict("ticks", "2026-10-01'; DROP"),
@@ -929,8 +1031,8 @@ mod tests {
     #[test]
     fn test_box_file_verdict_scope_keep_list_and_date_fence() {
         use Verdict::*;
-        let old = secs("2026-10-31 23:59");
-        let new = secs("2026-11-01 00:00");
+        let old = secs("2026-10-27 23:59");
+        let new = secs("2026-10-28 00:00");
         let cases = [
             (
                 "data/ws_wal/ws-frames-01790000000000000000.wal",
@@ -987,7 +1089,7 @@ mod tests {
             Delete
         );
         assert_eq!(
-            detached_dir_verdict("ticks~12", "2026-11-01T09.detached"),
+            detached_dir_verdict("ticks~12", "2026-10-28T09.detached"),
             KeepNotOld
         );
         assert_eq!(
@@ -1071,12 +1173,16 @@ mod tests {
             None
         );
         // Apply needs the word.
-        assert!(run_refusal(Box, Apply, "", at("2026-10-31 22:00")).is_some());
-        assert!(run_refusal(Box, Apply, "wipe", at("2026-10-31 22:00")).is_some());
-        // Apply only on the night of 31 Oct.
+        assert!(run_refusal(Box, Apply, "", at("2026-10-27 22:00")).is_some());
+        assert!(run_refusal(Box, Apply, "wipe", at("2026-10-27 22:00")).is_some());
+        // Apply from 18:00 IST on Tuesday 27 Oct (Quote 42) to 08:00 IST
+        // on 1 Nov, never in market hours.
         for ok in [
+            "2026-10-27 18:00",
+            "2026-10-27 23:59",
+            "2026-10-28 03:00",
+            "2026-10-28 16:30",
             "2026-10-31 18:00",
-            "2026-10-31 23:59",
             "2026-11-01 03:00",
             "2026-11-01 08:00",
         ] {
@@ -1090,8 +1196,11 @@ mod tests {
         }
         for bad in [
             "2026-10-23 22:00",
-            "2026-10-30 23:00",
-            "2026-10-31 17:59",
+            "2026-10-27 08:00",
+            "2026-10-27 15:44",
+            "2026-10-27 17:59",
+            "2026-10-28 09:00",
+            "2026-10-28 15:44",
             "2026-11-01 08:01",
             "2026-11-01 10:00",
             "2026-11-01 15:44",
@@ -1103,8 +1212,354 @@ mod tests {
             );
         }
         // Never inside 09:00-15:45 IST (checked before the window).
-        let r = run_refusal(Box, Apply, APPLY_CONFIRM, at("2026-10-31 09:00")).unwrap();
+        let r = run_refusal(Box, Apply, APPLY_CONFIRM, at("2026-10-28 09:00")).unwrap();
         assert!(r.contains("09:00-15:45"), "{r}");
+    }
+
+    #[test]
+    fn test_snapshot_delete_refused_before_wednesday_close() {
+        // Quote 42: the old-root snapshot stays until 2026-10-28 16:30 IST.
+        for early in [
+            "2026-10-27 18:00",
+            "2026-10-27 23:59",
+            "2026-10-28 08:00",
+            "2026-10-28 16:29",
+        ] {
+            let why = snapshot_delete_refusal(at(early)).unwrap_or_default();
+            assert!(why.contains(SNAPSHOT_DELETE_FROM_IST), "{early}: {why}");
+            assert!(why.contains("Quote 42"), "{early}: {why}");
+        }
+        for ok in ["2026-10-28 16:30", "2026-10-28 22:00", "2026-11-01 08:00"] {
+            assert_eq!(snapshot_delete_refusal(at(ok)), None, "{ok}");
+        }
+        // The run window never opens before the snapshot time is checked:
+        // tonight the apply window is open but the snapshot is still refused.
+        let tonight = at("2026-10-27 21:00");
+        assert_eq!(
+            run_refusal(Phase::Snapshot, Mode::Apply, APPLY_CONFIRM, tonight),
+            None
+        );
+        assert!(snapshot_delete_refusal(tonight).is_some());
+    }
+
+    #[test]
+    fn test_regression_wipe_never_touches_data_dated_2026_10_28_or_later() {
+        use Verdict::*;
+        // Partition keys (day, hour, version-suffixed, sha sidecar), dated
+        // roots and the quarantine roots, all on Wednesday or later.
+        for key in [
+            "questdb-partitions/ticks/2026-10-28.csv.gz",
+            "questdb-partitions/ticks/2026-10-28T00.csv.gz",
+            "questdb-partitions/ticks/2026-10-28T09.sha-ab12.csv.gz",
+            "questdb-partitions/candles_1m/2026-10-29.csv.gz",
+            "questdb-partitions/market_depth/2026-10-31T15.csv.gz",
+            "raw-frames/2026-10-28/ws-frames-1.wal.gz",
+            "seal-spill/2026-10-28/seals_v6-x.bin.gz",
+            "top-volume-spill/2026-10-30/x.gz",
+            "tick-quarantine/2026-10-28/ticks-1.ndjson.gz",
+            "depth-quarantine/2026-10-28/d.gz",
+            "top-volume-quarantine/2026-11-01/x.gz",
+        ] {
+            assert_eq!(classify_s3_key(key, None), KeepNotOld, "{key}");
+        }
+        // The undated rebuild copy is dated by its write time.
+        let hex = "a".repeat(64);
+        let key = format!("{REBUILD_TABLES_ROOT}ticks/{hex}.csv.gz");
+        assert_eq!(
+            classify_s3_key(&key, Some(secs("2026-10-28 00:00"))),
+            KeepNotOld
+        );
+        assert_eq!(classify_s3_key(&key, None), KeepUnparsed);
+        assert_eq!(
+            classify_s3_key(&key, Some(secs("2026-10-27 23:59"))),
+            Delete
+        );
+        // Partitions and detached dirs on the box.
+        assert_eq!(partition_verdict("ticks", "2026-10-28"), KeepNotOld);
+        assert_eq!(partition_verdict("ticks", "2026-10-28T00"), KeepNotOld);
+        assert_eq!(partition_verdict("ticks", "2026-10-27T23"), Delete);
+        assert_eq!(
+            detached_dir_verdict("ticks~1", "2026-10-28T00.detached"),
+            KeepNotOld
+        );
+        let names = vec!["2026-10-27T15".to_string(), "2026-10-28T09".to_string()];
+        assert_eq!(
+            table_action("ticks", &names),
+            TableAction::DropList(vec!["2026-10-27T15".to_string()])
+        );
+        // Files written on the new box from Wednesday's first second.
+        let wed = secs("2026-10-28 00:00");
+        for rel in [
+            "data/ws_wal/ws-frames-1.wal",
+            "data/spill/ticks/a.ilp",
+            "data/dlq/seals.ndjson",
+        ] {
+            assert_eq!(box_file_verdict(rel, wed), KeepNotOld, "{rel}");
+            assert_eq!(box_file_verdict(rel, wed - 1), Delete, "{rel}");
+        }
+    }
+
+    #[test]
+    fn test_rebuild_prefix_keeps_keep_list_tables() {
+        use Verdict::*;
+        // The rebuild's whole-table key shape, from the code that writes it.
+        let hex = "0123456789abcdef".repeat(4);
+        let tonight = Some(secs("2026-10-27 20:00"));
+        let written = tickvault_storage::partition_archive::rebuild_whole_table_key(
+            &format!(
+                "{}/tables",
+                tickvault_storage::rebuild_copy::REBUILD_S3_PREFIX
+            ),
+            "ticks",
+            &hex,
+        );
+        assert!(written.starts_with(REBUILD_TABLES_ROOT), "{written}");
+        assert_eq!(classify_s3_key(&written, tonight), Delete);
+        // Every keep-list table under the rebuild root is kept (the rebuild
+        // copies `top_volume_rank` there whole).
+        for t in tickvault_storage::partition_manager::rebuild_keep_tables() {
+            let key = format!("{REBUILD_TABLES_ROOT}{t}/{hex}.csv.gz");
+            assert_eq!(classify_s3_key(&key, tonight), KeepProtected, "{key}");
+        }
+        let rank = format!("{REBUILD_TABLES_ROOT}top_volume_rank/{hex}.csv.gz");
+        assert_eq!(classify_s3_key(&rank, tonight), KeepProtected);
+        // The rebuild's keep copies, file copies and manifests are never deleted.
+        for key in [
+            format!("rebuild-2026-10-22/keep/order_audit/{hex}.csv.gz"),
+            format!("rebuild-2026-10-22/keep/ticks/{hex}.csv.gz"),
+            format!("rebuild-2026-10-22/files/spill/ticks/a.ilp.sha-{hex}"),
+            "rebuild-2026-10-22/manifests/copy-20261027T133500Z.json".to_string(),
+        ] {
+            assert_ne!(classify_s3_key(&key, tonight), Delete, "{key}");
+        }
+        // Unknown tables and odd file names are kept and reported.
+        for key in [
+            format!("{REBUILD_TABLES_ROOT}not_a_table/{hex}.csv.gz"),
+            format!("{REBUILD_TABLES_ROOT}ticks/{hex}.csv"),
+            format!("{REBUILD_TABLES_ROOT}ticks/ABC.csv.gz"),
+            format!("{REBUILD_TABLES_ROOT}ticks/sub/{hex}.csv.gz"),
+            format!("{REBUILD_TABLES_ROOT}ticks"),
+        ] {
+            assert_eq!(classify_s3_key(&key, tonight), KeepUnparsed, "{key}");
+        }
+        assert!(s3_list_prefixes().contains(&REBUILD_TABLES_ROOT.to_string()));
+    }
+
+    /// IAM's ARN wildcard match: `*` any run (including `/`), `?` one char.
+    fn iam_glob(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => iam_glob(&p[1..], s) || (!s.is_empty() && iam_glob(p, &s[1..])),
+            (Some(b'?'), Some(_)) => iam_glob(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a == b => iam_glob(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+
+    /// The S3 delete patterns the terraform grants and denies, as the tool
+    /// sees them (bucket ARN stripped). Kept in lockstep with
+    /// `wipe-2026-10-31.tf` by `test_iam_patterns_are_the_terraform_patterns`.
+    fn iam_allow_patterns() -> Vec<String> {
+        let mut out = Vec::new();
+        for t in market_data_tables() {
+            out.push(format!("questdb-partitions/{t}/2026-??-??*"));
+            out.push(format!("{REBUILD_TABLES_ROOT}{t}/*"));
+        }
+        for r in DATED_ROOTS {
+            out.push(format!("{r}2026-??-??/*"));
+        }
+        out
+    }
+
+    const IAM_DENY_DATES: [&str; 5] = [
+        "2026-10-28",
+        "2026-10-29",
+        "2026-10-3?",
+        "2026-11-",
+        "2026-12-",
+    ];
+
+    fn iam_deny_patterns() -> Vec<String> {
+        let mut out: Vec<String> = IAM_DENY_DATES.iter().map(|d| format!("*/{d}*")).collect();
+        for r in PROTECTED_ROOTS {
+            out.push(format!("{r}*"));
+        }
+        out.push(format!("{REBUILD_KEEP_ROOT}*"));
+        out
+    }
+
+    #[test]
+    fn test_iam_patterns_are_the_terraform_patterns() {
+        let tf = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/aws/terraform/wipe-2026-10-31.tf"
+        ))
+        .unwrap();
+        // Quote 42 dates: deletes from 18:00 IST Tuesday, the snapshot from
+        // 16:30 IST Wednesday, expiry unchanged.
+        assert!(tf.contains("wipe_deletes_from = \"2026-10-27T12:30:00Z\""));
+        assert!(tf.contains("wipe_snapshot_delete_from = \"2026-10-28T11:00:00Z\""));
+        assert!(tf.contains("wipe_expires_at = \"2026-11-01T18:30:00Z\""));
+        assert!(tf.contains("\"aws:CurrentTime\" = local.wipe_snapshot_delete_from"));
+        for want in [
+            "/questdb-partitions/${t}/2026-??-??*\"",
+            "/rebuild-2026-10-22/tables/${t}/*\"",
+            "/${r}/2026-??-??/*\"",
+            "/*/${d}*\"",
+            "/rebuild-2026-10-22/keep/*\"",
+            "[\"rebuild-2026-10-22/tables/\"]",
+        ] {
+            assert!(tf.contains(want), "{want}");
+        }
+        for r in DATED_ROOTS {
+            let quoted = format!("\"{}\"", r.trim_end_matches('/'));
+            assert!(tf.contains(&quoted), "{r}");
+        }
+        let deny = IAM_DENY_DATES.map(|d| format!("\"{d}\"")).join(", ");
+        assert!(
+            tf.contains(&format!("wipe_deny_dates = [{deny}]")),
+            "{deny}"
+        );
+        for r in PROTECTED_ROOTS {
+            assert!(tf.contains(&format!("tv_cold.arn}}/{r}*\"")), "{r}");
+        }
+    }
+
+    #[test]
+    fn test_every_delete_is_granted_and_nothing_denied_is_a_delete() {
+        let allow = iam_allow_patterns();
+        let deny = iam_deny_patterns();
+        let hex = "f".repeat(64);
+        let tonight = Some(secs("2026-10-27 20:00"));
+        let mut keys = Vec::new();
+        for t in market_data_tables() {
+            for d in ["2026-09-30", "2026-10-01", "2026-10-27", "2026-10-28"] {
+                keys.push(format!("questdb-partitions/{t}/{d}.csv.gz"));
+                keys.push(format!("questdb-partitions/{t}/{d}T09.sha-{hex}.csv.gz"));
+            }
+            keys.push(format!("{REBUILD_TABLES_ROOT}{t}/{hex}.csv.gz"));
+        }
+        for r in DATED_ROOTS {
+            for d in ["2026-09-30", "2026-10-27", "2026-10-28", "2026-10-31"] {
+                keys.push(format!("{r}{d}/x.gz"));
+            }
+        }
+        let mut deletes = 0;
+        for k in &keys {
+            let granted = allow.iter().any(|p| iam_glob(p.as_bytes(), k.as_bytes()));
+            let denied = deny.iter().any(|p| iam_glob(p.as_bytes(), k.as_bytes()));
+            if classify_s3_key(k, tonight) == Verdict::Delete {
+                deletes += 1;
+                assert!(granted && !denied, "{k}: granted {granted} denied {denied}");
+            } else {
+                assert!(
+                    !granted || denied || k.starts_with(REBUILD_TABLES_ROOT),
+                    "{k}"
+                );
+            }
+        }
+        assert!(deletes > 100, "{deletes}");
+    }
+
+    #[test]
+    fn test_snapshot_delete_refusal_is_none_from_wednesday_close_to_expiry() {
+        assert_eq!(snapshot_delete_refusal(at(SNAPSHOT_DELETE_FROM_IST)), None);
+        let one_minute_early = at(SNAPSHOT_DELETE_FROM_IST) - chrono::TimeDelta::minutes(1);
+        assert!(snapshot_delete_refusal(one_minute_early).is_some());
+        assert_eq!(snapshot_delete_refusal(at(APPLY_UNTIL_IST)), None);
+    }
+
+    /// IAM refuses a role's inline policies past 10,240 characters
+    /// (whitespace not counted). The policy body in the terraform, stripped of
+    /// whitespace, bounds the fixed statements; every ARN and list prefix the
+    /// `for` expressions render is added on top. An estimate (HCL and JSON
+    /// differ by a few characters a line), held well under the limit.
+    #[test]
+    fn test_iam_policy_fits_the_inline_limit() {
+        const IAM_ROLE_INLINE_LIMIT: usize = 10_240;
+        const BUCKET_ARN: &str = "arn:aws:s3:::tv-prod-cold/";
+        let tf = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/aws/terraform/wipe-2026-10-31.tf"
+        ))
+        .unwrap();
+        let start = tf.find("resource \"aws_iam_role_policy\"").unwrap();
+        let end = start + tf[start..].find("\noutput ").unwrap();
+        let fixed = tf[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .count();
+        let rendered: usize = iam_allow_patterns()
+            .iter()
+            .chain(iam_deny_patterns().iter())
+            .map(|p| BUCKET_ARN.len() + p.len() + 3)
+            .chain(s3_list_prefixes().iter().map(|p| p.len() + 3))
+            .sum();
+        let total = fixed + rendered;
+        assert!(
+            total < IAM_ROLE_INLINE_LIMIT - 1_000,
+            "estimated inline policy {total} chars (fixed {fixed}, rendered {rendered})"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+        /// Nothing on the keep-list, and nothing dated 2026-10-28 or later,
+        /// is ever a Delete, for any date, table, root or write time.
+        #[test]
+        fn proptest_keep_list_and_wednesday_onwards_are_never_deleted(
+            year in 2025i32..=2027,
+            month in 1u32..=12,
+            day in 1u32..=31,
+            hour in proptest::option::of(0u32..=23),
+            table_pick in 0usize..10_000,
+            root_pick in 0usize..12,
+            written_offset in -900_000i64..900_000,
+        ) {
+            use Verdict::*;
+            let date = format!("{year:04}-{month:02}-{day:02}");
+            let hour = hour.map_or(String::new(), |h| format!("T{h:02}"));
+            let keep = tickvault_storage::partition_manager::rebuild_keep_tables();
+            let market = market_data_tables();
+            let all: Vec<&str> = keep.iter().chain(market.iter()).copied().collect();
+            let table = all[table_pick % all.len()];
+            let written = secs("2026-10-28 00:00") + written_offset;
+            let cutoff = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+            let dated_new = NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_ok_and(|d| d >= cutoff);
+            let key = match root_pick {
+                0..=3 => format!("questdb-partitions/{table}/{date}{hour}.csv.gz"),
+                4 => format!("{REBUILD_TABLES_ROOT}{table}/{}.csv.gz", "b".repeat(64)),
+                5 => format!("rebuild-2026-10-22/keep/{table}/{}.csv.gz", "c".repeat(64)),
+                r => format!("{}{date}/f.gz", DATED_ROOTS[(r - 6) % DATED_ROOTS.len()]),
+            };
+            let v = classify_s3_key(&key, Some(written));
+            if keep.contains(&table) && (root_pick <= 5) {
+                proptest::prop_assert_ne!(v, Delete, "{}", key);
+            }
+            if root_pick == 4 && written >= secs("2026-10-28 00:00") {
+                proptest::prop_assert_ne!(v, Delete, "{}", key);
+            }
+            if root_pick != 4 && dated_new {
+                proptest::prop_assert_ne!(v, Delete, "{}", key);
+            }
+            if root_pick <= 3 {
+                let p = format!("{date}{hour}");
+                proptest::prop_assert_eq!(partition_verdict(table, &p) == Delete, v == Delete);
+            }
+            for prefix in ["deploys/", "sebi-preserve/", "logs/"] {
+                proptest::prop_assert_eq!(
+                    classify_s3_key(&format!("{prefix}{date}/{table}"), Some(written)),
+                    KeepProtected
+                );
+            }
+            // The box: a file written at or after the cutoff instant stays.
+            for rel in ["data/ws_wal/ws-frames-7.wal", "data/spill/ticks/a.ilp"] {
+                let bv = box_file_verdict(rel, written);
+                proptest::prop_assert_eq!(bv == Delete, written < secs("2026-10-28 00:00"));
+            }
+        }
     }
 
     #[test]
@@ -1131,20 +1586,20 @@ mod tests {
     fn test_table_action_truncate_drop_list_and_refusals() {
         let names = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
         assert_eq!(
-            table_action("ticks", &names(&["2026-10-30T09", "2026-10-31T10"])),
+            table_action("ticks", &names(&["2026-10-26T09", "2026-10-27T10"])),
             TableAction::Truncate(2)
         );
         assert_eq!(
-            table_action("ticks", &names(&["2026-10-31T10", "2026-11-01T09"])),
-            TableAction::DropList(names(&["2026-10-31T10"]))
+            table_action("ticks", &names(&["2026-10-27T10", "2026-10-28T09"])),
+            TableAction::DropList(names(&["2026-10-27T10"]))
         );
         // An unparsable partition is never dropped and blocks the truncate.
         assert_eq!(
-            table_action("ticks", &names(&["2026-10-31T10", "weird"])),
-            TableAction::DropList(names(&["2026-10-31T10"]))
+            table_action("ticks", &names(&["2026-10-27T10", "weird"])),
+            TableAction::DropList(names(&["2026-10-27T10"]))
         );
         assert_eq!(
-            table_action("ticks", &names(&["2026-11-01T09"])),
+            table_action("ticks", &names(&["2026-10-28T09"])),
             TableAction::Nothing
         );
         assert_eq!(table_action("ticks", &[]), TableAction::Nothing);

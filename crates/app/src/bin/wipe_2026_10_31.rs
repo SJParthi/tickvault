@@ -1,5 +1,6 @@
-//! `tv-wipe-2026-10-31` — the one-off full market-data wipe of the night of
-//! Saturday 2026-10-31 (plan item 67; operator Quote 35).
+//! `tv-wipe-2026-10-31` — the one-off full market-data wipe (plan item 67;
+//! operator Quote 35, brought forward to the night of Tuesday 2026-10-27 by
+//! Quote 42; the name stays).
 //!
 //! Run only by `.github/workflows/wipe-2026-10-31.yml`. What is deleted and
 //! kept, the run window and the reports are in
@@ -17,10 +18,10 @@
 //! | `preflight` | stored keys | instance facts | same (never deletes) |
 //! | `box` | stored keys | box inventory over SSM (starts a stopped box, stops it again) | app stopped, old files and partitions deleted on the box, box stopped |
 //! | `s3` | one-off role | every version under the exact prefixes, what goes and what stays | deletes by version id, lists again, fails unless nothing in scope is left |
-//! | `snapshot` | one-off role | the rebuild's old-root snapshot | deletes it, describes again |
+//! | `snapshot` | one-off role | the rebuild's old-root snapshot | deletes it, describes again; before 16:30 IST 28 Oct it is KEPT (inside `cloud`) or refused (alone) |
 //!
-//! An apply needs the typed confirmation, the 18:00 31 Oct – 08:00 1 Nov IST
-//! window, no deploy queued or running, and a successful `dry all` run of
+//! An apply needs the typed confirmation, the 18:00 27 Oct – 08:00 1 Nov IST
+//! window (never 09:00–15:45), no deploy queued or running, and a successful `dry all` run of
 //! the workflow on the same commit. The S3 and snapshot applies also need the
 //! instance stopped (so the app cannot be writing).
 //!
@@ -39,9 +40,9 @@ use aws_sdk_ec2::types::Filter;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use chrono::Utc;
 use tickvault_app::wipe_2026_10_31::{
-    COLD_BUCKET, DELETE_BATCH_MAX, Mode, OLD_ROOT_TAG_KEY, Phase, S3Plan, SNAPSHOT_TAG_KEY,
-    SNAPSHOT_TAG_VALUE, Verdict, VersionEntry, is_commit_sha, now_ist, parse_box_report,
-    run_refusal, s3_list_prefixes, snapshot_verdict,
+    COLD_BUCKET, DELETE_BATCH_MAX, Mode, OLD_ROOT_TAG_KEY, Phase, S3Plan, SNAPSHOT_DELETE_FROM_IST,
+    SNAPSHOT_TAG_KEY, SNAPSHOT_TAG_VALUE, Verdict, VersionEntry, is_commit_sha, now_ist,
+    parse_box_report, run_refusal, s3_list_prefixes, snapshot_delete_refusal, snapshot_verdict,
 };
 
 const REGION: &str = "ap-south-1";
@@ -90,6 +91,9 @@ struct Run {
     log: Vec<String>,
     keep_alive_before: Option<String>,
     keep_alive_set: bool,
+    /// The snapshot phase kept the old-root snapshot because its Quote 42
+    /// time had not come.
+    snapshot_deferred: bool,
 }
 
 impl Run {
@@ -496,6 +500,7 @@ impl Run {
                         version_id: v.version_id().unwrap_or("null").to_string(),
                         bytes: v.size().unwrap_or(0),
                         is_delete_marker: false,
+                        last_modified_unix_secs: v.last_modified().map(|t| t.secs()),
                     });
                 }
                 for m in resp.delete_markers() {
@@ -504,6 +509,7 @@ impl Run {
                         version_id: m.version_id().unwrap_or("null").to_string(),
                         bytes: 0,
                         is_delete_marker: true,
+                        last_modified_unix_secs: m.last_modified().map(|t| t.secs()),
                     });
                 }
                 if resp.is_truncated() != Some(true) {
@@ -680,6 +686,14 @@ impl Run {
             self.say(format!("dry: would delete {}", doomed.join(", ")));
             return Ok(());
         }
+        if let Some(why) = snapshot_delete_refusal(now_ist(Utc::now())) {
+            // Quote 42: the S3 delete of the same `cloud` run still stands;
+            // only the snapshot waits. A `--phase snapshot` run alone is
+            // refused before any AWS call (`real_main`).
+            self.say(format!("snapshot NOT deleted, KEPT: {why}"));
+            self.snapshot_deferred = true;
+            return Ok(());
+        }
         let mut errors = Vec::new();
         for id in &doomed {
             match self.ec2().delete_snapshot().snapshot_id(id).send().await {
@@ -732,6 +746,14 @@ async fn real_main(args: &[String]) -> Result<Vec<String>, (String, Vec<String>)
             return Err((format!("refused: {why}"), Vec::new()));
         }
     }
+    // Quote 42: a snapshot-only apply before its time is refused outright
+    // (inside `cloud` the S3 delete still runs and the snapshot is kept).
+    if mode == Mode::Apply
+        && phases == [Phase::Snapshot]
+        && let Some(why) = snapshot_delete_refusal(now)
+    {
+        return Err((format!("refused: {why}"), Vec::new()));
+    }
     let conf = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(REGION))
         .load()
@@ -746,6 +768,7 @@ async fn real_main(args: &[String]) -> Result<Vec<String>, (String, Vec<String>)
         log: Vec::new(),
         keep_alive_before: None,
         keep_alive_set: false,
+        snapshot_deferred: false,
     };
     if mode == Mode::Apply && phases != [Phase::Preflight] {
         match run.busy_deploys().await {
@@ -773,7 +796,13 @@ async fn real_main(args: &[String]) -> Result<Vec<String>, (String, Vec<String>)
             return Err((e, run.log));
         }
     }
-    run.say("done");
+    if run.snapshot_deferred {
+        run.say(format!(
+            "done, except the old-root snapshot, which is KEPT until {SNAPSHOT_DELETE_FROM_IST} IST"
+        ));
+    } else {
+        run.say("done");
+    }
     Ok(run.log)
 }
 
