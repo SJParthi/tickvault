@@ -3190,3 +3190,33 @@ Measured first (read-only, 2026-10-27 ~08:10 IST): instance `i-0c3fe906dad5492fc
 - Any per-contract or order-dependent input to the `tick_quotes` routing decision.
 - Dropping, sampling or coalescing a packet instead of routing it.
 - Deleting a keep-list, audit, SEBI, deploy or log file under cover of this quote.
+
+#### Quote 44 (2026-10-28, ~09:05 IST) — THE DAILY `instrument_lifecycle` WRITER STOPS; BOTH SEBI TABLES ARE FROZEN AS HISTORY (preserve EXACTLY)
+
+> "See as per. The current approach we don't even need to worry about this instrument lifecycle right dude see everyday just go ahead with new fetch and new store right dude because initially when I built this I designed this kind of tracking everything from instrument lifecycle dude okay? But as per the current design and current approach see every morning just pull the fresh one along and save it right dude its very simple right dude am I right bro check this also do a deep thorough research fn tell me dude okay?"
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "Research done: you're right, nothing in live trading reads the instrument-history table (subscriptions come from the morning files). The keep-forever rule says those rows can never be deleted. Which way do you want it?" | **"Just stop the old writer"** | "Stop writing instrument history at all; freeze the old table. Morning files still drive trading. No daily record in the database from now on (the raw files stay in S3)." |
+
+**Measured before the decision (live, read-only, 2026-10-28):** `instrument_lifecycle` holds 18,784,013 rows for 161,886 `security_id` (about 116 copies each). ILP auto-created it long ago, so its designated column is `timestamp`, it has no `ts` column and no DEDUP key; every daily run appended a full copy. From 27 Oct 23:12 IST the audit-J3 check refused the write (`ALTER ... DEDUP ENABLE UPSERT KEYS(ts, ...)` answers 400). Nothing on the live path reads either table: subscriptions, contracts, candles, ticks and orders come from the morning artifact files (`dhan-nse-mapping-<date>.json`, the contract artifact). The only other reader is the depth movers name join (`depth_rebalance.rs`), dormant while `depth_sockets_enabled = false`.
+
+**What this changes, and nothing else:**
+
+Follow-up the same morning, after being told the morning files are kept only 7 days on the server (`ARTIFACT_RETENTION_DAYS`) and are NOT copied to S3:
+
+> "see its just simpley betetr to go ahead with everyday snapshots rigth new fiels right why we have impkemebted thsi design architecture and approach previously dude tekl me dude okay?"
+
+| Item | Change |
+|---|---|
+| §5 / §6 daily write | The morning write of `instrument_lifecycle` and `instrument_lifecycle_audit` STOPS. The morning master download, the mapping and contract artifacts, and their copies are unchanged. |
+| The two tables and every row in them | KEPT, frozen as point-in-time history: never deleted, dropped, truncated, de-duplicated, renamed or rewritten. They stay on every keep-forever, retention-exempt, rebuild-keep and wipe-keep list. §25's "never delete" stands. |
+| Daily snapshot files (new) | Each trading morning, after the artifacts are written, the day's instrument artifacts (`dhan-nse-mapping-<date>.json`, `dhan-contracts-<date>.json`, `dhan-fno-underlyings-<date>.json`, `dhan-ntm-spot-<date>.json`) are copied to `s3://tv-<env>-cold/instrument-snapshots/<date>/` and verified (length and SHA-256). Kept FOREVER: never deleted, expired, wiped or lifecycle-transitioned to deletion. The 7-day local sweep deletes a local file only after its verified copy exists. |
+| §25 point-in-time questions after 2026-10-27 | Answered from the dated snapshot files in S3, not from the tables. |
+
+##### What violates Quote 44 (REJECT)
+- Deleting, dropping, truncating, de-duplicating, renaming or rewriting any row of `instrument_lifecycle` or `instrument_lifecycle_audit`, or removing either from a keep list, under cover of this quote.
+- Re-starting a daily write to either table, or adding a replacement table, without a fresh dated quote here first.
+- Switching depth back on (`depth_sockets_enabled = true`) without first moving the movers name join off `instrument_lifecycle` (it would read frozen, duplicated rows).
+- Touching the morning master download or the artifacts the live lane reads under cover of this quote.
+- Deleting, expiring or wiping any object under `instrument-snapshots/`, or sweeping a local artifact before its verified S3 copy exists.
