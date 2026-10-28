@@ -1379,16 +1379,138 @@ fn test_build_expiry_index_an_expired_duplicate_never_makes_a_selected_contract_
         let report = check_selected_expiries(&[inst(1)], &rows, TODAY);
         assert!(report.refused.is_empty(), "{report:?}");
         assert_eq!(report.checked, 1);
-        // The daily check judges it from the admissible row: current.
-        let (counts, _) = classify_candle_contracts(
-            &[candle(1, "NSE_FNO", Some("SBIN-23Nov2026-1000-CE"))],
-            &index,
-            TODAY,
+        // The daily check judges it from the admissible row: current. The
+        // stored name comes from the production name table, never hand-fed
+        // (2026-10-28 review: a hand-fed name hid that the table took the
+        // LAST row, the expired NIFTY one, when it sat later in the file).
+        let names = crate::dhan_contract_universe::option_labels_from(&rows, TODAY);
+        let stored = names.get(&(1, "NSE_FNO")).map(|s| s.to_string());
+        assert_eq!(
+            stored.as_deref(),
+            Some("SBIN-23Nov2026-1000-CE"),
+            "expired_first {expired_first}"
         );
+        let (counts, _) =
+            classify_candle_contracts(&[candle(1, "NSE_FNO", stored.as_deref())], &index, TODAY);
         assert_eq!(counts.contracts_checked, 1);
         assert_eq!(counts.unresolved, 0);
+        assert_eq!(counts.label_mismatch, 0, "expired_first {expired_first}");
         assert_eq!(counts.violations(), 0);
     }
+}
+
+#[test]
+fn test_option_labels_from_names_a_reused_id_as_the_row_the_selector_admits() {
+    // Regression (2026-10-28 review): the expired twin sits LAST in the
+    // file. The candle name for the id must be the current SBIN contract the
+    // selector subscribed, not the expired NIFTY row.
+    let mut rows = chain(1001, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]);
+    rows.push(opt(1001, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE"));
+    let names = crate::dhan_contract_universe::option_labels_from(&rows, TODAY);
+    assert_eq!(
+        names.get(&(1001, "NSE_FNO")).map(|s| &**s),
+        Some("SBIN-23Nov2026-1000-CE")
+    );
+    // Every other id is still named once, and nothing is dropped.
+    assert_eq!(names.len(), 4);
+}
+
+#[test]
+fn test_preferred_option_rows_keeps_one_row_per_key_as_by_key_does() {
+    // Every file order of a reused id (expired twin, leg-less twin, second
+    // admissible twin) keeps exactly the row `build_expiry_index` keeps.
+    let base = chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]);
+    let twins = [
+        opt(1, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE"),
+        opt(1, "OPTSTK", "OTHER", NEXT, 1000, ""),
+        opt(1, "OPTSTK", "SBIN", NEXT, 1000, "CE"),
+    ];
+    for twin in twins {
+        for twin_first in [true, false] {
+            let mut rows = Vec::new();
+            if twin_first {
+                rows.push(twin.clone());
+            }
+            rows.extend(base.iter().cloned());
+            if !twin_first {
+                rows.push(twin.clone());
+            }
+            // A future is left out; a zero-id option is kept (no key to
+            // share).
+            rows.push(opt(7, "FUTSTK", "SBIN", CURRENT, 0, ""));
+            rows.push(opt(0, "OPTSTK", "SBIN", CURRENT, 1000, "CE"));
+            let kept = preferred_option_rows(&rows, TODAY);
+            let index = build_expiry_index(&rows, TODAY, None);
+            let key = (1, ExchangeSegment::NseFno);
+            let ones: Vec<&ContractRow> = kept.iter().copied().filter(|r| r.i == 1).collect();
+            assert_eq!(ones.len(), 1, "{twin:?} first {twin_first}");
+            assert!(
+                index
+                    .by_key
+                    .get(&key)
+                    .is_some_and(|held| std::ptr::eq(*held, ones[0])),
+                "{twin:?} first {twin_first}"
+            );
+            assert!(kept.iter().all(|r| r.c != "FUTSTK"));
+            assert!(kept.iter().any(|r| r.i == 0));
+            // Ids 2, 3 and 4 of the chain are untouched.
+            assert_eq!(kept.iter().filter(|r| (2..=4).contains(&r.i)).count(), 3);
+        }
+    }
+}
+
+#[test]
+fn test_preferred_option_rows_maps_a_reused_id_to_the_admissible_underlying() {
+    // The attach builds the contract-to-underlying map from these rows. The
+    // raw file maps the reused id to the expired NIFTY row (last wins); the
+    // preferred rows map it to SBIN, the contract the selector subscribed.
+    let mut rows = chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]);
+    rows.push(opt(1, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE"));
+    let symbols: HashMap<String, (u64, u8)> = [
+        (
+            "SBIN".to_string(),
+            (3045, ExchangeSegment::NseEquity.binary_code()),
+        ),
+        (
+            "NIFTY".to_string(),
+            (13, ExchangeSegment::IdxI.binary_code()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let underlying = |rows: &[ContractRow]| {
+        let (legs, _) = crate::contract_underlying_map::legs_from_artifact(rows, &symbols);
+        let (map, _) = crate::contract_underlying_map::build_snapshot(&legs);
+        map.get(&(1, ExchangeSegment::NseFno))
+            .map(|owner| (owner.underlying_id, owner.family))
+    };
+    assert_eq!(
+        underlying(&rows),
+        Some((13, crate::option_rank::OptionFamily::Index)),
+        "the raw file is last-wins (the defect the attach now avoids)"
+    );
+    let preferred: Vec<ContractRow> = preferred_option_rows(&rows, TODAY)
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(
+        underlying(&preferred),
+        Some((3045, crate::option_rank::OptionFamily::Stock))
+    );
+}
+
+#[test]
+fn test_preferred_option_rows_feeds_every_per_id_table_the_attach_builds() {
+    let universe = production(include_str!("dhan_contract_universe.rs"));
+    assert!(universe.contains("expiry_scope_check::preferred_option_rows(&contracts, today_ymd)"));
+    assert!(universe.contains("legs_from_artifact(&named_rows, &symbols)"));
+    let labels = universe
+        .find("labels_from_artifact_selected_first(")
+        .expect("labels");
+    let after = universe.get(labels..labels + 80).unwrap_or("");
+    assert!(after.contains("&named_rows"), "{after}");
+    // The candle names apply the same rule inside `option_labels_from`.
+    assert!(universe.contains("expiry_scope_check::preferred_option_rows(contracts, today_ymd)"));
 }
 
 #[test]

@@ -44,7 +44,10 @@
 //! rows the selector would admit count when the id has one (an expired or
 //! leg-less duplicate under a reused id cannot be what the selector picked,
 //! so it never refuses a selected contract); an id with no admissible row is
-//! judged over its unusable rows, as before.
+//! judged over its unusable rows, as before. The candle names and the
+//! contract-to-underlying map read the same row per id
+//! ([`preferred_option_rows`]), so a reused id is named and mapped as the
+//! contract the selector subscribed, never as its expired twin.
 //!
 //! The daily check runs at 15:50 IST, or at once when the process starts
 //! later on a trading day (an evening restart), so a restart never skips the
@@ -400,6 +403,70 @@ fn counts_as_a_leg(row: &ContractRow, today_ymd: u32) -> bool {
         && matches!(row.l.as_str(), "CE" | "PE")
 }
 
+/// Whether `row` takes over from `held` as the one row kept for their shared
+/// composite key: only a row the selector would admit replaces one it would
+/// not; otherwise the first row stays. The rule [`ExpiryIndex::by_key`]
+/// keeps, and the rule every per-id table built from the file must keep
+/// ([`preferred_option_rows`]). Pure, O(1).
+fn replaces_held_row(held: &ContractRow, row: &ContractRow, today_ymd: u32) -> bool {
+    !counts_as_a_leg(held, today_ymd) && counts_as_a_leg(row, today_ymd)
+}
+
+/// The option rows of the day's file with every duplicate composite key
+/// reduced to the ONE row [`ExpiryIndex::by_key`] keeps (the first row the
+/// selector would admit, else the first row), in file order. Option rows with
+/// id 0 or an unknown exchange are kept as they are (no key to share); rows
+/// of any other class are left out.
+///
+/// Every per-id table built from the file (the candle names, the
+/// contract-to-underlying map and its labels) reads these rows, so a reused
+/// id whose expired twin sits later in the file is named and mapped as the
+/// contract the selector subscribed, never as the expired one (regression,
+/// 2026-10-28 review: the candle names took the LAST row, so a current SBIN
+/// option was stored under an expired NIFTY name and the daily check read
+/// `label_mismatch` every day). Two passes, O(rows), one hash entry per
+/// option key; cold (boot, attach, after-close repair), never per tick.
+#[must_use]
+pub fn preferred_option_rows(contracts: &[ContractRow], today_ymd: u32) -> Vec<&ContractRow> {
+    let option_key = |row: &ContractRow| -> Option<ContractKey> {
+        if row.i == 0 {
+            return None;
+        }
+        artifact_option_segment(&row.x).map(|segment| (row.i, segment))
+    };
+    let mut kept: HashMap<ContractKey, usize> = HashMap::with_capacity(contracts.len());
+    for (at, row) in contracts.iter().enumerate() {
+        if !is_option_row(row) {
+            continue;
+        }
+        let Some(key) = option_key(row) else {
+            continue;
+        };
+        match kept.entry(key) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(at);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if contracts
+                    .get(*slot.get())
+                    .is_some_and(|held| replaces_held_row(held, row, today_ymd))
+                {
+                    slot.insert(at);
+                }
+            }
+        }
+    }
+    contracts
+        .iter()
+        .enumerate()
+        .filter(|&(at, row)| {
+            is_option_row(row)
+                && option_key(row).is_none_or(|key| kept.get(&key).copied() == Some(at))
+        })
+        .map(|(_, row)| row)
+        .collect()
+}
+
 /// Builds the [`ExpiryIndex`]. `only`, when given, limits `by_key` and
 /// `ambiguous` to those composite keys (the subscribe-time check needs only
 /// the selection); the nearest-expiry table always covers the whole file.
@@ -473,6 +540,14 @@ pub fn build_expiry_index<'a>(
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 let held = *slot.get();
+                // The first ADMISSIBLE row replaces the unusable ones, and any
+                // ambiguity recorded among those goes with them. The same rule
+                // `preferred_option_rows` applies for every per-id table.
+                if replaces_held_row(held, row, today_ymd) {
+                    slot.insert(row);
+                    index.ambiguous.remove(&key);
+                    continue;
+                }
                 match (
                     counts_as_a_leg(held, today_ymd),
                     counts_as_a_leg(row, today_ymd),
@@ -481,13 +556,8 @@ pub fn build_expiry_index<'a>(
                     // underlying) is a row the selector never admits, so it
                     // cannot be what the selector picked: it neither replaces
                     // an admissible row nor makes the id ambiguous.
-                    (true, false) => {}
-                    // The first ADMISSIBLE row replaces the unusable ones, and
-                    // any ambiguity recorded among those goes with them.
-                    (false, true) => {
-                        slot.insert(row);
-                        index.ambiguous.remove(&key);
-                    }
+                    // (`(false, true)` was taken by `replaces_held_row` above.)
+                    (true, false) | (false, true) => {}
                     // Both admissible: two contracts the selector could pick
                     // under one id. Both unusable: the selector picks neither,
                     // so refusing costs no selected contract, and the daily

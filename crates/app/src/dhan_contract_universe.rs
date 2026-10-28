@@ -2010,17 +2010,25 @@ pub fn spot_labels_from(
 /// the attach. O(rows), once per boot; about 11 MB until the attach replaces
 /// the table (estimate: ~121,000 entries of key, pointer and a ~25-byte name).
 ///
+/// A composite key the file lists twice (Dhan reuses derivative ids) is named
+/// from the row the selector would admit on `today_ymd` (the file's own day),
+/// never from whichever row came last: the same row the expiry index keeps
+/// (`expiry_scope_check::preferred_option_rows`). Until 2026-10-28 the last
+/// row won, so a current contract whose expired twin sat later in the file
+/// was stored under the expired name. One more O(rows) pass.
+///
 /// [`contract_label`]: crate::contract_underlying_map::contract_label
 #[must_use]
-fn option_labels_from(
+pub(crate) fn option_labels_from(
     contracts: &[ContractRow],
+    today_ymd: u32,
 ) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
     let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
         tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
             contracts.len(),
             ahash::RandomState::default(),
         );
-    for row in contracts {
+    for row in crate::expiry_scope_check::preferred_option_rows(contracts, today_ymd) {
         if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") || row.i == 0 {
             continue;
         }
@@ -2135,7 +2143,7 @@ pub fn publish_contract_labels_at_boot(date_ist: &str) -> usize {
     // only matters for readability. A missing contract file publishes spot
     // names only, as before.
     if let Ok(contracts) = read_contract_artifact(&date) {
-        labels.extend(option_labels_from(&contracts));
+        labels.extend(option_labels_from(&contracts, day_key(&date)));
     }
     let n = labels.len();
     let new_day = day_key(&date);
@@ -2175,7 +2183,7 @@ pub fn contract_names_for_day(
     let symbols = read_symbol_map(date_ist).ok()?;
     let mut labels = spot_labels_from(&symbols);
     if let Ok(contracts) = read_contract_artifact(date_ist) {
-        labels.extend(option_labels_from(&contracts));
+        labels.extend(option_labels_from(&contracts, day_key(date_ist)));
     }
     Some(labels)
 }
@@ -2348,8 +2356,21 @@ pub async fn load_contract_universe(
     // of it.
     {
         crate::contract_underlying_map::pre_register_contract_underlying_counters();
+        // One row per composite key, the row the selector would admit
+        // (2026-10-28 review): the owner map and its labels are last-wins per
+        // id, so a reused id whose expired twin sits later in the file would
+        // otherwise be mapped to the expired contract's underlying and family.
+        // The option rows are cloned once per attach attempt (about 120,000
+        // rows, cold, off the runtime worker), so the two builders below keep
+        // their slice inputs.
+        let named_rows: Vec<ContractRow> = tickvault_storage::off_worker::off_worker(|| {
+            crate::expiry_scope_check::preferred_option_rows(&contracts, today_ymd)
+                .into_iter()
+                .cloned()
+                .collect()
+        });
         let (legs, artifact_refusals) =
-            crate::contract_underlying_map::legs_from_artifact(&contracts, &symbols);
+            crate::contract_underlying_map::legs_from_artifact(&named_rows, &symbols);
         // Counted by REASON, not just totalled. The count alone is what the
         // line below carried until 2026-09-09, and on 2026-09-08 and
         // 2026-09-09 it read `113182` then `113746` -- EVERY option leg in the
@@ -2393,7 +2414,7 @@ pub async fn load_contract_universe(
         // owner map: the projection only reads a label for a contract the
         // leaderboard already tracks.
         let labels = crate::contract_underlying_map::labels_from_artifact_selected_first(
-            &contracts,
+            &named_rows,
             &selection.instruments,
         );
         // The candle writer fills `candles_<tf>.contract` from this table,
@@ -2417,7 +2438,7 @@ pub async fn load_contract_universe(
         // off the runtime worker (`off_worker`).
         let mut candle_labels = spot_labels_from(&symbols);
         candle_labels.extend(tickvault_storage::off_worker::off_worker(|| {
-            option_labels_from(&contracts)
+            option_labels_from(&contracts, today_ymd)
         }));
         // Set BEFORE the publish: from here on a boot publish never replaces
         // the attach's table (2026-10-10).
@@ -2589,7 +2610,7 @@ mod tests {
             u: "NIFTY".into(),
             z: 75,
         };
-        let out = super::option_labels_from(&[row]);
+        let out = super::option_labels_from(&[row], 20_260_901);
         let nse =
             tickvault_common::segment::segment_code_to_str(ExchangeSegment::NseFno.binary_code());
         assert_eq!(nse, "NSE_FNO");
@@ -2613,7 +2634,7 @@ mod tests {
             .and_then(|rest| rest.split("\n}\n").next())
             .unwrap_or("");
         assert!(
-            body.contains("option_labels_from(&contracts)")
+            body.contains("option_labels_from(&contracts, today_ymd)")
                 && body.contains("candle_labels.extend(tickvault_storage::off_worker::off_worker("),
             "the attach must name every option row of the day's file"
         );
@@ -4623,7 +4644,7 @@ mod tests {
         bse.x = "BSE".into();
         let mut zero = itc.clone();
         zero.i = 0;
-        let labels = option_labels_from(&[itc.clone(), future, bse, zero]);
+        let labels = option_labels_from(&[itc.clone(), future, bse, zero], 20_261_001);
         assert_eq!(labels.len(), 1, "options on NSE only, never a zero id");
         let name = labels.get(&(85_650, "NSE_FNO")).map(|s| &**s);
         assert_eq!(name, Some("ITC-27Oct2026-255-CE"));
@@ -4647,14 +4668,14 @@ mod tests {
                 row
             })
             .collect();
-        let labels = option_labels_from(&rows);
+        let labels = option_labels_from(&rows, 20_260_901);
         assert_eq!(labels.len(), 30_000);
         assert!(labels.contains_key(&(30_000, "NSE_FNO")));
     }
 
     #[test]
     fn test_option_labels_from_an_empty_file_is_empty() {
-        assert!(option_labels_from(&[]).is_empty());
+        assert!(option_labels_from(&[], 20_260_901).is_empty());
     }
 
     #[test]
