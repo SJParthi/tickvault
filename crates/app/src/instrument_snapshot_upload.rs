@@ -1827,29 +1827,38 @@ mod tests {
     }
 
     /// Finding 2, end to end: with an unread entry the sweep does not run,
-    /// so even a proven file with a matching marker, and an unproven file
-    /// with a stale one, both stay.
-    #[test]
-    fn test_sweep_after_rechecked_pass_keeps_every_file_after_an_unread_entry() {
-        let dir = scratch_dir("unread_entry");
+    /// so even a proven file with a matching marker stays. The same summary
+    /// with the entry read DOES delete that file (the control below), so the
+    /// `exists()` check fails if the unread-entry block is ever removed.
+    #[tokio::test]
+    async fn test_sweep_after_rechecked_pass_keeps_every_file_after_an_unread_entry() {
         let proven_name = "dhan-contracts-1999-01-01.json";
         let other_name = "dhan-nse-mapping-1999-01-01.json";
-        for name in [proven_name, other_name] {
-            std::fs::write(dir.join(name), b"{}").unwrap();
+        for unreadable in [1_usize, 0] {
+            let dir = scratch_dir("unread_entry");
+            std::fs::write(dir.join(proven_name), b"{\"rows\":[1]}").unwrap();
+            // A real pass uploads and marks the proven file.
+            let pass = run_snapshot_pass(&FakeBucket::default(), &dir).await;
+            assert!(pass.proven.contains(proven_name), "{pass:?}");
+            std::fs::write(dir.join(other_name), b"{}").unwrap();
+            let summary = SnapshotPassSummary { unreadable, ..pass };
+            let tally = sweep_dir(&dir, &summary, "1999-01-09");
+            if unreadable > 0 {
+                assert!(tally.is_none(), "no sweep after an unread entry");
+                assert!(
+                    dir.join(proven_name).exists(),
+                    "kept: the sweep did not run"
+                );
+            } else {
+                assert!(tally.is_some(), "control: the sweep runs");
+                assert!(
+                    !dir.join(proven_name).exists(),
+                    "control: a proven, marked file is swept when every entry was read"
+                );
+            }
+            assert!(dir.join(other_name).exists(), "never proven, never swept");
+            std::fs::remove_dir_all(&dir).unwrap();
         }
-        let summary = SnapshotPassSummary {
-            listed: true,
-            unreadable: 1,
-            proven: std::iter::once(proven_name.to_string()).collect(),
-            ..SnapshotPassSummary::default()
-        };
-        assert!(
-            sweep_dir(&dir, &summary, "1999-01-09").is_none(),
-            "no sweep"
-        );
-        assert!(dir.join(proven_name).exists());
-        assert!(dir.join(other_name).exists());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Review 2026-10-28, finding 3: the gap between a file's proof and the
