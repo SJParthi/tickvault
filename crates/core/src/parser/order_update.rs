@@ -234,7 +234,7 @@ fn normalize_order_update_frame(value: &mut serde_json::Value) {
         // moved onto the accepted key so the typed parse refuses it loudly
         // (see `FILL_CRITICAL_FIELDS`); the generic merge would drop a null
         // alt and let the field default to 0.
-        if is_fill_critical(accepted)
+        if fails_loud_when_blank(accepted)
             && !data.contains_key(accepted)
             && data.get(alt).is_some_and(is_blank_value)
             && let Some(moved) = data.remove(alt)
@@ -387,6 +387,17 @@ fn is_fill_critical(key: &str) -> bool {
     )
 }
 
+/// The fields whose `null` must keep failing the typed parse loudly
+/// (ORDER-EVT-02 `typed_parse_failed`, the order-path loss page) instead of
+/// reading as absent: the fill fields, plus `OrderNo` and `Status`, which
+/// decide whether the OMS applies a fill at all. A null `Status` read as
+/// absent parses to `""`, which the OMS skips as an unknown status with no
+/// page; a null `OrderNo` skips the update as an unknown order. One fixed
+/// `match`, no list walk.
+fn fails_loud_when_blank(key: &str) -> bool {
+    is_fill_critical(key) || matches!(key, "OrderNo" | "Status")
+}
+
 /// Identity text fields that are numbers on the wire when they are numbers
 /// at all. A non-integral number here (`12.5`, or one past `u64::MAX`,
 /// which serde reads as a rounded float) is not converted: it would become
@@ -422,7 +433,7 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 ///   bool, a non-finite number) → keep, so the typed parse fails loud.
 fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> FieldFix {
     use serde_json::Value;
-    if is_blank_value(value) && is_fill_critical(key) {
+    if is_blank_value(value) && fails_loud_when_blank(key) {
         return FieldFix::Keep;
     }
     match (kind, value) {
@@ -1288,6 +1299,33 @@ mod tests {
         assert_eq!(update.order_no, "3");
     }
 
+    /// Regression (PR #2134 review): a null `Status` or `OrderNo` on a TRADED
+    /// frame read as absent parsed to `""`, and the OMS skipped the fill as
+    /// an unknown status or unknown order with no page. Both must keep
+    /// failing the typed parse loudly, in either casing.
+    #[test]
+    fn test_fails_loud_when_blank_null_status_or_order_no_never_parses() {
+        let frames = [
+            r#"{"Data":{"OrderNo":"1124","Status":null,"TradedQty":75,"Quantity":75,"AvgTradedPrice":245.4},"Type":"order_alert"}"#,
+            r#"{"Data":{"OrderNo":"1124","status":null,"TradedQty":75,"Quantity":75},"Type":"order_alert"}"#,
+            r#"{"Data":{"OrderNo":null,"Status":"TRADED","TradedQty":75,"Quantity":75},"Type":"order_alert"}"#,
+            r#"{"Data":{"orderNo":null,"Status":"TRADED","TradedQty":75,"Quantity":75},"Type":"order_alert"}"#,
+        ];
+        for frame in frames {
+            assert!(
+                parse_order_update(frame).is_err(),
+                "must fail loud: {frame}"
+            );
+        }
+        assert!(fails_loud_when_blank("Status"));
+        assert!(fails_loud_when_blank("OrderNo"));
+        assert!(fails_loud_when_blank("TradedQty"));
+        assert!(!fails_loud_when_blank("Series"));
+        // Any other null still reads as absent.
+        let ok = r#"{"Data":{"OrderNo":"1124","Status":"TRADED","CorrelationId":null},"Type":"order_alert"}"#;
+        assert_eq!(parse_order_update(ok).unwrap().order_no, "1124");
+    }
+
     #[test]
     fn test_both_null_drops_alt_and_accepted_null_reads_as_absent() {
         // alt null → dropped; accepted null → dropped too (2026-10-28: null
@@ -1498,17 +1536,21 @@ mod tests {
             );
             let mut null = full_sample_value();
             null["Data"][accepted] = serde_json::Value::Null;
-            if FILL_CRITICAL_FIELDS.contains(&accepted) {
+            if fails_loud_when_blank(accepted) {
                 assert!(
                     parse_order_update(&null.to_string()).is_err(),
                     "{accepted} null must fail loud"
                 );
-                let mut blank = full_sample_value();
-                blank["Data"][accepted] = serde_json::Value::from("");
-                assert!(
-                    parse_order_update(&blank.to_string()).is_err(),
-                    "{accepted} empty must fail loud"
-                );
+                // An empty string fails the typed parse only in a numeric
+                // fill field; `""` is a valid text value (as before 10-28).
+                if FILL_CRITICAL_FIELDS.contains(&accepted) {
+                    let mut blank = full_sample_value();
+                    blank["Data"][accepted] = serde_json::Value::from("");
+                    assert!(
+                        parse_order_update(&blank.to_string()).is_err(),
+                        "{accepted} empty must fail loud"
+                    );
+                }
             } else {
                 assert_eq!(
                     parse_order_update(&null.to_string()).unwrap(),
@@ -1575,12 +1617,10 @@ mod tests {
     fn test_every_field_missing_decodes_hollow() {
         let update = parse_order_update(r#"{"Data": {}, "Type": "order_alert"}"#).unwrap();
         assert!(is_hollow_order_update(&update));
-        // Every non-fill field null (the fill fields absent): hollow.
+        // Every other field null (the fail-loud fields absent): hollow.
         let mut all_null = full_sample_value();
         let data = all_null["Data"].as_object_mut().unwrap();
-        for fill in FILL_CRITICAL_FIELDS {
-            data.remove(*fill);
-        }
+        data.retain(|key, _| !fails_loud_when_blank(key));
         for value in data.values_mut() {
             *value = serde_json::Value::Null;
         }
@@ -1846,7 +1886,7 @@ mod tests {
                     // A null fill field fails loud (pinned by
                     // `test_every_single_field_missing_or_null_still_parses`),
                     // so this decode-always property removes it instead.
-                    _ if FILL_CRITICAL_FIELDS.contains(&accepted) => {
+                    _ if fails_loud_when_blank(accepted) => {
                         data.remove(accepted);
                         expected[accepted] = default_for(kind);
                     }
