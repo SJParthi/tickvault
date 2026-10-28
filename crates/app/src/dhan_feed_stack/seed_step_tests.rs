@@ -445,7 +445,6 @@ fn test_queue_seed_batch_seed_time_is_the_arrival_time_not_the_step_time() {
 /// scan then judges X silent up to one queue-depth of time early (a false
 /// RISK-GAP-03 episode). Before DT-A1 seeds ran in arrival order.
 #[test]
-#[ignore = "BUG: a queued seed applied after a newer inline seed rewinds last_seen_millis (2000 -> 1000)"]
 fn test_queue_seed_batch_inline_then_queued_seed_never_rewinds_seed_time() {
     let mut ingest = ingest_with_detector(16);
     assert_eq!(

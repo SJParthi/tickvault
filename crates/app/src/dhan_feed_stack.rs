@@ -1676,6 +1676,11 @@ struct SeedQueue {
     cursor: usize,
     /// Instruments of the front batch the detector accepted so far.
     added: usize,
+    /// Newest seed time an inline seed (a call on a full queue) used while
+    /// batches were queued; 0 when none. A queued step seeds at
+    /// `max(batch time, this)`, so an older queued batch never rewinds a seed
+    /// time a later inline seed set. Cleared when the queue empties.
+    inline_seed_floor: u64,
 }
 
 impl SeedQueue {
@@ -1684,6 +1689,7 @@ impl SeedQueue {
             batches: std::collections::VecDeque::with_capacity(SEED_QUEUE_BATCHES),
             cursor: 0,
             added: 0,
+            inline_seed_floor: 0,
         }
     }
 }
@@ -4360,13 +4366,18 @@ impl LiveIngest {
     ///
     /// A call while the queue is full (the arm never makes one) seeds the
     /// batch at once, the pre-DT-A1 behaviour, rather than grow the queue or
-    /// drop the batch; returns that `(requested, seeded)` in that case.
+    /// drop the batch; returns that `(requested, seeded)` in that case. That
+    /// inline time is kept as a floor for the batches still queued, so a
+    /// later queued step never rewinds the seed time this call set; those
+    /// batches then seed at the later of their own time and this one, which
+    /// can only delay a never-ticked reading, never bring it forward.
     pub fn queue_seed_batch(
         &mut self,
         batch: Vec<SubscribeInstrument>,
         now_millis: u64,
     ) -> Option<SeedBatchDone> {
         if !self.seed_queue_has_room() {
+            self.seed_queue.inline_seed_floor = self.seed_queue.inline_seed_floor.max(now_millis);
             let mut added = 0usize;
             for inst in &batch {
                 if self.seed(inst.security_id, inst.segment, now_millis) {
@@ -4389,14 +4400,16 @@ impl LiveIngest {
     /// batch's `Vec` is freed here, once per batch).
     fn step_seed(&mut self) -> Option<SeedBatchDone> {
         let queue = &mut self.seed_queue;
-        let (batch, now_millis) = queue.batches.front()?;
+        let (batch, batch_millis) = queue.batches.front()?;
+        // Never older than a seed an inline call already applied.
+        let now_millis = (*batch_millis).max(queue.inline_seed_floor);
         let len = batch.len();
         let from = queue.cursor.min(len);
         let to = from.saturating_add(SEED_STEP_INSTRUMENTS).min(len);
         for inst in batch.get(from..to).unwrap_or_default() {
             if self
                 .detector
-                .seed((inst.security_id, inst.segment), *now_millis)
+                .seed((inst.security_id, inst.segment), now_millis)
             {
                 queue.added = queue.added.saturating_add(1);
             }
@@ -4409,6 +4422,9 @@ impl LiveIngest {
         queue.batches.pop_front();
         queue.cursor = 0;
         queue.added = 0;
+        if queue.batches.is_empty() {
+            queue.inline_seed_floor = 0;
+        }
         Some(done)
     }
 
