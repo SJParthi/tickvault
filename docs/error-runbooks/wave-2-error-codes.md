@@ -324,6 +324,38 @@ All three writers now retry a transport failure or a 5xx answer for 10 s
 before giving up on a chunk (they shipped with no retry). A 4xx refusal (a
 bad row) is never retried. The counters are seeded at 0 at boot.
 
+**⚠ CHANGED 2026-10-28 (owner Quote 44).** The daily `instrument_lifecycle`
+and `instrument_lifecycle_audit` write is stopped and its code deleted, so
+the `lifecycle_persist_failed` and `lifecycle_audit_persist_failed` sources
+and their two counters no longer exist. Both tables are kept, frozen as
+history. Only `rider_constituency_persist_failed` remains in the table above.
+
+### 2026-10-28 note — daily instrument snapshot copies (owner Quote 44)
+
+Each trading morning, after a successful daily build, the dated artifact
+files in `data/instrument-cache` (`dhan-nse-mapping-`, `dhan-contracts-`,
+`dhan-fno-underlyings-`, `dhan-ntm-spot-<date>.json`) are gzipped and copied
+to `s3://tv-<env>-cold/instrument-snapshots/<date>/<file>.gz`, verified by
+length and SHA-256, and recorded by a marker in
+`data/instrument-cache/uploaded/`. Kept forever. A failed copy logs
+STORAGE-GAP-04 with `source = "instrument_snapshot_upload"` (or
+`instrument_snapshot_no_bucket` when no cold bucket resolves) and counts on
+`tv_instrument_snapshot_upload_total{outcome="failed"|"no_bucket"}` (local
+`/metrics` only, no page). The 7-day local sweep keeps any dated file without
+a verified copy and counts it on `tv_instrument_snapshot_sweep_held_total`.
+A pass is bounded at 30 minutes and stops after 3 S3 time-outs in a row
+(each logged as above, `file = "pass"`). A request that finds a pass still
+running is counted on `outcome="skipped_busy"` and the running pass runs once
+more; two such requests in a row log a coded STORAGE-GAP-04 `warn!` with
+`source = "instrument_snapshot_pass_busy"`. A folder entry that cannot be read
+is skipped and counted on `outcome="entry_unreadable"`.
+**What to do:** check S3 reachability from the box
+(`aws s3 ls s3://tv-prod-cold/instrument-snapshots/`); the next day's pass
+retries every date still missing. Never delete a local artifact by hand
+before its copy exists. The console's QuestDB wipe and Docker reset/nuke
+actions remove `data/instrument-cache` whole: run them only after the day's
+copies exist.
+
 ### 2026-09-22 note — the one-shot fresh-start reset emits this code
 
 `crates/storage/src/fresh_start_reset.rs` logs STORAGE-GAP-03 with

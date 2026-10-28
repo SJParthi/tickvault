@@ -318,23 +318,11 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
             "ensure_index_constituency_table",
             "src/index_constituency_boot.rs",
         ),
-        // instrument_lifecycle + instrument_lifecycle_audit — the SEBI
-        // never-delete master and its 5-year transition chain (audit J3,
-        // 2026-10-26). The master had NO production ensure until this date:
-        // its only writer ensured the audit table alone, so a fresh or
-        // restored QuestDB auto-created the master with no DEDUP key and its
-        // constant designated `ts` then took a second copy of all ~150,000
-        // instruments every day. Needles are CALL-shaped, because both names
-        // also appear on the `use` line, which a bare-name needle would
-        // accept on its own.
-        (
-            "ensure_instrument_lifecycle_table(questdb).await",
-            "src/dhan_lifecycle.rs",
-        ),
-        (
-            "ensure_instrument_lifecycle_audit_table(questdb).await",
-            "src/dhan_lifecycle.rs",
-        ),
+        // (instrument_lifecycle + instrument_lifecycle_audit rows RETIRED
+        // 2026-10-28, owner Quote 44: the daily writer and both ensures were
+        // deleted; the tables are frozen SEBI history, never written again.
+        // `no_production_code_writes_the_frozen_lifecycle_tables` below pins
+        // that no writer comes back.)
         // order_update_events / position_update_events / order_leg_pnl —
         // order-side capture tables, each ensured by its own consumer.
         (
@@ -678,48 +666,177 @@ fn the_day_roll_seals_the_fold_before_resetting_the_ranking() {
     );
 }
 
-/// Audit J3 (2026-10-26): the SEBI lifecycle writer must hold its write back
-/// when either table's DEDUP key is not confirmed. Calling the ensure is not
-/// enough on its own: an ensure whose verdict is dropped lets the write go
-/// ahead into an ILP-auto-created table with no key, which is the duplicate
-/// class the call exists to prevent.
+/// Owner Quote 44 (2026-10-28): the daily `instrument_lifecycle` /
+/// `instrument_lifecycle_audit` write STOPPED; both tables are frozen SEBI
+/// history. This replaces the audit-J3 pin (which held the write back on an
+/// unkeyed table): there is no write left to hold back, and none may come
+/// back without a fresh dated quote. Scans every production `.rs` file in the
+/// app crate (comments and test modules stripped) for any lifecycle writer.
 #[test]
-fn the_lifecycle_write_is_held_back_when_a_sebi_table_is_not_keyed() {
-    let src = production_region(&read_src("src/dhan_lifecycle.rs"));
-    let body = src
-        .split(concat!("pub async ", "fn write_dhan_lifecycle("))
-        .nth(1)
-        .expect("write_dhan_lifecycle must exist");
-    let ensure_master = body
-        .find("let lifecycle_keyed = ensure_instrument_lifecycle_table(questdb).await;")
-        .expect("the master ensure's verdict must be kept");
-    let ensure_audit = body
-        .find("let audit_keyed = ensure_instrument_lifecycle_audit_table(questdb).await;")
-        .expect("the audit ensure's verdict must be kept");
-    let gate = body
-        .find("if !(lifecycle_keyed && audit_keyed) {")
-        .expect("both verdicts must gate the write");
-    let first_write = body
-        .find("write_audit_then_lifecycle(")
-        .expect("the write must exist");
-    let first_read = body
-        .find("fetch_known_instruments(questdb)")
-        .expect("the known-instruments read must exist");
+fn no_production_code_writes_the_frozen_lifecycle_tables() {
     assert!(
-        ensure_master < gate && ensure_audit < gate,
-        "both ensures must run before the gate"
+        !manifest_dir().join("src/dhan_lifecycle.rs").exists(),
+        "the daily lifecycle writer module must stay deleted (Quote 44)"
+    );
+    let mut files = Vec::new();
+    collect_rs_files(&manifest_dir().join("src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the scan must actually walk the app crate (found {} files)",
+        files.len()
+    );
+    let banned = [
+        concat!("write_dhan_", "lifecycle"),
+        concat!("append_instrument_", "lifecycle"),
+        concat!("ensure_instrument_", "lifecycle"),
+        concat!("dhan_", "lifecycle::"),
+        concat!("mod dhan_", "lifecycle"),
+    ];
+    for path in &files {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        // Every `#[cfg(test)]` item is stripped, not only the first test
+        // module, so a function after a test module is still scanned.
+        let prod = strip_line_comments(&strip_cfg_test_items(&src));
+        for needle in banned {
+            assert!(
+                !prod.contains(needle),
+                "{} writes a frozen lifecycle table (`{needle}`): Quote 44 stopped that write",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Quote 44, the broader half: no production code in the app OR storage crate
+/// may write either frozen table by ANY route, not only through the deleted
+/// helpers' names. Bans, outside the one file that defines the table-name
+/// constants:
+/// - the constants `QUESTDB_TABLE_INSTRUMENT_LIFECYCLE(_AUDIT)` (an ILP
+///   `.table(…)` or a formatted SQL statement would need them), and
+/// - a literal ILP `.table("instrument_lifecycle…")` or a literal SQL write
+///   (`INSERT INTO` / `UPDATE` / `ALTER TABLE` / `DELETE FROM` / `TRUNCATE
+///   TABLE` / `DROP TABLE` followed by `instrument_lifecycle`), case-insensitive.
+///
+/// The scan strips every `#[cfg(test)]` item (not only the first test module),
+/// so a production function written AFTER a test module is still read.
+#[test]
+fn no_production_code_in_app_or_storage_names_a_route_into_the_frozen_tables() {
+    const DEFINING_FILE: &str = "instrument_lifecycle_persistence.rs";
+    let constant_needles = [
+        concat!("QUESTDB_TABLE_INSTRUMENT_", "LIFECYCLE"),
+        concat!("QUESTDB_TABLE_INSTRUMENT_", "LIFECYCLE_AUDIT"),
+    ];
+    let sql_verbs = [
+        "insert into ",
+        "update ",
+        "alter table ",
+        "delete from ",
+        "truncate table ",
+        "drop table ",
+    ];
+    let table = concat!("instrument_", "lifecycle");
+    let mut files = Vec::new();
+    collect_rs_files(&manifest_dir().join("src"), &mut files);
+    collect_rs_files(&manifest_dir().join("../storage/src"), &mut files);
+    assert!(
+        files.len() > 100,
+        "the scan must walk both crates (found {} files)",
+        files.len()
+    );
+    for path in &files {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let prod = strip_line_comments(&strip_cfg_test_items(&src));
+        let lower = prod.to_ascii_lowercase();
+        let defining = path.file_name().is_some_and(|n| n == DEFINING_FILE);
+        if !defining {
+            for needle in constant_needles {
+                assert!(
+                    !prod.contains(needle),
+                    "{} names `{needle}` in production code: Quote 44 froze that table",
+                    path.display()
+                );
+            }
+        }
+        for verb in sql_verbs {
+            let statement = format!("{verb}{table}");
+            assert!(
+                !lower.contains(&statement),
+                "{} carries a literal `{statement}`: Quote 44 froze that table",
+                path.display()
+            );
+        }
+        assert!(
+            !lower.contains(&format!(".table(\"{table}")),
+            "{} writes ILP rows to a frozen lifecycle table",
+            path.display()
+        );
+    }
+}
+
+/// Drops every item tagged `#[cfg(test)]` at column 0: a block item (its
+/// header line ends with `{`) up to its column-0 closing `}` (rustfmt puts
+/// nothing else at column 0 inside it), a one-line item (`use …;`) alone.
+fn strip_cfg_test_items(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut lines = src.lines();
+    while let Some(line) = lines.next() {
+        if line != "#[cfg(test)]" {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // Further attributes on the same item.
+        let mut header = lines.next();
+        while header.is_some_and(|h| h.starts_with("#[")) {
+            header = lines.next();
+        }
+        let Some(header) = header else { break };
+        if header.trim_end().ends_with('{') {
+            for inner in lines.by_ref() {
+                if inner == "}" {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `strip_cfg_test_items` must keep a production function that follows a
+/// test module, and drop both the module and a one-line test item.
+#[test]
+fn strip_cfg_test_items_keeps_code_after_a_test_module() {
+    let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n    }\n}\nfn b() {}\n#[cfg(test)]\nuse x::y;\nfn c() {}\n";
+    let kept = strip_cfg_test_items(src);
+    assert!(kept.contains("fn a()"), "{kept}");
+    assert!(
+        kept.contains("fn b()"),
+        "code after a test module is kept: {kept}"
+    );
+    assert!(kept.contains("fn c()"), "{kept}");
+    assert!(
+        !kept.contains("fn t()"),
+        "the test module is dropped: {kept}"
     );
     assert!(
-        gate < first_read && gate < first_write,
-        "the gate must come before any read or write of the SEBI tables"
+        !kept.contains("use x::y"),
+        "a one-line test item is dropped: {kept}"
     );
-    let held_back = &body[gate..first_read];
-    assert!(
-        held_back.contains("return Err("),
-        "a refused ensure must stop the write, not log and carry on"
-    );
-    assert!(
-        held_back.contains("ErrorCode::StorageGap03AuditWriteFailed"),
-        "the hold-back must log a coded error"
-    );
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", dir.display()))
+            .path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
 }

@@ -185,17 +185,22 @@ pub mod wal_suspension_watcher;
 // partition_manager sweep-list string, per the retirement banner in
 // daily-universe-instr-fetch-error-codes.md).
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
-// + DEDUP keys + LifecycleState/TransitionKind enums + DDL/Row/append
-// helpers. PR-C3 (2026-07-14): compiles unconditionally (feature gate
-// deleted); the live writer is the Groww shared_master_writer.
+// + DEDUP keys + LifecycleState/TransitionKind enums. PR-C3 (2026-07-14):
+// compiles unconditionally (feature gate deleted). 2026-10-28 (owner Quote
+// 44): NO writer. The DDL/Row/append helpers were deleted with the daily
+// write; both tables are frozen history, kept on every keep list.
 pub mod instrument_lifecycle_persistence;
 // §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
 // queryable both directions. Map-only (does NOT change the subscription).
 // PR-C3 (2026-07-14): compiles unconditionally (feature gate deleted).
 pub mod index_constituency_persistence;
 // Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). PR-C3
-// (2026-07-14): compiles unconditionally (feature gate deleted); consumed
-// by the Groww shared_master_writer's classify_transition path.
+// (2026-07-14): compiles unconditionally (feature gate deleted). DORMANT:
+// its only consumer, the Groww shared master writer, was deleted with the
+// Groww feed (2026-08-21), and the daily lifecycle write it would feed
+// stopped under owner Quote 44 (2026-10-28). No production caller; kept as
+// the documented decision rules for reading the frozen rows. Restarting a
+// caller needs a fresh dated quote (Quote 44 REJECT list).
 pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The

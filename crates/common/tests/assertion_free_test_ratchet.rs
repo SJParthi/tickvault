@@ -109,7 +109,11 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// 152 -> 148 on 2026-10-26: measured on the PR J/K assurance-audit fixes
 /// branch (already 148 on its base before J/K landed, found by the K4
 /// session). Nothing was rewritten to reach it.
-const ASSERTION_FREE_BUDGET: usize = 148;
+/// 148 -> 146 on 2026-10-28: owner Quote 44 deleted the daily
+/// `instrument_lifecycle` writer, and two assertion-free tests of it (the
+/// `ensure_*` / `append_*` reachability probes) went with it. Nothing was
+/// rewritten to reach it.
+const ASSERTION_FREE_BUDGET: usize = 146;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [

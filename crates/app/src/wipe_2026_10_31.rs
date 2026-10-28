@@ -1059,6 +1059,43 @@ mod tests {
         }
     }
 
+    /// Owner Quote 44 (2026-10-28): the daily instrument snapshot copies in
+    /// `instrument-snapshots/` are kept forever, so the wipe must never list,
+    /// delete or touch them, and the local morning files they come from are
+    /// not in the box wipe's scope either. Dated keys from before the cutoff
+    /// are used on purpose: a date-only rule would delete them.
+    #[test]
+    fn test_classify_s3_key_keeps_every_instrument_snapshot() {
+        let prefix = crate::instrument_snapshot_upload::INSTRUMENT_SNAPSHOT_S3_PREFIX;
+        for file in [
+            "dhan-nse-mapping-2026-10-20.json.gz",
+            "dhan-contracts-2026-10-20.json.gz",
+            "dhan-fno-underlyings-2026-10-20.json.gz",
+            "dhan-ntm-spot-2026-10-20.json.sha-ab12.gz",
+        ] {
+            let key = format!("{prefix}/2026-10-20/{file}");
+            let verdict = classify_s3_key(&key, Some(secs("2026-10-20 08:00")));
+            assert_ne!(verdict, Verdict::Delete, "{key}");
+            assert_eq!(verdict, Verdict::KeepUnparsed, "{key}");
+        }
+        assert!(
+            !s3_list_prefixes()
+                .iter()
+                .any(|p| p.starts_with(prefix) || prefix.starts_with(p.trim_end_matches('/'))),
+            "the wipe must not even list the snapshot prefix"
+        );
+        for rel in [
+            "data/instrument-cache/dhan-contracts-2026-10-20.json",
+            "data/instrument-cache/uploaded/dhan-contracts-2026-10-20.json",
+        ] {
+            assert_ne!(
+                box_file_verdict(rel, secs("2026-10-20 08:00")),
+                Verdict::Delete,
+                "{rel}"
+            );
+        }
+    }
+
     #[test]
     fn test_classify_s3_key_date_fence_and_shapes() {
         use Verdict::*;
