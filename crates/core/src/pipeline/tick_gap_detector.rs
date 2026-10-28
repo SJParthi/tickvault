@@ -89,6 +89,10 @@
 //!   construction; when they are full the detector **fails closed** (refuses
 //!   and counts) rather than growing, so allocation on this path is
 //!   impossible by construction rather than merely unlikely.
+//! * [`TickGapDetector::observe_tracked`] — the same update for an
+//!   instrument that already holds a slot; it never assigns one. **O(1)**
+//!   average, allocation-free. A WAL replay uses it so frames from earlier
+//!   sessions cannot fill the table ahead of the live subscribe set.
 //! * [`TickGapDetector::scan_silence`] — **O(n) in tracked instruments, NOT
 //!   O(1)**. Stated plainly rather than relabelled. The constraint is that a
 //!   silence sweep is inherently a question about every instrument at once,
@@ -680,7 +684,31 @@ impl TickGapDetector {
                 refused: true,
             };
         };
+        self.observe_slot(slot, obs)
+    }
 
+    /// Records one tick ONLY if its instrument already holds a slot; never
+    /// assigns a new one. Returns `None` for an untracked instrument, and
+    /// that is NOT counted as a refusal: nothing the caller subscribed was
+    /// turned away.
+    ///
+    /// For a write-ahead-log replay (added 2026-10-28). A replay folds frames
+    /// from earlier sessions, so with [`Self::observe`] every contract of
+    /// every replayed day took a slot it never gave back, and the live
+    /// contracts seeded after the replay found the table full. The
+    /// subscribe set is what the detector watches; a replayed tick may
+    /// refresh an instrument already in it, never add one.
+    ///
+    /// **O(1) average, allocation-free.** One hash lookup, then the same
+    /// in-place update as [`Self::observe`].
+    pub fn observe_tracked(&mut self, obs: TickObservation) -> Option<TickAssessment> {
+        let slot = *self.index.get(&obs.key)?;
+        Some(self.observe_slot(slot, obs))
+    }
+
+    /// The in-place update shared by [`Self::observe`] and
+    /// [`Self::observe_tracked`]. O(1), allocation-free.
+    fn observe_slot(&mut self, slot: u32, obs: TickObservation) -> TickAssessment {
         let warmup = self.config.baseline_warmup_samples;
         let multiplier = self.config.volume_jump_multiplier;
         let state = &mut self.slots[slot as usize];
@@ -1715,6 +1743,54 @@ mod tests {
         // Healthy verdicts never count regardless of sparseness.
         assert!(!report(SilenceVerdict::Live, false).counts_toward_alarm());
         assert!(!report(SilenceVerdict::Warming, false).counts_toward_alarm());
+    }
+
+    #[test]
+    fn test_observe_tracked_never_assigns_a_slot_and_never_counts_a_refusal() {
+        let mut d = TickGapDetector::with_capacity(2, DetectorConfig::default());
+        assert!(
+            d.observe_tracked(obs(NIFTY, 1_000, 1, 0, 0)).is_none(),
+            "an untracked instrument is skipped"
+        );
+        assert_eq!(d.tracked_instruments(), 0, "no slot was assigned");
+        assert_eq!(d.refused_count(), 0, "a skip is not blindness");
+
+        assert!(d.seed(NIFTY, 500));
+        let first = d.observe_tracked(obs(NIFTY, 1_000, 1, 0, 1_000));
+        assert!(matches!(first, Some(a) if !a.was_refused()));
+        let second = d.observe_tracked(obs(NIFTY, 1_001, 5, 0, 2_000));
+        assert!(
+            matches!(second, Some(a) if matches!(a.volume, VolumeVerdict::Advanced { delta: 4 })),
+            "a tracked instrument gets the same update as observe"
+        );
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        assert_eq!(d.tracked_instruments(), 1);
+    }
+
+    /// REGRESSION (live 2026-10-28): the WAL replay folded frames from earlier
+    /// sessions through `observe`, every replayed contract took a slot for the
+    /// rest of the process, and the live contracts seeded after it were
+    /// refused. A replay of the authorized ceiling's worth of foreign keys
+    /// must leave room for the whole live universe (20,519 on 28 Oct).
+    #[test]
+    fn test_observe_tracked_replay_cannot_starve_the_live_universe_of_20519() {
+        const CEILING: usize = 25_000;
+        const LIVE_UNIVERSE: u64 = 20_519;
+        let mut d = TickGapDetector::with_capacity(CEILING, DetectorConfig::default());
+        // A replay of prior-day keys, none of them in today's subscribe set.
+        for sid in 1_000_000..1_000_000 + CEILING as u64 {
+            let key = (sid, ExchangeSegment::NseFno);
+            assert!(d.observe_tracked(obs(key, 1_000, 1, 0, 0)).is_none());
+        }
+        assert_eq!(d.tracked_instruments(), 0);
+        for sid in 0..LIVE_UNIVERSE {
+            assert!(
+                d.seed((sid, ExchangeSegment::NseFno), 1_000),
+                "live instrument {sid} refused a slot"
+            );
+        }
+        assert_eq!(d.refused_count(), 0);
+        assert_eq!(d.tracked_instruments(), LIVE_UNIVERSE as usize);
     }
 
     #[test]

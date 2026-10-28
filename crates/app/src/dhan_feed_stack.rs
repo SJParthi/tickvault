@@ -2877,12 +2877,24 @@ impl LiveIngest {
         // `refused_timestamp`, `refused_slot_exhausted`) already carry the
         // aggregate, and AGGREGATOR-DROP-01's 30-second delta report is where
         // a systemic refusal rate surfaces today.
+        //
+        // A WAL replay (2026-10-28) only refreshes instruments that already
+        // hold a slot (`observe_tracked`) and never assigns one: replayed
+        // frames from earlier sessions used to take a slot per contract per
+        // day, never released, so the live contracts seeded after the replay
+        // were refused (RISK-GAP-03 "ran out of slots"). One bool test, O(1).
         if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
-            let assessment = self.detector.observe(obs);
+            let assessment = if self.replaying_wal {
+                self.detector.observe_tracked(obs)
+            } else {
+                Some(self.detector.observe(obs))
+            };
             // Plan item K3: count the two loss-adjacent verdicts instead of
             // dropping them. Pre-resolved handles, two matches, no allocation.
-            let c = counters();
-            count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
+            if let Some(assessment) = assessment {
+                let c = counters();
+                count_tick_verdicts(&c.verdict_ltt_backward, &c.verdict_volume_jump, &assessment);
+            }
         }
         // M5 (2026-10-27, owner Quotes 41 + 43): a packet whose trade time is
         // more than 2 s before its WAL receipt goes to `tick_quotes`. Packet
@@ -26173,6 +26185,69 @@ mod wal_refold_tests {
         p[8..12].copy_from_slice(&24_000.0_f32.to_le_bytes());
         p[12..16].copy_from_slice(&ltt_ist_secs.to_le_bytes());
         bytes::Bytes::copy_from_slice(&p)
+    }
+
+    /// REGRESSION (live 2026-10-28, RISK-GAP-03 "ran out of slots"). The boot
+    /// replay and catch-up fold WAL frames from earlier sessions BEFORE the
+    /// contracts attach, and every replayed key took a detector slot for the
+    /// rest of the process. With the table at the authorized ceiling, a
+    /// backlog naming as many distinct keys as the ceiling left no slot for
+    /// the live contracts seeded afterwards. A replay must now leave the
+    /// whole live universe (20,519 instruments on 28 Oct) room.
+    #[test]
+    fn a_wal_replay_cannot_use_up_the_silence_detector_slots_of_the_live_universe() {
+        const LIVE_UNIVERSE: u64 = 20_519;
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_detector_capacity(super::AGGREGATOR_MAX_SLOTS);
+        // One spot seeded at boot, before the replay, as the lane does.
+        assert!(ingest.seed(13, ExchangeSegment::IdxI, 1_000));
+
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let yesterday_ist = u32::try_from(
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS) - 86_400,
+        )
+        .expect("fits u32 until 2106");
+        let received = (now_utc_secs - 86_400) * 1_000_000_000;
+        // A prior-session backlog naming the ceiling's worth of keys that are
+        // not in today's subscribe set.
+        let backlog: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> = (0..super::AGGREGATOR_MAX_SLOTS)
+            .map(|i| {
+                let sid = 1_000_000 + u32::try_from(i).expect("fits u32");
+                (
+                    u64::try_from(i).expect("fits u64") + 1,
+                    received,
+                    WalEndpoint::MainFeed,
+                    replay_ticker(sid, yesterday_ist),
+                )
+            })
+            .collect();
+        let out = refold_wal_frames(&mut ingest, &backlog, &[], None);
+        // Non-vacuous: the replay really walked every backlog tick.
+        assert_eq!(
+            out.refolded + out.refused_wrong_day + out.lost,
+            u64::try_from(backlog.len()).expect("fits u64"),
+            "every replayed tick is accounted for"
+        );
+        assert_eq!(
+            ingest.tracked_instruments(),
+            1,
+            "a replayed key outside the subscribe set must not take a slot"
+        );
+        assert_eq!(ingest.detector_refused(), 0);
+
+        // The contracts attach after the replay, as `seed_rx` delivers them.
+        let mut seeded = 0u64;
+        for sid in 0..LIVE_UNIVERSE {
+            if ingest.seed(sid, ExchangeSegment::NseFno, 2_000) {
+                seeded += 1;
+            }
+        }
+        assert_eq!(seeded, LIVE_UNIVERSE, "every live instrument gets a slot");
+        assert_eq!(ingest.detector_refused(), 0, "none refused");
+        assert_eq!(
+            ingest.tracked_instruments(),
+            usize::try_from(LIVE_UNIVERSE + 1).expect("fits usize")
+        );
     }
 
     /// THE 08:31 FALSE PAGE (2026-09-23). Every trading morning the boot
