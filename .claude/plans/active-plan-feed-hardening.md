@@ -7095,7 +7095,7 @@ Burst at 09:15 (12,500 packets/s); ring full (frame already in the WAL, re-folde
 A runaway RT thread is capped by the kernel RT throttle (950 ms/s, Assumed default; checked at boot and logged). Lost wake → ring fills → shed to WAL → re-fold (no loss; counted). QuestDB on core 0 may apply slower (apply lag watched; rollback if worse).
 
 ### Test Plan (Item DT)
-DHAT zero-alloc on the new stage and drain loop; proptest on the wake protocol; the 2-core harness gate p99 ≤ 500 µs; one live canary day on r8g.large: receipt→folded p50 ≤ 50 µs, p99 ≤ 500 µs, p99.9 ≤ 2 ms, worst per minute ≤ 5 ms, ticks lost 0.
+DHAT zero-alloc on the new stage and drain loop; proptest on the wake protocol; the 2-core harness gate p99 ≤ 500 µs; one live canary day on r8g.large: receipt→folded p50 ≤ 50 µs, p99 ≤ 200 µs, p99.9 ≤ 1 ms, worst per minute ≤ 1 ms, ticks lost 0 (owner 2026-10-28: "this shodu leb einstantl yfixed as less than 1 ms always dud eokay?"; tightened from p99 ≤ 500 µs / p99.9 ≤ 2 ms / worst ≤ 5 ms). Hypervisor steal time is measured and shown separately (`/proc/stat` steal, O(1) per sample on the telemetry thread), so a tick over 1 ms is attributed to us or to the host. The harness gate is p99 ≤ 200 µs.
 
 ### Rollback (Item DT)
 Each step behind a config switch defaulting to today's behaviour until its live day passes (`[feeds] drain_thread`, `[feeds] rt_priority`); revert = flip the switch and redeploy; DT0 is measurement only.
