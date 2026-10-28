@@ -997,7 +997,7 @@ fn test_build_expiry_index_uses_the_underlying_as_the_file_spells_it() {
 }
 
 #[test]
-fn test_expiry_index_current_expiry_of_and_by_name() {
+fn test_expiry_index_current_expiry_of_and_current_expiry_by_name() {
     let rows = havells_file();
     let index = build_expiry_index(&rows, TODAY, None);
     let row = index
