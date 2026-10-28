@@ -36,6 +36,10 @@
 //! A stored name the file does not list carries no option class, so it is
 //! judged by `(segment, trimmed underlying)` only when every bucket of that
 //! name agrees on the expiry; otherwise it reads `unknown_underlying`.
+//! Stored under several names, it is judged by the worst of them (expired,
+//! then off expiry, then no judged expiry, then current) and counted
+//! `label_mismatch`, so the result never depends on the row order of the
+//! read (`select distinct` has none).
 //!
 //! A composite key the file lists twice with a different underlying, option
 //! class or expiry is AMBIGUOUS: which contract the vendor streams under that
@@ -97,7 +101,9 @@
 //!   day reads `partial`, never `clean`.
 //! - The subscribe-time `error!` is de-duplicated per day by a 64-bit
 //!   fingerprint of the refused set; two different sets with the same
-//!   fingerprint would log once (the counter still counts both).
+//!   fingerprint would log once (the counter still counts both). The day
+//!   remembers the last 16 distinct refused sets (a fixed ring); a set
+//!   refused again after 16 other sets that day logs once more.
 //! - Delivery is log only: no CloudWatch filter, no EMF name, no alarm, no
 //!   Telegram (`dhan-rest-only-noise-lock-2026-07-14.md` §3).
 
@@ -121,7 +127,10 @@ use tickvault_storage::expiry_scope_audit_persistence::ExpiryScopeRow;
 use tickvault_trading::candles::tf_index::TfIndex;
 
 use crate::contract_underlying_map::{ContractKey, contract_label};
-use crate::dhan_contract_universe::{ContractRow, ContractSelection, MIN_LEGS_FOR_A_REAL_EXPIRY};
+use crate::dhan_contract_universe::{
+    ContractRow, ContractSelection, FULL_CHAIN_INDEX_UNDERLYINGS, MIN_LEGS_FOR_A_REAL_EXPIRY,
+    derivative_segment,
+};
 use crate::dhan_live_crossverify_boot::{Completeness, Durability, LiveReadiness};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -627,8 +636,15 @@ pub fn check_selected_expiries(
         .collect();
     let index = build_expiry_index(contracts, today_ymd, Some(&keys));
     let mut report = SubscribeScopeReport::default();
+    // A contract selected twice (same composite key, I-P1-11) is judged
+    // once: counted once, refused once. The selector never repeats a key,
+    // so this only guards a hand-built or merged selection.
+    let mut judged: HashSet<ContractKey> = HashSet::with_capacity(keys.len());
     for instrument in selected {
         let key = (instrument.security_id, instrument.segment);
+        if !judged.insert(key) {
+            continue;
+        }
         let row = index.by_key.get(&key).copied();
         let ambiguous = index.ambiguous.contains(&key);
         let refuse = match row {
@@ -680,6 +696,103 @@ pub fn check_selected_expiries(
     report
 }
 
+/// The per-class count the selector raised for a picked contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorClass {
+    /// Pushed by the index pass (`index_options`).
+    IndexOption,
+    /// Pushed by the stock pass (`stock_options`).
+    StockOption,
+}
+
+/// For each key in `keys`, the class the selector counted it under, by the
+/// selector's own order (`select_contract_universe`): the index pass runs
+/// first and pushes every admissible `OPTIDX` row of an underlying in
+/// [`FULL_CHAIN_INDEX_UNDERLYINGS`] on that underlying's nearest real expiry
+/// (legs counted over the rows the selector admits, NSE only, bucketed by the
+/// underlying name alone); a key it pushed counts as an index option even when
+/// the file also lists a stock row under it. Any other key with an
+/// admissible `OPTSTK` row counts as a stock option; any other key with an
+/// admissible `OPTIDX` row as an index option (a pick the selector and this
+/// check disagree on). A key with no admissible option row (a future, only
+/// expired or leg-less rows, a BSE row) is absent: the selector counted it
+/// under no option class. Two passes, O(rows), cold.
+fn selector_classes(
+    keys: &HashSet<ContractKey>,
+    contracts: &[ContractRow],
+    today_ymd: u32,
+) -> HashMap<ContractKey, SelectorClass> {
+    let index_underlying = |row: &ContractRow| {
+        FULL_CHAIN_INDEX_UNDERLYINGS
+            .iter()
+            .position(|u| *u == row.u)
+    };
+    let admitted = |row: &ContractRow| {
+        is_option_row(row)
+            && derivative_segment(&row.x).is_some()
+            && counts_as_a_leg(row, today_ymd)
+    };
+    let mut legs: HashMap<(usize, u32), usize> = HashMap::new();
+    for row in contracts {
+        if admitted(row)
+            && is_index_option_row(row)
+            && let Some(at) = index_underlying(row)
+        {
+            *legs.entry((at, row.e)).or_insert(0) += 1;
+        }
+    }
+    let mut nearest = [None::<u32>; FULL_CHAIN_INDEX_UNDERLYINGS.len()];
+    for (&(at, expiry), &n) in &legs {
+        if n >= MIN_LEGS_FOR_A_REAL_EXPIRY
+            && let Some(slot) = nearest.get_mut(at)
+        {
+            *slot = Some(slot.map_or(expiry, |held| held.min(expiry)));
+        }
+    }
+    // Highest rank wins, so the answer does not depend on the row order:
+    // 3 a row the index pass pushes, 2 an admissible stock option (the stock
+    // pass), 1 any other admissible index option. Rank 1 is not a pick the
+    // selector makes; it covers a selection the selector and this check
+    // disagree on (the case the check exists to catch), where the contract
+    // could only have been counted by the index pass.
+    let mut ranks: HashMap<ContractKey, u8> = HashMap::with_capacity(keys.len());
+    for row in contracts {
+        if !admitted(row) {
+            continue;
+        }
+        let Some(segment) = derivative_segment(&row.x) else {
+            continue;
+        };
+        let key = (row.i, segment);
+        if !keys.contains(&key) {
+            continue;
+        }
+        let rank = if !is_index_option_row(row) {
+            2
+        } else if index_underlying(row)
+            .and_then(|at| nearest.get(at).copied().flatten())
+            .is_some_and(|expiry| expiry == row.e)
+        {
+            3
+        } else {
+            1
+        };
+        let held = ranks.entry(key).or_insert(rank);
+        *held = (*held).max(rank);
+    }
+    ranks
+        .into_iter()
+        .map(|(key, rank)| {
+            let class = if rank == 2 {
+                SelectorClass::StockOption
+            } else {
+                SelectorClass::IndexOption
+            };
+            (key, class)
+        })
+        .collect()
+}
+
 /// Runs [`check_selected_expiries`] and REMOVES every refused contract from
 /// the selection (instruments and backup rank), lowering the per-class counts
 /// and recording the total in `refused_off_expiry`. Pure apart from the
@@ -699,28 +812,15 @@ pub fn enforce_subscribe_expiry_scope(
         .iter()
         .map(|i| (i.security_id, i.segment))
         .collect();
-    // The class the selector counted the contract under: its admissible row
-    // when the file has one (an unusable duplicate of another class must not
-    // lower the wrong count), else its first row.
-    let mut classes: HashMap<ContractKey, (bool, bool)> = HashMap::new();
-    for r in contracts {
-        let Some(segment) = artifact_option_segment(&r.x) else {
-            continue;
-        };
-        let key = (r.i, segment);
-        if !refused.contains(&key) {
-            continue;
-        }
-        let admitted = is_option_row(r) && counts_as_a_leg(r, today_ymd);
-        let entry = classes.entry(key).or_insert((r.c == "OPTIDX", admitted));
-        if admitted && !entry.1 {
-            *entry = (r.c == "OPTIDX", true);
-        }
-    }
+    let classes = selector_classes(&refused, contracts, today_ymd);
     for key in &refused {
-        match classes.get(key).map(|&(index_option, _)| index_option) {
-            Some(true) => selection.index_options = selection.index_options.saturating_sub(1),
-            Some(false) => selection.stock_options = selection.stock_options.saturating_sub(1),
+        match classes.get(key) {
+            Some(SelectorClass::IndexOption) => {
+                selection.index_options = selection.index_options.saturating_sub(1);
+            }
+            Some(SelectorClass::StockOption) => {
+                selection.stock_options = selection.stock_options.saturating_sub(1);
+            }
             None => {}
         }
     }
@@ -741,8 +841,64 @@ static SUBSCRIBE_SCOPE_DAY: AtomicU32 = AtomicU32::new(0);
 /// The largest refusal count of any subscribe-time check on that day.
 static SUBSCRIBE_SCOPE_REFUSED: AtomicU64 = AtomicU64::new(0);
 
-/// The fingerprint of the refused set last logged at `error!` (0 = none).
-static SUBSCRIBE_SCOPE_LOGGED: AtomicU64 = AtomicU64::new(0);
+/// Distinct refused sets remembered per day for the log de-duplication.
+/// A day's selection normally settles on one set; a flapping one moves
+/// between a few. Past this many distinct sets in one day the OLDEST is
+/// forgotten (a ring), so a set refused again after this many other sets
+/// logs its `error!` once more: the memory stays fixed and a refusal is
+/// never silenced, at the cost of a repeat line in that rare case.
+const SUBSCRIBE_SCOPE_LOGGED_SETS: usize = 16;
+
+/// The refused-set fingerprints already logged at `error!` on one day.
+/// Fixed size, no allocation.
+#[derive(Debug)]
+struct LoggedSets {
+    /// The IST day (`YYYYMMDD`) the fingerprints belong to, 0 before any.
+    day: u32,
+    /// Remembered fingerprints; slots `0..len` are in use.
+    sets: [u64; SUBSCRIBE_SCOPE_LOGGED_SETS],
+    /// Slots in use.
+    len: usize,
+    /// The slot the next new fingerprint replaces once every slot is used.
+    next: usize,
+}
+
+impl LoggedSets {
+    const EMPTY: Self = Self {
+        day: 0,
+        sets: [0; SUBSCRIBE_SCOPE_LOGGED_SETS],
+        len: 0,
+        next: 0,
+    };
+
+    /// Records `fingerprint` for `day` and says whether it is new that day
+    /// (so its `error!` is due). A new day forgets every earlier set.
+    /// O([`SUBSCRIBE_SCOPE_LOGGED_SETS`]), no allocation.
+    fn first_time(&mut self, day: u32, fingerprint: u64) -> bool {
+        if self.day != day {
+            *self = Self::EMPTY;
+            self.day = day;
+        }
+        if self
+            .sets
+            .get(..self.len)
+            .is_some_and(|held| held.contains(&fingerprint))
+        {
+            return false;
+        }
+        if let Some(slot) = self.sets.get_mut(self.next) {
+            *slot = fingerprint;
+        }
+        self.len = (self.len + 1).min(SUBSCRIBE_SCOPE_LOGGED_SETS);
+        self.next = (self.next + 1) % SUBSCRIBE_SCOPE_LOGGED_SETS;
+        true
+    }
+}
+
+/// The refused sets already logged at `error!` today. Taken once per attach
+/// attempt, cold; never held across the log call.
+static SUBSCRIBE_SCOPE_LOGGED: std::sync::Mutex<LoggedSets> =
+    std::sync::Mutex::new(LoggedSets::EMPTY);
 
 /// splitmix64 finaliser: spreads one word over all 64 bits. Pure, O(1).
 const fn mix64(mut z: u64) -> u64 {
@@ -771,7 +927,10 @@ fn refusal_fingerprint(report: &SubscribeScopeReport, today_ymd: u32) -> u64 {
 /// coded `error!` (`EXPIRY-SCOPE-01`, log only) the first time that exact set
 /// is refused that day; the same set refused again on a later attach attempt
 /// (the attach retries every few seconds through the morning) is `debug!`,
-/// while the counter still counts every refusal. A clean check is `debug!`.
+/// while the counter still counts every refusal, also when the selection
+/// flaps between sets (A, B, A logs A once). The memory is a fixed ring of
+/// [`SUBSCRIBE_SCOPE_LOGGED_SETS`] fingerprints per day. A clean check is
+/// `debug!`.
 // TEST-EXEMPT: logging + metrics side effects over the unit-tested report; the day memory it writes is tested through `subscribe_refused_for_day`, the de-duplication through `test_refusal_fingerprint_*`.
 pub fn record_subscribe_expiry_scope(report: &SubscribeScopeReport, today_ymd: u32) {
     let refused = report.refused.len() as u64;
@@ -784,7 +943,10 @@ pub fn record_subscribe_expiry_scope(report: &SubscribeScopeReport, today_ymd: u
     metrics::counter!(SUBSCRIBE_REFUSED_COUNTER).increment(refused);
     let fingerprint = refusal_fingerprint(report, today_ymd);
     let repeat = fingerprint != 0
-        && SUBSCRIBE_SCOPE_LOGGED.swap(fingerprint, Ordering::AcqRel) == fingerprint;
+        && !SUBSCRIBE_SCOPE_LOGGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_time(today_ymd, fingerprint);
     if repeat {
         debug!(
             refused,
@@ -936,20 +1098,55 @@ impl ExpiryScopeCounts {
     }
 }
 
+/// `(underlying, expiry, strike in paise, leg)` of a stored name that parses.
+type ParsedName<'a> = (&'a str, u32, i64, &'a str);
+
 #[derive(Default)]
 struct KeyState<'a> {
     any_unlabelled: bool,
     malformed: bool,
-    /// `(underlying, expiry, strike in paise, leg)` of the first name that
-    /// parses.
-    parsed: Option<(&'a str, u32, i64, &'a str)>,
+    /// The parsed name kept for the key, with its [`name_severity`] and the
+    /// stored name it came from: the MAXIMUM of `(severity, parsed, name)`
+    /// over the key's rows. A maximum under a total order does not depend on
+    /// the row order (`select distinct` has none), so a contract the file
+    /// does not list, stored under one current and one off-expiry name, is
+    /// judged by the off-expiry one whichever row comes first.
+    parsed: Option<(u8, ParsedName<'a>, &'a str)>,
+    /// At least two distinct parsed names were seen. Order-independent: the
+    /// kept name is one of the seen ones, so a second distinct name always
+    /// differs from it when it arrives.
     conflicting: bool,
-    first_name: Option<&'a str>,
+    /// The smallest stored name (a total order), the audit sample for a
+    /// contract the file lists.
+    min_name: Option<&'a str>,
+}
+
+/// How bad a stored name is as the evidence for a contract the file does not
+/// list: 3 expired, 2 off its underlying's current expiry, 1 underlying with
+/// no judged expiry, 0 current. Any name off the current expiry therefore
+/// wins over a current one. Pure, O(1).
+fn name_severity(
+    index: &ExpiryIndex<'_>,
+    segment: ExchangeSegment,
+    parsed: ParsedName<'_>,
+    today_ymd: u32,
+) -> u8 {
+    let (underlying, expiry, _, _) = parsed;
+    if expiry < today_ymd {
+        return 3;
+    }
+    match index.current_expiry_by_name(segment, underlying) {
+        Some(nearest) if nearest != expiry => 2,
+        Some(_) => 0,
+        None => 1,
+    }
 }
 
 /// Judges every stored contract. Returns the counts and the name of the
-/// lowest-keyed offender (off-expiry or expired), for the audit row. Pure,
-/// O(rows + contracts in the index lookups).
+/// lowest-keyed offender (off-expiry or expired), for the audit row. The
+/// result does not depend on the row order: every per-key choice is a
+/// maximum or minimum under a total order. Pure, O(rows), one index probe
+/// per parsed name and per contract.
 #[must_use]
 pub fn classify_candle_contracts(
     rows: &[CandleContractRow],
@@ -973,15 +1170,24 @@ pub fn classify_candle_contracts(
             state.any_unlabelled = true;
             continue;
         };
-        state.first_name.get_or_insert(name);
+        if state.min_name.is_none_or(|held| name < held) {
+            state.min_name = Some(name);
+        }
         match parse_contract_label(name) {
             None => state.malformed = true,
             Some(p) => {
                 let seen = (p.underlying.trim(), p.expiry_ymd, p.strike_paise, p.leg);
+                let ranked = (name_severity(index, segment, seen, today_ymd), seen, name);
                 match state.parsed {
-                    None => state.parsed = Some(seen),
-                    Some(held) if held != seen => state.conflicting = true,
-                    Some(_) => {}
+                    None => state.parsed = Some(ranked),
+                    Some(held) => {
+                        if held.1 != seen {
+                            state.conflicting = true;
+                        }
+                        if ranked > held {
+                            state.parsed = Some(ranked);
+                        }
+                    }
                 }
             }
         }
@@ -1001,7 +1207,8 @@ pub fn classify_candle_contracts(
         // used only for a contract the file does not list. The whole name is
         // compared (underlying, expiry, strike and leg), so a name carried by
         // the wrong contract is a mismatch even when the expiry agrees.
-        let resolved: Option<(u32, Option<u32>)> = match (artifact, state.parsed) {
+        let parsed = state.parsed.map(|(_, p, _)| p);
+        let resolved: Option<(u32, Option<u32>)> = match (artifact, parsed) {
             _ if index.ambiguous.contains(key) => None,
             (Some(row), parsed) => {
                 let truth = (row.u.trim(), row.e, row.s, row.l.as_str());
@@ -1010,6 +1217,7 @@ pub fn classify_candle_contracts(
                 }
                 Some((row.e, index.current_expiry_of(row, key.1)))
             }
+            // Judged by the worst of its names (see `KeyState::parsed`).
             (None, Some((underlying, expiry, _, _))) => {
                 if state.conflicting {
                     counts.label_mismatch += 1;
@@ -1050,7 +1258,14 @@ pub fn classify_candle_contracts(
                 .as_ref()
                 .is_none_or(|(held, _)| sort_key(*key) < sort_key(*held))
         {
-            let name = match (state.first_name, artifact) {
+            // A contract the file does not list is named by the name it was
+            // judged by; one the file lists by its smallest stored name. Both
+            // are total-order choices, so the sample is order-independent.
+            let judged_by = state
+                .parsed
+                .filter(|_| artifact.is_none())
+                .map(|(_, _, n)| n);
+            let name = match (judged_by.or(state.min_name), artifact) {
                 (Some(n), _) => n.to_owned(),
                 (None, Some(row)) => contract_label(&row.u, row.e, row.s, &row.l),
                 (None, None) => format!("security_id {}", key.0),

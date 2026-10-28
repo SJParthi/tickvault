@@ -625,17 +625,20 @@ fn test_classify_candle_contracts_label_disagreeing_with_the_file_is_judged_by_t
     assert_eq!(counts.label_mismatch, 1);
     assert_eq!(counts.off_expiry, 0);
     assert_eq!(sample, None);
-    // Two names for one contract also disagree.
-    let (counts, _) = classify_candle_contracts(
-        &[
-            candle(150, "NSE_FNO", Some("HAVELLS-23Nov2026-1240-CE")),
-            candle(150, "NSE_FNO", Some("HAVELLS-29Dec2026-1240-CE")),
-        ],
-        &index,
-        TODAY,
-    );
-    assert_eq!(counts.label_mismatch, 1);
-    assert_eq!(counts.off_expiry, 0, "judged by the first name: current");
+    // Two names for one contract also disagree. A contract the file does not
+    // list is judged by the worse of its names (the December one, off
+    // expiry), in either row order.
+    let current = candle(150, "NSE_FNO", Some("HAVELLS-23Nov2026-1240-CE"));
+    let december = candle(150, "NSE_FNO", Some("HAVELLS-29Dec2026-1240-CE"));
+    for rows in [
+        [current.clone(), december.clone()],
+        [december.clone(), current.clone()],
+    ] {
+        let (counts, sample) = classify_candle_contracts(&rows, &index, TODAY);
+        assert_eq!(counts.label_mismatch, 1);
+        assert_eq!(counts.off_expiry, 1, "judged by the off-expiry name");
+        assert_eq!(sample.as_deref(), Some("HAVELLS-29Dec2026-1240-CE"));
+    }
 }
 
 #[test]
@@ -1736,7 +1739,6 @@ proptest! {
     /// names that disagree on expiry: counts, verdict AND the sample name
     /// must not depend on the row order.
     #[test]
-    #[ignore = "BUG: classify_candle_contracts keeps the FIRST parsed name of a contract the file does not list (KeyState::parsed) and the first name as the sample, so a name-only contract stored under two names that disagree on expiry reads partial/label_mismatch in one row order and violation/off_expiry in the other"]
     fn proptest_classify_candle_contracts_is_row_order_independent_over_the_full_key_space(
         (rows, shuffled) in x_rows_strategy(false),
     ) {
@@ -1751,7 +1753,6 @@ proptest! {
 }
 
 #[test]
-#[ignore = "BUG: a name-only contract under two names that disagree on expiry is judged by whichever row comes first (KeyState::parsed keeps the first): current-name-first gives off_expiry 0 (partial, label_mismatch), next-name-first gives off_expiry 1 (violation)"]
 fn test_classify_candle_contracts_a_name_only_contract_with_two_expiries_is_order_independent() {
     let file = x_file();
     let index = build_expiry_index(&file, TODAY, None);
@@ -1971,53 +1972,84 @@ fn keys_of(instruments: &[SubscribeInstrument]) -> Vec<ContractKey> {
         .collect()
 }
 
+/// One case of the dirty-file refusal property (see the test below).
+/// Returns how many picks were refused, so the test can prove the property
+/// was exercised on at least one refusal.
+fn dirty_file_refuses_only_ambiguous_picks(rows: &[ContractRow]) -> Result<usize, TestCaseError> {
+    let master: Vec<_> = rows.iter().map(ContractRow::to_master_row).collect();
+    let mut selection = select_contract_universe(&master, &dirty_spot(), TODAY, 25_000);
+    let picked = keys_of(&selection.instruments);
+    let backup_before = keys_of(&selection.backup_rank);
+    let index = build_expiry_index(rows, TODAY, None);
+    let report = enforce_subscribe_expiry_scope(&mut selection, rows, TODAY);
+    let refused: HashSet<ContractKey> = keys_of(&report.refused).into_iter().collect();
+    for key in &refused {
+        prop_assert!(
+            key.0 == 0 || index.ambiguous.contains(key),
+            "refused a non-ambiguous pick {:?}: {:?}",
+            key,
+            report
+        );
+    }
+    prop_assert_eq!(report.off_expiry, 0, "{:?}", report);
+    prop_assert_eq!(report.expired, 0, "{:?}", report);
+    prop_assert_eq!(report.unknown, report.refused.len());
+    prop_assert_eq!(report.checked + report.refused.len(), picked.len());
+    prop_assert_eq!(selection.refused_off_expiry, report.refused.len());
+    let kept: Vec<ContractKey> = picked
+        .iter()
+        .copied()
+        .filter(|k| !refused.contains(k))
+        .collect();
+    prop_assert_eq!(keys_of(&selection.instruments), kept);
+    let backup_kept: Vec<ContractKey> = backup_before
+        .into_iter()
+        .filter(|k| !refused.contains(k))
+        .collect();
+    prop_assert_eq!(keys_of(&selection.backup_rank), backup_kept);
+    Ok(report.refused.len())
+}
+
+/// The selector and the check compute "current expiry" separately. On a
+/// dirty file (duplicate rows, ids reused across underlyings, classes and
+/// expiries, expired twins, leg-less and strike-0 rows, id 0, a
+/// whitespace or trailing-space underlying, BSE rows, chains of 2 to 6
+/// legs around `MIN_LEGS_FOR_A_REAL_EXPIRY`) the check refuses a picked
+/// contract ONLY when its id names two contracts in the file (ambiguous,
+/// by design) or is 0 (never a key); never off expiry, never expired; it
+/// judges every other pick, and the selection keeps exactly the rest.
+///
+/// Witness: a run whose cases never refused anything would pass the
+/// per-refusal assertions vacuously, so the run must also see at least one
+/// case with a refusal.
+#[test]
+fn proptest_enforce_subscribe_expiry_scope_on_a_dirty_file_refuses_only_ambiguous_picks() {
+    let cases_with_a_refusal = std::cell::Cell::new(0_usize);
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(512));
+    let outcome = runner.run(&dirty_file(), |rows| {
+        let refused = dirty_file_refuses_only_ambiguous_picks(&rows)?;
+        if refused > 0 {
+            cases_with_a_refusal.set(cases_with_a_refusal.get() + 1);
+        }
+        Ok(())
+    });
+    if let Err(failure) = outcome {
+        panic!("{failure}");
+    }
+    assert!(
+        cases_with_a_refusal.get() > 0,
+        "no case refused a pick: the refusal assertions were never exercised"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// The selector and the check compute "current expiry" separately. On a
-    /// dirty file (duplicate rows, ids reused across underlyings, classes and
-    /// expiries, expired twins, leg-less and strike-0 rows, id 0, a
-    /// whitespace or trailing-space underlying, BSE rows, chains of 2 to 6
-    /// legs around `MIN_LEGS_FOR_A_REAL_EXPIRY`) the check refuses a picked
-    /// contract ONLY when its id names two contracts in the file (ambiguous,
-    /// by design) or is 0 (never a key); never off expiry, never expired; it
-    /// judges every other pick, and the selection keeps exactly the rest.
-    #[test]
-    fn proptest_enforce_subscribe_expiry_scope_on_a_dirty_file_refuses_only_ambiguous_picks(
-        rows in dirty_file(),
-    ) {
-        let master: Vec<_> = rows.iter().map(ContractRow::to_master_row).collect();
-        let mut selection = select_contract_universe(&master, &dirty_spot(), TODAY, 25_000);
-        let picked = keys_of(&selection.instruments);
-        let backup_before = keys_of(&selection.backup_rank);
-        let index = build_expiry_index(&rows, TODAY, None);
-        let report = enforce_subscribe_expiry_scope(&mut selection, &rows, TODAY);
-        let refused: HashSet<ContractKey> = keys_of(&report.refused).into_iter().collect();
-        for key in &refused {
-            prop_assert!(
-                key.0 == 0 || index.ambiguous.contains(key),
-                "refused a non-ambiguous pick {:?}: {:?}", key, report
-            );
-        }
-        prop_assert_eq!(report.off_expiry, 0, "{:?}", report);
-        prop_assert_eq!(report.expired, 0, "{:?}", report);
-        prop_assert_eq!(report.unknown, report.refused.len());
-        prop_assert_eq!(report.checked + report.refused.len(), picked.len());
-        prop_assert_eq!(selection.refused_off_expiry, report.refused.len());
-        let kept: Vec<ContractKey> =
-            picked.iter().copied().filter(|k| !refused.contains(k)).collect();
-        prop_assert_eq!(keys_of(&selection.instruments), kept);
-        let backup_kept: Vec<ContractKey> =
-            backup_before.into_iter().filter(|k| !refused.contains(k)).collect();
-        prop_assert_eq!(keys_of(&selection.backup_rank), backup_kept);
-    }
 
     /// After a refusal the per-class counts still describe what is left: the
     /// index count equals the remaining contracts the index pass picked (the
     /// selector run with no stock prices picks exactly those), and the stock
     /// count the rest.
     #[test]
-    #[ignore = "BUG: enforce_subscribe_expiry_scope lowers the class of the FIRST admissible file row of a refused key, but the selector counts a reused id under the class it pushed first (index options before stock options), so refusing an ambiguous id whose stock row comes first in the file lowers stock_options for a contract counted as an index option"]
     fn proptest_enforce_subscribe_expiry_scope_keeps_the_class_counts_of_what_is_left(
         rows in dirty_file(),
     ) {
@@ -2561,7 +2593,6 @@ fn test_enforce_subscribe_expiry_scope_count_shapes() {
 }
 
 #[test]
-#[ignore = "BUG: a selection that holds one contract twice is judged twice: check_selected_expiries pushes it into `refused` twice, so refused_off_expiry rises by 2 and `checked`/`off_expiry` double count while stock_options drops by 1"]
 fn test_enforce_subscribe_expiry_scope_counts_a_contract_selected_twice_once() {
     let rows = havells_file();
     let mut selection = ContractSelection {
@@ -2578,7 +2609,6 @@ fn test_enforce_subscribe_expiry_scope_counts_a_contract_selected_twice_once() {
 }
 
 #[test]
-#[ignore = "BUG: enforce_subscribe_expiry_scope's class lookup does not check is_option_row on the first insert, so a refused key whose only same-id row is a FUTURE (FUTIDX) lowers stock_options although the selector never counted it as a stock option"]
 fn test_enforce_subscribe_expiry_scope_a_future_only_key_lowers_no_option_count() {
     let mut rows = havells_file();
     rows.push(opt(888, "FUTIDX", "NIFTY", CURRENT, 0, ""));
@@ -2741,7 +2771,6 @@ fn test_record_subscribe_expiry_scope_logs_each_refused_set_once_per_day() {
 }
 
 #[test]
-#[ignore = "BUG: record_subscribe_expiry_scope remembers only the LAST logged fingerprint (SUBSCRIBE_SCOPE_LOGGED), so a selection flapping A, B, A on one day logs A's EXPIRY-SCOPE-01 error twice, against the documented 'the first time that exact set is refused that day'"]
 fn test_record_subscribe_expiry_scope_a_flapping_selection_logs_each_set_once() {
     let _guard = RECORD_SCOPE_LOCK
         .lock()
@@ -2752,6 +2781,34 @@ fn test_record_subscribe_expiry_scope_a_flapping_selection_logs_each_set_once() 
     assert_eq!(errors_logged_by_record(&a, day), 1);
     assert_eq!(errors_logged_by_record(&b, day), 1);
     assert_eq!(errors_logged_by_record(&a, day), 0);
+}
+
+#[test]
+fn test_logged_sets_remembers_a_fixed_number_of_sets_per_day() {
+    let mut sets = LoggedSets::EMPTY;
+    let day = 19_970_401;
+    // Flapping between sets inside the memory logs each once.
+    assert!(sets.first_time(day, 11));
+    assert!(sets.first_time(day, 22));
+    assert!(!sets.first_time(day, 11));
+    assert!(!sets.first_time(day, 22));
+    // Fill every slot: 11, 22 and N - 2 more.
+    for fp in 0..(SUBSCRIBE_SCOPE_LOGGED_SETS as u64 - 2) {
+        assert!(sets.first_time(day, 100 + fp));
+    }
+    assert_eq!(sets.len, SUBSCRIBE_SCOPE_LOGGED_SETS);
+    assert!(!sets.first_time(day, 11));
+    // One more distinct set evicts the OLDEST (11); 22 is still held.
+    assert!(sets.first_time(day, 999));
+    assert_eq!(sets.len, SUBSCRIBE_SCOPE_LOGGED_SETS);
+    assert!(!sets.first_time(day, 22));
+    assert!(
+        sets.first_time(day, 11),
+        "past the ring the oldest set logs once more"
+    );
+    // A new day forgets every set.
+    assert!(sets.first_time(day + 1, 22));
+    assert_eq!(sets.len, 1);
 }
 
 proptest! {
