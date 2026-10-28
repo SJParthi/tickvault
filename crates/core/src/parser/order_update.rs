@@ -163,7 +163,8 @@ const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 /// fields as absent, exact number/string coercion; see
 /// `normalize_order_update_frame`), then deserialized into the derived
 /// `OrderUpdateMessage` struct. Structural errors (malformed JSON,
-/// missing/null/non-object `Data`) keep failing exactly as before.
+/// missing/null/non-object `Data`, a top-level array) keep failing; an
+/// array `Data` or top-level array is refused before the typed parse.
 ///
 /// # Arguments
 /// * `json_str` — Raw JSON string from the WebSocket.
@@ -181,8 +182,28 @@ pub fn parse_order_update(json_str: &str) -> Result<OrderUpdate, OrderUpdatePars
     }
     let mut value: serde_json::Value = serde_json::from_str(json_str)?;
     normalize_order_update_frame(&mut value);
+    refuse_array_frame(&value)?;
     let message: OrderUpdateMessage = serde_json::from_value(value)?;
     Ok(message.data)
+}
+
+/// Refuses a top-level array or an array `Data` (after the wrapper casing
+/// pass) as a structural error. Without this, serde's derived sequence
+/// visitor decodes `{"Data":[...]}` POSITIONALLY (or as an all-default
+/// update for `[]`) and `[{"Data":{...}}]` as a hollow update, bypassing
+/// the casing and coercion pass. Scalar and null `Data` already fail the
+/// typed parse. Pure, O(1), no allocation on the accept path.
+fn refuse_array_frame(value: &serde_json::Value) -> Result<(), OrderUpdateParseError> {
+    let is_array = value.is_array() || value.get("Data").is_some_and(serde_json::Value::is_array);
+    if is_array {
+        return Err(OrderUpdateParseError::JsonError(
+            <serde_json::Error as serde::de::Error>::invalid_type(
+                serde::de::Unexpected::Seq,
+                &"an object",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Normalizes a raw order-update frame in place before the typed parse.
@@ -423,10 +444,17 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 ///   values without `.0`). `AlgoOrdNo` keeps its own quirk kind
 ///   (`numeric_algo_ord_no`, the live doc table types it `float`). A
 ///   [`INTEGRAL_ID_TEXT_FIELDS`] field accepts integral numbers only.
-/// - Int field holding a string → the integer it spells (`"50"`, `"50.0"`);
-///   an empty string → remove.
-/// - Int field holding an integral float (`50.0`) inside the `i64` range →
-///   that integer.
+/// - Int field holding a string → the integer it spells EXACTLY (`"50"`,
+///   `"50.0"`, `"1e3"`; see [`exact_decimal_i64`]); a fractional or
+///   out-of-range spelling is kept (loud), never rounded; an empty string →
+///   remove.
+/// - Int field holding an integral float (`50.0`) with magnitude below 2^53
+///   → that integer. At or past 2^53 the `f64` serde read may stand for a
+///   different wire integer, so it is kept (loud). Honest limit: serde has
+///   already rounded a JSON number to `f64` before this runs, so a
+///   fractional wire number whose nearest `f64` is integral
+///   (`1.00000000000000001`) reads as that integer; only a string spelling
+///   is judged digit by digit.
 /// - Float field holding a string → the finite number it spells; an empty
 ///   string → remove.
 /// - Anything else (a fractional quantity, `"ten"`, an object, an array, a
@@ -467,7 +495,7 @@ fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> Field
             if let Ok(integral) = trimmed.parse::<i64>() {
                 return FieldFix::Replace(Value::from(integral), "numeric_string_coerced");
             }
-            match trimmed.parse::<f64>().ok().and_then(exact_i64) {
+            match exact_decimal_i64(trimmed) {
                 Some(integral) => {
                     FieldFix::Replace(Value::from(integral), "numeric_string_coerced")
                 }
@@ -475,7 +503,15 @@ fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> Field
             }
         }
         (FieldKind::Int, Value::Number(number)) if number.as_i64().is_none() => {
-            match number.as_f64().and_then(exact_i64) {
+            // Only below 2^53: every integer there is an exact f64, so the
+            // f64 serde read cannot stand for a different integer. At or
+            // past 2^53 two wire integers share one f64
+            // (9007199254740993.0 reads as 2^53), so it is refused.
+            match number
+                .as_f64()
+                .filter(|float| float.abs() < F64_EXACT_INTEGER_LIMIT)
+                .and_then(exact_i64)
+            {
                 Some(integral) => {
                     FieldFix::Replace(Value::from(integral), "integral_float_coerced")
                 }
@@ -513,6 +549,105 @@ fn exact_i64(float: f64) -> Option<i64> {
     }
 }
 
+/// 2^53. Below it every integer is an exact `f64`, so an integral `f64`
+/// there names exactly one wire integer; at or past it two integers can
+/// share one `f64` (`9007199254740993.0` reads as 2^53).
+const F64_EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
+/// The `i64` a decimal string spells EXACTLY, never rounded: an optional
+/// sign, digits with an optional `.` fraction, an optional `e`/`E`
+/// exponent (the `f64` grammar without `inf`/`nan`). `None` when the value
+/// has a non-zero fractional part (`"50.5"`, `"5e-1"`), lies outside the
+/// `i64` range, or the text is not such a decimal. Unlike a parse through
+/// `f64`, `"9007199254740993.0"` is 9007199254740993, never 2^53.
+///
+/// Pure, O(text length), no allocation. Cold: the order-update read task.
+fn exact_decimal_i64(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    let (negative, rest) = match bytes.split_first() {
+        Some((b'-', after)) => (true, after),
+        Some((b'+', after)) => (false, after),
+        _ => (false, bytes),
+    };
+    let int_len = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let (int_digits, rest) = rest.split_at(int_len);
+    let (frac_digits, rest) = match rest.split_first() {
+        Some((b'.', after)) => {
+            let frac_len = after.iter().take_while(|b| b.is_ascii_digit()).count();
+            after.split_at(frac_len)
+        }
+        _ => rest.split_at(0),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    let exponent: i64 = match rest.split_first() {
+        None => 0,
+        Some((b'e' | b'E', after)) => {
+            let (exp_negative, exp_digits) = match after.split_first() {
+                Some((b'-', digits)) => (true, digits),
+                Some((b'+', digits)) => (false, digits),
+                _ => (false, after),
+            };
+            if exp_digits.is_empty() || !exp_digits.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let magnitude = exp_digits.iter().fold(0i64, |acc, digit| {
+                acc.saturating_mul(10)
+                    .saturating_add(i64::from(digit.saturating_sub(b'0')))
+            });
+            if exp_negative {
+                0i64.saturating_sub(magnitude)
+            } else {
+                magnitude
+            }
+        }
+        Some(_) => return None,
+    };
+    let digits = || int_digits.iter().chain(frac_digits);
+    let total = int_digits.len().saturating_add(frac_digits.len());
+    let trailing_zeros = digits().rev().take_while(|&&digit| digit == b'0').count();
+    if trailing_zeros == total {
+        return Some(0);
+    }
+    // Value = (all digits as an integer) x 10^shift.
+    let shift = exponent.saturating_sub(i64::try_from(frac_digits.len()).ok()?);
+    let (keep, scale) = if shift < 0 {
+        let drop = usize::try_from(shift.unsigned_abs()).ok()?;
+        if drop > trailing_zeros {
+            return None; // a non-zero digit sits after the decimal point
+        }
+        (total.saturating_sub(drop), 0)
+    } else {
+        (total, shift.unsigned_abs())
+    };
+    // 2^63 - 1, or 2^63 for a negative value (i64::MIN).
+    let limit = u128::from(i64::MAX.unsigned_abs()).saturating_add(u128::from(negative));
+    let mut magnitude: u128 = 0;
+    for digit in digits().take(keep) {
+        magnitude = magnitude
+            .saturating_mul(10)
+            .saturating_add(u128::from(digit.saturating_sub(b'0')));
+        if magnitude > limit {
+            return None;
+        }
+    }
+    // `magnitude` holds a non-zero digit here, so this ends within 20 steps.
+    for _ in 0..scale {
+        magnitude = magnitude.saturating_mul(10);
+        if magnitude > limit {
+            return None;
+        }
+    }
+    let signed = i128::try_from(magnitude).ok()?;
+    i64::try_from(if negative {
+        signed.checked_neg()?
+    } else {
+        signed
+    })
+    .ok()
+}
+
 /// Builds the login JSON message for the order update WebSocket.
 ///
 /// Must be sent immediately after WebSocket connection is established.
@@ -538,14 +673,17 @@ pub fn build_order_update_login(client_id: &str, access_token: &str) -> String {
 }
 
 /// True when a decoded update carries none of the three identity fields:
-/// `order_no`, `status` and `security_id` are all empty. Pure, O(1), no
-/// allocation.
+/// `order_no`, `status` and `security_id` are all empty after trimming
+/// (a whitespace-only value is blank, as in `is_blank_value`). Pure, no
+/// allocation, O(length of the three fields).
 ///
 /// `OrderUpdate` defaults every field, so a frame whose `Data` keys match
 /// nothing the struct knows still parses `Ok` and decodes to this shape.
 /// A real partial update (say only `OrderNo`) is NOT hollow.
 pub fn is_hollow_order_update(update: &OrderUpdate) -> bool {
-    update.order_no.is_empty() && update.status.is_empty() && update.security_id.is_empty()
+    update.order_no.trim().is_empty()
+        && update.status.trim().is_empty()
+        && update.security_id.trim().is_empty()
 }
 
 /// The ORDER-EVT-02 verdict for a frame that [`parse_order_update`] decoded:
@@ -567,18 +705,19 @@ pub fn is_hollow_order_update(update: &OrderUpdate) -> bool {
 /// captured frame shows another one, so an unknown tag is exactly the
 /// vendor-format-change case ORDER-EVT-02 exists to page on.
 ///
-/// The returned tag is the frame's `Type` (or a drifted `type`), trimmed
-/// and bounded to `MESSAGE_TYPE_LOG_MAX_CHARS` characters; empty when the
-/// tag is absent, not a string, or the frame is oversized or does not
-/// re-parse.
+/// The returned tag is the frame's string `Type` (or a drifted string
+/// `type` when `Type` is absent or not a string), trimmed and bounded to
+/// `MESSAGE_TYPE_LOG_MAX_CHARS` characters; empty when neither casing holds
+/// a string, or the frame is oversized or does not re-parse. An order
+/// number, status or security id made only of whitespace counts as absent.
 ///
 /// # Complexity
-/// O(1) and allocation-free for a frame that carries an order number (the
+/// Allocation-free for a frame that carries an order number (the
 /// normal case). Otherwise one more `serde_json::Value` parse of the frame,
 /// O(frame bytes) bounded by [`ORDER_UPDATE_MAX_FRAME_BYTES`]. Cold: the
 /// order-update read task, 1 to 100 orders a day.
 pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Option<String> {
-    if !update.order_no.is_empty() {
+    if !update.order_no.trim().is_empty() {
         return None;
     }
     let parsed = (json_str.len() <= ORDER_UPDATE_MAX_FRAME_BYTES)
@@ -586,8 +725,15 @@ pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Opti
         .flatten();
     let tag = parsed
         .as_ref()
-        .and_then(|value| value.get("Type").or_else(|| value.get("type")))
-        .and_then(serde_json::Value::as_str)
+        .and_then(|value| {
+            // A `Type` that is present but not a string (null, a number, an
+            // object) is as unreadable as an absent one, so the drifted
+            // lowercase `type` is read in both cases.
+            value
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("type").and_then(serde_json::Value::as_str))
+        })
         .map(str::trim)
         .unwrap_or_default();
     let foreign = !tag.is_empty() && !tag.eq_ignore_ascii_case(ORDER_ALERT_MESSAGE_TYPE);
@@ -1736,6 +1882,83 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_decimal_i64_never_rounds() {
+        let rows: &[(&str, Option<i64>)] = &[
+            ("0", Some(0)),
+            ("-0.000", Some(0)),
+            ("0e99999999999999999999", Some(0)),
+            ("50", Some(50)),
+            ("+50.00", Some(50)),
+            ("5.", Some(5)),
+            ("50e-1", Some(5)),
+            ("1.5e1", Some(15)),
+            ("0.0000000000000000000001e22", Some(1)),
+            ("00000000000000000000000000000042", Some(42)),
+            ("9007199254740993.0", Some(9_007_199_254_740_993)),
+            ("18014398509481985.0", Some(18_014_398_509_481_985)),
+            ("9223372036854775807.0", Some(i64::MAX)),
+            ("-9223372036854775808.0", Some(i64::MIN)),
+            ("9223372036854775808.0", None),
+            ("-9223372036854775809", None),
+            ("1e19", None),
+            ("1e99999999999999999999", None),
+            ("1.00000000000000001", None),
+            ("4503599627370496.5", None),
+            ("5e-1", None),
+            ("1e-99999999999999999999", None),
+            (".5", None),
+            ("", None),
+            (".", None),
+            ("+", None),
+            ("e5", None),
+            ("5e", None),
+            ("5e+", None),
+            ("5ee1", None),
+            ("1.2.3", None),
+            ("--5", None),
+            ("0x10", None),
+            ("inf", None),
+            ("NaN", None),
+            ("５０", None),
+            ("1_000", None),
+            ("50 ", None),
+        ];
+        for (text, expected) in rows {
+            assert_eq!(exact_decimal_i64(text), *expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_refuse_array_frame() {
+        use serde_json::json;
+        assert!(refuse_array_frame(&json!({"Data": {}})).is_ok());
+        assert!(refuse_array_frame(&json!({"Data": null})).is_ok());
+        assert!(refuse_array_frame(&json!({"OrderNo": "1"})).is_ok());
+        assert!(
+            refuse_array_frame(&json!("x")).is_ok(),
+            "the typed parse refuses it"
+        );
+        for bad in [json!([]), json!([{"Data": {}}]), json!({"Data": []})] {
+            assert!(
+                matches!(
+                    refuse_array_frame(&bad),
+                    Err(OrderUpdateParseError::JsonError(_))
+                ),
+                "{bad}"
+            );
+        }
+        // A JSON number past 2^53 in an Int field is refused, never rounded.
+        assert_eq!(
+            fix_for_field("LotSize", FieldKind::Int, &json!(9_007_199_254_740_992.0)),
+            FieldFix::Keep
+        );
+        assert_eq!(
+            fix_for_field("LotSize", FieldKind::Int, &json!(9_007_199_254_740_991.0)),
+            FieldFix::Replace(json!(9_007_199_254_740_991i64), "integral_float_coerced")
+        );
+    }
+
+    #[test]
     fn test_exact_i64_boundaries() {
         assert_eq!(exact_i64(i64::MIN as f64), Some(i64::MIN));
         assert_eq!(
@@ -1990,7 +2213,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "BUG: unreadable_order_frame_type reads value.get(\"Type\").or_else(|| value.get(\"type\")); a present-but-junk Type (null/5/true/{}/[]) is Some, so the lowercase foreign `type` is never read, the tag is \"\", and a no-order-number frame typed login_ack returns None (no ORDER-EVT-02)"]
         fn test_unreadable_order_frame_type_junk_type_falls_back_to_foreign_lowercase_type() {
             let mut misses = Vec::new();
             for junk in JUNK_TYPE_TAGS {
@@ -2065,7 +2287,8 @@ mod tests {
                 assert_eq!(update.order_no, sent[0].unwrap_or(""), "{json}");
                 assert_eq!(update.status, sent[1].unwrap_or(""), "{json}");
                 assert_eq!(update.security_id, sent[2].unwrap_or(""), "{json}");
-                assert_eq!(is_hollow_order_update(&update), exactly_blank, "{json}");
+                // Hollow means blank after trimming (whitespace-only is blank).
+                assert_eq!(is_hollow_order_update(&update), trimmed_blank, "{json}");
                 // Rows with no whitespace-only identity: both rules agree.
                 if trimmed_blank == exactly_blank {
                     let expected = trimmed_blank.then(|| "order_alert".to_string());
@@ -2083,7 +2306,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "BUG: is_hollow_order_update / unreadable_order_frame_type test `is_empty()`, so an identity made only of whitespace (OrderNo \"  \", Status \"\\t\", SecurityId \" \") is not hollow and returns None (no ORDER-EVT-02), although is_blank_value treats trimmed-empty as blank"]
         fn test_unreadable_order_frame_type_whitespace_only_identity_is_hollow() {
             let mut misses = Vec::new();
             for (json, trimmed_blank, _, _) in identity_grid() {
@@ -2516,7 +2738,7 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "BUG: serde_json is built without `float_roundtrip`, so a JSON number is parsed up to one ULP off while the same text as a string is coerced by Rust's exact parser: \"refLtp\": 204443773.92190543 and \"refLtp\": \"204443773.92190543\" decode to different f64, re-serializing a decoded update does not always decode back to it, and an exact integral float such as \"LotSize\": 4085276730493842.0 is read as ...841.5 and fails the typed parse"]
+        #[ignore = "needs serde_json float_roundtrip feature: owner approval"]
         fn test_parse_order_update_float_number_and_string_forms_agree() {
             let mut misses = Vec::new();
             for text in ["204443773.92190543", "204443773.92190546"] {
@@ -2542,7 +2764,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "BUG: a JSON array `Data` is not a structural error: serde's derived seq visitor decodes `{\"Data\":[]}` as an all-default (hollow) update and `{\"Data\":[\"NSE\",\"D\",\"52432\",\"c\",\"1124\"]}` POSITIONALLY (order_no \"1124\"), bypassing the casing and coercion pass, and a top-level array `[{\"Data\":{...}}]` also decodes as a hollow update, while the parse_order_update doc says non-object `Data` keeps failing"]
         fn test_parse_order_update_array_data_is_a_structural_error() {
             for json in [
                 r#"{"Data":[]}"#,
@@ -2669,7 +2890,25 @@ mod tests {
                     "Quantity",
                     FieldKind::Int,
                     json!("9223372036854775807.0"),
+                    coerced(json!(i64::MAX)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9223372036854775808.0"),
                     FieldFix::Keep,
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("-9223372036854775808.0"),
+                    coerced(json!(i64::MIN)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9007199254740993.0"),
+                    coerced(json!(9_007_199_254_740_993i64)),
                 ),
                 (
                     "Quantity",
@@ -2701,7 +2940,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "BUG: fix_for_field coerces an Int string past 2^53 through f64, so \"9007199254740993.0\" becomes 9007199254740992 and \"-9223372036854775809\" becomes i64::MIN, and a JSON number 9007199254740993.0 decodes as 9007199254740992: a silent wrong integer, where the docs promise conversion only when exact"]
         fn test_fix_for_field_int_never_rounds_an_inexact_integral_value() {
             let rounded = [
                 ("9007199254740993.0", 9_007_199_254_740_992i64),
@@ -2737,7 +2975,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore = "BUG: an Int string \"<n>.0\" with n > 2^53 is coerced through f64 and lands on a different integer (see test_fix_for_field_int_never_rounds_an_inexact_integral_value)"]
             fn proptest_fix_for_field_int_float_string_above_2_pow_53_is_exact_or_refused(
                 n in (1u64 << 53) + 1..=u64::MAX,
             ) {
