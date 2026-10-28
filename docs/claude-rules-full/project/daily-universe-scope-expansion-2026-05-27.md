@@ -3220,3 +3220,37 @@ Follow-up the same morning, after being told the morning files are kept only 7 d
 - Switching depth back on (`depth_sockets_enabled = true`) without first moving the movers name join off `instrument_lifecycle` (it would read frozen, duplicated rows).
 - Touching the morning master download or the artifacts the live lane reads under cover of this quote.
 - Deleting, expiring or wiping any object under `instrument-snapshots/`, or sweeping a local artifact before its verified S3 copy exists.
+
+##### How Quote 44 is built, and its honest limits (2026-10-28, implementation notes; NOT a new quote, changes no row above)
+
+| Point | What the code does |
+|---|---|
+| Object and check | Each file is stored as its gzip at `instrument-snapshots/<date>/<file>.gz`. S3's own SHA-256 checksum and the HeadObject length check cover the gzip bytes. The raw file's length and SHA-256 are in the object's user metadata and in the local marker (`data/instrument-cache/uploaded/<file>`); S3 does not check user metadata against the content, so the raw-bytes proof is the upload's own gzip round-trip check before sending. This is the same upload path as the raw frames (`raw_frame_upload::upload_file`). |
+| Never overwritten | Writes only to an empty key (`If-None-Match: "*"`). A same-day rebuild with different bytes goes to a content-addressed sidecar key beside the first copy, with a warning; the newest copy of a date is the one whose `raw_mtime` is latest, sidecars included. |
+| When it runs | On its own task after each successful daily build, never inside the build the live lane waits on. A request during a running pass is counted (`outcome="skipped_busy"`) and that pass runs once more; every pass is bounded (`SNAPSHOT_PASS_TIMEOUT_SECS`, 30 min) and stops after 3 S3 time-outs in a row. Copies to `[partition_retention] archive_bucket` (empty = `tv-<env>-cold`), the same bucket as the raw frames. |
+| Local sweep | A dated `.json` is deleted only when its marker matches its length and mtime. A `.json.tmp` crash leftover is deleted only when the `.json` of the same name exists with a verified copy; an orphan `.tmp` (possibly the only record of its day) is kept and counted. |
+| Delivery (log-sink only) | A failed copy is a coded STORAGE-GAP-04 `error!` plus `tv_instrument_snapshot_upload_total{outcome="failed"}` and `tv_instrument_snapshot_sweep_held_total`, local `/metrics` only. **No alarm pages on it**: a page needs a dated row in `dhan-rest-only-noise-lock-2026-07-14.md` first. Nothing is lost while copies fail (every uncopied file is kept), but those files exist only on the box until a copy lands, so a box rebuild or terminate in that window loses them. A marker write that fails after a verified upload counts on the shared `tv_raw_upload_marker_write_failed_total`, which feeds the existing cold-backup page (its text names market data; the cause, a failing local disk, is shared). |
+| Console wipes | Three operator-console command lists (`WIPE_QUESTDB_COMMANDS`, `DOCKER_RESET_COMMANDS`, `DOCKER_NUKE_BARE_COMMANDS` in `operator_control_action_commands.rs`) run `rm -rf /opt/tickvault/data/instrument-cache`, which deletes dated files and markers whether or not a copy exists. Not changed here (they are operator-chosen destructive actions whose purpose includes forcing a fresh universe, and their shell is parity-pinned); an operator who runs one after a failed copy loses that day's snapshot. Changing them needs its own decision. |
+| Retention lists, corrected | `instrument_lifecycle` is in `RETENTION_EXEMPT_TABLES`. `instrument_lifecycle_audit` never was: it is in `DAY_PARTITIONED_TABLES`, so the retention sweep archives its old partitions to S3 and then DETACHES them (never drops). "Both stay on every retention-exempt list" above describes the intent; this row is the fact as of 2026-10-28, unchanged by Quote 44. |
+| Dormant code kept | `lifecycle_reconciler` (no caller since the Groww feed was removed) and the `LifecycleState` / `TransitionKind` labels are kept as the written meaning of the frozen rows; nothing calls them. |
+
+#### Quote 45 (2026-10-28, ~10:40 IST) — OCTOBER 2026 ONLY: THE STOP LINE MOVES $170 → $185 (preserve EXACTLY)
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "October spend is $157.18 and AWS forecasts $175.88 by 31 Oct, but the automatic switch-off is $170. It could stop the server during Friday's session. What should I do?" | **"Raise Oct to $185 (Recommended)"** | "October only; November stays at the $75 you set. Keeps Thu/Fri sessions safe and lets us keep the old disk as a backup until Sunday. I record your approval in the rule file, then a reviewed change updates the four places the line lives." |
+
+Then, the same morning: "see ic elalry told yo uto from tonoght itself the enitre arhcietcture deisng system shdou leb fully changed right dude then why worried abotu 170 dud ewhy?" (answered: the line counts the whole month to date; $157.18 is already spent).
+
+**Measured before the decision:** the free Budgets API read `tv-prod-monthly-budget-v2` actual $157.176 and forecast $175.884 against the $170 limit (2026-10-28 ~10:30 IST). The Quote 32/33 rebuild slipped a day (27 → 28 Oct), the old 600 GB root is kept detached as the backup (about $1.60 a day), and Thursday and Friday are trading days.
+
+| Item | Change |
+|---|---|
+| October 2026 kill line | $170 → **$185** in all four lockstep sites (`budget.tf` `limit_amount`, `budget-guards.tf` `BUDGET_KILL_USD`, `budget_digest.rs` `BUDGET_USD`, `hard_stop_guard.rs` `DEFAULT_BUDGET_KILL_USD`) and `OCTOBER_2026_KILL_USD`. |
+| November 2026 onward | **Unchanged: $75**, GST included (Quote 37). `STANDING_BUDGET_KILL_USD` stays $75; the guard clamps every month after October to it; the native `limit_amount` moves to $75 on or after 1 November (unchanged follow-up). |
+| One native stop at 100% | Unchanged (Quote 30). |
+
+##### What violates Quote 45 (REJECT)
+- Any month other than October 2026 above $75 (or the native stop below $185 before 1 November) without a fresh dated quote.
+- Treating $185 as a new standing line, or keeping `limit_amount` above $75 after 1 November without the planned follow-up.
+- Changing instance, disk, IOPS, throughput or the depth switch under cover of this quote.

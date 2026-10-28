@@ -64,12 +64,15 @@ const BUDGET: &[(&str, usize)] = &[
     // cannot be staged in a unit test). Paired behaviour test:
     // `test_regression_reserved_connections_gauge_follows_the_widen`.
     ("dhan_feed_stack/reserved_connections_tests.rs", 1),
-    ("dhan_lifecycle.rs", 2),
     ("dhan_live_crossverify.rs", 7),
     ("dhan_live_crossverify_boot.rs", 8),
     ("dhan_live_universe.rs", 18),
     ("dhan_rest_stack.rs", 4),
-    ("dhan_universe.rs", 3),
+    // 3 -> 4 (2026-10-28, Quote 44 review): `build_once` cannot run without
+    // the network, so the held-counter emit after the sweep is pinned by
+    // source. Paired behaviour test for the count itself:
+    // `test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy`.
+    ("dhan_universe.rs", 4),
     ("disk_pressure_boot.rs", 7),
     ("ensure_questdb.rs", 1),
     // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,

@@ -135,7 +135,6 @@ pub mod dhan_feed_stack;
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
-pub mod dhan_lifecycle;
 /// Daily post-market 1-minute cross-verification: our `candles_1m`
 /// (feed=dhan) against Dhan's own `charts/intraday` tape, integer paise
 /// (no-rest-except-live-feed §12.15, 2026-09-24).
@@ -300,6 +299,10 @@ pub mod api_token_rotation;
 /// methods directly).
 pub mod exit_execution;
 pub mod index_constituency_boot;
+/// Daily instrument snapshot files copied to the cold bucket, verified and
+/// kept forever (owner Quote 44, 2026-10-28); the sweep deletes a local
+/// dated file only after its verified copy exists.
+pub mod instrument_snapshot_upload;
 pub mod observability;
 /// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
 /// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so

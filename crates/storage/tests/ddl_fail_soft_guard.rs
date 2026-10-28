@@ -74,22 +74,8 @@ async fn ensure_index_constituency_table_degrades_on_unreachable_questdb() {
     );
 }
 
-#[tokio::test]
-async fn ensure_instrument_lifecycle_tables_degrade_on_unreachable_questdb() {
-    let cfg = unreachable_questdb();
-    let started = Instant::now();
-    let _ = tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_table(
-        &cfg,
-    )
-    .await;
-    let _ = tickvault_storage::instrument_lifecycle_persistence::ensure_instrument_lifecycle_audit_table(
-        &cfg,
-    )
-    .await;
-    assert!(
-        started.elapsed() < MUST_RETURN_WITHIN,
-        "the instrument-lifecycle DDL pair took {:?} against a refused port — \
-         these are SEBI never-delete tables and their ensure runs every boot",
-        started.elapsed()
-    );
-}
+// REMOVED 2026-10-28 (owner Quote 44): `ensure_instrument_lifecycle_tables_degrade_on_unreachable_questdb`
+// exercised `ensure_instrument_lifecycle_table` / `ensure_instrument_lifecycle_audit_table`,
+// which were deleted with the daily lifecycle writer (both tables are frozen
+// history, nothing creates or writes them). The "no writer" truth is pinned by
+// `daily_universe_scope_guard::lifecycle_persistence_has_no_writer_after_quote_44`.
