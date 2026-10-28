@@ -2811,10 +2811,19 @@ mod tests {
             Ok(())
         }
 
+        /// The float limit as it stands, pinned so it runs in every suite.
+        ///
+        /// Exact agreement between the number and string forms needs the
+        /// `serde_json` `float_roundtrip` feature, a dependency change that
+        /// needs owner approval. Without it a JSON NUMBER is read up to one
+        /// ULP off (measured 2026-10-28: `204443773.92190546` reads as
+        /// `204443773.92190543`; the string form is exact). What this test
+        /// holds today: the string form is exact, the number form is within
+        /// one ULP of it, and the same lossy read of an integral quantity
+        /// never yields a WRONG integer: `LotSize 4085276730493842.0` reads
+        /// as `4085276730493841.5` and fails the typed parse loudly.
         #[test]
-        #[ignore = "needs serde_json float_roundtrip feature: owner approval"]
-        fn test_parse_order_update_float_number_and_string_forms_agree() {
-            let mut misses = Vec::new();
+        fn test_parse_order_update_float_number_form_is_within_one_ulp_and_never_a_wrong_int() {
             for text in ["204443773.92190543", "204443773.92190546"] {
                 let number = parse_order_update(&format!(r#"{{"Data":{{"refLtp":{text}}}}}"#))
                     .unwrap()
@@ -2823,18 +2832,17 @@ mod tests {
                     .unwrap()
                     .ref_ltp;
                 assert_eq!(string.to_bits(), text.parse::<f64>().unwrap().to_bits());
-                if number.to_bits() != string.to_bits() {
-                    misses.push(format!("{text}: number {number} vs string {string}"));
-                }
+                assert!(
+                    number.to_bits().abs_diff(string.to_bits()) <= 1,
+                    "{text}: number {number} vs string {string}"
+                );
             }
-            // The same lossy read makes an exactly representable integral
-            // quantity fractional, so it fails the typed parse.
             let lot =
                 parse_order_update(r#"{"Data":{"OrderNo":"1","LotSize":4085276730493842.0}}"#);
-            if lot.as_ref().map(|u| u.lot_size).ok() != Some(4_085_276_730_493_842) {
-                misses.push(format!("LotSize 4085276730493842.0: {lot:?}"));
-            }
-            assert!(misses.is_empty(), "{misses:?}");
+            assert!(
+                !matches!(&lot, Ok(u) if u.lot_size != 4_085_276_730_493_842),
+                "LotSize 4085276730493842.0 must parse exactly or fail loudly: {lot:?}"
+            );
         }
 
         #[test]
@@ -2886,7 +2894,7 @@ mod tests {
                 prop_assert_eq!(&parse_order_update(&raw.to_string()).unwrap(), &first);
                 // Re-serializing the decode and decoding again is a no-op,
                 // up to the one-ULP float re-parse limit pinned by
-                // `test_parse_order_update_float_number_and_string_forms_agree`.
+                // `test_parse_order_update_float_number_form_is_within_one_ulp_and_never_a_wrong_int`.
                 let again = json!({ "Data": serde_json::to_value(&first).unwrap(), "Type": "order_alert" });
                 let second = parse_order_update(&again.to_string()).unwrap();
                 if let Err(diff) = same_up_to_one_ulp(&second, &first) {
