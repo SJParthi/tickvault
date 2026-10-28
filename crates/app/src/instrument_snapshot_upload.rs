@@ -51,8 +51,18 @@
 //! the marker (`outcome="copy_gone"`) and the file is copied again in the same
 //! pass; a re-check the bucket does not answer (`outcome="recheck_failed"`)
 //! keeps the file and that pass sweeps nothing
-//! ([`SnapshotPassSummary::sweep_allowed`]). Cost: one HeadObject per marked
-//! file per pass, about 30 a day for the 7-day window.
+//! ([`SnapshotPassSummary::sweep_allowed`]); so does a folder entry the
+//! listing could not read (`outcome="entry_unreadable"`), because it was
+//! never re-checked. Cost: one HeadObject per marked file per pass, about 30
+//! a day for the 7-day window.
+//!
+//! The marker is never trusted on its own (2026-10-28 review). The sweep
+//! deletes a file only when this pass proved its copy itself: the re-check
+//! HeadObject matched, or the pass uploaded (or reused an identical object)
+//! and verified it ([`SnapshotPassSummary::proven`]). A marker that outlives
+//! its copy and whose unlink then fails (`stale_marker_kept`, logged) still
+//! matches the file; if the re-upload also fails or times out, the file is
+//! not in `proven` and the sweep keeps it.
 //!
 //! # Honest limits
 //!
@@ -81,10 +91,16 @@
 //!   and drops a rerun queued on it; the next request runs a pass. Every
 //!   other request is served: claiming the slot and queueing a rerun is one
 //!   atomic step, and so is ending a pass (fixed 2026-10-28, review).
-//! - The re-check proves the object is at its key with the recorded gzip
-//!   length a moment before the sweep; a delete in the bucket between the two
-//!   (seconds) is not caught. A box with no cold bucket now sweeps nothing at
-//!   all (before, the sweep ran in the build and trusted the markers alone).
+//! - The re-check (or the verified upload) proves the object is at its key
+//!   with the recorded gzip length when it runs; the sweep runs only after
+//!   the whole pass. A delete in the bucket between a file's proof and the
+//!   sweep is not caught. That gap is NOT seconds: it is bounded by the pass
+//!   bound, [`SNAPSHOT_PASS_TIMEOUT_SECS`] (1,800 s, 30 minutes; a pass that
+//!   runs past it sweeps nothing), because the first file's proof can be
+//!   followed by every other file's S3 calls, plus the sweep's own folder
+//!   walk, which has no time bound of its own (a wedged disk holds it). A box
+//!   with no cold bucket sweeps nothing at all (before, the sweep ran in the
+//!   build and trusted the markers alone).
 //!
 //! Cold path only: one folder listing and at most a few small files a day.
 
@@ -369,17 +385,30 @@ pub(crate) struct SnapshotPassSummary {
     /// Files not tried because the pass stopped after
     /// [`SNAPSHOT_MAX_CONSECUTIVE_TIMEOUTS`] S3 time-outs in a row.
     pub not_attempted: usize,
+    /// Of `copy_gone`, the files whose stale marker could not be removed
+    /// (the unlink failed, or its task did not finish). The marker still
+    /// matches the file; the sweep keeps the file anyway unless this pass
+    /// re-uploads it (it is not in `proven`).
+    pub stale_marker_kept: usize,
+    /// File names whose S3 copy THIS pass confirmed itself: a HeadObject
+    /// that matched the marker's key and length, or an upload (canonical,
+    /// sidecar or reused identical object) it verified. The sweep deletes
+    /// only names in this set, whatever the markers on disk say. At most
+    /// one entry per dated file in the folder (about 30), cold.
+    pub proven: std::collections::BTreeSet<String>,
 }
 
 impl SnapshotPassSummary {
     /// Whether the retention sweep may run after this pass: the folder was
-    /// listed, every file was looked at, and every marker the sweep could
-    /// rely on was re-checked against the bucket. Otherwise a marker left
-    /// from a copy someone deleted could let the sweep delete the only
-    /// remaining file.
+    /// listed, every entry in it was read (an entry the listing could not
+    /// read was never re-checked, 2026-10-28 review), every file was looked
+    /// at, and every marker the sweep could rely on was re-checked against
+    /// the bucket. Otherwise a marker left from a copy someone deleted could
+    /// let the sweep delete the only remaining file. Even when it is `true`,
+    /// the sweep deletes only the files in [`Self::proven`].
     #[must_use]
     pub(crate) fn sweep_allowed(&self) -> bool {
-        self.listed && self.not_attempted == 0 && self.unconfirmed == 0
+        self.listed && self.unreadable == 0 && self.not_attempted == 0 && self.unconfirmed == 0
     }
 }
 
@@ -434,6 +463,37 @@ async fn recheck_marked_copy<S: ColdObjectStore>(store: &S, path: &Path) -> Copy
             timed_out: true,
         },
     }
+}
+
+/// Removes the marker of `path`, whose copy the bucket no longer holds, and
+/// reports whether it is gone afterwards: `false` when the unlink failed
+/// (the marker file is still there) or its blocking task did not finish.
+/// The caller counts a `false`; the sweep never trusts the marker either
+/// way, because it deletes only the files this pass proved
+/// ([`SnapshotPassSummary::proven`]). Cold path: one unlink and one stat on
+/// the blocking pool.
+async fn drop_stale_marker(path: &Path) -> bool {
+    let gone = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        CopyGate::Required.forget(&gone);
+        marker_file_absent(&gone)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether no marker file exists for `path` in its `uploaded/` folder. A
+/// stat that fails for any reason other than not-found counts as present.
+fn marker_file_absent(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    path.parent().is_some_and(|dir| {
+        matches!(
+            std::fs::symlink_metadata(dir.join(UPLOADED_SUBDIR).join(name)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        )
+    })
 }
 
 /// One dated artifact the pass looks at.
@@ -535,7 +595,7 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
         info!(
             unreadable = listing.unreadable,
             "instrument snapshot folder entries could not be read this pass; \
-             they are looked at again on the next pass"
+             this pass sweeps nothing and they are looked at again on the next pass"
         );
     }
     let markers_dir = dir.join(UPLOADED_SUBDIR);
@@ -561,6 +621,7 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
                 CopyRecheck::Present => {
                     consecutive_timeouts = 0;
                     summary.already_copied += 1;
+                    summary.proven.insert(candidate.file_name);
                     continue;
                 }
                 CopyRecheck::Gone => {
@@ -577,12 +638,22 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
                          holds; the marker is dropped and the file is copied again (the \
                          sweep keeps it until that copy is verified)"
                     );
-                    let gone = candidate.path.clone();
-                    // A failed unlink leaves a marker that no longer matches
-                    // anything in the bucket; the upload below rewrites it.
-                    drop(
-                        tokio::task::spawn_blocking(move || CopyGate::Required.forget(&gone)).await,
-                    );
+                    if !drop_stale_marker(&candidate.path).await {
+                        // The marker still matches the file. The sweep keeps
+                        // the file regardless: it deletes only what this pass
+                        // proves (`proven`), so it goes only if the upload
+                        // below succeeds and verifies (which also rewrites the
+                        // marker).
+                        summary.stale_marker_kept += 1;
+                        warn!(
+                            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                            source = "instrument_snapshot_stale_marker_kept",
+                            file = %candidate.file_name,
+                            "instrument snapshot marker for a copy the cold bucket no \
+                             longer holds could not be removed; the file is kept until \
+                             a copy is verified again"
+                        );
+                    }
                 }
                 CopyRecheck::NoMarker => {}
                 CopyRecheck::Unconfirmed { reason, timed_out } => {
@@ -611,6 +682,7 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
             SegmentOutcome::Uploaded { key } => {
                 consecutive_timeouts = 0;
                 summary.uploaded += 1;
+                summary.proven.insert(candidate.file_name.clone());
                 metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_UPLOADED)
                     .increment(1);
                 info!(
@@ -624,6 +696,7 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
                 consecutive_timeouts = 0;
                 summary.uploaded += 1;
                 summary.sidecar += 1;
+                summary.proven.insert(candidate.file_name.clone());
                 metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_UPLOADED)
                     .increment(1);
                 warn!(
@@ -639,6 +712,7 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
             SegmentOutcome::Reused { .. } => {
                 consecutive_timeouts = 0;
                 summary.reused += 1;
+                summary.proven.insert(candidate.file_name.clone());
                 metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_REUSED)
                     .increment(1);
             }
@@ -770,6 +844,8 @@ async fn one_snapshot_request(bucket: &str, today_ist: &str) {
         failed = summary.failed,
         unreadable = summary.unreadable,
         not_attempted = summary.not_attempted,
+        stale_marker_kept = summary.stale_marker_kept,
+        proven = summary.proven.len(),
         "instrument snapshot pass finished"
     );
     sweep_after_rechecked_pass(
@@ -780,23 +856,27 @@ async fn one_snapshot_request(bucket: &str, today_ist: &str) {
 }
 
 /// Runs `sweep` for `today_ist` only when `summary` says the pass re-checked
-/// every marked copy against the bucket ([`SnapshotPassSummary::sweep_allowed`]);
-/// otherwise logs why it was skipped. Returns whether it ran. O(1).
+/// every marked copy against the bucket ([`SnapshotPassSummary::sweep_allowed`]),
+/// handing it the names this pass proved ([`SnapshotPassSummary::proven`]),
+/// the only files it may delete; otherwise logs why it was skipped. Returns
+/// whether it ran. O(1).
 fn sweep_after_rechecked_pass(
     summary: &SnapshotPassSummary,
     today_ist: &str,
-    sweep: impl FnOnce(&str),
+    sweep: impl FnOnce(&str, &std::collections::BTreeSet<String>),
 ) -> bool {
     if summary.sweep_allowed() {
-        sweep(today_ist);
+        sweep(today_ist, &summary.proven);
         return true;
     }
     info!(
         unconfirmed = summary.unconfirmed,
         not_attempted = summary.not_attempted,
+        unreadable = summary.unreadable,
         listed = summary.listed,
-        "instrument artifact sweep skipped this pass: not every marked copy was \
-         re-checked against the cold bucket; nothing is deleted until one is"
+        "instrument artifact sweep skipped this pass: not every folder entry was \
+         read and every marked copy re-checked against the cold bucket; nothing is \
+         deleted until one is"
     );
     false
 }
@@ -847,6 +927,8 @@ mod tests {
         fail_heads: bool,
         /// Every HeadObject waits forever (a hung connection).
         hang: bool,
+        /// Every PutObject waits forever (HeadObject still answers).
+        hang_puts: bool,
         /// Per-file S3 budget override (the production budget otherwise).
         budget: Option<std::time::Duration>,
     }
@@ -889,6 +971,9 @@ mod tests {
             _metadata: &[(&'static str, String)],
         ) -> anyhow::Result<()> {
             self.puts.fetch_add(1, Ordering::SeqCst);
+            if self.hang_puts {
+                std::future::pending::<()>().await;
+            }
             if self.fail_puts {
                 anyhow::bail!("injected PutObject failure");
             }
@@ -1590,16 +1675,213 @@ mod tests {
             listed: true,
             ..SnapshotPassSummary::default()
         };
-        assert!(sweep_after_rechecked_pass(&clean, "2026-10-28", |d| ran
+        assert!(sweep_after_rechecked_pass(&clean, "2026-10-28", |d, _| ran
             .borrow_mut()
             .push(d.to_string())));
         let blind = SnapshotPassSummary {
             unconfirmed: 2,
             ..clean
         };
-        assert!(!sweep_after_rechecked_pass(&blind, "2026-10-29", |d| ran
-            .borrow_mut()
-            .push(d.to_string())));
+        assert!(!sweep_after_rechecked_pass(&blind, "2026-10-29", |d, _| {
+            ran.borrow_mut().push(d.to_string())
+        }));
         assert_eq!(*ran.borrow(), ["2026-10-28"]);
+    }
+
+    /// The sweep, as production calls it, over `dir`, with the proven names
+    /// the pass hands it.
+    fn sweep_dir(
+        dir: &Path,
+        summary: &SnapshotPassSummary,
+        today: &str,
+    ) -> Option<crate::dhan_universe::SweepTally> {
+        let mut tally = None;
+        sweep_after_rechecked_pass(summary, today, |day, proven| {
+            tally = Some(crate::dhan_universe::sweep_stale_artifacts_in(
+                dir,
+                day,
+                CopyGate::Required,
+                proven,
+            ));
+        });
+        tally
+    }
+
+    /// Review 2026-10-28, finding 1: the copy is gone from the bucket, the
+    /// unlink of its marker fails (the marker survives and still matches the
+    /// file), and the re-upload fails or times out. The sweep must keep the
+    /// file: it deletes only what this pass proved, never on a marker alone.
+    /// The positive control (re-upload succeeds) is deleted.
+    #[tokio::test]
+    async fn test_run_snapshot_pass_keeps_a_file_whose_stale_marker_survived_a_failed_reupload() {
+        let name = "dhan-contracts-1999-01-01.json";
+        let cases = [
+            (
+                "gone_put_failed",
+                FakeBucket {
+                    fail_puts: true,
+                    ..FakeBucket::default()
+                },
+                false,
+            ),
+            (
+                "gone_put_timed_out",
+                FakeBucket {
+                    hang_puts: true,
+                    budget: Some(Duration::from_millis(50)),
+                    ..FakeBucket::default()
+                },
+                false,
+            ),
+            ("gone_put_ok", FakeBucket::default(), true),
+        ];
+        for (tag, bucket, reupload_lands) in cases {
+            let dir = scratch_dir(tag);
+            let path = dir.join(name);
+            std::fs::write(&path, b"{\"rows\":[1]}").unwrap();
+            // The first copy lands in another (same-named) bucket and is marked.
+            assert_eq!(
+                run_snapshot_pass(&FakeBucket::default(), &dir)
+                    .await
+                    .uploaded,
+                1,
+                "{tag}"
+            );
+            let marker_path = dir.join(UPLOADED_SUBDIR).join(name);
+            let marker_body = std::fs::read(&marker_path).unwrap();
+
+            // `bucket` is empty: the copy is gone (a bucket-wide delete).
+            let pass = run_snapshot_pass(&bucket, &dir).await;
+            assert_eq!(pass.copy_gone, 1, "{tag}: {pass:?}");
+            assert_eq!(pass.stale_marker_kept, 0, "{tag}: {pass:?}");
+            assert_eq!(
+                pass.proven.contains(name),
+                reupload_lands,
+                "{tag}: {pass:?}"
+            );
+            assert!(pass.sweep_allowed(), "{tag}: {pass:?}");
+            if !reupload_lands {
+                assert_eq!(pass.failed, 1, "{tag}: {pass:?}");
+                // The state a failed unlink leaves: the old marker is there
+                // and still matches the file's length and mtime.
+                assert!(!marker_path.exists(), "{tag}: the real unlink ran");
+                std::fs::write(&marker_path, &marker_body).unwrap();
+                let meta = std::fs::metadata(&path).unwrap();
+                assert!(
+                    CopyGate::Required.allows_delete(&path, &meta),
+                    "{tag}: the marker alone would let the sweep delete the file"
+                );
+            }
+
+            let tally = sweep_dir(&dir, &pass, "1999-01-09").expect("the sweep ran");
+            assert_eq!(
+                path.exists(),
+                !reupload_lands,
+                "{tag}: kept unless this pass proved the copy: {tally:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `drop_stale_marker` reports a marker it could not remove (here a
+    /// directory where the marker file belongs, which `unlink` refuses even
+    /// for root) instead of dropping the error, and `true` once the marker
+    /// is gone or was never there.
+    #[tokio::test]
+    async fn test_drop_stale_marker_reports_a_marker_it_could_not_remove() {
+        let dir = scratch_dir("drop_marker");
+        let markers = dir.join(UPLOADED_SUBDIR);
+        std::fs::create_dir_all(&markers).unwrap();
+
+        let stuck = dir.join("dhan-contracts-1999-01-01.json");
+        std::fs::create_dir_all(markers.join("dhan-contracts-1999-01-01.json").join("x")).unwrap();
+        assert!(!drop_stale_marker(&stuck).await, "an unremovable marker");
+        assert!(!marker_file_absent(&stuck));
+
+        let removable = dir.join("dhan-nse-mapping-1999-01-01.json");
+        std::fs::write(markers.join("dhan-nse-mapping-1999-01-01.json"), b"{}").unwrap();
+        assert!(!marker_file_absent(&removable));
+        assert!(drop_stale_marker(&removable).await, "a removed marker");
+        assert!(marker_file_absent(&removable));
+
+        let never = dir.join("dhan-ntm-spot-1999-01-01.json");
+        assert!(drop_stale_marker(&never).await, "no marker at all");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review 2026-10-28, finding 2: a folder entry the listing could not
+    /// read was never re-checked, so it blocks the whole sweep, even when
+    /// every other file was proven.
+    #[test]
+    fn test_sweep_allowed_is_false_while_any_folder_entry_was_unread() {
+        let clean = SnapshotPassSummary {
+            listed: true,
+            ..SnapshotPassSummary::default()
+        };
+        assert!(clean.sweep_allowed());
+        let unread = SnapshotPassSummary {
+            unreadable: 1,
+            ..clean
+        };
+        assert!(!unread.sweep_allowed(), "{unread:?}");
+    }
+
+    /// Finding 2, end to end: with an unread entry the sweep does not run,
+    /// so even a proven file with a matching marker, and an unproven file
+    /// with a stale one, both stay.
+    #[test]
+    fn test_sweep_after_rechecked_pass_keeps_every_file_after_an_unread_entry() {
+        let dir = scratch_dir("unread_entry");
+        let proven_name = "dhan-contracts-1999-01-01.json";
+        let other_name = "dhan-nse-mapping-1999-01-01.json";
+        for name in [proven_name, other_name] {
+            std::fs::write(dir.join(name), b"{}").unwrap();
+        }
+        let summary = SnapshotPassSummary {
+            listed: true,
+            unreadable: 1,
+            proven: std::iter::once(proven_name.to_string()).collect(),
+            ..SnapshotPassSummary::default()
+        };
+        assert!(
+            sweep_dir(&dir, &summary, "1999-01-09").is_none(),
+            "no sweep"
+        );
+        assert!(dir.join(proven_name).exists());
+        assert!(dir.join(other_name).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review 2026-10-28, finding 3: the gap between a file's proof and the
+    /// sweep is bounded by the pass bound, not "seconds". The header states
+    /// that bound and its value; a pass past it never sweeps.
+    #[tokio::test]
+    async fn test_run_bounded_snapshot_pass_bounds_the_gap_between_proof_and_sweep() {
+        assert_eq!(SNAPSHOT_PASS_TIMEOUT_SECS, 1_800, "the header says 1,800 s");
+        let src = include_str!("instrument_snapshot_upload.rs");
+        let header: String = src
+            .lines()
+            .take_while(|l| l.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!header.contains("(seconds)"), "the gap is not seconds");
+        assert!(
+            header.contains("[`SNAPSHOT_PASS_TIMEOUT_SECS`] (1,800 s, 30 minutes"),
+            "the honest limit must name the real bound"
+        );
+        // A pass that runs past the bound yields no summary, so no sweep.
+        let dir = scratch_dir("bound");
+        std::fs::write(dir.join("dhan-contracts-1999-01-01.json"), b"{}").unwrap();
+        let hung = FakeBucket {
+            hang_puts: true,
+            ..FakeBucket::default()
+        };
+        assert!(
+            run_bounded_snapshot_pass(&hung, &dir, Duration::from_millis(50))
+                .await
+                .is_none()
+        );
+        assert!(dir.join("dhan-contracts-1999-01-01.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
