@@ -28150,6 +28150,9 @@ mod contract_attach_tests;
 mod tick_quotes_route_tests;
 
 #[cfg(test)]
+mod seed_step_tests;
+
+#[cfg(test)]
 mod alive_connection_guard_tests {
     use super::{ALIVE_CONNECTIONS, AliveConnectionGuard};
     use std::sync::atomic::Ordering;
