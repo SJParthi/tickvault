@@ -7085,6 +7085,10 @@ Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.
   - Files: crates/core/src/websocket/reader_runtime.rs, crates/app/src/main.rs, deploy/systemd/tickvault.service
   - Tests: test_rt_priority_refusal_falls_back_to_a_pinned_thread
 
+- [ ] DT4. Instant "period ended" view for decisions (owner 2026-10-28: "see what about ticks secons cmintiues candle formations dude see that also shodu lbe fully taken care right dude"). A liquid instrument's bar already seals on its own next tick; a quiet one seals only after `CATCHUP_LATENESS_MARGIN_SECS` (240 s, derived from the measured 198.69 s worst Dhan delivery lag) so a late print is not lost. For decisions, the drain publishes, at each timeframe boundary of the drain clock, a provisional "period ended" read of the open bucket (values complete in RAM at that instant) without sealing it; the stored bar still waits for the margin and is amended by a late print. Boundary work is O(instruments touched in the period) sliced in fixed steps on the drain thread, never per tick; per-instrument read O(1). Measured: boundary-to-view p99.
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs (read-only view only; no indicator/strategy code, §28), crates/app/src/dhan_feed_stack.rs
+  - Tests: test_period_end_view_reads_the_open_bucket_without_sealing, test_late_print_after_period_end_view_still_amends_the_stored_bar
+
 ### Design (Item DT)
 The drain's per-frame work is O(packets) ≤ 0.26 ms worst; the tail is scheduling wait. A dedicated thread removes the wait behind ~117 tasks; core placement and priority remove CPU contention; the sleeping-consumer flag keeps the reader's hand-off O(1) and wake-free while the drain is busy. Each step lands as its own PR, measured live before the next (DT0 first).
 
