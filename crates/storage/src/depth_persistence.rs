@@ -2199,10 +2199,18 @@ impl DepthWriter {
         }
         // DT-A2: one allocation per spare-less hand-off (see the doc above for
         // where that runs), none per row. A spare at least the pre-size costs
-        // nothing.
+        // nothing. A smaller spare is replaced by a fresh buffer rather than
+        // grown: `Buffer` exposes no `reserve_exact`, and `reserve` on a
+        // non-empty capacity doubles it (a spare of pre-size - 1 became
+        // 2 x pre-size - 2), while from capacity 0 it reserves exactly the
+        // amount asked. The buffer is empty here (every caller just swapped
+        // it out), so nothing is lost; a non-empty one keeps `reserve`.
         let presize = self.layout.row_buffer_presize_bytes();
         if self.buffer.capacity() < presize {
             let have = self.buffer.len();
+            if have == 0 {
+                self.buffer = Buffer::new(protocol);
+            }
             self.buffer.reserve(presize.saturating_sub(have));
         }
     }
@@ -6522,7 +6530,6 @@ mod tests {
     /// is about twice the pre-size the doc states. Address space only (no
     /// page is committed) and still under the producer bound.
     #[test]
-    #[ignore = "BUG: install_spare_buffer reserves ~2x the pre-size for a spare in (pre/2, pre); reserve_exact would hold it at the pre-size"]
     fn test_install_spare_buffer_reserves_exactly_the_presize_below_it() {
         for layout in [DepthLayout::Levels, DepthLayout::Book] {
             let pre = layout.row_buffer_presize_bytes();
