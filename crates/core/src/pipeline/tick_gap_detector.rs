@@ -1774,7 +1774,7 @@ mod tests {
     /// must leave room for the whole live universe (20,519 on 28 Oct).
     #[test]
     fn test_observe_tracked_replay_cannot_starve_the_live_universe_of_20519() {
-        const CEILING: usize = 25_000;
+        const CEILING: usize = tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE;
         const LIVE_UNIVERSE: u64 = 20_519;
         let mut d = TickGapDetector::with_capacity(CEILING, DetectorConfig::default());
         // A replay of prior-day keys, none of them in today's subscribe set.
