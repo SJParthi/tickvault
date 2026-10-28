@@ -3220,3 +3220,24 @@ Follow-up the same morning, after being told the morning files are kept only 7 d
 - Switching depth back on (`depth_sockets_enabled = true`) without first moving the movers name join off `instrument_lifecycle` (it would read frozen, duplicated rows).
 - Touching the morning master download or the artifacts the live lane reads under cover of this quote.
 - Deleting, expiring or wiping any object under `instrument-snapshots/`, or sweeping a local artifact before its verified S3 copy exists.
+
+#### Quote 45 (2026-10-28, ~10:40 IST) — OCTOBER 2026 ONLY: THE STOP LINE MOVES $170 → $185 (preserve EXACTLY)
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "October spend is $157.18 and AWS forecasts $175.88 by 31 Oct, but the automatic switch-off is $170. It could stop the server during Friday's session. What should I do?" | **"Raise Oct to $185 (Recommended)"** | "October only; November stays at the $75 you set. Keeps Thu/Fri sessions safe and lets us keep the old disk as a backup until Sunday. I record your approval in the rule file, then a reviewed change updates the four places the line lives." |
+
+Then, the same morning: "see ic elalry told yo uto from tonoght itself the enitre arhcietcture deisng system shdou leb fully changed right dude then why worried abotu 170 dud ewhy?" (answered: the line counts the whole month to date; $157.18 is already spent).
+
+**Measured before the decision:** the free Budgets API read `tv-prod-monthly-budget-v2` actual $157.176 and forecast $175.884 against the $170 limit (2026-10-28 ~10:30 IST). The Quote 32/33 rebuild slipped a day (27 → 28 Oct), the old 600 GB root is kept detached as the backup (about $1.60 a day), and Thursday and Friday are trading days.
+
+| Item | Change |
+|---|---|
+| October 2026 kill line | $170 → **$185** in all four lockstep sites (`budget.tf` `limit_amount`, `budget-guards.tf` `BUDGET_KILL_USD`, `budget_digest.rs` `BUDGET_USD`, `hard_stop_guard.rs` `DEFAULT_BUDGET_KILL_USD`) and `OCTOBER_2026_KILL_USD`. |
+| November 2026 onward | **Unchanged: $75**, GST included (Quote 37). `STANDING_BUDGET_KILL_USD` stays $75; the guard clamps every month after October to it; the native `limit_amount` moves to $75 on or after 1 November (unchanged follow-up). |
+| One native stop at 100% | Unchanged (Quote 30). |
+
+##### What violates Quote 45 (REJECT)
+- Any month other than October 2026 above $75 (or the native stop below $185 before 1 November) without a fresh dated quote.
+- Treating $185 as a new standing line, or keeping `limit_amount` above $75 after 1 November without the planned follow-up.
+- Changing instance, disk, IOPS, throughput or the depth switch under cover of this quote.
