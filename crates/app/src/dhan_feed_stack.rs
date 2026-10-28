@@ -1651,7 +1651,45 @@ pub struct LiveIngest {
     /// Quote 43). Set once per frame by the live drain and the replay; one
     /// `bool` store.
     frame_receipt_is_wal_stamp: bool,
+    /// Late-attach seed batches waiting for the drain's idle arm (plan item
+    /// DT-A1, 2026-10-28), seeded [`SEED_STEP_INSTRUMENTS`] at a time.
+    seed_queue: SeedQueue,
 }
+
+/// Batches the seed arm may hold before it stops taking more from the seed
+/// channel (DT-A1). The channel holds 8 more, so 16 batches can be waiting
+/// before a sender's `try_send` is refused, against 8 before this change.
+pub const SEED_QUEUE_BATCHES: usize = 8;
+
+/// Late-attached seed batches waiting to be handed to the silence detector,
+/// a bounded step at a time (plan item DT-A1, 2026-10-28).
+///
+/// Each batch is the `Vec` the attach task sent, MOVED in (never copied), with
+/// the millisecond it arrived (the seed time every instrument in it gets, as
+/// the one-arm seed gave it). The queue is pre-sized to
+/// [`SEED_QUEUE_BATCHES`] and the arm refuses to receive past it, so pushing
+/// never grows it and a step never allocates.
+#[derive(Debug)]
+struct SeedQueue {
+    batches: std::collections::VecDeque<(Vec<SubscribeInstrument>, u64)>,
+    /// Next instrument of the front batch.
+    cursor: usize,
+    /// Instruments of the front batch the detector accepted so far.
+    added: usize,
+}
+
+impl SeedQueue {
+    fn new() -> Self {
+        Self {
+            batches: std::collections::VecDeque::with_capacity(SEED_QUEUE_BATCHES),
+            cursor: 0,
+            added: 0,
+        }
+    }
+}
+
+/// What one finished seed batch did: `(requested, seeded)`.
+pub type SeedBatchDone = (usize, usize);
 
 /// Seals routed by [`route_catch_up_seal`], in the three outcomes a seal can
 /// have.
@@ -1856,6 +1894,39 @@ impl LiveIngest {
         self
     }
 
+    /// Replaces the candle fold with one pre-sized for `capacity` instruments
+    /// (clamped to [`AGGREGATOR_MAX_SLOTS`]) — plan item DT-A6, 2026-10-28.
+    ///
+    /// The boot site hands [`Self::new`] the boot-time universe (the ~865
+    /// spot instruments); the ~22,000 contracts attach minutes later, so the
+    /// first tick of the ~866th instrument used to reallocate the slot table
+    /// (a ~2.4 MB move at ~2.8 KB a slot) and rehash the index INSIDE
+    /// `drain_main_feed_frame`, once a session, on the frame drain. The live
+    /// lane therefore sizes the fold at the ceiling, exactly as it sizes the
+    /// detector. MEMORY: 25,000 × `size_of::<InstrumentSlot>()` of address
+    /// space, MEASURED 2026-10-28 at 2,816 B a slot = 70,400,000 B (67.1 MiB)
+    /// plus an index of about 1 MiB, against the 13 GiB budget (Quote 38)
+    /// (the figure is printed and pinned under 128 MiB by the
+    /// aggregator's `test_slot_capacity_at_the_ceiling_never_reallocates_while_the_universe_fills`),
+    /// committed only as slots are written; the grow-once path reserved the
+    /// same ceiling on the first slot past the boot count, so the steady-state
+    /// footprint is unchanged and only the mid-session move is gone. Tests
+    /// keep the small `new` capacity.
+    ///
+    /// Must be called during construction, before any tick is folded — it
+    /// REPLACES the fold, discarding whatever it held.
+    #[must_use]
+    pub fn with_fold_capacity(mut self, capacity: usize) -> Self {
+        self.aggregator = live_fold(capacity);
+        self
+    }
+
+    /// Slots the candle fold holds without reallocating (DT-A6). O(1).
+    #[must_use]
+    pub fn fold_slot_capacity(&self) -> usize {
+        self.aggregator.slot_capacity()
+    }
+
     /// Builds the fold, pre-sized for `capacity` instruments so the slot table
     /// and the detector index never realloc mid-session.
     #[must_use]
@@ -1874,14 +1945,7 @@ impl LiveIngest {
             backup: crate::main_feed_backup::BackupDedup::new(),
             replay_backup: None,
             replay_backup_loaded: false,
-            aggregator: {
-                let mut aggregator =
-                    MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
-                // A WAL replay judges late ticks by the SAME margin the live
-                // catch-up seal uses (plan ITEM 47, review round 7).
-                aggregator.set_catch_up_margin_secs(CATCHUP_LATENESS_MARGIN_SECS);
-                aggregator
-            },
+            aggregator: live_fold(capacity),
             writer,
             seq_refused: 0,
             unknown_segment_ticks: 0,
@@ -1925,6 +1989,7 @@ impl LiveIngest {
             catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
             frame_receipt_is_wal_stamp: true,
+            seed_queue: SeedQueue::new(),
         }
     }
 
@@ -4277,19 +4342,95 @@ impl LiveIngest {
     /// 62) — the guard on the drain's idle arm.
     #[must_use]
     pub fn idle_work_pending(&self) -> bool {
-        self.catch_up.is_some()
+        self.catch_up.is_some() || !self.seed_queue.batches.is_empty()
     }
 
-    /// Runs ONE bounded step of the idle work: the catch-up seal
-    /// ([`CATCHUP_SEAL_STEP_SLOTS`] slots). (The top-volume sweep that ran
-    /// second was removed 2026-10-22, plan item 62.)
+    /// Whether the seed queue can take one more batch (DT-A1). The drain's
+    /// seed arm receives only while this holds, so the pre-sized queue never
+    /// grows; a full queue leaves batches in the bounded seed channel. O(1).
+    #[must_use]
+    pub fn seed_queue_has_room(&self) -> bool {
+        self.seed_queue.batches.len() < SEED_QUEUE_BATCHES
+    }
+
+    /// Queues a late-attach seed batch for the idle arm (DT-A1, 2026-10-28):
+    /// the batch is MOVED in, O(1), and seeded [`SEED_STEP_INSTRUMENTS`] at a
+    /// time by [`Self::step_idle_work`] instead of all at once in the seed
+    /// arm. Every instrument gets `now_millis` as its seed time, as before.
+    ///
+    /// A call while the queue is full (the arm never makes one) seeds the
+    /// batch at once, the pre-DT-A1 behaviour, rather than grow the queue or
+    /// drop the batch; returns that `(requested, seeded)` in that case.
+    pub fn queue_seed_batch(
+        &mut self,
+        batch: Vec<SubscribeInstrument>,
+        now_millis: u64,
+    ) -> Option<SeedBatchDone> {
+        if !self.seed_queue_has_room() {
+            let mut added = 0usize;
+            for inst in &batch {
+                if self.seed(inst.security_id, inst.segment, now_millis) {
+                    added = added.saturating_add(1);
+                }
+            }
+            return Some((batch.len(), added));
+        }
+        self.seed_queue.batches.push_back((batch, now_millis));
+        None
+    }
+
+    /// One step of the queued seed: at most [`SEED_STEP_INSTRUMENTS`]
+    /// instruments of the front batch into the detector. Returns
+    /// `(requested, seeded)` when this step finishes a batch.
+    ///
+    /// # Complexity
+    /// O([`SEED_STEP_INSTRUMENTS`]) composite-key inserts per call, no
+    /// allocation (the detector is pre-sized at the ceiling; a finished
+    /// batch's `Vec` is freed here, once per batch).
+    fn step_seed(&mut self) -> Option<SeedBatchDone> {
+        let queue = &mut self.seed_queue;
+        let (batch, now_millis) = queue.batches.front()?;
+        let len = batch.len();
+        let from = queue.cursor.min(len);
+        let to = from.saturating_add(SEED_STEP_INSTRUMENTS).min(len);
+        for inst in batch.get(from..to).unwrap_or_default() {
+            if self
+                .detector
+                .seed((inst.security_id, inst.segment), *now_millis)
+            {
+                queue.added = queue.added.saturating_add(1);
+            }
+        }
+        queue.cursor = to;
+        if to < len {
+            return None;
+        }
+        let done = (len, queue.added);
+        queue.batches.pop_front();
+        queue.cursor = 0;
+        queue.added = 0;
+        Some(done)
+    }
+
+    /// Runs ONE bounded step of the idle work: a queued seed batch first
+    /// ([`SEED_STEP_INSTRUMENTS`] instruments; bounded in total, so a busy
+    /// drain whose catch-up sweep is always running cannot starve it), then
+    /// the catch-up seal ([`CATCHUP_SEAL_STEP_SLOTS`] slots). (The top-volume
+    /// sweep that ran second was removed 2026-10-22, plan item 62.)
     ///
     /// # Complexity
     /// **O(one step)** per call — the bound on how long a queued frame waits.
     pub fn step_idle_work(&mut self) -> IdleStep {
+        if !self.seed_queue.batches.is_empty() {
+            return IdleStep {
+                seed_done: self.step_seed(),
+                ..IdleStep::default()
+            };
+        }
         if self.catch_up.is_some() {
             return IdleStep {
                 catch_up_done: self.step_catch_up_seal(),
+                ..IdleStep::default()
             };
         }
         IdleStep::default()
@@ -5967,6 +6108,41 @@ const CATCHUP_SEAL_INTERVAL: std::time::Duration =
 /// one channel send per bar.
 pub const CATCHUP_SEAL_STEP_SLOTS: usize = 256;
 
+/// The live candle fold, pre-sized for `capacity` instruments (clamped to
+/// [`AGGREGATOR_MAX_SLOTS`] by the aggregator) with the catch-up lateness
+/// margin applied: a WAL replay judges late ticks by the SAME margin the live
+/// catch-up seal uses (plan ITEM 47, review round 7). One allocation of the
+/// slot table and one of the index, at construction only.
+fn live_fold(capacity: usize) -> MultiTfAggregator {
+    let mut aggregator = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
+    aggregator.set_catch_up_margin_secs(CATCHUP_LATENESS_MARGIN_SECS);
+    aggregator
+}
+
+/// Contracts one step of the sliced late-attach seed hands to the silence
+/// detector (plan item DT-A1, 2026-10-28). The contract attach sends ~22,000
+/// instruments in one batch; seeding them in one `select!` arm held every
+/// queued frame behind ~22,000 hash inserts. One step is 512 composite-key
+/// inserts into a detector pre-sized at the ceiling, Assumed a few tens of
+/// microseconds (not measured), the same order as one catch-up seal step.
+/// While a batch is part-seeded, the 30 s silence scan (an arm above the idle
+/// arm) sees only the part seeded so far, so it can under-count never-ticked
+/// instruments for at most one scan per attach batch.
+pub const SEED_STEP_INSTRUMENTS: usize = 512;
+
+/// The one line a finished late-attach seed batch logs (unchanged wording
+/// from the one-arm seed). `seeded` counts instruments the detector
+/// ACCEPTED, not new ones -- a repeat seed is a successful no-op -- so a
+/// value below `requested` means detector slots ran out. Once per batch.
+fn log_seed_batch_done(ingest: &LiveIngest, requested: usize, seeded: usize) {
+    info!(
+        requested,
+        seeded,
+        tracked = ingest.tracked_instruments(),
+        "late-attached instruments seeded into the silence detector"
+    );
+}
+
 /// Counts catch-up timer fires that found the previous sliced sweep still
 /// running. The running sweep keeps its cursor and takes the newer cutoff;
 /// the slots it already visited are sealed by the next sweep.
@@ -6059,6 +6235,9 @@ struct CatchUpSweep {
 pub struct IdleStep {
     /// `(emitted, dropped)` totals of a catch-up sweep this step finished.
     pub catch_up_done: Option<(u64, u64)>,
+    /// `(requested, seeded)` of a late-attach seed batch this step finished
+    /// (DT-A1).
+    pub seed_done: Option<SeedBatchDone>,
 }
 
 /// How far BEHIND the watermark the catch-up cutoff sits.
@@ -7319,28 +7498,21 @@ async fn run_frame_drain(
             // detector that learned instruments from arriving ticks could
             // never report the one failure that matters here — an instrument
             // that arrives never.
-            maybe_seed = seed_rx.recv(), if !seed_closed => {
+            //
+            // DT-A1 (2026-10-28): the arm only QUEUES the batch (a move, O(1));
+            // the idle arm below seeds it `SEED_STEP_INSTRUMENTS` at a time.
+            // Seeding a ~22,000-contract batch here held every queued frame
+            // behind ~22,000 hash inserts. The arm takes no batch while the
+            // pre-sized queue is full, so the bounded channel holds the rest.
+            maybe_seed = seed_rx.recv(), if !seed_closed && ingest.seed_queue_has_room() => {
                 if let Some(batch) = maybe_seed {
                     let now_millis = u64::try_from(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
                     )
                     .unwrap_or(0);
-                    // `seed` returns whether the slot allocator ACCEPTED the
-                    // instrument, not whether it was new -- a repeat seed is a
-                    // successful no-op. So this counts accepted, and a value
-                    // below `requested` means slots ran out.
-                    let mut added = 0usize;
-                    for inst in &batch {
-                        if ingest.seed(inst.security_id, inst.segment, now_millis) {
-                            added = added.saturating_add(1);
-                        }
+                    if let Some((requested, added)) = ingest.queue_seed_batch(batch, now_millis) {
+                        log_seed_batch_done(&ingest, requested, added);
                     }
-                    info!(
-                        requested = batch.len(),
-                        seeded = added,
-                        tracked = ingest.tracked_instruments(),
-                        "late-attached instruments seeded into the silence detector"
-                    );
                 }
                 // A closed channel is NORMAL — the attach task finishes and
                 // drops its sender. `recv` then returns None forever, so this
@@ -7858,6 +8030,9 @@ async fn run_frame_drain(
             // bounded step per call, in the priority `step_idle_work` states.
             () = tokio::task::coop::consume_budget(), if ingest.idle_work_pending() => {
                 let step = ingest.step_idle_work();
+                if let Some((requested, added)) = step.seed_done {
+                    log_seed_batch_done(&ingest, requested, added);
+                }
                 if let Some((emitted, dropped)) = step.catch_up_done {
                     if emitted > 0 || dropped > 0 {
                         publish_fold_depth(&ingest);
@@ -13503,8 +13678,11 @@ async fn attach_depth_when_available(
                         // instruments nobody ever asked for.
                         //
                         // `try_send` rather than `send`: this task must never
-                        // block on the drain, and a full 8-slot buffer means
-                        // the drain is wedged — which its own alarms cover.
+                        // block on the drain. A full 8-slot buffer means the
+                        // drain is wedged, or (since DT-A1, 2026-10-28) its 8
+                        // queued batches are waiting on an idle arm a busy
+                        // ring has starved; 16 batches in all, against a
+                        // handful sent per session.
                         if let Err(err) = seed_tx.try_send(contracts.instruments.clone()) {
                             warn!(
                                 %err,
@@ -16609,12 +16787,21 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
     )
-    // The fold keeps the boot-time pre-size above; the DETECTOR gets the
-    // authorized ceiling, because its capacity is a hard cap and the universe
+    // The DETECTOR gets the authorized ceiling (and, since DT-A6 below, so
+    // does the fold), because its capacity is a hard cap and the universe
     // grows ~26x after boot when contracts attach. See
     // `with_detector_capacity` for the 1.2M refusals this fixes.
     .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
+    // DT-A6 (2026-10-28): the fold too, so the ~22,000 contracts that attach
+    // after boot never move the slot table or rehash its index inside a
+    // frame. Address space only; see `with_fold_capacity` for the bytes.
+    .with_fold_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since));
+    info!(
+        boot_instruments = capacity,
+        fold_slots = ingest.fold_slot_capacity(),
+        "live candle fold pre-sized at the slot ceiling; no mid-session slot-table move"
+    );
 
     // Taken immediately, so the attach tasks read the SAME store this drain
     // writes. Cloning the `Arc` here rather than constructing a second store
@@ -23647,6 +23834,10 @@ mod tests {
              universe: `capacity` is computed before any socket opens, so it counts the spot \
              set and misses every contract that attaches later"
         );
+        // DT-A6 (2026-10-28): the fold the same way, so the contracts that
+        // attach after boot never move its slot table inside a frame.
+        assert_eq!(src.matches(".with_fold_capacity(").count(), 1);
+        assert!(src.contains(".with_fold_capacity(AGGREGATOR_MAX_SLOTS)"));
     }
 
     #[test]
@@ -23954,6 +24145,152 @@ mod tests {
         ingest.begin_catch_up_seal();
         assert!(!ingest.idle_work_pending());
         assert_eq!(ingest.step_idle_work(), IdleStep::default());
+    }
+
+    fn seed_batch(n: u64) -> Vec<SubscribeInstrument> {
+        (0..n)
+            .map(|sid| SubscribeInstrument {
+                security_id: 40_000 + sid,
+                segment: ExchangeSegment::NseFno,
+            })
+            .collect()
+    }
+
+    /// DT-A1 (2026-10-28): a ~22,000-contract attach batch is queued by the
+    /// seed arm (nothing seeded there) and seeded by the idle arm at most
+    /// `SEED_STEP_INSTRUMENTS` per call, so a frame waits for one step, never
+    /// for the whole batch.
+    #[test]
+    fn test_queue_seed_batch_and_step_seed_are_bounded_per_call() {
+        const CONTRACTS: u64 = 22_000;
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_detector_capacity(AGGREGATOR_MAX_SLOTS);
+        assert!(!ingest.idle_work_pending());
+        assert!(ingest.seed_queue_has_room());
+        assert_eq!(ingest.queue_seed_batch(seed_batch(CONTRACTS), 1_000), None);
+        assert_eq!(
+            ingest.tracked_instruments(),
+            0,
+            "the arm seeds nothing itself"
+        );
+        assert!(
+            ingest.idle_work_pending(),
+            "the idle arm wakes for the seed"
+        );
+
+        let mut steps = 0usize;
+        let mut done = None;
+        let mut before = 0usize;
+        while ingest.idle_work_pending() {
+            let step = ingest.step_idle_work();
+            steps += 1;
+            let now = ingest.tracked_instruments();
+            assert!(
+                now - before <= SEED_STEP_INSTRUMENTS,
+                "step {steps} seeded {} instruments, past the step bound",
+                now - before
+            );
+            before = now;
+            if step.seed_done.is_some() {
+                assert!(done.is_none(), "a batch finishes once");
+                done = step.seed_done;
+            }
+        }
+        assert_eq!(steps, (CONTRACTS as usize).div_ceil(SEED_STEP_INSTRUMENTS));
+        assert_eq!(done, Some((CONTRACTS as usize, CONTRACTS as usize)));
+        assert_eq!(ingest.tracked_instruments(), CONTRACTS as usize);
+        assert_eq!(ingest.detector_refused(), 0);
+    }
+
+    /// DT-A1: with a seed batch and a catch-up sweep both pending, the idle
+    /// arm seeds first (bounded), and the sweep waits with its cursor, then
+    /// finishes; neither is dropped.
+    #[test]
+    fn test_step_idle_work_seeds_before_the_catch_up_sweep_then_finishes_it() {
+        let instruments = (CATCHUP_SEAL_STEP_SLOTS * 2 + 3) as u32;
+        let mut ingest = catch_up_book(instruments).with_detector_capacity(AGGREGATOR_MAX_SLOTS);
+        ingest.begin_catch_up_seal();
+        assert!(ingest.catch_up.is_some(), "the timer queued a sweep");
+        let n = SEED_STEP_INSTRUMENTS * 2 + 1;
+        assert_eq!(ingest.queue_seed_batch(seed_batch(n as u64), 1_000), None);
+        for i in 0..3 {
+            let step = ingest.step_idle_work();
+            assert!(step.catch_up_done.is_none(), "seed step {i} ran no sweep");
+            let expect = (i == 2).then_some((n, n));
+            assert_eq!(step.seed_done, expect, "seed step {i}");
+            assert!(ingest.catch_up.is_some(), "the sweep waits, never dropped");
+        }
+        let mut done = None;
+        let mut steps = 0usize;
+        while ingest.idle_work_pending() {
+            let step = ingest.step_idle_work();
+            assert!(step.seed_done.is_none());
+            if step.catch_up_done.is_some() {
+                done = step.catch_up_done;
+            }
+            steps += 1;
+            assert!(steps <= 4, "the sweep finishes in its own bounded steps");
+        }
+        assert!(done.is_some(), "the waiting sweep finished after the seed");
+    }
+
+    /// DT-A1: the queue never grows past its pre-size. Past it the arm stops
+    /// receiving (`seed_queue_has_room`); a call anyway seeds inline rather
+    /// than drop or grow, and batches are seeded oldest first.
+    #[test]
+    fn test_seed_queue_has_room_refuses_past_the_bound_and_never_grows() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_detector_capacity(AGGREGATOR_MAX_SLOTS);
+        let cap = ingest.seed_queue.batches.capacity();
+        for _ in 0..SEED_QUEUE_BATCHES {
+            assert!(ingest.seed_queue_has_room());
+            assert_eq!(ingest.queue_seed_batch(seed_batch(3), 1_000), None);
+        }
+        assert!(!ingest.seed_queue_has_room(), "full at the bound");
+        assert_eq!(ingest.seed_queue.batches.capacity(), cap, "never grew");
+
+        let extra = vec![SubscribeInstrument {
+            security_id: 9,
+            segment: ExchangeSegment::IdxI,
+        }];
+        assert_eq!(
+            ingest.queue_seed_batch(extra, 1_000),
+            Some((1, 1)),
+            "a call past the bound seeds inline, never drops"
+        );
+        assert_eq!(ingest.seed_queue.batches.len(), SEED_QUEUE_BATCHES);
+
+        let mut finished = 0usize;
+        while ingest.idle_work_pending() {
+            if ingest.step_idle_work().seed_done == Some((3, 3)) {
+                finished += 1;
+            } else if finished == 0 {
+                panic!("a 3-instrument batch finishes in its first step");
+            }
+        }
+        // 3 instruments per batch, the same ids each time: the first batch
+        // adds them, the repeats are accepted no-ops (seeded counts accepted).
+        assert_eq!(finished, SEED_QUEUE_BATCHES);
+        assert_eq!(ingest.tracked_instruments(), 4);
+        assert!(ingest.seed_queue_has_room());
+    }
+
+    /// DT-A6 (2026-10-28): the live lane builds its fold at the slot ceiling,
+    /// so the contracts that attach after boot never move the slot table
+    /// inside a frame; tests keep the small `new` capacity.
+    #[test]
+    fn test_with_fold_capacity_and_fold_slot_capacity_at_the_ceiling() {
+        let small = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert!(small.fold_slot_capacity() < AGGREGATOR_MAX_SLOTS);
+        let live = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_fold_capacity(AGGREGATOR_MAX_SLOTS);
+        assert!(live.fold_slot_capacity() >= AGGREGATOR_MAX_SLOTS);
+        // Clamped: never past the ceiling.
+        let clamped = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_fold_capacity(AGGREGATOR_MAX_SLOTS * 2);
+        assert!(clamped.fold_slot_capacity() < AGGREGATOR_MAX_SLOTS * 2);
+        // The boot-site wiring is pinned in
+        // `the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling`.
     }
 
     /// A fire that finds the previous sweep still running keeps its cursor,
@@ -29760,6 +30097,27 @@ mod late_seed_tests {
             drain.contains("seed_closed = true;"),
             "nothing sets the seed latch, so `if !seed_closed` can never become \
              false and the guard above is decorative"
+        );
+        // DT-A1 (2026-10-28): the arm only QUEUES (gated on queue room); the
+        // idle arm seeds. A loop over the batch in the arm would put ~22,000
+        // inserts back in front of every queued frame.
+        let arm = drain
+            .split_once(
+                "maybe_seed = seed_rx.recv(), if !seed_closed && ingest.seed_queue_has_room()",
+            )
+            .expect("the seed arm is gated on queue room")
+            .1;
+        let arm = arm
+            .split_once("silence_timer.tick()")
+            .map_or(arm, |(a, _)| a);
+        assert!(arm.contains("ingest.queue_seed_batch(batch, now_millis)"));
+        assert!(
+            !arm.contains("ingest.seed("),
+            "the seed arm must not seed instruments itself"
+        );
+        assert!(
+            drain.contains("step.seed_done"),
+            "the idle arm reports finished batches"
         );
         // The four snapshot timer arms this list was derived from went with
         // top_volume on 2026-10-22 (plan item 62); the silence read-out is

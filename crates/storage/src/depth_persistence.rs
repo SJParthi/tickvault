@@ -560,6 +560,63 @@ impl DepthLayout {
             Self::Book => 2,
         }
     }
+
+    /// Bytes a row buffer of this layout is reserved with up front (plan item
+    /// DT-A2, 2026-10-28): [`DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES`] or
+    /// [`DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES`]. Pure, O(1).
+    #[must_use]
+    pub const fn row_buffer_presize_bytes(self) -> usize {
+        match self {
+            Self::Levels => DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES,
+            Self::Book => DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES,
+        }
+    }
+}
+
+/// Bytes a LEVEL-row depth buffer is reserved with up front (plan item DT-A2,
+/// 2026-10-28; the depth twin of the tick writer's K6
+/// `TICK_ROW_BUFFER_PRESIZE_BYTES`).
+///
+/// A depth row buffer used to start at zero capacity and regrow by doubling
+/// inside the frames whose appends crossed each power of two, so on the frame
+/// drain; the last copies before a flush were megabytes. The live drain cuts a
+/// level batch at 10,000 rows (`DEPTH_FLUSH_ROW_THRESHOLD` in the app crate)
+/// at about 179 bytes a row, about 1.8 MB, so 4 MiB holds a full batch plus
+/// the rows of the frame that crosses the cut. A bigger batch (the late-row
+/// writers, which cut at [`DEPTH_LATE_FLUSH_BYTES`]) still grows past it by
+/// doubling, off the live drain. SPACE: one buffer in the producer, at most
+/// [`DEPTH_FLUSH_QUEUE_DEPTH`] queued and as many spares, so at most 9 × 4 MiB
+/// reserved per level writer; pages are committed only as rows are written.
+pub const DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bytes an ARRAY-row (`market_depth_book`) buffer is reserved with up front
+/// (plan item DT-A2, 2026-10-28).
+///
+/// The book writer cuts on bytes at [`DEPTH_BOOK_FLUSH_BYTES`] (8 MiB), checked
+/// after a frame, so a batch reaches 8 MiB plus the rows of one frame. Reserved
+/// at the threshold plus 1 MiB of headroom for that frame. Before, the buffer
+/// doubled from zero and the frame that crossed 8 MiB copied 8 MiB into a new
+/// 16 MiB buffer on the drain; a recycled spare then kept the 16 MiB capacity.
+/// SPACE: at most 9 × 9 MiB reserved, under the 16 MiB spares the doubling
+/// left behind; pages are committed only as rows are written.
+pub const DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES: usize = DEPTH_BOOK_FLUSH_BYTES + 1024 * 1024;
+
+const _: () = assert!(
+    DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES <= MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        && DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+    "a pre-sized depth buffer must be one the spare lane will take back"
+);
+const _: () = assert!(
+    DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES > DEPTH_BOOK_FLUSH_BYTES,
+    "the book pre-size must hold a full batch plus the frame that crosses the cut"
+);
+
+/// An empty row buffer for `layout`, reserved to its pre-size. One
+/// allocation, at construction; never per row.
+fn presized_depth_row_buffer(layout: DepthLayout) -> Buffer {
+    let mut buffer = Buffer::new(layout.protocol());
+    buffer.reserve(layout.row_buffer_presize_bytes());
+    buffer
 }
 
 /// One side of one depth packet, prepared for an array-row append.
@@ -1538,7 +1595,9 @@ impl DepthWriter {
         register_depth_drop_baseline(feed);
         match Sender::from_conf(depth_ilp_http_conf(config, layout)) {
             Ok(s) => {
-                let b = s.new_buffer();
+                let mut b = s.new_buffer();
+                // DT-A2: reserved up front, so no batch regrows on the drain.
+                b.reserve(layout.row_buffer_presize_bytes());
                 Self {
                     layout,
                     sender: Some(s),
@@ -1574,7 +1633,7 @@ impl DepthWriter {
                 Self {
                     sender: None,
                     layout,
-                    buffer: Buffer::new(layout.protocol()),
+                    buffer: presized_depth_row_buffer(layout),
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
@@ -1613,7 +1672,7 @@ impl DepthWriter {
         Self {
             sender: None,
             layout: DepthLayout::Levels,
-            buffer: Buffer::new(ProtocolVersion::V1),
+            buffer: presized_depth_row_buffer(DepthLayout::Levels),
             pending: 0,
             pending_min_seq: 0,
             pending_max_seq: 0,
@@ -1643,7 +1702,7 @@ impl DepthWriter {
     pub fn for_test_book(feed: Feed) -> Self {
         Self {
             layout: DepthLayout::Book,
-            buffer: Buffer::new(DepthLayout::Book.protocol()),
+            buffer: presized_depth_row_buffer(DepthLayout::Book),
             ..Self::for_test(feed)
         }
     }
@@ -2120,17 +2179,31 @@ impl DepthWriter {
     /// several reallocations per flush on the drain task, at the depth path's
     /// ~2 MB batch size. A spare of another protocol version is dropped rather
     /// than used, because the next batch must speak the protocol the sender
-    /// negotiated. `try_recv`, never `recv`: no spare simply means the next
-    /// append allocates as before.
+    /// negotiated. `try_recv`, never `recv`. With no spare (or one under the
+    /// layout's pre-size) the buffer is reserved to that size here (DT-A2,
+    /// 2026-10-28), so the next batch does not regrow inside the frames that
+    /// append it. WHERE this runs: on every hand-off, which on the live drain
+    /// is either the 500 ms flush arm or, for the depth size trigger
+    /// (`depth_flush_due`), INSIDE the frame arm right after the frame that
+    /// tripped it. So the reserve is one allocation (a 4 or 9 MiB `mmap`, no
+    /// page committed) per hand-off that finds no spare, sometimes on the
+    /// frame path; never per tick or per row. Before, that path allocated
+    /// nothing there and the next batch's appends did the regrowing instead.
     fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
-        let Some(spares) = self.spare_buffers.as_ref() else {
-            return;
-        };
-        if let Ok(mut spare) = spares.try_recv()
+        if let Some(spares) = self.spare_buffers.as_ref()
+            && let Ok(mut spare) = spares.try_recv()
             && spare.protocol_version() == protocol
         {
             spare.clear();
             self.buffer = spare;
+        }
+        // DT-A2: one allocation per spare-less hand-off (see the doc above for
+        // where that runs), none per row. A spare at least the pre-size costs
+        // nothing.
+        let presize = self.layout.row_buffer_presize_bytes();
+        if self.buffer.capacity() < presize {
+            let have = self.buffer.len();
+            self.buffer.reserve(presize.saturating_sub(have));
         }
     }
 
@@ -5097,8 +5170,12 @@ mod tests {
     #[test]
     fn a_depth_spare_of_another_protocol_is_never_installed() {
         let (mut w, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        // DT-A2 (2026-10-28): the foreign spare is reserved PAST the pre-size,
+        // so a wrongly installed spare would show a larger capacity than the
+        // fresh pre-sized buffer the assert below expects.
         let mut foreign = Buffer::new(ProtocolVersion::V2);
-        foreign.reserve(4096);
+        foreign.reserve(DepthLayout::Levels.row_buffer_presize_bytes() + 64 * 1024);
+        assert!(foreign.capacity() > DepthLayout::Levels.row_buffer_presize_bytes());
         sink.spare_return
             .as_ref()
             .expect("split opens the lane")
@@ -5113,7 +5190,92 @@ mod tests {
             ProtocolVersion::V1,
             "the next batch must speak the protocol the sender negotiated"
         );
-        assert_eq!(w.buffer.capacity(), 0, "the foreign spare was dropped");
+        // The foreign spare (larger than the pre-size) was dropped; the buffer
+        // in its place is a fresh DT-A2 pre-size, reserved by the hand-off.
+        assert_eq!(
+            w.buffer.capacity(),
+            DepthLayout::Levels.row_buffer_presize_bytes(),
+            "the foreign spare was dropped"
+        );
+    }
+
+    // Regression: 2026-10-28 (DT-A2) — the depth row buffer started at zero
+    // capacity and regrew by doubling inside the frames that appended to it
+    // (up to an 8 MiB copy into a 16 MiB buffer on the book layout), on the
+    // frame drain. The tick writer had been fixed two days earlier (K6).
+    #[test]
+    fn test_regression_depth_row_buffer_is_presized_and_never_regrows_on_append() {
+        for (layout, w) in [
+            (DepthLayout::Levels, DepthWriter::for_test(Feed::Dhan)),
+            (DepthLayout::Book, DepthWriter::for_test_book(Feed::Dhan)),
+        ] {
+            assert!(
+                w.buffer.capacity() >= layout.row_buffer_presize_bytes(),
+                "{layout:?}: a new writer's row buffer is reserved up front"
+            );
+            assert_eq!(w.buffer.protocol_version(), layout.protocol());
+        }
+
+        // Levels: a full live batch (the drain cuts at 10,000 rows,
+        // `DEPTH_FLUSH_ROW_THRESHOLD` in the app crate) never reallocates.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let ptr = w.buffer.as_bytes().as_ptr();
+        let cap = w.buffer.capacity();
+        for _ in 0..10_000 {
+            w.append_row(&row()).expect("append");
+        }
+        assert!(!w.buffer.as_bytes().is_empty());
+        assert_eq!(w.buffer.capacity(), cap, "no regrowth below the pre-size");
+        assert_eq!(w.buffer.as_bytes().as_ptr(), ptr, "no reallocation");
+
+        // Book: rows up to the byte cut (`book_flush_due`) never reallocate.
+        let mut book = DepthWriter::for_test_book(Feed::Dhan);
+        let book_ptr = book.buffer.as_bytes().as_ptr();
+        let book_cap = book.buffer.capacity();
+        let (p, q, o) = book_levels(200);
+        let mut seq = 1_i64;
+        while !book.book_flush_due() {
+            book.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+            seq += 1;
+            assert!(seq < 10_000, "8 MiB must arrive within a few thousand rows");
+        }
+        assert_eq!(
+            book.buffer.capacity(),
+            book_cap,
+            "book: no regrowth to the cut"
+        );
+        assert_eq!(
+            book.buffer.as_bytes().as_ptr(),
+            book_ptr,
+            "book: no reallocation"
+        );
+
+        // A hand-off that finds no spare waiting reserves the pre-size for the
+        // next batch at the hand-off, never leaving a zero buffer.
+        let (mut producer, _sink, _rx) = w.split_for_offload();
+        producer.flush().expect("hand off");
+        assert!(producer.buffer.as_bytes().is_empty());
+        assert!(
+            producer.buffer.capacity() >= DepthLayout::Levels.row_buffer_presize_bytes(),
+            "the batch after a spare-less hand-off starts pre-sized"
+        );
+    }
+
+    #[test]
+    fn test_row_buffer_presize_bytes_per_layout() {
+        assert_eq!(
+            DepthLayout::Levels.row_buffer_presize_bytes(),
+            DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES
+        );
+        assert_eq!(
+            DepthLayout::Book.row_buffer_presize_bytes(),
+            DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES
+        );
+        // A full book batch plus a frame fits without a doubling.
+        assert!(DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES > DEPTH_BOOK_FLUSH_BYTES);
+        // 10,000 level rows at ~179 B (the live cut) fit with room to spare.
+        assert!(DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES >= 10_000 * 179 * 2);
     }
 
     #[test]

@@ -1115,6 +1115,34 @@ Approved by: owner 2026-10-28, "go ahead and add the daily expiry check" (a guar
     test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts,
     test_live_hollow_shapes_parse_or_page
 
+### PR DT-small — 2026-10-28 three drain waits over 1 ms (app, storage, trading)
+
+- [ ] DT-small (app, storage, trading) Three confirmed causes of a frame waiting
+  more than 1 ms on the frame drain (hostile review, 2026-10-28):
+  DT-A1 the late-attach seed arm seeded a ~22,000-contract batch in one arm;
+  now it queues the batch (a move) and the idle arm seeds
+  `SEED_STEP_INSTRUMENTS` (512) per step, queue pre-sized to
+  `SEED_QUEUE_BATCHES` (8), arm gated on room. DT-A2 the depth row buffer had
+  no pre-size; now `DepthLayout::row_buffer_presize_bytes` (4 MiB level,
+  9 MiB book) at construction and after a spare-less hand-off (the flush arm,
+  or the depth size trigger inside the frame arm, so one allocation per
+  spare-less hand-off can land on the frame path), like the tick writer's K6. DT-A6 the live fold was sized at the
+  boot-time spot count, so the ~866th instrument moved the slot table and
+  rehashed the index inside a frame; now `LiveIngest::with_fold_capacity(AGGREGATOR_MAX_SLOTS)`
+  at the boot site (67.1 MiB of address space measured, committed as slots
+  are written; the grow-once path already reserved the same ceiling).
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/storage/src/depth_persistence.rs,
+    crates/trading/src/candles/multi_tf_aggregator.rs, CLAUDE.md
+  - Tests: test_queue_seed_batch_and_step_seed_are_bounded_per_call,
+    test_seed_queue_has_room_refuses_past_the_bound_and_never_grows,
+    the_drain_has_a_seed_arm_that_does_not_outrank_frames (extended),
+    test_with_fold_capacity_and_fold_slot_capacity_at_the_ceiling,
+    test_slot_capacity_at_the_ceiling_never_reallocates_while_the_universe_fills,
+    test_regression_depth_row_buffer_is_presized_and_never_regrows_on_append,
+    test_row_buffer_presize_bytes_per_layout,
+    test_step_idle_work_seeds_before_the_catch_up_sweep_then_finishes_it,
+    a_depth_spare_of_another_protocol_is_never_installed (strengthened)
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Shipping `tv_dhan_token_publish_total` / `tv_dhan_shared_token_adoption_total`
@@ -1147,6 +1175,8 @@ PR K: each fix keeps the existing tiers: replay classification and streak stop a
 
 PR M: every item starts from a live measurement and ends with a before/after number; fixes reuse existing tiers.
 
+PR DT-small: each fix moves work off a frame, never adds any: the seed batch rides the existing idle arm (`consume_budget`, last in the biased select) as a bounded step before the catch-up seal step; the depth buffer reuses the K6 reserve-at-hand-off shape (for depth the hand-off can run inside the frame arm, after the frame that tripped the size trigger: one allocation per spare-less hand-off there, never per row); the fold is built at the ceiling the grow-once path already reserved, with the same builder shape as `with_detector_capacity`.
+
 PR L: each fix reuses an existing mechanism: the owed close code is already stored in `pending_close`; the seal floor reuses `classify_spill_floor`; the Muhurat gate reuses the writers' Muhurat flag; workflow guards reuse the deploy-aws IST check; budget distrust widens an existing day-1 rule.
 
 PR N (Quote 44): the rider asks for a snapshot pass on its own task after each successful build; the pass lists data/instrument-cache, uploads every dated .json with no matching marker through raw_frame_upload::upload_file (gzip, conditional put, HeadObject verify, marker), and the 7-day sweep inside build_once deletes only marked files. The lifecycle writer and its storage helpers are deleted.
@@ -1177,6 +1207,8 @@ OE1 (ORDER-EVT-02): the order-update parse reads both casings of every `OrderUpd
 
 - PR M: a session that saturates the disk; a backlog larger than one boot's replay budget; a check that reads rows still in spill.
 
+- PR DT-small: more than 8 seed batches waiting (the arm stops receiving and the 8-deep channel holds the rest; a call anyway seeds inline, never drops); a drain whose catch-up sweep never finishes (seed steps run first, so seeding still ends in at most ceil(n/512) idle steps); a book batch past 8 MiB plus one frame (grows by doubling as before); more than 25,000 instruments (refused and counted as before).
+
 - PR L: a disconnect code stacked behind data at a failed write; a QuestDB that accepts TCP and never answers at exit; a Muhurat session in the evening; Monday 2 November with October's total still showing; a deploy failing at 09:10.
 
 PR N: a file replaced mid-copy (marker no longer matches, copied again next pass); a same-day rebuild with different bytes (sidecar key, warning); an orphan .json.tmp (kept, counted); no bucket resolves (no_bucket counted, nothing swept); a request during a running pass (skipped_busy counted, rerun queued).
@@ -1202,6 +1234,8 @@ OE1: a frame with both casings keeps the accepted key (as since 2026-07-14); `Ty
 
 - PR M: a fix that moves writes rather than removing them shows up in the next session's EBS bytes.
 
+- PR DT-small: an instrument attached while its batch waits is not yet in the silence detector, so its silence is judged up to ceil(n/512) idle steps later (milliseconds), and the 30 s silence scan, an arm above the idle arm, can run on a part-seeded batch and under-count never-ticked instruments for at most one scan per attach batch; the pre-sized buffers and fold take address space at boot whether or not the session fills them.
+
 - PR L: a lane retry that never gets the lock keeps retrying on a capped backoff (logged per episode); a budget reading distrusted on day 2 pages instead of stopping.
 
 PR N: S3 down or hung (counted failure, pass bounded at 30 min, stops after 3 time-outs in a row, files kept); marker write fails (verified copy held in memory, shared marker counter); a folder entry unreadable (skipped, counted); the console wipes still remove instrument-cache (documented limit, not changed).
@@ -1225,6 +1259,8 @@ PR J: per-crate `cargo test -p` for storage, app, core, api, common; new self-te
 PR K: per-crate `cargo test -p` for storage, app, core; one regression test per item; clippy and fmt.
 
 PR M: per-crate tests plus the next live session's EBS throughput, spill count and cross-check verdict read back read-only.
+
+PR DT-small: `cargo test -p tickvault-trading`, `-p tickvault-storage`, `-p tickvault-app --lib` plus the DHAT drain tests (`dhat_live_ingest_seam`, `dhat_depth_drain`); one test per fix; the next live session read back: `ring_dwell` (max and buckets, 09:00 to 09:15) for A1, which runs in its own select arms outside the `drain_main_frame` timing, and `drain_main_frame` for A2 and A6.
 
 PR L: per-crate `cargo test -p` for core, storage, trading, app, aws-lambdas; restart differential; workflow window pins; clippy and fmt.
 
@@ -1262,6 +1298,8 @@ S1: revert the commit; no config flag or schema change.
 
 OE1: revert the change; no schema, table, config or alarm change.
 
+PR DT-small: revert the commit; no config flag, schema or metric change.
+
 ## Observability
 
 No new metric: depth flushes and drops are already counted by the writer and
@@ -1283,6 +1321,8 @@ PR J: `tv_ticks_lost_total{source="rescue_abandoned"}` and `{source="shutdown_ri
 PR K: tick-gap verdict counters and WAL staging-failure counters, local `/metrics` only, no EMF name, filter or alarm.
 
 PR M: no new alarm or page; local `/metrics` only for any new counter.
+
+PR DT-small: no new metric, alarm or page; the seed line keeps its wording (now once per finished batch), one boot `info!` names the fold's slot capacity, and the existing `tv_hot_path_stage_max_ns` shows the effect: `stage="ring_dwell"` for A1 (seeding runs in its own arms, outside the `drain_main_frame` timing), `stage="drain_main_frame"` for A2 and A6.
 
 PR L: new reason labels and refusal counters only, local `/metrics` only; no new alarm or page (the liveness alarm's schedule moves, the page is unchanged).
 
