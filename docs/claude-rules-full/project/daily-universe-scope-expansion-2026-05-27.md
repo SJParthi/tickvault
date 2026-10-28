@@ -3277,3 +3277,19 @@ Then the card "Tonight's wipe already deletes ALL old market data on the server 
 - Running it without a dry run listing what will go, or without a verify listing after.
 - Touching any bucket other than `tv-prod-cold`, the Terraform state, alarms, log groups or the repository under this quote.
 - Keeping the one-off role, workflow or tool after the run, or reusing Quote 46 for a second run.
+
+#### Quote 47 (2026-10-28, ~12:15 IST) — DELETE THE OLD 600 GB ROOT DISK TONIGHT (preserve EXACTLY)
+
+Card: "From tonight the server runs on the new 150 GB disk. The old 600 GB disk is unplugged and kept only as the way back if the new server fails (the backup snapshot is deleted tonight, as you chose). It costs about $55/month until deleted. When should it be deleted?" The owner tapped **"Delete tonight"**: "Delete it right after tonight's rebuild. Saves ~$2, but if the new server fails Thursday there is no way back to the old one."
+
+| Item | What Quote 47 authorizes |
+|---|---|
+| What | The one detached EBS volume tagged `tv-rebuild-old-root` (the r8g.xlarge 600 GB root) and nothing else. |
+| When | ONE delete tonight (28→29 Oct), only after the rebuild postcheck is green and the Quote 35/42 wipe has finished; never 09:00–15:45 IST. |
+| How | No tool or role in the repository may delete a volume (the wipe role has no `ec2:DeleteVolume`), so the owner deletes it in the AWS console (EC2 → Volumes), or a reviewed one-off grant does; the session confirms it is gone with a read-only describe. |
+| Consequence | After it, no rollback to the old server exists: the snapshot is deleted by the wipe and the volume by this quote. |
+
+##### What violates Quote 47 (REJECT)
+- Deleting any other volume, the new 150 GB root, or any snapshot under this quote.
+- Deleting it before the rebuild postcheck is green or while the rebuild or the wipe is running.
+- Adding `ec2:DeleteVolume` to the wipe role, the instance role or any standing role.
