@@ -448,9 +448,13 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 ///   `"50.0"`, `"1e3"`; see [`exact_decimal_i64`]); a fractional or
 ///   out-of-range spelling is kept (loud), never rounded; an empty string →
 ///   remove.
-/// - Int field holding an integral float (`50.0`) with magnitude below 2^53
-///   → that integer. At or past 2^53 the `f64` serde read may stand for a
-///   different wire integer, so it is kept (loud). Honest limit: serde has
+/// - Int field holding an integral float (`50.0`) with magnitude below 2^52
+///   → that integer. This serde_json build (no `float_roundtrip`) can read a
+///   JSON number up to about 1 off in absolute terms near 2^52; below 2^52
+///   the `f64` spacing is at most 0.5, so that error makes the value
+///   fractional (kept, loud), never a neighbouring integer. At or past 2^52
+///   the spacing is 1 or more and an error can land on another integer
+///   (`8000000000000007.0` reads as 8000000000000006), so it is kept (loud). Honest limit: serde has
 ///   already rounded a JSON number to `f64` before this runs, so a
 ///   fractional wire number whose nearest `f64` is integral
 ///   (`1.00000000000000001`) reads as that integer; only a string spelling
@@ -503,13 +507,12 @@ fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> Field
             }
         }
         (FieldKind::Int, Value::Number(number)) if number.as_i64().is_none() => {
-            // Only below 2^53: every integer there is an exact f64, so the
-            // f64 serde read cannot stand for a different integer. At or
-            // past 2^53 two wire integers share one f64
-            // (9007199254740993.0 reads as 2^53), so it is refused.
+            // Only below 2^52 (see F64_INT_COERCE_LIMIT): there a misread
+            // JSON number turns fractional and is refused; at or past it a
+            // misread can name a neighbouring integer, so it is refused.
             match number
                 .as_f64()
-                .filter(|float| float.abs() < F64_EXACT_INTEGER_LIMIT)
+                .filter(|float| float.abs() < F64_INT_COERCE_LIMIT)
                 .and_then(exact_i64)
             {
                 Some(integral) => {
@@ -549,10 +552,21 @@ fn exact_i64(float: f64) -> Option<i64> {
     }
 }
 
-/// 2^53. Below it every integer is an exact `f64`, so an integral `f64`
-/// there names exactly one wire integer; at or past it two integers can
-/// share one `f64` (`9007199254740993.0` reads as 2^53).
-const F64_EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+/// 2^52, the magnitude below which a JSON-number Int is coerced.
+///
+/// Being an exact `f64` is not enough (every integer below 2^53 is one):
+/// without serde_json `float_roundtrip`, a number such as `v.0` or `v0e-1`
+/// is read as an integer significand rounded to `f64`, then multiplied or
+/// divided by an exact power of ten (the significand keeps at most about 19
+/// digits, so an integral result below 2^52 needs a power of at most
+/// 10^19, inside the exact range up to 10^22) and rounded again. Two
+/// roundings of at most half a unit each put the result within
+/// `v x 2^-52` of `v`, which is under 1 for `v < 2^52`. There the `f64`
+/// spacing is at most 0.5, so a misread lands on a fraction (refused by
+/// `exact_i64`), never on another integer. In [2^52, 2^53) the spacing is 1
+/// and `8000000000000007.0` reads as 8000000000000006. Raising this needs
+/// `float_roundtrip` (owner approval). Order Int fields are far below it.
+const F64_INT_COERCE_LIMIT: f64 = 4_503_599_627_370_496.0;
 
 /// The `i64` a decimal string spells EXACTLY, never rounded: an optional
 /// sign, digits with an optional `.` fraction, an optional `e`/`E`
@@ -1947,14 +1961,74 @@ mod tests {
                 "{bad}"
             );
         }
-        // A JSON number past 2^53 in an Int field is refused, never rounded.
+        // A JSON number at or past 2^52 in an Int field is refused, never
+        // rounded (see F64_INT_COERCE_LIMIT); just below it, coerced.
+        for refused in [
+            9_007_199_254_740_992.0,
+            9_007_199_254_740_991.0,
+            4_503_599_627_370_496.0,
+            -4_503_599_627_370_496.0,
+        ] {
+            assert_eq!(
+                fix_for_field("LotSize", FieldKind::Int, &json!(refused)),
+                FieldFix::Keep,
+                "{refused}"
+            );
+        }
         assert_eq!(
-            fix_for_field("LotSize", FieldKind::Int, &json!(9_007_199_254_740_992.0)),
-            FieldFix::Keep
+            fix_for_field("LotSize", FieldKind::Int, &json!(4_503_599_627_370_495.0)),
+            FieldFix::Replace(json!(4_503_599_627_370_495i64), "integral_float_coerced")
         );
         assert_eq!(
-            fix_for_field("LotSize", FieldKind::Int, &json!(9_007_199_254_740_991.0)),
-            FieldFix::Replace(json!(9_007_199_254_740_991i64), "integral_float_coerced")
+            fix_for_field("LotSize", FieldKind::Int, &json!(-4_503_599_627_370_495.0)),
+            FieldFix::Replace(json!(-4_503_599_627_370_495i64), "integral_float_coerced")
+        );
+    }
+
+    /// A JSON number in an Int field is coerced only below 2^52. This
+    /// serde_json build (no `float_roundtrip`) reads `8000000000000007.0` as
+    /// significand 80000000000000070 rounded to `f64`, then divided by 10 and
+    /// rounded again: 8000000000000006. Below 2^52 the `f64` spacing is at
+    /// most 0.5 and that read is off by under 1, so an error lands on a
+    /// fraction (refused), never on a neighbouring integer.
+    #[test]
+    fn test_parse_order_update_json_number_int_never_lands_on_another_integer() {
+        let lossy = parse_order_update(r#"{"Data":{"OrderNo":"1","Quantity":8000000000000007.0}}"#);
+        assert!(
+            lossy
+                .as_ref()
+                .map_or(true, |u| u.quantity != 8_000_000_000_000_006),
+            "8000000000000007.0 decoded as 8000000000000006"
+        );
+        // Deterministic sweep below 2^52: a decode is the exact integer or a
+        // loud failure, never another integer.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let (mut exact, mut refused) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let v = (state >> 12) as i64; // [0, 2^52)
+            for spelling in [
+                format!("{v}.0"),
+                format!("{v}0e-1"),
+                format!("{v}00e-2"),
+                format!("{v}.000"),
+                format!("{v}000e-3"),
+            ] {
+                let frame = format!(r#"{{"Data":{{"OrderNo":"1","Quantity":{spelling}}}}}"#);
+                match parse_order_update(&frame) {
+                    Ok(update) => {
+                        assert_eq!(update.quantity, v, "{spelling}");
+                        exact += 1;
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        assert!(
+            exact > 90_000,
+            "sweep is not vacuous: {exact} exact, {refused} refused"
         );
     }
 

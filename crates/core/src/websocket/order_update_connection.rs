@@ -1239,7 +1239,10 @@ static UNPARSEABLE_ORDER_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// R4 (2026-10-01). Pure, allocation-free. True iff a frame that FAILED
 /// `parse_order_update` still carries the documented order envelope: the
 /// `"order_alert"` tag, or a `"Data"` (or drifted `"data"`) key whose value
-/// opens an object.
+/// opens an object or an array. An array `Data` is refused by the typed
+/// parse (`parse_order_update`), and this is what routes that refusal to
+/// the coded ORDER-EVT-02 `typed_parse_failed` arm instead of the debug-only
+/// non-order arm.
 ///
 /// # Complexity
 /// O(frame bytes), bounded by `ORDER_UPDATE_MAX_FRAME_BYTES`, the same bound
@@ -1254,7 +1257,7 @@ fn looks_like_order_update(text: &str) -> bool {
         while let Some(at) = rest.find(key) {
             rest = &rest[at + key.len()..];
             if let Some(value) = rest.trim_start().strip_prefix(':')
-                && value.trim_start().starts_with('{')
+                && value.trim_start().starts_with(['{', '['])
             {
                 return true;
             }
@@ -1720,6 +1723,32 @@ mod tests {
         assert!(between.contains("\"unparseable_order\""));
         assert!(between.contains("OrderEvt02DecodedHollow"));
         assert!(between.contains("stage = \"typed_parse_failed\""));
+    }
+
+    /// An array `Data` is refused by the typed parse (it would decode
+    /// positionally or as an all-default update). The refusal must reach the
+    /// coded ORDER-EVT-02 `typed_parse_failed` arm, not the debug-only
+    /// non-order arm: the parse fails, the auth classifier calls it Success,
+    /// and the envelope check (matched first, pinned by the source test
+    /// above) recognises it.
+    #[test]
+    fn test_array_data_frame_reaches_the_typed_parse_failed_arm() {
+        for frame in [
+            r#"{"Data":[]}"#,
+            r#"{"data":[]}"#,
+            r#"{ "Data" : [ ] }"#,
+            r#"{"Data":["NSE","D","52432","c","1124"]}"#,
+            r#"{"data":[{"OrderNo":"1"}],"Type":"login_ack"}"#,
+            r#"[{"Data":{"OrderNo":"1"}}]"#,
+        ] {
+            assert!(parse_order_update(frame).is_err(), "precondition: {frame}");
+            assert_eq!(
+                classify_auth_response(frame),
+                AuthResponseKind::Success,
+                "precondition: {frame}"
+            );
+            assert!(looks_like_order_update(frame), "{frame}");
+        }
     }
 
     // ========================================================================
