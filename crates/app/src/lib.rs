@@ -72,6 +72,9 @@ pub mod tf_consistency_readiness;
 // `ticks` again. Daily rows-accepted-vs-rows-stored check after 15:40 IST, and
 // the boot `feed_gap_audit` row for the downtime before a mid-session start.
 pub mod tick_conservation;
+// The expiry-scope guarantee (owner 2026-10-28): subscribe-time refusal +
+// the 15:50 IST daily check into `expiry_scope_audit`.
+pub mod expiry_scope_check;
 // Plan item M5 (2026-10-27): routes a no-new-trade packet to `tick_quotes`.
 pub mod tick_quote_route;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`

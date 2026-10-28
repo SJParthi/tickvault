@@ -145,6 +145,8 @@ pub mod delay_render;
 // RESTORED 2026-10-26 (plan item K4): the Dhan live lane writes `ticks`
 // again, so the daily conservation check writes new rows into the retained
 // table. `tick_conservation_ledger` is the process-side count it reads.
+/// The daily expiry-scope check's audit table (owner 2026-10-28).
+pub mod expiry_scope_audit_persistence;
 pub mod table_storage_probe;
 pub mod tick_conservation_audit_persistence;
 pub mod tick_conservation_ledger;
