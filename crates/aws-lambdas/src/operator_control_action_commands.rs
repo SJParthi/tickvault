@@ -48,9 +48,12 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 11] = [
     ON_BOX_LOCK_GUARD,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
-    r#"rm -rf /opt/tickvault/data/ws_wal /opt/tickvault/data/groww /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/instrument-cache 2>/dev/null || true"#,
+    // 2026-10-28 (Quote 44 review): `instrument-cache` is NOT removed: its dated
+    // snapshot files may not have a verified cold-bucket copy yet (Quote 44
+    // REJECTs deleting one before it has).
+    r#"rm -rf /opt/tickvault/data/ws_wal /opt/tickvault/data/groww /opt/tickvault/data/spill /opt/tickvault/data/dlq 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
-    r#"echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq, instrument-cache)'"#,
+    r#"echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq); instrument snapshots kept'"#,
     // 2026-08-01 (operator directive — pure Rust, nowhere the banned runtime):
     // this element WAS a 17-line embedded interpreter program dispatched via
     // SSM RunCommand to the prod box — i.e. the banned runtime EXECUTING in
@@ -394,9 +397,12 @@ lock_check"#,
         r#" || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#
     ),
     r#"echo 'OK: tv-questdb-data removed'"#,
-    r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
+    // 2026-10-28 (Quote 44 review): `instrument-cache` is NOT removed: its dated
+    // snapshot files may not have a verified cold-bucket copy yet (Quote 44
+    // REJECTs deleting one before it has).
+    r#"rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
-    r#"echo 'OK: host caches + feed capture/replay sources wiped (instrument-cache, spill, dlq, ws_wal, groww); logs preserved'"#,
+    r#"echo 'OK: feed capture/replay sources wiped (spill, dlq, ws_wal, groww); logs and instrument snapshots preserved'"#,
     concat!(ensure_questdb_cmd!(), " || true"),
     r#"systemctl enable tickvault || true"#,
     r#"systemctl restart tickvault || true"#,
@@ -675,7 +681,10 @@ lock_check"#,
     r#"docker images -aq | xargs -r docker rmi -f 2>/dev/null || true"#,
     r#"docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true"#,
     r#"docker system prune -af --volumes 2>/dev/null || true"#,
-    r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
+    // 2026-10-28 (Quote 44 review): `instrument-cache` is NOT removed: its dated
+    // snapshot files may not have a verified cold-bucket copy yet (Quote 44
+    // REJECTs deleting one before it has).
+    r#"rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
     r#"C=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' '); I=$(docker images -aq 2>/dev/null | wc -l | tr -d ' '); V=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' '); echo "BARE-NUKE-RESULT containers=$C images=$I volumes=$V"; if [ "$C" = 0 ] && [ "$I" = 0 ] && [ "$V" = 0 ]; then echo bare-nuke-complete; else echo 'bare-nuke-PARTIAL: something is still present (likely in-use)'; fi"#,
     // 2026-08-20 INCIDENT FIX — the auto-start guarantee. This action used to

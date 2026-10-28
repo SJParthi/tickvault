@@ -1175,10 +1175,30 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // otherwise.
     persist_constituents(questdb, date, &outcome).await;
 
-    // Retention, LAST: after every artifact for today has landed and after the
-    // SEBI tables above are written. Ordering is the safety property -- a sweep
-    // that ran first could delete the only artifact a failed build would have
-    // left the lane, and the lane's fallback is four index SIDs.
+    // Retention does NOT run here any more (2026-10-28, Quote 44 review): it
+    // runs in the snapshot task the rider starts after this build returns,
+    // after a pass that re-checked every marked copy against the cold bucket
+    // (`sweep_artifacts_after_verified_copies`). A marker can outlive its
+    // copy (a bucket-wide delete), and only that task holds a bucket client.
+    // It still runs after every artifact for today has landed: the rider
+    // starts it only after this build succeeded.
+
+    Ok(outcome)
+}
+
+/// The retention sweep, run by the snapshot task only after a pass that
+/// re-checked every marked copy against the cold bucket
+/// ([`crate::instrument_snapshot_upload`], `SnapshotPassSummary::sweep_allowed`).
+/// Ordering is the safety property: it runs after today's build succeeded
+/// (the rider starts the task only then), so it can never delete the only
+/// artifact a failed build would have left the lane, and after the re-check,
+/// so a marker whose copy was deleted from the bucket deletes nothing.
+/// The folder walk runs off the shared worker (`off_worker`).
+// TEST-EXEMPT: thin wrapper (off_worker + counter + log) over
+// `sweep_stale_artifacts_in`, whose behaviour is tested directly; the call
+// site and the held-counter emit are pinned by source in
+// `test_sweep_artifacts_after_verified_copies_counts_the_held_files`.
+pub(crate) fn sweep_artifacts_after_verified_copies(date: &str) {
     // Sweep S5: the directory walk runs off the shared tokio worker.
     let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date));
     metrics::counter!(crate::instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER)
@@ -1194,8 +1214,6 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
             "stale instrument artifacts swept (a file with no verified S3 copy is kept)"
         );
     }
-
-    Ok(outcome)
 }
 
 /// Persists the resolved mapping into the SEBI `index_constituency` table.
@@ -1783,8 +1801,11 @@ async fn run_dhan_universe_rider(
                     // bucket, verified. Its own task, after the build: the
                     // live lane already has its mapping artifact, so nothing
                     // here can delay it. A running pass is not doubled; it runs once more.
+                    // The retention sweep runs in that task, after the pass
+                    // re-checked every marked copy against the bucket.
                     drop(crate::instrument_snapshot_upload::spawn_snapshot_upload(
                         snapshot_bucket.clone(),
+                        today.clone(),
                     ));
                 }
                 Err(err) => {
@@ -2068,11 +2089,13 @@ mod tests {
         );
     }
 
-    /// The daily build publishes every artifact the sweep KEPT for lack of a
-    /// verified copy on the held counter (Quote 44): without it a broken copy
-    /// would only grow the folder, with no number anywhere saying so.
+    /// The sweep publishes every artifact it KEPT for lack of a verified copy
+    /// on the held counter (Quote 44): without it a broken copy would only
+    /// grow the folder, with no number anywhere saying so. Since the 2026-10-28
+    /// review the sweep runs in the snapshot task after a pass that re-checked
+    /// every marked copy against the bucket, never inside `build_once`.
     #[test]
-    fn test_build_once_counts_the_sweep_held_files_on_the_held_counter() {
+    fn test_sweep_artifacts_after_verified_copies_counts_the_held_files() {
         let src = include_str!("dhan_universe.rs");
         let prod = src
             .split("\n#[cfg(test)]\nmod tests")
@@ -2081,11 +2104,24 @@ mod tests {
         let build_at = prod
             .find("async fn build_once(")
             .expect("`build_once` must exist");
-        let build = &prod[build_at..];
-        let sweep_at = build
+        let build_end = build_at
+            + prod[build_at..]
+                .find("\n}\n")
+                .expect("`build_once` body must close");
+        assert!(
+            !prod[build_at..build_end].contains("sweep_stale_artifacts("),
+            "`build_once` must not sweep: it holds no bucket client to re-check a \
+             marker against, so a marker whose copy was deleted would let it delete \
+             the only remaining file"
+        );
+        let fn_at = prod
+            .find("pub(crate) fn sweep_artifacts_after_verified_copies(date: &str)")
+            .expect("the sweep wrapper must exist");
+        let wrapper = &prod[fn_at..];
+        let sweep_at = wrapper
             .find("sweep_stale_artifacts(date)")
-            .expect("`build_once` must run the sweep");
-        let after = &build[sweep_at..];
+            .expect("the wrapper must run the sweep");
+        let after = &wrapper[sweep_at..];
         let held_at = after
             .find("instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER")
             .expect("the held counter must be bumped after the sweep");

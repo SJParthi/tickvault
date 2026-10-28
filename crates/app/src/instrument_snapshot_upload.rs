@@ -44,6 +44,16 @@
 //! marker matches the file's current length and mtime. No verified copy, no
 //! delete: the file stays and is counted on [`SNAPSHOT_SWEEP_HELD_COUNTER`].
 //!
+//! A marker can outlive its copy (a bucket-wide delete such as owner
+//! Quote 46). So, since the 2026-10-28 review, the sweep runs only here,
+//! after a pass that re-checked every marked file's copy with one HeadObject
+//! (the key recorded in its marker): a copy the bucket no longer holds drops
+//! the marker (`outcome="copy_gone"`) and the file is copied again in the same
+//! pass; a re-check the bucket does not answer (`outcome="recheck_failed"`)
+//! keeps the file and that pass sweeps nothing
+//! ([`SnapshotPassSummary::sweep_allowed`]). Cost: one HeadObject per marked
+//! file per pass, about 30 a day for the 7-day window.
+//!
 //! # Honest limits
 //!
 //! - The S3 object is the gzip of the file (key suffix `.gz`), not the raw
@@ -67,12 +77,20 @@
 //!   it again (identical bytes are reused, different bytes go to a sidecar).
 //! - A timed-out pass cannot stop a blocking file read already handed to the
 //!   blocking pool; that thread finishes (or stays stuck) on its own.
+//! - A pass that panics (or whose task is dropped at shutdown) frees the slot
+//!   and drops a rerun queued on it; the next request runs a pass. Every
+//!   other request is served: claiming the slot and queueing a rerun is one
+//!   atomic step, and so is ending a pass (fixed 2026-10-28, review).
+//! - The re-check proves the object is at its key with the recorded gzip
+//!   length a moment before the sweep; a delete in the bucket between the two
+//!   (seconds) is not caught. A box with no cold bucket now sweeps nothing at
+//!   all (before, the sweep ran in the build and trusted the markers alone).
 //!
 //! Cold path only: one folder listing and at most a few small files a day.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tickvault_common::error_code::ErrorCode;
@@ -104,8 +122,8 @@ const SNAPSHOT_MAX_CONSECUTIVE_TIMEOUTS: usize = 3;
 const SNAPSHOT_SKIPS_BEFORE_WARN: u32 = 2;
 
 /// Outcomes of each snapshot copy, `outcome` = `uploaded` | `reused` |
-/// `failed` | `no_bucket` | `skipped_busy` | `entry_unreadable`. Local
-/// `/metrics` only: no alarm reads it.
+/// `failed` | `no_bucket` | `skipped_busy` | `entry_unreadable` |
+/// `copy_gone` | `recheck_failed`. Local `/metrics` only: no alarm reads it.
 pub(crate) const SNAPSHOT_UPLOAD_COUNTER: &str = "tv_instrument_snapshot_upload_total";
 
 /// Old dated artifacts the sweep KEPT because no verified copy is recorded.
@@ -118,94 +136,186 @@ const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_NO_BUCKET: &str = "no_bucket";
 const OUTCOME_SKIPPED_BUSY: &str = "skipped_busy";
 const OUTCOME_ENTRY_UNREADABLE: &str = "entry_unreadable";
+/// A file's marker named a copy the bucket no longer holds (for example
+/// after a bucket-wide delete): the marker is dropped and the file copied
+/// again.
+const OUTCOME_COPY_GONE: &str = "copy_gone";
+/// The re-check of a marked file's copy could not reach the bucket: the
+/// file is kept and this pass sweeps nothing.
+const OUTCOME_RECHECK_FAILED: &str = "recheck_failed";
 
 /// Every `outcome` label, seeded at 0 at rider start.
-const ALL_OUTCOMES: [&str; 6] = [
+const ALL_OUTCOMES: [&str; 8] = [
     OUTCOME_UPLOADED,
     OUTCOME_REUSED,
     OUTCOME_FAILED,
     OUTCOME_NO_BUCKET,
     OUTCOME_SKIPPED_BUSY,
     OUTCOME_ENTRY_UNREADABLE,
+    OUTCOME_COPY_GONE,
+    OUTCOME_RECHECK_FAILED,
 ];
 
+/// No pass is running.
+const GATE_IDLE: u8 = 0;
+/// A pass holds the slot and no request arrived during it.
+const GATE_RUNNING: u8 = 1;
+/// A pass holds the slot and at least one request arrived during it: the
+/// pass runs once more when it ends.
+const GATE_RUNNING_RERUN: u8 = 2;
+
 /// One pass at a time, and a request that arrives during a pass is not lost.
+///
+/// The whole gate is ONE atomic state (`GATE_*`), so "is a pass running?"
+/// and "queue a rerun" are a single compare-and-swap for a request, and
+/// "was a rerun queued? then keep the slot, else free it" is a single
+/// compare-and-swap for the pass that ends. Before 2026-10-28 these were two
+/// flags: a request could find the slot taken, the pass could then end and
+/// read no rerun, and only then would the request set its flag, so no pass
+/// ran for it until the next day's request
+/// (`test_request_pass_never_drops_a_request_racing_the_end_of_a_pass`).
+/// Lock-free, no allocation; cold path (a few requests a day).
 struct PassGate {
-    /// A pass holds the slot.
-    running: AtomicBool,
-    /// A request arrived while a pass ran: run once more when it ends.
-    rerun: AtomicBool,
+    /// `GATE_IDLE`, `GATE_RUNNING` or `GATE_RUNNING_RERUN`.
+    state: AtomicU8,
     /// Requests in a row that found the slot taken.
     consecutive_skips: AtomicU32,
+}
+
+/// What a request got from [`PassGate::request_pass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassRequest {
+    /// The slot was free and is now held by the caller, who must run a pass.
+    Claimed,
+    /// A pass holds the slot; it runs once more when it ends. Carries how
+    /// many requests in a row found the slot taken.
+    Queued(u32),
 }
 
 impl PassGate {
     const fn new() -> Self {
         Self {
-            running: AtomicBool::new(false),
-            rerun: AtomicBool::new(false),
+            state: AtomicU8::new(GATE_IDLE),
             consecutive_skips: AtomicU32::new(0),
         }
     }
 
-    /// Claims the slot. `false` when a pass already holds it.
-    fn try_begin(&self) -> bool {
-        let claimed = self
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if claimed {
-            self.consecutive_skips.store(0, Ordering::Release);
+    /// Claims the slot, or queues a rerun on the pass holding it, in one
+    /// atomic step: a request is never lost between the two.
+    fn request_pass(&self) -> PassRequest {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let next = if current == GATE_IDLE {
+                GATE_RUNNING
+            } else {
+                GATE_RUNNING_RERUN
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) if current == GATE_IDLE => {
+                    self.consecutive_skips.store(0, Ordering::Release);
+                    return PassRequest::Claimed;
+                }
+                Ok(_) => {
+                    let skips = self
+                        .consecutive_skips
+                        .fetch_add(1, Ordering::AcqRel)
+                        .saturating_add(1);
+                    return PassRequest::Queued(skips);
+                }
+                Err(actual) => current = actual,
+            }
         }
-        claimed
     }
 
-    /// Records a request that found the slot taken: the running pass will
-    /// run once more. Returns how many requests in a row were skipped.
-    fn note_skipped(&self) -> u32 {
-        self.rerun.store(true, Ordering::Release);
-        self.consecutive_skips
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1)
+    /// Ends the pass holding the slot. `true` when a request arrived during
+    /// it: the slot stays held and the caller runs once more. `false` frees
+    /// the slot. One atomic step, so a request racing this either was queued
+    /// before it (and is run) or finds the slot free (and claims it).
+    fn finish_pass(&self) -> bool {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let (next, again) = if current == GATE_RUNNING_RERUN {
+                (GATE_RUNNING, true)
+            } else {
+                (GATE_IDLE, false)
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if again {
+                        self.consecutive_skips.store(0, Ordering::Release);
+                    }
+                    return again;
+                }
+                Err(actual) => current = actual,
+            }
+        }
     }
 
-    /// Takes the "run once more" request, if any.
-    fn take_rerun(&self) -> bool {
-        self.rerun.swap(false, Ordering::AcqRel)
+    /// Frees the slot unconditionally (a pass that panicked or whose task
+    /// was dropped). A rerun queued on that pass is dropped with it; the
+    /// next request claims the free slot.
+    fn release(&self) {
+        self.state.store(GATE_IDLE, Ordering::Release);
     }
 
-    fn end(&self) {
-        self.running.store(false, Ordering::Release);
+    /// Whether a pass holds the slot (tests only).
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.state.load(Ordering::Acquire) != GATE_IDLE
     }
 }
 
 static SNAPSHOT_PASS_GATE: PassGate = PassGate::new();
 
-/// Releases the slot when a pass ends, however it ends (a panic included).
-struct PassSlot<'gate>(&'gate PassGate);
+/// Holds the slot for one pass. Frees it if the pass ends without
+/// [`PassSlot::finish`] (a panic, or the task dropped at shutdown).
+struct PassSlot<'gate> {
+    gate: &'gate PassGate,
+    armed: bool,
+}
+
+impl<'gate> PassSlot<'gate> {
+    fn new(gate: &'gate PassGate) -> Self {
+        Self { gate, armed: true }
+    }
+
+    /// Ends the pass normally; see [`PassGate::finish_pass`].
+    fn finish(mut self) -> bool {
+        self.armed = false;
+        self.gate.finish_pass()
+    }
+}
 
 impl Drop for PassSlot<'_> {
     fn drop(&mut self) {
-        self.0.end();
+        if self.armed {
+            self.gate.release();
+        }
     }
 }
 
 /// Runs `one_pass` with the slot already claimed by the caller, then once
-/// more for every request that arrived meanwhile. The slot is released
-/// BEFORE the rerun flag is read, so a request racing the end of a pass
-/// either finds the slot free (and starts its own pass) or sets the flag
-/// this loop reads; it is never dropped.
+/// more for every request that arrived meanwhile (several requests during
+/// one pass are one rerun: the rerun lists the folder after all of them).
 async fn drive_snapshot_passes<F, Fut>(gate: &PassGate, mut one_pass: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = ()>,
 {
     loop {
-        {
-            let _slot = PassSlot(gate);
-            one_pass().await;
-        }
-        if !gate.take_rerun() || !gate.try_begin() {
+        let slot = PassSlot::new(gate);
+        one_pass().await;
+        if !slot.finish() {
             return;
         }
     }
@@ -232,10 +342,19 @@ pub(crate) fn instrument_snapshot_key(date: &str, file_name: &str) -> String {
 /// What one pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SnapshotPassSummary {
+    /// The folder was listed (a failed listing sweeps nothing).
+    pub listed: bool,
     /// Dated `.json` artifacts found in the folder.
     pub candidates: usize,
-    /// Already carrying a marker that matches the file: no network call.
+    /// Already carrying a marker that matches the file, and the copy the
+    /// marker names is still in the bucket (one HeadObject, no upload).
     pub already_copied: usize,
+    /// Marked files whose copy the bucket no longer holds (a bucket-wide
+    /// delete): the marker is dropped and the file is copied again this pass.
+    pub copy_gone: usize,
+    /// Marked files whose copy could not be re-checked (the bucket did not
+    /// answer): kept, and this pass sweeps nothing.
+    pub unconfirmed: usize,
     /// Copied and verified this pass (canonical or sidecar key).
     pub uploaded: usize,
     /// Of `uploaded`, how many went to a content-addressed sidecar key.
@@ -250,6 +369,71 @@ pub(crate) struct SnapshotPassSummary {
     /// Files not tried because the pass stopped after
     /// [`SNAPSHOT_MAX_CONSECUTIVE_TIMEOUTS`] S3 time-outs in a row.
     pub not_attempted: usize,
+}
+
+impl SnapshotPassSummary {
+    /// Whether the retention sweep may run after this pass: the folder was
+    /// listed, every file was looked at, and every marker the sweep could
+    /// rely on was re-checked against the bucket. Otherwise a marker left
+    /// from a copy someone deleted could let the sweep delete the only
+    /// remaining file.
+    #[must_use]
+    pub(crate) fn sweep_allowed(&self) -> bool {
+        self.listed && self.not_attempted == 0 && self.unconfirmed == 0
+    }
+}
+
+/// What the bucket says about the copy a marked file's marker names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyRecheck {
+    /// The object is there with the recorded gzip length.
+    Present,
+    /// Nothing at the key, or a different object: the copy is gone.
+    Gone,
+    /// The marker vanished since the listing: treat the file as unmarked.
+    NoMarker,
+    /// The bucket did not answer (error or time-out); `timed_out` feeds the
+    /// pass's run of time-outs.
+    Unconfirmed { reason: String, timed_out: bool },
+}
+
+/// Re-checks, with one HeadObject under the store's call budget, that the
+/// copy recorded in `path`'s marker is still in the bucket. The marker can
+/// outlive its copy (a bucket-wide delete such as owner Quote 46); a stale
+/// marker would let the sweep delete the only remaining file. Cold path.
+async fn recheck_marked_copy<S: ColdObjectStore>(store: &S, path: &Path) -> CopyRecheck {
+    let marker_path = path.to_path_buf();
+    let marker = match tokio::task::spawn_blocking(move || {
+        tickvault_storage::raw_frame_upload::read_sibling_marker(&marker_path)
+    })
+    .await
+    {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return CopyRecheck::NoMarker,
+        Err(err) => {
+            return CopyRecheck::Unconfirmed {
+                reason: format!("marker read task failed: {err}"),
+                timed_out: false,
+            };
+        }
+    };
+    if marker.bucket != store.bucket_name() {
+        // Copied to another bucket: nothing proves a copy in this one.
+        return CopyRecheck::Gone;
+    }
+    let budget = store.call_budget(marker.gzip_len);
+    match tokio::time::timeout(budget, store.head_object(&marker.key)).await {
+        Ok(Ok(Some(meta))) if meta.len == marker.gzip_len => CopyRecheck::Present,
+        Ok(Ok(_)) => CopyRecheck::Gone,
+        Ok(Err(err)) => CopyRecheck::Unconfirmed {
+            reason: format!("HeadObject {} failed: {err}", marker.key),
+            timed_out: false,
+        },
+        Err(_elapsed) => CopyRecheck::Unconfirmed {
+            reason: format!("HeadObject {} ran past {budget:?}", marker.key),
+            timed_out: true,
+        },
+    }
 }
 
 /// One dated artifact the pass looks at.
@@ -343,6 +527,7 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
             return summary;
         }
     };
+    summary.listed = true;
     if listing.unreadable > 0 {
         summary.unreadable = listing.unreadable;
         metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_ENTRY_UNREADABLE)
@@ -372,8 +557,54 @@ pub(crate) async fn run_snapshot_pass<S: ColdObjectStore>(
         }
         summary.candidates += 1;
         if candidate.already_copied {
-            summary.already_copied += 1;
-            continue;
+            match recheck_marked_copy(store, &candidate.path).await {
+                CopyRecheck::Present => {
+                    consecutive_timeouts = 0;
+                    summary.already_copied += 1;
+                    continue;
+                }
+                CopyRecheck::Gone => {
+                    consecutive_timeouts = 0;
+                    summary.copy_gone += 1;
+                    metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_COPY_GONE)
+                        .increment(1);
+                    warn!(
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        source = "instrument_snapshot_copy_gone",
+                        file = %candidate.file_name,
+                        bucket = store.bucket_name(),
+                        "instrument snapshot marker named a copy the cold bucket no longer \
+                         holds; the marker is dropped and the file is copied again (the \
+                         sweep keeps it until that copy is verified)"
+                    );
+                    let gone = candidate.path.clone();
+                    // A failed unlink leaves a marker that no longer matches
+                    // anything in the bucket; the upload below rewrites it.
+                    drop(
+                        tokio::task::spawn_blocking(move || CopyGate::Required.forget(&gone)).await,
+                    );
+                }
+                CopyRecheck::NoMarker => {}
+                CopyRecheck::Unconfirmed { reason, timed_out } => {
+                    if timed_out {
+                        consecutive_timeouts += 1;
+                    } else {
+                        consecutive_timeouts = 0;
+                    }
+                    summary.unconfirmed += 1;
+                    metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_RECHECK_FAILED)
+                        .increment(1);
+                    warn!(
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        source = "instrument_snapshot_recheck_failed",
+                        file = %candidate.file_name,
+                        reason = %reason,
+                        "instrument snapshot copy could not be re-checked; the file is \
+                         kept and this pass sweeps nothing"
+                    );
+                    continue;
+                }
+            }
         }
         let key = instrument_snapshot_key(&candidate.date, &candidate.file_name);
         match upload_file(store, &markers_dir, &candidate.path, &key).await {
@@ -473,11 +704,11 @@ pub(crate) fn register_snapshot_metrics() {
 /// the request is then counted as skipped and the running pass runs once
 /// more when it ends.
 fn claim_or_queue_pass(gate: &PassGate) -> bool {
-    if gate.try_begin() {
-        return true;
-    }
+    let skips = match gate.request_pass() {
+        PassRequest::Claimed => return true,
+        PassRequest::Queued(skips) => skips,
+    };
     metrics::counter!(SNAPSHOT_UPLOAD_COUNTER, "outcome" => OUTCOME_SKIPPED_BUSY).increment(1);
-    let skips = gate.note_skipped();
     if skips >= SNAPSHOT_SKIPS_BEFORE_WARN {
         warn!(
             code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
@@ -492,8 +723,10 @@ fn claim_or_queue_pass(gate: &PassGate) -> bool {
     false
 }
 
-/// One request's work: resolve the bucket, then one bounded pass.
-async fn one_snapshot_request(bucket: &str) {
+/// One request's work: resolve the bucket, one bounded pass, then (only when
+/// that pass re-checked every marked copy against the bucket) the retention
+/// sweep for `today_ist`.
+async fn one_snapshot_request(bucket: &str, today_ist: &str) {
     let limit = Duration::from_secs(SNAPSHOT_PASS_TIMEOUT_SECS);
     let loaded =
         tokio::time::timeout(limit, tickvault_storage::s3_cold::S3Cold::load(bucket)).await;
@@ -522,37 +755,75 @@ async fn one_snapshot_request(bucket: &str) {
         }
     };
     let dir = Path::new(crate::dhan_universe::MAPPING_DIR);
-    if let Some(summary) = run_bounded_snapshot_pass(&store, dir, limit).await {
-        info!(
-            bucket = store.bucket(),
-            candidates = summary.candidates,
-            already_copied = summary.already_copied,
-            uploaded = summary.uploaded,
-            sidecar = summary.sidecar,
-            reused = summary.reused,
-            failed = summary.failed,
-            unreadable = summary.unreadable,
-            not_attempted = summary.not_attempted,
-            "instrument snapshot pass finished"
-        );
+    let Some(summary) = run_bounded_snapshot_pass(&store, dir, limit).await else {
+        return;
+    };
+    info!(
+        bucket = store.bucket(),
+        candidates = summary.candidates,
+        already_copied = summary.already_copied,
+        copy_gone = summary.copy_gone,
+        unconfirmed = summary.unconfirmed,
+        uploaded = summary.uploaded,
+        sidecar = summary.sidecar,
+        reused = summary.reused,
+        failed = summary.failed,
+        unreadable = summary.unreadable,
+        not_attempted = summary.not_attempted,
+        "instrument snapshot pass finished"
+    );
+    sweep_after_rechecked_pass(
+        &summary,
+        today_ist,
+        crate::dhan_universe::sweep_artifacts_after_verified_copies,
+    );
+}
+
+/// Runs `sweep` for `today_ist` only when `summary` says the pass re-checked
+/// every marked copy against the bucket ([`SnapshotPassSummary::sweep_allowed`]);
+/// otherwise logs why it was skipped. Returns whether it ran. O(1).
+fn sweep_after_rechecked_pass(
+    summary: &SnapshotPassSummary,
+    today_ist: &str,
+    sweep: impl FnOnce(&str),
+) -> bool {
+    if summary.sweep_allowed() {
+        sweep(today_ist);
+        return true;
     }
+    info!(
+        unconfirmed = summary.unconfirmed,
+        not_attempted = summary.not_attempted,
+        listed = summary.listed,
+        "instrument artifact sweep skipped this pass: not every marked copy was \
+         re-checked against the cold bucket; nothing is deleted until one is"
+    );
+    false
 }
 
 /// Starts one snapshot pass over `data/instrument-cache` on its own task,
 /// copying to `bucket` (the configured cold bucket; empty means
-/// `tv-<env>-cold` from the runtime environment, as for the raw frames).
-/// Returns `None` (and starts nothing) while an earlier pass is still
-/// running; that pass then runs once more when it ends.
+/// `tv-<env>-cold` from the runtime environment, as for the raw frames),
+/// then the retention sweep for `today_ist`. Returns `None` (and starts
+/// nothing) while an earlier pass is still running; that pass then runs once
+/// more when it ends (with its own date: a rerun queued by the next day's
+/// build sweeps with the earlier date, which keeps one day more, never less).
 // TEST-EXEMPT: loads the live AWS config chain and the real cold bucket; the
 // pass it drives is tested through `run_snapshot_pass` /
 // `run_bounded_snapshot_pass` with an in-memory store, the slot and rerun
 // through `claim_or_queue_pass` / `drive_snapshot_passes` on a test gate.
-pub(crate) fn spawn_snapshot_upload(bucket: String) -> Option<tokio::task::JoinHandle<()>> {
+pub(crate) fn spawn_snapshot_upload(
+    bucket: String,
+    today_ist: String,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !claim_or_queue_pass(&SNAPSHOT_PASS_GATE) {
         return None;
     }
     Some(tokio::spawn(async move {
-        drive_snapshot_passes(&SNAPSHOT_PASS_GATE, || one_snapshot_request(&bucket)).await;
+        drive_snapshot_passes(&SNAPSHOT_PASS_GATE, || {
+            one_snapshot_request(&bucket, &today_ist)
+        })
+        .await;
     }))
 }
 #[cfg(test)]
@@ -565,13 +836,15 @@ mod tests {
     use tickvault_storage::s3_cold::S3ObjectMeta;
 
     /// In-memory bucket: key -> (length, base64 SHA-256). Counts calls so a
-    /// test can prove a marked file costs no network call.
+    /// test can prove a marked file costs one HeadObject and no upload.
     #[derive(Default)]
     struct FakeBucket {
         objects: Mutex<HashMap<String, (u64, String)>>,
         puts: AtomicUsize,
         heads: AtomicUsize,
         fail_puts: bool,
+        /// Every HeadObject returns an error (the bucket did not answer).
+        fail_heads: bool,
         /// Every HeadObject waits forever (a hung connection).
         hang: bool,
         /// Per-file S3 budget override (the production budget otherwise).
@@ -594,6 +867,9 @@ mod tests {
             self.heads.fetch_add(1, Ordering::SeqCst);
             if self.hang {
                 std::future::pending::<()>().await;
+            }
+            if self.fail_heads {
+                anyhow::bail!("injected HeadObject failure");
             }
             let objects = self
                 .objects
@@ -722,14 +998,19 @@ mod tests {
             assert!(CopyGate::Required.allows_delete(&path, &meta), "{name}");
         }
 
-        // Second pass: idempotent, and a marked file costs no network call.
+        assert!(first.sweep_allowed(), "{first:?}");
+
+        // Second pass: idempotent; a marked file costs one HeadObject (the
+        // re-check that its copy is still there) and no upload.
         let puts = bucket.puts.load(Ordering::SeqCst);
         let heads = bucket.heads.load(Ordering::SeqCst);
         let second = run_snapshot_pass(&bucket, &dir).await;
         assert_eq!(second.already_copied, 2, "{second:?}");
         assert_eq!(second.uploaded + second.reused + second.failed, 0);
+        assert_eq!(second.copy_gone + second.unconfirmed, 0);
+        assert!(second.sweep_allowed(), "{second:?}");
         assert_eq!(bucket.puts.load(Ordering::SeqCst), puts);
-        assert_eq!(bucket.heads.load(Ordering::SeqCst), heads);
+        assert_eq!(bucket.heads.load(Ordering::SeqCst), heads + 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -783,7 +1064,17 @@ mod tests {
         let dir = std::env::temp_dir().join("tv_instrument_snapshot_never_created_folder");
         let bucket = FakeBucket::default();
         let summary = run_snapshot_pass(&bucket, &dir).await;
-        assert_eq!(summary, SnapshotPassSummary::default());
+        assert_eq!(
+            summary,
+            SnapshotPassSummary {
+                listed: true,
+                ..SnapshotPassSummary::default()
+            }
+        );
+        assert!(
+            summary.sweep_allowed(),
+            "an empty folder holds nothing to keep"
+        );
         assert_eq!(bucket.heads.load(Ordering::SeqCst), 0);
     }
 
@@ -835,11 +1126,6 @@ mod tests {
         );
         assert!(!claim_or_queue_pass(&gate));
         assert_eq!(gate.consecutive_skips.load(Ordering::Acquire), 2);
-        assert!(
-            gate.take_rerun(),
-            "the skipped request is queued as a rerun"
-        );
-        assert!(!gate.take_rerun(), "the rerun is taken once");
         let rendered = handle.render();
         assert!(
             rendered.contains(&format!(
@@ -847,40 +1133,134 @@ mod tests {
             )),
             "{rendered}"
         );
-        gate.end();
         assert!(
-            claim_or_queue_pass(&gate),
-            "the slot is free once the pass ends"
+            gate.finish_pass(),
+            "the skipped requests are queued as one rerun"
         );
         assert_eq!(
             gate.consecutive_skips.load(Ordering::Acquire),
             0,
-            "a started pass resets the skip run"
+            "a rerun resets the skip run"
         );
-        gate.end();
+        assert!(!gate.finish_pass(), "the rerun is taken once");
+        assert!(!gate.is_running());
+        assert!(
+            claim_or_queue_pass(&gate),
+            "the slot is free once the pass ends"
+        );
+        assert!(!gate.finish_pass());
+    }
+
+    #[test]
+    fn test_request_pass_never_drops_a_request_racing_the_end_of_a_pass() {
+        // Regression 2026-10-28 (review): with two flags, a request could
+        // find the slot taken, the pass then ended reading no rerun, and the
+        // request set its rerun flag afterwards: no pass ran for it. Every
+        // order of the two one-step operations now ends with a pass for it.
+        // Request first, then the end: the end sees the rerun.
+        let gate = PassGate::new();
+        assert_eq!(gate.request_pass(), PassRequest::Claimed);
+        assert_eq!(gate.request_pass(), PassRequest::Queued(1));
+        assert!(gate.finish_pass(), "the queued request is run");
+        assert!(gate.is_running(), "the slot stays held for the rerun");
+        assert!(!gate.finish_pass());
+        // The end first, then the request: the request claims the free slot.
+        assert_eq!(gate.request_pass(), PassRequest::Claimed);
+        assert!(!gate.finish_pass());
+        assert_eq!(gate.request_pass(), PassRequest::Claimed);
+        assert!(!gate.finish_pass());
+        assert!(!gate.is_running());
+    }
+
+    #[test]
+    fn test_finish_pass_serves_every_request_under_concurrent_load() {
+        // Threads request passes while drivers run and end them. A request
+        // is served when a pass STARTS after it. The invariant: once all
+        // threads stop, the last pass started after the last request.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        for _round in 0..50 {
+            let gate = Arc::new(PassGate::new());
+            let requested = Arc::new(AtomicU64::new(0));
+            let served = Arc::new(AtomicU64::new(0));
+            let mut threads = Vec::new();
+            for _ in 0..4 {
+                let gate = Arc::clone(&gate);
+                let requested = Arc::clone(&requested);
+                let served = Arc::clone(&served);
+                threads.push(std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        requested.fetch_add(1, Ordering::SeqCst);
+                        if gate.request_pass() == PassRequest::Claimed {
+                            loop {
+                                // The pass starts: it covers every request so far.
+                                let seen = requested.load(Ordering::SeqCst);
+                                served.fetch_max(seen, Ordering::SeqCst);
+                                std::thread::yield_now();
+                                if !gate.finish_pass() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert!(!gate.is_running(), "every pass ended");
+            assert_eq!(
+                served.load(Ordering::SeqCst),
+                requested.load(Ordering::SeqCst),
+                "a request was left with no pass after it"
+            );
+        }
     }
 
     #[test]
     fn test_spawn_snapshot_upload_starts_nothing_while_a_pass_runs() {
         // The only test touching the process-wide gate.
-        assert!(SNAPSHOT_PASS_GATE.try_begin(), "a free slot is claimed");
+        assert_eq!(
+            SNAPSHOT_PASS_GATE.request_pass(),
+            PassRequest::Claimed,
+            "a free slot is claimed"
+        );
         assert!(
-            spawn_snapshot_upload(String::new()).is_none(),
+            spawn_snapshot_upload(String::new(), String::new()).is_none(),
             "a request while a pass runs returns before any task is spawned"
         );
-        assert!(SNAPSHOT_PASS_GATE.take_rerun(), "and is queued as a rerun");
-        SNAPSHOT_PASS_GATE.end();
+        assert!(SNAPSHOT_PASS_GATE.finish_pass(), "and is queued as a rerun");
+        assert!(!SNAPSHOT_PASS_GATE.finish_pass());
+    }
+
+    #[test]
+    fn test_pass_slot_frees_the_gate_when_a_pass_panics() {
+        let gate = PassGate::new();
+        assert_eq!(gate.request_pass(), PassRequest::Claimed);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = PassSlot::new(&gate);
+            panic!("a pass panicked");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !gate.is_running(),
+            "a panicked pass must not wedge the slot"
+        );
+        assert_eq!(gate.request_pass(), PassRequest::Claimed);
+        assert!(!PassSlot::new(&gate).finish());
+        assert!(!gate.is_running());
     }
 
     #[tokio::test]
     async fn test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass() {
         let gate = PassGate::new();
-        assert!(gate.try_begin());
+        assert!(claim_or_queue_pass(&gate));
         let runs = AtomicUsize::new(0);
         drive_snapshot_passes(&gate, || {
             let run = runs.fetch_add(1, Ordering::SeqCst);
             if run == 0 {
-                // A request arrives while the first pass runs.
+                // Two requests arrive while the first pass runs: one rerun.
+                assert!(!claim_or_queue_pass(&gate));
                 assert!(!claim_or_queue_pass(&gate));
             }
             async {}
@@ -888,11 +1268,11 @@ mod tests {
         .await;
         assert_eq!(runs.load(Ordering::SeqCst), 2, "the queued request ran");
         assert!(
-            !gate.running.load(Ordering::Acquire),
+            !gate.is_running(),
             "the slot is released when the last pass ends"
         );
         // Without a request during the pass, exactly one pass runs.
-        assert!(gate.try_begin());
+        assert!(claim_or_queue_pass(&gate));
         let single = AtomicUsize::new(0);
         drive_snapshot_passes(&gate, || {
             single.fetch_add(1, Ordering::SeqCst);
@@ -900,7 +1280,7 @@ mod tests {
         })
         .await;
         assert_eq!(single.load(Ordering::SeqCst), 1);
-        assert!(!gate.running.load(Ordering::Acquire));
+        assert!(!gate.is_running());
     }
 
     #[tokio::test]
@@ -964,7 +1344,7 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, register_snapshot_metrics);
         let rendered = handle.render();
-        assert_eq!(ALL_OUTCOMES.len(), 6);
+        assert_eq!(ALL_OUTCOMES.len(), 8);
         for outcome in ALL_OUTCOMES {
             let line = format!("{SNAPSHOT_UPLOAD_COUNTER}{{outcome=\"{outcome}\"}} 0");
             assert!(rendered.contains(&line), "missing `{line}` in:\n{rendered}");
@@ -992,17 +1372,36 @@ mod tests {
         assert_eq!(run_snapshot_pass(&bucket, &dir).await.reused, 2);
         // failed: a third file and a bucket that refuses every put.
         std::fs::write(dir.join("dhan-contracts-2026-10-26.json"), b"{}").unwrap();
+        // (The same objects, so the two marked files re-check as present.)
         let failing = FakeBucket {
+            objects: Mutex::new(bucket.objects.lock().unwrap().clone()),
             fail_puts: true,
             ..FakeBucket::default()
         };
         assert_eq!(run_snapshot_pass(&failing, &dir).await.failed, 1);
+        // copy_gone: an empty bucket (a bucket-wide delete). The two marked
+        // files are copied again, the third for the first time.
+        let empty = FakeBucket::default();
+        let refilled = run_snapshot_pass(&empty, &dir).await;
+        assert_eq!(
+            (refilled.copy_gone, refilled.uploaded),
+            (2, 3),
+            "{refilled:?}"
+        );
+        // recheck_failed: a bucket that does not answer HeadObject.
+        let blind = FakeBucket {
+            fail_heads: true,
+            ..FakeBucket::default()
+        };
+        assert_eq!(run_snapshot_pass(&blind, &dir).await.unconfirmed, 3);
 
         let rendered = handle.render();
         for (outcome, count) in [
-            (OUTCOME_UPLOADED, 2),
+            (OUTCOME_UPLOADED, 5),
             (OUTCOME_REUSED, 2),
             (OUTCOME_FAILED, 1),
+            (OUTCOME_COPY_GONE, 2),
+            (OUTCOME_RECHECK_FAILED, 3),
         ] {
             let line = format!("{SNAPSHOT_UPLOAD_COUNTER}{{outcome=\"{outcome}\"}} {count}");
             assert!(rendered.contains(&line), "missing `{line}` in:\n{rendered}");
@@ -1036,5 +1435,171 @@ mod tests {
         let meta = std::fs::metadata(dir.join(name)).unwrap();
         assert!(CopyGate::Required.allows_delete(&dir.join(name), &meta));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_recheck_marked_copy_reports_present_gone_and_unconfirmed() {
+        let dir = scratch_dir("recheck");
+        let name = "dhan-contracts-2026-10-23.json";
+        let path = dir.join(name);
+        std::fs::write(&path, b"{\"rows\":[1]}").unwrap();
+        let bucket = FakeBucket::default();
+        assert_eq!(
+            recheck_marked_copy(&bucket, &path).await,
+            CopyRecheck::NoMarker,
+            "no marker yet"
+        );
+        assert_eq!(run_snapshot_pass(&bucket, &dir).await.uploaded, 1);
+        assert_eq!(
+            recheck_marked_copy(&bucket, &path).await,
+            CopyRecheck::Present
+        );
+        // The bucket did not answer: unconfirmed, not gone.
+        let failing = FakeBucket {
+            fail_heads: true,
+            ..FakeBucket::default()
+        };
+        assert!(matches!(
+            recheck_marked_copy(&failing, &path).await,
+            CopyRecheck::Unconfirmed {
+                timed_out: false,
+                ..
+            }
+        ));
+        // A hung bucket times out against the per-call budget.
+        let hung = FakeBucket {
+            hang: true,
+            budget: Some(std::time::Duration::from_millis(20)),
+            ..FakeBucket::default()
+        };
+        assert!(matches!(
+            recheck_marked_copy(&hung, &path).await,
+            CopyRecheck::Unconfirmed {
+                timed_out: true,
+                ..
+            }
+        ));
+        // A different object length at the key is not our copy.
+        let key = instrument_snapshot_key("2026-10-23", name);
+        bucket
+            .objects
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .and_modify(|(len, _)| *len += 1);
+        assert_eq!(recheck_marked_copy(&bucket, &path).await, CopyRecheck::Gone);
+        // Deleted from the bucket (owner Quote 46): gone.
+        bucket.objects.lock().unwrap().remove(&key);
+        assert_eq!(recheck_marked_copy(&bucket, &path).await, CopyRecheck::Gone);
+        // A marker naming another bucket proves nothing about this one.
+        let fresh = FakeBucket::default();
+        assert_eq!(run_snapshot_pass(&fresh, &dir).await.copy_gone, 1);
+        let marker_file = dir.join(UPLOADED_SUBDIR).join(name);
+        let text = std::fs::read_to_string(&marker_file).unwrap();
+        assert!(text.contains("tv-test-cold"), "{text}");
+        std::fs::write(&marker_file, text.replace("tv-test-cold", "tv-other-cold")).unwrap();
+        assert_eq!(recheck_marked_copy(&fresh, &path).await, CopyRecheck::Gone);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_snapshot_pass_recopies_a_file_whose_copy_was_deleted_from_the_bucket() {
+        // Regression 2026-10-28 (review): after a bucket-wide delete (owner
+        // Quote 46) the local marker still matched the file, so the sweep
+        // would have deleted the only remaining copy. The pass now re-checks
+        // the marker against the bucket, drops it, and copies the file again.
+        let dir = scratch_dir("gone");
+        let name = "dhan-ntm-spot-2026-10-19.json";
+        let path = dir.join(name);
+        std::fs::write(&path, b"{\"spots\":[9]}").unwrap();
+        let bucket = FakeBucket::default();
+        assert_eq!(run_snapshot_pass(&bucket, &dir).await.uploaded, 1);
+        let key = instrument_snapshot_key("2026-10-19", name);
+        bucket.objects.lock().unwrap().clear(); // the bucket-wide delete
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            CopyGate::Required.allows_delete(&path, &meta),
+            "the stale marker alone would let the sweep delete the file"
+        );
+
+        let pass = run_snapshot_pass(&bucket, &dir).await;
+        assert_eq!(pass.copy_gone, 1, "{pass:?}");
+        assert_eq!(pass.uploaded, 1, "copied again in the same pass: {pass:?}");
+        assert_eq!(pass.already_copied, 0, "{pass:?}");
+        assert!(pass.sweep_allowed(), "{pass:?}");
+        assert!(
+            bucket.objects.lock().unwrap().contains_key(&key),
+            "the copy is back in the bucket before any sweep runs"
+        );
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(CopyGate::Required.allows_delete(&path, &meta));
+
+        // A bucket that does not answer: the file is kept and no sweep runs.
+        let failing = FakeBucket {
+            fail_heads: true,
+            ..FakeBucket::default()
+        };
+        let blind = run_snapshot_pass(&failing, &dir).await;
+        assert_eq!(blind.unconfirmed, 1, "{blind:?}");
+        assert!(!blind.sweep_allowed(), "{blind:?}");
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_sweep_allowed_needs_a_listed_complete_and_rechecked_pass() {
+        let clean = SnapshotPassSummary {
+            listed: true,
+            ..SnapshotPassSummary::default()
+        };
+        assert!(clean.sweep_allowed());
+        assert!(
+            !SnapshotPassSummary::default().sweep_allowed(),
+            "not listed"
+        );
+        assert!(
+            !SnapshotPassSummary {
+                unconfirmed: 1,
+                ..clean.clone()
+            }
+            .sweep_allowed()
+        );
+        assert!(
+            !SnapshotPassSummary {
+                not_attempted: 1,
+                ..clean.clone()
+            }
+            .sweep_allowed()
+        );
+        // A failed upload of an unmarked file does not block the sweep: the
+        // sweep keeps every file with no verified copy anyway.
+        assert!(
+            SnapshotPassSummary {
+                failed: 1,
+                copy_gone: 1,
+                ..clean
+            }
+            .sweep_allowed()
+        );
+    }
+
+    #[test]
+    fn test_sweep_after_rechecked_pass_runs_only_after_a_full_recheck() {
+        let ran = std::cell::RefCell::new(Vec::new());
+        let clean = SnapshotPassSummary {
+            listed: true,
+            ..SnapshotPassSummary::default()
+        };
+        assert!(sweep_after_rechecked_pass(&clean, "2026-10-28", |d| ran
+            .borrow_mut()
+            .push(d.to_string())));
+        let blind = SnapshotPassSummary {
+            unconfirmed: 2,
+            ..clean
+        };
+        assert!(!sweep_after_rechecked_pass(&blind, "2026-10-29", |d| ran
+            .borrow_mut()
+            .push(d.to_string())));
+        assert_eq!(*ran.borrow(), ["2026-10-28"]);
     }
 }

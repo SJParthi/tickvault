@@ -4917,8 +4917,10 @@ mod tests {
     async fn test_docker_reset_forced_is_hardened_full_nuke() {
         // Regression 2026-06-05: "the nuke didn't wipe the data". The forced
         // docker-reset must (a) remove containers by VOLUME, (b) fail LOUD
-        // without recreating if the volume survives, and (c) wipe the HOST app
-        // caches the Docker nuke can't see (instrument-cache/spill/dlq).
+        // without recreating if the volume survives, and (c) wipe the HOST
+        // feed folders the Docker nuke can't see (spill/dlq). Since 2026-10-28
+        // (Quote 44 review) it keeps `instrument-cache`: its dated snapshot
+        // files may not have a verified cold-bucket copy yet.
         let shell = MockShell {
             ssm_result: Ok("cmd-123".to_string()),
             ..MockShell::default()
@@ -4930,8 +4932,9 @@ mod tests {
         assert!(joined.contains("--filter volume=tv-questdb-data"));
         // (b) hard fail-loud gate — must NOT recreate if the volume survives
         assert!(joined.contains("DOCKER-RESET-FAILED"));
-        // (c) host caches wiped too (the dirs the Docker nuke cannot see)
-        assert!(joined.contains("/opt/tickvault/data/instrument-cache"));
+        // (c) host feed folders wiped too (the dirs the Docker nuke cannot
+        // see); the instrument snapshot folder is kept.
+        assert!(!joined.contains("instrument-cache"));
         assert!(joined.contains("/opt/tickvault/data/spill"));
         assert!(joined.contains("/opt/tickvault/data/dlq"));
         // (d) the FULL-NUKE sequence: stop app → compose down -v → prune →
@@ -4941,6 +4944,33 @@ mod tests {
         assert!(joined.contains("docker system prune -af --volumes"));
         assert!(joined.contains("tickvault-host ensure-questdb"));
         assert!(joined.contains("systemctl restart tickvault"));
+    }
+
+    #[test]
+    fn test_destructive_command_lists_keep_the_instrument_snapshot_folder() {
+        // Regression 2026-10-28 (Quote 44 review): wipe-questdb, docker-reset
+        // and docker-nuke-bare ran `rm -rf /opt/tickvault/data/instrument-cache`,
+        // which deleted dated instrument snapshot files (and their verified-copy
+        // markers) that might not have a cold-bucket copy yet. Quote 44 REJECTs
+        // sweeping a local artifact before its verified copy, so no destructive
+        // list may touch that folder; the feed folders are still wiped.
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let joined = cmds.join("\n");
+            assert!(
+                !joined.contains("instrument-cache"),
+                "{name} must not remove the instrument snapshot folder"
+            );
+            for kept_wipe in ["/opt/tickvault/data/spill", "/opt/tickvault/data/dlq"] {
+                assert!(
+                    joined.contains(kept_wipe),
+                    "{name} must still wipe {kept_wipe}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
