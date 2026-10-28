@@ -3293,3 +3293,13 @@ Card: "From tonight the server runs on the new 150 GB disk. The old 600 GB disk 
 - Deleting any other volume, the new 150 GB root, or any snapshot under this quote.
 - Deleting it before the rebuild postcheck is green or while the rebuild or the wipe is running.
 - Adding `ec2:DeleteVolume` to the wipe role, the instance role or any standing role.
+
+#### Quote 46b (2026-10-28, ~12:25 IST) — THE QUOTE 46 DELETE MOVES TO TONIGHT, AFTER THE WIPE (preserve EXACTLY)
+
+Owner message: "eevrythign shodu leb entirley chanbegs from tonight dud eokay?" Then the card "Tonight already changes the server, the disk, and deletes all old market data, the snapshot and the old disk. Your 'delete everything' run (SEBI/audit tables + all of S3) has no tool yet: it needs a new reviewed tool + AWS permission merged to main, and a merge tonight would start a deploy in the middle of the rebuild. When should that run happen?" The owner tapped **"Tonight, after the wipe"**: "Merge the new tool after tonight's wipe finishes (deploy then runs at night), then run it. Same night, but less review time and a late-night deploy."
+
+This SUPERSEDES only the "When" row of Quote 46 ("only after the rebuilt server has run one healthy session"): the one Quote 46 run may now start once the Quote 35/42 wipe apply has finished and been verified on 2026-10-28 night, never while the rebuild or the wipe is running, never 08:00–16:30 IST on a trading day, app stopped. Every other Quote 46 row and REJECT stands. The tool's PR may merge only after the wipe is verified (merging earlier starts a deploy during the rebuild).
+
+##### What violates Quote 46b (REJECT)
+- Merging the tool's PR, or running the tool, before the wipe apply has finished and been verified, or while the rebuild or wipe workflow is queued or running.
+- Running it 08:00–16:30 IST on a trading day.
