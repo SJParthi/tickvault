@@ -2587,7 +2587,10 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
         // November: the same configured $185 is clamped to the standing $75.
-        assert_eq!(effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11), 75.0);
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
+            75.0
+        );
     }
 
     #[tokio::test]
