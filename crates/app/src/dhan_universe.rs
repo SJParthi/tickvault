@@ -2132,7 +2132,10 @@ mod tests {
             .expect("`build_once` must exist");
         let build_end = build_at
             + prod[build_at..]
-                .find("\n}\n")
+                // The escape is a closing brace, written escaped so the braces on
+                // this line stay balanced for the banned-pattern scanner's
+                // test-module tracking.
+                .find("\n\u{7d}\n")
                 .expect("`build_once` body must close");
         assert!(
             !prod[build_at..build_end].contains("sweep_stale_artifacts("),
