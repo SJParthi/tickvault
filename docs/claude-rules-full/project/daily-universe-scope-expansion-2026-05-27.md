@@ -3303,3 +3303,19 @@ This SUPERSEDES only the "When" row of Quote 46 ("only after the rebuilt server 
 ##### What violates Quote 46b (REJECT)
 - Merging the tool's PR, or running the tool, before the wipe apply has finished and been verified, or while the rebuild or wipe workflow is queued or running.
 - Running it 08:00–16:30 IST on a trading day.
+
+#### Quote 46c (2026-10-28, ~12:45 IST) — THE QUOTE 46 DELETE RUNS DIRECTLY FROM THE SESSION, NO NEW TOOL (preserve EXACTLY)
+
+Owner message: "nope bro yo uagve all teh acecss to aws dude first chekc that br oi agev all teh access to aws dude so checl evrythign clelary and do it dude oaky?"
+
+Checked the same minute with the session's credentials (`claude-code-agent`): `s3:ListBucketVersions`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on `tv-prod-cold` ALLOWED (a probe delete marker on `tmp/claude-permission-probe-2026-10-28` was created and then removed by version id; 0 versions left under `tmp/`); `ec2:StartInstances` / `StopInstances` ALLOWED (dry run); `ssm:SendCommand` ALLOWED; `s3:PutObject`, `ec2:DeleteVolume`, `ec2:DeleteSnapshot`, `ec2:DetachVolume`, `ec2:CreateVolume` and the IAM reads DENIED.
+
+This SUPERSEDES only the "How" row of Quote 46 (the Quote 29e/35 tool-and-role shape): the one Quote 46 run is done directly from this session with those credentials, no new role, workflow or code:
+1. Box: after the Quote 35/42 wipe is verified, by SSM: the app is stopped and verified stopped; a listing of every SEBI/audit table (`rebuild_keep_tables()` plus any `*_audit` table) is taken; each is dropped with `DROP TABLE`; `/opt/tickvault/data/sebi-preserve/` is removed; a second listing proves they are gone.
+2. S3: a full listing of every object version and delete marker in `tv-prod-cold` is written as the dry report (counts and bytes per top-level prefix); every one is deleted by version id in batches of at most 1,000; a verify listing proves the bucket is empty, objects written after the start (Firehose `logs/`) reported separately.
+Every other Quote 46 / 46b row and REJECT stands (when, scope, never 08:00–16:30 IST on a trading day, never during the rebuild or wipe). The old 600 GB disk (Quote 47) still needs the owner in the console: `ec2:DeleteVolume` is denied to the session.
+
+##### What violates Quote 46c (REJECT)
+- Deleting without first writing the full listing, or without the verify listing after.
+- Touching any bucket other than `tv-prod-cold`, any EBS volume or snapshot, versioning, lifecycle or bucket policy under this quote.
+- Running any step before the wipe is verified, during the rebuild or wipe, or 08:00–16:30 IST on a trading day.
