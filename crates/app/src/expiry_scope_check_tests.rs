@@ -2033,9 +2033,8 @@ fn proptest_enforce_subscribe_expiry_scope_on_a_dirty_file_refuses_only_ambiguou
         }
         Ok(())
     });
-    if let Err(failure) = outcome {
-        panic!("{failure}");
-    }
+    let failure = outcome.err().map(|f| f.to_string());
+    assert!(failure.is_none(), "{}", failure.unwrap_or_default());
     assert!(
         cases_with_a_refusal.get() > 0,
         "no case refused a pick: the refusal assertions were never exercised"
@@ -2357,10 +2356,9 @@ fn test_spawn_expiry_scope_check_loop_body_matches_the_simulated_steps() {
     ];
     let mut at = 0;
     for step in steps {
-        let found = body[at..]
-            .find(step)
-            .unwrap_or_else(|| panic!("loop step missing or out of order: {step}"));
-        at += found + step.len();
+        let found = body[at..].find(step);
+        assert!(found.is_some(), "loop step missing or out of order: {step}");
+        at += found.unwrap_or_default() + step.len();
     }
     // The run sits inside the trading-day block: the block closes after the
     // run and before the after-run clock read.

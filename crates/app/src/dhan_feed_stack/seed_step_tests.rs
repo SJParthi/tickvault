@@ -45,12 +45,11 @@ fn ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
 /// Folds one IDX_I ticker tick for `security_id` received at `recv_millis`.
 fn tick(ingest: &mut LiveIngest, security_id: u32, ltt: u32, recv_millis: u64, seq: u64) {
     let packet = ticker_packet(security_id, 100.0, ltt);
-    let ParsedFrame::Tick(t) =
-        dispatch_frame(&packet, i64::from(ltt) * 1_000_000_000).expect("parse")
-    else {
-        panic!("expected a tick");
-    };
-    let _ = ingest.ingest_tick(&t, seq, recv_millis);
+    let parsed = dispatch_frame(&packet, i64::from(ltt) * 1_000_000_000).expect("parse");
+    assert!(matches!(parsed, ParsedFrame::Tick(_)), "expected a tick");
+    if let ParsedFrame::Tick(t) = parsed {
+        let _ = ingest.ingest_tick(&t, seq, recv_millis);
+    }
 }
 
 /// The detector's report for one key at `now`.

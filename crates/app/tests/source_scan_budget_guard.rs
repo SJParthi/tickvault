@@ -67,6 +67,12 @@ const BUDGET: &[(&str, usize)] = &[
     // cannot be staged in a unit test). Paired behaviour test:
     // `test_regression_reserved_connections_gauge_follows_the_widen`.
     ("dhan_feed_stack/reserved_connections_tests.rs", 1),
+    // 2026-10-28 (DT-small seed queue): 1 wiring scan, the drain's idle arm is
+    // gated on `idle_work_pending()` alone, never the seed latch (the select!
+    // arm guard cannot be driven from a unit test). Paired behaviour half in
+    // the same test, `test_idle_arm_keeps_seeding_queued_batches_after_the_seed_channel_closes`:
+    // idle steps alone seed every queued batch after the sender is dropped.
+    ("dhan_feed_stack/seed_step_tests.rs", 1),
     ("dhan_live_crossverify.rs", 7),
     ("dhan_live_crossverify_boot.rs", 8),
     ("dhan_live_universe.rs", 18),
@@ -89,10 +95,23 @@ const BUDGET: &[(&str, usize)] = &[
     // tests: `test_check_selected_expiries_refuses_off_expiry_expired_unknown_and_the_stub`,
     // `test_classify_candle_contracts_all_current_is_clean`,
     // `test_record_subscribe_expiry_scope_and_subscribe_refused_for_day`.
-    ("expiry_scope_check_tests.rs", 5),
+    // 5 -> 7 (2026-10-28, expiry check review): +1 the attach feeds every
+    // per-id table from `preferred_option_rows` (the attach needs the network);
+    // paired behaviour tests `test_preferred_option_rows_keeps_one_row_per_key_as_by_key_does`,
+    // `test_preferred_option_rows_maps_a_reused_id_to_the_admissible_underlying`.
+    // +1 the real 15:50 loop keeps the simulated loop's step order (the loop
+    // sleeps until 15:50 and cannot run in a test); paired behaviour test
+    // `test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_trading_day_once`.
+    ("expiry_scope_check_tests.rs", 7),
     ("feed_scoreboard_boot.rs", 2),
     ("index_constituency_boot.rs", 1),
     ("infra.rs", 3),
+    // 2026-10-28 (Quote 44 review, finding 3): 1 doc scan, the module header
+    // must name the real proof-to-sweep bound (`SNAPSHOT_PASS_TIMEOUT_SECS`,
+    // 1,800 s), not "seconds". Paired behaviour half in the same test,
+    // `test_run_bounded_snapshot_pass_bounds_the_gap_between_proof_and_sweep`:
+    // a pass past the bound returns no summary and sweeps nothing.
+    ("instrument_snapshot_upload.rs", 1),
     ("log_coalescer.rs", 1),
     ("main.rs", 3),
     ("observability.rs", 3),

@@ -940,13 +940,15 @@ pub fn record_subscribe_expiry_scope(report: &SubscribeScopeReport, today_ymd: u
         SUBSCRIBE_SCOPE_REFUSED.fetch_max(refused, Ordering::AcqRel);
     }
     metrics::gauge!(SUBSCRIBE_CHECKED_GAUGE).set(report.checked as f64);
-    metrics::counter!(SUBSCRIBE_REFUSED_COUNTER).increment(refused);
     let fingerprint = refusal_fingerprint(report, today_ymd);
     let repeat = fingerprint != 0
         && !SUBSCRIBE_SCOPE_LOGGED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .first_time(today_ymd, fingerprint);
+    // Counted here, beside the coded `error!` below that reports a new
+    // refused set (the loss-counter visibility guard reads that pairing).
+    metrics::counter!(SUBSCRIBE_REFUSED_COUNTER).increment(refused);
     if repeat {
         debug!(
             refused,
