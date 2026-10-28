@@ -1092,6 +1092,29 @@ Approved by: owner 2026-10-28, "go ahead and add the daily expiry check" (a guar
     test_observe_tracked_replay_cannot_starve_the_live_universe_of_20519,
     a_wal_replay_cannot_use_up_the_silence_detector_slots_of_the_live_universe
 
+- [x] OE1 (done: `order_update.rs`, `order_update_connection.rs`, branch order-evt-hollow) (core) ORDER-EVT-02 "hollow order updates", 18 live lines.
+  Assumed cause (not Verified, no live excerpt available): the parser read the other casing
+  of only seven fields, so a frame with camelCase order keys (`orderNo`, `status`,
+  `securityId`) decoded with every identity field empty. The 2026-08-25 rows had `mkt_type`
+  filled, which the old parser read only from PascalCase, so they do not fully fit this
+  cause; ORDER-EVT-02 stays open until a captured excerpt confirms it. Fix: both casings of
+  every field and of the wrapper; null field = absent except a fill field (null or empty
+  quantity / filled quantity / price still fails loud); exact number/string coercion, ids
+  integral only; every unreadable frame (hollow, or no order number with a foreign `Type`)
+  stays ORDER-EVT-02 at ERROR with `msg_type` and is still broadcast and audited.
+  - Files: crates/core/src/parser/order_update.rs, crates/core/src/parser/mod.rs,
+    crates/core/src/websocket/order_update_connection.rs,
+    docs/error-runbooks/order-update-events-error-codes.md, CLAUDE.md (O(1) row)
+  - Tests: test_field_table_covers_every_order_update_field,
+    test_parse_order_update_all_camel_case_frame_decodes_like_pascal,
+    test_every_single_field_missing_or_null_still_parses,
+    test_traded_update_with_blank_fill_fields_fails_loud,
+    test_is_hollow_order_update_all_identity_permutations,
+    test_unreadable_order_frame_type_verdicts, test_fix_for_field_coercions,
+    prop_any_field_subset_and_casing_decodes,
+    test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts,
+    test_live_hollow_shapes_parse_or_page
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Shipping `tv_dhan_token_publish_total` / `tv_dhan_shared_token_adoption_total`
@@ -1137,6 +1160,8 @@ whole main-feed universe (5 sockets × 5,000). Only the slot ASSIGNMENT moves:
 `observe_tracked` during a replay, `observe` otherwise. Slots are therefore
 taken only by the subscribe set (boot seed + `seed_rx`) and live ticks.
 
+OE1 (ORDER-EVT-02): the order-update parse reads both casings of every `OrderUpdate` field from one table (`ORDER_UPDATE_FIELDS`) pinned to the struct's serialized keys, and of the `Data` / `Type` wrapper; a null field reads as absent, except a fill field (`FILL_CRITICAL_FIELDS`: quantity, filled quantity, remaining quantity, prices), where a null or empty value in either casing still fails the parse loudly so a TRADED update never decodes with a defaulted 0; a value in the wrong JSON type is converted only when it converts exactly, and an order or security id only from an integral number. `unreadable_order_frame_type` decides the ORDER-EVT-02 line: a hollow frame (no order number, status or security id) or a frame with no order number whose `Type` names something other than `order_alert`; it never filters, every frame is still broadcast and audited. All on the order-update read task, cold; one table walk per frame, one extra parse only for a frame with no order number.
+
 ## Edge Cases
 
 - No depth sink: `is_some_and` gives false; nothing changes.
@@ -1164,6 +1189,8 @@ PR EX: a hyphenated underlying (`BAJAJ-AUTO`, parsed from the right); a decimal 
   its seed, the same as on a boot with no backlog; a live universe above the
   ceiling is still refused and counted (fail-closed kept).
 
+OE1: a frame with both casings keeps the accepted key (as since 2026-07-14); `Type` null, a number or an object is dropped so it never costs the event; a null `TradedQty` / `tradedQty` / `AvgTradedPrice` or an empty one fails loud, a missing one is still a partial update; a value that does not convert exactly (`1.5` for a quantity, `12.5` for an order number, `"ten"`, a bool) still fails loud as `typed_parse_failed`; an oversized or unparseable frame logs an empty `msg_type` and still pages if hollow.
+
 ## Failure Modes
 
 - Extra flushes under load: at most one per 500 ms from the frame arm.
@@ -1184,6 +1211,8 @@ PR EX: the contract file is missing (partial, artifact_missing); the read fails 
 - S1: a contract that attaches after a mid-session restart reads NeverTicked
   until its first live tick (before, the replay pre-registered it); the
   K3 verdict counters no longer count replayed ticks of untracked keys.
+
+- OE1: if the camelCase cause is wrong, ORDER-EVT-02 keeps firing at the same rate, now with `msg_type` and the excerpt to write the real fix against. An undocumented frame with no order number is logged and broadcast, never dropped (the order book ignores an unknown order at debug). No frame is kept from the order book or the audit tables.
 
 ## Test Plan
 
@@ -1207,6 +1236,8 @@ S1: `cargo test -p tickvault-core --lib tick_gap_detector`, the app regression
 (replay 25,000 prior-day keys, then seed 20,519, none refused), the existing
 detector capacity tests and `dhat_live_ingest_seam`, clippy, fmt.
 
+OE1: `cargo test -p tickvault-core --lib order_update` (parser + connection), the three order-update guard tests in `crates/core/tests/`; every field missing and null one at a time (fill fields must fail), all 8 identity-field permutations, blank fill fields on a TRADED frame, a proptest over random subsets and casings, the verdict over hollow, foreign-typed and readable frames.
+
 ## Rollback
 
 Revert the PR: the frame arm loses the extra check; the timer arm's 500 ms flush
@@ -1228,6 +1259,8 @@ PR N: revert the PR. Reverting does NOT restart the lifecycle write lawfully: Qu
 PR EX: revert the commit. The table stays (nothing drops it); with the code gone nothing writes it. The candle names at the attach revert to the capped ranking table, which restores the 2026-10-28 naming gap only.
 
 S1: revert the commit; no config flag or schema change.
+
+OE1: revert the change; no schema, table, config or alarm change.
 
 ## Observability
 
@@ -1261,6 +1294,8 @@ S1: no new metric, alarm or page. The existing `tv_dhan_feed_silence_detector_re
 gauge and the edge-latched RISK-GAP-03 "ran out of slots" line read 0 / stay
 quiet once the fix is live; `tracked` in the scan lines should equal the
 subscribed count.
+
+OE1: no new counter or alarm; new `kind` labels on `tv_order_update_decode_quirks_total` (local only); ORDER-EVT-02 gains a `msg_type` field and also fires for a frame with no order number and a foreign `Type`. After a live session, check whether `tv_order_update_hollow_decode_total` stays at 0.
 
 ## Guarantee matrix
 

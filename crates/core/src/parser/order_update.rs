@@ -45,34 +45,112 @@ pub enum OrderUpdateParseError {
 /// oversized/hostile frame BEFORE the two-stage parse allocates anything.
 pub const ORDER_UPDATE_MAX_FRAME_BYTES: usize = 262_144;
 
-/// Dual-casing merge pairs: `(accepted-by-struct key, alternate-casing key)`.
+/// How the `OrderUpdate` field behind an accepted key is typed. Drives the
+/// tolerant coercion in [`fix_for_field`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    /// `String` field.
+    Text,
+    /// `i64` field.
+    Int,
+    /// `f64` field.
+    Float,
+}
+
+/// Every `OrderUpdate` field: `(key the struct accepts, other casing, type)`.
 ///
-/// The live Dhan order-update sample (2026-07-14 runner crawl of
+/// Per-pair rule (unchanged since 2026-07-14): accepted-key-wins. The live
+/// Dhan sample (2026-07-14 runner crawl of
 /// `docs/dhan-ref/10-live-order-update-websocket.md`) carries a camelCase
-/// DUPLICATE cluster ahead of the PascalCase fields — real wire frames may
-/// carry EITHER or BOTH casings. Per-pair rule: accepted-key-wins. The
-/// precise invariant (refuter-C wording, 2026-07-14): output is identical to
-/// the pre-normalizer derive ONLY for frames carrying the accepted key;
-/// alt-casing-only frames now populate values (previously silently
-/// defaulted); previously-`Err` duplicate-key frames now parse last-wins
-/// (spec-blessed JSON duplicate handling).
-const CASING_PAIRS: &[(&str, &str)] = &[
-    ("refLtp", "RefLtp"),
-    ("tickSize", "TickSize"),
-    ("Series", "series"),
-    ("GoodTillDaysDate", "goodTillDaysDate"),
-    ("AlgoId", "algoId"),
-    ("Multiplier", "multiplier"),
-    ("AlgoOrdNo", "algoOrdNo"),
+/// DUPLICATE cluster ahead of the PascalCase fields, and the reference's
+/// SDK note reads the order number as `data["orderNo"]` (camelCase), so a
+/// real wire frame may carry EITHER or BOTH casings for ANY field.
+///
+/// ORDER-EVT-02 fix (2026-10-28): this table used to cover only seven
+/// fields (`refLtp`, `tickSize`, `Series`, `GoodTillDaysDate`, `AlgoId`,
+/// `Multiplier`, `AlgoOrdNo`). A frame whose core keys arrived in camelCase
+/// (`orderNo`, `status`, `securityId`, ...) therefore decoded with every
+/// core field empty and ONLY those seven populated, which is exactly the
+/// shape of the 2026-08-25 hollow rows (`ref_ltp`, `tick_size`,
+/// `multiplier`, `good_till_days_date`, `algo_ord_no` set, identity blank).
+/// It now covers every field. `test_field_table_covers_every_order_update_field`
+/// pins it against the struct's own serialized key set, so a field added to
+/// `OrderUpdate` without a row here fails the build.
+///
+/// `refLtp` / `tickSize` are the two fields whose struct key is camelCase
+/// (explicit `#[serde(rename)]`), so their "other casing" is PascalCase.
+const ORDER_UPDATE_FIELDS: &[(&str, &str, FieldKind)] = &[
+    ("Exchange", "exchange", FieldKind::Text),
+    ("Segment", "segment", FieldKind::Text),
+    ("SecurityId", "securityId", FieldKind::Text),
+    ("ClientId", "clientId", FieldKind::Text),
+    ("OrderNo", "orderNo", FieldKind::Text),
+    ("ExchOrderNo", "exchOrderNo", FieldKind::Text),
+    ("Product", "product", FieldKind::Text),
+    ("TxnType", "txnType", FieldKind::Text),
+    ("OrderType", "orderType", FieldKind::Text),
+    ("Validity", "validity", FieldKind::Text),
+    ("Quantity", "quantity", FieldKind::Int),
+    ("TradedQty", "tradedQty", FieldKind::Int),
+    ("RemainingQuantity", "remainingQuantity", FieldKind::Int),
+    ("Price", "price", FieldKind::Float),
+    ("TriggerPrice", "triggerPrice", FieldKind::Float),
+    ("TradedPrice", "tradedPrice", FieldKind::Float),
+    ("AvgTradedPrice", "avgTradedPrice", FieldKind::Float),
+    ("Status", "status", FieldKind::Text),
+    ("Symbol", "symbol", FieldKind::Text),
+    ("DisplayName", "displayName", FieldKind::Text),
+    ("CorrelationId", "correlationId", FieldKind::Text),
+    ("Remarks", "remarks", FieldKind::Text),
+    ("ReasonDescription", "reasonDescription", FieldKind::Text),
+    ("OrderDateTime", "orderDateTime", FieldKind::Text),
+    ("ExchOrderTime", "exchOrderTime", FieldKind::Text),
+    ("LastUpdatedTime", "lastUpdatedTime", FieldKind::Text),
+    ("Instrument", "instrument", FieldKind::Text),
+    ("LotSize", "lotSize", FieldKind::Int),
+    ("StrikePrice", "strikePrice", FieldKind::Float),
+    ("ExpiryDate", "expiryDate", FieldKind::Text),
+    ("OptType", "optType", FieldKind::Text),
+    ("Isin", "isin", FieldKind::Text),
+    ("DiscQuantity", "discQuantity", FieldKind::Int),
+    ("DiscQtyRem", "discQtyRem", FieldKind::Int),
+    ("LegNo", "legNo", FieldKind::Int),
+    ("ProductName", "productName", FieldKind::Text),
+    ("refLtp", "RefLtp", FieldKind::Float),
+    ("tickSize", "TickSize", FieldKind::Float),
+    ("Source", "source", FieldKind::Text),
+    ("OffMktFlag", "offMktFlag", FieldKind::Text),
+    ("AlgoOrdNo", "algoOrdNo", FieldKind::Text),
+    ("MktType", "mktType", FieldKind::Text),
+    ("Series", "series", FieldKind::Text),
+    ("GoodTillDaysDate", "goodTillDaysDate", FieldKind::Text),
+    ("AlgoId", "algoId", FieldKind::Text),
+    ("Multiplier", "multiplier", FieldKind::Int),
 ];
 
 /// The docs' "likely twin" of `Instrument` — Assumed (no parameter-table row
 /// upstream), fallback-only, never overrides a present `Instrument`.
 const ASSUMED_TWIN_PAIR: (&str, &str) = ("Instrument", "instrumentType");
 
-/// Quirk counter name — 5 static `kind` label values:
+/// Wrapper keys: `(accepted, other casing)`. The typed parse needs `Data`
+/// and reads `Type`; a lowercase wrapper is moved onto them when the
+/// accepted key is absent (accepted-key-wins, as for the fields).
+const WRAPPER_CASING_PAIRS: &[(&str, &str)] = &[("Data", "data"), ("Type", "type")];
+
+/// The documented message type of an order event (`"Type": "order_alert"`).
+const ORDER_ALERT_MESSAGE_TYPE: &str = "order_alert";
+
+/// Longest message-type string [`unreadable_order_frame_type`] keeps for a
+/// log line. A vendor tag is a short word; the bound only stops a garbage
+/// frame from putting an arbitrarily long string into a log field.
+const MESSAGE_TYPE_LOG_MAX_CHARS: usize = 64;
+
+/// Quirk counter name — static `kind` label values:
 /// `casing_fallback`, `casing_conflict`, `numeric_algo_ord_no`,
-/// `assumed_twin`, `null_alt_dropped`.
+/// `assumed_twin`, `null_alt_dropped`, and since 2026-10-28
+/// `wrapper_casing`, `type_not_string`, `null_field_dropped`,
+/// `numeric_text_coerced`, `numeric_string_coerced`,
+/// `integral_float_coerced`, `empty_number_dropped`.
 const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 
 /// Parses a JSON order update message from the Dhan order update WebSocket.
@@ -81,8 +159,9 @@ const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 ///
 /// Two-stage parse: the frame is first read into a `serde_json::Value`
 /// (literal same-key duplicates collapse last-wins at this stage), the
-/// `"Data"` object is normalized for the known dual-casing drift pairs and
-/// the numeric `AlgoOrdNo` typing quirk, then deserialized into the derived
+/// frame is normalized (both casings of every field and of the wrapper, null
+/// fields as absent, exact number/string coercion; see
+/// `normalize_order_update_frame`), then deserialized into the derived
 /// `OrderUpdateMessage` struct. Structural errors (malformed JSON,
 /// missing/null/non-object `Data`) keep failing exactly as before.
 ///
@@ -101,25 +180,71 @@ pub fn parse_order_update(json_str: &str) -> Result<OrderUpdate, OrderUpdatePars
         });
     }
     let mut value: serde_json::Value = serde_json::from_str(json_str)?;
-    normalize_order_update_data(&mut value);
+    normalize_order_update_frame(&mut value);
     let message: OrderUpdateMessage = serde_json::from_value(value)?;
     Ok(message.data)
 }
 
-/// Normalizes the `"Data"` object of a raw order-update frame in place.
+/// Normalizes a raw order-update frame in place before the typed parse.
 ///
-/// Operates ONLY on the `"Data"` member if it is present AND an object —
-/// absent/null/non-object `Data` is left untouched so the wrapper's
-/// missing-`Data` / `Data: null` error contract is preserved unchanged.
-fn normalize_order_update_data(value: &mut serde_json::Value) {
-    let Some(data) = value
+/// Wrapper: a lowercase `data` / `type` is moved onto `Data` / `Type` when
+/// the accepted key is absent; a `Type` that is null or not a string is
+/// dropped (the struct defaults it), because the tag is metadata and a bad
+/// tag must never cost the order event its decode.
+///
+/// `Data`: operates ONLY when `Data` is present AND an object, so the
+/// missing-`Data` / `Data: null` / non-object `Data` error contract is
+/// preserved unchanged. For every field in [`ORDER_UPDATE_FIELDS`] it merges
+/// the two casings (accepted-key-wins), then applies [`fix_for_field`]:
+/// a null field is dropped (the struct default applies, as for an absent
+/// one), and a number or string in the wrong JSON type is coerced when the
+/// value converts exactly; anything else is left so the typed parse fails
+/// loud (ORDER-EVT-02 `typed_parse_failed`) and the WAL keeps the frame.
+///
+/// # Complexity
+/// O(`ORDER_UPDATE_FIELDS`) = 46 map probes per frame, a fixed constant,
+/// on the order-update read task (orders are sparse: 1 to 100 a day). Not
+/// on the market-data hot path.
+fn normalize_order_update_frame(value: &mut serde_json::Value) {
+    let Some(top) = value.as_object_mut() else {
+        return;
+    };
+    for &(accepted, alt) in WRAPPER_CASING_PAIRS {
+        if !top.contains_key(accepted)
+            && let Some(moved) = top.remove(alt)
+        {
+            // O(1) EXEMPT: begin — cold-path key rename on the order-update frame
+            top.insert(accepted.to_string(), moved);
+            // O(1) EXEMPT: end
+            metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => "wrapper_casing").increment(1);
+        }
+    }
+    if top.get("Type").is_some_and(|tag| !tag.is_string()) {
+        top.remove("Type");
+        metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => "type_not_string").increment(1);
+    }
+    let Some(data) = top
         .get_mut("Data")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return;
     };
-    for &(accepted, alt) in CASING_PAIRS {
+    for &(accepted, alt, kind) in ORDER_UPDATE_FIELDS {
+        // A blank fill field in the OTHER casing, with no accepted key, is
+        // moved onto the accepted key so the typed parse refuses it loudly
+        // (see `FILL_CRITICAL_FIELDS`); the generic merge would drop a null
+        // alt and let the field default to 0.
+        if FILL_CRITICAL_FIELDS.contains(&accepted)
+            && !data.contains_key(accepted)
+            && data.get(alt).is_some_and(is_blank_value)
+            && let Some(moved) = data.remove(alt)
+        {
+            // O(1) EXEMPT: begin — cold-path key rename on the order-update frame
+            data.insert(accepted.to_string(), moved);
+            // O(1) EXEMPT: end
+        }
         merge_casing_pair(data, accepted, alt, "casing_fallback");
+        apply_field_fix(data, accepted, kind);
     }
     merge_casing_pair(
         data,
@@ -127,7 +252,7 @@ fn normalize_order_update_data(value: &mut serde_json::Value) {
         ASSUMED_TWIN_PAIR.1,
         "assumed_twin",
     );
-    coerce_numeric_algo_ord_no(data);
+    apply_field_fix(data, ASSUMED_TWIN_PAIR.0, FieldKind::Text);
 }
 
 /// Applies the accepted-key-wins rule for one casing pair, treating JSON
@@ -197,31 +322,172 @@ fn json_values_equivalent(a: &serde_json::Value, b: &serde_json::Value) -> bool 
     false
 }
 
-/// Coerces a JSON Number `AlgoOrdNo` (the live doc table types it `float`)
-/// into its string rendering so the `String`-typed struct field accepts it.
-///
-/// Integral values render without a `.0` suffix; other numbers use the f64
-/// `Display` rendering. String/null values are untouched (null hits
-/// `#[serde(default)]` as today); object/array values are left in place so
-/// the typed parse error stays loud and the WAL retains the frame.
-fn coerce_numeric_algo_ord_no(data: &mut serde_json::Map<String, serde_json::Value>) {
-    let Some(algo_ord_no) = data.get_mut("AlgoOrdNo") else {
-        return;
+/// What [`fix_for_field`] decided for one accepted key.
+#[derive(Debug, Clone, PartialEq)]
+enum FieldFix {
+    /// The value already fits the struct, or cannot be converted exactly
+    /// (left in place so the typed parse fails loud).
+    Keep,
+    /// Remove the key so `#[serde(default)]` applies; carries the quirk kind.
+    Remove(&'static str),
+    /// Replace the value; carries the quirk kind.
+    Replace(serde_json::Value, &'static str),
+}
+
+/// Applies [`fix_for_field`] to `key` in `data` and counts the quirk.
+fn apply_field_fix(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    kind: FieldKind,
+) {
+    let fix = match data.get(key) {
+        None => return,
+        Some(value) => fix_for_field(key, kind, value),
     };
-    if let serde_json::Value::Number(number) = algo_ord_no {
-        // O(1) EXEMPT: begin — cold-path number→string rendering
-        let rendered = if let Some(integral) = number.as_i64() {
-            integral.to_string()
-        } else if let Some(unsigned) = number.as_u64() {
-            unsigned.to_string()
-        } else if let Some(float) = number.as_f64() {
-            float.to_string()
-        } else {
-            return;
-        };
-        // O(1) EXEMPT: end
-        *algo_ord_no = serde_json::Value::String(rendered);
-        metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => "numeric_algo_ord_no").increment(1);
+    match fix {
+        FieldFix::Keep => {}
+        FieldFix::Remove(quirk) => {
+            data.remove(key);
+            metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => quirk).increment(1);
+        }
+        FieldFix::Replace(fixed, quirk) => {
+            if let Some(slot) = data.get_mut(key) {
+                *slot = fixed;
+            }
+            metrics::counter!(DECODE_QUIRKS_COUNTER, "kind" => quirk).increment(1);
+        }
+    }
+}
+
+/// The fields the order book reads to compute a fill (`extract_fill_delta`
+/// in the OMS engine): quantity, filled quantity and prices. A `null` or an
+/// empty string in any of them is NEVER read as "absent": a defaulted 0
+/// there turns a TRADED update into a terminal order with no fill, so the
+/// position and P&L go wrong with nothing logged. Such a frame keeps
+/// failing the typed parse loudly (ORDER-EVT-02 `typed_parse_failed`,
+/// `tv_order_update_frames_dropped_total{reason="unparseable_order"}`),
+/// exactly as before 2026-10-28; the WAL keeps the raw frame.
+const FILL_CRITICAL_FIELDS: &[&str] = &[
+    "Quantity",
+    "TradedQty",
+    "RemainingQuantity",
+    "Price",
+    "TradedPrice",
+    "AvgTradedPrice",
+];
+
+/// Identity text fields that are numbers on the wire when they are numbers
+/// at all. A non-integral number here (`12.5`, or one past `u64::MAX`,
+/// which serde reads as a rounded float) is not converted: it would become
+/// a made-up order or instrument id, so it is left for the typed parse to
+/// refuse loudly. `AlgoOrdNo` is NOT in this list: the live doc table types
+/// it `float`, and its fractional rendering predates 2026-10-28.
+const INTEGRAL_ID_TEXT_FIELDS: &[&str] = &["OrderNo", "ExchOrderNo", "SecurityId"];
+
+/// `null`, or a string that is empty after trimming. Pure, no allocation.
+fn is_blank_value(value: &serde_json::Value) -> bool {
+    value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+}
+
+/// Decides how one field value is made to fit its struct type. Pure.
+///
+/// - `null` or an empty string in a [`FILL_CRITICAL_FIELDS`] field → keep,
+///   so the typed parse fails loud (a defaulted 0 would lose the fill).
+/// - `null` in any other field → remove: null means absent, and every
+///   `OrderUpdate` field defaults when absent. Before 2026-10-28 one null
+///   field (say `"CorrelationId": null`) failed the whole typed parse and
+///   the order event was dropped.
+/// - Text field holding a number → its exact string rendering (integral
+///   values without `.0`). `AlgoOrdNo` keeps its own quirk kind
+///   (`numeric_algo_ord_no`, the live doc table types it `float`). A
+///   [`INTEGRAL_ID_TEXT_FIELDS`] field accepts integral numbers only.
+/// - Int field holding a string → the integer it spells (`"50"`, `"50.0"`);
+///   an empty string → remove.
+/// - Int field holding an integral float (`50.0`) inside the `i64` range →
+///   that integer.
+/// - Float field holding a string → the finite number it spells; an empty
+///   string → remove.
+/// - Anything else (a fractional quantity, `"ten"`, an object, an array, a
+///   bool, a non-finite number) → keep, so the typed parse fails loud.
+fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> FieldFix {
+    use serde_json::Value;
+    if is_blank_value(value) && FILL_CRITICAL_FIELDS.contains(&key) {
+        return FieldFix::Keep;
+    }
+    match (kind, value) {
+        (_, Value::Null) => FieldFix::Remove("null_field_dropped"),
+        (FieldKind::Text, Value::Number(number)) => {
+            // O(1) EXEMPT: begin — cold-path number→string rendering
+            let rendered = if let Some(integral) = number.as_i64() {
+                integral.to_string()
+            } else if let Some(unsigned) = number.as_u64() {
+                unsigned.to_string()
+            } else if INTEGRAL_ID_TEXT_FIELDS.contains(&key) {
+                return FieldFix::Keep;
+            } else if let Some(float) = number.as_f64() {
+                float.to_string()
+            } else {
+                return FieldFix::Keep;
+            };
+            // O(1) EXEMPT: end
+            let quirk = if key == "AlgoOrdNo" {
+                "numeric_algo_ord_no"
+            } else {
+                "numeric_text_coerced"
+            };
+            FieldFix::Replace(Value::String(rendered), quirk)
+        }
+        (FieldKind::Int, Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return FieldFix::Remove("empty_number_dropped");
+            }
+            if let Ok(integral) = trimmed.parse::<i64>() {
+                return FieldFix::Replace(Value::from(integral), "numeric_string_coerced");
+            }
+            match trimmed.parse::<f64>().ok().and_then(exact_i64) {
+                Some(integral) => {
+                    FieldFix::Replace(Value::from(integral), "numeric_string_coerced")
+                }
+                None => FieldFix::Keep,
+            }
+        }
+        (FieldKind::Int, Value::Number(number)) if number.as_i64().is_none() => {
+            match number.as_f64().and_then(exact_i64) {
+                Some(integral) => {
+                    FieldFix::Replace(Value::from(integral), "integral_float_coerced")
+                }
+                None => FieldFix::Keep,
+            }
+        }
+        (FieldKind::Float, Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return FieldFix::Remove("empty_number_dropped");
+            }
+            match trimmed
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+            {
+                Some(number) => FieldFix::Replace(Value::Number(number), "numeric_string_coerced"),
+                None => FieldFix::Keep,
+            }
+        }
+        _ => FieldFix::Keep,
+    }
+}
+
+/// The `i64` an `f64` holds exactly: finite, no fractional part, inside the
+/// `i64` range (`i64::MAX as f64` is 2^63, which is out of range, hence `<`).
+fn exact_i64(float: f64) -> Option<i64> {
+    // `i64::MIN as f64` is exactly -2^63 and `i64::MAX as f64` rounds up to
+    // 2^63, so `[lo, hi)` is exactly the range an `i64` can hold.
+    let (lo, hi) = (i64::MIN as f64, i64::MAX as f64);
+    if float.is_finite() && float.fract() == 0.0 && float >= lo && float < hi {
+        Some(float as i64)
+    } else {
+        None
     }
 }
 
@@ -246,6 +512,68 @@ pub fn build_order_update_login(client_id: &str, access_token: &str) -> String {
         "UserType": "SELF"
     })
     .to_string()
+    // O(1) EXEMPT: end
+}
+
+/// True when a decoded update carries none of the three identity fields:
+/// `order_no`, `status` and `security_id` are all empty. Pure, O(1), no
+/// allocation.
+///
+/// `OrderUpdate` defaults every field, so a frame whose `Data` keys match
+/// nothing the struct knows still parses `Ok` and decodes to this shape.
+/// A real partial update (say only `OrderNo`) is NOT hollow.
+pub fn is_hollow_order_update(update: &OrderUpdate) -> bool {
+    update.order_no.is_empty() && update.status.is_empty() && update.security_id.is_empty()
+}
+
+/// The ORDER-EVT-02 verdict for a frame that [`parse_order_update`] decoded:
+/// `Some(message type)` when the frame must be logged as an order event we
+/// cannot read, `None` for a readable one. Two shapes qualify:
+///
+/// 1. Hollow ([`is_hollow_order_update`]): no order number, status or
+///    security id in either casing, whatever the frame's `Type`.
+/// 2. No order number AND a `Type` naming something other than
+///    `order_alert`. Since every field is read in both casings, an
+///    undocumented frame carrying a camelCase `status` (say
+///    `{"Data":{"status":"success"},"Type":"login_ack"}`) is no longer
+///    hollow; without this arm it would reach the order book as an order
+///    with no number and log nothing, where before 2026-10-28 it paged.
+///
+/// Deliberately NOT a filter: nothing here keeps a frame from the order
+/// book or the audit tables (the caller broadcasts every frame). Dhan
+/// documents a single message type on this socket (`order_alert`) and no
+/// captured frame shows another one, so an unknown tag is exactly the
+/// vendor-format-change case ORDER-EVT-02 exists to page on.
+///
+/// The returned tag is the frame's `Type` (or a drifted `type`), trimmed
+/// and bounded to `MESSAGE_TYPE_LOG_MAX_CHARS` characters; empty when the
+/// tag is absent, not a string, or the frame is oversized or does not
+/// re-parse.
+///
+/// # Complexity
+/// O(1) and allocation-free for a frame that carries an order number (the
+/// normal case). Otherwise one more `serde_json::Value` parse of the frame,
+/// O(frame bytes) bounded by [`ORDER_UPDATE_MAX_FRAME_BYTES`]. Cold: the
+/// order-update read task, 1 to 100 orders a day.
+pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Option<String> {
+    if !update.order_no.is_empty() {
+        return None;
+    }
+    let parsed = (json_str.len() <= ORDER_UPDATE_MAX_FRAME_BYTES)
+        .then(|| serde_json::from_str::<serde_json::Value>(json_str).ok())
+        .flatten();
+    let tag = parsed
+        .as_ref()
+        .and_then(|value| value.get("Type").or_else(|| value.get("type")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let foreign = !tag.is_empty() && !tag.eq_ignore_ascii_case(ORDER_ALERT_MESSAGE_TYPE);
+    if !(is_hollow_order_update(update) || foreign) {
+        return None;
+    }
+    // O(1) EXEMPT: begin — cold-path bounded copy of the tag for the log
+    Some(tag.chars().take(MESSAGE_TYPE_LOG_MAX_CHARS).collect())
     // O(1) EXEMPT: end
 }
 
@@ -836,11 +1164,12 @@ mod tests {
         let update = parse_order_update(r#"{"Data": {"AlgoOrdNo": "ABC123"}}"#).unwrap();
         assert_eq!(update.algo_ord_no, "ABC123");
 
-        // Null untouched by the normalizer — #[serde(default)] covers only a
-        // MISSING field, so an explicit null errored before this change too
-        // (behavior unchanged); a missing field still defaults to "".
-        let err = parse_order_update(r#"{"Data": {"AlgoOrdNo": null}}"#).unwrap_err();
-        assert!(matches!(err, OrderUpdateParseError::JsonError(_)));
+        // 2026-10-28 (ORDER-EVT-02 fix): an explicit null now reads as
+        // ABSENT and defaults to "" — before, one null field failed the whole
+        // typed parse and the order event was dropped. A missing field still
+        // defaults to "".
+        let update = parse_order_update(r#"{"Data": {"AlgoOrdNo": null}}"#).unwrap();
+        assert_eq!(update.algo_ord_no, "");
         let update = parse_order_update(r#"{"Data": {"OrderNo": "1"}}"#).unwrap();
         assert_eq!(update.algo_ord_no, "");
 
@@ -949,13 +1278,14 @@ mod tests {
     }
 
     #[test]
-    fn test_both_null_drops_alt_and_accepted_null_still_errors_where_typed() {
-        // alt null → dropped; accepted stays null. For a String-typed field
-        // an explicit null still errors (behavior unchanged for null
-        // accepted with nothing to recover from).
-        let json = r#"{"Data": {"Series": null, "series": null}}"#;
-        let err = parse_order_update(json).unwrap_err();
-        assert!(matches!(err, OrderUpdateParseError::JsonError(_)));
+    fn test_both_null_drops_alt_and_accepted_null_reads_as_absent() {
+        // alt null → dropped; accepted null → dropped too (2026-10-28: null
+        // means absent, so the struct default applies). Before, an explicit
+        // null on a String field failed the typed parse and lost the event.
+        let json = r#"{"Data": {"Series": null, "series": null, "OrderNo": "8"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.series, "");
+        assert_eq!(update.order_no, "8");
     }
 
     #[test]
@@ -1005,6 +1335,499 @@ mod tests {
         let small = r#"{"Data": {"OrderNo": "5"}}"#;
         assert!(small.len() <= ORDER_UPDATE_MAX_FRAME_BYTES);
         assert_eq!(parse_order_update(small).unwrap().order_no, "5");
+    }
+
+    // -----------------------------------------------------------------------
+    // ORDER-EVT-02 fix (2026-10-28): every field in both casings, null as
+    // absent, exact coercion, and the hollow-frame classification.
+    // -----------------------------------------------------------------------
+
+    /// A real Dhan order event (the reference's §3 sample, one `Remarks`)
+    /// with every `OrderUpdate` field present, keyed as the struct accepts.
+    const FULL_ACCEPTED_SAMPLE: &str = r#"{
+        "Data": {
+            "Exchange": "NSE", "Segment": "D", "Source": "P",
+            "SecurityId": "52432", "ClientId": "1000000001",
+            "ExchOrderNo": "1400000000404591", "OrderNo": "1124091136546",
+            "Product": "I", "TxnType": "B", "OrderType": "LMT", "Validity": "DAY",
+            "DiscQuantity": 5, "DiscQtyRem": 4, "RemainingQuantity": 25,
+            "Quantity": 75, "TradedQty": 50, "Price": 245.5, "TriggerPrice": 240.25,
+            "TradedPrice": 245.45, "AvgTradedPrice": 245.4, "AlgoOrdNo": "1124091136500",
+            "OffMktFlag": "0", "OrderDateTime": "2026-10-28 10:30:45",
+            "ExchOrderTime": "2026-10-28 10:30:45", "LastUpdatedTime": "2026-10-28 10:30:46",
+            "Remarks": "Super Order", "MktType": "NL", "ReasonDescription": "CONFIRMED",
+            "LegNo": 2, "Instrument": "OPTIDX", "Symbol": "NIFTY",
+            "ProductName": "INTRADAY", "Status": "PART_TRADED", "LotSize": 75,
+            "StrikePrice": 24500.0, "ExpiryDate": "2026-11-04", "OptType": "CE",
+            "DisplayName": "NIFTY 04 NOV 24500 CALL", "Isin": "XX0000000000",
+            "Series": "XX", "GoodTillDaysDate": "2026-10-28", "refLtp": 245.55,
+            "tickSize": 0.05, "AlgoId": "7", "Multiplier": 3,
+            "CorrelationId": "corr-abc_123"
+        },
+        "Type": "order_alert"
+    }"#;
+
+    fn full_sample_value() -> serde_json::Value {
+        serde_json::from_str(FULL_ACCEPTED_SAMPLE).unwrap()
+    }
+
+    fn default_for(kind: FieldKind) -> serde_json::Value {
+        match kind {
+            FieldKind::Text => serde_json::json!(""),
+            FieldKind::Int => serde_json::json!(0),
+            FieldKind::Float => serde_json::json!(0.0),
+        }
+    }
+
+    /// The full sample's struct with one field reset to its default, built
+    /// through serde (not the parser) so it is an independent expectation.
+    fn expected_without(accepted: &str, kind: FieldKind) -> OrderUpdate {
+        let full = parse_order_update(FULL_ACCEPTED_SAMPLE).unwrap();
+        let mut value = serde_json::to_value(&full).unwrap();
+        value[accepted] = default_for(kind);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn test_field_table_covers_every_order_update_field() {
+        // The struct's own serialized key set IS the accepted key set; a
+        // field added to OrderUpdate without a table row fails here.
+        let empty = parse_order_update(r#"{"Data": {}}"#).unwrap();
+        let value = serde_json::to_value(&empty).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), ORDER_UPDATE_FIELDS.len());
+        for &(accepted, alt, kind) in ORDER_UPDATE_FIELDS {
+            let field = object
+                .get(accepted)
+                .unwrap_or_else(|| panic!("{accepted} is not an OrderUpdate key"));
+            let actual = if field.is_string() {
+                FieldKind::Text
+            } else if field.is_i64() {
+                FieldKind::Int
+            } else {
+                FieldKind::Float
+            };
+            assert_eq!(actual, kind, "{accepted} is typed {actual:?}");
+            // The other casing differs only in the first letter's case.
+            let mut a = accepted.chars();
+            let mut b = alt.chars();
+            let (fa, fb) = (a.next().unwrap(), b.next().unwrap());
+            assert_eq!(a.as_str(), b.as_str(), "{accepted} / {alt}");
+            assert_ne!(fa, fb, "{accepted} / {alt}");
+            assert_eq!(fa.to_ascii_lowercase(), fb.to_ascii_lowercase());
+        }
+    }
+
+    #[test]
+    fn test_full_accepted_sample_populates_every_field() {
+        let update = parse_order_update(FULL_ACCEPTED_SAMPLE).unwrap();
+        let value = serde_json::to_value(&update).unwrap();
+        for &(accepted, _, kind) in ORDER_UPDATE_FIELDS {
+            assert_ne!(
+                value[accepted],
+                default_for(kind),
+                "{accepted} must carry a non-default value in the sample"
+            );
+        }
+        assert!(!is_hollow_order_update(&update));
+    }
+
+    #[test]
+    fn test_parse_order_update_all_camel_case_frame_decodes_like_pascal() {
+        // The 2026-08-25 / 2026-10-28 hollow shape: every key in its other
+        // casing. Before the fix only seven fields survived; now all do.
+        let mut value = full_sample_value();
+        let data = value["Data"].as_object_mut().unwrap();
+        for &(accepted, alt, _) in ORDER_UPDATE_FIELDS {
+            let moved = data.remove(accepted).unwrap();
+            data.insert(alt.to_string(), moved);
+        }
+        let camel = parse_order_update(&value.to_string()).unwrap();
+        let pascal = parse_order_update(FULL_ACCEPTED_SAMPLE).unwrap();
+        assert_eq!(camel, pascal);
+        assert_eq!(camel.order_no, "1124091136546");
+        assert_eq!(camel.status, "PART_TRADED");
+        assert_eq!(camel.security_id, "52432");
+        assert_eq!(camel.quantity, 75);
+        assert!(!is_hollow_order_update(&camel));
+    }
+
+    #[test]
+    fn test_parse_order_update_camel_case_wrapper_and_core_fields() {
+        let json = r#"{"data": {"orderNo": "77", "status": "TRADED", "securityId": "14366",
+            "txnType": "S", "tradedQty": 10, "avgTradedPrice": 13.2}, "type": "order_alert"}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.order_no, "77");
+        assert_eq!(update.status, "TRADED");
+        assert_eq!(update.security_id, "14366");
+        assert_eq!(update.txn_type, "S");
+        assert_eq!(update.traded_qty, 10);
+        assert!((update.avg_traded_price - 13.2).abs() < f64::EPSILON);
+        // Accepted wrapper wins when both are present.
+        let both = r#"{"Data": {"OrderNo": "1"}, "data": {"OrderNo": "2"}}"#;
+        assert_eq!(parse_order_update(both).unwrap().order_no, "1");
+        // A lowercase null wrapper still fails like `Data: null`.
+        assert!(parse_order_update(r#"{"data": null}"#).is_err());
+    }
+
+    #[test]
+    fn test_every_single_field_missing_or_null_still_parses() {
+        // Every field-missing permutation of one field, and the same field
+        // sent as null: the event still decodes, only that field defaults.
+        // A null fill field (quantity, filled quantity, a price) is the one
+        // exception: it fails the parse loudly instead of reading as 0.
+        for &(accepted, _, kind) in ORDER_UPDATE_FIELDS {
+            let expected = expected_without(accepted, kind);
+            let mut missing = full_sample_value();
+            missing["Data"].as_object_mut().unwrap().remove(accepted);
+            assert_eq!(
+                parse_order_update(&missing.to_string()).unwrap(),
+                expected,
+                "{accepted} missing"
+            );
+            let mut null = full_sample_value();
+            null["Data"][accepted] = serde_json::Value::Null;
+            if FILL_CRITICAL_FIELDS.contains(&accepted) {
+                assert!(
+                    parse_order_update(&null.to_string()).is_err(),
+                    "{accepted} null must fail loud"
+                );
+                let mut blank = full_sample_value();
+                blank["Data"][accepted] = serde_json::Value::from("");
+                assert!(
+                    parse_order_update(&blank.to_string()).is_err(),
+                    "{accepted} empty must fail loud"
+                );
+            } else {
+                assert_eq!(
+                    parse_order_update(&null.to_string()).unwrap(),
+                    expected,
+                    "{accepted} null"
+                );
+            }
+        }
+    }
+
+    /// Hostile review 2026-10-28: a TRADED update whose filled quantity or
+    /// price is null or empty must never decode with a defaulted 0 (the
+    /// order book would mark the order Traded with no fill and refuse every
+    /// later re-send). It fails the parse, which counts it on
+    /// `unparseable_order` and logs ORDER-EVT-02, as before 2026-10-28.
+    #[test]
+    fn test_traded_update_with_blank_fill_fields_fails_loud() {
+        for (field, blank) in [
+            ("TradedQty", "null"),
+            ("TradedQty", r#""""#),
+            ("tradedQty", "null"),
+            ("AvgTradedPrice", "null"),
+            ("AvgTradedPrice", r#"" ""#),
+            ("TradedPrice", "null"),
+            ("Quantity", "null"),
+            ("RemainingQuantity", r#""""#),
+            ("Price", "null"),
+        ] {
+            let json = format!(
+                r#"{{"Data":{{"OrderNo":"1","Status":"TRADED","SecurityId":"52432","Exchange":"NSE","Segment":"D","{field}":{blank}}},"Type":"order_alert"}}"#
+            );
+            assert!(
+                parse_order_update(&json).is_err(),
+                "{field}={blank} must fail loud, not default to 0"
+            );
+        }
+        // A missing fill key is a partial update, as it always was.
+        let partial = r#"{"Data":{"OrderNo":"1","Status":"PENDING"},"Type":"order_alert"}"#;
+        assert_eq!(parse_order_update(partial).unwrap().traded_qty, 0);
+    }
+
+    #[test]
+    fn test_every_field_missing_decodes_hollow() {
+        let update = parse_order_update(r#"{"Data": {}, "Type": "order_alert"}"#).unwrap();
+        assert!(is_hollow_order_update(&update));
+        // Every non-fill field null (the fill fields absent): hollow.
+        let mut all_null = full_sample_value();
+        let data = all_null["Data"].as_object_mut().unwrap();
+        for fill in FILL_CRITICAL_FIELDS {
+            data.remove(*fill);
+        }
+        for value in data.values_mut() {
+            *value = serde_json::Value::Null;
+        }
+        let update = parse_order_update(&all_null.to_string()).unwrap();
+        assert!(is_hollow_order_update(&update));
+    }
+
+    #[test]
+    fn test_is_hollow_order_update_all_identity_permutations() {
+        // 8 permutations of the three identity fields: hollow iff all three
+        // are missing.
+        for mask in 0u8..8 {
+            let mut value = full_sample_value();
+            let data = value["Data"].as_object_mut().unwrap();
+            for (bit, key) in ["OrderNo", "Status", "SecurityId"].iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    data.remove(*key);
+                }
+            }
+            let update = parse_order_update(&value.to_string()).unwrap();
+            assert_eq!(is_hollow_order_update(&update), mask == 7, "mask {mask}");
+        }
+    }
+
+    #[test]
+    fn test_fix_for_field_coercions() {
+        use serde_json::json;
+        let int = |v: serde_json::Value| fix_for_field("Quantity", FieldKind::Int, &v);
+        assert_eq!(
+            int(json!("50")),
+            FieldFix::Replace(json!(50), "numeric_string_coerced")
+        );
+        assert_eq!(
+            int(json!(" 50.0 ")),
+            FieldFix::Replace(json!(50), "numeric_string_coerced")
+        );
+        assert_eq!(
+            int(json!("-1")),
+            FieldFix::Replace(json!(-1), "numeric_string_coerced")
+        );
+        // A blank fill field is never read as absent: it fails loud.
+        assert_eq!(int(json!("  ")), FieldFix::Keep);
+        let lot = |v: serde_json::Value| fix_for_field("LotSize", FieldKind::Int, &v);
+        assert_eq!(lot(json!("  ")), FieldFix::Remove("empty_number_dropped"));
+        assert_eq!(lot(json!(null)), FieldFix::Remove("null_field_dropped"));
+        assert_eq!(int(json!("ten")), FieldFix::Keep);
+        assert_eq!(int(json!("50.5")), FieldFix::Keep);
+        assert_eq!(
+            int(json!(50.0)),
+            FieldFix::Replace(json!(50), "integral_float_coerced")
+        );
+        assert_eq!(int(json!(50.5)), FieldFix::Keep);
+        assert_eq!(int(json!(1e20)), FieldFix::Keep);
+        assert_eq!(int(json!(18_446_744_073_709_551_615u64)), FieldFix::Keep);
+        assert_eq!(int(json!(50)), FieldFix::Keep);
+        assert_eq!(int(json!(null)), FieldFix::Keep);
+        assert_eq!(int(json!(true)), FieldFix::Keep);
+        for fill in FILL_CRITICAL_FIELDS {
+            for blank in [json!(null), json!(""), json!("  ")] {
+                assert_eq!(
+                    fix_for_field(fill, FieldKind::Int, &blank),
+                    FieldFix::Keep,
+                    "{fill} {blank}"
+                );
+            }
+        }
+
+        let float = |v: serde_json::Value| fix_for_field("Price", FieldKind::Float, &v);
+        assert_eq!(
+            float(json!("245.5")),
+            FieldFix::Replace(json!(245.5), "numeric_string_coerced")
+        );
+        assert_eq!(float(json!("NaN")), FieldFix::Keep);
+        assert_eq!(float(json!("inf")), FieldFix::Keep);
+        assert_eq!(float(json!("")), FieldFix::Keep);
+        assert_eq!(
+            fix_for_field("StrikePrice", FieldKind::Float, &json!("")),
+            FieldFix::Remove("empty_number_dropped")
+        );
+        assert_eq!(float(json!("abc")), FieldFix::Keep);
+        assert_eq!(float(json!(245.5)), FieldFix::Keep);
+        assert_eq!(float(json!([1])), FieldFix::Keep);
+
+        let text = |v: serde_json::Value| fix_for_field("OrderNo", FieldKind::Text, &v);
+        assert_eq!(
+            text(json!(1_124_091_136_546i64)),
+            FieldFix::Replace(json!("1124091136546"), "numeric_text_coerced")
+        );
+        // An identity id accepts integral numbers only.
+        assert_eq!(text(json!(12.5)), FieldFix::Keep);
+        assert_eq!(text(json!(1e30)), FieldFix::Keep);
+        assert_eq!(
+            text(json!(18_446_744_073_709_551_615u64)),
+            FieldFix::Replace(json!("18446744073709551615"), "numeric_text_coerced")
+        );
+        for id in INTEGRAL_ID_TEXT_FIELDS {
+            assert_eq!(
+                fix_for_field(id, FieldKind::Text, &json!(1.5)),
+                FieldFix::Keep
+            );
+        }
+        assert_eq!(
+            fix_for_field("Remarks", FieldKind::Text, &json!(12.5)),
+            FieldFix::Replace(json!("12.5"), "numeric_text_coerced")
+        );
+        assert_eq!(text(json!("x")), FieldFix::Keep);
+        assert_eq!(text(json!(true)), FieldFix::Keep);
+        assert_eq!(text(json!({"a": 1})), FieldFix::Keep);
+        assert_eq!(
+            fix_for_field("AlgoOrdNo", FieldKind::Text, &json!(5)),
+            FieldFix::Replace(json!("5"), "numeric_algo_ord_no")
+        );
+    }
+
+    #[test]
+    fn test_exact_i64_boundaries() {
+        assert_eq!(exact_i64(i64::MIN as f64), Some(i64::MIN));
+        assert_eq!(
+            exact_i64(9_223_372_036_854_775_807.0),
+            None,
+            "2^63 is out of range"
+        );
+        assert_eq!(exact_i64(0.0), Some(0));
+        assert_eq!(exact_i64(-0.0), Some(0));
+        assert_eq!(exact_i64(0.5), None);
+        assert_eq!(exact_i64(f64::NAN), None);
+        assert_eq!(exact_i64(f64::INFINITY), None);
+        assert_eq!(
+            exact_i64(9_007_199_254_740_992.0),
+            Some(9_007_199_254_740_992)
+        );
+    }
+
+    #[test]
+    fn test_parse_order_update_numbers_and_strings_swapped() {
+        let json = r#"{"Data": {"OrderNo": 1124091136546, "SecurityId": 14366,
+            "ExchOrderNo": 1400000000404591, "Quantity": "75", "TradedQty": 50.0,
+            "Price": "245.5", "StrikePrice": "", "LegNo": " 1 ", "Status": "TRADED"}}"#;
+        let update = parse_order_update(json).unwrap();
+        assert_eq!(update.order_no, "1124091136546");
+        assert_eq!(update.security_id, "14366");
+        assert_eq!(update.exch_order_no, "1400000000404591");
+        assert_eq!(update.quantity, 75);
+        assert_eq!(update.traded_qty, 50);
+        assert!((update.price - 245.5).abs() < f64::EPSILON);
+        assert!(update.strike_price.abs() < f64::EPSILON);
+        assert_eq!(update.leg_no, 1);
+        // A value that does not convert exactly still fails loud.
+        assert!(parse_order_update(r#"{"Data": {"OrderNo": "1", "Quantity": 1.5}}"#).is_err());
+        assert!(parse_order_update(r#"{"Data": {"OrderNo": "1", "Status": true}}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_order_update_bad_type_tag_never_costs_the_event() {
+        for tag in ["null", "5", "true", "{}", "[]"] {
+            let json = format!(r#"{{"Data": {{"OrderNo": "9"}}, "Type": {tag}}}"#);
+            let update = parse_order_update(&json).unwrap();
+            assert_eq!(update.order_no, "9", "Type {tag}");
+        }
+    }
+
+    #[test]
+    fn test_unreadable_order_frame_type_verdicts() {
+        let verdict = |json: &str| {
+            let update = parse_order_update(json).unwrap();
+            unreadable_order_frame_type(&update, json)
+        };
+        // Readable order events: no verdict, whatever the tag.
+        assert_eq!(
+            verdict(r#"{"Data":{"OrderNo":"1","Status":"TRADED"},"Type":"order_alert"}"#),
+            None
+        );
+        assert_eq!(
+            verdict(r#"{"Data":{"orderNo":"1","status":"TRADED"},"Type":"heartbeat"}"#),
+            None,
+            "an order number makes the frame readable"
+        );
+        assert_eq!(
+            verdict(r#"{"Data":{"Status":"PENDING","SecurityId":"5"}}"#),
+            None
+        );
+        assert_eq!(
+            verdict(r#"{"Data":{"Status":"PENDING"},"Type":"order_alert"}"#),
+            None
+        );
+        // Hollow: always a verdict, with the tag for the log.
+        assert_eq!(
+            verdict(r#"{"Data":{"MktType":"XX"},"Type":"order_alert"}"#).as_deref(),
+            Some("order_alert")
+        );
+        assert_eq!(
+            verdict(r#"{"Data":{"MktType":"XX","RefLtp":11.15}}"#).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            verdict(r#"{"Data":{},"Type":" ORDER_ALERT "}"#).as_deref(),
+            Some("ORDER_ALERT")
+        );
+        assert_eq!(
+            verdict(r#"{"data":{},"type":"trade_alert"}"#).as_deref(),
+            Some("trade_alert"),
+            "an unknown tag is never suppressed"
+        );
+        assert_eq!(verdict(r#"{"Data":{},"Type":"   "}"#).as_deref(), Some(""));
+        assert_eq!(verdict(r#"{"Data":{},"Type":5}"#).as_deref(), Some(""));
+        assert_eq!(verdict(r#"{"Data":{},"Type":null}"#).as_deref(), Some(""));
+        // Hostile review MEDIUM: a foreign-typed frame that now decodes a
+        // camelCase status but carries no order number still pages.
+        assert_eq!(
+            verdict(r#"{"Data":{"status":"success","message":"ok"},"Type":"login_ack"}"#)
+                .as_deref(),
+            Some("login_ack")
+        );
+        // A frame that does not re-parse or is oversized reads an empty tag.
+        let hollow = parse_order_update(r#"{"Data":{}}"#).unwrap();
+        assert_eq!(
+            unreadable_order_frame_type(&hollow, "not json").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            unreadable_order_frame_type(&hollow, "[1,2]").as_deref(),
+            Some("")
+        );
+        let oversized = format!(
+            r#"{{"Data": {{}}, "Type": "heartbeat", "Pad": "{}"}}"#,
+            "x".repeat(ORDER_UPDATE_MAX_FRAME_BYTES)
+        );
+        assert_eq!(
+            unreadable_order_frame_type(&hollow, &oversized).as_deref(),
+            Some("")
+        );
+        // The tag is bounded for the log.
+        let long = format!(r#"{{"Data": {{}}, "Type": "{}"}}"#, "₹".repeat(500));
+        assert_eq!(
+            unreadable_order_frame_type(&hollow, &long).map(|tag| tag.chars().count()),
+            Some(MESSAGE_TYPE_LOG_MAX_CHARS)
+        );
+    }
+
+    proptest::proptest! {
+        /// Any subset of fields removed or nulled, each remaining field in a
+        /// random casing: the frame always decodes, every kept field equals
+        /// the full sample's value, and every dropped one is its default.
+        #[test]
+        fn prop_any_field_subset_and_casing_decodes(
+            drop_mask in proptest::collection::vec(0u8..4, ORDER_UPDATE_FIELDS.len()),
+        ) {
+            let full = parse_order_update(FULL_ACCEPTED_SAMPLE).unwrap();
+            let mut expected = serde_json::to_value(&full).unwrap();
+            let mut frame = full_sample_value();
+            let data = frame["Data"].as_object_mut().unwrap();
+            for (&(accepted, alt, kind), &choice) in ORDER_UPDATE_FIELDS.iter().zip(&drop_mask) {
+                match choice {
+                    0 => {}
+                    1 => {
+                        let moved = data.remove(accepted).unwrap();
+                        data.insert(alt.to_string(), moved);
+                    }
+                    2 => {
+                        data.remove(accepted);
+                        expected[accepted] = default_for(kind);
+                    }
+                    // A null fill field fails loud (pinned by
+                    // `test_every_single_field_missing_or_null_still_parses`),
+                    // so this decode-always property removes it instead.
+                    _ if FILL_CRITICAL_FIELDS.contains(&accepted) => {
+                        data.remove(accepted);
+                        expected[accepted] = default_for(kind);
+                    }
+                    _ => {
+                        data.insert(accepted.to_string(), serde_json::Value::Null);
+                        expected[accepted] = default_for(kind);
+                    }
+                }
+            }
+            let expected: OrderUpdate = serde_json::from_value(expected).unwrap();
+            let decoded = parse_order_update(&frame.to_string()).unwrap();
+            proptest::prop_assert_eq!(decoded, expected);
+        }
     }
 
     proptest::proptest! {
