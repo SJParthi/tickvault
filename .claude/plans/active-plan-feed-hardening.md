@@ -7065,3 +7065,40 @@ Per item: the crate's lib and integration tests, clippy `-D warnings -W clippy::
 62: the six tables stop growing; `tv_candle_*` counters show 8 timeframes. 63: the digest and guard log the spend source (`budgets`). 64: the stop Lambda logs the 16:30 stop and any drain-hold deferral. 65: the review file is the record. 66/67: workflow logs plus a verify listing committed to `docs/audits/`. No new alarm, page, metric filter or EMF name in any item.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM DT — DESIGN ADDENDUM (added 2026-10-28): the frame drain never waits behind other work (p99 tail)
+
+**Approved by:** Parthiban, 2026-10-28, decision card "Approve all steps (Recommended)" on: "Live today: a typical tick is in RAM in ~21 µs and the slowest 1% in ~0.1 ms; only 1 in 1,000 takes ~1 ms and a few per day take several ms. Approve the plan to remove that rare tail (measure first, give the candle-builder its own thread, put the reader+builder on one core at high priority and the database on the other)?" The card stated the high-priority setting is a security change approved by this answer. Crates: `tickvault-core` (crates/core), `tickvault-app` (crates/app); plus `deploy/systemd/tickvault.service`. Never `crates/trading/src/indicator` or `strategy` (§28).
+
+**Measured before (live, 28 Oct 09:15–09:45 IST, 131,476 frames, per-message histogram `tv_hot_path_stage_ns_bucket`):** socket_to_wal p50 ≤ 1 µs, p99 ≤ 16 µs, p99.9 ≤ 33 µs; ring_dwell p50 ≤ 16 µs, p99 ≤ 66 µs, p99.9 ≤ 1.05 ms; drain_main_frame p50 ≤ 4 µs, p99 ≤ 16 µs, p99.9 ≤ 33 µs. Worst per minute (27–28 Oct): ring_dwell 9.2 ms, `tv_dhan_feed_ring_dwell_max_ms` 18.4 ms, main_runtime_lag 8.8 ms. The drain is one task among ~117 on a 2-worker main runtime.
+
+- [ ] DT0. Measure first: a per-message receipt→folded stage (`receipt_to_fold`) in `hot_path_telemetry` with finer low buckets, O(1), zero allocation (DHAT), plus a 2-core `taskset` harness (400 µs spacing, 12,500 packets/s burst) that prints p50/p99/p99.9. Time the metrics upkeep tick.
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/src/dhan_feed_stack.rs, crates/core/tests/ (harness)
+  - Tests: test_receipt_to_fold_stage_records_one_sample_per_frame, dhat_receipt_to_fold_stage_zero_alloc
+- [ ] DT1. Sleeping consumer for the frame ring: a "drain parked" flag; the reader pays the wake only when it is set (same pattern as `wal_writer_wait`).
+  - Files: crates/core/src/websocket/frame_ring.rs
+  - Tests: test_reader_wakes_the_drain_only_when_it_is_parked, proptest_frame_ring_sleeping_consumer_never_loses_a_wake
+- [ ] DT2. The drain runs on its own OS thread `tv-frame-drain` (plain loop; timers as deadline checks; shutdown as an atomic flag), the chain WAL → ring → fold → rescue → catch-up seal → shutdown withhold/final seal unchanged.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs
+  - Tests: test_drain_thread_shutdown_empties_the_ring_and_runs_the_exit_seal, the existing drain source scans moved with it
+- [ ] DT3. Core placement and priority: reader runtime and drain on core 1 (real-time priority 2 and 1), OS + QuestDB + main runtime on core 0 on the 2-vCPU r8g.large; `LimitRTPRIO` in the unit; refusal falls back to a plain pinned thread with one coded warning.
+  - Files: crates/core/src/websocket/reader_runtime.rs, crates/app/src/main.rs, deploy/systemd/tickvault.service
+  - Tests: test_rt_priority_refusal_falls_back_to_a_pinned_thread
+
+### Design (Item DT)
+The drain's per-frame work is O(packets) ≤ 0.26 ms worst; the tail is scheduling wait. A dedicated thread removes the wait behind ~117 tasks; core placement and priority remove CPU contention; the sleeping-consumer flag keeps the reader's hand-off O(1) and wake-free while the drain is busy. Each step lands as its own PR, measured live before the next (DT0 first).
+
+### Edge Cases (Item DT)
+Burst at 09:15 (12,500 packets/s); ring full (frame already in the WAL, re-folded later); drain thread panic (panic = abort in release: process exit, systemd restart, WAL replay); RT priority refused by the kernel or container; 1-vCPU host (both on one core, no RT); shutdown mid-burst; clock step; QuestDB stall (the drain's blocking flush paths still run inline, unchanged).
+
+### Failure Modes (Item DT)
+A runaway RT thread is capped by the kernel RT throttle (950 ms/s, Assumed default; checked at boot and logged). Lost wake → ring fills → shed to WAL → re-fold (no loss; counted). QuestDB on core 0 may apply slower (apply lag watched; rollback if worse).
+
+### Test Plan (Item DT)
+DHAT zero-alloc on the new stage and drain loop; proptest on the wake protocol; the 2-core harness gate p99 ≤ 500 µs; one live canary day on r8g.large: receipt→folded p50 ≤ 50 µs, p99 ≤ 500 µs, p99.9 ≤ 2 ms, worst per minute ≤ 5 ms, ticks lost 0.
+
+### Rollback (Item DT)
+Each step behind a config switch defaulting to today's behaviour until its live day passes (`[feeds] drain_thread`, `[feeds] rt_priority`); revert = flip the switch and redeploy; DT0 is measurement only.
+
+### Observability (Item DT)
+New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
