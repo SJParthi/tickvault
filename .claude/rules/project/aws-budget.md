@@ -40,6 +40,15 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-10-28 — October 2026 only: stop at $185 (supersedes "October 2026 stays capped at $170" below)
+
+Owner, 2026-10-28: tapped "Raise Oct to $185 (Recommended)" after the Budgets API read $157.18 spent and $175.88 forecast against $170. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 45.
+
+| | Before (Quote 37) | After (Quote 45) |
+|---|---|---|
+| October 2026 line (`OCTOBER_2026_KILL_USD`, four lockstep sites) | $170 | **$185**, October 2026 only |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) |
+
 ## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
 
 Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 37 (also: free Budgets API lookups, alarm squeeze, dashboard kept, 16:30 IST stop).

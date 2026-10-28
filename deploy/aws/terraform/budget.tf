@@ -233,7 +233,11 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   change: the one native stop is at 100% = $170, matching the hourly
   #   guard's line. Disk IOPS 6000 -> 3000 (variables.tf) brings the October
   #   projection to ~$165 (Assumed).
-  limit_amount      = "170"
+  # 2026-10-28 (operator Quote 45, daily-universe §0): $170 -> $185 for
+  #   OCTOBER 2026 only (Budgets API: $157.18 spent, $175.88 forecast). The
+  #   Lambda clamps November onward to $75 in code; this native stop moves
+  #   to $75 on or after 1 November.
+  limit_amount      = "185"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

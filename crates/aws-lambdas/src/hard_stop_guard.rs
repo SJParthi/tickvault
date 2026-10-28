@@ -68,7 +68,11 @@ use tracing::{error, info, warn};
 /// October 2026. From November the month clamp brings it down to
 /// `STANDING_BUDGET_KILL_USD` ($75 since operator Quote 37) in code; the terraform `limit_amount`
 /// (the native 100% stop) can follow on or after 1 November.
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 170.0;
+///
+/// 2026-10-28 (operator Quote 45): 170.0 → 185.0 for October 2026 only
+/// (Budgets API: $157.18 spent, $175.88 forecast). November onward is still
+/// clamped to `STANDING_BUDGET_KILL_USD` in code.
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 185.0;
 
 /// The STANDING monthly kill line: from October 2026 the bill must stay within
 /// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md),
@@ -93,13 +97,14 @@ const _: () = assert!(STANDING_BUDGET_KILL_USD <= DEFAULT_BUDGET_KILL_USD);
 /// `STANDING_BUDGET_KILL_USD`.
 pub const SEPTEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 9);
 
-/// October 2026 keeps the $170 line (`OCTOBER_2026_KILL_USD`) while the $75 standing line
+/// October 2026 keeps its own line (`OCTOBER_2026_KILL_USD`, $185 since Quote 45) while the $75 standing line
 /// starts in November (operator Quotes 33, 36 and 37, 2026-10-21). One month, like September.
 pub const OCTOBER_2026_ALLOWANCE: (i32, u32) = (2026, 10);
 
-/// The line October 2026 is capped at, whatever is configured (Quote 30, $170).
+/// The line October 2026 is capped at, whatever is configured (Quote 30, $170;
+/// raised to $185 by operator Quote 45, 2026-10-28, October 2026 only).
 /// A mistaken higher configured value still clamps to it, as it did before.
-pub const OCTOBER_2026_KILL_USD: f64 = 170.0;
+pub const OCTOBER_2026_KILL_USD: f64 = 185.0;
 
 /// The kill line that actually applies to one billing month.
 ///
@@ -2477,7 +2482,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     }
 
     #[tokio::test]
-    async fn effective_ceiling_october_breach_at_175_stops_even_with_a_225_config() {
+    async fn effective_ceiling_october_breach_at_190_stops_even_with_a_225_config() {
         // 2026-10-05 is a Monday; 04:30 UTC = 10:00 IST, inside the window.
         // Moved from 1 Oct on 2026-10-22 (plan item 63): on UTC day 1 a
         // Budgets reading at or above the line is unknown (no month stamp),
@@ -2500,7 +2505,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &sns,
             &events,
             &FakeBudgets {
-                amount: Some(175.0),
+                amount: Some(190.0),
             },
             &ssm,
             utc(2026, 10, 5, 4, 30),
@@ -2511,7 +2516,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
         let published = sns.published.borrow();
         assert!(
-            published[0].message.contains(">= $170 stop-budget"),
+            published[0].message.contains(">= $185 stop-budget"),
             "the breach page must name the EFFECTIVE line: {}",
             published[0].message
         );
@@ -2548,6 +2553,44 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_ne!(out["breach"], json!(true));
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_regression_quote45_october_at_178_does_not_stop() {
+        // Operator Quote 45 (2026-10-28): October 2026 only, the line is $185.
+        // The 28 Oct forecast was $175.88; a Thursday month-to-date of $178
+        // was a breach at the old $170 line and must not stop the box now.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(178.0),
+            },
+            &ssm,
+            utc(2026, 10, 29, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_ne!(out["breach"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+        // November: the same configured $185 is clamped to the standing $75.
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
+            75.0
+        );
     }
 
     #[tokio::test]
