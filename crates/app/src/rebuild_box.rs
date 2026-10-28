@@ -64,6 +64,21 @@ const CLOUD_INIT_WAIT_SECS: u64 = 1800;
 /// spawning `cloud-init` (not a Rust binary; the spawn allowlist refuses it).
 const CLOUD_INIT_DONE: &str = "/var/lib/cloud/instance/boot-finished";
 const CLOUD_INIT_RESULT: &str = "/run/cloud-init/result.json";
+/// The first-boot user-data log and the line it writes as its last step.
+/// `boot-finished` alone is not enough: on 2026-10-28 it existed 46 s after
+/// the swap while `/opt/tickvault` did not, and prepare-new failed.
+const USER_DATA_LOG: &str = "/var/log/tv-user-data.log";
+const USER_DATA_COMPLETE: &str = "=== tickvault user-data complete";
+/// cloud-init's own output log, quoted when first boot did not complete.
+const CLOUD_INIT_OUTPUT_LOG: &str = "/var/log/cloud-init-output.log";
+/// The file prepare-new needs from first boot.
+const FIRST_BOOT_COMPOSE: &str = "/opt/tickvault/repo/deploy/docker/docker-compose.yml";
+/// Once `boot-finished` exists, how long to keep waiting for user-data to
+/// report complete (covers a stale marker while a slow `dnf update` runs)
+/// before giving up and quoting the logs.
+const FIRST_BOOT_AFTER_DONE_GRACE_SECS: u64 = 600;
+/// Log lines quoted into the report per log file.
+const FIRST_BOOT_LOG_TAIL_LINES: usize = 12;
 /// Poll interval for every wait above.
 const POLL_SECS: u64 = 5;
 /// Raw-frame upload passes before giving up on a backlog.
@@ -76,6 +91,101 @@ const LOCAL_REPORT_DIR: &str = "/var/tmp";
 const NEW_ROOT_MIN_FS_BYTES: u64 = 140 * 1_000_000_000;
 /// The new root is 150 GB; a filesystem larger than this is not the new root.
 const NEW_ROOT_MAX_FS_BYTES: u64 = 170 * 1_000_000_000;
+
+/// What the first-boot wait should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstBootWait {
+    /// User-data reported complete and the compose file exists.
+    Ready,
+    /// Keep polling.
+    KeepWaiting,
+    /// Stop waiting and report the first-boot logs.
+    GiveUp,
+}
+
+/// Decides the first-boot wait. Ready only on positive proof (user-data's
+/// last line plus the compose file it clones); gives up once `boot-finished`
+/// has existed for the grace period without that proof, or at the overall
+/// bound. Pure, O(1).
+#[must_use]
+pub fn first_boot_wait(
+    user_data_complete: bool,
+    compose_present: bool,
+    boot_finished_for: Option<Duration>,
+    waited: Duration,
+) -> FirstBootWait {
+    if user_data_complete && compose_present {
+        return FirstBootWait::Ready;
+    }
+    if waited >= Duration::from_secs(CLOUD_INIT_WAIT_SECS) {
+        return FirstBootWait::GiveUp;
+    }
+    match boot_finished_for {
+        Some(d) if d >= Duration::from_secs(FIRST_BOOT_AFTER_DONE_GRACE_SECS) => {
+            FirstBootWait::GiveUp
+        }
+        _ => FirstBootWait::KeepWaiting,
+    }
+}
+
+/// The last `max_lines` lines of `text`, oldest first. O(bytes).
+#[must_use]
+pub fn tail_lines(text: &str, max_lines: usize) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].to_vec()
+}
+
+/// Waits for first-boot provisioning on a fresh root. `None` when it is
+/// ready; otherwise the report lines that say why not, with the tail of the
+/// user-data and cloud-init logs, so a failed run names its cause.
+async fn wait_for_first_boot() -> Option<Vec<String>> {
+    let started = Instant::now();
+    let mut finished_at: Option<Instant> = None;
+    loop {
+        let log = std::fs::read_to_string(USER_DATA_LOG).ok();
+        let complete = log
+            .as_deref()
+            .is_some_and(|text| text.contains(USER_DATA_COMPLETE));
+        let compose = Path::new(FIRST_BOOT_COMPOSE).exists();
+        if finished_at.is_none() && Path::new(CLOUD_INIT_DONE).exists() {
+            finished_at = Some(Instant::now());
+        }
+        match first_boot_wait(
+            complete,
+            compose,
+            finished_at.map(|at| at.elapsed()),
+            started.elapsed(),
+        ) {
+            FirstBootWait::Ready => return None,
+            FirstBootWait::KeepWaiting => {
+                tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+            }
+            FirstBootWait::GiveUp => {
+                let mut why = vec![format!(
+                    "first boot did not complete after {} s (boot-finished: {}, user-data complete: {complete}, compose file: {compose})",
+                    started.elapsed().as_secs(),
+                    finished_at.is_some()
+                )];
+                match std::fs::read(CLOUD_INIT_RESULT) {
+                    Ok(body) => why.push(format!("cloud-init: {}", cloud_init_summary(&body))),
+                    Err(e) => why.push(format!("cloud-init result unreadable: {e}")),
+                }
+                for path in [USER_DATA_LOG, CLOUD_INIT_OUTPUT_LOG] {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) => {
+                            for line in tail_lines(&text, FIRST_BOOT_LOG_TAIL_LINES) {
+                                why.push(format!("{path}: {line}"));
+                            }
+                        }
+                        Err(e) => why.push(format!("{path} unreadable: {e}")),
+                    }
+                }
+                return Some(why);
+            }
+        }
+    }
+}
 
 /// True when the process was started as `tickvault rebuild-box ...`.
 #[must_use]
@@ -165,13 +275,18 @@ pub async fn run(args: &[String]) -> i32 {
             // provisioning reaches it, minutes after the SSM agent is
             // online, so prepare-new waits for provisioning BEFORE it
             // enters the folder (2026-10-27 pre-run review).
-            if waits_for_first_boot_before_entering(parsed.phase, parsed.mode) {
-                let deadline = Instant::now() + Duration::from_secs(CLOUD_INIT_WAIT_SECS);
-                while !Path::new(CLOUD_INIT_DONE).exists() && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+            let first_boot = if waits_for_first_boot_before_entering(parsed.phase, parsed.mode) {
+                wait_for_first_boot().await
+            } else {
+                None
+            };
+            if let Some(why) = first_boot {
+                let mut r = BoxReport::new(parsed.phase, parsed.mode);
+                for line in why {
+                    r.problem(line);
                 }
-            }
-            if let Err(err) = std::env::set_current_dir(BOX_ROOT) {
+                r
+            } else if let Err(err) = std::env::set_current_dir(BOX_ROOT) {
                 let mut r = BoxReport::new(parsed.phase, parsed.mode);
                 r.problem(format!("cannot enter {BOX_ROOT}: {err}"));
                 r
@@ -1285,6 +1400,83 @@ async fn postcheck(mode: Mode, manifest_key: Option<&str>) -> BoxReport {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression (live 2026-10-28 18:17 IST): `boot-finished` existed 46 s
+    /// after the swap while /opt/tickvault did not, so prepare-new failed and
+    /// rolled back. Ready now needs user-data's own last line AND the compose
+    /// file; a marker alone keeps waiting, then gives up with the logs.
+    #[test]
+    fn test_first_boot_wait_needs_user_data_complete_and_compose() {
+        let secs = Duration::from_secs;
+        // The 18:17 case: marker present, nothing else.
+        assert_eq!(
+            first_boot_wait(false, false, Some(secs(0)), secs(46)),
+            FirstBootWait::KeepWaiting
+        );
+        assert_eq!(
+            first_boot_wait(
+                false,
+                false,
+                Some(secs(FIRST_BOOT_AFTER_DONE_GRACE_SECS)),
+                secs(700)
+            ),
+            FirstBootWait::GiveUp
+        );
+        // Half proof is not proof, in either order.
+        assert_eq!(
+            first_boot_wait(true, false, None, secs(10)),
+            FirstBootWait::KeepWaiting
+        );
+        assert_eq!(
+            first_boot_wait(false, true, None, secs(10)),
+            FirstBootWait::KeepWaiting
+        );
+        // Full proof is ready even before the marker appears.
+        assert_eq!(
+            first_boot_wait(true, true, None, secs(10)),
+            FirstBootWait::Ready
+        );
+        // The overall bound holds with no marker at all.
+        assert_eq!(
+            first_boot_wait(false, false, None, secs(CLOUD_INIT_WAIT_SECS)),
+            FirstBootWait::GiveUp
+        );
+        // Every combination below the bounds with no full proof waits.
+        for complete in [false, true] {
+            for compose in [false, true] {
+                if complete && compose {
+                    continue;
+                }
+                for finished in [None, Some(secs(FIRST_BOOT_AFTER_DONE_GRACE_SECS - 1))] {
+                    assert_eq!(
+                        first_boot_wait(
+                            complete,
+                            compose,
+                            finished,
+                            secs(CLOUD_INIT_WAIT_SECS - 1)
+                        ),
+                        FirstBootWait::KeepWaiting
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tail_lines_keeps_the_last_lines_in_order() {
+        assert_eq!(tail_lines("a\nb\nc\nd", 2), vec!["c", "d"]);
+        assert_eq!(tail_lines("a\nb", 5), vec!["a", "b"]);
+        assert!(tail_lines("", 3).is_empty());
+        assert!(tail_lines("a\nb", 0).is_empty());
+    }
+
+    /// The marker the wait looks for is the user-data script's real last line.
+    #[test]
+    fn test_user_data_complete_marker_matches_the_terraform_user_data() {
+        let user_data = include_str!("../../../deploy/aws/terraform/user-data.sh.tftpl");
+        assert!(user_data.contains(USER_DATA_COMPLETE));
+        assert!(user_data.contains(USER_DATA_LOG));
+    }
 
     /// Pre-run review 2026-10-27: prepare-new must wait for first-boot
     /// provisioning before it enters /opt/tickvault on a fresh root; no other

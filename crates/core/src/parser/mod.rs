@@ -105,5 +105,8 @@ pub use depth::{
     parse_depth_packet, split_depth_frame,
 };
 pub use dispatcher::{dispatch_depth_packet, dispatch_frame, prewarm_dispatcher_counters};
-pub use order_update::{OrderUpdateParseError, build_order_update_login, parse_order_update};
+pub use order_update::{
+    OrderUpdateParseError, build_order_update_login, is_hollow_order_update, parse_order_update,
+    unreadable_order_frame_type,
+};
 pub use types::{PacketHeader, ParseError, ParsedFrame};

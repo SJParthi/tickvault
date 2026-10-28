@@ -268,3 +268,39 @@ dropping it would trade one silent loss for another. What it changes is that
 the frame is now visible. The detector is three `is_empty()` calls on an
 already-decoded struct and builds the excerpt ONLY on the hollow branch, so
 a healthy frame pays nothing beyond the compares.
+
+**2026-10-28 change (18 live ORDER-EVT-02 lines). ORDER-EVT-02 stays OPEN.**
+
+1. **camelCase order keys (Assumed cause, not Verified).** The parser read
+   the other casing of only seven fields (`refLtp`, `tickSize`, `Series`,
+   `GoodTillDaysDate`, `AlgoId`, `Multiplier`, `AlgoOrdNo`). A frame keyed
+   `orderNo`, `status`, `securityId`, ... (the casing the reference's SDK
+   note reads) decoded with every identity field empty. `parse_order_update`
+   now reads both casings of every field (`ORDER_UPDATE_FIELDS`, pinned to
+   the struct) and of the `Data` / `Type` wrapper. **The evidence does not
+   fully fit this cause:** the 2026-08-25 rows had `mkt_type` filled, which
+   the old parser read only from PascalCase `MktType`, so those frames
+   carried at least one PascalCase field; they also lacked `series` and
+   `algo_id`, which the old parser already read in both casings. No live
+   excerpt was available. If the next session still logs ORDER-EVT-02, the
+   excerpt and the new `msg_type` field on the line are what the real fix
+   must be written against.
+2. **Every unreadable frame still pages.** A hollow frame stays ORDER-EVT-02
+   at ERROR on `tv_order_update_hollow_decode_total` and is still broadcast
+   and audited, whatever its `Type` tag. A frame with no order number whose
+   `Type` names something other than `order_alert` pages the same way, even
+   if it now decodes a camelCase `status` (`unreadable_order_frame_type`).
+   Dhan documents only `order_alert` on this socket, so an unknown tag is
+   the format change this page exists for. The line carries `msg_type`.
+3. **A null field reads as absent**, except in a fill field. One
+   `"CorrelationId": null` used to fail the whole typed parse and drop the
+   order event as `typed_parse_failed`; it now defaults. A null or empty
+   `Quantity`, `TradedQty`, `RemainingQuantity`, `Price`, `TradedPrice` or
+   `AvgTradedPrice` (either casing) still fails the parse loudly
+   (`typed_parse_failed`, `unparseable_order`): a defaulted 0 there would
+   mark a TRADED order terminal with no fill.
+4. **Exact type conversion.** A number or string in the wrong JSON type is
+   converted when it converts exactly (`"Quantity": "75"`, `"OrderNo":
+   1124091136546`, `"TradedQty": 50.0`). `OrderNo`, `ExchOrderNo` and
+   `SecurityId` accept integral numbers only. Anything else (`"Quantity":
+   1.5`, `"OrderNo": 12.5`, `"ten"`, a bool, an object) still fails loud.

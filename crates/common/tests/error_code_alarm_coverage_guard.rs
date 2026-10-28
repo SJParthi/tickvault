@@ -345,6 +345,13 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // The losses it can expose already page on their own counters
     // (`dhan_ticks_dropped`, HOT-PATH-02, WS-SPILL-01/-02).
     "TICK-CONSERVE-01",
+    // ADDED 2026-10-28 (owner: "go ahead and add the daily expiry check"), an
+    // addition to a shrink-only list, so the reason: EXPIRY-SCOPE-01 is a scope
+    // verdict (the attach refused an off-expiry contract, or the daily check
+    // found one stored). The task brief and the Dhan noise lock §3 make it log
+    // only; a page needs a dated quote there first. The refusal itself already
+    // keeps the wrong contract off the wire.
+    "EXPIRY-SCOPE-01",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",

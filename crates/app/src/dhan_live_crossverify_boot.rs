@@ -1266,6 +1266,34 @@ async fn attempt_readiness(
     readiness
 }
 
+/// The live side's readiness for a reader other than this cross-check (the
+/// daily expiry-scope check, 2026-10-28): the same wait over the same three
+/// barriers and the same completeness rule (§12.15.10), with no earlier
+/// sample carried in and nothing stored for this module's own attempts, so
+/// the cross-check's `Frozen` judgement is unaffected. A client that cannot
+/// be built reads not applied. O(tables + spill files) per sample, at most
+/// one sample per [`READINESS_POLL_SECS`], cold.
+pub async fn live_side_readiness(
+    exec_url: &str,
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+    deadline: tokio::time::Instant,
+) -> LiveReadiness {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
+        .build()
+    else {
+        return LiveReadiness {
+            durability: Durability::NotReady(DhanLiveXverifyNotReady::NotApplied),
+            completeness: Completeness::Unknown,
+        };
+    };
+    let src = ProductionReadiness { client, exec_url };
+    wait_live_final(&src, today, day_start_ist_nanos, deadline, None)
+        .await
+        .0
+}
+
 /// One `wal_tables()` probe's own timeout during the readiness wait.
 const READINESS_PROBE_TIMEOUT_SECS: u64 = 10;
 

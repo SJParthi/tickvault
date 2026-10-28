@@ -1043,6 +1043,15 @@ impl MultiTfAggregator {
         }
     }
 
+    /// Slots the table holds without reallocating (plan item DT-A6,
+    /// 2026-10-28): the live drain builds its fold at [`AGGREGATOR_MAX_SLOTS`]
+    /// so this equals the ceiling from boot and no tick ever moves the table.
+    /// O(1).
+    #[must_use]
+    pub fn slot_capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
     /// Number of instruments with allocated fold state.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1435,6 +1444,15 @@ impl MultiTfAggregator {
         // ceiling is 25,000 x ~5.4 KB ~= 135 MB, and `with_capacity` is the
         // constructor every unit test uses, so it would put that reservation
         // behind every test in the crate to save one 4.7 MB move in prod.
+        //
+        // ⚠ CHANGED 2026-10-28 (plan item DT-A6): the one remaining move ran
+        // inside `drain_main_feed_frame` on the frame drain, so the LIVE lane
+        // now builds its fold at the ceiling (`LiveIngest::with_fold_capacity`
+        // in the app crate) and never reaches this branch; "the fold was left
+        // on the boot count" above no longer holds for production. Unit tests
+        // keep the small constructor, exactly as the paragraph above wanted,
+        // and still take this one-time reserve. Measured that day: 2,816 B a
+        // slot, so the ceiling is 70.4 MB of address space, not ~135 MB.
         //
         // `reserve_exact` and not `reserve`: the amount asked for IS the final
         // size, so the growth-amortisation `reserve` would add on top is pure
@@ -10219,6 +10237,13 @@ mod tests {
     /// here: the first growth reserves the whole remaining ceiling, after
     /// which `len == capacity` is unreachable because the exhaustion check
     /// refuses first.
+    ///
+    /// ⚠ CHANGED 2026-10-28 (plan item DT-A6): the live lane no longer leaves
+    /// the fold on the boot count; it builds it at the ceiling
+    /// (`LiveIngest::with_fold_capacity`), pinned by
+    /// `test_slot_capacity_at_the_ceiling_never_reallocates_while_the_universe_fills`.
+    /// This test still pins the at-most-once growth for every other caller
+    /// (unit tests, and any future small construction).
     #[test]
     fn the_slot_table_reallocs_at_most_once_when_the_universe_outgrows_the_boot_pre_size() {
         // Same SHAPE as production, scaled down so the test is fast: a boot
@@ -10295,6 +10320,48 @@ mod tests {
         assert!(
             agg.slots.capacity() >= 64,
             "the first slot past the pre-size must reserve the whole remaining ceiling"
+        );
+    }
+
+    /// DT-A6 (2026-10-28): a fold built at the ceiling never moves its slot
+    /// table or its index while the universe fills it, and the memory that
+    /// pre-size commits is pinned here (the figure the plan item states).
+    #[test]
+    fn test_slot_capacity_at_the_ceiling_never_reallocates_while_the_universe_fills() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, AGGREGATOR_MAX_SLOTS);
+        assert!(agg.slot_capacity() >= AGGREGATOR_MAX_SLOTS);
+        let slots_ptr = agg.slots.as_ptr();
+        let index_cap = agg.index.capacity();
+        // The measured live peak is 22,996 instruments; fill past it.
+        for sid in 0..23_000u64 {
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid + 1, SEG_IDX, OPEN, 100.0, 1),
+                None,
+                ignore_seal,
+            );
+            assert!(
+                stats.folded(),
+                "sid {sid} must get a slot below the ceiling"
+            );
+        }
+        assert_eq!(agg.len(), 23_000);
+        assert_eq!(agg.slots.as_ptr(), slots_ptr, "the slot table never moved");
+        assert_eq!(agg.index.capacity(), index_cap, "the index never rehashed");
+
+        // The bytes this pre-size reserves (pages are committed only as slots
+        // are written, and the grow-once path reserved the same ceiling on
+        // the first slot past the boot count before DT-A6).
+        let slot_bytes = std::mem::size_of::<InstrumentSlot>();
+        let reserved = slot_bytes * AGGREGATOR_MAX_SLOTS;
+        eprintln!(
+            "DT-A6: InstrumentSlot = {slot_bytes} B; slots reserved at the ceiling = \
+             {reserved} B ({:.1} MiB)",
+            reserved as f64 / (1024.0 * 1024.0)
+        );
+        assert!(
+            reserved <= 128 * 1024 * 1024,
+            "the ceiling pre-size must stay under 128 MiB of the 13 GiB budget"
         );
     }
 

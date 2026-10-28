@@ -46,7 +46,10 @@ const BUDGET: &[(&str, usize)] = &[
     // both depth halves done, main stores the switch); paired behaviour test
     // `test_set_depth_sockets_enabled_round_trips`.
     ("depth_switch.rs", 2),
-    ("dhan_contract_universe.rs", 1),
+    // 1 -> 2 (2026-10-28, daily expiry check): pins that the attach builds its
+    // candle names from every option row, not the capped ranking table. Paired
+    // behaviour test: `test_option_labels_from_keys_exactly_as_a_candle_row_probes`.
+    ("dhan_contract_universe.rs", 2),
     ("dhan_depth_universe.rs", 3),
     // 2026-10-14 (ITEM 57): 90 -> 88; `contract_attach_tests` (3 scans) moved
     // to its own file, one scan added by `test_live_tick_flush_leaves_depth_to_its_own_cadence`,
@@ -64,12 +67,15 @@ const BUDGET: &[(&str, usize)] = &[
     // cannot be staged in a unit test). Paired behaviour test:
     // `test_regression_reserved_connections_gauge_follows_the_widen`.
     ("dhan_feed_stack/reserved_connections_tests.rs", 1),
-    ("dhan_lifecycle.rs", 2),
     ("dhan_live_crossverify.rs", 7),
     ("dhan_live_crossverify_boot.rs", 8),
     ("dhan_live_universe.rs", 18),
     ("dhan_rest_stack.rs", 4),
-    ("dhan_universe.rs", 3),
+    // 3 -> 4 (2026-10-28, Quote 44 review): `build_once` cannot run without
+    // the network, so the held-counter emit after the sweep is pinned by
+    // source. Paired behaviour test for the count itself:
+    // `test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy`.
+    ("dhan_universe.rs", 4),
     ("disk_pressure_boot.rs", 7),
     ("ensure_questdb.rs", 1),
     // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
@@ -77,6 +83,13 @@ const BUDGET: &[(&str, usize)] = &[
     // `test_catchup_budget_for_only_a_fresh_evening_pending_flag`,
     // `test_request_self_restart_resolves_a_later_self_restart_requested`.
     ("evening_drain.rs", 3),
+    // 2026-10-28 (daily expiry check): 5 wiring scans (main spawns the 15:50
+    // check, it runs on its own task never the frame drain, the attach refuses
+    // before it names or dials, every error carries its code). Paired behaviour
+    // tests: `test_check_selected_expiries_refuses_off_expiry_expired_unknown_and_the_stub`,
+    // `test_classify_candle_contracts_all_current_is_clean`,
+    // `test_record_subscribe_expiry_scope_and_subscribe_refused_for_day`.
+    ("expiry_scope_check_tests.rs", 5),
     ("feed_scoreboard_boot.rs", 2),
     ("index_constituency_boot.rs", 1),
     ("infra.rs", 3),

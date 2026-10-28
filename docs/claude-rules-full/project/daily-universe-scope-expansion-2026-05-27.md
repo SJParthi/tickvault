@@ -3221,6 +3221,19 @@ Follow-up the same morning, after being told the morning files are kept only 7 d
 - Touching the morning master download or the artifacts the live lane reads under cover of this quote.
 - Deleting, expiring or wiping any object under `instrument-snapshots/`, or sweeping a local artifact before its verified S3 copy exists.
 
+##### How Quote 44 is built, and its honest limits (2026-10-28, implementation notes; NOT a new quote, changes no row above)
+
+| Point | What the code does |
+|---|---|
+| Object and check | Each file is stored as its gzip at `instrument-snapshots/<date>/<file>.gz`. S3's own SHA-256 checksum and the HeadObject length check cover the gzip bytes. The raw file's length and SHA-256 are in the object's user metadata and in the local marker (`data/instrument-cache/uploaded/<file>`); S3 does not check user metadata against the content, so the raw-bytes proof is the upload's own gzip round-trip check before sending. This is the same upload path as the raw frames (`raw_frame_upload::upload_file`). |
+| Never overwritten | Writes only to an empty key (`If-None-Match: "*"`). A same-day rebuild with different bytes goes to a content-addressed sidecar key beside the first copy, with a warning; the newest copy of a date is the one whose `raw_mtime` is latest, sidecars included. |
+| When it runs | On its own task after each successful daily build, never inside the build the live lane waits on. A request during a running pass is counted (`outcome="skipped_busy"`) and that pass runs once more; every pass is bounded (`SNAPSHOT_PASS_TIMEOUT_SECS`, 30 min) and stops after 3 S3 time-outs in a row. Copies to `[partition_retention] archive_bucket` (empty = `tv-<env>-cold`), the same bucket as the raw frames. |
+| Local sweep | A dated `.json` is deleted only when its marker matches its length and mtime. A `.json.tmp` crash leftover is deleted only when the `.json` of the same name exists with a verified copy; an orphan `.tmp` (possibly the only record of its day) is kept and counted. |
+| Delivery (log-sink only) | A failed copy is a coded STORAGE-GAP-04 `error!` plus `tv_instrument_snapshot_upload_total{outcome="failed"}` and `tv_instrument_snapshot_sweep_held_total`, local `/metrics` only. **No alarm pages on it**: a page needs a dated row in `dhan-rest-only-noise-lock-2026-07-14.md` first. Nothing is lost while copies fail (every uncopied file is kept), but those files exist only on the box until a copy lands, so a box rebuild or terminate in that window loses them. A marker write that fails after a verified upload counts on the shared `tv_raw_upload_marker_write_failed_total`, which feeds the existing cold-backup page (its text names market data; the cause, a failing local disk, is shared). |
+| Console wipes | Three operator-console command lists (`WIPE_QUESTDB_COMMANDS`, `DOCKER_RESET_COMMANDS`, `DOCKER_NUKE_BARE_COMMANDS` in `operator_control_action_commands.rs`) run `rm -rf /opt/tickvault/data/instrument-cache`, which deletes dated files and markers whether or not a copy exists. Not changed here (they are operator-chosen destructive actions whose purpose includes forcing a fresh universe, and their shell is parity-pinned); an operator who runs one after a failed copy loses that day's snapshot. Changing them needs its own decision. |
+| Retention lists, corrected | `instrument_lifecycle` is in `RETENTION_EXEMPT_TABLES`. `instrument_lifecycle_audit` never was: it is in `DAY_PARTITIONED_TABLES`, so the retention sweep archives its old partitions to S3 and then DETACHES them (never drops). "Both stay on every retention-exempt list" above describes the intent; this row is the fact as of 2026-10-28, unchanged by Quote 44. |
+| Dormant code kept | `lifecycle_reconciler` (no caller since the Groww feed was removed) and the `LifecycleState` / `TransitionKind` labels are kept as the written meaning of the frozen rows; nothing calls them. |
+
 #### Quote 45 (2026-10-28, ~10:40 IST) — OCTOBER 2026 ONLY: THE STOP LINE MOVES $170 → $185 (preserve EXACTLY)
 
 | Card | Owner's tap | What the card said |
@@ -3241,3 +3254,68 @@ Then, the same morning: "see ic elalry told yo uto from tonoght itself the enitr
 - Any month other than October 2026 above $75 (or the native stop below $185 before 1 November) without a fresh dated quote.
 - Treating $185 as a new standing line, or keeping `limit_amount` above $75 after 1 November without the planned follow-up.
 - Changing instance, disk, IOPS, throughput or the depth switch under cover of this quote.
+
+#### Quote 46 (2026-10-28, ~11:30 IST) — AFTER THE REBUILD: DELETE THE SEBI/AUDIT TABLES AND EVERYTHING IN THE COLD BUCKET (preserve EXACTLY)
+
+Owner message: "dude ic elalry todl yo uto evebn delete seb iand s3 evryhtign entirley fully completel ydude okay? see because i need the fersh scratch new applciation dude okay?"
+
+Then the card "Tonight's wipe already deletes ALL old market data on the server and in S3, so the app starts fresh on Thursday. The only things kept are the SEBI/audit record tables (orders, P&L, instrument history), the program files in S3 (the rebuild and rollback need them), logs, and sebi-preserve/. Deleting those is permanent, may break record-keeping rules if they apply to you, and needs your rule file, the code and the cloud permissions changed first. What do you want?" The owner tapped **"Delete all, after rebuild"**: "Tonight runs as planned. Then I record your approval in the rule files and build a reviewed one-off delete of SEBI/audit tables and all of S3, run on a later night once the new server is healthy. Permanent."
+
+| Item | What Quote 46 authorizes |
+|---|---|
+| Tonight (28 Oct) | **Nothing changes.** The Quote 32/33 rebuild and the Quote 35/42/43 wipe run as approved, keep-list included. |
+| What it deletes, ONE run | On the box: every SEBI/audit table on the keep lists (`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `pnl_audit`, `order_leg_pnl`, order/position update events, `ws_event_audit` and the other `*_audit` tables) and `/opt/tickvault/data/sebi-preserve/`. In `s3://tv-prod-cold/`: every object version, `deploys/`, `logs/`, `sebi-preserve/`, `instrument-snapshots/` and every audit copy included. |
+| When | Only after the rebuilt server has run one healthy session (earliest Thu 2026-10-29 after 16:30 IST), never 09:00–15:45 IST, never during a deploy, app stopped. |
+| How | The Quote 29e/35 shape: a reviewed one-off Rust tool and workflow (dry run, apply, verify listing), one new IAM role scoped to this delete and a fixed window, both deleted by the next PR. The program for the next boot is uploaded again after the delete, so deploys keep working. |
+| Not covered | The Terraform state bucket and any bucket other than `tv-prod-cold`; the AWS account, alarms and log groups; the Git repository. These need their own dated quote. |
+| After the run | Quote 46 is SPENT. Every never-delete rule (Quote 27, the SEBI rows of §5/§6/§25, the Quote 44 snapshot rule) binds again for everything written after it. |
+
+**Recorded risk (owner told before the tap):** the deletion is permanent and may break record-keeping rules if they apply to the owner; no copy is kept anywhere.
+
+##### What violates Quote 46 (REJECT)
+- Running it tonight, before the rebuilt server's first healthy session, inside 09:00–15:45 IST, during a deploy, or with the app running.
+- Running it without a dry run listing what will go, or without a verify listing after.
+- Touching any bucket other than `tv-prod-cold`, the Terraform state, alarms, log groups or the repository under this quote.
+- Keeping the one-off role, workflow or tool after the run, or reusing Quote 46 for a second run.
+
+#### Quote 47 (2026-10-28, ~12:15 IST) — DELETE THE OLD 600 GB ROOT DISK TONIGHT (preserve EXACTLY)
+
+Card: "From tonight the server runs on the new 150 GB disk. The old 600 GB disk is unplugged and kept only as the way back if the new server fails (the backup snapshot is deleted tonight, as you chose). It costs about $55/month until deleted. When should it be deleted?" The owner tapped **"Delete tonight"**: "Delete it right after tonight's rebuild. Saves ~$2, but if the new server fails Thursday there is no way back to the old one."
+
+| Item | What Quote 47 authorizes |
+|---|---|
+| What | The one detached EBS volume tagged `tv-rebuild-old-root` (the r8g.xlarge 600 GB root) and nothing else. |
+| When | ONE delete tonight (28→29 Oct), only after the rebuild postcheck is green and the Quote 35/42 wipe has finished; never 09:00–15:45 IST. |
+| How | No tool or role in the repository may delete a volume (the wipe role has no `ec2:DeleteVolume`), so the owner deletes it in the AWS console (EC2 → Volumes), or a reviewed one-off grant does; the session confirms it is gone with a read-only describe. |
+| Consequence | After it, no rollback to the old server exists: the snapshot is deleted by the wipe and the volume by this quote. |
+
+##### What violates Quote 47 (REJECT)
+- Deleting any other volume, the new 150 GB root, or any snapshot under this quote.
+- Deleting it before the rebuild postcheck is green or while the rebuild or the wipe is running.
+- Adding `ec2:DeleteVolume` to the wipe role, the instance role or any standing role.
+
+#### Quote 46b (2026-10-28, ~12:25 IST) — THE QUOTE 46 DELETE MOVES TO TONIGHT, AFTER THE WIPE (preserve EXACTLY)
+
+Owner message: "eevrythign shodu leb entirley chanbegs from tonight dud eokay?" Then the card "Tonight already changes the server, the disk, and deletes all old market data, the snapshot and the old disk. Your 'delete everything' run (SEBI/audit tables + all of S3) has no tool yet: it needs a new reviewed tool + AWS permission merged to main, and a merge tonight would start a deploy in the middle of the rebuild. When should that run happen?" The owner tapped **"Tonight, after the wipe"**: "Merge the new tool after tonight's wipe finishes (deploy then runs at night), then run it. Same night, but less review time and a late-night deploy."
+
+This SUPERSEDES only the "When" row of Quote 46 ("only after the rebuilt server has run one healthy session") and its matching REJECT bullet's first clause ("Running it tonight, before the rebuilt server's first healthy session"); that bullet's other clauses (inside 09:00–15:45 IST, during a deploy, with the app running) still bind: the one Quote 46 run may now start once the Quote 35/42 wipe apply has finished and been verified on 2026-10-28 night, never while the rebuild or the wipe is running, never 08:00–16:30 IST on a trading day, app stopped. Every other Quote 46 row and REJECT stands. The tool's PR may merge only after the wipe is verified (merging earlier starts a deploy during the rebuild).
+
+##### What violates Quote 46b (REJECT)
+- Merging the tool's PR, or running the tool, before the wipe apply has finished and been verified, or while the rebuild or wipe workflow is queued or running.
+- Running it 08:00–16:30 IST on a trading day.
+
+#### Quote 46c (2026-10-28, ~12:45 IST) — THE QUOTE 46 DELETE RUNS DIRECTLY FROM THE SESSION, NO NEW TOOL (preserve EXACTLY)
+
+Owner message: "nope bro yo uagve all teh acecss to aws dude first chekc that br oi agev all teh access to aws dude so checl evrythign clelary and do it dude oaky?"
+
+Checked the same minute with the session's credentials (`claude-code-agent`): `s3:ListBucketVersions`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on `tv-prod-cold` ALLOWED (a probe delete marker on `tmp/claude-permission-probe-2026-10-28` was created and then removed by version id; 0 versions left under `tmp/`); `ec2:StartInstances` / `StopInstances` ALLOWED (dry run); `ssm:SendCommand` ALLOWED; `s3:PutObject`, `ec2:DeleteVolume`, `ec2:DeleteSnapshot`, `ec2:DetachVolume`, `ec2:CreateVolume` and the IAM reads DENIED.
+
+This SUPERSEDES only the "How" row of Quote 46 (the Quote 29e/35 tool-and-role shape): the one Quote 46 run is done directly from this session with those credentials, no new role, workflow or code:
+1. Box: after the Quote 35/42 wipe is verified, by SSM: the app is stopped and verified stopped; a listing of every SEBI/audit table (`rebuild_keep_tables()` plus any `*_audit` table) is taken; each is dropped with `DROP TABLE`; `/opt/tickvault/data/sebi-preserve/` is removed; a second listing proves they are gone.
+2. S3: a full listing of every object version and delete marker in `tv-prod-cold` is written as the dry report (counts and bytes per top-level prefix); every one is deleted by version id in batches of at most 1,000; a verify listing proves the bucket is empty, objects written after the start (Firehose `logs/`) reported separately.
+Every other Quote 46 / 46b row and REJECT stands (when, scope, never 08:00–16:30 IST on a trading day, never during the rebuild or wipe). Required safety step (PR #2134 review, 2026-10-28, adds no authority): right after the S3 delete is verified, the box's upload markers (every `uploaded/` folder under `/opt/tickvault/data`: the WAL's, the spill folders', `instrument-cache/uploaded/`) are removed, because a marker is the only proof the prune and the artifact sweep read; a marker left behind for a deleted S3 copy would let them delete the local file as if it were still copied. With the markers gone they refuse and copy again. The old 600 GB disk (Quote 47) still needs the owner in the console: `ec2:DeleteVolume` is denied to the session.
+
+##### What violates Quote 46c (REJECT)
+- Deleting without first writing the full listing, or without the verify listing after.
+- Touching any bucket other than `tv-prod-cold`, any EBS volume or snapshot, versioning, lifecycle or bucket policy under this quote.
+- Running any step before the wipe is verified, during the rebuild or wipe, or 08:00–16:30 IST on a trading day.

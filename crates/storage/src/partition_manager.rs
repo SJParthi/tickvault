@@ -151,6 +151,11 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // `ws_event_audit` lifecycle rows by the app forwarder. Same SEBI-audit
     // class + DAY partitioning; `feed` is in the DEDUP key.
     "feed_gap_audit",
+    // (2026-10-28, owner: "go ahead and add the daily expiry check") one row
+    // per (trading day, feed): did every option contract stored today sit on
+    // its underlying's nearest real expiry. Same SEBI-audit class + DAY
+    // partitioning; `feed` is in the DEDUP key.
+    "expiry_scope_audit",
     // (2026-08-29, per-table disk-footprint measurement): one row per
     // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
     // class + DAY partitioning as the scoreboard tables above. Swept with

@@ -1871,12 +1871,11 @@ async fn async_main() -> Result<()> {
     // Local /metrics only: no alarm or filter reads it.
     metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
-    // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
+    // SEBI constituency write failures (audit OBS-2, 2026-10-11).
     // Seeded here, after the recorder install, so a scrape records 0 before
     // the once-a-day write that may fail. Local /metrics only: no alarm reads
-    // them yet (that needs a dated loss-group row).
-    metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(0);
-    metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(0);
+    // it yet (that needs a dated loss-group row). The two lifecycle write
+    // counters left with the writer (owner Quote 44, 2026-10-28).
     metrics::counter!("tv_index_constituency_persist_failed_total").increment(0);
     for reason in ["too_large", "unparseable_order"] {
         metrics::counter!("tv_order_update_frames_dropped_total", "reason" => reason).increment(0);
@@ -1984,8 +1983,6 @@ async fn async_main() -> Result<()> {
     }
     for site in [
         "boot_probe",
-        "lifecycle_audit_ensure",
-        "lifecycle_ensure",
         "oms_wiring",
         "retired_views_drop",
         "shadow_drop_legacy",
@@ -3240,6 +3237,9 @@ async fn async_main() -> Result<()> {
     let _dhan_universe_rider = tickvault_app::dhan_universe::spawn_dhan_universe_rider(
         config.dhan_universe.clone(),
         config.questdb.clone(),
+        // Quote 44: the daily instrument snapshots go to the same cold bucket
+        // as the raw frames (`[partition_retention] archive_bucket`).
+        config.partition_retention.archive_bucket.clone(),
     );
 
     // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
@@ -4014,6 +4014,13 @@ async fn async_main() -> Result<()> {
             std::sync::Arc::clone(&trading_calendar),
             process_start_ist_nanos,
             previous_process_last_receipt,
+        )
+    });
+    // 2026-10-28: the daily expiry-scope check (15:50 IST), own task.
+    let _expiry_scope = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::expiry_scope_check::spawn_expiry_scope_check(
+            config.questdb.clone(),
+            std::sync::Arc::clone(&trading_calendar),
         )
     });
 

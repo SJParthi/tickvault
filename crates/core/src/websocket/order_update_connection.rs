@@ -38,6 +38,7 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{
     OrderUpdateParseError, build_order_update_login, parse_order_update,
+    unreadable_order_frame_type,
 };
 
 /// PR-E: poll cadence (secs) while the Dhan feed is disabled at runtime — the
@@ -944,21 +945,42 @@ async fn connect_and_listen(
                         // an already-decoded struct. The excerpt is built
                         // ONLY on the hollow branch, so a healthy frame pays
                         // nothing beyond the three compares.
-                        if update.order_no.is_empty()
-                            && update.status.is_empty()
-                            && update.security_id.is_empty()
-                        {
+                        //
+                        // 2026-10-28 (18 live ORDER-EVT-02 lines). The parser
+                        // now reads both casings of every field (it read the
+                        // other casing of only seven before). A frame whose
+                        // order keys came in camelCase (`orderNo`, `status`)
+                        // therefore no longer decodes hollow. That this was
+                        // the cause of the live lines is ASSUMED, not proven:
+                        // the 2026-08-25 rows had `mkt_type` filled, which the
+                        // old parser read only from PascalCase `MktType`, so
+                        // those frames carried at least one PascalCase field
+                        // and do not fit an all-camelCase frame. ORDER-EVT-02
+                        // stays open until a captured excerpt confirms it.
+                        // Every hollow frame, whatever its `Type` tag, stays
+                        // ORDER-EVT-02 at ERROR on the hollow counter and is
+                        // still broadcast: Dhan documents only `order_alert`
+                        // on this socket, so an unknown tag is the format
+                        // change this page exists for. So does a frame with
+                        // no order number whose tag names another type (it
+                        // may now decode a camelCase `status` and not be
+                        // hollow). The tag is logged so the next capture
+                        // says what the frame was. A frame carrying an order
+                        // number pays one `is_empty()` here.
+                        if let Some(msg_type) = unreadable_order_frame_type(&update, &text) {
                             metrics::counter!(ORDER_UPDATE_HOLLOW_DECODE_COUNTER).increment(1);
                             error!(
                                 code = tickvault_common::error_code::ErrorCode::OrderEvt02DecodedHollow
                                     .code_str(),
+                                msg_type = %msg_type,
                                 excerpt = %redacted_frame_excerpt(&text),
                                 "order update PARSED but decoded HOLLOW — order_no, status and \
-                                 security_id are all empty, so this frame's key names do not \
-                                 match what OrderUpdate expects. The row is still captured; the \
-                                 excerpt above is the raw frame (client id redacted, length \
-                                 bounded) and is what a schema fix must be written against — do \
-                                 not guess at Dhan's field names from this message alone."
+                                 security_id are all empty in either casing, so this frame's key \
+                                 names do not match what OrderUpdate expects. The row is still \
+                                 captured; the excerpt above is the raw frame (client id \
+                                 redacted, length bounded) and is what a schema fix must be \
+                                 written against — do not guess at Dhan's field names from this \
+                                 message alone."
                             );
                         }
                         // Broadcast to subscribers (OMS, notification, etc.).
@@ -2898,6 +2920,77 @@ mod tests {
              page on every legitimately partial frame"
         );
     }
+    /// 2026-10-28 (hostile review): every frame the parser cannot read as
+    /// an order (hollow, or no order number with a foreign `Type`) stays on
+    /// ORDER-EVT-02 at ERROR and on the hollow counter that feeds the
+    /// order-path loss page, and is STILL broadcast: no `continue`, no
+    /// second counter, no info-level side path between the verdict and the
+    /// send.
+    #[test]
+    fn test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts() {
+        let src = include_str!("order_update_connection.rs");
+        let prod = &src[..src
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("test marker present")];
+        let gate = prod
+            .find("if let Some(msg_type) = unreadable_order_frame_type(&update, &text)")
+            .expect("the ORDER-EVT-02 gate uses the parser's verdict");
+        let send = prod
+            .find("order_sender.send(update)")
+            .expect("the broadcast exists");
+        assert!(gate < send);
+        let arm = &prod[gate..send];
+        assert!(arm.contains("ORDER_UPDATE_HOLLOW_DECODE_COUNTER"));
+        assert!(arm.contains("OrderEvt02DecodedHollow"));
+        assert!(arm.contains(concat!("error", "!(")));
+        assert!(arm.contains("msg_type = %msg_type"));
+        assert!(
+            !arm.contains("continue;"),
+            "an unreadable order frame must never skip the broadcast"
+        );
+        assert!(!arm.contains("info!("));
+        assert!(
+            !prod.contains("non_order_typed"),
+            "no side counter may take frames off the loss page"
+        );
+    }
+
+    /// The frame shapes behind the live ORDER-EVT-02 lines, end to end
+    /// through the real parser: an all-camelCase order event is readable;
+    /// a hollow one pages whatever its tag; a foreign-typed frame with no
+    /// order number pages even when it decodes a camelCase status.
+    #[test]
+    fn test_live_hollow_shapes_parse_or_page() {
+        let camel = r#"{"Data":{"exchange":"NSE","segment":"D","source":"N","securityId":"52432","orderNo":"1124091136546","txnType":"B","status":"TRADED","quantity":75,"tradedQty":75,"refLtp":11.15,"tickSize":0.05,"mktType":"NL","multiplier":1,"goodTillDaysDate":"2026-10-28","algoOrdNo":"0"},"Type":"order_alert"}"#;
+        let update = parse_order_update(camel).expect("camelCase order event parses");
+        assert_eq!(unreadable_order_frame_type(&update, camel), None);
+        assert_eq!(update.order_no, "1124091136546");
+        assert_eq!(update.status, "TRADED");
+        assert_eq!(update.traded_qty, 75);
+
+        for (frame, tag) in [
+            (
+                r#"{"Data":{"MktType":"XX","RefLtp":11.15},"Type":"order_alert"}"#,
+                "order_alert",
+            ),
+            (
+                r#"{"Data":{"Message":"session ok"},"Type":"heartbeat"}"#,
+                "heartbeat",
+            ),
+            (
+                r#"{"Data":{"status":"success"},"Type":"login_ack"}"#,
+                "login_ack",
+            ),
+        ] {
+            let update = parse_order_update(frame).expect("parses");
+            assert_eq!(
+                unreadable_order_frame_type(&update, frame).as_deref(),
+                Some(tag),
+                "{frame}"
+            );
+        }
+    }
+
     #[test]
     fn test_hollow_decode_detector_is_wired_at_the_parse_site() {
         let src = include_str!("order_update_connection.rs");
