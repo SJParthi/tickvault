@@ -1952,17 +1952,44 @@ pub fn labels_from_artifact_selected_first(
     contracts: &[ContractRow],
     selected: &[SubscribeInstrument],
 ) -> HashMap<ContractKey, Arc<str>> {
-    let picked: HashSet<ContractKey> = selected
-        .iter()
-        .map(|instrument| (instrument.security_id, instrument.segment))
-        .collect();
+    labels_from_artifact_in_tiers(contracts, &[selected])
+}
+
+/// [`labels_from_artifact`] in priority TIERS: every contract of tier 0 is
+/// labelled before any of tier 1, and so on, then the rest of the file in
+/// file order, until [`MAX_TRACKED_CONTRACTS`]. A key in two tiers belongs to
+/// the first. `labels_from_artifact_selected_first` is the one-tier form.
+///
+/// Added 2026-10-28 (the daily expiry check's naming gap). The attach retries
+/// through the morning and REPLACES the name table on every attempt from that
+/// attempt's selection. A contract an EARLIER attempt subscribed (the socket
+/// keeps it) but the latest one no longer selects (the at-the-money window
+/// narrows as more stocks price, or the spot moves) fell to the file-order
+/// pass, past the 25,000 cap, and its candles were written with no
+/// `contract` (seen live 2026-10-28: one HAVELLS 23Nov2026 1260 CE candle).
+/// The attach now passes the current selection as tier 0 and everything
+/// selected earlier today as tier 1 ([`earlier_selected_today`]).
+///
+/// `tiers.len() + 1` passes over the rows, O(rows x passes), once per
+/// attach, never on the tick path.
+#[must_use]
+pub fn labels_from_artifact_in_tiers(
+    contracts: &[ContractRow],
+    tiers: &[&[SubscribeInstrument]],
+) -> HashMap<ContractKey, Arc<str>> {
+    let mut tier_of: HashMap<ContractKey, usize> = HashMap::new();
+    for (tier, members) in tiers.iter().enumerate() {
+        for instrument in *members {
+            tier_of
+                .entry((instrument.security_id, instrument.segment))
+                .or_insert(tier);
+        }
+    }
+    let rest = tiers.len();
     let mut labels: HashMap<ContractKey, Arc<str>> =
         HashMap::with_capacity(contracts.len().min(MAX_TRACKED_CONTRACTS));
-    // Pass 1 takes only subscribed keys; pass 2 fills what room is left. With
-    // an empty selection pass 1 takes nothing and this is the plain file-order
-    // walk.
-    for want_selected in [true, false] {
-        if want_selected && picked.is_empty() {
+    for pass in 0..=rest {
+        if tiers.get(pass).is_some_and(|members| members.is_empty()) {
             continue;
         }
         for row in contracts {
@@ -1976,7 +2003,7 @@ pub fn labels_from_artifact_selected_first(
                 continue;
             };
             let key = (row.i, segment);
-            if picked.contains(&key) != want_selected {
+            if tier_of.get(&key).copied().unwrap_or(rest) != pass {
                 continue;
             }
             if labels.len() >= MAX_TRACKED_CONTRACTS && !labels.contains_key(&key) {
@@ -1989,6 +2016,183 @@ pub fn labels_from_artifact_selected_first(
         }
     }
     labels
+}
+
+/// Every contract the attach selected on one IST day, in first-selection
+/// order. Reset when the day changes; bounded by the day's option rows.
+#[derive(Debug, Default)]
+pub struct SelectedToday {
+    day_ymd: u32,
+    keys: HashSet<ContractKey>,
+    order: Vec<SubscribeInstrument>,
+}
+
+impl SelectedToday {
+    /// Records `current` as selected on `today_ymd` (a new day starts empty)
+    /// and returns the contracts selected EARLIER that day that `current` no
+    /// longer holds, in first-selection order. O(current + held).
+    pub fn record_and_earlier(
+        &mut self,
+        today_ymd: u32,
+        current: &[SubscribeInstrument],
+    ) -> Vec<SubscribeInstrument> {
+        if self.day_ymd != today_ymd {
+            *self = Self {
+                day_ymd: today_ymd,
+                ..Self::default()
+            };
+        }
+        let now: HashSet<ContractKey> =
+            current.iter().map(|i| (i.security_id, i.segment)).collect();
+        let earlier = self
+            .order
+            .iter()
+            .filter(|i| !now.contains(&(i.security_id, i.segment)))
+            .copied()
+            .collect();
+        for instrument in current {
+            if self
+                .keys
+                .insert((instrument.security_id, instrument.segment))
+            {
+                self.order.push(*instrument);
+            }
+        }
+        earlier
+    }
+}
+
+static SELECTED_TODAY: std::sync::Mutex<Option<SelectedToday>> = std::sync::Mutex::new(None);
+
+/// The process-wide [`SelectedToday`]: records this attach's selection and
+/// returns what earlier attaches today selected that this one does not.
+/// Called once per attach attempt, cold.
+#[must_use]
+pub fn earlier_selected_today(
+    today_ymd: u32,
+    current: &[SubscribeInstrument],
+) -> Vec<SubscribeInstrument> {
+    let mut held = SELECTED_TODAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.get_or_insert_with(SelectedToday::default)
+        .record_and_earlier(today_ymd, current)
+}
+
+#[cfg(test)]
+mod label_tier_tests {
+    use super::*;
+
+    fn row(id: u64, e: u32) -> ContractRow {
+        ContractRow {
+            i: id,
+            x: "NSE".into(),
+            c: "OPTSTK".into(),
+            e,
+            s: 126_000,
+            l: "CE".into(),
+            u: "HAVELLS".into(),
+            z: 500,
+        }
+    }
+
+    fn inst(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+        }
+    }
+
+    #[test]
+    fn test_labels_from_artifact_in_tiers_names_an_earlier_selection_past_the_cap() {
+        // The 2026-10-28 shape: the file fills the cap before the contract an
+        // earlier attempt subscribed; the latest attempt no longer selects it.
+        let mut rows: Vec<ContractRow> = (1..=MAX_TRACKED_CONTRACTS as u64)
+            .map(|i| row(i, 2026_11_23))
+            .collect();
+        let earlier = MAX_TRACKED_CONTRACTS as u64 + 9;
+        let current = MAX_TRACKED_CONTRACTS as u64 + 10;
+        rows.push(row(earlier, 2026_11_23));
+        rows.push(row(current, 2026_11_23));
+        let one_tier = labels_from_artifact_selected_first(&rows, &[inst(current)]);
+        assert!(
+            !one_tier.contains_key(&(earlier, ExchangeSegment::NseFno)),
+            "control: the one-tier walk drops the earlier selection"
+        );
+        let tiers = labels_from_artifact_in_tiers(&rows, &[&[inst(current)], &[inst(earlier)]]);
+        assert_eq!(tiers.len(), MAX_TRACKED_CONTRACTS, "the cap still holds");
+        assert!(tiers.contains_key(&(current, ExchangeSegment::NseFno)));
+        assert_eq!(
+            tiers
+                .get(&(earlier, ExchangeSegment::NseFno))
+                .map(|s| s.as_ref()),
+            Some("HAVELLS-23Nov2026-1260-CE")
+        );
+    }
+
+    #[test]
+    fn test_labels_from_artifact_in_tiers_with_no_tiers_is_the_file_order_walk() {
+        let rows: Vec<ContractRow> = (1..=5).map(|i| row(i, 2026_11_23)).collect();
+        assert_eq!(
+            labels_from_artifact_in_tiers(&rows, &[]),
+            labels_from_artifact(&rows)
+        );
+        assert_eq!(
+            labels_from_artifact_in_tiers(&rows, &[&[], &[]]),
+            labels_from_artifact(&rows)
+        );
+    }
+
+    #[test]
+    fn test_labels_from_artifact_in_tiers_first_tier_wins_under_the_cap() {
+        // More tier-1 keys than room: tier 0 is never squeezed out.
+        let rows: Vec<ContractRow> = (1..=(MAX_TRACKED_CONTRACTS as u64 + 2))
+            .map(|i| row(i, 2026_11_23))
+            .collect();
+        let last = MAX_TRACKED_CONTRACTS as u64 + 2;
+        let tier1: Vec<SubscribeInstrument> =
+            (1..=MAX_TRACKED_CONTRACTS as u64).map(inst).collect();
+        let labels = labels_from_artifact_in_tiers(&rows, &[&[inst(last)], &tier1]);
+        assert!(labels.contains_key(&(last, ExchangeSegment::NseFno)));
+        assert_eq!(labels.len(), MAX_TRACKED_CONTRACTS);
+    }
+
+    #[test]
+    fn test_selected_today_record_and_earlier_keeps_the_day_and_resets_on_a_new_one() {
+        let mut held = SelectedToday::default();
+        assert!(
+            held.record_and_earlier(2026_10_28, &[inst(1), inst(2)])
+                .is_empty()
+        );
+        // The window narrowed: 2 is no longer selected, 3 is new.
+        assert_eq!(
+            held.record_and_earlier(2026_10_28, &[inst(1), inst(3)]),
+            vec![inst(2)]
+        );
+        // Both earlier contracts stay remembered, in first-selection order.
+        assert_eq!(
+            held.record_and_earlier(2026_10_28, &[inst(1)]),
+            vec![inst(2), inst(3)]
+        );
+        // A new day forgets yesterday.
+        assert!(held.record_and_earlier(2026_10_29, &[inst(9)]).is_empty());
+        // The composite key: the same id on another segment is another contract.
+        let other = SubscribeInstrument {
+            security_id: 9,
+            segment: ExchangeSegment::NseEquity,
+        };
+        assert_eq!(held.record_and_earlier(2026_10_29, &[other]), vec![inst(9)]);
+    }
+
+    #[test]
+    fn test_earlier_selected_today_uses_one_process_wide_memory() {
+        // A day no other test uses, so the shared memory is this test's own.
+        assert!(earlier_selected_today(1_999_01_01, &[inst(41)]).is_empty());
+        assert_eq!(
+            earlier_selected_today(1_999_01_01, &[inst(42)]),
+            vec![inst(41)]
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1047,6 +1047,24 @@ Approved by: owner Quote 44 (2026-10-28), recorded in the daily-universe rule fi
   - Files: crates/app/src/wipe_2026_10_31.rs
   - Tests: test_classify_s3_key_keeps_every_instrument_snapshot
 
+### PR EX — owner 2026-10-28: the daily expiry check (app, storage, common, aws-lambdas, docs)
+
+Approved by: owner 2026-10-28, "go ahead and add the daily expiry check" (a guarantee, with daily proof, that only the CURRENT expiry of each underlying is subscribed).
+
+- [ ] EX1 (app, storage, common) Two layers. Subscribe time: after
+  `select_contract_universe`, `enforce_subscribe_expiry_scope` recomputes each
+  underlying's nearest real expiry from the day's contract file (a pass
+  separate from the selector) and REFUSES any selected contract that is
+  expired, on another expiry, or unknown, with one coded `EXPIRY-SCOPE-01`
+  line. Daily at 15:50 IST: today's distinct option contracts in `candles_1m`
+  judged against the same table, one `expiry_scope_audit` row (`clean` /
+  `violation` / `partial`). Also fixes the 2026-10-28 naming gap (a contract
+  an earlier attach subscribed lost its name when a later attach replaced the
+  name table): names are built in tiers, current selection then everything
+  selected earlier today.
+  - Files: crates/app/src/expiry_scope_check.rs, crates/app/src/expiry_scope_check_tests.rs, crates/app/src/dhan_contract_universe.rs, crates/app/src/contract_underlying_map.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/app/tests/ensure_ddl_boot_wiring_guard.rs, crates/storage/src/expiry_scope_audit_persistence.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs, crates/storage/tests/ilp_overflow_bound_guard.rs, crates/common/src/error_code.rs, crates/common/tests/error_code_alarm_coverage_guard.rs, crates/aws-lambdas/src/operator_control_action_commands.rs, docs/error-runbooks/expiry-scope-error-codes.md, .claude/triage/error-rules.yaml
+  - Tests: test_parse_contract_label_keeps_a_hyphenated_underlying_whole, proptest_parse_contract_label_round_trips_the_renderer, test_build_expiry_index_skips_a_thin_stub_and_picks_the_real_chain, test_build_expiry_index_counts_the_expiry_day_itself_as_current, test_build_expiry_index_on_yesterdays_file_finds_nothing_current, test_check_selected_expiries_refuses_off_expiry_expired_unknown_and_the_stub, test_enforce_subscribe_expiry_scope_removes_and_counts, proptest_selector_output_always_passes_the_expiry_scope_check, test_classify_candle_contracts_the_havells_unlabelled_candle_counts_once, test_classify_expiry_scope_every_combination, test_main_wires_spawn_expiry_scope_check, test_the_daily_check_runs_on_its_own_task_never_the_frame_drain, test_the_attach_refuses_before_it_names_or_dials, test_expiry_scope_audit_ddl_statements_self_heal_every_column_and_never_drop, test_labels_from_artifact_in_tiers_names_an_earlier_selection_past_the_cap, test_selected_today_record_and_earlier_keeps_the_day_and_resets_on_a_new_one
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Shipping `tv_dhan_token_publish_total` / `tv_dhan_shared_token_adoption_total`
@@ -1083,6 +1101,8 @@ PR L: each fix reuses an existing mechanism: the owed close code is already stor
 
 PR N (Quote 44): the rider asks for a snapshot pass on its own task after each successful build; the pass lists data/instrument-cache, uploads every dated .json with no matching marker through raw_frame_upload::upload_file (gzip, conditional put, HeadObject verify, marker), and the 7-day sweep inside build_once deletes only marked files. The lifecycle writer and its storage helpers are deleted.
 
+PR EX (design): two layers. The attach refuses an off-expiry contract before it is named, mapped or dialled (fail-closed: a wrong-expiry contract looks healthy and mixes two chains); the 15:50 IST task reads today's distinct option contracts from `candles_1m` (bounded, 100,001 rows, 60 s timeout, 3 reads 120 s apart), judges each contract once on its composite key, and writes one `expiry_scope_audit` row (DEDUP `ts, trading_date_ist, feed`). "Current expiry" is recomputed by its own pass with the selector's rule (smallest expiry >= today with at least 4 legs), so the two can disagree only if one of them is wrong.
+
 ## Edge Cases
 
 - No depth sink: `is_some_and` gives false; nothing changes.
@@ -1102,6 +1122,8 @@ PR N (Quote 44): the rider asks for a snapshot pass on its own task after each s
 
 PR N: a file replaced mid-copy (marker no longer matches, copied again next pass); a same-day rebuild with different bytes (sidecar key, warning); an orphan .json.tmp (kept, counted); no bucket resolves (no_bucket counted, nothing swept); a request during a running pass (skipped_busy counted, rerun queued).
 
+PR EX: a hyphenated underlying (`BAJAJ-AUTO`, parsed from the right); a decimal strike; a capped name (malformed, judged from the file); a thin earlier expiry (skipped, as the selector does); the expiry day itself (current); yesterday's file (every contract expired, never clean); one contract stored with and without a name (counted once, unlabelled); two names for one contract (label_mismatch); a BSE contract (judged on BSE_FNO).
+
 ## Failure Modes
 
 - Extra flushes under load: at most one per 500 ms from the frame arm.
@@ -1116,6 +1138,8 @@ PR N: a file replaced mid-copy (marker no longer matches, copied again next pass
 - PR L: a lane retry that never gets the lock keeps retrying on a capped backoff (logged per episode); a budget reading distrusted on day 2 pages instead of stopping.
 
 PR N: S3 down or hung (counted failure, pass bounded at 30 min, stops after 3 time-outs in a row, files kept); marker write fails (verified copy held in memory, shared marker counter); a folder entry unreadable (skipped, counted); the console wipes still remove instrument-cache (documented limit, not changed).
+
+PR EX: the contract file is missing (partial, artifact_missing); the read fails three times (partial, read_failed); more rows than the cap (partial, row_cap_hit unless a violation is already proven); the audit write fails (coded STORAGE-GAP-03 line, the verdict stays in the log); the selector picks a stub or a later expiry (refused, coded line, the rest dials).
 
 ## Test Plan
 
@@ -1132,6 +1156,8 @@ PR M: per-crate tests plus the next live session's EBS throughput, spill count a
 PR L: per-crate `cargo test -p` for core, storage, trading, app, aws-lambdas; restart differential; workflow window pins; clippy and fmt.
 
 PR N: cargo test -p tickvault-app --lib -- instrument_snapshot dhan_universe; the ensure_ddl_boot_wiring_guard and universe_boot_race_guard test binaries; cargo test -p tickvault-storage --lib instrument_lifecycle; cargo test -p tickvault-app --lib wipe_2026_10_31.
+
+PR EX: unit tests for the name parser, the nearest-expiry table, the subscribe check and its mutation, the daily classifier and every verdict combination; proptests (renderer round trip, parser never panics, the real selector's output always passes the check); DDL self-heal and DEDUP-with-feed tests; source scans that main.rs spawns the task, the frame drain never calls it, and the attach refuses before it names. Commands: cargo test -p tickvault-app --lib, cargo test -p tickvault-storage, the changed guard binaries, crates/common tests.
 
 ## Rollback
 
@@ -1150,6 +1176,8 @@ PR M: revert the merge commit of each sub-branch.
 PR L: revert the merge commit of each sub-branch; no schema change.
 
 PR N: revert the PR. Reverting does NOT restart the lifecycle write lawfully: Quote 44 REJECTs a restart without a fresh dated quote. The snapshot objects already copied stay in S3 (kept forever).
+
+PR EX: revert the commit. The table stays (nothing drops it); with the code gone nothing writes it. The tiered naming reverts to selected-first, which restores the 2026-10-28 naming gap only.
 
 ## Observability
 
@@ -1176,6 +1204,8 @@ PR M: no new alarm or page; local `/metrics` only for any new counter.
 PR L: new reason labels and refusal counters only, local `/metrics` only; no new alarm or page (the liveness alarm's schedule moves, the page is unchanged).
 
 PR N: tv_instrument_snapshot_upload_total{outcome=uploaded|reused|failed|no_bucket|skipped_busy|entry_unreadable} and tv_instrument_snapshot_sweep_held_total, registered at 0 at rider start, local /metrics only; failures log a coded STORAGE-GAP-04 error. No new alarm or page (needs a dated noise-lock row first).
+
+PR EX: `tv_expiry_scope_subscribe_refused_total`, `tv_expiry_scope_subscribe_checked`, `tv_expiry_scope_daily_runs_total{verdict}`, `tv_expiry_scope_{off_expiry,expired,unlabelled}_contracts` (local `/metrics` only, registered at 0 when the task spawns); `expiry_scope_audit` rows; coded `EXPIRY-SCOPE-01` (log only, no filter, alarm, EMF name or page: Dhan noise lock §3); `refused_off_expiry` on the attach's `contract universe resolved` line.
 
 ## Guarantee matrix
 

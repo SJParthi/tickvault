@@ -727,6 +727,11 @@ pub struct ContractSelection {
     /// what gets a backup copy on a second main-feed socket (scope lock
     /// 2026-10-02). A subset of [`Self::instruments`], in rank order.
     pub backup_rank: Vec<SubscribeInstrument>,
+    /// Contracts the subscribe-time expiry-scope check REFUSED after selection
+    /// (`expiry_scope_check::enforce_subscribe_expiry_scope`, owner 2026-10-28):
+    /// on a live expiry that is not the current one, expired, or unknown to the
+    /// contract file. 0 on a healthy day: the selector cannot pick one.
+    pub refused_off_expiry: usize,
 }
 
 /// Maps a master row's `EXCH_ID` to the derivative segment we subscribe.
@@ -1216,7 +1221,7 @@ fn push_contract(
 /// Deliberately small. A genuinely thin weekly on an illiquid stock is real
 /// and must survive; the case this rejects is the single-row artefact, not the
 /// quiet market.
-const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
+pub(crate) const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
 
 /// The nearest expiry at or after today that carries a real chain.
 ///
@@ -2330,6 +2335,16 @@ pub async fn load_contract_universe(
 
     let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
     let mut selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+    // The expiry-scope guarantee, layer 1 (owner 2026-10-28): every selected
+    // contract must sit on its underlying's current expiry, recomputed from the
+    // same file by a separate pass. A contract that does not is REFUSED here,
+    // before anything below names, maps or dials it.
+    let expiry_scope = crate::expiry_scope_check::enforce_subscribe_expiry_scope(
+        &mut selection,
+        &contracts,
+        today_ymd,
+    );
+    crate::expiry_scope_check::record_subscribe_expiry_scope(&expiry_scope, today_ymd);
     // Carried on the selection rather than logged here alone, so the pure
     // classifier below can tell the two failures apart without re-reading I/O.
     selection.spot_rows_available = prices.len();
@@ -2397,9 +2412,15 @@ pub async fn load_contract_universe(
         // size) — an extra label, which is harmless. Published BEFORE the
         // owner map: the projection only reads a label for a contract the
         // leaderboard already tracks.
-        let labels = crate::contract_underlying_map::labels_from_artifact_selected_first(
-            &contracts,
+        // Tier 1 is everything an EARLIER attach today selected (2026-10-28):
+        // the socket keeps those contracts, so they keep their names too.
+        let earlier = crate::contract_underlying_map::earlier_selected_today(
+            today_ymd,
             &selection.instruments,
+        );
+        let labels = crate::contract_underlying_map::labels_from_artifact_in_tiers(
+            &contracts,
+            &[&selection.instruments, &earlier],
         );
         // The candle writer fills `candles_<tf>.contract` from the SAME names,
         // re-keyed into the row's own `(security_id, segment-string)` shape
@@ -2463,6 +2484,7 @@ pub async fn load_contract_universe(
         underlyings_total = selection.stock_option_underlyings,
         without_spot = selection.underlyings_without_spot,
         dropped_for_capacity = selection.dropped_for_capacity,
+        refused_off_expiry = selection.refused_off_expiry,
         "contract universe resolved"
     );
     selection

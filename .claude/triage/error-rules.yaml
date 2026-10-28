@@ -1956,6 +1956,24 @@ rules:
       the operator checks QuestDB apply lag and the loss counters named in
       the runbook before deciding. Nothing is safe to auto-fix.
 
+  # EXPIRY-SCOPE-01 (2026-10-28) = an option contract outside its underlying's
+  # current expiry was refused at the contract attach, or found stored in
+  # today's candles_1m by the 15:50 IST check. A scope verdict
+  # (is_auto_triage_safe = false): a selector bug, a stale contract file or a
+  # vendor relisting each need a human to tell apart.
+  - name: expiry-scope-01-off-expiry-escalate
+    match:
+      code: EXPIRY-SCOPE-01
+    action: escalate
+    runbook_path: docs/error-runbooks/expiry-scope-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      EXPIRY-SCOPE-01 = a contract outside the current expiry of its underlying.
+      The expiry_scope_audit row carries the counts and one sample name; the
+      operator compares it with the day's contract file per the runbook.
+      Nothing is safe to auto-fix.
+
   # TF-VERIFY-02 = the verifier run itself degraded (client build /
   # discovery / per-SID query / truncation / flush / budget). Best-effort
   # forensic cold-path task: a lost run loses one day's verification
