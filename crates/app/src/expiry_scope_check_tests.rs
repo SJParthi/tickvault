@@ -2258,11 +2258,14 @@ fn sweep_calendar() -> TradingCalendar {
 /// One daily check the simulated loop ran: its day, start and end (IST nanos).
 type SimCheck = (NaiveDate, i64, i64);
 
-/// The body of `spawn_expiry_scope_check`'s loop, step for step, on a
+/// A hand-written COPY of `spawn_expiry_scope_check`'s loop body on a
 /// simulated IST clock: read the clock, on a trading day wait for 15:50 (or
 /// none when it has passed) and run for `run_secs`, then sleep by
 /// `secs_until_after_checked_day` measured from the instant read. Runs until
-/// the clock reaches `until`.
+/// the clock reaches `until`. It reuses the production helpers but NOT the
+/// production loop, so it proves only that the helpers compose correctly in
+/// this order; that the real loop keeps this order is pinned separately, by
+/// source, in `test_spawn_expiry_scope_check_loop_body_matches_the_simulated_steps`.
 fn simulate_daily_loop(
     calendar: &TradingCalendar,
     start: i64,
@@ -2291,8 +2294,62 @@ fn simulate_daily_loop(
     checks
 }
 
+/// The production loop's statements, in the order `simulate_daily_loop`
+/// copies them. A source scan, not an execution: it fails when the real loop
+/// drops the trading-day gate, the 15:50 wait, or the run, reads the clock
+/// for the after-run sleep before the run, or measures that sleep from the
+/// instant after the run instead of the instant read before it.
 #[test]
-fn test_spawn_expiry_scope_check_loop_checks_every_trading_day_once_with_a_real_calendar() {
+fn test_spawn_expiry_scope_check_loop_body_matches_the_simulated_steps() {
+    let me = production(include_str!("expiry_scope_check.rs"));
+    let spawn = me
+        .find("pub fn spawn_expiry_scope_check(")
+        .expect("spawn fn");
+    let body_start = spawn + me[spawn..].find("loop {").expect("loop");
+    let body_end = body_start
+        + me[body_start..]
+            .find("async fn read_candle_contracts(")
+            .expect("next fn");
+    let body = &me[body_start..body_end];
+    let steps = [
+        "let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);",
+        "let today = ist_date_of(now_ist);",
+        "let trading = today.is_some_and(|d| calendar.is_trading_day(d));",
+        "if let (true, Some(day)) = (trading, today) {",
+        "let wait = secs_until_expiry_scope_check(secs_of_day(now_ist));",
+        "tokio::time::sleep(Duration::from_secs(wait)).await;",
+        "run_one_check(&questdb, day, now_ist).await;",
+        "let after = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);",
+        "let secs = secs_until_after_checked_day(now_ist, after);",
+        "tokio::time::sleep(Duration::from_secs(secs)).await;",
+    ];
+    let mut at = 0;
+    for step in steps {
+        let found = body[at..]
+            .find(step)
+            .unwrap_or_else(|| panic!("loop step missing or out of order: {step}"));
+        at += found + step.len();
+    }
+    // The run sits inside the trading-day block: the block closes after the
+    // run and before the after-run clock read.
+    let run = body.find("run_one_check(").expect("run");
+    let after = body.find("let after =").expect("after");
+    let gate = body.find("if let (true, Some(day))").expect("gate");
+    assert!(gate < run && run < after);
+    assert!(body[run..after].contains('}'), "the run is gated");
+    // Exactly one clock read before the run, exactly one after it, and the
+    // checked-day instant is never reassigned.
+    assert_eq!(body.matches("now_utc_nanos()").count(), 2);
+    assert_eq!(body.matches("let now_ist").count(), 1);
+    assert_eq!(body.matches("now_ist =").count(), 1, "now_ist reassigned");
+    assert_eq!(body.matches("secs_until_after_checked_day(").count(), 1);
+}
+
+/// Composes `secs_until_expiry_scope_check` and
+/// `secs_until_after_checked_day` with a real calendar through
+/// `simulate_daily_loop` (a copy of the loop, see its doc).
+#[test]
+fn test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_trading_day_once() {
     use chrono::Weekday;
     let calendar = sweep_calendar();
     let thursday = NaiveDate::from_ymd_opt(2026, 10, 29).expect("date");
@@ -2357,15 +2414,13 @@ fn test_spawn_expiry_scope_check_loop_checks_every_trading_day_once_with_a_real_
             }
         }
     }
-    // The bound on the only skip: a 25-hour run drifts one hour a day, and
-    // only once it starts within an hour of midnight does a run swallow a
-    // whole day; across both starts and all four start times that happens a
-    // handful of times, never on a run of a day or less.
+    // The only skip is the one asserted per case above: a trading day lying
+    // wholly inside one run longer than a day (90,000 s here; the real run is
+    // bounded far below a day, see the 1,568 s case). No count bound is
+    // claimed: each skip is already proven to be that shape, and a run of a
+    // day or less skips nothing. This only proves the long-run case was
+    // reached, so the per-case check is not vacuous.
     assert!(skipped_inside_long_runs > 0);
-    assert!(
-        skipped_inside_long_runs <= 2 * 4 * 3,
-        "{skipped_inside_long_runs}"
-    );
 }
 
 proptest! {
