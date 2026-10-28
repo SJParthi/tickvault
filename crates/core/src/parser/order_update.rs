@@ -234,7 +234,7 @@ fn normalize_order_update_frame(value: &mut serde_json::Value) {
         // moved onto the accepted key so the typed parse refuses it loudly
         // (see `FILL_CRITICAL_FIELDS`); the generic merge would drop a null
         // alt and let the field default to 0.
-        if FILL_CRITICAL_FIELDS.contains(&accepted)
+        if is_fill_critical(accepted)
             && !data.contains_key(accepted)
             && data.get(alt).is_some_and(is_blank_value)
             && let Some(moved) = data.remove(alt)
@@ -367,6 +367,7 @@ fn apply_field_fix(
 /// failing the typed parse loudly (ORDER-EVT-02 `typed_parse_failed`,
 /// `tv_order_update_frames_dropped_total{reason="unparseable_order"}`),
 /// exactly as before 2026-10-28; the WAL keeps the raw frame.
+#[cfg(test)]
 const FILL_CRITICAL_FIELDS: &[&str] = &[
     "Quantity",
     "TradedQty",
@@ -375,6 +376,16 @@ const FILL_CRITICAL_FIELDS: &[&str] = &[
     "TradedPrice",
     "AvgTradedPrice",
 ];
+
+/// Whether `key` is a fill-critical field (the list above): one fixed `match`, no
+/// list walk. Kept in step with the list by
+/// `test_is_fill_critical_matches_the_list`.
+fn is_fill_critical(key: &str) -> bool {
+    matches!(
+        key,
+        "Quantity" | "TradedQty" | "RemainingQuantity" | "Price" | "TradedPrice" | "AvgTradedPrice"
+    )
+}
 
 /// Identity text fields that are numbers on the wire when they are numbers
 /// at all. A non-integral number here (`12.5`, or one past `u64::MAX`,
@@ -391,7 +402,7 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 
 /// Decides how one field value is made to fit its struct type. Pure.
 ///
-/// - `null` or an empty string in a [`FILL_CRITICAL_FIELDS`] field → keep,
+/// - `null` or an empty string in a [`is_fill_critical`] field → keep,
 ///   so the typed parse fails loud (a defaulted 0 would lose the fill).
 /// - `null` in any other field → remove: null means absent, and every
 ///   `OrderUpdate` field defaults when absent. Before 2026-10-28 one null
@@ -411,7 +422,7 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 ///   bool, a non-finite number) → keep, so the typed parse fails loud.
 fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> FieldFix {
     use serde_json::Value;
-    if is_blank_value(value) && FILL_CRITICAL_FIELDS.contains(&key) {
+    if is_blank_value(value) && is_fill_critical(key) {
         return FieldFix::Keep;
     }
     match (kind, value) {
@@ -1537,6 +1548,27 @@ mod tests {
         // A missing fill key is a partial update, as it always was.
         let partial = r#"{"Data":{"OrderNo":"1","Status":"PENDING"},"Type":"order_alert"}"#;
         assert_eq!(parse_order_update(partial).unwrap().traded_qty, 0);
+    }
+
+    #[test]
+    fn test_is_fill_critical_matches_the_list() {
+        for &field in FILL_CRITICAL_FIELDS {
+            assert!(is_fill_critical(field), "{field} is in the list");
+        }
+        for &(accepted, alt, _) in ORDER_UPDATE_FIELDS {
+            assert_eq!(
+                is_fill_critical(accepted),
+                FILL_CRITICAL_FIELDS.contains(&accepted),
+                "{accepted}"
+            );
+            assert_eq!(
+                is_fill_critical(alt),
+                FILL_CRITICAL_FIELDS.contains(&alt),
+                "{alt}"
+            );
+        }
+        assert!(!is_fill_critical(""));
+        assert!(!is_fill_critical("quantity"), "casing matters");
     }
 
     #[test]
