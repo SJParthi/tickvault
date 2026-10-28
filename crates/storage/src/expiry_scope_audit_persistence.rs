@@ -59,7 +59,44 @@ pub const DEDUP_KEY_EXPIRY_SCOPE_AUDIT: &str = "ts, trading_date_ist, feed";
 /// row whatever the input.
 pub const EXPIRY_SCOPE_SAMPLE_MAX_BYTES: usize = 96;
 
-const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
+/// Timeout of one DDL statement of the ensure (the whole HTTP request:
+/// connect, send, response).
+pub const EXPIRY_SCOPE_AUDIT_DDL_TIMEOUT_SECS: u64 = 10;
+const QUESTDB_DDL_TIMEOUT_SECS: u64 = EXPIRY_SCOPE_AUDIT_DDL_TIMEOUT_SECS;
+
+/// Statements one ensure sends, one after the other: the `CREATE`, one
+/// `ADD COLUMN IF NOT EXISTS` per column except `ts`, and the `DEDUP ENABLE`
+/// (`EXPIRY_SCOPE_AUDIT_COLUMNS.len() - 1 + 2`). Pinned against
+/// [`expiry_scope_audit_ddl_statements`] by a test.
+pub const EXPIRY_SCOPE_AUDIT_DDL_STATEMENTS: u64 = EXPIRY_SCOPE_AUDIT_COLUMNS.len() as u64 + 1;
+
+/// Worst-case seconds of one [`ensure_expiry_scope_audit_table`]: every
+/// statement runs to its timeout (a QuestDB that accepts the connection and
+/// never answers). A refused connection returns at once.
+pub const EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS: u64 =
+    EXPIRY_SCOPE_AUDIT_DDL_STATEMENTS * EXPIRY_SCOPE_AUDIT_DDL_TIMEOUT_SECS;
+
+/// ILP-HTTP request timeout of the writer's sender, in seconds. The sender
+/// is built with `retry_timeout=0` (the caller owns the retry cadence) and
+/// an explicit `protocol_version=1`, so building it makes no `/settings`
+/// request and one flush is ONE request.
+pub const EXPIRY_SCOPE_AUDIT_ILP_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Worst-case seconds of one writer flush: the request timeout plus the
+/// sender's minimum-throughput allowance for the body (the default 100 KiB/s
+/// floor; one row is under 1 KiB, so under 0.01 s), rounded up to a whole
+/// second.
+pub const EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS: u64 =
+    EXPIRY_SCOPE_AUDIT_ILP_REQUEST_TIMEOUT_SECS + 1;
+
+/// The writer's ILP conf string for `host:port`. Pure.
+#[must_use]
+pub fn expiry_scope_audit_ilp_conf(host: &str, http_port: u16) -> String {
+    format!(
+        "http::addr={host}:{http_port};protocol_version=1;retry_timeout=0;request_timeout={};",
+        EXPIRY_SCOPE_AUDIT_ILP_REQUEST_TIMEOUT_SECS * 1000
+    )
+}
 
 const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
 
@@ -249,7 +286,7 @@ impl ExpiryScopeAuditWriter {
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); append/flush covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
         crate::ilp_overflow::register_overflow_baseline(EXPIRY_SCOPE_AUDIT_TABLE);
-        let conf = format!("http::addr={}:{};", config.host, config.http_port);
+        let conf = expiry_scope_audit_ilp_conf(&config.host, config.http_port);
         match Sender::from_conf(conf) {
             Ok(s) => {
                 let buffer = s.new_buffer();
@@ -426,6 +463,44 @@ mod tests {
             stmts
                 .iter()
                 .all(|s| !s.to_ascii_uppercase().contains("DROP"))
+        );
+    }
+
+    #[test]
+    fn test_expiry_scope_audit_ddl_statements_count_matches_the_worst_case_bound() {
+        // The app's time-budget assert multiplies this count by the DDL
+        // timeout; a statement added without moving the count would make
+        // that proof short.
+        assert_eq!(
+            expiry_scope_audit_ddl_statements().len() as u64,
+            EXPIRY_SCOPE_AUDIT_DDL_STATEMENTS
+        );
+        assert_eq!(
+            EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS,
+            EXPIRY_SCOPE_AUDIT_DDL_STATEMENTS * QUESTDB_DDL_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_expiry_scope_audit_ilp_conf_is_one_bounded_request() {
+        let conf = expiry_scope_audit_ilp_conf("tv-questdb", 9000);
+        assert!(conf.starts_with("http::addr=tv-questdb:9000;"));
+        // No /settings probe at build, no hidden retry loop inside a flush,
+        // and the request timeout the app's budget counts.
+        assert!(conf.contains("protocol_version=1;"));
+        assert!(conf.contains("retry_timeout=0;"));
+        assert!(conf.contains(&format!(
+            "request_timeout={};",
+            EXPIRY_SCOPE_AUDIT_ILP_REQUEST_TIMEOUT_SECS * 1000
+        )));
+        assert!(EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS > EXPIRY_SCOPE_AUDIT_ILP_REQUEST_TIMEOUT_SECS);
+        // The questdb client accepts it (HTTP builds lazily: no network).
+        assert!(Sender::from_conf(conf).is_ok());
+        // The production constructor uses it.
+        let full = include_str!("expiry_scope_audit_persistence.rs");
+        let src = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        assert!(
+            src.contains("let conf = expiry_scope_audit_ilp_conf(&config.host, config.http_port);")
         );
     }
 

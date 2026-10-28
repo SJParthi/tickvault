@@ -1234,3 +1234,278 @@ async fn test_live_side_readiness_is_never_ready_without_a_drained_seal_writer()
     .await;
     assert!(readiness_reason(readiness).is_some(), "{readiness:?}");
 }
+
+// ------------------------------------------- 2026-10-28 review, round 2
+
+/// IST-epoch nanos of `ymd` at `secs` seconds of the day.
+fn ist_at(day: NaiveDate, secs: u32) -> i64 {
+    let start = day
+        .and_hms_opt(0, 0, 0)
+        .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+        .expect("nanos");
+    start + i64::from(secs) * NANOS_PER_SEC
+}
+
+#[test]
+fn test_secs_until_after_checked_day_wakes_just_past_the_checked_days_end() {
+    let d = NaiveDate::from_ymd_opt(2026, 10, 28).expect("date");
+    // A normal run: checked at 15:50, finished at 16:20.
+    let checked = ist_at(d, EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST);
+    let now = ist_at(d, 16 * 3600 + 20 * 60);
+    assert_eq!(
+        secs_until_after_checked_day(checked, now),
+        (86_400 - (16 * 3600 + 20 * 60)) + EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS
+    );
+    // A non-trading day looked at 08:00 and not run.
+    let early = ist_at(d, 8 * 3600);
+    assert_eq!(
+        secs_until_after_checked_day(early, early),
+        (86_400 - 8 * 3600) + EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS
+    );
+    // Exactly at the wake point: 0. One nanosecond before: rounds UP to 1,
+    // so the wake never lands before the next day begins.
+    let wake = ist_at(d, 0) + NANOS_PER_DAY + 5 * NANOS_PER_SEC;
+    assert_eq!(secs_until_after_checked_day(checked, wake), 0);
+    assert_eq!(secs_until_after_checked_day(checked, wake - 1), 1);
+}
+
+#[test]
+fn test_secs_until_after_checked_day_a_run_across_midnight_does_not_skip_the_next_day() {
+    // Reproduction (2026-10-28 review): an evening restart at 23:58 IST runs
+    // the check at once; the readiness wait and the reads take it past
+    // midnight to 00:30. The old loop slept "to just past the NEXT midnight"
+    // measured from 00:30, so it woke on the day after next and the next
+    // day had no check.
+    let d = NaiveDate::from_ymd_opt(2026, 10, 28).expect("date");
+    let next = d.succ_opt().expect("next day");
+    let checked = ist_at(d, 23 * 3600 + 58 * 60);
+    let after_run = ist_at(next, 30 * 60);
+    // The old computation, kept here as the reproduction.
+    let old_to_midnight = NANOS_PER_DAY - after_run.rem_euclid(NANOS_PER_DAY);
+    let old_secs = u64::try_from(old_to_midnight / NANOS_PER_SEC).expect("secs") + 5;
+    let old_wake = after_run + i64::try_from(old_secs).expect("secs") * NANOS_PER_SEC;
+    assert_eq!(
+        ist_date_of(old_wake),
+        next.succ_opt(),
+        "the old loop woke on the day after next"
+    );
+    // The fix: no sleep, so the next iteration reads the clock on `next`.
+    assert_eq!(secs_until_after_checked_day(checked, after_run), 0);
+    // A run that ends a few seconds after midnight, before the margin.
+    let just_after = ist_at(next, 2);
+    assert_eq!(
+        secs_until_after_checked_day(checked, just_after),
+        EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS - 2
+    );
+}
+
+#[test]
+fn test_secs_until_after_checked_day_visits_every_day_whatever_the_run_length() {
+    // Simulates the loop: each iteration looks at the clock, "runs" for
+    // `run_secs` (0 on a non-trading day), then sleeps by the rule. Every
+    // calendar day must be looked at exactly once.
+    let start_day = NaiveDate::from_ymd_opt(2026, 10, 28).expect("date");
+    for &(start_secs, run_secs) in &[
+        (0_u32, 0_i64),
+        (EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST, 1_568),
+        (23 * 3600 + 58 * 60, 1_920),
+        (86_399, 3_600),
+        (12 * 3600, 12 * 3600 - 1),
+    ] {
+        let mut now = ist_at(start_day, start_secs);
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let day = ist_date_of(now).expect("day");
+            seen.push(day);
+            let after = now + run_secs * NANOS_PER_SEC;
+            let sleep = secs_until_after_checked_day(now, after);
+            now = after + i64::try_from(sleep).expect("secs") * NANOS_PER_SEC;
+        }
+        for pair in seen.windows(2) {
+            assert_eq!(
+                pair[0].succ_opt(),
+                Some(pair[1]),
+                "start {start_secs} run {run_secs}: {seen:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_secs_until_after_checked_day_extremes_never_panic() {
+    for &(a, b) in &[
+        (i64::MIN, i64::MIN),
+        (i64::MIN, i64::MAX),
+        (i64::MAX, i64::MIN),
+        (i64::MAX, i64::MAX),
+        (0, 0),
+        (-1, -1),
+    ] {
+        let _ = secs_until_after_checked_day(a, b);
+    }
+    assert_eq!(secs_until_after_checked_day(0, i64::MAX), 0);
+    assert_eq!(
+        secs_until_after_checked_day(0, 0),
+        86_400 + EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS
+    );
+}
+
+#[test]
+fn test_build_expiry_index_an_expired_duplicate_never_makes_a_selected_contract_ambiguous() {
+    // Regression (2026-10-28 review): Dhan reuses derivative ids. An expired
+    // row (the selector never admits it) under the same id as a current
+    // contract made the id "ambiguous", so the subscribe check refused a
+    // contract the selector rightly picked. Both file orders.
+    for expired_first in [true, false] {
+        let expired = opt(1, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE");
+        let mut rows = Vec::new();
+        if expired_first {
+            rows.push(expired.clone());
+        }
+        rows.extend(chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]));
+        if !expired_first {
+            rows.push(expired);
+        }
+        let index = build_expiry_index(&rows, TODAY, None);
+        let key = (1, ExchangeSegment::NseFno);
+        assert!(
+            !index.ambiguous.contains(&key),
+            "expired_first {expired_first}"
+        );
+        assert_eq!(
+            index.by_key.get(&key).map(|r| (r.e, r.u.as_str())),
+            Some((CURRENT, "SBIN"))
+        );
+        let report = check_selected_expiries(&[inst(1)], &rows, TODAY);
+        assert!(report.refused.is_empty(), "{report:?}");
+        assert_eq!(report.checked, 1);
+        // The daily check judges it from the admissible row: current.
+        let (counts, _) = classify_candle_contracts(
+            &[candle(1, "NSE_FNO", Some("SBIN-23Nov2026-1000-CE"))],
+            &index,
+            TODAY,
+        );
+        assert_eq!(counts.contracts_checked, 1);
+        assert_eq!(counts.unresolved, 0);
+        assert_eq!(counts.violations(), 0);
+    }
+}
+
+#[test]
+fn test_build_expiry_index_ignores_every_unusable_duplicate_for_ambiguity() {
+    // No leg, no strike, no underlying, expiry 0: each is a row the selector
+    // skips, so none makes the admissible contract under the same id
+    // ambiguous.
+    let unusable = [
+        opt(1, "OPTSTK", "OTHER", NEXT, 1000, ""),
+        opt(1, "OPTSTK", "OTHER", NEXT, 0, "CE"),
+        opt(1, "OPTSTK", "", NEXT, 1000, "CE"),
+        opt(1, "OPTIDX", "OTHER", 0, 1000, "CE"),
+    ];
+    for dup in unusable {
+        let mut rows = vec![dup.clone()];
+        rows.extend(chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]));
+        let index = build_expiry_index(&rows, TODAY, None);
+        assert!(index.ambiguous.is_empty(), "{dup:?}");
+        let report = check_selected_expiries(&[inst(1)], &rows, TODAY);
+        assert!(report.refused.is_empty(), "{dup:?} {report:?}");
+    }
+}
+
+#[test]
+fn test_build_expiry_index_two_admissible_rows_stay_ambiguous_beside_an_unusable_one() {
+    // The other direction: two contracts the selector could pick under one
+    // id are still ambiguous (refused, never judged), whatever unusable row
+    // sits between them.
+    let mut rows = vec![opt(1, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE")];
+    rows.extend(chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]));
+    rows.extend(chain(50, "OPTSTK", "SBIN", NEXT, &[1000, 1020]));
+    rows.push(opt(1, "OPTSTK", "SBIN", NEXT, 1000, "CE"));
+    let index = build_expiry_index(&rows, TODAY, None);
+    assert!(index.ambiguous.contains(&(1, ExchangeSegment::NseFno)));
+    let report = check_selected_expiries(&[inst(1)], &rows, TODAY);
+    assert_eq!(report.unknown, 1);
+    assert_eq!(report.refused, vec![inst(1)]);
+}
+
+#[test]
+fn test_build_expiry_index_a_key_with_only_unusable_rows_keeps_the_old_rule() {
+    // No admissible row: the selector never picks the id, so ambiguity among
+    // its unusable rows costs no selected contract and keeps the daily check
+    // fail-closed (unresolved, never judged).
+    let mut rows = vec![
+        opt(1, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE"),
+        opt(1, "OPTSTK", "SBIN", 2026_10_20, 1000, "CE"),
+    ];
+    rows.extend(chain(10, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]));
+    let index = build_expiry_index(&rows, TODAY, None);
+    assert!(index.ambiguous.contains(&(1, ExchangeSegment::NseFno)));
+    // Two unusable rows naming ONE contract are not ambiguous.
+    let same = vec![
+        opt(2, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE"),
+        opt(2, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE"),
+    ];
+    assert!(build_expiry_index(&same, TODAY, None).ambiguous.is_empty());
+}
+
+#[test]
+fn test_enforce_subscribe_expiry_scope_agrees_with_the_real_selector_on_a_reused_id() {
+    // The real selector picks the current SBIN chain; an expired NIFTY row in
+    // the same file reuses one of its ids. The selector admits only the
+    // current row, so the check must refuse nothing.
+    let mut rows = vec![opt(1_001, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "CE")];
+    rows.extend(chain(1_000, "OPTSTK", "SBIN", CURRENT, &[1000, 1020, 1040]));
+    let master: Vec<_> = rows.iter().map(ContractRow::to_master_row).collect();
+    let spot: HashMap<String, i64> = [("SBIN".to_owned(), 102_000_i64)].into_iter().collect();
+    let mut selection = select_contract_universe(&master, &spot, TODAY, 25_000);
+    assert!(
+        selection.instruments.iter().any(|i| i.security_id == 1_001),
+        "the selector picks the reused id"
+    );
+    let picked = selection.instruments.len();
+    let report = enforce_subscribe_expiry_scope(&mut selection, &rows, TODAY);
+    assert!(report.refused.is_empty(), "{report:?}");
+    assert_eq!(report.checked, picked);
+    assert_eq!(selection.instruments.len(), picked);
+}
+
+#[test]
+fn test_enforce_subscribe_expiry_scope_counts_a_refusal_under_its_admissible_class() {
+    // A next-month stock contract (refused: off expiry) whose id an expired
+    // INDEX row also uses, listed after it. The refusal lowers the stock
+    // count the selector raised, never the index count.
+    let mut rows = havells_file();
+    rows.push(opt(200, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "CE"));
+    let mut selection = ContractSelection {
+        instruments: vec![inst(100), inst(200)],
+        stock_options: 2,
+        index_options: 7,
+        ..ContractSelection::default()
+    };
+    let report = enforce_subscribe_expiry_scope(&mut selection, &rows, TODAY);
+    assert_eq!(report.refused, vec![inst(200)]);
+    assert_eq!(selection.stock_options, 1);
+    assert_eq!(selection.index_options, 7);
+}
+
+#[test]
+fn test_expiry_scope_run_worst_secs_ends_before_the_stop_window() {
+    use tickvault_storage::expiry_scope_audit_persistence::{
+        EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS, EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS,
+    };
+    // 17 DDL statements x 10 s, one 5 s request + 1 s.
+    assert_eq!(EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS, 170);
+    assert_eq!(EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS, 6);
+    // 170 + 300 + 30 + 3x60 + 2x120 + 3x(170+6) + 2x60.
+    assert_eq!(expiry_scope_run_worst_secs(), 1_568);
+    let end = u64::from(EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST) + expiry_scope_run_worst_secs();
+    assert_eq!(end, 16 * 3600 + 16 * 60 + 8, "16:16:08 IST");
+    assert!(end < u64::from(crate::shutdown_class::SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST));
+    // The DDL ensure and the flush are inside the bound (the old bound left
+    // both out): removing either would lower it.
+    assert!(
+        expiry_scope_run_worst_secs()
+            > 4 * EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS
+                + u64::from(EXPIRY_SCOPE_PERSIST_ATTEMPTS) * EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS
+    );
+}

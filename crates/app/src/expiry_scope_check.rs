@@ -40,7 +40,11 @@
 //! A composite key the file lists twice with a different underlying, option
 //! class or expiry is AMBIGUOUS: which contract the vendor streams under that
 //! id is unknown, so the subscribe-time layer refuses it (`unknown`) and the
-//! daily check counts it `unresolved` (never judged, never `clean`).
+//! daily check counts it `unresolved` (never judged, never `clean`). Only
+//! rows the selector would admit count when the id has one (an expired or
+//! leg-less duplicate under a reused id cannot be what the selector picked,
+//! so it never refuses a selected contract); an id with no admissible row is
+//! judged over its unusable rows, as before.
 //!
 //! The daily check runs at 15:50 IST, or at once when the process starts
 //! later on a trading day (an evening restart), so a restart never skips the
@@ -127,7 +131,10 @@ pub const EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST: u32 = TICK_PERSIST_END_SECS_OF_DAY
 
 // After the close, before the 16:25 scheduled-stop window.
 const _: () = assert!(EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST > TICK_PERSIST_END_SECS_OF_DAY_IST);
-const _: () = assert!(EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST < 16 * 3600 + 25 * 60);
+const _: () = assert!(
+    EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST
+        < crate::shutdown_class::SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
+);
 
 /// Most distinct rows one daily read takes. The main feed carries at most
 /// 25,000 instruments, so a normal day is far below; more rows than this is
@@ -154,15 +161,51 @@ pub const EXPIRY_SCOPE_PERSIST_ATTEMPTS: u32 = 3;
 /// Seconds between audit-row write attempts.
 pub const EXPIRY_SCOPE_PERSIST_SPACING_SECS: u64 = 60;
 
-// Worst case: the readiness wait, three reads with their spacing, three
-// writes with theirs, all after 15:50 and before the 16:25 stop window.
-const _: () = assert!(
-    EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST as u64
+/// Allowance for the run's local, un-networked work: reading today's
+/// contract file from disk and classifying the rows on a blocking thread.
+/// **Assumed**, not measured: both are O(rows) over ~120,000 file rows and at
+/// most [`EXPIRY_SCOPE_MAX_ROWS`] candle rows; a stalled disk has no bound
+/// here (the file read has no timeout).
+pub const EXPIRY_SCOPE_LOCAL_WORK_SLACK_SECS: u64 = 30;
+
+/// Worst-case seconds from the start of a daily run to its last write
+/// attempt ending, counting every bounded step:
+///
+/// | step | worst case |
+/// |---|---|
+/// | the task's own table ensure at spawn (a process started just before 15:50) | `ENSURE_WORST` |
+/// | the readiness wait (bounded by its deadline) | [`EXPIRY_SCOPE_READINESS_WAIT_SECS`] |
+/// | the contract-file read and the classification | [`EXPIRY_SCOPE_LOCAL_WORK_SLACK_SECS`] (Assumed) |
+/// | the reads: each under its timeout, a spacing between two | `reads × timeout + (reads − 1) × spacing` |
+/// | the writes: each re-runs the ensure, then one ILP flush; a spacing between two | `attempts × (ENSURE_WORST + FLUSH_WORST) + (attempts − 1) × spacing` |
+///
+/// `ENSURE_WORST` is every DDL statement running to its timeout
+/// (`EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS`); `FLUSH_WORST` is the sender's
+/// one bounded request (`EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS`). Before
+/// 2026-10-28 (review) the bound left out both, and counted a spacing after
+/// the last read and the last write. Pure.
+#[must_use]
+pub const fn expiry_scope_run_worst_secs() -> u64 {
+    use tickvault_storage::expiry_scope_audit_persistence::{
+        EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS, EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS,
+    };
+    let reads = EXPIRY_SCOPE_MAX_READS as u64;
+    let writes = EXPIRY_SCOPE_PERSIST_ATTEMPTS as u64;
+    EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS
         + EXPIRY_SCOPE_READINESS_WAIT_SECS
-        + EXPIRY_SCOPE_MAX_READS as u64
-            * (EXPIRY_SCOPE_QUERY_TIMEOUT_SECS + EXPIRY_SCOPE_READ_SPACING_SECS)
-        + EXPIRY_SCOPE_PERSIST_ATTEMPTS as u64 * EXPIRY_SCOPE_PERSIST_SPACING_SECS
-        < 16 * 3600 + 25 * 60
+        + EXPIRY_SCOPE_LOCAL_WORK_SLACK_SECS
+        + reads * EXPIRY_SCOPE_QUERY_TIMEOUT_SECS
+        + reads.saturating_sub(1) * EXPIRY_SCOPE_READ_SPACING_SECS
+        + writes * (EXPIRY_SCOPE_AUDIT_ENSURE_WORST_SECS + EXPIRY_SCOPE_AUDIT_FLUSH_WORST_SECS)
+        + writes.saturating_sub(1) * EXPIRY_SCOPE_PERSIST_SPACING_SECS
+}
+
+// The worst case, started at 15:50, ends before the 16:25 scheduled-stop
+// window opens. Today: 170 + 300 + 30 + 180 + 240 + 528 + 120 = 1,568 s,
+// so 16:16:08 IST, about 9 minutes clear.
+const _: () = assert!(
+    EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST as u64 + expiry_scope_run_worst_secs()
+        < crate::shutdown_class::SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64
 );
 
 /// Counter: contracts the subscribe-time check refused (per attempt).
@@ -304,11 +347,16 @@ pub struct ExpiryIndex<'a> {
     /// unjudged, never judged against the wrong chain.
     pub nearest_by_name: HashMap<(ExchangeSegment, &'a str), Option<u32>>,
     /// `(security_id, segment)` → its option row (every expiry, expired too).
-    /// A duplicate composite key keeps its first row; see `ambiguous`.
+    /// A duplicate composite key keeps its first row the selector would
+    /// admit (see `counts_as_a_leg`), else its first row; see `ambiguous`.
     pub by_key: HashMap<ContractKey, &'a ContractRow>,
     /// Composite keys the file lists on two option rows that differ in
     /// underlying, option class or expiry. Which contract the vendor streams
-    /// under such an id is unknown, so neither layer judges it.
+    /// under such an id is unknown, so neither layer judges it. Counted only
+    /// over rows the selector would admit when the key has one (an expired
+    /// or leg-less duplicate cannot be what the selector picked, so it never
+    /// makes a selected contract ambiguous); a key with no admissible row is
+    /// judged over its unusable rows (the selector never picks it).
     pub ambiguous: HashSet<ContractKey>,
     /// Earlier expiries skipped for carrying fewer than the minimum legs.
     pub thin_expiries_skipped: usize,
@@ -423,15 +471,43 @@ pub fn build_expiry_index<'a>(
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(row);
             }
-            std::collections::hash_map::Entry::Occupied(slot) => {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
                 let held = *slot.get();
-                if held.e != row.e || held.u != row.u || held.c != row.c {
-                    index.ambiguous.insert(key);
+                match (
+                    counts_as_a_leg(held, today_ymd),
+                    counts_as_a_leg(row, today_ymd),
+                ) {
+                    // An unusable duplicate (expired, no leg, no strike, no
+                    // underlying) is a row the selector never admits, so it
+                    // cannot be what the selector picked: it neither replaces
+                    // an admissible row nor makes the id ambiguous.
+                    (true, false) => {}
+                    // The first ADMISSIBLE row replaces the unusable ones, and
+                    // any ambiguity recorded among those goes with them.
+                    (false, true) => {
+                        slot.insert(row);
+                        index.ambiguous.remove(&key);
+                    }
+                    // Both admissible: two contracts the selector could pick
+                    // under one id. Both unusable: the selector picks neither,
+                    // so refusing costs no selected contract, and the daily
+                    // check keeps it unjudged (fail-closed).
+                    (true, true) | (false, false) => {
+                        if differs_as_a_contract(held, row) {
+                            index.ambiguous.insert(key);
+                        }
+                    }
                 }
             }
         }
     }
     index
+}
+
+/// Two rows under one composite key name different contracts when their
+/// underlying, option class or expiry differ. Pure.
+fn differs_as_a_contract(a: &ContractRow, b: &ContractRow) -> bool {
+    a.e != b.e || a.u != b.u || a.c != b.c
 }
 
 fn index_current_expiry(
@@ -553,15 +629,26 @@ pub fn enforce_subscribe_expiry_scope(
         .iter()
         .map(|i| (i.security_id, i.segment))
         .collect();
-    let classes: HashMap<ContractKey, bool> = contracts
-        .iter()
-        .filter_map(|r| {
-            let key = (r.i, artifact_option_segment(&r.x)?);
-            refused.contains(&key).then_some((key, r.c == "OPTIDX"))
-        })
-        .collect();
+    // The class the selector counted the contract under: its admissible row
+    // when the file has one (an unusable duplicate of another class must not
+    // lower the wrong count), else its first row.
+    let mut classes: HashMap<ContractKey, (bool, bool)> = HashMap::new();
+    for r in contracts {
+        let Some(segment) = artifact_option_segment(&r.x) else {
+            continue;
+        };
+        let key = (r.i, segment);
+        if !refused.contains(&key) {
+            continue;
+        }
+        let admitted = is_option_row(r) && counts_as_a_leg(r, today_ymd);
+        let entry = classes.entry(key).or_insert((r.c == "OPTIDX", admitted));
+        if admitted && !entry.1 {
+            *entry = (r.c == "OPTIDX", true);
+        }
+    }
     for key in &refused {
-        match classes.get(key) {
+        match classes.get(key).map(|&(index_option, _)| index_option) {
             Some(true) => selection.index_options = selection.index_options.saturating_sub(1),
             Some(false) => selection.stock_options = selection.stock_options.saturating_sub(1),
             None => {}
@@ -1023,6 +1110,33 @@ pub const fn secs_until_expiry_scope_check(now_secs_of_day_ist: u32) -> u64 {
     EXPIRY_SCOPE_CHECK_SECS_OF_DAY_IST.saturating_sub(now_secs_of_day_ist) as u64
 }
 
+/// Seconds past the next IST midnight after a day the daily loop already
+/// handled, at which the loop wakes for the following day.
+pub const EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS: u64 = 5;
+
+/// Seconds the daily loop sleeps after handling the IST day that contains
+/// `checked_ist_nanos` (any instant of that day; the loop passes the instant
+/// it read before the run), when the clock now reads `now_ist_nanos`: until
+/// [`EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS`] past the end of THAT day, and 0 when
+/// that point has already passed (a run that crossed midnight), so the next
+/// day is never skipped. Before (2026-10-28 review), the sleep ran to the
+/// midnight after the run ended, which skipped the next day whenever the run
+/// crossed one. Pure, O(1).
+#[must_use]
+pub const fn secs_until_after_checked_day(checked_ist_nanos: i64, now_ist_nanos: i64) -> u64 {
+    let day_start = checked_ist_nanos.saturating_sub(checked_ist_nanos.rem_euclid(NANOS_PER_DAY));
+    let wake = day_start
+        .saturating_add(NANOS_PER_DAY)
+        .saturating_add(EXPIRY_SCOPE_NEXT_DAY_MARGIN_SECS as i64 * NANOS_PER_SEC);
+    let left = wake.saturating_sub(now_ist_nanos);
+    if left <= 0 {
+        0
+    } else {
+        // Round up so the wake never lands a fraction before the target.
+        (left as u64).div_ceil(NANOS_PER_SEC as u64)
+    }
+}
+
 /// `YYYYMMDD` of an IST date. Pure.
 #[must_use]
 pub fn ymd_of(day: NaiveDate) -> u32 {
@@ -1067,7 +1181,7 @@ fn secs_of_day(ist_nanos: i64) -> u32 {
 
 /// Spawns the daily check on its own task (never the frame drain). Returns
 /// the task handle.
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (parse_contract_label, build_expiry_index, classify_candle_contracts, classify_expiry_scope, expiry_scope_sql, parse_candle_contract_rows, secs_until_expiry_scope_check); spawn site pinned by test_main_wires_spawn_expiry_scope_check.
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (parse_contract_label, build_expiry_index, classify_candle_contracts, classify_expiry_scope, expiry_scope_sql, parse_candle_contract_rows, secs_until_expiry_scope_check, secs_until_after_checked_day); spawn site pinned by test_main_wires_spawn_expiry_scope_check.
 pub fn spawn_expiry_scope_check(
     questdb: QuestDbConfig,
     calendar: Arc<TradingCalendar>,
@@ -1087,10 +1201,13 @@ pub fn spawn_expiry_scope_check(
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 run_one_check(&questdb, day, now_ist).await;
             }
-            // Sleep to just past the next IST midnight (a multi-day process).
-            let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
-            let to_midnight = NANOS_PER_DAY - now_ist.rem_euclid(NANOS_PER_DAY);
-            let secs = u64::try_from(to_midnight / NANOS_PER_SEC).unwrap_or(0) + 5;
+            // Sleep to just past the END of the day this iteration looked at
+            // (a multi-day process), measured from that day, never from the
+            // clock after the run: a run that crossed IST midnight (an
+            // evening restart that began close to it) must not skip the next
+            // day, so the sleep is then 0 and the next iteration takes it.
+            let after = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
+            let secs = secs_until_after_checked_day(now_ist, after);
             tokio::time::sleep(Duration::from_secs(secs)).await;
         }
     })
