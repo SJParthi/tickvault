@@ -3254,3 +3254,26 @@ Then, the same morning: "see ic elalry told yo uto from tonoght itself the enitr
 - Any month other than October 2026 above $75 (or the native stop below $185 before 1 November) without a fresh dated quote.
 - Treating $185 as a new standing line, or keeping `limit_amount` above $75 after 1 November without the planned follow-up.
 - Changing instance, disk, IOPS, throughput or the depth switch under cover of this quote.
+
+#### Quote 46 (2026-10-28, ~11:30 IST) — AFTER THE REBUILD: DELETE THE SEBI/AUDIT TABLES AND EVERYTHING IN THE COLD BUCKET (preserve EXACTLY)
+
+Owner message: "dude ic elalry todl yo uto evebn delete seb iand s3 evryhtign entirley fully completel ydude okay? see because i need the fersh scratch new applciation dude okay?"
+
+Then the card "Tonight's wipe already deletes ALL old market data on the server and in S3, so the app starts fresh on Thursday. The only things kept are the SEBI/audit record tables (orders, P&L, instrument history), the program files in S3 (the rebuild and rollback need them), logs, and sebi-preserve/. Deleting those is permanent, may break record-keeping rules if they apply to you, and needs your rule file, the code and the cloud permissions changed first. What do you want?" The owner tapped **"Delete all, after rebuild"**: "Tonight runs as planned. Then I record your approval in the rule files and build a reviewed one-off delete of SEBI/audit tables and all of S3, run on a later night once the new server is healthy. Permanent."
+
+| Item | What Quote 46 authorizes |
+|---|---|
+| Tonight (28 Oct) | **Nothing changes.** The Quote 32/33 rebuild and the Quote 35/42/43 wipe run as approved, keep-list included. |
+| What it deletes, ONE run | On the box: every SEBI/audit table on the keep lists (`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `pnl_audit`, `order_leg_pnl`, order/position update events, `ws_event_audit` and the other `*_audit` tables) and `/opt/tickvault/data/sebi-preserve/`. In `s3://tv-prod-cold/`: every object version, `deploys/`, `logs/`, `sebi-preserve/`, `instrument-snapshots/` and every audit copy included. |
+| When | Only after the rebuilt server has run one healthy session (earliest Thu 2026-10-29 after 16:30 IST), never 09:00–15:45 IST, never during a deploy, app stopped. |
+| How | The Quote 29e/35 shape: a reviewed one-off Rust tool and workflow (dry run, apply, verify listing), one new IAM role scoped to this delete and a fixed window, both deleted by the next PR. The program for the next boot is uploaded again after the delete, so deploys keep working. |
+| Not covered | The Terraform state bucket and any bucket other than `tv-prod-cold`; the AWS account, alarms and log groups; the Git repository. These need their own dated quote. |
+| After the run | Quote 46 is SPENT. Every never-delete rule (Quote 27, the SEBI rows of §5/§6/§25, the Quote 44 snapshot rule) binds again for everything written after it. |
+
+**Recorded risk (owner told before the tap):** the deletion is permanent and may break record-keeping rules if they apply to the owner; no copy is kept anywhere.
+
+##### What violates Quote 46 (REJECT)
+- Running it tonight, before the rebuilt server's first healthy session, inside 09:00–15:45 IST, during a deploy, or with the app running.
+- Running it without a dry run listing what will go, or without a verify listing after.
+- Touching any bucket other than `tv-prod-cold`, the Terraform state, alarms, log groups or the repository under this quote.
+- Keeping the one-off role, workflow or tool after the run, or reusing Quote 46 for a second run.
