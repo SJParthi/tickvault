@@ -12,6 +12,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# sha256 of published strategy files (brutex_host manifest check), 2026-10-29.
+sha2 = { workspace = true }
 toml = { workspace = true }
 notify = { workspace = true }
 chrono = { workspace = true }

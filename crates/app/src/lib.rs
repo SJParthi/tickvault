@@ -243,6 +243,8 @@ pub mod infra;
 pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
 pub mod log_coalescer;
+/// `tickvault strategy-dry-run`: load, verify and replay published brutex strategy folders (no order, no live change).
+pub mod strategy_dry_run;
 // The one-off 2026-10-22 rebuild (plan item 66, Quotes 32/33/34): its pure
 // module, box subcommand and SSM shell were DELETED 2026-10-29 after the
 // 2026-10-28 run, per rust-only lock §0.13 (`shell_budget_guard.rs`

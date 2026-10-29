@@ -335,8 +335,77 @@ impl S3Cold {
         }))
     }
 
-    // (2026-10-29: `get_to_path` and `list_keys`, used only by the one-off
-    // 2026-10-22 rebuild's restore and inventory, were DELETED with it.)
+    /// GetObject streamed into a new local file. The file is written to
+    /// `path` and `sync_all`ed; returns the bytes written. Cold path: the
+    /// read-only brutex strategy download (`strategy_recipe_fetch`), once
+    /// before the open or in the dry-run CLI. (Written for the one-off
+    /// 2026-10-22 rebuild restore; kept when that tool was deleted
+    /// 2026-10-29 because the strategy download reads the bucket the same way.)
+    // TEST-EXEMPT: one AWS SDK call; the download plan around it is tested in strategy_recipe_fetch
+    pub(crate) async fn get_to_path(&self, key: &str, path: &Path) -> Result<u64> {
+        let resp = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", aws_sdk_s3::error::DisplayErrorContext(&e)))
+            .with_context(|| format!("S3 GetObject {key}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let mut file =
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut body = resp.body;
+        let mut written: u64 = 0;
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .with_context(|| format!("S3 GetObject body {key}"))?
+        {
+            file.write_all(&chunk)
+                .with_context(|| format!("write {}", path.display()))?;
+            written = written.saturating_add(chunk.len() as u64);
+        }
+        file.sync_all()
+            .with_context(|| format!("fsync {}", path.display()))?;
+        Ok(written)
+    }
+
+    /// Every key under `prefix` with its size (ListObjectsV2, all pages).
+    /// Cold path: the read-only brutex strategy download
+    /// (`strategy_recipe_fetch::fetch_strategy`).
+    // TEST-EXEMPT: one paginated AWS SDK call; the download plan built from it is tested in strategy_recipe_fetch
+    pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let resp = self
+                .s3
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .set_continuation_token(token.clone())
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", aws_sdk_s3::error::DisplayErrorContext(&e)))
+                .with_context(|| format!("S3 ListObjectsV2 {prefix}"))?;
+            for obj in resp.contents() {
+                let size = obj.size().and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+                out.push((obj.key().unwrap_or_default().to_string(), size));
+            }
+            if resp.is_truncated() != Some(true) {
+                break;
+            }
+            token = resp.next_continuation_token().map(str::to_string);
+            if token.is_none() {
+                anyhow::bail!("S3 listing under {prefix} was truncated with no continuation token");
+            }
+        }
+        Ok(out)
+    }
 
     /// DeleteObject. Used only by the partition archiver for an object the
     /// same run uploaded (see `partition_archive`). The box role has no
