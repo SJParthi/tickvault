@@ -1160,6 +1160,23 @@ Approved by: owner 2026-10-28, "go ahead and add the daily expiry check" (a guar
   without a dated measured row (websocket-connection-scope-lock.md 2026-10-10).
 - Uncoded `error!` in `indicator/engine.rs` and `strategy/hot_reload.rs`: §28 frozen area.
 
+### ITEM SC — brutex strategy consumer side (owner brief 2026-10-29, "WHAT TO DO NOW" A–D; no live change)
+
+Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They are final" (rule `brutex-strategy-host-2026-10-29.md`). Design, edge cases, failure modes, tests, rollback and observability for this item are in `docs/architecture/brutex-strategy-contract.md` §2–§5 and in the module headers; summary: pure logic in `crates/trading/src/brutex_host/` (no I/O), a read-only S3 lister/downloader in `crates/storage/src/strategy_recipe_fetch.rs` (List + Get only), the `StrategyEngine` trait with a test double, replay harness naming the first differing bar and field, pre-open swap decision, NDJSON audit; nothing is wired into the live trading path and no order is placed. Rollback: delete the modules (no caller on the live path).
+
+- [ ] SC1. Rules + docs (rule file, readonly-lock §1.3, contract doc with crate API and formats, build-access table + ls-remote check)
+  - Files: .claude/rules/project/brutex-strategy-host-2026-10-29.md, .claude/rules/project/brutex-readonly-lock-2026-07-18.md, docs/architecture/brutex-strategy-contract.md
+  - Tests: (docs only)
+- [ ] SC2. Recipe/manifest parse + sha256 verify + version/snapshot selection + gates + replay harness + swap decision + audit, pure, in crates/trading
+  - Files: crates/trading/src/brutex_host/mod.rs, crates/trading/src/brutex_host/*.rs, crates/trading/Cargo.toml
+  - Tests: test_manifest_hash_mismatch_refuses, test_missing_file_refuses, test_version_gap_picks_newest_and_logs_gap, test_empty_candle_file_refuses, test_one_bar_file_replays, test_signal_mismatch_on_last_bar_names_bar_and_field, test_two_faults_at_once_report_the_first, test_swap_refused_mid_session
+- [ ] SC3. Read-only S3 fetch (List + Get) into a local staging folder, in crates/storage
+  - Files: crates/storage/src/strategy_recipe_fetch.rs, crates/storage/src/lib.rs
+  - Tests: test_fetch_never_calls_a_write_api (source scan), test_local_fixture_source_lists_versions
+- [ ] SC4. Dry run on a fixture recipe (a `strategy-dry-run --dir` app subcommand that loads, verifies, gates and replays a fixture with the test double, printing the audit lines)
+  - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/tests/fixtures/brutex_recipe/
+  - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the
