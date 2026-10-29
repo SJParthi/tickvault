@@ -528,6 +528,229 @@ pub fn market_depth_book_ensure_statements() -> Vec<String> {
     out
 }
 
+/// One row of QuestDB's `table_columns(..)` answer: what the boot needs to
+/// know about a column before it asks for the `market_depth_book` DEDUP key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableColumn {
+    name: String,
+    ty: String,
+    designated: bool,
+}
+
+/// Why an existing `market_depth_book` cannot take its DEDUP key (live audit
+/// LH-01, 2026-10-28): the key leads with `ts`, and QuestDB accepts a DEDUP
+/// key only when it holds the table's DESIGNATED timestamp. A table that an
+/// ILP write auto-created before the boot CREATE ran names that column
+/// `timestamp`, so every boot's `DEDUP ENABLE` failed with "deduplicate key
+/// column not found [column=ts]" and depth fell back to `market_depth`.
+/// `CREATE TABLE IF NOT EXISTS` and `ADD COLUMN` cannot repair it: QuestDB
+/// does not rename or re-designate a table's timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BookTimestampProblem {
+    /// The table has no designated timestamp. `plain_ts_present`: a `ts`
+    /// column exists, but not as the designated timestamp.
+    Missing { plain_ts_present: bool },
+    /// The designated timestamp exists under another name.
+    Misnamed {
+        designated: String,
+        plain_ts_present: bool,
+    },
+}
+
+impl BookTimestampProblem {
+    /// The cause, in words, for the boot's refusal line.
+    fn cause(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Missing {
+                plain_ts_present: true,
+            } => "market_depth_book has a ts column but it is not the designated \
+                  timestamp, and the table has none"
+                .into(),
+            Self::Missing {
+                plain_ts_present: false,
+            } => "market_depth_book has no ts column and no designated timestamp".into(),
+            Self::Misnamed {
+                designated,
+                plain_ts_present,
+            } => {
+                // APPROVED: boot-only refusal text, once per ensure
+                std::borrow::Cow::Owned(format!(
+                    "market_depth_book's designated timestamp is named {designated}, not ts \
+                     (a ts column {}), so the DEDUP key on ts cannot be enabled",
+                    if *plain_ts_present {
+                        "exists but is not designated"
+                    } else {
+                        "does not exist"
+                    }
+                ))
+            }
+        }
+    }
+}
+
+/// The manual repair for a [`BookTimestampProblem`]. The boot never drops,
+/// renames or alters the table itself: a table with rows is market data (zero
+/// loss, Quotes 27 + 28), and only the operator can confirm it is empty.
+///
+/// Why the start time matters (review, 2026-10-29): the depth spill replay is
+/// spawned in `main` BEFORE the Dhan lane runs this ensure, and outside 08:00 to
+/// 15:40 IST its first round POSTs at once. A spilled `market_depth_book` row
+/// reaching QuestDB before the ensure auto-creates the table with its
+/// designated timestamp named `timestamp` again. Inside that window the depth
+/// replay is held (`tick_spill_replay::depth_replay_held_at`), so the boot's
+/// CREATE runs first. That replay is one path that can make this table; that
+/// it made the live LH-01 table is Assumed, not read from the box.
+/// A non-empty table is RENAMED, never dropped, so no row is deleted.
+const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app stopped \
+     (after the 16:30 IST stop): run SELECT count() FROM market_depth_book. If it \
+     is 0, DROP TABLE market_depth_book. If it has rows, keep them: RENAME TABLE \
+     market_depth_book TO market_depth_book_lh01 (nothing is deleted; that copy \
+     is not archived or swept, so decide separately whether to copy it to S3). \
+     Then leave the app stopped until the scheduled 08:30 IST start: from 08:00 \
+     to 15:40 IST the depth spill replay is held, so the boot creates the new \
+     table with ts before any spilled market_depth_book row reaches QuestDB. A \
+     start outside that window replays data/spill/depth first, and a spilled \
+     market_depth_book row would auto-create the table with the wrong timestamp \
+     again. Until then depth is written to market_depth and nothing is lost. \
+     The boot never drops, renames or alters this table itself";
+
+/// Counts boots that found `market_depth_book` with a designated timestamp
+/// other than `ts` and kept depth in `market_depth` (review, 2026-10-29).
+///
+/// Deliberately NOT `tv_depth_persist_errors_total`: that series is summed by
+/// the always-armed market-data persistence-loss alarm, whose text says rows
+/// did not reach QuestDB and are not recoverable. This refusal loses nothing
+/// (every depth row goes to `market_depth`), so it counts here, local
+/// `/metrics` only (not EMF-selected, no alarm), registered at 0 at boot.
+pub const MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER: &str = "tv_depth_book_layout_refused_total";
+
+/// What [`ensure_market_depth_book_table`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "anything but Ensured means market_depth_book cannot take array rows; keep depth in market_depth"]
+pub enum BookEnsureOutcome {
+    /// Every statement was accepted: the table has its DEDUP key.
+    Ensured,
+    /// A statement was refused or QuestDB was unreachable (already counted on
+    /// `tv_depth_persist_errors_total{stage}` and logged by the DDL runner).
+    Failed,
+    /// The table exists with a designated timestamp other than `ts`, so its
+    /// DEDUP key can never be enabled. No statement was sent and nothing is
+    /// lost (depth stays in `market_depth`); logged once at `warn!` with the
+    /// cause and the remedy, counted on [`MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER`].
+    LayoutRefused,
+}
+
+impl BookEnsureOutcome {
+    /// `true` only when the array-row writer may be armed.
+    pub fn is_ensured(self) -> bool {
+        self == Self::Ensured
+    }
+}
+
+/// Counts and logs a [`BookTimestampProblem`] refusal: once per ensure, at
+/// `warn!` (the HOT-PATH-02 page filter matches ERROR only) and on the
+/// non-loss counter, because no row is lost. O(1), boot only.
+fn report_book_layout_refusal(problem: &BookTimestampProblem) {
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(1);
+    // APPROVED: not a write failure; no row is lost, every depth row is written to market_depth instead; counted on tv_depth_book_layout_refused_total (review 2026-10-29: the loss counter and an ERROR line paged a loss that does not exist)
+    warn!(
+        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+        stage = "ensure_book_designated_ts",
+        table = MARKET_DEPTH_BOOK_TABLE,
+        cause = %problem.cause(),
+        remedy = MARKET_DEPTH_BOOK_TS_REMEDY,
+        "market_depth_book not ensured: its designated timestamp is not ts, so \
+         the DEDUP key cannot be enabled; this process keeps every depth row in \
+         market_depth, nothing is lost. Repair the table outside market hours \
+         (see remedy)"
+    );
+}
+
+/// Reads QuestDB's `/exec` answer to `SELECT * FROM table_columns('..')` by
+/// column NAME (`column`, `type`, `designated`), so an added or reordered
+/// result column does not break it. `None` for anything it cannot read (an
+/// error body, a missing column): the check then refuses nothing.
+fn parse_table_columns_answer(body: &str) -> Option<Vec<TableColumn>> {
+    let answer: serde_json::Value = serde_json::from_str(body).ok()?;
+    let header = answer.get("columns")?.as_array()?;
+    let index_of = |wanted: &str| {
+        header
+            .iter()
+            .position(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(wanted))
+    };
+    let (name_at, type_at, designated_at) = (
+        index_of("column")?,
+        index_of("type")?,
+        index_of("designated")?,
+    );
+    let rows = answer.get("dataset")?.as_array()?;
+    let mut out = Vec::with_capacity(rows.len()); // APPROVED: boot-only column list
+    for row in rows {
+        let row = row.as_array()?;
+        out.push(TableColumn {
+            // APPROVED: boot-only column name, once per ensure
+            name: row.get(name_at)?.as_str()?.to_string(),
+            // APPROVED: boot-only column type, once per ensure
+            ty: row.get(type_at)?.as_str()?.to_string(),
+            designated: row.get(designated_at)?.as_bool()?,
+        });
+    }
+    Some(out)
+}
+
+/// `Some` when an existing `market_depth_book` cannot take its DEDUP key
+/// because its designated timestamp is not `ts`. An empty list (no table yet)
+/// is `None`: the boot CREATE makes it with `ts`. O(columns), once per boot.
+fn market_depth_book_designated_ts_problem(
+    columns: &[TableColumn],
+) -> Option<BookTimestampProblem> {
+    if columns.is_empty() {
+        return None;
+    }
+    let plain_ts_present = columns.iter().any(|c| c.name == "ts" && !c.designated);
+    // O(1) EXEMPT: boot-only, once per ensure, over the table's few columns.
+    match columns.iter().find(|c| c.designated) {
+        Some(c) if c.name == "ts" => None,
+        Some(c) => Some(BookTimestampProblem::Misnamed {
+            // APPROVED: boot-only, once per ensure
+            designated: c.name.clone(),
+            plain_ts_present,
+        }),
+        None => Some(BookTimestampProblem::Missing { plain_ts_present }),
+    }
+}
+
+/// Reads `market_depth_book`'s columns once and returns what stops its DEDUP
+/// key, if anything. Any failure to read (unreachable, the table does not
+/// exist yet, an answer it cannot parse) is `None`: the ensure then runs as
+/// before and reports QuestDB's own answer.
+async fn probe_market_depth_book_ts(
+    questdb_config: &QuestDbConfig,
+) -> Option<BookTimestampProblem> {
+    // APPROVED: QuestDB base URL, once per boot ensure
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+    // APPROVED: boot-only probe query
+    let query = format!("SELECT * FROM table_columns('{MARKET_DEPTH_BOOK_TABLE}')");
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    market_depth_book_designated_ts_problem(&parse_table_columns_answer(&body)?)
+}
+
 /// Which table a [`DepthWriter`] writes. One writer writes ONE table: a row
 /// written to `market_depth_book` without its three arrays would set them to
 /// NULL over a stored book (seen on the scratch table, plan item 49d), so a
@@ -684,18 +907,32 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
 
 /// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run by
 /// the Dhan lane at its start, only with `[depth_storage] array_rows` on; the
-/// array-row writer is armed only when this returns `true`. With the setting
-/// off the table need not exist: the archive and retention sweeps read a
-/// missing table as nothing to do.
-#[must_use = "a false verdict means the market_depth_book DEDUP key may be missing; retry it"]
+/// array-row writer is armed only when this returns
+/// [`BookEnsureOutcome::Ensured`]. With the setting off the table need not
+/// exist: the archive and retention sweeps read a missing table as nothing to
+/// do.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
-pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> bool {
-    run_depth_ddl(
+pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> BookEnsureOutcome {
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
+    // LH-01: an existing table whose designated timestamp is not `ts` can never
+    // take the DEDUP key, so refuse with the cause and the remedy instead of the
+    // generic DEDUP failure. Nothing is dropped or altered here, and no row is
+    // lost, so it is not counted or logged as a persistence failure.
+    if let Some(problem) = probe_market_depth_book_ts(questdb_config).await {
+        report_book_layout_refusal(&problem);
+        return BookEnsureOutcome::LayoutRefused;
+    }
+    if run_depth_ddl(
         questdb_config,
         MARKET_DEPTH_BOOK_TABLE,
         &market_depth_book_ensure_statements(),
     )
     .await
+    {
+        BookEnsureOutcome::Ensured
+    } else {
+        BookEnsureOutcome::Failed
+    }
 }
 
 /// Runs one depth table's ensure statements in order. `true` only when every
@@ -1317,6 +1554,7 @@ fn register_depth_drop_baseline(feed: Feed) {
     metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_client_build")
         .increment(0);
     metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl").increment(0);
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
     // Same reasoning as the tick side: this is the series that fires when the
     // depth rescue proof (`dropped == spilled`) stops holding, so it must be
     // registered before the bad day rather than during it.
@@ -6197,7 +6435,315 @@ mod tests {
             pg_port: 1,
             ilp_port: 1,
         };
-        assert!(!ensure_market_depth_book_table(&cfg).await);
+        assert_eq!(
+            ensure_market_depth_book_table(&cfg).await,
+            BookEnsureOutcome::Failed
+        );
+    }
+
+    /// Review 2026-10-29: the LH-01 refusal loses nothing (depth stays in
+    /// `market_depth`), so it must not move `tv_depth_persist_errors_total`,
+    /// the series the always-armed market-data persistence-loss alarm sums.
+    /// Before the fix it bumped `{stage="ensure_ddl"}` on every boot.
+    #[test]
+    fn test_lh01_refusal_does_not_move_the_persistence_loss_counter() {
+        let rt = crate::tick_spill_replay::tests::counter_test_runtime();
+        let port = rt.block_on(lh01_spawn_stub(
+            lh01_http_200(LH01_AUTO_CREATED_COLUMNS),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        let loss = crate::tick_spill_replay::tests::OneCounterRecorder::new(
+            "tv_depth_persist_errors_total",
+        );
+        let (outcome, loss_moved) =
+            loss.count_during(&rt, ensure_market_depth_book_table(&lh01_cfg(port)));
+        assert_eq!(outcome, BookEnsureOutcome::LayoutRefused);
+        assert!(!outcome.is_ensured());
+        assert_eq!(loss_moved, 0, "a no-loss refusal is not a persistence loss");
+        // It is still counted, on the non-loss series.
+        let refused = crate::tick_spill_replay::tests::OneCounterRecorder::new(
+            MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER,
+        );
+        let (_, refused_moved) =
+            refused.count_during(&rt, ensure_market_depth_book_table(&lh01_cfg(port)));
+        assert_eq!(refused_moved, 1);
+    }
+
+    /// Only `Ensured` arms the array-row writer.
+    #[test]
+    fn test_book_ensure_outcome_is_ensured_only_when_ensured() {
+        assert!(BookEnsureOutcome::Ensured.is_ensured());
+        assert!(!BookEnsureOutcome::Failed.is_ensured());
+        assert!(!BookEnsureOutcome::LayoutRefused.is_ensured());
+    }
+
+    /// Review 2026-10-29: the remedy never drops a table with rows (it is
+    /// renamed), and says to start inside the depth replay hold, so a spilled
+    /// book row cannot auto-create the table again before the boot CREATE.
+    #[test]
+    fn test_lh01_remedy_keeps_rows_and_starts_inside_the_depth_replay_hold() {
+        let r = MARKET_DEPTH_BOOK_TS_REMEDY;
+        assert!(r.contains("RENAME TABLE market_depth_book TO"), "{r}");
+        assert!(
+            r.contains("If it is 0, DROP TABLE market_depth_book"),
+            "{r}"
+        );
+        assert!(r.contains("08:30 IST start"), "{r}");
+        assert!(r.contains("data/spill/depth"), "{r}");
+        // The window the remedy names is the replay hold the code enforces.
+        assert!(crate::tick_spill_replay::depth_replay_held_at(
+            8 * 3600 + 30 * 60
+        ));
+        assert!(!crate::tick_spill_replay::depth_replay_held_at(
+            crate::tick_spill_replay::DEPTH_REPLAY_HOLD_END_SECS_OF_DAY_IST
+        ));
+        assert!(r.contains("08:00") && r.contains("15:40"), "{r}");
+    }
+
+    /// The column list of a `market_depth_book` the boot CREATE would have
+    /// made: every data column plus a designated `ts`.
+    fn book_columns_as_created() -> Vec<TableColumn> {
+        let mut out: Vec<TableColumn> = MARKET_DEPTH_BOOK_COLUMNS
+            .iter()
+            .map(|(name, ty)| TableColumn {
+                name: (*name).to_string(),
+                ty: (*ty).to_string(),
+                designated: false,
+            })
+            .collect();
+        out.push(TableColumn {
+            name: "ts".to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated: true,
+        });
+        out
+    }
+
+    /// LH-01: a table created by the boot CREATE has its designated `ts`, so
+    /// the ensure goes ahead.
+    #[test]
+    fn test_book_ts_check_accepts_the_table_the_create_makes() {
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&book_columns_as_created()),
+            None
+        );
+    }
+
+    /// LH-01: an absent table (no columns) is left to the CREATE.
+    #[test]
+    fn test_book_ts_check_leaves_an_absent_table_to_the_create() {
+        assert_eq!(market_depth_book_designated_ts_problem(&[]), None);
+    }
+
+    /// LH-01 (live, 2026-10-28): the table an ILP write auto-creates names its
+    /// designated timestamp `timestamp`, so every boot's DEDUP ALTER failed with
+    /// "deduplicate key column not found [column=ts]". The check names it.
+    #[test]
+    fn test_book_ts_check_names_a_designated_timestamp_under_another_name() {
+        let mut cols = book_columns_as_created();
+        cols.retain(|c| c.name != "ts");
+        cols.push(TableColumn {
+            name: "timestamp".to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated: true,
+        });
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Misnamed {
+                designated: "timestamp".to_string(),
+                plain_ts_present: false,
+            })
+        );
+    }
+
+    /// LH-01: a `ts` column that is not the designated timestamp is still a
+    /// refusal: the DEDUP key needs `ts` to BE the designated timestamp.
+    #[test]
+    fn test_book_ts_check_refuses_a_plain_ts_column() {
+        let mut cols = book_columns_as_created();
+        for c in &mut cols {
+            c.designated = false;
+        }
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Missing {
+                plain_ts_present: true,
+            })
+        );
+        cols.push(TableColumn {
+            name: "timestamp".to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated: true,
+        });
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Misnamed {
+                designated: "timestamp".to_string(),
+                plain_ts_present: true,
+            })
+        );
+    }
+
+    /// LH-01: a table with no `ts` and no designated timestamp at all.
+    #[test]
+    fn test_book_ts_check_refuses_a_table_with_no_designated_timestamp() {
+        let mut cols = book_columns_as_created();
+        cols.retain(|c| c.name != "ts");
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Missing {
+                plain_ts_present: false,
+            })
+        );
+    }
+
+    /// LH-01: the `/exec` answer to `SELECT * FROM table_columns(..)` is read
+    /// by column NAME, so a QuestDB that adds or reorders columns still parses.
+    #[test]
+    fn test_parse_table_columns_answer_reads_by_column_name() {
+        let body = r#"{"query":"x","columns":[{"name":"designated","type":"BOOLEAN"},{"name":"indexed","type":"BOOLEAN"},{"name":"column","type":"STRING"},{"name":"type","type":"STRING"}],"timestamp":-1,"dataset":[[false,false,"feed","SYMBOL"],[true,false,"timestamp","TIMESTAMP"]],"count":2}"#;
+        let cols = parse_table_columns_answer(body).expect("parses");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[1].name, "timestamp");
+        assert_eq!(cols[1].ty, "TIMESTAMP");
+        assert!(cols[1].designated);
+        assert!(!cols[0].designated);
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Misnamed {
+                designated: "timestamp".to_string(),
+                plain_ts_present: false,
+            })
+        );
+    }
+
+    /// LH-01: an answer the check cannot read is `None`, never a refusal:
+    /// the ensure then runs as before and reports what QuestDB says.
+    #[test]
+    fn test_parse_table_columns_answer_refuses_nothing_it_cannot_read() {
+        assert_eq!(parse_table_columns_answer("not json"), None);
+        assert_eq!(
+            parse_table_columns_answer(r#"{"error":"table does not exist"}"#),
+            None
+        );
+        let no_designated =
+            r#"{"columns":[{"name":"column","type":"STRING"}],"dataset":[["feed"]]}"#;
+        assert_eq!(parse_table_columns_answer(no_designated), None);
+    }
+
+    /// The answer an ILP-auto-created `market_depth_book` gives to
+    /// `table_columns(..)`: designated timestamp named `timestamp`, no `ts`.
+    const LH01_AUTO_CREATED_COLUMNS: &str = r#"{"query":"x","columns":[{"name":"column","type":"STRING"},{"name":"type","type":"STRING"},{"name":"designated","type":"BOOLEAN"}],"timestamp":-1,"dataset":[["feed","SYMBOL",false],["price","DOUBLE[]",false],["timestamp","TIMESTAMP",true]],"count":3}"#;
+
+    fn lh01_http_200(body: &str) -> &'static str {
+        let resp = String::from("HTTP/1.1 200 OK\r\nContent-Length: ")
+            + &body.len().to_string()
+            + "\r\n\r\n"
+            + body;
+        Box::leak(resp.into_boxed_str())
+    }
+
+    /// A stub QuestDB: `columns_answer` for the `table_columns` probe, `{}`
+    /// (200) for every other statement; `dedup_seen` turns true when any
+    /// request carries a DEDUP statement.
+    async fn lh01_spawn_stub(
+        columns_answer: &'static str,
+        dedup_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> u16 {
+        let other = lh01_http_200("[]");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let dedup_seen = std::sync::Arc::clone(&dedup_seen);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let first = request.lines().next().unwrap_or("");
+                    if first.contains("DEDUP") {
+                        dedup_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let resp = if first.contains("table_columns") {
+                        columns_answer
+                    } else {
+                        other
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    fn lh01_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// LH-01 end to end: against a QuestDB whose `market_depth_book` names its
+    /// designated timestamp `timestamp`, the ensure refuses BEFORE it sends any
+    /// statement (so no generic DEDUP failure) and reports false. Before the
+    /// fix it sent every statement and, with a QuestDB that accepts them,
+    /// reported true over a table whose DEDUP key can never exist.
+    #[tokio::test]
+    async fn test_ensure_market_depth_book_refuses_a_misnamed_designated_timestamp() {
+        let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let port = lh01_spawn_stub(
+            lh01_http_200(LH01_AUTO_CREATED_COLUMNS),
+            std::sync::Arc::clone(&dedup_seen),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(
+            !dedup_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the refusal comes before the DEDUP statement"
+        );
+    }
+
+    /// LH-01: a probe answer it cannot read refuses nothing; the ensure runs
+    /// every statement as before (the DEDUP one included) and reports true.
+    #[tokio::test]
+    async fn test_ensure_market_depth_book_runs_as_before_when_the_probe_is_unreadable() {
+        let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let port = lh01_spawn_stub(lh01_http_200("[]"), std::sync::Arc::clone(&dedup_seen)).await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::Ensured
+        );
+        assert!(dedup_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// LH-01: the refusal names the cause and the manual remedy, and never
+    /// drops anything itself.
+    #[test]
+    fn test_book_ts_problem_text_names_cause_and_remedy() {
+        let text = BookTimestampProblem::Misnamed {
+            designated: "timestamp".to_string(),
+            plain_ts_present: false,
+        }
+        .cause();
+        assert!(text.contains("timestamp"), "{text}");
+        let missing = BookTimestampProblem::Missing {
+            plain_ts_present: true,
+        }
+        .cause();
+        assert!(missing.contains("not the designated"), "{missing}");
+        assert!(MARKET_DEPTH_BOOK_TS_REMEDY.contains("outside market hours"));
+        assert!(MARKET_DEPTH_BOOK_TS_REMEDY.contains("DROP TABLE market_depth_book"));
     }
 
     #[test]
