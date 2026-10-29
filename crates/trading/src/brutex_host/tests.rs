@@ -836,4 +836,406 @@ fn test_toy_check_files_and_write_demo_fixture_load_cleanly() {
         assert!(out.live.is_some(), "{:?}", out.events);
     }
 }
+
+// ---- Direct replay harness: every mismatch branch names file, row and field.
+
+mod replay_direct {
+    use super::super::check_files::{
+        CheckBar, CheckValues, SignalKind, SignalRow, ValueRowExpected,
+    };
+    use super::super::engine::{
+        BarInput, IntentKind, IntentSink, OrderIntent, ReferenceDouble, Side, StrategyEngine,
+        TickInput,
+    };
+    use super::super::recipe::{ParamSnapshot, Recipe};
+    use super::super::replay::{Mismatch, replay};
+    use super::super::{InstrumentKey, Refusal};
+
+    const K: InstrumentKey = InstrumentKey {
+        security_id: 7,
+        exchange_segment: 1,
+    };
+
+    fn tfs() -> Vec<String> {
+        vec!["1m".to_owned()]
+    }
+
+    fn bar(row: usize, ts: &str, close: f64) -> CheckBar {
+        CheckBar {
+            row,
+            ts_ist: ts.to_owned(),
+            key: K,
+            timeframe: "1m".to_owned(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1,
+        }
+    }
+
+    fn vrow(row: usize, ts: &str, close: f64, prev: f64) -> ValueRowExpected {
+        ValueRowExpected {
+            row,
+            ts_ist: ts.to_owned(),
+            key: K,
+            timeframe: "1m".to_owned(),
+            values: vec![close, prev],
+        }
+    }
+
+    fn srow(row: usize, ts: &str, signal: SignalKind, side: &str, close: f64) -> SignalRow {
+        SignalRow {
+            row,
+            ts_ist: ts.to_owned(),
+            key: K,
+            timeframe: "1m".to_owned(),
+            signal,
+            side: side.to_owned(),
+            qty_lots: 1,
+            entry_price: 0.0,
+            stop_loss: close - 1.0,
+            target: close + 2.0,
+        }
+    }
+
+    const T1: &str = "2026-10-27T09:15:00";
+    const T2: &str = "2026-10-27T09:16:00";
+
+    /// Two bars, close 100 then 101: the double emits an entry/buy on bar 2.
+    fn good() -> (Vec<CheckBar>, CheckValues, Vec<SignalRow>) {
+        (
+            vec![bar(2, T1, 100.0), bar(3, T2, 101.0)],
+            CheckValues {
+                columns: vec!["close".to_owned(), "prev_close".to_owned()],
+                rows: vec![vrow(2, T1, 100.0, 0.0), vrow(3, T2, 101.0, 100.0)],
+            },
+            vec![
+                srow(2, T1, SignalKind::None, "", 100.0),
+                srow(3, T2, SignalKind::Entry, "buy", 101.0),
+            ],
+        )
+    }
+
+    fn mismatch(c: &[CheckBar], v: &CheckValues, s: &[SignalRow]) -> Mismatch {
+        match replay(&mut ReferenceDouble::new(), &tfs(), c, v, s) {
+            Err(Refusal::Replay(m)) => *m,
+            other => panic!("expected a replay mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replay_direct_good_pair_passes_and_counts() {
+        let (c, v, s) = good();
+        let r = replay(&mut ReferenceDouble::new(), &tfs(), &c, &v, &s).unwrap();
+        assert_eq!((r.bars, r.values_checked, r.signals_checked), (2, 4, 2));
+    }
+
+    #[test]
+    fn test_replay_header_timeframe_and_ts_refusals() {
+        let (c, mut v, s) = good();
+        v.columns = vec!["close".to_owned()];
+        let m = mismatch(&c, &v, &s);
+        assert_eq!((m.field.as_str(), m.row, m.key), ("header", 0, None));
+        assert!(m.to_string().contains("instrument -"), "{m}");
+
+        let (mut c, v, s) = good();
+        c[0].timeframe = "7m".to_owned();
+        let e = replay(&mut ReferenceDouble::new(), &tfs(), &c, &v, &s).unwrap_err();
+        assert!(
+            e.to_string().contains("timeframe 7m not in the recipe"),
+            "{e}"
+        );
+
+        let (mut c, v, s) = good();
+        c[1].ts_ist = "27/10/2026 09:16".to_owned();
+        let e = replay(&mut ReferenceDouble::new(), &tfs(), &c, &v, &s).unwrap_err();
+        assert!(matches!(e, Refusal::BadCheckFile { row: 3, .. }), "{e:?}");
+
+        let (_, v, s) = good();
+        assert_eq!(
+            replay(&mut ReferenceDouble::new(), &tfs(), &[], &v, &s).unwrap_err(),
+            Refusal::EmptyCandles
+        );
+    }
+
+    #[test]
+    fn test_replay_value_row_count_and_alignment_refusals() {
+        let (c, mut v, s) = good();
+        v.rows.truncate(1);
+        let m = mismatch(&c, &v, &s);
+        assert_eq!(
+            (m.file.as_str(), m.field.as_str()),
+            ("check_values.csv", "row count")
+        );
+        assert_eq!((m.expected.as_str(), m.got.as_str()), ("2", "1"));
+
+        let (c, mut v, s) = good();
+        v.rows.push(vrow(4, "2026-10-27T09:17:00", 1.0, 1.0));
+        let m = mismatch(&c, &v, &s);
+        assert_eq!((m.field.as_str(), m.row, m.key), ("row count", 4, None));
+
+        let (c, mut v, s) = good();
+        v.rows[1].ts_ist = "2026-10-27T09:17:00".to_owned();
+        let m = mismatch(&c, &v, &s);
+        assert_eq!((m.field.as_str(), m.row), ("bar alignment", 3));
+
+        let (c, mut v, s) = good();
+        v.rows[0].values[0] = 100.5;
+        let m = mismatch(&c, &v, &s);
+        assert_eq!(
+            (m.field.as_str(), m.expected.as_str(), m.got.as_str()),
+            ("close", "100.5", "100")
+        );
+    }
+
+    #[test]
+    fn test_replay_signal_row_count_and_alignment_refusals() {
+        let (c, v, mut s) = good();
+        s.truncate(1);
+        let m = mismatch(&c, &v, &s);
+        assert_eq!(
+            (m.file.as_str(), m.field.as_str()),
+            ("check_signals.csv", "row count")
+        );
+
+        let (c, v, mut s) = good();
+        s.push(srow(4, "2026-10-27T09:17:00", SignalKind::None, "", 1.0));
+        let m = mismatch(&c, &v, &s);
+        assert_eq!(
+            (m.file.as_str(), m.field.as_str(), m.row),
+            ("check_signals.csv", "row count", 4)
+        );
+
+        let (c, v, mut s) = good();
+        s[0].timeframe = "5m".to_owned();
+        let m = mismatch(&c, &v, &s);
+        assert_eq!((m.field.as_str(), m.row), ("bar alignment", 2));
+    }
+
+    #[test]
+    fn test_replay_signal_field_refusals_name_each_field() {
+        // Expected none, got an entry.
+        let (c, v, mut s) = good();
+        s[1] = srow(3, T2, SignalKind::None, "", 101.0);
+        let m = mismatch(&c, &v, &s);
+        assert_eq!(
+            (m.field.as_str(), m.expected.as_str(), m.got.as_str()),
+            ("signal", "none", "entry")
+        );
+        // Expected exit, got an entry.
+        let (c, v, mut s) = good();
+        s[1].signal = SignalKind::Exit;
+        let m = mismatch(&c, &v, &s);
+        assert_eq!((m.expected.as_str(), m.got.as_str()), ("exit", "entry"));
+        // Side, quantity, stop-loss, target, entry price.
+        let (c, v, mut s) = good();
+        s[1].side = "sell".to_owned();
+        assert_eq!(mismatch(&c, &v, &s).field, "side");
+        let (c, v, mut s) = good();
+        s[1].qty_lots = 2;
+        assert_eq!(mismatch(&c, &v, &s).field, "qty_lots");
+        let (c, v, mut s) = good();
+        s[1].stop_loss = 99.0;
+        assert_eq!(mismatch(&c, &v, &s).field, "stop_loss");
+        let (c, v, mut s) = good();
+        s[1].target = 104.0;
+        assert_eq!(mismatch(&c, &v, &s).field, "target");
+        let (c, v, mut s) = good();
+        s[1].entry_price = -0.0;
+        assert_eq!(mismatch(&c, &v, &s).field, "entry_price");
+        // Falling close: the double exits; the file said exit/sell, so it passes.
+        let mut c = vec![bar(2, T1, 100.0), bar(3, T2, 99.0)];
+        let v = CheckValues {
+            columns: vec!["close".to_owned(), "prev_close".to_owned()],
+            rows: vec![vrow(2, T1, 100.0, 0.0), vrow(3, T2, 99.0, 100.0)],
+        };
+        let s = vec![
+            srow(2, T1, SignalKind::None, "", 100.0),
+            srow(3, T2, SignalKind::Exit, "sell", 99.0),
+        ];
+        assert!(replay(&mut ReferenceDouble::new(), &tfs(), &c, &v, &s).is_ok());
+        // Flat close: no signal either side.
+        c[1].close = 100.0;
+        let v2 = CheckValues {
+            columns: v.columns.clone(),
+            rows: vec![vrow(2, T1, 100.0, 0.0), vrow(3, T2, 100.0, 100.0)],
+        };
+        let s2 = vec![
+            srow(2, T1, SignalKind::None, "", 100.0),
+            srow(3, T2, SignalKind::None, "", 100.0),
+        ];
+        assert!(replay(&mut ReferenceDouble::new(), &tfs(), &c, &v2, &s2).is_ok());
+    }
+
+    /// An engine that emits two intents per bar and has no values: the two
+    /// remaining refusal branches.
+    struct Noisy {
+        cols: Vec<String>,
+        values: bool,
+    }
+
+    impl StrategyEngine for Noisy {
+        fn configure(
+            &mut self,
+            _: &Recipe,
+            _: Option<&ParamSnapshot>,
+            _: &[InstrumentKey],
+        ) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn on_tick(&mut self, _: &TickInput, _: &mut IntentSink) {}
+        fn on_bar(&mut self, bar: &BarInput, out: &mut IntentSink) {
+            for id in 0..2 {
+                out.push(OrderIntent {
+                    key: bar.key,
+                    timeframe: bar.timeframe,
+                    kind: IntentKind::Entry,
+                    side: Side::Buy,
+                    qty_lots: 1,
+                    entry_price: 0.0,
+                    stop_loss: 0.0,
+                    target: 0.0,
+                    intent_id: id,
+                    at_ist_secs: bar.open_ist_secs,
+                });
+            }
+        }
+        fn value_columns(&self) -> &[String] {
+            &self.cols
+        }
+        fn bar_values(&self, _: InstrumentKey, _: u8, out: &mut [f64]) -> bool {
+            if self.values {
+                out.iter_mut().for_each(|x| *x = 100.0);
+            }
+            self.values
+        }
+    }
+
+    #[test]
+    fn test_replay_engine_with_no_values_or_two_signals_refuses() {
+        let (c, v, s) = good();
+        let cols = v.columns.clone();
+        let mut e = Noisy {
+            cols: cols.clone(),
+            values: false,
+        };
+        let Err(Refusal::Replay(m)) = replay(&mut e, &tfs(), &c, &v, &s) else {
+            panic!("expected a mismatch");
+        };
+        assert_eq!((m.field.as_str(), m.got.as_str()), ("values", "none"));
+
+        let one = CheckValues {
+            columns: cols.clone(),
+            rows: vec![ValueRowExpected {
+                values: vec![100.0, 100.0],
+                ..v.rows[0].clone()
+            }],
+        };
+        let mut e = Noisy { cols, values: true };
+        let sig = vec![srow(2, T1, SignalKind::Entry, "buy", 1.0)];
+        let Err(Refusal::Replay(m)) = replay(&mut e, &tfs(), &c[..1], &one, &sig) else {
+            panic!("expected a mismatch");
+        };
+        assert_eq!(
+            (m.field.as_str(), m.expected.as_str(), m.got.as_str()),
+            ("signal count", "1", "2")
+        );
+        e.on_tick(
+            &TickInput {
+                key: K,
+                exchange_time_ist_secs: 0,
+                receipt_ns: 0,
+                ltp: 1.0,
+                cumulative_volume: 0,
+            },
+            &mut IntentSink::with_capacity(1),
+        );
+    }
+
+    #[test]
+    fn test_reference_double_on_tick_and_bar_values_without_a_bar() {
+        let mut d = ReferenceDouble::new();
+        let mut sink = IntentSink::with_capacity(2);
+        d.on_tick(
+            &TickInput {
+                key: K,
+                exchange_time_ist_secs: 0,
+                receipt_ns: 0,
+                ltp: 1.0,
+                cumulative_volume: 0,
+            },
+            &mut sink,
+        );
+        assert!(sink.intents().is_empty());
+        let mut out = [0.0_f64; 2];
+        assert!(!d.bar_values(K, 0, &mut out));
+        let mut short = [0.0_f64; 1];
+        d.on_bar(
+            &BarInput {
+                key: K,
+                timeframe: 0,
+                open_ist_secs: 0,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 0,
+            },
+            &mut sink,
+        );
+        assert!(
+            !d.bar_values(K, 0, &mut short),
+            "an output too short is refused"
+        );
+        assert!(d.bar_values(K, 0, &mut out));
+        assert_eq!(out, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_every_refusal_variant_renders_a_readable_line() {
+        let all = [
+            Refusal::Unreadable {
+                name: "a".into(),
+                detail: "d".into(),
+            },
+            Refusal::BadManifest("m".into()),
+            Refusal::MissingFile { name: "a".into() },
+            Refusal::UnlistedFile { name: "a".into() },
+            Refusal::SizeMismatch {
+                name: "a".into(),
+                expected: 1,
+                got: 2,
+            },
+            Refusal::HashMismatch {
+                name: "a".into(),
+                expected: "e".into(),
+                got: "g".into(),
+            },
+            Refusal::BadRecipe("r".into()),
+            Refusal::NotApproved("draft".into()),
+            Refusal::VersionMismatch {
+                folder: 2,
+                in_file: 3,
+            },
+            Refusal::CommitMismatch {
+                recipe: "r".into(),
+                built: "b".into(),
+            },
+            Refusal::BadCheckFile {
+                name: "a".into(),
+                row: 4,
+                detail: "d".into(),
+            },
+            Refusal::EmptyCandles,
+            Refusal::Gate("g".into()),
+            Refusal::Engine("e".into()),
+            Refusal::NoVersion,
+            Refusal::Swap("s".into()),
+        ];
+        for r in all {
+            assert!(!r.to_string().is_empty(), "{r:?}");
+        }
+    }
+}
 // O(1) EXEMPT: end
