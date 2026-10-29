@@ -588,14 +588,83 @@ impl BookTimestampProblem {
     }
 }
 
-/// The manual repair for a [`BookTimestampProblem`]. The boot never drops or
-/// alters the table itself: a table with rows is market data (zero loss,
-/// Quotes 27 + 28), and only the operator can confirm it is empty.
-const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app stopped: \
-     confirm the table is empty (SELECT count() FROM market_depth_book), then \
-     DROP TABLE market_depth_book and start the app; the boot recreates it with \
-     ts as the designated timestamp. Until then depth is written to market_depth \
-     and nothing is lost. The boot never drops or alters this table itself";
+/// The manual repair for a [`BookTimestampProblem`]. The boot never drops,
+/// renames or alters the table itself: a table with rows is market data (zero
+/// loss, Quotes 27 + 28), and only the operator can confirm it is empty.
+///
+/// Why the start time matters (review, 2026-10-29): the depth spill replay is
+/// spawned in `main` BEFORE the Dhan lane runs this ensure, and outside 08:00 to
+/// 15:40 IST its first round POSTs at once. A spilled `market_depth_book` row
+/// reaching QuestDB before the ensure auto-creates the table with its
+/// designated timestamp named `timestamp` again. Inside that window the depth
+/// replay is held (`tick_spill_replay::depth_replay_held_at`), so the boot's
+/// CREATE runs first. That replay is one path that can make this table; that
+/// it made the live LH-01 table is Assumed, not read from the box.
+/// A non-empty table is RENAMED, never dropped, so no row is deleted.
+const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app stopped \
+     (after the 16:30 IST stop): run SELECT count() FROM market_depth_book. If it \
+     is 0, DROP TABLE market_depth_book. If it has rows, keep them: RENAME TABLE \
+     market_depth_book TO market_depth_book_lh01 (nothing is deleted; that copy \
+     is not archived or swept, so decide separately whether to copy it to S3). \
+     Then leave the app stopped until the scheduled 08:30 IST start: from 08:00 \
+     to 15:40 IST the depth spill replay is held, so the boot creates the new \
+     table with ts before any spilled market_depth_book row reaches QuestDB. A \
+     start outside that window replays data/spill/depth first, and a spilled \
+     market_depth_book row would auto-create the table with the wrong timestamp \
+     again. Until then depth is written to market_depth and nothing is lost. \
+     The boot never drops, renames or alters this table itself";
+
+/// Counts boots that found `market_depth_book` with a designated timestamp
+/// other than `ts` and kept depth in `market_depth` (review, 2026-10-29).
+///
+/// Deliberately NOT `tv_depth_persist_errors_total`: that series is summed by
+/// the always-armed market-data persistence-loss alarm, whose text says rows
+/// did not reach QuestDB and are not recoverable. This refusal loses nothing
+/// (every depth row goes to `market_depth`), so it counts here, local
+/// `/metrics` only (not EMF-selected, no alarm), registered at 0 at boot.
+pub const MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER: &str = "tv_depth_book_layout_refused_total";
+
+/// What [`ensure_market_depth_book_table`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "anything but Ensured means market_depth_book cannot take array rows; keep depth in market_depth"]
+pub enum BookEnsureOutcome {
+    /// Every statement was accepted: the table has its DEDUP key.
+    Ensured,
+    /// A statement was refused or QuestDB was unreachable (already counted on
+    /// `tv_depth_persist_errors_total{stage}` and logged by the DDL runner).
+    Failed,
+    /// The table exists with a designated timestamp other than `ts`, so its
+    /// DEDUP key can never be enabled. No statement was sent and nothing is
+    /// lost (depth stays in `market_depth`); logged once at `warn!` with the
+    /// cause and the remedy, counted on [`MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER`].
+    LayoutRefused,
+}
+
+impl BookEnsureOutcome {
+    /// `true` only when the array-row writer may be armed.
+    pub fn is_ensured(self) -> bool {
+        self == Self::Ensured
+    }
+}
+
+/// Counts and logs a [`BookTimestampProblem`] refusal: once per ensure, at
+/// `warn!` (the HOT-PATH-02 page filter matches ERROR only) and on the
+/// non-loss counter, because no row is lost. O(1), boot only.
+fn report_book_layout_refusal(problem: &BookTimestampProblem) {
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(1);
+    // APPROVED: not a write failure; no row is lost, every depth row is written to market_depth instead; counted on tv_depth_book_layout_refused_total (review 2026-10-29: the loss counter and an ERROR line paged a loss that does not exist)
+    warn!(
+        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+        stage = "ensure_book_designated_ts",
+        table = MARKET_DEPTH_BOOK_TABLE,
+        cause = %problem.cause(),
+        remedy = MARKET_DEPTH_BOOK_TS_REMEDY,
+        "market_depth_book not ensured: its designated timestamp is not ts, so \
+         the DEDUP key cannot be enabled; this process keeps every depth row in \
+         market_depth, nothing is lost. Repair the table outside market hours \
+         (see remedy)"
+    );
+}
 
 /// Reads QuestDB's `/exec` answer to `SELECT * FROM table_columns('..')` by
 /// column NAME (`column`, `type`, `designated`), so an added or reordered
@@ -837,36 +906,32 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
 
 /// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run by
 /// the Dhan lane at its start, only with `[depth_storage] array_rows` on; the
-/// array-row writer is armed only when this returns `true`. With the setting
-/// off the table need not exist: the archive and retention sweeps read a
-/// missing table as nothing to do.
-#[must_use = "a false verdict means the market_depth_book DEDUP key may be missing; retry it"]
+/// array-row writer is armed only when this returns
+/// [`BookEnsureOutcome::Ensured`]. With the setting off the table need not
+/// exist: the archive and retention sweeps read a missing table as nothing to
+/// do.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
-pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> bool {
+pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> BookEnsureOutcome {
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
     // LH-01: an existing table whose designated timestamp is not `ts` can never
     // take the DEDUP key, so refuse with the cause and the remedy instead of the
-    // generic DEDUP failure. Nothing is dropped or altered here.
+    // generic DEDUP failure. Nothing is dropped or altered here, and no row is
+    // lost, so it is not counted or logged as a persistence failure.
     if let Some(problem) = probe_market_depth_book_ts(questdb_config).await {
-        metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl").increment(1);
-        error!(
-            code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-            stage = "ensure_book_designated_ts",
-            table = MARKET_DEPTH_BOOK_TABLE,
-            cause = %problem.cause(),
-            remedy = MARKET_DEPTH_BOOK_TS_REMEDY,
-            "market_depth_book not ensured: its designated timestamp is not ts, so \
-             the DEDUP key cannot be enabled; this process writes depth to \
-             market_depth instead. Drop and recreate the EMPTY table outside \
-             market hours (see remedy)"
-        );
-        return false;
+        report_book_layout_refusal(&problem);
+        return BookEnsureOutcome::LayoutRefused;
     }
-    run_depth_ddl(
+    if run_depth_ddl(
         questdb_config,
         MARKET_DEPTH_BOOK_TABLE,
         &market_depth_book_ensure_statements(),
     )
     .await
+    {
+        BookEnsureOutcome::Ensured
+    } else {
+        BookEnsureOutcome::Failed
+    }
 }
 
 /// Runs one depth table's ensure statements in order. `true` only when every
@@ -1488,6 +1553,7 @@ fn register_depth_drop_baseline(feed: Feed) {
     metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_client_build")
         .increment(0);
     metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl").increment(0);
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
     // Same reasoning as the tick side: this is the series that fires when the
     // depth rescue proof (`dropped == spilled`) stops holding, so it must be
     // registered before the bad day rather than during it.
@@ -6368,7 +6434,69 @@ mod tests {
             pg_port: 1,
             ilp_port: 1,
         };
-        assert!(!ensure_market_depth_book_table(&cfg).await);
+        assert_eq!(
+            ensure_market_depth_book_table(&cfg).await,
+            BookEnsureOutcome::Failed
+        );
+    }
+
+    /// Review 2026-10-29: the LH-01 refusal loses nothing (depth stays in
+    /// `market_depth`), so it must not move `tv_depth_persist_errors_total`,
+    /// the series the always-armed market-data persistence-loss alarm sums.
+    /// Before the fix it bumped `{stage="ensure_ddl"}` on every boot.
+    #[test]
+    fn test_lh01_refusal_does_not_move_the_persistence_loss_counter() {
+        let rt = crate::tick_spill_replay::tests::counter_test_runtime();
+        let port = rt.block_on(lh01_spawn_stub(
+            lh01_http_200(LH01_AUTO_CREATED_COLUMNS),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        let loss = crate::tick_spill_replay::tests::OneCounterRecorder::new(
+            "tv_depth_persist_errors_total",
+        );
+        let (outcome, loss_moved) =
+            loss.count_during(&rt, ensure_market_depth_book_table(&lh01_cfg(port)));
+        assert_eq!(outcome, BookEnsureOutcome::LayoutRefused);
+        assert!(!outcome.is_ensured());
+        assert_eq!(loss_moved, 0, "a no-loss refusal is not a persistence loss");
+        // It is still counted, on the non-loss series.
+        let refused = crate::tick_spill_replay::tests::OneCounterRecorder::new(
+            MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER,
+        );
+        let (_, refused_moved) =
+            refused.count_during(&rt, ensure_market_depth_book_table(&lh01_cfg(port)));
+        assert_eq!(refused_moved, 1);
+    }
+
+    /// Only `Ensured` arms the array-row writer.
+    #[test]
+    fn test_book_ensure_outcome_is_ensured_only_when_ensured() {
+        assert!(BookEnsureOutcome::Ensured.is_ensured());
+        assert!(!BookEnsureOutcome::Failed.is_ensured());
+        assert!(!BookEnsureOutcome::LayoutRefused.is_ensured());
+    }
+
+    /// Review 2026-10-29: the remedy never drops a table with rows (it is
+    /// renamed), and says to start inside the depth replay hold, so a spilled
+    /// book row cannot auto-create the table again before the boot CREATE.
+    #[test]
+    fn test_lh01_remedy_keeps_rows_and_starts_inside_the_depth_replay_hold() {
+        let r = MARKET_DEPTH_BOOK_TS_REMEDY;
+        assert!(r.contains("RENAME TABLE market_depth_book TO"), "{r}");
+        assert!(
+            r.contains("If it is 0, DROP TABLE market_depth_book"),
+            "{r}"
+        );
+        assert!(r.contains("08:30 IST start"), "{r}");
+        assert!(r.contains("data/spill/depth"), "{r}");
+        // The window the remedy names is the replay hold the code enforces.
+        assert!(crate::tick_spill_replay::depth_replay_held_at(
+            8 * 3600 + 30 * 60
+        ));
+        assert!(!crate::tick_spill_replay::depth_replay_held_at(
+            crate::tick_spill_replay::DEPTH_REPLAY_HOLD_END_SECS_OF_DAY_IST
+        ));
+        assert!(r.contains("08:00") && r.contains("15:40"), "{r}");
     }
 
     /// The column list of a `market_depth_book` the boot CREATE would have
@@ -6575,7 +6703,10 @@ mod tests {
             std::sync::Arc::clone(&dedup_seen),
         )
         .await;
-        assert!(!ensure_market_depth_book_table(&lh01_cfg(port)).await);
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::LayoutRefused
+        );
         assert!(
             !dedup_seen.load(std::sync::atomic::Ordering::SeqCst),
             "the refusal comes before the DEDUP statement"
@@ -6588,7 +6719,10 @@ mod tests {
     async fn test_ensure_market_depth_book_runs_as_before_when_the_probe_is_unreadable() {
         let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let port = lh01_spawn_stub(lh01_http_200("[]"), std::sync::Arc::clone(&dedup_seen)).await;
-        assert!(ensure_market_depth_book_table(&lh01_cfg(port)).await);
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::Ensured
+        );
         assert!(dedup_seen.load(std::sync::atomic::Ordering::SeqCst));
     }
 

@@ -16933,16 +16933,28 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // with no DEDUP key and no hourly partition. On a refusal this process
     // keeps writing `market_depth`, as with the setting off, and the start
     // instant is left untouched for the next boot.
-    let depth_book_since = if params.depth_storage.array_rows
-        && !tickvault_storage::depth_persistence::ensure_market_depth_book_table(&params.questdb)
-            .await
-    {
-        error!(
-            code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-            table = tickvault_storage::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
-            "depth array rows are on but market_depth_book could not be created — this \
-             process keeps writing depth to market_depth; nothing is lost"
-        );
+    //
+    // A table found with the wrong designated timestamp (LH-01) is refused by
+    // the ensure itself, which logs the cause and remedy once at warn! and
+    // counts it off the loss alarm's series: no row is lost, so no second
+    // ERROR line here (review, 2026-10-29).
+    let book_outcome = if params.depth_storage.array_rows {
+        Some(
+            tickvault_storage::depth_persistence::ensure_market_depth_book_table(&params.questdb)
+                .await,
+        )
+    } else {
+        None
+    };
+    let depth_book_since = if let Some(outcome) = book_outcome.filter(|o| !o.is_ensured()) {
+        if outcome == tickvault_storage::depth_persistence::BookEnsureOutcome::Failed {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                table = tickvault_storage::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
+                "depth array rows are on but market_depth_book could not be created — this \
+                 process keeps writing depth to market_depth; nothing is lost"
+            );
+        }
         None
     } else {
         crate::depth_book_since::resolve_depth_book_since(
