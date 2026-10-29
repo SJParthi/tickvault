@@ -35,7 +35,7 @@
 #      A failed cloud job can be re-run alone with phase=cloud.
 #
 # CREDENTIALS: the box job uses the stored keys with EC2 and SSM grants (the
-# same pair rebuild-2026-10-22.yml uses). The cloud job assumes the one-off
+# same pair the deleted 2026-10-22 rebuild used). The cloud job assumes the one-off
 # role tv-prod-wipe-2026-10-31 (deploy/aws/terraform/wipe-2026-10-31.tf),
 # trusted only by the environment wipe-2026-10-31 and expiring at the end of
 # 2026-11-01 IST. Dispatch inputs reach the tool only through `env:`.

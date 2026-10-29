@@ -243,16 +243,10 @@ pub mod infra;
 pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
 pub mod log_coalescer;
-/// One-off (plan item 66, operator Quotes 32/33/34, 2026-10-21): the pure
-/// half of the 2026-10-22 rebuild (150 GB root, r8g.large). Removed with the
-/// tool, the box subcommand and the workflow after the run.
-pub mod rebuild_2026_10_22;
-/// One-off (plan item 66): `tickvault rebuild-box <phase>`, the box-side half
-/// of the 2026-10-22 rebuild, run over SSM only. Removed after the run.
-pub mod rebuild_box;
-/// One-off (plan item 66): the one budgeted SSM shell element the rebuild
-/// sends. Removed after the run.
-pub mod rebuild_ssm;
+// The one-off 2026-10-22 rebuild (plan item 66, Quotes 32/33/34): its pure
+// module, box subcommand and SSM shell were DELETED 2026-10-29 after the
+// 2026-10-28 run, per rust-only lock §0.13 (`shell_budget_guard.rs`
+// `retired_one_off_rebuild_tool_stays_deleted` keeps them out).
 /// One-off (plan item 67, operator Quote 35, 2026-10-21): the pure half of
 /// the 2026-10-31 market-data wipe (what is deleted and kept, the run
 /// window). Removed with the tool, the box subcommand and the workflow after

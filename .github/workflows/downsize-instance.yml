@@ -182,7 +182,7 @@ env:
   # exactly one thing.
   FROM_TYPE: t4g.medium
   # 2026-10-21 (Quotes 32/33): the lock is r8g.large; the 2026-10-22 rebuild
-  # (rebuild-2026-10-22.yml) is the tool that moves the box there.
+  # (its one-off workflow, deleted after the 2026-10-28 run) moved the box there.
   TO_TYPE: r8g.large
   QDB_MEM: 1g
 
