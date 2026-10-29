@@ -708,6 +708,7 @@ fn market_depth_book_designated_ts_problem(
         return None;
     }
     let plain_ts_present = columns.iter().any(|c| c.name == "ts" && !c.designated);
+    // O(1) EXEMPT: boot-only, once per ensure, over the table's few columns.
     match columns.iter().find(|c| c.designated) {
         Some(c) if c.name == "ts" => None,
         Some(c) => Some(BookTimestampProblem::Misnamed {

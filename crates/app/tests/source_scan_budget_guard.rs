@@ -59,7 +59,12 @@ const BUDGET: &[(&str, usize)] = &[
     // 2026-10-26 (audit K3): +1 wiring scan, the tick-gap verdict counters are
     // counted at ingest, seeded at 0 and never EMF-shipped. Paired behaviour
     // test: `tick_verdict_counters_move_on_a_backward_ltt_and_a_volume_jump`.
-    ("dhan_feed_stack.rs", 82),
+    // 2026-10-29 (live audit LH-03, LH-05): +2 wiring scans. The landed-rows
+    // INFO line is gated on the confirm (paired behaviour test:
+    // `test_regression_a_flush_that_hands_nothing_off_does_not_busy_spin`), and
+    // the lag class split is reached from the drain and the publish (paired
+    // behaviour test: `test_ws_lag_max_takes_the_largest_and_resets`).
+    ("dhan_feed_stack.rs", 84),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     // 2026-10-26 (audit PR M / M4): 1 wiring scan, every dial batch republishes
