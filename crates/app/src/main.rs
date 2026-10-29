@@ -794,11 +794,6 @@ async fn async_main() -> Result<()> {
         let code = tickvault_app::ensure_questdb::run().await;
         std::process::exit(code);
     }
-    // `tickvault wipe-box <mode> <sha>` (plan item 67, one-off, Quote 35): the
-    // box half of the 2026-10-31 wipe, sent over SSM by its workflow only.
-    if tickvault_app::wipe_box::is_invocation(&cli_args) {
-        std::process::exit(tickvault_app::wipe_box::run(&cli_args).await);
-    }
 
     // -----------------------------------------------------------------------
     // Step 0.9: Panic hook (audit CR-3, 2026-10-11)

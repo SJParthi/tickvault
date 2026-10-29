@@ -375,11 +375,11 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
 /// - `contract_name_repair_map` (2026-10-10, plan item 56): the one-day name
 ///   list the after-close contract name repair joins against
 ///   (`contract_name_repair`), created fresh for each day and dropped after it.
-/// - `rebuild_probe_` (2026-10-22, plan item 66): the prefix of the restore
-///   rehearsal's scratch table (`rebuild_copy::REBUILD_PROBE_TABLE_PREFIX`),
-///   created and dropped by one `rebuild-box copy apply` run on the old box.
+///
+/// (2026-10-29: the restore rehearsal's `rebuild_probe_` prefix left this
+/// list with the one-off rebuild tool that created it.)
 #[cfg(test)]
-const SCRATCH_TABLES: &[&str] = &["contract_name_repair_map", "rebuild_probe_"];
+const SCRATCH_TABLES: &[&str] = &["contract_name_repair_map"];
 
 /// Every table the retention system knows about, de-duplicated and sorted —
 /// the measurement set for `table_storage_probe`.
@@ -405,24 +405,10 @@ pub fn all_managed_table_names() -> Vec<&'static str> {
     names
 }
 
-/// The tables the 2026-10-22 rebuild (plan item 66) carries onto the new
-/// disk: every DAY-partitioned audit / daily-data table plus every
-/// retention-EXEMPT table — the same union the operator console's SEBI
-/// preserve exports, and the keep-list Quote 35 names. De-duplicated and
-/// sorted. Derived from the retention lists, never restated, so a table that
-/// joins either list is restored automatically.
-///
-/// Market-data tables (`ticks`, `market_depth*`, `candles_*`, `top_volume*`,
-/// `feed_aux_packets`) are NOT in it: they are copied to S3 and verified, and
-/// start empty on the new disk.
-#[must_use]
-pub fn rebuild_keep_tables() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = DAY_PARTITIONED_TABLES.to_vec();
-    names.extend_from_slice(RETENTION_EXEMPT_TABLES);
-    names.sort_unstable();
-    names.dedup();
-    names
-}
+// `rebuild_keep_tables` (the 2026-10-22 rebuild and Quote 35 wipe keep-list:
+// every DAY-partitioned and retention-EXEMPT table) was DELETED 2026-10-29
+// with the one-off rebuild and wipe tools, its only callers, after their
+// 2026-10-28 runs (rust-only lock §§0.13/0.14).
 
 // ---------------------------------------------------------------------------
 // Partition Manager

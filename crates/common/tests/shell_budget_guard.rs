@@ -603,13 +603,9 @@ const CONSOLE_SHELL_SOURCES: &[(&str, usize, usize)] = &[
     ),
 ];
 
-/// Rust sources whose production string literals are the SSM shell of the
-/// one-off 2026-10-31 market-data wipe (plan item 67, operator Quote 35):
-/// `(path, literal lines, bytes)` ceilings, measured exactly 2026-10-22. One
-/// element: fetch the deployed binary, then run its Rust `wipe-box`
-/// subcommand. Rust-only lock §0.14, approved by the owner 2026-10-22. The
-/// row goes with the tool in the PR after the run.
-const WIPE_SSM_SHELL_SOURCES: &[(&str, usize, usize)] = &[("crates/app/src/wipe_ssm.rs", 3, 231)];
+// 2026-10-29: the one-off wipe's SSM shell row (rust-only lock §0.14) and its
+// test were DELETED with the tool after the 2026-10-28 run;
+// `retired_one_off_tools_stay_deleted` keeps the files out.
 
 /// Per workflow file: `(path, SSM command elements, bytes)` ceilings,
 /// measured 2026-10-04. A workflow absent here may send no SSM shell.
@@ -1099,22 +1095,31 @@ fn console_embedded_shell_never_grows() {
     );
 }
 
-/// One-off tools that ran and were deleted, per rust-only lock §0.13 ("removed
-/// after the run"): the 2026-10-22 rebuild ran on 2026-10-28 and its tool,
-/// box subcommand, SSM shell and workflow were deleted in the next PR. Each
-/// path here must stay absent, and `crates/app/Cargo.toml` must declare no
-/// bin by the tool's name, so the deleted SSM sender cannot come back
+/// One-off tools that ran and were deleted, per rust-only lock §0.13 and
+/// §0.14 ("removed after the run"): the 2026-10-22 rebuild and the market-data
+/// wipe both ran on 2026-10-28, and each tool, box subcommand, SSM shell,
+/// workflow (and the wipe's IAM role file) was deleted in the next PR. With
+/// them went the storage crate's rebuild copy module, which only they used.
+/// Each path here must stay absent, and `crates/app/Cargo.toml` must declare
+/// no bin by either tool's name, so a deleted SSM sender cannot come back
 /// unbudgeted. Re-adding one needs a fresh dated quote in the rust-only lock.
 const RETIRED_ONE_OFF_PATHS: &[&str] = &[
     ".github/workflows/rebuild-2026-10-22.yml",
+    ".github/workflows/wipe-2026-10-31.yml",
     "crates/app/src/bin/rebuild_2026_10_22.rs",
+    "crates/app/src/bin/wipe_2026_10_31.rs",
     "crates/app/src/rebuild_2026_10_22.rs",
     "crates/app/src/rebuild_box.rs",
     "crates/app/src/rebuild_ssm.rs",
+    "crates/app/src/wipe_2026_10_31.rs",
+    "crates/app/src/wipe_box.rs",
+    "crates/app/src/wipe_ssm.rs",
+    "crates/storage/src/rebuild_copy.rs",
+    "deploy/aws/terraform/wipe-2026-10-31.tf",
 ];
 
 #[test]
-fn retired_one_off_rebuild_tool_stays_deleted() {
+fn retired_one_off_tools_stay_deleted() {
     assert_sorted_unique(RETIRED_ONE_OFF_PATHS, "RETIRED_ONE_OFF_PATHS");
     let present: Vec<&str> = RETIRED_ONE_OFF_PATHS
         .iter()
@@ -1123,52 +1128,36 @@ fn retired_one_off_rebuild_tool_stays_deleted() {
         .collect();
     assert!(
         present.is_empty(),
-        "deleted one-off rebuild files are back: {present:?}. Rust-only lock \
-         §0.13 removed them after the 2026-10-28 run; re-adding needs a fresh \
-         dated quote there first."
+        "deleted one-off rebuild/wipe files are back: {present:?}. Rust-only \
+         lock §0.13/§0.14 removed them after the 2026-10-28 runs; re-adding \
+         needs a fresh dated quote there first."
     );
     let cargo = read_text("crates/app/Cargo.toml").expect("crates/app/Cargo.toml must exist");
-    assert!(
-        !cargo.contains("tv-rebuild-2026-10-22"),
-        "crates/app/Cargo.toml declares the deleted `tv-rebuild-2026-10-22` bin again"
-    );
+    for bin in ["tv-rebuild-2026-10-22", "tv-wipe-2026-10-31"] {
+        assert!(
+            !cargo.contains(bin),
+            "crates/app/Cargo.toml declares the deleted `{bin}` bin again"
+        );
+    }
     let lib = read_text("crates/app/src/lib.rs").expect("crates/app/src/lib.rs must exist");
-    for module in ["rebuild_2026_10_22", "rebuild_box", "rebuild_ssm"] {
+    for module in [
+        "rebuild_2026_10_22",
+        "rebuild_box",
+        "rebuild_ssm",
+        "wipe_2026_10_31",
+        "wipe_box",
+        "wipe_ssm",
+    ] {
         assert!(
             !lib.contains(&format!("pub mod {module};")),
             "crates/app/src/lib.rs declares the deleted module `{module}` again"
         );
     }
-}
-
-#[test]
-fn wipe_ssm_shell_never_grows() {
-    let names: Vec<&str> = WIPE_SSM_SHELL_SOURCES.iter().map(|r| r.0).collect();
-    assert_sorted_unique(&names, "WIPE_SSM_SHELL_SOURCES");
-    let mut report = Vec::new();
-    let mut over = Vec::new();
-    for (path, max_lines, max_bytes) in WIPE_SSM_SHELL_SOURCES {
-        let src = read_text(path)
-            .unwrap_or_else(|| panic!("wipe shell source `{path}` is gone: remove its row"));
-        let region = production_region(&src);
-        // Anti-vacuity: the file still carries the one command.
-        assert!(
-            region.contains("wipe-box"),
-            "`{path}`: the box command is gone; the row is stale"
-        );
-        let lits = rust_string_literals(region)
-            .unwrap_or_else(|| panic!("`{path}`: unterminated literal or comment"));
-        let (lines, bytes) = literal_lines_and_bytes(&lits);
-        report.push(format!("    (\"{path}\", {lines}, {bytes}),"));
-        if lines > *max_lines || bytes > *max_bytes {
-            over.push((path.to_string(), lines, *max_lines, bytes, *max_bytes));
-        }
-    }
+    let storage_lib =
+        read_text("crates/storage/src/lib.rs").expect("crates/storage/src/lib.rs must exist");
     assert!(
-        over.is_empty(),
-        "the wipe's SSM shell grew (path, lines, ceiling, bytes, ceiling): {over:?}. \
-         Do the step in the Rust `wipe-box` subcommand instead. Measured now:\n{}",
-        report.join("\n")
+        !storage_lib.contains("pub mod rebuild_copy;"),
+        "crates/storage/src/lib.rs declares the deleted module `rebuild_copy` again"
     );
 }
 
@@ -1181,11 +1170,7 @@ fn wipe_ssm_shell_never_grows() {
 /// in code or in a comment, must be here. SHRINK-ONLY: a listed file that no
 /// longer carries a marker must leave in the same PR, and adding a file needs
 /// a dated operator quote in the rust-only lock first. Measured 2026-10-26.
-const SSM_SENDER_FILES: &[&str] = &[
-    "crates/app/src/bin/wipe_2026_10_31.rs",
-    "crates/app/src/wipe_ssm.rs",
-    "crates/aws-lambdas/src/operator_control.rs",
-];
+const SSM_SENDER_FILES: &[&str] = &["crates/aws-lambdas/src/operator_control.rs"];
 
 /// What marks a file as an SSM shell sender: the two shell document names,
 /// the SDK call, the CLI verb, and the API action name.
@@ -1596,10 +1581,6 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     // right before `terraform apply` (+2), paid by joining the guard job's
     // four clock reads into one line (−3).
     (".github/workflows/terraform-apply.yml", 286),
-    // 2026-10-22 (plan item 67), rust-only lock §0.14 (Quote 35), approved by the
-    // owner 2026-10-22: the one-off 31 Oct wipe only builds and runs its
-    // Rust tool, once per job. Removed with the workflow after the run.
-    (".github/workflows/wipe-2026-10-31.yml", 4),
     (".github/workflows/wipe-log-streams.yml", 115),
 ];
 
