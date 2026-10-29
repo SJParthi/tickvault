@@ -126,6 +126,13 @@ pub struct SpillReplayOutcome {
     /// are not yet confirmed (audit DA-13b: suspect sink, fewer than two
     /// clean probes since, or inside the durability lag).
     pub files_awaiting_confirm: usize,
+    /// Spill lines older than the market-data floor, kept in
+    /// `quarantine/<file>.below-floor-lines` and never posted (live audit
+    /// F2/F5/F6, 2026-10-29).
+    pub lines_below_floor: u64,
+    /// Framed depth files older than the market-data floor, moved whole to
+    /// `quarantine/` and never posted.
+    pub files_below_floor: usize,
 }
 
 impl SpillReplayOutcome {
@@ -145,6 +152,12 @@ impl SpillReplayOutcome {
         self.files_awaiting_confirm = self
             .files_awaiting_confirm
             .saturating_add(other.files_awaiting_confirm);
+        self.lines_below_floor = self
+            .lines_below_floor
+            .saturating_add(other.lines_below_floor);
+        self.files_below_floor = self
+            .files_below_floor
+            .saturating_add(other.files_below_floor);
     }
 }
 
@@ -326,7 +339,10 @@ impl QuarantineStreak {
 /// that name destroyed it. The target is now the first free name of
 /// `<name>`, `<name>.1`, `<name>.2`, … The check-then-rename is not atomic,
 /// which is safe here because one drain task owns each spill directory.
-fn quarantine_spill_file(dir: &Path, path: &Path) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn quarantine_spill_file(
+    dir: &Path,
+    path: &Path,
+) -> std::io::Result<std::path::PathBuf> {
     let quarantine = dir.join(QUARANTINE_DIR);
     std::fs::create_dir_all(&quarantine)?;
     let name = path
@@ -919,6 +935,11 @@ pub struct SpillSinkView {
     /// probes must not count as having run after its last ack. `false`
     /// for a view a test built, which is stamped as given.
     pub live: bool,
+    /// The market-data floor (Unix nanoseconds) installed at boot or by the
+    /// fresh-start reset (`market_data_floor`). A spill line whose row
+    /// timestamp is below it is set aside, never posted. `None`: no floor,
+    /// the replay behaves as before it existed.
+    pub market_data_floor_unix_nanos: Option<i64>,
 }
 
 impl SpillSinkView {
@@ -956,6 +977,8 @@ impl SpillSinkView {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             live: true,
+            market_data_floor_unix_nanos:
+                crate::market_data_floor::installed_market_data_floor_unix_nanos(),
         }
     }
 }
@@ -1806,6 +1829,19 @@ pub(crate) fn set_aside_rejected_lines(
     chunk: &[u8],
     rejected: &[std::ops::Range<usize>],
 ) -> std::io::Result<u64> {
+    set_aside_lines_with_suffix(dir, spill_path, chunk, rejected, REJECTED_LINES_SUFFIX)
+}
+
+/// [`set_aside_rejected_lines`] into `quarantine/<file><suffix>`: the same
+/// append and sync, for any reason a line is kept out of the database
+/// (refused by QuestDB, or older than the market-data floor). Cold path.
+pub(crate) fn set_aside_lines_with_suffix(
+    dir: &Path,
+    spill_path: &Path,
+    chunk: &[u8],
+    rejected: &[std::ops::Range<usize>],
+    suffix: &str,
+) -> std::io::Result<u64> {
     use std::io::Write as _;
     let quarantine = dir.join(QUARANTINE_DIR);
     std::fs::create_dir_all(&quarantine)?;
@@ -1813,9 +1849,10 @@ pub(crate) fn set_aside_rejected_lines(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("spill");
-    let target = quarantine.join(format!("{name}{REJECTED_LINES_SUFFIX}"));
-    let mut out: Vec<u8> = Vec::new(); // APPROVED: cold path, after a permanent refusal
-    // O(1) EXEMPT: begin — cold, bounded by REPLAY_MAX_REJECTED_LINES_PER_CHUNK lines.
+    let target = quarantine.join(format!("{name}{suffix}"));
+    let mut out: Vec<u8> = Vec::new(); // APPROVED: cold path, after a refusal or a below-floor line
+    // O(1) EXEMPT: begin — cold, bounded by the lines of one chunk
+    // (REPLAY_MAX_REJECTED_LINES_PER_CHUNK for a refusal, one chunk for the floor).
     for range in rejected {
         let line = chunk.get(range.clone()).unwrap_or_default();
         out.extend_from_slice(line);
@@ -1841,6 +1878,67 @@ fn nanos_are_a_plausible_epoch(nanos: i64) -> bool {
     u32::try_from(secs).is_ok_and(|s| {
         (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS).contains(&s)
     })
+}
+
+/// Suffix of the quarantine file that keeps spill lines older than the
+/// market-data floor (live audit F2/F5/F6, 2026-10-29).
+pub const BELOW_FLOOR_LINES_SUFFIX: &str = ".below-floor-lines";
+
+/// The trailing ILP timestamp of `line` when it is a bare integer that is a
+/// plausible epoch. `None` for every other shape (a field, a torn stamp, no
+/// stamp): such a line is never judged against the floor, exactly as the
+/// window filter never judges it. O(line), no allocation.
+fn plausible_line_timestamp(line: &[u8]) -> Option<i64> {
+    let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+    let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+    let last = trimmed.rsplit(|b| *b == b' ').next()?;
+    if last.is_empty() || last.contains(&b'=') {
+        return None;
+    }
+    let nanos = std::str::from_utf8(last).ok()?.parse::<i64>().ok()?;
+    nanos_are_a_plausible_epoch(nanos).then_some(nanos)
+}
+
+/// The floor on the row clock: every spill row (`ticks`, `tick_quotes`,
+/// `feed_aux_packets`, `market_depth`) is stamped in IST epoch nanoseconds,
+/// and the floor file holds Unix (UTC) nanoseconds. O(1).
+fn floor_on_row_clock(floor_unix_nanos: Option<i64>) -> Option<i64> {
+    floor_unix_nanos.map(|f| f.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS))
+}
+
+/// Splits the lines of `chunk` whose row timestamp is below `floor_ist_nanos`
+/// out of it: their ranges go to `below` (cleared first), the rest is
+/// returned. Borrowed when nothing is below the floor (the common case, and
+/// always with no floor). One parse and one `i64` compare per line; cold
+/// replay path only.
+fn split_below_floor<'a>(
+    chunk: &'a [u8],
+    floor_ist_nanos: Option<i64>,
+    below: &mut Vec<std::ops::Range<usize>>,
+) -> std::borrow::Cow<'a, [u8]> {
+    below.clear();
+    let Some(floor) = floor_ist_nanos else {
+        return std::borrow::Cow::Borrowed(chunk);
+    };
+    let mut at = 0_usize;
+    for line in chunk.split_inclusive(|b| *b == b'\n') {
+        let end = at.saturating_add(line.len());
+        if plausible_line_timestamp(line).is_some_and(|nanos| nanos < floor) {
+            below.push(at..end);
+        }
+        at = end;
+    }
+    if below.is_empty() {
+        return std::borrow::Cow::Borrowed(chunk);
+    }
+    let mut kept = Vec::with_capacity(chunk.len());
+    let mut from = 0_usize;
+    for range in below.iter() {
+        kept.extend_from_slice(chunk.get(from..range.start).unwrap_or_default());
+        from = range.end;
+    }
+    kept.extend_from_slice(chunk.get(from..).unwrap_or_default());
+    std::borrow::Cow::Owned(kept)
 }
 
 /// Replays every text spill file in `dir` into QuestDB, judging liveness and
@@ -1871,6 +1969,17 @@ pub async fn replay_spill_dir(
     )
     .increment(0);
     metrics::counter!(REPLAY_LINES_REJECTED_COUNTER, "dir" => dir_label(dir)).increment(0);
+    metrics::counter!(
+        crate::market_data_floor::SPILL_REPLAY_BELOW_FLOOR_COUNTER,
+        "dir" => dir_label(dir),
+        "unit" => "line"
+    )
+    .increment(0);
+    // The market-data floor on the row clock, read once per round (live
+    // audit F2/F5/F6, 2026-10-29). `None` = no floor, nothing changes.
+    let floor_ist_nanos = floor_on_row_clock(view.market_data_floor_unix_nanos);
+    // Ranges of below-floor lines in the current chunk; reused across chunks.
+    let mut below_floor: Vec<std::ops::Range<usize>> = Vec::new();
     // ONE buffer for the whole round, reused across files: a fixed cost per
     // round rather than per file, and the thing that makes the peak resident
     // size independent of how large any spill file has grown.
@@ -1978,6 +2087,9 @@ pub async fn replay_spill_dir(
         // claim rows it declined to write -- the class of false-OK this
         // repository has had to withdraw before.
         let mut refused_bytes: u64 = 0;
+        // Lines of this file set aside as older than the market-data floor
+        // this round: one coded warn per file, after the walk.
+        let mut below_floor_lines: u64 = 0;
         let mut failed = false;
         let mut quarantined = false;
         // The HTTP status a whole-file quarantine carried (audit K1).
@@ -2172,6 +2284,50 @@ pub async fn replay_spill_dir(
                 // still advance it or the round would re-read the same bytes
                 // forever and never converge.
                 let len = raw.len() as u64;
+                // The market-data floor FIRST (live audit F2/F5/F6,
+                // 2026-10-29): the window filter judges the time of day only,
+                // so after a wipe a file holding rows from earlier days was
+                // replayed in full. A line older than the floor is kept in
+                // `quarantine/<file>.below-floor-lines` and never posted. Kept
+                // on a re-send too: a duplicate in quarantine is harmless, a
+                // dropped row is not. With no floor this borrows `raw`.
+                let floor_kept = split_below_floor(raw, floor_ist_nanos, &mut below_floor);
+                if !below_floor.is_empty() {
+                    match set_aside_lines_with_suffix(
+                        dir,
+                        &path,
+                        raw,
+                        &below_floor,
+                        BELOW_FLOOR_LINES_SUFFIX,
+                    ) {
+                        Ok(_) => {
+                            let lines = below_floor.len() as u64;
+                            metrics::counter!(
+                                crate::market_data_floor::SPILL_REPLAY_BELOW_FLOOR_COUNTER,
+                                "dir" => dir_label(dir),
+                                "unit" => "line"
+                            )
+                            .increment(lines);
+                            below_floor_lines = below_floor_lines.saturating_add(lines);
+                            outcome.lines_below_floor =
+                                outcome.lines_below_floor.saturating_add(lines);
+                        }
+                        Err(err) => {
+                            warn!(
+                                code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                                source = "spill_below_floor_set_aside_failed",
+                                path = %path.display(),
+                                %err,
+                                "spill lines older than the market-data floor could NOT be \
+                                 written to quarantine — the file is kept intact and retried \
+                                 next round; nothing from this chunk is posted"
+                            );
+                            failed = true;
+                            break 'file;
+                        }
+                    }
+                }
+                let raw: &[u8] = &floor_kept;
                 // The depth spill is ARRIVAL-clocked (see the CLOCK CHOICE note in
                 // `line_is_positively_out_of_window`); every other spill dir is
                 // exchange-clocked. Deciding it HERE, from the dir being drained,
@@ -2413,6 +2569,22 @@ pub async fn replay_spill_dir(
             if carry > 0 {
                 buf.copy_within(cut..filled, 0);
             }
+        }
+
+        // One coded warn per file for the lines the market-data floor kept
+        // out (live audit F2/F5/F6, 2026-10-29).
+        if below_floor_lines > 0 {
+            warn!(
+                code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                source = "spill_below_market_data_floor",
+                path = %path.display(),
+                lines = below_floor_lines,
+                floor_unix_nanos = view.market_data_floor_unix_nanos.unwrap_or_default(),
+                "spill replay set aside lines whose row timestamp is OLDER than the \
+                 market-data floor (the last reset). They are NOT posted: they are kept, \
+                 byte for byte, in quarantine as <file>.below-floor-lines, so a wipe is not \
+                 undone by an old spill file."
+            );
         }
 
         if over_long_line {
@@ -2765,6 +2937,8 @@ pub fn describe_send_error(err: &reqwest::Error) -> &'static str {
 /// same reason `tick_persistence` pre-registers its drop and spill counters.
 pub fn register_replay_baseline() {
     metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(0);
+    // Live audit F2/F5/F6 (2026-10-29): the market-data floor counters.
+    crate::market_data_floor::register_market_data_floor_baseline();
     metrics::counter!("tv_tick_spill_replay_failed_total").increment(0);
     // Audit DA-13b: the empty-out gate's local counters, every label pair.
     for dir in ["ticks", "depth"] {
@@ -3032,6 +3206,10 @@ pub fn spawn_supervised_tick_spill_replay(
     require_upload: bool,
 ) -> tokio::task::JoinHandle<()> {
     let policy = replay_policy_for_dir(&dir);
+    // Live audit F2/F5/F6 (2026-10-29): read the market-data floor once per
+    // process, before the first round, so a wipe is not undone by an old
+    // spill file. No file: nothing changes.
+    crate::market_data_floor::ensure_market_data_floor_loaded();
     spawn_supervised_spill_replay(dir, write_url(host, http_port), require_upload, policy)
 }
 
@@ -6643,4 +6821,220 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
 
     // `test_replayed_top_volume_rows_upsert_onto_themselves` REMOVED
     // 2026-10-22 (plan item 62): nothing replays the top_volume folder.
+
+    // ---- Live audit F2/F5/F6 (2026-10-29): the market-data floor ----------
+
+    /// Unix nanos of an IST epoch-nanos row stamp.
+    fn unix_of_ist(ist_nanos: i64) -> i64 {
+        ist_nanos - tickvault_common::constants::IST_UTC_OFFSET_NANOS
+    }
+
+    /// A 12:00 IST tick line `days` days after the fixture date.
+    fn tick_line_on_day(days: i64) -> String {
+        tick_line(days * 86_400 + 12 * 3600)
+    }
+
+    #[test]
+    fn test_split_below_floor_keeps_everything_with_no_floor() {
+        let chunk = format!("{}{}", tick_line_on_day(0), tick_line_on_day(7));
+        let mut below = vec![0..1];
+        let kept = split_below_floor(chunk.as_bytes(), None, &mut below);
+        assert!(below.is_empty());
+        assert!(matches!(kept, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*kept, chunk.as_bytes());
+    }
+
+    #[test]
+    fn test_split_below_floor_sets_aside_only_lines_below_the_floor() {
+        let old = tick_line_on_day(0);
+        let new = tick_line_on_day(7);
+        let at_floor = tick_line_on_day(3);
+        let torn = "ticks,segment=NSE_EQ ltp=1.0 17160237\n".to_string();
+        let no_ts = "ticks,segment=NSE_EQ ltp=1.0,volume=1i\n".to_string();
+        let chunk = format!("{old}{new}{at_floor}{torn}{no_ts}{old}");
+        let floor_ist = ist_at(3 * 86_400 + 12 * 3600);
+        let mut below = Vec::new();
+        let kept = split_below_floor(chunk.as_bytes(), Some(floor_ist), &mut below);
+        assert_eq!(below.len(), 2, "both old lines, nothing else");
+        for range in &below {
+            assert_eq!(&chunk.as_bytes()[range.clone()], old.as_bytes());
+        }
+        assert_eq!(
+            String::from_utf8(kept.into_owned()).expect("utf8"),
+            format!("{new}{at_floor}{torn}{no_ts}"),
+            "a line AT the floor, a torn stamp and a stampless line are kept"
+        );
+    }
+
+    #[test]
+    fn test_floor_on_row_clock_shifts_unix_to_ist() {
+        assert_eq!(floor_on_row_clock(None), None);
+        assert_eq!(
+            floor_on_row_clock(Some(5)),
+            Some(5 + tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+        );
+    }
+
+    /// Records every POST body and answers 204.
+    async fn spawn_recording_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind"); // APPROVED: test
+        let addr = listener.local_addr().expect("addr"); // APPROVED: test
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req: Vec<u8> = Vec::new();
+                let mut buf = vec![0_u8; 65536];
+                let mut body_start = None;
+                let mut content_len = 0_usize;
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0); // APPROVED: test
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if body_start.is_none()
+                        && let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        body_start = Some(i + 4);
+                        let head = String::from_utf8_lossy(&req[..i]).to_ascii_lowercase();
+                        content_len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                    if let Some(start) = body_start
+                        && req.len() >= start + content_len
+                    {
+                        break;
+                    }
+                }
+                let start = body_start.unwrap_or(req.len()).min(req.len());
+                if let Ok(mut all) = sink.lock() {
+                    all.extend_from_slice(&req[start..]);
+                }
+                let resp =
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/write"), seen, handle)
+    }
+
+    /// The defect (live audit F2/F5/F6): a spill file holding rows from
+    /// earlier days was replayed in full after a wipe. With a floor, a line
+    /// below it is kept in quarantine and NOT posted; a line at or above it
+    /// is posted.
+    #[tokio::test]
+    async fn test_regression_a_spill_line_below_the_floor_is_quarantined_not_posted() {
+        let dir = temp_dir("below-floor");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let old = tick_line_on_day(0);
+        let at_floor = tick_line_on_day(3);
+        let new = tick_line_on_day(7);
+        std::fs::write(&path, format!("{old}{at_floor}{new}")).expect("write"); // APPROVED: test
+        let (url, seen, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.market_data_floor_unix_nanos = Some(unix_of_ist(ist_at(3 * 86_400 + 12 * 3600)));
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            !posted.contains(&old),
+            "the line below the floor must NOT be posted"
+        );
+        assert!(posted.contains(&at_floor), "a line AT the floor is posted");
+        assert!(posted.contains(&new), "a line above the floor is posted");
+        assert_eq!(out.lines_below_floor, 1);
+        assert_eq!(out.files_failed, 0);
+        let kept = std::fs::read_to_string(
+            dir.join(QUARANTINE_DIR)
+                .join(format!("ticks-dhan-1.ilp{BELOW_FLOOR_LINES_SUFFIX}")),
+        )
+        .expect("the below-floor line is kept in quarantine"); // APPROVED: test
+        assert_eq!(kept, old, "kept byte for byte");
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No floor (no floor file): every line is posted, nothing is set aside,
+    /// exactly as before the floor existed.
+    #[tokio::test]
+    async fn test_no_floor_posts_every_line_as_before() {
+        let dir = temp_dir("no-floor");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let old = tick_line_on_day(0);
+        let new = tick_line_on_day(7);
+        std::fs::write(&path, format!("{old}{new}")).expect("write"); // APPROVED: test
+        let (url, seen, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.market_data_floor_unix_nanos = None;
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(posted.contains(&old) && posted.contains(&new));
+        assert_eq!(out.lines_below_floor, 0);
+        assert!(!dir.join(QUARANTINE_DIR).exists());
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_aside_lines_with_suffix_appends_whole_lines_to_its_own_file() {
+        let dir = temp_dir("suffix-set-aside");
+        let spill = dir.join("ticks-dhan-9.ilp");
+        let chunk = b"a 1\nb 2\nc 3";
+        let kept = set_aside_lines_with_suffix(
+            &dir,
+            &spill,
+            chunk,
+            &[0..4, 8..11],
+            BELOW_FLOOR_LINES_SUFFIX,
+        )
+        .expect("set aside"); // APPROVED: test
+        assert_eq!(kept, 8, "two lines, the torn one given its newline");
+        let target = dir
+            .join(QUARANTINE_DIR)
+            .join(format!("ticks-dhan-9.ilp{BELOW_FLOOR_LINES_SUFFIX}"));
+        assert_eq!(std::fs::read(&target).expect("read"), b"a 1\nc 3\n"); // APPROVED: test
+        assert!(
+            !dir.join(QUARANTINE_DIR)
+                .join(format!("ticks-dhan-9.ilp{REJECTED_LINES_SUFFIX}"))
+                .exists(),
+            "the floor's lines never mix with QuestDB's refusals"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_quarantine_spill_file_moves_the_file_and_never_overwrites() {
+        let dir = temp_dir("quarantine-move");
+        let path = dir.join("depth-dhan-3.dspl");
+        std::fs::write(&path, b"first").expect("w1"); // APPROVED: test
+        let first = quarantine_spill_file(&dir, &path).expect("move 1"); // APPROVED: test
+        std::fs::write(&path, b"second").expect("w2"); // APPROVED: test
+        let second = quarantine_spill_file(&dir, &path).expect("move 2"); // APPROVED: test
+        assert!(!path.exists());
+        assert_ne!(
+            first, second,
+            "a second file of the same name gets a new name"
+        );
+        assert_eq!(std::fs::read(&first).expect("r1"), b"first"); // APPROVED: test
+        assert_eq!(std::fs::read(&second).expect("r2"), b"second"); // APPROVED: test
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

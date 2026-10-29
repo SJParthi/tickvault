@@ -310,6 +310,9 @@ pub mod feed_aux_persistence;
 // Real-time proof that the live path is not waiting (2026-10-02): per-stage
 // latency buckets, stall counters and task heartbeats, Prometheus only.
 pub mod hot_path_telemetry;
+// Live audit F2/F5/F6 (2026-10-29): the durable market-data floor. Spill
+// replay sets aside rows older than the last reset instead of posting them.
+pub mod market_data_floor;
 // Moves the current tokio worker aside for one blocking step (sweep S1/S5).
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;

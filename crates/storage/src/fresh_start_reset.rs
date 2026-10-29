@@ -1134,14 +1134,66 @@ pub async fn run_fresh_start_reset_at_boot(questdb: &QuestDbConfig) -> ResetDeci
         }
     };
     let base_url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
-    run_fresh_start_reset_retrying(
+    let decision = run_fresh_start_reset_retrying(
         &client,
         &base_url,
         RESET_LOG_READ_ATTEMPTS,
         Duration::from_secs(RESET_LOG_READ_BACKOFF_SECS),
         || chrono::Utc::now().timestamp(),
     )
-    .await
+    .await;
+    // Live audit F2/F5/F6 (2026-10-29): a reset that ran sets the durable
+    // market-data floor, so the spill replay never brings older rows back,
+    // and installs it for this process.
+    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    if let Some(floor) = record_market_data_floor_after_reset(
+        decision,
+        std::path::Path::new(crate::market_data_floor::MARKET_DATA_FLOOR_PATH),
+        now_nanos,
+    ) {
+        crate::market_data_floor::install_market_data_floor(floor);
+    }
+    decision
+}
+
+/// After a reset that RAN ([`ResetDecision::Run`]), writes the market-data
+/// floor at `floor_unix_nanos` to `path` (temp file, sync, rename) and
+/// returns it; any other decision writes nothing. A failed write is a coded
+/// `error!` and returns `None`: the reset itself is not undone, but the spill
+/// replay then has no floor and can bring rows from before the reset back.
+/// Cold path, once per reset.
+pub fn record_market_data_floor_after_reset(
+    decision: ResetDecision,
+    path: &std::path::Path,
+    floor_unix_nanos: i64,
+) -> Option<i64> {
+    if decision != ResetDecision::Run {
+        return None;
+    }
+    match crate::market_data_floor::write_market_data_floor(path, floor_unix_nanos) {
+        Ok(()) => {
+            info!(
+                path = %path.display(),
+                floor_unix_nanos,
+                "fresh-start reset wrote the market-data floor: spill replay sets aside rows \
+                 older than this reset"
+            );
+            Some(floor_unix_nanos)
+        }
+        Err(err) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::TickSpill01FileQuarantined
+                    .code_str(),
+                source = "market_data_floor_write_failed",
+                path = %path.display(),
+                %err,
+                "fresh-start reset could NOT write the market-data floor. The reset ran, but \
+                 the spill replay has no floor, so spilled rows from before the reset can come \
+                 back into the database. Check the disk and data/state/."
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1157,6 +1209,44 @@ mod tests {
     #[test]
     fn the_id_is_the_scope_locks_one_constant() {
         assert_eq!(FRESH_START_RESET_ID, "2026-09-19-fresh-start");
+    }
+
+    #[test]
+    fn test_record_market_data_floor_after_reset_writes_only_when_the_reset_ran() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-reset-floor-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let path = dir.join("state").join("market_data_floor");
+        let floor = 1_761_696_000_000_000_000_i64;
+        for decision in [
+            ResetDecision::AlreadyDone,
+            ResetDecision::RefuseInSession,
+            ResetDecision::RefuseUnreadable,
+            ResetDecision::NothingToWipe,
+        ] {
+            assert_eq!(
+                record_market_data_floor_after_reset(decision, &path, floor),
+                None
+            );
+            assert!(!path.exists(), "{decision:?} must not write a floor");
+        }
+        assert_eq!(
+            record_market_data_floor_after_reset(ResetDecision::Run, &path, floor),
+            Some(floor)
+        );
+        assert_eq!(
+            crate::market_data_floor::read_market_data_floor(&path),
+            crate::market_data_floor::FloorRead::Floor(floor)
+        );
+        // A path under a regular FILE cannot be written: refused, None.
+        let blocked = path.join("below_a_file");
+        assert_eq!(
+            record_market_data_floor_after_reset(ResetDecision::Run, &blocked, floor),
+            None
+        );
+        let _cleanup = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
