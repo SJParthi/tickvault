@@ -649,6 +649,11 @@ fn main() -> Result<()> {
     if let Some(code) = tickvault_app::host_tuning::run_cli(&cli_args) {
         std::process::exit(code);
     }
+    // `tickvault strategy-dry-run ...` (rule brutex-strategy-host-2026-10-29.md):
+    // loads and checks published brutex strategy folders; no order, no live change.
+    if let Some(code) = tickvault_app::strategy_dry_run::run_cli(&cli_args) {
+        std::process::exit(code);
+    }
 
     let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
     let (host_cpus, cpu_source) = host_cpu_allowance();

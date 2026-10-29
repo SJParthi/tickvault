@@ -227,6 +227,8 @@ pub mod partition_manager;
 // archive_enabled (serde default false).
 pub mod partition_archive;
 pub mod s3_cold;
+/// Read-only fetch of a published brutex strategy (rule brutex-strategy-host-2026-10-29.md).
+pub mod strategy_recipe_fetch;
 // Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
 // verified, and marked, before any WAL prune may delete them.
 pub mod raw_frame_upload;

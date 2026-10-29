@@ -253,6 +253,8 @@ pub mod rebuild_box;
 /// One-off (plan item 66): the one budgeted SSM shell element the rebuild
 /// sends. Removed after the run.
 pub mod rebuild_ssm;
+/// `tickvault strategy-dry-run`: load, verify and replay published brutex strategy folders (no order, no live change).
+pub mod strategy_dry_run;
 /// One-off (plan item 67, operator Quote 35, 2026-10-21): the pure half of
 /// the 2026-10-31 market-data wipe (what is deleted and kept, the run
 /// window). Removed with the tool, the box subcommand and the workflow after
