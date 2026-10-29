@@ -1984,6 +1984,44 @@ the build again and needs its own fresh dated quote.
 ---
 
 > **[ARCHIVED 2026-07-20]** §29 warm-resubscribe snapshot + §31 NTM subscription authorization (retired subscription chain; §31.1 mapping contract kept live) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
+### §28.5 — NARROW LIFT for SPEED-ONLY work on the in-memory decision path (operator-approved 2026-10-29)
+
+**The operator authorization (2026-10-29, ~17:00 IST).** The owner asked
+(typed in-session, typos preserved): *"suppose letss asay when we do real lvie
+tradign without even tocuhing db base don tcojs or seconds candles or minutes
+candles alogn with strategeis indictaors patterns ect etc etce measn we need to
+strictly achieve one microseconds dude always less than one microseocnds dude
+okay?"*. Asked on a decision card whether the indicators and strategies area may
+be touched for this, the owner tapped **"Allow for speed work (Recommended)"**,
+whose text read: *"I record your OK in the rule file first, then change only
+speed (same results, proven by tests that compare old and new outputs). No new
+strategies, no logic changes, no live orders."*
+
+**What this lift allows.** Changes under `crates/trading/src/indicator/` and
+`crates/trading/src/strategy/` whose ONLY purpose is speed on the in-memory
+decision path (tick → candles → indicators → strategies → patterns → decision,
+no database read or write on that path), toward a per-tick cost under 1 µs:
+data layout, fewer lookups, removing allocation or division, precomputation,
+benchmarks and their budgets. Every such change ships with a test that runs the
+old and new code on the same inputs and requires identical outputs (bit for bit
+for floats, or the documented `f64` equality the module already uses), and a
+benchmark with a budget.
+
+**What it does NOT allow (REJECT):**
+- any change to what an indicator computes, a strategy's rules, thresholds,
+  signals, or a new indicator or strategy;
+- wiring the dormant trading pipeline (`spawn_trading_pipeline`) into
+  production, or any order placement, `dry_run` change, or live order path;
+- a database read or write added to the decision path;
+- any change justified as "speed" that changes an output, even by one ULP,
+  without a dated operator quote naming it;
+- reusing this lift for anything other than speed.
+
+**Honest limit, recorded so the target is not overstated:** the decision can be
+made in memory in under 1 µs; sending an order to the broker cannot (a network
+round trip, milliseconds), and neither can writing to disk or the database. Those
+stay off the decision path.
+
 ## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
 
 > **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the
