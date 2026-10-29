@@ -94,6 +94,9 @@ mod unbacked_depth;
 // Plan item J2 (2026-10-26): what the drain and its writer threads still
 // held at shutdown, counted rather than dropped silently.
 mod shutdown_residue;
+// Live audit LH-05 (2026-10-29): the worst delivery delay split by segment
+// class (index/cash vs contracts), local /metrics only.
+mod ws_lag_class;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -316,11 +319,16 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// a few integer operations and one uncontended `fetch_max`; no allocation.
 /// A non-positive lag (the ±1 s truncation floor) adds nothing to a maximum,
 /// so it is skipped rather than stored.
-fn record_ws_lag_max(exchange_timestamp: u32, received_at_nanos: i64) {
+///
+/// The same sample also goes into its segment class's maximum
+/// ([`ws_lag_class`], one compare and one relaxed `fetch_max`), published
+/// beside this one as `tv_dhan_ws_lag_max_ms_by_class`.
+fn record_ws_lag_max(segment_code: u8, exchange_timestamp: u32, received_at_nanos: i64) {
     if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
         && lag_ms > 0
     {
         WS_LAG_MAX_MILLIS.fetch_max(lag_ms, Ordering::Relaxed);
+        ws_lag_class::WS_LAG_MAX_BY_CLASS.note(segment_code, lag_ms);
     }
 }
 
@@ -8622,7 +8630,11 @@ pub fn drain_main_feed_frame(
                         // Worst delay on a LIVE socket only: a replayed WAL
                         // frame (`u8::MAX`) carries its replay time.
                         if frame.connection_index != u8::MAX {
-                            record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
+                            record_ws_lag_max(
+                                tick.exchange_segment_code,
+                                tick.exchange_timestamp,
+                                received_at_nanos,
+                            );
                         }
                     }
                     _ => record_ws_lag_not_a_trade_excluded(),
@@ -11199,6 +11211,9 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)
         .set(RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms));
     metrics::gauge!(WS_LAG_MAX_MS_GAUGE).set(WS_LAG_PEAK.publish(take_ws_lag_max_ms(), now_ms));
+    // The same maximum split by segment class (live audit LH-05), local
+    // /metrics only; the gauge above and its alarm are unchanged.
+    ws_lag_class::publish_ws_lag_max_by_class(now_ms);
     // The lag histogram's buckets ride the same publish (audit M6): the tick
     // path only adds to atomics; the exposition counters are set here.
     ws_lag_handles().publish();
@@ -19100,12 +19115,28 @@ mod tests {
     #[test]
     fn test_ws_lag_max_takes_the_largest_and_resets() {
         let _ = take_ws_lag_max_ms();
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 2_000_000_000);
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 46_000_000_000);
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
+        const FNO_CODE: u8 = 2;
+        // The class split (LH-05) leaves this gauge unchanged: it still
+        // takes the maximum across every segment, index and cash included.
+        record_ws_lag_max(0, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 30_000_000_000);
+        record_ws_lag_max(
+            FNO_CODE,
+            LTT_IST_SECS,
+            SIMULTANEOUS_RECV_NANOS + 2_000_000_000,
+        );
+        record_ws_lag_max(
+            FNO_CODE,
+            LTT_IST_SECS,
+            SIMULTANEOUS_RECV_NANOS + 46_000_000_000,
+        );
+        record_ws_lag_max(FNO_CODE, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
         // A negative (truncation floor) and a garbage stamp add nothing.
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS - 900_000_000);
-        record_ws_lag_max(0, SIMULTANEOUS_RECV_NANOS);
+        record_ws_lag_max(
+            FNO_CODE,
+            LTT_IST_SECS,
+            SIMULTANEOUS_RECV_NANOS - 900_000_000,
+        );
+        record_ws_lag_max(FNO_CODE, 0, SIMULTANEOUS_RECV_NANOS);
         assert!((take_ws_lag_max_ms() - 46_000.0).abs() < f64::EPSILON);
         assert!(
             take_ws_lag_max_ms().abs() < f64::EPSILON,
