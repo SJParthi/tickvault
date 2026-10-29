@@ -76,7 +76,16 @@
 //! and `tv_hot_path_receipt_to_fold_fine_{p50,p99,p999}_ns`) and
 //! `metrics_upkeep` (one run of the Prometheus exporter's upkeep on the main
 //! runtime). The publisher thread also publishes the hot threads'
-//! scheduling wait (`crate::hot_thread_sched`).
+//! scheduling wait (`crate::hot_thread_sched`). `receipt_to_fold` covers
+//! frames that took the live path only; ring-refused frames are on the ring
+//! counters (see [`Stage::ReceiptToFold`]).
+//!
+//! These series are never paged and have no EMF name or metric filter, but
+//! they are not confined to the box: the CloudWatch agent scrapes all of
+//! `/metrics` once a minute, with no relabel filter, into the metrics log
+//! group. DT0 added about 143 series (two stages of ~35 each, the 61 fine
+//! ones, 12 scheduling ones); at ~150 bytes a line and ~8 hours a day that
+//! is ~0.25 GB a month, about $0.15 to $0.30 (Assumed, not billed yet).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -118,10 +127,19 @@ pub enum Stage {
     /// One main-feed frame, end to end inside this process: the read task's
     /// receipt instant → the drain finished folding it (plan item DT0,
     /// 2026-10-29). It spans `socket_to_wal`, `ring_dwell` and
-    /// `drain_main_frame`, so a tick that took over 1 ms to reach RAM shows
-    /// here once, whichever step held it. Recorded once per main-feed frame
-    /// by [`record_receipt_to_fold_nanos`], which also fills the finer
-    /// quarter-octave histogram below. Never paged.
+    /// `drain_main_frame`, so a frame that took the LIVE path and took over
+    /// 1 ms to reach RAM shows here once, whichever step held it. Recorded
+    /// once per main-feed frame by [`record_receipt_to_fold_nanos`], which
+    /// also fills the finer quarter-octave histogram below. Never paged.
+    ///
+    /// Not every tick: a frame the ring refused (frame-count or byte budget
+    /// full, or the drain gone) is kept only in the WAL and reaches the fold
+    /// later through refold or catch-up, the slowest path a tick can take,
+    /// and records nothing here. Those frames are counted on
+    /// `tv_dhan_ws_ring_full_total` and `tv_dhan_ws_ring_closed_total`
+    /// (`endpoint="main_feed"`); read them beside this stage. In a window
+    /// where either rose the tail is partly unmeasured, so this stage's
+    /// p99.9 reads low for that window.
     ReceiptToFold = 5,
     /// One run of the Prometheus exporter's upkeep (it drains every
     /// histogram), which runs every 5 s on the MAIN tokio runtime, the one

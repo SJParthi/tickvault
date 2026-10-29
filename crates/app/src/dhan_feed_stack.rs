@@ -7479,8 +7479,6 @@ async fn run_frame_drain(
                 tickvault_storage::hot_path_telemetry::beat(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
                 );
-                // DT0: which worker thread hosts the drain now (O(1)).
-                tickvault_storage::hot_thread_sched::note_frame_drain_thread();
                 flush_ticks_and_record(&mut ingest, &feed_health);
                 // ITEM 57b: depth on every `DEPTH_TIMER_FLUSH_EVERY_TICKS`th
                 // tick (2 s), not every tick; its size trigger in the frame

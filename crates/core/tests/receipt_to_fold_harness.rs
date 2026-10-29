@@ -1,13 +1,30 @@
-//! Wall-clock harness for the `receipt_to_fold` stage (plan item DT0,
-//! 2026-10-29): socket receipt → WAL + ring hand-off → drain pick-up →
-//! decode, on the production shapes, with and without CPU competition.
+//! Wall-clock RING-PLUS-DECODE yardstick (plan item DT0, 2026-10-29):
+//! socket receipt → WAL + ring hand-off → a stand-in consumer's pick-up →
+//! decode, with and without CPU competition.
+//!
+//! # What this is NOT (review of DT0, 2026-10-29)
+//!
+//! It does not run the production drain. The consumer below is a bare
+//! `recv` loop: no `run_frame_drain` select arms (500 ms flush, 5 s
+//! catch-up seal, 30 s silence, idle and seed arms), no
+//! `drain_main_feed_frame`, no candle fold, no row append, and it never
+//! records the `receipt_to_fold` stage. So it is NOT the `receipt_to_fold`
+//! stage and it cannot judge DT1 (sleeping consumer) or DT2 (the drain on
+//! its own thread): both change `run_frame_drain` in the app crate, which
+//! this core-crate test cannot reach. Judge those steps on the live
+//! `receipt_to_fold` stage. What this CAN show is the cost of the WAL +
+//! ring hand-off and of a consumer that competes for a CPU, for example
+//! before and after a DT3 core-placement change on a two-core machine.
+//!
+//! Debug-build figures are dominated by host noise (one debug run printed
+//! a worse p99.9 quiet than contended); record only release runs on two
+//! otherwise idle cores.
 //!
 //! Live evidence, 29 Oct on the 2-vCPU r8g.large: `socket_to_wal` and
 //! `drain_main_frame` p99 ≤ 32.8 µs, yet about 35 to 50 frames a session
 //! over 1 ms and the worst 8 to 16 ms. The steps themselves are short; the
-//! tail is the reader and the drain waiting for a CPU. This harness gives
-//! later steps (DT1 sleeping consumer, DT2 own drain thread, DT3 core
-//! placement and priority) one fixed yardstick to compare against.
+//! tail is the reader and the drain waiting for a CPU. This harness measures
+//! only the hand-off half of that; see "What this is NOT" above.
 //!
 //! What it runs, per scenario:
 //!
@@ -16,12 +33,14 @@
 //!   real `frame_ring`), paced by `thread::sleep` like a socket read that
 //!   blocks between frames (it does NOT spin, so it competes for a CPU only
 //!   while it works);
-//! * a drain task on a separate two-worker tokio runtime (the production
-//!   main runtime's shape) that receives, decodes the packet with the real
-//!   dispatcher and records `received_at.elapsed()`;
-//! * optionally `NOISE_TASKS` other tasks on the drain's runtime, each doing
-//!   ~50 µs of work every ~1 ms (the main runtime holds ~117 tasks), and one
-//!   CPU-burning thread per available CPU that spins 5 ms and sleeps 1 ms.
+//! * a stand-in consumer task (NOT the production drain) on a separate
+//!   two-worker tokio runtime (the main runtime's shape) that receives,
+//!   decodes the packet with the real dispatcher and records
+//!   `received_at.elapsed()`;
+//! * optionally `NOISE_TASKS` other tasks on the consumer's runtime, each
+//!   doing ~50 µs of work every ~1 ms (the main runtime holds ~117
+//!   tasks), and one CPU-burning thread per available CPU that spins
+//!   5 ms and sleeps 1 ms.
 //!
 //! Scenarios: 400 µs spacing (≈ 2,600 frames a second, the live average)
 //! quiet and contended, and a 12,500 frames-a-second burst (the 09:15
@@ -57,7 +76,7 @@ const GAP_BURST: Duration = Duration::from_micros(80);
 const TARGET_NANOS: u64 = 1_000_000;
 /// Ring slots, same order as `FRAME_RING_CAPACITY`.
 const RING_SLOTS: usize = 65_536;
-/// Other tasks sharing the drain's runtime in the contended scenarios.
+/// Other tasks sharing the consumer's runtime in the contended scenarios.
 const NOISE_TASKS: usize = 100;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -143,8 +162,9 @@ fn spawn_burners(stop: &Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>> {
         .collect()
 }
 
-/// The drain: receive, decode, record receipt → done. Returns every sample.
-async fn drain(
+/// The stand-in consumer (NOT `run_frame_drain`): receive, decode, record
+/// receipt → decoded. Returns every sample.
+async fn consume(
     mut rx: FrameRingReceiver<CapturedFrame>,
     budget: Arc<RingByteBudget>,
     expect: usize,
@@ -160,7 +180,7 @@ async fn drain(
 }
 
 /// One scenario: `frames` frames `gap` apart through a real WAL + ring into
-/// a drain on a two-worker runtime, with or without competition.
+/// a stand-in consumer on a two-worker runtime, with or without competition.
 fn run_scenario(tag: &str, frames: usize, gap: Duration, contended: bool) -> Summary {
     let dir = temp_dir(tag);
     let spill = Arc::new(WsFrameSpill::new(&dir).expect("spill"));
@@ -191,7 +211,7 @@ fn run_scenario(tag: &str, frames: usize, gap: Duration, contended: bool) -> Sum
     } else {
         Vec::new()
     };
-    let drain_task = rt.spawn(drain(rx, Arc::clone(&budget), frames));
+    let consumer_task = rt.spawn(consume(rx, Arc::clone(&budget), frames));
     let sink = WalRingSink::new(
         Arc::clone(&spill),
         tx,
@@ -218,13 +238,17 @@ fn run_scenario(tag: &str, frames: usize, gap: Duration, contended: bool) -> Sum
         })
         .expect("reader thread");
     reader.join().expect("reader");
-    let samples = rt.block_on(drain_task).expect("drain");
+    let samples = rt.block_on(consumer_task).expect("consumer");
     stop.store(true, Ordering::Relaxed);
     for b in burners {
         let _ = b.join();
     }
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(samples.len(), frames, "the drain saw every accepted frame");
+    assert_eq!(
+        samples.len(),
+        frames,
+        "the consumer saw every accepted frame"
+    );
     summarise(samples)
 }
 
@@ -232,7 +256,7 @@ fn run_scenario(tag: &str, frames: usize, gap: Duration, contended: bool) -> Sum
 #[ignore = "wall-clock harness; run by hand with taskset -c 0,1 ... --ignored --nocapture"]
 fn receipt_to_fold_cost_with_and_without_cpu_competition() {
     println!(
-        "receipt_to_fold harness: {} CPUs available (production r8g.large: 2)",
+        "ring+decode yardstick (not the production drain): {} CPUs available (production r8g.large: 2)",
         std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get)
     );
     let quiet = run_scenario("quiet", FRAMES_STEADY, GAP_STEADY, false);
