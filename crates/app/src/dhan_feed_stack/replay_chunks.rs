@@ -226,9 +226,9 @@ mod pacer_tests {
             "the lane's own counter reads 0 here: the value the old pacer trusted"
         );
         assert!(
-            replay_rows_held(&ingest, false),
+            replay_rows_held(&ingest, false) > 0,
             "the pacer must see the rows the queue gave back, or it never waits"
         );
-        assert!(replay_rows_held(&ingest, true));
+        assert!(replay_rows_held(&ingest, true) > 0);
     }
 }

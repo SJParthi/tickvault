@@ -15386,6 +15386,14 @@ fn replay_rows_landed(ingest: &mut LiveIngest, stage: &'static str, unlanded_bef
     false
 }
 
+/// Whether the boot refold may say its rows are in the database (live audit
+/// LH-03): rows were flushed AND the ack check saw them land. A refused
+/// confirm logs its own coded error; the INFO line must not contradict it.
+/// O(1).
+fn refold_rows_reached_database(flushed: u64, landed: bool) -> bool {
+    flushed > 0 && landed
+}
+
 pub fn report_unfolded_wal_frames(frames: &[(u64, i64, WalEndpoint, bytes::Bytes)], refusal: &str) {
     if frames.is_empty() {
         return;
@@ -15752,11 +15760,19 @@ pub fn wal_replay_pace_until(ist_secs_of_day: u64, now: Instant) -> Option<Insta
 /// third one rescues the batch, which is the outcome this exists to prevent.
 /// Returns the waits spent.
 ///
+/// A flush that does not reduce the held rows handed nothing to the writers,
+/// so the next wait has nothing to drain and returns at once. The loop then
+/// sleeps one step (clipped to the deadline) instead of spinning (live audit
+/// LH-02: with the writers idle and the rows still held, `pace_waits` reached
+/// 963,130,754 and the lane came up 5 minutes late on every out-of-session
+/// boot). `rows_held` is the count of rows still held; 0 ends the pacing.
+///
 /// O(1) per step; bounded by the deadline, never by the database.
 pub fn pace_after_replay_flush(
     mut flush: impl FnMut(),
-    mut rows_held: impl FnMut() -> bool,
+    mut rows_held: impl FnMut() -> usize,
     mut wait_drained: impl FnMut(std::time::Duration) -> bool,
+    mut sleep: impl FnMut(std::time::Duration),
     mut now: impl FnMut() -> Instant,
     pace_until: Option<Instant>,
     step: std::time::Duration,
@@ -15765,7 +15781,8 @@ pub fn pace_after_replay_flush(
         return 0;
     };
     let mut waits = 0u32;
-    while rows_held() {
+    let mut held = rows_held();
+    while held > 0 {
         let at = now();
         if at >= until {
             break;
@@ -15773,6 +15790,13 @@ pub fn pace_after_replay_flush(
         waits = waits.saturating_add(1);
         if wait_drained(until.saturating_duration_since(at).min(step)) {
             flush();
+            let after = rows_held();
+            if after >= held {
+                sleep(until.saturating_duration_since(now()).min(step));
+            }
+            held = after;
+        } else {
+            held = rows_held();
         }
     }
     waits
@@ -15785,9 +15809,15 @@ pub fn pace_after_replay_flush(
 /// on all eight boot replays from 19 to 26 Oct). The third full-queue flush
 /// then rescued the rows, the busy rescue thread handed them back to the WAL,
 /// and the ack check refused the batch: the same 5 segments were re-read on
-/// every boot from 21 Oct. O(1).
-fn replay_rows_held(ingest: &LiveIngest, with_depth: bool) -> bool {
-    ingest.writer.pending() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
+/// every boot from 21 Oct. Returns the row count, so the pacer can tell a
+/// flush that handed nothing off (LH-02). O(1).
+fn replay_rows_held(ingest: &LiveIngest, with_depth: bool) -> usize {
+    let depth = if with_depth {
+        ingest.depth_pending_rows()
+    } else {
+        0
+    };
+    ingest.writer.pending().saturating_add(depth)
 }
 
 /// [`pace_after_replay_flush`] on the real writers (audit R1).
@@ -15818,7 +15848,7 @@ fn replay_pace_after_flush(
             // replay runs unpaced, so a full queue rescues its rows to the
             // spill tier or back to the WAL instead of holding the stop.
             if shutdown_requested() {
-                return false;
+                return 0;
             }
             replay_rows_held(&ingest.borrow(), with_depth)
         },
@@ -15828,6 +15858,8 @@ fn replay_pace_after_flush(
             let unlanded = wm.unlanded_total();
             blocking_flush(|| wm.wait_for_offload_drained(step, unlanded))
         },
+        // A flush that handed nothing off (LH-02): one step off the worker.
+        |step| blocking_flush(|| std::thread::sleep(step)),
         Instant::now,
         pace_until,
         std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
@@ -17147,14 +17179,17 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // ACK BEFORE CONFIRMING (2026-09-05): `flush` on the offloaded path
             // returns rows handed to a queue. Wait for the writer threads to
             // land or rescue them before the segments leave the replay path.
-            if replay_rows_landed(&mut ingest, "boot_refold", unlanded_before) {
+            let landed = replay_rows_landed(&mut ingest, "boot_refold", unlanded_before);
+            if landed {
                 tickvault_storage::wal_replay_settle::settle_confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
                     settle_start,
                 );
                 boot_refold_confirmed = true;
             }
-            if flushed > 0 {
+            // Only when the rows landed (LH-03): a refused confirm already
+            // logged its coded error, and this line said the opposite.
+            if refold_rows_reached_database(flushed, landed) {
                 info!(
                     rows = flushed,
                     "flushed the re-folded WAL rows before archiving their segments — \
@@ -27135,8 +27170,9 @@ mod wal_refold_tests {
         sim.flush();
         pace_after_replay_flush(
             || sim.flush(),
-            || sim.held.get(),
+            || usize::from(sim.held.get()),
             |step| sim.wait(step),
+            |step| sim.clock.set(sim.clock.get() + step),
             || sim.clock.get(),
             pace_until,
             std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
@@ -27183,6 +27219,91 @@ mod wal_refold_tests {
     }
 
     #[test]
+    fn test_regression_a_flush_that_hands_nothing_off_does_not_busy_spin() {
+        // LH-02: writers idle, so every wait reports drained at once (and
+        // takes no time); the flush hands nothing off; rows stay held. The
+        // loop must sleep one step per round and end at the deadline, not
+        // spin (963,130,754 waits live).
+        let clock = std::cell::Cell::new(Instant::now());
+        let until = clock.get() + std::time::Duration::from_millis(2_500);
+        let calls = std::cell::Cell::new(0u32);
+        let flushes = std::cell::Cell::new(0u32);
+        let waits = pace_after_replay_flush(
+            || flushes.set(flushes.get() + 1),
+            || 7,
+            |_step| {
+                calls.set(calls.get() + 1);
+                assert!(calls.get() < 1_000, "the pacer busy-spins");
+                true
+            },
+            |step| clock.set(clock.get() + step),
+            || clock.get(),
+            Some(until),
+            std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
+        );
+        assert_eq!(waits, 3, "one wait per slept step: 1 s + 1 s + 0.5 s");
+        assert_eq!(flushes.get(), 3);
+        assert_eq!(clock.get(), until, "the loop ends at the deadline");
+    }
+
+    #[test]
+    fn a_flush_that_hands_rows_off_is_not_followed_by_a_sleep() {
+        // The sleep is only for a flush that reduced nothing: a draining
+        // writer keeps the pacing at full speed.
+        let held = std::cell::Cell::new(3usize);
+        let start = Instant::now();
+        let waits = pace_after_replay_flush(
+            || held.set(held.get().saturating_sub(1)),
+            || held.get(),
+            |_step| true,
+            |_step| panic!("slept after a flush that handed rows off"),
+            || start,
+            Some(start + std::time::Duration::from_secs(300)),
+            std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
+        );
+        assert_eq!(waits, 3);
+        assert_eq!(held.get(), 0);
+    }
+
+    /// This file up to its first test module: one `include_str!` shared by the
+    /// source scans below, so they stay inside the self-scan budget.
+    fn production_source() -> &'static str {
+        include_str!("dhan_feed_stack.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn test_regression_the_in_the_database_line_needs_the_rows_to_have_landed() {
+        // LH-03: the INFO line said the recovered ticks were in the database
+        // whenever the flush handed rows off, also when the ack check refused
+        // the confirm (a false OK beside the coded error).
+        let production = production_source();
+        let line = production
+            .find("the recovered ticks are in the database")
+            .expect("the boot refold still reports its landed rows");
+        let gate = production[..line]
+            .rfind("if ")
+            .expect("the line is gated by a condition");
+        assert!(
+            production[gate..line].starts_with("if refold_rows_reached_database(flushed, landed)"),
+            "the line must be gated on the rows having landed"
+        );
+    }
+
+    #[test]
+    fn refold_rows_reached_database_needs_both_a_flush_and_a_landing() {
+        assert!(refold_rows_reached_database(5, true));
+        assert!(
+            !refold_rows_reached_database(5, false),
+            "a refused confirm is not rows in the database"
+        );
+        assert!(!refold_rows_reached_database(0, true), "nothing flushed");
+        assert!(!refold_rows_reached_database(0, false));
+    }
+
+    #[test]
     fn a_paced_replay_past_its_deadline_behaves_as_before() {
         let sim = PaceSim::new(1, 1);
         let past = sim.clock.get();
@@ -27213,8 +27334,7 @@ mod wal_refold_tests {
 
     #[test]
     fn both_replay_passes_are_paced() {
-        let src = include_str!("dhan_feed_stack.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap_or("");
+        let production = production_source();
         assert_eq!(
             production.matches("refold_wal_frames(&mut ingest").count(),
             2,
@@ -32181,7 +32301,7 @@ mod shutdown_before_dial_tests {
         // And the pacing stops waiting on the writers.
         let pace = body_of(prod, "fn replay_pace_after_flush(");
         assert!(
-            pace.contains("if shutdown_requested() {\n                return false;"),
+            pace.contains("if shutdown_requested() {\n                return 0;"),
             "a stop must end the replay pacing"
         );
     }
