@@ -1195,6 +1195,14 @@ second SSM element or any shell line to `rebuild_ssm.rs`; raising either
 ceiling; splicing an unvalidated value into the command; adding a schedule
 or push trigger to the workflow; keeping any of it after 2026-10-31 IST.
 
+**ENDED 2026-10-29.** The rebuild ran on 2026-10-28 (GitHub runs
+40733150126 and 40745078734 that night; the latter is the wipe's apply run).
+The tool, `rebuild_box.rs`, `rebuild_ssm.rs`, the workflow and both budget
+rows were deleted in the first PR after the run, with the storage crate's
+rebuild copy module that only the rebuild and the wipe used. This exception
+authorizes nothing further; any new SSM shell needs its own dated section
+here.
+
 ## §0.14. 2026-10-22 — ONE-OFF SSM shell for the 2026-10-31 wipe (APPROVED 2026-10-22)
 
 > **Status: APPROVED 2026-10-22, about 19:25 IST.** The owner answered the
@@ -1252,3 +1260,11 @@ workflow or payload; adding a second SSM element or any shell line to
 `wipe_ssm.rs`; raising either ceiling; splicing an unvalidated value into the
 command; adding a schedule or push trigger to the workflow; keeping any of it
 after 2026-11-01 IST.
+
+**ENDED 2026-10-29.** The wipe ran on 2026-10-28 (GitHub runs 40733150126
+and 40745078734; the apply run is 40745078734). The tool, `wipe_box.rs`,
+`wipe_ssm.rs`, `wipe_2026_10_31.rs`, the workflow, the role's Terraform file
+(`tv-prod-wipe-2026-10-31`, destroyed by the next Terraform apply) and both
+budget rows were deleted in the first PR after the run. This exception
+authorizes nothing further; any new SSM shell needs its own dated section
+here.

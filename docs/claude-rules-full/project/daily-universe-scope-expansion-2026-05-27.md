@@ -1984,6 +1984,44 @@ the build again and needs its own fresh dated quote.
 ---
 
 > **[ARCHIVED 2026-07-20]** §29 warm-resubscribe snapshot + §31 NTM subscription authorization (retired subscription chain; §31.1 mapping contract kept live) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
+### §28.5 — NARROW LIFT for SPEED-ONLY work on the in-memory decision path (operator-approved 2026-10-29)
+
+**The operator authorization (2026-10-29, ~17:00 IST).** The owner asked
+(typed in-session, typos preserved): *"suppose letss asay when we do real lvie
+tradign without even tocuhing db base don tcojs or seconds candles or minutes
+candles alogn with strategeis indictaors patterns ect etc etce measn we need to
+strictly achieve one microseconds dude always less than one microseocnds dude
+okay?"*. Asked on a decision card whether the indicators and strategies area may
+be touched for this, the owner tapped **"Allow for speed work (Recommended)"**,
+whose text read: *"I record your OK in the rule file first, then change only
+speed (same results, proven by tests that compare old and new outputs). No new
+strategies, no logic changes, no live orders."*
+
+**What this lift allows.** Changes under `crates/trading/src/indicator/` and
+`crates/trading/src/strategy/` whose ONLY purpose is speed on the in-memory
+decision path (tick → candles → indicators → strategies → patterns → decision,
+no database read or write on that path), toward a per-tick cost under 1 µs:
+data layout, fewer lookups, removing allocation or division, precomputation,
+benchmarks and their budgets. Every such change ships with a test that runs the
+old and new code on the same inputs and requires identical outputs (bit for bit
+for floats, or the documented `f64` equality the module already uses), and a
+benchmark with a budget.
+
+**What it does NOT allow (REJECT):**
+- any change to what an indicator computes, a strategy's rules, thresholds,
+  signals, or a new indicator or strategy;
+- wiring the dormant trading pipeline (`spawn_trading_pipeline`) into
+  production, or any order placement, `dry_run` change, or live order path;
+- a database read or write added to the decision path;
+- any change justified as "speed" that changes an output, even by one ULP,
+  without a dated operator quote naming it;
+- reusing this lift for anything other than speed.
+
+**Honest limit, recorded so the target is not overstated:** the decision can be
+made in memory in under 1 µs; sending an order to the broker cannot (a network
+round trip, milliseconds), and neither can writing to disk or the database. Those
+stay off the decision path.
+
 ## §31.1 — Constituent → Dhan `security_id` mapping contract (LOCKED 2026-06-06)
 
 > **Authority for Sub-PR #4.** This is the precise, fail-closed mapping the
@@ -3005,6 +3043,8 @@ This table records how the shape above is built. It authorizes nothing beyond Qu
 - Treating Quote 35 as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
 - Skipping the Quote 32/33 copy-first rule for the 2026-10-22 rebuild because the copies are deleted on 31 Oct anyway: Quote 27 binds until Quote 35 runs.
 
+**ENDED 2026-10-29.** The wipe ran on 2026-10-28, brought forward by Quote 42 (GitHub runs 40733150126 and 40745078734; the apply run is 40745078734). The first PR after the run deleted the tool (`tv-wipe-2026-10-31`), its box subcommand and SSM shell, the workflow, the role's Terraform file (the role `tv-prod-wipe-2026-10-31` is destroyed by the next Terraform apply), both budget rows, and the in-code keep-list `rebuild_keep_tables()` with the storage crate's rebuild copy module, so no delete permission is kept. Quote 35 authorizes nothing further; Quote 27 binds again. Left for the owner by hand: the GitHub environment `wipe-2026-10-31`.
+
 #### Quote 36 (2026-10-21, ~17:55 IST) — THE SPEND STOP IS $85 FROM 1 NOVEMBER, NOT $100 (amends Quote 33's budget line, preserve EXACTLY, typos included)
 
 Asked whether $75 could be the monthly maximum once every Quote 32 step is done, the owner was told that $70–75 is an estimate of a normal month and the only hard maximum is the spend stop, and was offered: keep $100 for November (recommended), set $85, or set $75. Answer:
@@ -3169,6 +3209,8 @@ Measured first (read-only, 2026-10-27 ~08:10 IST): instance `i-0c3fe906dad5492fc
 - Deleting a keep-list table, `sebi-preserve/`, `deploys/` or `logs/`.
 - Skipping the rebuild's copy-first verification.
 - Reusing Quote 42 after this one run: Quote 27 binds again, and the first PR after the run deletes the role, workflow, tool and budget rows and marks Quotes 35 and 42 ENDED.
+
+**ENDED 2026-10-29.** The rebuild and the wipe both ran on 2026-10-28 (GitHub runs 40733150126 and 40745078734). The rebuild tool was deleted first, the wipe tool, its workflow, role file and budget rows in the next PR (see Quote 35's ENDED note). Quote 42 authorizes nothing further; Quote 27 binds again.
 
 #### Quote 43 (2026-10-27, ~10:45 IST) — `tick_quotes` ROUTES ON THE PACKET ALONE; TONIGHT'S WIPE ALSO DELETES THE REBUILD'S SPILL-FILE COPIES (decision cards, preserve EXACTLY)
 

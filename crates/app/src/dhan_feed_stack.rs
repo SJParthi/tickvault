@@ -94,6 +94,9 @@ mod unbacked_depth;
 // Plan item J2 (2026-10-26): what the drain and its writer threads still
 // held at shutdown, counted rather than dropped silently.
 mod shutdown_residue;
+// Live audit LH-05 (2026-10-29): the worst delivery delay split by segment
+// class (index/cash vs contracts), local /metrics only.
+mod ws_lag_class;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -316,18 +319,48 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// a few integer operations and one uncontended `fetch_max`; no allocation.
 /// A non-positive lag (the ±1 s truncation floor) adds nothing to a maximum,
 /// so it is skipped rather than stored.
-fn record_ws_lag_max(exchange_timestamp: u32, received_at_nanos: i64) {
+///
+/// The same sample also goes into its segment class's maximum
+/// ([`ws_lag_class`], one compare and one relaxed `fetch_max`), published
+/// beside this one as `tv_dhan_ws_lag_max_ms_by_class`.
+fn record_ws_lag_max(segment_code: u8, exchange_timestamp: u32, received_at_nanos: i64) {
+    record_ws_lag_max_into(
+        &WS_LAG_MAX_MILLIS,
+        &ws_lag_class::WS_LAG_MAX_BY_CLASS,
+        segment_code,
+        exchange_timestamp,
+        received_at_nanos,
+    );
+}
+
+/// The body of [`record_ws_lag_max`], over the cells it writes. Production
+/// passes the two statics; tests pass their own cells, so they never race the
+/// lib tests that run the real drain against the shared statics.
+#[inline]
+fn record_ws_lag_max_into(
+    max_millis: &std::sync::atomic::AtomicI64,
+    by_class: &ws_lag_class::LagMaxByClass,
+    segment_code: u8,
+    exchange_timestamp: u32,
+    received_at_nanos: i64,
+) {
     if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
         && lag_ms > 0
     {
-        WS_LAG_MAX_MILLIS.fetch_max(lag_ms, Ordering::Relaxed);
+        max_millis.fetch_max(lag_ms, Ordering::Relaxed);
+        by_class.note(segment_code, lag_ms);
     }
 }
 
 /// Takes the lag maximum and RESETS it, in milliseconds. Lossless: saturates
 /// at `u32::MAX` ms (~49 days), which no real delay reaches.
 fn take_ws_lag_max_ms() -> f64 {
-    let millis = WS_LAG_MAX_MILLIS.swap(0, Ordering::Relaxed);
+    take_ws_lag_max_ms_from(&WS_LAG_MAX_MILLIS)
+}
+
+/// The body of [`take_ws_lag_max_ms`], over one cell.
+fn take_ws_lag_max_ms_from(max_millis: &std::sync::atomic::AtomicI64) -> f64 {
+    let millis = max_millis.swap(0, Ordering::Relaxed);
     f64::from(u32::try_from(millis).unwrap_or(u32::MAX))
 }
 
@@ -1645,6 +1678,11 @@ pub struct LiveIngest {
     /// the volume ranking, whose monotonicity gate a stale cumulative would
     /// re-latch; that ranking is removed with `top_volume`.
     replaying_wal: bool,
+    /// A market-data floor (Unix nanos) given to this ingest IN ADDITION to
+    /// the process-wide one (`market_data_floor`); [`refold_wal_frames`]
+    /// judges receipts against the higher of the two. Production leaves it
+    /// `None`; a test sets it so it never has to raise the process floor.
+    market_data_floor_unix_nanos: Option<i64>,
     /// `false` while the frame being drained carries no WAL receipt stamp
     /// (the live drain substituted a wall-clock reading, which a replay
     /// cannot reproduce), so its packets stay in `ticks` (plan item M5,
@@ -1994,6 +2032,7 @@ impl LiveIngest {
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
+            market_data_floor_unix_nanos: None,
             frame_receipt_is_wal_stamp: true,
             seed_queue: SeedQueue::new(),
         }
@@ -2609,7 +2648,15 @@ impl LiveIngest {
     /// 1,000,000). Flushing depth with every 1,000 tick rows multiplied those
     /// commits. O(1) here; the flush itself is one hand-off or one request.
     pub fn flush_ticks(&mut self) -> u64 {
-        if self.pending_rows == 0 {
+        // Rows a full hand-off queue gave back stay in the writer while
+        // `pending_rows` already reads 0, so the writer is asked whenever it
+        // still holds rows (live audit LH-02, review): returning on
+        // `pending_rows` alone never re-sent them, the replay pacer idled to
+        // its 300 s deadline and `replay_rows_landed`'s retry flush was a
+        // no-op. `TickWriter::flush` retries the hand-off ("the next flush
+        // tries again"). Two integer reads when there is nothing to send.
+        let retained = self.writer.pending();
+        if self.pending_rows == 0 && retained == 0 {
             return 0;
         }
         let covered = self.pending_rows;
@@ -2672,6 +2719,7 @@ impl LiveIngest {
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
+                    writer_rows = retained,
                     "live tick flush to QuestDB FAILED — these rows are NOT in the database. \
                      They are NOT lost, and there are TWO recoveries. Immediately: the writer \
                      rescues the failed batch to a tick spill file (the WS-GAP-03 line beside \
@@ -8622,7 +8670,11 @@ pub fn drain_main_feed_frame(
                         // Worst delay on a LIVE socket only: a replayed WAL
                         // frame (`u8::MAX`) carries its replay time.
                         if frame.connection_index != u8::MAX {
-                            record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
+                            record_ws_lag_max(
+                                tick.exchange_segment_code,
+                                tick.exchange_timestamp,
+                                received_at_nanos,
+                            );
                         }
                     }
                     _ => record_ws_lag_not_a_trade_excluded(),
@@ -11199,6 +11251,9 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)
         .set(RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms));
     metrics::gauge!(WS_LAG_MAX_MS_GAUGE).set(WS_LAG_PEAK.publish(take_ws_lag_max_ms(), now_ms));
+    // The same maximum split by segment class (live audit LH-05), local
+    // /metrics only; the gauge above and its alarm are unchanged.
+    ws_lag_class::publish_ws_lag_max_by_class(now_ms);
     // The lag histogram's buckets ride the same publish (audit M6): the tick
     // path only adds to atomics; the exposition counters are set here.
     ws_lag_handles().publish();
@@ -15203,6 +15258,11 @@ pub struct WalRefoldOutcome {
     /// handing them the next batch (audit R1, 2026-10-03). Zero when the
     /// replay was not paced or the writers kept up.
     pub pace_waits: u64,
+    /// Frames skipped because their recorded receipt is below the
+    /// market-data floor (live audit F2/F5/F6 review, 2026-10-29): data from
+    /// before the fresh-start reset. Not loss: the bytes stay in the archived
+    /// segment, and the reset already set those days' tables aside.
+    pub frames_below_floor: u64,
 }
 /// Is this WAL frame from a DEPTH socket rather than the main feed?
 ///
@@ -15373,6 +15433,14 @@ fn replay_rows_landed(ingest: &mut LiveIngest, stage: &'static str, unlanded_bef
          re-offers them. Nothing is archived while its only copy is in RAM."
     );
     false
+}
+
+/// Whether the boot refold may say its rows are in the database (live audit
+/// LH-03): rows were flushed AND the ack check saw them land. A refused
+/// confirm logs its own coded error; the INFO line must not contradict it.
+/// O(1).
+fn refold_rows_reached_database(flushed: u64, landed: bool) -> bool {
+    flushed > 0 && landed
 }
 
 pub fn report_unfolded_wal_frames(frames: &[(u64, i64, WalEndpoint, bytes::Bytes)], refusal: &str) {
@@ -15709,6 +15777,21 @@ pub const WAL_REPLAY_PACE_STEP_MILLIS: u64 = 1_000;
 /// Counter: waits a paced replay spent on the writer threads (audit R1).
 pub const WAL_REPLAY_PACE_WAITS_COUNTER: &str = "tv_wal_replay_pace_waits_total";
 
+/// Counter: steps a paced replay SLEPT because a flush after a drained wait
+/// handed none of the held rows off (LH-02 review). Read beside
+/// [`WAL_REPLAY_PACE_WAITS_COUNTER`]: waits with no stalls is a writer that
+/// drained; stalls is rows held and not re-sent. 0 on a healthy boot.
+pub const WAL_REPLAY_PACE_STALLED_COUNTER: &str = "tv_wal_replay_pace_stalled_total";
+
+/// The once-per-process latch for the coded stall warning below.
+static PACE_STALL_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a pacing pass that slept `stalls` steps is the first one this
+/// process to warn about it. One `swap` per pass, only when it stalled. O(1).
+fn pace_stall_warn_due(latch: &AtomicBool, stalls: u32) -> bool {
+    stalls > 0 && !latch.swap(true, Ordering::Relaxed)
+}
+
 /// Until when a WAL replay started at `ist_secs_of_day` paces itself on the
 /// writer threads (audit R1, 2026-10-03).
 ///
@@ -15741,11 +15824,19 @@ pub fn wal_replay_pace_until(ist_secs_of_day: u64, now: Instant) -> Option<Insta
 /// third one rescues the batch, which is the outcome this exists to prevent.
 /// Returns the waits spent.
 ///
+/// A flush that does not reduce the held rows handed nothing to the writers,
+/// so the next wait has nothing to drain and returns at once. The loop then
+/// sleeps one step (clipped to the deadline) instead of spinning (live audit
+/// LH-02: with the writers idle and the rows still held, `pace_waits` reached
+/// 963,130,754 and the lane came up 5 minutes late on every out-of-session
+/// boot). `rows_held` is the count of rows still held; 0 ends the pacing.
+///
 /// O(1) per step; bounded by the deadline, never by the database.
 pub fn pace_after_replay_flush(
     mut flush: impl FnMut(),
-    mut rows_held: impl FnMut() -> bool,
+    mut rows_held: impl FnMut() -> usize,
     mut wait_drained: impl FnMut(std::time::Duration) -> bool,
+    mut sleep: impl FnMut(std::time::Duration),
     mut now: impl FnMut() -> Instant,
     pace_until: Option<Instant>,
     step: std::time::Duration,
@@ -15754,7 +15845,8 @@ pub fn pace_after_replay_flush(
         return 0;
     };
     let mut waits = 0u32;
-    while rows_held() {
+    let mut held = rows_held();
+    while held > 0 {
         let at = now();
         if at >= until {
             break;
@@ -15762,6 +15854,13 @@ pub fn pace_after_replay_flush(
         waits = waits.saturating_add(1);
         if wait_drained(until.saturating_duration_since(at).min(step)) {
             flush();
+            let after = rows_held();
+            if after >= held {
+                sleep(until.saturating_duration_since(now()).min(step));
+            }
+            held = after;
+        } else {
+            held = rows_held();
         }
     }
     waits
@@ -15774,9 +15873,15 @@ pub fn pace_after_replay_flush(
 /// on all eight boot replays from 19 to 26 Oct). The third full-queue flush
 /// then rescued the rows, the busy rescue thread handed them back to the WAL,
 /// and the ack check refused the batch: the same 5 segments were re-read on
-/// every boot from 21 Oct. O(1).
-fn replay_rows_held(ingest: &LiveIngest, with_depth: bool) -> bool {
-    ingest.writer.pending() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
+/// every boot from 21 Oct. Returns the row count, so the pacer can tell a
+/// flush that handed nothing off (LH-02). O(1).
+fn replay_rows_held(ingest: &LiveIngest, with_depth: bool) -> usize {
+    let depth = if with_depth {
+        ingest.depth_pending_rows()
+    } else {
+        0
+    };
+    ingest.writer.pending().saturating_add(depth)
 }
 
 /// [`pace_after_replay_flush`] on the real writers (audit R1).
@@ -15794,6 +15899,7 @@ fn replay_pace_after_flush(
     }
     let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
     let ingest = std::cell::RefCell::new(ingest);
+    let stalls = std::cell::Cell::new(0u32);
     let waits = pace_after_replay_flush(
         || {
             if with_depth {
@@ -15807,7 +15913,7 @@ fn replay_pace_after_flush(
             // replay runs unpaced, so a full queue rescues its rows to the
             // spill tier or back to the WAL instead of holding the stop.
             if shutdown_requested() {
-                return false;
+                return 0;
             }
             replay_rows_held(&ingest.borrow(), with_depth)
         },
@@ -15817,12 +15923,36 @@ fn replay_pace_after_flush(
             let unlanded = wm.unlanded_total();
             blocking_flush(|| wm.wait_for_offload_drained(step, unlanded))
         },
+        // A flush that handed nothing off (LH-02): one step off the worker,
+        // counted so an idle pacing pass never reads as a draining one.
+        |step| {
+            stalls.set(stalls.get().saturating_add(1));
+            blocking_flush(|| std::thread::sleep(step));
+        },
         Instant::now,
         pace_until,
         std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
     );
     if waits > 0 {
         metrics::counter!(WAL_REPLAY_PACE_WAITS_COUNTER).increment(u64::from(waits));
+    }
+    let stalls = stalls.get();
+    if stalls > 0 {
+        metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(u64::from(stalls));
+    }
+    if pace_stall_warn_due(&PACE_STALL_WARNED, stalls) {
+        let held = replay_rows_held(&ingest.borrow(), with_depth);
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_pace_no_progress",
+            stalls,
+            waits,
+            held_rows = held,
+            "WAL replay pacing: a flush after a drained wait handed none of the held rows to \
+             the writer threads, so the pacer slept instead of draining. The rows are still \
+             in RAM and in the WAL; the ack check decides whether the segments are confirmed. \
+             Logged once per process; tv_wal_replay_pace_stalled_total counts every step."
+        );
     }
     waits
 }
@@ -15881,7 +16011,22 @@ pub fn refold_wal_frames(
     gaps: &[usize],
     pace_until: Option<Instant>,
 ) -> WalRefoldOutcome {
+    // Live audit F2/F5/F6 review (2026-10-29): the market-data floor, read
+    // once per call (the file once per process, then one atomic load), raised
+    // by any floor this ingest was given.
+    tickvault_storage::market_data_floor::ensure_market_data_floor_loaded();
+    let floor_unix_nanos = match (
+        tickvault_storage::market_data_floor::installed_market_data_floor_unix_nanos(),
+        ingest.market_data_floor_unix_nanos,
+    ) {
+        (Some(installed), Some(own)) => Some(installed.max(own)),
+        (installed, own) => installed.or(own),
+    };
     let mut out = WalRefoldOutcome::default();
+    // Set when a frame below the floor was skipped and no frame was folded
+    // since: the next folded frame marks a replay gap (frames before it were
+    // not folded, so no baseline may carry across them).
+    let mut skipped_below_floor = false;
     // Item 45h: the replay's `feed_aux_packets` rows, reported beside
     // `non_tick` below as the difference across this pass.
     let aux_rows_before = ingest.writer.aux_rows_appended();
@@ -16059,6 +16204,31 @@ pub fn refold_wal_frames(
                 gap_marked_here = true;
             }
             gap_cursor += 1;
+        }
+        // Live audit F2/F5/F6 review (2026-10-29): a frame RECEIVED before
+        // the market-data floor (the fresh-start reset's cutoff) is from
+        // before the reset and is not folded, so an old segment cannot put
+        // pre-reset rows back into the fresh tables whether or not QuestDB is
+        // fast enough to take them without a spill. Its bytes stay in the
+        // segment, which is archived like any replayed segment. A frame with
+        // no plausible recorded receipt is never judged, and neither is an
+        // order-update frame (not market data). O(1) per frame.
+        if *endpoint != WalEndpoint::OrderUpdate
+            && tickvault_storage::market_data_floor::wal_frame_is_below_floor(
+                *wal_received_at_nanos,
+                floor_unix_nanos,
+            )
+        {
+            out.frames_below_floor = out.frames_below_floor.saturating_add(1);
+            skipped_below_floor = true;
+            continue;
+        }
+        if skipped_below_floor {
+            skipped_below_floor = false;
+            if !gap_marked_here {
+                ingest.aggregator.mark_replay_gap();
+                out.gaps_marked = out.gaps_marked.saturating_add(1);
+            }
         }
         // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
         // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
@@ -16494,6 +16664,23 @@ pub fn refold_wal_frames(
         );
     }
 
+    // Live audit F2/F5/F6 review (2026-10-29): one coded warn per pass for
+    // the frames the market-data floor kept out.
+    if out.frames_below_floor > 0 {
+        metrics::counter!(tickvault_storage::market_data_floor::WAL_REPLAY_BELOW_FLOOR_COUNTER)
+            .increment(out.frames_below_floor);
+        warn!(
+            code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+            source = "wal_replay_below_market_data_floor",
+            frames_below_floor = out.frames_below_floor,
+            frames = frames.len(),
+            floor_unix_nanos = floor_unix_nanos.unwrap_or_default(),
+            "WAL replay skipped frames RECEIVED before the market-data floor (the fresh-start \
+             reset's cutoff): they are from before the reset and are NOT folded into the fresh \
+             tables. Their bytes stay in the WAL segment, which is archived as usual."
+        );
+    }
+
     // The ranking observer was held off for the whole backlog (see the
     // `replaying_wal` field): a replayed frame re-latches the monotonicity
     // gate to a stale cumulative, and a post-replay rebaseline seeds from
@@ -16588,6 +16775,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Rule 11: the lane reads DOWN until it is provably carrying data, so a
     // half-wired stack is never presented as up.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    // The replay pacing series, before the boot refold can move them: a
+    // series that never emits reads the same as a healthy zero (LH-02 review).
+    metrics::counter!(WAL_REPLAY_PACE_WAITS_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(0);
     // Before any dial and before the drain starts: both read it.
     set_configured_frame_silence_fast_path(params.frame_silence_fast_path);
 
@@ -16782,16 +16973,28 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // with no DEDUP key and no hourly partition. On a refusal this process
     // keeps writing `market_depth`, as with the setting off, and the start
     // instant is left untouched for the next boot.
-    let depth_book_since = if params.depth_storage.array_rows
-        && !tickvault_storage::depth_persistence::ensure_market_depth_book_table(&params.questdb)
-            .await
-    {
-        error!(
-            code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-            table = tickvault_storage::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
-            "depth array rows are on but market_depth_book could not be created — this \
-             process keeps writing depth to market_depth; nothing is lost"
-        );
+    //
+    // A table found with the wrong designated timestamp (LH-01) is refused by
+    // the ensure itself, which logs the cause and remedy once at warn! and
+    // counts it off the loss alarm's series: no row is lost, so no second
+    // ERROR line here (review, 2026-10-29).
+    let book_outcome = if params.depth_storage.array_rows {
+        Some(
+            tickvault_storage::depth_persistence::ensure_market_depth_book_table(&params.questdb)
+                .await,
+        )
+    } else {
+        None
+    };
+    let depth_book_since = if let Some(outcome) = book_outcome.filter(|o| !o.is_ensured()) {
+        if outcome == tickvault_storage::depth_persistence::BookEnsureOutcome::Failed {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                table = tickvault_storage::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
+                "depth array rows are on but market_depth_book could not be created — this \
+                 process keeps writing depth to market_depth; nothing is lost"
+            );
+        }
         None
     } else {
         crate::depth_book_since::resolve_depth_book_since(
@@ -17079,14 +17282,17 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // ACK BEFORE CONFIRMING (2026-09-05): `flush` on the offloaded path
             // returns rows handed to a queue. Wait for the writer threads to
             // land or rescue them before the segments leave the replay path.
-            if replay_rows_landed(&mut ingest, "boot_refold", unlanded_before) {
+            let landed = replay_rows_landed(&mut ingest, "boot_refold", unlanded_before);
+            if landed {
                 tickvault_storage::wal_replay_settle::settle_confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
                     settle_start,
                 );
                 boot_refold_confirmed = true;
             }
-            if flushed > 0 {
+            // Only when the rows landed (LH-03): a refused confirm already
+            // logged its coded error, and this line said the opposite.
+            if refold_rows_reached_database(flushed, landed) {
                 info!(
                     rows = flushed,
                     "flushed the re-folded WAL rows before archiving their segments — \
@@ -19099,17 +19305,88 @@ mod tests {
 
     #[test]
     fn test_ws_lag_max_takes_the_largest_and_resets() {
-        let _ = take_ws_lag_max_ms();
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 2_000_000_000);
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 46_000_000_000);
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
+        use super::ws_lag_class::{LagClass, LagMaxByClass};
+        // Own cells: the lib tests that run the real drain write the shared
+        // statics, so reading those here would race.
+        let max = std::sync::atomic::AtomicI64::new(0);
+        let by_class = LagMaxByClass::new();
+        let idx = ExchangeSegment::IdxI.binary_code();
+        let fno = ExchangeSegment::NseFno.binary_code();
+        let rec = |code: u8, ts: u32, recv: i64| {
+            record_ws_lag_max_into(&max, &by_class, code, ts, recv);
+        };
+        // The class split (LH-05) leaves this gauge unchanged: it still takes
+        // the maximum across every segment. The INDEX tick carries the largest
+        // lag, so this fails if index ticks stop reaching the shared maximum.
+        rec(idx, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 61_000_000_000);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 2_000_000_000);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 46_000_000_000);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
         // A negative (truncation floor) and a garbage stamp add nothing.
-        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS - 900_000_000);
-        record_ws_lag_max(0, SIMULTANEOUS_RECV_NANOS);
-        assert!((take_ws_lag_max_ms() - 46_000.0).abs() < f64::EPSILON);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS - 900_000_000);
+        rec(fno, 0, SIMULTANEOUS_RECV_NANOS);
+        assert!((take_ws_lag_max_ms_from(&max) - 61_000.0).abs() < f64::EPSILON);
         assert!(
-            take_ws_lag_max_ms().abs() < f64::EPSILON,
+            take_ws_lag_max_ms_from(&max).abs() < f64::EPSILON,
             "must reset on read"
+        );
+        // The same samples reached the class cells (fails if the `note` in
+        // `record_ws_lag_max_into` is removed).
+        assert!(
+            (by_class.take_published(LagClass::IndexSpot, 0) - 61_000.0).abs() < f64::EPSILON,
+            "the index tick must reach the index_spot class"
+        );
+        assert!(
+            (by_class.take_published(LagClass::Fno, 0) - 46_000.0).abs() < f64::EPSILON,
+            "the contract ticks must reach the fno class"
+        );
+    }
+
+    /// LH-05 wiring: the per-tick recorder writes the shared statics the
+    /// publish reads, the drain calls that recorder, and the report arm's
+    /// publish reaches the per-class gauges. The behaviour of each piece is
+    /// tested on private cells; this pins that production joins them.
+    #[test]
+    fn test_ws_lag_class_split_is_wired_into_the_drain_and_the_publish() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+        fn body_of<'a>(prod: &'a str, sig: &str) -> &'a str {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+            let rest = &prod[start..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        }
+        let record = body_of(prod, "fn record_ws_lag_max(segment_code: u8,");
+        assert!(
+            record.contains("&WS_LAG_MAX_MILLIS,")
+                && record.contains("&ws_lag_class::WS_LAG_MAX_BY_CLASS,"),
+            "record_ws_lag_max must write the two statics the publish reads"
+        );
+        let into = body_of(prod, "fn record_ws_lag_max_into(");
+        assert!(
+            into.contains("max_millis.fetch_max(lag_ms, Ordering::Relaxed);")
+                && into.contains("by_class.note(segment_code, lag_ms);"),
+            "both maxima must take every positive lag"
+        );
+        let drain = body_of(prod, "pub fn drain_main_feed_frame(");
+        let call = drain
+            .split_once("record_ws_lag_max(")
+            .expect("the drain must call record_ws_lag_max")
+            .1;
+        assert!(
+            call.trim_start().starts_with("tick.exchange_segment_code,"),
+            "the drain must pass each tick's segment byte to the recorder"
+        );
+        let publish = body_of(prod, "fn publish_fold_depth(ingest: &LiveIngest) {");
+        assert!(
+            publish.contains("ws_lag_class::publish_ws_lag_max_by_class(now_ms);"),
+            "the report arm must publish the per-class maximum"
+        );
+        let class_src = include_str!("dhan_feed_stack/ws_lag_class.rs");
+        let class_prod = &class_src[..class_src.find("#[cfg(test)]").unwrap_or(class_src.len())];
+        let class_publish = body_of(class_prod, "pub(super) fn publish_ws_lag_max_by_class(");
+        assert!(
+            class_publish.contains("WS_LAG_MAX_BY_CLASS.take_published("),
+            "the per-class publish must read the static the recorder writes"
         );
     }
 
@@ -26678,6 +26955,67 @@ mod wal_refold_tests {
         assert_eq!(out.refolded, 0, "no receipt clock, no proof, no write-back");
     }
 
+    /// Live audit F2/F5/F6 review (2026-10-29): a WAL frame received before
+    /// the market-data floor (the fresh-start reset's cutoff) must not come
+    /// back into `ticks` through the WAL refold. Before the fix the same
+    /// prior-session frame the test above writes back was refolded whatever
+    /// the floor said.
+    #[test]
+    fn test_regression_a_wal_frame_received_below_the_floor_is_not_refolded() {
+        // An ingest judging receipts against `floor` (the process-wide floor
+        // is never raised by a test).
+        fn floored(floor: Option<i64>) -> LiveIngest {
+            let mut ingest = ingest();
+            ingest.market_data_floor_unix_nanos = floor;
+            ingest
+        }
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let now_ist_secs =
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+        let yesterday_ist = u32::try_from(now_ist_secs - 86_400).expect("fits u32 until 2106");
+        let received = (now_utc_secs - 86_400) * 1_000_000_000;
+        let frame = (
+            2u64,
+            received,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        // Floor one second after the receipt: the frame is below it.
+        let mut below = floored(Some(received + 1_000_000_000));
+        let out = refold_wal_frames(&mut below, std::slice::from_ref(&frame), &[], None);
+        assert_eq!(out.refolded, 0, "a frame below the floor reaches no table");
+        assert_eq!(below.pending_rows(), 0, "no row was staged for ticks");
+        assert_eq!(out.frames_below_floor, 1, "and it is counted");
+        assert_eq!(out.lost, 0, "set aside by the floor, not lost");
+        // A below-floor frame followed by a kept one: the kept one is folded
+        // after a replay gap (nothing before it was folded).
+        let later = (
+            3u64,
+            received + 2_000_000_000,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        let out = refold_wal_frames(
+            &mut floored(Some(received + 1_000_000_000)),
+            &[frame.clone(), later],
+            &[],
+            None,
+        );
+        assert_eq!((out.frames_below_floor, out.refolded), (1, 1));
+        assert_eq!(out.gaps_marked, 1, "the fold resumes after a gap");
+        // No floor: folded as before.
+        let out = refold_wal_frames(&mut floored(None), std::slice::from_ref(&frame), &[], None);
+        assert_eq!((out.frames_below_floor, out.refolded), (0, 1));
+        // Floor at the receipt: written back exactly as before.
+        let out = refold_wal_frames(
+            &mut floored(Some(received)),
+            std::slice::from_ref(&frame),
+            &[],
+            None,
+        );
+        assert_eq!(out.refolded, 1, "a frame at the floor is kept");
+    }
+
     /// A depth-20 frame exactly as the depth socket writes it: 12-byte header
     /// whose `msg_length` is the whole frame and whose feed code is bid/ask.
     fn depth_frame(feed_code: u8, rows: usize) -> Vec<u8> {
@@ -27006,8 +27344,9 @@ mod wal_refold_tests {
         sim.flush();
         pace_after_replay_flush(
             || sim.flush(),
-            || sim.held.get(),
+            || usize::from(sim.held.get()),
             |step| sim.wait(step),
+            |step| sim.clock.set(sim.clock.get() + step),
             || sim.clock.get(),
             pace_until,
             std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
@@ -27054,6 +27393,124 @@ mod wal_refold_tests {
     }
 
     #[test]
+    fn test_regression_a_flush_that_hands_nothing_off_does_not_busy_spin() {
+        // LH-02: writers idle, so every wait reports drained at once (and
+        // takes no time); the flush hands nothing off; rows stay held. The
+        // loop must sleep one step per round and end at the deadline, not
+        // spin (963,130,754 waits live). This is the FALLBACK for a flush
+        // that genuinely cannot hand off: the cause seen live (retained rows
+        // never re-sent) is fixed in `flush_ticks`, pinned by
+        // `test_regression_lh02_flush_ticks_re_sends_rows_a_full_queue_gave_back`,
+        // and the real pacer counts these sleeps on their own counter.
+        let clock = std::cell::Cell::new(Instant::now());
+        let until = clock.get() + std::time::Duration::from_millis(2_500);
+        let calls = std::cell::Cell::new(0u32);
+        let flushes = std::cell::Cell::new(0u32);
+        let waits = pace_after_replay_flush(
+            || flushes.set(flushes.get() + 1),
+            || 7,
+            |_step| {
+                calls.set(calls.get() + 1);
+                assert!(calls.get() < 1_000, "the pacer busy-spins");
+                true
+            },
+            |step| clock.set(clock.get() + step),
+            || clock.get(),
+            Some(until),
+            std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
+        );
+        assert_eq!(waits, 3, "one wait per slept step: 1 s + 1 s + 0.5 s");
+        assert_eq!(flushes.get(), 3);
+        assert_eq!(clock.get(), until, "the loop ends at the deadline");
+    }
+
+    #[test]
+    fn a_flush_that_hands_rows_off_is_not_followed_by_a_sleep() {
+        // The sleep is only for a flush that reduced nothing: a draining
+        // writer keeps the pacing at full speed.
+        let held = std::cell::Cell::new(3usize);
+        let start = Instant::now();
+        let waits = pace_after_replay_flush(
+            || held.set(held.get().saturating_sub(1)),
+            || held.get(),
+            |_step| true,
+            |_step| panic!("slept after a flush that handed rows off"),
+            || start,
+            Some(start + std::time::Duration::from_secs(300)),
+            std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
+        );
+        assert_eq!(waits, 3);
+        assert_eq!(held.get(), 0);
+    }
+
+    /// This file up to its first test module: one `include_str!` shared by the
+    /// source scans below, so they stay inside the self-scan budget.
+    fn production_source() -> &'static str {
+        include_str!("dhan_feed_stack.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn test_regression_the_in_the_database_line_needs_the_rows_to_have_landed() {
+        // LH-03: the INFO line said the recovered ticks were in the database
+        // whenever the flush handed rows off, also when the ack check refused
+        // the confirm (a false OK beside the coded error).
+        let production = production_source();
+        let line = production
+            .find("the recovered ticks are in the database")
+            .expect("the boot refold still reports its landed rows");
+        let gate = production[..line]
+            .rfind("if ")
+            .expect("the line is gated by a condition");
+        assert!(
+            production[gate..line].starts_with("if refold_rows_reached_database(flushed, landed)"),
+            "the line must be gated on the rows having landed"
+        );
+    }
+
+    #[test]
+    fn refold_rows_reached_database_needs_both_a_flush_and_a_landing() {
+        assert!(refold_rows_reached_database(5, true));
+        assert!(
+            !refold_rows_reached_database(5, false),
+            "a refused confirm is not rows in the database"
+        );
+        assert!(!refold_rows_reached_database(0, true), "nothing flushed");
+        assert!(!refold_rows_reached_database(0, false));
+    }
+
+    #[test]
+    fn test_regression_lh02_the_real_pacer_counts_and_seeds_its_stalls() {
+        // LH-02 review: an idle pacing pass (rows held, nothing re-sent) must
+        // not read as waits spent on a draining writer. Its sleeps go on their
+        // own counter, seeded at 0 before the boot refold, with one coded warn.
+        let production = production_source();
+        let pace = production
+            .split_once("fn replay_pace_after_flush(")
+            .map_or("", |(_, rest)| {
+                rest.split_once("\n}\n").map_or("", |(body, _)| body)
+            });
+        assert!(pace.contains("stalls.set(stalls.get().saturating_add(1));"));
+        assert!(pace.contains(
+            "metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(u64::from(stalls));"
+        ));
+        assert!(pace.contains("if pace_stall_warn_due(&PACE_STALL_WARNED, stalls) {"));
+        assert!(pace.contains("source = \"replay_pace_no_progress\""));
+        let lane = production
+            .split_once("async fn run_dhan_feed_stack(")
+            .map_or("", |(_, rest)| rest);
+        let seed = lane
+            .find("metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(0);")
+            .expect("the stall counter is seeded at 0 in the lane");
+        let refold = lane
+            .find("refold_wal_frames(&mut ingest")
+            .expect("the boot refold");
+        assert!(seed < refold, "seeded before the boot refold can move it");
+    }
+
+    #[test]
     fn a_paced_replay_past_its_deadline_behaves_as_before() {
         let sim = PaceSim::new(1, 1);
         let past = sim.clock.get();
@@ -27084,8 +27541,7 @@ mod wal_refold_tests {
 
     #[test]
     fn both_replay_passes_are_paced() {
-        let src = include_str!("dhan_feed_stack.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap_or("");
+        let production = production_source();
         assert_eq!(
             production.matches("refold_wal_frames(&mut ingest").count(),
             2,
@@ -32052,7 +32508,7 @@ mod shutdown_before_dial_tests {
         // And the pacing stops waiting on the writers.
         let pace = body_of(prod, "fn replay_pace_after_flush(");
         assert!(
-            pace.contains("if shutdown_requested() {\n                return false;"),
+            pace.contains("if shutdown_requested() {\n                return 0;"),
             "a stop must end the replay pacing"
         );
     }

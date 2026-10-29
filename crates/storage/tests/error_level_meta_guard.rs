@@ -206,6 +206,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     // ---- storage ----
     (
+        "crates/storage/src/fresh_start_reset.rs",
+        "its first-boot marker could not be read",
+        "2026-10-29: a READ, not a write: nothing is persisted or lost. Coded TICK-SPILL-01 (source market_data_floor_no_marker), once per boot; the boot keeps any floor file an earlier boot wrote, and without one the replays bring back more rows (never fewer)",
+    ),
+    (
         "crates/storage/src/tick_persistence.rs",
         "so the tick spill ceiling falls back",
         "a sizing probe; the spill keeps working at its fixed floor",

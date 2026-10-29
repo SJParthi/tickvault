@@ -21,7 +21,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::time::Instant;
 
 use tickvault_storage::hot_path_telemetry::{
-    ALL_STAGES, HotTask, STAGE_BUCKETS, Stage, beat_at, record_stage_nanos, stage_quantiles,
+    ALL_STAGES, HotTask, RollingMax, STAGE_BUCKETS, Stage, beat_at, record_stage_nanos,
+    stage_quantiles,
 };
 
 mod dhat_support;
@@ -86,5 +87,25 @@ fn dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation() {
         (q_bytes, q_blocks),
         (0, 0),
         "stage_quantiles allocated on the publisher thread"
+    );
+
+    // The rolling 75-publish maximum (live audit HP-2, 2026-10-29): one push
+    // per stage per second on the publisher thread, a fixed ring.
+    let mut rolling = [RollingMax::new(); ALL_STAGES.len()];
+    let (r_bytes, r_blocks) = dhat_support::measure_with_phantom_retry(
+        BUDGET_BYTES,
+        BUDGET_BLOCKS,
+        || {},
+        || {
+            for i in 0..10_000_u64 {
+                let slot = &mut rolling[(i as usize) % ALL_STAGES.len()];
+                assert!(slot.push(i % 977) <= 976);
+            }
+        },
+    );
+    assert_eq!(
+        (r_bytes, r_blocks),
+        (0, 0),
+        "RollingMax::push allocated on the publisher thread"
     );
 }

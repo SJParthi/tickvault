@@ -1020,7 +1020,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   16:30 IST. Terraform role `tv-prod-wipe-2026-10-31`: deletes from
   2026-10-27T12:30Z, dated-key conditions before 2026-10-28, the new
   prefixes, snapshot delete from 2026-10-28T11:00Z, expiry unchanged.
-  - Files: crates/app/src/wipe_2026_10_31.rs, crates/app/src/bin/wipe_2026_10_31.rs,
+  - Files: (originally crates/app/src/wipe_2026_10_31.rs and crates/app/src/bin/wipe_2026_10_31.rs; both deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b, with the role file and workflow below)
     crates/app/src/wipe_box.rs (cutoff), deploy/aws/terraform/wipe-2026-10-31.tf,
     .github/workflows/wipe-2026-10-31.yml (text only, budgets unchanged)
   - Tests: the tool's date and verdict tests moved to the new dates, plus
@@ -1044,8 +1044,8 @@ Approved by: owner Quote 44 (2026-10-28), recorded in the daily-universe rule fi
   - Files: crates/app/src/instrument_snapshot_upload.rs, crates/app/src/dhan_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
   - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_build_once_counts_the_sweep_held_files_on_the_held_counter, the_snapshot_copy_uses_the_configured_cold_bucket
 - [x] N3 (app) The 31 Oct wipe keeps every object under `instrument-snapshots/`.
-  - Files: crates/app/src/wipe_2026_10_31.rs
-  - Tests: test_classify_s3_key_keeps_every_instrument_snapshot
+  - Files: (crates/app/src/wipe_2026_10_31.rs, deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b)
+  - Tests: (test_classify_s3_key_keeps_every_instrument_snapshot, deleted 2026-10-29 with the tool)
 
 ### PR EX — owner 2026-10-28: the daily expiry check (app, storage, common, aws-lambdas, docs)
 
