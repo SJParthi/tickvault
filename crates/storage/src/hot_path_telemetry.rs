@@ -63,8 +63,9 @@
 //! |---|---|
 //! | [`record_stage_nanos`] | O(1): one `leading_zeros`, four relaxed atomics |
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
-//! | [`publish_once`] | O(stages × buckets + tasks) = O(5 × 28 + 6), once a second, on its own thread; the percentile window adds O(5 × 28) more and keeps the previous read in fixed arrays (no allocation) |
-//! | [`stage_quantiles`] | O(buckets) = O(28), on the publisher thread only, never on the frame path |
+//! | [`record_receipt_to_fold_nanos`] | O(1): the stage record plus one more relaxed add into the fine histogram |
+//! | [`publish_once`] | O(stages × buckets + tasks) = O(7 × 28 + 6), plus O(58) for the fine `receipt_to_fold` histogram, once a second, on its own thread; the percentile windows add the same again and keep the previous read in fixed arrays (no allocation) |
+//! | [`stage_quantiles`] / [`fine_quantiles`] | O(buckets) = O(28) / O(58), on the publisher thread only, never on the frame path |
 //! | [`RollingMax::push`] | O(window) = O(75) per stage, once a second, on the publisher thread only; a fixed array, no allocation |
 //!
 //! # The rolling 75-second maximum (2026-10-29, live audit HP-2)
@@ -82,6 +83,17 @@
 //! the margin: a spike can be read by two consecutive scrapes. The per-second gauge is
 //! unchanged. Local `/metrics` only: no EMF name, no metric filter, no alarm,
 //! no Telegram path (noise lock). Registered at 0 when the handles resolve.
+//!
+//! # Plan item DT0 (2026-10-29)
+//!
+//! Two stages are measurement only and never page (they sit past
+//! `PAGED_STAGE_COUNT`): `receipt_to_fold` (a main-feed frame's receipt at
+//! the socket read → the drain finished folding it, with a finer
+//! quarter-octave histogram, `tv_hot_path_receipt_to_fold_fine_ns_bucket`
+//! and `tv_hot_path_receipt_to_fold_fine_{p50,p99,p999}_ns`) and
+//! `metrics_upkeep` (one run of the Prometheus exporter's upkeep on the main
+//! runtime). The publisher thread also publishes the hot threads'
+//! scheduling wait (`crate::hot_thread_sched`).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -120,18 +132,43 @@ pub enum Stage {
     /// it into the candles and append its row (plan item K6, 2026-10-26).
     /// Recorded once per main-feed frame; depth frames are not timed here.
     DrainMainFrame = 4,
+    /// One main-feed frame, end to end inside this process: the read task's
+    /// receipt instant → the drain finished folding it (plan item DT0,
+    /// 2026-10-29). It spans `socket_to_wal`, `ring_dwell` and
+    /// `drain_main_frame`, so a tick that took over 1 ms to reach RAM shows
+    /// here once, whichever step held it. Recorded once per main-feed frame
+    /// by [`record_receipt_to_fold_nanos`], which also fills the finer
+    /// quarter-octave histogram below. Never paged.
+    ReceiptToFold = 5,
+    /// One run of the Prometheus exporter's upkeep (it drains every
+    /// histogram), which runs every 5 s on the MAIN tokio runtime, the one
+    /// the frame drain shares (plan item DT0). Never paged.
+    MetricsUpkeep = 6,
 }
 
 /// Every stage, in index order.
-pub const ALL_STAGES: [Stage; 5] = [
+pub const ALL_STAGES: [Stage; 7] = [
     Stage::SocketToWal,
     Stage::RingDwell,
     Stage::MainRuntimeLag,
     Stage::ReaderRuntimeLag,
     Stage::DrainMainFrame,
+    Stage::ReceiptToFold,
+    Stage::MetricsUpkeep,
 ];
 
 const STAGE_COUNT: usize = ALL_STAGES.len();
+
+/// The stall page (`HOT-PATH-STALL-01`) reads only the first this-many
+/// stages. `receipt_to_fold` and `metrics_upkeep` (DT0, 2026-10-29) are
+/// measurement only: `receipt_to_fold` is the sum of three paged stages, so
+/// paging on it could page where none of them reached 2 s, and no dated
+/// noise-lock row authorizes a new page.
+const PAGED_STAGE_COUNT: usize = 5;
+
+const _: () = assert!(PAGED_STAGE_COUNT <= STAGE_COUNT);
+const _: () = assert!(Stage::ReceiptToFold as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::MetricsUpkeep as usize >= PAGED_STAGE_COUNT);
 
 impl Stage {
     /// The `stage` label value.
@@ -143,6 +180,8 @@ impl Stage {
             Self::MainRuntimeLag => "main_runtime_lag",
             Self::ReaderRuntimeLag => "reader_runtime_lag",
             Self::DrainMainFrame => "drain_main_frame",
+            Self::ReceiptToFold => "receipt_to_fold",
+            Self::MetricsUpkeep => "metrics_upkeep",
         }
     }
 
@@ -158,13 +197,17 @@ impl Stage {
     ///   every frame queued behind it. A frame stacks at most
     ///   `MAX_PACKETS_PER_FRAME` packets, so a very large frame can pass this
     ///   honestly; the stall page (2 s) is far above either.
+    /// * receipt → folded 1 ms: the owner's target for every tick
+    ///   (2026-10-28, "less than 1 ms always").
+    /// * metrics upkeep 1 ms: an upkeep this long held a main-runtime worker
+    ///   the drain may have needed for that long.
     #[must_use]
     pub const fn stall_budget_nanos(self) -> u64 {
         match self {
             Self::SocketToWal => 100_000,
             Self::RingDwell => 100_000_000,
             Self::MainRuntimeLag | Self::ReaderRuntimeLag => 10_000_000,
-            Self::DrainMainFrame => 1_000_000,
+            Self::DrainMainFrame | Self::ReceiptToFold | Self::MetricsUpkeep => 1_000_000,
         }
     }
 }
@@ -340,6 +383,89 @@ pub fn record_stage(stage: Stage, elapsed: Duration) {
     record_stage_nanos(stage, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
 }
 
+/// Buckets in the finer `receipt_to_fold` histogram (plan item DT0,
+/// 2026-10-29): bucket 0 holds samples up to 1,024 ns, then each power of
+/// two from 2^10 to 2^24 ns (16.8 ms) is split into four equal parts, and the
+/// last bucket holds everything above 2^24 ns. A quantile read from it is at
+/// most 25% above the true value, where the stage histogram reads up to 2×:
+/// between 10 µs and 1 ms, the range the owner's 1 ms target sits in, the
+/// stage histogram has only seven buckets.
+pub const FINE_BUCKETS: usize = 58;
+
+/// Sub-buckets per power of two in the fine histogram, as a shift (4).
+const FINE_SUB_SHIFT: u32 = 2;
+
+/// The fine histogram's top bound is 2^this nanoseconds.
+const FINE_TOP_EXP: u32 = 24;
+
+const _: () = assert!(
+    FINE_BUCKETS == 2 + ((FINE_TOP_EXP - BUCKET_BASE_SHIFT) as usize) * (1usize << FINE_SUB_SHIFT)
+);
+
+/// The fine bucket a `receipt_to_fold` sample of `nanos` lands in. O(1):
+/// one `leading_zeros`, two shifts.
+#[must_use]
+pub const fn fine_bucket_index(nanos: u64) -> usize {
+    if nanos <= (1 << BUCKET_BASE_SHIFT) {
+        return 0;
+    }
+    // v in [2^e, 2^(e+1)); a sample is in a bucket when it is at most the
+    // bucket's inclusive upper bound, i.e. when v is below it.
+    let v = nanos - 1;
+    let e = 63 - v.leading_zeros();
+    if e >= FINE_TOP_EXP {
+        return FINE_BUCKETS - 1;
+    }
+    let sub = ((v >> (e - FINE_SUB_SHIFT)) & ((1 << FINE_SUB_SHIFT) - 1)) as usize;
+    1 + ((e - BUCKET_BASE_SHIFT) as usize) * (1 << FINE_SUB_SHIFT) + sub
+}
+
+/// The inclusive upper bound, in nanoseconds, of fine bucket `k`; `None`
+/// for the last (unbounded) bucket.
+#[must_use]
+pub const fn fine_bucket_upper_bound_nanos(k: usize) -> Option<u64> {
+    if k == 0 {
+        return Some(1 << BUCKET_BASE_SHIFT);
+    }
+    if k + 1 >= FINE_BUCKETS {
+        return None;
+    }
+    let j = k - 1;
+    let e = BUCKET_BASE_SHIFT + (j >> FINE_SUB_SHIFT) as u32;
+    let sub = (j & ((1 << FINE_SUB_SHIFT) - 1)) as u64;
+    Some((1u64 << e) + (sub + 1) * (1u64 << (e - FINE_SUB_SHIFT)))
+}
+
+#[repr(align(64))]
+struct FineStats {
+    buckets: [AtomicU64; FINE_BUCKETS],
+}
+
+static RECEIPT_TO_FOLD_FINE: FineStats = FineStats {
+    buckets: [const { AtomicU64::new(0) }; FINE_BUCKETS],
+};
+
+/// Records one main-feed frame's receipt → folded time: the
+/// [`Stage::ReceiptToFold`] stage plus its fine histogram. O(1), five
+/// relaxed atomics, zero allocation, lock-free. The drain calls it once per
+/// main-feed frame, after the fold.
+#[inline]
+pub fn record_receipt_to_fold_nanos(nanos: u64) {
+    record_stage_nanos(Stage::ReceiptToFold, nanos);
+    RECEIPT_TO_FOLD_FINE.buckets[fine_bucket_index(nanos)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-bucket (NOT cumulative) counts of the fine `receipt_to_fold`
+/// histogram, read without resetting anything.
+#[must_use]
+pub fn receipt_to_fold_fine_snapshot() -> [u64; FINE_BUCKETS] {
+    let mut out = [0u64; FINE_BUCKETS];
+    for (o, b) in out.iter_mut().zip(RECEIPT_TO_FOLD_FINE.buckets.iter()) {
+        *o = b.load(Ordering::Relaxed);
+    }
+    out
+}
+
 /// The task made progress at `at`. O(1), zero allocation.
 #[inline]
 pub fn beat_at(task: HotTask, at: Instant) {
@@ -488,6 +614,21 @@ fn quantile_rank(total: u64, num: u64, den: u64) -> u64 {
 /// the samples actually walked. O(buckets), no allocation.
 #[must_use]
 pub fn stage_quantiles(window: &[u64; STAGE_BUCKETS]) -> Option<StageQuantiles> {
+    let (samples, found) = quantile_buckets(window)?;
+    Some(StageQuantiles {
+        samples,
+        p50: QuantileBound::of_bucket(found[0]),
+        p99: QuantileBound::of_bucket(found[1]),
+        p999: QuantileBound::of_bucket(found[2]),
+    })
+}
+
+/// The bucket each of p50 / p99 / p99.9 falls in, and the sample count, from
+/// per-bucket counts; `None` for an empty window. O(buckets), no
+/// allocation. Every rank is at most `samples`, which the walk reaches at
+/// its last non-empty bucket, so every slot is set; the top bucket is the
+/// safe (conservative) reading if that ever failed.
+fn quantile_buckets(window: &[u64]) -> Option<(u64, [usize; 3])> {
     let samples = window.iter().fold(0u64, |acc, n| acc.saturating_add(*n));
     if samples == 0 {
         return None;
@@ -503,16 +644,36 @@ pub fn stage_quantiles(window: &[u64; STAGE_BUCKETS]) -> Option<StageQuantiles> 
             }
         }
     }
-    // Every rank is at most `samples`, which the walk reaches at its last
-    // non-empty bucket, so every slot is set; the top bucket is the safe
-    // (conservative) reading if that ever failed.
-    let bound = |slot: Option<usize>| QuantileBound::of_bucket(slot.unwrap_or(STAGE_BUCKETS - 1));
-    Some(StageQuantiles {
+    let top = window.len().saturating_sub(1);
+    Some((samples, found.map(|slot| slot.unwrap_or(top))))
+}
+
+/// p50, p99 and p99.9 of one window of the fine `receipt_to_fold`
+/// histogram, each the upper bound of its fine bucket in nanoseconds
+/// (`None` = above the top bound, 2^24 ns). The true value is at most 25%
+/// below it. O(buckets), no allocation.
+#[must_use]
+pub fn fine_quantiles(window: &[u64; FINE_BUCKETS]) -> Option<FineQuantiles> {
+    let (samples, found) = quantile_buckets(window)?;
+    Some(FineQuantiles {
         samples,
-        p50: bound(found[0]),
-        p99: bound(found[1]),
-        p999: bound(found[2]),
+        p50: fine_bucket_upper_bound_nanos(found[0]),
+        p99: fine_bucket_upper_bound_nanos(found[1]),
+        p999: fine_bucket_upper_bound_nanos(found[2]),
     })
+}
+
+/// p50, p99 and p99.9 of one fine-histogram window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FineQuantiles {
+    /// Samples in the window.
+    pub samples: u64,
+    /// Median bound, nanoseconds; `None` above 2^24 ns.
+    pub p50: Option<u64>,
+    /// 99th-percentile bound.
+    pub p99: Option<u64>,
+    /// 99.9th-percentile bound.
+    pub p999: Option<u64>,
 }
 
 /// True when the window's p99 sample is above the stage budget. Exact, not
@@ -655,6 +816,7 @@ pub struct TelemetryHandles {
     tasks: Vec<TaskHandles>,
     windows: QuantileWindows,
     rolling: [RollingMax; STAGE_COUNT],
+    fine: FineHandles,
 }
 
 /// How many one-second maxima [`RollingMax`] keeps: one scrape interval of
@@ -697,6 +859,68 @@ impl RollingMax {
         self.ring[self.next] = sample;
         self.next = (self.next + 1) % ROLLING_MAX_WINDOW_PUBLISHES;
         self.ring.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// The fine `receipt_to_fold` histogram's series, and the counts it last
+/// read (for the per-second quantiles). Publisher thread only.
+struct FineHandles {
+    buckets: Vec<metrics::Counter>,
+    p50: metrics::Gauge,
+    p99: metrics::Gauge,
+    p999: metrics::Gauge,
+    prev: [u64; FINE_BUCKETS],
+}
+
+impl FineHandles {
+    fn resolve() -> Self {
+        Self {
+            buckets: (0..FINE_BUCKETS)
+                .map(|k| {
+                    // APPROVED: one label String per bucket, once at boot (cold)
+                    let le = fine_bucket_upper_bound_nanos(k)
+                        .map_or_else(|| String::from("+Inf"), |n| n.to_string());
+                    metrics::counter!("tv_hot_path_receipt_to_fold_fine_ns_bucket", "le" => le)
+                })
+                .collect(),
+            p50: metrics::gauge!("tv_hot_path_receipt_to_fold_fine_p50_ns"),
+            p99: metrics::gauge!("tv_hot_path_receipt_to_fold_fine_p99_ns"),
+            p999: metrics::gauge!("tv_hot_path_receipt_to_fold_fine_p999_ns"),
+            prev: [0; FINE_BUCKETS],
+        }
+    }
+
+    /// Publishes the cumulative fine buckets and this window's quantiles
+    /// (NaN for an empty window, `+Inf` above the top bound). O(58), no
+    /// allocation.
+    fn publish(&mut self) {
+        let now = receipt_to_fold_fine_snapshot();
+        let mut window = [0u64; FINE_BUCKETS];
+        let mut cumulative = 0u64;
+        for (((count, counter), before), out) in now
+            .iter()
+            .zip(self.buckets.iter())
+            .zip(self.prev.iter())
+            .zip(window.iter_mut())
+        {
+            cumulative = cumulative.saturating_add(*count);
+            counter.absolute(cumulative);
+            *out = count.saturating_sub(*before);
+        }
+        self.prev = now;
+        let gauge = |bound: Option<u64>| bound.map_or(f64::INFINITY, nanos_to_f64);
+        match fine_quantiles(&window) {
+            Some(q) => {
+                self.p50.set(gauge(q.p50));
+                self.p99.set(gauge(q.p99));
+                self.p999.set(gauge(q.p999));
+            }
+            None => {
+                self.p50.set(f64::NAN);
+                self.p99.set(f64::NAN);
+                self.p999.set(f64::NAN);
+            }
+        }
     }
 }
 
@@ -785,6 +1009,7 @@ impl TelemetryHandles {
             tasks,
             windows: QuantileWindows::new(),
             rolling: [RollingMax::new(); STAGE_COUNT],
+            fine: FineHandles::resolve(),
         }
     }
 }
@@ -848,6 +1073,7 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         }
         h.busy.set(busy_seconds_at(*task, now));
     }
+    handles.fine.publish();
     readings
 }
 
@@ -864,9 +1090,13 @@ pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
         .name("tv-telemetry".to_owned())
         .spawn(move || {
             let mut alarm = StallAlarm::new();
+            let mut sched = crate::hot_thread_sched::SchedPublisher::new();
             loop {
                 let now = Instant::now();
                 let readings = publish_once(&mut handles, now);
+                // DT0 (2026-10-29): the hot threads' scheduling wait, from
+                // /proc, on this thread only (cold, once a second).
+                let _published = sched.publish();
                 let in_session = in_session_now() && !is_shutting_down();
                 if let Some(line) = alarm.observe(now, in_session, &readings) {
                     report_stall(&line);
@@ -904,7 +1134,7 @@ pub const WATCHED_TASKS: [HotTask; 3] = [
     HotTask::FrameDrain,
 ];
 
-const SIGNAL_COUNT: usize = WATCHED_TASKS.len() + STAGE_COUNT;
+const SIGNAL_COUNT: usize = WATCHED_TASKS.len() + PAGED_STAGE_COUNT;
 
 /// What the stall alarm reads once per publish.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -967,7 +1197,8 @@ impl StallAlarm {
 
     /// Feeds one publish's readings. Returns the line to write, if any.
     /// Outside the session every signal re-arms and nothing is reported, so
-    /// a stall at boot or after the close never pages. O(signals) = O(7).
+    /// a stall at boot or after the close never pages. O(signals) = O(8):
+    /// three heartbeats and the [`PAGED_STAGE_COUNT`] paged stages.
     pub fn observe(
         &mut self,
         now: Instant,
@@ -1025,14 +1256,21 @@ impl StallAlarm {
     }
 }
 
-/// Signal `i` in seconds: watched tasks first, then stages.
+/// Signal `i` in seconds: watched tasks first, then the paged stages.
+/// A stage at or past [`PAGED_STAGE_COUNT`] is never a signal.
 fn signal_secs(readings: &StallReadings, i: usize) -> Option<f64> {
     match readings.task_age_secs.get(i) {
         Some(age) => *age,
-        None => readings
-            .stage_max_nanos
-            .get(i - WATCHED_TASKS.len())
-            .map(|n| nanos_to_secs(*n)),
+        None => {
+            let stage = i - WATCHED_TASKS.len();
+            if stage >= PAGED_STAGE_COUNT {
+                return None;
+            }
+            readings
+                .stage_max_nanos
+                .get(stage)
+                .map(|n| nanos_to_secs(*n))
+        }
     }
 }
 
@@ -1784,5 +2022,119 @@ mod tests {
         for (i, tk) in ALL_TASKS.iter().enumerate() {
             assert_eq!(*tk as usize, i);
         }
+    }
+
+    /// DT0 (2026-10-29): every sample lands in the fine bucket whose bound
+    /// is the smallest one at or above it, and the bounds rise strictly.
+    #[test]
+    fn test_fine_bucket_index_puts_each_sample_under_its_upper_bound() {
+        let mut prev = 0u64;
+        for k in 0..FINE_BUCKETS - 1 {
+            let bound = fine_bucket_upper_bound_nanos(k).expect("bounded");
+            assert!(bound > prev, "bounds rise: {prev} then {bound}");
+            assert_eq!(
+                fine_bucket_index(bound),
+                k,
+                "the bound itself is in bucket {k}"
+            );
+            assert_eq!(
+                fine_bucket_index(bound + 1),
+                k + 1,
+                "one past it is in the next"
+            );
+            prev = bound;
+        }
+        assert_eq!(fine_bucket_upper_bound_nanos(FINE_BUCKETS - 1), None);
+        assert_eq!(prev, 1 << FINE_TOP_EXP, "the top bound is 2^24 ns");
+        assert_eq!(fine_bucket_index(0), 0);
+        assert_eq!(fine_bucket_index(u64::MAX), FINE_BUCKETS - 1);
+        // Four buckets per octave: 1,280 / 1,536 / 1,792 / 2,048 ns.
+        assert_eq!(fine_bucket_upper_bound_nanos(1), Some(1_280));
+        assert_eq!(fine_bucket_upper_bound_nanos(4), Some(2_048));
+        // A bound is at most 25% above any sample in its bucket.
+        for nanos in [1_025u64, 9_999, 100_001, 999_999, 1_000_001, 16_000_000] {
+            let bound = fine_bucket_upper_bound_nanos(fine_bucket_index(nanos)).expect("bounded");
+            assert!(
+                bound >= nanos && bound * 4 <= nanos * 5 + 4,
+                "{nanos} -> {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fine_quantiles_reads_the_ranked_fine_bucket() {
+        assert_eq!(fine_quantiles(&[0; FINE_BUCKETS]), None);
+        let mut w = [0u64; FINE_BUCKETS];
+        w[fine_bucket_index(20_000)] = 990; // p50 and p99 near 20 µs
+        w[fine_bucket_index(500_000)] = 9; // p99.9 near 0.5 ms
+        w[FINE_BUCKETS - 1] = 1; // one sample above 16.8 ms
+        let q = fine_quantiles(&w).expect("samples");
+        assert_eq!(q.samples, 1_000);
+        assert_eq!(
+            q.p50,
+            fine_bucket_upper_bound_nanos(fine_bucket_index(20_000))
+        );
+        assert_eq!(q.p99, q.p50);
+        assert_eq!(
+            q.p999,
+            fine_bucket_upper_bound_nanos(fine_bucket_index(500_000))
+        );
+        let mut top = [0u64; FINE_BUCKETS];
+        top[FINE_BUCKETS - 1] = 5;
+        assert_eq!(fine_quantiles(&top).expect("samples").p50, None, "overflow");
+    }
+
+    /// One call records one `receipt_to_fold` stage sample and one fine
+    /// sample in the matching bucket.
+    #[test]
+    fn test_record_receipt_to_fold_nanos_fills_the_stage_and_the_fine_histogram() {
+        assert_eq!(Stage::ReceiptToFold.as_str(), "receipt_to_fold");
+        assert_eq!(Stage::MetricsUpkeep.as_str(), "metrics_upkeep");
+        assert_eq!(Stage::ReceiptToFold.stall_budget_nanos(), 1_000_000);
+        assert_eq!(Stage::MetricsUpkeep.stall_budget_nanos(), 1_000_000);
+        let nanos = 1_234_567u64;
+        let k = fine_bucket_index(nanos);
+        let before = stage_snapshot(Stage::ReceiptToFold);
+        let fine_before = receipt_to_fold_fine_snapshot();
+        record_receipt_to_fold_nanos(nanos);
+        let after = stage_snapshot(Stage::ReceiptToFold);
+        let fine_after = receipt_to_fold_fine_snapshot();
+        assert!(after.count > before.count);
+        assert!(
+            after.over_budget > before.over_budget,
+            "1.23 ms is over the 1 ms budget"
+        );
+        assert!(fine_after[k] > fine_before[k]);
+    }
+
+    #[test]
+    fn test_receipt_to_fold_fine_snapshot_counts_only_rise() {
+        let before = receipt_to_fold_fine_snapshot();
+        record_receipt_to_fold_nanos(50_000);
+        let after = receipt_to_fold_fine_snapshot();
+        assert!(before.iter().zip(after.iter()).all(|(b, a)| a >= b));
+        assert!(after[fine_bucket_index(50_000)] > before[fine_bucket_index(50_000)]);
+    }
+
+    /// The two DT0 stages are measurement only: a 5 s sample in either never
+    /// starts a stall page, and no signal is ever labelled with them.
+    #[test]
+    fn test_receipt_to_fold_and_metrics_upkeep_never_page() {
+        let mut readings = quiet();
+        readings.stage_max_nanos[Stage::ReceiptToFold as usize] = 5_000_000_000;
+        readings.stage_max_nanos[Stage::MetricsUpkeep as usize] = 5_000_000_000;
+        let mut alarm = StallAlarm::new();
+        assert_eq!(alarm.observe(Instant::now(), true, &readings), None);
+        for i in 0..SIGNAL_COUNT {
+            let (label, _) = signal_label(i);
+            assert_ne!(label, "receipt_to_fold");
+            assert_ne!(label, "metrics_upkeep");
+        }
+        // The five paged stages still page.
+        readings.stage_max_nanos[Stage::DrainMainFrame as usize] = 5_000_000_000;
+        let line = alarm
+            .observe(Instant::now(), true, &readings)
+            .expect("a paged stage still pages");
+        assert_eq!(line.signal, "drain_main_frame");
     }
 }

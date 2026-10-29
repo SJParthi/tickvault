@@ -7182,9 +7182,20 @@ async fn run_frame_drain(
                         // hot-path stage, so the live p99 covers the drain's
                         // own work. One clock read and four relaxed atomics,
                         // no allocation.
+                        let frame_work_end = std::time::Instant::now();
                         tickvault_storage::hot_path_telemetry::record_stage(
                             tickvault_storage::hot_path_telemetry::Stage::DrainMainFrame,
-                            frame_work_start.elapsed(),
+                            frame_work_end.saturating_duration_since(frame_work_start),
+                        );
+                        // DT0 (2026-10-29): socket receipt -> folded, on the
+                        // same clock read; five relaxed atomics.
+                        tickvault_storage::hot_path_telemetry::record_receipt_to_fold_nanos(
+                            u64::try_from(
+                                frame_work_end
+                                    .saturating_duration_since(frame.received_at)
+                                    .as_nanos(),
+                            )
+                            .unwrap_or(u64::MAX),
                         );
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
@@ -7516,6 +7527,8 @@ async fn run_frame_drain(
                 tickvault_storage::hot_path_telemetry::beat(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
                 );
+                // DT0: which worker thread hosts the drain now (O(1)).
+                tickvault_storage::hot_thread_sched::note_frame_drain_thread();
                 flush_ticks_and_record(&mut ingest, &feed_health);
                 // ITEM 57b: depth on every `DEPTH_TIMER_FLUSH_EVERY_TICKS`th
                 // tick (2 s), not every tick; its size trigger in the frame
@@ -28623,6 +28636,9 @@ mod tick_quotes_route_tests;
 
 #[cfg(test)]
 mod seed_step_tests;
+
+#[cfg(test)]
+mod receipt_to_fold_tests;
 
 #[cfg(test)]
 mod alive_connection_guard_tests {
