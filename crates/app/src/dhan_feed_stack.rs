@@ -2615,7 +2615,15 @@ impl LiveIngest {
     /// 1,000,000). Flushing depth with every 1,000 tick rows multiplied those
     /// commits. O(1) here; the flush itself is one hand-off or one request.
     pub fn flush_ticks(&mut self) -> u64 {
-        if self.pending_rows == 0 {
+        // Rows a full hand-off queue gave back stay in the writer while
+        // `pending_rows` already reads 0, so the writer is asked whenever it
+        // still holds rows (live audit LH-02, review): returning on
+        // `pending_rows` alone never re-sent them, the replay pacer idled to
+        // its 300 s deadline and `replay_rows_landed`'s retry flush was a
+        // no-op. `TickWriter::flush` retries the hand-off ("the next flush
+        // tries again"). Two integer reads when there is nothing to send.
+        let retained = self.writer.pending();
+        if self.pending_rows == 0 && retained == 0 {
             return 0;
         }
         let covered = self.pending_rows;
@@ -2678,6 +2686,7 @@ impl LiveIngest {
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
+                    writer_rows = retained,
                     "live tick flush to QuestDB FAILED — these rows are NOT in the database. \
                      They are NOT lost, and there are TWO recoveries. Immediately: the writer \
                      rescues the failed batch to a tick spill file (the WS-GAP-03 line beside \
@@ -15728,6 +15737,21 @@ pub const WAL_REPLAY_PACE_STEP_MILLIS: u64 = 1_000;
 /// Counter: waits a paced replay spent on the writer threads (audit R1).
 pub const WAL_REPLAY_PACE_WAITS_COUNTER: &str = "tv_wal_replay_pace_waits_total";
 
+/// Counter: steps a paced replay SLEPT because a flush after a drained wait
+/// handed none of the held rows off (LH-02 review). Read beside
+/// [`WAL_REPLAY_PACE_WAITS_COUNTER`]: waits with no stalls is a writer that
+/// drained; stalls is rows held and not re-sent. 0 on a healthy boot.
+pub const WAL_REPLAY_PACE_STALLED_COUNTER: &str = "tv_wal_replay_pace_stalled_total";
+
+/// The once-per-process latch for the coded stall warning below.
+static PACE_STALL_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a pacing pass that slept `stalls` steps is the first one this
+/// process to warn about it. One `swap` per pass, only when it stalled. O(1).
+fn pace_stall_warn_due(latch: &AtomicBool, stalls: u32) -> bool {
+    stalls > 0 && !latch.swap(true, Ordering::Relaxed)
+}
+
 /// Until when a WAL replay started at `ist_secs_of_day` paces itself on the
 /// writer threads (audit R1, 2026-10-03).
 ///
@@ -15835,6 +15859,7 @@ fn replay_pace_after_flush(
     }
     let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
     let ingest = std::cell::RefCell::new(ingest);
+    let stalls = std::cell::Cell::new(0u32);
     let waits = pace_after_replay_flush(
         || {
             if with_depth {
@@ -15858,14 +15883,36 @@ fn replay_pace_after_flush(
             let unlanded = wm.unlanded_total();
             blocking_flush(|| wm.wait_for_offload_drained(step, unlanded))
         },
-        // A flush that handed nothing off (LH-02): one step off the worker.
-        |step| blocking_flush(|| std::thread::sleep(step)),
+        // A flush that handed nothing off (LH-02): one step off the worker,
+        // counted so an idle pacing pass never reads as a draining one.
+        |step| {
+            stalls.set(stalls.get().saturating_add(1));
+            blocking_flush(|| std::thread::sleep(step));
+        },
         Instant::now,
         pace_until,
         std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
     );
     if waits > 0 {
         metrics::counter!(WAL_REPLAY_PACE_WAITS_COUNTER).increment(u64::from(waits));
+    }
+    let stalls = stalls.get();
+    if stalls > 0 {
+        metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(u64::from(stalls));
+    }
+    if pace_stall_warn_due(&PACE_STALL_WARNED, stalls) {
+        let held = replay_rows_held(&ingest.borrow(), with_depth);
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_pace_no_progress",
+            stalls,
+            waits,
+            held_rows = held,
+            "WAL replay pacing: a flush after a drained wait handed none of the held rows to \
+             the writer threads, so the pacer slept instead of draining. The rows are still \
+             in RAM and in the WAL; the ack check decides whether the segments are confirmed. \
+             Logged once per process; tv_wal_replay_pace_stalled_total counts every step."
+        );
     }
     waits
 }
@@ -16688,6 +16735,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Rule 11: the lane reads DOWN until it is provably carrying data, so a
     // half-wired stack is never presented as up.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    // The replay pacing series, before the boot refold can move them: a
+    // series that never emits reads the same as a healthy zero (LH-02 review).
+    metrics::counter!(WAL_REPLAY_PACE_WAITS_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(0);
     // Before any dial and before the drain starts: both read it.
     set_configured_frame_silence_fast_path(params.frame_silence_fast_path);
 
@@ -27223,7 +27274,11 @@ mod wal_refold_tests {
         // LH-02: writers idle, so every wait reports drained at once (and
         // takes no time); the flush hands nothing off; rows stay held. The
         // loop must sleep one step per round and end at the deadline, not
-        // spin (963,130,754 waits live).
+        // spin (963,130,754 waits live). This is the FALLBACK for a flush
+        // that genuinely cannot hand off: the cause seen live (retained rows
+        // never re-sent) is fixed in `flush_ticks`, pinned by
+        // `test_regression_lh02_flush_ticks_re_sends_rows_a_full_queue_gave_back`,
+        // and the real pacer counts these sleeps on their own counter.
         let clock = std::cell::Cell::new(Instant::now());
         let until = clock.get() + std::time::Duration::from_millis(2_500);
         let calls = std::cell::Cell::new(0u32);
@@ -27301,6 +27356,35 @@ mod wal_refold_tests {
         );
         assert!(!refold_rows_reached_database(0, true), "nothing flushed");
         assert!(!refold_rows_reached_database(0, false));
+    }
+
+    #[test]
+    fn test_regression_lh02_the_real_pacer_counts_and_seeds_its_stalls() {
+        // LH-02 review: an idle pacing pass (rows held, nothing re-sent) must
+        // not read as waits spent on a draining writer. Its sleeps go on their
+        // own counter, seeded at 0 before the boot refold, with one coded warn.
+        let production = production_source();
+        let pace = production
+            .split_once("fn replay_pace_after_flush(")
+            .map_or("", |(_, rest)| {
+                rest.split_once("\n}\n").map_or("", |(body, _)| body)
+            });
+        assert!(pace.contains("stalls.set(stalls.get().saturating_add(1));"));
+        assert!(pace.contains(
+            "metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(u64::from(stalls));"
+        ));
+        assert!(pace.contains("if pace_stall_warn_due(&PACE_STALL_WARNED, stalls) {"));
+        assert!(pace.contains("source = \"replay_pace_no_progress\""));
+        let lane = production
+            .split_once("async fn run_dhan_feed_stack(")
+            .map_or("", |(_, rest)| rest);
+        let seed = lane
+            .find("metrics::counter!(WAL_REPLAY_PACE_STALLED_COUNTER).increment(0);")
+            .expect("the stall counter is seeded at 0 in the lane");
+        let refold = lane
+            .find("refold_wal_frames(&mut ingest")
+            .expect("the boot refold");
+        assert!(seed < refold, "seeded before the boot refold can move it");
     }
 
     #[test]

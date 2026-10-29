@@ -231,4 +231,70 @@ mod pacer_tests {
         );
         assert!(replay_rows_held(&ingest, true) > 0);
     }
+
+    /// LH-02 review: the rows a full queue gave back must be RE-SENT by the
+    /// next flush once the queue has room. `flush_ticks` returned on
+    /// `pending_rows == 0`, so the pacer's flush (and `replay_rows_landed`'s
+    /// retry) never re-sent them and the boot pass idled to its 300 s
+    /// deadline with the rows still in RAM.
+    #[test]
+    fn test_regression_lh02_flush_ticks_re_sends_rows_a_full_queue_gave_back() {
+        let (producer, _sink, rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        let mut ingest = LiveIngest::new(producer, 4);
+        let depth = tickvault_storage::tick_persistence::FLUSH_QUEUE_DEPTH;
+        for seq in 1..=(depth as u64 + 1) {
+            let _outcome = refold_wal_frames(&mut ingest, &[ticker_now(seq)], &[], None);
+            ingest.flush_ticks();
+        }
+        let retained = ingest.writer.pending();
+        assert!(retained > 0, "the full queue gave the last batch back");
+        assert_eq!(ingest.pending_rows(), 0);
+        // The writer threads drain the queue (what a drained pacer wait means).
+        let mut drained = 0usize;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, depth, "the queue held one batch per slot");
+        assert_eq!(
+            ingest.flush_ticks(),
+            0,
+            "no newly appended rows are covered"
+        );
+        assert_eq!(
+            ingest.writer.pending(),
+            0,
+            "the flush must hand the retained rows off once the queue has room"
+        );
+        let batch = rx.try_recv().expect("the retained batch reached the queue");
+        assert_eq!(batch.rows(), retained);
+    }
+
+    /// With nothing appended and nothing retained the flush stays a no-op.
+    #[test]
+    fn flush_ticks_with_nothing_held_hands_nothing_off() {
+        let (producer, _sink, rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        let mut ingest = LiveIngest::new(producer, 4);
+        assert_eq!(ingest.flush_ticks(), 0);
+        assert!(rx.try_recv().is_err(), "an empty flush sends no batch");
+    }
+
+    /// LH-02 review: a pacing pass that slept warns once per process, and
+    /// the warning is not repeated for later passes.
+    #[test]
+    fn test_regression_lh02_pace_stall_warns_once_and_only_on_a_stall() {
+        let latch = AtomicBool::new(false);
+        assert!(!pace_stall_warn_due(&latch, 0), "no stall, no warning");
+        assert!(
+            !latch.load(Ordering::Relaxed),
+            "a clean pass leaves the latch armed"
+        );
+        assert!(
+            pace_stall_warn_due(&latch, 3),
+            "the first stalled pass warns"
+        );
+        assert!(
+            !pace_stall_warn_due(&latch, 5),
+            "later stalled passes do not"
+        );
+    }
 }
