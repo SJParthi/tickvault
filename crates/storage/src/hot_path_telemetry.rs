@@ -65,6 +65,19 @@
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
 //! | [`publish_once`] | O(stages × buckets + tasks) = O(5 × 28 + 6), once a second, on its own thread; the percentile window adds O(5 × 28) more and keeps the previous read in fixed arrays (no allocation) |
 //! | [`stage_quantiles`] | O(buckets) = O(28), on the publisher thread only, never on the frame path |
+//! | [`RollingMax::push`] | O(window) = O(60) per stage, once a second, on the publisher thread only; a fixed array, no allocation |
+//!
+//! # The 60-second maximum (2026-10-29, live audit HP-2)
+//!
+//! `tv_hot_path_stage_max_ns{stage}` is reset on every one-second publish,
+//! while the CloudWatch agent and Prometheus read `/metrics` once a minute. A
+//! scrape therefore sees only the last second of each minute: live, minutes
+//! whose buckets held 4.2 to 8.4 ms samples read at most 590 µs on the gauge.
+//! `tv_hot_path_stage_max_ns_60s{stage}` is the maximum of the last
+//! [`ROLLING_MAX_WINDOW_SECS`] one-second maxima ([`RollingMax`]), so a spike
+//! anywhere in the minute before a scrape is visible. The per-second gauge is
+//! unchanged. Local `/metrics` only: no EMF name, no metric filter, no alarm,
+//! no Telegram path (noise lock). Registered at 0 when the handles resolve.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -620,6 +633,7 @@ struct StageHandles {
     sum: metrics::Counter,
     over_budget: metrics::Counter,
     max: metrics::Gauge,
+    max_60s: metrics::Gauge,
     p50: metrics::Gauge,
     p99: metrics::Gauge,
     p999: metrics::Gauge,
@@ -636,6 +650,47 @@ pub struct TelemetryHandles {
     stages: Vec<StageHandles>,
     tasks: Vec<TaskHandles>,
     windows: QuantileWindows,
+    rolling: [RollingMax; STAGE_COUNT],
+}
+
+/// How many one-second maxima [`RollingMax`] keeps: one scrape interval of
+/// the CloudWatch agent and Prometheus (60 s), so every spike is in the gauge
+/// at the next scrape.
+pub const ROLLING_MAX_WINDOW_SECS: usize = 60;
+
+/// The maximum of the last [`ROLLING_MAX_WINDOW_SECS`] samples pushed, one
+/// push per publish. A fixed ring of `u64`, built once; lives on the
+/// publisher thread only, never on the frame path.
+#[derive(Debug, Clone, Copy)]
+pub struct RollingMax {
+    ring: [u64; ROLLING_MAX_WINDOW_SECS],
+    next: usize,
+}
+
+impl Default for RollingMax {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RollingMax {
+    /// An empty window (every slot 0).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ring: [0; ROLLING_MAX_WINDOW_SECS],
+            next: 0,
+        }
+    }
+
+    /// Records one window's maximum, overwriting the oldest, and returns the
+    /// maximum over the last [`ROLLING_MAX_WINDOW_SECS`] pushes (this one
+    /// included). O(window), no allocation.
+    pub fn push(&mut self, sample: u64) -> u64 {
+        self.ring[self.next] = sample;
+        self.next = (self.next + 1) % ROLLING_MAX_WINDOW_SECS;
+        self.ring.iter().copied().max().unwrap_or(0)
+    }
 }
 
 const BUCKET_LABELS: [&str; STAGE_BUCKETS] = [
@@ -695,6 +750,13 @@ impl TelemetryHandles {
                         "stage" => name
                     ),
                     max: metrics::gauge!("tv_hot_path_stage_max_ns", "stage" => name),
+                    max_60s: {
+                        // Registered at 0 so the series exists before the
+                        // first publish, as "no stall seen yet".
+                        let g = metrics::gauge!("tv_hot_path_stage_max_ns_60s", "stage" => name);
+                        g.set(0.0);
+                        g
+                    },
                     p50: metrics::gauge!("tv_hot_path_stage_p50_ns", "stage" => name),
                     p99: metrics::gauge!("tv_hot_path_stage_p99_ns", "stage" => name),
                     p999: metrics::gauge!("tv_hot_path_stage_p999_ns", "stage" => name),
@@ -715,6 +777,7 @@ impl TelemetryHandles {
             stages,
             tasks,
             windows: QuantileWindows::new(),
+            rolling: [RollingMax::new(); STAGE_COUNT],
         }
     }
 }
@@ -749,6 +812,8 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         h.over_budget.absolute(snap.over_budget);
         let max = STAGES[*stage as usize].max_nanos.swap(0, Ordering::Relaxed);
         h.max.set(nanos_to_f64(max));
+        let max_60s = handles.rolling[*stage as usize].push(max);
+        h.max_60s.set(nanos_to_f64(max_60s));
         readings.stage_max_nanos[*stage as usize] = max;
         let outcome = handles.windows.advance(*stage, &snap);
         match outcome.quantiles {
@@ -1175,6 +1240,167 @@ mod tests {
                 .max_nanos
                 .load(Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    fn test_rolling_max_keeps_a_spike_for_the_window_and_then_drops_it() {
+        let mut rolling = RollingMax::new();
+        assert_eq!(rolling.push(0), 0, "an empty window reads 0");
+        assert_eq!(rolling.push(8_400_000), 8_400_000);
+        // 30 one-second publishes later the spike still shows.
+        for _ in 0..30 {
+            assert_eq!(rolling.push(500), 8_400_000);
+        }
+        // Through the 59th publish after it, the spike is the oldest slot.
+        for _ in 30..59 {
+            assert_eq!(rolling.push(500), 8_400_000);
+        }
+        // The 60th overwrites it: the window is the last 60 publishes.
+        assert_eq!(rolling.push(500), 500);
+        // And 61 seconds after, still gone.
+        assert_eq!(rolling.push(500), 500);
+    }
+
+    #[test]
+    fn test_rolling_max_reads_the_largest_of_several_spikes_as_each_ages_out() {
+        let mut rolling = RollingMax::default();
+        rolling.push(9_000);
+        for _ in 0..10 {
+            rolling.push(0);
+        }
+        rolling.push(4_000);
+        // 9,000 was pushed 11 publishes before 4,000, so it leaves first.
+        for _ in 0..(ROLLING_MAX_WINDOW_SECS - 12) {
+            assert_eq!(rolling.push(0), 9_000);
+        }
+        assert_eq!(rolling.push(0), 4_000, "9,000 aged out, 4,000 remains");
+        for _ in 0..10 {
+            assert_eq!(rolling.push(0), 4_000);
+        }
+        assert_eq!(rolling.push(0), 0, "both aged out");
+    }
+
+    /// Captures one gauge series (name + `stage` label) of a local recorder,
+    /// so the test reads what `/metrics` would carry without a global install.
+    #[derive(Clone)]
+    struct OneGaugeRecorder {
+        name: &'static str,
+        stage: &'static str,
+        bits: std::sync::Arc<AtomicU64>,
+    }
+
+    struct OneGauge {
+        bits: std::sync::Arc<AtomicU64>,
+    }
+
+    impl metrics::GaugeFn for OneGauge {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, value: f64) {
+            self.bits.store(value.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    impl metrics::Recorder for OneGaugeRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            let stage_matches = key
+                .labels()
+                .any(|l| l.key() == "stage" && l.value() == self.stage);
+            if key.name() == self.name && stage_matches {
+                metrics::Gauge::from_arc(std::sync::Arc::new(OneGauge {
+                    bits: std::sync::Arc::clone(&self.bits),
+                }))
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn test_publish_once_holds_a_spike_in_the_60s_gauge_for_60_publishes() {
+        // ReaderRuntimeLag: no other test in this module records it, so the
+        // spike below is the largest sample that stage sees.
+        const SPIKE: u64 = 3_000_000_000;
+        let bits = std::sync::Arc::new(AtomicU64::new(f64::NAN.to_bits()));
+        let recorder = OneGaugeRecorder {
+            name: "tv_hot_path_stage_max_ns_60s",
+            stage: Stage::ReaderRuntimeLag.as_str(),
+            bits: std::sync::Arc::clone(&bits),
+        };
+        let read = || f64::from_bits(bits.load(Ordering::Relaxed));
+        let mut handles = metrics::with_local_recorder(&recorder, TelemetryHandles::resolve);
+        assert!(
+            read().abs() < f64::EPSILON,
+            "registered at 0 before the first publish, read {}",
+            read()
+        );
+        // `spawn_publisher_starts_a_named_thread` leaves a real publisher
+        // running in this process, which can take the window max between our
+        // record and our publish; retry until our publish is the one that
+        // read it (bounded).
+        let mut seen = false;
+        for _ in 0..1_000 {
+            record_stage_nanos(Stage::ReaderRuntimeLag, SPIKE);
+            publish_once(&mut handles, Instant::now());
+            if read() >= nanos_to_f64(SPIKE) {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "the spike never reached this publish");
+        // 30 published seconds later the 60 s gauge still shows it, while
+        // the per-second gauge has long been reset.
+        for _ in 0..30 {
+            publish_once(&mut handles, Instant::now());
+        }
+        assert!(read() >= nanos_to_f64(SPIKE), "30 s ago: still visible");
+        for _ in 30..59 {
+            publish_once(&mut handles, Instant::now());
+        }
+        assert!(read() >= nanos_to_f64(SPIKE), "59 s ago: oldest slot");
+        // 60 and 61 published seconds later it has left the window.
+        publish_once(&mut handles, Instant::now());
+        publish_once(&mut handles, Instant::now());
+        assert!(
+            read() < nanos_to_f64(SPIKE),
+            "61 s ago: gone, read {}",
+            read()
         );
     }
 
