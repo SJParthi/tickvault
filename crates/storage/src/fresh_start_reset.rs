@@ -11,8 +11,8 @@
 //!
 //! | log state | in-session? | verdict |
 //! |---|---|---|
-//! | id present | — | [`ResetDecision::AlreadyDone`] — nothing happens, forever |
-//! | unreadable / unwritable | — | [`ResetDecision::RefuseUnreadable`] — boots on whatever schema exists, loudly; NEVER wipes on a guess |
+//! | id present, or the done file present | — | [`ResetDecision::AlreadyDone`] — nothing happens, forever |
+//! | unreadable / unwritable, or a refused done file | — | [`ResetDecision::RefuseUnreadable`] — boots on whatever schema exists, loudly; NEVER wipes on a guess |
 //! | id absent, none of the reset tables exist | yes | [`ResetDecision::NothingToWipe`] — a bare-nuked volume; the id is recorded so no later boot wipes today |
 //! | id absent, reset tables exist (or unknown) | yes | [`ResetDecision::RefuseInSession`] — never wipes a live session; the next out-of-session boot runs it |
 //! | id absent | no | [`ResetDecision::Run`] — drop the allowlist, write the id, re-read it |
@@ -44,6 +44,20 @@
 //! one needs its own dated operator quote in the scope lock first. The id is
 //! written LAST and then RE-READ; if the re-read does not find it the boot
 //! says so loudly, because a wipe whose id is missing would repeat.
+//!
+//! *(⚠ ADDED 2026-10-29, live audit F3.)* The id lives in a QuestDB table, and
+//! the overnight SEBI/audit delete dropped that table: the next boot found no
+//! id, ran the reset again and renamed `ticks` and `market_depth` aside. The
+//! done-state is now also kept in a durable file,
+//! [`FRESH_START_RESET_DONE_PATH`] (temp file, sync, rename, folder sync). The
+//! reset is done when EITHER the log row or the file says so
+//! ([`decide_with_done_file`]). The file is written when the reset completes
+//! (also when its id row could not be confirmed, since the drops already ran),
+//! on a `NothingToWipe` boot, and on every boot that finds the row without the
+//! file; a row missing beside the file is written back once, best effort. A
+//! file that exists but does not hold the exact expected text is treated like
+//! an unreadable log: no wipe on a guess. Honest limit: a wipe that removes
+//! BOTH the table and `data/state/` re-arms the reset, as before.
 //!
 //! A DROP QuestDB refuses is retried [`RESET_DROP_RETRY_ROUNDS`] more times
 //! before it is given up on, and the id write is tried
@@ -791,6 +805,149 @@ fn record(outcome: &'static str) {
     metrics::counter!("tv_fresh_start_reset_total", "outcome" => outcome).increment(1);
 }
 
+// ---- 2026-10-29, live audit F3: a durable file beside the table row --------
+//
+// The overnight SEBI/audit delete dropped `schema_reset_log`, so the next boot
+// found no id, ran the reset again and renamed `ticks` and `market_depth`
+// aside. The done-state is now ALSO kept in a small file under `data/state/`;
+// the reset is done when EITHER the table row or the file says so.
+
+/// Where the reset's done file lives, relative to the working directory like
+/// every other `data/state/` marker.
+pub const FRESH_START_RESET_DONE_PATH: &str = "data/state/fresh_start_reset.done";
+
+/// The first token of the done file; the version is in it.
+const DONE_FILE_MAGIC: &str = "tvfsr1";
+
+/// What reading the done file found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneFile {
+    /// No file.
+    Absent,
+    /// The file names [`FRESH_START_RESET_ID`]: the reset is done.
+    Done,
+    /// A file exists but could not be read or does not hold the exact bytes
+    /// [`encode_reset_done_file`] writes. Whether the reset ran is unknown.
+    Refused(&'static str),
+}
+
+/// The exact bytes of the done file: `tvfsr1 <reset id>\n`.
+#[must_use]
+pub fn encode_reset_done_file() -> String {
+    format!("{DONE_FILE_MAGIC} {FRESH_START_RESET_ID}\n")
+}
+
+/// Reads the done file at `path`. Anything but the exact bytes of
+/// [`encode_reset_done_file`] is refused with a coded `error!`. Cold, once a
+/// boot: one small file read.
+#[must_use]
+pub fn read_reset_done_file(path: &std::path::Path) -> DoneFile {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return DoneFile::Absent,
+        Err(err) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
+                source = "fresh_start_reset_done_file_unreadable",
+                path = %path.display(),
+                %err,
+                "the fresh-start reset's done file exists but could not be read. Whether the \
+                 one-shot reset already ran is unknown, so it is NOT run on a guess unless the \
+                 reset log says it is done. Check the file's owner and mode."
+            );
+            return DoneFile::Refused("unreadable");
+        }
+    };
+    if bytes == encode_reset_done_file().as_bytes() {
+        return DoneFile::Done;
+    }
+    error!(
+        code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        source = "fresh_start_reset_done_file_refused",
+        path = %path.display(),
+        bytes = bytes.len(),
+        "the fresh-start reset's done file does not hold the expected text and is REFUSED. \
+         Whether the one-shot reset already ran is unknown, so it is NOT run on a guess unless \
+         the reset log says it is done. The file is left as it is for inspection, unless the \
+         reset log proves the reset done, in which case it is rewritten."
+    );
+    DoneFile::Refused("content")
+}
+
+/// Writes the done file durably: temp file, `sync_all`, rename over `path`,
+/// then the folder is synced. Cold path (once a boot at most).
+///
+/// # Errors
+/// Any I/O error from creating the folder, writing, syncing or renaming.
+pub fn write_reset_done_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(encode_reset_done_file().as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// The decision with the done file in it. The reset is done when EITHER the
+/// log row or the file says so; a refused file (unknown state) is treated like
+/// an unreadable log and never wipes; otherwise [`decide`] rules.
+#[must_use]
+pub const fn decide_with_done_file(
+    logged_count: Option<i64>,
+    done_file: DoneFile,
+    ist_secs_of_day: u32,
+) -> ResetDecision {
+    match (done_file, logged_count) {
+        (DoneFile::Done, _) => ResetDecision::AlreadyDone,
+        (_, Some(n)) if n > 0 => ResetDecision::AlreadyDone,
+        (DoneFile::Refused(_), _) => ResetDecision::RefuseUnreadable,
+        (DoneFile::Absent, _) => decide(logged_count, ist_secs_of_day),
+    }
+}
+
+/// Writes the done file when there is a path. Returns whether the file now
+/// holds the done state. A failed write is a coded `error!`.
+fn record_done_file(path: Option<&std::path::Path>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    match write_reset_done_file(path) {
+        Ok(()) => {
+            info!(
+                path = %path.display(),
+                reset_id = FRESH_START_RESET_ID,
+                "fresh-start reset done file written"
+            );
+            true
+        }
+        Err(err) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
+                source = "fresh_start_reset_done_file_write_failed",
+                path = %path.display(),
+                %err,
+                "the fresh-start reset's done file could NOT be written. The reset log row \
+                 still records it, but if that table is dropped the next out-of-session boot \
+                 runs the reset again. Check the disk and data/state/."
+            );
+            false
+        }
+    }
+}
+
 /// Run the one-shot reset against `base_url` (`http://host:port/exec`) with
 /// the given wall clock. Returns the decision it acted on.
 ///
@@ -801,8 +958,15 @@ pub async fn run_fresh_start_reset_with(
     base_url: &str,
     utc_epoch_secs: i64,
 ) -> ResetDecision {
-    run_fresh_start_reset_retrying(client, base_url, 1, Duration::ZERO, move || utc_epoch_secs)
-        .await
+    run_fresh_start_reset_retrying(
+        client,
+        base_url,
+        1,
+        Duration::ZERO,
+        move || utc_epoch_secs,
+        None,
+    )
+    .await
 }
 
 /// Whether the retry budget still allows STARTING another retry.
@@ -846,15 +1010,29 @@ async fn write_and_verify_id(client: &Client, base_url: &str, backoff: Duration)
 /// Retries of the log read and of refused DROPs stop STARTING once
 /// [`RESET_RETRY_BUDGET_SECS`] has elapsed; the id write is bounded by count
 /// alone. Every first attempt always runs.
+///
+/// `done_path` is the durable done file ([`FRESH_START_RESET_DONE_PATH`] at
+/// boot; `None` disables it). The reset is done when EITHER the log row or
+/// the file says so ([`decide_with_done_file`]); the file is written whenever
+/// the reset completes or is found already recorded, and a log row missing
+/// beside a done file is written back once, best effort.
 pub async fn run_fresh_start_reset_retrying(
     client: &Client,
     base_url: &str,
     attempts: u32,
     backoff: Duration,
     now_utc_epoch_secs: impl Fn() -> i64,
+    done_path: Option<&std::path::Path>,
 ) -> ResetDecision {
     let started = tokio::time::Instant::now();
-    let attempts = attempts.max(1);
+    let done_file = done_path.map_or(DoneFile::Absent, read_reset_done_file);
+    // A done file already answers: one log read (to write a dropped row
+    // back), never the retry loop.
+    let attempts = if done_file == DoneFile::Done {
+        1
+    } else {
+        attempts.max(1)
+    };
     let mut logged = None;
     for attempt in 1..=attempts {
         logged = read_logged_count(client, base_url).await;
@@ -879,7 +1057,7 @@ pub async fn run_fresh_start_reset_retrying(
     }
     let now_utc = now_utc_epoch_secs();
     let ist = ist_secs_of_day(now_utc);
-    let mut decision = decide(logged, ist);
+    let mut decision = decide_with_done_file(logged, done_file, ist);
     // Seeded so the first rename is not swallowed by the agent's
     // dropped-first-sample rule.
     metrics::counter!("tv_fresh_start_reset_renamed_total").increment(0);
@@ -899,8 +1077,24 @@ pub async fn run_fresh_start_reset_retrying(
         ResetDecision::AlreadyDone => {
             info!(
                 reset_id = FRESH_START_RESET_ID,
+                done_file = done_file == DoneFile::Done,
+                logged = ?logged,
                 "fresh-start reset already recorded — nothing to do"
             );
+            if done_file == DoneFile::Done {
+                // Live audit F3: the log was dropped (or answered no row)
+                // while the file says done. Write the row back once so both
+                // records agree; a failure changes nothing, the file holds.
+                if logged == Some(0) && exec(client, base_url, &insert_log_sql()).await.is_some() {
+                    info!(
+                        reset_id = FRESH_START_RESET_ID,
+                        "fresh-start reset: the reset log had lost its row; written back \
+                         from the done file"
+                    );
+                }
+            } else {
+                let _written = record_done_file(done_path);
+            }
         }
         ResetDecision::NothingToWipe => {}
         ResetDecision::RefuseUnreadable => {
@@ -931,6 +1125,7 @@ pub async fn run_fresh_start_reset_retrying(
                          tables — nothing to wipe, id recorded so no later boot wipes today"
                     );
                     decision = ResetDecision::NothingToWipe;
+                    let _written = record_done_file(done_path);
                 }
             }
             if decision == ResetDecision::RefuseInSession {
@@ -1094,11 +1289,16 @@ pub async fn run_fresh_start_reset_retrying(
                 return decision;
             }
             let (verified, id_attempts) = write_and_verify_id(client, base_url, backoff).await;
+            // The drops and renames are done whether or not the id row was
+            // confirmed, so the done file is written either way (live audit
+            // F3): it is what stops a repeat when the log row is missing.
+            let done_file_written = record_done_file(done_path);
             if verified {
                 info!(
                     reset_id = FRESH_START_RESET_ID,
                     dropped = attempted - refused_count,
                     id_attempts,
+                    done_file_written,
                     "fresh-start reset COMPLETE — id written and verified; the ensure DDL \
                      that follows recreates every dropped or renamed object"
                 );
@@ -1110,8 +1310,10 @@ pub async fn run_fresh_start_reset_retrying(
                     source = "fresh_start_reset",
                     reset_id = FRESH_START_RESET_ID,
                     id_attempts,
+                    done_file_written,
                     "fresh-start reset: the tables were dropped but the reset id could NOT be \
-                     written and read back. The NEXT out-of-session boot will run the wipe \
+                     written and read back. Unless the done file was written \
+                     (done_file_written), the NEXT out-of-session boot will run the wipe \
                      AGAIN. Insert it by hand before then: \
                      INSERT INTO schema_reset_log (reset_id, ts) VALUES ('2026-09-19-fresh-start', now());"
                 );
@@ -1152,6 +1354,7 @@ pub async fn run_fresh_start_reset_at_boot(questdb: &QuestDbConfig) -> ResetDeci
         RESET_LOG_READ_ATTEMPTS,
         Duration::from_secs(RESET_LOG_READ_BACKOFF_SECS),
         || chrono::Utc::now().timestamp(),
+        Some(std::path::Path::new(FRESH_START_RESET_DONE_PATH)),
     )
     .await;
     // Live audit F2/F5/F6 (2026-10-29): once the reset is done, the floor is
@@ -2057,6 +2260,7 @@ mod tests {
             RESET_LOG_READ_ATTEMPTS,
             Duration::ZERO,
             || OFF_HOURS_UTC,
+            None,
         )
         .await;
         assert_eq!(d, ResetDecision::Run);
@@ -2073,9 +2277,14 @@ mod tests {
             ..Cfg::default()
         })
         .await;
-        let d = run_fresh_start_reset_retrying(&client(), &url(&m), 3, Duration::ZERO, || {
-            OFF_HOURS_UTC
-        })
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            3,
+            Duration::ZERO,
+            || OFF_HOURS_UTC,
+            None,
+        )
         .await;
         assert_eq!(d, ResetDecision::RefuseUnreadable);
         assert_eq!(drops_seen(&m), 0);
@@ -2095,19 +2304,26 @@ mod tests {
         })
         .await;
         let seen = Arc::clone(&m.seen);
-        let d = run_fresh_start_reset_retrying(&client(), &url(&m), 3, Duration::ZERO, || {
-            let creates = seen
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|q| q.contains("CREATE"))
-                .count();
-            if creates >= 2 {
-                IN_SESSION_UTC
-            } else {
-                OFF_HOURS_UTC
-            }
-        })
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            3,
+            Duration::ZERO,
+            || {
+                let creates = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|q| q.contains("CREATE"))
+                    .count();
+                if creates >= 2 {
+                    IN_SESSION_UTC
+                } else {
+                    OFF_HOURS_UTC
+                }
+            },
+            None,
+        )
         .await;
         assert_eq!(d, ResetDecision::RefuseInSession);
         assert_eq!(drops_seen(&m), 0);
@@ -2871,5 +3087,183 @@ mod tests {
         .await;
         run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await;
         assert_eq!(seen_matching(&m, "max(ts)"), RESET_TABLES.len());
+    }
+
+    // ---- live audit F3 (2026-10-29): the durable done file ----------------
+
+    fn done_temp_path(tag: &str) -> std::path::PathBuf {
+        floor_temp_dir(&format!("done-{tag}")).join("fresh_start_reset.done")
+    }
+
+    #[test]
+    fn test_write_reset_done_file_then_read_is_done_and_absent_is_absent() {
+        let path = done_temp_path("roundtrip");
+        assert_eq!(read_reset_done_file(&path), DoneFile::Absent);
+        write_reset_done_file(&path).expect("write");
+        assert_eq!(read_reset_done_file(&path), DoneFile::Done);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "tvfsr1 2026-09-19-fresh-start\n"
+        );
+        assert!(!path.with_extension("done.tmp").exists(), "no temp left");
+    }
+
+    #[test]
+    fn test_read_reset_done_file_refuses_torn_prefixes_of_encode_reset_done_file() {
+        let path = done_temp_path("torn");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let full = encode_reset_done_file();
+        for cut in 0..full.len() {
+            std::fs::write(&path, &full.as_bytes()[..cut]).unwrap();
+            assert!(matches!(read_reset_done_file(&path), DoneFile::Refused(_)));
+        }
+        std::fs::write(&path, "tvfsr1 2099-01-01-other\n").unwrap();
+        assert_eq!(read_reset_done_file(&path), DoneFile::Refused("content"));
+    }
+
+    #[test]
+    fn test_decide_with_done_file_either_record_means_done() {
+        let off = ist_secs_of_day(OFF_HOURS_UTC);
+        let on = ist_secs_of_day(IN_SESSION_UTC);
+        for ist in [off, on] {
+            for logged in [None, Some(0), Some(1)] {
+                assert_eq!(
+                    decide_with_done_file(logged, DoneFile::Done, ist),
+                    ResetDecision::AlreadyDone
+                );
+                assert_eq!(
+                    decide_with_done_file(logged, DoneFile::Absent, ist),
+                    decide(logged, ist)
+                );
+            }
+            assert_eq!(
+                decide_with_done_file(Some(1), DoneFile::Refused("content"), ist),
+                ResetDecision::AlreadyDone
+            );
+            assert_eq!(
+                decide_with_done_file(Some(0), DoneFile::Refused("content"), ist),
+                ResetDecision::RefuseUnreadable
+            );
+        }
+    }
+
+    /// F3: `schema_reset_log` was dropped (the log answers, recreated, with no
+    /// row), the done file is present: the reset does NOT run again, nothing
+    /// is dropped or renamed, and the row is written back once.
+    #[tokio::test]
+    async fn test_regression_a_dropped_reset_log_with_the_done_file_does_not_rerun() {
+        let path = done_temp_path("dropped-log");
+        write_reset_done_file(&path).unwrap();
+        let m = spawn_mock(0, true, true, None).await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            RESET_LOG_READ_ATTEMPTS,
+            Duration::ZERO,
+            || EVENING_UTC,
+            Some(&path),
+        )
+        .await;
+        assert_eq!(d, ResetDecision::AlreadyDone);
+        assert_eq!(drops_seen(&m), 0, "no DROP");
+        assert_eq!(seen_matching(&m, "RENAME"), 0, "no RENAME");
+        assert_eq!(
+            seen_matching(&m, "first-boot"),
+            0,
+            "no new first-boot marker"
+        );
+        assert_eq!(id_inserts(&m), 1, "the lost row is written back once");
+        assert_eq!(read_reset_done_file(&path), DoneFile::Done);
+
+        // A log that does not answer at all: still done, and not retried.
+        let m = spawn_mock(0, false, true, None).await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            RESET_LOG_READ_ATTEMPTS,
+            Duration::ZERO,
+            || EVENING_UTC,
+            Some(&path),
+        )
+        .await;
+        assert_eq!(d, ResetDecision::AlreadyDone);
+        assert_eq!(drops_seen(&m), 0);
+        assert_eq!(seen_matching(&m, "CREATE"), 1);
+    }
+
+    /// F3: the row is present and the file is missing: done, and the file is
+    /// written so a later dropped log cannot re-arm the reset.
+    #[tokio::test]
+    async fn test_regression_a_logged_row_without_the_done_file_is_done_and_writes_it() {
+        let path = done_temp_path("row-only");
+        let m = spawn_mock(1, true, true, None).await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            1,
+            Duration::ZERO,
+            || EVENING_UTC,
+            Some(&path),
+        )
+        .await;
+        assert_eq!(d, ResetDecision::AlreadyDone);
+        assert_eq!(drops_seen(&m), 0);
+        assert_eq!(id_inserts(&m), 0, "the row is there; nothing re-inserted");
+        assert_eq!(read_reset_done_file(&path), DoneFile::Done);
+    }
+
+    /// Neither record: the reset runs, and the done file is written after it.
+    #[tokio::test]
+    async fn test_neither_record_runs_the_reset_and_then_writes_the_done_file() {
+        let path = done_temp_path("neither");
+        let m = spawn_mock(0, true, true, None).await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            1,
+            Duration::ZERO,
+            || OFF_HOURS_UTC,
+            Some(&path),
+        )
+        .await;
+        assert_eq!(d, ResetDecision::Run);
+        assert_eq!(drops_seen(&m), drop_statements().len());
+        assert_eq!(id_inserts(&m), 1);
+        assert_eq!(read_reset_done_file(&path), DoneFile::Done);
+
+        // The next boot, its log dropped in between, does nothing.
+        let m = spawn_mock(0, true, true, None).await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            1,
+            Duration::ZERO,
+            || OFF_HOURS_UTC,
+            Some(&path),
+        )
+        .await;
+        assert_eq!(d, ResetDecision::AlreadyDone);
+        assert_eq!(drops_seen(&m), 0);
+    }
+
+    /// A done file that cannot be trusted never wipes on a guess.
+    #[tokio::test]
+    async fn test_a_refused_done_file_with_no_logged_row_refuses_the_wipe() {
+        let path = done_temp_path("refused");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "garbage").unwrap();
+        let m = spawn_mock(0, true, true, None).await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            1,
+            Duration::ZERO,
+            || OFF_HOURS_UTC,
+            Some(&path),
+        )
+        .await;
+        assert_eq!(d, ResetDecision::RefuseUnreadable);
+        assert_eq!(drops_seen(&m), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"garbage", "left as it is");
     }
 }
