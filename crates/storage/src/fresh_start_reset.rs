@@ -1466,6 +1466,9 @@ pub async fn record_market_data_floor_at_boot(
 ///   (a floor is only ever raised).
 /// - A torn file is left for inspection (the read already logged it) and the
 ///   marker floor is returned for this process only.
+/// - A marker floor more than 5 minutes ahead of the wall clock is refused
+///   (coded `error!`, nothing written); a valid file on disk still holds.
+///   A file refused for being ahead of the clock is written over.
 /// - Otherwise the floor is written (temp file, sync, rename). A failed write
 ///   is a coded `error!`; the floor is still returned for this process.
 ///
@@ -1492,8 +1495,23 @@ pub fn record_market_data_floor_after_reset(
         return None;
     };
     let floor = market_data_floor_from_marker(marker);
+    // 2026-10-29 review (item 4c): a marker so far ahead of the wall clock
+    // that its floor is more than 5 minutes in the future would set aside
+    // today's rows. Refused, never written; a valid file already on disk
+    // (itself clock-checked by the read) still holds.
+    let now = crate::market_data_floor::wall_clock_unix_nanos();
+    if crate::market_data_floor::floor_is_too_far_ahead(floor, now) {
+        crate::market_data_floor::report_floor_ahead_of_wall_clock("marker", path, floor, now);
+        return match read_market_data_floor(path) {
+            FloorRead::Floor(existing) => Some(existing),
+            FloorRead::Absent | FloorRead::Refused(_) => None,
+        };
+    }
     match read_market_data_floor(path) {
         FloorRead::Floor(existing) if existing >= floor => return Some(existing),
+        // A file refused only for being ahead of the clock is untrusted, not
+        // torn: it is written over with the marker floor below.
+        FloorRead::Refused("ahead_of_wall_clock") => {}
         FloorRead::Refused(_) => return Some(floor),
         FloorRead::Floor(_) | FloorRead::Absent => {}
     }
@@ -1683,6 +1701,115 @@ mod tests {
             Some(marker_floor)
         );
         let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-29 review (item 4c): a marker whose floor is more than 5
+    /// minutes ahead of the wall clock is refused and never written; a valid
+    /// file on disk still holds; a file refused for being ahead is written
+    /// over by a sane marker.
+    #[test]
+    fn test_record_market_data_floor_after_reset_refuses_a_marker_ahead_of_the_clock() {
+        let dir = floor_temp_dir("ahead");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("market_data_floor");
+        let hour_micros: i64 = 3_600 * 1_000_000;
+        let now_micros = crate::market_data_floor::wall_clock_unix_nanos() / 1_000;
+        // The floor is the marker less the lag margin, so a marker this far
+        // ahead puts the floor well past 5 minutes ahead.
+        let future_marker = now_micros + NEWEST_ROW_LAG_MARGIN_SECS * 1_000_000 + hour_micros;
+        assert_eq!(
+            record_market_data_floor_after_reset(
+                ResetDecision::AlreadyDone,
+                Some(future_marker),
+                &path
+            ),
+            None
+        );
+        assert!(!path.exists(), "a future floor is never written");
+        // A valid (past) file already on disk still holds.
+        let past = market_data_floor_from_marker(MARKER_UTC_MICROS);
+        crate::market_data_floor::write_market_data_floor(&path, past).unwrap();
+        assert_eq!(
+            record_market_data_floor_after_reset(
+                ResetDecision::AlreadyDone,
+                Some(future_marker),
+                &path
+            ),
+            Some(past)
+        );
+        // A file ahead of the clock is untrusted and is written over by a
+        // sane marker floor.
+        let ahead_file = (now_micros + hour_micros) * 1_000;
+        crate::market_data_floor::write_market_data_floor(&path, ahead_file).unwrap();
+        assert_eq!(
+            record_market_data_floor_after_reset(
+                ResetDecision::AlreadyDone,
+                Some(MARKER_UTC_MICROS),
+                &path
+            ),
+            Some(past)
+        );
+        assert_eq!(
+            crate::market_data_floor::read_market_data_floor(&path),
+            crate::market_data_floor::FloorRead::Floor(past)
+        );
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 4d (2026-10-29): the live box's boots after the reset ran are
+    /// AlreadyDone, decided from `schema_reset_log`. The same boot then reads
+    /// the first-boot marker from that table and produces the floor, end to
+    /// end through the real decision.
+    #[tokio::test]
+    async fn test_an_already_done_decision_from_the_reset_log_produces_the_floor() {
+        let dir = floor_temp_dir("e2e");
+        let path = dir.join("market_data_floor");
+        let done = done_temp_path("e2e-done");
+        let m = spawn_mock_with(Cfg {
+            initial_logged: 1,
+            marker: Some(MARKER_UTC_MICROS),
+            ..Cfg::default()
+        })
+        .await;
+        let decision = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            1,
+            Duration::ZERO,
+            || EVENING_UTC,
+            Some(&done),
+        )
+        .await;
+        assert_eq!(decision, ResetDecision::AlreadyDone);
+        assert_eq!(drops_seen(&m), 0, "an AlreadyDone boot drops nothing");
+        let floor = record_market_data_floor_at_boot(&client(), &url(&m), decision, &path).await;
+        assert_eq!(
+            floor,
+            Some(market_data_floor_from_marker(MARKER_UTC_MICROS))
+        );
+        assert_eq!(
+            crate::market_data_floor::read_market_data_floor(&path),
+            crate::market_data_floor::FloorRead::Floor(market_data_floor_from_marker(
+                MARKER_UTC_MICROS
+            ))
+        );
+        let marker_inserts = m
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| q.contains("INSERT") && q.contains(FIRST_BOOT_MARKER_ID))
+            .count();
+        assert_eq!(
+            marker_inserts, 0,
+            "the marker is never written on an AlreadyDone boot"
+        );
+        assert!(
+            seen_matching(&m, FIRST_BOOT_MARKER_ID) >= 1,
+            "the marker was read from the log"
+        );
+        let _cleanup = std::fs::remove_dir_all(&dir);
+        let _cleanup = done.parent().map(std::fs::remove_dir_all);
     }
 
     /// The boot read against a stand-in QuestDB: an AlreadyDone boot reads the

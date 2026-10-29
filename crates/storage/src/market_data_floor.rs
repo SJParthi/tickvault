@@ -65,6 +65,52 @@ const FLOOR_MAGIC: &str = "tvmdf1";
 /// "No floor" in the installed atomic.
 const NO_FLOOR: i64 = i64::MIN;
 
+/// How far ahead of this machine's wall clock a floor may be and still be
+/// trusted: 5 minutes. A floor further ahead (a clock that ran fast when it
+/// was written, a hand edit, a bad marker) would set aside rows captured
+/// today, so it is REFUSED and read as no floor (2026-10-29 review, item 4c).
+pub const MARKET_DATA_FLOOR_MAX_AHEAD_NANOS: i64 = 5 * 60 * 1_000_000_000;
+
+/// This machine's wall clock, Unix nanoseconds (0 if before 1970, which no
+/// floor is ahead of in practice; saturates far in the future).
+#[must_use]
+pub(crate) fn wall_clock_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Whether `floor_unix_nanos` is more than [`MARKET_DATA_FLOOR_MAX_AHEAD_NANOS`]
+/// ahead of `now_unix_nanos`. Saturating. O(1).
+#[must_use]
+pub(crate) const fn floor_is_too_far_ahead(floor_unix_nanos: i64, now_unix_nanos: i64) -> bool {
+    floor_unix_nanos > now_unix_nanos.saturating_add(MARKET_DATA_FLOOR_MAX_AHEAD_NANOS)
+}
+
+/// Logs and counts a floor refused for being too far ahead of the wall clock.
+/// `origin` names where it came from (`file` or `marker`).
+pub(crate) fn report_floor_ahead_of_wall_clock(
+    origin: &'static str,
+    path: &Path,
+    floor_unix_nanos: i64,
+    now_unix_nanos: i64,
+) {
+    metrics::counter!(MARKET_DATA_FLOOR_REFUSED_COUNTER).increment(1);
+    error!(
+        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+        source = "market_data_floor_ahead_of_wall_clock",
+        origin,
+        path = %path.display(),
+        floor_unix_nanos,
+        now_unix_nanos,
+        ahead_secs = floor_unix_nanos.saturating_sub(now_unix_nanos) / 1_000_000_000,
+        "the market-data floor is more than 5 minutes ahead of this machine's clock and is \
+         REFUSED: it would set aside rows captured today. It is treated as NO floor, so spill \
+         and WAL replays post every row as they did before the floor existed. Check the clock \
+         (chrony) and the floor file."
+    );
+}
+
 /// The floor this process judges replayed lines against, Unix nanoseconds.
 static INSTALLED_FLOOR_UNIX_NANOS: AtomicI64 = AtomicI64::new(NO_FLOOR);
 
@@ -165,9 +211,27 @@ pub fn parse_market_data_floor(bytes: &[u8]) -> Result<i64, &'static str> {
 }
 
 /// Reads the floor file at `path`. A refused file is logged as a coded
-/// `error!` and counted; the caller treats it as no floor.
+/// `error!` and counted; the caller treats it as no floor. A floor more than
+/// [`MARKET_DATA_FLOOR_MAX_AHEAD_NANOS`] ahead of the wall clock is refused
+/// too (`Refused("ahead_of_wall_clock")`).
 #[must_use]
 pub fn read_market_data_floor(path: &Path) -> FloorRead {
+    read_market_data_floor_at(path, wall_clock_unix_nanos())
+}
+
+/// [`read_market_data_floor`] against an explicit wall clock (tests).
+fn read_market_data_floor_at(path: &Path, now_unix_nanos: i64) -> FloorRead {
+    match read_market_data_floor_unchecked(path) {
+        FloorRead::Floor(floor) if floor_is_too_far_ahead(floor, now_unix_nanos) => {
+            report_floor_ahead_of_wall_clock("file", path, floor, now_unix_nanos);
+            FloorRead::Refused("ahead_of_wall_clock")
+        }
+        other => other,
+    }
+}
+
+/// The file read and strict parse, with no clock check.
+fn read_market_data_floor_unchecked(path: &Path) -> FloorRead {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return FloorRead::Absent,
@@ -393,10 +457,157 @@ mod tests {
         assert!(!wal_frame_is_below_floor(-1, Some(FLOOR)));
     }
 
+    /// Records every counter key registered, scoped with
+    /// `metrics::with_local_recorder` (never a global install).
+    #[derive(Default)]
+    struct KeyRecorder {
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl KeyRecorder {
+        fn keys(&self) -> Vec<String> {
+            self.keys.lock().map(|k| k.clone()).unwrap_or_default()
+        }
+    }
+
+    impl metrics::Recorder for KeyRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let mut labels: Vec<String> = key
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            labels.sort();
+            if let Ok(mut keys) = self.keys.lock() {
+                keys.push(format!("{}{{{}}}", key.name(), labels.join(",")));
+            }
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
     #[test]
     fn test_register_market_data_floor_baseline_can_run_twice() {
-        register_market_data_floor_baseline();
-        register_market_data_floor_baseline();
+        let recorder = KeyRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            register_market_data_floor_baseline();
+            register_market_data_floor_baseline();
+        });
+        let keys = recorder.keys();
+        // Five series per call, the same five both times.
+        assert_eq!(keys.len(), 10, "{keys:?}");
+        let mut distinct = keys;
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 5, "{distinct:?}");
+        for expected in [
+            format!("{SPILL_REPLAY_BELOW_FLOOR_COUNTER}{{dir=ticks,unit=line}}"),
+            format!("{SPILL_REPLAY_BELOW_FLOOR_COUNTER}{{dir=depth,unit=line}}"),
+            format!("{SPILL_REPLAY_BELOW_FLOOR_COUNTER}{{dir=depth,unit=file}}"),
+            format!("{MARKET_DATA_FLOOR_REFUSED_COUNTER}{{}}"),
+            format!("{WAL_REPLAY_BELOW_FLOOR_COUNTER}{{}}"),
+        ] {
+            assert!(
+                distinct.contains(&expected),
+                "{expected} not registered: {distinct:?}"
+            );
+        }
+    }
+
+    const FIVE_MIN_NANOS: i64 = 300 * 1_000_000_000;
+
+    #[test]
+    fn test_floor_is_too_far_ahead_only_past_five_minutes() {
+        assert_eq!(MARKET_DATA_FLOOR_MAX_AHEAD_NANOS, FIVE_MIN_NANOS);
+        let now = FLOOR;
+        assert!(!floor_is_too_far_ahead(now - 1, now), "the past is fine");
+        assert!(!floor_is_too_far_ahead(now, now));
+        assert!(
+            !floor_is_too_far_ahead(now + FIVE_MIN_NANOS, now),
+            "exactly 5 min"
+        );
+        assert!(floor_is_too_far_ahead(now + FIVE_MIN_NANOS + 1, now));
+        assert!(floor_is_too_far_ahead(i64::MAX, now));
+        // Saturating: a clock at the far end never overflows.
+        assert!(!floor_is_too_far_ahead(i64::MAX, i64::MAX));
+    }
+
+    #[test]
+    fn test_wall_clock_unix_nanos_is_after_2026() {
+        // 2026-01-01T00:00:00Z.
+        assert!(wall_clock_unix_nanos() > 1_767_225_600_000_000_000);
+    }
+
+    /// 2026-10-29 review (item 4c): a floor file dated more than 5 minutes
+    /// past the wall clock is refused, counted, and read as no floor.
+    #[test]
+    fn test_read_market_data_floor_refuses_a_floor_ahead_of_the_wall_clock() {
+        let dir = temp_dir("ahead");
+        let path = dir.join("market_data_floor");
+        let now = FLOOR;
+        write_market_data_floor(&path, now + FIVE_MIN_NANOS + 1).expect("write");
+        let recorder = KeyRecorder::default();
+        let read =
+            metrics::with_local_recorder(&recorder, || read_market_data_floor_at(&path, now));
+        assert_eq!(read, FloorRead::Refused("ahead_of_wall_clock"));
+        assert!(
+            recorder
+                .keys()
+                .contains(&format!("{MARKET_DATA_FLOOR_REFUSED_COUNTER}{{}}")),
+            "the refusal is counted"
+        );
+        // Up to 5 minutes ahead is accepted, and the past always is.
+        write_market_data_floor(&path, now + FIVE_MIN_NANOS).expect("write");
+        assert_eq!(
+            read_market_data_floor_at(&path, now),
+            FloorRead::Floor(now + FIVE_MIN_NANOS)
+        );
+        // Against the real clock a 2025 floor is in the past: accepted.
+        write_market_data_floor(&path, FLOOR).expect("write");
+        assert_eq!(read_market_data_floor(&path), FloorRead::Floor(FLOOR));
+        // A far-future floor against the real clock: refused, and the boot
+        // load installs nothing.
+        write_market_data_floor(&path, wall_clock_unix_nanos() + 3_600 * 1_000_000_000)
+            .expect("write");
+        assert_eq!(
+            read_market_data_floor(&path),
+            FloorRead::Refused("ahead_of_wall_clock")
+        );
+        assert_eq!(load_market_data_floor_at_boot(&path), None);
+        let _cleanup = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
