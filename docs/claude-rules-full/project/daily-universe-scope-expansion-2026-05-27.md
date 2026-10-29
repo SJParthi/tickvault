@@ -3319,3 +3319,27 @@ Every other Quote 46 / 46b row and REJECT stands (when, scope, never 08:00–16:
 - Deleting without first writing the full listing, or without the verify listing after.
 - Touching any bucket other than `tv-prod-cold`, any EBS volume or snapshot, versioning, lifecycle or bucket policy under this quote.
 - Running any step before the wipe is verified, during the rebuild or wipe, or 08:00–16:30 IST on a trading day.
+
+#### Quote 48 (2026-10-29, ~03:45 and ~10:10 IST) — START EMPTY: DELETE WHAT IS LEFT FROM BEFORE TODAY'S FIRST BOOT (preserve EXACTLY)
+
+Owner messages (2026-10-28 night): "I clealry aske dyou to make it as the fresh app dude I mean very fresh starting scratch fresh app dude so tomorrow sshoidl be purely new dude okau" and "Bro I want everything entirely to be new by tomorrow morning with a real time proof dude oaky". On a card asking whether the remaining 28 Oct market data should go too (told: no copy exists anywhere, it is gone for good), the owner tapped "Delete it, start empty (Recommended)". At ~10:10 IST on 29 Oct, asked on a card to add exactly this rule in the owner's name, the owner tapped "Yes, add Quote 48 (Recommended)".
+
+Read the next morning (read-only, 09:17 IST): the new server boots at 08:30 and captures live; leftovers are 617,000 `ticks` rows dated 9, 10 and 12 Oct (replayed from spill files the rebuild copied), the tables `ticks_pre_reset_20261029` (617,713 rows) and `market_depth_pre_reset_20261029` (10,002 rows) that the re-armed fresh-start reset renamed aside, and old spill files and WAL segments on the box that can replay them again.
+
+| Item | What Quote 48 authorizes |
+|---|---|
+| When | ONE run on 2026-10-29 after 16:30 IST (never 08:00–16:30 IST on a trading day), after the drain hold is released and the after-15:40 spill replay has finished, with the app stopped and masked; the `aws-autopilot` and `deploy-aws-after-close` workflows paused for the run and re-enabled after |
+| Box files first | Spill and DLQ files and WAL segments (`data/ws_wal`, `replaying/`, `settling/`) holding only rows dated before today's first boot (2026-10-29 08:30:38 IST); a file holding any row at or after that instant is KEPT and left to replay |
+| Box tables | Every market-data partition (`ticks`, `tick_quotes`, `market_depth`, `market_depth_book`, `feed_aux_packets`, `candles_*`) whose newest row is before 2026-10-29 08:30:38 IST, and the two tables `ticks_pre_reset_20261029` and `market_depth_pre_reset_20261029` |
+| Cloud | The 21 old `top-volume-quarantine/` objects in `tv-prod-cold` re-uploaded at the 2026-10-29 00:12 IST boot, by version id |
+| Proof | A listing before and after every step (per-day row counts, file names and sizes, object versions) |
+| Not authorized | Any row, file or object from today's capture (at or after 08:30:38 IST); any SEBI/audit table; `schema_reset_log`; `applied.tvaw`, the unapplied-ranges sidecar, the owner lock, `data/spill/audit`; any other bucket, volume or snapshot; versioning, lifecycle or policy |
+
+Quote 27 binds again after this run: no further market-data delete without a verified copy and a fresh dated quote.
+
+##### What violates Quote 48 (REJECT)
+- Any step 08:00–16:30 IST on a trading day, or with the app running.
+- Deleting a file, segment, partition or object that holds any row captured at or after 2026-10-29 08:30:38 IST.
+- Deleting `schema_reset_log`, any SEBI/audit table, the WAL control files or `data/spill/audit` under this quote.
+- Deleting without the listing before and the listing after.
+- A second run under Quote 48.
