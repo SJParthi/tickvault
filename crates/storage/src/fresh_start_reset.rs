@@ -56,7 +56,8 @@
 //! on a `NothingToWipe` boot, and on every boot that finds the row without the
 //! file; a row missing beside the file is written back once, best effort. A
 //! file that exists but does not hold the exact expected text is treated like
-//! an unreadable log: no wipe on a guess. Honest limit: a wipe that removes
+//! an unreadable log: no wipe on a guess. The file name carries the reset id,
+//! so a later id never reads an earlier id's file. Honest limit: a wipe that removes
 //! BOTH the table and `data/state/` re-arms the reset, as before.
 //!
 //! A DROP QuestDB refuses is retried [`RESET_DROP_RETRY_ROUNDS`] more times
@@ -813,8 +814,47 @@ fn record(outcome: &'static str) {
 // the reset is done when EITHER the table row or the file says so.
 
 /// Where the reset's done file lives, relative to the working directory like
-/// every other `data/state/` marker.
-pub const FRESH_START_RESET_DONE_PATH: &str = "data/state/fresh_start_reset.done";
+/// every other `data/state/` marker. The file NAME carries the reset id
+/// (review fix 2026-10-29): a later dated quote that bumps
+/// [`FRESH_START_RESET_ID`] gets a file of its own, so the previous id's file,
+/// left on every box that ran it, is never read as a damaged file for the new
+/// id (which would refuse that reset on every boot). The compile-time assert
+/// below fails the build if the id changes without this path.
+pub const FRESH_START_RESET_DONE_PATH: &str =
+    "data/state/fresh_start_reset.2026-09-19-fresh-start.done";
+
+/// The done path's fixed parts around the reset id.
+const DONE_PATH_PREFIX: &str = "data/state/fresh_start_reset.";
+const DONE_PATH_SUFFIX: &str = ".done";
+
+/// True when `path` is exactly `DONE_PATH_PREFIX + id + DONE_PATH_SUFFIX`.
+const fn done_path_names_id(path: &str, id: &str) -> bool {
+    let (p, i) = (path.as_bytes(), id.as_bytes());
+    let (pre, suf) = (DONE_PATH_PREFIX.as_bytes(), DONE_PATH_SUFFIX.as_bytes());
+    if i.is_empty() || p.len() != pre.len() + i.len() + suf.len() {
+        return false;
+    }
+    let mut k = 0;
+    while k < p.len() {
+        let want = if k < pre.len() {
+            pre[k]
+        } else if k < pre.len() + i.len() {
+            i[k - pre.len()]
+        } else {
+            suf[k - pre.len() - i.len()]
+        };
+        if p[k] != want {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+const _: () = assert!(done_path_names_id(
+    FRESH_START_RESET_DONE_PATH,
+    FRESH_START_RESET_ID
+));
 
 /// The first token of the done file; the version is in it.
 const DONE_FILE_MAGIC: &str = "tvfsr1";
@@ -3119,6 +3159,61 @@ mod tests {
         }
         std::fs::write(&path, "tvfsr1 2099-01-01-other\n").unwrap();
         assert_eq!(read_reset_done_file(&path), DoneFile::Refused("content"));
+    }
+
+    /// Review fix (2026-10-29): the done file is per reset id. A later dated
+    /// quote that bumps the id must not find the previous id's file at its
+    /// own path, read it as `Refused` and refuse every boot. The previous
+    /// id's file lives at the path its own constant names; this id's path is
+    /// a different file and reads `Absent`, so the new reset decides normally.
+    #[test]
+    fn test_regression_a_previous_reset_ids_done_file_does_not_refuse_this_id() {
+        const PRIOR_ID: &str = "2025-01-01-older-reset";
+        assert!(
+            FRESH_START_RESET_DONE_PATH.contains(FRESH_START_RESET_ID),
+            "the done path must name the reset id"
+        );
+        assert!(done_path_names_id(
+            FRESH_START_RESET_DONE_PATH,
+            FRESH_START_RESET_ID
+        ));
+        assert!(!done_path_names_id(FRESH_START_RESET_DONE_PATH, PRIOR_ID));
+        assert!(!done_path_names_id(
+            "data/state/fresh_start_reset.done",
+            FRESH_START_RESET_ID
+        ));
+        assert!(!done_path_names_id(
+            "data/state/fresh_start_reset..done",
+            ""
+        ));
+        let dir = floor_temp_dir("done-prior-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let this_name = std::path::Path::new(FRESH_START_RESET_DONE_PATH)
+            .file_name()
+            .unwrap();
+        let prior_full = FRESH_START_RESET_DONE_PATH.replace(FRESH_START_RESET_ID, PRIOR_ID);
+        let prior_name = std::path::Path::new(&prior_full).file_name().unwrap();
+        let this_path = dir.join(this_name);
+        let prior_path = dir.join(prior_name);
+        std::fs::write(&prior_path, format!("{DONE_FILE_MAGIC} {PRIOR_ID}\n")).unwrap();
+        assert_eq!(read_reset_done_file(&this_path), DoneFile::Absent);
+        let off = ist_secs_of_day(OFF_HOURS_UTC);
+        assert_eq!(
+            decide_with_done_file(Some(0), read_reset_done_file(&this_path), off),
+            decide(Some(0), off)
+        );
+        assert_ne!(
+            decide_with_done_file(Some(0), read_reset_done_file(&this_path), off),
+            ResetDecision::RefuseUnreadable
+        );
+        // This id's own file still reads Done, and a damaged one still refuses.
+        write_reset_done_file(&this_path).unwrap();
+        assert_eq!(read_reset_done_file(&this_path), DoneFile::Done);
+        std::fs::write(&this_path, "tvfsr1 2026-09-19-fresh-sta").unwrap();
+        assert_eq!(
+            read_reset_done_file(&this_path),
+            DoneFile::Refused("content")
+        );
     }
 
     #[test]
