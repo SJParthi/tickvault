@@ -6837,7 +6837,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     #[test]
     fn test_split_below_floor_keeps_everything_with_no_floor() {
         let chunk = format!("{}{}", tick_line_on_day(0), tick_line_on_day(7));
-        let mut below = vec![0..1];
+        let mut below = vec![0..1, 2..3]; // stale ranges the call must clear
         let kept = split_below_floor(chunk.as_bytes(), None, &mut below);
         assert!(below.is_empty());
         assert!(matches!(kept, std::borrow::Cow::Borrowed(_)));
