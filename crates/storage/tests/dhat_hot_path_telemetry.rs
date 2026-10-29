@@ -89,7 +89,7 @@ fn dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation() {
         "stage_quantiles allocated on the publisher thread"
     );
 
-    // The 60-second rolling maximum (live audit HP-2, 2026-10-29): one push
+    // The rolling 75-publish maximum (live audit HP-2, 2026-10-29): one push
     // per stage per second on the publisher thread, a fixed ring.
     let mut rolling = [RollingMax::new(); ALL_STAGES.len()];
     let (r_bytes, r_blocks) = dhat_support::measure_with_phantom_retry(

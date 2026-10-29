@@ -324,18 +324,43 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// ([`ws_lag_class`], one compare and one relaxed `fetch_max`), published
 /// beside this one as `tv_dhan_ws_lag_max_ms_by_class`.
 fn record_ws_lag_max(segment_code: u8, exchange_timestamp: u32, received_at_nanos: i64) {
+    record_ws_lag_max_into(
+        &WS_LAG_MAX_MILLIS,
+        &ws_lag_class::WS_LAG_MAX_BY_CLASS,
+        segment_code,
+        exchange_timestamp,
+        received_at_nanos,
+    );
+}
+
+/// The body of [`record_ws_lag_max`], over the cells it writes. Production
+/// passes the two statics; tests pass their own cells, so they never race the
+/// lib tests that run the real drain against the shared statics.
+#[inline]
+fn record_ws_lag_max_into(
+    max_millis: &std::sync::atomic::AtomicI64,
+    by_class: &ws_lag_class::LagMaxByClass,
+    segment_code: u8,
+    exchange_timestamp: u32,
+    received_at_nanos: i64,
+) {
     if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
         && lag_ms > 0
     {
-        WS_LAG_MAX_MILLIS.fetch_max(lag_ms, Ordering::Relaxed);
-        ws_lag_class::WS_LAG_MAX_BY_CLASS.note(segment_code, lag_ms);
+        max_millis.fetch_max(lag_ms, Ordering::Relaxed);
+        by_class.note(segment_code, lag_ms);
     }
 }
 
 /// Takes the lag maximum and RESETS it, in milliseconds. Lossless: saturates
 /// at `u32::MAX` ms (~49 days), which no real delay reaches.
 fn take_ws_lag_max_ms() -> f64 {
-    let millis = WS_LAG_MAX_MILLIS.swap(0, Ordering::Relaxed);
+    take_ws_lag_max_ms_from(&WS_LAG_MAX_MILLIS)
+}
+
+/// The body of [`take_ws_lag_max_ms`], over one cell.
+fn take_ws_lag_max_ms_from(max_millis: &std::sync::atomic::AtomicI64) -> f64 {
+    let millis = max_millis.swap(0, Ordering::Relaxed);
     f64::from(u32::try_from(millis).unwrap_or(u32::MAX))
 }
 
@@ -19114,33 +19139,88 @@ mod tests {
 
     #[test]
     fn test_ws_lag_max_takes_the_largest_and_resets() {
-        let _ = take_ws_lag_max_ms();
-        const FNO_CODE: u8 = 2;
-        // The class split (LH-05) leaves this gauge unchanged: it still
-        // takes the maximum across every segment, index and cash included.
-        record_ws_lag_max(0, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 30_000_000_000);
-        record_ws_lag_max(
-            FNO_CODE,
-            LTT_IST_SECS,
-            SIMULTANEOUS_RECV_NANOS + 2_000_000_000,
-        );
-        record_ws_lag_max(
-            FNO_CODE,
-            LTT_IST_SECS,
-            SIMULTANEOUS_RECV_NANOS + 46_000_000_000,
-        );
-        record_ws_lag_max(FNO_CODE, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
+        use super::ws_lag_class::{LagClass, LagMaxByClass};
+        // Own cells: the lib tests that run the real drain write the shared
+        // statics, so reading those here would race.
+        let max = std::sync::atomic::AtomicI64::new(0);
+        let by_class = LagMaxByClass::new();
+        let idx = ExchangeSegment::IdxI.binary_code();
+        let fno = ExchangeSegment::NseFno.binary_code();
+        let rec = |code: u8, ts: u32, recv: i64| {
+            record_ws_lag_max_into(&max, &by_class, code, ts, recv);
+        };
+        // The class split (LH-05) leaves this gauge unchanged: it still takes
+        // the maximum across every segment. The INDEX tick carries the largest
+        // lag, so this fails if index ticks stop reaching the shared maximum.
+        rec(idx, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 61_000_000_000);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 2_000_000_000);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 46_000_000_000);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
         // A negative (truncation floor) and a garbage stamp add nothing.
-        record_ws_lag_max(
-            FNO_CODE,
-            LTT_IST_SECS,
-            SIMULTANEOUS_RECV_NANOS - 900_000_000,
-        );
-        record_ws_lag_max(FNO_CODE, 0, SIMULTANEOUS_RECV_NANOS);
-        assert!((take_ws_lag_max_ms() - 46_000.0).abs() < f64::EPSILON);
+        rec(fno, LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS - 900_000_000);
+        rec(fno, 0, SIMULTANEOUS_RECV_NANOS);
+        assert!((take_ws_lag_max_ms_from(&max) - 61_000.0).abs() < f64::EPSILON);
         assert!(
-            take_ws_lag_max_ms().abs() < f64::EPSILON,
+            take_ws_lag_max_ms_from(&max).abs() < f64::EPSILON,
             "must reset on read"
+        );
+        // The same samples reached the class cells (fails if the `note` in
+        // `record_ws_lag_max_into` is removed).
+        assert!(
+            (by_class.take_published(LagClass::IndexSpot, 0) - 61_000.0).abs() < f64::EPSILON,
+            "the index tick must reach the index_spot class"
+        );
+        assert!(
+            (by_class.take_published(LagClass::Fno, 0) - 46_000.0).abs() < f64::EPSILON,
+            "the contract ticks must reach the fno class"
+        );
+    }
+
+    /// LH-05 wiring: the per-tick recorder writes the shared statics the
+    /// publish reads, the drain calls that recorder, and the report arm's
+    /// publish reaches the per-class gauges. The behaviour of each piece is
+    /// tested on private cells; this pins that production joins them.
+    #[test]
+    fn test_ws_lag_class_split_is_wired_into_the_drain_and_the_publish() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+        fn body_of<'a>(prod: &'a str, sig: &str) -> &'a str {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+            let rest = &prod[start..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        }
+        let record = body_of(prod, "fn record_ws_lag_max(segment_code: u8,");
+        assert!(
+            record.contains("&WS_LAG_MAX_MILLIS,")
+                && record.contains("&ws_lag_class::WS_LAG_MAX_BY_CLASS,"),
+            "record_ws_lag_max must write the two statics the publish reads"
+        );
+        let into = body_of(prod, "fn record_ws_lag_max_into(");
+        assert!(
+            into.contains("max_millis.fetch_max(lag_ms, Ordering::Relaxed);")
+                && into.contains("by_class.note(segment_code, lag_ms);"),
+            "both maxima must take every positive lag"
+        );
+        let drain = body_of(prod, "pub fn drain_main_feed_frame(");
+        let call = drain
+            .split_once("record_ws_lag_max(")
+            .expect("the drain must call record_ws_lag_max")
+            .1;
+        assert!(
+            call.trim_start().starts_with("tick.exchange_segment_code,"),
+            "the drain must pass each tick's segment byte to the recorder"
+        );
+        let publish = body_of(prod, "fn publish_fold_depth(ingest: &LiveIngest) {");
+        assert!(
+            publish.contains("ws_lag_class::publish_ws_lag_max_by_class(now_ms);"),
+            "the report arm must publish the per-class maximum"
+        );
+        let class_src = include_str!("dhan_feed_stack/ws_lag_class.rs");
+        let class_prod = &class_src[..class_src.find("#[cfg(test)]").unwrap_or(class_src.len())];
+        let class_publish = body_of(class_prod, "pub(super) fn publish_ws_lag_max_by_class(");
+        assert!(
+            class_publish.contains("WS_LAG_MAX_BY_CLASS.take_published("),
+            "the per-class publish must read the static the recorder writes"
         );
     }
 

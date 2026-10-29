@@ -99,7 +99,7 @@ impl LagMaxByClass {
 
     /// Takes one class's window maximum (reset on read), folds it into that
     /// class's 60 s peak hold at `now_ms`, and returns the value to publish.
-    fn take_published(&self, class: LagClass, now_ms: i64) -> f64 {
+    pub(super) fn take_published(&self, class: LagClass, now_ms: i64) -> f64 {
         let i = class as usize;
         let millis = self.max_millis[i].swap(0, Ordering::Relaxed);
         let sample = f64::from(u32::try_from(millis).unwrap_or(u32::MAX));
@@ -190,12 +190,5 @@ mod tests {
         // The window closes at 60 s with its maximum; the next one is quiet.
         assert!((by_class.take_published(LagClass::Fno, 60_000) - 152_000.0).abs() < f64::EPSILON);
         assert!(by_class.take_published(LagClass::Fno, 120_000).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_publish_ws_lag_max_by_class_runs_without_a_recorder() {
-        WS_LAG_MAX_BY_CLASS.note(ExchangeSegment::NseFno.binary_code(), 10);
-        publish_ws_lag_max_by_class(0);
-        assert_eq!(class_gauges().len(), CLASS_COUNT);
     }
 }
