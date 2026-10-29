@@ -485,6 +485,18 @@ pub fn sibling_markers_dir(path: &Path) -> Option<PathBuf> {
     path.parent().map(|p| p.join(UPLOADED_SUBDIR))
 }
 
+/// The marker recorded in `<dir>/uploaded/` for the file at `path` (see
+/// [`sibling_markers_dir`]), `None` when absent or unreadable. Lets a caller
+/// that holds a store re-check that the copy the marker names is still in
+/// the bucket (the instrument snapshot pass, before its sweep). Cold path:
+/// one small file read.
+#[must_use]
+pub fn read_sibling_marker(path: &Path) -> Option<UploadMarker> {
+    let markers = sibling_markers_dir(path)?;
+    let name = path.file_name()?.to_str()?;
+    read_marker(&markers, name)
+}
+
 /// Whether a spill or quarantine prune may delete a file (operator Quotes 27
 /// + 28: no market-data delete without a verified copy). Config:
 /// `[raw_frame_archive] require_upload_before_prune`.
@@ -2446,6 +2458,22 @@ mod tests {
         let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
         assert_eq!(m.raw_len, 12);
         assert_eq!(m.raw_mtime_secs, mtime_secs_of(&meta));
+    }
+
+    #[test]
+    fn test_read_sibling_marker_returns_the_recorded_key_or_none() {
+        let dir = temp_wal_dir("sibling-read");
+        let file = plant(&dir, DAY_FILE, b"twelve bytes");
+        assert!(read_sibling_marker(&file).is_none(), "no marker yet");
+        write_file_marker_for_test(&file);
+        let m = read_sibling_marker(&file).expect("marker"); // APPROVED: test-only
+        assert_eq!(m.raw_len, 12);
+        assert_eq!(
+            Some(m),
+            read_marker(&dir.join(UPLOADED_SUBDIR), DAY_FILE),
+            "the same marker the prune reads"
+        );
+        assert!(read_sibling_marker(Path::new("/")).is_none());
     }
 
     #[test]

@@ -352,9 +352,15 @@ is skipped and counted on `outcome="entry_unreadable"`.
 **What to do:** check S3 reachability from the box
 (`aws s3 ls s3://tv-prod-cold/instrument-snapshots/`); the next day's pass
 retries every date still missing. Never delete a local artifact by hand
-before its copy exists. The console's QuestDB wipe and Docker reset/nuke
-actions remove `data/instrument-cache` whole: run them only after the day's
-copies exist.
+before its copy exists. Since the 2026-10-28 review the console's QuestDB wipe
+and Docker reset/nuke actions keep `data/instrument-cache` (they used to remove
+it whole). The local sweep now runs inside the copy task, after a pass that
+re-checked every marked file's copy with a HeadObject: a copy the bucket no
+longer holds (a bucket-wide delete) drops its marker, counts on
+`outcome="copy_gone"`, logs a coded STORAGE-GAP-04 `warn!` with
+`source = "instrument_snapshot_copy_gone"`, and is copied again; a re-check the
+bucket does not answer counts on `outcome="recheck_failed"`, logs
+`source = "instrument_snapshot_recheck_failed"`, and that pass sweeps nothing.
 
 ### 2026-09-22 note — the one-shot fresh-start reset emits this code
 

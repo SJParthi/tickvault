@@ -776,7 +776,7 @@ fn artifact_retention_cutoff(today_ist: &str) -> Option<String> {
 /// What one sweep did. Returned rather than logged inside so the decision
 /// logic is testable without a filesystem.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct SweepTally {
+pub(crate) struct SweepTally {
     removed: usize,
     bytes: u64,
     /// Files whose names this sweep does not recognise. Counted, never removed.
@@ -816,11 +816,15 @@ struct SweepTally {
 /// delete costs the session its universe -- strictly worse.
 ///
 /// O(files in the directory), once per day, on the cold daily-rider path.
-fn sweep_stale_artifacts(today_ist: &str) -> SweepTally {
+fn sweep_stale_artifacts(
+    today_ist: &str,
+    proven: &std::collections::BTreeSet<String>,
+) -> SweepTally {
     sweep_stale_artifacts_in(
         std::path::Path::new(MAPPING_DIR),
         today_ist,
         tickvault_storage::raw_frame_upload::CopyGate::Required,
+        proven,
     )
 }
 
@@ -832,10 +836,21 @@ fn sweep_stale_artifacts(today_ist: &str) -> SweepTally {
 /// that `.json` exists with a verified copy, and kept and counted otherwise.
 /// The `uploaded/` marker folder is skipped, never counted as unknown, and a
 /// deleted file's marker is removed with it.
-fn sweep_stale_artifacts_in(
+///
+/// Under `CopyGate::Required` the marker alone is NOT enough (2026-10-28
+/// review): the file's name must also be in `proven`, the names whose copy
+/// the snapshot pass that ran just before this sweep confirmed itself (a
+/// HeadObject that matched, or a fresh upload it verified). A marker that
+/// survived its copy (a bucket-wide delete, then a marker unlink that failed
+/// and a re-upload that failed too) therefore deletes nothing. A `.json.tmp`
+/// leftover follows its `.json` sibling's proof. `proven` is ignored under
+/// `CopyGate::NotRequired` (no copy required). One `BTreeSet` probe per old
+/// file, O(log proven), cold.
+pub(crate) fn sweep_stale_artifacts_in(
     dir: &std::path::Path,
     today_ist: &str,
     gate: tickvault_storage::raw_frame_upload::CopyGate,
+    proven: &std::collections::BTreeSet<String>,
 ) -> SweepTally {
     let mut tally = SweepTally::default();
     let Some(cutoff) = artifact_retention_cutoff(today_ist) else {
@@ -884,14 +899,14 @@ fn sweep_stale_artifacts_in(
         };
         let is_snapshot = !name.ends_with(ARTIFACT_TMP_SUFFIX);
         let copied = if is_snapshot {
-            gate.allows_delete(&path, &meta)
+            gate.allows_delete(&path, &meta) && (!gate.copy_in_s3() || proven.contains(name))
         } else {
             // A crash leftover is never copied itself. It may go only when the
             // complete `.json` of the same name exists with its own verified
             // copy; otherwise it could be the only record of that day (every
             // attempt died between write and rename), so it is kept and
             // counted (Quote 44).
-            tmp_sibling_is_copied(&path, gate)
+            tmp_sibling_is_copied(&path, gate, proven)
         };
         if !copied {
             tally.held_without_copy += 1;
@@ -921,11 +936,13 @@ fn sweep_stale_artifacts_in(
 }
 
 /// Whether the complete `.json` beside the `.json.tmp` leftover at `tmp_path`
-/// exists and `gate` allows deleting it (its verified S3 copy is recorded).
+/// exists, `gate` allows deleting it (its verified S3 copy is recorded) and
+/// its copy is in `proven` (confirmed by the pass just before this sweep).
 /// `false` for any other name or an unreadable sibling: keep the leftover.
 fn tmp_sibling_is_copied(
     tmp_path: &std::path::Path,
     gate: tickvault_storage::raw_frame_upload::CopyGate,
+    proven: &std::collections::BTreeSet<String>,
 ) -> bool {
     let Some(json_name) = tmp_path
         .file_name()
@@ -938,7 +955,11 @@ fn tmp_sibling_is_copied(
         // No copy is required (the shape before Quote 44): age alone.
         return true;
     }
-    let json_path = tmp_path.with_file_name(format!("{json_name}.json"));
+    let json_file = format!("{json_name}.json");
+    if !proven.contains(&json_file) {
+        return false;
+    }
+    let json_path = tmp_path.with_file_name(json_file);
     std::fs::metadata(&json_path)
         .is_ok_and(|meta| meta.is_file() && gate.allows_delete(&json_path, &meta))
 }
@@ -1175,12 +1196,37 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // otherwise.
     persist_constituents(questdb, date, &outcome).await;
 
-    // Retention, LAST: after every artifact for today has landed and after the
-    // SEBI tables above are written. Ordering is the safety property -- a sweep
-    // that ran first could delete the only artifact a failed build would have
-    // left the lane, and the lane's fallback is four index SIDs.
+    // Retention does NOT run here any more (2026-10-28, Quote 44 review): it
+    // runs in the snapshot task the rider starts after this build returns,
+    // after a pass that re-checked every marked copy against the cold bucket
+    // (`sweep_artifacts_after_verified_copies`). A marker can outlive its
+    // copy (a bucket-wide delete), and only that task holds a bucket client.
+    // It still runs after every artifact for today has landed: the rider
+    // starts it only after this build succeeded.
+
+    Ok(outcome)
+}
+
+/// The retention sweep, run by the snapshot task only after a pass that
+/// re-checked every marked copy against the cold bucket
+/// ([`crate::instrument_snapshot_upload`], `SnapshotPassSummary::sweep_allowed`).
+/// Ordering is the safety property: it runs after today's build succeeded
+/// (the rider starts the task only then), so it can never delete the only
+/// artifact a failed build would have left the lane, and after the re-check,
+/// so a marker whose copy was deleted from the bucket deletes nothing.
+/// `proven` names the files whose copy that pass confirmed itself; a file
+/// outside it is kept whatever its marker says (`sweep_stale_artifacts_in`).
+/// The folder walk runs off the shared worker (`off_worker`).
+// TEST-EXEMPT: thin wrapper (off_worker + counter + log) over
+// `sweep_stale_artifacts_in`, whose behaviour is tested directly; the call
+// site and the held-counter emit are pinned by source in
+// `test_sweep_artifacts_after_verified_copies_counts_the_held_files`.
+pub(crate) fn sweep_artifacts_after_verified_copies(
+    date: &str,
+    proven: &std::collections::BTreeSet<String>,
+) {
     // Sweep S5: the directory walk runs off the shared tokio worker.
-    let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date));
+    let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date, proven));
     metrics::counter!(crate::instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER)
         .increment(swept.held_without_copy as u64);
     if swept.removed > 0 || swept.failed > 0 || swept.held_without_copy > 0 {
@@ -1194,8 +1240,6 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
             "stale instrument artifacts swept (a file with no verified S3 copy is kept)"
         );
     }
-
-    Ok(outcome)
 }
 
 /// Persists the resolved mapping into the SEBI `index_constituency` table.
@@ -1783,8 +1827,11 @@ async fn run_dhan_universe_rider(
                     // bucket, verified. Its own task, after the build: the
                     // live lane already has its mapping artifact, so nothing
                     // here can delay it. A running pass is not doubled; it runs once more.
+                    // The retention sweep runs in that task, after the pass
+                    // re-checked every marked copy against the bucket.
                     drop(crate::instrument_snapshot_upload::spawn_snapshot_upload(
                         snapshot_bucket.clone(),
+                        today.clone(),
                     ));
                 }
                 Err(err) => {
@@ -2068,11 +2115,13 @@ mod tests {
         );
     }
 
-    /// The daily build publishes every artifact the sweep KEPT for lack of a
-    /// verified copy on the held counter (Quote 44): without it a broken copy
-    /// would only grow the folder, with no number anywhere saying so.
+    /// The sweep publishes every artifact it KEPT for lack of a verified copy
+    /// on the held counter (Quote 44): without it a broken copy would only
+    /// grow the folder, with no number anywhere saying so. Since the 2026-10-28
+    /// review the sweep runs in the snapshot task after a pass that re-checked
+    /// every marked copy against the bucket, never inside `build_once`.
     #[test]
-    fn test_build_once_counts_the_sweep_held_files_on_the_held_counter() {
+    fn test_sweep_artifacts_after_verified_copies_counts_the_held_files() {
         let src = include_str!("dhan_universe.rs");
         let prod = src
             .split("\n#[cfg(test)]\nmod tests")
@@ -2081,11 +2130,27 @@ mod tests {
         let build_at = prod
             .find("async fn build_once(")
             .expect("`build_once` must exist");
-        let build = &prod[build_at..];
-        let sweep_at = build
-            .find("sweep_stale_artifacts(date)")
-            .expect("`build_once` must run the sweep");
-        let after = &build[sweep_at..];
+        let build_end = build_at
+            + prod[build_at..]
+                // The escape is a closing brace, written escaped so the braces on
+                // this line stay balanced for the banned-pattern scanner's
+                // test-module tracking.
+                .find("\n\u{7d}\n")
+                .expect("`build_once` body must close");
+        assert!(
+            !prod[build_at..build_end].contains("sweep_stale_artifacts("),
+            "`build_once` must not sweep: it holds no bucket client to re-check a \
+             marker against, so a marker whose copy was deleted would let it delete \
+             the only remaining file"
+        );
+        let fn_at = prod
+            .find("pub(crate) fn sweep_artifacts_after_verified_copies(")
+            .expect("the sweep wrapper must exist");
+        let wrapper = &prod[fn_at..];
+        let sweep_at = wrapper
+            .find("sweep_stale_artifacts(date, proven)")
+            .expect("the wrapper must run the sweep");
+        let after = &wrapper[sweep_at..];
         let held_at = after
             .find("instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER")
             .expect("the held counter must be bumped after the sweep");
@@ -2267,7 +2332,12 @@ mod tests {
 
         // Sweeping as if today were 1999-01-08: the cutoff is 1999-01-01, so
         // the 01-01 files are AT the cutoff and kept.
-        let at_cutoff = sweep_stale_artifacts_in(&dir, "1999-01-08", CopyGate::NotRequired);
+        let at_cutoff = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-08",
+            CopyGate::NotRequired,
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(
             at_cutoff.removed, 0,
             "a file exactly at the cutoff is inside the window and must be kept"
@@ -2276,7 +2346,12 @@ mod tests {
 
         // One day later the 01-01 files fall out; the 01-08 one and the
         // foreign name stay.
-        let past_cutoff = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::NotRequired);
+        let past_cutoff = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-09",
+            CopyGate::NotRequired,
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(
             past_cutoff.removed, 2,
             "both the .json and its .tmp sibling go, and nothing else"
@@ -2334,7 +2409,16 @@ mod tests {
         // The file changed after its copy: the marker no longer matches.
         std::fs::write(&stale_marker, b"{\"rows\":1,\"rewritten\":true}").unwrap();
 
-        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required);
+        // Both marked files were proven by the pass; the stale marker still
+        // blocks its file because the marker no longer matches it.
+        let proven: std::collections::BTreeSet<String> = [
+            "dhan-contracts-1999-01-01.json",
+            "dhan-ntm-spot-1999-01-01.json",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required, &proven);
         assert!(!copied.exists(), "a verified copy lets the file go");
         assert!(
             !dir.join(UPLOADED_SUBDIR)
@@ -2365,6 +2449,58 @@ mod tests {
             tally.skipped_unknown, 0,
             "the marker folder is not an unknown artifact: {tally:?}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 2026-10-28 review: a marker that matches its file is NOT enough to
+    /// delete it. The file must also be in `proven` (the pass just before
+    /// the sweep confirmed its copy). A matching marker this pass did not
+    /// prove (its copy was found gone, the unlink of the marker failed and
+    /// the re-upload failed) keeps the file, and its `.json.tmp` leftover.
+    #[test]
+    fn test_sweep_stale_artifacts_in_keeps_a_marked_file_this_pass_did_not_prove() {
+        use tickvault_storage::raw_frame_upload::{CopyGate, UPLOADED_SUBDIR};
+        let dir = sweep_scratch_dir("unproven");
+        let proven_file = dir.join("dhan-contracts-1999-01-01.json");
+        let unproven_file = dir.join("dhan-nse-mapping-1999-01-01.json");
+        let unproven_tmp = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        for p in [&proven_file, &unproven_file, &unproven_tmp] {
+            std::fs::write(p, b"{\"rows\":1}").unwrap();
+        }
+        // Both carry a marker that matches the file's length and mtime.
+        mark_copied(&proven_file);
+        mark_copied(&unproven_file);
+        let proven: std::collections::BTreeSet<String> =
+            std::iter::once("dhan-contracts-1999-01-01.json".to_string()).collect();
+
+        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required, &proven);
+        assert!(!proven_file.exists(), "proven and marked: deleted");
+        assert!(
+            unproven_file.exists(),
+            "a matching marker this pass did not prove deletes nothing"
+        );
+        assert!(
+            dir.join(UPLOADED_SUBDIR)
+                .join("dhan-nse-mapping-1999-01-01.json")
+                .exists(),
+            "the kept file keeps its marker"
+        );
+        assert!(
+            unproven_tmp.exists(),
+            "a leftover beside an unproven .json is kept"
+        );
+        assert_eq!(tally.removed, 1, "{tally:?}");
+        assert_eq!(tally.held_without_copy, 2, "{tally:?}");
+
+        // An empty proof set (a pass that proved nothing) deletes nothing.
+        let none = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-09",
+            CopyGate::Required,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(none.removed, 0, "{none:?}");
+        assert!(unproven_file.exists() && unproven_tmp.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

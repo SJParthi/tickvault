@@ -163,7 +163,8 @@ const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 /// fields as absent, exact number/string coercion; see
 /// `normalize_order_update_frame`), then deserialized into the derived
 /// `OrderUpdateMessage` struct. Structural errors (malformed JSON,
-/// missing/null/non-object `Data`) keep failing exactly as before.
+/// missing/null/non-object `Data`, a top-level array) keep failing; an
+/// array `Data` or top-level array is refused before the typed parse.
 ///
 /// # Arguments
 /// * `json_str` — Raw JSON string from the WebSocket.
@@ -181,8 +182,28 @@ pub fn parse_order_update(json_str: &str) -> Result<OrderUpdate, OrderUpdatePars
     }
     let mut value: serde_json::Value = serde_json::from_str(json_str)?;
     normalize_order_update_frame(&mut value);
+    refuse_array_frame(&value)?;
     let message: OrderUpdateMessage = serde_json::from_value(value)?;
     Ok(message.data)
+}
+
+/// Refuses a top-level array or an array `Data` (after the wrapper casing
+/// pass) as a structural error. Without this, serde's derived sequence
+/// visitor decodes `{"Data":[...]}` POSITIONALLY (or as an all-default
+/// update for `[]`) and `[{"Data":{...}}]` as a hollow update, bypassing
+/// the casing and coercion pass. Scalar and null `Data` already fail the
+/// typed parse. Pure, O(1), no allocation on the accept path.
+fn refuse_array_frame(value: &serde_json::Value) -> Result<(), OrderUpdateParseError> {
+    let is_array = value.is_array() || value.get("Data").is_some_and(serde_json::Value::is_array);
+    if is_array {
+        return Err(OrderUpdateParseError::JsonError(
+            <serde_json::Error as serde::de::Error>::invalid_type(
+                serde::de::Unexpected::Seq,
+                &"an object",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Normalizes a raw order-update frame in place before the typed parse.
@@ -423,10 +444,21 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 ///   values without `.0`). `AlgoOrdNo` keeps its own quirk kind
 ///   (`numeric_algo_ord_no`, the live doc table types it `float`). A
 ///   [`INTEGRAL_ID_TEXT_FIELDS`] field accepts integral numbers only.
-/// - Int field holding a string → the integer it spells (`"50"`, `"50.0"`);
-///   an empty string → remove.
-/// - Int field holding an integral float (`50.0`) inside the `i64` range →
-///   that integer.
+/// - Int field holding a string → the integer it spells EXACTLY (`"50"`,
+///   `"50.0"`, `"1e3"`; see [`exact_decimal_i64`]); a fractional or
+///   out-of-range spelling is kept (loud), never rounded; an empty string →
+///   remove.
+/// - Int field holding an integral float (`50.0`) with magnitude below 2^52
+///   → that integer. This serde_json build (no `float_roundtrip`) can read a
+///   JSON number up to about 1 off in absolute terms near 2^52; below 2^52
+///   the `f64` spacing is at most 0.5, so that error makes the value
+///   fractional (kept, loud), never a neighbouring integer. At or past 2^52
+///   the spacing is 1 or more and an error can land on another integer
+///   (`8000000000000007.0` reads as 8000000000000006), so it is kept (loud). Honest limit: serde has
+///   already rounded a JSON number to `f64` before this runs, so a
+///   fractional wire number whose nearest `f64` is integral
+///   (`1.00000000000000001`) reads as that integer; only a string spelling
+///   is judged digit by digit.
 /// - Float field holding a string → the finite number it spells; an empty
 ///   string → remove.
 /// - Anything else (a fractional quantity, `"ten"`, an object, an array, a
@@ -467,7 +499,7 @@ fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> Field
             if let Ok(integral) = trimmed.parse::<i64>() {
                 return FieldFix::Replace(Value::from(integral), "numeric_string_coerced");
             }
-            match trimmed.parse::<f64>().ok().and_then(exact_i64) {
+            match exact_decimal_i64(trimmed) {
                 Some(integral) => {
                     FieldFix::Replace(Value::from(integral), "numeric_string_coerced")
                 }
@@ -475,7 +507,14 @@ fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> Field
             }
         }
         (FieldKind::Int, Value::Number(number)) if number.as_i64().is_none() => {
-            match number.as_f64().and_then(exact_i64) {
+            // Only below 2^52 (see F64_INT_COERCE_LIMIT): there a misread
+            // JSON number turns fractional and is refused; at or past it a
+            // misread can name a neighbouring integer, so it is refused.
+            match number
+                .as_f64()
+                .filter(|float| float.abs() < F64_INT_COERCE_LIMIT)
+                .and_then(exact_i64)
+            {
                 Some(integral) => {
                     FieldFix::Replace(Value::from(integral), "integral_float_coerced")
                 }
@@ -513,6 +552,116 @@ fn exact_i64(float: f64) -> Option<i64> {
     }
 }
 
+/// 2^52, the magnitude below which a JSON-number Int is coerced.
+///
+/// Being an exact `f64` is not enough (every integer below 2^53 is one):
+/// without serde_json `float_roundtrip`, a number such as `v.0` or `v0e-1`
+/// is read as an integer significand rounded to `f64`, then multiplied or
+/// divided by an exact power of ten (the significand keeps at most about 19
+/// digits, so an integral result below 2^52 needs a power of at most
+/// 10^19, inside the exact range up to 10^22) and rounded again. Two
+/// roundings of at most half a unit each put the result within
+/// `v x 2^-52` of `v`, which is under 1 for `v < 2^52`. There the `f64`
+/// spacing is at most 0.5, so a misread lands on a fraction (refused by
+/// `exact_i64`), never on another integer. In [2^52, 2^53) the spacing is 1
+/// and `8000000000000007.0` reads as 8000000000000006. Raising this needs
+/// `float_roundtrip` (owner approval). Order Int fields are far below it.
+const F64_INT_COERCE_LIMIT: f64 = 4_503_599_627_370_496.0;
+
+/// The `i64` a decimal string spells EXACTLY, never rounded: an optional
+/// sign, digits with an optional `.` fraction, an optional `e`/`E`
+/// exponent (the `f64` grammar without `inf`/`nan`). `None` when the value
+/// has a non-zero fractional part (`"50.5"`, `"5e-1"`), lies outside the
+/// `i64` range, or the text is not such a decimal. Unlike a parse through
+/// `f64`, `"9007199254740993.0"` is 9007199254740993, never 2^53.
+///
+/// Pure, O(text length), no allocation. Cold: the order-update read task.
+fn exact_decimal_i64(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    let (negative, rest) = match bytes.split_first() {
+        Some((b'-', after)) => (true, after),
+        Some((b'+', after)) => (false, after),
+        _ => (false, bytes),
+    };
+    let int_len = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let (int_digits, rest) = rest.split_at(int_len);
+    let (frac_digits, rest) = match rest.split_first() {
+        Some((b'.', after)) => {
+            let frac_len = after.iter().take_while(|b| b.is_ascii_digit()).count();
+            after.split_at(frac_len)
+        }
+        _ => rest.split_at(0),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    let exponent: i64 = match rest.split_first() {
+        None => 0,
+        Some((b'e' | b'E', after)) => {
+            let (exp_negative, exp_digits) = match after.split_first() {
+                Some((b'-', digits)) => (true, digits),
+                Some((b'+', digits)) => (false, digits),
+                _ => (false, after),
+            };
+            if exp_digits.is_empty() || !exp_digits.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let magnitude = exp_digits.iter().fold(0i64, |acc, digit| {
+                acc.saturating_mul(10)
+                    .saturating_add(i64::from(digit.saturating_sub(b'0')))
+            });
+            if exp_negative {
+                0i64.saturating_sub(magnitude)
+            } else {
+                magnitude
+            }
+        }
+        Some(_) => return None,
+    };
+    let digits = || int_digits.iter().chain(frac_digits);
+    let total = int_digits.len().saturating_add(frac_digits.len());
+    let trailing_zeros = digits().rev().take_while(|&&digit| digit == b'0').count();
+    if trailing_zeros == total {
+        return Some(0);
+    }
+    // Value = (all digits as an integer) x 10^shift.
+    let shift = exponent.saturating_sub(i64::try_from(frac_digits.len()).ok()?);
+    let (keep, scale) = if shift < 0 {
+        let drop = usize::try_from(shift.unsigned_abs()).ok()?;
+        if drop > trailing_zeros {
+            return None; // a non-zero digit sits after the decimal point
+        }
+        (total.saturating_sub(drop), 0)
+    } else {
+        (total, shift.unsigned_abs())
+    };
+    // 2^63 - 1, or 2^63 for a negative value (i64::MIN).
+    let limit = u128::from(i64::MAX.unsigned_abs()).saturating_add(u128::from(negative));
+    let mut magnitude: u128 = 0;
+    for digit in digits().take(keep) {
+        magnitude = magnitude
+            .saturating_mul(10)
+            .saturating_add(u128::from(digit.saturating_sub(b'0')));
+        if magnitude > limit {
+            return None;
+        }
+    }
+    // `magnitude` holds a non-zero digit here, so this ends within 20 steps.
+    for _ in 0..scale {
+        magnitude = magnitude.saturating_mul(10);
+        if magnitude > limit {
+            return None;
+        }
+    }
+    let signed = i128::try_from(magnitude).ok()?;
+    i64::try_from(if negative {
+        signed.checked_neg()?
+    } else {
+        signed
+    })
+    .ok()
+}
+
 /// Builds the login JSON message for the order update WebSocket.
 ///
 /// Must be sent immediately after WebSocket connection is established.
@@ -538,14 +687,17 @@ pub fn build_order_update_login(client_id: &str, access_token: &str) -> String {
 }
 
 /// True when a decoded update carries none of the three identity fields:
-/// `order_no`, `status` and `security_id` are all empty. Pure, O(1), no
-/// allocation.
+/// `order_no`, `status` and `security_id` are all empty after trimming
+/// (a whitespace-only value is blank, as in `is_blank_value`). Pure, no
+/// allocation, O(length of the three fields).
 ///
 /// `OrderUpdate` defaults every field, so a frame whose `Data` keys match
 /// nothing the struct knows still parses `Ok` and decodes to this shape.
 /// A real partial update (say only `OrderNo`) is NOT hollow.
 pub fn is_hollow_order_update(update: &OrderUpdate) -> bool {
-    update.order_no.is_empty() && update.status.is_empty() && update.security_id.is_empty()
+    update.order_no.trim().is_empty()
+        && update.status.trim().is_empty()
+        && update.security_id.trim().is_empty()
 }
 
 /// The ORDER-EVT-02 verdict for a frame that [`parse_order_update`] decoded:
@@ -567,18 +719,19 @@ pub fn is_hollow_order_update(update: &OrderUpdate) -> bool {
 /// captured frame shows another one, so an unknown tag is exactly the
 /// vendor-format-change case ORDER-EVT-02 exists to page on.
 ///
-/// The returned tag is the frame's `Type` (or a drifted `type`), trimmed
-/// and bounded to `MESSAGE_TYPE_LOG_MAX_CHARS` characters; empty when the
-/// tag is absent, not a string, or the frame is oversized or does not
-/// re-parse.
+/// The returned tag is the frame's string `Type` (or a drifted string
+/// `type` when `Type` is absent or not a string), trimmed and bounded to
+/// `MESSAGE_TYPE_LOG_MAX_CHARS` characters; empty when neither casing holds
+/// a string, or the frame is oversized or does not re-parse. An order
+/// number, status or security id made only of whitespace counts as absent.
 ///
 /// # Complexity
-/// O(1) and allocation-free for a frame that carries an order number (the
+/// Allocation-free for a frame that carries an order number (the
 /// normal case). Otherwise one more `serde_json::Value` parse of the frame,
 /// O(frame bytes) bounded by [`ORDER_UPDATE_MAX_FRAME_BYTES`]. Cold: the
 /// order-update read task, 1 to 100 orders a day.
 pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Option<String> {
-    if !update.order_no.is_empty() {
+    if !update.order_no.trim().is_empty() {
         return None;
     }
     let parsed = (json_str.len() <= ORDER_UPDATE_MAX_FRAME_BYTES)
@@ -586,8 +739,15 @@ pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Opti
         .flatten();
     let tag = parsed
         .as_ref()
-        .and_then(|value| value.get("Type").or_else(|| value.get("type")))
-        .and_then(serde_json::Value::as_str)
+        .and_then(|value| {
+            // A `Type` that is present but not a string (null, a number, an
+            // object) is as unreadable as an absent one, so the drifted
+            // lowercase `type` is read in both cases.
+            value
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("type").and_then(serde_json::Value::as_str))
+        })
         .map(str::trim)
         .unwrap_or_default();
     let foreign = !tag.is_empty() && !tag.eq_ignore_ascii_case(ORDER_ALERT_MESSAGE_TYPE);
@@ -1736,6 +1896,143 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_decimal_i64_never_rounds() {
+        let rows: &[(&str, Option<i64>)] = &[
+            ("0", Some(0)),
+            ("-0.000", Some(0)),
+            ("0e99999999999999999999", Some(0)),
+            ("50", Some(50)),
+            ("+50.00", Some(50)),
+            ("5.", Some(5)),
+            ("50e-1", Some(5)),
+            ("1.5e1", Some(15)),
+            ("0.0000000000000000000001e22", Some(1)),
+            ("00000000000000000000000000000042", Some(42)),
+            ("9007199254740993.0", Some(9_007_199_254_740_993)),
+            ("18014398509481985.0", Some(18_014_398_509_481_985)),
+            ("9223372036854775807.0", Some(i64::MAX)),
+            ("-9223372036854775808.0", Some(i64::MIN)),
+            ("9223372036854775808.0", None),
+            ("-9223372036854775809", None),
+            ("1e19", None),
+            ("1e99999999999999999999", None),
+            ("1.00000000000000001", None),
+            ("4503599627370496.5", None),
+            ("5e-1", None),
+            ("1e-99999999999999999999", None),
+            (".5", None),
+            ("", None),
+            (".", None),
+            ("+", None),
+            ("e5", None),
+            ("5e", None),
+            ("5e+", None),
+            ("5ee1", None),
+            ("1.2.3", None),
+            ("--5", None),
+            ("0x10", None),
+            ("inf", None),
+            ("NaN", None),
+            ("５０", None),
+            ("1_000", None),
+            ("50 ", None),
+        ];
+        for (text, expected) in rows {
+            assert_eq!(exact_decimal_i64(text), *expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_refuse_array_frame() {
+        use serde_json::json;
+        assert!(refuse_array_frame(&json!({"Data": {}})).is_ok());
+        assert!(refuse_array_frame(&json!({"Data": null})).is_ok());
+        assert!(refuse_array_frame(&json!({"OrderNo": "1"})).is_ok());
+        assert!(
+            refuse_array_frame(&json!("x")).is_ok(),
+            "the typed parse refuses it"
+        );
+        for bad in [json!([]), json!([{"Data": {}}]), json!({"Data": []})] {
+            assert!(
+                matches!(
+                    refuse_array_frame(&bad),
+                    Err(OrderUpdateParseError::JsonError(_))
+                ),
+                "{bad}"
+            );
+        }
+        // A JSON number at or past 2^52 in an Int field is refused, never
+        // rounded (see F64_INT_COERCE_LIMIT); just below it, coerced.
+        for refused in [
+            9_007_199_254_740_992.0,
+            9_007_199_254_740_991.0,
+            4_503_599_627_370_496.0,
+            -4_503_599_627_370_496.0,
+        ] {
+            assert_eq!(
+                fix_for_field("LotSize", FieldKind::Int, &json!(refused)),
+                FieldFix::Keep,
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            fix_for_field("LotSize", FieldKind::Int, &json!(4_503_599_627_370_495.0)),
+            FieldFix::Replace(json!(4_503_599_627_370_495i64), "integral_float_coerced")
+        );
+        assert_eq!(
+            fix_for_field("LotSize", FieldKind::Int, &json!(-4_503_599_627_370_495.0)),
+            FieldFix::Replace(json!(-4_503_599_627_370_495i64), "integral_float_coerced")
+        );
+    }
+
+    /// A JSON number in an Int field is coerced only below 2^52. This
+    /// serde_json build (no `float_roundtrip`) reads `8000000000000007.0` as
+    /// significand 80000000000000070 rounded to `f64`, then divided by 10 and
+    /// rounded again: 8000000000000006. Below 2^52 the `f64` spacing is at
+    /// most 0.5 and that read is off by under 1, so an error lands on a
+    /// fraction (refused), never on a neighbouring integer.
+    #[test]
+    fn test_parse_order_update_json_number_int_never_lands_on_another_integer() {
+        let lossy = parse_order_update(r#"{"Data":{"OrderNo":"1","Quantity":8000000000000007.0}}"#);
+        assert!(
+            lossy
+                .as_ref()
+                .map_or(true, |u| u.quantity != 8_000_000_000_000_006),
+            "8000000000000007.0 decoded as 8000000000000006"
+        );
+        // Deterministic sweep below 2^52: a decode is the exact integer or a
+        // loud failure, never another integer.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let (mut exact, mut refused) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let v = (state >> 12) as i64; // [0, 2^52)
+            for spelling in [
+                format!("{v}.0"),
+                format!("{v}0e-1"),
+                format!("{v}00e-2"),
+                format!("{v}.000"),
+                format!("{v}000e-3"),
+            ] {
+                let frame = format!(r#"{{"Data":{{"OrderNo":"1","Quantity":{spelling}}}}}"#);
+                match parse_order_update(&frame) {
+                    Ok(update) => {
+                        assert_eq!(update.quantity, v, "{spelling}");
+                        exact += 1;
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        assert!(
+            exact > 90_000,
+            "sweep is not vacuous: {exact} exact, {refused} refused"
+        );
+    }
+
+    #[test]
     fn test_exact_i64_boundaries() {
         assert_eq!(exact_i64(i64::MIN as f64), Some(i64::MIN));
         assert_eq!(
@@ -1919,6 +2216,1248 @@ mod tests {
             let _ = parse_order_update(&value.to_string());
             let value = serde_json::json!({ "Data": { key: s } });
             let _ = parse_order_update(&value.to_string());
+        }
+    }
+    // -----------------------------------------------------------------------
+    // Gap audit 2026-10-28: exhaustive grids over the normalizer, the field
+    // fixer, the quirk counters and the ORDER-EVT-02 verdict. Each grid is
+    // checked against an independent oracle written from the documented
+    // rules, never against the code under test.
+    // -----------------------------------------------------------------------
+    mod gap_grid {
+        use super::*;
+        use proptest::prelude::*;
+        use serde_json::{Value, json};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        /// `Type` values that are present but not a string.
+        const JUNK_TYPE_TAGS: [&str; 5] = ["null", "5", "true", "{}", "[]"];
+
+        fn verdict(json: &str) -> Option<String> {
+            let update = parse_order_update(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            unreadable_order_frame_type(&update, json)
+        }
+
+        fn frame_with_data(data: serde_json::Map<String, Value>) -> String {
+            json!({ "Data": Value::Object(data), "Type": "order_alert" }).to_string()
+        }
+
+        /// The full sample with `accepted` and `alt` both removed.
+        fn sample_data_without(accepted: &str, alt: &str) -> serde_json::Map<String, Value> {
+            let value = full_sample_value();
+            let mut data = value["Data"].as_object().unwrap().clone();
+            data.remove(accepted);
+            data.remove(alt);
+            data
+        }
+
+        /// The full sample's struct with `accepted` set to `field` (built
+        /// through serde, not the parser).
+        fn expected_with(accepted: &str, field: Value) -> OrderUpdate {
+            let full = parse_order_update(FULL_ACCEPTED_SAMPLE).unwrap();
+            let mut value = serde_json::to_value(&full).unwrap();
+            value[accepted] = field;
+            serde_json::from_value(value).unwrap()
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 1: a junk `Type` next to a lowercase `type`.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_unreadable_order_frame_type_junk_type_tag_with_order_alert_or_no_lowercase_tag() {
+            // Rows where today's behaviour is already right: no lowercase
+            // tag, or a lowercase `order_alert`, next to a junk `Type`.
+            for junk in JUNK_TYPE_TAGS {
+                for lower in ["", r#","type":"order_alert""#, r#","type":" ORDER_ALERT ""#] {
+                    let json = format!(r#"{{"Data":{{"status":"success"}},"Type":{junk}{lower}}}"#);
+                    let update = parse_order_update(&json).unwrap();
+                    assert_eq!(update.status, "success", "{json}");
+                    assert_eq!(update.order_no, "", "{json}");
+                    assert_eq!(unreadable_order_frame_type(&update, &json), None, "{json}");
+                }
+            }
+            // Control: with `Type` ABSENT the lowercase tag is moved onto
+            // `Type` and a foreign tag pages, as documented.
+            assert_eq!(
+                verdict(r#"{"Data":{"status":"success"},"type":"login_ack"}"#).as_deref(),
+                Some("login_ack")
+            );
+        }
+
+        #[test]
+        fn test_unreadable_order_frame_type_junk_type_falls_back_to_foreign_lowercase_type() {
+            let mut misses = Vec::new();
+            for junk in JUNK_TYPE_TAGS {
+                let json = format!(
+                    r#"{{"Data":{{"status":"success"}},"Type":{junk},"type":"login_ack"}}"#
+                );
+                if verdict(&json).as_deref() != Some("login_ack") {
+                    misses.push(json);
+                }
+            }
+            assert!(misses.is_empty(), "foreign frames not paged: {misses:?}");
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 2: whitespace-only identity fields.
+        // ---------------------------------------------------------------
+
+        /// The three identity fields with a real value each.
+        const IDENTITY: [(&str, &str, &str); 3] = [
+            ("OrderNo", "orderNo", "1124"),
+            ("Status", "status", "TRADED"),
+            ("SecurityId", "securityId", "52432"),
+        ];
+
+        /// One identity slot: absent, or a value text under one casing.
+        /// `None` text = absent.
+        fn identity_options(real: &'static str) -> Vec<Option<(&'static str, bool)>> {
+            let mut options = vec![None];
+            for text in ["", "  ", "\t", real] {
+                for alt in [false, true] {
+                    options.push(Some((text, alt)));
+                }
+            }
+            options
+        }
+
+        /// Every one of the 9 x 9 x 9 identity combinations: the frame,
+        /// the trimmed-empty oracle and the exactly-empty (today's) rule.
+        fn identity_grid() -> Vec<(String, bool, bool, [Option<&'static str>; 3])> {
+            let per_field: Vec<_> = IDENTITY.iter().map(|f| identity_options(f.2)).collect();
+            let mut rows = Vec::new();
+            for a in &per_field[0] {
+                for b in &per_field[1] {
+                    for c in &per_field[2] {
+                        let mut data = serde_json::Map::new();
+                        let mut sent = [None; 3];
+                        for (i, slot) in [a, b, c].into_iter().enumerate() {
+                            if let Some((text, alt)) = slot {
+                                let key = if *alt { IDENTITY[i].1 } else { IDENTITY[i].0 };
+                                data.insert(key.to_string(), json!(text));
+                                sent[i] = Some(*text);
+                            }
+                        }
+                        let trimmed_blank =
+                            sent.iter().all(|s| s.is_none_or(|t| t.trim().is_empty()));
+                        let exactly_blank = sent.iter().all(|s| s.is_none_or(str::is_empty));
+                        rows.push((frame_with_data(data), trimmed_blank, exactly_blank, sent));
+                    }
+                }
+            }
+            rows
+        }
+
+        #[test]
+        fn test_is_hollow_order_update_identity_grid_without_whitespace_rows() {
+            let rows = identity_grid();
+            assert_eq!(rows.len(), 729);
+            let mut checked = 0;
+            for (json, trimmed_blank, exactly_blank, sent) in rows {
+                let update = parse_order_update(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
+                // Each field decodes to exactly what was sent, in either casing.
+                assert_eq!(update.order_no, sent[0].unwrap_or(""), "{json}");
+                assert_eq!(update.status, sent[1].unwrap_or(""), "{json}");
+                assert_eq!(update.security_id, sent[2].unwrap_or(""), "{json}");
+                // Hollow means blank after trimming (whitespace-only is blank).
+                assert_eq!(is_hollow_order_update(&update), trimmed_blank, "{json}");
+                // Rows with no whitespace-only identity: both rules agree.
+                if trimmed_blank == exactly_blank {
+                    let expected = trimmed_blank.then(|| "order_alert".to_string());
+                    assert_eq!(
+                        unreadable_order_frame_type(&update, &json),
+                        expected,
+                        "{json}"
+                    );
+                    checked += 1;
+                }
+            }
+            // 5^3 rows have no whitespace-only identity at all, and some
+            // whitespace rows still carry a real value elsewhere.
+            assert!(checked >= 125, "only {checked} rows checked");
+        }
+
+        #[test]
+        fn test_unreadable_order_frame_type_whitespace_only_identity_is_hollow() {
+            let mut misses = Vec::new();
+            for (json, trimmed_blank, _, _) in identity_grid() {
+                let expected = trimmed_blank.then(|| "order_alert".to_string());
+                if verdict(&json) != expected {
+                    misses.push(json);
+                }
+            }
+            assert!(
+                misses.is_empty(),
+                "{} rows disagree, e.g. {:?}",
+                misses.len(),
+                misses.first()
+            );
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 3: the eight fail-loud fields, accepted x alt state matrix.
+        // ---------------------------------------------------------------
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Slot {
+            Absent,
+            Null,
+            Empty,
+            Spaces,
+            Valid,
+        }
+
+        const SLOTS: [Slot; 5] = [
+            Slot::Absent,
+            Slot::Null,
+            Slot::Empty,
+            Slot::Spaces,
+            Slot::Valid,
+        ];
+
+        /// Distinct valid values for the accepted and the alt casing, so the
+        /// winner is visible.
+        fn valid_pair(kind: FieldKind) -> (Value, Value) {
+            match kind {
+                FieldKind::Text => (json!("ACC"), json!("ALT")),
+                FieldKind::Int => (json!(50), json!(60)),
+                FieldKind::Float => (json!(245.5), json!(246.5)),
+            }
+        }
+
+        fn slot_value(slot: Slot, valid: &Value) -> Option<Value> {
+            match slot {
+                Slot::Absent => None,
+                Slot::Null => Some(Value::Null),
+                Slot::Empty => Some(json!("")),
+                Slot::Spaces => Some(json!("  ")),
+                Slot::Valid => Some(valid.clone()),
+            }
+        }
+
+        /// Oracle: which slot survives the merge, and from which casing.
+        /// A null accepted key is absent; a blank (non-null) accepted key is
+        /// a value and wins; a blank alt with no accepted key is moved onto
+        /// the accepted key so it fails loud.
+        fn survivor(accepted: Slot, alt: Slot) -> (Slot, bool) {
+            match (accepted, alt) {
+                (Slot::Absent, Slot::Absent) => (Slot::Absent, false),
+                (Slot::Absent, b) => (b, true),
+                (Slot::Null, Slot::Absent | Slot::Null) => (Slot::Null, false),
+                (Slot::Null, b) => (b, true),
+                (a, _) => (a, false),
+            }
+        }
+
+        #[test]
+        fn test_normalize_order_update_frame_fail_loud_fields_accepted_by_alt_matrix() {
+            let fields: Vec<_> = ORDER_UPDATE_FIELDS
+                .iter()
+                .filter(|f| fails_loud_when_blank(f.0))
+                .collect();
+            assert_eq!(fields.len(), 8);
+            let mut rows = 0;
+            for &&(accepted, alt, kind) in &fields {
+                let (acc_valid, alt_valid) = valid_pair(kind);
+                for a in SLOTS {
+                    for b in SLOTS {
+                        let mut data = sample_data_without(accepted, alt);
+                        if let Some(v) = slot_value(a, &acc_valid) {
+                            data.insert(accepted.to_string(), v);
+                        }
+                        if let Some(v) = slot_value(b, &alt_valid) {
+                            data.insert(alt.to_string(), v);
+                        }
+                        let json = frame_with_data(data);
+                        let (slot, from_alt) = survivor(a, b);
+                        let expected = match slot {
+                            Slot::Absent => Some(default_for(kind)),
+                            Slot::Null => None,
+                            Slot::Empty | Slot::Spaces if kind != FieldKind::Text => None,
+                            Slot::Empty => Some(json!("")),
+                            Slot::Spaces => Some(json!("  ")),
+                            Slot::Valid if from_alt => Some(alt_valid.clone()),
+                            Slot::Valid => Some(acc_valid.clone()),
+                        };
+                        let note = match (a, b) {
+                            (Slot::Null, Slot::Valid) => {
+                                " (asymmetry: a null accepted key yields to a valid alt)"
+                            }
+                            (Slot::Empty | Slot::Spaces, Slot::Valid) => {
+                                " (asymmetry: a blank accepted key is kept over a valid alt)"
+                            }
+                            _ => "",
+                        };
+                        let got = parse_order_update(&json);
+                        match expected {
+                            None => assert!(
+                                got.is_err(),
+                                "{accepted} {a:?} / {alt} {b:?}{note}: {got:?}"
+                            ),
+                            Some(field) => {
+                                let got = got.unwrap_or_else(|e| {
+                                    panic!("{accepted} {a:?} / {alt} {b:?}{note}: {e}")
+                                });
+                                assert_eq!(
+                                    got,
+                                    expected_with(accepted, field),
+                                    "{accepted} {a:?} / {alt} {b:?}{note}"
+                                );
+                            }
+                        }
+                        rows += 1;
+                    }
+                }
+            }
+            assert_eq!(rows, 200);
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 4: every field x both casings x 12 value classes.
+        // ---------------------------------------------------------------
+
+        const VALUE_CLASSES: [&str; 12] = [
+            "null", r#""""#, r#""  ""#, "7", "7.0", "7.5", r#""7""#, r#""7.0""#, r#""x""#, "true",
+            "{}", "[]",
+        ];
+
+        /// Independent oracle: the decoded field value, or `None` for a
+        /// loud parse failure.
+        fn field_oracle(key: &str, kind: FieldKind, raw: &str) -> Option<Value> {
+            let fail_loud = fails_loud_when_blank(key);
+            let fill = is_fill_critical(key);
+            let is_id = INTEGRAL_ID_TEXT_FIELDS.contains(&key);
+            match (raw, kind) {
+                ("null", _) if fail_loud => None,
+                ("null", _) => Some(default_for(kind)),
+                (r#""""#, FieldKind::Text) => Some(json!("")),
+                (r#""  ""#, FieldKind::Text) => Some(json!("  ")),
+                (r#""""# | r#""  ""#, _) if fill => None,
+                (r#""""# | r#""  ""#, _) => Some(default_for(kind)),
+                ("7" | r#""7""#, FieldKind::Text) => Some(json!("7")),
+                ("7.0", FieldKind::Text) if is_id => None,
+                ("7.0", FieldKind::Text) => Some(json!("7")),
+                ("7.5", FieldKind::Text) if is_id => None,
+                ("7.5", FieldKind::Text) => Some(json!("7.5")),
+                (r#""7.0""#, FieldKind::Text) => Some(json!("7.0")),
+                (r#""x""#, FieldKind::Text) => Some(json!("x")),
+                ("7" | "7.0" | r#""7""# | r#""7.0""#, FieldKind::Int) => Some(json!(7)),
+                ("7" | "7.0" | r#""7""# | r#""7.0""#, FieldKind::Float) => Some(json!(7.0)),
+                ("7.5", FieldKind::Float) => Some(json!(7.5)),
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn test_fix_for_field_every_field_both_casings_every_value_class() {
+            let mut cases = 0;
+            for &(accepted, alt, kind) in ORDER_UPDATE_FIELDS {
+                for use_alt in [false, true] {
+                    for raw in VALUE_CLASSES {
+                        let mut data = sample_data_without(accepted, alt);
+                        let key = if use_alt { alt } else { accepted };
+                        data.insert(key.to_string(), serde_json::from_str(raw).unwrap());
+                        let json = frame_with_data(data);
+                        let got = parse_order_update(&json);
+                        match field_oracle(accepted, kind, raw) {
+                            None => assert!(got.is_err(), "{key}={raw}: {got:?}"),
+                            Some(field) => assert_eq!(
+                                got.unwrap_or_else(|e| panic!("{key}={raw}: {e}")),
+                                expected_with(accepted, field),
+                                "{key}={raw}"
+                            ),
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+            assert_eq!(cases, 1_104);
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 5: the decode-quirk counters.
+        // ---------------------------------------------------------------
+
+        type CounterMap = Arc<Mutex<BTreeMap<String, u64>>>;
+
+        #[derive(Default)]
+        struct QuirkRecorder {
+            counters: CounterMap,
+        }
+
+        struct QuirkCounter {
+            key: String,
+            counters: CounterMap,
+        }
+
+        impl metrics::CounterFn for QuirkCounter {
+            fn increment(&self, value: u64) {
+                if let Ok(mut m) = self.counters.lock() {
+                    let slot = m.entry(self.key.clone()).or_insert(0);
+                    *slot = slot.saturating_add(value);
+                }
+            }
+            fn absolute(&self, value: u64) {
+                if let Ok(mut m) = self.counters.lock() {
+                    m.insert(self.key.clone(), value);
+                }
+            }
+        }
+
+        impl metrics::Recorder for QuirkRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                // `name` alone for any other counter, `kind` value for ours.
+                let rendered = if key.name() == DECODE_QUIRKS_COUNTER {
+                    key.labels()
+                        .find(|l| l.key() == "kind")
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_else(|| "<no kind label>".to_string())
+                } else {
+                    format!("other:{}", key.name())
+                };
+                metrics::Counter::from_arc(Arc::new(QuirkCounter {
+                    key: rendered,
+                    counters: Arc::clone(&self.counters),
+                }))
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        fn quirks_of(json: &str) -> BTreeMap<String, u64> {
+            let recorder = QuirkRecorder::default();
+            metrics::with_local_recorder(&recorder, || {
+                let _ = parse_order_update(json);
+            });
+            recorder.counters.lock().unwrap().clone()
+        }
+
+        #[test]
+        fn test_normalize_order_update_frame_quirk_counters_exact_counts() {
+            let rows: &[(&str, &[(&str, u64)])] = &[
+                (FULL_ACCEPTED_SAMPLE, &[]),
+                (
+                    r#"{"data":{"OrderNo":"1"},"type":"order_alert"}"#,
+                    &[("wrapper_casing", 2)],
+                ),
+                (
+                    r#"{"data":{"OrderNo":"1"},"type":5}"#,
+                    &[("wrapper_casing", 2), ("type_not_string", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1"},"Type":5}"#,
+                    &[("type_not_string", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1"},"Type":null,"type":"order_alert"}"#,
+                    &[("type_not_string", 1)],
+                ),
+                (r#"{"Data":{"orderNo":"1"}}"#, &[("casing_fallback", 1)]),
+                (
+                    r#"{"Data":{"OrderNo":"1","orderNo":"2"}}"#,
+                    &[("casing_conflict", 1)],
+                ),
+                (r#"{"Data":{"OrderNo":"1","orderNo":"1"}}"#, &[]),
+                (
+                    r#"{"Data":{"OrderNo":"1","Multiplier":1,"multiplier":1.0}}"#,
+                    &[],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","exchange":null}}"#,
+                    &[("null_alt_dropped", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","Exchange":null,"exchange":null}}"#,
+                    &[("null_alt_dropped", 1), ("null_field_dropped", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","instrumentType":"EQ"}}"#,
+                    &[("assumed_twin", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","instrumentType":5}}"#,
+                    &[("assumed_twin", 1), ("numeric_text_coerced", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","Instrument":null,"instrumentType":"EQ"}}"#,
+                    &[("null_field_dropped", 1), ("assumed_twin", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","Remarks":null}}"#,
+                    &[("null_field_dropped", 1)],
+                ),
+                (r#"{"Data":{"OrderNo":5}}"#, &[("numeric_text_coerced", 1)]),
+                (
+                    r#"{"Data":{"OrderNo":"1","AlgoOrdNo":5}}"#,
+                    &[("numeric_algo_ord_no", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","LotSize":"75"}}"#,
+                    &[("numeric_string_coerced", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","LotSize":75.0}}"#,
+                    &[("integral_float_coerced", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","LotSize":""}}"#,
+                    &[("empty_number_dropped", 1)],
+                ),
+                // The fail-loud pre-move counts nothing (and the parse fails).
+                (r#"{"Data":{"OrderNo":"1","tradedQty":null}}"#, &[]),
+                (r#"{"Data":{"OrderNo":"1","tradedQty":""}}"#, &[]),
+                (r#"{"Data":{"OrderNo":"1","TradedQty":null}}"#, &[]),
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":null,"tradedQty":50}}"#,
+                    &[("casing_fallback", 1)],
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","tradedQty":"50"}}"#,
+                    &[("casing_fallback", 1), ("numeric_string_coerced", 1)],
+                ),
+                // No Data object: no field pass at all.
+                (r#"{"Data":null}"#, &[]),
+                (r#"{"Data":{}}"#, &[]),
+            ];
+            for (json, expected) in rows {
+                let expected: BTreeMap<String, u64> = expected
+                    .iter()
+                    .map(|(k, n)| ((*k).to_string(), *n))
+                    .collect();
+                assert_eq!(quirks_of(json), expected, "{json}");
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 6: idempotence over coerced and drifted frames.
+        // ---------------------------------------------------------------
+
+        const TWO_POW_53: i64 = 1 << 53;
+
+        fn generated_value(kind: FieldKind, form: u8, n: i64, x: f64, s: &str) -> Value {
+            // Below 2^49, so serde_json's lossy float parse reads `<n>.0`
+            // back exactly (see the float BUG test for larger values).
+            let small = n % (1 << 49);
+            match (kind, form) {
+                (FieldKind::Text, 0 | 3) => json!(s),
+                (FieldKind::Text, 1) => json!(n),
+                (FieldKind::Text, _) => json!(n.unsigned_abs()),
+                (FieldKind::Int, 0) => json!(n),
+                (FieldKind::Int, 1) => json!(n.to_string()),
+                (FieldKind::Int, 2) => json!(small as f64),
+                (FieldKind::Int, _) => json!(format!("{small}.0")),
+                (FieldKind::Float, 0) => json!(x),
+                (FieldKind::Float, 1) => json!(format!("{x}")),
+                (FieldKind::Float, 2) => json!(n % 1_000_000),
+                (FieldKind::Float, _) => json!(format!("{}", n % 1_000_000)),
+            }
+        }
+
+        /// Field-by-field equality, allowing a float to differ by one ULP.
+        fn same_up_to_one_ulp(a: &OrderUpdate, b: &OrderUpdate) -> Result<(), String> {
+            let (a, b) = (
+                serde_json::to_value(a).unwrap(),
+                serde_json::to_value(b).unwrap(),
+            );
+            for (key, left) in a.as_object().unwrap() {
+                let right = &b[key];
+                let same = match (left.as_f64(), right.as_f64(), left.is_f64()) {
+                    (Some(x), Some(y), true) => x.to_bits().abs_diff(y.to_bits()) <= 1,
+                    _ => left == right,
+                };
+                if !same {
+                    return Err(format!("{key}: {left} != {right}"));
+                }
+            }
+            Ok(())
+        }
+
+        /// The float limit as it stands, pinned so it runs in every suite.
+        ///
+        /// Exact agreement between the number and string forms needs the
+        /// `serde_json` `float_roundtrip` feature, a dependency change that
+        /// needs owner approval. Without it a JSON NUMBER is read up to one
+        /// ULP off (measured 2026-10-28: `204443773.92190546` reads as
+        /// `204443773.92190543`; the string form is exact). What this test
+        /// holds today: the string form is exact, the number form is within
+        /// one ULP of it, and the same lossy read of an integral quantity
+        /// never yields a WRONG integer: `LotSize 4085276730493842.0` reads
+        /// as `4085276730493841.5` and fails the typed parse loudly.
+        #[test]
+        fn test_parse_order_update_float_number_form_is_within_one_ulp_and_never_a_wrong_int() {
+            for text in ["204443773.92190543", "204443773.92190546"] {
+                let number = parse_order_update(&format!(r#"{{"Data":{{"refLtp":{text}}}}}"#))
+                    .unwrap()
+                    .ref_ltp;
+                let string = parse_order_update(&format!(r#"{{"Data":{{"refLtp":"{text}"}}}}"#))
+                    .unwrap()
+                    .ref_ltp;
+                assert_eq!(string.to_bits(), text.parse::<f64>().unwrap().to_bits());
+                assert!(
+                    number.to_bits().abs_diff(string.to_bits()) <= 1,
+                    "{text}: number {number} vs string {string}"
+                );
+            }
+            let lot =
+                parse_order_update(r#"{"Data":{"OrderNo":"1","LotSize":4085276730493842.0}}"#);
+            assert!(
+                !matches!(&lot, Ok(u) if u.lot_size != 4_085_276_730_493_842),
+                "LotSize 4085276730493842.0 must parse exactly or fail loudly: {lot:?}"
+            );
+        }
+
+        #[test]
+        fn test_parse_order_update_array_data_is_a_structural_error() {
+            for json in [
+                r#"{"Data":[]}"#,
+                r#"{"data":[]}"#,
+                r#"{"Data":[],"data":{"OrderNo":"2"}}"#,
+                r#"{"Data":["NSE","D","52432","c","1124"]}"#,
+                r#"[{"Data":{"OrderNo":"1"}}]"#,
+            ] {
+                let got = parse_order_update(json);
+                assert!(got.is_err(), "{json}: {got:?}");
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_parse_order_update_coerced_frames_are_idempotent(
+                choices in proptest::collection::vec(
+                    (0u8..3, 0u8..4, any::<i64>(), -1e9f64..1e9, "[ -~]{0,8}"),
+                    ORDER_UPDATE_FIELDS.len(),
+                ),
+            ) {
+                let mut data = serde_json::Map::new();
+                for (&(accepted, alt, kind), (casing, form, n, x, s)) in
+                    ORDER_UPDATE_FIELDS.iter().zip(&choices)
+                {
+                    let value = generated_value(kind, *form, *n, *x, s);
+                    if let FieldFix::Replace(fixed, _) = fix_for_field(accepted, kind, &value) {
+                        prop_assert_eq!(
+                            fix_for_field(accepted, kind, &fixed),
+                            FieldFix::Keep,
+                            "{} {:?} -> {:?}", accepted, value, fixed
+                        );
+                    }
+                    if *casing != 1 {
+                        data.insert(accepted.to_string(), value.clone());
+                    }
+                    if *casing != 0 {
+                        data.insert(alt.to_string(), value);
+                    }
+                }
+                let raw = json!({ "Data": Value::Object(data), "Type": "order_alert" });
+                let first = parse_order_update(&raw.to_string());
+                prop_assert!(first.is_ok(), "{:?}", first);
+                let first = first.unwrap();
+                // A replay of the same raw frame decodes identically.
+                prop_assert_eq!(&parse_order_update(&raw.to_string()).unwrap(), &first);
+                // Re-serializing the decode and decoding again is a no-op,
+                // up to the one-ULP float re-parse limit pinned by
+                // `test_parse_order_update_float_number_form_is_within_one_ulp_and_never_a_wrong_int`.
+                let again = json!({ "Data": serde_json::to_value(&first).unwrap(), "Type": "order_alert" });
+                let second = parse_order_update(&again.to_string()).unwrap();
+                if let Err(diff) = same_up_to_one_ulp(&second, &first) {
+                    prop_assert!(false, "{}", diff);
+                }
+                // Normalizing an already-normalized frame changes nothing.
+                let mut once = raw.clone();
+                normalize_order_update_frame(&mut once);
+                let mut twice = once.clone();
+                normalize_order_update_frame(&mut twice);
+                prop_assert_eq!(twice, once);
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 7: precision and identity-id edges.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_fix_for_field_precision_and_id_edges() {
+            let coerced = |v: Value| FieldFix::Replace(v, "numeric_string_coerced");
+            let rows: Vec<(&str, FieldKind, Value, FieldFix)> = vec![
+                // An integral float in an identity id is refused (loud), not
+                // rendered: pinned, the safe direction.
+                (
+                    "OrderNo",
+                    FieldKind::Text,
+                    json!(1_124_091_136_546.0),
+                    FieldFix::Keep,
+                ),
+                (
+                    "SecurityId",
+                    FieldKind::Text,
+                    json!(52_432.0),
+                    FieldFix::Keep,
+                ),
+                // Negative and zero integer ids are rendered as sent.
+                (
+                    "OrderNo",
+                    FieldKind::Text,
+                    json!(-5),
+                    FieldFix::Replace(json!("-5"), "numeric_text_coerced"),
+                ),
+                (
+                    "SecurityId",
+                    FieldKind::Text,
+                    json!(0),
+                    FieldFix::Replace(json!("0"), "numeric_text_coerced"),
+                ),
+                (
+                    "ExchOrderNo",
+                    FieldKind::Text,
+                    json!(u64::MAX),
+                    FieldFix::Replace(json!(u64::MAX.to_string()), "numeric_text_coerced"),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9223372036854775807"),
+                    coerced(json!(i64::MAX)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9223372036854775808"),
+                    FieldFix::Keep,
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("-9223372036854775808"),
+                    coerced(json!(i64::MIN)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9223372036854775807.0"),
+                    coerced(json!(i64::MAX)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9223372036854775808.0"),
+                    FieldFix::Keep,
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("-9223372036854775808.0"),
+                    coerced(json!(i64::MIN)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9007199254740993.0"),
+                    coerced(json!(9_007_199_254_740_993i64)),
+                ),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!("9007199254740992.0"),
+                    coerced(json!(TWO_POW_53)),
+                ),
+                ("Quantity", FieldKind::Int, json!(i64::MAX), FieldFix::Keep),
+                ("Quantity", FieldKind::Int, json!(i64::MIN), FieldFix::Keep),
+                (
+                    "Quantity",
+                    FieldKind::Int,
+                    json!(9_223_372_036_854_775_808u64),
+                    FieldFix::Keep,
+                ),
+                ("Quantity", FieldKind::Int, json!(u64::MAX), FieldFix::Keep),
+            ];
+            for (key, kind, value, expected) in rows {
+                assert_eq!(fix_for_field(key, kind, &value), expected, "{key} {value}");
+            }
+            // Through the parser: the refused integral-float id fails loud.
+            assert!(parse_order_update(r#"{"Data":{"OrderNo":1124091136546.0}}"#).is_err());
+            assert_eq!(
+                parse_order_update(r#"{"Data":{"OrderNo":-5}}"#)
+                    .unwrap()
+                    .order_no,
+                "-5"
+            );
+        }
+
+        #[test]
+        fn test_fix_for_field_int_never_rounds_an_inexact_integral_value() {
+            let rounded = [
+                ("9007199254740993.0", 9_007_199_254_740_992i64),
+                ("-9223372036854775809", i64::MIN),
+                ("18014398509481985.0", 18_014_398_509_481_984),
+            ];
+            for (text, wrong) in rounded {
+                assert_ne!(
+                    fix_for_field("Quantity", FieldKind::Int, &json!(text)),
+                    FieldFix::Replace(json!(wrong), "numeric_string_coerced"),
+                    "{text} rounded to {wrong}"
+                );
+            }
+            let decoded =
+                parse_order_update(r#"{"Data":{"OrderNo":"1","LotSize":9007199254740993.0}}"#);
+            assert!(
+                decoded
+                    .as_ref()
+                    .map_or(true, |u| u.lot_size != 9_007_199_254_740_992),
+                "a JSON number 9007199254740993.0 decoded as 9007199254740992"
+            );
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_fix_for_field_int_float_string_at_or_below_2_pow_53_is_exact(
+                n in -TWO_POW_53..=TWO_POW_53,
+            ) {
+                prop_assert_eq!(
+                    fix_for_field("Quantity", FieldKind::Int, &json!(format!("{n}.0"))),
+                    FieldFix::Replace(json!(n), "numeric_string_coerced")
+                );
+            }
+
+            #[test]
+            fn proptest_fix_for_field_int_float_string_above_2_pow_53_is_exact_or_refused(
+                n in (1u64 << 53) + 1..=u64::MAX,
+            ) {
+                let fix = fix_for_field("Quantity", FieldKind::Int, &json!(format!("{n}.0")));
+                let exact = i64::try_from(n)
+                    .map(|m| FieldFix::Replace(json!(m), "numeric_string_coerced"));
+                prop_assert!(
+                    fix == FieldFix::Keep || Ok(fix.clone()) == exact,
+                    "{}.0 -> {:?}", n, fix
+                );
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 8: size and depth boundaries.
+        // ---------------------------------------------------------------
+
+        /// `prefix + pad + suffix`, `target` bytes long, padded with `fill`
+        /// characters then ASCII `x` to land on the exact byte count.
+        fn padded(prefix: &str, suffix: &str, target: usize, fill: char) -> String {
+            let room = target
+                .saturating_sub(prefix.len())
+                .saturating_sub(suffix.len());
+            let wide = room.checked_div(fill.len_utf8()).unwrap();
+            let rest = room.saturating_sub(wide.saturating_mul(fill.len_utf8()));
+            let frame = format!(
+                "{prefix}{}{}{suffix}",
+                fill.to_string().repeat(wide),
+                "x".repeat(rest)
+            );
+            assert_eq!(frame.len(), target);
+            frame
+        }
+
+        #[test]
+        fn test_parse_order_update_and_unreadable_order_frame_type_size_boundary() {
+            let cap = ORDER_UPDATE_MAX_FRAME_BYTES;
+            let hollow = parse_order_update(r#"{"Data":{}}"#).unwrap();
+            for fill in ['x', '₹'] {
+                for target in [cap - 1, cap] {
+                    let readable = padded(
+                        r#"{"Data":{"OrderNo":"1","Remarks":""#,
+                        r#""},"Type":"order_alert"}"#,
+                        target,
+                        fill,
+                    );
+                    let update = parse_order_update(&readable).unwrap();
+                    assert_eq!(update.order_no, "1");
+                    assert_eq!(unreadable_order_frame_type(&update, &readable), None);
+                    let foreign = padded(
+                        r#"{"Data":{"Remarks":""#,
+                        r#""},"Type":"login_ack"}"#,
+                        target,
+                        fill,
+                    );
+                    assert_eq!(
+                        verdict(&foreign).as_deref(),
+                        Some("login_ack"),
+                        "{target} {fill}"
+                    );
+                }
+                let over = padded(
+                    r#"{"Data":{"Remarks":""#,
+                    r#""},"Type":"login_ack"}"#,
+                    cap + 1,
+                    fill,
+                );
+                assert!(matches!(
+                    parse_order_update(&over),
+                    Err(OrderUpdateParseError::FrameTooLarge { len }) if len == cap + 1
+                ));
+                assert_eq!(
+                    unreadable_order_frame_type(&hollow, &over).as_deref(),
+                    Some("")
+                );
+            }
+            // Bytes, not characters: under the cap in characters, over it in bytes.
+            let wide = format!(r#"{{"Data":{{"Remarks":"{}"}}}}"#, "₹".repeat(cap / 3 + 10));
+            assert!(wide.chars().count() < cap && wide.len() > cap);
+            assert!(matches!(
+                parse_order_update(&wide),
+                Err(OrderUpdateParseError::FrameTooLarge { len }) if len == wide.len()
+            ));
+            assert_eq!(
+                unreadable_order_frame_type(&hollow, &wide).as_deref(),
+                Some("")
+            );
+        }
+
+        #[test]
+        fn test_parse_order_update_deep_nesting_is_an_error_not_a_crash() {
+            let hollow = parse_order_update(r#"{"Data":{}}"#).unwrap();
+            for depth in [200usize, 5_000] {
+                for (open, close) in [("[", "]"), (r#"{"a":"#, "}")] {
+                    let json = format!(
+                        r#"{{"Data":{{"OrderNo":"1","Remarks":{}0{}}},"Type":"x"}}"#,
+                        open.repeat(depth),
+                        close.repeat(depth)
+                    );
+                    assert!(json.len() <= ORDER_UPDATE_MAX_FRAME_BYTES);
+                    assert!(
+                        matches!(
+                            parse_order_update(&json),
+                            Err(OrderUpdateParseError::JsonError(_))
+                        ),
+                        "depth {depth} {open}"
+                    );
+                    assert_eq!(
+                        unreadable_order_frame_type(&hollow, &json).as_deref(),
+                        Some("")
+                    );
+                }
+            }
+            // Under serde_json's recursion limit, deep junk outside `Data`
+            // is ignored and the event still decodes.
+            let json = format!(
+                r#"{{"Data":{{"OrderNo":"1"}},"Pad":{}0{}}}"#,
+                "[".repeat(100),
+                "]".repeat(100)
+            );
+            assert_eq!(parse_order_update(&json).unwrap().order_no, "1");
+        }
+
+        #[test]
+        fn test_parse_order_update_twenty_thousand_junk_keys_and_both_casings() {
+            let mut value = full_sample_value();
+            let data = value["Data"].as_object_mut().unwrap();
+            for &(accepted, alt, _) in ORDER_UPDATE_FIELDS {
+                let copy = data[accepted].clone();
+                data.insert(alt.to_string(), copy);
+            }
+            for i in 0..20_000 {
+                data.insert(format!("j{i}"), json!(0));
+            }
+            let json = value.to_string();
+            assert!(
+                json.len() <= ORDER_UPDATE_MAX_FRAME_BYTES,
+                "{} bytes",
+                json.len()
+            );
+            assert_eq!(
+                parse_order_update(&json).unwrap(),
+                parse_order_update(FULL_ACCEPTED_SAMPLE).unwrap()
+            );
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 9: wrapper casing.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_normalize_order_update_frame_wrapper_casing_table() {
+            let rows: &[(&str, Option<&str>)] = &[
+                // Pinned decision: a present null `Data` blocks the lowercase
+                // fallback (a null wrapper is an error, not "absent").
+                (r#"{"Data":null,"data":{"OrderNo":"1"}}"#, None),
+                (r#"{"Data":{"OrderNo":"1"},"data":null}"#, Some("1")),
+                (r#"{"Data":"x","data":{"OrderNo":"2"}}"#, None),
+                (
+                    r#"{"Type":null,"type":"order_alert","Data":{"OrderNo":"1"}}"#,
+                    Some("1"),
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1"},"data":{"OrderNo":"2"},"type":5}"#,
+                    Some("1"),
+                ),
+                (r#"{"data":{"OrderNo":"1"},"Type":"x"}"#, Some("1")),
+                (r#"{"DATA":{"OrderNo":"1"}}"#, None),
+                (r#"{"data":"x"}"#, None),
+                (r#"{}"#, None),
+                (r#""Data""#, None),
+                ("5", None),
+                ("null", None),
+                ("true", None),
+            ];
+            for (json, expected) in rows {
+                let got = parse_order_update(json);
+                match expected {
+                    Some(order_no) => assert_eq!(got.unwrap().order_no, *order_no, "{json}"),
+                    None => assert!(
+                        matches!(got, Err(OrderUpdateParseError::JsonError(_))),
+                        "{json}: {got:?}"
+                    ),
+                }
+            }
+            // A junk `Type` is removed and the lowercase tag is left behind.
+            let mut value: Value =
+                serde_json::from_str(r#"{"Type":null,"type":"order_alert","Data":{}}"#).unwrap();
+            normalize_order_update_frame(&mut value);
+            assert!(value.get("Type").is_none());
+            assert_eq!(value["type"], json!("order_alert"));
+            // Non-object frames are left untouched.
+            for raw in ["[1]", "5", "null", r#""x""#] {
+                let mut value: Value = serde_json::from_str(raw).unwrap();
+                let before = value.clone();
+                normalize_order_update_frame(&mut value);
+                assert_eq!(value, before, "{raw}");
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 10: literal duplicate keys x casing.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_normalize_order_update_frame_literal_duplicates_with_casing() {
+            // `Ok(traded_qty)` or `Err`; every frame carries OrderNo "1"
+            // unless the row is about OrderNo.
+            let order_no_rows: &[(&str, &str)] = &[
+                (
+                    r#"{"Data":{"OrderNo":"1","orderNo":"2","OrderNo":"3"}}"#,
+                    "3",
+                ),
+                (r#"{"Data":{"orderNo":"2","orderNo":"4"}}"#, "4"),
+                (
+                    r#"{"Data":{"OrderNo":null,"OrderNo":"5","orderNo":"6"}}"#,
+                    "5",
+                ),
+            ];
+            for (json, expected) in order_no_rows {
+                assert_eq!(
+                    parse_order_update(json).unwrap().order_no,
+                    *expected,
+                    "{json}"
+                );
+            }
+            let qty_rows: &[(&str, Option<i64>)] = &[
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":50,"TradedQty":null}}"#,
+                    None,
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","tradedQty":50,"tradedQty":""}}"#,
+                    None,
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","tradedQty":50,"tradedQty":"  "}}"#,
+                    None,
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":50,"TradedQty":"","tradedQty":7}}"#,
+                    None,
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":null,"TradedQty":50,"tradedQty":null}}"#,
+                    Some(50),
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":"","TradedQty":50}}"#,
+                    Some(50),
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","tradedQty":"","tradedQty":50}}"#,
+                    Some(50),
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":50,"tradedQty":null,"tradedQty":7}}"#,
+                    Some(50),
+                ),
+                (
+                    r#"{"Data":{"OrderNo":"1","TradedQty":null,"tradedQty":null,"tradedQty":9}}"#,
+                    Some(9),
+                ),
+            ];
+            for (json, expected) in qty_rows {
+                let got = parse_order_update(json);
+                match expected {
+                    Some(qty) => assert_eq!(got.unwrap().traded_qty, *qty, "{json}"),
+                    None => assert!(got.is_err(), "{json} must fail loud: {got:?}"),
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 11: the Instrument assumed twin.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_normalize_order_update_frame_instrument_assumed_twin_table() {
+            let rows: &[(&str, Option<&str>)] = &[
+                (
+                    r#""instrument":"OPTIDX","instrumentType":"EQ""#,
+                    Some("OPTIDX"),
+                ),
+                (
+                    r#""Instrument":"FUTIDX","instrument":"OPTIDX","instrumentType":"EQ""#,
+                    Some("FUTIDX"),
+                ),
+                (r#""Instrument":null,"instrumentType":"EQ""#, Some("EQ")),
+                (r#""instrument":null,"instrumentType":"EQ""#, Some("EQ")),
+                (r#""Instrument":"","instrumentType":"EQ""#, Some("")),
+                (r#""instrumentType":"EQ""#, Some("EQ")),
+                (r#""instrumentType":5"#, Some("5")),
+                (r#""instrumentType":7.5"#, Some("7.5")),
+                (r#""instrumentType":null"#, Some("")),
+                (r#""instrumentType":{}"#, None),
+                (r#""instrumentType":[]"#, None),
+                (r#""instrumentType":true"#, None),
+                (r#""Instrument":"EQ","instrumentType":{}"#, Some("EQ")),
+            ];
+            for (fields, expected) in rows {
+                let json = format!(r#"{{"Data":{{"OrderNo":"1",{fields}}}}}"#);
+                let got = parse_order_update(&json);
+                match expected {
+                    Some(instrument) => {
+                        assert_eq!(got.unwrap().instrument, *instrument, "{json}")
+                    }
+                    None => assert!(got.is_err(), "{json}: {got:?}"),
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Gap 12: numeric string forms.
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn test_fix_for_field_numeric_string_forms() {
+            let int = |text: &str| fix_for_field("Quantity", FieldKind::Int, &json!(text));
+            let int_ok = |n: i64| FieldFix::Replace(json!(n), "numeric_string_coerced");
+            let int_rows: &[(&str, Option<i64>)] = &[
+                ("+50", Some(50)),
+                // Pinned choice: an exponent spelling is an exact integer.
+                ("1e3", Some(1_000)),
+                ("1E3", Some(1_000)),
+                ("1e18", Some(1_000_000_000_000_000_000)),
+                ("5.", Some(5)),
+                ("-0", Some(0)),
+                ("\u{a0}50\u{a0}", Some(50)),
+                ("\n50\t", Some(50)),
+                ("5e-1", None),
+                (".5", None),
+                ("0x10", None),
+                ("50 50", None),
+                ("５０", None),
+                ("1_000", None),
+                ("1,000", None),
+                ("inf", None),
+                ("NaN", None),
+                ("1e19", None),
+                ("--5", None),
+            ];
+            for (text, expected) in int_rows {
+                let want = expected.map_or(FieldFix::Keep, int_ok);
+                assert_eq!(int(text), want, "Int {text:?}");
+            }
+            let float = |text: &str| fix_for_field("Price", FieldKind::Float, &json!(text));
+            let float_rows: &[(&str, Option<f64>)] = &[
+                (".5", Some(0.5)),
+                ("5.", Some(5.0)),
+                ("+5", Some(5.0)),
+                ("1e3", Some(1_000.0)),
+                ("-0", Some(-0.0)),
+                ("\u{a0}245.5", Some(245.5)),
+                ("1e400", None),
+                ("-1e400", None),
+                ("245,50", None),
+                ("+inf", None),
+                ("infinity", None),
+                ("-Infinity", None),
+                ("nan", None),
+                ("0x10", None),
+                ("1_000", None),
+            ];
+            for (text, expected) in float_rows {
+                match (float(text), expected) {
+                    (FieldFix::Replace(Value::Number(n), "numeric_string_coerced"), Some(x)) => {
+                        assert_eq!(n.as_f64().unwrap().to_bits(), x.to_bits(), "Float {text:?}");
+                    }
+                    (FieldFix::Keep, None) => {}
+                    (got, _) => panic!("Float {text:?}: {got:?}, expected {expected:?}"),
+                }
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_fix_for_field_int_parses_every_i64_string(n in any::<i64>()) {
+                prop_assert_eq!(
+                    fix_for_field("Quantity", FieldKind::Int, &json!(n.to_string())),
+                    FieldFix::Replace(json!(n), "numeric_string_coerced")
+                );
+            }
+
+            #[test]
+            fn proptest_fix_for_field_float_parses_every_finite_f64_display(
+                x in proptest::num::f64::ANY.prop_filter("finite", |x| x.is_finite()),
+            ) {
+                match fix_for_field("Price", FieldKind::Float, &json!(format!("{x}"))) {
+                    FieldFix::Replace(Value::Number(n), "numeric_string_coerced") => {
+                        prop_assert_eq!(n.as_f64().unwrap().to_bits(), x.to_bits());
+                    }
+                    other => prop_assert!(false, "{} -> {:?}", x, other),
+                }
+            }
+
+            #[test]
+            fn proptest_fix_for_field_non_numeric_strings_are_kept(s in "[^0-9eE.+-]+") {
+                prop_assert_eq!(fix_for_field("Quantity", FieldKind::Int, &json!(s)), FieldFix::Keep);
+                prop_assert_eq!(fix_for_field("Price", FieldKind::Float, &json!(s)), FieldFix::Keep);
+            }
         }
     }
 }

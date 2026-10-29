@@ -2199,10 +2199,18 @@ impl DepthWriter {
         }
         // DT-A2: one allocation per spare-less hand-off (see the doc above for
         // where that runs), none per row. A spare at least the pre-size costs
-        // nothing.
+        // nothing. A smaller spare is replaced by a fresh buffer rather than
+        // grown: `Buffer` exposes no `reserve_exact`, and `reserve` on a
+        // non-empty capacity doubles it (a spare of pre-size - 1 became
+        // 2 x pre-size - 2), while from capacity 0 it reserves exactly the
+        // amount asked. The buffer is empty here (every caller just swapped
+        // it out), so nothing is lost; a non-empty one keeps `reserve`.
         let presize = self.layout.row_buffer_presize_bytes();
         if self.buffer.capacity() < presize {
             let have = self.buffer.len();
+            if have == 0 {
+                self.buffer = Buffer::new(protocol);
+            }
             self.buffer.reserve(presize.saturating_sub(have));
         }
     }
@@ -6311,5 +6319,250 @@ mod tests {
             DepthWriter::new(&cfg, Feed::Dhan).layout(),
             DepthLayout::Levels
         );
+    }
+
+    // ---- DT-A2 worst-case width and crossing-frame bounds (2026-10-28) ----
+
+    /// Rows the app drain cuts a level batch at (`DEPTH_FLUSH_ROW_THRESHOLD`
+    /// in the app crate; the storage crate cannot import it).
+    const LEVEL_CUT_ROWS: usize = 10_000;
+
+    /// The largest number of Full packets (10 level rows each) in the frame
+    /// that crosses the 10,000-row cut for which the level pre-size still
+    /// holds the whole batch at the WIDEST legal row. Derived in
+    /// `test_level_presize_holds_the_cut_plus_a_crossing_frame_of_widest_rows`
+    /// as `(PRESIZE / W - 10,000) / 10`; a frame with more packets than this
+    /// regrows the buffer on the drain (MAX_PACKETS_PER_FRAME is 70,000).
+    const LEVEL_CROSSING_PACKETS_MAX: usize = 815;
+
+    /// The same bound for the book layout: Full packets (2 inline 5-level
+    /// rows each) in the frame that crosses the 8 MiB cut, from
+    /// `(PRESIZE - DEPTH_BOOK_FLUSH_BYTES) / (2 * W)`.
+    const BOOK_CROSSING_PACKETS_MAX: usize = 1_565;
+
+    /// Prices tried for the widest text rendering of a level price.
+    const WIDE_PRICES: [f64; 7] = [
+        24_500.25,
+        123_456.789_012_345_67,
+        99_999_999.999_999_99,
+        0.000_123_456_789_012_345_67,
+        1.234_567_890_123_456_7e-7,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+    ];
+
+    fn widest_level_row(price: f64) -> DepthRow {
+        DepthRow {
+            security_id: i64::from(u32::MAX),
+            segment: "NSE_CURRENCY",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_BID,
+            level: 200,
+            price,
+            quantity: i64::from(u32::MAX),
+            orders: i64::from(u32::MAX),
+            capture_seq: i64::MAX,
+            ts_nanos: row().ts_nanos,
+        }
+    }
+
+    /// Bytes one level row takes in the buffer.
+    fn level_row_width(r: &DepthRow) -> usize {
+        let mut w = DepthWriter::for_test(Feed::Truedata);
+        w.append_row(r).expect("append");
+        w.pending_bytes()
+    }
+
+    /// The widest legal level row and its width W.
+    fn widest_level_row_and_width() -> (DepthRow, usize) {
+        WIDE_PRICES
+            .iter()
+            .map(|&p| {
+                let r = widest_level_row(p);
+                let w = level_row_width(&r);
+                (r, w)
+            })
+            .max_by_key(|(_, w)| *w)
+            .expect("prices")
+    }
+
+    #[test]
+    fn test_level_presize_holds_the_cut_plus_a_crossing_frame_of_widest_rows() {
+        let (wide, w) = widest_level_row_and_width();
+        assert!(w > level_row_width(&row()), "the wide row is wider");
+        let presize = DepthLayout::Levels.row_buffer_presize_bytes();
+        let derived = (presize / w - LEVEL_CUT_ROWS) / 10;
+        assert_eq!(derived, LEVEL_CROSSING_PACKETS_MAX, "W = {w} B");
+        assert!((LEVEL_CUT_ROWS + 10 * LEVEL_CROSSING_PACKETS_MAX) * w <= presize);
+        assert!((LEVEL_CUT_ROWS + 10 * (LEVEL_CROSSING_PACKETS_MAX + 1)) * w > presize);
+
+        for p in [1usize, 4, LEVEL_CROSSING_PACKETS_MAX] {
+            let mut wr = DepthWriter::for_test(Feed::Truedata);
+            let ptr = wr.buffer.as_bytes().as_ptr();
+            let cap = wr.buffer.capacity();
+            for _ in 0..LEVEL_CUT_ROWS + 10 * p {
+                wr.append_row(&wide).expect("append");
+            }
+            assert_eq!(wr.pending_bytes(), (LEVEL_CUT_ROWS + 10 * p) * w);
+            assert_eq!(wr.buffer.capacity(), cap, "P={p}: no regrowth");
+            assert_eq!(wr.buffer.as_bytes().as_ptr(), ptr, "P={p}: no reallocation");
+        }
+        // One packet past the bound regrows: the documented limit.
+        let mut wr = DepthWriter::for_test(Feed::Truedata);
+        let cap = wr.buffer.capacity();
+        for _ in 0..LEVEL_CUT_ROWS + 10 * (LEVEL_CROSSING_PACKETS_MAX + 1) {
+            wr.append_row(&wide).expect("append");
+        }
+        assert!(
+            wr.buffer.capacity() > cap,
+            "past the bound the buffer regrows"
+        );
+    }
+
+    /// One inline book row (5 levels) at the widest legal values.
+    fn widest_book_row<'a>(p: &'a [f64], q: &'a [f64], o: &'a [f64]) -> DepthBookRow<'a> {
+        DepthBookRow {
+            security_id: i64::from(u32::MAX),
+            segment: "NSE_CURRENCY",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_ASK,
+            prices: p,
+            quantities: q,
+            orders: o,
+            capture_seq: i64::MAX,
+            ts_nanos: BOOK_TS_NANOS,
+        }
+    }
+
+    #[test]
+    fn test_book_presize_holds_the_cut_plus_a_crossing_frame_of_widest_rows() {
+        let p = [f64::MAX; 5];
+        let q = [f64::from(u32::MAX); 5];
+        let o = [f64::from(u32::MAX); 5];
+        let wide = widest_book_row(&p, &q, &o);
+        let mut probe = DepthWriter::for_test_book(Feed::Truedata);
+        probe.append_book_row(&wide).expect("append");
+        let w = probe.pending_bytes();
+        let presize = DepthLayout::Book.row_buffer_presize_bytes();
+        let derived = (presize - DEPTH_BOOK_FLUSH_BYTES) / (2 * w);
+        assert_eq!(derived, BOOK_CROSSING_PACKETS_MAX, "W = {w} B");
+        assert!(DEPTH_BOOK_FLUSH_BYTES + 2 * BOOK_CROSSING_PACKETS_MAX * w <= presize);
+        assert!(DEPTH_BOOK_FLUSH_BYTES + 2 * (BOOK_CROSSING_PACKETS_MAX + 1) * w > presize);
+
+        for packets in [1usize, 4, BOOK_CROSSING_PACKETS_MAX] {
+            let mut wr = DepthWriter::for_test_book(Feed::Truedata);
+            let ptr = wr.buffer.as_bytes().as_ptr();
+            let cap = wr.buffer.capacity();
+            // Fill to within one row of the cut, not yet due.
+            while wr.pending_bytes() + w < DEPTH_BOOK_FLUSH_BYTES {
+                wr.append_book_row(&wide).expect("fill");
+            }
+            assert!(!wr.book_flush_due(), "packets={packets}: not yet due");
+            for _ in 0..2 * packets {
+                wr.append_book_row(&wide).expect("crossing frame");
+            }
+            assert!(
+                wr.book_flush_due(),
+                "packets={packets}: the frame crossed the cut"
+            );
+            assert_eq!(wr.buffer.capacity(), cap, "packets={packets}: no regrowth");
+            assert_eq!(
+                wr.buffer.as_bytes().as_ptr(),
+                ptr,
+                "packets={packets}: no reallocation"
+            );
+        }
+    }
+
+    /// `install_spare_buffer` at the pre-size boundary, both layouts: a spare
+    /// of capacity >= the pre-size is installed as is (same pointer, never
+    /// shrunk); below it the buffer is reserved up to the pre-size.
+    #[test]
+    fn test_install_spare_buffer_keeps_or_reserves_at_the_presize_boundary() {
+        for layout in [DepthLayout::Levels, DepthLayout::Book] {
+            let pre = layout.row_buffer_presize_bytes();
+            for spare_cap in [0, pre - 1, pre, pre + 1, MAX_DEPTH_PRODUCER_BUFFER_BYTES] {
+                let writer = match layout {
+                    DepthLayout::Levels => DepthWriter::for_test(Feed::Dhan),
+                    DepthLayout::Book => DepthWriter::for_test_book(Feed::Dhan),
+                };
+                let (mut w, sink, _rx) = writer.split_for_offload();
+                let mut spare = Buffer::new(layout.protocol());
+                if spare_cap > 0 {
+                    spare.reserve(spare_cap);
+                }
+                let got_cap = spare.capacity();
+                assert!(got_cap >= spare_cap);
+                let spare_ptr = spare.as_bytes().as_ptr();
+                sink.spare_return
+                    .as_ref()
+                    .expect("split opens the lane")
+                    .try_send(spare)
+                    .expect("lane has room");
+                match layout {
+                    DepthLayout::Levels => w.append_row(&row()).expect("append"),
+                    DepthLayout::Book => {
+                        let (p, q, o) = book_levels(5);
+                        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+                            .expect("append");
+                    }
+                }
+                w.flush().expect("hand off");
+                let case = format!("{layout:?} spare {spare_cap}");
+                assert!(w.buffer.as_bytes().is_empty(), "{case}");
+                assert_eq!(w.buffer.protocol_version(), layout.protocol(), "{case}");
+                assert!(w.buffer.capacity() >= pre, "{case}: at least the pre-size");
+                if got_cap >= pre {
+                    assert_eq!(w.buffer.as_bytes().as_ptr(), spare_ptr, "{case}: kept");
+                    assert_eq!(w.buffer.capacity(), got_cap, "{case}: never shrunk");
+                }
+                assert!(
+                    w.buffer.capacity() <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// BUG (DT-A2): a returned spare just under the pre-size is grown with
+    /// `reserve(presize - len)`, whose amortized growth doubles it (a
+    /// Levels spare of 4 MiB - 1 becomes 8 MiB - 2), so the installed buffer
+    /// is about twice the pre-size the doc states. Address space only (no
+    /// page is committed) and still under the producer bound.
+    #[test]
+    fn test_install_spare_buffer_reserves_exactly_the_presize_below_it() {
+        for layout in [DepthLayout::Levels, DepthLayout::Book] {
+            let pre = layout.row_buffer_presize_bytes();
+            for spare_cap in [0, pre / 2 + 1, pre - 1] {
+                let writer = match layout {
+                    DepthLayout::Levels => DepthWriter::for_test(Feed::Dhan),
+                    DepthLayout::Book => DepthWriter::for_test_book(Feed::Dhan),
+                };
+                let (mut w, sink, _rx) = writer.split_for_offload();
+                let mut spare = Buffer::new(layout.protocol());
+                if spare_cap > 0 {
+                    spare.reserve(spare_cap);
+                }
+                sink.spare_return
+                    .as_ref()
+                    .expect("split opens the lane")
+                    .try_send(spare)
+                    .expect("lane has room");
+                match layout {
+                    DepthLayout::Levels => w.append_row(&row()).expect("append"),
+                    DepthLayout::Book => {
+                        let (p, q, o) = book_levels(5);
+                        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+                            .expect("append");
+                    }
+                }
+                w.flush().expect("hand off");
+                assert_eq!(
+                    w.buffer.capacity(),
+                    pre,
+                    "{layout:?} spare {spare_cap}: reserved to exactly the pre-size"
+                );
+            }
+        }
     }
 }

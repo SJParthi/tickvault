@@ -1706,4 +1706,363 @@ mod tests {
         assert_eq!(gib(1_073_741_824), "1.0 GiB");
         assert_eq!(gib(0), "0.0 GiB");
     }
+
+    /// Edge cases for `first_boot_wait` and `tail_lines`: bounds, sub-second
+    /// durations, extremes, and properties over the whole input space.
+    mod first_boot_edges {
+        use super::*;
+        use proptest::prelude::*;
+
+        const GRACE: u64 = FIRST_BOOT_AFTER_DONE_GRACE_SECS;
+        const BOUND: u64 = CLOUD_INIT_WAIT_SECS;
+
+        /// The rule written out independently: full proof wins; otherwise
+        /// give up at either bound (both inclusive); otherwise keep waiting.
+        fn oracle(c: bool, p: bool, f: Option<Duration>, w: Duration) -> FirstBootWait {
+            if c && p {
+                FirstBootWait::Ready
+            } else if w >= Duration::from_secs(BOUND)
+                || f.is_some_and(|f| f >= Duration::from_secs(GRACE))
+            {
+                FirstBootWait::GiveUp
+            } else {
+                FirstBootWait::KeepWaiting
+            }
+        }
+
+        /// The last poll before the overall bound can be the first that sees
+        /// both proofs: Ready must win even when both give-up bounds are met.
+        #[test]
+        fn test_first_boot_wait_ready_wins_over_both_give_up_bounds() {
+            let finished = [
+                None,
+                Some(Duration::ZERO),
+                Some(Duration::from_secs(GRACE - 1)),
+                Some(Duration::from_secs(GRACE)),
+                Some(Duration::from_secs(GRACE + 1)),
+                Some(Duration::MAX),
+            ];
+            let waited = [
+                Duration::ZERO,
+                Duration::from_secs(BOUND - 1),
+                Duration::from_secs(BOUND),
+                Duration::from_secs(BOUND + 1),
+                Duration::MAX,
+            ];
+            let mut rows = 0;
+            for f in finished {
+                for w in waited {
+                    assert_eq!(
+                        first_boot_wait(true, true, f, w),
+                        FirstBootWait::Ready,
+                        "finished={f:?} waited={w:?}"
+                    );
+                    rows += 1;
+                }
+            }
+            assert_eq!(rows, 30);
+        }
+
+        /// Every proof pair x every finished boundary x every waited boundary
+        /// (2 x 2 x 9 x 9 = 324 cases) against the independent oracle, so a
+        /// `>=` turned into `>` on either bound fails here.
+        #[test]
+        fn test_first_boot_wait_exhaustive_boundary_table() {
+            let s = Duration::from_secs;
+            let finished = [
+                None,
+                Some(s(0)),
+                Some(s(1)),
+                Some(s(599)),
+                Some(s(600)),
+                Some(s(601)),
+                Some(s(1799)),
+                Some(s(1800)),
+                Some(Duration::MAX),
+            ];
+            let waited = [
+                s(0),
+                s(1),
+                s(599),
+                s(600),
+                s(601),
+                s(1799),
+                s(1800),
+                s(1801),
+                Duration::MAX,
+            ];
+            let mut cases = 0;
+            for c in [false, true] {
+                for p in [false, true] {
+                    for f in finished {
+                        for w in waited {
+                            assert_eq!(
+                                first_boot_wait(c, p, f, w),
+                                oracle(c, p, f, w),
+                                "c={c} p={p} f={f:?} w={w:?}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(cases, 324);
+            // The oracle encodes the constants this table was written for.
+            assert_eq!((GRACE, BOUND), (600, 1800));
+        }
+
+        /// Half proof (user-data done but clone failed, or a stale compose
+        /// file with no complete line) gives up at each bound and waits one
+        /// second below it.
+        #[test]
+        fn test_first_boot_wait_half_proof_at_and_below_the_bounds() {
+            let s = Duration::from_secs;
+            let rows = [
+                // (complete, compose, finished, waited, expected)
+                (true, false, Some(s(GRACE)), s(10), FirstBootWait::GiveUp),
+                (false, true, Some(s(GRACE)), s(10), FirstBootWait::GiveUp),
+                (true, false, None, s(BOUND), FirstBootWait::GiveUp),
+                (false, true, None, s(BOUND), FirstBootWait::GiveUp),
+                (
+                    true,
+                    false,
+                    Some(s(GRACE - 1)),
+                    s(10),
+                    FirstBootWait::KeepWaiting,
+                ),
+                (
+                    false,
+                    true,
+                    Some(s(GRACE - 1)),
+                    s(10),
+                    FirstBootWait::KeepWaiting,
+                ),
+                (true, false, None, s(BOUND - 1), FirstBootWait::KeepWaiting),
+                (false, true, None, s(BOUND - 1), FirstBootWait::KeepWaiting),
+            ];
+            for (c, p, f, w, want) in rows {
+                assert_eq!(
+                    first_boot_wait(c, p, f, w),
+                    want,
+                    "c={c} p={p} f={f:?} w={w:?}"
+                );
+            }
+        }
+
+        /// Production passes `Instant::elapsed()`, which carries nanoseconds:
+        /// one nanosecond below a bound still waits, the bound itself gives up.
+        #[test]
+        fn test_first_boot_wait_sub_second_boundaries() {
+            let rows = [
+                (
+                    Some(Duration::from_millis(599_999)),
+                    Duration::ZERO,
+                    FirstBootWait::KeepWaiting,
+                ),
+                (
+                    Some(Duration::new(599, 999_999_999)),
+                    Duration::ZERO,
+                    FirstBootWait::KeepWaiting,
+                ),
+                (
+                    Some(Duration::new(600, 0)),
+                    Duration::ZERO,
+                    FirstBootWait::GiveUp,
+                ),
+                (
+                    None,
+                    Duration::new(1799, 999_999_999),
+                    FirstBootWait::KeepWaiting,
+                ),
+                (None, Duration::new(1800, 0), FirstBootWait::GiveUp),
+                (
+                    Some(Duration::new(599, 999_999_999)),
+                    Duration::new(1799, 999_999_999),
+                    FirstBootWait::KeepWaiting,
+                ),
+            ];
+            for (f, w, want) in rows {
+                assert_eq!(first_boot_wait(false, false, f, w), want, "f={f:?} w={w:?}");
+            }
+        }
+
+        /// ZERO and MAX on both durations: total, no panic, no overflow.
+        #[test]
+        fn test_first_boot_wait_extreme_durations() {
+            let z = Duration::ZERO;
+            let m = Duration::MAX;
+            let rows = [
+                (false, false, Some(z), z, FirstBootWait::KeepWaiting),
+                (false, false, None, z, FirstBootWait::KeepWaiting),
+                (false, false, Some(m), z, FirstBootWait::GiveUp),
+                (false, false, None, m, FirstBootWait::GiveUp),
+                (true, true, Some(m), m, FirstBootWait::Ready),
+                (true, true, Some(z), z, FirstBootWait::Ready),
+            ];
+            for (c, p, f, w, want) in rows {
+                assert_eq!(first_boot_wait(c, p, f, w), want);
+            }
+        }
+
+        /// Inputs the caller cannot produce today (marker older than the
+        /// wait). Pinned deliberately: the marker's age wins over the elapsed
+        /// wait, and full proof still wins over both.
+        #[test]
+        fn test_first_boot_wait_marker_older_than_the_wait() {
+            let s = Duration::from_secs;
+            assert_eq!(
+                first_boot_wait(false, false, Some(s(700)), s(10)),
+                FirstBootWait::GiveUp
+            );
+            assert_eq!(
+                first_boot_wait(false, true, Some(s(1800)), s(0)),
+                FirstBootWait::GiveUp
+            );
+            assert_eq!(
+                first_boot_wait(true, true, Some(s(5000)), s(0)),
+                FirstBootWait::Ready
+            );
+        }
+
+        fn check_properties(
+            c: bool,
+            p: bool,
+            f: Option<Duration>,
+            w: Duration,
+            f2: Option<Duration>,
+            w2: Duration,
+        ) -> Result<(), TestCaseError> {
+            let got = first_boot_wait(c, p, f, w);
+            prop_assert_eq!(got, oracle(c, p, f, w));
+            // (a) Ready if and only if both proofs are true.
+            prop_assert_eq!(got == FirstBootWait::Ready, c && p);
+            // (c) With full proof the durations do not matter.
+            if c && p {
+                prop_assert_eq!(first_boot_wait(c, p, f2, w2), FirstBootWait::Ready);
+            }
+            // (b) Once given up, a later poll (larger or equal durations,
+            // proof pair unchanged) never goes back to waiting.
+            if got == FirstBootWait::GiveUp {
+                prop_assert_eq!(first_boot_wait(c, p, f2, w2), FirstBootWait::GiveUp);
+            }
+            Ok(())
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_first_boot_wait_ready_iff_full_proof_and_give_up_is_final(
+                c in any::<bool>(),
+                p in any::<bool>(),
+                f in proptest::option::of(0u64..=4000),
+                w in 0u64..=4000,
+                d in 0u64..=4000,
+            ) {
+                let s = Duration::from_secs;
+                check_properties(
+                    c,
+                    p,
+                    f.map(s),
+                    s(w),
+                    f.map(|f| s(f + d)),
+                    s(w + d),
+                )?;
+            }
+
+            #[test]
+            fn proptest_first_boot_wait_sub_second_space(
+                c in any::<bool>(),
+                p in any::<bool>(),
+                f in proptest::option::of((any::<u64>(), 0u32..1_000_000_000)),
+                w in (any::<u64>(), 0u32..1_000_000_000),
+                d in (0u64..=4000, 0u32..1_000_000_000),
+            ) {
+                let dur = |(secs, nanos): (u64, u32)| Duration::new(secs, nanos);
+                let delta = dur(d);
+                let fd = f.map(dur);
+                let wd = dur(w);
+                check_properties(
+                    c,
+                    p,
+                    fd,
+                    wd,
+                    fd.map(|f| f.saturating_add(delta)),
+                    wd.saturating_add(delta),
+                )?;
+            }
+        }
+
+        /// Logs normally end with a newline: only ONE trailing newline is
+        /// dropped, so the quoted tail never starts with an empty last line.
+        #[test]
+        fn test_tail_lines_trailing_newline() {
+            assert_eq!(tail_lines("a\nb\n", 1), vec!["b"]);
+            assert_eq!(tail_lines("a\nb\n", 2), vec!["a", "b"]);
+            assert_eq!(tail_lines("a\nb\n", 5), vec!["a", "b"]);
+            assert_eq!(tail_lines("\n", 3), vec![""]);
+            assert_eq!(tail_lines("a\n\n", 2), vec!["a", ""]);
+        }
+
+        /// CRLF splits and drops the CR; a lone CR (dnf/curl progress bars)
+        /// does not split, so a progress line is quoted as one long line.
+        /// Pinned as a known limit.
+        #[test]
+        fn test_tail_lines_crlf_and_lone_cr() {
+            assert_eq!(tail_lines("a\r\nb\r\n", 2), vec!["a", "b"]);
+            let lone = tail_lines("a\rb", 5);
+            assert_eq!(lone, vec!["a\rb"]);
+            assert_eq!(lone.len(), 1);
+            assert!(lone[0].contains('\r'));
+            let progress = tail_lines("x\n 10%\r 50%\r100%\ndone\n", 2);
+            assert_eq!(progress, vec![" 10%\r 50%\r100%", "done"]);
+        }
+
+        /// Around the production tail length (12): n == len is where the
+        /// saturating start is 0 and an off-by-one would hide.
+        #[test]
+        fn test_tail_lines_at_the_production_tail_length() {
+            let n = FIRST_BOOT_LOG_TAIL_LINES;
+            assert_eq!(n, 12);
+            for k in [n - 1, n, n + 1] {
+                let text = (1..=k)
+                    .map(|i| format!("L{i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let got = tail_lines(&text, n);
+                assert_eq!(got.len(), k.min(n), "k={k}");
+                let first = format!("L{}", k.saturating_sub(n) + 1);
+                let last = format!("L{k}");
+                assert_eq!(got.first().copied(), Some(first.as_str()), "k={k}");
+                assert_eq!(got.last().copied(), Some(last.as_str()), "k={k}");
+            }
+            // Blank lines in the middle count as lines.
+            assert_eq!(tail_lines("a\n\nb", 2), vec!["", "b"]);
+            // usize::MAX saturates to the whole text.
+            assert_eq!(tail_lines("a\nb\nc", usize::MAX), vec!["a", "b", "c"]);
+            assert!(tail_lines("", usize::MAX).is_empty());
+        }
+
+        proptest! {
+            /// Equivalence with the obvious definition over arbitrary text
+            /// (multibyte, empty, newline-only, CR), and every line borrowed
+            /// from inside the input.
+            #[test]
+            fn proptest_tail_lines_matches_lines_rev_take(
+                s in proptest::string::string_regex("([\\PC\\r]{0,20}\\n?){0,40}")
+                    .expect("valid regex"),
+                n in 0usize..60,
+            ) {
+                let got = tail_lines(&s, n);
+                let mut want: Vec<&str> = s.lines().rev().take(n).collect();
+                want.reverse();
+                prop_assert_eq!(&got, &want);
+                prop_assert_eq!(got.len(), n.min(s.lines().count()));
+                let base = s.as_ptr() as usize;
+                let end = base + s.len();
+                for line in &got {
+                    let lp = line.as_ptr() as usize;
+                    prop_assert!(lp >= base && lp + line.len() <= end);
+                }
+            }
+        }
+    }
 }
