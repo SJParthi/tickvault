@@ -1645,6 +1645,11 @@ pub struct LiveIngest {
     /// the volume ranking, whose monotonicity gate a stale cumulative would
     /// re-latch; that ranking is removed with `top_volume`.
     replaying_wal: bool,
+    /// A market-data floor (Unix nanos) given to this ingest IN ADDITION to
+    /// the process-wide one (`market_data_floor`); [`refold_wal_frames`]
+    /// judges receipts against the higher of the two. Production leaves it
+    /// `None`; a test sets it so it never has to raise the process floor.
+    market_data_floor_unix_nanos: Option<i64>,
     /// `false` while the frame being drained carries no WAL receipt stamp
     /// (the live drain substituted a wall-clock reading, which a replay
     /// cannot reproduce), so its packets stay in `ticks` (plan item M5,
@@ -1994,6 +1999,7 @@ impl LiveIngest {
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
+            market_data_floor_unix_nanos: None,
             frame_receipt_is_wal_stamp: true,
             seed_queue: SeedQueue::new(),
         }
@@ -15203,6 +15209,11 @@ pub struct WalRefoldOutcome {
     /// handing them the next batch (audit R1, 2026-10-03). Zero when the
     /// replay was not paced or the writers kept up.
     pub pace_waits: u64,
+    /// Frames skipped because their recorded receipt is below the
+    /// market-data floor (live audit F2/F5/F6 review, 2026-10-29): data from
+    /// before the fresh-start reset. Not loss: the bytes stay in the archived
+    /// segment, and the reset already set those days' tables aside.
+    pub frames_below_floor: u64,
 }
 /// Is this WAL frame from a DEPTH socket rather than the main feed?
 ///
@@ -15881,7 +15892,22 @@ pub fn refold_wal_frames(
     gaps: &[usize],
     pace_until: Option<Instant>,
 ) -> WalRefoldOutcome {
+    // Live audit F2/F5/F6 review (2026-10-29): the market-data floor, read
+    // once per call (the file once per process, then one atomic load), raised
+    // by any floor this ingest was given.
+    tickvault_storage::market_data_floor::ensure_market_data_floor_loaded();
+    let floor_unix_nanos = match (
+        tickvault_storage::market_data_floor::installed_market_data_floor_unix_nanos(),
+        ingest.market_data_floor_unix_nanos,
+    ) {
+        (Some(installed), Some(own)) => Some(installed.max(own)),
+        (installed, own) => installed.or(own),
+    };
     let mut out = WalRefoldOutcome::default();
+    // Set when a frame below the floor was skipped and no frame was folded
+    // since: the next folded frame marks a replay gap (frames before it were
+    // not folded, so no baseline may carry across them).
+    let mut skipped_below_floor = false;
     // Item 45h: the replay's `feed_aux_packets` rows, reported beside
     // `non_tick` below as the difference across this pass.
     let aux_rows_before = ingest.writer.aux_rows_appended();
@@ -16059,6 +16085,31 @@ pub fn refold_wal_frames(
                 gap_marked_here = true;
             }
             gap_cursor += 1;
+        }
+        // Live audit F2/F5/F6 review (2026-10-29): a frame RECEIVED before
+        // the market-data floor (the fresh-start reset's cutoff) is from
+        // before the reset and is not folded, so an old segment cannot put
+        // pre-reset rows back into the fresh tables whether or not QuestDB is
+        // fast enough to take them without a spill. Its bytes stay in the
+        // segment, which is archived like any replayed segment. A frame with
+        // no plausible recorded receipt is never judged, and neither is an
+        // order-update frame (not market data). O(1) per frame.
+        if *endpoint != WalEndpoint::OrderUpdate
+            && tickvault_storage::market_data_floor::wal_frame_is_below_floor(
+                *wal_received_at_nanos,
+                floor_unix_nanos,
+            )
+        {
+            out.frames_below_floor = out.frames_below_floor.saturating_add(1);
+            skipped_below_floor = true;
+            continue;
+        }
+        if skipped_below_floor {
+            skipped_below_floor = false;
+            if !gap_marked_here {
+                ingest.aggregator.mark_replay_gap();
+                out.gaps_marked = out.gaps_marked.saturating_add(1);
+            }
         }
         // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
         // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
@@ -16491,6 +16542,23 @@ pub fn refold_wal_frames(
              fold — they are not in the database, and the segment is archived either way. \
              The raw frames remain in the WAL archive and can be recovered by hand.",
             out.lost
+        );
+    }
+
+    // Live audit F2/F5/F6 review (2026-10-29): one coded warn per pass for
+    // the frames the market-data floor kept out.
+    if out.frames_below_floor > 0 {
+        metrics::counter!(tickvault_storage::market_data_floor::WAL_REPLAY_BELOW_FLOOR_COUNTER)
+            .increment(out.frames_below_floor);
+        warn!(
+            code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+            source = "wal_replay_below_market_data_floor",
+            frames_below_floor = out.frames_below_floor,
+            frames = frames.len(),
+            floor_unix_nanos = floor_unix_nanos.unwrap_or_default(),
+            "WAL replay skipped frames RECEIVED before the market-data floor (the fresh-start \
+             reset's cutoff): they are from before the reset and are NOT folded into the fresh \
+             tables. Their bytes stay in the WAL segment, which is archived as usual."
         );
     }
 
@@ -26676,6 +26744,67 @@ mod wal_refold_tests {
         );
         let out = refold_wal_frames(&mut ingest(), &[no_receipt], &[], None);
         assert_eq!(out.refolded, 0, "no receipt clock, no proof, no write-back");
+    }
+
+    /// Live audit F2/F5/F6 review (2026-10-29): a WAL frame received before
+    /// the market-data floor (the fresh-start reset's cutoff) must not come
+    /// back into `ticks` through the WAL refold. Before the fix the same
+    /// prior-session frame the test above writes back was refolded whatever
+    /// the floor said.
+    #[test]
+    fn test_regression_a_wal_frame_received_below_the_floor_is_not_refolded() {
+        // An ingest judging receipts against `floor` (the process-wide floor
+        // is never raised by a test).
+        fn floored(floor: Option<i64>) -> LiveIngest {
+            let mut ingest = ingest();
+            ingest.market_data_floor_unix_nanos = floor;
+            ingest
+        }
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let now_ist_secs =
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+        let yesterday_ist = u32::try_from(now_ist_secs - 86_400).expect("fits u32 until 2106");
+        let received = (now_utc_secs - 86_400) * 1_000_000_000;
+        let frame = (
+            2u64,
+            received,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        // Floor one second after the receipt: the frame is below it.
+        let mut below = floored(Some(received + 1_000_000_000));
+        let out = refold_wal_frames(&mut below, std::slice::from_ref(&frame), &[], None);
+        assert_eq!(out.refolded, 0, "a frame below the floor reaches no table");
+        assert_eq!(below.pending_rows(), 0, "no row was staged for ticks");
+        assert_eq!(out.frames_below_floor, 1, "and it is counted");
+        assert_eq!(out.lost, 0, "set aside by the floor, not lost");
+        // A below-floor frame followed by a kept one: the kept one is folded
+        // after a replay gap (nothing before it was folded).
+        let later = (
+            3u64,
+            received + 2_000_000_000,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        let out = refold_wal_frames(
+            &mut floored(Some(received + 1_000_000_000)),
+            &[frame.clone(), later],
+            &[],
+            None,
+        );
+        assert_eq!((out.frames_below_floor, out.refolded), (1, 1));
+        assert_eq!(out.gaps_marked, 1, "the fold resumes after a gap");
+        // No floor: folded as before.
+        let out = refold_wal_frames(&mut floored(None), std::slice::from_ref(&frame), &[], None);
+        assert_eq!((out.frames_below_floor, out.refolded), (0, 1));
+        // Floor at the receipt: written back exactly as before.
+        let out = refold_wal_frames(
+            &mut floored(Some(received)),
+            std::slice::from_ref(&frame),
+            &[],
+            None,
+        );
+        assert_eq!(out.refolded, 1, "a frame at the floor is kept");
     }
 
     /// A depth-20 frame exactly as the depth socket writes it: 12-byte header

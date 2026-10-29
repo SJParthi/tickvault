@@ -96,7 +96,19 @@
 //! - **Rows from before the reset can come back in the same boot.** The tick
 //!   and depth spill drains and the staged live-feed WAL run AFTER the drops
 //!   and write whatever they hold into the fresh tables. The seal spill is
-//!   version-gated and does not.
+//!   version-gated and does not. *(⚠ CHANGED 2026-10-29, live audit F2/F5/F6
+//!   and its review: once the reset is done, EVERY boot reads the first-boot
+//!   marker and sets the market-data floor to the marker less
+//!   [`NEWEST_ROW_LAG_MARGIN_SECS`] ([`record_market_data_floor_at_boot`]).
+//!   Below it the text tick/depth spill replay sets lines aside to
+//!   `quarantine/`, the framed depth spill sets whole files aside, and the WAL
+//!   refold skips frames by their recorded receipt. NOT covered: a WAL frame
+//!   with no recorded receipt (pre-TVW3 records), a spill line with no
+//!   plausible timestamp, the framed depth file of the hour the floor falls
+//!   in, seal spill records of the current format version (6, written since
+//!   2026-10-22), the after-close deferred-depth pass, a boot whose marker
+//!   cannot be read and that has no floor file, and any wipe that does not go
+//!   through this reset.)*
 //! - **A refused recreate after the drop leaves a table without its DEDUP
 //!   key.** If the ensure DDL that follows the reset is refused on every
 //!   attempt, the first ILP write auto-creates the table key-less, and the
@@ -1142,43 +1154,114 @@ pub async fn run_fresh_start_reset_at_boot(questdb: &QuestDbConfig) -> ResetDeci
         || chrono::Utc::now().timestamp(),
     )
     .await;
-    // Live audit F2/F5/F6 (2026-10-29): a reset that ran sets the durable
-    // market-data floor, so the spill replay never brings older rows back,
-    // and installs it for this process.
-    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    if let Some(floor) = record_market_data_floor_after_reset(
+    // Live audit F2/F5/F6 (2026-10-29): once the reset is done, the floor is
+    // its first-boot marker, read on EVERY boot (not only the one Run), so a
+    // box whose reset ran long ago still gets one. Installed for this process
+    // and kept on disk for a boot whose QuestDB does not answer.
+    if let Some(floor) = record_market_data_floor_at_boot(
+        &client,
+        &base_url,
         decision,
         std::path::Path::new(crate::market_data_floor::MARKET_DATA_FLOOR_PATH),
-        now_nanos,
-    ) {
+    )
+    .await
+    {
         crate::market_data_floor::install_market_data_floor(floor);
     }
     decision
 }
 
-/// After a reset that RAN ([`ResetDecision::Run`]), writes the market-data
-/// floor at `floor_unix_nanos` to `path` (temp file, sync, rename) and
-/// returns it; any other decision writes nothing. A failed write is a coded
-/// `error!` and returns `None`: the reset itself is not undone, but the spill
-/// replay then has no floor and can bring rows from before the reset back.
-/// Cold path, once per reset.
-pub fn record_market_data_floor_after_reset(
+/// The market-data floor a first-boot marker implies, in Unix nanoseconds:
+/// the marker less [`NEWEST_ROW_LAG_MARGIN_SECS`], i.e. the cutoff the reset
+/// itself protects rows from ([`marker_cutoff_micros`] is the same instant in
+/// naive-IST micros). Rows captured since the first boot with the reset
+/// pending sit at or above it, so this floor never sets aside a row the reset
+/// kept in the fresh tables. Saturating. O(1).
+#[must_use]
+pub const fn market_data_floor_from_marker(marker_utc_micros: i64) -> i64 {
+    marker_utc_micros
+        .saturating_sub(NEWEST_ROW_LAG_MARGIN_SECS * 1_000_000)
+        .saturating_mul(1_000)
+}
+
+/// Whether `decision` means the reset is finished on this volume, so its
+/// first-boot marker may set the market-data floor. A refused boot has not
+/// reset anything yet: its old rows still belong in the old tables.
+const fn reset_is_done(decision: ResetDecision) -> bool {
+    matches!(
+        decision,
+        ResetDecision::Run | ResetDecision::AlreadyDone | ResetDecision::NothingToWipe
+    )
+}
+
+/// Reads the first-boot marker (never writes it) and records the floor it
+/// implies through [`record_market_data_floor_after_reset`]. Any decision but
+/// a finished reset reads nothing and returns `None`. Cold, one query a boot.
+pub async fn record_market_data_floor_at_boot(
+    client: &Client,
+    base_url: &str,
     decision: ResetDecision,
     path: &std::path::Path,
-    floor_unix_nanos: i64,
 ) -> Option<i64> {
-    if decision != ResetDecision::Run {
+    if !reset_is_done(decision) {
         return None;
     }
-    match crate::market_data_floor::write_market_data_floor(path, floor_unix_nanos) {
+    let marker = match read_first_boot_marker(client, base_url).await {
+        Some((n, Some(utc_micros))) if n > 0 => Some(utc_micros),
+        _ => None,
+    };
+    record_market_data_floor_after_reset(decision, marker, path)
+}
+
+/// Records the market-data floor for a finished reset (`Run`, `AlreadyDone`,
+/// `NothingToWipe`) from its first-boot marker (REAL-UTC micros; `None` when
+/// absent or unreadable) and returns the floor to install.
+///
+/// - Any other decision, or no marker: nothing written, `None`. With no marker
+///   a coded `warn!` says this boot's replays run without a marker floor.
+/// - A valid file already at or above the marker floor is kept and returned
+///   (a floor is only ever raised).
+/// - A torn file is left for inspection (the read already logged it) and the
+///   marker floor is returned for this process only.
+/// - Otherwise the floor is written (temp file, sync, rename). A failed write
+///   is a coded `error!`; the floor is still returned for this process.
+///
+/// Cold path, once per boot.
+pub fn record_market_data_floor_after_reset(
+    decision: ResetDecision,
+    marker_utc_micros: Option<i64>,
+    path: &std::path::Path,
+) -> Option<i64> {
+    use crate::market_data_floor::{FloorRead, read_market_data_floor, write_market_data_floor};
+    if !reset_is_done(decision) {
+        return None;
+    }
+    let Some(marker) = marker_utc_micros else {
+        warn!(
+            code = tickvault_common::error_code::ErrorCode::TickSpill01FileQuarantined.code_str(),
+            source = "market_data_floor_no_marker",
+            decision = decision.as_str(),
+            "the fresh-start reset is done but its first-boot marker could not be read, so this \
+             boot sets NO market-data floor from it: the spill and WAL replays bring back every \
+             row they hold, older than the reset or not, unless a floor file from an earlier \
+             boot is on disk."
+        );
+        return None;
+    };
+    let floor = market_data_floor_from_marker(marker);
+    match read_market_data_floor(path) {
+        FloorRead::Floor(existing) if existing >= floor => return Some(existing),
+        FloorRead::Refused(_) => return Some(floor),
+        FloorRead::Floor(_) | FloorRead::Absent => {}
+    }
+    match write_market_data_floor(path, floor) {
         Ok(()) => {
             info!(
                 path = %path.display(),
-                floor_unix_nanos,
-                "fresh-start reset wrote the market-data floor: spill replay sets aside rows \
-                 older than this reset"
+                floor_unix_nanos = floor,
+                "market-data floor written from the fresh-start reset's first-boot marker: \
+                 spill and WAL replays set aside rows older than it"
             );
-            Some(floor_unix_nanos)
         }
         Err(err) => {
             error!(
@@ -1186,14 +1269,15 @@ pub fn record_market_data_floor_after_reset(
                     .code_str(),
                 source = "market_data_floor_write_failed",
                 path = %path.display(),
+                floor_unix_nanos = floor,
                 %err,
-                "fresh-start reset could NOT write the market-data floor. The reset ran, but \
-                 the spill replay has no floor, so spilled rows from before the reset can come \
-                 back into the database. Check the disk and data/state/."
+                "the market-data floor could NOT be written to disk. It holds for this process \
+                 (read from the reset's first-boot marker); a later boot whose QuestDB does not \
+                 answer then has no floor. Check the disk and data/state/."
             );
-            None
         }
     }
+    Some(floor)
 }
 
 #[cfg(test)]
@@ -1211,41 +1295,215 @@ mod tests {
         assert_eq!(FRESH_START_RESET_ID, "2026-09-19-fresh-start");
     }
 
-    #[test]
-    fn test_record_market_data_floor_after_reset_writes_only_when_the_reset_ran() {
-        let dir = std::env::temp_dir().join(format!(
-            "tv-reset-floor-{}-{}",
+    fn floor_temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tv-reset-floor-{tag}-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
+        ))
+    }
+
+    /// The first boot with the reset pending, REAL-UTC micros.
+    const MARKER_UTC_MICROS: i64 = 1_761_696_000_000_000;
+
+    #[test]
+    fn test_market_data_floor_from_marker_is_the_reset_cutoff_in_unix_nanos() {
+        let floor = market_data_floor_from_marker(MARKER_UTC_MICROS);
+        assert_eq!(
+            floor,
+            (MARKER_UTC_MICROS - NEWEST_ROW_LAG_MARGIN_SECS * 1_000_000) * 1_000
+        );
+        // On the IST row clock it is exactly the reset's own cutoff.
+        assert_eq!(
+            floor + tickvault_common::constants::IST_UTC_OFFSET_NANOS,
+            marker_cutoff_micros(MARKER_UTC_MICROS) * 1_000
+        );
+        assert_eq!(market_data_floor_from_marker(i64::MAX), i64::MAX);
+        assert_eq!(market_data_floor_from_marker(i64::MIN), i64::MIN);
+    }
+
+    /// Review finding 1 (2026-10-29): an AlreadyDone boot — every boot after
+    /// the one Run, i.e. the live box — must still get the floor.
+    #[test]
+    fn test_regression_an_already_done_boot_records_the_floor_from_the_marker() {
+        let dir = floor_temp_dir("done");
         let path = dir.join("state").join("market_data_floor");
-        let floor = 1_761_696_000_000_000_000_i64;
+        let want = market_data_floor_from_marker(MARKER_UTC_MICROS);
         for decision in [
             ResetDecision::AlreadyDone,
-            ResetDecision::RefuseInSession,
-            ResetDecision::RefuseUnreadable,
             ResetDecision::NothingToWipe,
+            ResetDecision::Run,
         ] {
             assert_eq!(
-                record_market_data_floor_after_reset(decision, &path, floor),
+                record_market_data_floor_after_reset(decision, Some(MARKER_UTC_MICROS), &path),
+                Some(want),
+                "{decision:?}"
+            );
+            assert_eq!(
+                crate::market_data_floor::read_market_data_floor(&path),
+                crate::market_data_floor::FloorRead::Floor(want)
+            );
+        }
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding 2 (2026-10-29): the floor is the marker cutoff, never
+    /// the time the reset ran, so a day captured before a later Run is kept.
+    #[test]
+    fn test_regression_the_floor_is_the_marker_cutoff_not_the_run_time() {
+        let dir = floor_temp_dir("cutoff");
+        let path = dir.join("market_data_floor");
+        let got = record_market_data_floor_after_reset(
+            ResetDecision::Run,
+            Some(MARKER_UTC_MICROS),
+            &path,
+        );
+        // A row captured one second after the first boot (IST row clock) is
+        // above the floor, whatever hour the Run came at.
+        let row_ist_nanos = (MARKER_UTC_MICROS + 1_000_000) * 1_000
+            + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        let floor_ist = got.map(|f| f + tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        assert!(floor_ist.is_some_and(|f| row_ist_nanos >= f), "{got:?}");
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_record_market_data_floor_after_reset_refuses_refusals_and_no_marker() {
+        let dir = floor_temp_dir("none");
+        let path = dir.join("market_data_floor");
+        for decision in [
+            ResetDecision::RefuseInSession,
+            ResetDecision::RefuseUnreadable,
+        ] {
+            assert_eq!(
+                record_market_data_floor_after_reset(decision, Some(MARKER_UTC_MICROS), &path),
                 None
             );
-            assert!(!path.exists(), "{decision:?} must not write a floor");
         }
         assert_eq!(
-            record_market_data_floor_after_reset(ResetDecision::Run, &path, floor),
-            Some(floor)
+            record_market_data_floor_after_reset(ResetDecision::AlreadyDone, None, &path),
+            None
+        );
+        assert!(!path.exists(), "nothing may write a floor here");
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_record_market_data_floor_after_reset_only_raises_and_keeps_a_torn_file() {
+        let dir = floor_temp_dir("raise");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("market_data_floor");
+        let marker_floor = market_data_floor_from_marker(MARKER_UTC_MICROS);
+        // A higher floor already on disk is kept and returned, not lowered.
+        crate::market_data_floor::write_market_data_floor(&path, marker_floor + 5).unwrap();
+        assert_eq!(
+            record_market_data_floor_after_reset(
+                ResetDecision::AlreadyDone,
+                Some(MARKER_UTC_MICROS),
+                &path
+            ),
+            Some(marker_floor + 5)
+        );
+        // A lower one is raised to the marker floor.
+        crate::market_data_floor::write_market_data_floor(&path, marker_floor - 5).unwrap();
+        assert_eq!(
+            record_market_data_floor_after_reset(
+                ResetDecision::AlreadyDone,
+                Some(MARKER_UTC_MICROS),
+                &path
+            ),
+            Some(marker_floor)
         );
         assert_eq!(
             crate::market_data_floor::read_market_data_floor(&path),
-            crate::market_data_floor::FloorRead::Floor(floor)
+            crate::market_data_floor::FloorRead::Floor(marker_floor)
         );
-        // A path under a regular FILE cannot be written: refused, None.
+        // A torn file is left as it is; the floor holds for this process.
+        std::fs::write(&path, b"tvmdf1 12").unwrap();
+        assert_eq!(
+            record_market_data_floor_after_reset(
+                ResetDecision::AlreadyDone,
+                Some(MARKER_UTC_MICROS),
+                &path
+            ),
+            Some(marker_floor)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"tvmdf1 12");
+        // A path under a regular FILE cannot be written: still installed.
         let blocked = path.join("below_a_file");
         assert_eq!(
-            record_market_data_floor_after_reset(ResetDecision::Run, &blocked, floor),
+            record_market_data_floor_after_reset(
+                ResetDecision::Run,
+                Some(MARKER_UTC_MICROS),
+                &blocked
+            ),
+            Some(marker_floor)
+        );
+        let _cleanup = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot read against a stand-in QuestDB: an AlreadyDone boot reads the
+    /// marker (never writes it) and records the floor; a refused boot reads
+    /// nothing.
+    #[tokio::test]
+    async fn test_record_market_data_floor_at_boot_reads_the_marker_on_an_already_done_boot() {
+        let dir = floor_temp_dir("boot");
+        let path = dir.join("market_data_floor");
+        let m = spawn_mock_with(Cfg {
+            initial_logged: 1,
+            marker: Some(MARKER_UTC_MICROS),
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            record_market_data_floor_at_boot(
+                &client(),
+                &url(&m),
+                ResetDecision::AlreadyDone,
+                &path
+            )
+            .await,
+            Some(market_data_floor_from_marker(MARKER_UTC_MICROS))
+        );
+        assert_eq!(seen_matching(&m, "first-boot"), 1, "one marker read");
+        assert_eq!(
+            seen_matching(&m, "INSERT"),
+            0,
+            "the marker is never written"
+        );
+        assert_eq!(
+            record_market_data_floor_at_boot(
+                &client(),
+                &url(&m),
+                ResetDecision::RefuseInSession,
+                &path
+            )
+            .await,
             None
         );
+        assert_eq!(
+            seen_matching(&m, "first-boot"),
+            1,
+            "a refused boot reads nothing"
+        );
+        // No marker on the volume: no floor.
+        let empty = spawn_mock_with(Cfg {
+            initial_logged: 1,
+            ..Cfg::default()
+        })
+        .await;
+        let other = dir.join("other_floor");
+        assert_eq!(
+            record_market_data_floor_at_boot(
+                &client(),
+                &url(&empty),
+                ResetDecision::AlreadyDone,
+                &other
+            )
+            .await,
+            None
+        );
+        assert!(!other.exists());
         let _cleanup = std::fs::remove_dir_all(&dir);
     }
 

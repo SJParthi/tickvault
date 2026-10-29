@@ -8,12 +8,16 @@
 //! therefore replayed in full: on 2026-10-29 about 617,000 rows from 9, 10
 //! and 12 October came back into `ticks`.
 //!
-//! The floor is the instant the market data was last reset. A small state
-//! file holds it, written by the fresh-start reset when that reset runs
-//! (`fresh_start_reset::record_market_data_floor_after_reset`), and read once
-//! at boot by the spill replay. The tick and depth spill replay set aside
-//! every line whose row timestamp is below the floor, to the spill file's
-//! `quarantine/` (kept on disk, never posted).
+//! The floor is the fresh-start reset's cutoff: its first-boot marker less
+//! the reset's own lag margin (`fresh_start_reset::market_data_floor_from_marker`),
+//! so a row the reset kept in the fresh tables is never below it. Once the
+//! reset is done, EVERY boot reads the marker and records the floor
+//! (`fresh_start_reset::record_market_data_floor_at_boot`), installs it, and
+//! keeps it in a small state file for a boot whose QuestDB does not answer.
+//! The tick and depth spill replay set aside every line whose row timestamp
+//! is below the floor, to the spill file's `quarantine/` (kept on disk, never
+//! posted); the WAL refold skips a frame whose recorded receipt is below it
+//! ([`wal_frame_is_below_floor`]).
 //!
 //! # File format
 //!
@@ -47,6 +51,11 @@ pub const MARKET_DATA_FLOOR_PATH: &str = "data/state/market_data_floor";
 /// no alarm, no EMF name.
 pub const SPILL_REPLAY_BELOW_FLOOR_COUNTER: &str = "tv_spill_replay_below_floor_set_aside_total";
 
+/// Counter of replayed WAL frames the refold skipped because their recorded
+/// receipt is below the floor. Local `/metrics` only; no alarm, no EMF name.
+/// The frames stay in their segment (archived like any replayed segment).
+pub const WAL_REPLAY_BELOW_FLOOR_COUNTER: &str = "tv_wal_replay_below_floor_frames_total";
+
 /// Counter of floor files refused at read (torn or malformed).
 pub const MARKET_DATA_FLOOR_REFUSED_COUNTER: &str = "tv_market_data_floor_refused_total";
 
@@ -73,7 +82,7 @@ pub enum FloorRead {
     Refused(&'static str),
 }
 
-/// Registers both floor counters at 0, every label pair. O(1).
+/// Registers every floor counter at 0, every label pair. O(1).
 pub fn register_market_data_floor_baseline() {
     for dir in ["ticks", "depth"] {
         metrics::counter!(SPILL_REPLAY_BELOW_FLOOR_COUNTER, "dir" => dir, "unit" => "line")
@@ -82,6 +91,26 @@ pub fn register_market_data_floor_baseline() {
     metrics::counter!(SPILL_REPLAY_BELOW_FLOOR_COUNTER, "dir" => "depth", "unit" => "file")
         .increment(0);
     metrics::counter!(MARKET_DATA_FLOOR_REFUSED_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_BELOW_FLOOR_COUNTER).increment(0);
+}
+
+/// Whether a replayed WAL frame whose record carries `receipt_unix_nanos` is
+/// older than `floor_unix_nanos`. A receipt outside the plausible band
+/// (including the pre-TVW3 "unknown" sentinel) is never judged: nothing
+/// proves when that frame arrived, so it is folded as before. With no floor,
+/// always `false`. O(1): a few compares.
+#[must_use]
+pub const fn wal_frame_is_below_floor(
+    receipt_unix_nanos: i64,
+    floor_unix_nanos: Option<i64>,
+) -> bool {
+    let receipt = crate::ws_frame_spill::plausible_receipt_nanos(receipt_unix_nanos);
+    match floor_unix_nanos {
+        Some(floor) => {
+            receipt != crate::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS && receipt < floor
+        }
+        None => false,
+    }
 }
 
 /// The body before the checksum: `tvmdf1 <nanos>`.
@@ -346,6 +375,22 @@ mod tests {
         install_market_data_floor(1);
         let seen = installed_market_data_floor_unix_nanos();
         assert!(seen.is_some_and(|f| f >= 1), "got {seen:?}");
+    }
+
+    #[test]
+    fn test_wal_frame_is_below_floor_judges_only_a_plausible_receipt() {
+        assert!(wal_frame_is_below_floor(FLOOR - 1, Some(FLOOR)));
+        assert!(!wal_frame_is_below_floor(FLOOR, Some(FLOOR)));
+        assert!(!wal_frame_is_below_floor(FLOOR + 1, Some(FLOOR)));
+        // No floor: never below.
+        assert!(!wal_frame_is_below_floor(FLOOR - 1, None));
+        // The unknown sentinel and implausible receipts are never judged.
+        assert!(!wal_frame_is_below_floor(
+            crate::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS,
+            Some(FLOOR)
+        ));
+        assert!(!wal_frame_is_below_floor(5, Some(FLOOR)));
+        assert!(!wal_frame_is_below_floor(-1, Some(FLOOR)));
     }
 
     #[test]
