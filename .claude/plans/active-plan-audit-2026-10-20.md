@@ -1187,6 +1187,9 @@ Approved by: Parthiban, 2026-10-30, "always ensure saving into db, auditing, log
 - [x] SH2. Dashboard panel painting the server's tiles; script compacted under the existing ceilings; ceilings lowered to the new size
   - Files: crates/api/src/handlers/dashboard_page.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs
   - Tests: test_dashboard_page_paints_the_speed_panel_from_server_verdicts, test_dashboard_page_fetches_all_required_endpoints
+- [x] SH3. Second hostile review round (3 reviewers, 2 refuters each): sockets tile reads per-socket last-frame stamps (a task in backoff is not "connected"); a stopped database table reads red and blocks "caught up"; a database-check reading older than 150 s reads unknown; pinned bytes at zero carry no verdict; both token-gated reads share one stop-after-refusal guard; worst refresh cost corrected to about 6 s
+  - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/dashboard_page.rs, crates/common/src/ingest_shed.rs
+  - Tests: test_sockets_delivering_counts_only_stamps_inside_the_window, test_sockets_now_tile_every_case, test_fresh_wal_reading_withdraws_a_reading_older_than_two_and_a_half_polls, test_apply_lag_tile_database_caught_up_and_database_not_answering, test_wal_apply_lag_published_at_unix_secs_is_never_zero_or_negative, test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal
 
 ### Muhurat 2026-11-08 (Sunday) — the weekday-only protections
 

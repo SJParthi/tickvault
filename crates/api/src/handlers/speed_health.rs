@@ -14,7 +14,7 @@
 //! | Section | Source |
 //! |---|---|
 //! | How fast each step runs | the process's own step-latency counters (`hot_path_telemetry::stage_snapshot`), read in memory: the API runs inside the same process as the feed |
-//! | Database catch-up queue, feed sockets connected now | read in process: the WAL watcher's last apply-lag reading (`ingest_shed::wal_apply_lag_max`) and the feed's live socket count (the `/health` source) |
+//! | Database catch-up queue, feed sockets delivering data now | read in process: the WAL watcher's last apply-lag and stopped-table reading (`ingest_shed::wal_apply_lag_max`, `wal_suspended_tables`), used only while under 150 s old, and each socket's last-frame stamp (`pool_supervisor::snapshot_frame_activity`, the feed's own "delivered in the last 10 s" evidence) |
 //! | Worst step in the last 75 s, bytes kept on disk until confirmed, reconnects, candle overflow | the app's own metrics page (`[observability]` address), read once per refresh |
 //! | Ticks per minute | QuestDB `ticks` and `tick_quotes`, the last 15 full minutes |
 //! | Every tick accounted for | QuestDB `tick_conservation_audit`, the last 14 days |
@@ -50,8 +50,10 @@
 //! ([`crate::state::SharedAppState::speed_health_cache`]). A miss takes a
 //! single-flight lock and re-checks the cache, so concurrent misses (several
 //! tabs, or a pass slower than the 5 s TTL while the database is slow) run one
-//! pass, not one each; the worst pass is about 9 s (the per-minute table's
-//! columns probe and rows read run one after the other). Reading the metrics page is
+//! pass, not one each; the worst pass is about 6 s (the per-minute table's
+//! columns probe and rows read run one after the other, 3 s each; everything
+//! else runs beside them at 3 s or less), so a request waiting on the lock
+//! waits at most about that long before it reads the fresh cache. Reading the metrics page is
 //! **O(lines)** in one pass; reading the step counters is O(5 steps × 28
 //! buckets). Neither runs on the feed path. The route is bearer-gated with the
 //! other `/api/debug/*` reads.
@@ -69,6 +71,9 @@ use tickvault_storage::hot_path_telemetry::{
 };
 
 use crate::state::SharedAppState;
+use tickvault_core::websocket::pool_supervisor::{
+    SIBLING_FUTURE_SKEW_MS, SIBLING_LIVE_EVIDENCE_SECS, snapshot_frame_activity,
+};
 
 /// Per-request timeout for each QuestDB query this endpoint runs.
 const SPEED_HEALTH_QUERY_TIMEOUT_SECS: u64 = 3;
@@ -111,6 +116,12 @@ const APPLY_LAG_GREEN_MAX: u64 = 10;
 /// Quote 31), so the dashboard reads it as red.
 const APPLY_LAG_AMBER_MAX: u64 = 500;
 
+/// The WAL watcher's reading counts as current for two and a half of its
+/// polls. It keeps its last reading through up to four failed polls before it
+/// withdraws it, so an older reading is shown as unknown, never as current.
+const APPLY_LAG_FRESH_MAX_SECS: u64 =
+    tickvault_storage::wal_suspension_watcher::WAL_SUSPENSION_POLL_INTERVAL_SECS * 5 / 2;
+
 /// Bytes the frame log keeps on disk because the database has not confirmed
 /// them; from this much the tile is red. A dashboard colour choice, about 7%
 /// of the 150 GB root disk; nothing pages on it.
@@ -131,13 +142,19 @@ const SECS_PER_HOUR: i64 = 3_600;
 /// Nanoseconds per second.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
+/// Nanoseconds per millisecond.
+const NANOS_PER_MILLI: i64 = 1_000_000;
+
 /// End of continuous trading, 15:30 IST, as seconds of the IST day. The
 /// closing session that follows (to 15:40) trades too rarely to judge each
 /// minute. Pinned to `MARKET_CLOSE_TIME_IST_EXCLUSIVE` by a test.
 const CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST: i64 = 55_800;
 
 /// A newest daily tick check older than this many days reads amber: a
-/// weekend plus a holiday is three days, so four means a check went missing.
+/// weekend plus a holiday is three days, so four usually means a check went
+/// missing. Two holidays around one weekend (five days) also turn it amber;
+/// the page says so. Counting trading days instead needs the session calendar,
+/// which this crate does not read; amber is the loud side of that trade.
 const CONSERVATION_STALE_DAYS: i64 = 4;
 
 /// Metric names read from the metrics page. Where the producing module exports
@@ -271,14 +288,30 @@ pub(crate) async fn compute_speed_health(state: &SharedAppState) -> SpeedHealthR
         }
     });
 
+    let (apply_lag, suspended_tables) = fresh_wal_reading(
+        tickvault_common::ingest_shed::wal_apply_lag_max(),
+        tickvault_common::ingest_shed::wal_suspended_tables(),
+        tickvault_common::ingest_shed::wal_apply_lag_published_at_unix_secs(),
+        chrono::Utc::now().timestamp(),
+    );
+    let health = state.health_status();
+    let sockets_delivering = health.websocket_reported().then(|| {
+        // The stamps are on the frame log's receipt clock; read now on it too.
+        let now_ms =
+            tickvault_storage::ws_frame_spill::receipt_nanos_from(std::time::Instant::now())
+                / NANOS_PER_MILLI;
+        sockets_delivering(&snapshot_frame_activity(), now_ms)
+    });
+
     build_sections(&Inputs {
         market_open,
         ist_now,
-        apply_lag: tickvault_common::ingest_shed::wal_apply_lag_max(),
-        sockets_now: state
-            .health_status()
+        apply_lag,
+        suspended_tables,
+        sockets_delivering,
+        connection_tasks: health
             .websocket_reported()
-            .then(|| state.health_status().websocket_connections()),
+            .then(|| health.websocket_connections()),
         stages,
         exporter,
         ticks,
@@ -308,10 +341,17 @@ pub(crate) struct Inputs {
     pub market_open: bool,
     pub ist_now: i64,
     /// The database apply backlog the WAL watcher last read, in process;
-    /// `None` when unknown (watcher blind, database not answering).
+    /// `None` when unknown or not fresh (see [`fresh_wal_reading`]).
     pub apply_lag: Option<u64>,
-    /// Feed sockets connected right now; `None` until the feed reports.
-    pub sockets_now: Option<u64>,
+    /// Tables the database has stopped applying at the same reading; `None`
+    /// when unknown or not fresh.
+    pub suspended_tables: Option<u64>,
+    /// Feed sockets whose last frame arrived in the last 10 s; `None` until
+    /// the feed reports.
+    pub sockets_delivering: Option<u64>,
+    /// Feed connection tasks running (a task stays counted through its own
+    /// reconnects, so this is not "connected"); `None` until the feed reports.
+    pub connection_tasks: Option<u64>,
     pub stages: [StageFigures; 5],
     pub exporter: Option<ExporterReadings>,
     pub ticks: QueryOutcome,
@@ -701,8 +741,9 @@ pub(crate) fn conservation_freshness_tile(
             if age_days <= CONSERVATION_STALE_DAYS {
                 Tile::new(LABEL, value, Light::Green)
             } else {
-                Tile::new(LABEL, value, Light::Amber)
-                    .with_detail("a daily check is missing since then")
+                Tile::new(LABEL, value, Light::Amber).with_detail(
+                    "a daily check may be missing; a long holiday stretch can also do this",
+                )
             }
         }
     }
@@ -777,9 +818,12 @@ pub(crate) fn apply_lag_light(lag: u64) -> Light {
 }
 
 /// The verdict on bytes the frame log keeps until the database confirms them.
+/// Zero is GREY, not green: the figure is measured only at start-up and after
+/// each catch-up, and it does not count what a session adds in between (a
+/// shed minute, a database stall), so zero cannot say nothing is kept now.
 pub(crate) fn pinned_bytes_light(bytes: f64) -> Light {
     if bytes <= 0.0 {
-        Light::Green
+        Light::Grey
     } else if bytes < PINNED_BYTES_RED_MIN {
         Light::Amber
     } else {
@@ -800,7 +844,29 @@ pub(crate) fn database_caught_up(inputs: &Inputs) -> bool {
     inputs
         .apply_lag
         .is_some_and(|lag| lag <= APPLY_LAG_GREEN_MAX)
+        && inputs.suspended_tables == Some(0)
         && !database_not_answering(inputs)
+}
+
+/// The watcher's apply lag and suspended-table count, only while its reading
+/// is fresh: both `None` when there is no stamp or the stamp is older than
+/// [`APPLY_LAG_FRESH_MAX_SECS`]. A stamp ahead of `now_unix` (a clock step)
+/// counts as fresh. O(1).
+pub(crate) fn fresh_wal_reading(
+    apply_lag: Option<u64>,
+    suspended_tables: Option<u64>,
+    published_at_unix: Option<i64>,
+    now_unix: i64,
+) -> (Option<u64>, Option<u64>) {
+    let fresh = published_at_unix.is_some_and(|at| {
+        u64::try_from(now_unix.saturating_sub(at))
+            .map_or(true, |age| age <= APPLY_LAG_FRESH_MAX_SECS)
+    });
+    if fresh {
+        (apply_lag, suspended_tables)
+    } else {
+        (None, None)
+    }
 }
 
 /// True when every database read in this pass got no answer.
@@ -824,15 +890,22 @@ pub(crate) fn apply_lag_tile(inputs: &Inputs) -> Tile {
         return Tile::new(LABEL, "not known", Light::Grey)
             .with_detail("the database is not answering");
     }
-    match inputs.apply_lag {
-        Some(lag) => Tile::new(
+    match (inputs.apply_lag, inputs.suspended_tables) {
+        // A stopped table never applies, whatever the lag reads.
+        (_, Some(n)) if n > 0 => Tile::new(
+            LABEL,
+            format!("{} table(s) stopped", group_digits(n)),
+            Light::Red,
+        )
+        .with_detail("the database stopped saving to these tables"),
+        (Some(lag), Some(0)) => Tile::new(
             LABEL,
             format!("{} transactions", group_digits(lag)),
             apply_lag_light(lag),
         )
         .with_detail("green up to 10, red above 500"),
-        None => Tile::new(LABEL, "not known", Light::Grey)
-            .with_detail("the last check could not read it"),
+        _ => Tile::new(LABEL, "not known", Light::Grey)
+            .with_detail("no fresh reading from the database check"),
     }
 }
 
@@ -844,10 +917,13 @@ fn backlog_section(inputs: &Inputs) -> Section {
             Some(bytes) => Tile::new(PINNED, human_bytes(bytes), pinned_bytes_light(bytes))
                 .with_detail(match e.pinned_segments {
                     Some(n) => format!(
-                        "{} file(s); measured at start-up and after each catch-up",
+                        "{} file(s); measured at start-up and after each catch-up, \
+                         so zero has no verdict",
                         group_digits(as_count(n))
                     ),
-                    None => "measured at start-up and after each catch-up".to_string(),
+                    None => "measured at start-up and after each catch-up, so zero has \
+                             no verdict"
+                        .to_string(),
                 }),
             None => Tile::new(PINNED, NOT_REPORTED, Light::Grey),
         },
@@ -870,20 +946,49 @@ pub(crate) fn reconnects_light(reconnects: f64) -> Light {
     }
 }
 
-/// The live socket tile: sockets connected right now, from the feed's own
-/// count. Grey when the feed has not reported or the market is closed; red
-/// when none is connected while the market is open; else green. A green tile
-/// means at least one socket is up, not that every socket is.
-pub(crate) fn sockets_now_tile(market_open: bool, sockets_now: Option<u64>) -> Tile {
-    const LABEL: &str = "Feed sockets connected now";
-    match sockets_now {
-        None => Tile::new(LABEL, NOT_REPORTED, Light::Grey),
-        Some(n) if !market_open => {
-            Tile::new(LABEL, group_digits(n), Light::Grey).with_detail("market closed; no verdict")
+/// Sockets whose last frame is at most [`SIBLING_LIVE_EVIDENCE_SECS`] old (and
+/// no more than [`SIBLING_FUTURE_SKEW_MS`] ahead), from the read tasks' own
+/// per-socket stamps: the same "delivered in the last 10 s" evidence the
+/// feed's silence checks use. A connection task in backoff delivers nothing,
+/// so it is not counted. O(32 slots), no allocation.
+pub(crate) fn sockets_delivering(stamps: &[i64], now_ms: i64) -> u64 {
+    let window_ms = i64::try_from(SIBLING_LIVE_EVIDENCE_SECS.saturating_mul(1_000)).unwrap_or(0);
+    let mut count = 0_u64;
+    for stamp in stamps {
+        if *stamp <= 0 {
+            continue;
         }
-        Some(0) => Tile::new(LABEL, "0", Light::Red).with_detail("no socket is connected"),
+        let age = now_ms.saturating_sub(*stamp);
+        if age >= -SIBLING_FUTURE_SKEW_MS && age <= window_ms {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// The live socket tile: sockets that delivered data in the last 10 s. Judged
+/// only in continuous trading (09:15 to 15:30 on a session day), when every
+/// main-feed socket carries ticks every second: grey outside it or before the
+/// feed reports, red when none delivered, else green. A green tile means at
+/// least one socket is delivering, not that every one is. The connection-task
+/// count (which stays up through a task's own reconnects) is detail only.
+pub(crate) fn sockets_now_tile(
+    judged: bool,
+    delivering: Option<u64>,
+    connection_tasks: Option<u64>,
+) -> Tile {
+    const LABEL: &str = "Feed sockets delivering data now";
+    let tasks = connection_tasks.map_or_else(String::new, |n| {
+        format!("; {} connection task(s) running", group_digits(n))
+    });
+    match delivering {
+        None => Tile::new(LABEL, NOT_REPORTED, Light::Grey),
+        Some(n) if !judged => Tile::new(LABEL, group_digits(n), Light::Grey)
+            .with_detail(format!("judged only 09:15 to 15:30{tasks}")),
+        Some(0) => Tile::new(LABEL, "0", Light::Red)
+            .with_detail(format!("no socket delivered data in the last 10 s{tasks}")),
         Some(n) => Tile::new(LABEL, group_digits(n), Light::Green)
-            .with_detail("green means at least one is up"),
+            .with_detail(format!("delivered in the last 10 s{tasks}")),
     }
 }
 
@@ -891,7 +996,11 @@ fn connections_section(inputs: &Inputs) -> Section {
     const RECONNECTS: &str = "Socket reconnects since the app started";
     const GAPS: &str = "Connection gaps closed today";
     let mut tiles = Vec::with_capacity(3);
-    tiles.push(sockets_now_tile(inputs.market_open, inputs.sockets_now));
+    tiles.push(sockets_now_tile(
+        inputs.market_open && in_continuous_trading(inputs.ist_now),
+        inputs.sockets_delivering,
+        inputs.connection_tasks,
+    ));
     tiles.push(match inputs.exporter.as_ref() {
         None => unavailable_tile(RECONNECTS),
         Some(e) => match e.reconnects {
@@ -1432,7 +1541,9 @@ mod tests {
             market_open,
             ist_now: IST_0930_25,
             apply_lag: None,
-            sockets_now: None,
+            suspended_tables: None,
+            sockets_delivering: None,
+            connection_tasks: None,
             stages: ALL_STAGES.map(empty_stage),
             exporter: None,
             ticks: QueryOutcome::Unreachable,
@@ -1859,7 +1970,11 @@ garbage line without a number x
         assert_eq!(apply_lag_light(11), Light::Amber);
         assert_eq!(apply_lag_light(500), Light::Amber);
         assert_eq!(apply_lag_light(501), Light::Red);
-        assert_eq!(pinned_bytes_light(0.0), Light::Green);
+        assert_eq!(
+            pinned_bytes_light(0.0),
+            Light::Grey,
+            "zero is measured only at scans"
+        );
         assert_eq!(pinned_bytes_light(1.0), Light::Amber);
         assert_eq!(pinned_bytes_light(PINNED_BYTES_RED_MIN), Light::Red);
         assert_eq!(reconnects_light(0.0), Light::Green);
@@ -1943,6 +2058,7 @@ garbage line without a number x
         // A last reading of 0 taken before the database stopped answering is
         // not shown green.
         inputs.apply_lag = Some(0);
+        inputs.suspended_tables = Some(0);
         assert!(database_not_answering(&inputs));
         assert!(!database_caught_up(&inputs));
         let stale = apply_lag_tile(&inputs);
@@ -1962,8 +2078,22 @@ garbage line without a number x
         inputs.apply_lag = Some(11);
         assert!(!database_caught_up(&inputs));
         assert_eq!(apply_lag_tile(&inputs).status, Light::Amber);
+        // A stopped table is red whatever the lag reads, and never caught up.
+        inputs.apply_lag = Some(2);
+        inputs.suspended_tables = Some(1);
+        assert!(!database_caught_up(&inputs));
+        let stopped = apply_lag_tile(&inputs);
+        assert_eq!(
+            (stopped.value.as_str(), stopped.status),
+            ("1 table(s) stopped", Light::Red)
+        );
+        // An unknown suspended count is not "none": grey, not caught up.
+        inputs.suspended_tables = None;
+        assert!(!database_caught_up(&inputs));
+        assert_eq!(apply_lag_tile(&inputs).status, Light::Grey);
         // Unknown (watcher blind) is grey, not 0.
         inputs.apply_lag = None;
+        inputs.suspended_tables = Some(0);
         assert!(!database_caught_up(&inputs));
         let unknown = apply_lag_tile(&inputs);
         assert_eq!(
@@ -1973,12 +2103,60 @@ garbage line without a number x
     }
 
     #[test]
+    fn test_fresh_wal_reading_withdraws_a_reading_older_than_two_and_a_half_polls() {
+        let now = 1_793_352_625;
+        let fresh_max = i64::try_from(APPLY_LAG_FRESH_MAX_SECS).unwrap_or(i64::MAX);
+        assert_eq!(fresh_max, 150, "2.5 x the 60 s watcher poll");
+        assert_eq!(
+            fresh_wal_reading(Some(3), Some(0), Some(now - fresh_max), now),
+            (Some(3), Some(0))
+        );
+        // Kept through failed polls past the window: unknown, never current.
+        assert_eq!(
+            fresh_wal_reading(Some(3), Some(0), Some(now - fresh_max - 1), now),
+            (None, None)
+        );
+        // No stamp (withdrawn or never published) is unknown.
+        assert_eq!(fresh_wal_reading(Some(3), Some(0), None, now), (None, None));
+        // A stamp ahead of the clock (a step back) still counts.
+        assert_eq!(
+            fresh_wal_reading(Some(3), Some(1), Some(now + 30), now),
+            (Some(3), Some(1))
+        );
+    }
+
+    #[test]
     fn test_sockets_now_tile_every_case() {
-        assert_eq!(sockets_now_tile(true, None).status, Light::Grey);
-        assert_eq!(sockets_now_tile(false, Some(0)).status, Light::Grey);
-        assert_eq!(sockets_now_tile(true, Some(0)).status, Light::Red);
-        let up = sockets_now_tile(true, Some(16));
-        assert_eq!((up.value.as_str(), up.status), ("16", Light::Green));
+        assert_eq!(sockets_now_tile(true, None, Some(5)).status, Light::Grey);
+        assert_eq!(
+            sockets_now_tile(false, Some(0), Some(5)).status,
+            Light::Grey
+        );
+        // Five tasks running but none delivering is red: a task in backoff is
+        // not a connected socket.
+        let dead = sockets_now_tile(true, Some(0), Some(5));
+        assert_eq!(dead.status, Light::Red);
+        assert!(dead.detail.ends_with("; 5 connection task(s) running"));
+        let up = sockets_now_tile(true, Some(4), None);
+        assert_eq!((up.value.as_str(), up.status), ("4", Light::Green));
+        assert_eq!(up.detail, "delivered in the last 10 s");
+    }
+
+    #[test]
+    fn test_sockets_delivering_counts_only_stamps_inside_the_window() {
+        let now = 1_793_352_625_000_i64;
+        let window = i64::try_from(SIBLING_LIVE_EVIDENCE_SECS * 1_000).unwrap_or(0);
+        let stamps = [
+            0,                                // never delivered
+            now,                              // just now
+            now - window,                     // at the edge: counted
+            now - window - 1,                 // just outside: not counted
+            now + SIBLING_FUTURE_SKEW_MS,     // ahead within the skew: counted
+            now + SIBLING_FUTURE_SKEW_MS + 1, // too far ahead: not counted
+            -7,                               // nonsense: not counted
+        ];
+        assert_eq!(sockets_delivering(&stamps, now), 3);
+        assert_eq!(sockets_delivering(&[], now), 0);
     }
 
     #[test]
@@ -2068,7 +2246,9 @@ garbage line without a number x
         );
         inputs.minute_table = QueryOutcome::Missing;
         inputs.apply_lag = Some(42);
-        inputs.sockets_now = Some(3);
+        inputs.suspended_tables = Some(0);
+        inputs.sockets_delivering = Some(3);
+        inputs.connection_tasks = Some(5);
         let resp = build_sections(&inputs);
         let by_label = |label: &str| {
             all_tiles(&resp)
@@ -2101,7 +2281,7 @@ garbage line without a number x
             gaps.detail,
             "1m 15s down in total; a gap still open is not counted"
         );
-        let sockets = by_label("Feed sockets connected now");
+        let sockets = by_label("Feed sockets delivering data now");
         assert_eq!(
             (sockets.value.as_str(), sockets.status),
             ("3", Light::Green)
