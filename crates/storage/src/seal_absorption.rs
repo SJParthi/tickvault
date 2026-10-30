@@ -687,8 +687,8 @@ impl SealAbsorptionPipeline {
                                 security_id = evicted.security_id,
                                 exchange_segment_code = evicted.exchange_segment_code,
                                 "tier-3 DLQ also failed — caller MUST fire AGGREGATOR-DROP-01; \
-                                 later DLQ failures of this episode are counted, not logged, until the DLQ or \
-                                 the spill accepts a seal or a live candle flush commits"
+                                 later DLQ failures of this episode are counted, not logged, until \
+                                 the episode ends (one info line then gives the count)"
                             );
                         }
                         SubmitOutcome::Dropped(evicted)
