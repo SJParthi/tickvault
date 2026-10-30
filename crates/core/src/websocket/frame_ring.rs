@@ -45,6 +45,13 @@
 //! notifications coalesce into one permit, which is safe because the consumer
 //! always drains before it sleeps; a stale permit costs one extra loop pass.
 //!
+//! The consumer first takes a queued item WITHOUT registering (ITEM DT1,
+//! 2026-10-30) and registers only when the queue looks empty, so the order
+//! above (register, then check, then sleep) still holds for every sleep. While
+//! frames are queued the drain therefore takes no waiter lock, and a producer
+//! never finds it registered, so the reader pays the wake only for a drain
+//! that is about to sleep.
+//!
 //! # Complexity
 //!
 //! `try_send`, `try_recv`, a ready `recv`: O(1), lock-free, zero allocation.
@@ -64,6 +71,9 @@ struct Shared {
     notify: Notify,
     /// Live STRONG senders. Weak senders are not counted.
     senders: AtomicUsize,
+    /// Test-only: how many times the consumer called `enable()` on `notify`.
+    #[cfg(test)]
+    registrations: AtomicUsize,
 }
 
 /// Why [`FrameRingSender::try_send`] refused an item. The item is handed back.
@@ -108,6 +118,8 @@ pub fn frame_ring<T>(capacity: usize) -> (FrameRingSender<T>, FrameRingReceiver<
     let shared = Arc::new(Shared {
         notify: Notify::new(),
         senders: AtomicUsize::new(1),
+        #[cfg(test)]
+        registrations: AtomicUsize::new(0),
     });
     (
         FrameRingSender {
@@ -206,10 +218,25 @@ impl<T> FrameRingReceiver<T> {
 
     async fn recv_uncharged(&mut self) -> Option<T> {
         loop {
+            // Fast path (ITEM DT1, 2026-10-30): take a queued item WITHOUT
+            // registering. Registering costs the drain a waiter-list lock to
+            // add itself and another to remove itself, and while it is
+            // registered a producer's `notify_one` finds the state WAITING and
+            // pays that lock plus a task wake for a drain that is already
+            // running. Registration is only needed before SLEEPING, so it now
+            // happens only once the queue looks empty, and the queue is
+            // checked again after it (below), which is what keeps every wake.
+            match self.rx.try_recv() {
+                Ok(item) => return Some(item),
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
             let notified = self.shared.notify.notified();
             tokio::pin!(notified);
             // Register BEFORE checking, so a push that lands after the check
             // wakes this waiter (see the module docs).
+            #[cfg(test)]
+            self.shared.registrations.fetch_add(1, Ordering::Relaxed);
             notified.as_mut().enable();
             match self.rx.try_recv() {
                 Ok(item) => return Some(item),
@@ -245,6 +272,7 @@ impl<T> FrameRingReceiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::time::Duration;
 
     #[tokio::test]
@@ -408,6 +436,148 @@ mod tests {
             }
         }
         assert_eq!(got, (0..1_000).collect::<Vec<_>>());
+    }
+
+    /// A waker that counts how many times it was woken.
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// ITEM DT1 (2026-10-30): while frames are queued the drain never touches
+    /// the `Notify`, so it takes no waiter lock, and a producer pushing at the
+    /// same time never finds it registered and never pays a waiter lock and a
+    /// task wake for a drain that is already running.
+    ///
+    /// Bite: before the fast path every `recv` called `enable()` first. With a
+    /// stored permit that consumed it; without one (every pop once the
+    /// producer below has finished) it took the waiter lock to register and
+    /// again to deregister on return, and a push landing in that window woke
+    /// this waker. `registrations` counts the `enable()` calls: the old `recv`
+    /// makes one per pop (300,000), the new one makes none while an item is
+    /// queued. Then, once the queue IS empty, the drain parks and the next push
+    /// wakes it exactly once.
+    #[test]
+    fn test_reader_wakes_the_drain_only_when_it_is_parked() {
+        const PREFILL: u64 = 400_000;
+        const CONCURRENT: u64 = 200_000;
+        const POPS: u64 = 300_000;
+        let (tx, mut rx) = frame_ring::<u64>(1 << 20);
+        for i in 0..PREFILL {
+            tx.try_send(i).expect("room");
+        }
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let producer = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for i in 0..CONCURRENT {
+                    tx.try_send(PREFILL + i).expect("room");
+                }
+            })
+        };
+        for expected in 0..POPS {
+            let mut fut = std::pin::pin!(rx.recv());
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(Some(v)) => assert_eq!(v, expected, "in order"),
+                other => panic!("an item was queued, got {other:?}"),
+            }
+        }
+        producer.join().expect("producer");
+        assert_eq!(
+            rx.shared.registrations.load(Ordering::Relaxed),
+            0,
+            "the drain registered on the Notify although frames were queued"
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a producer woke a drain that had frames queued"
+        );
+        // Drain the rest, then the drain parks: the next push wakes it once.
+        while rx.try_recv().is_some() {}
+        let mut fut = std::pin::pin!(rx.recv());
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "empty: the drain parks"
+        );
+        tx.try_send(7).expect("room");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "a parked drain is woken"
+        );
+        tx.try_send(8).expect("room");
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1, "wakes coalesce");
+        assert_eq!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Some(7)));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// ITEM DT1: with the fast path, no interleaving of producers and a
+        /// parking drain loses a wake: every item is received and the drain
+        /// ends. Producers push with random pauses so the drain parks and
+        /// wakes many times per case.
+        #[test]
+        fn proptest_frame_ring_sleeping_consumer_never_loses_a_wake(
+            producers in 1_u64..5,
+            per_producer in 1_u64..3_000,
+            pause_every in 1_u64..64,
+            pause_spins in 0_u32..20_000,
+            capacity in 1_usize..256,
+        ) {
+            // The drain runs on this thread (`block_on`); the producers are
+            // their own OS threads.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let (tx, mut rx) = frame_ring::<u64>(capacity);
+            let mut handles = Vec::new();
+            for p in 0..producers {
+                let tx = tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut sent = 0;
+                    while sent < per_producer {
+                        match tx.try_send(p * per_producer + sent) {
+                            Ok(()) => {
+                                sent += 1;
+                                if sent % pause_every == 0 {
+                                    for _ in 0..pause_spins {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                            Err(FrameRingTrySendError::Full(_)) => std::thread::yield_now(),
+                            Err(FrameRingTrySendError::Closed(_)) => panic!("receiver alive"),
+                        }
+                    }
+                }));
+            }
+            drop(tx);
+            let total = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut total = 0_u64;
+                    while rx.recv().await.is_some() {
+                        total += 1;
+                    }
+                    total
+                })
+                .await
+            });
+            for h in handles {
+                h.join().expect("producer");
+            }
+            proptest::prop_assert_eq!(total, Ok(producers * per_producer), "a lost wake hangs or drops");
+        }
     }
 
     /// A full backlog must not hold a current-thread runtime: the cooperative

@@ -1,52 +1,69 @@
-//! Benchmark: STAGE-D P7.6 — WS reader frame handle latency.
+//! Benchmark: the socket READ path's in-memory work per frame.
 //!
-//! Measures the end-to-end hot path inside every WS read loop:
+//! Rewritten 2026-10-30 (plan ITEM DT, owner: every in-memory step a tick
+//! passes through under 1 µs at p99). The old `ws_reader/frame_handle_ns`
+//! timed a `Vec` clone (a heap allocation the read loop never makes), a
+//! `WsFrameSpill::append` and a `dispatch_frame` parse (the drain parses, not
+//! the reader). It now times exactly what the supervisor's read loop does per
+//! frame and records as `Stage::SocketToWal`, in the same order:
 //!
-//!   1. relaxed atomic counter bump (activity watchdog)
-//!   2. durable WAL append via `WsFrameSpill::append` (disk-spill non-blocking)
-//!   3. Dhan binary ticker packet dispatch via `dispatch_frame`
+//!   1. `classify_frame` (is this frame a disconnect?);
+//!   2. `silent_swap::note_depth200_frame` (one compare off depth-200);
+//!   3. `WalRingSink::accept`: receipt stamp, sequence mint, WAL hand-off to a
+//!      real writer thread, ring byte budget, ring push, drain notify.
 //!
-//! Budget (`quality/benchmark-budgets.toml::ws_reader_frame_handle_ns`):
-//!   < 100 ns/op on t4g.medium. 5 % regression = CI hard fail.
+//! # What the number does NOT include
 //!
-//! Rationale: the plan (P1.2 + P3.1 + P7.6) requires the read loop to
-//! stay O(1) and never block on downstream. These three operations are
-//! the ONLY work done per frame inside the read loop, so benchmarking
-//! them together guarantees the hot path meets the latency bar even as
-//! the WAL and watchdog primitives evolve.
+//! The consumer is awake: after each timed batch the bench takes every frame
+//! back off the ring, untimed, so no drain is parked on the ring's `Notify`.
+//! When the drain IS parked (most frames in production, which arrive about
+//! 400 µs apart) `accept` also pays a cross-thread wake, a futex/eventfd
+//! syscall of about 18 µs on the x86 dev VM, the same as a bare
+//! `Thread::unpark`. That cost is measured by
+//! `crates/core/tests/socket_to_wal_tail_harness.rs`, not here, and the
+//! production-spaced p50/p99/max of this path are in
+//! `crates/core/tests/socket_read_in_memory_harness.rs`.
+//!
+//! Budget: `quality/benchmark-budgets.toml::ws_reader_frame_handle` = 1,000 ns
+//! (matches `ws_reader/frame_handle_ns`; bench-gate reads Criterion's median).
 
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use tickvault_common::constants::{RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE};
-use tickvault_core::parser::dispatcher::dispatch_frame;
-use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
+use tickvault_core::websocket::connection::classify_frame;
+use tickvault_core::websocket::frame_ring::{FrameRingReceiver, frame_ring};
+use tickvault_core::websocket::pool_budget::{ConnectionSlot, DhanAccount, DhanEndpointType};
+use tickvault_core::websocket::pool_supervisor::{
+    CapturedFrame, FrameSink, RingByteBudget, WalRingSink,
+};
+use tickvault_core::websocket::silent_swap::note_depth200_frame;
+use tickvault_storage::ws_frame_spill::{
+    WalEndpoint, WsFrameSpill, WsType, next_frame_seq, receipt_nanos_from,
+};
 
-/// Build a minimal valid 16-byte ticker packet matching the format
-/// defined in `docs/dhan-ref/03-live-market-feed-websocket.md`.
-fn build_ticker_packet() -> Vec<u8> {
-    let mut buf = vec![0u8; TICKER_PACKET_SIZE];
-    buf[0] = RESPONSE_CODE_TICKER; // response code
-    buf[1..3].copy_from_slice(&(TICKER_PACKET_SIZE as u16).to_le_bytes()); // message length
-    buf[3] = 2; // segment (NSE_FNO)
-    buf[4..8].copy_from_slice(&1337_u32.to_le_bytes()); // security_id
-    // payload: LTP (f32 LE), LTT (u32 LE)
+/// Ring slots, same order as `FRAME_RING_CAPACITY`.
+const RING_SLOTS: usize = 65_536;
+/// Frames per timed batch. Under the ring's slots and the WAL queue, so
+/// neither refuses: the bench measures the capture path, not a shed.
+const BATCH: u64 = 512;
+
+/// One main-feed Quote packet (code 4, 50 bytes).
+fn quote_frame() -> Bytes {
+    let mut buf = vec![0u8; 50];
+    buf[0] = 4;
+    buf[1..3].copy_from_slice(&50_u16.to_le_bytes());
+    buf[3] = 2;
+    buf[4..8].copy_from_slice(&1337_u32.to_le_bytes());
     buf[8..12].copy_from_slice(&1500.75_f32.to_le_bytes());
-    buf[12..16].copy_from_slice(&1_700_000_000_u32.to_le_bytes());
-    buf
+    Bytes::from(buf)
 }
 
-/// Build a unique temp dir path for this benchmark run. We deliberately
-/// do NOT add a new dependency (`tempfile` is not in the workspace and
-/// adding deps requires Parthiban approval — see CLAUDE.md). Instead,
-/// generate a unique path under `std::env::temp_dir()` using the
-/// process PID + nanosecond timestamp so concurrent bench runs do not
-/// collide, and remove it on Drop of the returned `TempDirGuard`.
+/// A unique temp dir, removed on drop (no `tempfile` dependency).
 struct TempDirGuard {
     path: PathBuf,
 }
@@ -58,103 +75,168 @@ impl TempDirGuard {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let path = std::env::temp_dir().join(format!(
-            "tickvault_ws_spill_bench_{tag}_{}_{nanos}",
+            "tickvault_ws_reader_bench_{tag}_{}_{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path).expect("create_dir_all bench temp");
         Self { path }
     }
-
-    fn path(&self) -> &std::path::Path {
-        &self.path
-    }
 }
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        // Best-effort cleanup. If the background writer thread still
-        // holds an open segment, the directory may retain files. That
-        // is acceptable for a benchmark — /tmp is cleaned on reboot.
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-/// Spawn a temporary WAL spill backed by a fresh temp dir.
-fn spawn_spill(tag: &str) -> (TempDirGuard, Arc<WsFrameSpill>) {
-    let tmp = TempDirGuard::new(tag);
-    let spill = WsFrameSpill::new(tmp.path()).expect("WsFrameSpill::new");
-    (tmp, Arc::new(spill))
+/// Waits (untimed) until the WAL writer has taken every queued record.
+fn wait_wal_empty(spill: &WsFrameSpill) {
+    while spill.queued_records() > 0 {
+        std::hint::spin_loop();
+    }
 }
 
-/// Benchmark the atomic counter bump in isolation. This is the single
-/// hottest instruction in the read loop (fires on every frame) and is
-/// the ratchet that keeps the activity watchdog wake-up reliable.
-fn bench_activity_counter_bump(c: &mut Criterion) {
-    let counter = AtomicU64::new(0);
-    c.bench_function("ws_reader/activity_counter_bump", |b| {
-        b.iter(|| {
-            black_box(counter.fetch_add(1, Ordering::Relaxed));
-        });
+/// Takes every frame back off the ring (untimed) and returns its bytes to
+/// the budget, as the drain does.
+fn drain_ring(rx: &mut FrameRingReceiver<CapturedFrame>, budget: &RingByteBudget) {
+    while let Some(frame) = rx.try_recv() {
+        budget.release(frame.bytes.len());
+    }
+}
+
+fn bench_classify(c: &mut Criterion) {
+    let frame = quote_frame();
+    c.bench_function("ws_reader/classify_frame", |b| {
+        b.iter(|| classify_frame(black_box(DhanEndpointType::MainFeed), black_box(&frame)));
     });
 }
 
-/// Benchmark the WAL append path alone — allocate owned Vec from a
-/// reference buffer, hand it to `WsFrameSpill::append`. This is the
-/// single biggest source of work per frame, so it dominates the budget.
+fn bench_receipt_and_seq(c: &mut Criterion) {
+    c.bench_function("ws_reader/receipt_stamp", |b| {
+        b.iter(|| black_box(receipt_nanos_from(Instant::now())));
+    });
+    c.bench_function("ws_reader/next_frame_seq", |b| {
+        b.iter(|| black_box(next_frame_seq()));
+    });
+}
+
+/// The WAL hand-off alone, with the production `Bytes` clone (a refcount
+/// bump, no allocation).
 fn bench_wal_append(c: &mut Criterion) {
-    let (_tmp, spill) = spawn_spill("append");
-    let packet = build_ticker_packet();
+    let tmp = TempDirGuard::new("append");
+    let spill = WsFrameSpill::new(&tmp.path).expect("WsFrameSpill::new");
+    let frame = quote_frame();
+    let mut seq = 1_u64 << 40;
     c.bench_function("ws_reader/wal_append", |b| {
-        b.iter(|| {
-            // The read loop now hands the WAL an O(1) `Bytes` clone (H1);
-            // this `Vec` clone is the bench's owned input (append takes
-            // `impl Into<Bytes>`, so the `Vec` is buffer-stolen, not copied).
-            let frame_vec = packet.clone();
-            black_box(spill.append(WsType::LiveFeed, black_box(frame_vec)));
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                let n = left.min(BATCH);
+                let started = Instant::now();
+                for _ in 0..n {
+                    seq += 1 << 16;
+                    black_box(spill.append_with_seq_at(
+                        WsType::LiveFeed,
+                        frame.clone(),
+                        seq,
+                        1_700_000_000_000_000_000,
+                        WalEndpoint::MainFeed,
+                    ));
+                }
+                total += started.elapsed();
+                left -= n;
+                wait_wal_empty(&spill);
+            }
+            total
         });
     });
 }
 
-/// Benchmark the binary dispatch — the parse done AFTER the WAL append.
-/// Already covered by `tick_parser.rs::dispatch_frame/ticker`, kept here
-/// for side-by-side comparison in the same run.
-fn bench_dispatch(c: &mut Criterion) {
-    let packet = build_ticker_packet();
-    c.bench_function("ws_reader/dispatch_ticker", |b| {
-        b.iter(|| dispatch_frame(black_box(&packet), black_box(0)));
+/// The ring push alone (crossbeam slot + drain notify, no parked drain).
+fn bench_ring_push(c: &mut Criterion) {
+    let (tx, mut rx) = frame_ring::<CapturedFrame>(RING_SLOTS);
+    let budget = RingByteBudget::with_slot_cap(1 << 30, RING_SLOTS);
+    let frame = quote_frame();
+    let base = Instant::now();
+    c.bench_function("ws_reader/ring_push", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                let n = left.min(BATCH);
+                let started = Instant::now();
+                for seq in 0..n {
+                    let pushed = tx.try_send(CapturedFrame {
+                        seq,
+                        endpoint: DhanEndpointType::MainFeed,
+                        connection_index: 0,
+                        received_at: base,
+                        received_at_nanos: 0,
+                        wal_backed: true,
+                        bytes: frame.clone(),
+                    });
+                    black_box(pushed.is_ok());
+                }
+                total += started.elapsed();
+                left -= n;
+                drain_ring(&mut rx, &budget);
+            }
+            total
+        });
     });
 }
 
-/// Benchmark the full WS reader hot-path combining all three steps in
-/// the exact order they execute inside the read loop:
-///   counter bump → WAL append → dispatch.
-///
-/// This is the number compared against
-/// `ws_reader_frame_handle_ns = 100` in the budget file.
+/// The whole per-frame read path, in the read loop's order.
 fn bench_full_frame_handle(c: &mut Criterion) {
-    let (_tmp, spill) = spawn_spill("full");
-    let counter = AtomicU64::new(0);
-    let packet = build_ticker_packet();
+    let tmp = TempDirGuard::new("full");
+    let spill = Arc::new(WsFrameSpill::new(&tmp.path).expect("WsFrameSpill::new"));
+    let (tx, mut rx) = frame_ring::<CapturedFrame>(RING_SLOTS);
+    let budget = Arc::new(RingByteBudget::with_slot_cap(1 << 30, RING_SLOTS));
+    let sink = WalRingSink::new(
+        Arc::clone(&spill),
+        tx,
+        Arc::clone(&budget),
+        WsType::LiveFeed,
+        DhanEndpointType::MainFeed,
+        0,
+    );
+    let slot = ConnectionSlot {
+        account: DhanAccount::Primary,
+        endpoint: DhanEndpointType::MainFeed,
+        pool_index: 0,
+        global_index: 0,
+    };
+    let frame = quote_frame();
     c.bench_function("ws_reader/frame_handle_ns", |b| {
-        b.iter(|| {
-            // 1. Activity watchdog counter bump.
-            counter.fetch_add(1, Ordering::Relaxed);
-            // 2. Durable WAL append (owns a fresh Vec).
-            let frame_vec = packet.clone();
-            let outcome = spill.append(WsType::LiveFeed, frame_vec);
-            black_box(outcome);
-            // 3. Dispatch the binary packet.
-            let parsed = dispatch_frame(black_box(&packet), black_box(0));
-            black_box(parsed)
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                let n = left.min(BATCH);
+                let started = Instant::now();
+                for _ in 0..n {
+                    let class = classify_frame(DhanEndpointType::MainFeed, black_box(&frame));
+                    note_depth200_frame(slot, &frame, started);
+                    black_box(class);
+                    black_box(sink.accept(frame.clone()));
+                }
+                total += started.elapsed();
+                left -= n;
+                drain_ring(&mut rx, &budget);
+                wait_wal_empty(&spill);
+            }
+            total
         });
     });
 }
 
 criterion_group!(
     benches,
-    bench_activity_counter_bump,
+    bench_classify,
+    bench_receipt_and_seq,
     bench_wal_append,
-    bench_dispatch,
+    bench_ring_push,
     bench_full_frame_handle
 );
 criterion_main!(benches);
