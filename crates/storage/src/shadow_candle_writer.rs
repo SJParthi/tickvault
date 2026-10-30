@@ -605,7 +605,10 @@ impl ShadowCandleWriter {
     /// `CANDLE_ILP_COLUMN_NAMES`)
     /// and goes in through `ColumnName::new_unchecked`: questdb-rs otherwise
     /// re-validates the name character by character on every call, which a
-    /// split-out bench measured at about 530 ns of a 1.38 µs row (22 names).
+    /// split-out bench measured at about 530 ns of a 1.38 µs row (22 names:
+    /// 2 symbols and 20 columns). A production row writes 2 or 3 symbols
+    /// (`contract` when the day's table names the bar) and 12 or 18 columns
+    /// (the six delay columns only with receipt stamps), from 21 constants.
     /// The names are validated once, by
     /// `test_every_candle_ilp_column_name_passes_the_questdb_check`, and every
     /// key the row writes is re-checked by the old-vs-new proptest. The table

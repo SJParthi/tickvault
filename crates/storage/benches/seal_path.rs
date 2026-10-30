@@ -10,7 +10,7 @@
 //! | `seal_path/row_build` | `ShadowSealRow::from_buffered_seal` | seal writer task |
 //! | `seal_ilp/append_unlabelled` | ILP row into the candle buffer, no contract name | seal writer task |
 //! | `seal_ilp/append_labelled` | the same, with the day's ~120,000-name table published | seal writer task |
-//! | `seal_ilp/pop_append` | ring pop + ILP append (what `drain_once` does per seal) | seal writer task |
+//! | `seal_ilp/pop_append` | ring pop + ILP append with the day's names published (what `drain_once` does per seal) | seal writer task |
 //! | `seal_path/ledger_probe_miss` | live-commit ledger probe, bar not tracked | seal writer task |
 //! | `seal_path/ledger_probe_hit` | live-commit ledger probe, bar tracked | seal writer task |
 //!
@@ -37,8 +37,8 @@
 //! # What does NOT meet 1 µs, stated plainly
 //!
 //! The three `seal_ilp` steps write one candle row through questdb-rs's
-//! `Buffer` API (table, three or four symbols, 17 to 20 columns, the
-//! timestamp). Measured 2026-10-30 on the x86 dev container: median about
+//! `Buffer` API (the table, 2 or 3 symbols, 12 or 18 columns, the
+//! timestamp; the bench rows carry all 18 columns). Measured 2026-10-30 on the x86 dev container: median about
 //! 1.06 µs, p99 1.8 to 2.4 µs, after this change took out the per-call name
 //! validation and the `fmt` delay text (it was median 1.95 µs, p99 3.6 to
 //! 4.3 µs). A split-out experiment put the library's own writing, with no
@@ -268,7 +268,7 @@ impl Step {
     /// Process-wide setup for this step (the contract-name table).
     fn install(self) {
         let labels = match self {
-            Self::IlpAppendLabelled => label_table(),
+            Self::IlpAppendLabelled | Self::DrainPopAppend => label_table(),
             _ => CandleContractLabels::default(),
         };
         publish_candle_contract_labels(labels);

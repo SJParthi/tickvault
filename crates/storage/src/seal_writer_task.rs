@@ -163,13 +163,20 @@ pub fn drain_once(
 
 /// [`drain_once`] with a caller-owned rescue buffer (2026-10-30 O(1) sweep).
 ///
-/// The seal writer runner keeps one buffer across cycles, so a cycle no
-/// longer allocates up to `max_drain` seals (about 2.9 MB at 16,384) every
-/// time it flushes. The buffer is cleared on entry and on exit and never
-/// shrunk: it allocates only when a cycle pops more seals than any cycle
-/// before it. Same seals, same order, same rows and outcomes as
-/// [`drain_once`], which is this function with a fresh buffer.
-pub fn drain_once_into(
+/// # Why (owner directive 2026-10-30: per-seal work under 1 µs, no
+/// allocation per seal)
+/// `drain_once` reserved a fresh buffer every flush: up to
+/// `max_drain` (16,384) seals of ~176 bytes, about 2.9 MB. Anything past
+/// the allocator's mmap threshold (128 KiB, ~740 seals) was a fresh
+/// mapping per flush, so every page of it faulted in on first write and
+/// was unmapped again at return. The runner keeps one buffer; after the
+/// largest batch it has seen, the live cycle allocates nothing here.
+///
+/// # Complexity
+/// O(seals popped). SPACE: the buffer keeps the capacity of the largest
+/// batch drained, at most `max_drain` seals (~2.9 MB at 16,384; growth uses
+/// `reserve_exact`, never doubling), for the life of the runner.
+pub fn drain_once_reusing(
     pipeline: &mut SealAbsorptionPipeline,
     writer: &mut ShadowCandleWriter,
     max_drain: usize,
@@ -194,7 +201,11 @@ pub fn drain_once_into(
     // seals. `ring_len` is the real bound on how many `pop_oldest` can yield
     // this cycle, and the `.min` keeps the reservation exact in both
     // directions — no over-reserve when idle, no re-alloc when saturated.
-    popped.reserve(max_drain.min(pipeline.ring_len()));
+    // `reserve_exact` on a cleared buffer that already holds this capacity
+    // is a compare, no allocation; when it must grow it grows to exactly
+    // the request (never the doubling `reserve` would take), so the kept
+    // buffer never exceeds `max_drain` seals.
+    popped.reserve_exact(max_drain.min(pipeline.ring_len()));
     while popped.len() < max_drain {
         match pipeline.pop_oldest() {
             Some(seal) => {
@@ -3245,6 +3256,34 @@ mod tests {
         let outcome = drain_once_reusing(&mut pipeline, &mut writer, 16, now, &mut scratch);
         assert!(outcome.is_idle());
         assert_eq!(Some(scratch.as_ptr()), first_ptr);
+
+        // Growth past the kept capacity is exact, never a doubling: a buffer
+        // holding 6 that then takes a full 16-seal batch keeps 16, not 32.
+        // `Vec::reserve` would take max(2 x 6, 16) = 16 here too, so the case
+        // that tells them apart is next: 9 kept, then 16 wanted.
+        let mut grown: Vec<BufferedSeal> = Vec::with_capacity(9);
+        for (cycle, batch) in [(10_u32, 16_usize), (11, 16)] {
+            for i in 0..batch {
+                pipeline.submit(
+                    mk_seal(
+                        200 + i as u64,
+                        0,
+                        TfIndex::M1,
+                        1_716_023_700 + cycle * 60 + i as u32,
+                        100.0,
+                    ),
+                    now,
+                );
+            }
+            let outcome = drain_once_reusing(&mut pipeline, &mut writer, 16, now, &mut grown);
+            assert_eq!(outcome.ring_seals_popped, batch, "cycle {cycle}");
+            assert!(
+                grown.capacity() <= 16,
+                "cycle {cycle}: the kept buffer grew to {} seals, past max_drain = 16 \
+                 (a doubling reserve gives 18 from a capacity of 9)",
+                grown.capacity()
+            );
+        }
         cleanup(&spill, &dlq);
     }
 
