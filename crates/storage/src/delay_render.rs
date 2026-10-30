@@ -60,16 +60,22 @@ const DELAY_SECOND_FLOOR_NANOS: i64 = 999_500_000;
 /// `overflow-checks = true` — and the sign is carried as a leading `-` so the
 /// sentence cannot silently claim a negative delay was positive.
 ///
-/// # Allocation
+/// # Allocation and cost
 ///
 /// Writes into a caller-owned buffer, which the caller CLEARS first. The naive
 /// `format!` shape would be three fresh `String`s per row — at the measured
 /// 20,220-contract ceiling that is 60,660 allocations per sweep, on the frame
 /// drain, in a codebase whose first principle is zero allocation on the hot
 /// path. One reused buffer is the whole difference.
+///
+/// The digits are written by hand into a 20-byte stack array (2026-10-30,
+/// owner directive: per-seal work under 1 µs at p99): the earlier
+/// `write!(out, "{value} {unit}")` went through the `fmt` machinery for every
+/// one of the three delay columns of every sealed bar. The text is byte for
+/// byte what that `write!` produced, pinned against a copy of the old body by
+/// `proptest_render_delay_into_matches_the_fmt_version_byte_for_byte`.
+/// O(digits) (at most 20), no allocation once `out` holds a short string.
 pub fn render_delay_into(out: &mut String, nanos: i64) {
-    use std::fmt::Write as _;
-
     out.clear();
     let magnitude = nanos.unsigned_abs();
     if nanos < 0 {
@@ -86,20 +92,29 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
     } else {
         ((magnitude + 500_000_000) / 1_000_000_000, "second")
     };
-    // `String`'s `fmt::Write` impl is infallible, so this Result can only ever
-    // be `Ok`. It is DISCARDED rather than unwrapped because `unwrap_used` and
-    // `expect_used` are both denied outside tests, and a panic path on the
-    // frame drain — under `panic = "abort"` — for an error that cannot occur
-    // is a worse trade than an ignored Ok.
-    //
-    // `_ =` rather than `let _ =`: clippy's `let_underscore_must_use` fires on
-    // the second and not the first, and the destructuring-assignment form is
-    // the modern idiom for a deliberate discard. No `#[allow]` is needed, so
-    // none is added — the house rule requires an `// APPROVED:` beside every
-    // allow, and an allow that can be avoided should be.
-    _ = write!(out, "{value} {unit}");
+    push_decimal(out, value);
+    out.push(' ');
+    out.push_str(unit);
     if value != 1 {
         out.push('s');
+    }
+}
+
+/// Appends `value` in base 10, as `{value}` would. `u64::MAX` has 20 digits.
+fn push_decimal(out: &mut String, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        // `value % 10` is below 10, so the cast cannot truncate.
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for &digit in &digits[start..] {
+        out.push(char::from(digit));
     }
 }
 
@@ -204,5 +219,97 @@ mod tests {
             by_nanos.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             vec![1_000_000_000, 2_000_000, 3_000, 4],
         );
+    }
+
+    /// The body `render_delay_into` had until 2026-10-30, kept verbatim as the
+    /// reference the hand-written digits are checked against.
+    fn render_delay_into_fmt_reference(out: &mut String, nanos: i64) {
+        use std::fmt::Write as _;
+
+        out.clear();
+        let magnitude = nanos.unsigned_abs();
+        if nanos < 0 {
+            out.push('-');
+        }
+        let (value, unit) = if magnitude < DELAY_MICRO_FLOOR_NANOS.unsigned_abs() {
+            (magnitude, "nanosecond")
+        } else if magnitude < DELAY_MILLI_FLOOR_NANOS.unsigned_abs() {
+            ((magnitude + 500) / 1_000, "microsecond")
+        } else if magnitude < DELAY_SECOND_FLOOR_NANOS.unsigned_abs() {
+            ((magnitude + 500_000) / 1_000_000, "millisecond")
+        } else {
+            ((magnitude + 500_000_000) / 1_000_000_000, "second")
+        };
+        _ = write!(out, "{value} {unit}");
+        if value != 1 {
+            out.push('s');
+        }
+    }
+
+    #[test]
+    fn test_render_delay_into_matches_the_fmt_version_at_every_edge() {
+        let (mut new, mut old) = (String::new(), String::new());
+        let mut edges = vec![i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1, 0];
+        for base in [
+            1_i64,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1_000,
+            999_499,
+            999_500,
+            999_499_999,
+            999_500_000,
+            1_499_999_999,
+            1_500_000_000,
+            9_999_999_999,
+            10_000_000_000,
+        ] {
+            for d in -1..=1 {
+                edges.push(base + d);
+                edges.push(-(base + d));
+            }
+        }
+        for nanos in edges {
+            render_delay_into(&mut new, nanos);
+            render_delay_into_fmt_reference(&mut old, nanos);
+            assert_eq!(new, old, "{nanos} ns");
+        }
+    }
+
+    #[test]
+    fn test_push_decimal_writes_every_digit_count_up_to_u64_max() {
+        let mut out = String::new();
+        let mut value = 0_u64;
+        for digits in 1..=19 {
+            value = if digits == 1 { 7 } else { value * 10 + 3 };
+            out.clear();
+            push_decimal(&mut out, value);
+            assert_eq!(out, value.to_string());
+        }
+        out.clear();
+        push_decimal(&mut out, u64::MAX);
+        assert_eq!(out, u64::MAX.to_string());
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4_096))]
+        #[test]
+        fn proptest_render_delay_into_matches_the_fmt_version_byte_for_byte(nanos in proptest::prelude::any::<i64>()) {
+            let (mut new, mut old) = (String::from("stale text"), String::new());
+            render_delay_into(&mut new, nanos);
+            render_delay_into_fmt_reference(&mut old, nanos);
+            proptest::prop_assert_eq!(new, old);
+        }
+
+        #[test]
+        fn proptest_render_delay_into_matches_in_the_realistic_range(nanos in -300_000_000_000_i64..300_000_000_000) {
+            let (mut new, mut old) = (String::new(), String::new());
+            render_delay_into(&mut new, nanos);
+            render_delay_into_fmt_reference(&mut old, nanos);
+            proptest::prop_assert_eq!(new, old);
+        }
     }
 }

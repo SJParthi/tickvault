@@ -835,6 +835,7 @@ jobs:
           crates/storage/tests/dhat_hot_path_telemetry.rs
           crates/storage/tests/dhat_receipt_to_fold_stage.rs
           crates/storage/tests/dhat_rescue_floor_zero_alloc.rs
+          crates/storage/tests/dhat_seal_per_seal_path.rs
           crates/storage/tests/dhat_seal_queue_backlog.rs
           crates/storage/tests/dhat_tick_row_append.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
@@ -984,22 +985,24 @@ jobs:
       # a line with two others, so the run: line count does not grow.
       # 2026-10-30: with PR #2146's two (hot_path_latency_minute, receipt_to_fold) -> 9;
       # the flags are packed three per line so the run: line count stays at its ceiling.
+      # Merged with PR #2143: dhat_seal_per_seal_path (the whole per-seal path after
+      # the fold allocates nothing) shares the second flag line, 9 -> 10; its drift-list
+      # line is paid for by joining the zero-tests echo and exit 1 below.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
             --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc \
-            --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle \
+            --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle --test dhat_seal_per_seal_path \
             --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
             2>&1 | tee /tmp/dhat-storage.log
           if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
-            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
-            exit 1
+            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."; exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
+          if [ "$ran" -ne 10 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step."; exit 1
           fi
 
       - name: DHAT (trading)
