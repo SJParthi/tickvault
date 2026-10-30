@@ -39,6 +39,10 @@ pub struct TradingCalendar {
     muhurat_dates: HashSet<NaiveDate>,
     /// Muhurat name lookup for display/persistence.
     muhurat_names: HashMap<NaiveDate, String>,
+    /// Muhurat session times as IST seconds of day `(start, end)`, end
+    /// exclusive, for each date whose times are published. A listed date
+    /// with empty times is absent here (NSE has not announced them yet).
+    muhurat_sessions: HashMap<NaiveDate, (u32, u32)>,
     /// NSE mock trading session dates (Saturdays, ~monthly).
     /// NOT real trading days — for system testing awareness only.
     mock_trading_dates: HashSet<NaiveDate>,
@@ -74,10 +78,18 @@ impl TradingCalendar {
 
         let mut muhurat_dates = HashSet::new();
         let mut muhurat_names = HashMap::new();
+        let mut muhurat_sessions = HashMap::new();
         for entry in &trading.muhurat_trading_dates {
             let date = NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d").map_err(|e| {
                 anyhow::anyhow!("invalid Muhurat trading date '{}': {}", entry.date, e)
             })?;
+            if let Some(window) = parse_muhurat_session_times(
+                &entry.date,
+                &entry.session_start_ist,
+                &entry.session_end_ist,
+            )? {
+                muhurat_sessions.insert(date, window);
+            }
             muhurat_dates.insert(date);
             muhurat_names.insert(date, entry.name.clone());
         }
@@ -107,6 +119,7 @@ impl TradingCalendar {
             holiday_names,
             muhurat_dates,
             muhurat_names,
+            muhurat_sessions,
             mock_trading_dates,
             mock_trading_names,
         })
@@ -141,6 +154,21 @@ impl TradingCalendar {
     /// Returns `true` if today (IST) has a Muhurat Trading session.
     pub fn is_muhurat_trading_today(&self) -> bool {
         self.is_muhurat_trading_day(today_ist())
+    }
+
+    /// The Muhurat session on `date` as IST seconds of day `(start, end)`,
+    /// end exclusive. `None` when `date` is not a Muhurat date or its times
+    /// are not published yet. O(1).
+    pub fn muhurat_session_secs(&self, date: NaiveDate) -> Option<(u32, u32)> {
+        self.muhurat_sessions.get(&date).copied()
+    }
+
+    /// Returns `true` if NSE holds ANY session on `date`: a regular trading
+    /// day, or a calendar-listed Muhurat session (which can fall on a weekend
+    /// or a weekday holiday). An ordinary weekend or holiday is `false`, and
+    /// so is a mock session (no settlement). O(1).
+    pub fn is_session_day(&self, date: NaiveDate) -> bool {
+        self.is_trading_day(date) || self.is_muhurat_trading_day(date)
     }
 
     /// Returns `true` if the given date is an NSE holiday.
@@ -386,6 +414,58 @@ impl TradingCalendar {
     }
 }
 
+/// Parse one `HH:MM` IST time into seconds of day. Exactly five characters,
+/// so `9:05` or `09:05:00` are refused rather than guessed.
+fn parse_session_hhmm(raw: &str) -> Option<u32> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 5 || bytes[2] != b':' {
+        return None;
+    }
+    let time = chrono::NaiveTime::parse_from_str(raw, "%H:%M").ok()?;
+    Some(chrono::Timelike::num_seconds_from_midnight(&time))
+}
+
+/// Parse a Muhurat entry's session times into IST seconds of day
+/// `(start, end)`.
+///
+/// Both empty = the times are not published yet → `Ok(None)`. Otherwise both
+/// must be `HH:MM` and start must be earlier than end (the same rules the
+/// terraform `muhurat_sessions` validation applies), or the calendar refuses
+/// to build: a half-written or reversed session would start the box at the
+/// wrong hour, which is worse than a boot that says why it stopped.
+///
+/// # Errors
+/// One time set without the other, a time that is not `HH:MM`, or
+/// `start >= end`.
+pub fn parse_muhurat_session_times(
+    date: &str,
+    start_ist: &str,
+    end_ist: &str,
+) -> Result<Option<(u32, u32)>> {
+    let (start_raw, end_raw) = (start_ist.trim(), end_ist.trim());
+    match (start_raw.is_empty(), end_raw.is_empty()) {
+        (true, true) => return Ok(None),
+        (false, false) => {}
+        _ => bail!(
+            "Muhurat date '{date}': session_start_ist and session_end_ist must both be set or \
+             both be empty (got start '{start_raw}', end '{end_raw}')"
+        ),
+    }
+    let Some(start) = parse_session_hhmm(start_raw) else {
+        bail!("Muhurat date '{date}': session_start_ist '{start_raw}' is not HH:MM (IST)");
+    };
+    let Some(end) = parse_session_hhmm(end_raw) else {
+        bail!("Muhurat date '{date}': session_end_ist '{end_raw}' is not HH:MM (IST)");
+    };
+    if start >= end {
+        bail!(
+            "Muhurat date '{date}': session_start_ist '{start_raw}' must be earlier than \
+             session_end_ist '{end_raw}'"
+        );
+    }
+    Ok(Some((start, end)))
+}
+
 /// Returns the IST timezone offset (+05:30 / UTC+19800s).
 ///
 /// Use this instead of `FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS).expect(...)` everywhere.
@@ -428,7 +508,7 @@ pub fn is_calendar_coverage_stale(days_remaining: Option<i64>, threshold_days: i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NseHolidayEntry;
+    use crate::config::{MuhuratTradingEntry, NseHolidayEntry};
 
     fn make_test_config() -> TradingConfig {
         TradingConfig {
@@ -453,9 +533,10 @@ mod tests {
                     name: "Dussehra".to_string(),
                 },
             ],
-            muhurat_trading_dates: vec![NseHolidayEntry {
+            muhurat_trading_dates: vec![MuhuratTradingEntry {
                 date: "2026-11-08".to_string(),
                 name: "Diwali 2026".to_string(),
+                ..Default::default()
             }],
             nse_mock_trading_dates: vec![
                 NseHolidayEntry {
@@ -818,9 +899,10 @@ mod tests {
     #[test]
     fn test_invalid_muhurat_date_string_rejected() {
         let mut config = make_test_config();
-        config.muhurat_trading_dates.push(NseHolidayEntry {
+        config.muhurat_trading_dates.push(MuhuratTradingEntry {
             date: "garbage".to_string(),
             name: "Bad Muhurat".to_string(),
+            ..Default::default()
         });
         let err = TradingCalendar::from_config(&config).unwrap_err();
         assert!(err.to_string().contains("invalid Muhurat trading date"));
@@ -921,13 +1003,15 @@ mod tests {
             },
         ];
         config.muhurat_trading_dates = vec![
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-11-08".to_string(), // Sun (Diwali evening)
                 name: "Muhurat Trading Diwali".to_string(),
+                ..Default::default()
             },
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-03-14".to_string(), // Sat (some hypothetical muhurat)
                 name: "Muhurat Holi".to_string(),
+                ..Default::default()
             },
         ];
 
@@ -984,13 +1068,15 @@ mod tests {
         config.nse_holidays.clear();
         config.nse_mock_trading_dates.clear();
         config.muhurat_trading_dates = vec![
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-11-08".to_string(),
                 name: "Muhurat A".to_string(),
+                ..Default::default()
             },
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-03-14".to_string(),
                 name: "Muhurat B".to_string(),
+                ..Default::default()
             },
         ];
         let cal = TradingCalendar::from_config(&config).unwrap();
@@ -1033,9 +1119,10 @@ mod tests {
             date: "2026-11-09".to_string(), // Mon
             name: "Diwali".to_string(),
         }];
-        config.muhurat_trading_dates = vec![NseHolidayEntry {
+        config.muhurat_trading_dates = vec![MuhuratTradingEntry {
             date: "2026-11-09".to_string(), // Same date
             name: "Muhurat Trading".to_string(),
+            ..Default::default()
         }];
 
         let cal = TradingCalendar::from_config(&config).unwrap();
@@ -1078,13 +1165,15 @@ mod tests {
             },
         ];
         config.muhurat_trading_dates = vec![
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-11-08".to_string(), // Sun
                 name: "Muhurat Diwali".to_string(),
+                ..Default::default()
             },
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-03-14".to_string(), // Sat
                 name: "Muhurat Holi".to_string(),
+                ..Default::default()
             },
         ];
 
@@ -1178,17 +1267,20 @@ mod tests {
             },
         ];
         config.muhurat_trading_dates = vec![
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-11-08".to_string(),
                 name: "M1".to_string(),
+                ..Default::default()
             },
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-03-14".to_string(),
                 name: "M2".to_string(),
+                ..Default::default()
             },
-            NseHolidayEntry {
+            MuhuratTradingEntry {
                 date: "2026-06-06".to_string(),
                 name: "M3".to_string(),
+                ..Default::default()
             },
         ];
 
