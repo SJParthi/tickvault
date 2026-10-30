@@ -341,37 +341,23 @@ pub struct DepthRow {
 // Pre-checked ILP names (the per-level row cost, 2026-10-30)
 // ---------------------------------------------------------------------------
 
-/// Every table and column name the two depth writers put on a line.
-///
-/// Passing a plain `&str` to a `questdb::ingress::Buffer` method makes it
-/// re-check the name character by character on EVERY call: eleven names per
-/// `market_depth` row, so on the drain that is one validation pass per name
-/// per level. These names are fixed literals, so the answer never changes;
-/// `the_depth_ilp_names_pass_questdbs_own_name_checks` runs QuestDB's own
-/// validators over this list, and the writers pass the names as
-/// [`ColumnName`] / [`TableName`] built unchecked, which skips only that
-/// re-check. The bytes written are the same (the check can only return an
-/// error, never change the output), pinned by
-/// `the_prechecked_writer_writes_the_same_bytes_as_the_checked_one`.
-#[cfg(test)]
-const DEPTH_ILP_COLUMN_NAMES: [&str; 12] = [
-    "segment",
-    "depth_kind",
-    "side",
-    "feed",
-    "contract",
-    "security_id",
-    "level",
-    // `market_depth_book` writes `price`, `quantity` and `orders` as array
-    // columns under the same names.
-    "price",
-    "quantity",
-    "orders",
-    "capture_seq",
-    "levels",
-];
+// Passing a plain `&str` to a `questdb::ingress::Buffer` method makes it
+// re-check the name character by character on EVERY call: eleven names per
+// `market_depth` row, so on the drain that is one validation pass per name
+// per level. These names are fixed literals, so the answer never changes;
+// `the_depth_ilp_names_pass_questdbs_own_name_checks` (test module) runs
+// QuestDB's own validators over every one of them, and the writers pass the
+// names as `ColumnName` / `TableName` built unchecked, which skips only that
+// re-check. The bytes written are the same (the check can only return an
+// error, never change the output), pinned by
+// `the_prechecked_writer_writes_the_same_bytes_as_the_checked_one`.
+//
+// The name list lives in the test module, not here: a test-only item above
+// the production code would cut the production half that source-scan guards
+// read (they split the file at the first test-config attribute, so that
+// attribute must not appear above the test module, not even in a comment).
 
-/// A depth column name, already proven valid (see [`DEPTH_ILP_COLUMN_NAMES`]).
+/// A depth column name, already proven valid by the test module's name list.
 ///
 /// Every debug and test build still runs QuestDB's own check on each call,
 /// so a name added at a call site without being valid fails every test that
@@ -388,7 +374,7 @@ fn depth_col(name: &'static str) -> ColumnName<'static> {
     ColumnName::new_unchecked(name)
 }
 
-/// A depth table name, already proven valid (see [`DEPTH_ILP_COLUMN_NAMES`]).
+/// A depth table name, already proven valid by the test module's name check.
 #[inline(always)]
 fn depth_table(name: &'static str) -> TableName<'static> {
     debug_assert!(
@@ -4234,6 +4220,24 @@ mod tests {
     // -----------------------------------------------------------------------
     // Pre-checked ILP names (2026-10-30): same bytes as the checked API
     // -----------------------------------------------------------------------
+
+    /// Every table column name the two depth writers put on a line.
+    const DEPTH_ILP_COLUMN_NAMES: [&str; 12] = [
+        "segment",
+        "depth_kind",
+        "side",
+        "feed",
+        "contract",
+        "security_id",
+        "level",
+        // `market_depth_book` writes `price`, `quantity` and `orders` as array
+        // columns under the same names.
+        "price",
+        "quantity",
+        "orders",
+        "capture_seq",
+        "levels",
+    ];
 
     /// A session-window arrival stamp (10:00 IST on 2026-10-29), so the
     /// writer's window gate never refuses the rows these tests compare.
