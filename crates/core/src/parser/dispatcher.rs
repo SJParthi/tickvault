@@ -1275,7 +1275,7 @@ mod uncounted_dispatch_tests {
     }
 
     #[test]
-    fn test_count_packets_by_response_code_accepts_zero_and_any_code() {
+    fn test_count_packets_by_response_code_with_any_code_or_zero_never_panics() {
         // No recorder: the handles are no-ops; this pins that every code,
         // known or not, and a zero count are accepted without a panic.
         for code in 0..=u8::MAX {
