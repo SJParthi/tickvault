@@ -24,55 +24,79 @@
 //!   delivering for other instruments, the missing instruments are offered
 //!   again through the existing `LiveSubscriptionCommand::Resubscribe` on the
 //!   SAME socket: first an unsubscribe of them, then a subscribe of them. Never
-//!   a close, never a redial for this (scope lock 2026-10-02). At most
-//!   [`RECONCILE_MAX_ROUNDS`] rounds per instrument per IST day,
-//!   [`RECONCILE_ROUND_INTERVAL_SECS`] apart per socket; then the instrument is
-//!   counted as exhausted and named in one log line.
+//!   a close, never a redial for this (scope lock 2026-10-02). One round in
+//!   flight per socket, at most [`RECONCILE_MAX_ROUNDS`] rounds per instrument
+//!   per IST day, the next round no sooner than [`RECONCILE_ROUND_INTERVAL_SECS`]
+//!   after the previous one FINISHED; then the instrument is counted as
+//!   exhausted and named in one log line.
 //! - **Switch.** `[dhan_universe] subscribe_reconcile_auto_resubscribe`,
 //!   default `false`: the delta and the round planning run and are counted as
-//!   `would_resubscribe`, and nothing is sent.
+//!   `would_resubscribe`, nothing is sent, and no round is spent (so nothing
+//!   is ever reported as exhausted or recovered in that mode).
 //!
 //! ## Why two commands and not one
 //!
 //! `Resubscribe` treats an instrument named on BOTH lists as "stays held, costs
 //! nothing on the wire", so one command cannot re-send a held instrument. The
 //! first command removes them from the socket and from the reconnect replay
-//! list; the second adds them back. The second is always sent (unless the
-//! first was refused before anything changed), and it is retried, because
-//! between the two the instruments are off the socket.
+//! list; the second adds back exactly the ones that left. The socket refuses a
+//! whole unsubscribe if any one instrument in it is not held, so a refused
+//! batch is split in halves until each refused part is a single instrument;
+//! a not-held instrument is not on the socket at all, so it goes straight to
+//! the subscribe half. The subscribe half is retried on a definite failure,
+//! because between the two commands the instruments are off the socket.
 //!
 //! ## Gates (each one keeps a whole-socket or whole-market silence out of it)
 //!
-//! - Continuous session only (09:15 to the confirmed-silence close, trading
-//!   days, the same clock the frame-silence redials read).
-//! - The whole feed must be delivering: if no expected instrument has ticked
-//!   at all, it is a halt or a dead lane, not a partial subscribe.
-//! - The socket must be delivering for at least one other expected
-//!   instrument; a socket where nothing ticks is the frame-silence redial's
+//! - Continuous session only, from 120 s after its open (09:17) to the
+//!   confirmed-silence close, trading days, the same clock the frame-silence
+//!   redials read.
+//! - The whole feed must be delivering NOW: at least one expected instrument
+//!   reads `Live` or `Warming`. An instrument that ticked earlier and has gone
+//!   quiet (`Exceeded`) does not count, so a halt is not a partial subscribe.
+//! - The socket must be delivering now for at least one other expected
+//!   instrument; a socket where nothing is live is the frame-silence redial's
 //!   job, counted here as `skipped_silent_socket` once per episode.
 //!
 //! ## Complexity
 //!
-//! `note` is one hash probe per silence report (O(1)), inside the drain's
-//! existing O(n) 30 s sweep, never per tick. `finish` is O(sockets +
-//! candidates). `record_subscribed` is O(instruments) once per subscribe
-//! command, cold. Space is bounded: at most [`RECONCILE_MAX_EXPECTED`]
-//! instruments (past it a new one is refused and counted) and
-//! [`RECONCILE_MAX_SOCKETS`] sockets. The executor is O(instruments) per
-//! round, on its own task.
+//! `note` is O(1) per report: one SipHash probe into a map of at most
+//! [`RECONCILE_MAX_EXPECTED`] entries, no allocation until a socket's
+//! candidate list passes its pre-sized capacity (never, at the per-round
+//! cap). It runs inside the drain's existing 30 s O(n) silence scan, so it
+//! adds O(n) probes to that scan, never per tick: measured by
+//! `sweep_cost_at_the_authorized_ceiling` (`#[ignore]`d, run it for the
+//! number). `finish` is O(sockets + candidates), except once per IST day,
+//! when the rollover walks every expected entry, O(expected).
+//! `record_subscribed` is O(instruments) once per subscribe command, cold.
+//! The sweep holds the book's `std::sync::Mutex` for the whole scan; the
+//! other takers are cold (a subscribe record, the executor finishing a round),
+//! and each holds it for O(its instruments). Space is bounded: at most
+//! [`RECONCILE_MAX_EXPECTED`] instruments (past it a new one is refused and
+//! counted) and [`RECONCILE_MAX_SOCKETS`] sockets. The executor runs on its
+//! own task: O(instruments) per round plus at most
+//! [`RECONCILE_MAX_UNSUBSCRIBE_COMMANDS`] split commands.
 //!
 //! ## Honest limits
 //!
 //! - An instrument the silence detector does not track gives no report and is
-//!   never judged.
-//! - A contract that genuinely never trades can read as missing; it costs at
-//!   most three resends a day and then one log line naming it.
+//!   never judged. An instrument that produced even one packet is never judged
+//!   again, so a subscribe lost on a later redial is not caught here.
+//! - A contract that genuinely never trades can read as missing; with the
+//!   switch on it costs at most three resends a day and then one log line
+//!   naming it.
 //! - Between the two commands the instruments are off the socket (one
-//!   round-trip, a few milliseconds); a process stop in that gap drops them
-//!   from the reconnect replay until the next attach.
+//!   round-trip); a process stop in that gap drops them from the reconnect
+//!   replay until the next attach.
+//! - An unsubscribe whose answer never came back is treated as having
+//!   happened: its instruments are subscribed again once. If it had in fact
+//!   not happened, the socket's duplicate check drops them and logs its own
+//!   WS-GAP-02 line.
+//! - The lane must call [`SubscribeReconcile::forget`] for any instrument it
+//!   deliberately removes from a socket, or a round would subscribe it again.
 //! - Local `/metrics` only: no alarm, no page, no CloudWatch metric.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -97,14 +121,20 @@ pub const RECONCILE_DELTA_SECS: u64 = 120;
 /// (plan item 3b: "max 3 rounds").
 pub const RECONCILE_MAX_ROUNDS: u8 = 3;
 
-/// Minimum spacing between two rounds on the same socket. Matches the delta,
-/// so a resent instrument gets the same 120 s to start before it is judged
-/// again.
+/// Minimum spacing between the end of one round on a socket and the start of
+/// the next. Matches the delta, so a resent instrument gets the same 120 s to
+/// start before it is judged again.
 pub const RECONCILE_ROUND_INTERVAL_SECS: u64 = 120;
 
 /// Most instruments one round resends on one socket (ten 100-instrument
 /// messages each way). A larger delta is taken over several rounds.
 pub const RECONCILE_MAX_PER_SOCKET_PER_ROUND: usize = 1_000;
+
+/// Most unsubscribe commands one round sends while splitting a refused batch.
+/// Finding k not-held instruments among n costs about 2·k·log2(n) commands;
+/// past this cap the rest of the round is left untouched and its rounds are
+/// refunded.
+pub const RECONCILE_MAX_UNSUBSCRIBE_COMMANDS: usize = 64;
 
 /// Most expected instruments held: the daily universe ceiling (5 main-feed
 /// sockets × 5,000), tied to it so a universe raise moves this too.
@@ -128,7 +158,7 @@ pub const RECONCILE_SUBSCRIBE_ATTEMPTS: u32 = 3;
 /// Pause between two subscribe attempts.
 pub const RECONCILE_SUBSCRIBE_RETRY_SECS: u64 = 2;
 
-/// Instruments named in one exhausted or lost log line.
+/// Instruments named in one exhausted, lost or unknown log line.
 const NAMED_IN_LOG: usize = 20;
 
 /// Counter: one per round decision or executor result, by `outcome`.
@@ -141,28 +171,31 @@ pub const RECONCILE_INSTRUMENTS_METRIC: &str = "tv_subscribe_reconcile_instrumen
 pub const RECONCILE_MISSING_GAUGE: &str = "tv_subscribe_reconcile_missing";
 
 /// Every `outcome` label of [`RECONCILE_ROUNDS_METRIC`], registered at 0.
-const ROUND_OUTCOMES: [&str; 13] = [
+const ROUND_OUTCOMES: [&str; 14] = [
     "would_resubscribe",
     "dispatched",
     "queue_full",
     "skipped_silent_socket",
     "skipped_feed_silent",
     "resubscribed",
-    "refused_not_held",
-    "refused_over_cap",
     "refused_halted_805",
     "send_failed",
+    "unsubscribe_split",
     "unsubscribe_unknown",
     "subscribe_retried",
+    "subscribe_unknown",
+    "split_cap_reached",
     "lost",
 ];
 
 /// Every `outcome` label of [`RECONCILE_INSTRUMENTS_METRIC`], registered at 0.
-const INSTRUMENT_OUTCOMES: [&str; 6] = [
+const INSTRUMENT_OUTCOMES: [&str; 8] = [
     "missing_found",
     "resent",
+    "not_held",
     "recovered",
     "exhausted",
+    "unknown",
     "lost",
     "refused_untracked",
 ];
@@ -179,7 +212,10 @@ struct Expected {
     instrument: SubscribeInstrument,
     socket: u8,
     recorded_at: Instant,
+    /// Rounds actually sent today (shadow mode never spends one).
     rounds: u8,
+    /// Counted on `missing_found` today.
+    missing_counted: bool,
     exhausted_reported: bool,
     recovered_reported: bool,
 }
@@ -188,8 +224,13 @@ struct Expected {
 #[derive(Debug)]
 struct Socket {
     tx: mpsc::Sender<LiveSubscriptionCommand>,
+    /// When the last round on this socket finished (shadow: when it was
+    /// planned).
     last_round_at: Option<Instant>,
-    ticking: u32,
+    /// A round for this socket is queued or running.
+    in_flight: bool,
+    /// Expected instruments delivering now (`Live` or `Warming`) this sweep.
+    delivering: u32,
     candidates: Vec<SubscribeInstrument>,
     silent_reported: bool,
 }
@@ -293,8 +334,11 @@ impl SubscribeReconcile {
                 inner.sockets.push(Socket {
                     tx: tx.clone(),
                     last_round_at: None,
-                    ticking: 0,
-                    candidates: Vec::new(),
+                    in_flight: false,
+                    delivering: 0,
+                    // Pre-sized to the per-round cap, so `note` never grows
+                    // it on the drain.
+                    candidates: Vec::with_capacity(RECONCILE_MAX_PER_SOCKET_PER_ROUND),
                     silent_reported: false,
                 });
                 inner.sockets.len() - 1
@@ -323,6 +367,7 @@ impl SubscribeReconcile {
                     socket,
                     recorded_at: now,
                     rounds: 0,
+                    missing_counted: false,
                     exhausted_reported: false,
                     recovered_reported: false,
                 },
@@ -350,8 +395,7 @@ impl SubscribeReconcile {
 
     /// Starts one judging pass. Feed it every report of the drain's silence
     /// sweep with [`ReconcileSweep::note`], then call
-    /// [`ReconcileSweep::finish_now`]. Holds the book's lock until finished;
-    /// the only other taker is a cold subscribe on an attach path.
+    /// [`ReconcileSweep::finish_now`]. Holds the book's lock until finished.
     #[must_use]
     pub fn sweep(&self) -> ReconcileSweep<'_> {
         self.sweep_at(Instant::now())
@@ -360,7 +404,7 @@ impl SubscribeReconcile {
     fn sweep_at(&self, now: Instant) -> ReconcileSweep<'_> {
         let mut inner = self.lock();
         for socket in &mut inner.sockets {
-            socket.ticking = 0;
+            socket.delivering = 0;
             socket.candidates.clear();
         }
         ReconcileSweep {
@@ -372,14 +416,18 @@ impl SubscribeReconcile {
         }
     }
 
-    /// Stops rounds for instruments a socket says it does not hold.
-    fn mark_not_held(&self, instruments: &[SubscribeInstrument]) {
+    /// The executor's report that a round on `socket` is over: the socket may
+    /// plan again [`RECONCILE_ROUND_INTERVAL_SECS`] from now, and the
+    /// instruments in `refund` (never actually resent) get their round back.
+    fn round_finished(&self, socket: u8, refund: &[SubscribeInstrument], now: Instant) {
         let mut inner = self.lock();
-        for instrument in instruments {
-            if let Some(entry) = inner.expected.get_mut(&key_of(instrument)) {
-                entry.rounds = RECONCILE_MAX_ROUNDS;
-                entry.exhausted_reported = true;
-            }
+        let Inner {
+            sockets, expected, ..
+        } = &mut *inner;
+        bump_rounds(expected, refund, -1);
+        if let Some(slot) = sockets.get_mut(usize::from(socket)) {
+            slot.in_flight = false;
+            slot.last_round_at = Some(now);
         }
     }
 }
@@ -405,13 +453,18 @@ impl ReconcileSweep<'_> {
         let Some(socket) = inner.sockets.get_mut(usize::from(entry.socket)) else {
             return;
         };
-        if report.verdict != SilenceVerdict::NeverTicked {
-            socket.ticking = socket.ticking.saturating_add(1);
-            if entry.rounds > 0 && !entry.recovered_reported {
-                entry.recovered_reported = true;
-                counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "recovered").increment(1);
+        match report.verdict {
+            SilenceVerdict::NeverTicked => {}
+            SilenceVerdict::Live | SilenceVerdict::Warming => {
+                socket.delivering = socket.delivering.saturating_add(1);
+                mark_recovered(entry);
+                return;
             }
-            return;
+            // Ticked earlier, quiet now: neither delivering nor missing.
+            SilenceVerdict::Exceeded => {
+                mark_recovered(entry);
+                return;
+            }
         }
         if now.saturating_duration_since(entry.recorded_at)
             < Duration::from_secs(RECONCILE_DELTA_SECS)
@@ -420,10 +473,12 @@ impl ReconcileSweep<'_> {
         }
         self.missing = self.missing.saturating_add(1);
         if entry.rounds >= RECONCILE_MAX_ROUNDS {
-            // The last round gets its full 120 s before it is judged spent.
-            let last_round_settled = socket.last_round_at.is_none_or(|at| {
-                now.saturating_duration_since(at) >= Duration::from_secs(RECONCILE_DELTA_SECS)
-            });
+            // The last round gets its full 120 s after it finished before it
+            // is judged spent.
+            let last_round_settled = !socket.in_flight
+                && socket.last_round_at.is_none_or(|at| {
+                    now.saturating_duration_since(at) >= Duration::from_secs(RECONCILE_DELTA_SECS)
+                });
             if last_round_settled && !entry.exhausted_reported {
                 entry.exhausted_reported = true;
                 self.exhausted.push(entry.instrument);
@@ -453,11 +508,14 @@ impl ReconcileSweep<'_> {
         gauge!(RECONCILE_MISSING_GAUGE).set(f64::from(self.missing));
         let inner = &mut *self.inner;
         if inner.ist_day != ist_day {
-            // A new session: every instrument gets its rounds back.
+            // A new session: every instrument gets its rounds back. O(expected),
+            // once a day. A round still in flight keeps its socket's flag; the
+            // executor clears it.
             inner.ist_day = ist_day;
             inner.feed_silent_reported = false;
             for entry in inner.expected.values_mut() {
                 entry.rounds = 0;
+                entry.missing_counted = false;
                 entry.exhausted_reported = false;
                 entry.recovered_reported = false;
             }
@@ -466,6 +524,7 @@ impl ReconcileSweep<'_> {
                 socket.silent_reported = false;
             }
             self.exhausted.clear();
+            summary.newly_exhausted = 0;
         }
         // The continuous session, and not its first 120 s: an instrument that has
         // not traded since the open is not yet a lost subscription.
@@ -476,14 +535,14 @@ impl ReconcileSweep<'_> {
         {
             return summary;
         }
-        let feed_ticking: u64 = inner.sockets.iter().map(|s| u64::from(s.ticking)).sum();
-        if feed_ticking == 0 {
+        let feed_delivering: u64 = inner.sockets.iter().map(|s| u64::from(s.delivering)).sum();
+        if feed_delivering == 0 {
             if summary.missing > 0 && !inner.feed_silent_reported {
                 inner.feed_silent_reported = true;
                 counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "skipped_feed_silent").increment(1);
                 warn!(
                     missing = summary.missing,
-                    "subscribe reconcile: no subscribed instrument has sent a packet - this is a \
+                    "subscribe reconcile: no subscribed instrument is delivering now - this is a \
                      halt or a dead feed, not a partial subscribe; nothing is resent"
                 );
             }
@@ -491,6 +550,7 @@ impl ReconcileSweep<'_> {
         }
         inner.feed_silent_reported = false;
         let interval = Duration::from_secs(RECONCILE_ROUND_INTERVAL_SECS);
+        let auto = self.book.auto_resubscribe;
         let Inner {
             sockets, expected, ..
         } = inner;
@@ -499,7 +559,7 @@ impl ReconcileSweep<'_> {
                 socket.silent_reported = false;
                 continue;
             }
-            if socket.ticking == 0 {
+            if socket.delivering == 0 {
                 if !socket.silent_reported {
                     socket.silent_reported = true;
                     counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "skipped_silent_socket")
@@ -507,24 +567,31 @@ impl ReconcileSweep<'_> {
                     warn!(
                         socket = index,
                         missing = socket.candidates.len(),
-                        "subscribe reconcile: a socket delivers nothing for any of its \
+                        "subscribe reconcile: a socket delivers nothing now for any of its \
                          instruments - left to the frame-silence redial, nothing is resent"
                     );
                 }
                 continue;
             }
             socket.silent_reported = false;
-            if socket
-                .last_round_at
-                .is_some_and(|at| self.now.saturating_duration_since(at) < interval)
+            if socket.in_flight
+                || socket
+                    .last_round_at
+                    .is_some_and(|at| self.now.saturating_duration_since(at) < interval)
             {
                 continue;
             }
-            let instruments = std::mem::take(&mut socket.candidates);
+            // `drain` keeps the pre-sized buffer for the next sweep; the round
+            // takes one allocation, cold, at most once per socket per 120 s.
+            let instruments: Vec<SubscribeInstrument> = socket.candidates.drain(..).collect();
             let count = instruments.len() as u64;
-            // One round spent per member, one hash probe each.
-            bump_rounds(expected, &instruments, 1);
-            if self.book.auto_resubscribe {
+            let first_seen = count_missing_once(expected, &instruments);
+            counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "missing_found")
+                .increment(first_seen);
+            if auto {
+                // One round spent per member, one hash probe each; refunded by
+                // the executor for any member it did not actually resend.
+                bump_rounds(expected, &instruments, 1);
                 let round = PlannedRound {
                     tx: socket.tx.clone(),
                     socket: u8::try_from(index).unwrap_or(u8::MAX),
@@ -532,10 +599,9 @@ impl ReconcileSweep<'_> {
                 };
                 match self.book.rounds_tx.try_send(round) {
                     Ok(()) => {
+                        socket.in_flight = true;
                         summary.dispatched = summary.dispatched.saturating_add(1);
                         counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "dispatched").increment(1);
-                        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent")
-                            .increment(count);
                     }
                     Err(
                         mpsc::error::TrySendError::Full(round)
@@ -549,15 +615,16 @@ impl ReconcileSweep<'_> {
                     }
                 }
             } else {
+                // Shadow: spacing only, so the counter reads one decision per
+                // socket per 120 s; no round is spent.
+                socket.last_round_at = Some(self.now);
                 summary.would_resubscribe = summary.would_resubscribe.saturating_add(1);
                 counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "would_resubscribe").increment(1);
             }
-            counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "missing_found").increment(count);
-            socket.last_round_at = Some(self.now);
             info!(
                 socket = index,
                 instruments = count,
-                auto_resubscribe = self.book.auto_resubscribe,
+                auto_resubscribe = auto,
                 "subscribe reconcile: instruments subscribed over 120 s ago have sent nothing \
                  while the socket delivers others"
             );
@@ -586,6 +653,14 @@ impl Drop for ReconcileSweep<'_> {
     }
 }
 
+/// Counts an instrument that ticked after a round was actually sent for it.
+fn mark_recovered(entry: &mut Expected) {
+    if entry.rounds > 0 && !entry.recovered_reported {
+        entry.recovered_reported = true;
+        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "recovered").increment(1);
+    }
+}
+
 /// Adds `delta` (+1 or -1) to each instrument's spent rounds. O(instruments).
 fn bump_rounds(
     expected: &mut HashMap<Key, Expected>,
@@ -601,6 +676,23 @@ fn bump_rounds(
             };
         }
     }
+}
+
+/// Marks instruments as counted missing today; returns how many were new.
+fn count_missing_once(
+    expected: &mut HashMap<Key, Expected>,
+    instruments: &[SubscribeInstrument],
+) -> u64 {
+    let mut fresh = 0u64;
+    for instrument in instruments {
+        if let Some(entry) = expected.get_mut(&key_of(instrument))
+            && !entry.missing_counted
+        {
+            entry.missing_counted = true;
+            fresh = fresh.saturating_add(1);
+        }
+    }
+    fresh
 }
 
 /// Up to [`NAMED_IN_LOG`] instruments as `segment:id`, for one log line.
@@ -629,18 +721,25 @@ impl std::fmt::Display for NamedInstruments<'_> {
 /// What one executed round ended as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundOutcome {
-    /// Both halves reached the socket (or its reconnect replay).
-    Resubscribed,
-    /// The unsubscribe half was refused before anything changed; the socket
-    /// holds exactly what it held. `reason` is a `ResubscribeOutcome::REASON_*`.
+    /// Every instrument that left the socket, and every one the socket did not
+    /// hold, was subscribed again (or handed to its reconnect replay).
+    Resubscribed {
+        /// Instruments subscribed by the second command.
+        resent: usize,
+        /// Of those, instruments the socket did not hold at all.
+        not_held: usize,
+    },
+    /// The socket refused every change after an 805; nothing changed.
     Refused {
-        /// Why the socket refused.
+        /// A `ResubscribeOutcome::REASON_*`.
         reason: &'static str,
     },
     /// The socket's task could not be reached; nothing changed.
     SendFailed,
-    /// Instruments the unsubscribe half took off that the subscribe half could
-    /// not put back after every attempt.
+    /// The subscribe command was handed over and no answer came back: these
+    /// may or may not be on the socket.
+    Unknown(Vec<SubscribeInstrument>),
+    /// Instruments the subscribe half could not put back after every attempt.
     Lost(Vec<SubscribeInstrument>),
 }
 
@@ -657,17 +756,26 @@ pub async fn run_reconcile_executor(
             break;
         };
         let socket = round.socket;
-        let outcome = execute_round(&book, round).await;
-        if let RoundOutcome::Lost(lost) = &outcome {
-            error!(
+        match execute_round(&book, round).await {
+            RoundOutcome::Lost(lost) => error!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                 source = "subscribe_reconcile_lost",
                 socket,
                 instruments = lost.len(),
-                first = %NamedInstruments(lost),
+                first = %NamedInstruments(&lost),
                 "subscribe reconcile: instruments were unsubscribed for a resend and could not \
                  be subscribed again - they are off this socket until the next attach or redial"
-            );
+            ),
+            RoundOutcome::Unknown(unknown) => warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "subscribe_reconcile_unknown",
+                socket,
+                instruments = unknown.len(),
+                first = %NamedInstruments(&unknown),
+                "subscribe reconcile: the socket never answered the subscribe half - these may be \
+                 off the socket; the next sweep judges them again"
+            ),
+            _ => {}
         }
     }
 }
@@ -697,65 +805,201 @@ async fn send_and_wait(
     )
 }
 
-/// Executes one round: unsubscribe the instruments, then subscribe them, on
-/// the same socket. Cold, on the executor's task.
-pub async fn execute_round(book: &SubscribeReconcile, round: PlannedRound) -> RoundOutcome {
+/// `all` minus `minus`, on the composite key. O(all + minus), cold.
+fn without(
+    all: Vec<SubscribeInstrument>,
+    minus: &[SubscribeInstrument],
+) -> Vec<SubscribeInstrument> {
+    if minus.is_empty() {
+        return all;
+    }
+    let drop: HashSet<Key> = minus.iter().map(key_of).collect();
+    all.into_iter()
+        .filter(|instrument| !drop.contains(&key_of(instrument)))
+        .collect()
+}
+
+/// What the unsubscribe half did to each instrument.
+#[derive(Debug, Default)]
+struct UnsubscribeHalf {
+    /// Left the socket (or the socket is being replaced without them).
+    removed: Vec<SubscribeInstrument>,
+    /// The socket did not hold them.
+    not_held: Vec<SubscribeInstrument>,
+    /// Handed over, never answered: treated as removed.
+    unknown: Vec<SubscribeInstrument>,
+    /// Never touched (send failed, stopped before them, cap reached): still on
+    /// the socket, not resent, refunded.
+    untouched: Vec<SubscribeInstrument>,
+    /// The socket refused every change after an 805.
+    halted: bool,
+    /// The very first command could not be handed over.
+    unreachable: bool,
+}
+
+/// The unsubscribe half: removes the round's instruments from the socket,
+/// splitting any batch the socket refuses as not held until each refused part
+/// is one instrument. Bounded by [`RECONCILE_MAX_UNSUBSCRIBE_COMMANDS`].
+async fn unsubscribe_half(
+    tx: &mpsc::Sender<LiveSubscriptionCommand>,
+    instruments: Vec<SubscribeInstrument>,
+) -> UnsubscribeHalf {
     let count_round = |outcome: &'static str| {
         counter!(RECONCILE_ROUNDS_METRIC, "outcome" => outcome).increment(1);
     };
-    // Half one: take them off. A refusal changed nothing, so the round ends.
-    match send_and_wait(&round.tx, round.instruments.clone(), Vec::new()).await {
-        None => {
-            count_round("send_failed");
-            return RoundOutcome::SendFailed;
-        }
-        Some(Some(ResubscribeOutcome::Refused { reason })) => {
-            count_round(match reason {
-                ResubscribeOutcome::REASON_NOT_HELD => "refused_not_held",
-                ResubscribeOutcome::REASON_OVER_CAP => "refused_over_cap",
-                _ => "refused_halted_805",
-            });
-            if reason == ResubscribeOutcome::REASON_NOT_HELD {
-                // The book named the wrong socket: never try these again today.
-                book.mark_not_held(&round.instruments);
+    let mut half = UnsubscribeHalf::default();
+    let mut work: Vec<Vec<SubscribeInstrument>> = vec![instruments];
+    let mut commands = 0usize;
+    while let Some(batch) = work.pop() {
+        if half.halted || commands >= RECONCILE_MAX_UNSUBSCRIBE_COMMANDS {
+            if !half.halted {
+                count_round("split_cap_reached");
             }
-            return RoundOutcome::Refused { reason };
+            half.untouched.extend(batch);
+            continue;
         }
-        // Applied, Stopped part-way, ReplayPending: some or all left the
-        // socket. No answer: unknown. In every case the subscribe half runs
-        // for the whole list; one the socket still holds is dropped by the
-        // socket's own duplicate check and costs no wire message.
-        Some(None) => count_round("unsubscribe_unknown"),
-        Some(Some(_)) => {}
+        commands += 1;
+        match send_and_wait(tx, batch.clone(), Vec::new()).await {
+            None => {
+                if commands == 1 {
+                    half.unreachable = true;
+                }
+                half.untouched.extend(batch);
+            }
+            Some(Some(ResubscribeOutcome::Applied | ResubscribeOutcome::ReplayPending)) => {
+                half.removed.extend(batch);
+            }
+            Some(Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed, ..
+            })) => {
+                half.untouched.extend_from_slice(&not_unsubscribed);
+                half.removed.extend(without(batch, &not_unsubscribed));
+            }
+            Some(Some(ResubscribeOutcome::Refused { reason }))
+                if reason == ResubscribeOutcome::REASON_NOT_HELD =>
+            {
+                if batch.len() == 1 {
+                    half.not_held.extend(batch);
+                } else {
+                    count_round("unsubscribe_split");
+                    let mut low = batch;
+                    let high = low.split_off(low.len() / 2);
+                    work.push(high);
+                    work.push(low);
+                }
+            }
+            // Over cap cannot come from an unsubscribe-only command; an 805
+            // refuses everything that follows, so stop sending.
+            Some(Some(ResubscribeOutcome::Refused { .. })) => {
+                half.halted = true;
+                half.untouched.extend(batch);
+            }
+            Some(None) => {
+                count_round("unsubscribe_unknown");
+                half.unknown.extend(batch);
+            }
+        }
     }
-    // Half two: put them back, with retries, because they may now be off the
-    // socket and off its reconnect replay.
-    let mut pending = round.instruments;
+    half
+}
+
+/// Executes one round on the round's socket: unsubscribe, then subscribe what
+/// left (plus what the socket did not hold). Cold, on the executor's task.
+/// Always reports back to the book, which clears the socket's in-flight flag
+/// and refunds the round for every instrument not actually resent.
+pub async fn execute_round(book: &SubscribeReconcile, round: PlannedRound) -> RoundOutcome {
+    let PlannedRound {
+        tx,
+        socket,
+        instruments,
+    } = round;
+    let outcome = execute_round_on(&tx, instruments, |refund| {
+        book.round_finished(socket, refund, Instant::now());
+    })
+    .await;
+    outcome
+}
+
+async fn execute_round_on<F>(
+    tx: &mpsc::Sender<LiveSubscriptionCommand>,
+    instruments: Vec<SubscribeInstrument>,
+    finished: F,
+) -> RoundOutcome
+where
+    F: FnOnce(&[SubscribeInstrument]),
+{
+    let count_round = |outcome: &'static str| {
+        counter!(RECONCILE_ROUNDS_METRIC, "outcome" => outcome).increment(1);
+    };
+    let half = unsubscribe_half(tx, instruments).await;
+    if half.unreachable && half.removed.is_empty() && half.unknown.is_empty() {
+        count_round("send_failed");
+        finished(&half.untouched);
+        return RoundOutcome::SendFailed;
+    }
+    if half.halted && half.removed.is_empty() && half.unknown.is_empty() {
+        count_round("refused_halted_805");
+        finished(&half.untouched);
+        return RoundOutcome::Refused {
+            reason: ResubscribeOutcome::REASON_HALTED_805,
+        };
+    }
+    let not_held = half.not_held.len();
+    counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "not_held").increment(not_held as u64);
+    let mut pending = half.removed;
+    pending.extend(half.unknown);
+    pending.extend(half.not_held);
+    let resent = pending.len();
+    if pending.is_empty() {
+        finished(&half.untouched);
+        return RoundOutcome::Resubscribed {
+            resent: 0,
+            not_held: 0,
+        };
+    }
+    // Half two: put them back. Retried only on a definite failure; a missing
+    // answer ends the round as unknown rather than resending blindly.
     for attempt in 0..RECONCILE_SUBSCRIBE_ATTEMPTS {
         if attempt > 0 {
             count_round("subscribe_retried");
             tokio::time::sleep(Duration::from_secs(RECONCILE_SUBSCRIBE_RETRY_SECS)).await;
         }
-        match send_and_wait(&round.tx, Vec::new(), pending.clone()).await {
+        match send_and_wait(tx, Vec::new(), pending.clone()).await {
             Some(Some(ResubscribeOutcome::Applied | ResubscribeOutcome::ReplayPending)) => {
-                count_round("resubscribed");
-                return RoundOutcome::Resubscribed;
+                pending.clear();
+                break;
             }
             Some(Some(ResubscribeOutcome::Stopped { not_subscribed, .. })) => {
-                if not_subscribed.is_empty() {
-                    count_round("resubscribed");
-                    return RoundOutcome::Resubscribed;
-                }
                 pending = not_subscribed;
+                if pending.is_empty() {
+                    break;
+                }
             }
-            // Over cap means another change filled the room; retrying cannot
-            // help, and the duplicate check makes a retry safe if it can.
-            Some(Some(ResubscribeOutcome::Refused { .. })) | Some(None) | None => {}
+            Some(None) => {
+                count_round("subscribe_unknown");
+                counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "unknown")
+                    .increment(pending.len() as u64);
+                counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent")
+                    .increment(resent.saturating_sub(pending.len()) as u64);
+                finished(&half.untouched);
+                return RoundOutcome::Unknown(pending);
+            }
+            // Refused (over cap: another change filled the room) or not handed
+            // over: try again after the pause.
+            Some(Some(ResubscribeOutcome::Refused { .. })) | None => {}
         }
     }
-    count_round("lost");
-    counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "lost").increment(pending.len() as u64);
-    RoundOutcome::Lost(pending)
+    counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent")
+        .increment(resent.saturating_sub(pending.len()) as u64);
+    finished(&half.untouched);
+    if pending.is_empty() {
+        count_round("resubscribed");
+        RoundOutcome::Resubscribed { resent, not_held }
+    } else {
+        count_round("lost");
+        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "lost").increment(pending.len() as u64);
+        RoundOutcome::Lost(pending)
+    }
 }
 
 /// Today's IST day number since the Unix epoch.
@@ -766,7 +1010,6 @@ pub fn ist_day_now() -> i64 {
         .saturating_add(IST_UTC_OFFSET_SECONDS_I64)
         .div_euclid(i64::from(SECONDS_PER_DAY))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,6 +1023,10 @@ mod tests {
             security_id: id,
             segment: ExchangeSegment::NseFno,
         }
+    }
+
+    fn sis(ids: &[u64]) -> Vec<SubscribeInstrument> {
+        ids.iter().copied().map(si).collect()
     }
 
     fn report(id: u64, verdict: SilenceVerdict) -> SilenceReport {
@@ -801,16 +1048,14 @@ mod tests {
         mpsc::channel(64)
     }
 
-    /// Book with socket A holding ids 1 (ticking) and 2 (missing), recorded at
-    /// `t0`, then one sweep at `at`.
     fn one_sweep(
         book: &SubscribeReconcile,
         at: Instant,
         secs: u32,
-        ticking: &[u64],
+        delivering: &[u64],
         missing: &[u64],
     ) -> SweepSummary {
-        one_sweep_on(book, at, secs, DAY, ticking, missing)
+        one_sweep_on(book, at, secs, DAY, delivering, missing)
     }
 
     fn one_sweep_on(
@@ -818,11 +1063,11 @@ mod tests {
         at: Instant,
         secs: u32,
         day: i64,
-        ticking: &[u64],
+        delivering: &[u64],
         missing: &[u64],
     ) -> SweepSummary {
         let mut sweep = book.sweep_at(at);
-        for id in ticking {
+        for id in delivering {
             sweep.note(&report(*id, SilenceVerdict::Live));
         }
         for id in missing {
@@ -831,8 +1076,27 @@ mod tests {
         sweep.finish_at(secs, day)
     }
 
+    /// Stands in for the executor: takes every queued round and reports it
+    /// finished at `at`, nothing refunded. Returns how many it took.
+    fn finish_queued(
+        book: &SubscribeReconcile,
+        rx: &mut mpsc::Receiver<PlannedRound>,
+        at: Instant,
+    ) -> usize {
+        let mut n = 0;
+        while let Ok(round) = rx.try_recv() {
+            book.round_finished(round.socket, &[], at);
+            n += 1;
+        }
+        n
+    }
+
     fn delta() -> Duration {
         Duration::from_secs(RECONCILE_DELTA_SECS)
+    }
+
+    fn entry(book: &SubscribeReconcile, id: u64) -> Expected {
+        book.lock().expected[&(id, ExchangeSegment::NseFno)]
     }
 
     #[test]
@@ -840,7 +1104,7 @@ mod tests {
         let (book, _rx) = SubscribeReconcile::new(false);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
         let early = one_sweep(
             &book,
             t0 + delta() - Duration::from_secs(1),
@@ -857,18 +1121,37 @@ mod tests {
     }
 
     #[test]
-    fn test_shadow_mode_counts_and_sends_nothing() {
+    fn test_shadow_mode_counts_sends_nothing_and_spends_no_round() {
         let (book, mut rx) = SubscribeReconcile::new(false);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
-        let summary = one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2]);
-        assert_eq!(summary.would_resubscribe, 1);
-        assert_eq!(summary.dispatched, 0);
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
+        let mut at = t0 + delta();
+        let mut would = 0;
+        let mut exhausted = 0;
+        // 30 s sweeps for 20 minutes.
+        for _ in 0..40 {
+            let s = one_sweep(&book, at, IN_SESSION, &[1], &[2]);
+            assert_eq!(s.dispatched, 0);
+            would += s.would_resubscribe;
+            exhausted += s.newly_exhausted;
+            at += Duration::from_secs(30);
+        }
         assert!(
             rx.try_recv().is_err(),
-            "shadow mode must hand nothing to the executor"
+            "shadow mode hands nothing to the executor"
         );
+        assert_eq!(
+            would, 10,
+            "one decision per socket per 120 s over 20 minutes"
+        );
+        assert_eq!(
+            exhausted, 0,
+            "nothing was resent, so nothing is reported exhausted"
+        );
+        let e = entry(&book, 2);
+        assert_eq!(e.rounds, 0, "shadow mode never spends a round");
+        assert!(e.missing_counted, "counted missing once");
     }
 
     #[test]
@@ -876,15 +1159,16 @@ mod tests {
         let (book, mut rx) = SubscribeReconcile::new(true);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2), si(3)], t0);
+        book.record_subscribed_at(&tx, &sis(&[1, 2, 3]), t0);
         let summary = one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2, 3]);
         assert_eq!(summary.dispatched, 1);
         let round = rx.try_recv().expect("a round");
-        assert_eq!(round.instruments, vec![si(2), si(3)]);
+        assert_eq!(round.instruments, sis(&[2, 3]));
         assert!(
             round.tx.same_channel(&tx),
             "the round targets the holding socket"
         );
+        assert_eq!(entry(&book, 2).rounds, 1);
     }
 
     #[test]
@@ -892,8 +1176,13 @@ mod tests {
         let (book, mut rx) = SubscribeReconcile::new(true);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
-        for secs in [8 * 3600, 9 * 3600 + 15 * 60, 9 * 3600 + 16 * 60, 16 * 3600] {
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
+        for secs in [
+            8 * 3600,
+            9 * 3600 + 15 * 60,
+            9 * 3600 + 16 * 60 + 59,
+            16 * 3600,
+        ] {
             let s = one_sweep(&book, t0 + delta(), secs, &[1], &[2]);
             assert_eq!(s.dispatched, 0, "no round at secs {secs}");
         }
@@ -909,8 +1198,8 @@ mod tests {
         let (tx_a, _a) = socket();
         let (tx_b, _b) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx_a, &[si(1)], t0);
-        book.record_subscribed_at(&tx_b, &[si(2), si(3)], t0);
+        book.record_subscribed_at(&tx_a, &sis(&[1]), t0);
+        book.record_subscribed_at(&tx_b, &sis(&[2, 3]), t0);
         // Socket B: nothing ticks. Socket A ticks, so the feed is alive.
         let s = one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2, 3]);
         assert_eq!(s.missing, 2);
@@ -922,66 +1211,131 @@ mod tests {
     }
 
     #[test]
+    fn test_a_socket_that_went_quiet_after_ticking_is_not_delivering() {
+        // Instrument 1 ticked earlier and is now quiet past its baseline
+        // (Exceeded): socket A is not delivering now, so its never-ticked
+        // instrument is not resent during what may be a halt.
+        let (book, mut rx) = SubscribeReconcile::new(true);
+        let (tx_a, _a) = socket();
+        let (tx_b, _b) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx_a, &sis(&[1, 2]), t0);
+        book.record_subscribed_at(&tx_b, &sis(&[3]), t0);
+        let mut sweep = book.sweep_at(t0 + delta());
+        sweep.note(&report(1, SilenceVerdict::Exceeded));
+        sweep.note(&report(2, SilenceVerdict::NeverTicked));
+        sweep.note(&report(3, SilenceVerdict::Live));
+        let s = sweep.finish_at(IN_SESSION, DAY);
+        assert_eq!(s.missing, 1);
+        assert_eq!(s.dispatched, 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn test_a_silent_feed_is_a_halt_not_a_partial_subscribe() {
         let (book, mut rx) = SubscribeReconcile::new(true);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
-        let s = one_sweep(&book, t0 + delta(), IN_SESSION, &[], &[1, 2]);
+        book.record_subscribed_at(&tx, &sis(&[1, 2, 3]), t0);
+        let mut sweep = book.sweep_at(t0 + delta());
+        // Everything that ever ticked is quiet now; the rest never ticked.
+        sweep.note(&report(1, SilenceVerdict::Exceeded));
+        sweep.note(&report(2, SilenceVerdict::NeverTicked));
+        sweep.note(&report(3, SilenceVerdict::NeverTicked));
+        let s = sweep.finish_at(IN_SESSION, DAY);
         assert_eq!(s.missing, 2);
         assert_eq!(s.dispatched, 0);
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn test_rounds_are_spaced_capped_and_then_exhausted_once() {
+    fn test_one_round_in_flight_per_socket() {
         let (book, mut rx) = SubscribeReconcile::new(true);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
-        let mut at = t0 + delta();
-        let mut dispatched = 0;
-        let mut exhausted = 0;
-        // 30 s sweeps for 15 minutes.
-        for _ in 0..30 {
-            let s = one_sweep(&book, at, IN_SESSION, &[1], &[2]);
-            dispatched += s.dispatched;
-            exhausted += s.newly_exhausted;
-            at += Duration::from_secs(30);
-        }
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
         assert_eq!(
-            dispatched,
-            u32::from(RECONCILE_MAX_ROUNDS),
-            "exactly max rounds, each at least 120 s apart"
+            one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2]).dispatched,
+            1
         );
+        // The round is still running ten minutes later: nothing new is planned.
+        let late = t0 + delta() + Duration::from_secs(600);
+        assert_eq!(one_sweep(&book, late, IN_SESSION, &[1], &[2]).dispatched, 0);
+        assert_eq!(
+            entry(&book, 2).rounds,
+            1,
+            "no round charged while one is in flight"
+        );
+        // It finishes; the spacing runs from the FINISH, not from the plan.
+        let done = late + Duration::from_secs(1);
+        assert_eq!(finish_queued(&book, &mut rx, done), 1);
+        assert_eq!(
+            one_sweep(
+                &book,
+                done + Duration::from_secs(119),
+                IN_SESSION,
+                &[1],
+                &[2]
+            )
+            .dispatched,
+            0
+        );
+        assert_eq!(
+            one_sweep(&book, done + delta(), IN_SESSION, &[1], &[2]).dispatched,
+            1
+        );
+    }
+
+    #[test]
+    fn test_rounds_are_capped_and_then_exhausted_once() {
+        let (book, mut rx) = SubscribeReconcile::new(true);
+        let (tx, _sock) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
+        let mut at = t0 + delta();
         let mut rounds = 0;
-        while rx.try_recv().is_ok() {
-            rounds += 1;
+        let mut exhausted = 0;
+        // 30 s sweeps for 20 minutes; each round finishes right away.
+        for _ in 0..40 {
+            let s = one_sweep(&book, at, IN_SESSION, &[1], &[2]);
+            exhausted += s.newly_exhausted;
+            rounds += finish_queued(&book, &mut rx, at);
+            at += Duration::from_secs(30);
         }
         assert_eq!(rounds, usize::from(RECONCILE_MAX_ROUNDS));
         assert_eq!(exhausted, 1, "reported exhausted in exactly one sweep");
-        let entry = book.lock().expected[&(2, ExchangeSegment::NseFno)];
-        assert_eq!(entry.rounds, RECONCILE_MAX_ROUNDS);
-        assert!(entry.exhausted_reported, "reported exhausted, once");
+        let e = entry(&book, 2);
+        assert_eq!(e.rounds, RECONCILE_MAX_ROUNDS);
+        assert!(e.exhausted_reported);
     }
 
     #[test]
     fn test_exhausted_waits_for_the_last_round_to_settle() {
-        let (book, _rx) = SubscribeReconcile::new(true);
+        let (book, mut rx) = SubscribeReconcile::new(true);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
         let mut at = t0 + delta();
+        let mut last_finish = at;
         for _ in 0..RECONCILE_MAX_ROUNDS {
             one_sweep(&book, at, IN_SESSION, &[1], &[2]);
+            finish_queued(&book, &mut rx, at);
+            last_finish = at;
             at += delta();
         }
-        // The third round ran at `at - delta`; 30 s later is too soon.
-        let soon = at - delta() + Duration::from_secs(30);
-        one_sweep(&book, soon, IN_SESSION, &[1], &[2]);
-        assert!(!book.lock().expected[&(2, ExchangeSegment::NseFno)].exhausted_reported);
-        one_sweep(&book, at, IN_SESSION, &[1], &[2]);
-        assert!(book.lock().expected[&(2, ExchangeSegment::NseFno)].exhausted_reported);
+        one_sweep(
+            &book,
+            last_finish + Duration::from_secs(30),
+            IN_SESSION,
+            &[1],
+            &[2],
+        );
+        assert!(
+            !entry(&book, 2).exhausted_reported,
+            "too soon after the last round"
+        );
+        one_sweep(&book, last_finish + delta(), IN_SESSION, &[1], &[2]);
+        assert!(entry(&book, 2).exhausted_reported);
     }
 
     #[test]
@@ -989,15 +1343,13 @@ mod tests {
         let (book, mut rx) = SubscribeReconcile::new(true);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
         let mut at = t0 + delta();
+        let mut spent = 0;
         for _ in 0..5 {
             one_sweep(&book, at, IN_SESSION, &[1], &[2]);
+            spent += finish_queued(&book, &mut rx, at);
             at += delta();
-        }
-        let mut spent = 0;
-        while rx.try_recv().is_ok() {
-            spent += 1;
         }
         assert_eq!(
             spent,
@@ -1012,13 +1364,18 @@ mod tests {
             s.newly_exhausted, 0,
             "yesterday's exhaustion is not re-reported"
         );
-        // From the next sweep the instrument has its rounds back.
-        let s = one_sweep_on(&book, at + delta(), IN_SESSION, DAY + 1, &[1], &[2]);
-        assert_eq!(s.dispatched, 1);
-        assert_eq!(
-            book.lock().expected[&(2, ExchangeSegment::NseFno)].rounds,
-            1
+        let e = entry(&book, 2);
+        assert_eq!(e.rounds, 0);
+        assert!(!e.missing_counted, "counted again on the new day");
+        let s = one_sweep_on(
+            &book,
+            at + Duration::from_secs(30),
+            IN_SESSION,
+            DAY + 1,
+            &[1],
+            &[2],
         );
+        assert_eq!(s.dispatched, 1, "the new day resends");
     }
 
     #[test]
@@ -1037,7 +1394,7 @@ mod tests {
         }
         let (tx, _sock) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
         let s = one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2]);
         assert_eq!(s.dispatched, 0);
         let inner = book.lock();
@@ -1046,6 +1403,7 @@ mod tests {
             inner.sockets[0].last_round_at.is_none(),
             "spacing not consumed"
         );
+        assert!(!inner.sockets[0].in_flight);
     }
 
     #[test]
@@ -1053,13 +1411,17 @@ mod tests {
         let (book, _rx) = SubscribeReconcile::new(false);
         let (tx_a, _a) = socket();
         let (tx_b, _b) = socket();
-        book.record_subscribed(&tx_a, &[si(1), si(1)]);
-        book.record_subscribed(&tx_b, &[si(1), si(2)]);
+        book.record_subscribed(&tx_a, &sis(&[1, 1]));
+        book.record_subscribed(&tx_b, &sis(&[1, 2]));
         assert_eq!(book.expected_len(), 2);
+        assert_eq!(entry(&book, 1).socket, 0);
+        assert_eq!(entry(&book, 2).socket, 1);
         let inner = book.lock();
-        assert_eq!(inner.expected[&(1, ExchangeSegment::NseFno)].socket, 0);
-        assert_eq!(inner.expected[&(2, ExchangeSegment::NseFno)].socket, 1);
         assert_eq!(inner.sockets.len(), 2);
+        assert!(
+            inner.sockets[0].candidates.capacity() >= RECONCILE_MAX_PER_SOCKET_PER_ROUND,
+            "candidates are pre-sized so note never grows them"
+        );
     }
 
     #[test]
@@ -1084,8 +1446,8 @@ mod tests {
         let (book, _rx) = SubscribeReconcile::new(true);
         let (tx, _s) = socket();
         let t0 = Instant::now();
-        book.record_subscribed_at(&tx, &[si(1), si(2)], t0);
-        book.forget(&[si(2)]);
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
+        book.forget(&sis(&[2]));
         // id 99 was never recorded: its report is ignored.
         let s = one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2, 99]);
         assert_eq!(s.missing, 0);
@@ -1120,8 +1482,10 @@ mod tests {
 
     #[test]
     fn test_named_instruments_truncates() {
-        let few = [si(1), si(2)];
-        assert_eq!(NamedInstruments(&few).to_string(), "NSE_FNO:1,NSE_FNO:2");
+        assert_eq!(
+            NamedInstruments(&sis(&[1, 2])).to_string(),
+            "NSE_FNO:1,NSE_FNO:2"
+        );
         let many: Vec<SubscribeInstrument> = (0..25).map(si).collect();
         let text = NamedInstruments(&many).to_string();
         assert!(text.ends_with(",+5 more"), "{text}");
@@ -1129,16 +1493,31 @@ mod tests {
     }
 
     #[test]
+    fn test_without_removes_on_the_composite_key() {
+        assert_eq!(without(sis(&[1, 2, 3]), &sis(&[2])), sis(&[1, 3]));
+        assert_eq!(without(sis(&[1, 2]), &[]), sis(&[1, 2]));
+        let other_segment = SubscribeInstrument {
+            security_id: 2,
+            segment: ExchangeSegment::IdxI,
+        };
+        assert_eq!(
+            without(sis(&[1, 2]), &[other_segment]),
+            sis(&[1, 2]),
+            "same id in another segment is a different instrument"
+        );
+    }
+
+    #[test]
     fn test_finish_now_reads_the_wall_clock_without_panicking() {
         // Whatever the wall clock says, finish_now must classify the pass and
-        // return; outside the session it dispatches nothing.
+        // return; shadow mode never dispatches.
         let (book, _rx) = SubscribeReconcile::new(false);
         let (tx, _s) = socket();
         book.record_subscribed(&tx, &[si(1)]);
         let mut sweep = book.sweep();
         sweep.note(&report(1, SilenceVerdict::Live));
         let summary = sweep.finish_now();
-        assert_eq!(summary.dispatched, 0, "shadow mode never dispatches");
+        assert_eq!(summary.dispatched, 0);
     }
 
     #[test]
@@ -1149,13 +1528,15 @@ mod tests {
 
     // ---- executor ---------------------------------------------------------
 
-    /// A fake connection task: answers each command with the next scripted
-    /// outcome (`None` = drop the ack unanswered) and records what it got.
+    type Seen = Vec<(Vec<SubscribeInstrument>, Vec<SubscribeInstrument>)>;
+
+    /// A fake connection task that answers from a script (`None` = drop the
+    /// ack unanswered) and records every command it got.
     fn fake_socket(
         script: Vec<Option<ResubscribeOutcome>>,
     ) -> (
         mpsc::Sender<LiveSubscriptionCommand>,
-        tokio::task::JoinHandle<Vec<(Vec<SubscribeInstrument>, Vec<SubscribeInstrument>)>>,
+        tokio::task::JoinHandle<Seen>,
     ) {
         let (tx, mut rx) = mpsc::channel(8);
         let handle = tokio::spawn(async move {
@@ -1185,112 +1566,239 @@ mod tests {
         (tx, handle)
     }
 
-    fn round(tx: mpsc::Sender<LiveSubscriptionCommand>, ids: &[u64]) -> PlannedRound {
-        PlannedRound {
-            tx,
-            socket: 0,
-            instruments: ids.iter().copied().map(si).collect(),
-        }
+    /// A fake connection task that behaves like the real guard: an unsubscribe
+    /// naming any instrument it does not hold is refused whole; a subscribe of
+    /// a held one is a (logged) duplicate, counted here.
+    fn guard_socket(
+        held: Vec<SubscribeInstrument>,
+    ) -> (
+        mpsc::Sender<LiveSubscriptionCommand>,
+        tokio::task::JoinHandle<(Vec<SubscribeInstrument>, usize, usize)>,
+    ) {
+        let (tx, mut rx) = mpsc::channel(8);
+        let handle = tokio::spawn(async move {
+            let mut held = held;
+            let mut commands = 0usize;
+            let mut duplicates = 0usize;
+            while let Some(command) = rx.recv().await {
+                let LiveSubscriptionCommand::Resubscribe {
+                    unsubscribe,
+                    subscribe,
+                    ack,
+                } = command
+                else {
+                    panic!("the reconciler must only send Resubscribe");
+                };
+                commands += 1;
+                let outcome = if unsubscribe.iter().any(|i| !held.contains(i)) {
+                    ResubscribeOutcome::Refused {
+                        reason: ResubscribeOutcome::REASON_NOT_HELD,
+                    }
+                } else {
+                    held.retain(|i| !unsubscribe.contains(i));
+                    for i in subscribe {
+                        if held.contains(&i) {
+                            duplicates += 1;
+                        } else {
+                            held.push(i);
+                        }
+                    }
+                    ResubscribeOutcome::Applied
+                };
+                if let Some(ack) = ack {
+                    let _ = ack.send(outcome);
+                }
+            }
+            held.sort_by_key(|i| i.security_id);
+            (held, commands, duplicates)
+        });
+        (tx, handle)
+    }
+
+    /// Runs one round through the executor with a recording `finished`.
+    async fn run_round(
+        tx: mpsc::Sender<LiveSubscriptionCommand>,
+        ids: &[u64],
+    ) -> (RoundOutcome, Vec<SubscribeInstrument>) {
+        let mut refunded = Vec::new();
+        let outcome = execute_round_on(&tx, sis(ids), |refund| refunded = refund.to_vec()).await;
+        (outcome, refunded)
     }
 
     #[tokio::test]
     async fn test_execute_round_unsubscribes_then_subscribes_on_the_same_socket() {
-        let (book, _rx) = SubscribeReconcile::new(true);
         let (tx, handle) = fake_socket(vec![
             Some(ResubscribeOutcome::Applied),
             Some(ResubscribeOutcome::Applied),
         ]);
-        let outcome = execute_round(&book, round(tx, &[5, 6])).await;
-        assert_eq!(outcome, RoundOutcome::Resubscribed);
+        let (outcome, refunded) = run_round(tx, &[5, 6]).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Resubscribed {
+                resent: 2,
+                not_held: 0
+            }
+        );
+        assert!(refunded.is_empty());
         let seen = handle.await.expect("fake socket");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(
-            seen[0],
-            (vec![si(5), si(6)], vec![]),
-            "unsubscribe only, first"
-        );
-        assert_eq!(
-            seen[1],
-            (vec![], vec![si(5), si(6)]),
-            "subscribe only, second"
-        );
+        assert_eq!(seen, vec![(sis(&[5, 6]), vec![]), (vec![], sis(&[5, 6]))]);
     }
 
     #[tokio::test]
-    async fn test_execute_round_refused_unsubscribe_sends_nothing_more() {
-        let (book, _rx) = SubscribeReconcile::new(true);
-        let (tx_rec, _s) = socket();
-        book.record_subscribed(&tx_rec, &[si(5)]);
-        let (tx, handle) = fake_socket(vec![Some(ResubscribeOutcome::Refused {
-            reason: ResubscribeOutcome::REASON_NOT_HELD,
-        })]);
-        let outcome = execute_round(&book, round(tx, &[5])).await;
+    async fn test_execute_round_splits_a_not_held_refusal_and_subscribes_the_unheld_one() {
+        // The socket holds 1, 2, 4 but not 3 (lost on an earlier round): the
+        // whole-batch refusal must not poison 1, 2 and 4.
+        let (tx, handle) = guard_socket(sis(&[1, 2, 4]));
+        let (outcome, refunded) = run_round(tx, &[1, 2, 3, 4]).await;
         assert_eq!(
             outcome,
-            RoundOutcome::Refused {
-                reason: ResubscribeOutcome::REASON_NOT_HELD
+            RoundOutcome::Resubscribed {
+                resent: 4,
+                not_held: 1
+            }
+        );
+        assert!(refunded.is_empty(), "every instrument was resent");
+        let (held, commands, duplicates) = handle.await.expect("guard socket");
+        assert_eq!(held, sis(&[1, 2, 3, 4]), "all four are on the socket again");
+        assert_eq!(duplicates, 0, "never re-offers a held instrument");
+        assert!(commands <= 8, "the split is bounded: {commands} commands");
+    }
+
+    #[tokio::test]
+    async fn test_execute_round_split_with_nothing_held_subscribes_everything() {
+        let (tx, handle) = guard_socket(Vec::new());
+        let (outcome, _) = run_round(tx, &[1, 2, 3]).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Resubscribed {
+                resent: 3,
+                not_held: 3
+            }
+        );
+        let (held, _, duplicates) = handle.await.expect("guard socket");
+        assert_eq!(held, sis(&[1, 2, 3]));
+        assert_eq!(duplicates, 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_round_stopped_unsubscribe_resends_only_what_left() {
+        let (tx, handle) = fake_socket(vec![
+            Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed: sis(&[6]),
+                not_subscribed: vec![],
+            }),
+            Some(ResubscribeOutcome::Applied),
+        ]);
+        let (outcome, refunded) = run_round(tx, &[5, 6]).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Resubscribed {
+                resent: 1,
+                not_held: 0
             }
         );
         assert_eq!(
-            handle.await.expect("fake").len(),
-            1,
-            "no subscribe after a refusal"
+            refunded,
+            sis(&[6]),
+            "the one never resent gets its round back"
         );
-        let entry = book.lock().expected[&(5, ExchangeSegment::NseFno)];
+        let seen = handle.await.expect("fake");
         assert_eq!(
-            entry.rounds, RECONCILE_MAX_ROUNDS,
-            "never tried again today"
+            seen[1],
+            (vec![], sis(&[5])),
+            "the still-held one is not re-offered"
         );
     }
 
     #[tokio::test]
-    async fn test_execute_round_unreachable_socket_is_send_failed() {
-        let (book, _rx) = SubscribeReconcile::new(true);
+    async fn test_execute_round_unreachable_socket_is_send_failed_and_refunded() {
         let (tx, rx) = socket();
         drop(rx);
+        let (outcome, refunded) = run_round(tx, &[5, 6]).await;
+        assert_eq!(outcome, RoundOutcome::SendFailed);
+        assert_eq!(refunded, sis(&[5, 6]));
+    }
+
+    #[tokio::test]
+    async fn test_execute_round_after_an_805_changes_nothing() {
+        let (tx, handle) = fake_socket(vec![Some(ResubscribeOutcome::Refused {
+            reason: ResubscribeOutcome::REASON_HALTED_805,
+        })]);
+        let (outcome, refunded) = run_round(tx, &[5]).await;
         assert_eq!(
-            execute_round(&book, round(tx, &[5])).await,
-            RoundOutcome::SendFailed
+            outcome,
+            RoundOutcome::Refused {
+                reason: ResubscribeOutcome::REASON_HALTED_805
+            }
+        );
+        assert_eq!(refunded, sis(&[5]));
+        assert_eq!(
+            handle.await.expect("fake").len(),
+            1,
+            "nothing sent after it"
         );
     }
 
     #[tokio::test]
     async fn test_execute_round_retries_the_part_not_subscribed() {
-        let (book, _rx) = SubscribeReconcile::new(true);
         let (tx, handle) = fake_socket(vec![
             Some(ResubscribeOutcome::ReplayPending),
             Some(ResubscribeOutcome::Stopped {
                 not_unsubscribed: vec![],
-                not_subscribed: vec![si(6)],
+                not_subscribed: sis(&[6]),
             }),
             Some(ResubscribeOutcome::Applied),
         ]);
         tokio::time::pause();
-        let outcome = execute_round(&book, round(tx, &[5, 6])).await;
-        assert_eq!(outcome, RoundOutcome::Resubscribed);
+        let (outcome, _) = run_round(tx, &[5, 6]).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Resubscribed {
+                resent: 2,
+                not_held: 0
+            }
+        );
         let seen = handle.await.expect("fake");
         assert_eq!(seen.len(), 3);
         assert_eq!(
             seen[2],
-            (vec![], vec![si(6)]),
+            (vec![], sis(&[6])),
             "only the unsent part is retried"
         );
     }
 
     #[tokio::test]
     async fn test_execute_round_unanswered_unsubscribe_still_resubscribes() {
-        let (book, _rx) = SubscribeReconcile::new(true);
-        // First ack dropped unanswered: the outcome is unknown, so the
-        // subscribe half still runs (a held duplicate costs no wire message).
+        // The unsubscribe's answer never came back: treated as done, so the
+        // subscribe half still runs, once.
         let (tx, handle) = fake_socket(vec![None, Some(ResubscribeOutcome::Applied)]);
-        let outcome = execute_round(&book, round(tx, &[5])).await;
-        assert_eq!(outcome, RoundOutcome::Resubscribed);
+        tokio::time::pause();
+        let (outcome, _) = run_round(tx, &[5]).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Resubscribed {
+                resent: 1,
+                not_held: 0
+            }
+        );
         assert_eq!(handle.await.expect("fake").len(), 2);
     }
 
     #[tokio::test]
+    async fn test_execute_round_unanswered_subscribe_is_unknown_not_lost() {
+        let (tx, handle) = fake_socket(vec![Some(ResubscribeOutcome::Applied), None]);
+        tokio::time::pause();
+        let (outcome, _) = run_round(tx, &[5, 6]).await;
+        assert_eq!(outcome, RoundOutcome::Unknown(sis(&[5, 6])));
+        assert_eq!(
+            handle.await.expect("fake").len(),
+            2,
+            "an unanswered subscribe is not resent blindly"
+        );
+    }
+
+    #[tokio::test]
     async fn test_execute_round_reports_lost_after_every_attempt_fails() {
-        let (book, _rx) = SubscribeReconcile::new(true);
         let mut script = vec![Some(ResubscribeOutcome::Applied)];
         for _ in 0..RECONCILE_SUBSCRIBE_ATTEMPTS {
             script.push(Some(ResubscribeOutcome::Refused {
@@ -1299,13 +1807,53 @@ mod tests {
         }
         let (tx, handle) = fake_socket(script);
         tokio::time::pause();
-        let outcome = execute_round(&book, round(tx, &[5, 6])).await;
-        assert_eq!(outcome, RoundOutcome::Lost(vec![si(5), si(6)]));
+        let (outcome, _) = run_round(tx, &[5, 6]).await;
+        assert_eq!(outcome, RoundOutcome::Lost(sis(&[5, 6])));
         assert_eq!(
             handle.await.expect("fake").len(),
             1 + RECONCILE_SUBSCRIBE_ATTEMPTS as usize,
             "bounded: one unsubscribe and at most the attempt cap of subscribes"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_round_reports_back_to_the_book() {
+        let (book, mut rx) = SubscribeReconcile::new(true);
+        let (tx, handle) = fake_socket(vec![
+            Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed: sis(&[3]),
+                not_subscribed: vec![],
+            }),
+            Some(ResubscribeOutcome::Applied),
+        ]);
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &sis(&[1, 2, 3]), t0);
+        assert_eq!(
+            one_sweep(&book, t0 + delta(), IN_SESSION, &[1], &[2, 3]).dispatched,
+            1
+        );
+        let round = rx.try_recv().expect("a round");
+        assert!(book.lock().sockets[0].in_flight);
+        let outcome = execute_round(&book, round).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Resubscribed {
+                resent: 1,
+                not_held: 0
+            }
+        );
+        let inner = book.lock();
+        assert!(!inner.sockets[0].in_flight, "the in-flight flag is cleared");
+        assert!(inner.sockets[0].last_round_at.is_some());
+        assert_eq!(inner.expected[&(2, ExchangeSegment::NseFno)].rounds, 1);
+        assert_eq!(
+            inner.expected[&(3, ExchangeSegment::NseFno)].rounds,
+            0,
+            "never resent, so refunded"
+        );
+        drop(inner);
+        drop(tx);
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -1316,14 +1864,20 @@ mod tests {
             Some(ResubscribeOutcome::Applied),
         ]);
         let executor = tokio::spawn(run_reconcile_executor(Arc::downgrade(&book), rounds_rx));
-        book.rounds_tx.try_send(round(tx, &[7])).expect("room");
+        book.rounds_tx
+            .try_send(PlannedRound {
+                tx,
+                socket: 0,
+                instruments: sis(&[7]),
+            })
+            .expect("room");
         // The round runs while the book lives; the socket's task ends once the
         // round drops its sender.
         let seen = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("the round ran")
             .expect("fake");
-        assert_eq!(seen, vec![(vec![si(7)], vec![]), (vec![], vec![si(7)])]);
+        assert_eq!(seen, vec![(sis(&[7]), vec![]), (vec![], sis(&[7]))]);
         // Dropping the only strong handle closes the queue: the loop ends.
         drop(book);
         tokio::time::timeout(Duration::from_secs(5), executor)
@@ -1336,12 +1890,73 @@ mod tests {
     async fn test_executor_skips_a_round_queued_after_the_book_is_gone() {
         let (book, rounds_rx) = SubscribeReconcile::new(true);
         let (tx, handle) = fake_socket(vec![Some(ResubscribeOutcome::Applied)]);
-        book.rounds_tx.try_send(round(tx, &[7])).expect("room");
+        book.rounds_tx
+            .try_send(PlannedRound {
+                tx,
+                socket: 0,
+                instruments: sis(&[7]),
+            })
+            .expect("room");
         drop(book);
         run_reconcile_executor(std::sync::Weak::new(), rounds_rx).await;
         assert!(
             handle.await.expect("fake").is_empty(),
             "nothing sent for a gone lane"
         );
+    }
+
+    /// Cost the reconcile adds to the drain's 30 s silence scan at the
+    /// authorized ceiling: 25,000 expected instruments, every report noted,
+    /// one sweep finished. Wall clock, so `#[ignore]`d (never a CI gate):
+    /// `cargo test -p tickvault-app --release --lib -- --ignored sweep_cost_at_the_authorized_ceiling --nocapture`.
+    #[test]
+    #[ignore]
+    fn sweep_cost_at_the_authorized_ceiling() {
+        let (book, _rx) = SubscribeReconcile::new(false);
+        let mut keep = Vec::new();
+        let t0 = Instant::now();
+        let per_socket = RECONCILE_MAX_EXPECTED / 5;
+        for s in 0..5u64 {
+            let (tx, rx) = socket();
+            let ids: Vec<SubscribeInstrument> = (0..per_socket as u64)
+                .map(|i| si(s * per_socket as u64 + i))
+                .collect();
+            book.record_subscribed_at(&tx, &ids, t0);
+            keep.push((tx, rx));
+        }
+        // Worst shape: one in five never ticked (capped per socket), the rest
+        // live.
+        let reports: Vec<SilenceReport> = (0..RECONCILE_MAX_EXPECTED as u64)
+            .map(|id| {
+                report(
+                    id,
+                    if id % 5 == 0 {
+                        SilenceVerdict::NeverTicked
+                    } else {
+                        SilenceVerdict::Live
+                    },
+                )
+            })
+            .collect();
+        let rounds = 50u32;
+        let mut total = Duration::ZERO;
+        for r in 0..rounds {
+            let at = t0 + delta() + Duration::from_secs(u64::from(r) * 30);
+            let start = Instant::now();
+            let mut sweep = book.sweep_at(at);
+            for report in &reports {
+                sweep.note(report);
+            }
+            let s = sweep.finish_at(IN_SESSION, DAY);
+            total += start.elapsed();
+            assert_eq!(s.missing, (RECONCILE_MAX_EXPECTED / 5) as u32);
+        }
+        let mean = total / rounds;
+        let per = mean.as_nanos() / RECONCILE_MAX_EXPECTED as u128;
+        eprintln!(
+            "subscribe reconcile sweep at {} reports: mean {:?} per sweep, {} ns per report",
+            RECONCILE_MAX_EXPECTED, mean, per
+        );
+        assert!(mean < Duration::from_secs(1));
     }
 }
