@@ -8,13 +8,14 @@
 //! `open_at_shutdown` flag) each lifecycle event produced. No real QuestDB,
 //! no network beyond loopback.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use tickvault_app::ws_audit_consumer::{
     spawn_live_feed_lifecycle_audit, spawn_ws_event_audit_consumer,
 };
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::ws_event_types::{
     WS_EVENT_NO_DHAN_CODE, WsEventAuditRow, WsEventKind, WsSubscriptionDetail, WsType,
 };
@@ -22,6 +23,31 @@ use tickvault_core::websocket::pool_budget::DhanEndpointType;
 use tickvault_core::websocket::pool_supervisor::WsLifecycleEvent;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
+
+/// Keeps every HTTP client in this binary off the session's outbound proxy:
+/// the stub lives on loopback, and a proxy in between would answer instead
+/// of it. Called first by every test that talks HTTP, before any client is
+/// built; `Once` makes every other caller wait until the variables are set.
+fn bypass_proxy_for_loopback() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        for key in ["NO_PROXY", "no_proxy"] {
+            let current = std::env::var(key).unwrap_or_default();
+            let joined = if current.trim().is_empty() {
+                "127.0.0.1,localhost".to_owned()
+            } else {
+                format!("{current},127.0.0.1,localhost")
+            };
+            // SAFETY: Rust 2024 marks env mutation unsafe. This runs once,
+            // inside `Once`, before any test in this binary builds a client;
+            // every HTTP test calls it first, so no reader races the write.
+            unsafe {
+                std::env::set_var(key, joined);
+            }
+        }
+    });
+}
 
 /// One request the stub received.
 #[derive(Debug, Clone)]
@@ -38,17 +64,22 @@ enum WriteMode {
     Accept,
     /// 400 Bad Request — a non-retriable ILP refusal.
     Refuse,
-    /// The FIRST write is held for [`STALL`] before its 204, then every
-    /// write is accepted at once: a database that stalls and recovers.
+    /// The FIRST write is held until the test releases its [`StallGate`],
+    /// then every write is accepted at once: a database that stalls and
+    /// recovers.
     StallFirst,
 }
 
-/// How long [`WriteMode::StallFirst`] holds the first write.
-const STALL: Duration = Duration::from_millis(1_500);
-
-/// Set once the stalled first write has been held (one stalling test only).
-static FIRST_WRITE_STALLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The hold on the first write of a [`WriteMode::StallFirst`] stub. Owned by
+/// one test, so no other test's stub can take or release it.
+#[derive(Default)]
+struct StallGate {
+    /// Set by the stub once it has taken the first write.
+    taken: std::sync::atomic::AtomicBool,
+    /// Released by the test; `notify_one` keeps a permit, so a release that
+    /// lands before the stub waits is not lost.
+    release: Notify,
+}
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -83,6 +114,13 @@ const SETTINGS_BODY: &str = r#"{"config":{"release.type":"OSS","release.version"
 /// blocking ILP calls (the sender's `/settings` probe runs synchronously on
 /// a runtime worker) can never starve it. Returns its port and the request log.
 async fn start_stub(mode: WriteMode) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+    start_stub_gated(mode, Arc::new(StallGate::default())).await
+}
+
+/// [`start_stub`] with the test holding the [`StallGate`] for a
+/// [`WriteMode::StallFirst`] stub.
+async fn start_stub_gated(mode: WriteMode, gate: Arc<StallGate>) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+    bypass_proxy_for_loopback();
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
@@ -95,20 +133,26 @@ async fn start_stub(mode: WriteMode) -> (u16, Arc<Mutex<Vec<Seen>>>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
             let port = listener.local_addr().expect("addr").port();
             port_tx.send(port).expect("report port");
-            serve(listener, mode, log).await;
+            serve(listener, mode, log, gate).await;
         });
     });
     let port = port_rx.recv().expect("stub port");
     (port, seen)
 }
 
-async fn serve(listener: TcpListener, mode: WriteMode, log: Arc<Mutex<Vec<Seen>>>) {
+async fn serve(
+    listener: TcpListener,
+    mode: WriteMode,
+    log: Arc<Mutex<Vec<Seen>>>,
+    gate: Arc<StallGate>,
+) {
     {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
             let log = Arc::clone(&log);
+            let gate = Arc::clone(&gate);
             tokio::spawn(async move {
                 let mut buf: Vec<u8> = Vec::new();
                 let mut chunk = [0u8; 8192];
@@ -157,9 +201,9 @@ async fn serve(listener: TcpListener, mode: WriteMode, log: Arc<Mutex<Vec<Seen>>
                         });
                         if is_write
                             && matches!(mode, WriteMode::StallFirst)
-                            && !FIRST_WRITE_STALLED.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            && !gate.taken.swap(true, std::sync::atomic::Ordering::SeqCst)
                         {
-                            tokio::time::sleep(STALL).await;
+                            gate.release.notified().await;
                         }
                         let response = if is_write {
                             match mode {
@@ -267,8 +311,101 @@ fn lifecycle(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Process-wide observers: the consumers log and count on runtime worker
+// threads, which a thread-scoped subscriber misses. Every test that reads
+// them filters to its own marker, because other tests in this binary log and
+// count into the same buffer and recorder.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct GlobalCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for GlobalCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("capture").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GlobalCapture {
+    type Writer = GlobalCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl GlobalCapture {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("capture")).to_string()
+    }
+
+    /// The captured lines that contain every one of `needles`.
+    fn lines_with(&self, needles: &[&str]) -> Vec<String> {
+        self.text()
+            .lines()
+            .filter(|l| needles.iter().all(|n| l.contains(n)))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// A process-wide log buffer and metrics recorder.
+fn global_observers() -> &'static (GlobalCapture, metrics_exporter_prometheus::PrometheusHandle) {
+    static OBS: std::sync::OnceLock<(
+        GlobalCapture,
+        metrics_exporter_prometheus::PrometheusHandle,
+    )> = std::sync::OnceLock::new();
+    OBS.get_or_init(|| {
+        let cap = GlobalCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::set_global_recorder(recorder).expect("one global recorder");
+        (cap, handle)
+    })
+}
+
+/// The value of the rendered series whose line starts with `prefix`
+/// (name plus `{labels}` exactly as rendered), 0 when absent.
+fn series(handle: &metrics_exporter_prometheus::PrometheusHandle, prefix: &str) -> f64 {
+    handle
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+fn dropped_rows(handle: &metrics_exporter_prometheus::PrometheusHandle) -> f64 {
+    series(
+        handle,
+        "tv_ws_event_audit_dropped_total{reason=\"live_feed_forward\"} ",
+    )
+}
+
+fn flush_errors(handle: &metrics_exporter_prometheus::PrometheusHandle) -> f64 {
+    series(
+        handle,
+        "tv_ws_event_audit_write_errors_total{stage=\"flush\"} ",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ws_event_audit consumer
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ws_audit_consumer_spawn_ws_event_audit_consumer_rows_reach_ilp_write() {
+    bypass_proxy_for_loopback();
     let (port, seen) = start_stub(WriteMode::Accept).await;
     let tx = spawn_ws_event_audit_consumer(cfg_for(port));
     tx.send(audit_row(WsEventKind::Connected, 2))
@@ -284,14 +421,26 @@ async fn test_ws_audit_consumer_spawn_ws_event_audit_consumer_rows_reach_ilp_wri
     .await;
     assert!(landed, "both rows must be flushed as ILP lines: {seen:?}");
 
-    // The DDL ran first, against /exec, and names the table.
-    let ddl_hits = seen
-        .lock()
-        .expect("log")
+    // The DDL reached the stub BEFORE the first write: the consumer ensures
+    // its table, against /exec, and only then builds the writer.
+    let log = seen.lock().expect("log").clone();
+    let first_ddl = log
         .iter()
-        .filter(|s| s.method == "GET" && s.target.starts_with("/exec"))
-        .count();
-    assert!(ddl_hits >= 1, "the consumer must ensure its table at start");
+        .position(|s| s.method == "GET" && s.target.starts_with("/exec"))
+        .expect("the consumer must ensure its table at start");
+    let first_write = log
+        .iter()
+        .position(|s| s.method == "POST")
+        .expect("a write reached the stub");
+    assert!(
+        first_ddl < first_write,
+        "the DDL (request #{first_ddl}) must precede the first write (request #{first_write}): {log:?}"
+    );
+    assert!(
+        log[first_ddl].target.contains("ws_event_audit"),
+        "the DDL names the table: {}",
+        log[first_ddl].target
+    );
 
     let lines = writes_containing(&seen, "ws_event_audit");
     assert!(
@@ -303,18 +452,33 @@ async fn test_ws_audit_consumer_spawn_ws_event_audit_consumer_rows_reach_ilp_wri
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ws_audit_consumer_spawn_ws_event_audit_consumer_refused_flush_keeps_consuming() {
+    bypass_proxy_for_loopback();
+    let (cap, metrics_handle) = global_observers();
+    // This test's own marker: no other test writes an order-update row or
+    // uses these connection indices, and only this test refuses a flush.
+    let persisted_order_update = || {
+        metrics_handle
+            .render()
+            .lines()
+            .filter(|l| {
+                l.starts_with("tv_ws_event_audit_rows_total{")
+                    && l.contains("ws_type=\"order_update\"")
+            })
+            .count()
+    };
+    let flush_errors_before = flush_errors(metrics_handle);
     let (port, seen) = start_stub(WriteMode::Refuse).await;
     let tx = spawn_ws_event_audit_consumer(cfg_for(port));
-    tx.send(audit_row(WsEventKind::Connected, 0))
-        .await
-        .expect("send row 1");
-    tx.send(audit_row(WsEventKind::Reconnected, 1))
-        .await
-        .expect("send row 2");
+    let mut row1 = audit_row(WsEventKind::Connected, 9_001);
+    row1.ws_type = WsType::OrderUpdate;
+    let mut row2 = audit_row(WsEventKind::Reconnected, 9_002);
+    row2.ws_type = WsType::OrderUpdate;
+    tx.send(row1).await.expect("send row 1");
+    tx.send(row2).await.expect("send row 2");
 
     // A refused flush is logged and the loop continues: the second row is
     // still attempted (a second POST reaches the stub).
-    let attempted = wait_until(Duration::from_secs(4), || {
+    let attempted = wait_until(Duration::from_secs(5), || {
         seen.lock()
             .expect("log")
             .iter()
@@ -327,12 +491,47 @@ async fn test_ws_audit_consumer_spawn_ws_event_audit_consumer_refused_flush_keep
         attempted,
         "every row must be attempted even after a refused flush: {seen:?}"
     );
+
+    // Each refusal is logged with its code and names the row it failed.
+    let code = ErrorCode::AuditWs01EventWriteFailed.code_str();
+    let logged = wait_until(Duration::from_secs(5), || {
+        ["connection_index=9001", "connection_index=9002"]
+            .iter()
+            .all(|marker| {
+                !cap.lines_with(&["ws_event_audit: flush failed", code, marker])
+                    .is_empty()
+            })
+    })
+    .await;
+    assert!(
+        logged,
+        "both refusals are logged as {code}: {:?}",
+        cap.lines_with(&["ws_event_audit: flush failed"])
+    );
+    // ... counted on the flush-error counter ...
+    assert!(
+        flush_errors(metrics_handle) >= flush_errors_before + 2.0,
+        "both refusals are counted: before {flush_errors_before}, now {}",
+        flush_errors(metrics_handle)
+    );
+    // ... and never reported as persisted.
+    assert_eq!(
+        persisted_order_update(),
+        0,
+        "a refused row is not counted as written:\n{}",
+        metrics_handle.render()
+    );
     drop(tx);
 }
+
+// ---------------------------------------------------------------------------
+// live-feed lifecycle forwarder + feed_gap_audit
+// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_gaps_close_on_connect_and_shutdown()
 {
+    bypass_proxy_for_loopback();
     let (port, seen) = start_stub(WriteMode::Accept).await;
     let tx = spawn_live_feed_lifecycle_audit(cfg_for(port));
 
@@ -395,42 +594,58 @@ async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_gaps_close_on_co
     .await
     .expect("send");
 
-    let gaps_landed = wait_until(Duration::from_secs(4), || {
+    let gaps_landed = wait_until(Duration::from_secs(5), || {
         writes_containing(&seen, "feed_gap_audit").len() >= 2
     })
     .await;
     assert!(gaps_landed, "two gaps must be written: {seen:?}");
-    let rows_landed = wait_until(Duration::from_secs(4), || {
+    let rows_landed = wait_until(Duration::from_secs(5), || {
         writes_containing(&seen, "ws_event_audit").len() >= 6
     })
     .await;
     assert!(rows_landed, "every lifecycle event is one audit row");
+    assert!(
+        writes_containing(&seen, "ws_event_audit")
+            .iter()
+            .any(|l| l.contains("connection_index=200i")),
+        "the out-of-range slot is still audited"
+    );
 
+    // Dropping the last sender ends the forwarder; with no gap left open it
+    // must write nothing more. Give any stray row time to land, then count.
+    drop(tx);
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let gaps = writes_containing(&seen, "feed_gap_audit");
+    assert_eq!(gaps.len(), 2, "exactly two gaps, no more: {gaps:?}");
     // The connect-closed depth-20 gap is not open at shutdown.
     assert!(
-        gaps.iter()
-            .any(|l| l.contains("ws_type=depth_20") && l.contains("open_at_shutdown=f")),
+        gaps.iter().any(|l| l.contains("ws_type=depth_20")
+            && l.contains("connection_index=3i")
+            && l.contains("open_at_shutdown=f")),
         "the depth-20 gap closed by its connect: {gaps:?}"
     );
     // The main-feed gap still open at the stop is closed AT the stop.
     assert!(
-        gaps.iter()
-            .any(|l| l.contains("ws_type=main_feed") && l.contains("open_at_shutdown=t")),
+        gaps.iter().any(|l| l.contains("ws_type=main_feed")
+            && l.contains("connection_index=4i")
+            && l.contains("open_at_shutdown=t")),
         "the main-feed gap closed by the shutdown: {gaps:?}"
     );
-    // No gap for the shutdown close itself (slot 5 opens nothing).
+    // No gap for the shutdown close itself (slot 5 opens nothing) ...
     assert!(
         !gaps.iter().any(|l| l.contains("ws_type=depth_200")),
         "a shutdown close opens no gap: {gaps:?}"
     );
-
-    // Dropping the last sender ends the forwarder cleanly.
-    drop(tx);
+    // ... and none for the out-of-range slot.
+    assert!(
+        !gaps.iter().any(|l| l.contains("connection_index=200i")),
+        "slot 200 is outside the tracker and opens no gap: {gaps:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_drop_closes_open_gaps() {
+    bypass_proxy_for_loopback();
     let (port, seen) = start_stub(WriteMode::Accept).await;
     let tx = spawn_live_feed_lifecycle_audit(cfg_for(port));
     tx.send(lifecycle(
@@ -444,17 +659,17 @@ async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_drop_closes_open
     .expect("send");
     // Wait for the row so the forwarder has processed the disconnect.
     assert!(
-        wait_until(Duration::from_secs(4), || {
+        wait_until(Duration::from_secs(5), || {
             !writes_containing(&seen, "ws_event_audit").is_empty()
         })
         .await
     );
     // Every producer is gone: the open gap is written closed, not lost.
     drop(tx);
-    let closed = wait_until(Duration::from_secs(4), || {
+    let closed = wait_until(Duration::from_secs(5), || {
         writes_containing(&seen, "feed_gap_audit")
             .iter()
-            .any(|l| l.contains("open_at_shutdown=t"))
+            .any(|l| l.contains("connection_index=1i") && l.contains("open_at_shutdown=t"))
     })
     .await;
     assert!(
@@ -468,87 +683,42 @@ async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_drop_closes_open
 // (counted, logged once per episode), and the episode closes when rows land.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-struct GlobalCapture(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for GlobalCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("capture").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GlobalCapture {
-    type Writer = GlobalCapture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// A process-wide log buffer and metrics recorder (the forwarder logs and
-/// counts on runtime worker threads, which a thread-scoped subscriber misses).
-fn global_observers() -> &'static (GlobalCapture, metrics_exporter_prometheus::PrometheusHandle) {
-    static OBS: std::sync::OnceLock<(
-        GlobalCapture,
-        metrics_exporter_prometheus::PrometheusHandle,
-    )> = std::sync::OnceLock::new();
-    OBS.get_or_init(|| {
-        let cap = GlobalCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(cap.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::set_global_recorder(recorder).expect("one global recorder");
-        (cap, handle)
-    })
-}
-
-fn dropped_rows(handle: &metrics_exporter_prometheus::PrometheusHandle) -> f64 {
-    handle
-        .render()
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("tv_ws_event_audit_dropped_total{reason=\"live_feed_forward\"} ")
-        })
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
+/// This test's connection slot: no other test uses it, so its log lines can
+/// be told apart from every other test's in the shared buffer.
+const STALL_TEST_SLOT: u8 = 27;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_stalled_writer_drops_then_recovers()
 {
+    bypass_proxy_for_loopback();
     let (cap, metrics_handle) = global_observers();
-    let (port, seen) = start_stub(WriteMode::StallFirst).await;
+    let marker = format!("connection_index={STALL_TEST_SLOT}");
+    let dropped_before = dropped_rows(metrics_handle);
+    let gate = Arc::new(StallGate::default());
+    let (port, seen) = start_stub_gated(WriteMode::StallFirst, Arc::clone(&gate)).await;
     let tx = spawn_live_feed_lifecycle_audit(cfg_for(port));
 
-    // The first row's flush is held by the stub.
+    // The first row's flush is held by the stub until this test releases it.
     tx.send(lifecycle(
         DhanEndpointType::MainFeed,
-        7,
+        STALL_TEST_SLOT,
         WsEventKind::DialFailed,
         "first_row",
         None,
     ))
     .await
     .expect("send");
-    let first_post = wait_until(Duration::from_secs(4), || {
-        seen.lock().expect("log").iter().any(|s| s.method == "POST")
+    let held = wait_until(Duration::from_secs(5), || {
+        gate.taken.load(std::sync::atomic::Ordering::SeqCst)
     })
     .await;
-    assert!(first_post, "the first write reaches the stub and stalls");
+    assert!(held, "the first write reaches the stub and is held");
 
-    // Flood well past the 1,024-row channel while the writer is stalled.
+    // Flood well past the 1,024-row channel while the writer is held.
     for _ in 0..1_200 {
         tx.send(lifecycle(
             DhanEndpointType::MainFeed,
-            7,
+            STALL_TEST_SLOT,
             WsEventKind::DialFailed,
             "flood_row",
             None,
@@ -556,17 +726,24 @@ async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_stalled_writer_d
         .await
         .expect("send");
     }
-    let dropped = wait_until(Duration::from_secs(4), || {
-        dropped_rows(metrics_handle) >= 1.0
+    let dropped = wait_until(Duration::from_secs(5), || {
+        dropped_rows(metrics_handle) >= dropped_before + 1.0
     })
     .await;
     assert!(
         dropped,
         "rows past the channel bound are counted as dropped"
     );
+    // Still held: nothing past the first write has reached the stub.
+    assert_eq!(
+        writes_containing(&seen, "flood_row").len(),
+        0,
+        "the writer is held, so no flood row can have been written yet"
+    );
 
-    // Once the stall clears the queue drains; the next row lands and closes
-    // the drop episode.
+    // Release the stall: the queue drains; the next row lands and closes the
+    // drop episode.
+    gate.release.notify_one();
     let drained = wait_until(Duration::from_secs(15), || {
         writes_containing(&seen, "flood_row").len() >= 900
     })
@@ -574,39 +751,36 @@ async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_stalled_writer_d
     assert!(drained, "the queued rows are written after the stall");
     tx.send(lifecycle(
         DhanEndpointType::MainFeed,
-        7,
+        STALL_TEST_SLOT,
         WsEventKind::DialFailed,
         "recovered_probe",
         None,
     ))
     .await
     .expect("send");
-    let landed = wait_until(Duration::from_secs(4), || {
+    let landed = wait_until(Duration::from_secs(5), || {
         !writes_containing(&seen, "recovered_probe").is_empty()
     })
     .await;
     assert!(landed, "a row sent after the episode lands");
 
-    let logs = cap.text();
+    let recovered = wait_until(Duration::from_secs(5), || {
+        !cap.lines_with(&["the drop episode is over", &marker])
+            .is_empty()
+    })
+    .await;
+    assert!(recovered, "the recovery is said once rows land again");
+    // Paged ONCE per episode, not once per dropped row; recovery said once.
+    let drop_lines = cap.lines_with(&["socket-lifecycle row was DROPPED", &marker]);
+    assert_eq!(drop_lines.len(), 1, "one line per episode: {drop_lines:?}");
     assert!(
-        logs.contains("socket-lifecycle row was DROPPED"),
-        "the episode is paged once"
+        drop_lines[0].contains(ErrorCode::HotPath02WriterQueueDrop.code_str()),
+        "the drop page carries its code: {drop_lines:?}"
     );
-    assert!(
-        logs.contains("the drop episode is over"),
-        "the recovery is said once rows land again"
-    );
-    // Paged ONCE per episode, not once per dropped row.
     assert_eq!(
-        logs.matches("socket-lifecycle row was DROPPED").count(),
+        cap.lines_with(&["the drop episode is over", &marker]).len(),
         1,
-        "one line per episode"
+        "one recovery line per episode"
     );
     drop(tx);
-}
-
-impl GlobalCapture {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("capture")).to_string()
-    }
 }

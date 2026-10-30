@@ -54,8 +54,26 @@ fn test_drain_hold_measure_day_work_is_stable_across_days_and_extreme_dates() {
     }
 }
 
+/// A reading with nothing left: every part known and empty.
+fn done_work() -> DayWork {
+    DayWork {
+        deferred_marks: 0,
+        deferred_overflowed: false,
+        deferred_retryable_left: None,
+        spill_files: 0,
+        seal_staged: Some(0),
+        apply_lag: Some(0),
+        suspended: Some(0),
+        sink_suspect: false,
+        wal_backlog: Some(0),
+        wal_holding: false,
+    }
+}
+
 #[test]
 fn test_drain_hold_measure_day_work_feeds_tracker_and_hold_state() {
+    // The real measurement still feeds the tracker (its parts are whatever
+    // this checkout holds, so only the anchor-then-stall shape is asserted).
     let work = measure_day_work(day(2026, 10, 29));
     let mut tracker = ProgressTracker::default();
     // The first reading only anchors.
@@ -67,18 +85,68 @@ fn test_drain_hold_measure_day_work_feeds_tracker_and_hold_state() {
     // The pass writing rows is progress again.
     assert!(!tracker.observe(&work, 1, 1_000 + DRAIN_HOLD_STALL_SECS + 1));
 
+    // The hold decision on two readings built directly, so both outcomes are
+    // determined whatever the checkout's spill folders hold.
+    let done = done_work();
+    assert!(done.is_done(), "{}", done.left_text());
     let mut state = HoldState::default();
-    let first = state.step(work.is_done(), 0);
-    if work.is_done() {
-        assert_eq!(first, HoldAction::None);
-    } else {
-        assert_eq!(first, HoldAction::Hold);
-        assert_eq!(
-            state.step(false, DRAIN_HOLD_REFRESH_SECS - 1),
-            HoldAction::None
-        );
-        assert_eq!(state.step(false, DRAIN_HOLD_REFRESH_SECS), HoldAction::Hold);
+    assert_eq!(state.step(done.is_done(), 0), HoldAction::None);
+
+    let not_done = DayWork {
+        spill_files: 1,
+        ..done_work()
+    };
+    assert!(!not_done.is_done(), "one waiting spill file is work");
+    let mut state = HoldState::default();
+    assert_eq!(state.step(not_done.is_done(), 0), HoldAction::Hold);
+    assert_eq!(
+        state.step(not_done.is_done(), DRAIN_HOLD_REFRESH_SECS - 1),
+        HoldAction::None
+    );
+    assert_eq!(
+        state.step(not_done.is_done(), DRAIN_HOLD_REFRESH_SECS),
+        HoldAction::Hold
+    );
+}
+
+#[test]
+fn test_drain_hold_hold_state_not_done_one_short_of_release_resets_streak() {
+    let mut state = HoldState::default();
+    assert_eq!(state.step(false, 0), HoldAction::Hold);
+    // One done reading short of the release streak.
+    for i in 0..(DRAIN_HOLD_DONE_POLLS - 1) {
+        assert_eq!(state.step(true, i64::from(i) + 1), HoldAction::None);
     }
+    assert_eq!(state.done_streak, DRAIN_HOLD_DONE_POLLS - 1);
+    // A not-done reading there resets the streak and releases nothing (the
+    // hold written at 0 is not yet due a refresh).
+    assert_eq!(state.step(false, 10), HoldAction::None);
+    assert_eq!(state.done_streak, 0);
+    assert!(!state.released);
+    assert_eq!(state.last_hold_write, Some(0));
+    // The streak starts over: DONE_POLLS - 1 done readings still release
+    // nothing, the next one releases.
+    for i in 0..(DRAIN_HOLD_DONE_POLLS - 1) {
+        assert_eq!(state.step(true, 20 + i64::from(i)), HoldAction::None);
+    }
+    assert_eq!(state.step(true, 100), HoldAction::Release);
+    assert!(state.released);
+}
+
+#[test]
+fn test_drain_hold_progress_tracker_clock_going_backwards_is_not_a_stall() {
+    let work = done_work();
+    let mut tracker = ProgressTracker::default();
+    assert!(!tracker.observe(&work, 0, 10_000));
+    // The wall clock steps back an hour and more: the elapsed time reads
+    // negative, which is never a stall, and nothing panics.
+    assert!(!tracker.observe(&work, 0, 10_000 - DRAIN_HOLD_STALL_SECS));
+    assert!(!tracker.observe(&work, 0, 0));
+    assert!(!tracker.observe(&work, 0, -1_000_000));
+    // The backward readings moved nothing, so the anchor time is still
+    // 10_000: a stall is reported exactly an hour after it.
+    assert!(!tracker.observe(&work, 0, 10_000 + DRAIN_HOLD_STALL_SECS - 1));
+    assert!(tracker.observe(&work, 0, 10_000 + DRAIN_HOLD_STALL_SECS));
 }
 
 #[test]

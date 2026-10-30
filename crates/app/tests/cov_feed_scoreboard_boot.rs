@@ -38,9 +38,9 @@ fn setup_env() {
     ONCE.call_once(|| {
         let existing = std::env::var("NO_PROXY").unwrap_or_default();
         let no_proxy = if existing.is_empty() {
-            "127.0.0.1".to_string()
+            "127.0.0.1,localhost".to_string()
         } else {
-            format!("127.0.0.1,{existing}")
+            format!("127.0.0.1,localhost,{existing}")
         };
         // SAFETY: set once, before any HTTP client in this binary is built.
         unsafe {
@@ -349,10 +349,54 @@ fn serve_one(
     let _ = stream.flush();
 }
 
-/// A port with nothing listening (bound, then released).
+/// A port that never answers: the listener stays bound for the life of the
+/// test process (so a parallel test can never be handed the same port) and
+/// closes every accepted connection before reading a byte. The production
+/// reads see a transport error, the same branch a refused connection takes
+/// (`send()` returns `Err`, which every caller here maps to "unreadable").
 fn dead_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr").port()
+    let port = l.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in l.incoming() {
+            drop(stream);
+        }
+    });
+    port
+}
+
+/// A shared byte buffer a test tracing subscriber writes into.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogBuf {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+    }
+}
+
+/// Captures this thread's log lines (the `#[tokio::test]` runtime is
+/// current-thread, so every task the test drives logs here).
+fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    let buf = LogBuf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (buf, guard)
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +771,19 @@ async fn test_feed_scoreboard_run_every_source_down_returns_err() {
     .await
     .expect_err("nothing measured");
     assert!(err.contains("every data source was unreachable"), "{err}");
-    // The daily rows were still attempted (and refused).
-    assert!(!server.writes().is_empty());
+    // The daily rows were still attempted (and refused), and the Dhan row
+    // carries the honest verdict: partial (no source answered, so coverage
+    // is incomplete; a past day is never same-day, so not degraded), with
+    // the -1 "unmeasured" sentinel, never a complete day of zeros.
+    let writes = server.writes().join("\n");
+    let dhan_row = writes
+        .lines()
+        .find(|l| l.contains("feed=dhan"))
+        .unwrap_or_else(|| panic!("a Dhan daily row was written: {writes}"));
+    assert!(dhan_row.contains("outcome=partial"), "{dhan_row}");
+    assert!(dhan_row.contains("partial_coverage=t"), "{dhan_row}");
+    assert!(dhan_row.contains("ticks_captured=-1i"), "{dhan_row}");
+    assert!(!writes.contains("outcome=complete"), "{writes}");
 }
 
 #[tokio::test]
@@ -1086,9 +1141,24 @@ async fn test_feed_scoreboard_reconcile_every_poll_fails_returns_no_rows() {
         pg_port: 1,
         ilp_port: 1,
     };
+    let (logs, _guard) = capture_logs();
     let rows =
         reconcile_process_death_episodes(&dead, DAY, ts_nanos(0), ts_nanos(hms(11, 0))).await;
     assert!(rows.is_empty());
+    // An empty result alone reads like a clean boot; what tells them apart
+    // is the coded SCOREBOARD-01 line naming the failed read.
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("reconcile_ws_events_read"))
+        .unwrap_or_else(|| panic!("the failed-read error is logged: {text}"));
+    assert!(line.contains("ERROR"), "{line}");
+    assert!(line.contains("SCOREBOARD-01"), "{line}");
+    assert!(line.contains("every poll attempt failed"), "{line}");
+    assert!(
+        !text.contains("clean boot"),
+        "a blind reconcile must never report a clean boot: {text}"
+    );
 }
 
 /// Every flush is refused: the rows are retried three times and still

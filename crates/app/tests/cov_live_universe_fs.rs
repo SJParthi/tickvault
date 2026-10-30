@@ -790,14 +790,44 @@ async fn test_live_universe_await_mapping_present_settles_each_narrowing() {
 
 #[tokio::test]
 async fn test_live_universe_await_mapping_producer_too_far_is_classified_by_expectation() {
+    use tickvault_app::dhan_live_universe::{
+        MAPPING_WAIT_DEADLINE_SECS, MAPPING_WAIT_MAX_STALL_SECS, MAPPING_WAIT_NEVER_PAST_IST_SECS,
+    };
     let _serial = SERIAL.lock().await;
     let _sb = Sandbox::new("await-far");
     metrics_handle();
     let cfg = master_cfg();
+    let target = cfg.target_secs_of_day_ist;
+    let deadline = u32::try_from(MAPPING_WAIT_DEADLINE_SECS).expect("deadline fits u32");
+
+    // The pure bound the wait is decided by, at fixed instants (no clock):
+    // an overnight boot is too far from the rider to wait at all ...
+    assert_eq!(mapping_wait_end_ist_secs(3_600, target), None);
+    // ... a boot inside the stall cap waits to the rider's full budget ...
+    let near = target.saturating_sub(MAPPING_WAIT_MAX_STALL_SECS / 2);
+    assert_eq!(
+        mapping_wait_end_ist_secs(near, target),
+        Some((target + deadline).min(MAPPING_WAIT_NEVER_PAST_IST_SECS))
+    );
+    // ... and nothing waits at or past the pre-open cutoff.
+    assert_eq!(
+        mapping_wait_end_ist_secs(MAPPING_WAIT_NEVER_PAST_IST_SECS, target),
+        None
+    );
+
     let now = tickvault_common::market_hours::now_ist_secs_of_day();
-    // Only when the pure bound says "do not wait" can this run without
-    // sleeping for the rider; that holds outside 08:10–09:10 IST.
-    if mapping_wait_end_ist_secs(now, cfg.target_secs_of_day_ist).is_some() {
+    // The live call can only run without sleeping for the rider when the
+    // bound says "do not wait" now; inside the waiting window (08:10–09:10
+    // IST with the default target) it would block for real.
+    if let Some(end) = mapping_wait_end_ist_secs(now, target) {
+        // In the waiting window the bound is a real future instant no later
+        // than the cutoff, and no longer than the stall cap away.
+        assert!(
+            end > now,
+            "a wait ends after it starts: now {now}, end {end}"
+        );
+        assert!(end <= MAPPING_WAIT_NEVER_PAST_IST_SECS);
+        assert!(end - now <= MAPPING_WAIT_MAX_STALL_SECS);
         return;
     }
     let before = wait_outcome("producer_too_far");
@@ -814,6 +844,126 @@ async fn test_live_universe_await_mapping_producer_too_far_is_classified_by_expe
         logs.contains("further away than this boot may stall for"),
         "unexpected boot: {logs}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Composite-key edges: (security_id, segment) is the identity, never the id
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_live_universe_resolve_exact_duplicate_and_extreme_ids_are_counted() {
+    let _serial = SERIAL.lock().await;
+    let sb = Sandbox::new("dup-extremes");
+    reset_widen_state();
+    // An exact duplicate (id, segment) row, the largest id, a zero id and a
+    // segment byte no Dhan segment uses (255).
+    sb.write(
+        &mapping_artifact_path(TODAY),
+        &artifact(&[
+            (500, 1, "DUP"),
+            (500, 1, "DUP"),
+            (u64::MAX, 1, "MAX"),
+            (0, 1, "ZERO"),
+            (777, 255, "BADSEG"),
+        ]),
+    );
+    let (cap, _g) = capture_logs();
+    let out = resolve_live_universe(&master_cfg(), index_universe(), TODAY, 25_000, false);
+    assert_eq!(out.len(), 6, "4 indices + 500 once + u64::MAX: {out:?}");
+    assert_eq!(
+        out.iter()
+            .filter(|i| i.security_id == 500 && i.segment == ExchangeSegment::NseEquity)
+            .count(),
+        1,
+        "the exact duplicate is subscribed once"
+    );
+    assert!(
+        out.iter()
+            .any(|i| i.security_id == u64::MAX && i.segment == ExchangeSegment::NseEquity),
+        "the largest id is a valid id: {out:?}"
+    );
+    assert!(!out.iter().any(|i| i.security_id == 0));
+    assert!(!out.iter().any(|i| i.security_id == 777));
+    let logs = cap.text();
+    assert!(logs.contains("widened from the resolved master"), "{logs}");
+    assert!(logs.contains("deduped=1"), "{logs}");
+    assert!(logs.contains("refused_zero_id=1"), "{logs}");
+    assert!(logs.contains("refused_unknown_segment=1"), "{logs}");
+    reset_widen_state();
+}
+
+#[tokio::test]
+async fn test_live_universe_resolve_same_id_in_two_segments_keeps_both() {
+    let _serial = SERIAL.lock().await;
+    let sb = Sandbox::new("same-id-two-segments");
+    reset_widen_state();
+    // id 13 as the NIFTY index (IDX_I) AND as an NSE_EQ stock: two different
+    // instruments. One more stock so the set is wider than the index set.
+    sb.write(
+        &mapping_artifact_path(TODAY),
+        &artifact(&[(13, 0, "NIFTY"), (13, 1, "STOCK13"), (100_000, 1, "STOCK")]),
+    );
+    let (cap, _g) = capture_logs();
+    let out = resolve_live_universe(&master_cfg(), index_universe(), TODAY, 25_000, false);
+    assert!(
+        out.iter()
+            .any(|i| i.security_id == 13 && i.segment == ExchangeSegment::IdxI),
+        "13 in IDX_I kept: {out:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|i| i.security_id == 13 && i.segment == ExchangeSegment::NseEquity),
+        "13 in NSE_EQ kept: {out:?}"
+    );
+    assert_eq!(
+        out.iter().filter(|i| i.security_id == 13).count(),
+        2,
+        "one instrument per segment, no more: {out:?}"
+    );
+    let logs = cap.text();
+    // The master's NIFTY row repeats the hardcoded (13, IDX_I) seed, so it is
+    // the one deduped row; the NSE_EQ row with the same id is not.
+    assert!(logs.contains("deduped=1"), "{logs}");
+    assert!(logs.contains("widened from the resolved master"), "{logs}");
+    reset_widen_state();
+}
+
+#[test]
+fn test_live_universe_parse_mapping_artifact_extreme_ids_and_segment_bytes() {
+    use tickvault_app::dhan_live_universe::parse_mapping_artifact;
+
+    let body = artifact(&[
+        (u64::MAX, 1, "MAX"),
+        (0, 1, "ZERO"),
+        (777, 255, "BADSEG"),
+        (13, 0, "NIFTY"),
+        (13, 1, "STOCK13"),
+    ]);
+    let rows = parse_mapping_artifact(&body).expect("valid file");
+    // The parser keeps every row whose id fits u64 and whose segment fits a
+    // byte; judging id 0 and an unknown segment is the selector's job.
+    let keys: Vec<(u64, u8)> = rows
+        .iter()
+        .map(|r| (r.security_id, r.exchange_segment_code))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![(u64::MAX, 1), (0, 1), (777, 255), (13, 0), (13, 1)]
+    );
+    // A segment past a byte (256) and an id past u64 are skipped, not wrapped.
+    let rows = parse_mapping_artifact(
+        r#"{"mappings":[
+            {"security_id": 1, "exchange_segment": 256},
+            {"security_id": 18446744073709551616, "exchange_segment": 1},
+            {"security_id": 2, "exchange_segment": 7}
+        ]}"#,
+    )
+    .expect("valid file");
+    let keys: Vec<(u64, u8)> = rows
+        .iter()
+        .map(|r| (r.security_id, r.exchange_segment_code))
+        .collect();
+    assert_eq!(keys, vec![(2, 7)]);
 }
 
 // ---------------------------------------------------------------------------
