@@ -14,10 +14,11 @@
 //! | Section | Source |
 //! |---|---|
 //! | How fast each step runs | the process's own step-latency counters (`hot_path_telemetry::stage_snapshot`), read in memory: the API runs inside the same process as the feed |
-//! | Worst step in the last 75 s, backlog, reconnects, candle overflow | the app's own metrics page (`[observability]` address), read once per refresh |
-//! | Ticks saved per minute | QuestDB `ticks` and `tick_quotes`, the last 15 full minutes |
+//! | Database catch-up queue, feed sockets connected now | read in process: the WAL watcher's last apply-lag reading (`ingest_shed::wal_apply_lag_max`) and the feed's live socket count (the `/health` source) |
+//! | Worst step in the last 75 s, bytes kept on disk until confirmed, reconnects, candle overflow | the app's own metrics page (`[observability]` address), read once per refresh |
+//! | Ticks per minute | QuestDB `ticks` and `tick_quotes`, the last 15 full minutes |
 //! | Every tick accounted for | QuestDB `tick_conservation_audit`, the last 14 days |
-//! | Connection gaps today | QuestDB `feed_gap_audit`, since IST midnight |
+//! | Connection gaps closed today | QuestDB `feed_gap_audit`, since IST midnight (a gap is written when it closes) |
 //! | Per-minute speed record | QuestDB `hot_path_latency_minute` when that table exists; "not yet available" when it does not |
 //!
 //! # Honesty rules
@@ -31,6 +32,13 @@
 //!   is not (possibly over).
 //! * The in-memory step figures cover the time since the app started; the
 //!   "worst in the last 75 s" figure is the only recent window.
+//! * Ticks are judged only between 09:15 and 15:30, and "no trade in the last
+//!   minute" is red only while the database is caught up: rows QuestDB has not
+//!   applied yet are not readable, so a backlog reads amber, not "lost".
+//! * Figures that cannot say whether something is wrong right now carry no
+//!   verdict (grey): closed connection gaps (an open gap has no row yet), the
+//!   candle overflow bytes (they include files already written back), and the
+//!   per-minute speed record (shown as stored, column names included).
 //!
 //! # Cost
 //!
@@ -39,8 +47,11 @@
 //! designated timestamp) and one read of the metrics page (bounded by
 //! [`METRICS_SCRAPE_TIMEOUT_SECS`] and [`METRICS_SCRAPE_MAX_BYTES`]), run
 //! concurrently; the body is cached for 5 s in a single slot
-//! ([`crate::state::SharedAppState::speed_health_cache`]), so any number of
-//! open tabs costs at most one pass per 5 s. Reading the metrics page is
+//! ([`crate::state::SharedAppState::speed_health_cache`]). A miss takes a
+//! single-flight lock and re-checks the cache, so concurrent misses (several
+//! tabs, or a pass slower than the 5 s TTL while the database is slow) run one
+//! pass, not one each; the worst pass is about 9 s (the per-minute table's
+//! columns probe and rows read run one after the other). Reading the metrics page is
 //! **O(lines)** in one pass; reading the step counters is O(5 steps × 28
 //! buckets). Neither runs on the feed path. The route is bearer-gated with the
 //! other `/api/debug/*` reads.
@@ -94,11 +105,11 @@ const CELL_MAX_CHARS: usize = 64;
 
 /// QuestDB apply backlog at or under this many transactions is idle (the
 /// same-day drain's "idle level", operator Quote 31).
-const APPLY_LAG_GREEN_MAX: f64 = 10.0;
+const APPLY_LAG_GREEN_MAX: u64 = 10;
 
 /// Above this many transactions the evening write-back pauses (operator
 /// Quote 31), so the dashboard reads it as red.
-const APPLY_LAG_AMBER_MAX: f64 = 500.0;
+const APPLY_LAG_AMBER_MAX: u64 = 500;
 
 /// Bytes the frame log keeps on disk because the database has not confirmed
 /// them; from this much the tile is red. A dashboard colour choice, about 7%
@@ -120,10 +131,18 @@ const SECS_PER_HOUR: i64 = 3_600;
 /// Nanoseconds per second.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
+/// End of continuous trading, 15:30 IST, as seconds of the IST day. The
+/// closing session that follows (to 15:40) trades too rarely to judge each
+/// minute. Pinned to `MARKET_CLOSE_TIME_IST_EXCLUSIVE` by a test.
+const CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST: i64 = 55_800;
+
+/// A newest daily tick check older than this many days reads amber: a
+/// weekend plus a holiday is three days, so four means a check went missing.
+const CONSERVATION_STALE_DAYS: i64 = 4;
+
 /// Metric names read from the metrics page. Where the producing module exports
 /// the name as a constant, that constant is used so a rename cannot drift.
 const STAGE_MAX_75S_METRIC: &str = "tv_hot_path_stage_max_ns_75s";
-const APPLY_LAG_METRIC: &str = "tv_questdb_wal_apply_lag_max";
 const SEAL_SPILL_BYTES_METRIC: &str = "tv_seal_spill_bytes";
 const SEAL_SPILL_WRITE_ERRORS_METRIC: &str = "tv_seal_spill_write_errors_total";
 
@@ -200,6 +219,13 @@ pub async fn speed_health(State(state): State<SharedAppState>) -> Response {
         metrics::counter!("tv_api_cache_hits_total", "endpoint" => "speed_health").increment(1);
         return crate::response_cache::cached_json_response(body, "hit");
     }
+    // Single flight: one pass at a time; a request that waited here finds
+    // the body the pass before it stored.
+    let _flight = state.speed_health_refresh().lock().await;
+    if let Some(body) = state.speed_health_cache().get() {
+        metrics::counter!("tv_api_cache_hits_total", "endpoint" => "speed_health").increment(1);
+        return crate::response_cache::cached_json_response(body, "hit");
+    }
     let snapshot = compute_speed_health(&state).await;
     match serde_json::to_string(&snapshot) {
         Ok(body) => {
@@ -248,6 +274,11 @@ pub(crate) async fn compute_speed_health(state: &SharedAppState) -> SpeedHealthR
     build_sections(&Inputs {
         market_open,
         ist_now,
+        apply_lag: tickvault_common::ingest_shed::wal_apply_lag_max(),
+        sockets_now: state
+            .health_status()
+            .websocket_reported()
+            .then(|| state.health_status().websocket_connections()),
         stages,
         exporter,
         ticks,
@@ -276,6 +307,11 @@ pub(crate) struct StageFigures {
 pub(crate) struct Inputs {
     pub market_open: bool,
     pub ist_now: i64,
+    /// The database apply backlog the WAL watcher last read, in process;
+    /// `None` when unknown (watcher blind, database not answering).
+    pub apply_lag: Option<u64>,
+    /// Feed sockets connected right now; `None` until the feed reports.
+    pub sockets_now: Option<u64>,
     pub stages: [StageFigures; 5],
     pub exporter: Option<ExporterReadings>,
     pub ticks: QueryOutcome,
@@ -290,9 +326,9 @@ pub(crate) fn build_sections(inputs: &Inputs) -> SpeedHealthResponse {
     let sections = vec![
         speed_section(&inputs.stages, inputs.exporter.as_ref()),
         ticks_section(inputs),
-        conservation_section(&inputs.conservation),
-        backlog_section(inputs.exporter.as_ref()),
-        connections_section(inputs.exporter.as_ref(), &inputs.gaps),
+        conservation_section(&inputs.conservation, inputs.ist_now),
+        backlog_section(inputs),
+        connections_section(inputs),
         overflow_section(inputs.exporter.as_ref()),
         minute_table_section(&inputs.minute_table),
     ];
@@ -479,25 +515,52 @@ pub(crate) fn minute_counts(outcome: &QueryOutcome, ist_now: i64) -> Option<Vec<
     Some(counts)
 }
 
-/// The verdict on the trade counts: grey when the market is closed or the
-/// counts are unreadable; red when the last full minute saved nothing; amber
-/// when an earlier minute inside the session saved nothing; else green.
-pub(crate) fn ticks_light(market_open: bool, counts: Option<&[u64]>, ist_now: i64) -> Light {
+/// Start of IST day `ist_now` falls in, plus `secs_of_day`.
+fn ist_day_at(ist_now: i64, secs_of_day: i64) -> i64 {
+    ist_now.div_euclid(SECS_PER_DAY) * SECS_PER_DAY + secs_of_day
+}
+
+/// True for a minute that starts inside continuous trading, 09:15 to 15:30.
+/// Outside it (the pre-open, the closing session to 15:40) trades are not
+/// expected every minute, so no verdict is given.
+pub(crate) fn in_continuous_trading(minute_start: i64) -> bool {
+    let open = ist_day_at(
+        minute_start,
+        tickvault_common::constants::MARKET_OPEN_IST_NANOS / NANOS_PER_SEC,
+    );
+    let close = ist_day_at(minute_start, CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST);
+    (open..close).contains(&minute_start)
+}
+
+/// The verdict on the trade counts. Grey when the counts are unreadable, the
+/// market is closed, or the last full minute is outside continuous trading.
+/// Red when the last full minute holds no trade while the database is caught
+/// up (so the rows would be readable); amber when it holds none while the
+/// database is behind or its backlog is unknown, or when an earlier minute of
+/// continuous trading holds none; else green.
+pub(crate) fn ticks_light(
+    market_open: bool,
+    counts: Option<&[u64]>,
+    ist_now: i64,
+    database_caught_up: bool,
+) -> Light {
     let Some(counts) = counts else {
         return Light::Grey;
     };
-    if !market_open {
+    let (start, end) = tick_window(ist_now);
+    if !market_open || !in_continuous_trading(end - SECS_PER_MINUTE) {
         return Light::Grey;
     }
     if counts.last().copied().unwrap_or(0) == 0 {
-        return Light::Red;
+        return if database_caught_up {
+            Light::Red
+        } else {
+            Light::Amber
+        };
     }
-    let (start, _) = tick_window(ist_now);
-    let session_open = ist_now.div_euclid(SECS_PER_DAY) * SECS_PER_DAY
-        + tickvault_common::constants::MARKET_OPEN_IST_NANOS / NANOS_PER_SEC;
     let quiet_in_session = counts.iter().enumerate().any(|(i, n)| {
         let minute_start = start + i64::try_from(i).unwrap_or(0) * SECS_PER_MINUTE;
-        *n == 0 && minute_start >= session_open
+        *n == 0 && in_continuous_trading(minute_start)
     });
     if quiet_in_session {
         Light::Amber
@@ -509,7 +572,12 @@ pub(crate) fn ticks_light(market_open: bool, counts: Option<&[u64]>, ist_now: i6
 fn ticks_section(inputs: &Inputs) -> Section {
     let trades = minute_counts(&inputs.ticks, inputs.ist_now);
     let quotes = minute_counts(&inputs.quotes, inputs.ist_now);
-    let light = ticks_light(inputs.market_open, trades.as_deref(), inputs.ist_now);
+    let light = ticks_light(
+        inputs.market_open,
+        trades.as_deref(),
+        inputs.ist_now,
+        database_caught_up(inputs),
+    );
     let mut tiles = Vec::with_capacity(3);
     match trades.as_deref() {
         Some(counts) => {
@@ -518,13 +586,13 @@ fn ticks_section(inputs: &Inputs) -> Section {
             let quiet = counts.iter().filter(|n| **n == 0).count();
             let average = total / u64::try_from(counts.len().max(1)).unwrap_or(1);
             tiles.push(Tile::new(
-                "Trades saved in the last full minute",
+                "Trades readable in the database, last full minute",
                 group_digits(last),
                 light,
             ));
             tiles.push(
                 Tile::new(
-                    "Trades saved per minute, 15-minute average",
+                    "Trades readable in the database, 15-minute average per minute",
                     group_digits(average),
                     light,
                 )
@@ -535,14 +603,18 @@ fn ticks_section(inputs: &Inputs) -> Section {
             );
         }
         None => tiles.push(
-            Tile::new("Trades saved per minute", "could not read", Light::Grey)
-                .with_detail(outcome_reason(&inputs.ticks)),
+            Tile::new(
+                "Trades readable in the database",
+                "could not read",
+                Light::Grey,
+            )
+            .with_detail(outcome_reason(&inputs.ticks)),
         ),
     }
     match quotes.as_deref() {
         Some(counts) => tiles.push(
             Tile::new(
-                "Late quotes saved in the last full minute",
+                "Late quotes readable in the database, last full minute",
                 group_digits(counts.last().copied().unwrap_or(0)),
                 Light::Grey,
             )
@@ -550,19 +622,16 @@ fn ticks_section(inputs: &Inputs) -> Section {
         ),
         None => tiles.push(
             Tile::new(
-                "Late quotes saved per minute",
+                "Late quotes readable in the database",
                 "could not read",
                 Light::Grey,
             )
             .with_detail(outcome_reason(&inputs.quotes)),
         ),
     }
-    let note = if inputs.market_open {
-        "The last 15 full minutes. Red: nothing saved in the last minute while the market \
-         is open. Amber: some minute since 09:15 saved nothing."
-    } else {
-        "The last 15 full minutes. The market is closed, so there is no verdict."
-    };
+    let note = "The last 15 full minutes, judged only between 09:15 and 15:30. Red: no trade \
+                in the last minute while the database is caught up. Amber: none while the \
+                database is behind, or some earlier minute had none. Grey: no verdict.";
     Section {
         title: "Ticks saved per minute",
         note: note.to_string(),
@@ -591,40 +660,80 @@ pub(crate) fn conservation_word(verdict: &str) -> &'static str {
     }
 }
 
-fn conservation_section(outcome: &QueryOutcome) -> Section {
+/// How old the newest daily tick check is. Green within
+/// [`CONSERVATION_STALE_DAYS`] days, amber older (a check went missing, so the
+/// older green rows below it say nothing about the last trading days), grey
+/// when its day cannot be read. `rows` come newest first.
+pub(crate) fn conservation_freshness_tile(
+    columns: &[String],
+    rows: &[Vec<Value>],
+    ist_now: i64,
+) -> Tile {
+    const LABEL: &str = "Newest daily tick check";
+    let newest = rows
+        .first()
+        .and_then(|row| column_value(columns, row, "trading_date_ist"))
+        .and_then(Value::as_str)
+        .and_then(parse_ts_secs);
+    match newest {
+        None => Tile::new(LABEL, "unknown day", Light::Grey),
+        Some(day) => {
+            let age_days = (ist_day_at(ist_now, 0) - ist_day_at(day, 0)).div_euclid(SECS_PER_DAY);
+            let value = match age_days {
+                d if d <= 0 => "today".to_string(),
+                1 => "1 day ago".to_string(),
+                d => format!("{d} days ago"),
+            };
+            if age_days <= CONSERVATION_STALE_DAYS {
+                Tile::new(LABEL, value, Light::Green)
+            } else {
+                Tile::new(LABEL, value, Light::Amber)
+                    .with_detail("a daily check is missing since then")
+            }
+        }
+    }
+}
+
+fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
     let tiles = match outcome {
-        QueryOutcome::Rows { columns, rows } if !rows.is_empty() => rows
-            .iter()
-            .map(|row| {
-                let cell = |name: &str| column_value(columns, row, name);
-                let verdict = cell("verdict").and_then(Value::as_str).unwrap_or("");
-                let day = cell("trading_date_ist")
-                    .and_then(Value::as_str)
-                    .map_or("unknown day", |d| d.get(..10).unwrap_or(d));
-                let feed = cell("feed").and_then(Value::as_str).unwrap_or("unknown");
-                let number = |name: &str| {
-                    cell(name)
-                        .and_then(Value::as_i64)
-                        .map_or_else(|| "unknown".to_string(), format_signed)
-                };
-                let db = match cell("db_tick_rows").and_then(Value::as_i64) {
-                    Some(n) if n >= 0 => format_signed(n),
-                    _ => "unknown".to_string(),
-                };
-                Tile::new(
-                    format!("{day} · {}", short_text(feed)),
-                    conservation_word(verdict),
-                    conservation_light(verdict),
-                )
-                .with_detail(format!(
-                    "received {} · in the database {db} · not landed {} · short by {} · reason {}",
-                    number("accepted_rows"),
-                    number("not_landed_rows"),
-                    number("shortfall"),
-                    short_text(cell("reason").and_then(Value::as_str).unwrap_or("none")),
-                ))
-            })
-            .collect(),
+        QueryOutcome::Rows { columns, rows } if !rows.is_empty() => {
+            std::iter::once(conservation_freshness_tile(columns, rows, ist_now))
+                .chain(rows.iter().map(|row| {
+                    let cell = |name: &str| column_value(columns, row, name);
+                    let verdict = cell("verdict").and_then(Value::as_str).unwrap_or("");
+                    let day = cell("trading_date_ist")
+                        .and_then(Value::as_str)
+                        .map_or("unknown day", |d| d.get(..10).unwrap_or(d));
+                    let feed = cell("feed").and_then(Value::as_str).unwrap_or("unknown");
+                    let number = |name: &str| {
+                        cell(name)
+                            .and_then(Value::as_i64)
+                            .map_or_else(|| "unknown".to_string(), format_signed)
+                    };
+                    let db = match cell("db_tick_rows").and_then(Value::as_i64) {
+                        Some(n) if n >= 0 => format_signed(n),
+                        _ => "unknown".to_string(),
+                    };
+                    Tile::new(
+                format!("{day} · {}", short_text(feed)),
+                conservation_word(verdict),
+                conservation_light(verdict),
+            )
+            .with_detail(format!(
+                "received {} · in the database {db} · not landed {} · short by {} · reason {}",
+                number("accepted_rows"),
+                number("not_landed_rows"),
+                number("shortfall"),
+                short_text(
+                    &cell("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("none")
+                        .replace('_', " ")
+                ),
+            ))
+                }))
+                .collect()
+        }
         QueryOutcome::Rows { .. } => vec![
             Tile::new("Daily tick check", "no check in 14 days", Light::Grey)
                 .with_detail("the check runs at 15:45 on trading days"),
@@ -643,7 +752,7 @@ fn conservation_section(outcome: &QueryOutcome) -> Section {
 }
 
 /// The verdict on the database's catch-up queue.
-pub(crate) fn apply_lag_light(lag: f64) -> Light {
+pub(crate) fn apply_lag_light(lag: u64) -> Light {
     if lag <= APPLY_LAG_GREEN_MAX {
         Light::Green
     } else if lag <= APPLY_LAG_AMBER_MAX {
@@ -671,28 +780,54 @@ fn unavailable_tile(label: &str) -> Tile {
     Tile::new(label, "not available", Light::Grey).with_detail(COUNTERS_UNREADABLE)
 }
 
-fn backlog_section(exporter: Option<&ExporterReadings>) -> Section {
-    let tiles = match exporter {
-        None => vec![
-            unavailable_tile("Database catch-up queue"),
-            unavailable_tile("Kept on disk until the database confirms"),
-        ],
-        Some(e) => vec![
-            match e.apply_lag_max {
-                Some(lag) => Tile::new(
-                    "Database catch-up queue",
-                    format!("{} transactions", group_digits(as_count(lag))),
-                    apply_lag_light(lag),
-                )
-                .with_detail("green up to 10, red above 500"),
-                None => Tile::new("Database catch-up queue", NOT_REPORTED, Light::Grey),
-            },
-            match e.pinned_bytes {
-                Some(bytes) => Tile::new(
-                    "Kept on disk until the database confirms",
-                    human_bytes(bytes),
-                    pinned_bytes_light(bytes),
-                )
+/// True when the database's apply backlog is known and at its idle level, so
+/// rows written a minute ago are readable now.
+pub(crate) fn database_caught_up(inputs: &Inputs) -> bool {
+    inputs
+        .apply_lag
+        .is_some_and(|lag| lag <= APPLY_LAG_GREEN_MAX)
+        && !database_not_answering(inputs)
+}
+
+/// True when every database read in this pass got no answer.
+pub(crate) fn database_not_answering(inputs: &Inputs) -> bool {
+    [
+        &inputs.ticks,
+        &inputs.quotes,
+        &inputs.conservation,
+        &inputs.gaps,
+    ]
+    .iter()
+    .all(|o| **o == QueryOutcome::Unreachable)
+}
+
+/// The catch-up queue tile: read in process from the WAL watcher's last poll.
+/// Grey when that reading is unknown or the database is not answering now,
+/// so a reading taken before an outage is never shown green during it.
+pub(crate) fn apply_lag_tile(inputs: &Inputs) -> Tile {
+    const LABEL: &str = "Database catch-up queue";
+    if database_not_answering(inputs) {
+        return Tile::new(LABEL, "not known", Light::Grey)
+            .with_detail("the database is not answering");
+    }
+    match inputs.apply_lag {
+        Some(lag) => Tile::new(
+            LABEL,
+            format!("{} transactions", group_digits(lag)),
+            apply_lag_light(lag),
+        )
+        .with_detail("green up to 10, red above 500"),
+        None => Tile::new(LABEL, "not known", Light::Grey)
+            .with_detail("the last check could not read it"),
+    }
+}
+
+fn backlog_section(inputs: &Inputs) -> Section {
+    const PINNED: &str = "Kept on disk until the database confirms";
+    let pinned = match inputs.exporter.as_ref() {
+        None => unavailable_tile(PINNED),
+        Some(e) => match e.pinned_bytes {
+            Some(bytes) => Tile::new(PINNED, human_bytes(bytes), pinned_bytes_light(bytes))
                 .with_detail(match e.pinned_segments {
                     Some(n) => format!(
                         "{} file(s); measured at start-up and after each catch-up",
@@ -700,18 +835,13 @@ fn backlog_section(exporter: Option<&ExporterReadings>) -> Section {
                     ),
                     None => "measured at start-up and after each catch-up".to_string(),
                 }),
-                None => Tile::new(
-                    "Kept on disk until the database confirms",
-                    NOT_REPORTED,
-                    Light::Grey,
-                ),
-            },
-        ],
+            None => Tile::new(PINNED, NOT_REPORTED, Light::Grey),
+        },
     };
     Section {
         title: "Backlog waiting to be saved",
         note: "Data received but not yet confirmed by the database. Zero is best.".to_string(),
-        tiles,
+        tiles: vec![apply_lag_tile(inputs), pinned],
     }
 }
 
@@ -726,21 +856,37 @@ pub(crate) fn reconnects_light(reconnects: f64) -> Light {
     }
 }
 
-fn connections_section(exporter: Option<&ExporterReadings>, gaps: &QueryOutcome) -> Section {
-    let mut tiles = Vec::with_capacity(2);
-    tiles.push(match exporter {
-        None => unavailable_tile("Socket reconnects since the app started"),
+/// The live socket tile: sockets connected right now, from the feed's own
+/// count. Grey when the feed has not reported or the market is closed; red
+/// when none is connected while the market is open; else green. A green tile
+/// means at least one socket is up, not that every socket is.
+pub(crate) fn sockets_now_tile(market_open: bool, sockets_now: Option<u64>) -> Tile {
+    const LABEL: &str = "Feed sockets connected now";
+    match sockets_now {
+        None => Tile::new(LABEL, NOT_REPORTED, Light::Grey),
+        Some(n) if !market_open => {
+            Tile::new(LABEL, group_digits(n), Light::Grey).with_detail("market closed; no verdict")
+        }
+        Some(0) => Tile::new(LABEL, "0", Light::Red).with_detail("no socket is connected"),
+        Some(n) => Tile::new(LABEL, group_digits(n), Light::Green)
+            .with_detail("green means at least one is up"),
+    }
+}
+
+fn connections_section(inputs: &Inputs) -> Section {
+    const RECONNECTS: &str = "Socket reconnects since the app started";
+    const GAPS: &str = "Connection gaps closed today";
+    let mut tiles = Vec::with_capacity(3);
+    tiles.push(sockets_now_tile(inputs.market_open, inputs.sockets_now));
+    tiles.push(match inputs.exporter.as_ref() {
+        None => unavailable_tile(RECONNECTS),
         Some(e) => match e.reconnects {
-            Some(n) => Tile::new(
-                "Socket reconnects since the app started",
-                group_digits(as_count(n)),
-                reconnects_light(n),
-            ),
-            None => Tile::new("Socket reconnects since the app started", "0", Light::Green)
-                .with_detail("none counted yet"),
+            Some(n) => Tile::new(RECONNECTS, group_digits(as_count(n)), reconnects_light(n)),
+            // Absent also when the feed never dialled, so no verdict.
+            None => Tile::new(RECONNECTS, NOT_REPORTED, Light::Grey),
         },
     });
-    tiles.push(match gaps {
+    tiles.push(match &inputs.gaps {
         QueryOutcome::Rows { rows, .. } => {
             let first = rows.first();
             let count = first
@@ -751,19 +897,23 @@ fn connections_section(exporter: Option<&ExporterReadings>, gaps: &QueryOutcome)
                 .and_then(|r| r.get(1))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
+            // A gap is written when it closes, so 0 here says nothing about a
+            // socket that is down right now: no verdict on 0.
             Tile::new(
-                "Connection gaps today",
+                GAPS,
                 group_digits(count),
                 if count == 0 {
-                    Light::Green
+                    Light::Grey
                 } else {
                     Light::Amber
                 },
             )
-            .with_detail(format!("{} down in total", human_secs(down)))
+            .with_detail(format!(
+                "{} down in total; a gap still open is not counted",
+                human_secs(down)
+            ))
         }
-        other => Tile::new("Connection gaps today", "could not read", Light::Grey)
-            .with_detail(outcome_reason(other)),
+        other => Tile::new(GAPS, "could not read", Light::Grey).with_detail(outcome_reason(other)),
     });
     Section {
         title: "Connections",
@@ -775,27 +925,21 @@ fn connections_section(exporter: Option<&ExporterReadings>, gaps: &QueryOutcome)
 fn overflow_section(exporter: Option<&ExporterReadings>) -> Section {
     let tiles = match exporter {
         None => vec![
-            unavailable_tile("Candles waiting in overflow files"),
+            unavailable_tile("Candle overflow files on disk"),
             unavailable_tile("Candle files set aside"),
             unavailable_tile("Overflow write errors"),
         ],
         Some(e) => vec![
             match e.seal_spill_bytes {
+                // The figure includes files already written back (kept for a
+                // while) and set-aside files, so it carries no verdict.
                 Some(bytes) => Tile::new(
-                    "Candles waiting in overflow files",
+                    "Candle overflow files on disk",
                     human_bytes(bytes),
-                    if bytes <= 0.0 {
-                        Light::Green
-                    } else {
-                        Light::Amber
-                    },
-                )
-                .with_detail("written back to the database later"),
-                None => Tile::new(
-                    "Candles waiting in overflow files",
-                    NOT_REPORTED,
                     Light::Grey,
-                ),
+                )
+                .with_detail("includes files already written back; no verdict"),
+                None => Tile::new("Candle overflow files on disk", NOT_REPORTED, Light::Grey),
             },
             match e.seal_refused_files {
                 Some(n) => Tile::new(
@@ -1040,7 +1184,6 @@ async fn fetch_metrics_text(client: &reqwest::Client, url: Option<&str>) -> Opti
 pub(crate) struct ExporterReadings {
     /// Worst sample per step in the last 75 s, nanoseconds, by step index.
     pub stage_max_75s: [Option<u64>; 5],
-    pub apply_lag_max: Option<f64>,
     pub pinned_bytes: Option<f64>,
     pub pinned_segments: Option<f64>,
     /// Sum over every label set.
@@ -1097,7 +1240,6 @@ pub(crate) fn parse_metrics_text(text: &str) -> ExporterReadings {
                     out.stage_max_75s[i] = Some(as_count(value));
                 }
             }
-            APPLY_LAG_METRIC => max_into(&mut out.apply_lag_max, value),
             n if n == WAL_UNAPPLIED_PINNED_BYTES_GAUGE => max_into(&mut out.pinned_bytes, value),
             n if n == WAL_UNAPPLIED_PINNED_SEGMENTS_GAUGE => {
                 max_into(&mut out.pinned_segments, value);
@@ -1217,7 +1359,7 @@ pub(crate) fn group_digits(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -1275,6 +1417,8 @@ mod tests {
         Inputs {
             market_open,
             ist_now: IST_0930_25,
+            apply_lag: None,
+            sockets_now: None,
             stages: ALL_STAGES.map(empty_stage),
             exporter: None,
             ticks: QueryOutcome::Unreachable,
@@ -1465,21 +1609,83 @@ mod tests {
     #[test]
     fn test_ticks_light_red_amber_green_grey() {
         let mut full = vec![5u64; 15];
-        assert_eq!(ticks_light(true, Some(&full), IST_0930_25), Light::Green);
-        assert_eq!(ticks_light(false, Some(&full), IST_0930_25), Light::Grey);
-        assert_eq!(ticks_light(true, None, IST_0930_25), Light::Grey);
+        assert_eq!(
+            ticks_light(true, Some(&full), IST_0930_25, true),
+            Light::Green
+        );
+        assert_eq!(
+            ticks_light(false, Some(&full), IST_0930_25, true),
+            Light::Grey
+        );
+        assert_eq!(ticks_light(true, None, IST_0930_25, true), Light::Grey);
         full[3] = 0;
-        assert_eq!(ticks_light(true, Some(&full), IST_0930_25), Light::Amber);
+        assert_eq!(
+            ticks_light(true, Some(&full), IST_0930_25, true),
+            Light::Amber
+        );
         full[14] = 0;
-        assert_eq!(ticks_light(true, Some(&full), IST_0930_25), Light::Red);
-        // At 09:20 the window starts at 09:05: quiet minutes before 09:15
-        // (the pre-open) are not a fault.
+        assert_eq!(
+            ticks_light(true, Some(&full), IST_0930_25, true),
+            Light::Red
+        );
+        // The same empty minute while the database is behind: not "lost".
+        assert_eq!(
+            ticks_light(true, Some(&full), IST_0930_25, false),
+            Light::Amber
+        );
+        // At 09:20 the window starts at 09:05: quiet pre-open minutes are
+        // not a fault.
         let at_0920 = IST_0930_25 - 10 * 60;
         let mut early = vec![0u64; 15];
         for n in early.iter_mut().skip(10) {
             *n = 3;
         }
-        assert_eq!(ticks_light(true, Some(&early), at_0920), Light::Green);
+        assert_eq!(ticks_light(true, Some(&early), at_0920, true), Light::Green);
+    }
+
+    #[test]
+    fn test_ticks_light_gives_no_verdict_outside_continuous_trading() {
+        let empty = vec![0u64; 15];
+        // 09:00:30 (last full minute 08:59), 09:05 (pre-open), 15:35 and
+        // 15:39 (closing session): the market is "open" but no trade is due.
+        for ist in [
+            IST_0930_25 - 29 * 60 - 55,
+            IST_0930_25 - 25 * 60,
+            IST_0930_25 + 6 * 3_600 + 5 * 60,
+            IST_0930_25 + 6 * 3_600 + 9 * 60,
+        ] {
+            assert_eq!(
+                ticks_light(true, Some(&empty), ist, true),
+                Light::Grey,
+                "at {}",
+                ist_literal(ist)
+            );
+        }
+        // 09:16:05: the last full minute 09:15 is judged.
+        assert_eq!(
+            ticks_light(true, Some(&empty), IST_0930_25 - 14 * 60 - 20, true),
+            Light::Red
+        );
+        // 15:30:10: the last full minute 15:29 is still judged.
+        assert_eq!(
+            ticks_light(true, Some(&empty), IST_0930_25 + 6 * 3_600 - 15, true),
+            Light::Red
+        );
+    }
+
+    #[test]
+    fn test_in_continuous_trading_edges_and_close_constant() {
+        let day = ist_day_at(IST_0930_25, 0);
+        assert!(!in_continuous_trading(day + 9 * 3_600 + 14 * 60));
+        assert!(in_continuous_trading(day + 9 * 3_600 + 15 * 60));
+        assert!(in_continuous_trading(day + 15 * 3_600 + 29 * 60));
+        assert!(!in_continuous_trading(day + 15 * 3_600 + 30 * 60));
+        let close = tickvault_common::constants::MARKET_CLOSE_TIME_IST_EXCLUSIVE;
+        let parsed = chrono::NaiveTime::parse_from_str(close, "%H:%M:%S").expect("time");
+        assert_eq!(
+            i64::from(chrono::Timelike::num_seconds_from_midnight(&parsed)),
+            CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST
+        );
     }
 
     #[test]
@@ -1574,7 +1780,6 @@ garbage line without a number x
             Some(1_048_576)
         );
         assert_eq!(r.stage_max_75s[Stage::RingDwell as usize], None);
-        assert_eq!(r.apply_lag_max, Some(42.0));
         assert_eq!(r.pinned_bytes, Some(1_073_741_824.0));
         assert_eq!(r.pinned_segments, Some(8.0));
         assert_eq!(r.reconnects, Some(3.0), "summed over label sets");
@@ -1589,7 +1794,6 @@ garbage line without a number x
         // The literals here must equal what the producers publish; the
         // exported constants are used directly where they exist.
         assert_eq!(STAGE_MAX_75S_METRIC, "tv_hot_path_stage_max_ns_75s");
-        assert_eq!(APPLY_LAG_METRIC, "tv_questdb_wal_apply_lag_max");
         assert_eq!(SEAL_SPILL_BYTES_METRIC, "tv_seal_spill_bytes");
         assert_eq!(
             SEAL_SPILL_WRITE_ERRORS_METRIC,
@@ -1632,11 +1836,11 @@ garbage line without a number x
     #[test]
     fn test_apply_lag_light_pinned_bytes_light_reconnects_light_conservation_light_conservation_word()
      {
-        assert_eq!(apply_lag_light(0.0), Light::Green);
-        assert_eq!(apply_lag_light(10.0), Light::Green);
-        assert_eq!(apply_lag_light(11.0), Light::Amber);
-        assert_eq!(apply_lag_light(500.0), Light::Amber);
-        assert_eq!(apply_lag_light(501.0), Light::Red);
+        assert_eq!(apply_lag_light(0), Light::Green);
+        assert_eq!(apply_lag_light(10), Light::Green);
+        assert_eq!(apply_lag_light(11), Light::Amber);
+        assert_eq!(apply_lag_light(500), Light::Amber);
+        assert_eq!(apply_lag_light(501), Light::Red);
         assert_eq!(pinned_bytes_light(0.0), Light::Green);
         assert_eq!(pinned_bytes_light(1.0), Light::Amber);
         assert_eq!(pinned_bytes_light(PINNED_BYTES_RED_MIN), Light::Red);
@@ -1688,21 +1892,122 @@ garbage line without a number x
                 ],
             ],
         );
-        let section = conservation_section(&outcome);
-        assert_eq!(section.tiles.len(), 2);
-        assert_eq!(section.tiles[0].label, "2026-10-29 · dhan");
-        assert_eq!(section.tiles[0].value, "every tick counted");
+        let section = conservation_section(&outcome, IST_0930_25);
+        assert_eq!(section.tiles.len(), 3);
+        assert_eq!(section.tiles[0].label, "Newest daily tick check");
+        assert_eq!(section.tiles[0].value, "1 day ago");
         assert_eq!(section.tiles[0].status, Light::Green);
-        assert!(section.tiles[0].detail.contains("received 64,349,753"));
-        assert_eq!(section.tiles[1].status, Light::Amber);
-        assert!(section.tiles[1].detail.contains("in the database unknown"));
-        assert!(section.tiles[1].detail.contains("short by -3"));
+        assert_eq!(section.tiles[1].label, "2026-10-29 · dhan");
+        assert_eq!(section.tiles[1].value, "every tick counted");
+        assert_eq!(section.tiles[1].status, Light::Green);
+        assert!(section.tiles[1].detail.contains("received 64,349,753"));
+        assert_eq!(section.tiles[2].status, Light::Amber);
+        assert!(section.tiles[2].detail.contains("in the database unknown"));
+        assert!(section.tiles[2].detail.contains("short by -3"));
+        assert!(section.tiles[2].detail.contains("reason db unreadable"));
 
-        let none = conservation_section(&rows(&["verdict"], vec![]));
+        // The same rows read eight days later: old greens, so the freshness
+        // tile goes amber.
+        let late = conservation_section(&outcome, IST_0930_25 + 7 * 86_400);
+        assert_eq!(late.tiles[0].value, "8 days ago");
+        assert_eq!(late.tiles[0].status, Light::Amber);
+
+        let none = conservation_section(&rows(&["verdict"], vec![]), IST_0930_25);
         assert_eq!(none.tiles[0].value, "no check in 14 days");
         assert_eq!(none.tiles[0].status, Light::Grey);
-        let down = conservation_section(&QueryOutcome::Unreachable);
+        let down = conservation_section(&QueryOutcome::Unreachable, IST_0930_25);
         assert_eq!(down.tiles[0].status, Light::Grey);
+    }
+
+    #[test]
+    fn test_apply_lag_tile_database_caught_up_and_database_not_answering() {
+        let mut inputs = all_down_inputs(true);
+        // A last reading of 0 taken before the database stopped answering is
+        // not shown green.
+        inputs.apply_lag = Some(0);
+        assert!(database_not_answering(&inputs));
+        assert!(!database_caught_up(&inputs));
+        let stale = apply_lag_tile(&inputs);
+        assert_eq!(
+            (stale.value.as_str(), stale.status),
+            ("not known", Light::Grey)
+        );
+        // The database answers: the reading counts.
+        inputs.gaps = rows(&["count", "sum"], vec![vec![Value::from(0), Value::Null]]);
+        assert!(!database_not_answering(&inputs));
+        assert!(database_caught_up(&inputs));
+        let live = apply_lag_tile(&inputs);
+        assert_eq!(
+            (live.value.as_str(), live.status),
+            ("0 transactions", Light::Green)
+        );
+        inputs.apply_lag = Some(11);
+        assert!(!database_caught_up(&inputs));
+        assert_eq!(apply_lag_tile(&inputs).status, Light::Amber);
+        // Unknown (watcher blind) is grey, not 0.
+        inputs.apply_lag = None;
+        assert!(!database_caught_up(&inputs));
+        let unknown = apply_lag_tile(&inputs);
+        assert_eq!(
+            (unknown.value.as_str(), unknown.status),
+            ("not known", Light::Grey)
+        );
+    }
+
+    #[test]
+    fn test_sockets_now_tile_every_case() {
+        assert_eq!(sockets_now_tile(true, None).status, Light::Grey);
+        assert_eq!(sockets_now_tile(false, Some(0)).status, Light::Grey);
+        assert_eq!(sockets_now_tile(true, Some(0)).status, Light::Red);
+        let up = sockets_now_tile(true, Some(16));
+        assert_eq!((up.value.as_str(), up.status), ("16", Light::Green));
+    }
+
+    #[test]
+    fn test_connections_section_absent_counter_and_zero_closed_gaps_are_grey() {
+        let mut inputs = all_down_inputs(true);
+        inputs.exporter = Some(ExporterReadings::default());
+        inputs.gaps = rows(&["count", "sum"], vec![vec![Value::from(0), Value::Null]]);
+        let section = connections_section(&inputs);
+        assert_eq!(section.tiles.len(), 3);
+        for tile in &section.tiles {
+            assert_eq!(
+                tile.status,
+                Light::Grey,
+                "{} must carry no verdict",
+                tile.label
+            );
+        }
+        assert_eq!(section.tiles[1].value, NOT_REPORTED);
+        assert_eq!(section.tiles[2].value, "0");
+    }
+
+    #[test]
+    fn test_conservation_freshness_tile_unknown_day_and_today() {
+        let cols = vec!["trading_date_ist".to_string()];
+        let unknown = conservation_freshness_tile(&cols, &[vec![Value::Null]], IST_0930_25);
+        assert_eq!(
+            (unknown.value.as_str(), unknown.status),
+            ("unknown day", Light::Grey)
+        );
+        let today = conservation_freshness_tile(
+            &cols,
+            &[vec![json_str("2026-10-30T00:00:00.000000Z")]],
+            IST_0930_25,
+        );
+        assert_eq!(
+            (today.value.as_str(), today.status),
+            ("today", Light::Green)
+        );
+        let four = conservation_freshness_tile(
+            &cols,
+            &[vec![json_str("2026-10-26T00:00:00.000000Z")]],
+            IST_0930_25,
+        );
+        assert_eq!(
+            (four.value.as_str(), four.status),
+            ("4 days ago", Light::Green)
+        );
     }
 
     #[test]
@@ -1744,6 +2049,8 @@ garbage line without a number x
             vec![vec![Value::from(2), Value::from(75)]],
         );
         inputs.minute_table = QueryOutcome::Missing;
+        inputs.apply_lag = Some(42);
+        inputs.sockets_now = Some(3);
         let resp = build_sections(&inputs);
         let by_label = |label: &str| {
             all_tiles(&resp)
@@ -1752,7 +2059,7 @@ garbage line without a number x
                 .unwrap_or_else(|| panic!("no tile {label}"))
                 .clone()
         };
-        let last = by_label("Trades saved in the last full minute");
+        let last = by_label("Trades readable in the database, last full minute");
         assert_eq!((last.value.as_str(), last.status), ("1,000", Light::Green));
         let lag = by_label("Database catch-up queue");
         assert_eq!(
@@ -1770,15 +2077,23 @@ garbage line without a number x
             (reconnects.value.as_str(), reconnects.status),
             ("3", Light::Amber)
         );
-        let gaps = by_label("Connection gaps today");
+        let gaps = by_label("Connection gaps closed today");
         assert_eq!((gaps.value.as_str(), gaps.status), ("2", Light::Amber));
-        assert_eq!(gaps.detail, "1m 15s down in total");
+        assert_eq!(
+            gaps.detail,
+            "1m 15s down in total; a gap still open is not counted"
+        );
+        let sockets = by_label("Feed sockets connected now");
+        assert_eq!(
+            (sockets.value.as_str(), sockets.status),
+            ("3", Light::Green)
+        );
         let refused = by_label("Candle files set aside");
         assert_eq!(refused.status, Light::Grey, "NaN reads as not reported");
-        let overflow = by_label("Candles waiting in overflow files");
+        let overflow = by_label("Candle overflow files on disk");
         assert_eq!(
             (overflow.value.as_str(), overflow.status),
-            ("0 bytes", Light::Green)
+            ("0 bytes", Light::Grey)
         );
         let record = by_label("Per-minute speed record");
         assert_eq!(
@@ -2005,15 +2320,12 @@ garbage line without a number x
             text.contains("ticks missing"),
             "conservation row read: {text}"
         );
-        assert!(
-            text.contains("42 transactions"),
-            "metrics page read: {text}"
-        );
+        assert!(text.contains("1.0 GB"), "metrics page read: {text}");
         assert!(
             text.contains("not yet available"),
             "minute table missing: {text}"
         );
-        assert!(text.contains("Connection gaps today"), "{text}");
+        assert!(text.contains("Connection gaps closed today"), "{text}");
         // 4 queries + table_columns + the metrics page; the missing minute
         // table is never queried for rows.
         let after_first = served.load(Ordering::SeqCst);
@@ -2039,7 +2351,14 @@ garbage line without a number x
     }
 
     #[test]
-    fn test_set_metrics_scrape_url_first_wins_and_speed_health_cache_starts_empty() {
+    fn test_set_metrics_scrape_url_first_wins_and_speed_health_cache_and_speed_health_refresh() {
+        // The single-flight lock is free when nothing computes.
+        assert!(
+            test_state_with_port(1)
+                .speed_health_refresh()
+                .try_lock()
+                .is_ok()
+        );
         let state = test_state_with_port(1);
         assert_eq!(state.metrics_scrape_url(), None);
         assert!(state.speed_health_cache().get().is_none());

@@ -166,6 +166,20 @@ async function getJson(url) {
   }
 }
 
+// The speed panel needs the token. With none, or after one refusal, it is not
+// asked again until Save, so an open tab cannot pile up refused requests.
+let speedDenied = false;
+async function getSpeed() {
+  if (!tokenEl.value.trim() || speedDenied) return null;
+  try {
+    const res = await fetch("/api/debug/speed-health", { headers: authHeaders() });
+    if (res.status === 401) { speedDenied = true; return null; }
+    return res.ok ? await res.json() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // In-flight guard: the 5s auto-refresh and a manual Save never overlap.
 let refreshing = false;
 async function refresh() {
@@ -177,7 +191,7 @@ async function refresh() {
       getJson("/api/feeds"),
       getJson("/api/feeds/health"),
       getJson("/api/stats"),
-      getJson("/api/debug/speed-health"),
+      getSpeed(),
     ]);
     renderOverall(health);
     renderFeeds(feeds, feedsHealth);
@@ -289,7 +303,9 @@ function renderStats(stats) {
 function renderSpeed(speed) {
   speedEl.replaceChildren();
   if (!speed || !speed.sections) {
-    speedEl.appendChild(el("div", "card", "— could not read speed and health."));
+    speedEl.appendChild(el("div", "card", speedDenied || !tokenEl.value.trim()
+      ? "— enter the API token above and press Save to see speed and health."
+      : "— could not read speed and health."));
     return;
   }
   for (const s of speed.sections) {
@@ -307,6 +323,7 @@ function renderSpeed(speed) {
 }
 
 document.getElementById("save").addEventListener("click", () => {
+  speedDenied = false;
   sessionStorage.setItem("tv_api_token", tokenEl.value.trim());
   refresh();
 });
@@ -485,6 +502,27 @@ mod tests {
                 "speed panel marker missing: {marker}"
             );
         }
+    }
+
+    #[test]
+    fn test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal() {
+        // Every 401 on the bearer-gated route counts toward the brute-force
+        // page (Sum >= 25 per 5 min). A tab with no token, or a stale one,
+        // must not poll it every 5 s: no token, no request; one 401 stops it
+        // until Save.
+        for marker in [
+            "if (!tokenEl.value.trim() || speedDenied) return null;",
+            "if (res.status === 401) { speedDenied = true; return null; }",
+            "  speedDenied = false;\n  sessionStorage.setItem",
+            "getSpeed(),",
+        ] {
+            assert!(DASHBOARD_HTML.contains(marker), "missing: {marker}");
+        }
+        assert_eq!(
+            DASHBOARD_HTML.matches("/api/debug/speed-health").count(),
+            1,
+            "the gated route is fetched in exactly one place, behind the token check"
+        );
     }
 
     #[test]
