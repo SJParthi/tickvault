@@ -15,8 +15,12 @@ mod cov_xvs_support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cov_xvs_support::{FakeQuestDb, TempRoot, init_tracing, is_weekday, ist_now, weekday_calendar};
+use cov_xvs_support::{
+    CwdGuard, FakeQuestDb, drive_paused, init_no_proxy, init_tracing, is_weekday, ist_now,
+    lock_cwd, weekday_calendar,
+};
 use tickvault_app::expiry_scope_check::spawn_expiry_scope_check;
+use tickvault_storage::expiry_scope_audit_persistence::EXPIRY_SCOPE_AUDIT_TABLE;
 
 fn responder() -> cov_xvs_support::ExecResponder {
     Arc::new(|q: &str| {
@@ -50,29 +54,20 @@ fn write_artifact(root: &std::path::Path, day: chrono::NaiveDate) {
 
 #[tokio::test(start_paused = true)]
 async fn test_expiry_scope_check_spawn_expiry_scope_check_writes_a_partial_row_on_a_weekday() {
+    init_no_proxy();
     init_tracing();
-    let original_cwd = std::env::current_dir().expect("cwd");
-    let root = TempRoot::new("expiry-spawn");
+    let _cwd_lock = lock_cwd().await;
     let (today, _) = ist_now();
-    write_artifact(&root.path, today);
-    std::env::set_current_dir(&root.path).expect("chdir temp");
+    let cwd = CwdGuard::enter("expiry-spawn");
+    write_artifact(cwd.path(), today);
 
     let srv = FakeQuestDb::start(responder());
     let handle = spawn_expiry_scope_check(srv.questdb_config(), weekday_calendar());
 
-    let real_start = std::time::Instant::now();
-    let mut found: Option<String> = None;
-    while real_start.elapsed() < Duration::from_secs(3) {
-        tokio::time::sleep(Duration::from_secs(600)).await;
-        found = srv
-            .writes()
-            .iter()
-            .flat_map(|w| w.lines().map(str::to_owned).collect::<Vec<_>>())
-            .find(|l| l.starts_with("expiry_scope_audit"));
-        if found.is_some() {
-            break;
-        }
-    }
+    // 17 h of virtual time reaches the 15:50 IST check from any start (and a
+    // weekday after 15:50 runs it at once); the loop stops at the first row.
+    let rows = || srv.ilp_lines(EXPIRY_SCOPE_AUDIT_TABLE);
+    drive_paused(&srv, Duration::from_secs(17 * 3_600), || !rows().is_empty()).await;
     assert!(
         !handle.is_finished(),
         "the daily loop never ends on its own"
@@ -81,21 +76,46 @@ async fn test_expiry_scope_check_spawn_expiry_scope_check_writes_a_partial_row_o
     let join = handle.await.expect_err("aborted task");
     assert!(join.is_cancelled(), "the task was cancelled, not panicked");
 
-    std::env::set_current_dir(&original_cwd).expect("chdir back");
-    root.cleanup();
+    let found = rows();
+    let queries = srv.exec_queries();
+    let requests = srv.request_lines();
+    drop(cwd);
+
+    // Every day: the task ensures its table first, and never calls Dhan.
+    assert!(
+        queries
+            .iter()
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS expiry_scope_audit")),
+        "the audit table DDL reached /exec: {queries:?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains("/v2/charts/intraday")),
+        "the vendor is never called: {requests:?}"
+    );
+    assert!(found.len() <= 1, "at most one row per day: {found:?}");
 
     let (end_day, _) = ist_now();
     if end_day != today {
         return; // crossed IST midnight during the test; no stable expectation
     }
+    let candle_read = format!("from candles_1m where ts in '{}'", today.format("%Y-%m-%d"));
     if is_weekday(today) {
-        let line = found.expect("a weekday run writes one expiry_scope_audit row");
+        assert_eq!(found.len(), 1, "a weekday run writes one row: {found:?}");
+        let line = &found[0];
         assert!(line.contains("feed=dhan"), "{line}");
         assert!(
             line.contains("verdict=partial"),
             "an under-specified day is never clean nor a violation: {line}"
         );
+        assert!(
+            queries.iter().any(|q| q.contains(&candle_read)),
+            "today's candle read reached /exec: {queries:?}"
+        );
     } else {
-        assert!(found.is_none(), "a weekend writes no row: {found:?}");
+        assert!(found.is_empty(), "a weekend writes no row: {found:?}");
+        assert!(
+            !queries.iter().any(|q| q.contains("candles_1m")),
+            "a weekend reads no candles: {queries:?}"
+        );
     }
 }
