@@ -1638,6 +1638,75 @@ pub struct AttemptStamp {
     /// `MAX_MARKER_REST_FAILURE_PERCENT` of the vendor fetches failed, budget
     /// not spent, live read not truncated.
     pub run_complete: bool,
+    /// How much of the session the attempt's targets were subscribed for
+    /// (plan item 51e, §12.15.13). Written on the daily row.
+    pub coverage: XverifyCoverage,
+}
+
+/// How much of the session a run's targets were subscribed for, in
+/// instrument-minutes (plan item 51e, §12.15.13).
+///
+/// `planned` is every target times [`SESSION_MINUTES`]: a target first
+/// subscribed at 15:29 still plans the whole session, so it can never read as
+/// full coverage. `covered` counts, per target, the session minutes that start
+/// at or after its first subscribed second of the day, from the day's own
+/// record (earliest across processes, so a restart keeps the earlier second).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XverifyCoverage {
+    /// Targets times [`SESSION_MINUTES`].
+    pub planned_instrument_minutes: i64,
+    /// Session minutes each target was subscribed for, summed.
+    pub covered_instrument_minutes: i64,
+    /// The targets came from the day's own record. `false` when the record
+    /// was absent or unreadable: the targets are then the boot set and
+    /// `covered_instrument_minutes` is 0.
+    pub known: bool,
+    /// The day's record holds only the four-index fallback (plan item 51f).
+    pub index_fallback_day: bool,
+}
+
+impl XverifyCoverage {
+    /// Every planned minute is covered, from a known record. O(1).
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.known && self.covered_instrument_minutes >= self.planned_instrument_minutes
+    }
+}
+
+/// Session minutes, of the compared window `[open, close)`, that start at or
+/// after `first_secs_of_day`: a minute already running when the subscribe
+/// happened is not counted. Pure, O(1).
+#[must_use]
+pub const fn session_minutes_subscribed(first_secs_of_day: u32) -> i64 {
+    let first = first_secs_of_day as i64;
+    let start = if first <= SESSION_OPEN_SECS_OF_DAY_IST {
+        SESSION_OPEN_SECS_OF_DAY_IST
+    } else {
+        // Round up to the next minute boundary.
+        (first + SECS_PER_MINUTE - 1) / SECS_PER_MINUTE * SECS_PER_MINUTE
+    };
+    if start >= SESSION_CLOSE_SECS_OF_DAY_IST {
+        0
+    } else {
+        (SESSION_CLOSE_SECS_OF_DAY_IST - start) / SECS_PER_MINUTE
+    }
+}
+
+/// Plan item 51f (§12.15.14): a run whose targets were not subscribed for the
+/// whole session (or whose coverage is unknown, or on the four-index fallback
+/// day) cannot read `clean`; it reads `partial`. Every other outcome, `diverged`
+/// above all, is returned unchanged. Pure, O(1).
+#[must_use]
+pub const fn downgrade_for_coverage(
+    outcome: DhanLiveXverifyOutcome,
+    coverage: XverifyCoverage,
+) -> DhanLiveXverifyOutcome {
+    match outcome {
+        DhanLiveXverifyOutcome::Clean if !coverage.is_full() || coverage.index_fallback_day => {
+            DhanLiveXverifyOutcome::Partial
+        }
+        other => other,
+    }
 }
 
 /// Build the daily audit row from a comparison. Pure.
@@ -1672,6 +1741,9 @@ pub fn daily_row(
         attempt_at_ist_nanos: attempt.at_ist_nanos,
         run_complete: attempt.run_complete,
         missing_minutes_would_page: cmp.missing_minutes_would_page,
+        planned_instrument_minutes: attempt.coverage.planned_instrument_minutes,
+        covered_instrument_minutes: attempt.coverage.covered_instrument_minutes,
+        coverage_known: attempt.coverage.known,
     }
 }
 
@@ -2834,6 +2906,12 @@ mod tests {
     const TEST_ATTEMPT: AttemptStamp = AttemptStamp {
         at_ist_nanos: 7,
         run_complete: true,
+        coverage: XverifyCoverage {
+            planned_instrument_minutes: 0,
+            covered_instrument_minutes: 0,
+            known: true,
+            index_fallback_day: false,
+        },
     };
 
     // =======================================================================
@@ -4024,6 +4102,12 @@ mod tests {
         let attempt = AttemptStamp {
             at_ist_nanos: RUN_TS + 13 * 60 * 1_000_000_000,
             run_complete: true,
+            coverage: XverifyCoverage {
+                planned_instrument_minutes: 770,
+                covered_instrument_minutes: 396,
+                known: true,
+                index_fallback_day: false,
+            },
         };
         let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, attempt);
         assert_eq!(row.trading_date_ist_nanos, DAY_START_NANOS);
@@ -5972,6 +6056,103 @@ mod tests {
         let cmp = unscoped(&live, &rest, strict_inputs(false));
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
         assert!(format_summary_line(&cmp).contains("0 minute(s) not yet judged"));
+    }
+
+    /// Plan item 51e (§12.15.13): minutes counted from the first whole minute
+    /// at or after the subscribe second.
+    #[test]
+    fn session_minutes_subscribed_counts_whole_minutes_from_the_subscribe() {
+        let full = SESSION_MINUTES as i64;
+        let open = SESSION_OPEN_SECS_OF_DAY_IST as u32;
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST as u32;
+        assert_eq!(session_minutes_subscribed(0), full);
+        assert_eq!(session_minutes_subscribed(open), full);
+        assert_eq!(
+            session_minutes_subscribed(open + 1),
+            full - 1,
+            "a running minute is not counted"
+        );
+        assert_eq!(session_minutes_subscribed(open + 60), full - 1);
+        assert_eq!(session_minutes_subscribed(close - 60), 1);
+        assert_eq!(session_minutes_subscribed(close - 59), 0);
+        assert_eq!(session_minutes_subscribed(close), 0);
+        assert_eq!(session_minutes_subscribed(u32::MAX), 0);
+        // A widen at 15:29 covers 15:29..close only.
+        let w = 15 * 3_600 + 29 * 60;
+        assert_eq!(
+            session_minutes_subscribed(w),
+            (SESSION_CLOSE_SECS_OF_DAY_IST - i64::from(w)) / 60
+        );
+        // Monotone: a later subscribe never covers more.
+        let mut prev = full;
+        for s in (0..86_400_u32).step_by(7) {
+            let m = session_minutes_subscribed(s);
+            assert!(m <= prev && (0..=full).contains(&m));
+            prev = m;
+        }
+    }
+
+    /// Plan item 51f (§12.15.14): only `clean` is ever downgraded, and only to
+    /// `partial`; `diverged` is never touched, over every coverage shape.
+    #[test]
+    fn downgrade_for_coverage_never_touches_diverged() {
+        let outcomes = [
+            DhanLiveXverifyOutcome::Clean,
+            DhanLiveXverifyOutcome::Diverged,
+            DhanLiveXverifyOutcome::Partial,
+            DhanLiveXverifyOutcome::Degraded,
+            DhanLiveXverifyOutcome::Blind,
+            DhanLiveXverifyOutcome::NoData,
+        ];
+        for outcome in outcomes {
+            for known in [false, true] {
+                for fallback in [false, true] {
+                    for covered in [0_i64, 384, 385] {
+                        let c = XverifyCoverage {
+                            planned_instrument_minutes: 385,
+                            covered_instrument_minutes: covered,
+                            known,
+                            index_fallback_day: fallback,
+                        };
+                        let got = downgrade_for_coverage(outcome, c);
+                        let short = !c.is_full() || fallback;
+                        let want = if outcome == DhanLiveXverifyOutcome::Clean && short {
+                            DhanLiveXverifyOutcome::Partial
+                        } else {
+                            outcome
+                        };
+                        assert_eq!(got, want, "{outcome:?} {c:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plan item 51e: the coverage rides the daily row unchanged.
+    #[test]
+    fn daily_row_carries_the_coverage() {
+        let b = bar(100.0, 101.0, 99.0, 100.5);
+        let cmp = compare_day(
+            &[side(13, OPEN, b)],
+            &[side(13, OPEN, b)],
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            false,
+        );
+        let attempt = AttemptStamp {
+            coverage: XverifyCoverage {
+                planned_instrument_minutes: 770,
+                covered_instrument_minutes: 396,
+                known: false,
+                index_fallback_day: false,
+            },
+            ..TEST_ATTEMPT
+        };
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, attempt);
+        assert_eq!(row.planned_instrument_minutes, 770);
+        assert_eq!(row.covered_instrument_minutes, 396);
+        assert!(!row.coverage_known);
     }
 
     #[test]
