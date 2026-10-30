@@ -34,8 +34,14 @@
 //!   task stuck in synchronous code (a blocking syscall on a runtime worker)
 //!   is reported but cannot be aborted; it keeps its worker until the call
 //!   returns.
-//! * The seal writer ([`WatchedTask::SealWriter`]) owns state that cannot be
-//!   rebuilt, so it is watched and never respawned.
+//! * Only the API token reload is ever respawned on missed beats (see
+//!   [`WatchedTask::respawnable`]). The seal writer and the WAL suspension
+//!   watcher hold state a fresh copy would lose, and the OOM, resource and
+//!   spill-disk monitors get stuck in blocking probes an abort cannot
+//!   cancel (a respawn would leak a blocking-pool thread per cycle), so for
+//!   them missed beats are reported and counted, never acted on.
+//! * A missed-beats respawn of the token reload is counted on the existing
+//!   `tv_api_token_reload_respawn_total{reason="missed_beats"}` too.
 //! * The publisher runs on the `tv-task-watch` thread
 //!   ([`crate::memory_watchdog::spawn_watch_thread`]), not on `tv-telemetry`:
 //!   that thread's file belongs to another change in flight. Moving the one
@@ -143,11 +149,21 @@ impl WatchedTask {
     }
 
     /// Whether a stuck task may be aborted for its supervisor to respawn.
-    /// False for the seal writer: its runner holds the sealed-candle ring
-    /// and cannot be rebuilt by a fresh spawn.
+    ///
+    /// Only the API token reload: it holds nothing but its warning latches,
+    /// and its one await (an SSM read over HTTP) is cancelled cleanly by an
+    /// abort. Every other watched task is watch-only (hostile review,
+    /// 2026-10-30):
+    /// * the seal writer's runner holds the sealed-candle ring;
+    /// * the WAL suspension watcher holds the lag and suspension latches the
+    ///   applied watermark depends on, so a fresh copy would read QuestDB as
+    ///   clean while a table is still behind;
+    /// * the OOM, resource and spill-disk monitors get stuck in a blocking
+    ///   probe (`statvfs`, a `/proc` read) that an abort cannot cancel, so a
+    ///   respawn would leak one blocking-pool thread per cycle.
     #[must_use]
     pub const fn respawnable(self) -> bool {
-        !matches!(self, Self::SealWriter)
+        matches!(self, Self::ApiTokenReload)
     }
 }
 
@@ -438,9 +454,11 @@ pub async fn await_watched_with<T>(
                 }
                 if respawn && task.respawnable() {
                     handle.abort();
-                    // Wait for the abort to land so two copies never run.
-                    let _aborted: Result<T, tokio::task::JoinError> = (&mut handle).await;
-                    return WatchedExit::MissedBeats;
+                    // Wait for the abort to land so two copies never run. A
+                    // task that ended on its own between the check and the
+                    // abort (returned or panicked) reports that, not a
+                    // missed beat.
+                    return exit_after_abort((&mut handle).await);
                 }
                 if !counted_episode {
                     counted_episode = true;
@@ -452,6 +470,17 @@ pub async fn await_watched_with<T>(
                 }
             }
         }
+    }
+}
+
+/// PURE: what an aborted task's join result means. Only a cancellation is
+/// the abort landing; a return or a panic that won the race is reported as
+/// what it was.
+#[must_use]
+pub fn exit_after_abort<T>(joined: Result<T, tokio::task::JoinError>) -> WatchedExit<T> {
+    match joined {
+        Err(e) if e.is_cancelled() => WatchedExit::MissedBeats,
+        other => WatchedExit::Joined(other),
     }
 }
 
@@ -495,9 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn test_respawnable_is_false_only_for_the_seal_writer() {
+    fn test_respawnable_is_true_only_for_the_api_token_reload() {
         for task in ALL_WATCHED_TASKS {
-            assert_eq!(task.respawnable(), task != WatchedTask::SealWriter);
+            assert_eq!(
+                task.respawnable(),
+                task == WatchedTask::ApiTokenReload,
+                "{}",
+                task.as_str()
+            );
         }
     }
 
@@ -631,7 +665,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let exit = await_watched_with(
-            WatchedTask::OomMonitor,
+            WatchedTask::ApiTokenReload,
             handle,
             true,
             Duration::from_millis(5),
@@ -662,6 +696,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_wal_suspension_watcher_is_never_aborted_even_with_respawn_on() {
+        // Hostile review 2026-10-30: a fresh copy would lose the lag and
+        // suspension latches and read QuestDB as clean.
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let watched = tokio::spawn(await_watched_with(
+            WatchedTask::WalSuspensionWatcher,
+            handle,
+            true,
+            Duration::from_millis(5),
+            far_future,
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!watched.is_finished(), "watch-only: never aborted");
+        watched.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exit_after_abort_reports_a_panic_or_return_that_won_the_race() {
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        let exit: WatchedExit<()> = exit_after_abort(panicked);
+        assert_eq!(exit.reason(), "panic");
+        let returned = tokio::spawn(async { 3u8 }).await;
+        assert!(matches!(
+            exit_after_abort(returned),
+            WatchedExit::Joined(Ok(3))
+        ));
+        let pending = tokio::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending.await;
+        assert!(matches!(
+            exit_after_abort(cancelled),
+            WatchedExit::MissedBeats
+        ));
+    }
+
+    #[tokio::test]
     async fn the_seal_writer_is_never_aborted_even_with_respawn_on() {
         let handle = tokio::spawn(std::future::pending::<()>());
         let watched = tokio::spawn(await_watched_with(
@@ -680,7 +750,7 @@ mod tests {
     async fn a_healthy_task_is_never_aborted() {
         let handle = tokio::spawn(std::future::pending::<()>());
         let watched = tokio::spawn(await_watched_with(
-            WatchedTask::ResourceMonitor,
+            WatchedTask::ApiTokenReload,
             handle,
             true,
             Duration::from_millis(5),

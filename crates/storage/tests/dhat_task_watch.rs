@@ -29,6 +29,12 @@ mod dhat_support;
 
 const GIB: u64 = 1 << 30;
 
+/// Allocation blocks allowed over 1,023 unreadable polls: 10 throttled
+/// warnings with no tracing subscriber installed. With no subscriber a
+/// `warn!` builds nothing, so this is normally 0; the room is for a test
+/// harness that installs one. 8 blocks a line, far below one per poll.
+const UNREADABLE_LOG_LINE_BLOCKS: u64 = 80;
+
 #[test]
 fn dhat_heartbeat_beat_publish_and_memory_poll_are_zero_allocation() {
     // Warm up: fix the anchor, resolve every handle, and take one read so
@@ -50,6 +56,17 @@ fn dhat_heartbeat_beat_publish_and_memory_poll_are_zero_allocation() {
         Some(10 * GIB),
     );
     let _ = dog.step(Some(8 * GIB + GIB / 2), 0, true);
+    // A second watchdog for unreadable polls: the first one resolves the
+    // probe-failed counter and logs once (power-of-two throttle), outside
+    // the window.
+    let mut blind = MemoryWatchdog::new(
+        MemoryWatchdogConfig {
+            mode: MemoryWatchdogMode::Shadow,
+            ..MemoryWatchdogConfig::default()
+        },
+        Some(10 * GIB),
+    );
+    let _ = blind.step(None, 0, true);
     assert_eq!(dog.level(), PressureLevel::Shed);
 
     let _profiler = dhat::Profiler::builder().testing().build();
@@ -111,4 +128,41 @@ fn dhat_heartbeat_beat_publish_and_memory_poll_are_zero_allocation() {
         );
         assert_eq!((r_bytes, r_blocks), (0, 0), "read_vmrss_bytes allocated");
     }
+
+    // Unreadable polls (hostile review 2026-10-30): the counter is resolved
+    // once, so a long unreadable streak allocates nothing except the throttled
+    // warning at powers of two. Polls 2..=1024 log at 2, 4, ..., 1024 (10
+    // lines); the budget allows for those lines, a per-poll leak would not fit.
+    let (u_bytes, u_blocks) = dhat_support::measure_with_phantom_retry(
+        u64::MAX,
+        UNREADABLE_LOG_LINE_BLOCKS,
+        || {},
+        || {
+            for i in 1..1_024_u64 {
+                let d = blind.step(None, i * 5, true);
+                assert_eq!(d.level, PressureLevel::Normal);
+            }
+        },
+    );
+    assert!(
+        u_blocks <= UNREADABLE_LOG_LINE_BLOCKS,
+        "unreadable polls allocated {u_blocks} blocks ({u_bytes} B) over 1,023 polls: more than \
+         the 10 throttled warnings account for"
+    );
+    // The streak then ends cleanly and steady polls are zero again.
+    let (s_bytes, s_blocks) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            for i in 0..1_000_u64 {
+                let _ = blind.step(Some(GIB), 10_000 + i * 5, true);
+            }
+        },
+    );
+    assert_eq!(
+        (s_bytes, s_blocks),
+        (0, 0),
+        "readable polls after a streak allocated"
+    );
 }
