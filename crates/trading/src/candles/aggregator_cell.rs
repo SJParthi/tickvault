@@ -46,7 +46,7 @@ use tickvault_common::constants::{IST_UTC_OFFSET_NANOS, MAX_PLAUSIBLE_LTP};
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
-use crate::candles::tf_index::{MARKET_OPEN_SECS_OF_DAY_IST, fold_clock_ist_secs};
+use crate::candles::tf_index::fold_clock_ist_secs;
 use crate::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,13 @@ pub struct TickPrices {
     pub day_open: f64,
     /// Widened `day_close`, or `0.0` when absent / non-positive / `NaN`.
     pub day_close: f64,
+    /// Widened `day_high` when [`usable_exchange_price`] accepts it, else
+    /// `None`. Widened once per tick here (plan ITEM DT, 2026-10-30) so the
+    /// session-extreme check and every timeframe whose open bucket is the
+    /// day's first adopt the same value without converting it again.
+    pub day_high: Option<f64>,
+    /// Widened `day_low`, same rule as [`Self::day_high`].
+    pub day_low: Option<f64>,
 }
 
 impl TickPrices {
@@ -237,7 +244,112 @@ impl TickPrices {
             } else {
                 0.0
             },
+            day_high: usable_exchange_price(tick.day_high).then(|| f32_to_f64_clean(tick.day_high)),
+            day_low: usable_exchange_price(tick.day_low).then(|| f32_to_f64_clean(tick.day_low)),
         }
+    }
+
+    /// The same five values as [`Self::from_tick`], with `last_traded_price`
+    /// already widened by the caller and the four day fields widened through
+    /// the instrument's [`WidenMemo`], so a day field that repeats the last
+    /// tick's bits (the day open and close all day, the day high and low
+    /// between new extremes) costs one compare instead of a conversion.
+    ///
+    /// `last_traded_price` MUST be `f32_to_f64_clean(tick.last_traded_price)`.
+    /// Equal to [`Self::from_tick`] for every tick and every memo state:
+    /// pinned by `proptest_from_tick_memo_equals_from_tick`.
+    ///
+    /// # Complexity
+    /// O(1) — four memo probes, at most four conversions, no allocation.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_tick_memo(
+        tick: &ParsedTick,
+        last_traded_price: f64,
+        memo: &mut WidenMemo,
+    ) -> Self {
+        Self {
+            last_traded_price,
+            day_open: if usable_exchange_price(tick.day_open) {
+                memo.widen(WidenMemo::DAY_OPEN, tick.day_open)
+            } else {
+                0.0
+            },
+            day_close: if usable_exchange_price(tick.day_close) {
+                memo.widen(WidenMemo::DAY_CLOSE, tick.day_close)
+            } else {
+                0.0
+            },
+            day_high: if usable_exchange_price(tick.day_high) {
+                Some(memo.widen(WidenMemo::DAY_HIGH, tick.day_high))
+            } else {
+                None
+            },
+            day_low: if usable_exchange_price(tick.day_low) {
+                Some(memo.widen(WidenMemo::DAY_LOW, tick.day_low))
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// One instrument's last widened day fields, keyed by their `f32` bits.
+///
+/// `f32_to_f64_clean` is a pure function of the `f32` bits, so a field whose
+/// bits equal the last ones widened has the same widened value. The day open
+/// and close repeat on every packet of a day, and the day high and low change
+/// only on a new extreme, so on the live path almost every probe is a hit
+/// (plan ITEM DT, 2026-10-30; measured before: about ten conversions a tick,
+/// each a loop of software rounding on x86).
+///
+/// Invariant: `values[i] == f32_to_f64_clean(f32::from_bits(bits[i]))` for
+/// every slot. The empty memo holds `+0.0` bits and `0.0`, which is
+/// `f32_to_f64_clean(0.0)`, so it holds from construction.
+///
+/// # Complexity
+/// O(1) per probe; 48 bytes per instrument; no allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WidenMemo {
+    bits: [u32; 4],
+    values: [f64; 4],
+}
+
+impl WidenMemo {
+    /// Slot of `day_open`.
+    pub(crate) const DAY_OPEN: usize = 0;
+    /// Slot of `day_close`.
+    pub(crate) const DAY_CLOSE: usize = 1;
+    /// Slot of `day_high`.
+    pub(crate) const DAY_HIGH: usize = 2;
+    /// Slot of `day_low`.
+    pub(crate) const DAY_LOW: usize = 3;
+
+    /// An empty memo (every slot `+0.0`).
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            bits: [0; 4],
+            values: [0.0; 4],
+        }
+    }
+
+    /// `f32_to_f64_clean(raw)`, from the memo when `raw` repeats the slot's
+    /// last bits.
+    #[inline]
+    fn widen(&mut self, slot: usize, raw: f32) -> f64 {
+        let bits = raw.to_bits();
+        if let (Some(held), Some(value)) = (self.bits.get(slot), self.values.get(slot))
+            && *held == bits
+        {
+            return *value;
+        }
+        let value = f32_to_f64_clean(raw);
+        if let (Some(held), Some(stored)) = (self.bits.get_mut(slot), self.values.get_mut(slot)) {
+            *held = bits;
+            *stored = value;
+        }
+        value
     }
 }
 
@@ -663,6 +775,23 @@ impl AggregatorCell {
         tick: &ParsedTick,
         fold_secs: u32,
     ) -> SessionExtremeDelta {
+        self.observe_session_extremes_widened(tick, fold_secs, &TickPrices::from_tick(tick))
+    }
+
+    /// [`Self::observe_session_extremes`] with the day high and low already
+    /// widened in `prices` (plan ITEM DT, 2026-10-30): the live fold widens
+    /// them once per tick for every timeframe, so this reuses that value
+    /// instead of converting again. `prices` MUST come from this `tick`.
+    ///
+    /// # Complexity
+    /// O(1), no conversion, no allocation.
+    #[inline]
+    pub(crate) fn observe_session_extremes_widened(
+        &mut self,
+        tick: &ParsedTick,
+        fold_secs: u32,
+        prices: &TickPrices,
+    ) -> SessionExtremeDelta {
         let mut delta = SessionExtremeDelta {
             prev_observed_ts: self.last_observed_ts,
             ..SessionExtremeDelta::default()
@@ -736,7 +865,9 @@ impl AggregatorCell {
                 // establishes the mark and reports NO delta — with no previous
                 // packet there is no interval for a delta to describe.
                 if self.last_seen_day_high > 0.0 {
-                    delta.new_high = Some(f32_to_f64_clean(tick.day_high));
+                    // `Some(f32_to_f64_clean(day_high))`: this branch runs
+                    // only when `day_high` is usable.
+                    delta.new_high = prices.day_high;
                 }
                 self.last_seen_day_high = tick.day_high;
             } else if tick.day_high < self.last_seen_day_high {
@@ -748,7 +879,8 @@ impl AggregatorCell {
         if usable_exchange_price(tick.day_low) {
             if self.last_seen_day_low == 0.0 || tick.day_low < self.last_seen_day_low {
                 if self.last_seen_day_low > 0.0 {
-                    delta.new_low = Some(f32_to_f64_clean(tick.day_low));
+                    // Same rule as the high above.
+                    delta.new_low = prices.day_low;
                 }
                 self.last_seen_day_low = tick.day_low;
             } else if tick.day_low > self.last_seen_day_low {
@@ -1506,7 +1638,7 @@ impl AggregatorCell {
             // function's own comment explains why conflating them mis-stamps
             // the opening bar.
             if is_days_first_session_bucket(tf, open_start) {
-                adopt_exchange_day_extremes(&mut self.slots[ord], tick);
+                adopt_exchange_day_extremes(&mut self.slots[ord], &prices);
             } else if attributable {
                 adopt_session_extreme_delta(&mut self.slots[ord], extremes);
             }
@@ -1535,8 +1667,8 @@ impl AggregatorCell {
             // disarms only once it has used the open or moved past the
             // bucket that owns it.
             let day_start = bucket_start - (bucket_start % 86_400);
-            let first_session_start =
-                tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST));
+            // The same table form as `is_days_first_session_bucket` (plan ITEM DT).
+            let first_session_start = day_start.saturating_add(tf.first_session_bucket_offset());
             let use_day_open = self.armed_for_day_open[ord]
                 && prices.day_open > 0.0
                 && bucket_start == first_session_start;
@@ -1921,7 +2053,19 @@ pub(crate) fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bo
     // bucket CONTAINS the market open - 09:15 for 1m/3m/5m/15m, and 09:00 for
     // the 30m/60m frames whose bucket spans it. That is correct in both
     // cases: the official open belongs to the bar it actually falls inside.
-    bucket_start == tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))
+    // (⚠ 2026-10-30: stale since the 2026-10-05 move back to a 09:15 grid
+    // (`CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = 33,300): every frame's bucket
+    // holding the open now starts at 09:15, the 30m and 60m frames included.)
+    //
+    // 2026-10-30 (plan ITEM DT): the expression above was
+    // `tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))`.
+    // `bucket_start` of a day start plus a constant is that day start plus
+    // the same bucket on day 0, so the offset is now a compile-time table
+    // (`TfIndex::first_session_bucket_offset`). The saturating day near
+    // `u32::MAX` gives `u32::MAX` both ways. Pinned by
+    // `test_first_session_bucket_matches_the_grid_on_every_day`, which checks
+    // every day start that fits a `u32` against the old expression.
+    bucket_start == day_start.saturating_add(tf.first_session_bucket_offset())
 }
 
 /// True when `raw` is a usable exchange-published price.
@@ -2115,7 +2259,7 @@ fn open_bucket(
     }
     widen_range_to_include(&mut state, open);
     if first_bucket_of_day {
-        adopt_exchange_day_extremes(&mut state, tick);
+        adopt_exchange_day_extremes(&mut state, &prices);
     }
     state
 }
@@ -2218,34 +2362,38 @@ fn net_volume_baseline(last_sealed: &LiveCandleState, bucket_start: u32) -> f64 
 /// second bucket onward they describe the whole day and would smear the
 /// session range across every bar.
 ///
-/// Both fields are read raw off `&ParsedTick` and widened inline here rather
-/// than being carried on [`TickPrices`]. That is deliberate: [`TickPrices`] is
-/// built once per tick for the whole session, so adding these two would pay
-/// ~100 ns of `f32_to_f64_clean` on EVERY tick to serve one bucket per day.
-/// Here the conversion runs during the first bucket only — roughly one minute
-/// out of 375 — and costs exactly zero for the rest of the session.
+/// ⚠ CHANGED 2026-10-30 (plan ITEM DT): both fields now come widened on
+/// [`TickPrices`]. This paragraph said they were widened inline here on
+/// purpose, because carrying them on [`TickPrices`] would pay a conversion on
+/// every tick. MEASURED the other way: widening here ran once per TIMEFRAME
+/// whose open bucket is the day's first (three of eight at 09:20, so six
+/// conversions a tick for the first hour), and the live fold now builds
+/// [`TickPrices`] through the instrument's [`WidenMemo`], so a day high or
+/// low that did not move costs one compare, not a conversion.
 ///
 /// # Complexity
-/// O(1) — two validity checks, at most two widenings. No allocation.
+/// O(1) — two compares, no conversion, no allocation.
 #[inline]
-fn adopt_exchange_day_extremes(state: &mut LiveCandleState, tick: &ParsedTick) {
-    if usable_exchange_price(tick.day_high) {
-        let dh = f32_to_f64_clean(tick.day_high);
-        if dh > state.high {
-            state.high = dh;
-            crate::candles::fold_counters::fold_counters()
-                .day_high_adopted
-                .increment(1);
-        }
+fn adopt_exchange_day_extremes(state: &mut LiveCandleState, prices: &TickPrices) {
+    // `prices.day_high` is `Some(f32_to_f64_clean(day_high))` exactly when
+    // `usable_exchange_price(day_high)`, the test this read before 2026-10-30
+    // (plan ITEM DT); taking it from `prices` widens it once per tick instead
+    // of once per timeframe.
+    if let Some(dh) = prices.day_high
+        && dh > state.high
+    {
+        state.high = dh;
+        crate::candles::fold_counters::fold_counters()
+            .day_high_adopted
+            .increment(1);
     }
-    if usable_exchange_price(tick.day_low) {
-        let dl = f32_to_f64_clean(tick.day_low);
-        if dl < state.low {
-            state.low = dl;
-            crate::candles::fold_counters::fold_counters()
-                .day_low_adopted
-                .increment(1);
-        }
+    if let Some(dl) = prices.day_low
+        && dl < state.low
+    {
+        state.low = dl;
+        crate::candles::fold_counters::fold_counters()
+            .day_low_adopted
+            .increment(1);
     }
 }
 
@@ -2655,6 +2803,123 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-2026-10-30 form of [`is_days_first_session_bucket`], kept as
+    /// the test reference the table form is checked against.
+    fn is_days_first_session_bucket_by_grid(tf: TfIndex, bucket_start: u32) -> bool {
+        let day_start = bucket_start - (bucket_start % 86_400);
+        bucket_start
+            == tf.bucket_start(
+                day_start.saturating_add(crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST),
+            )
+    }
+
+    fn prices_bits(p: &TickPrices) -> [u64; 5] {
+        [
+            p.last_traded_price.to_bits(),
+            p.day_open.to_bits(),
+            p.day_close.to_bits(),
+            p.day_high.map_or(u64::MAX, f64::to_bits),
+            p.day_low.map_or(u64::MAX, f64::to_bits),
+        ]
+    }
+
+    /// A day-field value drawn to hit every branch: absent, the edge cases the
+    /// usability gate refuses, values that collapse when widened, ordinary
+    /// prices, and one of four repeated values (so the memo hits).
+    fn day_field() -> impl proptest::strategy::Strategy<Value = f32> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(0.0f32),
+            Just(-0.0f32),
+            Just(f32::NAN),
+            Just(f32::INFINITY),
+            Just(f32::MIN_POSITIVE),
+            Just(f32::MAX),
+            Just(MAX_PLAUSIBLE_LTP),
+            prop::sample::select(vec![100.05f32, 99.5, 24_150.35, 0.05]),
+            (1u32..4_000_000).prop_map(|c| c as f32 * 0.05),
+            any::<u32>().prop_map(f32::from_bits),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2_000))]
+        /// Regression (plan ITEM DT, 2026-10-30): a run of ticks through ONE
+        /// memo widens every field exactly as `from_tick` does, whatever the
+        /// memo held before, and observing session extremes with those prices
+        /// gives the same delta and state as the old entry point.
+        #[test]
+        fn proptest_from_tick_memo_equals_from_tick(
+            fields in proptest::collection::vec(
+                (day_field(), day_field(), day_field(), day_field(), day_field()),
+                1..40,
+            ),
+        ) {
+            let mut memo = WidenMemo::new();
+            let mut old_cell = AggregatorCell::empty();
+            let mut new_cell = AggregatorCell::empty();
+            for (k, (ltp, open, close, high, low)) in fields.into_iter().enumerate() {
+                let mut tick = tick_at(OPEN + k as u32, 100.0, 10);
+                tick.last_traded_price = ltp;
+                tick.day_open = open;
+                tick.day_close = close;
+                tick.day_high = high;
+                tick.day_low = low;
+                let reference = TickPrices::from_tick(&tick);
+                let memoized =
+                    TickPrices::from_tick_memo(&tick, f32_to_f64_clean(ltp), &mut memo);
+                proptest::prop_assert_eq!(prices_bits(&reference), prices_bits(&memoized));
+                let old = old_cell.observe_session_extremes(&tick, OPEN + k as u32);
+                let new = new_cell.observe_session_extremes_widened(
+                    &tick,
+                    OPEN + k as u32,
+                    &memoized,
+                );
+                proptest::prop_assert_eq!(old, new);
+                proptest::prop_assert_eq!(format!("{old_cell:?}"), format!("{new_cell:?}"));
+            }
+        }
+    }
+
+    /// Regression (plan ITEM DT, 2026-10-30): the table form of
+    /// `is_days_first_session_bucket` equals the grid form for EVERY day start
+    /// that fits a `u32`, including the saturating last day, at the bucket
+    /// itself and around it.
+    #[test]
+    fn test_first_session_bucket_matches_the_grid_on_every_day() {
+        let last_day = (u32::MAX / 86_400) * 86_400;
+        let mut day = 0u32;
+        loop {
+            for tf in TfIndex::ALL {
+                let grid = tf.bucket_start(
+                    day.saturating_add(crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST),
+                );
+                assert_eq!(
+                    day.saturating_add(tf.first_session_bucket_offset()),
+                    grid,
+                    "{tf:?} on day {day}"
+                );
+                for probe in [
+                    day,
+                    grid,
+                    grid.saturating_sub(1),
+                    grid.saturating_add(1),
+                    day.saturating_add(86_399),
+                ] {
+                    assert_eq!(
+                        is_days_first_session_bucket(tf, probe),
+                        is_days_first_session_bucket_by_grid(tf, probe),
+                        "{tf:?} at {probe}"
+                    );
+                }
+            }
+            if day == last_day {
+                break;
+            }
+            day += 86_400;
+        }
+    }
 
     /// An exact multiple of 86_400 so `DAY + 33_300` is the 09:15 open.
     pub(super) const DAY: u32 = 1_779_321_600;
