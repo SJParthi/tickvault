@@ -675,8 +675,25 @@ impl TickGapDetector {
     ///
     /// **O(1) average, allocation-free.** One hash lookup plus an in-place
     /// slot mutation.
+    #[inline]
     pub fn observe(&mut self, obs: TickObservation) -> TickAssessment {
-        let Some(slot) = self.slot_for(obs.key) else {
+        // The tracked case first, exactly as `observe_tracked` takes it; slot
+        // assignment and refusal are out of line (plan ITEM DT, 2026-10-30:
+        // the bench measured `observe` on a tracked instrument at about
+        // twice `observe_tracked` for the same work).
+        if let Some(&slot) = self.index.get(&obs.key) {
+            return self.observe_slot(slot, obs);
+        }
+        self.observe_untracked(obs)
+    }
+
+    /// [`Self::observe`] for an instrument with no slot yet: assigns one, or
+    /// refuses (counted) when the table is full. O(1) average.
+    #[cold]
+    #[inline(never)]
+    fn observe_untracked(&mut self, obs: TickObservation) -> TickAssessment {
+        // `observe` has just missed the index, so no second probe.
+        let Some(slot) = self.assign_slot(obs.key) else {
             return TickAssessment {
                 ltt: LttVerdict::FirstSight,
                 volume: VolumeVerdict::FirstSight,
@@ -708,6 +725,7 @@ impl TickGapDetector {
 
     /// The in-place update shared by [`Self::observe`] and
     /// [`Self::observe_tracked`]. O(1), allocation-free.
+    #[inline]
     fn observe_slot(&mut self, slot: u32, obs: TickObservation) -> TickAssessment {
         let warmup = self.config.baseline_warmup_samples;
         let multiplier = self.config.volume_jump_multiplier;
@@ -851,6 +869,13 @@ impl TickGapDetector {
         if let Some(slot) = self.index.get(&key) {
             return Some(*slot);
         }
+        self.assign_slot(key)
+    }
+
+    /// Assigns the next free slot to `key`, which the caller has just found
+    /// absent from the index; `None` (counted) when the table is full. One
+    /// insert, O(1) average, never grows either structure.
+    fn assign_slot(&mut self, key: InstrumentKey) -> Option<u32> {
         if (self.next_slot as usize) >= self.slots.len() {
             self.refused_count = self.refused_count.saturating_add(1);
             return None;
@@ -1831,5 +1856,105 @@ mod tests {
         assert_eq!((d.tracked_instruments(), d.refused_count()), (2, 0));
         d.observe(obs((99, ExchangeSegment::IdxI), 1_000, 1, 0, 0));
         assert_eq!((d.tracked_instruments(), d.refused_count()), (2, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Old-vs-new equality (plan ITEM DT, 2026-10-30). `observe` now probes the
+    // index itself and assigns or refuses out of line; this is the body it
+    // replaced, verbatim, driven side by side over random operation sequences.
+    // -----------------------------------------------------------------------
+
+    fn reference_observe(d: &mut TickGapDetector, obs: TickObservation) -> TickAssessment {
+        let Some(slot) = d.slot_for(obs.key) else {
+            return TickAssessment {
+                ltt: LttVerdict::FirstSight,
+                volume: VolumeVerdict::FirstSight,
+                oi: OiVerdict::FirstSight,
+                refused: true,
+            };
+        };
+        d.observe_slot(slot, obs)
+    }
+
+    fn assert_same_state(a: &TickGapDetector, b: &TickGapDetector) {
+        assert_eq!(a.slots, b.slots);
+        assert_eq!(a.index.len(), b.index.len());
+        for (key, slot) in &a.index {
+            assert_eq!(b.index.get(key), Some(slot));
+        }
+        assert_eq!(a.next_slot, b.next_slot);
+        assert_eq!(a.refused_count, b.refused_count);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Observe(u8, u32, u32, u32, u64),
+        ObserveTracked(u8, u32, u32, u32, u64),
+        Seed(u8, u64),
+        Reset,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        // Small key space and a capacity of 4 so the table fills and refuses.
+        let key = 0u8..8;
+        prop_oneof![
+            8 => (key.clone(), 0u32..20, 0u32..50, 0u32..5, 0u64..10_000)
+                .prop_map(|(k, l, v, o, m)| Op::Observe(k, l, v, o, m)),
+            2 => (key.clone(), 0u32..20, 0u32..50, 0u32..5, 0u64..10_000)
+                .prop_map(|(k, l, v, o, m)| Op::ObserveTracked(k, l, v, o, m)),
+            2 => (key, 0u64..10_000).prop_map(|(k, m)| Op::Seed(k, m)),
+            1 => Just(Op::Reset),
+        ]
+    }
+
+    fn op_key(k: u8) -> InstrumentKey {
+        // Two segments share each id, so the composite key is exercised.
+        let segment = if k.is_multiple_of(2) {
+            ExchangeSegment::NseFno
+        } else {
+            ExchangeSegment::NseEquity
+        };
+        (u64::from(k / 2), segment)
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_observe_matches_the_previous_body(ops in proptest::collection::vec(op(), 1..200)) {
+            let mut new = TickGapDetector::with_capacity(4, DetectorConfig::default());
+            let mut old = TickGapDetector::with_capacity(4, DetectorConfig::default());
+            for op in ops {
+                match op {
+                    Op::Observe(k, l, v, o, m) => {
+                        let obs = obs(op_key(k), l, v, o, m);
+                        prop_assert_eq!(new.observe(obs), reference_observe(&mut old, obs));
+                    }
+                    Op::ObserveTracked(k, l, v, o, m) => {
+                        let obs = obs(op_key(k), l, v, o, m);
+                        prop_assert_eq!(new.observe_tracked(obs), old.observe_tracked(obs));
+                    }
+                    Op::Seed(k, m) => {
+                        prop_assert_eq!(new.seed(op_key(k), m), old.seed(op_key(k), m));
+                    }
+                    Op::Reset => {
+                        new.reset_session();
+                        old.reset_session();
+                    }
+                }
+                assert_same_state(&new, &old);
+            }
+        }
+    }
+
+    #[test]
+    fn test_observe_refusal_at_capacity_matches_the_previous_body() {
+        let mut new = TickGapDetector::with_capacity(1, DetectorConfig::default());
+        let mut old = TickGapDetector::with_capacity(1, DetectorConfig::default());
+        for (key, ltt) in [(NIFTY, 1), (BANKNIFTY, 2), (BANKNIFTY, 3), (NIFTY, 4)] {
+            let o = obs(key, ltt, ltt, 0, u64::from(ltt));
+            assert_eq!(new.observe(o), reference_observe(&mut old, o));
+            assert_same_state(&new, &old);
+        }
+        assert_eq!(new.refused_count(), 2);
+        assert_eq!(new.tracked_instruments(), 1);
     }
 }

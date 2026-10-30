@@ -121,6 +121,12 @@ feed_drain_depth         = 1500         # <1.5us per level — matches feed_drai
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
 
+# Per-tick side stores (plan ITEM DT, 2026-10-30)
+tick_gap_detector        = 400          # <400ns per call (measured 2026-10-30, x86 dev container: median 42 ns hit, p99 198 ns with the clock pair) — matches tick_gap_detector/observe_hit, observe_refused_full, observe_tracked_hit, observe_tracked_miss (full at 25,000). The same value is the per-call p99 ceiling in the bench (plan ITEM DT, side stores, 2026-10-30)
+spot_price_store         = 250          # <250ns per call (measured: median 27 ns, p99 157 ns with the clock pair) — matches spot_price_store/record_* (full at 25,000) and its p99 gate (plan ITEM DT, 2026-10-30)
+backup_dedup             = 400          # <400ns per packet (measured: median 55 ns accept, p99 153 ns with the clock pair) — matches backup_dedup/admit_* (set full at 5,000) and its p99 gate (plan ITEM DT, 2026-10-30)
+tick_conservation_ledger = 100          # <100ns per row (measured: median 8 ns, p99 58 ns with the clock pair) — matches tick_conservation_ledger/note_row_appended_* and its p99 gate (plan ITEM DT, 2026-10-30)
+
 # =============================================================================
 # Per-element counts for BATCH benchmarks (2026-06-02)
 # =============================================================================
@@ -141,3 +147,4 @@ feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PR
 feed_drain_main_feed_frame_4_full   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29)
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet
+backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)

@@ -76,5 +76,11 @@ tracing-subscriber = { workspace = true }
 # [[bench]] tick_persistence removed in the stage-2 dead-WS sweep
 # (2026-07-17) with the deleted tick_persistence.rs (the dead tick chain).
 
+# The per-row conservation ledger on the frame drain (plan ITEM DT, side
+# stores, 2026-10-30), with a p99 gate.
+[[bench]]
+name = "tick_conservation_ledger"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "metrics", "questdb-rs", "serde", "serde_json", "thiserror"]
