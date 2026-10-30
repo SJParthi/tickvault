@@ -378,12 +378,10 @@ impl OwnIlpBuffer {
     /// Writes the text the library writes for `value`, no `i`.
     #[inline]
     fn push_i64(&mut self, value: i64) {
-        let mut digits = [0u8; 20];
-        let start = write_u64_digits(value.unsigned_abs(), &mut digits);
         if value < 0 {
             self.bytes.push(b'-');
         }
-        self.bytes.extend_from_slice(&digits[start..]);
+        push_u64_digits(&mut self.bytes, value.unsigned_abs());
     }
 
     /// Writes the library's text for `value`.
@@ -442,23 +440,50 @@ const fn must_escape_unquoted(b: u8) -> bool {
     matches!(b, b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\')
 }
 
-/// Writes `n` in decimal at the end of `out`; returns the index of its first
-/// digit. O(digits).
+/// The two-digit decimal text of 00 to 99, so a number is written two digits
+/// per division.
+const DIGIT_PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
+
+/// Appends `n` in decimal to `out`, the text `itoa` (the library's integer
+/// writer) gives.
+///
+/// The digits are written left-aligned into a 20-byte stack block, two per
+/// division, and the whole block is appended (a fixed-size copy, no `memcpy`
+/// call) and then cut back to the digit count. O(digits / 2), no allocation
+/// while `out` has 20 bytes of room.
 #[inline]
-fn write_u64_digits(mut n: u64, out: &mut [u8; 20]) -> usize {
-    let mut i = out.len();
-    loop {
-        i -= 1;
-        // `n % 10` is below 10, so the narrowing is exact.
+fn push_u64_digits(out: &mut Vec<u8>, mut n: u64) {
+    // `ilog10` of a u64 is at most 19, so `len` is 1 to 20.
+    let len = n.checked_ilog10().map_or(1, |l| l as usize + 1);
+    let mut block = [b'0'; 20];
+    let mut end = len;
+    while n >= 100 {
+        // `n % 100` is below 100: one pair, two bytes in the table.
         #[allow(clippy::cast_possible_truncation)]
-        // APPROVED: one decimal digit
-        let digit = (n % 10) as u8;
-        out[i] = b'0' + digit;
-        n /= 10;
-        if n == 0 {
-            return i;
-        }
+        // APPROVED: a value below 100
+        let pair = (n % 100) as usize * 2;
+        n /= 100;
+        end -= 2;
+        block[end] = DIGIT_PAIRS[pair];
+        block[end + 1] = DIGIT_PAIRS[pair + 1];
     }
+    // `n` is below 100 here.
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: a value below 100
+    let last = n as usize;
+    if last >= 10 {
+        block[0] = DIGIT_PAIRS[last * 2];
+        block[1] = DIGIT_PAIRS[last * 2 + 1];
+    } else {
+        block[0] = DIGIT_PAIRS[last * 2 + 1];
+    }
+    let start = out.len();
+    out.extend_from_slice(&block);
+    out.truncate(start + len);
 }
 
 /// The whole number of paise `value` is exactly the nearest `f64` to, when
@@ -500,9 +525,7 @@ fn write_cents(out: &mut Vec<u8>, cents: i64) {
     let magnitude = cents.unsigned_abs();
     let whole = magnitude / 100;
     let frac = magnitude % 100;
-    let mut digits = [0u8; 20];
-    let start = write_u64_digits(whole, &mut digits);
-    out.extend_from_slice(&digits[start..]);
+    push_u64_digits(out, whole);
     out.push(b'.');
     // `frac` is below 100, so each narrowing is one exact digit.
     #[allow(clippy::cast_possible_truncation)]

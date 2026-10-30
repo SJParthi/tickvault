@@ -632,3 +632,24 @@ fn test_can_flush_only_between_rows() {
     assert!(IlpLine::at_nanos(&mut b, 1).is_ok());
     assert!(b.can_flush(), "row ended");
 }
+
+/// Every digit count from 1 to 20, at both ends of each length, against the
+/// standard formatter (the library writes integers with `itoa`, which prints
+/// the same text; the line proptest checks that end to end).
+#[test]
+fn test_push_u64_digits_matches_the_standard_formatter_at_every_length() {
+    let mut values = vec![0_u64, 1, 9, u64::MAX, u64::MAX - 1];
+    let mut p = 1_u64;
+    while let Some(next) = p.checked_mul(10) {
+        values.extend([p - 1, p, p + 1, next - 1]);
+        p = next;
+    }
+    values.extend([p - 1, p, p + 1]);
+    let mut out = Vec::new();
+    for v in values {
+        out.clear();
+        out.extend_from_slice(b"x=");
+        push_u64_digits(&mut out, v);
+        assert_eq!(&out[2..], v.to_string().as_bytes(), "{v}");
+    }
+}

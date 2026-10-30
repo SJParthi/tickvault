@@ -463,8 +463,17 @@ fn write_tick_line_into(
     // No context wrapper: the `ilp_append_failed` log prints `%err`, which shows
     // only the outermost message, so the questdb error itself (which names the
     // refused call and why) is kept as that message.
-    write_tick_line_columns(buffer, table, feed, row, exchange_ts_ist_nanos)
-        .map_err(anyhow::Error::from)
+    // One match per ROW picks the encoder, so each column call below is a
+    // direct call into that encoder (no per-column branch).
+    match buffer {
+        TickRowBuffer::Library(b) => {
+            write_tick_line_columns(b, table, feed, row, exchange_ts_ist_nanos)
+        }
+        TickRowBuffer::Own(b) => {
+            write_tick_line_columns(b, table, feed, row, exchange_ts_ist_nanos)
+        }
+    }
+    .map_err(anyhow::Error::from)
 }
 
 /// The body of [`write_tick_line_into`], written ONCE over [`IlpLine`] so the
@@ -3209,7 +3218,10 @@ impl TickWriter {
         let feed = self.feed.as_str();
         // Inside a marker, as `append_row` is (deep audit DA-12, 2026-10-12):
         // a failed aux row leaves the buffer exactly as it found it.
-        match append_within_marker(&mut self.buffer, |buffer| append_aux_row(buffer, feed, row)) {
+        match append_within_marker(&mut self.buffer, |buffer| match buffer {
+            TickRowBuffer::Library(b) => append_aux_row(b, feed, row),
+            TickRowBuffer::Own(b) => append_aux_row(b, feed, row),
+        }) {
             Ok(()) => {
                 self.pending = self.pending.saturating_add(1);
                 self.aux_rows_appended = self.aux_rows_appended.saturating_add(1);
