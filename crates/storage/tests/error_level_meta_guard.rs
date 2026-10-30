@@ -78,6 +78,16 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "deliberate per the site: the health verdict is set before the write; counted on tv_order_update_ws_audit_dropped_total",
     ),
     (
+        "crates/app/src/drain_thread.rs",
+        "its own runtime could not be built",
+        "a placement fallback, not a lost write: the drain runs on the shared runtime exactly as with the switch off, and the future is kept (plan ITEM DT-S1); log-sink-only HOT-PATH-03",
+    ),
+    (
+        "crates/app/src/drain_thread.rs",
+        "its own thread could not be created",
+        "a placement fallback, not a lost write: the drain runs on the shared runtime exactly as with the switch off, and the future is kept (plan ITEM DT-S1); log-sink-only HOT-PATH-03",
+    ),
+    (
         "crates/app/src/dhan_live_crossverify_boot.rs",
         "could not save the note that today was paged",
         "worst case is one duplicate page on a later failure, never a missed one",

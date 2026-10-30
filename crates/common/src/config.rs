@@ -1901,9 +1901,11 @@ pub struct TradingConfig {
     /// Source: official NSE circular (update annually).
     #[serde(default)]
     pub nse_holidays: Vec<NseHolidayEntry>,
-    /// Muhurat Trading dates — special sessions on otherwise closed days.
+    /// Muhurat Trading dates — special sessions on otherwise closed days,
+    /// each with its NSE session times (the one source the box schedule,
+    /// the deploy freeze and the liveness alarm arming are pinned to).
     #[serde(default)]
-    pub muhurat_trading_dates: Vec<NseHolidayEntry>,
+    pub muhurat_trading_dates: Vec<MuhuratTradingEntry>,
     /// NSE mock trading session dates (Saturdays, ~monthly).
     /// Source: NSE Contingency Drill / Mock Trading Calendar (update annually).
     /// Mock sessions are NOT real trading days — no real orders, no settlement.
@@ -1919,6 +1921,28 @@ pub struct NseHolidayEntry {
     pub date: String,
     /// Human-readable holiday name for display.
     pub name: String,
+}
+
+/// One NSE Muhurat trading date with its session times (IST).
+///
+/// The times are the ONE source of truth for the Muhurat session: the
+/// terraform `muhurat_sessions` variable must carry the same values (pinned
+/// by `crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs`). NSE
+/// announces them in a separate circular weeks before Diwali, so both may be
+/// empty until then (the box is then not started for the session).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MuhuratTradingEntry {
+    /// Date in YYYY-MM-DD format (IST).
+    pub date: String,
+    /// Human-readable name for display.
+    pub name: String,
+    /// Session start, `HH:MM` IST (the pre-open start). Empty = not yet
+    /// published by NSE.
+    #[serde(default)]
+    pub session_start_ist: String,
+    /// Session end, `HH:MM` IST. Empty = not yet published by NSE.
+    #[serde(default)]
+    pub session_end_ist: String,
 }
 
 /// Dhan API and WebSocket connection configuration.
@@ -3791,9 +3815,11 @@ mod tests {
                         name: "Holi".to_string(),
                     },
                 ],
-                muhurat_trading_dates: vec![NseHolidayEntry {
+                muhurat_trading_dates: vec![MuhuratTradingEntry {
                     date: "2026-11-08".to_string(),
                     name: "Diwali 2026".to_string(),
+                    session_start_ist: "14:05".to_string(),
+                    session_end_ist: "15:40".to_string(),
                 }],
                 nse_mock_trading_dates: vec![],
             },

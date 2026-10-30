@@ -3385,3 +3385,21 @@ Quote 27 binds again after this run: no further market-data delete without a ver
 - Deleting `schema_reset_log`, any SEBI/audit table, the WAL control files or `data/spill/audit` under this quote.
 - Deleting without the listing before and the listing after.
 - A second run under Quote 48.
+
+#### Quote 49 (2026-10-30, ~12:00 IST) — A CALENDAR MUHURAT SESSION IS TREATED LIKE A TRADING DAY BY THE SCHEDULE AND THE DEPLOY/STOP GUARDS (preserve EXACTLY)
+
+Owner, verbatim (relayed by the coordinator session): "go ahead and fix the muhurat risk dude". The risk: Muhurat 2026 is Sunday 2026-11-08, and several protections ran Monday to Friday only: the deploy no-go band (a merge would deploy and restart the app mid-session), the failed-deploy automatic stop, the terraform-apply band, the aws-control / downsize / emergency-recovery / log-wipe guards, and the liveness alarm arming.
+
+| Item | What Quote 49 authorizes |
+|---|---|
+| One source | `config/base.toml` `[[trading.muhurat_trading_dates]]`: the date makes the day a session day (`TradingCalendar::is_session_day`), `session_start_ist` / `session_end_ist` (HH:MM IST, both or neither) are the session; terraform `var.muhurat_sessions` must equal them (build-failing guard) |
+| Schedule | unchanged in shape (plan item J8): the box runs session start − 60 min to session end + 60 min on that date only; for 2026-11-08 at 14:05–15:40 that is 13:05–16:40 IST. The 16:30 weekday stop, the drain hold and the budget stop are unchanged |
+| Deploy/stop guards | every workflow market-hours guard also refuses the WHOLE IST Muhurat date (same overrides as on a weekday); the failed-deploy auto-stop does not stop the box on that date |
+| Liveness | the market-hours gate arms on that date (noise lock §2.15) |
+| Cost | only the few hours the box runs that evening (already priced by J8); no instance, disk, IOPS, throughput or budget-line change |
+
+##### What violates Quote 49 (REJECT)
+- A new alarm family or page, or any instance, disk, IOPS, throughput or budget-line change, under Quote 49.
+- Treating an ordinary weekend or a weekday holiday (no Muhurat entry) as a session day, or changing what any guard does on one.
+- Typing Muhurat times anywhere without the same change in `config/base.toml`.
+- Removing the Muhurat arm from a workflow guard, or a guard job that no longer has `config/base.toml` to read.

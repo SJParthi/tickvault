@@ -690,15 +690,23 @@ fn main() -> Result<()> {
         core_raw.as_deref(),
     );
     let _ = READER_CORE_PLAN.set(core_plan);
+    // Plan ITEM DT (2026-10-30): real-time priority for the readers and the
+    // drain, off unless asked AND the kernel's real-time throttle is active.
+    let rt_decision = tickvault_app::hot_thread_boot::decide_rt_from_env();
     let _ = READER_RUNTIME_OUTCOME.set(
         match tickvault_core::websocket::reader_runtime::install_reader_runtime(
             reader_threads,
             core_plan.core(),
+            rt_decision.reader(),
         ) {
             Ok(outcome) => format!("{outcome:?}"),
             Err(err) => format!("FAILED({err}) — readers share the main runtime"),
         },
     );
+    // Plan ITEM DT: the drain's placement, and (when asked) this thread
+    // pinned to the background core so the main runtime built below, and
+    // every thread it spawns, inherits it. Off by default; see hot_thread_boot.
+    tickvault_app::hot_thread_boot::place_drain_and_background(rt_decision);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
@@ -2751,6 +2759,7 @@ async fn async_main() -> Result<()> {
     if let Some(plan) = READER_CORE_PLAN.get() {
         report_reader_core_pin(*plan);
     }
+    tickvault_app::hot_thread_boot::report_hot_thread_placement();
 
     // Log trading day status — critical for operational awareness.
     let is_trading = trading_calendar.is_trading_day_today();
