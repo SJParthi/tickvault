@@ -45,9 +45,9 @@ use crate::daily_task_marker::{
 use crate::dhan_live_crossverify::{
     AttemptStamp, DayComparison, DhanLiveCrossverifyConfig, LIVE_FINAL_SECS_OF_DAY_IST,
     LateWindowPolicy, MissingJudgeable, RUN_SECS_OF_DAY_IST, ReadPolicy, RunReport,
-    SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_MINUTES, XverifyCoverage, XverifyTarget, daily_row,
-    deterministic_run_ts_nanos, downgrade_for_coverage, fetched_at_ist_nanos_now,
-    run_cross_verification, session_minutes_subscribed,
+    SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_MINUTES, SESSION_OPEN_SECS_OF_DAY_IST, XverifyCoverage,
+    XverifyTarget, daily_row, deterministic_run_ts_nanos, downgrade_for_coverage,
+    fetched_at_ist_nanos_now, run_cross_verification, session_minutes_subscribed,
 };
 use crate::option_rank::OptionFamily;
 use crate::shutdown_class::{
@@ -1493,14 +1493,21 @@ pub const fn past_day_worst_case_secs(run_budget_secs: u64) -> u64 {
         .saturating_add(XVERIFY_RETRY_INTERVAL_SECS.saturating_mul(attempts.saturating_sub(1)))
 }
 
+/// Slack between a past day's worst-case end and 15:41 (review round 1).
+pub const PAST_DAY_FIT_MARGIN_SECS: u64 = 60;
+
 /// Whether a past day started at `now_secs_of_day` ends, at its worst case,
 /// before today's own run at 15:41 (plan item 51g). Before the run a past day
 /// starts only when it does; otherwise it waits for the pass after today's
 /// run, so the one attempt today gets before the 16:30 stop (§12.15.12) is
-/// never pushed late. Pure, O(1).
+/// never pushed late. A margin of [`PAST_DAY_FIT_MARGIN_SECS`] keeps a pass
+/// that ends on the minute (whole seconds, a slow file write) off 15:41.
+/// Pure, O(1).
 #[must_use]
 pub const fn past_day_fits_before_run(now_secs_of_day: u64, run_budget_secs: u64) -> bool {
-    now_secs_of_day.saturating_add(past_day_worst_case_secs(run_budget_secs))
+    now_secs_of_day
+        .saturating_add(past_day_worst_case_secs(run_budget_secs))
+        .saturating_add(PAST_DAY_FIT_MARGIN_SECS)
         <= XVERIFY_RUN_AT_SECS_OF_DAY_IST
 }
 
@@ -1528,6 +1535,14 @@ pub const fn supervisor_should_page(
     trading_day && started_in_time && !worker_reported && !recorded && !paged
 }
 
+/// Seconds the supervisor still has to wait for 16:24 IST after a sleep that
+/// woke short of it (a wall clock stepped back during the sleep); 0 at or
+/// after it. Pure, O(1).
+#[must_use]
+pub const fn supervisor_shortfall_secs(now_secs_of_day: u64) -> u64 {
+    XVERIFY_SUPERVISOR_SECS_OF_DAY_IST.saturating_sub(now_secs_of_day)
+}
+
 /// Sleeps until 16:24 IST each day and pages `xverify_failed` (reason
 /// `worker_never_reported`) when [`supervisor_should_page`] says the worker
 /// never reported today (plan item 51g). Writes the paged marker like any
@@ -1542,6 +1557,17 @@ async fn run_supervisor(calendar: Arc<TradingCalendar>, started: (chrono::NaiveD
             SECS_PER_DAY - now + XVERIFY_SUPERVISOR_SECS_OF_DAY_IST
         };
         tokio::time::sleep(Duration::from_secs(wait)).await;
+        // The sleep runs on the monotonic clock, the check on the wall clock:
+        // a wall clock stepped back during the wait wakes short of 16:24,
+        // before the worker's last attempt can have reported. Sleep the
+        // shortfall, a bounded number of times (as `drive_day` does).
+        for _ in 0..XVERIFY_EVENING_RESLEEP_MAX {
+            let shortfall = supervisor_shortfall_secs(now_ist_secs_of_day());
+            if shortfall == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(shortfall)).await;
+        }
         let (today, _) = today_ist();
         let started_in_time = started.0 < today || started.1 < XVERIFY_LAST_END_SECS_OF_DAY_IST;
         if supervisor_should_page(
@@ -1627,7 +1653,16 @@ pub fn spawn_dhan_live_crossverify(
     let boot_set = main_feed.to_vec();
     let (boot_day, _) = today_ist();
     let boot_secs = now_ist_secs_of_day();
-    record_boot_set(boot_day, &boot_set, boot_secs, deps.universe_basis);
+    // §12.15.13 (review round 1): the boot set is recorded by the daily
+    // recorder, at 08:00 at the earliest and never after the close, so a
+    // night-time process (an evening-drain restart) never records a set into
+    // the next trading day's record.
+    crate::xverify_day_record::note_process_held(
+        crate::xverify_day_record::HeldOrigin::Boot,
+        &boot_set,
+        deps.universe_basis,
+    );
+    tokio::spawn(run_day_recorder());
     tokio::spawn(run_supervisor(
         Arc::clone(&deps.calendar),
         (boot_day, boot_secs),
@@ -1639,50 +1674,209 @@ pub fn spawn_dhan_live_crossverify(
             "Dhan 1-minute cross-verification armed — it compares our 1-minute candles \
              against Dhan's own record after the close, and today's S3 archive waits for it"
         );
-        let mut first = true;
-        let mut past_done_for: Option<chrono::NaiveDate> = None;
+        let mut state = WorkerDay::default();
         loop {
-            let (today, _) = today_ist();
-            let catch_up = first
-                && should_catch_up(
-                    now_ist_secs_of_day(),
-                    daily_marker_exists(CROSSVERIFY_MARKER_TASK, today),
-                );
-            first = false;
-            if !catch_up {
-                // §12.15.15: past days first when they fit before 15:41.
-                if past_done_for != Some(today)
-                    && run_past_days(&deps, &boot_set, today, true).await
-                {
-                    past_done_for = Some(today);
-                }
-                let sleep_secs = secs_until_next_run_ist(now_ist_secs_of_day());
-                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-            }
             let (today, day_start_ist_nanos) = today_ist();
-            if !deps.calendar.is_trading_day(today) {
-                info!(%today, "Dhan 1-minute cross-verification skipped — not a trading day");
-                note_worker_reported(today);
-            } else if daily_marker_exists(CROSSVERIFY_MARKER_TASK, today) {
-                info!(%today, "Dhan 1-minute cross-verification already recorded for today");
-                note_worker_reported(today);
-            } else {
-                run_day(&deps, &boot_set, today, day_start_ist_nanos, today).await;
-            }
-            // §12.15.15: whatever today's marker says.
-            if past_done_for != Some(today) {
-                run_past_days(&deps, &boot_set, today, false).await;
-                past_done_for = Some(today);
+            let now = now_ist_secs_of_day();
+            match worker_step(now, state.for_day(today)) {
+                WorkerStep::WaitUntil(target_secs) => {
+                    tokio::time::sleep(Duration::from_secs(target_secs.saturating_sub(now))).await;
+                }
+                WorkerStep::PastBeforeRun => {
+                    state.before_run_tried = Some(today);
+                    // §12.15.15: past days first when they fit before 15:41.
+                    if run_past_days(&deps, &boot_set, today, true).await {
+                        state.past_done = Some(today);
+                    }
+                }
+                WorkerStep::Today => {
+                    state.today_done = Some(today);
+                    if !deps.calendar.is_trading_day(today) {
+                        info!(%today, "Dhan 1-minute cross-verification skipped — not a trading day");
+                        note_worker_reported(today);
+                    } else if daily_marker_exists(CROSSVERIFY_MARKER_TASK, today) {
+                        info!(%today, "Dhan 1-minute cross-verification already recorded for today");
+                        note_worker_reported(today);
+                    } else {
+                        run_day(&deps, &boot_set, today, day_start_ist_nanos, today).await;
+                    }
+                }
+                WorkerStep::PastAfterRun => {
+                    // §12.15.15: whatever today's marker says.
+                    state.past_done = Some(today);
+                    run_past_days(&deps, &boot_set, today, false).await;
+                }
+                WorkerStep::WaitTomorrow => {
+                    let secs = SECS_PER_DAY
+                        .saturating_sub(now)
+                        .saturating_add(XVERIFY_MORNING_SECS_OF_DAY_IST);
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                }
             }
         }
     })
 }
 
-/// Records the boot set in the day's subscribe record (plan item 51e). A
+/// The earliest second of the IST day the worker starts work and the day
+/// recorder records (§12.15.13, §12.15.15; review round 1): 08:00 IST, after
+/// the drain hold's latest end (07:30) and before the 09:00 open. A process
+/// alive before it (an evening-drain restart after midnight) does nothing for
+/// the day until then, and one stopped before it records nothing.
+pub const XVERIFY_MORNING_SECS_OF_DAY_IST: u64 = 8 * 3_600;
+
+const _: () = assert!(
+    XVERIFY_MORNING_SECS_OF_DAY_IST < SESSION_OPEN_SECS_OF_DAY_IST as u64
+        && XVERIFY_MORNING_SECS_OF_DAY_IST < XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+    "the morning start must come before the session opens"
+);
+
+/// What the worker has done on one IST day, in this process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkerDay {
+    before_run_tried: Option<chrono::NaiveDate>,
+    today_done: Option<chrono::NaiveDate>,
+    past_done: Option<chrono::NaiveDate>,
+}
+
+impl WorkerDay {
+    /// The day's flags, for `day`.
+    fn for_day(self, day: chrono::NaiveDate) -> WorkerFlags {
+        WorkerFlags {
+            before_run_tried: self.before_run_tried == Some(day),
+            today_done: self.today_done == Some(day),
+            past_done: self.past_done == Some(day),
+        }
+    }
+}
+
+/// The worker's flags for the current IST day (§12.15.15).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerFlags {
+    /// The before-15:41 past-day pass ran today (it may have left days for
+    /// after today's check).
+    pub before_run_tried: bool,
+    /// Today's own check ran (or today needed none).
+    pub today_done: bool,
+    /// Every past day was taken today.
+    pub past_done: bool,
+}
+
+/// The worker's next step (§12.15.15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStep {
+    /// Sleep until this second of the IST day, then decide again.
+    WaitUntil(u64),
+    /// The past-day pass, only days that fit before 15:41.
+    PastBeforeRun,
+    /// Today's own check (or its skip on a non-trading or recorded day).
+    Today,
+    /// The past-day pass after today's check, every remaining day.
+    PastAfterRun,
+    /// Nothing left today: sleep until tomorrow's morning start.
+    WaitTomorrow,
+}
+
+/// The worker's next step from the IST second of day and today's flags
+/// (§12.15.15, review round 1). Pure, total, O(1).
+///
+/// | Now | Flags | Step |
+/// |---|---|---|
+/// | before 08:00 | any | wait until 08:00 |
+/// | 08:00 to 15:41 | before-run pass not tried | past days that fit before 15:41 |
+/// | 08:00 to 15:41 | tried | wait until 15:41 |
+/// | 15:41 or later | today not done | today's check (at once: a late boot or an overrunning pass) |
+/// | 15:41 or later | today done, past days not done | every remaining past day |
+/// | 15:41 or later | both done | wait until tomorrow's 08:00 |
+///
+/// Every step decides again afterwards, so a pass that overruns 15:41 runs
+/// today's check at once, and a restart after 15:41 on a recorded day still
+/// runs the past days.
+#[must_use]
+pub const fn worker_step(now_secs_of_day: u64, flags: WorkerFlags) -> WorkerStep {
+    if now_secs_of_day < XVERIFY_MORNING_SECS_OF_DAY_IST {
+        return WorkerStep::WaitUntil(XVERIFY_MORNING_SECS_OF_DAY_IST);
+    }
+    if !should_catch_up(now_secs_of_day, false) {
+        // Before 15:41.
+        return if flags.before_run_tried {
+            WorkerStep::WaitUntil(
+                now_secs_of_day.saturating_add(secs_until_next_run_ist(now_secs_of_day)),
+            )
+        } else {
+            WorkerStep::PastBeforeRun
+        };
+    }
+    if !flags.today_done {
+        WorkerStep::Today
+    } else if !flags.past_done {
+        WorkerStep::PastAfterRun
+    } else {
+        WorkerStep::WaitTomorrow
+    }
+}
+
+/// Records the process's held main-feed set in the day's subscribe record
+/// once per IST day, at 08:00 at the earliest and only before the close
+/// (§12.15.13, review round 1): a process alive before 08:00 waits, one that
+/// is stopped first records nothing, a process alive across midnight records
+/// the new day too, and a boot after the close records nothing (it could only
+/// add instruments it never captured in the session). One small file write a
+/// day, cold.
+async fn run_day_recorder() {
+    let mut recorded_for: Option<chrono::NaiveDate> = None;
+    loop {
+        let (today, _) = today_ist();
+        let now = now_ist_secs_of_day();
+        match day_record_step(now, recorded_for == Some(today)) {
+            DayRecordStep::WaitUntil(target_secs) => {
+                tokio::time::sleep(Duration::from_secs(target_secs.saturating_sub(now))).await;
+            }
+            DayRecordStep::Record => {
+                recorded_for = Some(today);
+                for (_, held, basis) in crate::xverify_day_record::process_held() {
+                    record_held_set(today, &held, now, basis);
+                }
+            }
+            DayRecordStep::WaitTomorrow => {
+                let secs = SECS_PER_DAY
+                    .saturating_sub(now)
+                    .saturating_add(XVERIFY_MORNING_SECS_OF_DAY_IST);
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+        }
+    }
+}
+
+/// The day recorder's next step (§12.15.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayRecordStep {
+    /// Sleep until this second of the IST day, then decide again.
+    WaitUntil(u64),
+    /// Record the held set now.
+    Record,
+    /// Nothing to record today: sleep until tomorrow's 08:00.
+    WaitTomorrow,
+}
+
+/// The day recorder's next step. Pure, total, O(1): before 08:00 wait; from
+/// 08:00 to the close record once; after the close, or once recorded, wait
+/// for tomorrow.
+#[must_use]
+pub const fn day_record_step(now_secs_of_day: u64, recorded_today: bool) -> DayRecordStep {
+    if now_secs_of_day < XVERIFY_MORNING_SECS_OF_DAY_IST {
+        DayRecordStep::WaitUntil(XVERIFY_MORNING_SECS_OF_DAY_IST)
+    } else if !recorded_today && now_secs_of_day < SESSION_CLOSE_SECS_OF_DAY_IST as u64 {
+        DayRecordStep::Record
+    } else {
+        DayRecordStep::WaitTomorrow
+    }
+}
+
+/// Records one held set in the day's subscribe record (plan item 51e). A
 /// failed write is one coded `warn!` on a source no alarm filter matches; the
 /// day's check then reads what the record holds, or reports its coverage
-/// unknown (§12.15.14). Cold, once per process.
-fn record_boot_set(
+/// unknown (§12.15.14). Cold, at most once per held set per day.
+fn record_held_set(
     day: chrono::NaiveDate,
     boot_set: &[SubscribeInstrument],
     secs_of_day: u64,
@@ -1696,7 +1890,7 @@ fn record_boot_set(
             recorded = outcome.recorded,
             basis = basis.as_str(),
             replaced_unreadable = outcome.replaced_unreadable,
-            "the boot's main-feed spot set is recorded for the 1-minute cross-check"
+            "a held main-feed spot set is recorded for the 1-minute cross-check"
         ),
         Err(err) => warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1705,7 +1899,7 @@ fn record_boot_set(
             %err,
             instruments = boot_set.len(),
             path = %crate::xverify_day_record::day_record_path(day).display(),
-            "could not save the boot's main-feed spot set for the 1-minute cross-check; \
+            "could not save a held main-feed spot set for the 1-minute cross-check; \
              the check covers only what its day record holds, and reports the shortfall"
         ),
     }
@@ -1998,7 +2192,21 @@ async fn run_day(
             None
         }
     };
-    let (owned_targets, _skipped, coverage) = targets_from_day_record(record.as_ref(), boot_set);
+    let (owned_targets, _skipped, mut coverage) =
+        targets_from_day_record(record.as_ref(), boot_set);
+    // §12.15.14 (review round 1): a widen that read today's list and never
+    // finished may have placed instruments the record does not hold, so the
+    // day's coverage is unknown (fail closed), never judged on a short record.
+    if today == pass_day && crate::dhan_live_universe::widen_unfinished_for(today) {
+        coverage.known = false;
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_widen_unfinished",
+            %today,
+            "today's spot-list widen never finished, so the 1-minute cross-check \
+             cannot tell which instruments were on the wire; coverage is unknown"
+        );
+    }
     let targets = owned_targets.as_slice();
     info!(
         %today,
@@ -6499,8 +6707,12 @@ mod tests {
             worst,
             4 * attempt_max_secs(600) + 3 * XVERIFY_RETRY_INTERVAL_SECS
         );
-        let last_start = XVERIFY_RUN_AT_SECS_OF_DAY_IST - worst;
+        let last_start = XVERIFY_RUN_AT_SECS_OF_DAY_IST - worst - PAST_DAY_FIT_MARGIN_SECS;
         assert!(past_day_fits_before_run(last_start, 600));
+        assert!(
+            !past_day_fits_before_run(XVERIFY_RUN_AT_SECS_OF_DAY_IST - worst, 600),
+            "a pass whose worst case ends exactly at 15:41 does not start (review round 1)"
+        );
         assert!(!past_day_fits_before_run(last_start + 1, 600));
         assert!(
             past_day_fits_before_run(8 * 3_600 + 30 * 60, 600),
@@ -6508,6 +6720,144 @@ mod tests {
         );
         assert!(!past_day_fits_before_run(u64::MAX, 600));
         assert!(!past_day_fits_before_run(0, u64::MAX));
+    }
+
+    /// Review round 1: the worker's step table, every flag combination at
+    /// the boundary seconds.
+    #[test]
+    fn test_worker_step_table() {
+        let run = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        let morning = XVERIFY_MORNING_SECS_OF_DAY_IST;
+        let none = WorkerFlags::default();
+        let tried = WorkerFlags {
+            before_run_tried: true,
+            ..none
+        };
+        let today = WorkerFlags {
+            today_done: true,
+            ..tried
+        };
+        let all = WorkerFlags {
+            past_done: true,
+            ..today
+        };
+        // Before 08:00: wait, whatever the flags (an evening-drain restart).
+        for flags in [none, tried, today, all] {
+            assert_eq!(worker_step(0, flags), WorkerStep::WaitUntil(morning));
+            assert_eq!(
+                worker_step(morning - 1, flags),
+                WorkerStep::WaitUntil(morning)
+            );
+        }
+        assert_eq!(worker_step(morning, none), WorkerStep::PastBeforeRun);
+        assert_eq!(worker_step(run - 1, none), WorkerStep::PastBeforeRun);
+        assert_eq!(worker_step(run - 1, tried), WorkerStep::WaitUntil(run));
+        assert_eq!(worker_step(morning, tried), WorkerStep::WaitUntil(run));
+        // From 15:41: today first (a late boot, or a pass that overran).
+        assert_eq!(worker_step(run, none), WorkerStep::Today);
+        assert_eq!(worker_step(run, tried), WorkerStep::Today);
+        assert_eq!(worker_step(SECS_PER_DAY - 1, none), WorkerStep::Today);
+        // A restart after 15:41 on a recorded day still runs the past days.
+        assert_eq!(worker_step(run + 3_600, today), WorkerStep::PastAfterRun);
+        assert_eq!(
+            worker_step(
+                run,
+                WorkerFlags {
+                    today_done: true,
+                    ..none
+                }
+            ),
+            WorkerStep::PastAfterRun
+        );
+        assert_eq!(worker_step(run, all), WorkerStep::WaitTomorrow);
+        // Past days done before 15:41 never skip today's own check.
+        let past_only = WorkerFlags {
+            before_run_tried: true,
+            past_done: true,
+            ..none
+        };
+        assert_eq!(worker_step(run, past_only), WorkerStep::Today);
+    }
+
+    /// Review round 1: every second of the day leads to today's check by
+    /// 15:41 at the latest and never runs it twice; a fresh process each day
+    /// (a process across days resets its flags with the date).
+    #[test]
+    fn test_worker_step_reaches_today_once_from_any_boot_second() {
+        for boot in (0..SECS_PER_DAY).step_by(97) {
+            let mut now = boot;
+            let mut flags = WorkerFlags::default();
+            let mut today_runs = 0;
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                assert!(steps < 10, "boot {boot}: the loop must settle");
+                match worker_step(now, flags) {
+                    WorkerStep::WaitUntil(target) => {
+                        assert!(target > now, "boot {boot}: a wait moves time forward");
+                        now = target;
+                    }
+                    WorkerStep::PastBeforeRun => flags.before_run_tried = true,
+                    WorkerStep::Today => {
+                        assert!(now >= XVERIFY_RUN_AT_SECS_OF_DAY_IST);
+                        today_runs += 1;
+                        flags.today_done = true;
+                    }
+                    WorkerStep::PastAfterRun => flags.past_done = true,
+                    WorkerStep::WaitTomorrow => break,
+                }
+            }
+            assert_eq!(today_runs, 1, "boot {boot}");
+        }
+    }
+
+    /// Review round 1: the per-day flags belong to one date only, so a
+    /// process alive across midnight starts the new day clean.
+    #[test]
+    fn test_worker_day_flags_reset_with_the_date() {
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).expect("date");
+        let tuesday = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+        let state = WorkerDay {
+            before_run_tried: Some(monday),
+            today_done: Some(monday),
+            past_done: Some(monday),
+        };
+        assert_eq!(
+            state.for_day(monday),
+            WorkerFlags {
+                before_run_tried: true,
+                today_done: true,
+                past_done: true,
+            }
+        );
+        assert_eq!(state.for_day(tuesday), WorkerFlags::default());
+    }
+
+    /// Review round 1: the day recorder writes once a day, from 08:00 and
+    /// before the close only, so a night-time process never records the next
+    /// trading day early and a post-close boot records nothing.
+    #[test]
+    fn test_day_record_step_table() {
+        let morning = XVERIFY_MORNING_SECS_OF_DAY_IST;
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST as u64;
+        for recorded in [false, true] {
+            assert_eq!(
+                day_record_step(3 * 3_600, recorded),
+                DayRecordStep::WaitUntil(morning)
+            );
+            assert_eq!(
+                day_record_step(close, recorded),
+                DayRecordStep::WaitTomorrow
+            );
+            assert_eq!(
+                day_record_step(SECS_PER_DAY - 1, recorded),
+                DayRecordStep::WaitTomorrow
+            );
+        }
+        assert_eq!(day_record_step(morning, false), DayRecordStep::Record);
+        assert_eq!(day_record_step(close - 1, false), DayRecordStep::Record);
+        assert_eq!(day_record_step(morning, true), DayRecordStep::WaitTomorrow);
+        assert!(morning < SESSION_OPEN_SECS_OF_DAY_IST as u64);
     }
 
     /// 51g: the supervisor pages only on a trading day, when the worker
@@ -6586,11 +6936,15 @@ mod tests {
         );
         assert!(run_once.contains(".and_then(|()| coverage_refusal(coverage));"));
         let spawn = fn_body(prod, "fn spawn_dhan_live_crossverify(");
-        assert!(
-            spawn.contains("record_boot_set(boot_day, &boot_set, boot_secs, deps.universe_basis);")
-        );
+        assert!(spawn.contains("crate::xverify_day_record::HeldOrigin::Boot,"));
+        assert!(spawn.contains("tokio::spawn(run_day_recorder());"));
         assert!(spawn.contains("tokio::spawn(run_supervisor("));
+        assert!(spawn.contains("match worker_step(now, state.for_day(today)) {"));
         assert_eq!(spawn.matches("run_past_days(").count(), 2);
+        assert!(run_day.contains("widen_unfinished_for(today)"));
+        let recorder = fn_body(prod, "async fn run_day_recorder(");
+        assert!(recorder.contains("match day_record_step(now, recorded_for == Some(today)) {"));
+        assert!(recorder.contains("record_held_set(today, &held, now, basis);"));
         let supervisor = fn_body(prod, "async fn run_supervisor(");
         assert!(
             supervisor

@@ -2699,7 +2699,7 @@ Quote 37 moves the daily stop 17:30 → **16:30 IST** and says "the cross-verifi
 | Aspect | Locked value |
 |---|---|
 | Day record | `data/instrument-cache/main-feed-spot-<YYYY-MM-DD>.json`, one per IST day, kept 10 days (`DAY_RECORD_KEEP_DAYS`, compile-time asserted above the hold ceiling plus 3) |
-| Written by | the boot (the resolved main-feed set, stamped at the resolve) and the end of a widen (today's list, stamped when the widen finishes) |
+| Written by | a daily recorder, once per IST day from 08:00 until the 15:30 close (never at night, never after the close), writing every set the process holds (its boot set, and today's list once a widen finishes), stamped at the later of the boot and 08:00; and the end of a widen (today's list, stamped when the widen finishes). A process alive across midnight records the new day too |
 | Merge | MIN per composite key `(security_id, segment)` (I-P1-11): a restart never moves an instrument's first second later. Flags OR-merged: `master_listed` (a day list was recorded), `index_fallback` (the four index ids were recorded while master sourcing was asked for) |
 | Write | temp file, `sync_all`, `rename`, folder `sync_all`, serialised in-process; at most 25,000 keys; a read refuses a file over 4 MiB, of another day, unparseable or holding a key twice |
 | Targets | read when each day's check starts: every recorded instrument the check can target, in `(segment, security_id)` order. No record (or an unreadable one): the boot set, coverage unknown |
@@ -2710,7 +2710,7 @@ Quote 37 moves the daily stop 17:30 → **16:30 IST** and says "the cross-verifi
 - The boot stamp is taken at the resolve, a few seconds before the sockets confirm; the widen stamp after its subscribes. Only whole minutes count.
 - The record holds the FIRST subscribe of the day; a later gap (a process down mid-session) is not in it.
 - A widen that finished short (no room, a connection that did not open) records today's whole list: which instruments landed on the missing room is not known where the widen finishes. Chosen because the alternative, recording nothing, would leave the placed instruments unverified with nothing to say so, and could make a widened day read as the four-index fallback day. The cost: an instrument that was never subscribed reads as missing minutes (a louder finding, never a quieter one).
-- A process that runs across midnight records only its boot set, and only for its boot day.
+- A boot after the close records nothing for its day (it captured nothing in the session); the check then reads the earlier processes' record, or reports coverage unknown when there is none.
 
 **What a PR that violates §12.15.13 looks like (REJECT):** targets fixed at boot again; a record keyed on `security_id` alone; a later recording moving a first second later; a widen at 15:29 reading as full coverage; the coverage columns in a DEDUP key; reading the record from the frame drain.
 
@@ -2722,6 +2722,7 @@ Quote 37 moves the daily stop 17:30 → **16:30 IST** and says "the cross-verifi
 |---|---|
 | Verdict | after the comparison, a `clean` run whose coverage is not full (unknown, short, or the fallback day) reads `partial`. Every other outcome is unchanged; `diverged` is never touched |
 | Marker | written only when the §12.15.7 rule holds AND, in order: the day is not the four-index fallback day (`fallback_universe`), its coverage is known (`coverage_unknown`), every planned minute is covered (`coverage_short`) |
+| Unfinished widen | when today's check fires while a widen has read today's list and not finished, the record may lack instruments already on the wire: coverage is unknown (`coverage_unknown`), fail closed, with one coded `warn!` (`xverify_widen_unfinished`, no filter) |
 | Fallback day | its record holds the four-index fallback and no day list. A day configured for the four indices (master sourcing off) is never a fallback day |
 | Retry | the three are TERMINAL: the record cannot change after the session, so the day ends at once, and a refused-day marker (`dhan_live_crossverify_refused`, 7 days) stops the past-day catch-up from fetching the vendor tape for it again. The archive never reads the refused marker |
 | Page | the existing `xverify_failed`, `reason` = the failure, once per IST day through the paged marker. `fallback_universe` names the upstream `live-universe-fallback` alarm. No new alarm, filter, EMF name or page |
@@ -2738,7 +2739,7 @@ Quote 37 moves the daily stop 17:30 → **16:30 IST** and says "the cross-verifi
 | Aspect | Locked value |
 |---|---|
 | Past days | every trading day 1 to `MAX_CROSSVERIFY_HOLD_DAYS` (3) days back with no day marker and no refused marker, whatever today's marker says, oldest first (the next the archive releases unverified) |
-| When | once per IST day per process: before 15:41 for each past day whose worst case (4 attempts and their sleeps) ends by 15:41, otherwise after today's own check. Today's one attempt before the stop (§12.15.12) is never pushed late |
+| When | once per IST day per process, from 08:00: before 15:41 for each past day whose worst case (4 attempts and their sleeps) plus a 60 s margin (`PAST_DAY_FIT_MARGIN_SECS`) ends by 15:41, otherwise after today's own check. A pure step table (`worker_step`) decides each move again after every step, so a restart after 15:41 on an already-recorded day still runs the past days, and a process alive across days runs the before-15:41 pass every day. Today's one attempt before the stop (§12.15.12) is never pushed late |
 | How | the same day loop, readiness `PAST_DAY`, each day's own record and its own paged marker, so a past day already paged is not paged again. No option pass for a past day |
 | Supervisor | at 16:24 IST (the deadline) on a trading day, when the worker started before 16:23 or on an earlier day, and nothing reported today (no report in this process, no day marker, no paged marker): pages `xverify_failed` `reason = worker_never_reported` and writes the paged marker. The report day is a maximum, so a past day reported later never hides today's |
 | Final-page state | the paged marker of §12.15.8, now also read for past days |

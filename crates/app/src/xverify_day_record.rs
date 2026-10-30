@@ -89,6 +89,50 @@ const DAY_RECORD_READ_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// a widen) never lose each other's keys.
 static RECORD_LOCK: Mutex<()> = Mutex::new(());
 
+/// The main-feed spot sets this process holds on its sockets, one per origin
+/// (the boot set, and the widened day list once a widen finishes), for the
+/// daily recorder (§12.15.13, review round 1). At most two entries, cold.
+static PROCESS_HELD: Mutex<Vec<HeldSet>> = Mutex::new(Vec::new());
+
+/// One noted set: where it came from in this process, the set, and its basis.
+pub type HeldSet = (HeldOrigin, Vec<SubscribeInstrument>, UniverseBasis);
+
+/// Which step of this process put a set on the main-feed sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldOrigin {
+    /// The boot subscribe.
+    Boot,
+    /// A finished widen to today's list (added beside the boot set).
+    Widen,
+}
+
+/// Notes a set this process holds on its main-feed sockets, replacing an
+/// earlier set of the same origin. The daily recorder writes every noted set
+/// into each IST day's record from 08:00 until the close, so a process alive
+/// across midnight records the new day too. O(entries ≤ 2) plus one copy.
+pub fn note_process_held(
+    origin: HeldOrigin,
+    instruments: &[SubscribeInstrument],
+    basis: UniverseBasis,
+) {
+    let mut held = PROCESS_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // O(1) EXEMPT: at most one entry per origin, two origins.
+    held.retain(|(o, _, _)| *o != origin);
+    held.push((origin, instruments.to_vec(), basis));
+}
+
+/// Every set noted by [`note_process_held`], cloned. O(total instruments),
+/// once a day, cold.
+#[must_use]
+pub fn process_held() -> Vec<HeldSet> {
+    PROCESS_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Where one recording's set came from (plan item 51f).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UniverseBasis {
@@ -826,5 +870,26 @@ mod tests {
             .unwrap_or_else(|| panic!("record missing"));
         assert_eq!(read.first_secs_of_day(&a), Some(33_300));
         let _removed = std::fs::remove_file(day_record_path(d));
+    }
+
+    /// Review round 1: a noted set replaces only the earlier set of the same
+    /// origin, so the boot set and the widened list are both recorded.
+    #[test]
+    fn note_process_held_keeps_one_set_per_origin_and_process_held_returns_them() {
+        let a = SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::IdxI,
+        };
+        let b = SubscribeInstrument {
+            security_id: 2_885,
+            segment: ExchangeSegment::NseEquity,
+        };
+        note_process_held(HeldOrigin::Boot, &[a], UniverseBasis::IndexFallback);
+        note_process_held(HeldOrigin::Widen, &[b], UniverseBasis::MasterList);
+        note_process_held(HeldOrigin::Widen, &[a, b], UniverseBasis::MasterList);
+        let held = process_held();
+        assert_eq!(held.len(), 2);
+        assert!(held.contains(&(HeldOrigin::Boot, vec![a], UniverseBasis::IndexFallback)));
+        assert!(held.contains(&(HeldOrigin::Widen, vec![a, b], UniverseBasis::MasterList)));
     }
 }
