@@ -30,7 +30,10 @@
 //! held to its group's budget in `quality/benchmark-budgets.toml` (`seal_path` =
 //! 1,000 ns, `seal_ilp` for the ILP-append steps), times
 //! `BENCH_BUDGET_MULTIPLIER` if set (1 to 10). Over the ceiling, the run
-//! exits 1 and the bench job fails. A self-test (an over-budget sample must
+//! exits 1 and the bench job fails. With `BENCH_TAIL_GATE_DEFER=1` (set by
+//! `bench.yml`) it prints `BENCH-TAIL-GATE-FAILED` and exits 0 instead, and
+//! a later step fails the run on that line, after the Criterion baseline is
+//! saved, so a p99 miss cannot stop the job before the save. A self-test (an over-budget sample must
 //! fail) runs first. Criterion's own gate (`scripts/bench-gate.sh`) reads the
 //! median against the same key.
 //!
@@ -78,6 +81,12 @@ const ILP_GROUP: &str = "seal_ilp";
 /// Env var that widens the ceiling on a slower runner (same name the
 /// `feed_drain` gate reads).
 const BUDGET_MULTIPLIER_ENV: &str = "BENCH_BUDGET_MULTIPLIER";
+/// Set to `1` by `bench.yml`: a p99 miss then prints [`TAIL_GATE_FAILED_MARKER`]
+/// and exits 0, and a later workflow step fails the run on that line after the
+/// Criterion baseline is saved. Unset (a local `cargo bench`), a miss exits 1.
+const TAIL_GATE_DEFER_ENV: &str = "BENCH_TAIL_GATE_DEFER";
+/// The line every failed p99 gate prints (same text in `feed_drain`).
+const TAIL_GATE_FAILED_MARKER: &str = "BENCH-TAIL-GATE-FAILED";
 /// The widest multiplier accepted.
 const MAX_BUDGET_MULTIPLIER: f64 = 10.0;
 /// Calls sampled per step for the p99 gate.
@@ -532,7 +541,9 @@ fn main() {
     if std::env::args().any(|a| a == "--bench")
         && let Err(why) = seal_path_tail_gate()
     {
-        eprintln!("seal_path p99 gate FAILED: {why}");
-        std::process::exit(1);
+        eprintln!("{TAIL_GATE_FAILED_MARKER} seal_path p99 gate: {why}");
+        if std::env::var(TAIL_GATE_DEFER_ENV).as_deref() != Ok("1") {
+            std::process::exit(1);
+        }
     }
 }

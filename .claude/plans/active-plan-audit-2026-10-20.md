@@ -1196,6 +1196,9 @@ Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 micr
 - [x] SP5. DHAT: the whole per-seal path allocates nothing
   - Files: crates/storage/tests/dhat_seal_per_seal_path.rs
   - Tests: dhat_the_per_seal_path_after_the_fold_never_allocates
+- [x] SP6. Review fixes: the candle ILP buffer is presized and written once at construction (no regrowth on the append); a p99 tail miss defers to a step after the Criterion baseline save
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/benches/seal_path.rs, crates/app/benches/feed_drain.rs, .github/workflows/bench.yml, crates/common/tests/shell_budget_guard.rs, crates/storage/tests/bench_tail_gate_defer_guard.rs
+  - Tests: test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows, test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows, both_benches_print_the_marker_and_exit_unless_deferred, bench_yml_defers_and_fails_after_the_baseline_save, workflow_run_lines_never_grow
 
 ## Design
 

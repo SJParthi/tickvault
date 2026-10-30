@@ -1554,7 +1554,9 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/auto-merge.yml", 25),
     (".github/workflows/aws-autopilot.yml", 7),
     (".github/workflows/aws-control.yml", 264),
-    (".github/workflows/bench.yml", 19),
+    // 2026-10-30 (PR #2143): 19 → 15. The p99 tail-miss step after the
+    // baseline save (+1) is paid by printing the gate summary in one line (−5).
+    (".github/workflows/bench.yml", 15),
     (".github/workflows/chaos-nightly.yml", 64),
     (".github/workflows/ci.yml", 293),
     (".github/workflows/claude-integration.yml", 17),

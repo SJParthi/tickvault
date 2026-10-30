@@ -84,6 +84,42 @@ fn column(name: &'static str) -> ColumnName<'static> {
     ColumnName::new_unchecked(name)
 }
 
+/// Bytes reserved in the candle ILP buffer when a writer is built: one full
+/// drain cycle (`SEAL_MAX_DRAIN_PER_CYCLE` in `main.rs`, 16,384 seals) of the
+/// largest realistic row (measured by
+/// `test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows`), with
+/// headroom (548 bytes x 16,384 = 8.6 MiB measured 2026-10-30, so about 17%).
+/// Resident from construction, since it is written once. Before this the
+/// buffer started at zero capacity and doubled
+/// inside `append_seal` on the first large drain.
+pub const CANDLE_ILP_BUFFER_PRESIZE_BYTES: usize = 10 * 1024 * 1024;
+
+/// One placeholder value written to fill the buffer once at construction.
+const PRESIZE_FILL_VALUE_BYTES: usize = 4_096;
+
+/// Reserves [`CANDLE_ILP_BUFFER_PRESIZE_BYTES`] in `buffer`, writes it once
+/// with placeholder rows and clears them, so neither the growth nor the
+/// first-touch page faults of those bytes land on the per-seal append.
+/// `Buffer::clear` keeps the capacity, and every flush and discard clears, so
+/// a row no larger than the measured one never regrows the buffer below a full
+/// drain. Placeholder rows are never flushed: the buffer is cleared here,
+/// before the writer exists. Cold: once per writer, a few milliseconds.
+fn presized_buffer(mut buffer: Buffer) -> Buffer {
+    buffer.reserve(CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+    let fill = "0".repeat(PRESIZE_FILL_VALUE_BYTES);
+    while buffer.len() + PRESIZE_FILL_VALUE_BYTES * 2 <= buffer.capacity() {
+        let written = buffer
+            .table("tv_presize")
+            .and_then(|b| b.column_str("p", fill.as_str()))
+            .and_then(|b| b.at_now());
+        if written.is_err() {
+            break;
+        }
+    }
+    buffer.clear();
+    buffer
+}
+
 /// Build the questdb-rs **ILP-over-HTTP** connection conf string for a given
 /// host + HTTP port.
 ///
@@ -370,7 +406,7 @@ impl ShadowCandleWriter {
         let conf_string = build_ilp_conf_string(&config.host, config.http_port);
         let (sender, buffer) = match Sender::from_conf(&conf_string) {
             Ok(s) => {
-                let b = s.new_buffer();
+                let b = presized_buffer(s.new_buffer());
                 (Some(s), b)
             }
             Err(err) => {
@@ -378,7 +414,7 @@ impl ShadowCandleWriter {
                     ?err,
                     "shadow candle writer: QuestDB unreachable at startup — will buffer locally until reconnect"
                 );
-                (None, Buffer::new(ProtocolVersion::V1))
+                (None, presized_buffer(Buffer::new(ProtocolVersion::V1)))
             }
         };
         Ok(Self {
@@ -401,7 +437,7 @@ impl ShadowCandleWriter {
     pub fn for_test() -> Self {
         Self {
             sender: None,
-            buffer: Buffer::new(ProtocolVersion::V1),
+            buffer: presized_buffer(Buffer::new(ProtocolVersion::V1)),
             pending_count: 0,
             delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(String::new()),
@@ -1197,6 +1233,68 @@ mod tests {
             String::from_utf8_lossy(&old.0)
         );
         assert_eq!(new.1, old.1);
+    }
+
+    /// Review fix 2026-10-30 (PR #2143): the candle buffer started at zero
+    /// capacity and doubled inside `append_seal` on the first large drain.
+    /// Bites: without `presized_buffer` the capacity is 0.
+    #[test]
+    fn test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows() {
+        const FULL_DRAIN_SEALS: usize = 16_384; // main.rs SEAL_MAX_DRAIN_PER_CYCLE
+        let mut writer = ShadowCandleWriter::for_test();
+        assert!(writer.buffer.capacity() >= CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+        assert_eq!(writer.buffer.len(), 0, "placeholder rows must be cleared");
+        assert_eq!(writer.buffer.row_count(), 0);
+        assert_eq!(writer.pending_count, 0);
+        let start_capacity = writer.buffer.capacity();
+        // A full row: every delay column set, the longest one i64::MIN, and a
+        // long contract name.
+        let seal = mk_seal(
+            1_234_567,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            33_300,
+            22_500.5,
+        );
+        let mut row = ShadowSealRow::from_buffered_seal(&seal);
+        row.open_latency_ns = Some(i64::MIN);
+        row.close_latency_ns = Some(i64::MIN);
+        row.window_span_latency_ns = Some(i64::MIN);
+        let name = "BANKNIFTY-30Dec2026-100000-CE-padded-to-sixty-characters-xx";
+        let mut one = Buffer::new(ProtocolVersion::V1);
+        let mut scratch = String::new();
+        ShadowCandleWriter::write_row(&mut one, &mut scratch, &row, Some(name))
+            .expect("full row writes");
+        assert!(
+            one.len() * FULL_DRAIN_SEALS <= CANDLE_ILP_BUFFER_PRESIZE_BYTES,
+            "a full row is {} bytes, so a full drain needs {} bytes, over the {} presize",
+            one.len(),
+            one.len() * FULL_DRAIN_SEALS,
+            CANDLE_ILP_BUFFER_PRESIZE_BYTES
+        );
+        for _ in 0..FULL_DRAIN_SEALS {
+            ShadowCandleWriter::write_row(&mut writer.buffer, &mut scratch, &row, Some(name))
+                .expect("full row writes");
+        }
+        assert_eq!(
+            writer.buffer.capacity(),
+            start_capacity,
+            "a full drain of full rows regrew the presized buffer"
+        );
+    }
+
+    #[test]
+    fn test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows() {
+        let buffer = presized_buffer(Buffer::new(ProtocolVersion::V1));
+        assert!(buffer.capacity() >= CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.row_count(), 0);
+        let mut writer = ShadowCandleWriter::for_test();
+        let capacity = writer.buffer.capacity();
+        let seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, TfIndex::M1, 33_300, 22_500.5);
+        writer.append_seal(&seal).expect("append");
+        writer.discard_pending();
+        assert_eq!(writer.buffer.capacity(), capacity);
     }
 
     fn arb_latency() -> impl proptest::strategy::Strategy<Value = Option<i64>> {
