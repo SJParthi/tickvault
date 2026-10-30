@@ -103,14 +103,8 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
 
     // Write to temp file first (atomic write pattern)
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-
-        // Set restrictive permissions BEFORE writing the token
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        // Created owner-only from the start, never through a link.
+        let mut file = create_owner_only(std::path::Path::new(&tmp_path))?;
 
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
@@ -131,6 +125,24 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
     }
 
     debug!("token cache saved for fast restart");
+}
+
+/// Creates `path` as a new file that only the owner can read and write.
+///
+/// Any file or link already at `path` is removed first, and the open uses
+/// `create_new`, so it never follows a link planted at the path and the
+/// token is never readable by others, even for a moment. Cold path only.
+fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
 }
 
 /// Loads a cached token from disk, validating expiry and client_id.
@@ -583,5 +595,69 @@ mod tests {
         );
 
         delete_cache_file();
+    }
+
+    /// A fresh, empty directory per test so parallel tests never share a path.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tv-token-cache-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_sets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("mode");
+        let path = dir.join("cache.tmp");
+        let file = create_owner_only(&path).unwrap();
+        drop(file);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "temp file must be owner-only from creation");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_never_writes_through_a_symlink() {
+        let dir = unique_temp_dir("link");
+        let sentinel = dir.join("sentinel");
+        std::fs::write(&sentinel, b"keep-me").unwrap();
+        let path = dir.join("cache.tmp");
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+
+        let mut file = create_owner_only(&path).unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep-me");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the link must be replaced by a regular file"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_create_owner_only_replaces_a_stale_tmp_file() {
+        let dir = unique_temp_dir("stale");
+        let path = dir.join("cache.tmp");
+        std::fs::write(&path, b"stale leftover from a crash").unwrap();
+
+        let mut file = create_owner_only(&path).unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

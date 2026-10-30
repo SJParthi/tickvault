@@ -1376,3 +1376,53 @@ fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
          variables.tf in the same change"
     );
 }
+
+/// Audit PR35: the aws-control market-hours guard reads the UTC clock in base
+/// 10 (a bare `08` or `09` is a bad octal number to bash, so stop, reboot and
+/// the rest failed at those hours and minutes), and restart-questdb is gated
+/// like the other session-interrupting actions (force=yes still overrides).
+#[test]
+fn aws_control_market_hours_guard_is_decimal_safe_and_gates_restart_questdb() {
+    let wf = std::fs::read_to_string(workspace_root().join(".github/workflows/aws-control.yml"))
+        .expect("aws-control.yml must be readable"); // APPROVED: test
+    assert!(
+        wf.contains("10#$(date -u +%H)") && wf.contains("10#$(date -u +%M)"),
+        "the market-hours guard must force base 10 on the UTC hour and minute"
+    );
+    assert!(
+        !wf.contains("$(( ( $(date -u +%H)"),
+        "the old octal-unsafe clock arithmetic must not come back"
+    );
+    assert!(
+        wf.lines()
+            .any(|line| line.contains("rotate-ip|restart-questdb)") && line.contains("sensitive=1")),
+        "restart-questdb must be in the sensitive (market-hours gated) case arm"
+    );
+}
+
+/// Audit PR36: the EventBridge scheduler role may pass only itself to SSM.
+/// The only target using it passes its own ARN as AutomationAssumeRole.
+#[test]
+fn eventbridge_scheduler_pass_role_is_scoped_to_itself() {
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    let policy =
+        terraform_resource_block(&content, "aws_iam_role_policy", "eventbridge_ec2_scheduler");
+    let pass_role_at = policy
+        .find("\"iam:PassRole\"")
+        .expect("the scheduler policy must carry an iam:PassRole statement"); // APPROVED: test
+    let rest = &policy[pass_role_at..];
+    let statement = &rest[..rest.find("Condition").unwrap_or(rest.len())];
+    assert!(
+        statement.contains("Resource = aws_iam_role.eventbridge_ec2_scheduler.arn"),
+        "the PassRole statement must name the scheduler role's own ARN. Found:\n{statement}"
+    );
+    assert!(
+        !statement.contains("Resource = \"*\""),
+        "the PassRole statement must not be Resource = \"*\". Found:\n{statement}"
+    );
+    assert!(
+        rest.contains("\"iam:PassedToService\" = \"ssm.amazonaws.com\""),
+        "the PassRole statement must keep the PassedToService = ssm condition"
+    );
+}

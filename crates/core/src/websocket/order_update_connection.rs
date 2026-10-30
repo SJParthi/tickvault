@@ -84,6 +84,12 @@ const ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 // The library requires the write ceiling to sit above the write buffer.
 const _: () = assert!(ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES > ORDER_UPDATE_WRITE_BUFFER_BYTES);
 
+/// Time limit on the order-update TCP + TLS + WebSocket connect, and again on
+/// the login send. Without it a peer that accepts and then goes quiet holds
+/// the connect forever, and the reconnect loop never runs. A timeout is an
+/// ordinary connect or send failure: same audit row, same backoff.
+const ORDER_UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The explicit WebSocket configuration of the order-update socket. Every
 /// field this product cares about is set, never inherited; message and frame
 /// caps are equal so fragments cannot add up past the frame cap. Cold path,
@@ -648,6 +654,36 @@ async fn order_update_post_close_sleep(
 
 /// Single connection lifecycle: connect → login → read loop.
 #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal + 2026-07-06 stability flag
+/// Dials the order-update socket, giving up after `limit`.
+///
+/// A timeout maps to `Connect`, so the caller treats it like any refused dial.
+/// Cold path, once per connect.
+async fn connect_order_update_socket(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tls_connector: tokio_tungstenite::Connector,
+    limit: Duration,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    OrderUpdateConnectionError,
+> {
+    let dial = connect_async_tls_with_config(
+        request,
+        Some(order_update_websocket_config()),
+        true,
+        Some(tls_connector),
+    );
+    let (ws_stream, _response) = time::timeout(limit, dial)
+        .await
+        .map_err(|_elapsed| {
+            OrderUpdateConnectionError::Connect(format!(
+                "connect timed out after {}s",
+                limit.as_secs_f64()
+            ))
+        })?
+        .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
+    Ok(ws_stream)
+}
+
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
@@ -692,7 +728,8 @@ async fn connect_and_listen(
         .into_client_request()
         .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
 
-    // Third argument is `disable_nagle`, set `true` (2026-08-18) to match the
+    // `connect_order_update_socket` passes `disable_nagle` (its third
+    // argument to the dial) as `true` (2026-08-18) to match the
     // main feed, which has disabled Nagle since the lane was revived. It was
     // `false` here, so this socket alone still coalesced small writes.
     //
@@ -708,14 +745,8 @@ async fn connect_and_listen(
     // standard practice for trading sockets. Receive-only paper mode today,
     // so the present blast radius is small — but this is the socket the live
     // order path re-uses, and the disconnect it prevents is the expensive one.
-    let (ws_stream, _response) = connect_async_tls_with_config(
-        request,
-        Some(order_update_websocket_config()),
-        true,
-        Some(tls_connector),
-    )
-    .await
-    .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
+    let ws_stream =
+        connect_order_update_socket(request, tls_connector, ORDER_UPDATE_CONNECT_TIMEOUT).await?;
     // O(1) EXEMPT: end
 
     info!("order update WebSocket connected");
@@ -761,10 +792,15 @@ async fn connect_and_listen(
 
     // Send login message.
     let login_msg = build_order_update_login(client_id, &access_token);
-    write
-        .send(Message::Text(login_msg.into()))
-        .await
-        .map_err(|err| OrderUpdateConnectionError::Send(err.to_string()))?; // O(1) EXEMPT: cold path, once per connect
+    // Bounded like the connect: a peer that stops reading cannot hold the
+    // login send forever.
+    time::timeout(
+        ORDER_UPDATE_CONNECT_TIMEOUT,
+        write.send(Message::Text(login_msg.into())),
+    )
+    .await
+    .map_err(|_elapsed| OrderUpdateConnectionError::Send("login send timed out".to_string()))?
+    .map_err(|err| OrderUpdateConnectionError::Send(err.to_string()))?; // O(1) EXEMPT: cold path, once per connect
 
     debug!("order update WebSocket login sent");
 
@@ -3112,5 +3148,47 @@ mod tests {
             "the RAW excerpt is the whole point — a counter alone leaves the \
              next occurrence as undiagnosable as this one was"
         );
+    }
+
+    #[test]
+    fn test_order_update_connect_timeout_is_bounded() {
+        // Long enough for a slow TLS handshake, far below the 4 h watchdog.
+        assert!(ORDER_UPDATE_CONNECT_TIMEOUT > Duration::ZERO);
+        assert!(
+            ORDER_UPDATE_CONNECT_TIMEOUT
+                < Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_update_connect_times_out_against_a_silent_server() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Accepts the TCP connection and never sends a TLS ServerHello.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _peer) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(socket);
+        });
+
+        let request = format!("wss://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        let tls_connector = build_websocket_tls_connector().unwrap();
+        let started = std::time::Instant::now();
+        let result =
+            connect_order_update_socket(request, tls_connector, Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(OrderUpdateConnectionError::Connect(msg)) => {
+                assert!(msg.contains("timed out"), "unexpected message: {msg}");
+            }
+            Err(other) => panic!("expected a Connect timeout, got {other}"),
+            Ok(_) => panic!("a silent server must not complete the handshake"),
+        }
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        server.abort();
     }
 }

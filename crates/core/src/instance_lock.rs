@@ -1356,8 +1356,9 @@ pub fn spawn_instance_lock_heartbeat(
                     };
                 }
                 _ = ticker.tick() => {
-                    // A successful renewal is silent (SELFTEST-01 gives the
-                    // daily positive ping); a lost lock exits; a failure or
+                    // A successful renewal is silent. No daily positive ping
+                    // exists today: the 09:16 market-open self-test is not
+                    // wired (plan item PR45). A lost lock exits; a failure or
                     // a renewal past its timeout is counted and retried.
                     let step = heartbeat_tick(
                         renew_instance_lock(&ssm, &env, &host_id),

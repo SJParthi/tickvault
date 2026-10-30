@@ -493,17 +493,20 @@ fn r20_no_workflow_publishes_the_operator_key() {
             !body.contains("#key="),
             "{name}: builds a #key= link; the operator key must never be sent (audit PR36a)"
         );
-        for (i, line) in body.lines().enumerate() {
-            if line.contains("--message") || line.contains("MESSAGE=") {
-                assert!(
-                    !line.contains("KEY}") && !line.contains("$KEY") && !line.contains("LINK}"),
-                    "{name}:{}: a published message references the key: {line}",
-                    i + 1
-                );
-            }
-        }
+        let hits = published_message_key_leaks(&body);
+        assert!(
+            hits.is_empty(),
+            "{name}: a published message references the key:\n{}",
+            hits.join("\n")
+        );
     }
     assert!(scanned > 0, "no workflow files scanned");
+    // Anti-vacuity: the variable terraform-apply.yml reads the key into is
+    // found, so the secret-variable check is not passing on an empty list.
+    assert!(
+        secret_holding_vars(&read(WORKFLOW)).contains(&"TOK".to_string()),
+        "the scan must find TOK, the variable terraform-apply.yml reads the key into"
+    );
 
     let body = read(WORKFLOW);
     let start = body
@@ -1227,4 +1230,148 @@ fn r_dispatch_input_scan_bites() {
     );
     assert!(hits[0].starts_with("x.yml:12:"), "{hits:?}");
     assert!(hits[1].starts_with("x.yml:15:"), "{hits:?}");
+}
+
+/// Shell lines of a workflow with `\`-continued lines joined into one.
+fn joined_shell_lines(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if let Some(head) = trimmed.strip_suffix('\\') {
+            current.push_str(head);
+            current.push(' ');
+        } else {
+            current.push_str(trimmed);
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Audit PR55: the names of shell variables a workflow reads the console
+/// secret into (`NAME=$(aws ssm get-parameter ... control-secret ...)`).
+fn secret_holding_vars(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in joined_shell_lines(body) {
+        if !(line.contains("aws ssm get-parameter") && line.contains("control-secret")) {
+            continue;
+        }
+        let text = line.trim_start();
+        let text = text.strip_prefix("if !").unwrap_or(text).trim_start();
+        let Some(at) = text.find("=$(") else { continue };
+        let head = &text[..at];
+        let start = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let name = &head[start..];
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// True when `line` expands `$NAME` or `${NAME}` (not a longer name such as
+/// `$NAME_X`).
+fn expands_var(line: &str, name: &str) -> bool {
+    if line.contains(&format!("${{{name}}}")) {
+        return true;
+    }
+    let needle = format!("${name}");
+    line.match_indices(&needle).any(|(i, _)| {
+        line[i + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
+/// Every published-message line of one workflow body that references the
+/// operator key: `KEY}`, `$KEY` or `LINK}` on a `--message` / `MESSAGE=`
+/// line (audit PR36a), or a variable the console secret was read into
+/// (audit PR55).
+fn published_message_key_leaks(body: &str) -> Vec<String> {
+    let is_message = |line: &str| line.contains("--message") || line.contains("MESSAGE=");
+    let mut hits = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        if is_message(line)
+            && (line.contains("KEY}") || line.contains("$KEY") || line.contains("LINK}"))
+        {
+            hits.push(format!("{}: {line}", i + 1));
+        }
+    }
+    let names = secret_holding_vars(body);
+    for line in joined_shell_lines(body) {
+        if is_message(&line) && names.iter().any(|n| expands_var(&line, n)) {
+            hits.push(format!("secret variable in a message: {line}"));
+        }
+    }
+    hits
+}
+
+/// Audit PR55: a variable that holds the console secret, published in a
+/// message, is caught even though its name is not KEY.
+#[test]
+fn secret_holding_variable_in_a_published_message_is_caught() {
+    let bad = "          if ! TOK=$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret \\\n              --with-decryption); then\n            exit 1\n          fi\n          aws sns publish --message \"$TOK\"\n";
+    assert_eq!(secret_holding_vars(bad), vec!["TOK".to_string()]);
+    assert_eq!(published_message_key_leaks(bad).len(), 1, "{bad}");
+    let braced = bad.replace("\"$TOK\"", "\"token ${TOK}\"");
+    assert_eq!(published_message_key_leaks(&braced).len(), 1, "{braced}");
+    // A longer name that only starts with the secret's name is not the secret.
+    let other = bad.replace("\"$TOK\"", "\"$TOKEN_COUNT\"");
+    assert!(published_message_key_leaks(&other).is_empty(), "{other}");
+    // The real workflow reads TOK and uses it only for the Authorization header.
+    let real = read(WORKFLOW);
+    assert!(secret_holding_vars(&real).contains(&"TOK".to_string()));
+    assert!(
+        published_message_key_leaks(&real).is_empty(),
+        "{:?}",
+        published_message_key_leaks(&real)
+    );
+}
+
+const EMERGENCY_FS_RECOVER_WORKFLOW: &str = ".github/workflows/emergency-fs-recover.yml";
+
+/// Audit PR35: once the recovery script disables the app, every exit after
+/// that (including the exit 1 paths) leaves the unit enabled again (not
+/// started), so the next boot brings the app back.
+#[test]
+fn emergency_fs_recover_reenables_the_app_on_every_exit() {
+    let body = read(EMERGENCY_FS_RECOVER_WORKFLOW);
+    let line = body
+        .lines()
+        .find(|line| line.contains("systemctl disable tickvault"))
+        .expect("the recovery script disables the app"); // APPROVED: test
+    assert!(
+        line.contains("trap")
+            && line.contains("systemctl enable tickvault")
+            && line.contains("EXIT"),
+        "the disable must set an EXIT trap that re-enables the unit: {line}"
+    );
+}
+
+/// Audit PR55: force_disk_check is free text and recover.sh runs as root,
+/// so only `yes` or `no` may be written into the script.
+#[test]
+fn emergency_fs_recover_force_disk_is_normalised() {
+    let body = read(EMERGENCY_FS_RECOVER_WORKFLOW);
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.contains("__FORCE_DISK__") && line.contains("${FORCE_DISK}")),
+        "the raw force_disk_check value must never be spliced into recover.sh"
+    );
+    let sed = body
+        .lines()
+        .find(|line| line.contains("sed -i") && line.contains("__FORCE_DISK__"))
+        .expect("the FORCE_DISK placeholder is filled by sed"); // APPROVED: test
+    assert!(
+        sed.contains("echo yes || echo no"),
+        "the sed must write only yes or no: {sed}"
+    );
 }

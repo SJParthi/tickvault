@@ -212,7 +212,7 @@ jobs:
           fi
           echo "=== 1. stop + disable the app ==="
           sudo systemctl stop tickvault || true
-          sudo systemctl disable tickvault || true
+          sudo systemctl disable tickvault || true; trap 'sudo systemctl enable tickvault >/dev/null 2>&1 || true' EXIT
           echo "UNIT=$(systemctl is-active tickvault) ENABLED=$(systemctl is-enabled tickvault)"
           echo "=== 2. free space WITHOUT touching market data (Quote 28) ==="
           # Sizes are printed so the operator can see what fills the disk; the
@@ -252,7 +252,7 @@ jobs:
           sleep 5; systemctl is-active amazon-ssm-agent || true
           echo "FINAL"; df -h / | tail -1
           EOS
-          sed -i "s/__FORCE_DISK__/${FORCE_DISK}/" recover.sh
+          sed -i "s/__FORCE_DISK__/$([ "$FORCE_DISK" = yes ] && echo yes || echo no)/" recover.sh
           echo "script written ($(wc -l < recover.sh) lines)"
 
       - name: Push a 60-second key via EC2 Instance Connect and run the recovery
