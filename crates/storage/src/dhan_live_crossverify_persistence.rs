@@ -68,7 +68,9 @@
 //!     tolerance_paise LONG, outcome SYMBOL,
 //!     late_excused LONG, missing_live_unjudged LONG, missing_judgeable SYMBOL,
 //!     attempt_at TIMESTAMP, run_complete BOOLEAN,
-//!     missing_minutes_would_page BOOLEAN
+//!     missing_minutes_would_page BOOLEAN,
+//!     planned_instrument_minutes LONG, covered_instrument_minutes LONG,
+//!     coverage_known BOOLEAN
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, outcome)
 //!
@@ -101,6 +103,16 @@
 //! It is a SHADOW: what a missing-minutes page would have said for that
 //! attempt. Nothing reads it to page; it is the measured baseline the page
 //! (51j) needs first.
+//!
+//! ## 2026-10-30 (plan ITEM 51e, `no-rest-except-live-feed-2026-06-27.md` §12.15.13)
+//!
+//! The daily table gains `planned_instrument_minutes`, `covered_instrument_minutes`
+//! (LONG) and `coverage_known` (BOOLEAN), through the same self-heal and outside
+//! the DEDUP key: how much of the session the run's targets were subscribed for,
+//! from the day's own subscribe record. Plan item 51f reads them to hold the S3
+//! archive and to keep a `clean` day at `partial`; they never touch `diverged`.
+//! The two minute counts mean something only when `coverage_known` is true: a
+//! row with it false may still carry the record's counts (review round 2).
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -499,6 +511,18 @@ pub struct DhanLiveXverifyDailyRow {
     /// fired for this attempt. Always `false` on a run that could not judge
     /// missing minutes. Read by no page; outside the DEDUP key.
     pub missing_minutes_would_page: bool,
+    /// Plan item 51e (§12.15.13): the run's targets times the session's
+    /// minutes. Outside the DEDUP key.
+    pub planned_instrument_minutes: i64,
+    /// Plan item 51e: of `planned_instrument_minutes`, the minutes that start
+    /// at or after each target's first subscribed second of the day (from the
+    /// day's own record). 0 when `coverage_known` is false. Outside the DEDUP
+    /// key.
+    pub covered_instrument_minutes: i64,
+    /// Plan item 51e: the targets came from the day's own record. `false`
+    /// when it was absent or unreadable and the boot set was checked instead.
+    /// Outside the DEDUP key.
+    pub coverage_known: bool,
 }
 
 /// One minute of the vendor's own tape, exactly as fetched.
@@ -580,7 +604,10 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             missing_judgeable SYMBOL, \
             attempt_at       TIMESTAMP, \
             run_complete     BOOLEAN, \
-            missing_minutes_would_page BOOLEAN\
+            missing_minutes_would_page BOOLEAN, \
+            planned_instrument_minutes LONG, \
+            covered_instrument_minutes LONG, \
+            coverage_known BOOLEAN\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
     )
@@ -672,6 +699,9 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("attempt_at", "TIMESTAMP"),
     ("run_complete", "BOOLEAN"),
     ("missing_minutes_would_page", "BOOLEAN"),
+    ("planned_instrument_minutes", "LONG"),
+    ("covered_instrument_minutes", "LONG"),
+    ("coverage_known", "BOOLEAN"),
 ];
 
 /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
@@ -1061,6 +1091,12 @@ impl DhanLiveXverifyAuditWriter {
             .context("run_complete")?
             .column_bool("missing_minutes_would_page", r.missing_minutes_would_page)
             .context("missing_minutes_would_page")?
+            .column_i64("planned_instrument_minutes", r.planned_instrument_minutes)
+            .context("planned_instrument_minutes")?
+            .column_i64("covered_instrument_minutes", r.covered_instrument_minutes)
+            .context("covered_instrument_minutes")?
+            .column_bool("coverage_known", r.coverage_known)
+            .context("coverage_known")?
             .at(TimestampNanos::new(r.run_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
@@ -1271,6 +1307,9 @@ mod tests {
             attempt_at_ist_nanos: 3,
             run_complete: false,
             missing_minutes_would_page: false,
+            planned_instrument_minutes: 1_540,
+            covered_instrument_minutes: 1_155,
+            coverage_known: true,
         }
     }
 
@@ -1791,6 +1830,54 @@ mod tests {
             assert!(!tags.contains(col), "{line}");
             assert!(fields.contains(&format!("{col}={wire}")), "{line}");
         }
+    }
+
+    /// Plan item 51e (§12.15.13): the coverage columns self-heal, reach the
+    /// wire as fields, and stay out of every DEDUP key.
+    #[test]
+    fn coverage_columns_self_heal_reach_the_wire_and_stay_out_of_dedup() {
+        for (col, ty) in [
+            ("planned_instrument_minutes", "LONG"),
+            ("covered_instrument_minutes", "LONG"),
+            ("coverage_known", "BOOLEAN"),
+        ] {
+            let alter = format!(
+                "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+            );
+            assert!(
+                dhan_live_xverify_ddl_statements().contains(&alter),
+                "missing self-heal: {alter}"
+            );
+            assert!(DAILY_COLUMNS.contains(&(col, ty)));
+            assert!(
+                dhan_live_xverify_daily_create_ddl()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')', '\\']) == ty),
+                "the CREATE must declare {col} {ty}"
+            );
+            assert!(!DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY.contains(col));
+            assert!(!dhan_live_xverify_cell_audit_create_ddl().contains(col));
+        }
+        let mut row = sample_daily();
+        row.planned_instrument_minutes = 770;
+        row.covered_instrument_minutes = 396;
+        row.coverage_known = false;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        for col in [
+            "planned_instrument_minutes",
+            "covered_instrument_minutes",
+            "coverage_known",
+        ] {
+            assert!(!tags.contains(col), "{line}");
+        }
+        assert!(fields.contains("planned_instrument_minutes=770i"), "{line}");
+        assert!(fields.contains("covered_instrument_minutes=396i"), "{line}");
+        assert!(fields.contains("coverage_known=f"), "{line}");
     }
 
     #[test]

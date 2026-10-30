@@ -2689,3 +2689,62 @@ Quote 37 moves the daily stop 17:30 → **16:30 IST** and says "the cross-verifi
 **⚠ Honest limit, stated because it is the cost of this change (Risk):** with the retry interval kept at 760 s, a second worst-case attempt cannot fit: 15:57:00 + 760 s + 960 s = 16:25:40, past 16:23. `attempt_is_last` decides from the latest possible end, so **the 15:41 attempt is decided last and a normal day gets no same-day retry before the stop** (it had up to three). A failed day pages `xverify_failed` at its end, as any last failure does. The 16:50 evening attempt still runs only for a day whose only attempt was skipped for time, unchanged. The box is often still up after 16:30 on the Quote 31 drain hold, but no attempt is started between 16:23 and 16:50, by the rules above. Two attempts would fit only with an interval of at most 600 s (zero slack); that is a separate decision and is not taken here.
 
 **What a PR that violates §12.15.12 looks like (REJECT):** every §12.15.8 REJECT row, read with 16:23 for 17:23, 16:25 for 17:25, 16:45 for 17:45 and 16:50 for 17:50; a bound written as a literal instead of derived from the one stop constant; moving the stop cron, the `stop_check` cron or the curfew cron without the pinned constants moving with it; claiming same-day retries that the 16:23 bound no longer leaves room for.
+
+### §12.15.13 — 2026-10-30: the check reads the day's own targets when it fires, and records how much of the session they were subscribed for (plan item 51e)
+
+**Authority.** The owner's 2026-10-06 approval of plan ITEM 51 ("Go ahead with whatever you want dude", "See do everything whatever is recommended dude okay?"), whose fifth finding was "targets fixed at boot"; the coordinator relayed the owner's 2026-10-30 instruction to build 51e to 51g. Recorded HERE before the code ships, per the rule-file-first law. It changes WHICH instruments the check targets and adds three columns. It does not change what a comparison compares, the verdict rules (§12.15.9), the readiness barriers (§12.15.10), the clock bounds (§12.15.12) or any alarm.
+
+**The gap (Verified by reading `origin/main` at `c309f59`).** The targets were built once, from the set the process booted with. A session that booted on the four index ids and widened to today's list later (audit D3b) checked only the four indices; a restart checked only what the new process subscribed.
+
+| Aspect | Locked value |
+|---|---|
+| Day record | `data/instrument-cache/main-feed-spot-<YYYY-MM-DD>.json`, one per IST day, kept 10 days (`DAY_RECORD_KEEP_DAYS`, compile-time asserted above the hold ceiling plus 3) |
+| Written by | a daily recorder, once per IST day from 08:00 until the 15:30 close (never at night, never after the close), writing every set the process holds (its boot set, and today's list once a widen finishes), stamped at the later of the boot and 08:00; and the end of a widen (today's list, stamped when the widen finishes). A process alive across midnight records the new day too. A failed write (here or at the end of a widen) is retried every 60 s (`DAY_RECORD_POLL_SECS`) until every held set lands. Each set is written at the later of the second it went on the wire that day and the recorder's first stamp, so a retry never moves a later widen earlier; a clear never erases a failure for a set noted after the retry's snapshot |
+| Merge | MIN per composite key `(security_id, segment)` (I-P1-11): a restart never moves an instrument's first second later. Flags OR-merged: `master_listed` (a day list was recorded), `index_fallback` (the four index ids were recorded while master sourcing was asked for) |
+| Write | temp file, `sync_all`, `rename`, folder `sync_all`, serialised in-process; at most 25,000 keys; a read refuses a file over 4 MiB, of another day, unparseable or holding a key twice |
+| Targets | read when each day's check starts: every recorded instrument the check can target, in `(segment, security_id)` order. No record (or an unreadable one): the boot set, coverage unknown |
+| Coverage | `planned` = targets × session minutes (385); `covered` = per target, the session minutes that START at or after its first recorded second. A widen at 15:29 plans 385 and covers 11 |
+| Daily row | `planned_instrument_minutes`, `covered_instrument_minutes` (LONG), `coverage_known` (BOOLEAN): ALTER self-heal, outside the DEDUP key |
+
+**Honest limits (Rule 11).**
+- The boot stamp is taken at the resolve, a few seconds before the sockets confirm; the widen stamp after its subscribes. Only whole minutes count.
+- The record holds the FIRST subscribe of the day; a later gap (a process down mid-session) is not in it.
+- A widen that finished short (no room, a connection that did not open) records today's whole list: which instruments landed on the missing room is not known where the widen finishes. Chosen because the alternative, recording nothing, would leave the placed instruments unverified with nothing to say so, and could make a widened day read as the four-index fallback day. The cost: an instrument that was never subscribed reads as missing minutes (a louder finding, never a quieter one).
+- A boot after the close records nothing for its day (it captured nothing in the session); the check then reads the earlier processes' record, or reports coverage unknown when there is none.
+
+**What a PR that violates §12.15.13 looks like (REJECT):** targets fixed at boot again; a record keyed on `security_id` alone; a later recording moving a first second later; a widen at 15:29 reading as full coverage; the coverage columns in a DEDUP key; reading the record from the frame drain.
+
+### §12.15.14 — 2026-10-30: a run that did not cover the subscribed universe does not release the S3 hold (plan item 51f)
+
+**Authority.** As §12.15.13; the page side is the owner's 2026-10-30 answer recorded in `dhan-rest-only-noise-lock-2026-07-14.md` §2.5 ("2026-10-30 note (51e/51f/51g)": "Yes, add the 4 reasons (Recommended)").
+
+| Aspect | Locked value |
+|---|---|
+| Verdict | after the comparison, a `clean` run whose coverage is not full (unknown, short, or the fallback day) reads `partial`. Every other outcome is unchanged; `diverged` is never touched |
+| Marker | written only when the §12.15.7 rule holds AND, in order: the day is not the four-index fallback day (`fallback_universe`), its coverage is known (`coverage_unknown`), every planned minute is covered (`coverage_short`) |
+| Unfinished widen | when today's check fires while a widen has read today's list and not finished, the record may lack instruments already on the wire: coverage is unknown (`coverage_unknown`), fail closed, with one coded `warn!` (`xverify_widen_unfinished`, no filter) |
+| Unsaved record | when today's check fires while a held set this process could not save to the record has not been saved by a retry, coverage is unknown (`coverage_unknown`), fail closed, with one coded `warn!` (`xverify_day_record_write_failed`, no filter) |
+| Fallback day | its record holds the four-index fallback and no day list. A day configured for the four indices (master sourcing off) is never a fallback day |
+| Retry | the three are TERMINAL: the record cannot change after the session, so the day ends at once, and a refused-day marker (`dhan_live_crossverify_refused`, 7 days) stops the past-day catch-up from fetching the vendor tape for it again, and a restarted process does not run today's check again when it finds it. The archive never reads the refused marker |
+| Page | the existing `xverify_failed`, `reason` = the failure, once per IST day through the paged marker. `fallback_universe` names the upstream `live-universe-fallback` alarm. No new alarm, filter, EMF name or page |
+| Verdict vs page | the daily row keeps the comparison's verdict (a `diverged` day stays `diverged`); the page reports the held archive, not a new verdict |
+
+**Honest limits.** A late-subscribed traded instrument usually also reads `diverged` (its early minutes are missing), so such a day pages twice when the divergence is catastrophic: once for the divergence, once for the hold. A day held this way archives after `MAX_CROSSVERIFY_HOLD_DAYS`, loudly, as any unrecorded day.
+
+**What a PR that violates §12.15.14 looks like (REJECT):** releasing the hold on short, unknown or fallback coverage; downgrading `diverged`, or any outcome but `clean`; retrying a terminal failure; the S3 gate reading the refused marker; any page beyond the §2.5 note.
+
+### §12.15.15 — 2026-10-30: a day with no run is found and run; a supervisor reports a worker that never did (plan item 51g)
+
+**Authority.** As §12.15.13 and §12.15.14.
+
+| Aspect | Locked value |
+|---|---|
+| Past days | every trading day 1 to `MAX_CROSSVERIFY_HOLD_DAYS` (3) days back with no day marker and no refused marker, whatever today's marker says, oldest first (the next the archive releases unverified) |
+| When | once per IST day per process, from 08:00: before 15:41 for each past day whose worst case (4 attempts and their sleeps) plus a 60 s margin (`PAST_DAY_FIT_MARGIN_SECS`) ends by 15:41, otherwise after today's own check. A pure step table (`worker_step`) decides each move again after every step, so a restart after 15:41 on an already-recorded day still runs the past days, and a process alive across days runs the before-15:41 pass every day. Today's one attempt before the stop (§12.15.12) is never pushed late |
+| How | the same day loop, readiness `PAST_DAY`, each day's own record and its own paged marker, so a past day already paged is not paged again. A past day runs at most once per IST day per process, even when the before-15:41 pass ran it and left another day for after the run. No option pass for a past day |
+| Supervisor | at 16:24 IST (the deadline) on a trading day, when the worker started before 16:23 or on an earlier day, and nothing reported today (no report in this process, no day marker, no paged marker): pages `xverify_failed` `reason = worker_never_reported` and writes the paged marker. The report day is a maximum, so a past day reported later never hides today's |
+| Final-page state | the paged marker of §12.15.8, now also read for past days |
+
+**Honest limits.** A past day's page text says "today" for the day it names (the `today` field carries that day). A box that never runs again inside the hold window gets no catch-up; the archive releases those days after the ceiling, loudly. The supervisor cannot see a worker in a frozen process (the whole process is frozen then).
+
+**What a PR that violates §12.15.15 looks like (REJECT):** a past-day run that can push today's own attempt past its start; checking days past the hold window; paging a past day already paged; a supervisor that pages when the day was recorded or paged, or on a non-trading day.
