@@ -137,3 +137,36 @@ mod tests {
         assert_eq!(compact["novel_count"], 4);
     }
 }
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[test]
+    fn run_completes_and_returns_zero_on_an_empty_repo_root() {
+        // A fresh root with no logs at all: every demo block must degrade to
+        // an empty answer, never panic, and the self-test exits 0.
+        let base = std::env::temp_dir().join(format!("tv-mcp-selftest-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        assert_eq!(run(&ctx), 0);
+        assert!(config::state_dir(&base).ends_with(".claude/state"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dumps_indent2_escapes_non_ascii_before_slicing() {
+        let out = dumps_indent2(&serde_json::json!({"k": "é"}));
+        assert!(out.contains("\\u00e9"), "{out}");
+        assert!(out.contains("\n  \"k\""), "two-space indent: {out}");
+    }
+
+    #[test]
+    fn compact_novel_demo_passes_a_non_object_through() {
+        let v = serde_json::json!(["not", "an", "object"]);
+        assert_eq!(compact_novel_demo(&v), v);
+    }
+}
