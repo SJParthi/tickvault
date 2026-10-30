@@ -620,3 +620,15 @@ fn test_send_refuses_a_half_written_row_and_sends_nothing_when_empty() {
     let err = ours.send(&mut b).expect_err("half row");
     assert!(!err.retryable);
 }
+
+#[test]
+fn test_can_flush_only_between_rows() {
+    let mut b = OwnIlpBuffer::new();
+    assert!(b.can_flush(), "empty");
+    assert!(IlpLine::table(&mut b, "t").is_ok());
+    assert!(!b.can_flush(), "table written");
+    assert!(IlpLine::column_i64(&mut b, "v", 1).is_ok());
+    assert!(!b.can_flush(), "column written");
+    assert!(IlpLine::at_nanos(&mut b, 1).is_ok());
+    assert!(b.can_flush(), "row ended");
+}
