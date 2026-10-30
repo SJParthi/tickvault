@@ -80,7 +80,7 @@ use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqWriter;
 use crate::seal_spill::SealSpillWriter;
 use crate::seal_writer_task::{
-    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once_into,
+    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once_reusing,
     drain_recovered_seals_for_replay,
 };
 use crate::shadow_candle_writer::ShadowCandleWriter;
@@ -1176,7 +1176,7 @@ impl SealWriterRunner {
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
             last_live_flush: None,
-            popped_scratch: Vec::new(),
+            drain_scratch: Vec::new(),
             spill,
         })
     }
@@ -1232,7 +1232,7 @@ impl SealWriterRunner {
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
             last_live_flush: None,
-            popped_scratch: Vec::new(),
+            drain_scratch: Vec::new(),
             spill,
         }
     }
@@ -1373,12 +1373,12 @@ impl SealWriterRunner {
                 now_unix_secs,
             );
         if due {
-            outcome.drain = drain_once_into(
+            outcome.drain = drain_once_reusing(
                 &mut self.pipeline,
                 &mut self.writer,
                 self.max_drain_per_cycle,
                 now_unix_secs,
-                &mut self.popped_scratch,
+                &mut self.drain_scratch,
             );
             if outcome.drain.ring_seals_popped > 0 {
                 self.last_live_flush = Some(now_unix_secs);

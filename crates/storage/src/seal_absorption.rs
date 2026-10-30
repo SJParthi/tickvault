@@ -435,9 +435,9 @@ impl SealAbsorptionPipeline {
             floor: SealDiskFloor::new(spill.spill_dir().to_path_buf()),
             spill,
             dlq: Arc::new(SealDlqWriter::new()),
-            spill_failure: FailureEpisode::default(),
-            dlq_failure: FailureEpisode::default(),
-        }
+        };
+        pipeline.prefault_ring();
+        pipeline
     }
 
     /// Test constructor. Tests inject isolated `tempdir` paths so they

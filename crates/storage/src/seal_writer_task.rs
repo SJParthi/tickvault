@@ -138,11 +138,10 @@ impl DrainOutcome {
 /// loop on whatever cadence is appropriate (the future tokio task in
 /// item 1.2f.4 sleeps `SEAL_DRAIN_INTERVAL` between cycles).
 ///
-/// **Cold path.** Allowed to allocate; allocates one rescue buffer of up to
-/// `max_drain` seals per call. The seal writer runner calls
-/// [`drain_once_into`] with a buffer it keeps across cycles instead
-/// (2026-10-30 O(1) sweep): it allocates only on a cycle that pops more
-/// seals than any cycle before it.
+/// Allocates one rescue buffer of up to `max_drain` seals per call. The
+/// live runner calls [`drain_once_reusing`] with a buffer it keeps, so the
+/// live cycle allocates nothing here; this form is for tests and one-off
+/// callers.
 ///
 /// **No FIFO inversion on rescue.** Popped seals are NOT pushed back
 /// into the ring (which would put them at the BACK and invert
@@ -158,10 +157,11 @@ pub fn drain_once(
     now_unix_secs: i64,
 ) -> DrainOutcome {
     let mut popped = Vec::new();
-    drain_once_into(pipeline, writer, max_drain, now_unix_secs, &mut popped)
+    drain_once_reusing(pipeline, writer, max_drain, now_unix_secs, &mut popped)
 }
 
-/// [`drain_once`] with a caller-owned rescue buffer (2026-10-30 O(1) sweep).
+/// [`drain_once`] with a caller-owned rescue buffer, cleared on entry and
+/// on return, whose capacity is kept across calls.
 ///
 /// # Why (owner directive 2026-10-30: per-seal work under 1 µs, no
 /// allocation per seal)
@@ -201,9 +201,10 @@ pub fn drain_once_reusing(
     // seals. `ring_len` is the real bound on how many `pop_oldest` can yield
     // this cycle, and the `.min` keeps the reservation exact in both
     // directions — no over-reserve when idle, no re-alloc when saturated.
-    // `reserve_exact` on the kept buffer (2026-10-30): plain `reserve` may
-    // double, which would let the runner keep up to twice `max_drain` seals
-    // for the process lifetime; exact growth keeps it at most `max_drain`.
+    // `reserve_exact` on a cleared buffer that already holds this capacity
+    // is a compare, no allocation; when it must grow it grows to exactly
+    // the request (never the doubling `reserve` would take), so the kept
+    // buffer never exceeds `max_drain` seals.
     popped.reserve_exact(max_drain.min(pipeline.ring_len()));
     while popped.len() < max_drain {
         match pipeline.pop_oldest() {
@@ -271,7 +272,8 @@ pub fn drain_once_reusing(
             // Audit PR41a: an amended bar committed live while its original
             // waits in the spill. Append the fuller copy behind it, so no
             // replay ends on the original.
-            pipeline.note_live_commits(popped, now_unix_secs);
+            pipeline.note_live_commits(popped.as_slice(), now_unix_secs);
+            popped.clear();
         }
         Err(flush_err) => {
             // Finding S3: seal-time ILP flush failure is a persist
