@@ -199,6 +199,14 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/storage/src/tick_row_identity_tests.rs",
         "tick_price_f64_matches_legacy_for_every_fast_path_f32",
     ),
+    // Added 2026-10-30 (plan item DT-OWN-ILP): every f32 price below 2^17,
+    // both signs, through both ILP encoders, about 2.2 billion values; minutes
+    // in release, far too slow for every PR. The sampled and proptest
+    // versions run on every PR.
+    (
+        "crates/storage/src/tick_ilp_tests.rs",
+        "test_exact_cents_every_f32_price_below_2_pow_17_matches_the_library",
+    ),
     // Added 2026-10-03 with sweep S1 (the drain flush no longer hands over
     // its worker): the same wall-clock shape as the harnesses below -- it
     // times `block_in_place` against a bare call and prints both, so a shared

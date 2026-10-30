@@ -156,8 +156,8 @@ fn shared_gate_users_exit_only_through_run_under_bench() {
         }
     }
     assert!(
-        users >= 5,
-        "expected at least 5 users of the shared gate, found {users}"
+        users >= 6,
+        "expected at least 6 users of the shared gate, found {users}"
     );
 }
 
