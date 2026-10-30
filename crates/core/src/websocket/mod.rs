@@ -59,6 +59,7 @@ pub mod pool_budget;
 // executes it. Opens no socket itself: the transport is a trait
 // (`DhanFeedSocket`) so every decision branch is unit-testable without a
 // network. Spawned by `tickvault_app::dhan_feed_stack`, DEFAULT-OFF.
+pub mod hot_thread_placement;
 pub mod pool_supervisor;
 pub mod reader_runtime;
 pub mod reconnect_ladder;
