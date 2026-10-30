@@ -845,7 +845,9 @@ jobs:
           crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
           crates/storage/tests/dhat_flush_buffer_recycle.rs
+          crates/storage/tests/dhat_hot_path_latency_minute.rs
           crates/storage/tests/dhat_hot_path_telemetry.rs
+          crates/storage/tests/dhat_receipt_to_fold_stage.rs
           crates/storage/tests/dhat_rescue_floor_zero_alloc.rs
           crates/storage/tests/dhat_seal_per_seal_path.rs
           crates/storage/tests/dhat_seal_queue_backlog.rs
@@ -989,32 +991,31 @@ jobs:
       # watermark durability-lag ring stay allocation-free.
       # 2026-10-26: dhat_hot_path_telemetry added (audit K5), 5 -> 6. It pins
       # that record_stage_nanos, beat_at and stage_quantiles allocate nothing.
+      # 2026-10-30: dhat_hot_path_latency_minute (the per-minute proof and
+      # capacity window on the telemetry thread) and dhat_receipt_to_fold_stage
+      # (DT0) added, 6 -> 8, each sharing an existing --test line.
       # Two --test flags share a line so the run: line count does not grow.
       # 2026-10-30: dhat_tick_row_append added (plan ITEM DT row stage), 6 -> 7.
       # It pins the per-tick ILP row build at zero allocations. Its flag shares
       # a line with two others, so the run: line count does not grow.
-      # 2026-10-30: dhat_task_watch added (plan item 4), 6 -> 7. It pins that
-      # the background-task heartbeat beat and publish and one memory-ladder
-      # poll allocate nothing. Two earlier --test lines merged so the run:
-      # line count does not grow.
-      # Both landed the same day: 7 -> 8.
+      # 2026-10-30: with PR #2146's two (hot_path_latency_minute, receipt_to_fold) -> 9;
+      # the flags are packed three per line so the run: line count stays at its ceiling.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
-            --test dhat_deferred_depth_note_shed --test dhat_depth_append_zero_alloc --test dhat_tick_row_append \
-            --test dhat_flush_buffer_recycle --test dhat_hot_path_telemetry \
-            --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog --test dhat_task_watch \
+            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc \
+            --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle \
+            --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
             2>&1 | tee /tmp/dhat-storage.log
           if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
             echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 8 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step."
-            exit 1
+          if [ "$ran" -ne 9 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
           fi
 
       - name: DHAT (trading)

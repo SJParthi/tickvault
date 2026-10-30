@@ -1197,6 +1197,7 @@ impl WsFrameSpill {
         let writer = thread::Builder::new()
             .name(WAL_WRITER_THREAD_NAME.to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
+                let _registered = crate::hot_thread_sched::register_wal_writer_thread();
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
                 // DISK-WATCHER-01). A fatal RETURN from the writer must NOT
                 // silently kill the durable WAL floor: we re-enter
