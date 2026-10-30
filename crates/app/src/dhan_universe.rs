@@ -2738,6 +2738,47 @@ mod tests {
     }
     use super::*;
 
+    /// The dashboard's F&O stocks endpoint (`tickvault_api::handlers::fno_stocks`,
+    /// 2026-10-30) reads this writer's F&O list from its own copy of the path
+    /// and the row tag, because the api crate cannot depend on this one. Two
+    /// copies of a filename let the reader look for a name the writer never
+    /// produces, so both copies, and the on-disk shape, are pinned here.
+    #[test]
+    fn test_fno_list_path_tag_and_shape_match_the_dashboard_reader() {
+        use tickvault_api::handlers::fno_stocks as reader;
+        assert_eq!(
+            fno_underlying_artifact_path("2026-10-30"),
+            reader::fno_underlying_artifact_path(
+                std::path::Path::new(reader::FNO_UNDERLYING_ARTIFACT_DIR),
+                "2026-10-30"
+            )
+        );
+        assert_eq!(FNO_UNDERLYING_TAG, reader::FNO_UNDERLYING_TAG);
+        let body = serde_json::to_vec(&FnoUnderlyingArtifact {
+            count: 2,
+            mappings: vec![
+                MappingEntry {
+                    index_name: FNO_UNDERLYING_TAG.to_string(),
+                    symbol: "RELIANCE".to_string(),
+                    isin: "INE002A01018".to_string(),
+                    security_id: 2885,
+                    exchange_segment: 1,
+                },
+                MappingEntry {
+                    index_name: "NIFTY 50".to_string(),
+                    symbol: "NIFTY 50".to_string(),
+                    isin: String::new(),
+                    security_id: 13,
+                    exchange_segment: 0,
+                },
+            ],
+        })
+        .expect("serialises");
+        let list = reader::parse_fno_underlyings(&body).expect("the reader parses the writer");
+        assert_eq!(list.len(), 1, "only the F&O stock row counts");
+        assert_eq!(list.name_of(2885, 1), Some("RELIANCE"));
+    }
+
     #[test]
     fn test_next_wait_runs_immediately_when_the_target_already_passed() {
         // THE production case, and the reason this function exists. The box
