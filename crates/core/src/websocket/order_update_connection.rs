@@ -3114,3 +3114,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "order_update_connection_run_loop_cov_tests.rs"]
+mod order_update_connection_run_loop_cov_tests;
