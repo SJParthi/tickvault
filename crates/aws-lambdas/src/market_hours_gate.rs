@@ -55,6 +55,33 @@ pub fn parse_alarm_names(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Event key naming gated alarms an `open` must leave disarmed.
+pub const SKIP_ALARMS_EVENT_KEY: &str = "skip_alarms";
+
+/// The alarms an `open` arms: `ALARM_NAMES` less every name the event lists
+/// under [`SKIP_ALARMS_EVENT_KEY`]. A subset only, never a widening: a name
+/// not in `ALARM_NAMES` is ignored, and a missing or malformed key skips
+/// nothing (the weekday 09:20 rule sends no key, so it arms the full list).
+///
+/// Why it exists (2026-10-30, owner: "go ahead and fix the muhurat risk
+/// dude"): the dated Muhurat open rule runs on a weekend date, and three gated
+/// alarms ask "did a MON-FRI Lambda run today?" (`Invocations < 1`, 86400 s,
+/// breaching). Armed on a Sunday they would page for a check that correctly
+/// did not run. The Muhurat rule lists those three here. Pure, O(names × skip).
+#[must_use]
+pub fn alarms_to_open(alarm_names: &[String], event: &Value) -> Vec<String> {
+    let skip: Vec<&str> = event
+        .get(SKIP_ALARMS_EVENT_KEY)
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    alarm_names
+        .iter()
+        .filter(|name| !skip.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Marker == today is AUTHORITATIVE for "intentionally stopped today".
 /// `raw_param = None` is the SSM-error / missing-param arm → fail-open
 /// (not a holiday). Stale markers (a previous holiday's date) never match.
@@ -130,6 +157,9 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     }
 
     // --- mode == open ---
+    // A dated Muhurat open leaves the weekday did-it-run alarms disarmed
+    // (`alarms_to_open`); the weekday rule sends no skip list.
+    let alarm_names = alarms_to_open(&alarm_names, &event);
     let ssm = crate::clients::ssm(&config);
     let today_ist = crate::time::today_ist_string(Utc::now());
     // FAIL-OPEN: any SSM error / missing param = not a holiday.
@@ -404,6 +434,38 @@ mod tests {
         }
     }
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn test_alarms_to_open_weekday_event_arms_the_full_list() {
+        let all = names(&["liveness", "no-ticks", "deploy-watchdog-not-invoked"]);
+        assert_eq!(alarms_to_open(&all, &json!({"mode": "open"})), all);
+        // A malformed skip value skips nothing.
+        assert_eq!(
+            alarms_to_open(&all, &json!({"mode": "open", "skip_alarms": "liveness"})),
+            all
+        );
+    }
+
+    #[test]
+    fn test_alarms_to_open_muhurat_event_leaves_the_skipped_alarms_disarmed() {
+        let all = names(&["liveness", "no-ticks", "deploy-watchdog-not-invoked"]);
+        let event = json!({"mode": "open", "skip_alarms": ["deploy-watchdog-not-invoked"]});
+        assert_eq!(
+            alarms_to_open(&all, &event),
+            names(&["liveness", "no-ticks"])
+        );
+    }
+
+    #[test]
+    fn test_alarms_to_open_never_widens_the_list() {
+        let all = names(&["liveness"]);
+        let event = json!({"mode": "open", "skip_alarms": ["some-other-alarm", 7]});
+        assert_eq!(alarms_to_open(&all, &event), all);
+    }
 
     #[test]
     fn test_parse_alarm_names_splits_trims_and_drops_empties() {

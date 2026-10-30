@@ -280,6 +280,38 @@ AllowedCPUs=1-2
 # ROLLBACK to the pre-2026-08-19 `num_cpus` behaviour on this box: set 4.
 Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
 
+# ---------------------------------------------------------------------------
+# Hot-thread placement (plan ITEM DT, 2026-10-30) — ALL OFF by default
+# ---------------------------------------------------------------------------
+#
+# On the 2-core r8g.large the socket readers and the frame drain sometimes
+# wait 2-16 ms for a CPU that QuestDB or a background thread holds (measured
+# 29 Oct). Four independent switches move them apart; each is off until the
+# operator turns it on for one measured live day:
+#
+#   TICKVAULT_DRAIN_THREAD=on        the frame drain on its own OS thread,
+#                                     pinned to the readers' core (core 1)
+#   TICKVAULT_BACKGROUND_CORE=0      every other app thread on core 0
+#   TICKVAULT_HOT_RT_PRIORITY=1      readers SCHED_FIFO 2, drain SCHED_FIFO 1;
+#                                     refused unless kernel.sched_rt_runtime_us
+#                                     is below its period and at least half of
+#                                     it (default 950000 of
+#                                     1000000), so a stuck thread can never
+#                                     freeze the box. Needs LimitRTPRIO below.
+#   TV_QDB_CORE_ISOLATION=1          (in deploy/docker/.env, not here)
+#                                     QuestDB alone on core 0, applied by
+#                                     `tickvault host-tuning apply`
+#
+# To turn on (all four, or any subset), in a drop-in, outside market hours:
+#   printf '[Service]\nEnvironment=TICKVAULT_DRAIN_THREAD=on\nEnvironment=TICKVAULT_BACKGROUND_CORE=0\nEnvironment=TICKVAULT_HOT_RT_PRIORITY=1\nLimitRTPRIO=2\n' \
+#     > /etc/systemd/system/tickvault.service.d/95-hot-threads.conf
+#   echo 'TV_QDB_CORE_ISOLATION=1' >> /opt/tickvault/repo/deploy/docker/.env
+#   systemctl daemon-reload && systemctl restart tickvault
+# Rollback: delete the drop-in and the .env line, daemon-reload, restart.
+# Read back: the boot log lines "frame drain placement" / "the frame drain
+# runs on its own thread", any HOT-PATH-03 line, and the live stage
+# tv_hot_path_stage_max_ns{stage="drain_main_frame"} / ring_dwell.
+
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096

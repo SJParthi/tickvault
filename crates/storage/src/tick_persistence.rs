@@ -309,6 +309,82 @@ pub enum TickRowError {
 // Row
 // ---------------------------------------------------------------------------
 
+/// Below this magnitude an `f32` step is at most 2^-7 (0.0078), smaller than
+/// 0.01, so at most one two-decimal number rounds to any given `f32`. That
+/// uniqueness is what makes [`tick_price_f64`]'s fast path exact.
+const TICK_PRICE_FAST_PATH_MAX_MAGNITUDE: f32 = 131_072.0;
+
+/// Exactly `round_to_2dp(f32_to_f64_clean(v))`, bit for bit, for every `f32`
+/// (plan ITEM DT, 2026-10-30). The price written to every `ticks` /
+/// `tick_quotes` price column.
+///
+/// # Why the fast path is exact
+///
+/// For `0 < |v| < 2^17` it takes the nearest whole number of hundredths to
+/// `v` (`cents`) and returns `cents / 100` when that rounds back to `v` as an
+/// `f32`. Then `cents / 100` is the ONLY two-decimal number that does (see
+/// [`TICK_PRICE_FAST_PATH_MAX_MAGNITUDE`]). `f32_to_f64_clean` tries scales
+/// 1, 10 and 100 first, and every hit it can make there is a two-decimal
+/// number that rounds back to `v`, so it is the same number, and at scale 100
+/// its nearest candidate is `cents` itself (|v - d| <= 2^-8, so `v * 100` is
+/// within 0.39 of `100 d`), so it always hits by scale 100. A decimal `m / s`
+/// and `(100 m / s) / 100` are the same rational, and IEEE division returns
+/// the nearest `f64` to it, so both paths return the same `f64`; and
+/// `round_to_2dp` leaves a value of at most two decimals unchanged (and never
+/// sees zero here). Anything else (zero, non-finite, larger, or a price with
+/// more than two decimals) takes the original path unchanged.
+///
+/// Pinned by the proptests in `tick_row_identity_tests` and by the
+/// exhaustive `#[ignore]`d test over every `f32` below 2^17.
+///
+/// # Performance
+///
+/// O(1). The fast path is one multiply, one add, one divide and three
+/// conversions, where `f32_to_f64_clean` tries up to six candidates (a divide
+/// and a software `round` each) and `round_to_2dp` one more `round`.
+/// Allocation-free.
+#[inline]
+#[must_use]
+pub(crate) fn tick_price_f64(v: f32) -> f64 {
+    let magnitude = v.abs();
+    if magnitude > 0.0 && magnitude < TICK_PRICE_FAST_PATH_MAX_MAGNITUDE {
+        // The widening is exact and only locates the two-decimal candidate;
+        // the widened value itself is never returned.
+        let scaled = f64::from(v) * 100.0; // APPROVED: exact widening, never stored
+        // DATA-INTEGRITY-EXEMPT: rounds the hundredths count, never a price.
+        // |scaled| < 1.4e7, so the cast is exact and cannot saturate; the
+        // value is within 0.39 of an integer, so adding 0.5 (with its sign)
+        // and truncating gives that integer.
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: exact, see above
+        let cents = (scaled + 0.5_f64.copysign(scaled)) as i64;
+        // APPROVED: |cents| < 1.4e7 < 2^24, exact in f64
+        #[allow(clippy::cast_precision_loss)]
+        let candidate = cents as f64 / 100.0;
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: narrowing is the round-trip test itself
+        if candidate as f32 == v {
+            return candidate;
+        }
+    }
+    round_to_2dp(f32_to_f64_clean(v))
+}
+
+/// `sanitize_ilp_symbol(segment)`, without the per-character UTF-8 walk when
+/// `ilp_symbol_is_clean` already holds (plain printable ASCII, no `,` or `=`,
+/// at most `ILP_SYMBOL_MAX_BYTES`; every
+/// `segment_code_to_str` value). Identical output: such a string has no
+/// character `sanitize_ilp_symbol` strips, and the length check is the same.
+/// O(len), allocation-free on that path.
+#[inline]
+fn ilp_segment_symbol(segment: &str) -> std::borrow::Cow<'_, str> {
+    if tickvault_common::sanitize::ilp_symbol_is_clean(segment) {
+        std::borrow::Cow::Borrowed(segment)
+    } else {
+        sanitize_ilp_symbol(segment)
+    }
+}
+
 /// Counter for float columns of a tick row that were non-finite at append
 /// time (QuestDB would store them as NULL). Expected to stay at zero.
 pub const TICK_NONFINITE_COLUMNS_COUNTER: &str = "tv_tick_nonfinite_columns_total";
@@ -397,17 +473,33 @@ fn write_tick_line_into(
     row: &TickRow,
     exchange_ts_ist_nanos: Option<i64>,
 ) -> Result<()> {
+    // No context wrapper: the `ilp_append_failed` log prints `%err`, which shows
+    // only the outermost message, so the questdb error itself (which names the
+    // refused call and why) is kept as that message.
+    write_tick_line_columns(buffer, table, feed, row, exchange_ts_ist_nanos)
+        .map_err(anyhow::Error::from)
+}
+
+/// The body of [`write_tick_line_into`]: every column through the questdb
+/// buffer with plain `?`, so the happy path pays no per-column `anyhow`
+/// wrapping (plan ITEM DT, 2026-10-30). The caller converts the questdb
+/// error unchanged, so its message (the refused call and why) is what the
+/// append-failure log prints. O(1), no allocation.
+fn write_tick_line_columns(
+    buffer: &mut Buffer,
+    table: &'static str,
+    feed: &'static str,
+    row: &TickRow,
+    exchange_ts_ist_nanos: Option<i64>,
+) -> questdb::Result<()> {
     debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
     buffer
-        .table(questdb::ingress::TableName::new_unchecked(table))
-        .context("table")?
+        .table(questdb::ingress::TableName::new_unchecked(table))?
         .symbol(
             tick_ilp_column("segment"),
-            sanitize_ilp_symbol(row.segment).as_ref(),
-        )
-        .context("segment")?
-        .symbol(tick_ilp_column("feed"), feed)
-        .context("feed")?;
+            ilp_segment_symbol(row.segment).as_ref(),
+        )?
+        .symbol(tick_ilp_column("feed"), feed)?;
     // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
     // SAME table the candle writer reads (operator 2026-09-22: "put either
     // contract or symbol name right in each and every table"). One ArcSwap
@@ -422,98 +514,64 @@ fn write_tick_line_into(
     let labels = crate::candle_contract_labels::candle_contract_labels();
     if let Some(name) = labels.get(&(row.security_id, row.segment)) {
         debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
-        buffer
-            .symbol(tick_ilp_column("contract"), &**name)
-            .context("contract")?;
+        buffer.symbol(tick_ilp_column("contract"), &**name)?;
     }
     buffer
-        .column_i64(tick_ilp_column("security_id"), row.security_id)
-        .context("security_id")?
-        .column_f64(tick_ilp_column("ltp"), row.ltp)
-        .context("ltp")?;
+        .column_i64(tick_ilp_column("security_id"), row.security_id)?
+        .column_f64(tick_ilp_column("ltp"), row.ltp)?;
 
     // Per-feed OPTIONAL columns — omitted (NULL) when None.
     if let Some(v) = row.open {
-        buffer
-            .column_f64(tick_ilp_column("open"), v)
-            .context("open")?;
+        buffer.column_f64(tick_ilp_column("open"), v)?;
     }
     if let Some(v) = row.high {
-        buffer
-            .column_f64(tick_ilp_column("high"), v)
-            .context("high")?;
+        buffer.column_f64(tick_ilp_column("high"), v)?;
     }
     if let Some(v) = row.low {
-        buffer
-            .column_f64(tick_ilp_column("low"), v)
-            .context("low")?;
+        buffer.column_f64(tick_ilp_column("low"), v)?;
     }
     if let Some(v) = row.close {
-        buffer
-            .column_f64(tick_ilp_column("close"), v)
-            .context("close")?;
+        buffer.column_f64(tick_ilp_column("close"), v)?;
     }
-    buffer
-        .column_i64(tick_ilp_column("volume"), row.volume)
-        .context("volume")?;
+    buffer.column_i64(tick_ilp_column("volume"), row.volume)?;
     if let Some(v) = row.oi {
-        buffer.column_i64(tick_ilp_column("oi"), v).context("oi")?;
+        buffer.column_i64(tick_ilp_column("oi"), v)?;
     }
     if let Some(v) = row.oi_day_high {
-        buffer
-            .column_i64(tick_ilp_column("oi_day_high"), v)
-            .context("oi_day_high")?;
+        buffer.column_i64(tick_ilp_column("oi_day_high"), v)?;
     }
     if let Some(v) = row.oi_day_low {
-        buffer
-            .column_i64(tick_ilp_column("oi_day_low"), v)
-            .context("oi_day_low")?;
+        buffer.column_i64(tick_ilp_column("oi_day_low"), v)?;
     }
     if let Some(v) = row.avg_price {
-        buffer
-            .column_f64(tick_ilp_column("avg_price"), v)
-            .context("avg_price")?;
+        buffer.column_f64(tick_ilp_column("avg_price"), v)?;
     }
     if let Some(v) = row.last_trade_qty {
-        buffer
-            .column_i64(tick_ilp_column("last_trade_qty"), v)
-            .context("last_trade_qty")?;
+        buffer.column_i64(tick_ilp_column("last_trade_qty"), v)?;
     }
     if let Some(v) = row.total_buy_qty {
-        buffer
-            .column_i64(tick_ilp_column("total_buy_qty"), v)
-            .context("total_buy_qty")?;
+        buffer.column_i64(tick_ilp_column("total_buy_qty"), v)?;
     }
     if let Some(v) = row.total_sell_qty {
-        buffer
-            .column_i64(tick_ilp_column("total_sell_qty"), v)
-            .context("total_sell_qty")?;
+        buffer.column_i64(tick_ilp_column("total_sell_qty"), v)?;
     }
     if let Some(v) = row.received_at_ist_nanos {
-        buffer
-            .column_ts(tick_ilp_column("received_at"), TimestampNanos::new(v))
-            .context("received_at")?;
+        buffer.column_ts(tick_ilp_column("received_at"), TimestampNanos::new(v))?;
     }
     if let Some(v) = row.payload_hash {
-        buffer
-            .column_i64(tick_ilp_column("payload_hash"), v)
-            .context("payload_hash")?;
+        buffer.column_i64(tick_ilp_column("payload_hash"), v)?;
     }
     if let Some(v) = exchange_ts_ist_nanos {
-        buffer
-            .column_ts(
-                tick_ilp_column("exchange_timestamp"),
-                TimestampNanos::new(v),
-            )
-            .context("exchange_timestamp")?;
+        buffer.column_ts(
+            tick_ilp_column("exchange_timestamp"),
+            TimestampNanos::new(v),
+        )?;
     }
 
     // capture_seq is the LAST column before the designated timestamp.
     buffer
-        .column_i64(tick_ilp_column("capture_seq"), row.capture_seq)
-        .context("capture_seq")?
-        .at(TimestampNanos::new(row.ts_ist_nanos))
-        .context("designated timestamp")?;
+        .column_i64(tick_ilp_column("capture_seq"), row.capture_seq)?
+        .at(TimestampNanos::new(row.ts_ist_nanos))?;
     Ok(())
 }
 
@@ -571,6 +629,7 @@ impl TickRow {
     /// * `volume` `u32` → `i64` widens losslessly through the saturating
     ///   boundary helper.
     /// * every `f32` price widens via `f32_to_f64_clean` then `round_to_2dp`
+    ///   (computed by [`tick_price_f64`], the same value bit for bit)
     ///   (STORAGE-GAP-02 + the 2-dp price rule) — never a bare `as f64`.
     /// * a zero-valued Ticker-packet field stays `Some(0.0)` only where the
     ///   exchange really sent it; fields a Ticker packet does not carry
@@ -667,7 +726,7 @@ impl TickRow {
                 );
                 return None;
             }
-            (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)))
+            (v != 0.0).then(|| tick_price_f64(v))
         };
         let opt_qty = |v: u32| (v != 0).then(|| i64::from(v));
 
@@ -682,7 +741,7 @@ impl TickRow {
         Ok(Self {
             security_id,
             segment: segment_code_to_str(tick.exchange_segment_code),
-            ltp: round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
+            ltp: tick_price_f64(tick.last_traded_price),
             volume: saturate_volume_to_i64(u64::from(tick.volume), security_id),
             // Dhan sends exchange_timestamp already in IST epoch SECONDS — no
             // +19800 offset (`.claude/rules/dhan/live-market-feed.md`). A
@@ -8598,3 +8657,7 @@ mod spill_held_bytes_cache_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tick_row_identity_tests.rs"]
+mod tick_row_identity_tests;
