@@ -925,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_flush_ends_an_episode_so_the_next_failure_logs_again() {
+    fn test_note_clean_flush_ends_an_episode_so_the_next_failure_logs_again() {
         // 2026-10-30 review: an episode whose tier never wrote again through
         // the pipeline must still end, so a later unrelated failure opens a
         // new episode (and logs its cause) instead of staying silent.
