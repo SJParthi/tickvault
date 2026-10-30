@@ -77,35 +77,8 @@ const COL_CLOSE_LATENCY_NS: &str = "close_latency_ns";
 const COL_WINDOW_SPAN_LATENCY: &str = "window_span_latency";
 const COL_WINDOW_SPAN_LATENCY_NS: &str = "window_span_latency_ns";
 
-/// Every column name a candle row can write. The questdb-rs check runs over
-/// this list in a test, never per row.
-#[cfg(test)]
-const CANDLE_ILP_COLUMN_NAMES: [&str; 21] = [
-    COL_FEED,
-    COL_SEGMENT,
-    COL_CONTRACT,
-    COL_SECURITY_ID,
-    COL_OPEN,
-    COL_HIGH,
-    COL_LOW,
-    COL_CLOSE,
-    COL_VOLUME,
-    COL_OI,
-    COL_TICK_COUNT,
-    COL_PERCENTAGE_CHANGE,
-    COL_OPEN_PERCENTAGE_CHANGE,
-    COL_TOTAL_BUY_QTY,
-    COL_TOTAL_SELL_QTY,
-    COL_OPEN_LATENCY,
-    COL_OPEN_LATENCY_NS,
-    COL_CLOSE_LATENCY,
-    COL_CLOSE_LATENCY_NS,
-    COL_WINDOW_SPAN_LATENCY,
-    COL_WINDOW_SPAN_LATENCY_NS,
-];
-
-/// A column name from [`CANDLE_ILP_COLUMN_NAMES`], unchecked. Only the
-/// constants above are passed in.
+/// A column name from the `COL_*` constants above, unchecked. Only those
+/// are passed in (the test list `CANDLE_ILP_COLUMN_NAMES` checks each).
 #[inline]
 fn column(name: &'static str) -> ColumnName<'static> {
     ColumnName::new_unchecked(name)
@@ -976,6 +949,32 @@ mod tests {
     use tickvault_common::constants::{EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ};
     use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
+
+    /// Every column name a candle row can write. The questdb-rs check runs over
+    /// this list in a test, never per row.
+    const CANDLE_ILP_COLUMN_NAMES: [&str; 21] = [
+        COL_FEED,
+        COL_SEGMENT,
+        COL_CONTRACT,
+        COL_SECURITY_ID,
+        COL_OPEN,
+        COL_HIGH,
+        COL_LOW,
+        COL_CLOSE,
+        COL_VOLUME,
+        COL_OI,
+        COL_TICK_COUNT,
+        COL_PERCENTAGE_CHANGE,
+        COL_OPEN_PERCENTAGE_CHANGE,
+        COL_TOTAL_BUY_QTY,
+        COL_TOTAL_SELL_QTY,
+        COL_OPEN_LATENCY,
+        COL_OPEN_LATENCY_NS,
+        COL_CLOSE_LATENCY,
+        COL_CLOSE_LATENCY_NS,
+        COL_WINDOW_SPAN_LATENCY,
+        COL_WINDOW_SPAN_LATENCY_NS,
+    ];
 
     /// The row writer as it was before 2026-10-30, verbatim except that the
     /// contract name arrives as an argument: every column name goes through
