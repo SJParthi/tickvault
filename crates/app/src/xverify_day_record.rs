@@ -94,11 +94,42 @@ static RECORD_LOCK: Mutex<()> = Mutex::new(());
 
 /// The main-feed spot sets this process holds on its sockets, one per origin
 /// (the boot set, and the widened day list once a widen finishes), for the
-/// daily recorder (§12.15.13, review round 1). At most two entries, cold.
-static PROCESS_HELD: Mutex<Vec<HeldSet>> = Mutex::new(Vec::new());
+/// daily recorder (§12.15.13, review round 1), with a generation bumped on
+/// every note so a clear never erases a failure noted after the recorder's
+/// snapshot (review round 3). At most two entries, cold.
+static PROCESS_HELD: Mutex<(u64, Vec<HeldSet>)> = Mutex::new((0, Vec::new()));
 
-/// One noted set: where it came from in this process, the set, and its basis.
-pub type HeldSet = (HeldOrigin, Vec<SubscribeInstrument>, UniverseBasis);
+/// One noted set (review round 3: each keeps the instant it went on the
+/// wire, so a retried write never stamps it earlier than that).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSet {
+    /// Which step of this process put it on the sockets.
+    pub origin: HeldOrigin,
+    /// The set.
+    pub instruments: Vec<SubscribeInstrument>,
+    /// Where it came from.
+    pub basis: UniverseBasis,
+    /// The IST date it was noted on.
+    pub noted_on: NaiveDate,
+    /// The IST second of that day it was noted at.
+    pub noted_secs: u32,
+}
+
+impl HeldSet {
+    /// The second to record this set at on `day`, given the recorder's
+    /// first stamp for that day: never earlier than the set was put on the
+    /// wire (its own second on its noting day), never earlier than the
+    /// recorder's stamp, and the recorder's stamp for a set held since an
+    /// earlier day. Pure, O(1).
+    #[must_use]
+    pub fn stamp_on(&self, day: NaiveDate, recorder_secs: u32) -> u32 {
+        if self.noted_on == day {
+            self.noted_secs.max(recorder_secs)
+        } else {
+            recorder_secs
+        }
+    }
+}
 
 /// Which step of this process put a set on the main-feed sockets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,27 +140,37 @@ pub enum HeldOrigin {
     Widen,
 }
 
-/// Notes a set this process holds on its main-feed sockets, replacing an
-/// earlier set of the same origin. The daily recorder writes every noted set
-/// into each IST day's record from 08:00 until the close, so a process alive
-/// across midnight records the new day too. O(entries ≤ 2) plus one copy.
+/// Notes a set this process put on its main-feed sockets at `noted_secs` of
+/// IST day `noted_on`, replacing an earlier set of the same origin, and
+/// bumps the generation. The daily recorder writes every noted set into each
+/// IST day's record from 08:00 until the close, so a process alive across
+/// midnight records the new day too. O(entries ≤ 2) plus one copy.
 pub fn note_process_held(
     origin: HeldOrigin,
     instruments: &[SubscribeInstrument],
     basis: UniverseBasis,
+    noted_on: NaiveDate,
+    noted_secs: u32,
 ) {
     let mut held = PROCESS_HELD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // O(1) EXEMPT: at most one entry per origin, two origins.
-    held.retain(|(o, _, _)| *o != origin);
-    held.push((origin, instruments.to_vec(), basis));
+    held.1.retain(|set| set.origin != origin);
+    held.1.push(HeldSet {
+        origin,
+        instruments: instruments.to_vec(),
+        basis,
+        noted_on,
+        noted_secs,
+    });
+    held.0 = held.0.wrapping_add(1);
 }
 
-/// Every set noted by [`note_process_held`], cloned. O(total instruments),
-/// once a day, cold.
+/// The generation and every set noted by [`note_process_held`], cloned.
+/// O(total instruments), cold.
 #[must_use]
-pub fn process_held() -> Vec<HeldSet> {
+pub fn process_held() -> (u64, Vec<HeldSet>) {
     PROCESS_HELD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -151,15 +192,27 @@ pub fn note_record_write_failed(date_ist: NaiveDate) {
     WRITE_FAILED_DAY.store(day_number(date_ist), Ordering::Release);
 }
 
-/// Clears a failure noted for `date_ist` once every held set was written
-/// again. One compare-and-swap, O(1); a failure noted for another day stays.
-pub fn clear_record_write_failed(date_ist: NaiveDate) {
+/// Clears a failure noted for `date_ist` once every held set of `generation`
+/// (from [`process_held`]) was written again, and returns whether it did.
+/// Nothing is cleared when a set was noted since that snapshot (review round
+/// 3): the check runs under the same lock [`note_process_held`] takes, so a
+/// widen noted after the snapshot keeps its failure for the next retry. A
+/// failure noted for another day stays. One lock and one compare-and-swap,
+/// O(1).
+pub fn clear_record_write_failed(date_ist: NaiveDate, generation: u64) -> bool {
+    let held = PROCESS_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.0 != generation {
+        return false;
+    }
     let _was = WRITE_FAILED_DAY.compare_exchange(
         day_number(date_ist),
         0,
         Ordering::AcqRel,
         Ordering::Acquire,
     );
+    true
 }
 
 /// Whether a write into `date_ist`'s record failed and was not yet redone.
@@ -908,10 +961,16 @@ mod tests {
         let _removed = std::fs::remove_file(day_record_path(d));
     }
 
-    /// Review round 1: a noted set replaces only the earlier set of the same
-    /// origin, so the boot set and the widened list are both recorded.
+    // The two tests below share PROCESS_HELD and WRITE_FAILED_DAY, so they
+    // are one test: run in parallel they would race on the statics.
+
+    /// Review rounds 1 to 3: a noted set replaces only the earlier set of the
+    /// same origin and bumps the generation; a failed write is noted per IST
+    /// day; a clear lands only for that day and only when nothing was noted
+    /// since the snapshot.
     #[test]
-    fn test_note_process_held_keeps_one_set_per_origin_and_process_held_returns_them() {
+    fn test_note_process_held_process_held_and_note_record_write_failed_record_write_failed_for_clear_record_write_failed()
+     {
         let a = SubscribeInstrument {
             security_id: 13,
             segment: ExchangeSegment::IdxI,
@@ -920,28 +979,85 @@ mod tests {
             security_id: 2_885,
             segment: ExchangeSegment::NseEquity,
         };
-        note_process_held(HeldOrigin::Boot, &[a], UniverseBasis::IndexFallback);
-        note_process_held(HeldOrigin::Widen, &[b], UniverseBasis::MasterList);
-        note_process_held(HeldOrigin::Widen, &[a, b], UniverseBasis::MasterList);
-        let held = process_held();
-        assert_eq!(held.len(), 2);
-        assert!(held.contains(&(HeldOrigin::Boot, vec![a], UniverseBasis::IndexFallback)));
-        assert!(held.contains(&(HeldOrigin::Widen, vec![a, b], UniverseBasis::MasterList)));
-    }
-
-    /// Review round 2: a failed write is noted per IST day, read back for
-    /// that day only, and cleared only for that day.
-    #[test]
-    fn test_note_record_write_failed_record_write_failed_for_and_clear_record_write_failed() {
         // Far-future days, so no other test's day collides.
         let day = NaiveDate::from_ymd_opt(2998, 1, 5).expect("date");
         let other = NaiveDate::from_ymd_opt(2998, 1, 6).expect("date");
+        note_process_held(
+            HeldOrigin::Boot,
+            &[a],
+            UniverseBasis::IndexFallback,
+            day,
+            30_600,
+        );
+        note_process_held(
+            HeldOrigin::Widen,
+            &[b],
+            UniverseBasis::MasterList,
+            day,
+            39_600,
+        );
+        let (first_generation, _) = process_held();
+        note_process_held(
+            HeldOrigin::Widen,
+            &[a, b],
+            UniverseBasis::MasterList,
+            day,
+            40_000,
+        );
+        let (generation, held) = process_held();
+        assert_eq!(generation, first_generation.wrapping_add(1));
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().any(|s| s.origin == HeldOrigin::Boot
+            && s.instruments == vec![a]
+            && s.noted_secs == 30_600));
+        assert!(held.iter().any(|s| s.origin == HeldOrigin::Widen
+            && s.instruments == vec![a, b]
+            && s.noted_secs == 40_000));
+
         note_record_write_failed(day);
         assert!(record_write_failed_for(day));
         assert!(!record_write_failed_for(other));
-        clear_record_write_failed(other);
+        assert!(
+            !clear_record_write_failed(day, first_generation),
+            "a set noted after the snapshot keeps the failure"
+        );
+        assert!(record_write_failed_for(day));
+        assert!(clear_record_write_failed(other, generation));
         assert!(record_write_failed_for(day), "another day's clear keeps it");
-        clear_record_write_failed(day);
+        assert!(clear_record_write_failed(day, generation));
         assert!(!record_write_failed_for(day));
+    }
+
+    /// Review round 3: a set is recorded at the later of its own second and
+    /// the recorder's first stamp on the day it was noted, and at the
+    /// recorder's stamp on a later day. A widen at 15:29 never reads earlier.
+    #[test]
+    fn test_held_set_stamp_on_never_moves_a_set_earlier_than_it_was_noted() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 2).expect("date");
+        let next = NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+        let widen = HeldSet {
+            origin: HeldOrigin::Widen,
+            instruments: Vec::new(),
+            basis: UniverseBasis::MasterList,
+            noted_on: day,
+            noted_secs: 55_740,
+        };
+        assert_eq!(widen.stamp_on(day, 28_800), 55_740);
+        assert_eq!(widen.stamp_on(next, 28_800), 28_800);
+        let night_boot = HeldSet {
+            origin: HeldOrigin::Boot,
+            noted_secs: 3 * 3_600,
+            ..widen.clone()
+        };
+        assert_eq!(night_boot.stamp_on(day, 28_800), 28_800);
+        // A retry on the noting day keeps the widen at 15:29: the record
+        // then holds it from 15:29, so coverage reads short.
+        let mut record = SpotDayRecord::new(day);
+        let inst = SubscribeInstrument {
+            security_id: 2_885,
+            segment: ExchangeSegment::NseEquity,
+        };
+        let _ = record.merge(&[inst], widen.stamp_on(day, 28_800), widen.basis);
+        assert_eq!(record.first_secs_of_day(&inst), Some(55_740));
     }
 }

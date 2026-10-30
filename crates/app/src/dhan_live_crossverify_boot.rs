@@ -1674,6 +1674,8 @@ pub fn spawn_dhan_live_crossverify(
         crate::xverify_day_record::HeldOrigin::Boot,
         &boot_set,
         deps.universe_basis,
+        boot_day,
+        u32::try_from(boot_secs).unwrap_or(u32::MAX),
     );
     tokio::spawn(run_day_recorder());
     tokio::spawn(run_supervisor(
@@ -1851,8 +1853,10 @@ pub const fn worker_step(now_secs_of_day: u64, flags: WorkerFlags) -> WorkerStep
 /// the new day too, and a boot after the close records nothing (it could only
 /// add instruments it never captured in the session). A failed write (here
 /// or at the end of a widen) is retried every [`DAY_RECORD_POLL_SECS`] until
-/// every held set lands (review round 2); the retry keeps the day's first
-/// stamp, so a set already on the wire never reads later than it was. One
+/// every held set lands (review round 2). Each set is written at the later
+/// of the day's first recorder stamp and the second it went on the wire that
+/// day (review round 3), so a retry never moves a set earlier than it was
+/// subscribed, nor later than its first recorded second. One
 /// small file write a day, plus a one-load poll a minute while the session
 /// runs; cold.
 async fn run_day_recorder() {
@@ -1869,15 +1873,23 @@ async fn run_day_recorder() {
             DayRecordStep::Record => {
                 let stamp = stamp_today.unwrap_or(now);
                 recorded_for = Some((today, stamp));
+                let day_secs = u32::try_from(stamp).unwrap_or(u32::MAX);
+                let (generation, held_sets) = crate::xverify_day_record::process_held();
                 let mut all_written = true;
-                for (_, held, basis) in crate::xverify_day_record::process_held() {
-                    all_written &= record_held_set(today, &held, stamp, basis);
+                for held in &held_sets {
+                    // Review round 3: each set at its own second when it went on
+                    // the wire today, never earlier.
+                    let set_secs = held.stamp_on(today, day_secs);
+                    all_written &=
+                        record_held_set(today, &held.instruments, u64::from(set_secs), held.basis);
                 }
-                if all_written {
-                    crate::xverify_day_record::clear_record_write_failed(today);
-                } else {
+                if !all_written {
                     crate::xverify_day_record::note_record_write_failed(today);
                     tokio::time::sleep(Duration::from_secs(DAY_RECORD_POLL_SECS)).await;
+                } else if !crate::xverify_day_record::clear_record_write_failed(today, generation) {
+                    // A set was noted after the snapshot; any failure noted for
+                    // it stays, and the next step writes it again.
+                    info!(%today, "a held spot set was noted during the record write");
                 }
             }
             DayRecordStep::WaitTomorrow => {
@@ -6977,7 +6989,12 @@ mod tests {
         ));
         let recorder = fn_body(prod, "async fn run_day_recorder(");
         assert!(recorder.contains("let stamp = stamp_today.unwrap_or(now);"));
-        assert!(recorder.contains("crate::xverify_day_record::clear_record_write_failed(today);"));
+        assert!(
+            recorder.contains(
+                "crate::xverify_day_record::clear_record_write_failed(today, generation)"
+            )
+        );
+        assert!(recorder.contains("let set_secs = held.stamp_on(today, day_secs);"));
         assert!(recorder.contains("crate::xverify_day_record::note_record_write_failed(today);"));
     }
 
@@ -7076,7 +7093,7 @@ mod tests {
         assert!(run_day.contains("widen_unfinished_for(today)"));
         let recorder = fn_body(prod, "async fn run_day_recorder(");
         assert!(recorder.contains("match day_record_step(now, stamp_today.is_some(), failed) {"));
-        assert!(recorder.contains("record_held_set(today, &held, stamp, basis);"));
+        assert!(recorder.contains("held.basis,"));
         let supervisor = fn_body(prod, "async fn run_supervisor(");
         assert!(
             supervisor

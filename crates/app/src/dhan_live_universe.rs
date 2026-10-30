@@ -929,14 +929,17 @@ fn record_widened_list_for_crossverify(truncated: bool) {
     let Ok(date) = chrono::NaiveDate::parse_from_str(&date_ist, "%Y-%m-%d") else {
         return;
     };
+    let secs = crate::xverify_day_record::ist_secs_of_day_now();
     // The daily recorder also writes it into each later day's record while
-    // this process lives (§12.15.13).
+    // this process lives, and retries a failed write at this second, never
+    // earlier (§12.15.13, review round 3).
     crate::xverify_day_record::note_process_held(
         crate::xverify_day_record::HeldOrigin::Widen,
         &list,
         crate::xverify_day_record::UniverseBasis::MasterList,
+        date,
+        secs,
     );
-    let secs = crate::xverify_day_record::ist_secs_of_day_now();
     match crate::xverify_day_record::record_spot_subscribed(
         date,
         &list,
