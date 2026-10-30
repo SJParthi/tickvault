@@ -280,12 +280,24 @@ mod tests {
         TradingCalendar::from_config(&cfg).expect("test calendar builds")
     }
 
-    fn today_ist() -> String {
+    fn today_ist() -> chrono::NaiveDate {
         chrono::Utc::now()
             .with_timezone(&tickvault_common::trading_calendar::ist_offset())
             .date_naive()
-            .format("%Y-%m-%d")
-            .to_string()
+    }
+
+    /// A calendar on which today (IST) is not a trading day. A weekday is
+    /// listed as a holiday; a Saturday or Sunday is already a non-trading day
+    /// and the calendar refuses a weekend holiday, so none is listed.
+    // Regression: 2026-10-31 — listing a Saturday as a holiday failed the build.
+    fn calendar_with_today_off() -> TradingCalendar {
+        use chrono::Datelike;
+        let today = today_ist();
+        let label = today.format("%Y-%m-%d").to_string();
+        match today.weekday() {
+            chrono::Weekday::Sat | chrono::Weekday::Sun => calendar_with_holidays(&[]),
+            _ => calendar_with_holidays(&[label.as_str()]),
+        }
     }
 
     /// Installs a per-thread calendar for the life of the guard.
@@ -445,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_session_secs_of_day_now_reads_the_test_calendar() {
-        let _guard = TestCalendarGuard::install(calendar_with_holidays(&[today_ist().as_str()]));
+        let _guard = TestCalendarGuard::install(calendar_with_today_off());
         assert_eq!(session_secs_of_day_now(), NON_TRADING_DAY_SECS_OF_DAY_IST);
     }
 
@@ -456,7 +468,7 @@ mod tests {
     #[test]
     fn test_holiday_suppresses_the_silence_redial_but_not_the_ping_watchdog() {
         use crate::websocket::idle_watchdog::IDLE_RECONNECT_TIMEOUT_SECS;
-        let _guard = TestCalendarGuard::install(calendar_with_holidays(&[today_ist().as_str()]));
+        let _guard = TestCalendarGuard::install(calendar_with_today_off());
         for (endpoint, global_index) in [
             (DhanEndpointType::MainFeed, 0_u8),
             (DhanEndpointType::Depth200, 10_u8),
@@ -549,7 +561,7 @@ mod tests {
                 TEST_STREAMING.with(|s| s.set(false));
             }
         }
-        let _guard = TestCalendarGuard::install(calendar_with_holidays(&[today_ist().as_str()]));
+        let _guard = TestCalendarGuard::install(calendar_with_today_off());
         let _streaming = StreamingGuard;
         TEST_STREAMING.with(|s| s.set(true));
         let before = tickvault_common::market_hours::now_ist_secs_of_day();
@@ -563,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_holiday_leaves_close_code_handling_unchanged() {
-        let _guard = TestCalendarGuard::install(calendar_with_holidays(&[today_ist().as_str()]));
+        let _guard = TestCalendarGuard::install(calendar_with_today_off());
         let (mut s, now) = live_supervisor(DhanEndpointType::MainFeed, 1);
         assert!(
             matches!(
