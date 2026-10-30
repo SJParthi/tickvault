@@ -26183,3 +26183,7 @@ mod subscription_audit_tests {
 #[cfg(test)]
 #[path = "pool_supervisor/frame_silence_evidence_tests.rs"]
 mod frame_silence_evidence_tests;
+
+#[cfg(test)]
+#[path = "pool_supervisor/cov_part1_tests.rs"]
+mod cov_part1_tests;
