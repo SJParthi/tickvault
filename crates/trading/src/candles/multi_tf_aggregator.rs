@@ -67,10 +67,12 @@ use tickvault_common::constants::{
     MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
 };
 use tickvault_common::feed::Feed;
+use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
 use crate::candles::aggregator_cell::{
-    AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices, is_days_first_session_bucket,
+    AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices, WidenMemo,
+    is_days_first_session_bucket,
 };
 use crate::candles::tf_index::{
     CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST, fold_clock_ist_secs,
@@ -295,6 +297,10 @@ struct InstrumentSlot {
     key: CompositeKey,
     /// Per-timeframe candle state.
     cell: AggregatorCell,
+    /// This instrument's last widened day open, close, high and low (plan
+    /// ITEM DT, 2026-10-30): a day field that repeats its last bits is not
+    /// widened again. See [`WidenMemo`].
+    widen_memo: WidenMemo,
     /// Cumulative day volume as of the END of the last tick folded. On a
     /// boundary crossing this becomes the new bucket's volume baseline.
     ///
@@ -1453,6 +1459,8 @@ impl MultiTfAggregator {
         // keep the small constructor, exactly as the paragraph above wanted,
         // and still take this one-time reserve. Measured that day: 2,816 B a
         // slot, so the ceiling is 70.4 MB of address space, not ~135 MB.
+        // (2026-10-30, plan ITEM DT: the 48 B `WidenMemo` made it 2,864 B a
+        // slot, 71.6 MB at the ceiling, measured by the same test.)
         //
         // `reserve_exact` and not `reserve`: the amount asked for IS the final
         // size, so the growth-amortisation `reserve` would add on top is pure
@@ -1470,6 +1478,7 @@ impl MultiTfAggregator {
         self.slots.push(InstrumentSlot {
             key,
             cell: AggregatorCell::empty(),
+            widen_memo: WidenMemo::new(),
             last_cumulative: 0,
             last_ltp: f64::NAN,
             last_tick_sign: 0,
@@ -1772,7 +1781,13 @@ impl MultiTfAggregator {
         // unchanged — the same single `TickPrices::from_tick` that always ran,
         // just earlier; a refused tick now pays a conversion it did not,
         // which is ~2% of arrivals against 100% for the alternative.
-        let prices = TickPrices::from_tick(tick);
+        //
+        // 2026-10-30 (plan ITEM DT): only the LAST TRADED PRICE is widened
+        // here now, for the gate. The four day fields are widened after the
+        // slot lookup through the instrument's memo (`TickPrices::from_tick_memo`),
+        // which gives the same values. Nothing between here and there reads
+        // them, and a tick refused in between never needed them.
+        let last_traded_price = f32_to_f64_clean(p);
         // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
         #[allow(clippy::manual_range_contains)]
         let raw_is_representable = p.is_finite() && p > 0.0 && p <= MAX_PLAUSIBLE_LTP;
@@ -1789,7 +1804,7 @@ impl MultiTfAggregator {
         // headline case straight through. Testing the widened value catches
         // every member of the class without inventing a lower price bound that
         // might refuse a legitimate five-paise option premium.
-        let price_is_representable = raw_is_representable && prices.last_traded_price > 0.0;
+        let price_is_representable = raw_is_representable && last_traded_price > 0.0;
         if !price_is_representable {
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_price
@@ -2130,6 +2145,9 @@ impl MultiTfAggregator {
                 ..ConsumeStats::default()
             };
         };
+        // The tick's prices, widened ONCE for every timeframe below. The day
+        // fields go through this instrument's memo (plan ITEM DT, 2026-10-30).
+        let prices = TickPrices::from_tick_memo(tick, last_traded_price, &mut slot.widen_memo);
         // Apply any replay gap marked since this slot was last touched, before
         // the baseline or the partial bits are read below. One compare per
         // tick when there is none.
@@ -2340,7 +2358,9 @@ impl MultiTfAggregator {
         // once per tick. Running it inside the loop would compare a packet
         // against itself for 23 of the 24 timeframes and silently destroy the
         // delta. It must stay above the loop.
-        let extremes = slot.cell.observe_session_extremes(tick, fold_secs);
+        let extremes = slot
+            .cell
+            .observe_session_extremes_widened(tick, fold_secs, &prices);
 
         // A repeat that ALSO moved a session extreme is not treated as a
         // repeat: the exchange's own running high or low reports a print we
