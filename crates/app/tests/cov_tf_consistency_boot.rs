@@ -166,7 +166,29 @@ fn init_tracing() {
     });
 }
 
+/// Keeps every request to the mock on loopback: appends `127.0.0.1` and
+/// `localhost` to `NO_PROXY` / `no_proxy` once, before any HTTP client in this
+/// binary exists (the session's agent proxy would otherwise be asked to
+/// reach 127.0.0.1).
+fn no_proxy_for_loopback() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let existing = std::env::var("NO_PROXY").unwrap_or_default();
+        let no_proxy = if existing.is_empty() {
+            "127.0.0.1,localhost".to_string()
+        } else {
+            format!("127.0.0.1,localhost,{existing}")
+        };
+        // SAFETY: set once, before any HTTP client in this binary is built.
+        unsafe {
+            std::env::set_var("NO_PROXY", &no_proxy);
+            std::env::set_var("no_proxy", &no_proxy);
+        }
+    });
+}
+
 fn qcfg(port: u16) -> QuestDbConfig {
+    no_proxy_for_loopback();
     init_tracing();
     QuestDbConfig {
         host: "127.0.0.1".to_string(),
@@ -186,6 +208,10 @@ struct Scenario {
     count: Option<Resp>,
     one_m: HashMap<i64, Resp>,
     union: HashMap<i64, Resp>,
+    /// Per `(security_id, segment)` answers, consulted before the per-id
+    /// maps: two instruments sharing an id in different segments.
+    one_m_seg: HashMap<(i64, String), Resp>,
+    union_seg: HashMap<(i64, String), Resp>,
     write_status: Option<u16>,
 }
 
@@ -193,6 +219,11 @@ fn sid_in(q: &str) -> Option<i64> {
     let rest = &q[q.find("security_id = ")? + "security_id = ".len()..];
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+fn seg_in(q: &str) -> Option<String> {
+    let rest = &q[q.find("segment = '")? + "segment = '".len()..];
+    Some(rest.chars().take_while(|c| *c != '\'').collect())
 }
 
 fn handler_for(sc: Scenario) -> Handler {
@@ -213,6 +244,15 @@ fn handler_for(sc: Scenario) -> Handler {
                 .unwrap_or_else(|| Resp::json(&json!({"dataset": [[0]]})));
         }
         if let Some(sid) = sid_in(q) {
+            let key = seg_in(q).map(|seg| (sid, seg));
+            let by_seg = if q.starts_with("SELECT * FROM (") {
+                &sc.union_seg
+            } else {
+                &sc.one_m_seg
+            };
+            if let Some(resp) = key.as_ref().and_then(|k| by_seg.get(k)) {
+                return resp.clone();
+            }
             if q.starts_with("SELECT * FROM (") {
                 return sc
                     .union
@@ -345,9 +385,63 @@ async fn run(sc: Scenario) -> (TfConsistencySummaryData, Mock) {
     (summary, mock)
 }
 
+/// A port that never answers: the listener stays bound for the life of the
+/// test process (so a parallel test can never be handed the same port) and
+/// closes every accepted connection before reading a byte. The pass sees a
+/// transport error on `send`, the same `questdb_unreachable` branch a
+/// refused connection takes.
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr").port()
+    let port = l.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in l.incoming() {
+            drop(stream);
+        }
+    });
+    port
+}
+
+/// The 5m bar for 09:15 of `full_day_1m`, computed by hand from minutes
+/// 0..=4: prices 100.00, 100.25, 100.50, 100.75, 101.00 (each row's
+/// open = price, high = price + 0.5, low = price - 0.5, close = price +
+/// 0.25, volume 10 + m, 3 ticks). Open = first open 100.00; high = 101.00 +
+/// 0.5; low = 100.00 - 0.5; close = last close 101.00 + 0.25; volume =
+/// 10 + 11 + 12 + 13 + 14; ticks = 5 x 3.
+fn hand_5m_0915() -> CandleRow {
+    CandleRow {
+        ts_nanos: ds() + 33_300 * 1_000_000_000,
+        open: 100.00,
+        high: 101.50,
+        low: 99.50,
+        close: 101.25,
+        volume: 60,
+        tick_count: 15,
+    }
+}
+
+/// The 15m bar for 09:15 of `full_day_1m`, by hand from minutes 0..=14:
+/// prices cycle 100.00..101.50 in 0.25 steps (m % 7), so the highest price
+/// is 101.50 (m = 6, 13) and the lowest 100.00; minute 14 is m % 7 = 0.
+/// Open 100.00; high 101.50 + 0.5; low 100.00 - 0.5; close 100.00 + 0.25;
+/// volume = 10 + 11 + ... + 24 = 255; ticks = 15 x 3.
+fn hand_15m_0915() -> CandleRow {
+    CandleRow {
+        ts_nanos: ds() + 33_300 * 1_000_000_000,
+        open: 100.00,
+        high: 102.00,
+        low: 99.50,
+        close: 100.25,
+        volume: 255,
+        tick_count: 45,
+    }
+}
+
+fn tf_label(secs: u32) -> &'static str {
+    TfIndex::ALL
+        .into_iter()
+        .find(|t| t.seconds_per_bucket() == secs)
+        .expect("frame")
+        .display_name()
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +571,18 @@ async fn test_tf_consistency_boot_run_discovery_streamed_oversize_body_is_refuse
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tf_consistency_boot_run_consistent_instrument_reads_pass() {
     let rows = full_day_1m();
-    let tf = tf_rows_for(&rows);
+    let mut tf = tf_rows_for(&rows);
+    // The 09:15 5m and 15m stored rows are the HAND-computed literals, not
+    // the fixture's own recompute, so a bug shared by `recompute_window` /
+    // `bucket_grid` and this fixture cannot make the pass read clean.
+    for (secs, literal) in [(300, hand_5m_0915()), (900, hand_15m_0915())] {
+        let label = tf_label(secs);
+        let slot = tf
+            .iter_mut()
+            .find(|(l, r)| *l == label && r.ts_nanos == literal.ts_nanos)
+            .expect("a 09:15 row of that frame");
+        slot.1 = literal;
+    }
     let mut sc = Scenario {
         discovery: Some(discovery(&[(5001, "IDX_I")])),
         ..Scenario::default()
@@ -499,6 +604,84 @@ async fn test_tf_consistency_boot_run_consistent_instrument_reads_pass() {
         "nothing to persist on a clean pass: {reqs:?}"
     );
     assert!(reqs.iter().any(|r| r.contains("FROM candles_1m")));
+}
+
+#[test]
+fn test_tf_consistency_boot_recompute_window_matches_hand_computed_5m_and_15m_bars() {
+    let rows = full_day_1m();
+    for (minutes, literal) in [(5_usize, hand_5m_0915()), (15, hand_15m_0915())] {
+        let rec = recompute_window(&rows[..minutes])
+            .expect("no overflow")
+            .expect("members present");
+        assert_eq!(rec.open, literal.open, "{minutes}m open");
+        assert_eq!(rec.high, literal.high, "{minutes}m high");
+        assert_eq!(rec.low, literal.low, "{minutes}m low");
+        assert_eq!(rec.close, literal.close, "{minutes}m close");
+        assert_eq!(rec.volume, literal.volume, "{minutes}m volume");
+        assert_eq!(rec.tick_count, literal.tick_count, "{minutes}m ticks");
+    }
+    // The grid's first 5m and 15m windows are exactly those minutes.
+    let w5 = bucket_grid(300)[0];
+    assert_eq!(
+        (w5.start_secs_of_day, w5.end_effective_secs_of_day),
+        (33_300, 33_600)
+    );
+    let w15 = bucket_grid(900)[0];
+    assert_eq!(
+        (w15.start_secs_of_day, w15.end_effective_secs_of_day),
+        (33_300, 34_200)
+    );
+}
+
+/// I-P1-11: the same `security_id` 27 in `IDX_I` and `NSE_EQ` is two
+/// instruments. Each is queried with its own segment and judged on its own
+/// rows: the index is clean, the equity has one wrong 5m close, and the
+/// finding names the equity alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tf_consistency_boot_run_same_id_in_two_segments_is_two_instruments() {
+    let rows = full_day_1m();
+    let clean_tf = tf_rows_for(&rows);
+    let mut bad_tf = clean_tf.clone();
+    let m5 = tf_label(300);
+    let idx = bad_tf.iter().position(|(l, _)| *l == m5).expect("a 5m row");
+    bad_tf[idx].1.close += 1.0;
+    let mut sc = Scenario {
+        discovery: Some(discovery(&[(27, "IDX_I"), (27, "NSE_EQ")])),
+        write_status: Some(204),
+        ..Scenario::default()
+    };
+    for (seg, tf) in [("IDX_I", &clean_tf), ("NSE_EQ", &bad_tf)] {
+        sc.one_m_seg
+            .insert((27, seg.to_string()), one_m_json(&rows));
+        sc.union_seg.insert((27, seg.to_string()), union_json(tf));
+    }
+    let (s, mock) = run(sc).await;
+    assert_eq!(s.instruments, 2, "summary: {s:?}");
+    assert_eq!(s.buckets_compared, 2 * clean_tf.len() as u64);
+    assert_eq!(s.mismatches, 1, "summary: {s:?}");
+    assert_eq!(s.status_label, "mismatch");
+    assert!(
+        s.top_detail.iter().any(|d| d.contains("NSE_EQ id 27")),
+        "{:?}",
+        s.top_detail
+    );
+    assert!(
+        !s.top_detail.iter().any(|d| d.contains("IDX_I id 27")),
+        "the clean index must not inherit the equity's finding: {:?}",
+        s.top_detail
+    );
+    let reqs = mock.requests();
+    for seg in ["IDX_I", "NSE_EQ"] {
+        let key = format!("security_id = 27 AND segment = '{seg}'");
+        let per_seg: Vec<&String> = reqs.iter().filter(|r| r.contains(&key)).collect();
+        assert!(
+            per_seg.iter().any(|r| r.contains("FROM candles_1m"))
+                && per_seg
+                    .iter()
+                    .any(|r| r.starts_with("/exec SELECT * FROM (")),
+            "both reads for {seg}: {reqs:?}"
+        );
+    }
 }
 
 /// Builds the mismatch fixture: a changed 5m close, an off-grid 15m row and a

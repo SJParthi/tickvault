@@ -20,7 +20,7 @@ use std::time::Duration;
 use tickvault_app::dhan_rest_stack::{
     LockReleaseAtShutdown, ShutdownLockGate, release_instance_lock_at_shutdown,
 };
-use tickvault_app::dhan_universe::{ist_secs_of_day, spawn_dhan_universe_rider};
+use tickvault_app::dhan_universe::{ist_secs_of_day, next_wait, spawn_dhan_universe_rider};
 use tickvault_app::host_tuning::{
     HOST_TUNING_SUBCOMMAND, QDB_CORE_ISOLATION_KEY, plan_questdb_host_env, run_cli,
     verify_this_host,
@@ -152,71 +152,130 @@ fn test_infra_clock_skew_sample_exceeds_is_inclusive_and_sign_blind() {
     );
 }
 
-#[tokio::test]
-async fn test_infra_probe_clock_skew_reports_a_sample_or_a_typed_unavailable() {
-    match probe_clock_skew().await {
-        Ok(sample) => {
-            assert_eq!(sample.source, "chronyc");
-            assert!(sample.skew_secs.is_finite());
+/// Points `PATH` at an empty folder for as long as it lives, so `chronyc`
+/// (or any launcher) cannot be found, and puts the old value back on drop.
+/// Hold [`ENV_LOCK`] for the whole lifetime: `PATH` is process-wide.
+struct EmptyPath {
+    dir: std::path::PathBuf,
+    saved: Option<std::ffi::OsString>,
+}
+
+impl EmptyPath {
+    fn new(tag: &str) -> Self {
+        let dir = unique_temp_dir(tag);
+        let saved = std::env::var_os("PATH");
+        // SAFETY: Rust 2024 marks env mutation unsafe; every caller holds
+        // ENV_LOCK, which serialises every env change in this binary, and
+        // the value is restored on drop.
+        unsafe {
+            std::env::set_var("PATH", &dir);
         }
-        Err(ClockSkewError::Unavailable { primary, fallback }) => {
-            assert!(!primary.is_empty(), "the primary failure is named");
-            assert!(!fallback.is_empty(), "the missing fallback is named");
-        }
-        Err(other) => panic!("the probe never judges a threshold itself: {other}"),
+        Self { dir, saved }
     }
 }
 
-#[tokio::test]
-async fn test_infra_enforce_clock_skew_at_boot_zero_threshold_never_passes() {
-    // A zero threshold is exceeded by every sample, so the gate either halts
-    // on the threshold or reports the probe as unavailable — it can never OK.
-    match enforce_clock_skew_at_boot(0.0).await {
-        Ok(sample) => panic!("a 0 s threshold must not pass: {sample:?}"),
-        Err(ClockSkewError::ThresholdExceeded {
-            threshold_secs,
-            source,
-            ..
-        }) => {
-            assert!((threshold_secs - 0.0).abs() < f64::EPSILON);
-            assert_eq!(source, "chronyc");
+impl Drop for EmptyPath {
+    fn drop(&mut self) {
+        // SAFETY: see `EmptyPath::new`.
+        unsafe {
+            match self.saved.take() {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
         }
-        Err(ClockSkewError::Unavailable { primary, .. }) => {
-            assert!(!primary.is_empty());
-        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
+/// The exact `Unavailable` shape when `chronyc` cannot be spawned.
+fn assert_chronyc_unavailable(err: &ClockSkewError) {
+    match err {
+        ClockSkewError::Unavailable { primary, fallback } => {
+            assert!(
+                primary.starts_with("chronyc spawn failed:"),
+                "the primary failure names chronyc and the spawn: {primary}"
+            );
+            assert!(
+                fallback.starts_with("none:") && fallback.contains("cannot measure skew"),
+                "there is no fallback source, and it says so: {fallback}"
+            );
+            assert!(
+                err.to_string()
+                    .starts_with("clock-skew probe unavailable: chronyc"),
+                "{err}"
+            );
+        }
+        other => panic!("a missing chronyc must be Unavailable, got {other:?}"),
+    }
+}
+
+/// Polls `pred` every 20 ms for up to five seconds.
+async fn eventually(mut pred: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    pred()
+}
+
 #[tokio::test]
-async fn test_infra_enforce_clock_skew_at_boot_huge_threshold_passes_or_is_unavailable() {
-    match enforce_clock_skew_at_boot(1.0e9).await {
-        Ok(sample) => assert!(!sample.exceeds(1.0e9)),
-        Err(ClockSkewError::Unavailable { .. }) => {}
-        Err(other) => panic!("a 1e9 s threshold cannot be exceeded: {other}"),
+async fn test_infra_probe_clock_skew_without_chronyc_is_a_typed_unavailable() {
+    let _env = ENV_LOCK.lock().await;
+    let _path = EmptyPath::new("probe");
+    let err = probe_clock_skew()
+        .await
+        .expect_err("no chronyc on PATH means no sample");
+    assert_chronyc_unavailable(&err);
+}
+
+#[tokio::test]
+async fn test_infra_enforce_clock_skew_at_boot_without_chronyc_is_unavailable_at_any_threshold() {
+    let _env = ENV_LOCK.lock().await;
+    let _path = EmptyPath::new("enforce");
+    // A zero threshold would be exceeded by any sample and 1e9 s by none;
+    // with no chronyc the probe fails first, so both report Unavailable and
+    // neither invents a pass or a threshold verdict.
+    for threshold in [0.0, 2.0, 1.0e9] {
+        let err = enforce_clock_skew_at_boot(threshold)
+            .await
+            .expect_err("no sample, no pass");
+        assert_chronyc_unavailable(&err);
     }
 }
 
 #[tokio::test]
 async fn test_infra_spawn_clock_skew_poller_keeps_running_and_logs_failed_resamples() {
-    let probe_ok = probe_clock_skew().await.is_ok();
+    let _env = ENV_LOCK.lock().await;
+    let _path = EmptyPath::new("poller");
     let (cap, _guard) = capture_logs();
     let handle = spawn_clock_skew_poller(Duration::from_millis(20));
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // No chronyc: every re-sample fails, and the first failure (a power of
+    // two) is logged with the BOOT-03 code.
+    let reported = eventually(|| {
+        let logs = cap.text();
+        logs.contains("clock-skew re-sample FAILED") && logs.contains("BOOT-03")
+    })
+    .await;
+    assert!(
+        reported,
+        "a failing re-sample must be reported with BOOT-03: {}",
+        cap.text()
+    );
+    let logs = cap.text();
+    assert!(
+        logs.contains("probe_unavailable") && logs.contains("chronyc spawn failed"),
+        "the line says why: {logs}"
+    );
     assert!(
         !handle.is_finished(),
         "the supervised poller never returns on its own"
     );
     handle.abort();
-    let logs = cap.text();
-    if !probe_ok {
-        // No chrony here: every re-sample fails and the first failure (a
-        // power of two) is logged with the BOOT-03 code.
-        assert!(
-            logs.contains("clock-skew re-sample FAILED"),
-            "a failing re-sample must be reported: {logs}"
-        );
-        assert!(logs.contains("BOOT-03"));
-    }
+    let err = handle.await.expect_err("aborted");
+    assert!(err.is_cancelled());
 }
 
 // ---------------------------------------------------------------------------
@@ -552,16 +611,45 @@ async fn test_dhan_universe_rider_disabled_returns_at_once() {
 
 #[tokio::test]
 async fn test_dhan_universe_rider_enabled_waits_for_its_target_hour() {
-    // Target the last second of the IST day so the rider SLEEPS rather than
-    // building (a build would download from the vendor). Skip in the final
-    // ten seconds of the IST day, where the target could already be due.
+    const LAST_SECOND: u32 = 86_399;
+    // The pure schedule the rider follows, at fixed instants (no clock): a
+    // target still ahead is a sleep of exactly the gap, a target reached is
+    // "build now", and a built day sleeps to the next day's target.
+    assert_eq!(
+        next_wait(0, LAST_SECOND, false),
+        Some(Duration::from_secs(u64::from(LAST_SECOND)))
+    );
+    assert_eq!(
+        next_wait(LAST_SECOND - 10, LAST_SECOND, false),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(next_wait(LAST_SECOND, LAST_SECOND, false), None);
+    assert_eq!(
+        next_wait(LAST_SECOND, LAST_SECOND, true),
+        Some(Duration::from_secs(1 + u64::from(LAST_SECOND))),
+        "already built: sleep to tomorrow's target"
+    );
+
+    // Target the last second of the IST day so the live rider SLEEPS rather
+    // than building (a build would download from the vendor). In the final
+    // ten seconds of the IST day the target could fall due during the test,
+    // so the live half is skipped there; the schedule above still ran.
     let now_sod = ist_secs_of_day(chrono::Utc::now().timestamp());
-    if now_sod >= 86_390 {
+    let wait = next_wait(now_sod, LAST_SECOND, false);
+    if now_sod >= LAST_SECOND - 10 {
+        assert!(
+            wait.is_none_or(|w| w <= Duration::from_secs(10)),
+            "inside the last ten seconds the target is at most ten seconds away: {wait:?}"
+        );
         return;
     }
+    assert!(
+        wait.is_some_and(|w| w > Duration::from_secs(10)),
+        "the rider will sleep longer than this test runs: {wait:?}"
+    );
     let cfg = DhanUniverseConfig {
         enabled: true,
-        target_secs_of_day_ist: 86_399,
+        target_secs_of_day_ist: LAST_SECOND,
         ..DhanUniverseConfig::default()
     };
     let handle = spawn_dhan_universe_rider(cfg, loopback_questdb(), String::new());

@@ -122,14 +122,41 @@ fn volume_used_pct(dir: &std::path::Path) -> u8 {
     }
 }
 
-/// The value of an unlabelled counter line in a Prometheus render (0 when
-/// absent).
-fn counter_value(rendered: &str, name: &str) -> u64 {
+/// The value of an unlabelled series line in a Prometheus render, if present.
+fn series_value(rendered: &str, name: &str) -> Option<f64> {
     rendered
         .lines()
         .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
+}
+
+/// The value of an unlabelled counter line in a Prometheus render (0 when
+/// absent).
+fn counter_value(rendered: &str, name: &str) -> u64 {
+    series_value(rendered, name).map_or(0, |v| v as u64)
+}
+
+/// The counters a pressure episode moves, read from one render.
+const EPISODE_COUNTERS: [&str; 3] = [
+    "tv_disk_pressure_episodes_total",
+    "tv_disk_pressure_passes_total",
+    "tv_disk_pressure_unrelievable_total",
+];
+
+fn episode_counters() -> [u64; 3] {
+    let rendered = recorder().render();
+    EPISODE_COUNTERS.map(|name| counter_value(&rendered, name))
+}
+
+/// Serialises every test in this binary that runs the loop: the counters,
+/// the used-percent gauge and the reclaim signal are process-wide, so exact
+/// before/after deltas need one loop at a time. A tokio mutex because the
+/// guard is held across awaits.
+static LOOP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Empties a reclaim request left pending by an earlier test.
+async fn drain_reclaim_signal() {
+    while tickvault_app::reclaim_signal::wait_for_reclaim_or(Duration::from_millis(1)).await {}
 }
 
 async fn run_polls(polls: u64) {
@@ -170,17 +197,25 @@ fn test_disk_pressure_boot_spawn_insane_thresholds_returns_none() {
     });
 }
 
-/// High water at 100%: a real volume is below it, so every poll decides
-/// `Idle`, publishes the used-percent gauge and keeps the loop alive.
+/// High water at 100%, low water at 1%: the decision is fixed by the reading
+/// alone (`used < high` is `Idle`, `used >= high` starts an episode), so a
+/// volume at 99% is as determined as one at 50%. The loop publishes the
+/// used-percent gauge on every readable poll and keeps running.
 #[tokio::test(start_paused = true)]
 async fn test_disk_pressure_boot_loop_idle_volume_publishes_used_gauge_and_keeps_running() {
+    let _serial = LOOP_LOCK.lock().await;
     let handle_metrics = recorder();
     no_archive_bucket();
     let dir = unique_dir("idle");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let (logs, _guard) = capture_logs();
+    // A sentinel no real reading can produce: a gauge still holding it after
+    // the polls was never set by this loop (the loop's own registration at
+    // start does not reset a value, so "the series exists" proves nothing).
+    metrics::gauge!("tv_data_disk_used_pct").set(255.0);
+    let before = episode_counters();
 
-    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(100, 99))
+    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(100, 1))
         .expect("a sane, enabled config spawns the loop");
     run_polls(3).await;
     assert!(
@@ -194,78 +229,100 @@ async fn test_disk_pressure_boot_loop_idle_volume_publishes_used_gauge_and_keeps
         text.contains("disk-pressure archival ARMED"),
         "logs: {text}"
     );
-    // The decision follows the measured fill: a volume reading below 100%
-    // never starts an episode at a 100% high water; a volume reading 100%
-    // (the shared build disk can be that full) does.
     let used = volume_used_pct(&dir);
-    // At 99% the fill may have crossed during the polls; only the clear
-    // cases are asserted.
     let started = text.contains("episode STARTED");
-    if used < 99 {
+    let delta: Vec<u64> = episode_counters()
+        .iter()
+        .zip(before)
+        .map(|(after, b)| after - b)
+        .collect();
+    if used < 100 {
+        // 99% included: below a 100% high water is always Idle.
         assert!(!started, "used_pct={used}: {text}");
-    } else if used >= 100 {
+        assert_eq!(delta, vec![0, 0, 0], "used_pct={used}: an idle volume");
+    } else {
+        // A 100%-full build disk: the first poll starts the episode.
         assert!(started, "used_pct={used}: {text}");
+        assert_eq!(delta[0], 1, "used_pct={used}: one episode");
     }
     let rendered = handle_metrics.render();
+    let gauge = series_value(&rendered, "tv_data_disk_used_pct")
+        .expect("the used-percent gauge is rendered");
     assert!(
-        rendered.contains("tv_data_disk_used_pct"),
-        "the used-percent gauge is published every readable poll: {rendered}"
+        (gauge - f64::from(used)).abs() <= 1.0,
+        "gauge {gauge} must match the volume's real fill {used}% within one point \
+         (255 = never published by the loop): {rendered}"
     );
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
-/// High water at 1%: the real volume is above it. With no archive bucket the
-/// pass never runs (`NotRun`), so the episode spends its passes, escalates to
-/// STORAGE-GAP-05, holds, and re-arms an hour later.
+/// High water at 1%: a volume at 1% or more is over it. With no archive
+/// bucket the pass never runs (`NotRun`), so the episode spends its
+/// `pressure_max_passes` passes, escalates to STORAGE-GAP-05, holds, and
+/// re-arms an hour later. A volume reading 0% (an empty tmpfs) is below
+/// even a 1% high water, so the documented outcome there is `Idle`: no
+/// episode, no pass, no reclaim request.
 #[tokio::test(start_paused = true)]
 async fn test_disk_pressure_boot_loop_over_high_water_starts_episode_then_escalates() {
-    let handle_metrics = recorder();
+    let _serial = LOOP_LOCK.lock().await;
+    let _ = recorder();
     no_archive_bucket();
     let dir = unique_dir("episode");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let (logs, _guard) = capture_logs();
+    drain_reclaim_signal().await;
+    let before = episode_counters();
+    let config = cfg(1, 0);
+    let max_passes = u64::from(config.pressure_max_passes);
 
-    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(1, 0))
+    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), config)
         .expect("a sane, enabled config spawns the loop");
-    // Start + 3 continue passes, then escalation, then holds past the
-    // one-hour re-arm and one more re-armed pass.
+    // 71 polls, t = 0..=4,200 s: polls 0..max_passes-1 pass, the next
+    // escalates (t = 240 at the default 4), then Hold until t = 3,840 where
+    // the one-hour re-arm runs one more pass; the next re-arm (t = 7,440)
+    // is out of range.
     run_polls(70).await;
     assert!(!handle.is_finished());
     handle.abort();
+    let used = volume_used_pct(&dir);
 
-    // The pass arm asked the spill/WAL reclaim sweep to run now.
-    assert!(
-        tickvault_app::reclaim_signal::wait_for_reclaim_or(Duration::from_millis(1)).await,
-        "an episode start must request a reclaim sweep"
-    );
-
+    let reclaim_requested =
+        tickvault_app::reclaim_signal::wait_for_reclaim_or(Duration::from_millis(1)).await;
     let text = logs.text();
-    assert!(
-        text.contains("disk-pressure episode STARTED"),
-        "logs: {text}"
-    );
-    assert!(
-        text.contains("no archive bucket resolvable"),
-        "with no bucket the pass is skipped, never run: {text}"
-    );
-    assert!(
-        text.contains("disk pressure could NOT be relieved"),
-        "four not-run passes escalate: {text}"
-    );
-    let rendered = handle_metrics.render();
-    // This loop alone: one episode; four passes then escalation; one
-    // re-armed pass after the hour. The counters are process-wide and the
-    // other loops here may also cross high water on a full disk, so these
-    // are lower bounds.
-    for (name, at_least) in [
-        ("tv_disk_pressure_episodes_total", 1),
-        ("tv_disk_pressure_passes_total", 5),
-        ("tv_disk_pressure_unrelievable_total", 1),
-    ] {
-        let got = counter_value(&rendered, name);
+    let delta: Vec<u64> = episode_counters()
+        .iter()
+        .zip(before)
+        .map(|(after, b)| after - b)
+        .collect();
+
+    if used == 0 {
+        assert!(!text.contains("episode STARTED"), "used_pct=0: {text}");
+        assert!(!reclaim_requested, "an idle volume requests no reclaim");
+        assert_eq!(delta, vec![0, 0, 0], "used_pct=0: nothing moves");
+    } else {
+        // The pass arm asked the spill/WAL reclaim sweep to run now.
         assert!(
-            got >= at_least,
-            "{name}={got}, want >= {at_least}: {rendered}"
+            reclaim_requested,
+            "an episode start must request a reclaim sweep"
+        );
+        assert!(
+            text.contains("disk-pressure episode STARTED"),
+            "logs: {text}"
+        );
+        assert!(
+            text.contains("no archive bucket resolvable"),
+            "with no bucket the pass is skipped, never run: {text}"
+        );
+        assert!(
+            text.contains("disk pressure could NOT be relieved"),
+            "not-run passes escalate: {text}"
+        );
+        // Exact, for this loop alone (every loop in the binary is serialised):
+        // one episode, max_passes passes plus one re-armed pass, one page.
+        assert_eq!(
+            delta,
+            vec![1, max_passes + 1, 1],
+            "episodes, passes, unrelievable for used_pct={used}"
         );
     }
     std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -276,6 +333,7 @@ async fn test_disk_pressure_boot_loop_over_high_water_starts_episode_then_escala
 /// itself reported. Creating the folder then reports the recovery.
 #[tokio::test(start_paused = true)]
 async fn test_disk_pressure_boot_loop_blind_probe_reports_sustained_failure_then_recovery() {
+    let _serial = LOOP_LOCK.lock().await;
     let handle_metrics = recorder();
     no_archive_bucket();
     let dir = unique_dir("blind");
