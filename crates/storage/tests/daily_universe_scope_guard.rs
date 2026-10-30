@@ -51,32 +51,42 @@ fn rule_file_body() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
+/// Quote 44 (2026-10-28): the daily `instrument_lifecycle` /
+/// `instrument_lifecycle_audit` write STOPPED and both tables are frozen as
+/// history. This test used to pin the bulk ILP writers; it now pins that no
+/// writer, DDL or UPDATE exists in the module, so one cannot come back
+/// without a fresh dated quote (and an edit here).
 #[test]
-fn lifecycle_persistence_uses_ilp_not_exec_url() {
-    let body = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+fn lifecycle_persistence_has_no_writer_after_quote_44() {
+    let body_src = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+    let body = production_part(&body_src);
+    for banned in [
+        "pub async fn append_instrument_lifecycle_rows",
+        "pub async fn append_instrument_lifecycle_audit_rows",
+        "pub async fn ensure_instrument_lifecycle_table",
+        "pub async fn ensure_instrument_lifecycle_audit_table",
+        "Sender::from_conf",
+        "CREATE TABLE",
+        "INSERT INTO",
+    ] {
+        assert!(
+            !body.contains(banned),
+            "instrument_lifecycle_persistence must not write (Quote 44): found `{banned}`"
+        );
+    }
+    // The identifier surface the keep-forever / retention / rebuild / wipe
+    // lists rely on must stay.
     assert!(
-        body.contains("pub async fn append_instrument_lifecycle_rows")
-            && body.contains("pub async fn append_instrument_lifecycle_audit_rows"),
-        "storage must expose the bulk lifecycle/audit append fns"
+        body.contains("pub const QUESTDB_TABLE_INSTRUMENT_LIFECYCLE: &str = \"instrument_lifecycle\";")
+            && body.contains(
+                "pub const QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT: &str = \"instrument_lifecycle_audit\";"
+            ),
+        "the frozen tables' name constants must stay"
     );
-    // The bulk writers MUST ingest via QuestDB ILP (port 9009) — the real
-    // ingestion pipe, like ticks/candles — NOT the /exec SQL/URL door. The
-    // /exec URL query string is capped by QuestDB's request buffer and
-    // overflowed at the ~79K-row F&O master (the "79190 write error(s)" /
-    // "connection closed" boot halts, 2026-05-29). ILP has no URL limit.
+    // And the rule file must carry the dated decision.
     assert!(
-        body.contains("sebi_master_ilp_http_conf")
-            && body.contains("Sender::from_conf")
-            && body.contains("build_lifecycle_ilp_row")
-            && body.contains("build_lifecycle_audit_ilp_row"),
-        "bulk lifecycle/audit writes must go through ILP (Sender/Buffer), not /exec URL"
-    );
-    // Regression: the old size-bounded /exec SQL path MUST be gone — its
-    // presence means someone reverted ILP back to the URL door.
-    assert!(
-        !body.contains("build_size_bounded_inserts")
-            && !body.contains("LIFECYCLE_INSERT_MAX_SQL_BYTES"),
-        "the /exec URL batch path must stay deleted — bulk writes are ILP-only"
+        rule_file_body().contains("THE DAILY `instrument_lifecycle` WRITER STOPS"),
+        "Quote 44 must be recorded in the daily-universe rule file"
     );
 }
 
@@ -97,13 +107,6 @@ fn sebi_master_writers_use_acknowledged_http_ilp() {
         lifecycle.contains("pub(crate) fn sebi_master_ilp_http_conf")
             && lifecycle.contains("\"http::addr={}:{};protocol_version=1;"),
         "the shared SEBI ILP conf must be HTTP"
-    );
-    assert_eq!(
-        lifecycle
-            .matches("let conf = sebi_master_ilp_http_conf(questdb_config);")
-            .count(),
-        2,
-        "both lifecycle bulk writers must use the HTTP ILP conf"
     );
     assert!(
         constituency.contains("sebi_master_ilp_http_conf(questdb_config)"),

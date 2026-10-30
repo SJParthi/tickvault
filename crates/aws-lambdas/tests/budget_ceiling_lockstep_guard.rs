@@ -242,7 +242,8 @@ fn standing_cap_is_75_from_november_and_each_allowance_is_one_month() {
     // assert in hard_stop_guard.rs, next to the two constants.
     assert_eq!(SEPTEMBER_2026_ALLOWANCE, (2026, 9));
     assert_eq!(OCTOBER_2026_ALLOWANCE, (2026, 10));
-    assert!((OCTOBER_2026_KILL_USD - 170.0).abs() < f64::EPSILON);
+    // Operator Quote 45 (2026-10-28): October 2026 only, $170 -> $185.
+    assert!((OCTOBER_2026_KILL_USD - 185.0).abs() < f64::EPSILON);
 
     // Every month of the next three years EXCEPT 2026-09 and 2026-10 resolves
     // to $75.
@@ -273,8 +274,9 @@ fn standing_cap_is_75_from_november_and_each_allowance_is_one_month() {
             body.contains("$150")
                 && body.contains("$225")
                 && body.contains("$170")
+                && body.contains("$185")
                 && body.contains("$75 from 1 November"),
-            "{rel} must record $150, $225, $170 and $75 from 1 November"
+            "{rel} must record $150, $225, $170, $185 and $75 from 1 November"
         );
     }
 }

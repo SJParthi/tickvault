@@ -61,7 +61,7 @@ const WRAPPED: &[(&str, &str)] = &[
     // Daily build (also on a mid-session restart).
     (
         "crates/app/src/dhan_universe.rs",
-        "off_worker(|| sweep_stale_artifacts(date))",
+        "off_worker(|| sweep_stale_artifacts(date, proven))",
     ),
     // Post-close ILP flushes.
     (

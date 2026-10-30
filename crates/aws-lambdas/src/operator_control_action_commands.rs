@@ -48,9 +48,12 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 11] = [
     ON_BOX_LOCK_GUARD,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
-    r#"rm -rf /opt/tickvault/data/ws_wal /opt/tickvault/data/groww /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/instrument-cache 2>/dev/null || true"#,
+    // 2026-10-28 (Quote 44 review): `instrument-cache` is NOT removed: its dated
+    // snapshot files may not have a verified cold-bucket copy yet (Quote 44
+    // REJECTs deleting one before it has).
+    r#"rm -rf /opt/tickvault/data/ws_wal /opt/tickvault/data/groww /opt/tickvault/data/spill /opt/tickvault/data/dlq 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
-    r#"echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq, instrument-cache)'"#,
+    r#"echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq); instrument snapshots kept'"#,
     // 2026-08-01 (operator directive — pure Rust, nowhere the banned runtime):
     // this element WAS a 17-line embedded interpreter program dispatched via
     // SSM RunCommand to the prod box — i.e. the banned runtime EXECUTING in
@@ -142,9 +145,8 @@ OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # DAY_PARTITIONED_TABLES and RETENTION_EXEMPT_TABLES in
 # crates/storage/src/partition_manager.rs — the repo's authoritative
 # never-delete definition — and a lockstep guard derives the expected
-# set from that source rather than restating it, so the two cannot drift
-# and the guard can never again assert a list against itself.
-SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_gap_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
+# set from that source, so the two cannot drift.
+SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape expiry_scope_audit feed_coverage_daily feed_episode_audit feed_gap_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
 # 2026-09-27 (audit PR20): the "QuestDB did not answer => proceed" branch is
 # GONE. It deleted the volume with every 5-year table still inside it and
@@ -395,9 +397,12 @@ lock_check"#,
         r#" || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#
     ),
     r#"echo 'OK: tv-questdb-data removed'"#,
-    r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
+    // 2026-10-28 (Quote 44 review): `instrument-cache` is NOT removed: its dated
+    // snapshot files may not have a verified cold-bucket copy yet (Quote 44
+    // REJECTs deleting one before it has).
+    r#"rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
-    r#"echo 'OK: host caches + feed capture/replay sources wiped (instrument-cache, spill, dlq, ws_wal, groww); logs preserved'"#,
+    r#"echo 'OK: feed capture/replay sources wiped (spill, dlq, ws_wal, groww); logs and instrument snapshots preserved'"#,
     concat!(ensure_questdb_cmd!(), " || true"),
     r#"systemctl enable tickvault || true"#,
     r#"systemctl restart tickvault || true"#,
@@ -441,9 +446,8 @@ OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # DAY_PARTITIONED_TABLES and RETENTION_EXEMPT_TABLES in
 # crates/storage/src/partition_manager.rs — the repo's authoritative
 # never-delete definition — and a lockstep guard derives the expected
-# set from that source rather than restating it, so the two cannot drift
-# and the guard can never again assert a list against itself.
-SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_gap_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
+# set from that source, so the two cannot drift.
+SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape expiry_scope_audit feed_coverage_daily feed_episode_audit feed_gap_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
 # 2026-09-27 (audit PR20): the "QuestDB did not answer => proceed" branch is
 # GONE. It deleted the volume with every 5-year table still inside it and
@@ -677,7 +681,10 @@ lock_check"#,
     r#"docker images -aq | xargs -r docker rmi -f 2>/dev/null || true"#,
     r#"docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true"#,
     r#"docker system prune -af --volumes 2>/dev/null || true"#,
-    r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
+    // 2026-10-28 (Quote 44 review): `instrument-cache` is NOT removed: its dated
+    // snapshot files may not have a verified cold-bucket copy yet (Quote 44
+    // REJECTs deleting one before it has).
+    r#"rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
     r#"C=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' '); I=$(docker images -aq 2>/dev/null | wc -l | tr -d ' '); V=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' '); echo "BARE-NUKE-RESULT containers=$C images=$I volumes=$V"; if [ "$C" = 0 ] && [ "$I" = 0 ] && [ "$V" = 0 ]; then echo bare-nuke-complete; else echo 'bare-nuke-PARTIAL: something is still present (likely in-use)'; fi"#,
     // 2026-08-20 INCIDENT FIX — the auto-start guarantee. This action used to

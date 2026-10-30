@@ -190,6 +190,13 @@ const DHAN_UNIVERSE_RS: &str = include_str!("../src/dhan_universe.rs");
 ///
 /// The file states the rule itself, for `persist_constituents`: "Disk first,
 /// then the table. The artifact is the cheaper, more reliable record."
+///
+/// **2026-10-28 (owner Quote 44):** `write_dhan_lifecycle` is deleted with the
+/// daily lifecycle write, so it is no longer a row here; this guard now
+/// asserts it is GONE. The new slow step, the cold-bucket copy of the day's
+/// artifact files (`spawn_snapshot_upload`), must also sit after the artifact
+/// write, and it must run on its own task from the rider, never inside
+/// `build_once` (the build the lane's budget is measured against).
 #[test]
 fn no_questdb_write_runs_before_the_mapping_artifact() {
     let code = code_only(DHAN_UNIVERSE_RS);
@@ -198,7 +205,42 @@ fn no_questdb_write_runs_before_the_mapping_artifact() {
         .find("write_mapping_atomic(date")
         .expect("`build_once` no longer writes the mapping artifact");
 
-    for slow in ["write_dhan_lifecycle", "persist_constituents(questdb"] {
+    assert!(
+        !code.contains("write_dhan_lifecycle"),
+        "the daily lifecycle write was stopped by owner Quote 44 and must not come back"
+    );
+
+    // The S3 copy is started by the rider after `build_once` returned, never
+    // from inside the build.
+    let build_at = code
+        .find("async fn build_once(")
+        .expect("`build_once` must exist");
+    let build_end = build_at
+        + code[build_at..]
+            .find("\n}\n")
+            .expect("`build_once` body must close");
+    assert!(
+        !code[build_at..build_end].contains("spawn_snapshot_upload("),
+        "the snapshot copy must not run inside `build_once`"
+    );
+    let spawn_at = code
+        .find("pub fn spawn_dhan_universe_rider(")
+        .expect("the rider spawn must exist");
+    let rider_at = code
+        .find("async fn run_dhan_universe_rider(")
+        .expect("the rider loop must exist");
+    assert!(
+        code[rider_at..].contains("instrument_snapshot_upload::spawn_snapshot_upload("),
+        "the rider must start the snapshot copy after a successful build"
+    );
+    assert!(
+        spawn_at < rider_at
+            && code[spawn_at..rider_at]
+                .contains("instrument_snapshot_upload::register_snapshot_metrics()"),
+        "the snapshot counters must be seeded when the rider starts"
+    );
+
+    for slow in ["persist_constituents(questdb", "spawn_snapshot_upload("] {
         let at = code
             .find(slow)
             .unwrap_or_else(|| panic!("`{slow}` call site not found in dhan_universe.rs"));
@@ -320,5 +362,34 @@ fn the_deploy_readiness_gate_outlasts_the_boot_wait_budget() {
          skipped provenance write, auto-stopped service — on a binary that swapped in \
          cleanly and is still inside its own budget. Raise the poll count in \
          deploy-aws.yml, or lower MAPPING_WAIT_DEADLINE_SECS; do not delete this test."
+    );
+}
+
+/// Quote 44 review: the snapshot copy must go to the SAME cold bucket as the
+/// raw frames. main.rs hands the rider `[partition_retention] archive_bucket`
+/// (the value the raw-frame uploader loads), and the rider passes it on to
+/// the copy instead of a hardcoded "derive from the environment".
+#[test]
+fn the_snapshot_copy_uses_the_configured_cold_bucket() {
+    let main = code_only(MAIN_RS);
+    let call_at = main
+        .find("spawn_dhan_universe_rider(")
+        .expect("main.rs must spawn the universe rider");
+    let call_end = call_at
+        + main[call_at..]
+            .find(");")
+            .expect("the rider spawn call must close");
+    assert!(
+        main[call_at..call_end].contains("config.partition_retention.archive_bucket.clone()"),
+        "the rider must be handed the configured cold bucket"
+    );
+    assert!(
+        main.contains("let raw_upload_bucket = config.partition_retention.archive_bucket.clone();"),
+        "the raw-frame uploader must read the same setting"
+    );
+    let rider = code_only(DHAN_UNIVERSE_RS);
+    assert!(
+        rider.contains("spawn_snapshot_upload(\n                        snapshot_bucket.clone(),"),
+        "the rider must pass its configured bucket to the snapshot copy"
     );
 }

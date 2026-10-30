@@ -38,6 +38,7 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{
     OrderUpdateParseError, build_order_update_login, parse_order_update,
+    unreadable_order_frame_type,
 };
 
 /// PR-E: poll cadence (secs) while the Dhan feed is disabled at runtime — the
@@ -944,21 +945,42 @@ async fn connect_and_listen(
                         // an already-decoded struct. The excerpt is built
                         // ONLY on the hollow branch, so a healthy frame pays
                         // nothing beyond the three compares.
-                        if update.order_no.is_empty()
-                            && update.status.is_empty()
-                            && update.security_id.is_empty()
-                        {
+                        //
+                        // 2026-10-28 (18 live ORDER-EVT-02 lines). The parser
+                        // now reads both casings of every field (it read the
+                        // other casing of only seven before). A frame whose
+                        // order keys came in camelCase (`orderNo`, `status`)
+                        // therefore no longer decodes hollow. That this was
+                        // the cause of the live lines is ASSUMED, not proven:
+                        // the 2026-08-25 rows had `mkt_type` filled, which the
+                        // old parser read only from PascalCase `MktType`, so
+                        // those frames carried at least one PascalCase field
+                        // and do not fit an all-camelCase frame. ORDER-EVT-02
+                        // stays open until a captured excerpt confirms it.
+                        // Every hollow frame, whatever its `Type` tag, stays
+                        // ORDER-EVT-02 at ERROR on the hollow counter and is
+                        // still broadcast: Dhan documents only `order_alert`
+                        // on this socket, so an unknown tag is the format
+                        // change this page exists for. So does a frame with
+                        // no order number whose tag names another type (it
+                        // may now decode a camelCase `status` and not be
+                        // hollow). The tag is logged so the next capture
+                        // says what the frame was. A frame carrying an order
+                        // number pays one `is_empty()` here.
+                        if let Some(msg_type) = unreadable_order_frame_type(&update, &text) {
                             metrics::counter!(ORDER_UPDATE_HOLLOW_DECODE_COUNTER).increment(1);
                             error!(
                                 code = tickvault_common::error_code::ErrorCode::OrderEvt02DecodedHollow
                                     .code_str(),
+                                msg_type = %msg_type,
                                 excerpt = %redacted_frame_excerpt(&text),
                                 "order update PARSED but decoded HOLLOW — order_no, status and \
-                                 security_id are all empty, so this frame's key names do not \
-                                 match what OrderUpdate expects. The row is still captured; the \
-                                 excerpt above is the raw frame (client id redacted, length \
-                                 bounded) and is what a schema fix must be written against — do \
-                                 not guess at Dhan's field names from this message alone."
+                                 security_id are all empty in either casing, so this frame's key \
+                                 names do not match what OrderUpdate expects. The row is still \
+                                 captured; the excerpt above is the raw frame (client id \
+                                 redacted, length bounded) and is what a schema fix must be \
+                                 written against — do not guess at Dhan's field names from this \
+                                 message alone."
                             );
                         }
                         // Broadcast to subscribers (OMS, notification, etc.).
@@ -1217,7 +1239,10 @@ static UNPARSEABLE_ORDER_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// R4 (2026-10-01). Pure, allocation-free. True iff a frame that FAILED
 /// `parse_order_update` still carries the documented order envelope: the
 /// `"order_alert"` tag, or a `"Data"` (or drifted `"data"`) key whose value
-/// opens an object.
+/// opens an object or an array. An array `Data` is refused by the typed
+/// parse (`parse_order_update`), and this is what routes that refusal to
+/// the coded ORDER-EVT-02 `typed_parse_failed` arm instead of the debug-only
+/// non-order arm.
 ///
 /// # Complexity
 /// O(frame bytes), bounded by `ORDER_UPDATE_MAX_FRAME_BYTES`, the same bound
@@ -1232,7 +1257,7 @@ fn looks_like_order_update(text: &str) -> bool {
         while let Some(at) = rest.find(key) {
             rest = &rest[at + key.len()..];
             if let Some(value) = rest.trim_start().strip_prefix(':')
-                && value.trim_start().starts_with('{')
+                && value.trim_start().starts_with(['{', '['])
             {
                 return true;
             }
@@ -1251,35 +1276,50 @@ const ORDER_UPDATE_EXCERPT_MAX_BYTES: usize = 1024;
 
 /// Builds a bounded, client-id-redacted excerpt of a raw order-update frame.
 ///
-/// Redacts the `"DhanClientId"` / `"ClientId"` VALUE — an order payload
-/// carries the account identifier, and this string goes to a log sink. The
-/// KEY is deliberately preserved: a schema fix needs to see which keys the
-/// frame contained, and a wholly-removed key would misrepresent that.
+/// Redacts the client-id VALUE whatever the key's casing: the parser reads
+/// `ClientId` and `clientId`, and the key is matched ASCII
+/// case-insensitively, so `DhanClientId`, `dhanClientId` and a snake_case
+/// `client_id` are redacted too. A string value and a bare JSON number
+/// are both redacted. An order payload carries the account identifier, and
+/// this string goes to a log sink. The KEY is deliberately preserved: a
+/// schema fix needs to see which keys the frame contained, and a
+/// wholly-removed key would misrepresent that. An occurrence that is not a
+/// `key: value` pair (the word inside another value, say) is left verbatim
+/// and the walk continues past it, so a later real key is still redacted.
 ///
 /// Truncation is on a CHARACTER boundary, never a byte index, so a multi-byte
 /// symbol name cannot panic the logging path.
 fn redacted_frame_excerpt(raw: &str) -> String {
-    const KEY: &str = "ClientId";
+    const NEEDLES: [&str; 2] = ["clientid", "client_id"];
+    // ASCII lowercasing keeps every byte offset, so a match in `lower` is the
+    // same span in `raw`.
+    let lower = raw.to_ascii_lowercase();
     let mut out = String::with_capacity(raw.len().min(ORDER_UPDATE_EXCERPT_MAX_BYTES) + 16);
-    let mut rest = raw;
+    let mut pos = 0;
     // Walk the frame replacing each client-id VALUE. A frame carries at most
     // one, but the loop costs nothing and a repeated key cannot slip through.
-    while let Some(found) = rest.find(KEY) {
-        let after_key = &rest[found + KEY.len()..];
-        // Expect exactly `"` `:` `"` <value> `"`. Anything else is left
-        // verbatim rather than guessed at — a redactor that reshapes a frame
-        // it did not understand would corrupt the evidence it exists to
+    while let Some((found, len)) = NEEDLES
+        .iter()
+        .filter_map(|n| lower[pos..].find(n).map(|i| (pos + i, n.len())))
+        .min_by_key(|(i, _)| *i)
+    {
+        let key_end = found + len;
+        let after_key = &raw[key_end..];
+        out.push_str(&raw[pos..key_end]);
+        // Expect `"` `:` then a quoted string or a bare number. Anything else
+        // is left verbatim rather than guessed at — a redactor that reshapes a
+        // frame it did not understand would corrupt the evidence it exists to
         // preserve.
-        let Some(parts) = split_quoted_value(after_key) else {
-            break;
-        };
-        let (prefix_end, value_end) = parts;
-        out.push_str(&rest[..found + KEY.len()]);
-        out.push_str(&after_key[..prefix_end]);
-        out.push_str("<redacted>");
-        rest = &after_key[value_end..];
+        match split_key_value(after_key) {
+            Some((prefix_end, value_end)) => {
+                out.push_str(&after_key[..prefix_end]);
+                out.push_str("<redacted>");
+                pos = key_end + value_end;
+            }
+            None => pos = key_end,
+        }
     }
-    out.push_str(rest);
+    out.push_str(&raw[pos..]);
     if out.len() > ORDER_UPDATE_EXCERPT_MAX_BYTES {
         let cut = out
             .char_indices()
@@ -1293,13 +1333,14 @@ fn redacted_frame_excerpt(raw: &str) -> String {
 }
 
 /// Given the text immediately AFTER a JSON key name, locates that key's
-/// string value.
+/// value: a quoted string or a bare JSON number.
 ///
 /// Returns `(prefix_end, value_end)` where `[..prefix_end]` is everything up
-/// to and including the value's opening quote, and `value_end` indexes the
-/// value's closing quote. `None` when the text does not have the exact
-/// `"` `:` `"` … `"` shape — the caller then leaves the frame untouched.
-fn split_quoted_value(after_key: &str) -> Option<(usize, usize)> {
+/// to the value (including a string's opening quote) and `value_end` indexes
+/// the first byte after the value's content (a string's closing quote, or the
+/// end of the number). `None` when the text is not `"` `:` followed by such a
+/// value — the caller then leaves that occurrence untouched.
+fn split_key_value(after_key: &str) -> Option<(usize, usize)> {
     // 1. The key's own closing quote.
     let kq = after_key.find('"')?;
     let after_kq = &after_key[kq + 1..];
@@ -1310,17 +1351,25 @@ fn split_quoted_value(after_key: &str) -> Option<(usize, usize)> {
         return None;
     }
     let after_colon = &after_kq[colon + 1..];
-    // 3. The value's opening quote (a non-string value is not redacted here;
-    //    the client id is documented as a string).
-    let vq = after_colon.find('"')?;
-    if after_colon[..vq].chars().any(|c| !c.is_whitespace()) {
-        return None;
+    let ws = after_colon.len() - after_colon.trim_start().len();
+    let value = &after_colon[ws..];
+    let base = kq + 1 + colon + 1 + ws;
+    if let Some(body) = value.strip_prefix('"') {
+        // 3a. A string: its closing quote, skipping backslash escapes so an
+        //     escaped quote cannot end the redaction early.
+        let mut escaped = false;
+        let vend = body.char_indices().find_map(|(i, c)| {
+            let close = c == '"' && !escaped;
+            escaped = c == '\\' && !escaped;
+            close.then_some(i)
+        })?;
+        return Some((base + 1, base + 1 + vend));
     }
-    let after_vq = &after_colon[vq + 1..];
-    // 4. The value's closing quote.
-    let vend = after_vq.find('"')?;
-    let prefix_end = kq + 1 + colon + 1 + vq + 1;
-    Some((prefix_end, prefix_end + vend))
+    // 3b. A bare number.
+    let len = value
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        .unwrap_or(value.len());
+    (len > 0 && matches!(value.as_bytes()[0], b'0'..=b'9' | b'-')).then_some((base, base + len))
 }
 
 /// O2 (2026-04-17): Fires the authenticated-signal notify exactly once per
@@ -1698,6 +1747,32 @@ mod tests {
         assert!(between.contains("\"unparseable_order\""));
         assert!(between.contains("OrderEvt02DecodedHollow"));
         assert!(between.contains("stage = \"typed_parse_failed\""));
+    }
+
+    /// An array `Data` is refused by the typed parse (it would decode
+    /// positionally or as an all-default update). The refusal must reach the
+    /// coded ORDER-EVT-02 `typed_parse_failed` arm, not the debug-only
+    /// non-order arm: the parse fails, the auth classifier calls it Success,
+    /// and the envelope check (matched first, pinned by the source test
+    /// above) recognises it.
+    #[test]
+    fn test_array_data_frame_reaches_the_typed_parse_failed_arm() {
+        for frame in [
+            r#"{"Data":[]}"#,
+            r#"{"data":[]}"#,
+            r#"{ "Data" : [ ] }"#,
+            r#"{"Data":["NSE","D","52432","c","1124"]}"#,
+            r#"{"data":[{"OrderNo":"1"}],"Type":"login_ack"}"#,
+            r#"[{"Data":{"OrderNo":"1"}}]"#,
+        ] {
+            assert!(parse_order_update(frame).is_err(), "precondition: {frame}");
+            assert_eq!(
+                classify_auth_response(frame),
+                AuthResponseKind::Success,
+                "precondition: {frame}"
+            );
+            assert!(looks_like_order_update(frame), "{frame}");
+        }
     }
 
     // ========================================================================
@@ -2846,6 +2921,58 @@ mod tests {
         assert_eq!(redacted_frame_excerpt(raw), raw);
     }
 
+    /// Review 2026-10-28: the parser now reads camelCase frames, so the
+    /// excerpt must redact `clientId` / `dhanClientId` too, a bare numeric
+    /// value as well as a string, and must keep walking past an occurrence
+    /// that is not a key/value pair.
+    #[test]
+    fn test_hollow_excerpt_redacts_every_client_id_casing_and_value_shape() {
+        let id = "1106656882";
+        let frames = [
+            format!(r#"{{"Data":{{"clientId":"{id}","mktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"dhanClientId":"{id}","mktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"ClientId": {id},"MktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"clientId":-{id},"MktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"client_id" : "{id}","MktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"CLIENTID":"{id}","MktType":"XX"}}}}"#),
+            // The word inside another value first, then the real key.
+            format!(r#"{{"Data":{{"Remarks":"clientId","ClientId":"{id}"}}}}"#),
+            // A non-value occurrence (`null`) does not stop the walk.
+            format!(r#"{{"Data":{{"ClientId":null,"clientId":"{id}"}}}}"#),
+            // Two keys, both redacted.
+            format!(r#"{{"Data":{{"ClientId":"{id}","clientId":{id}}}}}"#),
+            // An escaped quote inside the value does not end it early.
+            format!(r#"{{"Data":{{"clientId":"{id}\"{id}","X":"Y"}}}}"#),
+        ];
+        for raw in &frames {
+            let out = redacted_frame_excerpt(raw);
+            assert!(
+                !out.contains(id),
+                "the account id reached the excerpt: {out}"
+            );
+            assert!(
+                out.contains("<redacted>"),
+                "redaction must be visible: {out}"
+            );
+            assert!(
+                out.to_ascii_lowercase().contains("clientid")
+                    || out.to_ascii_lowercase().contains("client_id"),
+                "the KEY must survive: {out}"
+            );
+        }
+        assert_eq!(
+            redacted_frame_excerpt(r#"{"Data":{"clientId":1106656882,"mktType":"XX"}}"#),
+            r#"{"Data":{"clientId":<redacted>,"mktType":"XX"}}"#
+        );
+        assert_eq!(
+            redacted_frame_excerpt(r#"{"Data":{"Remarks":"clientId","ClientId":"7"}}"#),
+            r#"{"Data":{"Remarks":"clientId","ClientId":"<redacted>"}}"#
+        );
+        // `null` and booleans are not account ids and pass through verbatim.
+        let raw = r#"{"Data":{"clientId":null,"MktType":"XX"}}"#;
+        assert_eq!(redacted_frame_excerpt(raw), raw);
+    }
+
     /// The bound exists so a malformed-frame storm cannot flood the sink.
     #[test]
     fn test_hollow_excerpt_is_length_bounded() {
@@ -2898,6 +3025,77 @@ mod tests {
              page on every legitimately partial frame"
         );
     }
+    /// 2026-10-28 (hostile review): every frame the parser cannot read as
+    /// an order (hollow, or no order number with a foreign `Type`) stays on
+    /// ORDER-EVT-02 at ERROR and on the hollow counter that feeds the
+    /// order-path loss page, and is STILL broadcast: no `continue`, no
+    /// second counter, no info-level side path between the verdict and the
+    /// send.
+    #[test]
+    fn test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts() {
+        let src = include_str!("order_update_connection.rs");
+        let prod = &src[..src
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("test marker present")];
+        let gate = prod
+            .find("if let Some(msg_type) = unreadable_order_frame_type(&update, &text)")
+            .expect("the ORDER-EVT-02 gate uses the parser's verdict");
+        let send = prod
+            .find("order_sender.send(update)")
+            .expect("the broadcast exists");
+        assert!(gate < send);
+        let arm = &prod[gate..send];
+        assert!(arm.contains("ORDER_UPDATE_HOLLOW_DECODE_COUNTER"));
+        assert!(arm.contains("OrderEvt02DecodedHollow"));
+        assert!(arm.contains(concat!("error", "!(")));
+        assert!(arm.contains("msg_type = %msg_type"));
+        assert!(
+            !arm.contains("continue;"),
+            "an unreadable order frame must never skip the broadcast"
+        );
+        assert!(!arm.contains("info!("));
+        assert!(
+            !prod.contains("non_order_typed"),
+            "no side counter may take frames off the loss page"
+        );
+    }
+
+    /// The frame shapes behind the live ORDER-EVT-02 lines, end to end
+    /// through the real parser: an all-camelCase order event is readable;
+    /// a hollow one pages whatever its tag; a foreign-typed frame with no
+    /// order number pages even when it decodes a camelCase status.
+    #[test]
+    fn test_live_hollow_shapes_parse_or_page() {
+        let camel = r#"{"Data":{"exchange":"NSE","segment":"D","source":"N","securityId":"52432","orderNo":"1124091136546","txnType":"B","status":"TRADED","quantity":75,"tradedQty":75,"refLtp":11.15,"tickSize":0.05,"mktType":"NL","multiplier":1,"goodTillDaysDate":"2026-10-28","algoOrdNo":"0"},"Type":"order_alert"}"#;
+        let update = parse_order_update(camel).expect("camelCase order event parses");
+        assert_eq!(unreadable_order_frame_type(&update, camel), None);
+        assert_eq!(update.order_no, "1124091136546");
+        assert_eq!(update.status, "TRADED");
+        assert_eq!(update.traded_qty, 75);
+
+        for (frame, tag) in [
+            (
+                r#"{"Data":{"MktType":"XX","RefLtp":11.15},"Type":"order_alert"}"#,
+                "order_alert",
+            ),
+            (
+                r#"{"Data":{"Message":"session ok"},"Type":"heartbeat"}"#,
+                "heartbeat",
+            ),
+            (
+                r#"{"Data":{"status":"success"},"Type":"login_ack"}"#,
+                "login_ack",
+            ),
+        ] {
+            let update = parse_order_update(frame).expect("parses");
+            assert_eq!(
+                unreadable_order_frame_type(&update, frame).as_deref(),
+                Some(tag),
+                "{frame}"
+            );
+        }
+    }
+
     #[test]
     fn test_hollow_decode_detector_is_wired_at_the_parse_site() {
         let src = include_str!("order_update_connection.rs");

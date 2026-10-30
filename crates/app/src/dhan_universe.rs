@@ -201,7 +201,7 @@ const RETRY_BASE_SECS: u64 = 10;
 const BUILD_DEADLINE_SECS: u64 = 900;
 
 /// Directory for the resolved mapping artifact.
-const MAPPING_DIR: &str = "data/instrument-cache";
+pub(crate) const MAPPING_DIR: &str = "data/instrument-cache";
 
 /// Path of the day's resolved mapping artifact.
 ///
@@ -692,11 +692,17 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 /// Seven keeps a full trading week, which is the span over which a
 /// "the contract set looked wrong on Tuesday" question is asked and answered.
 ///
-/// This is NOT the SEBI record. `instrument_lifecycle`,
-/// `instrument_lifecycle_audit` and `index_constituency` are QuestDB tables
-/// written a few lines above this sweep, they are never-delete under the
-/// 2026-05-27 lock, and nothing here touches them. These JSON files are the
-/// rider-to-lane handoff.
+/// These JSON files are the rider-to-lane handoff. `index_constituency` is a
+/// QuestDB table written a few lines above this sweep and nothing here touches
+/// it; `instrument_lifecycle` and `instrument_lifecycle_audit` are frozen
+/// history since owner Quote 44 (2026-10-28) and nothing writes them.
+///
+/// **Since Quote 44 these files ARE the point-in-time record.** Each dated
+/// file is copied to `s3://tv-<env>-cold/instrument-snapshots/<date>/` and
+/// verified (`instrument_snapshot_upload`), kept there forever, and this sweep
+/// deletes a local dated file only once that verified copy is recorded. With
+/// no verified copy the file stays and is counted, so a broken upload costs
+/// disk (about 10 MB a day), never the record.
 ///
 /// The live lane reads this same number as its lookback when today's list is
 /// missing (`dhan_live_universe`, audit D3): a file older than this has already
@@ -716,6 +722,11 @@ const SWEEPABLE_PREFIXES: [&str; 4] = [
     "dhan-contracts-",
 ];
 
+/// The suffix of a crash leftover between `write` and `rename`. Never a
+/// snapshot itself (the complete `.json` beside it is); swept only once that
+/// `.json` has a verified copy (Quote 44), see `tmp_sibling_is_copied`.
+const ARTIFACT_TMP_SUFFIX: &str = ".json.tmp";
+
 /// The date a sweepable artifact filename carries, or `None`.
 ///
 /// `Some` requires ALL of: a known prefix, a `.json` or `.json.tmp` suffix, and
@@ -725,7 +736,7 @@ const SWEEPABLE_PREFIXES: [&str; 4] = [
 ///
 /// `.json.tmp` is swept too: a crash between `write` and `rename` leaves one
 /// beside the real file forever, and it is the same artifact by another name.
-fn sweepable_artifact_date(file_name: &str) -> Option<&str> {
+pub(crate) fn sweepable_artifact_date(file_name: &str) -> Option<&str> {
     let rest = SWEEPABLE_PREFIXES
         .iter()
         .find_map(|p| file_name.strip_prefix(p))?;
@@ -735,7 +746,7 @@ fn sweepable_artifact_date(file_name: &str) -> Option<&str> {
     // Reversing the two arms was tried and changed nothing. Longest first is
     // kept as a reading convention, not as a correctness argument.
     let date = rest
-        .strip_suffix(".json.tmp")
+        .strip_suffix(ARTIFACT_TMP_SUFFIX)
         .or_else(|| rest.strip_suffix(".json"))?;
     // ISO dates sort lexically, which is why the caller can compare them as
     // strings. That only holds for a fixed-width, zero-padded shape, so the
@@ -765,13 +776,17 @@ fn artifact_retention_cutoff(today_ist: &str) -> Option<String> {
 /// What one sweep did. Returned rather than logged inside so the decision
 /// logic is testable without a filesystem.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct SweepTally {
+pub(crate) struct SweepTally {
     removed: usize,
     bytes: u64,
     /// Files whose names this sweep does not recognise. Counted, never removed.
     skipped_unknown: usize,
     /// Removals the filesystem refused. Counted, never fatal.
     failed: usize,
+    /// Old dated artifacts KEPT because no verified S3 copy is recorded for
+    /// them (owner Quote 44: never sweep a local artifact before its verified
+    /// copy exists). Counted on the held counter, never deleted.
+    held_without_copy: usize,
 }
 
 /// Deletes instrument artifacts older than [`ARTIFACT_RETENTION_DAYS`].
@@ -801,23 +816,72 @@ struct SweepTally {
 /// delete costs the session its universe -- strictly worse.
 ///
 /// O(files in the directory), once per day, on the cold daily-rider path.
-fn sweep_stale_artifacts(today_ist: &str) -> SweepTally {
+fn sweep_stale_artifacts(
+    today_ist: &str,
+    proven: &std::collections::BTreeSet<String>,
+) -> SweepTally {
+    sweep_stale_artifacts_in(
+        std::path::Path::new(MAPPING_DIR),
+        today_ist,
+        tickvault_storage::raw_frame_upload::CopyGate::Required,
+        proven,
+    )
+}
+
+/// [`sweep_stale_artifacts`] over `dir`, deleting a dated `.json` artifact only
+/// when `gate` allows it (production passes `CopyGate::Required`: a verified
+/// S3 copy with this file's length and mtime must be recorded in
+/// `<dir>/uploaded/`). A `.json.tmp` crash leftover is not a snapshot (the
+/// complete `.json` beside it is the one copied); it is deleted only when
+/// that `.json` exists with a verified copy, and kept and counted otherwise.
+/// The `uploaded/` marker folder is skipped, never counted as unknown, and a
+/// deleted file's marker is removed with it.
+///
+/// Under `CopyGate::Required` the marker alone is NOT enough (2026-10-28
+/// review): the file's name must also be in `proven`, the names whose copy
+/// the snapshot pass that ran just before this sweep confirmed itself (a
+/// HeadObject that matched, or a fresh upload it verified). A marker that
+/// survived its copy (a bucket-wide delete, then a marker unlink that failed
+/// and a re-upload that failed too) therefore deletes nothing. A `.json.tmp`
+/// leftover follows its `.json` sibling's proof. `proven` is ignored under
+/// `CopyGate::NotRequired` (no copy required). One `BTreeSet` probe per old
+/// file, O(log proven), cold.
+pub(crate) fn sweep_stale_artifacts_in(
+    dir: &std::path::Path,
+    today_ist: &str,
+    gate: tickvault_storage::raw_frame_upload::CopyGate,
+    proven: &std::collections::BTreeSet<String>,
+) -> SweepTally {
     let mut tally = SweepTally::default();
     let Some(cutoff) = artifact_retention_cutoff(today_ist) else {
         // An unparseable date means the caller is broken, not the disk. Delete
         // nothing rather than compute a cutoff from a guess.
         return tally;
     };
-    let Ok(entries) = std::fs::read_dir(MAPPING_DIR) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         // No directory yet is the normal first-boot state, not an error.
         return tally;
     };
-    for entry in entries.flatten() {
+    // A `.json.tmp` is judged by its `.json` sibling, so every `.json.tmp` is
+    // looked at BEFORE any `.json` is deleted in this sweep (otherwise a
+    // sibling deleted a moment earlier would leave its leftover held for
+    // ever). O(files log files), once a day, cold.
+    let mut entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+    entries.sort_by_key(|e| {
+        !e.file_name()
+            .to_string_lossy()
+            .ends_with(ARTIFACT_TMP_SUFFIX)
+    });
+    for entry in entries {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             tally.skipped_unknown += 1;
             continue;
         };
+        if name == tickvault_storage::raw_frame_upload::UPLOADED_SUBDIR {
+            // The verified-copy markers (Quote 44), not an artifact.
+            continue;
+        }
         let Some(date) = sweepable_artifact_date(name) else {
             tally.skipped_unknown += 1;
             continue;
@@ -828,11 +892,34 @@ fn sweep_stale_artifacts(today_ist: &str) -> SweepTally {
             continue;
         }
         let path = entry.path();
-        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let Ok(meta) = entry.metadata() else {
+            // Unreadable metadata: no copy can be proven, so keep it.
+            tally.held_without_copy += 1;
+            continue;
+        };
+        let is_snapshot = !name.ends_with(ARTIFACT_TMP_SUFFIX);
+        let copied = if is_snapshot {
+            gate.allows_delete(&path, &meta) && (!gate.copy_in_s3() || proven.contains(name))
+        } else {
+            // A crash leftover is never copied itself. It may go only when the
+            // complete `.json` of the same name exists with its own verified
+            // copy; otherwise it could be the only record of that day (every
+            // attempt died between write and rename), so it is kept and
+            // counted (Quote 44).
+            tmp_sibling_is_copied(&path, gate, proven)
+        };
+        if !copied {
+            tally.held_without_copy += 1;
+            continue;
+        }
+        let bytes = meta.len();
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 tally.removed += 1;
                 tally.bytes = tally.bytes.saturating_add(bytes);
+                if is_snapshot {
+                    gate.forget(&path);
+                }
             }
             Err(err) => {
                 tally.failed += 1;
@@ -846,6 +933,35 @@ fn sweep_stale_artifacts(today_ist: &str) -> SweepTally {
         }
     }
     tally
+}
+
+/// Whether the complete `.json` beside the `.json.tmp` leftover at `tmp_path`
+/// exists, `gate` allows deleting it (its verified S3 copy is recorded) and
+/// its copy is in `proven` (confirmed by the pass just before this sweep).
+/// `false` for any other name or an unreadable sibling: keep the leftover.
+fn tmp_sibling_is_copied(
+    tmp_path: &std::path::Path,
+    gate: tickvault_storage::raw_frame_upload::CopyGate,
+    proven: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(json_name) = tmp_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(ARTIFACT_TMP_SUFFIX))
+    else {
+        return false;
+    };
+    if !gate.copy_in_s3() {
+        // No copy is required (the shape before Quote 44): age alone.
+        return true;
+    }
+    let json_file = format!("{json_name}.json");
+    if !proven.contains(&json_file) {
+        return false;
+    }
+    let json_path = tmp_path.with_file_name(json_file);
+    std::fs::metadata(&json_path)
+        .is_ok_and(|meta| meta.is_file() && gate.allows_delete(&json_path, &meta))
 }
 
 async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinOutcome> {
@@ -1056,7 +1172,7 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // HONEST LIMIT: `spawn_blocking` would be better still — it would leave
     // BOTH workers free instead of consuming one and its replacement. It is
     // not used here because `master`, `index` and `outcome` are borrowed and
-    // all three are still needed by the lifecycle-record write below, so
+    // `outcome` is still needed by the constituency write below, so
     // moving them into a `'static` closure means an ownership refactor of
     // `build_once` (wrapping them in `Arc`s). That is a larger change than
     // this fix, and doing it badly would risk the correctness of a daily
@@ -1064,81 +1180,66 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // silently settled for.
     tokio::task::block_in_place(|| write_mapping_atomic(date, &master, &index, &outcome))?;
 
-    // The never-delete lifecycle record.
+    // No `instrument_lifecycle` / `instrument_lifecycle_audit` write.
     //
-    // Operator directive 2026-08-19: an expired instrument is MARKED expired,
-    // never removed, so the table answers "was this tradeable on that day?"
-    // for every instrument that has ever existed.
-    //
-    // NON-FATAL: the mapping build is what the rider exists for, and a
-    // lifecycle write that fails must not cost the day its universe.
-    //
-    // MOVED BELOW `write_mapping_atomic` on 2026-08-21, and the move is the
-    // point. This is a ~150,000-row QuestDB round trip (a read of every
-    // instrument ever seen, then chunked ILP writes). It used to run BEFORE
-    // the mapping artifact — and the live lane blocks at boot waiting for
-    // exactly that artifact, bounded by `MAPPING_WAIT_DEADLINE_SECS`. So the
-    // lane's whole budget was being spent on a write nothing waits for, and
-    // when it ran out the session fell back to 4 index SIDs for the day.
-    //
-    // The budget was 120 s, derived from a 9-second production build measured
-    // on 2026-08-18 — before this write existed at all (it landed 2026-08-20
-    // in #1773). Nobody re-derived it, so the number described a build that
-    // no longer existed.
-    //
-    // This is the same "disk first, then the table" rule stated above for
-    // `write_mapping_atomic` / `persist_constituents`: the artifact is the
-    // cheaper, more reliable record and nothing slow may sit in front of it.
-    // Everything here is unchanged except WHEN it runs.
-    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
-    let today_nanos = ist_midnight_nanos(date);
-    match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
-        .await
-    {
-        Ok(tally) => info!(
-            active = tally.active,
-            expired_by_date = tally.expired_by_date,
-            expired_by_absence = tally.expired_by_absence,
-            "instrument lifecycle recorded"
-        ),
-        Err(err) => {
-            metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(1);
-            // Audit OBS-2 (2026-10-11): a failed SEBI lifecycle write is a
-            // storage audit-write failure (STORAGE-GAP-03), not a socket state.
-            error!(
-                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
-                    .code_str(),
-                source = "lifecycle_persist_failed",
-                ?err,
-                date,
-                "instrument lifecycle write did not fully land — nothing was deleted (the table \
-                 is append-and-upsert only). Rows that did not land keep yesterday's state, so \
-                 a query asking which instruments were tradeable today reads yesterday's answer \
-                 for them; rows held back because their audit transition was not written are \
-                 recorded by the next run. The error carries the counts."
-            );
-        }
-    }
+    // Owner Quote 44 (2026-10-28): the daily write of both SEBI tables
+    // STOPPED. Nothing on the live path read them (subscriptions, contracts,
+    // candles, ticks and orders come from the artifact files written above),
+    // and the lifecycle table had grown to 18,784,013 rows for 161,886 ids
+    // because every run appended a full copy. Both tables and every row in
+    // them are kept, frozen as history, never deleted. The point-in-time
+    // record from 2026-10-28 on is the dated snapshot of these artifact
+    // files in the cold bucket (`instrument_snapshot_upload`, started by the
+    // rider after this build returns, off the boot critical path). Restarting
+    // a write to either table needs a fresh dated quote first; the guard
+    // `no_production_code_writes_the_frozen_lifecycle_tables` fails the build
+    // otherwise.
     persist_constituents(questdb, date, &outcome).await;
 
-    // Retention, LAST: after every artifact for today has landed and after the
-    // SEBI tables above are written. Ordering is the safety property -- a sweep
-    // that ran first could delete the only artifact a failed build would have
-    // left the lane, and the lane's fallback is four index SIDs.
+    // Retention does NOT run here any more (2026-10-28, Quote 44 review): it
+    // runs in the snapshot task the rider starts after this build returns,
+    // after a pass that re-checked every marked copy against the cold bucket
+    // (`sweep_artifacts_after_verified_copies`). A marker can outlive its
+    // copy (a bucket-wide delete), and only that task holds a bucket client.
+    // It still runs after every artifact for today has landed: the rider
+    // starts it only after this build succeeded.
+
+    Ok(outcome)
+}
+
+/// The retention sweep, run by the snapshot task only after a pass that
+/// re-checked every marked copy against the cold bucket
+/// ([`crate::instrument_snapshot_upload`], `SnapshotPassSummary::sweep_allowed`).
+/// Ordering is the safety property: it runs after today's build succeeded
+/// (the rider starts the task only then), so it can never delete the only
+/// artifact a failed build would have left the lane, and after the re-check,
+/// so a marker whose copy was deleted from the bucket deletes nothing.
+/// `proven` names the files whose copy that pass confirmed itself; a file
+/// outside it is kept whatever its marker says (`sweep_stale_artifacts_in`).
+/// The folder walk runs off the shared worker (`off_worker`).
+// TEST-EXEMPT: thin wrapper (off_worker + counter + log) over
+// `sweep_stale_artifacts_in`, whose behaviour is tested directly; the call
+// site and the held-counter emit are pinned by source in
+// `test_sweep_artifacts_after_verified_copies_counts_the_held_files`.
+pub(crate) fn sweep_artifacts_after_verified_copies(
+    date: &str,
+    proven: &std::collections::BTreeSet<String>,
+) {
     // Sweep S5: the directory walk runs off the shared tokio worker.
-    let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date));
-    if swept.removed > 0 || swept.failed > 0 {
+    let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date, proven));
+    metrics::counter!(crate::instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER)
+        .increment(swept.held_without_copy as u64);
+    if swept.removed > 0 || swept.failed > 0 || swept.held_without_copy > 0 {
         info!(
             removed = swept.removed,
             bytes = swept.bytes,
             failed = swept.failed,
             skipped_unknown = swept.skipped_unknown,
+            held_without_copy = swept.held_without_copy,
             retention_days = ARTIFACT_RETENTION_DAYS,
-            "stale instrument artifacts swept"
+            "stale instrument artifacts swept (a file with no verified S3 copy is kept)"
         );
     }
-
-    Ok(outcome)
 }
 
 /// Persists the resolved mapping into the SEBI `index_constituency` table.
@@ -1608,6 +1709,11 @@ fn write_spot_artifact(
 /// Honest limit: release builds use `panic = "abort"`, so the respawn arm is
 /// reachable only in unwind builds. The counter is what makes a panic loop
 /// visible in production, where the process dies instead.
+///
+/// `snapshot_bucket` is the configured cold bucket for the daily instrument
+/// snapshot copy (owner Quote 44): `[partition_retention] archive_bucket`, the
+/// same value the raw-frame uploader uses, so every cold copy lands in one
+/// bucket. Empty means `tv-<env>-cold` from the runtime environment.
 #[must_use]
 // TEST-EXEMPT: tokio supervisor wiring over an infinite daily control-plane loop driving live
 // network + QuestDB I/O. The pure primitives it composes (`next_wait`, `ist_secs_of_day`,
@@ -1615,6 +1721,7 @@ fn write_spot_artifact(
 pub fn spawn_dhan_universe_rider(
     config: DhanUniverseConfig,
     questdb: QuestDbConfig,
+    snapshot_bucket: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !config.enabled {
@@ -1627,8 +1734,13 @@ pub fn spawn_dhan_universe_rider(
         metrics::counter!(RESPAWN_COUNTER, "reason" => "panic").increment(0);
         metrics::counter!(BUILD_COUNTER, "outcome" => "ok").increment(0);
         metrics::counter!(BUILD_COUNTER, "outcome" => "failed").increment(0);
+        crate::instrument_snapshot_upload::register_snapshot_metrics();
         loop {
-            let inner = tokio::spawn(run_dhan_universe_rider(config.clone(), questdb.clone()));
+            let inner = tokio::spawn(run_dhan_universe_rider(
+                config.clone(),
+                questdb.clone(),
+                snapshot_bucket.clone(),
+            ));
             let result = inner.await;
             if let Err(join_err) = &result
                 && join_err.is_cancelled()
@@ -1652,7 +1764,11 @@ pub fn spawn_dhan_universe_rider(
 }
 
 /// The rider loop body (supervised above): one build per IST day, forever.
-async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbConfig) {
+async fn run_dhan_universe_rider(
+    config: DhanUniverseConfig,
+    questdb: QuestDbConfig,
+    snapshot_bucket: String,
+) {
     {
         info!(
             target_secs_of_day_ist = config.target_secs_of_day_ist,
@@ -1706,6 +1822,17 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
                         unresolved_fraction = outcome.unresolved_fraction(),
                         "[dhan_universe] daily build COMPLETE"
                     );
+                    // Owner Quote 44 (2026-10-28): copy today's dated artifact
+                    // files (and any earlier date still missing) to the cold
+                    // bucket, verified. Its own task, after the build: the
+                    // live lane already has its mapping artifact, so nothing
+                    // here can delay it. A running pass is not doubled; it runs once more.
+                    // The retention sweep runs in that task, after the pass
+                    // re-checked every marked copy against the bucket.
+                    drop(crate::instrument_snapshot_upload::spawn_snapshot_upload(
+                        snapshot_bucket.clone(),
+                        today.clone(),
+                    ));
                 }
                 Err(err) => {
                     metrics::counter!(BUILD_COUNTER, "outcome" => "failed").increment(1);
@@ -1826,16 +1953,26 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("non-test half");
-        for (source, counter) in [
-            (
-                "source = \"lifecycle_persist_failed\"",
-                "tv_instrument_lifecycle_persist_failed_total",
-            ),
-            (
-                "source = \"rider_constituency_persist_failed\"",
-                "tv_index_constituency_persist_failed_total",
-            ),
+        let main_src = include_str!("main.rs");
+        // Owner Quote 44 (2026-10-28): the lifecycle write and its failure arm
+        // are gone with the writer; neither the source nor the counter may
+        // come back without a fresh dated quote.
+        for gone in [
+            "lifecycle_persist_failed",
+            "tv_instrument_lifecycle_persist_failed_total",
+            "tv_instrument_lifecycle_audit_failed_total",
         ] {
+            assert!(!prod.contains(gone), "{gone} left with the writer");
+            assert!(
+                !main_src.contains(gone),
+                "{gone} must not be seeded for a writer that no longer exists"
+            );
+        }
+        let (source, counter) = (
+            "source = \"rider_constituency_persist_failed\"",
+            "tv_index_constituency_persist_failed_total",
+        );
+        {
             let at = prod
                 .find(source)
                 .unwrap_or_else(|| panic!("{source} must exist"));
@@ -1852,7 +1989,7 @@ mod tests {
             // 2026-10-11): a seed milliseconds before the write that may fail
             // is a series no scrape ever sees at 0.
             assert!(
-                include_str!("main.rs").contains(&format!("counter!(\"{counter}\").increment(0)")),
+                main_src.contains(&format!("counter!(\"{counter}\").increment(0)")),
                 "{counter} must be seeded at 0 at boot"
             );
             assert!(
@@ -1978,6 +2115,69 @@ mod tests {
         );
     }
 
+    /// The sweep publishes every artifact it KEPT for lack of a verified copy
+    /// on the held counter (Quote 44): without it a broken copy would only
+    /// grow the folder, with no number anywhere saying so. Since the 2026-10-28
+    /// review the sweep runs in the snapshot task after a pass that re-checked
+    /// every marked copy against the bucket, never inside `build_once`.
+    #[test]
+    fn test_sweep_artifacts_after_verified_copies_counts_the_held_files() {
+        let src = include_str!("dhan_universe.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        let build_at = prod
+            .find("async fn build_once(")
+            .expect("`build_once` must exist");
+        let build_end = build_at
+            + prod[build_at..]
+                // The escape is a closing brace, written escaped so the braces on
+                // this line stay balanced for the banned-pattern scanner's
+                // test-module tracking.
+                .find("\n\u{7d}\n")
+                .expect("`build_once` body must close");
+        assert!(
+            !prod[build_at..build_end].contains("sweep_stale_artifacts("),
+            "`build_once` must not sweep: it holds no bucket client to re-check a \
+             marker against, so a marker whose copy was deleted would let it delete \
+             the only remaining file"
+        );
+        let fn_at = prod
+            .find("pub(crate) fn sweep_artifacts_after_verified_copies(")
+            .expect("the sweep wrapper must exist");
+        let wrapper = &prod[fn_at..];
+        let sweep_at = wrapper
+            .find("sweep_stale_artifacts(date, proven)")
+            .expect("the wrapper must run the sweep");
+        let after = &wrapper[sweep_at..];
+        let held_at = after
+            .find("instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER")
+            .expect("the held counter must be bumped after the sweep");
+        assert!(
+            after[held_at..].contains(".increment(swept.held_without_copy as u64)"),
+            "the held counter must carry the sweep's held count"
+        );
+    }
+
+    /// `sweepable_artifact_date` is shared with the snapshot upload (Quote
+    /// 44): the sweep accepts the `.json.tmp` leftover, the snapshot does not.
+    #[test]
+    fn test_sweepable_artifact_date_takes_the_tmp_leftover_the_snapshot_skips() {
+        let tmp = "dhan-contracts-2026-10-28.json.tmp";
+        assert_eq!(sweepable_artifact_date(tmp), Some("2026-10-28"));
+        assert_eq!(
+            crate::instrument_snapshot_upload::snapshot_artifact_date(tmp),
+            None
+        );
+        let json = "dhan-contracts-2026-10-28.json";
+        assert_eq!(sweepable_artifact_date(json), Some("2026-10-28"));
+        assert_eq!(
+            crate::instrument_snapshot_upload::snapshot_artifact_date(json),
+            Some("2026-10-28")
+        );
+    }
+
     #[test]
     fn only_the_four_known_artifact_names_are_ever_sweepable() {
         // The safety property. A `*.json` glob would delete whatever a future
@@ -2074,28 +2274,70 @@ mod tests {
         );
     }
 
+    /// A scratch folder for a sweep test (never `MAPPING_DIR`, so a test can
+    /// never delete a real artifact).
+    fn sweep_scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "tv_artifact_sweep_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Records a verified copy of `path` the way the snapshot upload does:
+    /// a marker in `<dir>/uploaded/` with the file's length and mtime.
+    fn mark_copied(path: &std::path::Path) {
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let marker = tickvault_storage::raw_frame_upload::UploadMarker {
+            version: 1,
+            bucket: "tv-test-cold".to_string(),
+            key: format!("instrument-snapshots/x/{name}.gz"),
+            gzip_sha256: String::new(),
+            gzip_len: 0,
+            raw_sha256: String::new(),
+            raw_len: meta.len(),
+            raw_mtime_secs: mtime,
+            first_frame_seq: None,
+        };
+        let markers = tickvault_storage::raw_frame_upload::sibling_markers_dir(path).unwrap();
+        std::fs::create_dir_all(&markers).unwrap();
+        std::fs::write(markers.join(&name), serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
     #[test]
     fn the_sweep_removes_only_what_is_both_known_and_old() {
-        // The end-to-end shape, on a real directory. Written into MAPPING_DIR
-        // because that is the only directory the sweep reads; the dates are far
-        // enough in the past that they can never collide with a real run.
-        if std::fs::create_dir_all(MAPPING_DIR).is_err() {
-            return; // a sandbox with no write access must not fail the suite
-        }
-        let old_known = std::path::Path::new(MAPPING_DIR).join("dhan-contracts-1999-01-01.json");
-        let old_tmp =
-            std::path::Path::new(MAPPING_DIR).join("dhan-nse-mapping-1999-01-01.json.tmp");
-        let old_foreign = std::path::Path::new(MAPPING_DIR).join("plan-snapshot-1999-01-01.json");
-        let recent_known = std::path::Path::new(MAPPING_DIR).join("dhan-contracts-1999-01-08.json");
+        // The end-to-end shape, on a real directory, with the copy gate off
+        // (the shape before owner Quote 44). The Required gate has its own
+        // test below.
+        use tickvault_storage::raw_frame_upload::CopyGate;
+        let dir = sweep_scratch_dir("known_old");
+        let old_known = dir.join("dhan-contracts-1999-01-01.json");
+        let old_tmp = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        let old_foreign = dir.join("plan-snapshot-1999-01-01.json");
+        let recent_known = dir.join("dhan-contracts-1999-01-08.json");
         for p in [&old_known, &old_tmp, &old_foreign, &recent_known] {
-            if std::fs::write(p, b"{}").is_err() {
-                return;
-            }
+            std::fs::write(p, b"{}").unwrap();
         }
 
         // Sweeping as if today were 1999-01-08: the cutoff is 1999-01-01, so
         // the 01-01 files are AT the cutoff and kept.
-        let at_cutoff = sweep_stale_artifacts("1999-01-08");
+        let at_cutoff = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-08",
+            CopyGate::NotRequired,
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(
             at_cutoff.removed, 0,
             "a file exactly at the cutoff is inside the window and must be kept"
@@ -2104,7 +2346,12 @@ mod tests {
 
         // One day later the 01-01 files fall out; the 01-08 one and the
         // foreign name stay.
-        let past_cutoff = sweep_stale_artifacts("1999-01-09");
+        let past_cutoff = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-09",
+            CopyGate::NotRequired,
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(
             past_cutoff.removed, 2,
             "both the .json and its .tmp sibling go, and nothing else"
@@ -2125,9 +2372,136 @@ mod tests {
             recent_known.exists(),
             "a known artifact inside the window must survive"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
-        let _ = std::fs::remove_file(&old_foreign);
-        let _ = std::fs::remove_file(&recent_known);
+    /// Owner Quote 44 (2026-10-28): a dated artifact is deleted only once its
+    /// verified S3 copy is recorded. No copy: kept and counted. A marker for a
+    /// different length or mtime does not count. A `.tmp` leftover goes only
+    /// when its complete `.json` sibling has a verified copy; an orphan `.tmp`
+    /// (the only record of its day) or one beside an uncopied `.json` is kept.
+    /// The marker folder is never counted as an unknown name.
+    #[test]
+    fn test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy() {
+        use tickvault_storage::raw_frame_upload::{CopyGate, UPLOADED_SUBDIR};
+        let dir = sweep_scratch_dir("required");
+        let copied = dir.join("dhan-contracts-1999-01-01.json");
+        let not_copied = dir.join("dhan-nse-mapping-1999-01-01.json");
+        let stale_marker = dir.join("dhan-ntm-spot-1999-01-01.json");
+        // Orphan: no `.json` of that name ever landed.
+        let tmp = dir.join("dhan-fno-underlyings-1999-01-01.json.tmp");
+        // Beside a copied `.json`: goes with it.
+        let tmp_of_copied = dir.join("dhan-contracts-1999-01-01.json.tmp");
+        // Beside an uncopied `.json`: kept.
+        let tmp_of_not_copied = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        for p in [
+            &copied,
+            &not_copied,
+            &stale_marker,
+            &tmp,
+            &tmp_of_copied,
+            &tmp_of_not_copied,
+        ] {
+            std::fs::write(p, b"{\"rows\":1}").unwrap();
+        }
+        mark_copied(&copied);
+        mark_copied(&stale_marker);
+        // The file changed after its copy: the marker no longer matches.
+        std::fs::write(&stale_marker, b"{\"rows\":1,\"rewritten\":true}").unwrap();
+
+        // Both marked files were proven by the pass; the stale marker still
+        // blocks its file because the marker no longer matches it.
+        let proven: std::collections::BTreeSet<String> = [
+            "dhan-contracts-1999-01-01.json",
+            "dhan-ntm-spot-1999-01-01.json",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required, &proven);
+        assert!(!copied.exists(), "a verified copy lets the file go");
+        assert!(
+            !dir.join(UPLOADED_SUBDIR)
+                .join("dhan-contracts-1999-01-01.json")
+                .exists(),
+            "the deleted file's marker goes with it"
+        );
+        assert!(not_copied.exists(), "no copy, no delete");
+        assert!(
+            stale_marker.exists(),
+            "a marker for other bytes is not a copy"
+        );
+        assert!(
+            tmp.exists(),
+            "an orphan leftover may be the only record of its day: kept"
+        );
+        assert!(
+            !tmp_of_copied.exists(),
+            "a leftover beside a copied .json goes (it was judged before the .json was deleted)"
+        );
+        assert!(
+            tmp_of_not_copied.exists(),
+            "a leftover beside an uncopied .json is kept"
+        );
+        assert_eq!(tally.removed, 2, "{tally:?}");
+        assert_eq!(tally.held_without_copy, 4, "{tally:?}");
+        assert_eq!(
+            tally.skipped_unknown, 0,
+            "the marker folder is not an unknown artifact: {tally:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 2026-10-28 review: a marker that matches its file is NOT enough to
+    /// delete it. The file must also be in `proven` (the pass just before
+    /// the sweep confirmed its copy). A matching marker this pass did not
+    /// prove (its copy was found gone, the unlink of the marker failed and
+    /// the re-upload failed) keeps the file, and its `.json.tmp` leftover.
+    #[test]
+    fn test_sweep_stale_artifacts_in_keeps_a_marked_file_this_pass_did_not_prove() {
+        use tickvault_storage::raw_frame_upload::{CopyGate, UPLOADED_SUBDIR};
+        let dir = sweep_scratch_dir("unproven");
+        let proven_file = dir.join("dhan-contracts-1999-01-01.json");
+        let unproven_file = dir.join("dhan-nse-mapping-1999-01-01.json");
+        let unproven_tmp = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        for p in [&proven_file, &unproven_file, &unproven_tmp] {
+            std::fs::write(p, b"{\"rows\":1}").unwrap();
+        }
+        // Both carry a marker that matches the file's length and mtime.
+        mark_copied(&proven_file);
+        mark_copied(&unproven_file);
+        let proven: std::collections::BTreeSet<String> =
+            std::iter::once("dhan-contracts-1999-01-01.json".to_string()).collect();
+
+        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required, &proven);
+        assert!(!proven_file.exists(), "proven and marked: deleted");
+        assert!(
+            unproven_file.exists(),
+            "a matching marker this pass did not prove deletes nothing"
+        );
+        assert!(
+            dir.join(UPLOADED_SUBDIR)
+                .join("dhan-nse-mapping-1999-01-01.json")
+                .exists(),
+            "the kept file keeps its marker"
+        );
+        assert!(
+            unproven_tmp.exists(),
+            "a leftover beside an unproven .json is kept"
+        );
+        assert_eq!(tally.removed, 1, "{tally:?}");
+        assert_eq!(tally.held_without_copy, 2, "{tally:?}");
+
+        // An empty proof set (a pass that proved nothing) deletes nothing.
+        let none = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-09",
+            CopyGate::Required,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(none.removed, 0, "{none:?}");
+        assert!(unproven_file.exists() && unproven_tmp.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

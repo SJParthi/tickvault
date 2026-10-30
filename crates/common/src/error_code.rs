@@ -797,6 +797,14 @@ pub enum ErrorCode {
     /// live lane writes `ticks` again. Log only (no filter, alarm or page).
     /// Severity::High; never auto-triaged (a data verdict the operator judges).
     TickConserve01DailyMismatch,
+    /// EXPIRY-SCOPE-01 — an option contract outside the current expiry of its
+    /// underlying was found (owner 2026-10-28: "add the daily expiry check").
+    /// Two emitters: the contract attach, which REFUSES such a contract before
+    /// it is subscribed, and the after-close check over today's `candles_1m`,
+    /// which writes the `expiry_scope_audit` row. Log only (no filter, alarm
+    /// or page). Severity::High; never auto-triaged (a scope verdict the
+    /// operator judges).
+    ExpiryScope01OffExpiry,
     // SPOT1M-01 RETIRED 2026-09-16 with the per-minute spot-1m REST fetch.
     // SPOT1M-02 below SURVIVES — its remaining emitter is the per-contract
     // 1m leg, not the spot leg.
@@ -1281,6 +1289,7 @@ impl ErrorCode {
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
             Self::DhanLiveXverify01RunDegraded => "DHAN-LIVE-XVERIFY-01",
             Self::TickConserve01DailyMismatch => "TICK-CONSERVE-01",
+            Self::ExpiryScope01OffExpiry => "EXPIRY-SCOPE-01",
             // Per-minute REST pipeline (operator grant 2026-07-12).
             Self::Spot1m02PersistFailed => "SPOT1M-02",
             // Daily timeframe-consistency verifier (operator 2026-07-13)
@@ -1555,6 +1564,9 @@ impl ErrorCode {
             // TICK-CONSERVE-01 (K4, 2026-10-26): today's `ticks` rows do not
             // reconcile with the rows accepted for persistence. High, log only.
             Self::TickConserve01DailyMismatch => Severity::High,
+            // EXPIRY-SCOPE-01 (2026-10-28): a contract outside its underlying's
+            // current expiry was refused or stored. High, log only.
+            Self::ExpiryScope01OffExpiry => Severity::High,
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
@@ -1798,6 +1810,7 @@ impl ErrorCode {
             Self::TickConserve01DailyMismatch => {
                 "docs/error-runbooks/tick-conservation-error-codes.md"
             }
+            Self::ExpiryScope01OffExpiry => "docs/error-runbooks/expiry-scope-error-codes.md",
             // Per-minute REST pipeline (operator grant 2026-07-12). Only the
             // contract-1m leg still emits in this family; see SPOT1M-02.
             Self::Spot1m02PersistFailed => {
@@ -1875,6 +1888,9 @@ impl ErrorCode {
                 // operator judges (restart, apply lag or a real loss); the
                 // TF-VERIFY-01 precedent.
                 | Self::TickConserve01DailyMismatch
+                // EXPIRY-SCOPE-01 (2026-10-28): a scope verdict the operator
+                // judges (selector bug, stale file, vendor relisting).
+                | Self::ExpiryScope01OffExpiry
                 // ORDER-READY-01 (Cluster F, 2026-07-14): restoring
                 // dataPlan/segment/token is an operator/broker ACCOUNT decision
                 // (CHAIN-01 precedent); no auto-triage action may ever touch the
@@ -2033,6 +2049,7 @@ impl ErrorCode {
             Self::Scoreboard01AggregationDegraded,
             Self::DhanLiveXverify01RunDegraded,
             Self::TickConserve01DailyMismatch,
+            Self::ExpiryScope01OffExpiry,
             // Per-minute REST pipeline (operator grant 2026-07-12). SPOT1M-02
             // is the sole survivor — see its docblock.
             Self::Spot1m02PersistFailed,
@@ -2455,6 +2472,8 @@ mod tests {
                 // 2026-10-26 (K4): re-added for `TickConserve01DailyMismatch`
                 // (the Dhan live lane writes `ticks` again).
                 || s.starts_with("TICK-CONSERVE-")
+                // 2026-10-28: the daily expiry-scope check.
+                || s.starts_with("EXPIRY-SCOPE-")
                 // PR-A 2026-06-28: Groww shared-master persist
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
                 // PR-R1 (2026-07-04): Groww native-Rust shadow client

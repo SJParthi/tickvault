@@ -83,10 +83,8 @@ const NO_GENERIC_SELF_HEAL: &[(&str, &str)] = &[
          reset contract, so a column change would be a new reset with its own \
          dated quote, never a silent ALTER (2026-09-22)",
     ),
-    (
-        "instrument_lifecycle_persistence.rs",
-        "two hand-rolled ALTERs; SEBI never-delete table",
-    ),
+    // instrument_lifecycle_persistence.rs left this list 2026-10-28 (owner
+    // Quote 44): its DDL and writer were deleted; the tables are frozen.
     (
         "order_leg_pnl_persistence.rs",
         "DDL is BUILT FROM the manifest, so CREATE cannot drift from it; only \
@@ -502,7 +500,6 @@ fn guard_self_test() {
 /// deliberate decision that must be argued in review.
 const NO_DOCUMENTED_SCHEMA: &[&str] = &[
     "depth_persistence.rs",
-    "instrument_lifecycle_persistence.rs",
     "order_leg_pnl_persistence.rs",
     "order_update_events_persistence.rs",
     "partition_archive.rs",

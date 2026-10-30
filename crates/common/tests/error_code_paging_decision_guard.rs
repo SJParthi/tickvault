@@ -65,6 +65,8 @@ const LOG_ONLY_CODES: &[&str] = &[
     "DRAIN-HOLD-01",
     "EXIT-ORDER-01",
     "EXIT-VERIFY-01",
+    // 2026-10-28: the daily expiry check; log only (Dhan noise lock §3).
+    "EXPIRY-SCOPE-01",
     "FEED-GAP-01",
     "FEED-REJECT-01",
     "FEED-SUPERVISOR-01",

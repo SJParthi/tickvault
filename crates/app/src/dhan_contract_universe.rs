@@ -727,6 +727,11 @@ pub struct ContractSelection {
     /// what gets a backup copy on a second main-feed socket (scope lock
     /// 2026-10-02). A subset of [`Self::instruments`], in rank order.
     pub backup_rank: Vec<SubscribeInstrument>,
+    /// Contracts the subscribe-time expiry-scope check REFUSED after selection
+    /// (`expiry_scope_check::enforce_subscribe_expiry_scope`, owner 2026-10-28):
+    /// on a live expiry that is not the current one, expired, or unknown to the
+    /// contract file. 0 on a healthy day: the selector cannot pick one.
+    pub refused_off_expiry: usize,
 }
 
 /// Maps a master row's `EXCH_ID` to the derivative segment we subscribe.
@@ -1216,7 +1221,7 @@ fn push_contract(
 /// Deliberately small. A genuinely thin weekly on an illiquid stock is real
 /// and must survive; the case this rejects is the single-row artefact, not the
 /// quiet market.
-const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
+pub(crate) const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
 
 /// The nearest expiry at or after today that carries a real chain.
 ///
@@ -1953,30 +1958,6 @@ fn parse_spot_rows(body: &str, floor: Option<i64>) -> Result<SpotPriceRows, Stri
     Ok(out)
 }
 
-/// Re-keys the app's contract-name table into the candle writer's shape:
-/// `(security_id as i64, segment string)` — exactly the fields a candle row
-/// carries. The segment string comes from the SAME `segment_code_to_str` the
-/// row uses, so the two can never spell a segment differently. An id that
-/// does not fit `i64` is dropped (no Dhan id is near 2^63; the candle row
-/// could not carry it either) — dropped means NULL, never a wrong name.
-fn candle_labels_from(
-    labels: &HashMap<crate::contract_underlying_map::ContractKey, std::sync::Arc<str>>,
-) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
-    let mut out =
-        tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
-            labels.len(),
-            ahash::RandomState::default(),
-        );
-    for ((id, segment), name) in labels {
-        let Ok(id) = i64::try_from(*id) else {
-            continue;
-        };
-        let seg = tickvault_common::segment::segment_code_to_str(segment.binary_code());
-        out.insert((id, seg), std::sync::Arc::clone(name));
-    }
-    out
-}
-
 /// Spot and index names for the same table, from the day's symbol map
 /// (added 2026-09-22 — until then every spot and index `ticks` / candle row
 /// wrote a NULL `contract`, because the table was built from option rows only).
@@ -2029,17 +2010,25 @@ pub fn spot_labels_from(
 /// the attach. O(rows), once per boot; about 11 MB until the attach replaces
 /// the table (estimate: ~121,000 entries of key, pointer and a ~25-byte name).
 ///
+/// A composite key the file lists twice (Dhan reuses derivative ids) is named
+/// from the row the selector would admit on `today_ymd` (the file's own day),
+/// never from whichever row came last: the same row the expiry index keeps
+/// (`expiry_scope_check::preferred_option_rows`). Until 2026-10-28 the last
+/// row won, so a current contract whose expired twin sat later in the file
+/// was stored under the expired name. One more O(rows) pass.
+///
 /// [`contract_label`]: crate::contract_underlying_map::contract_label
 #[must_use]
-fn option_labels_from(
+pub(crate) fn option_labels_from(
     contracts: &[ContractRow],
+    today_ymd: u32,
 ) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
     let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
         tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
             contracts.len(),
             ahash::RandomState::default(),
         );
-    for row in contracts {
+    for row in crate::expiry_scope_check::preferred_option_rows(contracts, today_ymd) {
         if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") || row.i == 0 {
             continue;
         }
@@ -2154,7 +2143,7 @@ pub fn publish_contract_labels_at_boot(date_ist: &str) -> usize {
     // only matters for readability. A missing contract file publishes spot
     // names only, as before.
     if let Ok(contracts) = read_contract_artifact(&date) {
-        labels.extend(option_labels_from(&contracts));
+        labels.extend(option_labels_from(&contracts, day_key(&date)));
     }
     let n = labels.len();
     let new_day = day_key(&date);
@@ -2194,7 +2183,7 @@ pub fn contract_names_for_day(
     let symbols = read_symbol_map(date_ist).ok()?;
     let mut labels = spot_labels_from(&symbols);
     if let Ok(contracts) = read_contract_artifact(date_ist) {
-        labels.extend(option_labels_from(&contracts));
+        labels.extend(option_labels_from(&contracts, day_key(date_ist)));
     }
     Some(labels)
 }
@@ -2330,6 +2319,20 @@ pub async fn load_contract_universe(
 
     let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
     let mut selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+    // The expiry-scope guarantee, layer 1 (owner 2026-10-28): every selected
+    // contract must sit on its underlying's current expiry, recomputed from the
+    // same file by a separate pass. A contract that does not is REFUSED here,
+    // before anything below names, maps or dials it.
+    // O(rows) over ~120,000 rows: moved off the runtime worker (`off_worker`)
+    // so the other tasks on this worker keep running while it builds.
+    let expiry_scope = tickvault_storage::off_worker::off_worker(|| {
+        crate::expiry_scope_check::enforce_subscribe_expiry_scope(
+            &mut selection,
+            &contracts,
+            today_ymd,
+        )
+    });
+    crate::expiry_scope_check::record_subscribe_expiry_scope(&expiry_scope, today_ymd);
     // Carried on the selection rather than logged here alone, so the pure
     // classifier below can tell the two failures apart without re-reading I/O.
     selection.spot_rows_available = prices.len();
@@ -2353,8 +2356,21 @@ pub async fn load_contract_universe(
     // of it.
     {
         crate::contract_underlying_map::pre_register_contract_underlying_counters();
+        // One row per composite key, the row the selector would admit
+        // (2026-10-28 review): the owner map and its labels are last-wins per
+        // id, so a reused id whose expired twin sits later in the file would
+        // otherwise be mapped to the expired contract's underlying and family.
+        // The option rows are cloned once per attach attempt (about 120,000
+        // rows, cold, off the runtime worker), so the two builders below keep
+        // their slice inputs.
+        let named_rows: Vec<ContractRow> = tickvault_storage::off_worker::off_worker(|| {
+            crate::expiry_scope_check::preferred_option_rows(&contracts, today_ymd)
+                .into_iter()
+                .cloned()
+                .collect()
+        });
         let (legs, artifact_refusals) =
-            crate::contract_underlying_map::legs_from_artifact(&contracts, &symbols);
+            crate::contract_underlying_map::legs_from_artifact(&named_rows, &symbols);
         // Counted by REASON, not just totalled. The count alone is what the
         // line below carried until 2026-09-09, and on 2026-09-08 and
         // 2026-09-09 it read `113182` then `113746` -- EVERY option leg in the
@@ -2398,21 +2414,32 @@ pub async fn load_contract_universe(
         // owner map: the projection only reads a label for a contract the
         // leaderboard already tracks.
         let labels = crate::contract_underlying_map::labels_from_artifact_selected_first(
-            &contracts,
+            &named_rows,
             &selection.instruments,
         );
-        // The candle writer fills `candles_<tf>.contract` from the SAME names,
-        // re-keyed into the row's own `(security_id, segment-string)` shape
-        // (storage cannot see this crate's map). Built from the same table in
-        // the same pass, so a `top_volume` row and a candle row for one
-        // contract can never carry two different names. `Arc<str>` clones are
-        // refcount bumps; this runs once per attach, never on the tick path.
-        // Spots and indices first, then options: the keys never collide (spot
-        // segments vs NSE_FNO / BSE_FNO), so the order only matters for
-        // readability. The whole table is REPLACED, so the spot names the boot
-        // published must be included again here or this publish would drop them.
+        // The candle writer fills `candles_<tf>.contract` from this table,
+        // keyed in the row's own `(security_id, segment-string)` shape
+        // (storage cannot see this crate's map). The whole table is REPLACED,
+        // so the spot names the boot published are included again here.
+        //
+        // EVERY option row of the day's file is named, uncapped, exactly as
+        // the boot publish names them (`option_labels_from`), never the
+        // 25,000-capped ranking table above. CORRECTED 2026-10-28: this was
+        // built from that capped table, so the attach NARROWED the boot's full
+        // table to the current selection plus whatever fitted in file order.
+        // The attach retries through the morning and the socket keeps every
+        // contract an earlier attempt subscribed; one the latest attempt no
+        // longer selects (the at-the-money window moves as stocks price) lost
+        // its name, and its candles were written with a NULL `contract` (seen
+        // live: HAVELLS-23Nov2026-1260-CE, security_id 114816, on 2026-10-28).
+        // Same names, same renderer (`contract_label`) as the ranking table.
+        // About 120,000 `Arc<str>` entries, the size the boot already
+        // publishes; once per attach attempt, never on the tick path, built
+        // off the runtime worker (`off_worker`).
         let mut candle_labels = spot_labels_from(&symbols);
-        candle_labels.extend(candle_labels_from(&labels));
+        candle_labels.extend(tickvault_storage::off_worker::off_worker(|| {
+            option_labels_from(&contracts, today_ymd)
+        }));
         // Set BEFORE the publish: from here on a boot publish never replaces
         // the attach's table (2026-10-10).
         ATTACH_LABELS_PUBLISHED.store(true, std::sync::atomic::Ordering::Release);
@@ -2463,6 +2490,7 @@ pub async fn load_contract_universe(
         underlyings_total = selection.stock_option_underlyings,
         without_spot = selection.underlyings_without_spot,
         dropped_for_capacity = selection.dropped_for_capacity,
+        refused_off_expiry = selection.refused_off_expiry,
         "contract universe resolved"
     );
     selection
@@ -2566,28 +2594,23 @@ pub async fn fetch_spot_prices(
 mod tests {
 
     /// The candle writer probes with `(row.security_id, row.segment)`, where
-    /// the segment is `segment_code_to_str(code)`. The re-keyed table must
-    /// spell it identically or every lookup misses and every option candle
-    /// silently reads NULL.
+    /// the segment is `segment_code_to_str(code)`. The option names the attach
+    /// publishes must spell it identically or every lookup misses and every
+    /// option candle silently reads NULL.
     #[test]
-    fn candle_labels_are_keyed_exactly_as_a_candle_row_probes() {
+    fn test_option_labels_from_keys_exactly_as_a_candle_row_probes() {
         use tickvault_common::types::ExchangeSegment;
-        let mut labels = std::collections::HashMap::new();
-        labels.insert(
-            (52_175_u64, ExchangeSegment::NseFno),
-            std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
-        );
-        labels.insert(
-            (1_122_u64, ExchangeSegment::BseFno),
-            std::sync::Arc::<str>::from("SENSEX-25Sep2026-81000-PE"),
-        );
-        // An id no candle row can carry: dropped, never wrapped negative.
-        labels.insert(
-            (u64::MAX, ExchangeSegment::NseFno),
-            std::sync::Arc::<str>::from("IMPOSSIBLE"),
-        );
-        let out = super::candle_labels_from(&labels);
-        assert_eq!(out.len(), 2, "the out-of-range id must be dropped");
+        let row = super::ContractRow {
+            i: 52_175,
+            x: "NSE".into(),
+            c: "OPTIDX".into(),
+            e: 20_260_925,
+            s: 2_450_000,
+            l: "CE".into(),
+            u: "NIFTY".into(),
+            z: 75,
+        };
+        let out = super::option_labels_from(&[row], 20_260_901);
         let nse =
             tickvault_common::segment::segment_code_to_str(ExchangeSegment::NseFno.binary_code());
         assert_eq!(nse, "NSE_FNO");
@@ -2595,11 +2618,30 @@ mod tests {
             out.get(&(52_175, nse)).map(|s| &**s),
             Some("NIFTY-25Sep2026-24500-CE")
         );
-        assert_eq!(
-            out.get(&(1_122, "BSE_FNO")).map(|s| &**s),
-            Some("SENSEX-25Sep2026-81000-PE")
+    }
+
+    /// Regression (2026-10-28, HAVELLS-23Nov2026-1260-CE written with a NULL
+    /// `contract`): the attach must publish the candle names from EVERY option
+    /// row of the day's file, never from the 25,000-capped ranking table, or a
+    /// contract an earlier attach attempt subscribed (the socket keeps it) but
+    /// the latest attempt no longer selects loses its name.
+    #[test]
+    fn test_regression_attach_publishes_every_option_name_uncapped() {
+        let src = include_str!("dhan_contract_universe.rs");
+        let body = src
+            .split("pub async fn load_contract_universe(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(
+            body.contains("option_labels_from(&contracts, today_ymd)")
+                && body.contains("candle_labels.extend(tickvault_storage::off_worker::off_worker("),
+            "the attach must name every option row of the day's file"
         );
-        assert!(out.values().all(|v| &**v != "IMPOSSIBLE"));
+        assert!(
+            !body.contains("candle_labels.extend(candle_labels_from("),
+            "the capped ranking table must never feed the candle names again"
+        );
     }
     /// The cache is a process-global single slot, so these tests must not run
     /// concurrently with each other — one storing while another reads would
@@ -4602,7 +4644,7 @@ mod tests {
         bse.x = "BSE".into();
         let mut zero = itc.clone();
         zero.i = 0;
-        let labels = option_labels_from(&[itc.clone(), future, bse, zero]);
+        let labels = option_labels_from(&[itc.clone(), future, bse, zero], 20_261_001);
         assert_eq!(labels.len(), 1, "options on NSE only, never a zero id");
         let name = labels.get(&(85_650, "NSE_FNO")).map(|s| &**s);
         assert_eq!(name, Some("ITC-27Oct2026-255-CE"));
@@ -4626,14 +4668,14 @@ mod tests {
                 row
             })
             .collect();
-        let labels = option_labels_from(&rows);
+        let labels = option_labels_from(&rows, 20_260_901);
         assert_eq!(labels.len(), 30_000);
         assert!(labels.contains_key(&(30_000, "NSE_FNO")));
     }
 
     #[test]
     fn test_option_labels_from_an_empty_file_is_empty() {
-        assert!(option_labels_from(&[]).is_empty());
+        assert!(option_labels_from(&[], 20_260_901).is_empty());
     }
 
     #[test]

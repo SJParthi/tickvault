@@ -30,6 +30,7 @@
 //! # Pipeline Position
 //! ParsedTick → **IndicatorEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
 
+pub mod brutex_host;
 pub mod candles;
 // PR #3 (2026-05-19): `greeks` module DELETED. Under the 4-IDX_I-only
 // LOCKED_UNIVERSE there are no live option contracts on the WebSocket

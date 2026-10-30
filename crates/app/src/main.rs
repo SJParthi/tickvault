@@ -649,6 +649,11 @@ fn main() -> Result<()> {
     if let Some(code) = tickvault_app::host_tuning::run_cli(&cli_args) {
         std::process::exit(code);
     }
+    // `tickvault strategy-dry-run ...` (rule brutex-strategy-host-2026-10-29.md):
+    // loads and checks published brutex strategy folders; no order, no live change.
+    if let Some(code) = tickvault_app::strategy_dry_run::run_cli(&cli_args) {
+        std::process::exit(code);
+    }
 
     let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
     let (host_cpus, cpu_source) = host_cpu_allowance();
@@ -793,19 +798,6 @@ async fn async_main() -> Result<()> {
     if tickvault_app::ensure_questdb::is_invocation(&cli_args) {
         let code = tickvault_app::ensure_questdb::run().await;
         std::process::exit(code);
-    }
-    // `tickvault rebuild-box <phase> ...` (plan item 66, one-off): the
-    // box-side half of the 2026-10-22 rebuild, sent over SSM by the rebuild
-    // workflow only. After the provider install for its AWS and HTTP clients;
-    // never reached by the app's own boot.
-    if tickvault_app::rebuild_box::is_invocation(&cli_args) {
-        let code = tickvault_app::rebuild_box::run(&cli_args).await;
-        std::process::exit(code);
-    }
-    // `tickvault wipe-box <mode> <sha>` (plan item 67, one-off, Quote 35): the
-    // box half of the 2026-10-31 wipe, sent over SSM by its workflow only.
-    if tickvault_app::wipe_box::is_invocation(&cli_args) {
-        std::process::exit(tickvault_app::wipe_box::run(&cli_args).await);
     }
 
     // -----------------------------------------------------------------------
@@ -1871,12 +1863,11 @@ async fn async_main() -> Result<()> {
     // Local /metrics only: no alarm or filter reads it.
     metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
-    // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
+    // SEBI constituency write failures (audit OBS-2, 2026-10-11).
     // Seeded here, after the recorder install, so a scrape records 0 before
     // the once-a-day write that may fail. Local /metrics only: no alarm reads
-    // them yet (that needs a dated loss-group row).
-    metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(0);
-    metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(0);
+    // it yet (that needs a dated loss-group row). The two lifecycle write
+    // counters left with the writer (owner Quote 44, 2026-10-28).
     metrics::counter!("tv_index_constituency_persist_failed_total").increment(0);
     for reason in ["too_large", "unparseable_order"] {
         metrics::counter!("tv_order_update_frames_dropped_total", "reason" => reason).increment(0);
@@ -1985,8 +1976,6 @@ async fn async_main() -> Result<()> {
     }
     for site in [
         "boot_probe",
-        "lifecycle_audit_ensure",
-        "lifecycle_ensure",
         "oms_wiring",
         "retired_views_drop",
         "shadow_drop_legacy",
@@ -3241,6 +3230,9 @@ async fn async_main() -> Result<()> {
     let _dhan_universe_rider = tickvault_app::dhan_universe::spawn_dhan_universe_rider(
         config.dhan_universe.clone(),
         config.questdb.clone(),
+        // Quote 44: the daily instrument snapshots go to the same cold bucket
+        // as the raw frames (`[partition_retention] archive_bucket`).
+        config.partition_retention.archive_bucket.clone(),
     );
 
     // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
@@ -4015,6 +4007,13 @@ async fn async_main() -> Result<()> {
             std::sync::Arc::clone(&trading_calendar),
             process_start_ist_nanos,
             previous_process_last_receipt,
+        )
+    });
+    // 2026-10-28: the daily expiry-scope check (15:50 IST), own task.
+    let _expiry_scope = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::expiry_scope_check::spawn_expiry_scope_check(
+            config.questdb.clone(),
+            std::sync::Arc::clone(&trading_calendar),
         )
     });
 

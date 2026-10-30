@@ -762,7 +762,8 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   order-side audit ensures retry until keyed; AUDIT-WS-01 drop warn carries a
   code and is latched once per episode; a guard requires DEDUP UPSERT KEYS on
   every CREATE TABLE literal (dated allowlist for the two scratch tables).
-  - Files: crates/app/src/dhan_lifecycle.rs, crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
+  - Files: crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
+  - Note (2026-10-28): the J3 lifecycle half lived in the app lifecycle writer module, DELETED by owner Quote 44 with the daily lifecycle write (PR N below); the J3 ensure-and-hold pin was replaced by the no-writer guard.
   - Tests: ensure-wiring source guard; create_table_has_dedup guard
 - [x] J4 (core, api) Order-update WebSocket connects with explicit bounded
   limits; the connect-config guard scans every `connect_async*` site; the error
@@ -1019,13 +1020,128 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   16:30 IST. Terraform role `tv-prod-wipe-2026-10-31`: deletes from
   2026-10-27T12:30Z, dated-key conditions before 2026-10-28, the new
   prefixes, snapshot delete from 2026-10-28T11:00Z, expiry unchanged.
-  - Files: crates/app/src/wipe_2026_10_31.rs, crates/app/src/bin/wipe_2026_10_31.rs,
+  - Files: (originally crates/app/src/wipe_2026_10_31.rs and crates/app/src/bin/wipe_2026_10_31.rs; both deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b, with the role file and workflow below)
     crates/app/src/wipe_box.rs (cutoff), deploy/aws/terraform/wipe-2026-10-31.tf,
     .github/workflows/wipe-2026-10-31.yml (text only, budgets unchanged)
   - Tests: the tool's date and verdict tests moved to the new dates, plus
     test_regression_wipe_never_touches_data_dated_2026_10_28_or_later,
     test_snapshot_delete_refused_before_wednesday_close,
     test_rebuild_prefix_keeps_keep_list_tables, and the terraform cross-check
+
+### PR N — owner Quote 44: stop the daily instrument_lifecycle write; daily instrument snapshots to the cold bucket (app, storage, docs) — 2026-10-28
+
+Approved by: owner Quote 44 (2026-10-28), recorded in the daily-universe rule file (full text) before any code.
+
+- [x] N1 (app, storage) Stop the daily `instrument_lifecycle` /
+  `instrument_lifecycle_audit` write; delete the writer and the storage
+  helpers only it used; both tables stay on every keep list, frozen.
+  - Files: crates/app/src/dhan_universe.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/storage/src/instrument_lifecycle_persistence.rs, crates/storage/src/lib.rs, crates/storage/src/lifecycle_reconciler.rs
+  - Tests: no_production_code_writes_the_frozen_lifecycle_tables, no_production_code_in_app_or_storage_names_a_route_into_the_frozen_tables, strip_cfg_test_items_keeps_code_after_a_test_module, no_questdb_write_runs_before_the_mapping_artifact
+- [x] N2 (app) Copy each morning's dated artifact files to
+  `instrument-snapshots/<date>/` in the cold bucket, verified, off the boot
+  path, one bounded pass at a time with a queued rerun; the 7-day sweep deletes
+  a file (and a `.json.tmp` leftover) only after a verified copy exists.
+  - Files: crates/app/src/instrument_snapshot_upload.rs, crates/app/src/dhan_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
+  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_build_once_counts_the_sweep_held_files_on_the_held_counter, the_snapshot_copy_uses_the_configured_cold_bucket
+- [x] N3 (app) The 31 Oct wipe keeps every object under `instrument-snapshots/`.
+  - Files: (crates/app/src/wipe_2026_10_31.rs, deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b)
+  - Tests: (test_classify_s3_key_keeps_every_instrument_snapshot, deleted 2026-10-29 with the tool)
+
+### PR EX — owner 2026-10-28: the daily expiry check (app, storage, common, aws-lambdas, docs)
+
+Approved by: owner 2026-10-28, "go ahead and add the daily expiry check" (a guarantee, with daily proof, that only the CURRENT expiry of each underlying is subscribed).
+
+- [ ] EX1 (app, storage, common) Two layers. Subscribe time: after
+  `select_contract_universe`, `enforce_subscribe_expiry_scope` recomputes each
+  underlying's nearest real expiry from the day's contract file (a pass
+  separate from the selector) and REFUSES any selected contract that is
+  expired, on another expiry, or unknown, with one coded `EXPIRY-SCOPE-01`
+  line. Daily at 15:50 IST: today's distinct option contracts in `candles_1m`
+  judged against the same table, one `expiry_scope_audit` row (`clean` /
+  `violation` / `partial`), at once when the process starts after 15:50 on a
+  trading day. "Current" is judged per selector bucket (segment, index or
+  stock option, underlying as the file spells it), so the check cannot refuse
+  a contract the selector rightly picked. Also fixes the 2026-10-28 naming gap
+  (HAVELLS-23Nov2026-1260-CE, security_id 114816, NULL `contract`): the attach
+  replaced the boot's full candle-name table with the 25,000-capped ranking
+  table, so a contract an earlier attach subscribed (the socket keeps it) lost
+  its name; the attach now names every option row of the day's file
+  (`option_labels_from`), as the boot does. Review fixes (same day): the
+  daily read first waits (≤ 300 s) for the cross-check's three live-final
+  barriers (`dhan_live_crossverify_boot::live_side_readiness`) and is never
+  `clean` when they did not hold; a stored candle with no name makes the day
+  `partial` (`unlabelled_rows`); an id the file lists on two different
+  contracts is refused at subscribe time and unjudged daily; the name is
+  compared on underlying, expiry, strike and leg; legs are counted exactly as
+  the selector counts them (id 0 included); the subscribe refusal logs once
+  per day per refused set; the audit row is written up to 3 times with the
+  DDL re-run first; the attach's O(rows) passes run through `off_worker`.
+  - Files: crates/app/src/expiry_scope_check.rs, crates/app/src/expiry_scope_check_tests.rs, crates/app/src/dhan_contract_universe.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/app/tests/ensure_ddl_boot_wiring_guard.rs, crates/storage/src/expiry_scope_audit_persistence.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs, crates/storage/tests/ilp_overflow_bound_guard.rs, crates/common/src/error_code.rs, crates/common/tests/error_code_alarm_coverage_guard.rs, crates/common/tests/error_code_paging_decision_guard.rs, crates/aws-lambdas/src/operator_control_action_commands.rs, docs/error-runbooks/expiry-scope-error-codes.md, .claude/triage/error-rules.yaml, CLAUDE.md
+  - Tests: test_parse_contract_label_keeps_a_hyphenated_underlying_whole, proptest_parse_contract_label_round_trips_the_renderer, test_build_expiry_index_skips_a_thin_stub_and_picks_the_real_chain, test_build_expiry_index_counts_the_expiry_day_itself_as_current, test_build_expiry_index_on_yesterdays_file_finds_nothing_current, test_check_selected_expiries_refuses_off_expiry_expired_unknown_and_the_stub, test_enforce_subscribe_expiry_scope_removes_and_counts, proptest_selector_output_always_passes_the_expiry_scope_check, test_classify_candle_contracts_the_havells_unlabelled_candle_counts_once, test_classify_expiry_scope_every_combination, test_main_wires_spawn_expiry_scope_check, test_the_daily_check_runs_on_its_own_task_never_the_frame_drain, test_the_attach_refuses_before_it_names_or_dials, test_expiry_scope_audit_ddl_statements_self_heal_every_column_and_never_drop, test_build_expiry_index_marks_a_duplicate_key_on_two_expiries_ambiguous, test_build_expiry_index_a_duplicate_key_on_one_contract_is_not_ambiguous, test_build_expiry_index_counts_an_id_zero_leg_like_the_selector, test_classify_candle_contracts_a_name_with_the_wrong_strike_or_leg_is_a_mismatch, test_refusal_fingerprint_dedupes_one_set_per_day, test_readiness_reason_is_clean_only_when_final_and_applied, test_classify_expiry_scope_a_live_side_not_final_is_partial_but_a_violation_still_wins, test_live_side_readiness_is_never_ready_without_a_drained_seal_writer, test_build_expiry_index_keeps_index_and_stock_buckets_apart, test_build_expiry_index_uses_the_underlying_as_the_file_spells_it, test_expiry_index_current_expiry_of_and_current_expiry_by_name, test_classify_candle_contracts_a_malformed_second_name_is_never_clean, test_classify_candle_contracts_hyphenated_underlying_name_only_is_judged, test_secs_until_expiry_scope_check, test_ymd_of_edges, test_option_labels_from_keys_exactly_as_a_candle_row_probes, test_regression_attach_publishes_every_option_name_uncapped
+
+- [ ] S1 (core, app) Silence detector out of slots (live 2026-10-28,
+  RISK-GAP-03 "ran out of slots"): the WAL replay folds frames from earlier
+  sessions through `TickGapDetector::observe` before the contracts attach,
+  every replayed contract takes a slot for the rest of the process, and the
+  live contracts seeded afterwards are refused. A replay now calls
+  `observe_tracked` (refreshes a key that already holds a slot, never
+  assigns one, a skip is not a refusal); the live path is unchanged.
+  - Files: crates/core/src/pipeline/tick_gap_detector.rs,
+    crates/app/src/dhan_feed_stack.rs
+  - Tests: test_observe_tracked_never_assigns_a_slot_and_never_counts_a_refusal,
+    test_observe_tracked_replay_cannot_starve_the_live_universe_of_20519,
+    a_wal_replay_cannot_use_up_the_silence_detector_slots_of_the_live_universe
+
+- [x] OE1 (done: `order_update.rs`, `order_update_connection.rs`, branch order-evt-hollow) (core) ORDER-EVT-02 "hollow order updates", 18 live lines.
+  Assumed cause (not Verified, no live excerpt available): the parser read the other casing
+  of only seven fields, so a frame with camelCase order keys (`orderNo`, `status`,
+  `securityId`) decoded with every identity field empty. The 2026-08-25 rows had `mkt_type`
+  filled, which the old parser read only from PascalCase, so they do not fully fit this
+  cause; ORDER-EVT-02 stays open until a captured excerpt confirms it. Fix: both casings of
+  every field and of the wrapper; null field = absent except a fill field (null or empty
+  quantity / filled quantity / price still fails loud); exact number/string coercion, ids
+  integral only; every unreadable frame (hollow, or no order number with a foreign `Type`)
+  stays ORDER-EVT-02 at ERROR with `msg_type` and is still broadcast and audited.
+  - Files: crates/core/src/parser/order_update.rs, crates/core/src/parser/mod.rs,
+    crates/core/src/websocket/order_update_connection.rs,
+    docs/error-runbooks/order-update-events-error-codes.md, CLAUDE.md (O(1) row)
+  - Tests: test_field_table_covers_every_order_update_field,
+    test_parse_order_update_all_camel_case_frame_decodes_like_pascal,
+    test_every_single_field_missing_or_null_still_parses,
+    test_traded_update_with_blank_fill_fields_fails_loud,
+    test_is_hollow_order_update_all_identity_permutations,
+    test_unreadable_order_frame_type_verdicts, test_fix_for_field_coercions,
+    prop_any_field_subset_and_casing_decodes,
+    test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts,
+    test_live_hollow_shapes_parse_or_page
+
+### PR DT-small — 2026-10-28 three drain waits over 1 ms (app, storage, trading)
+
+- [ ] DT-small (app, storage, trading) Three confirmed causes of a frame waiting
+  more than 1 ms on the frame drain (hostile review, 2026-10-28):
+  DT-A1 the late-attach seed arm seeded a ~22,000-contract batch in one arm;
+  now it queues the batch (a move) and the idle arm seeds
+  `SEED_STEP_INSTRUMENTS` (512) per step, queue pre-sized to
+  `SEED_QUEUE_BATCHES` (8), arm gated on room. DT-A2 the depth row buffer had
+  no pre-size; now `DepthLayout::row_buffer_presize_bytes` (4 MiB level,
+  9 MiB book) at construction and after a spare-less hand-off (the flush arm,
+  or the depth size trigger inside the frame arm, so one allocation per
+  spare-less hand-off can land on the frame path), like the tick writer's K6. DT-A6 the live fold was sized at the
+  boot-time spot count, so the ~866th instrument moved the slot table and
+  rehashed the index inside a frame; now `LiveIngest::with_fold_capacity(AGGREGATOR_MAX_SLOTS)`
+  at the boot site (67.1 MiB of address space measured, committed as slots
+  are written; the grow-once path already reserved the same ceiling).
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/storage/src/depth_persistence.rs,
+    crates/trading/src/candles/multi_tf_aggregator.rs, CLAUDE.md
+  - Tests: test_queue_seed_batch_and_step_seed_are_bounded_per_call,
+    test_seed_queue_has_room_refuses_past_the_bound_and_never_grows,
+    the_drain_has_a_seed_arm_that_does_not_outrank_frames (extended),
+    test_with_fold_capacity_and_fold_slot_capacity_at_the_ceiling,
+    test_slot_capacity_at_the_ceiling_never_reallocates_while_the_universe_fills,
+    test_regression_depth_row_buffer_is_presized_and_never_regrows_on_append,
+    test_row_buffer_presize_bytes_per_layout,
+    test_step_idle_work_seeds_before_the_catch_up_sweep_then_finishes_it,
+    a_depth_spare_of_another_protocol_is_never_installed (strengthened)
 
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
@@ -1044,6 +1160,23 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   without a dated measured row (websocket-connection-scope-lock.md 2026-10-10).
 - Uncoded `error!` in `indicator/engine.rs` and `strategy/hot_reload.rs`: §28 frozen area.
 
+### ITEM SC — brutex strategy consumer side (owner brief 2026-10-29, "WHAT TO DO NOW" A–D; no live change)
+
+Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They are final" (rule `brutex-strategy-host-2026-10-29.md`). Design, edge cases, failure modes, tests, rollback and observability for this item are in `docs/architecture/brutex-strategy-contract.md` §2–§5 and in the module headers; summary: pure logic in `crates/trading/src/brutex_host/` (no I/O), a read-only S3 lister/downloader in `crates/storage/src/strategy_recipe_fetch.rs` (List + Get only), the `StrategyEngine` trait with a test double, replay harness naming the first differing bar and field, pre-open swap decision, NDJSON audit; nothing is wired into the live trading path and no order is placed. Rollback: delete the modules (no caller on the live path).
+
+- [x] SC1. Rules + docs (rule file, readonly-lock §1.3, contract doc with crate API and formats, build-access table + ls-remote check)
+  - Files: .claude/rules/project/brutex-strategy-host-2026-10-29.md, .claude/rules/project/brutex-readonly-lock-2026-07-18.md, docs/architecture/brutex-strategy-contract.md
+  - Tests: (docs only)
+- [x] SC2. Recipe/manifest parse + sha256 verify + version/snapshot selection + gates + replay harness + swap decision + audit, pure, in crates/trading
+  - Files: crates/trading/src/brutex_host/mod.rs, crates/trading/src/brutex_host/*.rs, crates/trading/Cargo.toml
+  - Tests: test_manifest_hash_mismatch_refuses_and_keeps_previous, test_missing_file_refuses, test_version_gap_picks_newest_and_logs_gap, test_empty_candle_file_refuses, test_one_bar_file_replays, test_signal_mismatch_on_last_bar_names_bar_and_field, test_two_faults_at_once_report_the_first_check_that_fails, test_may_swap_and_apply_only_before_the_open_on_a_trading_day
+- [x] SC3. Read-only S3 fetch (List + Get) into a local staging folder, in crates/storage
+  - Files: crates/storage/src/strategy_recipe_fetch.rs, crates/storage/src/lib.rs
+  - Tests: test_fetch_strategy_never_calls_a_write_api (source scan), test_plan_download_picks_newest_version_two_newest_params_and_newest_universe
+- [x] SC4. Dry run on a fixture recipe (a `strategy-dry-run --dir` app subcommand that loads, verifies, gates and replays a fixture with the test double, printing the audit lines)
+  - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
+  - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the
@@ -1059,7 +1192,22 @@ PR K: each fix keeps the existing tiers: replay classification and streak stop a
 
 PR M: every item starts from a live measurement and ends with a before/after number; fixes reuse existing tiers.
 
+PR DT-small: each fix moves work off a frame, never adds any: the seed batch rides the existing idle arm (`consume_budget`, last in the biased select) as a bounded step before the catch-up seal step; the depth buffer reuses the K6 reserve-at-hand-off shape (for depth the hand-off can run inside the frame arm, after the frame that tripped the size trigger: one allocation per spare-less hand-off there, never per row); the fold is built at the ceiling the grow-once path already reserved, with the same builder shape as `with_detector_capacity`.
+
 PR L: each fix reuses an existing mechanism: the owed close code is already stored in `pending_close`; the seal floor reuses `classify_spill_floor`; the Muhurat gate reuses the writers' Muhurat flag; workflow guards reuse the deploy-aws IST check; budget distrust widens an existing day-1 rule.
+
+PR N (Quote 44): the rider asks for a snapshot pass on its own task after each successful build; the pass lists data/instrument-cache, uploads every dated .json with no matching marker through raw_frame_upload::upload_file (gzip, conditional put, HeadObject verify, marker), and the 7-day sweep inside build_once deletes only marked files. The lifecycle writer and its storage helpers are deleted.
+
+PR EX (design): two layers. The attach refuses an off-expiry contract before it is named, mapped or dialled (fail-closed: a wrong-expiry contract looks healthy and mixes two chains); the 15:50 IST task reads today's distinct option contracts from `candles_1m` (bounded, 100,001 rows, 60 s timeout, 3 reads 120 s apart), judges each contract once on its composite key, and writes one `expiry_scope_audit` row (DEDUP `ts, trading_date_ist, feed`). "Current expiry" is recomputed by its own pass with the selector's rule (smallest expiry >= today with at least 4 legs), so the two can disagree only if one of them is wrong. The bucket mirrors the selector's exactly (index and stock options apart, the underlying untrimmed), because the subscribe-time layer refuses: a looser key would merge two chains and drop a correct contract. A stored name the file does not list carries no class, so it is judged by trimmed name only when every bucket of that name agrees. A process that starts after 15:50 IST on a trading day runs the check at once (one row per run, `ts` in the key). Candle names at the attach come from every option row of the day's file, uncapped, as at boot.
+
+S1: the detector stays sized once at the authorized ceiling
+(`AGGREGATOR_MAX_SLOTS`, 25,000, `with_detector_capacity`), which covers the
+whole main-feed universe (5 sockets × 5,000). Only the slot ASSIGNMENT moves:
+`ingest_tick_at` reads the existing `replaying_wal` flag and calls
+`observe_tracked` during a replay, `observe` otherwise. Slots are therefore
+taken only by the subscribe set (boot seed + `seed_rx`) and live ticks.
+
+OE1 (ORDER-EVT-02): the order-update parse reads both casings of every `OrderUpdate` field from one table (`ORDER_UPDATE_FIELDS`) pinned to the struct's serialized keys, and of the `Data` / `Type` wrapper; a null field reads as absent, except a fill field (`FILL_CRITICAL_FIELDS`: quantity, filled quantity, remaining quantity, prices), where a null or empty value in either casing still fails the parse loudly so a TRADED update never decodes with a defaulted 0; a value in the wrong JSON type is converted only when it converts exactly, and an order or security id only from an integral number. `unreadable_order_frame_type` decides the ORDER-EVT-02 line: a hollow frame (no order number, status or security id) or a frame with no order number whose `Type` names something other than `order_alert`; it never filters, every frame is still broadcast and audited. All on the order-update read task, cold; one table walk per frame, one extra parse only for a frame with no order number.
 
 ## Edge Cases
 
@@ -1076,7 +1224,21 @@ PR L: each fix reuses an existing mechanism: the owed close code is already stor
 
 - PR M: a session that saturates the disk; a backlog larger than one boot's replay budget; a check that reads rows still in spill.
 
+- PR DT-small: more than 8 seed batches waiting (the arm stops receiving and the 8-deep channel holds the rest; a call anyway seeds inline, never drops); a drain whose catch-up sweep never finishes (seed steps run first, so seeding still ends in at most ceil(n/512) idle steps); a book batch past 8 MiB plus one frame (grows by doubling as before); more than 25,000 instruments (refused and counted as before).
+
 - PR L: a disconnect code stacked behind data at a failed write; a QuestDB that accepts TCP and never answers at exit; a Muhurat session in the evening; Monday 2 November with October's total still showing; a deploy failing at 09:10.
+
+PR N: a file replaced mid-copy (marker no longer matches, copied again next pass); a same-day rebuild with different bytes (sidecar key, warning); an orphan .json.tmp (kept, counted); no bucket resolves (no_bucket counted, nothing swept); a request during a running pass (skipped_busy counted, rerun queued).
+
+PR EX: a hyphenated underlying (`BAJAJ-AUTO`, parsed from the right); a decimal strike; a capped name (malformed, judged from the file); a thin earlier expiry (skipped, as the selector does); the expiry day itself (current); yesterday's file (every contract expired, never clean); one contract stored with and without a name (counted once, unlabelled); two names for one contract (label_mismatch); one good and one malformed name (malformed, never clean); a BSE contract (judged on BSE_FNO); a composite key listed twice on two different contracts (refused at subscribe time, unresolved daily, never clean); the same row listed twice (one contract, judged); a name on the wrong strike or leg (label_mismatch); a 4-leg expiry with an id-0 leg (real, as for the selector); the same refused set on every attach retry (one error line a day); an index and a stock option sharing an underlying name (separate buckets); an underlying spelled with a trailing space (its own bucket, as in the selector); a restart after 15:50 (checks at once); a restart mid-day (the subscribe count reads -1 only if this process never attached that day).
+
+- S1: a replayed tick for a seeded spot still refreshes it (no boot page
+  storm, the 2026-08-28 reason for the replay clock); a replayed tick for a
+  contract not yet seeded is skipped, so that contract starts NeverTicked at
+  its seed, the same as on a boot with no backlog; a live universe above the
+  ceiling is still refused and counted (fail-closed kept).
+
+OE1: a frame with both casings keeps the accepted key (as since 2026-07-14); `Type` null, a number or an object is dropped so it never costs the event; a null `TradedQty` / `tradedQty` / `AvgTradedPrice` or an empty one fails loud, a missing one is still a partial update; a value that does not convert exactly (`1.5` for a quantity, `12.5` for an order number, `"ten"`, a bool) still fails loud as `typed_parse_failed`; an oversized or unparseable frame logs an empty `msg_type` and still pages if hollow.
 
 ## Failure Modes
 
@@ -1089,7 +1251,19 @@ PR L: each fix reuses an existing mechanism: the owed close code is already stor
 
 - PR M: a fix that moves writes rather than removing them shows up in the next session's EBS bytes.
 
+- PR DT-small: an instrument attached while its batch waits is not yet in the silence detector, so its silence is judged up to ceil(n/512) idle steps later (milliseconds), and the 30 s silence scan, an arm above the idle arm, can run on a part-seeded batch and under-count never-ticked instruments for at most one scan per attach batch; the pre-sized buffers and fold take address space at boot whether or not the session fills them.
+
 - PR L: a lane retry that never gets the lock keeps retrying on a capped backoff (logged per episode); a budget reading distrusted on day 2 pages instead of stopping.
+
+PR N: S3 down or hung (counted failure, pass bounded at 30 min, stops after 3 time-outs in a row, files kept); marker write fails (verified copy held in memory, shared marker counter); a folder entry unreadable (skipped, counted); the console wipes still remove instrument-cache (documented limit, not changed).
+
+PR EX: the contract file is missing (partial, artifact_missing); the read fails three times (partial, read_failed); more rows than the cap (partial, row_cap_hit unless a violation is already proven); the live side not sealed, drained or applied by 15:55 (partial with the barrier's reason; a violation found is still reported); a stored candle with no name (partial, unlabelled_rows); the audit write fails (retried 3 times 60 s apart with the DDL re-run first, then a coded STORAGE-GAP-03 line, the verdict stays in the log); the selector picks a stub or a later expiry (refused, coded line, the rest dials).
+
+- S1: a contract that attaches after a mid-session restart reads NeverTicked
+  until its first live tick (before, the replay pre-registered it); the
+  K3 verdict counters no longer count replayed ticks of untracked keys.
+
+- OE1: if the camelCase cause is wrong, ORDER-EVT-02 keeps firing at the same rate, now with `msg_type` and the excerpt to write the real fix against. An undocumented frame with no order number is logged and broadcast, never dropped (the order book ignores an unknown order at debug). No frame is kept from the order book or the audit tables.
 
 ## Test Plan
 
@@ -1103,7 +1277,19 @@ PR K: per-crate `cargo test -p` for storage, app, core; one regression test per 
 
 PR M: per-crate tests plus the next live session's EBS throughput, spill count and cross-check verdict read back read-only.
 
+PR DT-small: `cargo test -p tickvault-trading`, `-p tickvault-storage`, `-p tickvault-app --lib` plus the DHAT drain tests (`dhat_live_ingest_seam`, `dhat_depth_drain`); one test per fix; the next live session read back: `ring_dwell` (max and buckets, 09:00 to 09:15) for A1, which runs in its own select arms outside the `drain_main_frame` timing, and `drain_main_frame` for A2 and A6.
+
 PR L: per-crate `cargo test -p` for core, storage, trading, app, aws-lambdas; restart differential; workflow window pins; clippy and fmt.
+
+PR N: cargo test -p tickvault-app --lib -- instrument_snapshot dhan_universe; the ensure_ddl_boot_wiring_guard and universe_boot_race_guard test binaries; cargo test -p tickvault-storage --lib instrument_lifecycle; cargo test -p tickvault-app --lib wipe_2026_10_31.
+
+PR EX: unit tests for the name parser, the nearest-expiry table, the subscribe check and its mutation, the daily classifier and every verdict combination; proptests (renderer round trip, parser never panics, the real selector's output always passes the check); DDL self-heal and DEDUP-with-feed tests; source scans that main.rs spawns the task, the frame drain never calls it, and the attach refuses before it names. Commands: cargo test -p tickvault-app --lib, cargo test -p tickvault-storage, the changed guard binaries, crates/common tests.
+
+S1: `cargo test -p tickvault-core --lib tick_gap_detector`, the app regression
+(replay 25,000 prior-day keys, then seed 20,519, none refused), the existing
+detector capacity tests and `dhat_live_ingest_seam`, clippy, fmt.
+
+OE1: `cargo test -p tickvault-core --lib order_update` (parser + connection), the three order-update guard tests in `crates/core/tests/`; every field missing and null one at a time (fill fields must fail), all 8 identity-field permutations, blank fill fields on a TRADED frame, a proptest over random subsets and casings, the verdict over hollow, foreign-typed and readable frames.
 
 ## Rollback
 
@@ -1120,6 +1306,16 @@ PR K: revert the merge commit of each sub-branch; no config flag or schema chang
 PR M: revert the merge commit of each sub-branch.
 
 PR L: revert the merge commit of each sub-branch; no schema change.
+
+PR N: revert the PR. Reverting does NOT restart the lifecycle write lawfully: Quote 44 REJECTs a restart without a fresh dated quote. The snapshot objects already copied stay in S3 (kept forever).
+
+PR EX: revert the commit. The table stays (nothing drops it); with the code gone nothing writes it. The candle names at the attach revert to the capped ranking table, which restores the 2026-10-28 naming gap only.
+
+S1: revert the commit; no config flag or schema change.
+
+OE1: revert the change; no schema, table, config or alarm change.
+
+PR DT-small: revert the commit; no config flag, schema or metric change.
 
 ## Observability
 
@@ -1143,7 +1339,20 @@ PR K: tick-gap verdict counters and WAL staging-failure counters, local `/metric
 
 PR M: no new alarm or page; local `/metrics` only for any new counter.
 
+PR DT-small: no new metric, alarm or page; the seed line keeps its wording (now once per finished batch), one boot `info!` names the fold's slot capacity, and the existing `tv_hot_path_stage_max_ns` shows the effect: `stage="ring_dwell"` for A1 (seeding runs in its own arms, outside the `drain_main_frame` timing), `stage="drain_main_frame"` for A2 and A6.
+
 PR L: new reason labels and refusal counters only, local `/metrics` only; no new alarm or page (the liveness alarm's schedule moves, the page is unchanged).
+
+PR N: tv_instrument_snapshot_upload_total{outcome=uploaded|reused|failed|no_bucket|skipped_busy|entry_unreadable} and tv_instrument_snapshot_sweep_held_total, registered at 0 at rider start, local /metrics only; failures log a coded STORAGE-GAP-04 error. No new alarm or page (needs a dated noise-lock row first).
+
+PR EX: `tv_expiry_scope_subscribe_refused_total`, `tv_expiry_scope_subscribe_checked`, `tv_expiry_scope_daily_runs_total{verdict}`, `tv_expiry_scope_{off_expiry,expired,unlabelled}_contracts` (local `/metrics` only, registered at 0 when the task spawns); `expiry_scope_audit` rows; coded `EXPIRY-SCOPE-01` (log only, no filter, alarm, EMF name or page: Dhan noise lock §3): `error!` on a refusal (once per day per refused set) or a daily violation, `warn!` with `verdict = "partial"` and its reason when the day cannot be vouched for; `refused_off_expiry` on the attach's `contract universe resolved` line.
+
+S1: no new metric, alarm or page. The existing `tv_dhan_feed_silence_detector_refused`
+gauge and the edge-latched RISK-GAP-03 "ran out of slots" line read 0 / stay
+quiet once the fix is live; `tracked` in the scan lines should equal the
+subscribed count.
+
+OE1: no new counter or alarm; new `kind` labels on `tv_order_update_decode_quirks_total` (local only); ORDER-EVT-02 gains a `msg_type` field and also fires for a frame with no order number and a foreign `Type`. After a live session, check whether `tv_order_update_hollow_decode_total` stays at 0.
 
 ## Guarantee matrix
 

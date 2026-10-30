@@ -212,8 +212,12 @@ fn test_unknown_wal_receipt_stays_in_ticks_live_and_on_replay() {
     // runs on (a trade dated 2026-10-28 against a 2026-10-27 wall clock is a
     // future trade and is refused). The property under test is the TABLE:
     // whatever is written, live or on replay, is never a `tick_quotes` row.
+    // The replay side used to assert `Some((false, _))` exactly; on 29 Oct the
+    // writer's day gate refuses this 28 Oct trade on replay too (`None`), so
+    // that form failed from the first midnight after it was written. Both
+    // sides now assert the property the test is about.
     assert!(!matches!(live[0], Some((true, _))), "{live:?}");
-    assert!(matches!(replay[0], Some((false, _))), "{replay:?}");
+    assert!(!matches!(replay[0], Some((true, _))), "{replay:?}");
 }
 
 /// Mixed stream: same table and the same bytes for every packet.

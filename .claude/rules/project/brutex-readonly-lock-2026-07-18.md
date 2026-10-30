@@ -52,6 +52,10 @@ the bruteX repo is OPERATOR-SIDE only — a tickvault session never writes/posts
 (this lock governs). The contract text stays here as the shared reference; delivery
 to bruteX is the operator's action.
 
+## §1.3 Amendment 2026-10-29 — the approved strategy crate is READ as a pinned dependency
+
+The owner's decisions of 29 Oct 2026 (recorded in `brutex-strategy-host-2026-10-29.md`) make ONE exception to the code-hygiene row above: tickvault depends on brutex's standalone strategy crate as a Cargo git dependency pinned to the approved commit (`rev = "<sha>"`). Fetching it is a READ. Every build machine uses a read-only deploy key or fine-grained read-only token from its own credential store or AWS SSM, never committed. Every write path in §1.1 stays FORBIDDEN, and vendoring any other brutex code stays a REJECT.
+
 ## §2. Precedent — the withdrawn split PR #1645 (2026-07-18)
 
 Earlier the same day, a tickvault session had opened bruteX PR #1645 (a CLAUDE.md

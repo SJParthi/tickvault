@@ -335,11 +335,13 @@ impl S3Cold {
         }))
     }
 
-    /// GetObject streamed into a new local file (plan item 66, the
-    /// 2026-10-22 rebuild restore). The file is written to `path` and
-    /// `sync_all`ed; returns the bytes written. Cold path: the box-side
-    /// restore only, never the app.
-    // TEST-EXEMPT: one AWS SDK call; the restore decisions around it are tested in rebuild_copy
+    /// GetObject streamed into a new local file. The file is written to
+    /// `path` and `sync_all`ed; returns the bytes written. Cold path: the
+    /// read-only brutex strategy download (`strategy_recipe_fetch`), once
+    /// before the open or in the dry-run CLI. (Written for the one-off
+    /// 2026-10-22 rebuild restore; kept when that tool was deleted
+    /// 2026-10-29 because the strategy download reads the bucket the same way.)
+    // TEST-EXEMPT: one AWS SDK call; the download plan around it is tested in strategy_recipe_fetch
     pub(crate) async fn get_to_path(&self, key: &str, path: &Path) -> Result<u64> {
         let resp = self
             .s3
@@ -373,8 +375,9 @@ impl S3Cold {
     }
 
     /// Every key under `prefix` with its size (ListObjectsV2, all pages).
-    /// Cold path: the rebuild inventory only.
-    // TEST-EXEMPT: one paginated AWS SDK call; callers' decisions are tested in rebuild_copy
+    /// Cold path: the read-only brutex strategy download
+    /// (`strategy_recipe_fetch::fetch_strategy`).
+    // TEST-EXEMPT: one paginated AWS SDK call; the download plan built from it is tested in strategy_recipe_fetch
     pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;

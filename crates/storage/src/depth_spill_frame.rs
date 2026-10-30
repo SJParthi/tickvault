@@ -61,9 +61,9 @@ use crate::tick_spill_replay::{
     EmptyOutcome, LineIsolation, QUARANTINE_DIR, REPLAY_LINES_REJECTED_COUNTER,
     REPLAY_MAX_CHUNK_BYTES, SpillReplayOutcome, SpillSinkView, describe_send_error,
     empty_drained_closed_file, forget_resume_offset, ilp_chunk_ranges, is_permanent_refusal,
-    isolate_refused_lines, note_spill_ack, note_spill_file_unreadable, record_resume_offset,
-    resend_through_for, resume_offset_for, rewind_after_suspicion, set_aside_rejected_lines,
-    spill_file_may_still_be_appended,
+    isolate_refused_lines, note_spill_ack, note_spill_file_unreadable, quarantine_spill_file,
+    record_resume_offset, resend_through_for, resume_offset_for, rewind_after_suspicion,
+    set_aside_rejected_lines, spill_file_may_still_be_appended,
 };
 
 /// File extension of the framed depth spill. Deliberately not `ilp`, so the
@@ -309,6 +309,41 @@ pub fn list_framed_spill_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Whether a framed spill file was written ENTIRELY before the market-data
+/// floor: the hour in its name has ended AND its mtime is, both at or before
+/// the floor. `false` with no floor, a name with no hour, or an unreadable
+/// mtime (doubt replays as before). O(1): two compares and one `SystemTime`
+/// subtraction.
+///
+/// Honest limit: the file of the hour the floor falls in is replayed whole,
+/// rows from before the floor included, because a binary v2 payload cannot be
+/// judged row by row here.
+fn framed_file_below_floor(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    floor_unix_nanos: Option<i64>,
+) -> bool {
+    let Some(floor) = floor_unix_nanos else {
+        return false;
+    };
+    let Ok(floor_secs) = u64::try_from(floor.div_euclid(1_000_000_000)) else {
+        return false;
+    };
+    let Some(hour) = crate::tick_spill_replay::spill_file_hour(path) else {
+        return false;
+    };
+    let hour_ended_by_floor = hour
+        .checked_add(1)
+        .and_then(|h| h.checked_mul(3_600))
+        .is_some_and(|end| end <= floor_secs);
+    let written_by_floor = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|m| m.as_secs() <= floor_secs);
+    hour_ended_by_floor && written_by_floor
+}
+
 /// Appends `bytes` to `<dir>/quarantine/<file name><suffix>` and syncs it.
 fn set_aside(dir: &Path, spill_path: &Path, suffix: &str, bytes: &[u8]) -> std::io::Result<()> {
     let quarantine = dir.join(QUARANTINE_DIR);
@@ -394,6 +429,41 @@ pub async fn replay_framed_spill_dir(
             forget_resume_offset(&path);
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
+        }
+        // The market-data floor (live audit F2/F5/F6, 2026-10-29). A framed
+        // payload can be binary ILP v2, so its rows cannot be judged line by
+        // line; a file is judged WHOLE, by the hour in its name and its
+        // mtime, and moved to `quarantine/` (kept, never posted) only when
+        // both end at or before the floor.
+        if framed_file_below_floor(&path, &meta, view.market_data_floor_unix_nanos) {
+            match quarantine_spill_file(dir, &path) {
+                Ok(moved) => {
+                    metrics::counter!(
+                        crate::market_data_floor::SPILL_REPLAY_BELOW_FLOOR_COUNTER,
+                        "dir" => "depth",
+                        "unit" => "file"
+                    )
+                    .increment(1);
+                    outcome.files_below_floor = outcome.files_below_floor.saturating_add(1);
+                    warn!(
+                        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                        source = "spill_below_market_data_floor",
+                        path = %moved.display(),
+                        bytes = file_len,
+                        floor_unix_nanos = view.market_data_floor_unix_nanos.unwrap_or_default(),
+                        "a framed depth spill file written entirely before the market-data \
+                         floor (the last reset) was moved to quarantine whole. It is NOT \
+                         posted and every byte is kept, so a wipe is not undone by an old \
+                         spill file."
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    note_spill_file_unreadable(&path, "spill_below_floor_move_failed", &err);
+                    outcome.files_failed = outcome.files_failed.saturating_add(1);
+                    return outcome;
+                }
+            }
         }
         let writer_may_still_append =
             spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, "depth");
@@ -1598,6 +1668,79 @@ mod tests {
         assert_eq!(out.files_quarantined, 1, "the record was set aside whole");
         assert_eq!(paged, 1, "the refused record is on the paged counter");
         forget_resume_offset(&closed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Live audit F2/F5/F6 (2026-10-29): the market-data floor ----------
+
+    fn now_unix_nanos() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+    }
+
+    #[test]
+    fn test_framed_file_below_floor_needs_both_the_hour_and_the_mtime() {
+        let dir = temp_dir("floor-judge");
+        let path = dir.join("depth-dhan-1.dspl");
+        write_records(&path, &[(b"market_depth,a=1 b=1i 1\n", 1)]);
+        let meta = std::fs::metadata(&path).expect("meta"); // APPROVED: test
+        let day = 86_400 * 1_000_000_000_i64;
+        assert!(!framed_file_below_floor(&path, &meta, None), "no floor");
+        assert!(
+            framed_file_below_floor(&path, &meta, Some(now_unix_nanos() + day)),
+            "hour 1 and an mtime of now are both before a floor a day ahead"
+        );
+        assert!(
+            !framed_file_below_floor(&path, &meta, Some(now_unix_nanos() - day)),
+            "written AFTER the floor (mtime): replayed"
+        );
+        let unnamed = dir.join("depth-dhan-x.dspl");
+        write_records(&unnamed, &[(b"market_depth,a=1 b=1i 1\n", 1)]);
+        let meta = std::fs::metadata(&unnamed).expect("meta"); // APPROVED: test
+        assert!(
+            !framed_file_below_floor(&unnamed, &meta, Some(now_unix_nanos() + day)),
+            "no hour in the name: doubt replays"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A framed depth file written wholly before the floor is moved to
+    /// quarantine whole and NOT posted.
+    #[tokio::test]
+    async fn test_regression_a_framed_file_below_the_floor_is_quarantined_not_posted() {
+        let dir = temp_dir("floor-replay");
+        let old = dir.join("depth-dhan-1.dspl");
+        write_records(&old, &[(b"market_depth,a=1 b=1i 1\n", 1)]);
+        let (url, bodies, server) = spawn_recording_server().await;
+        let mut view = crate::tick_spill_replay::tests::test_spill_view();
+        view.market_data_floor_unix_nanos = Some(now_unix_nanos() + 86_400 * 1_000_000_000);
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        server.abort();
+        assert!(
+            bodies.lock().expect("lock").is_empty(),
+            "nothing below the floor is posted"
+        );
+        assert_eq!(out.files_below_floor, 1);
+        assert_eq!(out.files_failed, 0);
+        assert!(!old.exists(), "moved out of the replay folder");
+        assert!(
+            dir.join(QUARANTINE_DIR).join("depth-dhan-1.dspl").exists(),
+            "kept whole in quarantine"
+        );
+        // With no floor the same file is posted, as before.
+        let again = dir.join("depth-dhan-2.dspl");
+        write_records(&again, &[(b"market_depth,a=2 b=2i 2\n", 1)]);
+        let (url, bodies, server) = spawn_recording_server().await;
+        view.market_data_floor_unix_nanos = None;
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        server.abort();
+        assert_eq!(
+            bodies.lock().expect("lock").clone(),
+            vec![b"market_depth,a=2 b=2i 2\n".to_vec()]
+        );
+        assert_eq!(out.files_below_floor, 0);
+        forget_resume_offset(&again);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

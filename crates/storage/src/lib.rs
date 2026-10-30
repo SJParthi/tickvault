@@ -145,6 +145,8 @@ pub mod delay_render;
 // RESTORED 2026-10-26 (plan item K4): the Dhan live lane writes `ticks`
 // again, so the daily conservation check writes new rows into the retained
 // table. `tick_conservation_ledger` is the process-side count it reads.
+/// The daily expiry-scope check's audit table (owner 2026-10-28).
+pub mod expiry_scope_audit_persistence;
 pub mod table_storage_probe;
 pub mod tick_conservation_audit_persistence;
 pub mod tick_conservation_ledger;
@@ -185,17 +187,22 @@ pub mod wal_suspension_watcher;
 // partition_manager sweep-list string, per the retirement banner in
 // daily-universe-instr-fetch-error-codes.md).
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
-// + DEDUP keys + LifecycleState/TransitionKind enums + DDL/Row/append
-// helpers. PR-C3 (2026-07-14): compiles unconditionally (feature gate
-// deleted); the live writer is the Groww shared_master_writer.
+// + DEDUP keys + LifecycleState/TransitionKind enums. PR-C3 (2026-07-14):
+// compiles unconditionally (feature gate deleted). 2026-10-28 (owner Quote
+// 44): NO writer. The DDL/Row/append helpers were deleted with the daily
+// write; both tables are frozen history, kept on every keep list.
 pub mod instrument_lifecycle_persistence;
 // §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
 // queryable both directions. Map-only (does NOT change the subscription).
 // PR-C3 (2026-07-14): compiles unconditionally (feature gate deleted).
 pub mod index_constituency_persistence;
 // Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). PR-C3
-// (2026-07-14): compiles unconditionally (feature gate deleted); consumed
-// by the Groww shared_master_writer's classify_transition path.
+// (2026-07-14): compiles unconditionally (feature gate deleted). DORMANT:
+// its only consumer, the Groww shared master writer, was deleted with the
+// Groww feed (2026-08-21), and the daily lifecycle write it would feed
+// stopped under owner Quote 44 (2026-10-28). No production caller; kept as
+// the documented decision rules for reading the frozen rows. Restarting a
+// caller needs a fresh dated quote (Quote 44 REJECT list).
 pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
@@ -220,14 +227,14 @@ pub mod partition_manager;
 // archive_enabled (serde default false).
 pub mod partition_archive;
 pub mod s3_cold;
+/// Read-only fetch of a published brutex strategy (rule brutex-strategy-host-2026-10-29.md).
+pub mod strategy_recipe_fetch;
 // Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
 // verified, and marked, before any WAL prune may delete them.
 pub mod raw_frame_upload;
-// Plan item 66 (2026-10-21, operator Quotes 32/33/34): the file-copy and
-// restore primitives of the one-off 2026-10-22 rebuild (150 GB root,
-// r8g.large). Cold path, box-side `tickvault rebuild-box` only; nothing here
-// deletes or overwrites.
-pub mod rebuild_copy;
+// Plan item 66 (2026-10-21, Quotes 32/33/34): the one-off 2026-10-22
+// rebuild's file-copy and restore primitives were DELETED 2026-10-29 with
+// the rebuild and wipe tools that used them (rust-only lock §§0.13/0.14).
 // Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
@@ -303,6 +310,9 @@ pub mod feed_aux_persistence;
 // Real-time proof that the live path is not waiting (2026-10-02): per-stage
 // latency buckets, stall counters and task heartbeats, Prometheus only.
 pub mod hot_path_telemetry;
+// Live audit F2/F5/F6 (2026-10-29): the durable market-data floor. Spill
+// replay sets aside rows older than the last reset instead of posting them.
+pub mod market_data_floor;
 // Moves the current tokio worker aside for one blocking step (sweep S1/S5).
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
