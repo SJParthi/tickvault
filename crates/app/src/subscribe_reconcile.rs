@@ -1851,8 +1851,14 @@ mod tests {
             "never resent, so refunded"
         );
         drop(inner);
+        // The book keeps a clone of the socket's sender, so the fake socket
+        // ends only once both are gone.
         drop(tx);
-        let _ = handle.await;
+        drop(book);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the fake socket ends once every sender is dropped")
+            .expect("fake");
     }
 
     #[tokio::test]
@@ -1909,7 +1915,7 @@ mod tests {
     /// one sweep finished. Wall clock, so `#[ignore]`d (never a CI gate):
     /// `cargo test -p tickvault-app --release --lib -- --ignored sweep_cost_at_the_authorized_ceiling --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "wall-clock cost harness, run by hand in release; never a CI gate"]
     fn sweep_cost_at_the_authorized_ceiling() {
         let (book, _rx) = SubscribeReconcile::new(false);
         let mut keep = Vec::new();
