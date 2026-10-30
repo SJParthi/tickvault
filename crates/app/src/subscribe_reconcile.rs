@@ -257,12 +257,6 @@ impl SubscribeReconcile {
         (Arc::new(book), rounds_rx)
     }
 
-    /// Whether rounds are sent (`true`) or only counted (`false`).
-    #[must_use]
-    pub const fn auto_resubscribe(&self) -> bool {
-        self.auto_resubscribe
-    }
-
     fn lock(&self) -> MutexGuard<'_, Inner> {
         // A poisoned lock means a panic elsewhere already took the process
         // down under `panic = "abort"`; in tests, keep reading the state.
@@ -442,6 +436,7 @@ impl ReconcileSweep<'_> {
 
     /// Ends the pass at the wall clock, with the trading-calendar session gate
     /// the frame-silence redials use.
+    // WIRING-EXEMPT: called from the frame drain's 30 s silence arm, which another session owns; the one-line wiring is proposed in the PR body (plan item 3b).
     pub fn finish_now(self) -> SweepSummary {
         let secs = tickvault_core::websocket::silence_calendar::session_secs_of_day_now();
         self.finish_at(secs, ist_day_now())
@@ -840,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_counts_only_after_the_delta() {
+    fn test_sweep_finish_at_counts_missing_only_after_the_delta() {
         let (book, _rx) = SubscribeReconcile::new(false);
         let (tx, _sock) = socket();
         let t0 = Instant::now();
@@ -1053,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_keeps_the_first_socket_and_dedups() {
+    fn test_record_subscribed_keeps_the_first_socket_and_dedups() {
         let (book, _rx) = SubscribeReconcile::new(false);
         let (tx_a, _a) = socket();
         let (tx_b, _b) = socket();
@@ -1067,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn test_same_id_in_two_segments_is_two_instruments() {
+    fn test_expected_len_counts_one_id_in_two_segments_twice() {
         // I-P1-11: the key is (security_id, segment), never the id alone.
         let (book, _rx) = SubscribeReconcile::new(false);
         let (tx, _s) = socket();
@@ -1084,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_forget_and_unknown_reports_are_ignored() {
+    fn test_forget_and_note_ignore_unknown_reports() {
         let (book, _rx) = SubscribeReconcile::new(true);
         let (tx, _s) = socket();
         let t0 = Instant::now();
@@ -1130,6 +1125,19 @@ mod tests {
         let text = NamedInstruments(&many).to_string();
         assert!(text.ends_with(",+5 more"), "{text}");
         assert_eq!(NamedInstruments(&[]).to_string(), "");
+    }
+
+    #[test]
+    fn test_finish_now_reads_the_wall_clock_without_panicking() {
+        // Whatever the wall clock says, finish_now must classify the pass and
+        // return; outside the session it dispatches nothing.
+        let (book, _rx) = SubscribeReconcile::new(false);
+        let (tx, _s) = socket();
+        book.record_subscribed(&tx, &[si(1)]);
+        let mut sweep = book.sweep();
+        sweep.note(&report(1, SilenceVerdict::Live));
+        let summary = sweep.finish_now();
+        assert_eq!(summary.dispatched, 0, "shadow mode never dispatches");
     }
 
     #[test]
@@ -1300,7 +1308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_executor_loop_runs_rounds_until_the_book_is_dropped() {
+    async fn test_run_reconcile_executor_runs_rounds_until_the_book_is_dropped() {
         let (book, rounds_rx) = SubscribeReconcile::new(true);
         let (tx, handle) = fake_socket(vec![
             Some(ResubscribeOutcome::Applied),
