@@ -22,4 +22,5 @@ pub mod feeds;
 pub mod feeds_page;
 pub mod health;
 pub mod quote;
+pub mod speed_health;
 pub mod stats;

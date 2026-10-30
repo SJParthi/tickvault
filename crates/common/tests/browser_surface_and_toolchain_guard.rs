@@ -677,7 +677,7 @@ fn spawn_scanner_extracts_literals_and_ignores_non_literals() {
 /// first, exactly like adding a path to `SCRIPT_BUDGET`.
 const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 263),
-    ("crates/api/src/handlers/dashboard_page.rs", 235),
+    ("crates/api/src/handlers/dashboard_page.rs", 192),
     ("crates/api/src/handlers/feeds_page.rs", 226),
     ("crates/aws-lambdas/src/operator_control_console.html", 319),
 ];
@@ -1116,7 +1116,7 @@ fn js_scanners_self_test() {
 /// as `JS_VOLUME_BUDGET`.
 const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 10_838),
-    ("crates/api/src/handlers/dashboard_page.rs", 8_781),
+    ("crates/api/src/handlers/dashboard_page.rs", 6_971),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
     (
         "crates/aws-lambdas/src/operator_control_console.html",
