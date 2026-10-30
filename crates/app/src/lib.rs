@@ -191,6 +191,10 @@ pub mod rest_candle_fold;
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
 pub mod spot_price_store;
+/// The day's subscribed main-feed spot set with each instrument's first
+/// subscribe second, read by the 1-minute cross-check when it fires (plan item
+/// 51e, no-rest-except-live-feed §12.15.13).
+pub mod xverify_day_record;
 // `top_volume_snapshot`, `top_volume_sweep` and `volume_leaderboard` DELETED
 // 2026-10-22 (plan item 62, operator Quote 34): nothing writes `top_volume_*`
 // and the ranking that only fed it is gone. The pieces the depth planners read

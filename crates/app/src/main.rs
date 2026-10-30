@@ -4045,6 +4045,14 @@ async fn async_main() -> Result<()> {
                 config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
                 questdb: config.questdb.clone(),
                 calendar: std::sync::Arc::clone(&trading_calendar),
+                // Plan item 51e/51f (§12.15.13-14): the boot set's basis goes
+                // into the day's subscribe record, so a day that only ever
+                // ran on the four-index fallback is refused, never recorded.
+                universe_basis: tickvault_app::xverify_day_record::universe_basis(
+                    config.dhan_universe.live_subscription_from_master,
+                    &main_feed_instruments,
+                    &tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                ),
             },
             &main_feed_instruments,
         )

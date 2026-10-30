@@ -878,6 +878,57 @@ pub fn finish_live_universe_widen(truncated: bool, subscribed: usize) {
         LIVE_UNIVERSE_DEGRADED.store(0, Ordering::Relaxed);
         publish_live_universe_size(subscribed);
     }
+    record_widened_list_for_crossverify(truncated);
+}
+
+/// Today's list as the last [`read_todays_live_universe`] call selected it,
+/// with the IST date it was read for. Read back once, when the widen
+/// finishes, so the 1-minute cross-check's day record holds the widened set
+/// (plan item 51e, §12.15.13). Written once per attach attempt that finds the
+/// list, never per tick.
+static LAST_TODAYS_LIST: std::sync::Mutex<Option<(String, Vec<SubscribeInstrument>)>> =
+    std::sync::Mutex::new(None);
+
+/// Records the list the widen just finished as subscribed now, in the day's
+/// cross-check record (plan item 51e). A widen that finished short records
+/// the whole list (see the record module's honest limits). A failed write is
+/// one coded `warn!` on a source no alarm filter matches: the check then
+/// targets what the day record does hold. O(list), cold, once per widen.
+fn record_widened_list_for_crossverify(truncated: bool) {
+    let taken = LAST_TODAYS_LIST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some((date_ist, list)) = taken else {
+        return;
+    };
+    let Ok(date) = chrono::NaiveDate::parse_from_str(&date_ist, "%Y-%m-%d") else {
+        return;
+    };
+    let secs = crate::xverify_day_record::ist_secs_of_day_now();
+    match crate::xverify_day_record::record_spot_subscribed(
+        date,
+        &list,
+        secs,
+        crate::xverify_day_record::UniverseBasis::MasterList,
+    ) {
+        Ok(outcome) => tracing::info!(
+            %date,
+            added = outcome.merge.added,
+            recorded = outcome.recorded,
+            truncated,
+            "today's widened spot list recorded for the 1-minute cross-check"
+        ),
+        Err(err) => tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_day_record_write_failed",
+            %date,
+            %err,
+            instruments = list.len(),
+            "could not save today's widened spot list for the 1-minute cross-check; the \
+             check covers only what its day record holds, and reports the shortfall"
+        ),
+    }
 }
 
 /// Page a running session that is short of today's list, and keep paging.
@@ -952,6 +1003,13 @@ pub fn read_todays_live_universe(
     );
     match selection.source {
         UniverseSource::MasterSourced | UniverseSource::TruncatedToCapacity => {
+            // Plan item 51e: kept for the cross-check's day record, which the
+            // widen's finish writes. One clone per attach attempt that finds
+            // the list, cold.
+            *LAST_TODAYS_LIST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((date_ist.to_owned(), selection.instruments.clone()));
             Some((selection, master.kind))
         }
         UniverseSource::HardcodedIndices | UniverseSource::FellBackToIndices => None,
