@@ -7090,6 +7090,28 @@ mod tests {
         );
         oms.placement_latency.record_ns(1_000);
         oms.publish_placement_latency();
+        assert_eq!(oms.placement_latency.published_count(), 1);
+    }
+
+    #[test]
+    fn test_publish_placement_latency_covers_a_paper_placement() {
+        let mut oms = OrderManagementSystem::new(
+            OrderApiClient::new(
+                reqwest::Client::new(),
+                "https://api.dhan.co/v2".to_owned(),
+                "100".to_owned(),
+            ),
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        let placed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime") // APPROVED: test
+            .block_on(oms.place_order(make_place_request()));
+        assert!(placed.is_ok(), "a paper placement succeeds");
+        oms.publish_placement_latency();
+        assert_eq!(oms.placement_latency.published_count(), 1);
     }
 
     // -----------------------------------------------------------------------

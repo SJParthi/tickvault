@@ -219,6 +219,12 @@ impl PlacementLatency {
         counters.sum.absolute(self.sum_ns.load(Ordering::Relaxed));
         self.published.store(total, Ordering::Relaxed);
     }
+
+    /// The sample count the last `publish` wrote (tests only).
+    #[cfg(test)]
+    pub(crate) fn published_count(&self) -> u64 {
+        self.published.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +248,12 @@ pub struct PaperTradeRecord {
 /// any burst the broker allows (10 orders a second) within one poll interval.
 pub const PAPER_TRADE_LOG_QUEUE_CAPACITY: usize = 1_024;
 
+/// How often, in milliseconds, the helper thread drains the queue.
+pub const PAPER_TRADE_LOG_POLL_MS: u64 = 20;
+
 /// How often the helper thread drains the queue. Also the most a line can
 /// trail its order.
-pub const PAPER_TRADE_LOG_POLL: Duration = Duration::from_millis(20);
+pub const PAPER_TRADE_LOG_POLL: Duration = Duration::from_millis(PAPER_TRADE_LOG_POLL_MS);
 
 /// The tracing target the line had when `place_order` wrote it.
 const PAPER_TRADE_LOG_TARGET: &str = "tickvault_trading::oms::engine";
@@ -461,6 +470,52 @@ mod tests {
             price: 0.0,
         });
         flush_paper_trade_log();
+    }
+
+    #[test]
+    fn test_ensure_paper_trade_logger_starts_once_and_flush_paper_trade_log_empties_the_queue() {
+        ensure_paper_trade_logger();
+        let first = PAPER_TRADE_LOG.get().map(std::ptr::from_ref);
+        ensure_paper_trade_logger();
+        let second = PAPER_TRADE_LOG.get().map(std::ptr::from_ref);
+        assert!(first.is_some(), "the queue is built on the first call");
+        assert_eq!(first, second, "a second call builds nothing new");
+
+        for counter in 0..8 {
+            log_paper_trade(PaperTradeRecord {
+                paper_order_counter: counter,
+                security_id: 13,
+                transaction_type: TransactionType::Sell,
+                quantity: 2,
+                price: 101.5,
+            });
+        }
+        flush_paper_trade_log();
+        let log = PAPER_TRADE_LOG
+            .get()
+            .and_then(Option::as_ref)
+            .expect("helper started"); // APPROVED: test
+        let receiver = log
+            .receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "a flush leaves nothing queued"
+        );
+    }
+
+    #[test]
+    fn test_publish_placement_latency_marks_every_sample_published() {
+        let latency = PlacementLatency::new();
+        assert_eq!(latency.published_count(), 0);
+        latency.record_ns(650);
+        latency.record_ns(4_000);
+        latency.publish();
+        assert_eq!(latency.published_count(), 2);
+        latency.record_ns(u64::MAX);
+        latency.publish();
+        assert_eq!(latency.published_count(), 3);
     }
 
     /// Records every span and event it sees as one line of target, level,
