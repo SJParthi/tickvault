@@ -145,6 +145,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </table></div>
   </div>
 
+  <h2>Speed and health</h2>
+  <p class="sub">How fast each step runs, ticks saved per minute, the daily tick check,
+     backlog, connections and candle overflow. Green is good, amber needs a look,
+     red needs action, grey means no verdict.</p>
+  <div id="speed"></div>
+
   <div id="status"></div>
 
   <div class="links">
@@ -215,18 +221,20 @@ async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
-    const [health, feeds, feedsHealth, stats, fno] = await Promise.all([
+    const [health, feeds, feedsHealth, stats, fno, speed] = await Promise.all([
       getJson("/health"),
       getJson("/api/feeds"),
       getJson("/api/feeds/health"),
       getJson("/api/stats"),
       getJson("/api/fno-stocks"),
+      getSpeed(),
     ]);
     renderOverall(health);
     renderFeeds(feeds, feedsHealth);
     renderStats(stats);
     fnoData = fno;
     renderFno();
+    renderSpeed(speed);
     setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
   } catch (e) {
     setStatus("Network error refreshing the dashboard.", "err");
@@ -391,6 +399,30 @@ document.getElementById("fno-sort").addEventListener("click", (e) => {
   renderFno();
 });
 
+// Speed and health: every label, number and colour is decided by the server;
+// this only paints the tiles it returns.
+function renderSpeed(speed) {
+  speedEl.replaceChildren();
+  if (!speed || !speed.sections) {
+    speedEl.appendChild(el("div", "card", speedDenied || !tokenEl.value.trim()
+      ? "— enter the API token above and press Save to see speed and health."
+      : "— could not read speed and health."));
+    return;
+  }
+  for (const s of speed.sections) {
+    const card = el("div", "card");
+    card.appendChild(el("div", "name", s.title));
+    if (s.note) card.appendChild(el("div", "reason", s.note));
+    const grid = el("div", "grid");
+    grid.style.marginTop = "10px";
+    for (const t of (s.tiles || [])) {
+      grid.appendChild(tile(t.label, (LIGHT_EMOJI[t.status] || "⚪") + " " + t.value, t.detail));
+    }
+    card.appendChild(grid);
+    speedEl.appendChild(card);
+  }
+}
+
 document.getElementById("save").addEventListener("click", () => {
   speedDenied = false;
   sessionStorage.setItem("tv_api_token", tokenEl.value.trim());
@@ -471,12 +503,14 @@ mod tests {
         // ALL the endpoints it depends on. Re-uses existing endpoints — there is
         // deliberately NO /api/dashboard aggregate; /api/fno-stocks (2026-10-30)
         // feeds only the F&O stocks section.
+        // /api/debug/speed-health (2026-10-30) feeds only the speed panel.
         for endpoint in [
             "/health",
             "/api/feeds",
             "/api/feeds/health",
             "/api/stats",
             "/api/fno-stocks",
+            "/api/debug/speed-health",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(endpoint),

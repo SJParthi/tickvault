@@ -679,7 +679,8 @@ const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 263),
     // 235 → 301 on 2026-10-30: the F&O stocks movers section (PR #2141),
     // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
-    ("crates/api/src/handlers/dashboard_page.rs", 301),
+    // 301 → 275 the same day: the speed-and-health panel compacted the script.
+    ("crates/api/src/handlers/dashboard_page.rs", 275),
     ("crates/api/src/handlers/feeds_page.rs", 226),
     ("crates/aws-lambdas/src/operator_control_console.html", 319),
 ];
@@ -1120,7 +1121,8 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 10_838),
     // 8,781 → 12,194 on 2026-10-30: the F&O stocks movers section (PR #2141),
     // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
-    ("crates/api/src/handlers/dashboard_page.rs", 12_194),
+    // 12,194 → 11,014 the same day: the speed-and-health panel compacted the script.
+    ("crates/api/src/handlers/dashboard_page.rs", 11_014),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
     (
         "crates/aws-lambdas/src/operator_control_console.html",
