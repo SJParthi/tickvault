@@ -83,7 +83,6 @@ use tracing::error;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::price_precision::{f32_to_f64_clean, round_to_2dp};
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::ParsedTick;
@@ -213,10 +212,11 @@ pub struct AuxPacketRow {
 
 /// A price column: NULL for the "not carried" `0.0` and for a non-finite
 /// value (QuestDB would refuse the whole batch over a NaN), otherwise the
-/// clean widening rounded to 2 dp. O(1).
+/// clean widening rounded to 2 dp ([`crate::tick_persistence::tick_price_f64`],
+/// the same value as `round_to_2dp(f32_to_f64_clean(v))`). O(1).
 #[must_use]
 pub fn aux_price(v: f32) -> Option<f64> {
-    (v.is_finite() && v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)))
+    (v.is_finite() && v != 0.0).then(|| crate::tick_persistence::tick_price_f64(v))
 }
 
 /// A quantity column: NULL for the "not carried" `0`. O(1).

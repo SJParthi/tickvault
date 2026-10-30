@@ -20,6 +20,7 @@ pub mod dashboard_page;
 pub mod debug;
 pub mod feeds;
 pub mod feeds_page;
+pub mod fno_stocks;
 pub mod health;
 pub mod quote;
 pub mod speed_health;
