@@ -118,6 +118,20 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/common/src/price_precision.rs",
         "test_f32_to_f64_clean_matches_text_path_for_every_f32",
     ),
+    // Added 2026-10-30 with the tick row fast price path (plan ITEM DT): the
+    // same shape as the entry above. It checks `tick_price_f64` against
+    // `round_to_2dp(f32_to_f64_clean(v))` for every f32 below 2^17, both
+    // signs (about 2.2 billion inputs). Measured: 0 differences, 265 s in
+    // release on the dev container; a debug CI build would take hours. It is
+    // not the gate: the proptests beside it (any bit pattern, price-like
+    // values, edge values, rows and ILP bytes against the legacy writer) run
+    // in every suite. Re-run it whenever `tick_price_f64` changes:
+    //
+    //   cargo test -p tickvault-storage --release --lib -- --ignored every_fast_path_f32
+    (
+        "crates/storage/src/tick_row_identity_tests.rs",
+        "tick_price_f64_matches_legacy_for_every_fast_path_f32",
+    ),
     // Added 2026-10-03 with sweep S1 (the drain flush no longer hands over
     // its worker): the same wall-clock shape as the harnesses below -- it
     // times `block_in_place` against a bare call and prints both, so a shared

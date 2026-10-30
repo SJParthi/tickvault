@@ -1268,3 +1268,34 @@ and 40745078734; the apply run is 40745078734). The tool, `wipe_box.rs`,
 budget rows were deleted in the first PR after the run. This exception
 authorizes nothing further; any new SSM shell needs its own dated section
 here.
+
+## §0.15. 2026-10-30 — the dashboard script grows for the F&O stocks movers page (owner-approved)
+
+> **Status: APPROVED 2026-10-30, about 11:50 IST.** The owner first asked,
+> 2026-10-30 about 11:15 IST: "yes add the fno stocks page to dashboard dude"
+> (with screenshots of Dhan's Markets > Stocks > Price Movers, F&O Stocks).
+> Then the owner answered, in the coordinator session, the decision card: "The F&O stocks movers page (pull
+> request 2141) is built and its tests pass. A project rule caps how much
+> browser code the dashboard may have, and only you can raise that cap, with a
+> dated note. The page needs the dashboard script to grow from 235 to 301
+> lines (8.8 KB to 12.2 KB). No new page and no new script file. May I record
+> your OK and raise the cap by exactly this much?" with **"Yes, raise it
+> (Recommended)"** ("I write your dated OK into the rule file and raise the
+> cap to exactly 301 lines / 12.2 KB, nothing more. The page then goes through
+> every check and merges on its own.").
+
+**What it authorizes:** in `crates/common/tests/browser_surface_and_toolchain_guard.rs`,
+the `crates/api/src/handlers/dashboard_page.rs` row of the script-line budget
+moves from 235 to at most **301**, and its row of the script-byte budget from
+8,781 to at most **12,194**, the measured size of the F&O stocks movers
+section (PR #2141). If the page ends smaller, the rows take the smaller
+measured numbers. Nothing else: `SCRIPT_BUDGET` and `HTML_ALLOWED_FRONTEND`
+are unchanged, no new `<script>` tag, no new page, no new HTML file.
+
+**REJECT:**
+- raising either dashboard row above 301 lines or 12,194 bytes under this
+  section, or raising it again without a fresh dated owner note here;
+- a new `<script>` tag, page, HTML file or browser surface under this section;
+- growing any other row of either budget under this section;
+- using this section for anything but the F&O stocks movers section of the
+  dashboard.
