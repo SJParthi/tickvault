@@ -801,7 +801,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 > the TOML). No `composite/*` bench exists under `crates/*/benches/`, so this
 > table showed two 10 μs ceilings that nothing measures. Struck, not deleted,
 > per house convention. Five live keys the subset leaves out are real and gated:
-> `token_handle` 50 ns, `ws_reader_frame_handle` 5 μs, `moneyness` 50 ns,
+> `token_handle` 50 ns, `ws_reader_frame_handle` 1 μs (was 5 μs until 2026-10-30, ITEM DT-SOCK), `moneyness` 50 ns,
 > `obi_compute` 1 μs, `order_gate_mark_forward` 100 ns. Read the TOML, not this
 > table; `benchmark_budget_reaches_a_bench_guard.rs` fails the build when a
 > TOML key matches no bench, and pins the key count in the sentence above.
