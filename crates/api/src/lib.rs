@@ -205,6 +205,14 @@ pub fn build_router_with_auth(
             "/api/debug/cross-verify/latest",
             axum::routing::get(handlers::debug::cross_verify_latest),
         )
+        // Owner 2026-10-30: speed and health numbers for the /dashboard page
+        // (step latencies, ticks per minute, the daily tick check, backlog,
+        // reconnects, candle overflow). Read-only, 5 s cached, bearer-gated
+        // like the other debug reads.
+        .route(
+            "/api/debug/speed-health",
+            axum::routing::get(handlers::speed_health::speed_health),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config,
             require_bearer_auth,

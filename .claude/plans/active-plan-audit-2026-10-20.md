@@ -1177,6 +1177,17 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
+### ITEM SH — speed and health on the operator dashboard (owner 2026-10-30; read-only, no live change)
+
+Approved by: Parthiban, 2026-10-30, "always ensure saving into db, auditing, logging, tracking, capturing, debugging, finding, searching, monitoring, dashboard visualising" (wave brief: make every speed and health number visible on our own dashboard pages from data already stored). Design: a bearer-gated read-only endpoint `GET /api/debug/speed-health` (crates/api) builds plain-English tiles with a green / amber / red / grey verdict in Rust from (a) the in-process step-latency counters (`hot_path_telemetry::stage_snapshot`, read only), (b) the app's own metrics page (address from `[observability]`, set once in crates/app main.rs), (c) bounded QuestDB reads: `ticks` / `tick_quotes` per minute for the last 15 full minutes, `tick_conservation_audit` last 14 days, `feed_gap_audit` since IST midnight, and `hot_path_latency_minute` when it exists ("not yet available" when it does not). Body cached 5 s in one slot. The `/dashboard` page paints the tiles generically; its script shrinks (235 → 192 lines, 8,781 → 6,971 bytes), so the browser-surface ceilings go down, never up. Edge cases: every source down reads grey, never green; NaN metric values skipped; a table with no designated timestamp is not read; a stored column name is used in a query only if it is letters/digits/underscore. Failure modes: database down or slow (3 s timeout per query, grey tiles), metrics page down or over 16 MiB (grey). Rollback: remove the route and the panel (no state, no writes). Observability: `tv_api_cache_hits_total{endpoint="speed_health"}`. Not on the feed path; no new table, alarm, page, EMF name or switch.
+
+- [x] SH1. Speed-and-health endpoint, tiles and verdicts, query builders, metrics-text reader, 5 s cache, metrics address set at boot
+  - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/app/src/main.rs
+  - Tests: test_ticks_per_minute_sql_covers_the_last_15_full_minutes, test_every_unreadable_source_is_grey_never_green, test_parse_metrics_text_reads_wanted_series_in_one_pass, test_handler_reads_every_source_and_a_second_call_is_a_cache_hit, test_stage_light_honours_bucket_resolution
+- [x] SH2. Dashboard panel painting the server's tiles; script compacted under the existing ceilings; ceilings lowered to the new size
+  - Files: crates/api/src/handlers/dashboard_page.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs
+  - Tests: test_dashboard_page_paints_the_speed_panel_from_server_verdicts, test_dashboard_page_fetches_all_required_endpoints
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the

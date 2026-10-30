@@ -25,6 +25,11 @@ const QUOTE_CACHE_TTL_SECS: u64 = 1;
 /// `board_data` handler docs).
 const BOARD_CACHE_TTL_SECS: u64 = 2;
 
+/// TTL for the cached `/api/debug/speed-health` body (owner 2026-10-30). The
+/// `/dashboard` page polls every 5 s, so one QuestDB-and-metrics pass per 5 s
+/// covers any number of open tabs.
+const SPEED_HEALTH_CACHE_TTL_SECS: u64 = 5;
+
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::feed_health::FeedHealthRegistry;
 
@@ -384,6 +389,12 @@ struct AppStateInner {
     /// TTL cache for the `/api/board/data` response body (2026-07-09
     /// follow-up). Single slot, 2s TTL — see [`BOARD_CACHE_TTL_SECS`].
     board_cache: crate::response_cache::SingleSlotTtlCache,
+    /// TTL cache for the `/api/debug/speed-health` body. Single slot, 5 s TTL.
+    speed_health_cache: crate::response_cache::SingleSlotTtlCache,
+    /// Address of this process's own metrics page, set once at boot from
+    /// `[observability]` when metrics are on; unset in tests and when off, in
+    /// which case the speed-health figures read from it show "not available".
+    metrics_scrape_url: std::sync::OnceLock<String>,
 }
 
 impl SharedAppState {
@@ -466,6 +477,10 @@ impl SharedAppState {
                 board_cache: crate::response_cache::SingleSlotTtlCache::new(
                     std::time::Duration::from_secs(BOARD_CACHE_TTL_SECS),
                 ),
+                speed_health_cache: crate::response_cache::SingleSlotTtlCache::new(
+                    std::time::Duration::from_secs(SPEED_HEALTH_CACHE_TTL_SECS),
+                ),
+                metrics_scrape_url: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -532,6 +547,24 @@ impl SharedAppState {
     // TEST-EXEMPT: trivial accessor; exercised by the board-handler cache test.
     pub fn board_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
         &self.inner.board_cache
+    }
+
+    /// Returns the `/api/debug/speed-health` TTL response cache (5 s).
+    // TEST-EXEMPT: trivial accessor; exercised by the speed-health handler cache test.
+    pub fn speed_health_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
+        &self.inner.speed_health_cache
+    }
+
+    /// Sets the address of this process's own metrics page. The first call
+    /// wins; returns `false` when it was already set (the address is fixed for
+    /// the process lifetime, like the config it comes from).
+    pub fn set_metrics_scrape_url(&self, url: String) -> bool {
+        self.inner.metrics_scrape_url.set(url).is_ok()
+    }
+
+    /// The metrics-page address, or `None` when metrics are off or not set.
+    pub fn metrics_scrape_url(&self) -> Option<&str> {
+        self.inner.metrics_scrape_url.get().map(String::as_str)
     }
 }
 

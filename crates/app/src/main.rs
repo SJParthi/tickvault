@@ -5185,6 +5185,16 @@ async fn build_shared_infra(
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
     );
+    // Owner 2026-10-30: the dashboard's speed-and-health panel reads a few
+    // figures from this process's own metrics page. Only when metrics are on.
+    if config.observability.metrics_enabled {
+        api_state.set_metrics_scrape_url(
+            tickvault_api::handlers::speed_health::metrics_scrape_url_for(
+                config.observability.metrics_bind_addr,
+                config.observability.metrics_port,
+            ),
+        );
+    }
     // Infra sweep row 12 (2026-09-08): this was ONE SSM call on the boot path
     // with no retry — a transient SSM throttle or a cold-start DNS blip at
     // 08:30 failed the whole boot, and the start-watchdog then paged for a
