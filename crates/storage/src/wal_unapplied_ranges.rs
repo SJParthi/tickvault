@@ -3712,7 +3712,9 @@ mod tests {
         // counted; moving one add out of its closure kept both counts.
         assert_eq!(
             off_worker_nesting(body),
-            Some((4, 4, 2)),
+            // W4 (2026-10-30): the exit adds its ranges through one
+            // `add_exit_ranges` call (both sinks, one sidecar write).
+            Some((3, 3, 2)),
             "every range add and a persist inside one of the two off_worker closures"
         );
         let bitten = "pub fn note_questdb_probe(&self) {\n    self.add_unapplied_range(a, b);\n    \
@@ -3750,7 +3752,8 @@ mod tests {
             }
             let close = close?;
             let closure = &rest[open..=close];
-            inside += closure.matches("add_unapplied_range(").count();
+            inside += closure.matches("add_unapplied_range(").count()
+                + closure.matches("add_exit_ranges(").count();
             if closure.contains("persist_now()") {
                 persisting += 1;
             }
@@ -3758,7 +3761,7 @@ mod tests {
         }
         Some((
             inside,
-            body.matches("add_unapplied_range(").count(),
+            body.matches("add_unapplied_range(").count() + body.matches("add_exit_ranges(").count(),
             persisting,
         ))
     }

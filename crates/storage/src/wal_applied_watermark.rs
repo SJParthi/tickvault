@@ -5029,7 +5029,7 @@ mod tests {
             assert!(gate < flag, "{name}: the gate is taken before the flag");
         }
         let start = src
-            .find("    fn note_questdb_probe_full(&self, clean: bool, basis: Option<(u64, u64)>, now: u64) {")
+            .find("    fn note_questdb_probe_full(&self, verdict: ProbeVerdict, basis: Option<(u64, u64)>, now: u64) {")
             .expect("probe present");
         let body = &src[start..];
         let body = &body[..body.find("\n    }\n").expect("end of the function")];
@@ -5390,6 +5390,32 @@ mod w4_parked_confirm_tests {
             parked_confirm_span(0, 0, u64::MAX, 0),
             Some((s + 1, u64::MAX))
         );
+    }
+
+    #[test]
+    fn test_note_questdb_probe_verdict_records_a_lag_only_exit() {
+        let wm = AppliedWatermark::new_for_tests();
+        ack_both(&wm, seq(10));
+        wm.note_questdb_probe_verdict(ProbeVerdict::Clean, wm.probe_basis());
+        wm.note_questdb_probe_verdict(ProbeVerdict::LagOnly, wm.probe_basis());
+        assert!(wm.is_sink_suspect());
+        assert_eq!(wm.suspect_episode_count(), 1);
+        ack_both(&wm, seq(100));
+        wm.note_questdb_probe_verdict(ProbeVerdict::Clean, wm.probe_basis());
+        assert!(!wm.is_sink_suspect());
+        assert!(
+            wm.lock_ranges().parked_confirm.is_some(),
+            "waits for the lag"
+        );
+        assert!(covered(&wm, seq(100)), "not confirmed before the lag");
+        // The bool entry never confirms: false is Unsafe.
+        let wm = AppliedWatermark::new_for_tests();
+        ack_both(&wm, seq(10));
+        wm.note_questdb_probe_with_basis(true, wm.probe_basis());
+        wm.note_questdb_probe_with_basis(false, wm.probe_basis());
+        ack_both(&wm, seq(100));
+        wm.note_questdb_probe_with_basis(true, wm.probe_basis());
+        assert!(wm.lock_ranges().parked_confirm.is_none());
     }
 
     #[test]
