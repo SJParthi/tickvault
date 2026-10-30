@@ -29,6 +29,10 @@ const BOARD_CACHE_TTL_SECS: u64 = 2;
 /// `/dashboard` page polls every 5 s, so one QuestDB-and-metrics pass per 5 s
 /// covers any number of open tabs.
 const SPEED_HEALTH_CACHE_TTL_SECS: u64 = 5;
+/// TTL for the cached `/api/fno-stocks` response body (2026-10-30). The
+/// dashboard polls every 5 s, so each poll sees a fresh answer; a burst of
+/// tabs costs at most one movers query per 2 s while QuestDB is healthy.
+const FNO_STOCKS_CACHE_TTL_SECS: u64 = 2;
 
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::feed_health::FeedHealthRegistry;
@@ -398,6 +402,9 @@ struct AppStateInner {
     /// `[observability]` when metrics are on; unset in tests and when off, in
     /// which case the speed-health figures read from it show "not available".
     metrics_scrape_url: std::sync::OnceLock<String>,
+    /// TTL cache for the `/api/fno-stocks` response body (2026-10-30).
+    /// Single slot, 2s TTL — see [`FNO_STOCKS_CACHE_TTL_SECS`].
+    fno_stocks_cache: crate::response_cache::SingleSlotTtlCache,
 }
 
 impl SharedAppState {
@@ -485,6 +492,9 @@ impl SharedAppState {
                 ),
                 metrics_scrape_url: std::sync::OnceLock::new(),
                 speed_health_refresh: tokio::sync::Mutex::new(()),
+                fno_stocks_cache: crate::response_cache::SingleSlotTtlCache::new(
+                    std::time::Duration::from_secs(FNO_STOCKS_CACHE_TTL_SECS),
+                ),
             }),
         }
     }
@@ -575,6 +585,12 @@ impl SharedAppState {
     /// The metrics-page address, or `None` when metrics are off or not set.
     pub fn metrics_scrape_url(&self) -> Option<&str> {
         self.inner.metrics_scrape_url.get().map(String::as_str)
+    }
+
+    /// Returns the `/api/fno-stocks` TTL response cache (2026-10-30).
+    // TEST-EXEMPT: trivial accessor; exercised by the fno-stocks cache test.
+    pub fn fno_stocks_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
+        &self.inner.fno_stocks_cache
     }
 }
 

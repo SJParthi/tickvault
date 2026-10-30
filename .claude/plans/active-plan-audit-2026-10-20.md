@@ -1183,10 +1183,21 @@ Approved by: Parthiban, 2026-10-30, "always ensure saving into db, auditing, log
 
 - [x] SH1. Speed-and-health endpoint, tiles and verdicts, query builders, metrics-text reader, 5 s cache, metrics address set at boot
   - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/app/src/main.rs
-  - Tests: test_ticks_per_minute_sql_covers_the_last_15_full_minutes, test_every_unreadable_source_is_grey_never_green, test_parse_metrics_text_reads_wanted_series_in_one_pass, test_handler_reads_every_source_and_a_second_call_is_a_cache_hit, test_stage_light_honours_bucket_resolution
+  - Tests: test_ticks_per_minute_sql_and_tick_window_cover_the_last_15_full_minutes, test_every_unreadable_source_is_grey_never_green, test_parse_metrics_text_reads_wanted_series_in_one_pass, test_handler_reads_every_source_and_a_second_call_is_a_cache_hit, test_stage_light_honours_bucket_resolution
 - [x] SH2. Dashboard panel painting the server's tiles; script compacted under the existing ceilings; ceilings lowered to the new size
   - Files: crates/api/src/handlers/dashboard_page.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs
   - Tests: test_dashboard_page_paints_the_speed_panel_from_server_verdicts, test_dashboard_page_fetches_all_required_endpoints
+
+### ITEM DASH — F&O stocks price movers on the dashboard (api; 2026-10-30)
+
+Requested: owner brief relayed to this session on 2026-10-30 ("yes add the fno stocks page to dashboard dude"). The brief reached the session as an automated notification, so the owner's approval of the item and of the dashboard script growth is to be confirmed on the PR. Design: one read-only endpoint `GET /api/fno-stocks` (bearer-gated, on the shared public rate limiter, 2 s single-slot cache) runs ONE bounded QuestDB query in session only (`LATEST ON ts PARTITION BY security_id, segment` over the last 15 min of `ticks`, `segment = 'NSE_EQ'`, `feed = 'dhan'`, ids from today's F&O underlying list); the list file is read once per IST date. Change is against `ticks.close` (the previous session's close on Quote/Full packets); value is an estimate (volume x avg price). The dashboard gets one section in its existing script (no new tag, no new page). Edge cases: market closed, list missing, empty result, NULL/zero/NaN previous close, an id in two segments, QuestDB timeout or error, stale newest row. Failure modes: every failure is a named status, never an empty "no movers"; only `live` is shown as live. Rollback: revert the PR (no config, no table, no alarm). Observability: `tv_api_cache_hits_total{endpoint="fno_stocks"}`; the status field.
+
+- [x] DASH1. Endpoint, cache, route, page section, writer/reader pin
+  - Files: crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/api/src/handlers/dashboard_page.rs, crates/app/src/dhan_universe.rs
+  - Tests: test_build_fno_stocks_sql_is_bounded_keyed_and_constant, test_empty_result_is_no_data_not_live, test_one_row_is_live_with_change_and_value, test_zero_and_nan_prev_close_give_no_change, test_rows_sort_by_change_pct_with_no_change_last, test_same_security_id_in_two_segments_keeps_only_nse_eq, test_questdb_timeout_is_unreachable, test_fno_stocks_route_requires_the_bearer_token, test_get_fno_stocks_cache_hit_skips_the_query, test_dashboard_page_has_the_fno_stocks_movers_section, test_fno_list_path_tag_and_shape_match_the_dashboard_reader
+- [x] DASH2. Raise the dashboard's JS budgets in `browser_surface_and_toolchain_guard.rs` (235 → 301 lines, 8,781 → 12,194 bytes) after the owner's dated note is recorded in `rust-only-forever-lock-2026-07-19.md` (that guard requires the note first). Note recorded as §0.15 by the coordinator session (commit b06c382); numbers raised to the measured sizes.
+  - Files: crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
+  - Tests: javascript_volume_inside_script_tags_only_shrinks, javascript_bytes_inside_script_tags_stay_under_the_ceiling
 
 ## Design
 

@@ -26,6 +26,14 @@
 //! works with no token). It iterates whatever feed rows the API returns (no
 //! hardcoded 2-feed list), so a future 3rd feed appears with zero page edits.
 //!
+//! **⚠ CHANGED 2026-10-30 (owner: "yes add the fno stocks page to dashboard
+//! dude"):** the page gains an "F&O stocks — price movers" section (Gainers /
+//! Losers / All, search, sort by change %), fed by ONE new endpoint,
+//! `GET /api/fno-stocks` (bearer-gated, rate-limited, 2 s cache; see
+//! `fno_stocks.rs`). So "adds NO new backend endpoint" above is no longer true
+//! for that one section. The section shows a price as live only when the
+//! endpoint says `live`; every other status is shown as a plain reason.
+//!
 //! Mirrors the `feeds_page.rs` pattern: a `const DASHBOARD_HTML` returned via
 //! `Html(...)` with `X-Frame-Options: SAMEORIGIN` + a `frame-ancestors 'self'`
 //! CSP, and every fetched value rendered via `textContent` (never `innerHTML`)
@@ -88,6 +96,17 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .warn { color: #b45309; }
   .err  { color: #b91c1c; }
   .ok   { color: #15803d; }
+  .fno-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .fno-bar button.on { background: #8885; font-weight: 700; }
+  .fno-bar input { flex: 1; min-width: 140px; padding: 7px 10px; font-size: 0.95rem;
+                   border: 1px solid #8884; border-radius: 8px; }
+  .fno-note { font-size: 0.85rem; color: #888; margin: 4px 0 8px; }
+  .fno-wrap { overflow-x: auto; }
+  .fno-wrap table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  .fno-wrap th, .fno-wrap td { padding: 6px 8px; border-bottom: 1px solid #8883;
+                               text-align: right; white-space: nowrap; }
+  .fno-wrap th:first-child, .fno-wrap td:first-child { text-align: left; }
+  .fno-wrap th { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -109,6 +128,22 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
   <h2>Database</h2>
   <div id="stats" class="card"></div>
+
+  <h2>F&amp;O stocks — price movers</h2>
+  <div class="card">
+    <div class="fno-bar">
+      <button id="fno-gain" class="on">Gainers</button>
+      <button id="fno-lose">Losers</button>
+      <button id="fno-all">All</button>
+      <input id="fno-q" type="search" placeholder="Search a stock" autocomplete="off">
+    </div>
+    <div id="fno-note" class="fno-note"></div>
+    <div class="fno-wrap"><table>
+      <thead><tr><th>Name</th><th>LTP</th><th>Change</th><th id="fno-sort">Change % ▼</th>
+        <th>Value (Cr.) est.</th><th>Volume</th></tr></thead>
+      <tbody id="fno-body"></tbody>
+    </table></div>
+  </div>
 
   <h2>Speed and health</h2>
   <p class="sub">How fast each step runs, ticks saved per minute, the daily tick check,
@@ -186,16 +221,19 @@ async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
-    const [health, feeds, feedsHealth, stats, speed] = await Promise.all([
+    const [health, feeds, feedsHealth, stats, fno, speed] = await Promise.all([
       getJson("/health"),
       getJson("/api/feeds"),
       getJson("/api/feeds/health"),
       getJson("/api/stats"),
+      getJson("/api/fno-stocks"),
       getSpeed(),
     ]);
     renderOverall(health);
     renderFeeds(feeds, feedsHealth);
     renderStats(stats);
+    fnoData = fno;
+    renderFno();
     renderSpeed(speed);
     setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
   } catch (e) {
@@ -298,6 +336,69 @@ function renderStats(stats) {
   statsEl.appendChild(grid);
 }
 
+// F&O stocks price movers (owner 2026-10-30). Rows come from /api/fno-stocks;
+// only status "live" is shown as live, every other status says why.
+let fnoData = null, fnoMode = "gain", fnoDesc = true;
+const fnoNote = document.getElementById("fno-note");
+const fnoBody = document.getElementById("fno-body");
+const fnoNum = (v, d) => (v === null || v === undefined) ? "—"
+  : Number(v).toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d });
+const FNO_STATUS = {
+  live: "🟢 Live",
+  stale: "⚠️ Not live — the newest price is old; the feed may be stalled",
+  closed: "⭕ Market closed — prices show only during the trading session",
+  no_fno_list: "❔ Today's F&O stock list is not ready yet",
+  no_data: "❔ No F&O stock price captured in the last few minutes",
+  unreachable: "🆘 The database did not answer — no prices shown",
+  query_failed: "🆘 The database refused the query — no prices shown",
+};
+function renderFno() {
+  fnoBody.replaceChildren();
+  const d = fnoData;
+  if (!d) { fnoNote.textContent = "— could not read F&O stocks."; fnoNote.className = "fno-note err"; return; }
+  let note = FNO_STATUS[d.status] || ("❔ " + d.status);
+  if (d.as_of_ist) note += " · as of " + d.as_of_ist + " IST";
+  if (d.fno_stocks_total) note += " · " + d.stocks_priced + " of " + d.fno_stocks_total + " F&O stocks priced";
+  fnoNote.textContent = note + ". " + d.value_basis + ".";
+  fnoNote.className = "fno-note " + (d.status === "live" ? "ok" : "warn");
+  const q = document.getElementById("fno-q").value.trim().toUpperCase();
+  let rows = (d.stocks || []).filter((s) => !q || s.name.toUpperCase().includes(q));
+  if (fnoMode !== "all") rows = rows.filter((s) => s.change_pct !== null && (fnoMode === "gain" ? s.change_pct > 0 : s.change_pct < 0));
+  const sign = (fnoMode === "lose" ? !fnoDesc : fnoDesc) ? -1 : 1;
+  rows.sort((a, b) => sign * ((a.change_pct ?? -1e9) - (b.change_pct ?? -1e9)));
+  for (const s of rows) {
+    const tr = document.createElement("tr");
+    const cls = s.change > 0 ? "ok" : (s.change < 0 ? "err" : "");
+    const cells = [[s.name, ""], [fnoNum(s.ltp, 2), ""], [fnoNum(s.change, 2), cls],
+      [s.change_pct === null ? "—" : fnoNum(s.change_pct, 2) + "%", cls],
+      [fnoNum(s.value_cr, 2), ""], [fnoNum(s.volume, 0), ""]];
+    for (const [text, c] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (c) td.className = c;
+      tr.appendChild(td);
+    }
+    fnoBody.appendChild(tr);
+  }
+  if (rows.length === 0 && d.stocks && d.stocks.length) {
+    const tr = document.createElement("tr"), td = document.createElement("td");
+    td.colSpan = 6; td.textContent = "No stock matches."; tr.appendChild(td); fnoBody.appendChild(tr);
+  }
+}
+for (const [id, mode] of [["fno-gain", "gain"], ["fno-lose", "lose"], ["fno-all", "all"]]) {
+  document.getElementById(id).addEventListener("click", () => {
+    fnoMode = mode;
+    for (const b of ["fno-gain", "fno-lose", "fno-all"]) document.getElementById(b).className = b === id ? "on" : "";
+    renderFno();
+  });
+}
+document.getElementById("fno-q").addEventListener("input", renderFno);
+document.getElementById("fno-sort").addEventListener("click", (e) => {
+  fnoDesc = !fnoDesc;
+  e.target.textContent = "Change % " + (fnoDesc ? "▼" : "▲");
+  renderFno();
+});
+
 // Speed and health: every label, number and colour is decided by the server;
 // this only paints the tiles it returns.
 function renderSpeed(speed) {
@@ -399,13 +500,16 @@ mod tests {
     #[test]
     fn test_dashboard_page_fetches_all_required_endpoints() {
         // Guards against the page drifting from the API contract: it must compose
-        // ALL the endpoints it depends on. There is deliberately NO aggregate
-        // /api/dashboard endpoint.
+        // ALL the endpoints it depends on. Re-uses existing endpoints — there is
+        // deliberately NO /api/dashboard aggregate; /api/fno-stocks (2026-10-30)
+        // feeds only the F&O stocks section.
+        // /api/debug/speed-health (2026-10-30) feeds only the speed panel.
         for endpoint in [
             "/health",
             "/api/feeds",
             "/api/feeds/health",
             "/api/stats",
+            "/api/fno-stocks",
             "/api/debug/speed-health",
         ] {
             assert!(
@@ -542,6 +646,55 @@ mod tests {
                 && DASHBOARD_HTML.contains("if (refreshing) return"),
             "refresh() has an in-flight guard"
         );
+    }
+
+    #[test]
+    fn test_dashboard_page_has_the_fno_stocks_movers_section() {
+        // Owner 2026-10-30: the F&O stocks price-movers view on the dashboard.
+        for marker in [
+            "F&amp;O stocks — price movers",
+            "/api/fno-stocks",
+            "Gainers",
+            "Losers",
+            "Search a stock",
+            "Change %",
+            "Value (Cr.) est.",
+            "Volume",
+            "as of ",
+            " IST",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(marker),
+                "dashboard must contain the F&O stocks marker '{marker}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_page_fno_section_shows_live_only_for_live_status() {
+        // Never show stale data as live: only status "live" gets the live
+        // label, every other status the endpoint can send has its own reason.
+        assert!(DASHBOARD_HTML.contains(r#"d.status === "live" ? "ok" : "warn""#));
+        for status in [
+            "live:",
+            "stale:",
+            "closed:",
+            "no_fno_list:",
+            "no_data:",
+            "unreachable:",
+            "query_failed:",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(status),
+                "the page must explain status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_page_fno_table_scrolls_inside_its_box_on_a_phone() {
+        assert!(DASHBOARD_HTML.contains(".fno-wrap { overflow-x: auto; }"));
+        assert!(DASHBOARD_HTML.contains("width=device-width"));
     }
 
     #[tokio::test]
