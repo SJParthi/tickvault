@@ -20,9 +20,15 @@
 //! | AUD | `audit_spill_at_its_cap_while_questdb_is_down_counts_every_refused_row` | QuestDB down → batches spill → the directory reaches its byte cap → a batch is REFUSED (counted on `tv_audit_spill_refused_rows_total`, never silent) → drain while still down keeps every file → QuestDB back with one poison batch: good rows land once, the poison batch is quarantined and counted lost; offered = replayed + quarantined + refused |
 //! | OOB | `oob_bar_amended_twice_across_a_crash_with_a_torn_tail_keeps_the_fullest_copy` | the fuller copy of a bar spills, the process dies mid-write (torn tail), the NEXT process (empty ledger) spills an emptier copy and dead-letters a third, emptier still; boot 1 commits once and then QuestDB dies; boot 2 must end on the fullest copy |
 //!
-//! Hermetic: temp dirs under `std::env::temp_dir()` tagged with the process
-//! id; QuestDB is a loopback listener in this process (no Docker, no
-//! network). Every test takes one process-wide lock so the metric deltas and
+//! | S1d | `s1d_exactly_at_the_line_cap_every_bad_line_is_set_aside_none_quarantined` | exactly `REPLAY_MAX_REJECTED_LINES_PER_CHUNK` (64) bad lines: every one is set aside, the file is not quarantined, every good line lands once (the post cap must not trip first) |
+//! | AUD-B | `audit_spill_cap_exact_fit_boundary_and_quarantine_not_counted` | a batch that exactly fits under the byte cap is accepted, one byte more is refused (counted by exactly its rows); a full-size file in `quarantine/` does not count; the 50,000-file cap admits the 50,000th file and refuses the next |
+//!
+//! Hermetic in its dependencies: temp dirs under `std::env::temp_dir()`
+//! tagged with the process id; QuestDB is a loopback listener in this
+//! process (no Docker, no network). NOT hermetic about free disk space: S5
+//! runs the real seal disk floor, so it needs at least 4 GiB (plus a margin)
+//! free on the temp volume and fails at once, naming that floor, when it is
+//! short. Every test takes one process-wide lock so the metric deltas and
 //! the audit test's working-directory switch cannot interleave.
 //!
 //! Honest limit: the audit spill's only public constructor writes to a
@@ -38,10 +44,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tickvault_common::feed::Feed;
 use tickvault_storage::audit_spill::{
-    AUDIT_SPILL_MAX_BYTES_PER_TABLE, AuditSpill, AuditSpillTable, drain_audit_spill_dir,
-    spill_failed_batch,
+    AUDIT_SPILL_MAX_BYTES_PER_TABLE, AUDIT_SPILL_MAX_FILES_PER_TABLE, AuditSpill, AuditSpillTable,
+    drain_audit_spill_dir, spill_failed_batch,
 };
-use tickvault_storage::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
+use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
+use tickvault_storage::seal_absorption::{
+    SEAL_ESCALATION_MIN_FREE_BYTES, SealAbsorptionPipeline, SubmitOutcome,
+};
 use tickvault_storage::seal_dlq::{SealDlqRecord, SealDlqWriter};
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_task::{
@@ -454,6 +463,36 @@ fn rejected_lines(dir: &Path, file_name: &str) -> Vec<Vec<u8>> {
         .unwrap_or_default()
 }
 
+/// Margin above the seal escalation floor this file needs on the temp volume
+/// (the seals it writes, rounded well up).
+const SEAL_FLOOR_TEST_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// S5 runs the REAL `SealDiskFloor`, which refuses every spill and DLQ write
+/// (`DroppedBelowFloor`) when the volume has less than
+/// `SEAL_ESCALATION_MIN_FREE_BYTES` (4 GiB) free. The floor's probe override
+/// is `#[cfg(test)] pub(crate)`, unreachable from an integration test, so on
+/// a short volume the test fails here, naming the cause, instead of failing
+/// later with counts that read like a probe bug.
+fn require_room_above_the_seal_floor(dir: &Path) {
+    let need = SEAL_ESCALATION_MIN_FREE_BYTES + SEAL_FLOOR_TEST_MARGIN_BYTES;
+    match probe_disk_free_bytes(dir) {
+        DiskHealthOutcome::Ok { free_bytes, .. } => assert!(
+            free_bytes >= need,
+            "precondition: the temp volume at {} has {free_bytes} bytes free, under the \
+             {SEAL_ESCALATION_MIN_FREE_BYTES}-byte (4 GiB) seal escalation floor plus a \
+             {SEAL_FLOOR_TEST_MARGIN_BYTES}-byte margin; every spill and DLQ write would be \
+             refused as DroppedBelowFloor. Free space on the temp volume and re-run.",
+            dir.display()
+        ),
+        DiskHealthOutcome::ProbeFailed { reason } => {
+            panic!(
+                "precondition: cannot read free space at {}: {reason}",
+                dir.display()
+            )
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // S5 — midnight seal burst on a dying disk
 // ---------------------------------------------------------------------------
@@ -489,6 +528,7 @@ fn s5_midnight_burst_on_a_dying_disk_every_seal_lands_once_or_is_counted_dropped
     let dlq = root.join("dlq");
     std::fs::create_dir_all(&spill).expect("spill");
     std::fs::create_dir_all(&dlq).expect("dlq");
+    require_room_above_the_seal_floor(&root);
 
     const RING: usize = 1_000;
     let mut pipeline =
@@ -898,6 +938,61 @@ async fn s1_past_the_line_cap_the_whole_file_is_quarantined_byte_for_byte() {
     assert_eq!(moved, body, "every byte, good and bad, is kept for salvage");
 }
 
+/// Exactly at the line cap: 64 bad lines in one chunk. Every bad line is set
+/// aside, the file is NOT quarantined (the bisection post cap,
+/// `replay_max_isolation_posts`, must not trip before the line cap: the K1
+/// regression), and QuestDB holds every good line exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s1d_exactly_at_the_line_cap_every_bad_line_is_set_aside_none_quarantined() {
+    let _serial = SERIAL.lock().await;
+    let _ = recorder();
+    let root = unique_root("s1d");
+    let _guard = RootGuard(root.clone());
+    let dir = replay_dir(&root);
+    let path = dir.join(TICK_FILE);
+    let bad = REPLAY_MAX_REJECTED_LINES_PER_CHUNK;
+    let (body, goods, bads) = tick_body(2 * bad, bad, 2);
+    assert_eq!(bads.len(), bad, "the body holds exactly the cap");
+    std::fs::write(&path, &body).expect("spill file");
+    let (db, server) = FakeDb::spawn().await;
+    let client = http_client();
+    let quarantined_before = counter(REPLAY_QUARANTINED_COUNTER, &[]);
+    let rejected_before = rejected_counter();
+
+    let out = replay_spill_dir(&dir, &db.url, &client, &quiet_view()).await;
+    server.abort();
+    assert_eq!(out.files_quarantined, 0, "{out:?}");
+    assert_eq!(out.files_failed, 0, "{out:?}");
+    assert_eq!(out.lines_set_aside, bad as u64, "{out:?}");
+    assert_eq!(
+        counter(REPLAY_QUARANTINED_COUNTER, &[]),
+        quarantined_before,
+        "at the cap nothing is quarantined"
+    );
+    assert_eq!(rejected_counter() - rejected_before, bad as u64);
+    assert_eq!(
+        count_lines(&rejected_lines(&dir, TICK_FILE)),
+        count_lines(&bads),
+        "exactly the 64 bad lines are set aside, once each"
+    );
+    let accepted = db.accepted_since(0);
+    assert!(
+        accepted
+            .iter()
+            .all(|l| !l.windows(POISON_MARKER.len()).any(|w| w == POISON_MARKER)),
+        "no bad line reached QuestDB"
+    );
+    assert_eq!(
+        count_lines(&accepted).keys().collect::<Vec<_>>(),
+        count_lines(&goods).keys().collect::<Vec<_>>(),
+        "every good line reached QuestDB"
+    );
+    assert!(
+        !dir.join(QUARANTINE_DIR).join(TICK_FILE).exists(),
+        "the file was not moved to quarantine"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AUD — audit spill at its cap while QuestDB is down
 // ---------------------------------------------------------------------------
@@ -1054,4 +1149,96 @@ async fn audit_spill_at_its_cap_while_questdb_is_down_counts_every_refused_row()
         &audit_batch(200, ROWS, false),
         ROWS
     ));
+}
+
+/// The audit spill caps at their exact boundaries. A batch that exactly fits
+/// under the byte cap is accepted; one byte more is refused and counted by
+/// exactly its rows; files in `quarantine/` never count toward the cap; the
+/// file-count cap admits the 50,000th file and refuses the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_spill_cap_exact_fit_boundary_and_quarantine_not_counted() {
+    let _serial = SERIAL.lock().await;
+    let _ = recorder();
+    let root = unique_root("aud-cap");
+    let _cwd = CwdGuard {
+        original: std::env::current_dir().expect("cwd"),
+        root: root.clone(),
+    };
+    std::env::set_current_dir(&root).expect("enter temp root");
+    let table = AuditSpillTable::OrderAudit;
+    let name = table.table_name();
+    let dir = root.join(table.default_dir());
+    std::fs::create_dir_all(&dir).expect("audit dir");
+    let spill = AuditSpill::for_table(table);
+    const ROWS: usize = 3;
+    let payload = audit_batch(0, ROWS, false);
+    let len = payload.len() as u64;
+    let refused = || counter("tv_audit_spill_refused_rows_total", &[("table", name)]);
+    let filler = dir.join("00000000000000000001-1-0000000000-1.ilp.tmp");
+    let set_filler = |size: u64| {
+        std::fs::File::create(&filler)
+            .and_then(|f| f.set_len(size))
+            .expect("sparse filler");
+    };
+    let clear_waiting = || {
+        for entry in std::fs::read_dir(&dir).expect("list").flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_file()) {
+                std::fs::remove_file(entry.path()).expect("remove");
+            }
+        }
+    };
+
+    // Exactly fits: filler + batch == the cap.
+    set_filler(AUDIT_SPILL_MAX_BYTES_PER_TABLE - len);
+    let before = refused();
+    assert!(
+        spill_failed_batch(Some(&spill), &payload, ROWS),
+        "a batch that brings the directory to exactly the cap is accepted"
+    );
+    assert_eq!(refused(), before);
+    clear_waiting();
+
+    // One byte more: refused, counted by exactly its rows.
+    set_filler(AUDIT_SPILL_MAX_BYTES_PER_TABLE - len + 1);
+    let before = refused();
+    assert!(
+        !spill_failed_batch(Some(&spill), &payload, ROWS),
+        "one byte over the cap is refused"
+    );
+    assert_eq!(
+        refused() - before,
+        ROWS as u64,
+        "counted by exactly its rows"
+    );
+    clear_waiting();
+
+    // A cap-sized file in quarantine/ does not count.
+    let q = dir.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&q).expect("quarantine dir");
+    std::fs::File::create(q.join("00000000000000000002-1-0000000000-1.ilp"))
+        .and_then(|f| f.set_len(AUDIT_SPILL_MAX_BYTES_PER_TABLE))
+        .expect("sparse quarantined file");
+    let before = refused();
+    assert!(
+        spill_failed_batch(Some(&spill), &payload, ROWS),
+        "quarantine/ never counts toward the cap"
+    );
+    assert_eq!(refused(), before);
+    clear_waiting();
+
+    // The file-count cap: AUDIT_SPILL_MAX_FILES_PER_TABLE - 1 empty files,
+    // then the 50,000th (a real spill) is accepted and the next refused.
+    for n in 0..AUDIT_SPILL_MAX_FILES_PER_TABLE - 1 {
+        std::fs::File::create(dir.join(format!("filler-{n:06}.tmp"))).expect("filler file");
+    }
+    let before = refused();
+    assert!(
+        spill_failed_batch(Some(&spill), &payload, ROWS),
+        "the 50,000th file is accepted"
+    );
+    assert!(
+        !spill_failed_batch(Some(&spill), &payload, ROWS),
+        "the 50,001st file is refused"
+    );
+    assert_eq!(refused() - before, ROWS as u64);
 }

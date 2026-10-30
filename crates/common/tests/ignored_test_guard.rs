@@ -49,6 +49,22 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-30 with the combined-fault chaos tests (PR #2157): two
+    // tests that expose real defects in the evening-drain state file and
+    // fail until those are fixed (the owner decides the fix; root cause and
+    // proposed fix are in each test's ignore reason and doc comment). They
+    // are kept, not deleted, so the defects stay visible and the fix PR only
+    // has to remove these two rows. Run them with:
+    //
+    //   cargo test -p tickvault-app --test chaos_combined_evening_drain -- --ignored
+    (
+        "crates/app/tests/chaos_combined_evening_drain.rs",
+        "a_single_flipped_bit_never_lets_more_restarts_through",
+    ),
+    (
+        "crates/app/tests/chaos_combined_evening_drain.rs",
+        "a_torn_file_from_last_evening_does_not_block_tonight",
+    ),
     // Added 2026-10-30 with plan ITEM DT-SOCK (owner: every in-memory step
     // under 1 us at p99): wall-clock harnesses for the socket read path's
     // in-memory work per frame (production spacing, bursts, a per-step

@@ -23,18 +23,29 @@
 //!    more than the frames really lost.
 //! 2. **Nothing silent:** every really lost frame moves the loss counter or
 //!    `tv_wal_lost_fate_unknown_total`. One documented exemption: a frame
-//!    lost only through the shutdown scan whose slot another frame of the
-//!    case holds. That is the table's window limit; in production the WAL
+//!    lost only through the shutdown scan whose slot a NEWER frame of the
+//!    case held when the scan ran (a frame holding its own slot is never
+//!    exempt, and the test asserts the exemption stays narrower). That is
+//!    the table's window limit; in production the WAL
 //!    queue holds at most 524,288 records against 2^22 slots, so two
 //!    unflushed frames never share a slot.
 //! 3. **No runaway unknown:** the unknown counter moves at most once per
 //!    `LostFate::Unknown` return and once per unrecordable ring shed.
 //! 4. **Counters match the returned outcomes** where they can be attributed
 //!    (cases without a shutdown scan): per frame at most one real count.
+//! 5. **Per-label attribution, every case:** the ring and drain loss labels
+//!    move exactly by the scan counts plus the `WasShed` and ring
+//!    `AlreadyLost` returns of their kind; `tv_ticks_lost_total` moves with
+//!    every ring loss; each drain-shed refusal is counted under the reason a
+//!    slot model predicts (`wal_lost` when the frame holds its slot already
+//!    lost, `unrecordable` when a newer frame holds it), and the verdict
+//!    matches the model.
 //!
 //! Plus the boundaries the permutations do not reach: the shutdown floor
-//! exactly at a frame and one below it, sequence zero, the highest base, and
-//! an unrecordable ring shed with no loss reported anywhere at or above it
+//! exactly at a frame and one below it, sequence zero, the highest base, a
+//! frame partly shed when the writer's loss lands mid-frame (packet bits in
+//! the sequence), a shutdown floor carrying packet bits, and an unrecordable
+//! ring shed with no loss reported anywhere at or above it
 //! (counted nowhere, correctly).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -46,7 +57,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use tickvault_storage::wal_frame_fate::{
     DRAIN_SHED_REFUSED_COUNTER, FATE_UNKNOWN_COUNTER, FrameFate, LostFate, SHED_LOST_COUNTER,
-    ShedKind, ShedMark, lost_high_seq,
+    ShedKind, ShedMark, TICKS_LOST_SOURCE, lost_high_seq,
 };
 use tickvault_storage::ws_frame_spill::{PACKET_INDEX_BITS, WsType};
 
@@ -125,18 +136,34 @@ const SLOTS: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Snap {
-    real: u64,
+    /// `tv_wal_shed_frames_lost_total{shed="ring"}`.
+    ring: u64,
+    /// `tv_wal_shed_frames_lost_total{shed="drain_depth"}`.
+    drain: u64,
+    /// `tv_ticks_lost_total{source="wal_lost_after_shed", ws_type="live_feed"}`.
+    ticks: u64,
     unknown: u64,
-    refused: u64,
+    refused_wal_lost: u64,
+    refused_unrecordable: u64,
+}
+
+impl Snap {
+    const fn real(&self) -> u64 {
+        self.ring + self.drain
+    }
 }
 
 fn snap() -> Snap {
     Snap {
-        real: counter(SHED_LOST_COUNTER, &[("shed", "ring")])
-            + counter(SHED_LOST_COUNTER, &[("shed", "drain_depth")]),
+        ring: counter(SHED_LOST_COUNTER, &[("shed", "ring")]),
+        drain: counter(SHED_LOST_COUNTER, &[("shed", "drain_depth")]),
+        ticks: counter(
+            "tv_ticks_lost_total",
+            &[("source", TICKS_LOST_SOURCE), ("ws_type", LIVE.as_str())],
+        ),
         unknown: counter(FATE_UNKNOWN_COUNTER, &[]),
-        refused: counter(DRAIN_SHED_REFUSED_COUNTER, &[("reason", "wal_lost")])
-            + counter(DRAIN_SHED_REFUSED_COUNTER, &[("reason", "unrecordable")]),
+        refused_wal_lost: counter(DRAIN_SHED_REFUSED_COUNTER, &[("reason", "wal_lost")]),
+        refused_unrecordable: counter(DRAIN_SHED_REFUSED_COUNTER, &[("reason", "unrecordable")]),
     }
 }
 
@@ -226,7 +253,30 @@ struct Tally {
     cases: u64,
     really_lost: u64,
     exempt: u64,
+    /// Frames lost only through the scan, in a colliding case.
+    window_candidates: u64,
     unknown_moves: u64,
+    refused: u64,
+}
+
+/// A reference model of one table slot: the frame base that holds it and its
+/// flags, updated by the same rules as `FrameFate` (claim when older or empty,
+/// refuse when newer, flags only for the holder).
+#[derive(Default, Debug, Clone, Copy)]
+struct ModelSlot {
+    tag: u64,
+    ring: bool,
+    drain: bool,
+    lost: bool,
+}
+
+impl ModelSlot {
+    fn claim(&mut self, base: u64) {
+        *self = Self {
+            tag: base,
+            ..Self::default()
+        };
+    }
 }
 
 fn run_case(order: &[Ev], kinds: [ShedKind; 2], b_offset: i64, floor: Floor, tally: &mut Tally) {
@@ -245,26 +295,71 @@ fn run_case(order: &[Ev], kinds: [ShedKind; 2], b_offset: i64, floor: Floor, tal
     };
     let floor_base = flushed >> PACKET_INDEX_BITS;
     let collide = (a % SLOTS) == (b % SLOTS);
+    let slot_of = |x: usize| usize::try_from(bases[x] % SLOTS).unwrap();
+    let mut model = [ModelSlot::default(); SLOTS as usize];
 
     let before = snap();
     let mut out = [FrameOutcome::default(); 2];
     let mut scan = None;
+    let mut holder_at_scan = [0u64; 2];
     let mut unrecordable_ring = 0u64;
     let mut unknown_returns = 0u64;
+    // Expected per-label counts, built from the returned outcomes.
+    let mut want_ring = 0u64;
+    let mut want_drain = 0u64;
+    let mut want_refused_wal_lost = 0u64;
+    let mut want_refused_unrecordable = 0u64;
     for ev in order {
         match *ev {
             Ev::Shed(x) => {
                 out[x].lost_high_before_shed = lost_high_seq();
+                let m = &mut model[slot_of(x)];
+                let bx = bases[x];
                 let mark = match kinds[x] {
-                    ShedKind::Ring => t.note_shed(seq(bases[x]), ShedKind::Ring, LIVE),
+                    ShedKind::Ring => {
+                        let mark = t.note_shed(seq(bx), ShedKind::Ring, LIVE);
+                        if mark == ShedMark::AlreadyLost {
+                            want_ring += 1;
+                        }
+                        mark
+                    }
                     ShedKind::DrainDepth => {
-                        if t.allow_drain_shed(seq(bases[x]), LIVE) {
-                            ShedMark::Marked
+                        // The reason the model expects a refusal, if any.
+                        let expect_wal_lost = m.tag == bx && m.lost;
+                        let expect_unrecordable = m.tag > bx;
+                        let allowed = t.allow_drain_shed(seq(bx), LIVE);
+                        assert_eq!(
+                            allowed,
+                            !(expect_wal_lost || expect_unrecordable),
+                            "drain shed verdict vs model: order {order:?} kinds {kinds:?} \
+                             b_offset {b_offset}"
+                        );
+                        if expect_wal_lost {
+                            want_refused_wal_lost += 1;
+                            ShedMark::AlreadyLost
+                        } else if expect_unrecordable {
+                            want_refused_unrecordable += 1;
+                            ShedMark::Unrecordable
                         } else {
-                            ShedMark::Unrecordable // refused: rows written instead
+                            ShedMark::Marked
                         }
                     }
                 };
+                // Model update, by the table's rules.
+                if m.tag == bx {
+                    if !m.lost {
+                        match kinds[x] {
+                            ShedKind::Ring => m.ring = true,
+                            ShedKind::DrainDepth => m.drain = true,
+                        }
+                    }
+                } else if m.tag < bx {
+                    m.claim(bx);
+                    match kinds[x] {
+                        ShedKind::Ring => m.ring = true,
+                        ShedKind::DrainDepth => m.drain = true,
+                    }
+                }
                 if kinds[x] == ShedKind::Ring && mark == ShedMark::Unrecordable {
                     unrecordable_ring += 1;
                 }
@@ -272,25 +367,78 @@ fn run_case(order: &[Ev], kinds: [ShedKind; 2], b_offset: i64, floor: Floor, tal
             }
             Ev::Lost(x) => {
                 let l = t.note_lost(seq(bases[x]), LIVE);
-                if l == LostFate::Unknown {
-                    unknown_returns += 1;
+                match l {
+                    LostFate::Unknown => unknown_returns += 1,
+                    LostFate::WasShed(ShedKind::Ring) => want_ring += 1,
+                    LostFate::WasShed(ShedKind::DrainDepth) => want_drain += 1,
+                    LostFate::NotShed => {}
+                }
+                let m = &mut model[slot_of(x)];
+                let bx = bases[x];
+                if m.tag < bx {
+                    m.claim(bx);
+                }
+                if m.tag == bx {
+                    m.lost = true;
                 }
                 out[x].lost = Some(l);
             }
-            Ev::Scan => scan = Some(t.count_unflushed_sheds(flushed, LIVE)),
+            Ev::Scan => {
+                let s = t.count_unflushed_sheds(flushed, LIVE);
+                want_ring += s.0;
+                want_drain += s.1;
+                for x in 0..2 {
+                    holder_at_scan[x] = model[slot_of(x)].tag;
+                }
+                for m in &mut model {
+                    if m.tag > floor_base && !m.lost && (m.ring || m.drain) {
+                        m.lost = true;
+                    }
+                }
+                scan = Some(s);
+            }
         }
     }
     let after = snap();
-    let real = after.real - before.real;
+    let real = after.real() - before.real();
     let unknown = after.unknown - before.unknown;
     let label = format!(
         "order {order:?} kinds {kinds:?} b_offset {b_offset} floor {floor:?} -> {out:?} scan {scan:?} \
          real {real} unknown {unknown}"
     );
 
+    // Per-label attribution: each counter moved exactly by the outcomes that
+    // report it, and every ring loss moved the tick-loss counter too.
+    assert_eq!(
+        after.ring - before.ring,
+        want_ring,
+        "ring loss counter: {label}"
+    );
+    assert_eq!(
+        after.drain - before.drain,
+        want_drain,
+        "drain loss counter: {label}"
+    );
+    assert_eq!(
+        after.ticks - before.ticks,
+        after.ring - before.ring,
+        "tv_ticks_lost_total must move with every ring loss: {label}"
+    );
+    assert_eq!(
+        after.refused_wal_lost - before.refused_wal_lost,
+        want_refused_wal_lost,
+        "refused{{wal_lost}}: {label}"
+    );
+    assert_eq!(
+        after.refused_unrecordable - before.refused_unrecordable,
+        want_refused_unrecordable,
+        "refused{{unrecordable}}: {label}"
+    );
+
     // The physical model.
     let mut truth = [false; 2];
     let mut exempt = [false; 2];
+    let mut window_candidates = 0u64;
     for x in 0..2 {
         let dropped = match (kinds[x], out[x].shed) {
             (_, None) => false,
@@ -300,7 +448,11 @@ fn run_case(order: &[Ev], kinds: [ShedKind; 2], b_offset: i64, floor: Floor, tal
         let reported = out[x].lost.is_some();
         let by_scan = scan.is_some() && bases[x] > floor_base;
         truth[x] = dropped && (reported || by_scan);
-        exempt[x] = truth[x] && !reported && collide;
+        let scan_only = truth[x] && !reported && collide;
+        window_candidates += u64::from(scan_only);
+        // The window limit only: a NEWER frame of the case held the slot when
+        // the scan ran. A frame that holds its own slot is never exempt.
+        exempt[x] = scan_only && holder_at_scan[x] > bases[x];
     }
     let truth_n = truth.iter().filter(|v| **v).count() as u64;
     let exempt_n = exempt.iter().filter(|v| **v).count() as u64;
@@ -347,19 +499,22 @@ fn run_case(order: &[Ev], kinds: [ShedKind; 2], b_offset: i64, floor: Floor, tal
             unknown, attributed_unknown,
             "unknown counter vs outcomes: {label}"
         );
-    } else if let Some((ring, drain)) = scan {
-        assert!(
-            ring + drain <= real,
-            "scan counts are part of the real counter: {label}"
+    } else {
+        // Exact with a scan too: the scan's counts plus the loss reports.
+        assert_eq!(
+            real,
+            want_ring + want_drain,
+            "real counter vs outcomes: {label}"
         );
     }
 
     tally.cases += 1;
     tally.really_lost += truth_n;
     tally.exempt += exempt_n;
+    tally.window_candidates += window_candidates;
     tally.unknown_moves += unknown;
+    tally.refused += want_refused_wal_lost + want_refused_unrecordable;
 }
-
 #[test]
 fn every_ordering_of_shed_lost_and_shutdown_counts_each_lost_frame() {
     recorder();
@@ -399,9 +554,24 @@ fn every_ordering_of_shed_lost_and_shutdown_counts_each_lost_frame() {
         tally.unknown_moves
     );
     assert!(tally.exempt > 0, "the window exemption was never exercised");
+    // The exemption is narrower than "lost only through the scan in a
+    // colliding case": a frame that holds its own slot at the scan is checked.
+    assert!(
+        tally.exempt < tally.window_candidates,
+        "exempt {} vs scan-only colliding {}: the exemption covers every candidate",
+        tally.exempt,
+        tally.window_candidates
+    );
+    assert!(tally.refused > 0, "no drain shed was ever refused");
     eprintln!(
-        "fate permutations: {} cases, {} really lost frames, {} unknown counts, {} window-exempt",
-        tally.cases, tally.really_lost, tally.unknown_moves, tally.exempt
+        "fate permutations: {} cases, {} really lost frames, {} unknown counts, {} window-exempt \
+         of {} scan-only colliding, {} drain refusals",
+        tally.cases,
+        tally.really_lost,
+        tally.unknown_moves,
+        tally.exempt,
+        tally.window_candidates,
+        tally.refused
     );
 }
 
@@ -424,7 +594,7 @@ fn test_regression_lost_then_slot_reused_at_boundary_then_ring_shed_is_counted()
         ShedMark::Unrecordable
     );
     let d = snap();
-    assert_eq!(d.real - before.real, 0);
+    assert_eq!(d.real() - before.real(), 0);
     assert_eq!(
         d.unknown - before.unknown,
         1,
@@ -459,7 +629,7 @@ fn unrecordable_ring_shed_with_no_loss_anywhere_above_counts_nothing_until_lost(
     assert_eq!(t.note_lost(seq(a), LIVE), LostFate::Unknown);
     let d = snap();
     assert_eq!(d.unknown - before.unknown, 1);
-    assert_eq!(d.real - before.real, 0);
+    assert_eq!(d.real() - before.real(), 0);
 }
 
 /// The shutdown scan's floor: a frame AT the flushed mark reached the kernel
@@ -482,7 +652,7 @@ fn shutdown_scan_floor_boundary_counts_only_frames_above_the_flush() {
     assert_eq!(t.note_lost(seq(a + 1), LIVE), LostFate::NotShed);
     // A's record was flushed; a late loss report of it is still counted once.
     assert_eq!(t.note_lost(seq(a), LIVE), LostFate::WasShed(ShedKind::Ring));
-    assert_eq!(snap().real - before.real, 2);
+    assert_eq!(snap().real() - before.real(), 2);
 
     // One base lower: the flushed mark just below A counts A as well.
     let t2 = FrameFate::<64>::new();
@@ -514,5 +684,70 @@ fn sequence_zero_and_the_highest_base_are_handled() {
     );
     assert_eq!(top_table.count_unflushed_sheds(seq(1), LIVE), (1, 0));
     assert_eq!(top_table.count_unflushed_sheds(seq(1), LIVE), (0, 0));
-    assert_eq!(snap().real - before.real, 1);
+    assert_eq!(snap().real() - before.real(), 1);
+}
+
+/// Inline depth asks per packet, so a frame can be partly shed: the first
+/// packets' rows are shed, the writer's loss lands, and the later packets
+/// are refused and written. The frame is counted lost once (as a drain
+/// loss) and each later packet is one `wal_lost` refusal. A ring shed of a
+/// lost frame carrying packet bits is `AlreadyLost` and counted once, and a
+/// second loss report of it counts nothing. A shutdown floor carrying packet
+/// bits treats its whole base as flushed.
+#[test]
+fn partial_frame_drain_shed_then_loss_mid_frame_counts_once_and_refuses_the_rest() {
+    recorder();
+    let _g = lock();
+    let t = FrameFate::<64>::new();
+    let a = fresh_base() + 1;
+    let before = snap();
+    assert!(t.allow_drain_shed(seq(a) | 1, LIVE), "packet 1 is shed");
+    assert_eq!(
+        t.note_lost(seq(a), LIVE),
+        LostFate::WasShed(ShedKind::DrainDepth),
+        "the writer's loss lands mid-frame"
+    );
+    assert!(
+        !t.allow_drain_shed(seq(a) | 2, LIVE),
+        "packet 2 is refused and written"
+    );
+    assert!(!t.allow_drain_shed(seq(a) | 3, LIVE), "packet 3 too");
+    let d = snap();
+    assert_eq!(d.drain - before.drain, 1, "the frame is lost once");
+    assert_eq!(d.ring - before.ring, 0);
+    assert_eq!(d.ticks - before.ticks, 0, "depth rows are not ticks");
+    assert_eq!(
+        d.refused_wal_lost - before.refused_wal_lost,
+        2,
+        "one refusal per later packet"
+    );
+    assert_eq!(d.refused_unrecordable - before.refused_unrecordable, 0);
+    assert_eq!(d.unknown - before.unknown, 0);
+
+    // A ring shed of a lost frame, carrying packet bits.
+    let c = fresh_base() + 1;
+    let before = snap();
+    assert_eq!(t.note_lost(seq(c), LIVE), LostFate::NotShed);
+    assert_eq!(
+        t.note_shed(seq(c) | 3, ShedKind::Ring, LIVE),
+        ShedMark::AlreadyLost
+    );
+    assert_eq!(t.note_lost(seq(c) | 7, LIVE), LostFate::NotShed);
+    let d = snap();
+    assert_eq!(d.ring - before.ring, 1, "counted once");
+    assert_eq!(d.ticks - before.ticks, 1, "and once as a lost tick");
+    assert_eq!(d.unknown - before.unknown, 0);
+
+    // A floor with packet bits: base e is flushed, e + 1 is not.
+    let t2 = FrameFate::<64>::new();
+    let e = fresh_base() + 1;
+    for f in [e, e + 1] {
+        assert_eq!(t2.note_shed(seq(f), ShedKind::Ring, LIVE), ShedMark::Marked);
+    }
+    let packet_mask = (1u64 << PACKET_INDEX_BITS) - 1;
+    assert_eq!(
+        t2.count_unflushed_sheds(seq(e) | packet_mask, LIVE),
+        (1, 0),
+        "only e + 1 is above the floor"
+    );
 }

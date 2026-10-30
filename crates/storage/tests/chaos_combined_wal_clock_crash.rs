@@ -48,6 +48,12 @@
 //! count two resyncs and two damaged segments with the exact abandoned bytes,
 //! and leave the torn tail uncounted (it is what every unclean stop leaves).
 //!
+//! Plus: a torn tail in an OLDER segment (pinned: not counted as damage, no
+//! `after_gap`; left to the consumer's process-boundary receipt rule, which
+//! cannot fire when the receipts are unknown), damage in a segment's first record, and 0-byte and
+//! 12-byte segments between damaged ones; and S2b, the backward clock against
+//! frames that exist only in `archive/` and `replaying/`.
+//!
 //! Tests share one process-wide metrics recorder and run one at a time
 //! (`SERIAL`) so counter deltas belong to the test reading them.
 
@@ -218,13 +224,19 @@ fn payload_for(seq: u64) -> Vec<u8> {
     p
 }
 
-/// One TVW4 record, byte for byte what the writer produces.
+/// One TVW4 record, byte for byte what the writer produces, with a receipt
+/// the WAL does not know (`7`, below the plausible band).
 fn record_bytes(seq: u64) -> Vec<u8> {
+    record_bytes_at(seq, 7)
+}
+
+/// One TVW4 record with receipt `received_at_nanos`.
+fn record_bytes_at(seq: u64, received_at_nanos: i64) -> Vec<u8> {
     let ws = WsType::LiveFeed.as_u8();
     let ep = WalEndpoint::MainFeed.as_u8();
     let frame = payload_for(seq);
     let seq_b = seq.to_le_bytes();
-    let recv = 7i64.to_le_bytes();
+    let recv = received_at_nanos.to_le_bytes();
     let len = (PAYLOAD_LEN as u32).to_le_bytes();
     let crc = crc32(&[&[ws], &seq_b[..], &recv[..], &[ep], &len[..], &frame[..]]);
     let mut v = Vec::with_capacity(RECORD_LEN);
@@ -249,6 +261,23 @@ fn write_segment(dir: &Path, name: u128, seqs: &[u64]) -> PathBuf {
     let mut f = std::fs::File::create(&path).expect("create segment");
     for &s in seqs {
         f.write_all(&record_bytes(s)).expect("write record");
+    }
+    f.sync_all().expect("sync segment");
+    path
+}
+
+/// A segment whose records carry receipts `receipt(k)` for the k-th record.
+fn write_segment_at(
+    dir: &Path,
+    name: u128,
+    seqs: &[u64],
+    receipt: impl Fn(usize) -> i64,
+) -> PathBuf {
+    let path = segment_path(dir, name);
+    let mut f = std::fs::File::create(&path).expect("create segment");
+    for (k, &s) in seqs.iter().enumerate() {
+        f.write_all(&record_bytes_at(s, receipt(k)))
+            .expect("write record");
     }
     f.sync_all().expect("sync segment");
     path
@@ -424,6 +453,89 @@ fn s2_backward_clock_across_two_rotations_keeps_names_sequences_and_replay_order
     }
     assert_strictly_rising_and_unique(&batch.frames, "S2 replay");
     assert_eq!(batch.segment_ends.len(), 4, "every segment was read");
+}
+
+/// S2b: the ratchet and the name clamp read EVERY directory, not only the
+/// live one. The earlier process's live segment is an hour ahead; its
+/// archive holds a segment named and sequenced two hours ahead WITH frames;
+/// `replaying/` holds one three hours ahead, above everything else. A
+/// regression that scanned only the live directory would re-issue
+/// `capture_seq` values below the archived and replaying frames, and the
+/// DEDUP key would silently drop those rows on replay.
+#[test]
+fn s2b_backward_clock_ratchets_past_archive_and_replaying_frames_and_names() {
+    let _g = serial();
+    let rec_before = counter(WAL_SEGMENT_NAME_CLAMPED_COUNTER);
+    let dir = chaos_dir("s2b-backward-clock");
+    let _cleanup = Cleanup(dir.clone());
+
+    const HOUR: u128 = 3_600 * 1_000_000_000;
+    let now = wall_nanos();
+    let (live_name, archive_name, replaying_name) = (now + HOUR, now + 2 * HOUR, now + 3 * HOUR);
+    let seqs_at = |name: u128| -> Vec<u64> {
+        let base = frame_base(u64::try_from(name).unwrap());
+        (1..=4u64).map(|k| base + (k << 17)).collect()
+    };
+    let live_seqs = seqs_at(live_name);
+    let archive_seqs = seqs_at(archive_name);
+    let replaying_seqs = seqs_at(replaying_name);
+    write_segment(&dir, live_name, &live_seqs);
+    let archive = dir.join("archive");
+    let replaying = dir.join("replaying");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::create_dir_all(&replaying).unwrap();
+    write_segment(&archive, archive_name, &archive_seqs);
+    write_segment(&replaying, replaying_name, &replaying_seqs);
+    let disk_high = *replaying_seqs.last().unwrap();
+    assert_eq!(
+        tickvault_storage::ws_frame_spill::highest_frame_seq_on_disk(&dir),
+        disk_high,
+        "the disk high-water mark is the replaying/ segment's newest frame"
+    );
+
+    let spill = WsFrameSpill::new(&dir).expect("spill");
+    let mut appended = Vec::new();
+    for _ in 0..3 {
+        append_one(&spill, &mut appended);
+    }
+    rotate_until(&spill, &dir, 3, &mut appended);
+    append_one(&spill, &mut appended);
+    assert_eq!(spill.shutdown(Duration::from_secs(10)), 0, "clean drain");
+    drop(spill);
+
+    assert!(
+        appended.iter().all(|&s| s > disk_high),
+        "every new frame is sequenced above the replaying/ and archived frames"
+    );
+    assert!(appended.windows(2).all(|w| w[0] < w[1]));
+    let names = live_segment_names(&dir);
+    assert_eq!(names.len(), 3, "names: {names:?}");
+    assert_eq!(names[0], live_name);
+    assert_eq!(
+        &names[1..],
+        &[replaying_name + 1, replaying_name + 2],
+        "every new name is clamped past the replaying/ name and rises by one"
+    );
+    assert_eq!(
+        counter(WAL_SEGMENT_NAME_CLAMPED_COUNTER) - rec_before,
+        2,
+        "both clamped names are counted"
+    );
+
+    // Replay order across the directories: what waits (live and replaying/)
+    // in name order, then the new frames; the archived segment was already
+    // replayed by the earlier process and is not read again.
+    let batch = replay(&dir);
+    let got: Vec<u64> = batch.frames.iter().map(|f| f.frame_seq).collect();
+    let mut want = live_seqs.clone();
+    want.extend_from_slice(&replaying_seqs);
+    want.extend_from_slice(&appended);
+    assert_eq!(got, want, "exact replay order across live and replaying/");
+    assert!(
+        archive_seqs.iter().all(|s| !got.contains(s)),
+        "an archived segment is not replayed again"
+    );
+    assert_strictly_rising_and_unique(&batch.frames, "S2b replay");
 }
 
 // ---------------------------------------------------------------------------
@@ -831,5 +943,186 @@ fn oob_replay_with_mid_segment_damage_and_a_torn_newest_tail_returns_exact_survi
         counter(WAL_REPLAY_ABANDONED_BYTES_COUNTER) - abandoned,
         2 * RECORD_LEN as u64,
         "exactly one record's bytes abandoned in A and one in B"
+    );
+}
+
+fn gaps_and_firsts(batch: &WalReplayBatch) -> (Vec<u64>, Vec<u64>) {
+    let gaps = batch
+        .frames
+        .iter()
+        .filter(|f| f.after_gap)
+        .map(|f| f.frame_seq)
+        .collect();
+    let firsts = batch
+        .frames
+        .iter()
+        .filter(|f| f.first_in_segment)
+        .map(|f| f.frame_seq)
+        .collect();
+    (gaps, firsts)
+}
+
+/// A torn tail in an OLDER segment (not the newest): the writer can tear only
+/// the last record a process wrote, so the next segment belongs to a new
+/// process. Pinned behaviour: the torn record is dropped and is NOT counted
+/// as damage (no resync, no damaged segment, no abandoned bytes), exactly as
+/// for a torn newest tail, and the replay does NOT set `after_gap` on the next
+/// segment's first frame. The missing frame is left to the CONSUMER's
+/// process-boundary rule (`process_boundary_is_gap`, applied by the app's
+/// replay fold to a `first_in_segment` frame): the receipts carried here make
+/// it fire for a restart 60 s later. Honest limit, pinned in the second half:
+/// with receipts the WAL does not know (legacy records) the rule cannot fire,
+/// so the torn frame is missing with no flag anywhere.
+#[test]
+fn oob_torn_tail_in_a_non_newest_segment_is_a_process_boundary_gap() {
+    let _g = serial();
+    let t0 = i64::try_from(wall_nanos()).unwrap() - 3_600 * 1_000_000_000;
+    let restart = t0 + 60_000_000_000;
+    for (label, known) in [("known receipts", true), ("legacy receipts", false)] {
+        let dir = chaos_dir("oob-torn-older");
+        let _cleanup = Cleanup(dir.clone());
+        let a_seqs: Vec<u64> = (101..=110).map(seq).collect();
+        let b_seqs: Vec<u64> = (501..=510).map(seq).collect();
+        let at = |base: i64| {
+            move |k: usize| {
+                if known {
+                    base + k as i64 * 1_000_000
+                } else {
+                    7
+                }
+            }
+        };
+        let a = write_segment_at(&dir, 1, &a_seqs, at(t0));
+        write_segment_at(&dir, 2, &b_seqs, at(restart));
+        // A's last record was interrupted: 20 of its bytes reached the disk.
+        let bytes = read(&a);
+        std::fs::write(&a, &bytes[..bytes.len() - (RECORD_LEN - 20)]).unwrap();
+
+        let resyncs = counter(WAL_REPLAY_RESYNCS_COUNTER);
+        let truncated = counter(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER);
+        let abandoned = counter(WAL_REPLAY_ABANDONED_BYTES_COUNTER);
+        let batch = replay(&dir);
+
+        let want: Vec<u64> = a_seqs[..9].iter().chain(b_seqs.iter()).copied().collect();
+        let got: Vec<u64> = batch.frames.iter().map(|f| f.frame_seq).collect();
+        assert_eq!(
+            got, want,
+            "{label}: exact survivors, the torn record dropped"
+        );
+        for f in &batch.frames {
+            assert_eq!(
+                f.frame,
+                payload_for(f.frame_seq),
+                "{label}: no fabricated record"
+            );
+        }
+        let (gaps, firsts) = gaps_and_firsts(&batch);
+        assert_eq!(firsts, vec![seq(101), seq(501)], "{label}");
+        assert_eq!(
+            gaps,
+            vec![seq(101)],
+            "{label}: pinned, the replay itself flags no gap after a torn older tail"
+        );
+        let last_a = &batch.frames[8];
+        let first_b = &batch.frames[9];
+        assert!(first_b.first_in_segment);
+        assert_eq!(
+            tickvault_storage::ws_frame_spill::process_boundary_is_gap(
+                last_a.received_at_nanos,
+                first_b.received_at_nanos
+            ),
+            known,
+            "{label}: the consumer's process-boundary rule fires only with known receipts"
+        );
+        assert!(!batch.trailing_gap, "{label}");
+        assert_eq!(counter(WAL_REPLAY_RESYNCS_COUNTER) - resyncs, 0, "{label}");
+        assert_eq!(
+            counter(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER) - truncated,
+            0,
+            "{label}: a torn tail is not counted as damage, older segment or newest"
+        );
+        assert_eq!(
+            counter(WAL_REPLAY_ABANDONED_BYTES_COUNTER) - abandoned,
+            0,
+            "{label}"
+        );
+    }
+}
+
+/// Damage in a segment's FIRST record, and a 0-byte and a 12-byte segment
+/// between intact ones. The first record is skipped by a resync (counted,
+/// exactly one record's bytes abandoned), the segment's first REPLAYED frame
+/// carries `first_in_segment` and `after_gap`, the tiny segments yield
+/// nothing and break nothing, and the segment after the damaged one starts
+/// with a gap.
+#[test]
+fn oob_first_record_damage_and_tiny_segments() {
+    let _g = serial();
+    let dir = chaos_dir("oob-first-record");
+    let _cleanup = Cleanup(dir.clone());
+    let a_seqs: Vec<u64> = (101..=110).map(seq).collect();
+    let m_seqs: Vec<u64> = (401..=410).map(seq).collect();
+    let b_seqs: Vec<u64> = (501..=510).map(seq).collect();
+    write_segment(&dir, 1, &a_seqs);
+    std::fs::write(segment_path(&dir, 2), b"").unwrap();
+    let mut short = b"TVW4".to_vec();
+    short.extend_from_slice(&[0u8; 8]);
+    assert_eq!(short.len(), 12);
+    std::fs::write(segment_path(&dir, 3), &short).unwrap();
+    let m = write_segment(&dir, 4, &m_seqs);
+    write_segment(&dir, 5, &b_seqs);
+    // M: a CRC flip inside its FIRST record (seq 401).
+    let mut bytes = read(&m);
+    bytes[FRAME_AT + 9] ^= 0xFF;
+    std::fs::write(&m, &bytes).unwrap();
+
+    let resyncs = counter(WAL_REPLAY_RESYNCS_COUNTER);
+    let truncated = counter(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER);
+    let abandoned = counter(WAL_REPLAY_ABANDONED_BYTES_COUNTER);
+    let batch = replay(&dir);
+
+    let want: Vec<u64> = a_seqs
+        .iter()
+        .chain(m_seqs[1..].iter())
+        .chain(b_seqs.iter())
+        .copied()
+        .collect();
+    let got: Vec<u64> = batch.frames.iter().map(|f| f.frame_seq).collect();
+    assert_eq!(got, want, "exact survivors, in order");
+    for f in &batch.frames {
+        assert_eq!(f.frame, payload_for(f.frame_seq), "no fabricated record");
+    }
+    assert_strictly_rising_and_unique(&batch.frames, "first-record damage replay");
+    let (gaps, firsts) = gaps_and_firsts(&batch);
+    assert_eq!(
+        firsts,
+        vec![seq(101), seq(402), seq(501)],
+        "the damaged segment's first replayed frame is marked first"
+    );
+    assert_eq!(
+        gaps,
+        vec![seq(101), seq(402), seq(501)],
+        "gaps at the pass start, after the skipped first record, and after the damaged segment"
+    );
+    assert!(!batch.trailing_gap);
+    assert_eq!(
+        batch.segment_ends.len(),
+        5,
+        "every segment was read, tiny ones included"
+    );
+    assert_eq!(
+        counter(WAL_REPLAY_RESYNCS_COUNTER) - resyncs,
+        1,
+        "one resync"
+    );
+    assert_eq!(
+        counter(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER) - truncated,
+        1,
+        "only the damaged segment is counted"
+    );
+    assert_eq!(
+        counter(WAL_REPLAY_ABANDONED_BYTES_COUNTER) - abandoned,
+        RECORD_LEN as u64,
+        "exactly the first record's bytes"
     );
 }
