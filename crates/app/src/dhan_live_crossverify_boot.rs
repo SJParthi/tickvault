@@ -7093,7 +7093,9 @@ mod tests {
         assert!(run_day.contains("widen_unfinished_for(today)"));
         let recorder = fn_body(prod, "async fn run_day_recorder(");
         assert!(recorder.contains("match day_record_step(now, stamp_today.is_some(), failed) {"));
-        assert!(recorder.contains("held.basis,"));
+        assert!(recorder.contains(
+            "record_held_set(today, &held.instruments, u64::from(set_secs), held.basis);"
+        ));
         let supervisor = fn_body(prod, "async fn run_supervisor(");
         assert!(
             supervisor
