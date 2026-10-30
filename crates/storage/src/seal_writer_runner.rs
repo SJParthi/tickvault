@@ -1121,7 +1121,8 @@ pub struct SealWriterRunner {
     last_live_flush: Option<i64>,
     /// The live drain's rescue buffer, kept across cycles so a flush
     /// allocates nothing (see [`drain_once_reusing`]). Holds the capacity of
-    /// the largest batch drained, at most `max_drain_per_cycle` seals.
+    /// the largest batch drained, at most `max_drain_per_cycle` seals (it grows
+    /// by `reserve_exact`, never by doubling).
     drain_scratch: Vec<BufferedSeal>,
 }
 
