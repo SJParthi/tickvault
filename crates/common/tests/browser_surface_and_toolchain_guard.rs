@@ -677,7 +677,9 @@ fn spawn_scanner_extracts_literals_and_ignores_non_literals() {
 /// first, exactly like adding a path to `SCRIPT_BUDGET`.
 const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 263),
-    ("crates/api/src/handlers/dashboard_page.rs", 235),
+    // 235 → 301 on 2026-10-30: the F&O stocks movers section (PR #2141),
+    // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
+    ("crates/api/src/handlers/dashboard_page.rs", 301),
     ("crates/api/src/handlers/feeds_page.rs", 226),
     ("crates/aws-lambdas/src/operator_control_console.html", 319),
 ];
@@ -1116,7 +1118,9 @@ fn js_scanners_self_test() {
 /// as `JS_VOLUME_BUDGET`.
 const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 10_838),
-    ("crates/api/src/handlers/dashboard_page.rs", 8_781),
+    // 8,781 → 12,194 on 2026-10-30: the F&O stocks movers section (PR #2141),
+    // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
+    ("crates/api/src/handlers/dashboard_page.rs", 12_194),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
     (
         "crates/aws-lambdas/src/operator_control_console.html",
