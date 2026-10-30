@@ -440,11 +440,12 @@ fn field_value(update: &OrderUpdate, accepted: &str) -> Value {
     serde_json::to_value(update).expect("serialize")[accepted].clone()
 }
 
-/// Above this magnitude serde_json (no `float_roundtrip`) can re-read a
-/// shortest-rendered float more than one ULP off (measured 2 ULPs at
-/// 9.3e257); no order price is anywhere near it.
+/// Outside [1 / EXTREME_MAGNITUDE, EXTREME_MAGNITUDE] serde_json (no
+/// `float_roundtrip`) can re-read a shortest-rendered float more than one ULP
+/// off (measured 2 ULPs at 9.3e257 and at 4.07e-171); no order price is
+/// anywhere near either end.
 const EXTREME_MAGNITUDE: f64 = 1e22;
-/// Relative tolerance applied above [`EXTREME_MAGNITUDE`] (about 45 ULPs).
+/// Relative tolerance applied outside that band (about 45 ULPs).
 const EXTREME_RELATIVE_TOLERANCE: f64 = 1e-14;
 
 /// Two decoded updates are the same order, with float fields allowed one
@@ -463,11 +464,12 @@ fn same_order_within_one_ulp(a: &OrderUpdate, b: &OrderUpdate) -> Result<(), Str
             );
             let ulps = ((fx.to_bits() as i64) - (fy.to_bits() as i64)).abs();
             // Measured: one ULP holds for prices; at extreme magnitudes the
-            // re-read drifts further (2 ULPs at -9.345468904800974e257).
+            // re-read drifts further (2 ULPs at -9.345468904800974e257 and 4.07e-171).
             let ulp_apart = fx == fy
                 || (fx.signum() == fy.signum()
                     && (ulps <= 1
-                        || (fx.abs() >= EXTREME_MAGNITUDE
+                        || ((fx.abs() >= EXTREME_MAGNITUDE
+                            || fx.abs() <= 1.0 / EXTREME_MAGNITUDE)
                             && ((fx - fy) / fx).abs() <= EXTREME_RELATIVE_TOLERANCE)));
             if !ulp_apart {
                 return Err(format!(
@@ -1101,13 +1103,13 @@ fn test_restated_field_table_covers_every_order_update_field() {
 #[test]
 #[ignore = "BUG: fractional JSON number on an Int field misread by serde_json onto an integer (100.00000000000001 -> 100)"]
 fn bug_fractional_json_number_on_int_field_is_never_an_integer() {
-    for (literal, correctly_rounded) in [
-        ("100.00000000000001", 100.000_000_000_000_01_f64),
-        ("4503599627370495.5", 4_503_599_627_370_495.5_f64),
-        ("2251799813685245.25", 2_251_799_813_685_245.25_f64),
+    for literal in [
+        "100.00000000000001",
+        "4503599627370495.5",
+        "2251799813685245.25",
     ] {
-        // The literal's correctly rounded f64 really is fractional.
-        assert_eq!(literal.parse::<f64>().ok(), Some(correctly_rounded));
+        // Rust's own parse is correctly rounded: the value really is fractional.
+        let correctly_rounded: f64 = literal.parse().expect("a decimal literal");
         assert_ne!(correctly_rounded.fract(), 0.0, "{literal}");
         let result = parse_order_update(&frame_with_one_numeric("Quantity", literal));
         assert!(
