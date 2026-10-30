@@ -65,6 +65,19 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `deploy/docker/docker-compose.yml`, `deploy/aws/terraform/user-data.sh.tftpl`,
     `deploy/systemd/tickvault.service`
   - Tests: `boot_limit_assertion_guard.rs`
+  - **PROGRESS 2026-10-30 (owner: "fix resolve implement everything now"), NOT ticked.**
+    Verified already on main before this change: `LimitNOFILE=65536` in
+    `deploy/systemd/tickvault.service`; `vm.max_map_count = 1048576` and
+    `net.core.rmem_max = 67108864` (64 MiB since Quote 38, not the 128 MiB above)
+    in `deploy/aws/sysctl/99-tickvault-net.conf`; the QuestDB cap DERIVED from host
+    MemTotal on every deploy (`deploy-aws.yml` questdb-mem step, 40%, floor 1g) —
+    the trap above is closed. Added in PR #2144: `crates/app/src/host_limits.rs`
+    also reads `vm.max_map_count` and this process's soft open-file limit
+    (`/proc/self/limits`), and `crates/app/tests/host_limits_lockstep_guard.rs`
+    pins both to the deploy files (the ratchet this item names). **Still open:**
+    the check WARNS and does not refuse to start. The Failure Modes row below says
+    "warn for one release, then enforce"; enforcing is a boot-blocker the owner
+    decides.
 
 - [ ] **Item 3 — Empty-subscription + partial-subscribe detectors (scenario #75, #62)**
   — **HALF DONE 2026-08-25.** Split below rather than ticked whole: the detection
@@ -110,6 +123,23 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
       with a detector.
     - Files: `crates/core/src/websocket/pool_supervisor.rs`
     - Tests: `subscribe_ack_reconciliation_guard.rs`
+    - **PROGRESS 2026-10-30 (owner: "fix resolve implement everything now"), NOT
+      ticked.** Built in PR #2144 as `crates/app/src/subscribe_reconcile.rs`
+      instead of `pool_supervisor.rs`: the delta is judged from the drain's
+      existing 30 s silence sweep (no per-tick work) and the resend is IN PLACE
+      through the existing `LiveSubscriptionCommand::Resubscribe` on the SAME
+      socket (unsubscribe, then subscribe), never a spare slot and never a redial
+      (owner instruction and scope lock 2026-10-02). This changes the plan text
+      above ("auto-resubscribe the delta on a spare slot"). Max 3 rounds per
+      instrument per IST day, 120 s apart per socket; continuous session only,
+      from 09:17; skipped when the socket or the whole feed delivers nothing.
+      Switch `[dhan_universe] subscribe_reconcile_auto_resubscribe`, default
+      false (count only). Counters local `/metrics` only; the exhausted list is a
+      coded `warn!`, NOT a page ("then page with the list" needs a dated quote in
+      the noise lock first). Tests: the module's own unit tests (no separate
+      `subscribe_ack_reconciliation_guard.rs`). **Still open:** the drain wiring
+      (`dhan_feed_stack.rs` is owned by another session; proposed in the PR
+      body), turning the switch on, and the page.
 
 - [ ] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
   - Restart at 80% memory, before the kernel's killer decides.
