@@ -2972,9 +2972,11 @@ name = "tickvault-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "serde_json",
  "tickvault-common",
  "tickvault-core",
  "tickvault-storage",
+ "tickvault-trading",
  "toml 1.1.8+spec-1.1.0",
 ]
 
