@@ -732,4 +732,31 @@ mod tests {
         tracker.clear();
         assert_eq!(tracker.pooled_ids(), CORRELATION_ID_POOL_SIZE);
     }
+
+    /// `track_ref` and `track` must agree on every outcome, for the same
+    /// sequence of calls on two trackers.
+    #[test]
+    fn test_track_ref_matches_track_outcomes_and_keeps_the_callers_id() {
+        let mut by_value = CorrelationTracker::new();
+        let mut by_ref = CorrelationTracker::new();
+        let too_long = "x".repeat(DHAN_CORRELATION_ID_MAX_LENGTH + 1);
+        let calls: [(&str, &str); 4] = [
+            ("corr-a", "order-1"),
+            ("corr-a", "order-2"),
+            ("corr-b", "order-3"),
+            (too_long.as_str(), "order-4"),
+        ];
+        for (corr, order) in calls {
+            let kept = corr.to_owned();
+            let outcome_ref = by_ref.track_ref(&kept, order.to_owned());
+            let outcome_value = by_value.track(corr.to_owned(), order.to_owned());
+            assert_eq!(outcome_ref, outcome_value, "outcomes differ for {corr}");
+            assert_eq!(kept, corr, "the caller keeps its id unchanged");
+        }
+        assert_eq!(by_ref.len(), by_value.len());
+        for corr in ["corr-a", "corr-b"] {
+            assert_eq!(by_ref.get_order_id(corr), by_value.get_order_id(corr));
+        }
+        assert_eq!(by_ref.get_order_id("corr-a"), Some(&"order-2".to_owned()));
+    }
 }

@@ -1494,6 +1494,10 @@ async fn run_order_runtime(
                 // Mark-to-market halt backstop (marks may be idle).
                 risk.evaluate_daily_loss_halt();
 
+                // Placement-duration buckets to `/metrics` (cold, O(14) loads, a
+                // no-op when nothing was placed this second).
+                oms.publish_placement_latency();
+
                 // 15:30 IST close sweep: cancel pending paper orders.
                 // Trading-day gated like the reconcile scheduler above —
                 // no weekend/holiday sweep firings (2026-07-17 audit, LOW).
@@ -2395,6 +2399,39 @@ mod tests {
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
         assert_eq!(risk.net_lots_for(13), 2, "fill must reach the risk engine");
         assert_eq!(book.mirror.get(&(13, ExchangeSegment::IdxI)), Some(&2));
+    }
+
+    /// 2026-10-30: `tv_risk_fills_recorded_total` moved from a label variable
+    /// to one literal label per arm. Under the production recorder a PAPER-
+    /// fill must count as `kind="paper"` and any other as `kind="live"`.
+    #[test]
+    fn test_apply_fill_counts_paper_and_live_under_their_literal_labels() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut risk = make_risk();
+            let mut book = BookState::new();
+            for (order_id, lots) in [("PAPER-1", 1), ("PAPER-2", 1), ("1234567", -1)] {
+                let fill = FillEvent {
+                    security_id: 13,
+                    segment_code: 0,
+                    fill_lots: lots,
+                    avg_price: 100.0,
+                    lot_size: 25,
+                    order_id: order_id.to_owned(),
+                };
+                assert!(apply_fill(&mut risk, &mut book, &fill, None));
+            }
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("tv_risk_fills_recorded_total{kind=\"paper\"} 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("tv_risk_fills_recorded_total{kind=\"live\"} 1"),
+            "{rendered}"
+        );
     }
     /// I-P1-11 BITE TEST (2026-08-29): a long in one segment and a short in
     /// another, on the SAME numeric id, must not net.

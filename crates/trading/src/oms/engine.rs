@@ -34,6 +34,7 @@ use super::error_taxonomy::{self, DhanErrorClass, OrderEndpoint, OrderErrorPolic
 use super::exit_rules;
 use super::idempotency::CorrelationTracker;
 use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_order_readiness};
+use super::placement_telemetry::{self, PaperTradeRecord, PlacementLatency};
 use super::rate_limiter::{OrderBudget, OrderRateLimiter};
 use super::reconciliation::reconcile_orders;
 use super::state_machine::{
@@ -247,13 +248,15 @@ pub struct OrderManagementSystem {
     /// MPP verify-ladder bookkeeping keyed by order id (a separate map so
     /// the `ManagedOrder` struct stays untouched for Cluster A).
     verify_states: HashMap<String, VerifyState>,
-    /// `tv_orders_placed_total{mode="paper"}` and
-    /// `tv_order_placement_duration_ns`, resolved once at first use instead of
-    /// a registry lookup per placement (about 40 ns and 130 ns with the
+    /// `tv_orders_placed_total{mode="paper"}`, resolved once at first use
+    /// instead of a registry lookup per placement (about 40 ns with the
     /// production recorder, measured 2026-10-30). Resolved at first USE, not
-    /// at construction, so they bind to the recorder installed at boot.
+    /// at construction, so it binds to the recorder installed at boot.
     paper_placed_total: OnceLock<metrics::Counter>,
-    placement_duration_ns: OnceLock<metrics::Histogram>,
+    /// `tv_order_placement_duration_ns` as fixed atomic buckets (owner,
+    /// 2026-10-30: "Yes, fixed counters"), published once a second by the
+    /// order runtime. See `placement_telemetry`.
+    placement_latency: PlacementLatency,
 }
 
 /// Cluster F: order-path halt record. Set idempotently; cleared only by an
@@ -403,6 +406,9 @@ impl OrderManagementSystem {
         token_provider: Box<dyn TokenProvider>,
         client_id: String,
     ) -> Self {
+        // Cold: the "PAPER TRADE" helper thread starts here (once per
+        // process), so no placement pays for it.
+        placement_telemetry::ensure_paper_trade_logger();
         Self {
             orders: HashMap::with_capacity(256),
             order_no_aliases: HashMap::with_capacity(64),
@@ -425,15 +431,15 @@ impl OrderManagementSystem {
             super_orders: HashMap::with_capacity(16),
             verify_states: HashMap::with_capacity(16),
             paper_placed_total: OnceLock::new(),
-            placement_duration_ns: OnceLock::new(),
+            placement_latency: PlacementLatency::new(),
         }
     }
 
-    /// The cached `tv_order_placement_duration_ns` handle (same name, no
-    /// labels) for the paper placement arm.
-    fn placement_duration_histogram(&self) -> &metrics::Histogram {
-        self.placement_duration_ns
-            .get_or_init(|| metrics::histogram!("tv_order_placement_duration_ns"))
+    /// Publishes `tv_order_placement_duration_ns_{bucket,count,sum}` from the
+    /// fixed buckets. Cold: O(14) loads, a no-op when nothing was placed since
+    /// the last call. The order runtime calls it once a second.
+    pub fn publish_placement_latency(&self) {
+        self.placement_latency.publish();
     }
 
     /// Returns whether the OMS is in dry-run (paper trading) mode.
@@ -800,17 +806,19 @@ impl OrderManagementSystem {
             self.paper_placed_total
                 .get_or_init(|| counter!("tv_orders_placed_total", "mode" => "paper"))
                 .increment(1);
-            self.placement_duration_histogram()
-                .record(start.elapsed().as_nanos() as f64);
+            self.placement_latency
+                .record_ns(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
-            info!(
-                order_id = %paper_order_id,
-                security_id = request.security_id,
-                transaction_type = %request.transaction_type.as_str(),
-                quantity = request.quantity,
-                price = request.price,
-                "PAPER TRADE: order simulated (no HTTP call)"
-            );
+            // The same INFO line as before, written by the helper thread right
+            // after this order (owner, 2026-10-30: "Write it after the
+            // order"). See `placement_telemetry::log_paper_trade`.
+            placement_telemetry::log_paper_trade(PaperTradeRecord {
+                paper_order_counter: self.paper_order_counter,
+                security_id: request.security_id,
+                transaction_type: request.transaction_type,
+                quantity: request.quantity,
+                price: request.price,
+            });
 
             return Ok(paper_order_id);
         }
@@ -962,8 +970,8 @@ impl OrderManagementSystem {
         self.total_placed = self.total_placed.saturating_add(1);
 
         counter!("tv_orders_placed_total", "mode" => "live").increment(1);
-        metrics::histogram!("tv_order_placement_duration_ns")
-            .record(start.elapsed().as_nanos() as f64);
+        self.placement_latency
+            .record_ns(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
         info!(
             order_id = %response.order_id,
@@ -1760,6 +1768,14 @@ impl OrderManagementSystem {
     #[cfg(test)]
     pub(crate) fn enable_live_mode(&mut self) {
         self.dry_run = false;
+    }
+}
+
+/// Writes any "PAPER TRADE" lines still queued for the helper thread, so an
+/// orderly shutdown (or a test) loses none of them. Cold.
+impl Drop for OrderManagementSystem {
+    fn drop(&mut self) {
+        placement_telemetry::flush_paper_trade_log();
     }
 }
 
@@ -6763,9 +6779,20 @@ mod tests {
 
     #[test]
     fn test_order_latency_metric() {
-        // Verify histogram macro compiles and doesn't panic when invoked.
-        // O(1) atomic call — safe for cold path (order placement).
-        metrics::histogram!("tv_order_placement_duration_ns").record(1000.0_f64);
+        // The fixed-bucket placement latency records and publishes without
+        // a recorder installed (every handle is a no-op then).
+        let oms = OrderManagementSystem::new(
+            OrderApiClient::new(
+                reqwest::Client::new(),
+                "https://api.dhan.co/v2".to_owned(),
+                "100".to_owned(),
+            ),
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        oms.placement_latency.record_ns(1_000);
+        oms.publish_placement_latency();
     }
 
     // -----------------------------------------------------------------------

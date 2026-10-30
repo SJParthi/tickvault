@@ -529,9 +529,19 @@ by cross-reference, as for the clusters above.
   - Files: crates/trading/src/oms/rate_limiter.rs, crates/trading/src/oms/circuit_breaker.rs, crates/trading/src/oms/engine.rs, crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
   - Tests: order_path_metrics_keep_their_names_labels_and_counts
 
-Design: no output changes; ids, metric names, labels and counts are the same.
+- [x] Owner decisions, Fri 30 Oct 2026 ~16:50 IST, relayed by the coordinator session (card answered there):
+  (1) Q: "Fix it the way we already fixed the tick-delay measurement: fixed counters set up at startup, same metric name, nothing new to read?" A: "Yes, fixed counters (Recommended)" — "Same name on the dashboard and alerts; the internal bucket layout changes slightly. Removes about 400 ns from the slowest orders."
+  (2) Q: the per-placement "PAPER TRADE" INFO line (~2.5 µs). A: "Write it after the order (Recommended)" — "Same log line, same content, but written by a background helper right after the order is placed, so it no longer slows the order step. Nothing is lost."
+  - Files: crates/trading/src/oms/placement_telemetry.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/mod.rs, crates/app/src/order_runtime.rs (once-a-second publish)
+  - Tests: fixed_placement_buckets_render_what_the_recorder_histogram_rendered, test_helper_line_is_identical_to_the_old_inline_line, dhat_order_path_with_the_production_recorder, test_apply_fill_counts_paper_and_live_under_their_literal_labels, test_track_ref_matches_track_outcomes_and_keeps_the_callers_id
+
+Design: no output changes beyond the two the owner chose above; ids, metric names, labels and counts are the same.
 Edge cases: pool empty (falls back to `generate_id`), recorder installed after
-first use (handle stays bound to the earlier one; production installs at boot).
+first use (handle stays bound to the earlier one; production installs at boot),
+log queue full or helper thread not started (the line is written inline and
+counted on `tv_oms_paper_trade_log_inline_total{reason}`), abrupt process stop
+(at most one 20 ms poll of PAPER TRADE lines unwritten; the orders themselves
+are in the book and the audit).
 Failure modes: none new; a refused order is refused exactly as before.
 Rollback: revert the PR; no data or config change.
 Observability: unchanged series (pinned by the parity test).

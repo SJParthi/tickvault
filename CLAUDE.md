@@ -791,9 +791,10 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 > which measured the tick chain the stage-2 dead-WS sweep deleted (dated note in
 > the TOML). No `composite/*` bench exists under `crates/*/benches/`, so this
 > table showed two 10 μs ceilings that nothing measures. Struck, not deleted,
-> per house convention. Five live keys the subset leaves out are real and gated:
+> per house convention. Six live keys the subset leaves out are real and gated:
 > `token_handle` 50 ns, `ws_reader_frame_handle` 5 μs, `moneyness` 50 ns,
-> `obi_compute` 1 μs, `order_gate_mark_forward` 100 ns. Read the TOML, not this
+> `obi_compute` 1 μs, `order_gate_mark_forward` 100 ns, and `order_path` 1 μs
+> (every in-memory order-path step, added 2026-10-30). Read the TOML, not this
 > table; `benchmark_budget_reaches_a_bench_guard.rs` fails the build when a
 > TOML key matches no bench, and pins the key count in the sentence above.
 

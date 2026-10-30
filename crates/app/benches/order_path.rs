@@ -16,8 +16,26 @@
 //! lookup (and a histogram sample can allocate a bucket block). A bench with
 //! no recorder would time no-ops and read low. This harness installs the same
 //! recorder (`PrometheusBuilder::build_recorder`) before the first sample.
-//! No tracing subscriber is installed: the steady-state paths log nothing,
-//! and the refusal paths that do log are marked `_refused` below.
+//!
+//! # Logging
+//!
+//! Most benches run with no tracing subscriber, so a span or line costs only
+//! its enabled check. Production installs JSON log layers at INFO, and two
+//! steps here emit at INFO: `place_order` opens a span on every call, and the
+//! risk check opens one too. The paper placement's "PAPER TRADE" line is no
+//! longer written on the order step: since 2026-10-30 a helper thread writes
+//! it after the order (owner: "Write it after the order"). The
+//! `_with_info_log` benches install a JSON INFO subscriber writing to a sink
+//! (formatting cost, never disk), so the gate also covers what production
+//! pays. The refusal paths that log at WARN are marked `_refused`.
+//!
+//! # The correlation-id pool
+//!
+//! Each fresh book here holds 256 pre-drawn correlation ids, and no chunk
+//! places more than 200, so `oms_place_paper` always takes the pooled id. A
+//! day's 257th placement onward draws its id on demand instead;
+//! `correlation_generate_id` gates that extra cost (about 290 ns of OS random
+//! call plus one allocation).
 //!
 //! Run: `cargo bench --bench order_path -p tickvault-app`
 
@@ -174,6 +192,12 @@ fn bench_idempotency(c: &mut Criterion) {
             black_box(tracker.get_order_id(black_box(&ids[i])).is_some())
         });
     });
+    // The on-demand draw a placement makes once the day's 256 pooled ids are
+    // used up (`CorrelationTracker::next_id` falls back to this).
+    let drawer = CorrelationTracker::new();
+    c.bench_function("order_path/correlation_generate_id", |b| {
+        b.iter(|| black_box(drawer.generate_id()));
+    });
     c.bench_function("order_path/correlation_get_miss", |b| {
         b.iter(|| black_box(tracker.get_order_id(black_box("not-a-tracked-correlation-id"))));
     });
@@ -205,8 +229,27 @@ fn bench_risk(c: &mut Criterion) {
         });
     });
 
-    // A fill that adds to a held position, then the reducing fill, so the book
-    // returns to the same state every iteration pair.
+    // The same check with production's log shape (the `#[instrument]` span
+    // on `check_order_in_segment` is created and formatted).
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::sink)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        c.bench_function("order_path/risk_check_approved_with_info_log", |b| {
+            b.iter(|| {
+                black_box(
+                    risk.check_order_in_segment(black_box(500), ExchangeSegment::NseFno, 1)
+                        .is_approved(),
+                )
+            });
+        });
+    });
+
+    // A fill that adds to a held position, then the reducing fill, so net lots
+    // return to the same value every iteration pair (the average price and
+    // realized P&L drift, bounded).
     c.bench_function("order_path/risk_record_fill_held", |b| {
         b.iter(|| {
             risk.record_fill_in_segment(black_box(500), ExchangeSegment::NseFno, 1, 100.5, 25);
@@ -306,6 +349,34 @@ fn bench_oms_engine(c: &mut Criterion) {
     // An update for an order this book never placed (the ignore path).
     let mut oms = make_oms();
     let unknown = traded_update("UNKNOWN-1", 1);
+    // The same placement with production's log shape: a JSON subscriber at
+    // INFO writing to a sink, set for this thread only. Covers the
+    // `place_order` span; the "PAPER TRADE" line goes to the helper thread.
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::sink)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        c.bench_function("order_path/oms_place_paper_with_info_log", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                let mut done = 0_u64;
+                while done < iters {
+                    let chunk = (iters - done).min(PLACEMENTS_PER_BOOK);
+                    let mut oms = make_oms();
+                    let start = Instant::now();
+                    for _ in 0..chunk {
+                        black_box(poll_ready(oms.place_order(paper_request(13))).is_ok());
+                    }
+                    total += start.elapsed();
+                    done += chunk;
+                }
+                total
+            });
+        });
+    });
+
     c.bench_function("order_path/oms_order_update_unknown", |b| {
         b.iter(|| black_box(oms.handle_order_update(black_box(&unknown)).is_ok()));
     });
