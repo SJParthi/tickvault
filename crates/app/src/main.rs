@@ -670,9 +670,6 @@ fn main() -> Result<()> {
         raw.as_deref().unwrap_or("unset")
     ));
 
-    // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
-    // Named threads so `top -H` / `perf` on the box can tell a runtime worker
-    // apart from a blocking-pool thread while attributing a stall.
     // The socket readers' own runtime (2026-10-02), built BEFORE the main
     // runtime's `block_on` so dropping a losing racer can never happen inside
     // async code. `0` in the env keeps the readers on the main runtime. The
@@ -708,11 +705,7 @@ fn main() -> Result<()> {
     // every thread it spawns, inherits it. Off by default; see hot_thread_boot.
     tickvault_app::hot_thread_boot::place_drain_and_background(rt_decision);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .thread_name("tv-worker")
-        .enable_all()
-        .build()
+    let runtime = tickvault_app::hot_path_proof_boot::build_main_runtime(worker_threads)
         .context("failed to build the tokio runtime")?;
 
     let outcome = runtime.block_on(async_main());
@@ -1263,6 +1256,8 @@ async fn async_main() -> Result<()> {
     // Live proof that nothing on the live path is waiting (2026-10-02):
     // the publisher thread, plus one lateness probe per tokio runtime. AFTER
     // the recorder install, like every pre-resolved handle above.
+    // 2026-10-30: the per-minute latency proof tables, writer before publisher.
+    let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
     if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
         error!(
             code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
