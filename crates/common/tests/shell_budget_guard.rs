@@ -133,7 +133,6 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/clippy-local.sh", 89),
     ("scripts/count-current-expiry-universe.sh", 128),
     ("scripts/coverage-gate.sh", 372),
-    ("scripts/cross-verify-show.sh", 50),
     ("scripts/diagnose-write-amplification.sh", 99),
     ("scripts/doctor.sh", 298),
     ("scripts/ensure-aws-cli.sh", 71),
@@ -143,7 +142,6 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/mcp-servers/tickvault-logs-launch.sh", 33),
     ("scripts/measure-ram-residency-cost.sh", 113),
     ("scripts/notify-telegram.sh", 84),
-    ("scripts/prev-day-show.sh", 44),
     ("scripts/provision-infra-secrets.sh", 101),
     ("scripts/quality-full.sh", 137),
     ("scripts/questdb-console-gate-matrix.sh", 265),
@@ -1585,7 +1583,12 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
 ];
 
 /// Makefile recipe-line ceiling, measured 2026-10-12.
-const MAKEFILE_RECIPE_LINE_CEILING: usize = 301;
+/// 2026-10-30: 301 → 295. The `cross-verify-show`, `cross-verify-now` and
+/// `prev-day-show` targets went with their two shell scripts: both features
+/// were retired 2026-07-14, nothing writes the files they showed, and
+/// nothing reads `TICKVAULT_CROSS_VERIFY_NOW` (the kept cross-verify files
+/// are served by `GET /api/debug/cross-verify/latest`, in Rust).
+const MAKEFILE_RECIPE_LINE_CEILING: usize = 295;
 
 /// Indentation (in columns) of a line.
 fn indent_of(line: &str) -> usize {

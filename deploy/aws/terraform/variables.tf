@@ -265,6 +265,16 @@ variable "muhurat_sessions" {
   # variant: 13:30-15:40 IST (15:40 is the app's own tick save end), so the box
   # runs 12:30-16:40 IST. Narrow it to the circular's exact times if desired;
   # empty times make the start watchdog refuse to start the box (fail closed).
+  #
+  # ⚠ CHANGED 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"):
+  # the times are no longer typed here first. The ONE source is
+  # config/base.toml [[trading.muhurat_trading_dates]] session_start_ist /
+  # session_end_ist; this default must carry exactly the same date and times
+  # (pinned by muhurat_window_wiring_guard.rs). 2026-11-08 is now 14:05-15:40
+  # (the reported pre-open start), so the box runs 13:05-16:40 IST and the
+  # market-hours liveness gate arms at 14:25 IST (start + 20 min,
+  # market-hours-liveness-alarm.tf), after the first pre-open tick. Times must
+  # sit inside 06:00-23:00 IST so every dated rule stays on its UTC date.
   description = "NSE Muhurat trading sessions (IST). Empty times = timing not yet published by NSE: the box is not started."
   type = list(object({
     date              = string
@@ -272,7 +282,7 @@ variable "muhurat_sessions" {
     session_end_ist   = string
   }))
   default = [
-    { date = "2026-11-08", session_start_ist = "13:30", session_end_ist = "15:40" },
+    { date = "2026-11-08", session_start_ist = "14:05", session_end_ist = "15:40" },
   ]
 
   validation {
@@ -300,5 +310,21 @@ variable "muhurat_sessions" {
       )
     ])
     error_message = "muhurat_sessions: session_start_ist must be earlier than session_end_ist."
+  }
+
+  # 2026-10-30: the dated Muhurat liveness rules convert IST to UTC on the same
+  # date (open = start + 20 min, close = end), so a session must sit inside
+  # 06:00-23:00 IST. HCL compares numbers only, so HH:MM becomes HHMM (the
+  # same shape as the start < end rule above, inside try()).
+  validation {
+    condition = alltrue([
+      for s in var.muhurat_sessions :
+      s.session_start_ist == "" || try(
+        tonumber(replace(s.session_start_ist, ":", "")) >= 600
+        && tonumber(replace(s.session_end_ist, ":", "")) <= 2300,
+        false
+      )
+    ])
+    error_message = "muhurat_sessions: times must sit inside 06:00-23:00 IST so every dated rule stays on its UTC date."
   }
 }
