@@ -1122,7 +1122,8 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // 8,781 → 12,194 on 2026-10-30: the F&O stocks movers section (PR #2141),
     // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
     // 12,194 → 11,014 the same day: the speed-and-health panel compacted the script.
-    ("crates/api/src/handlers/dashboard_page.rs", 11_014),
+    // 11,014 → 10,972 on review: both token-gated reads share one guard.
+    ("crates/api/src/handlers/dashboard_page.rs", 10_972),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
     (
         "crates/aws-lambdas/src/operator_control_console.html",

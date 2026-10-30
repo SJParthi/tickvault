@@ -201,14 +201,14 @@ async function getJson(url) {
   }
 }
 
-// Token-gated reads. With no token, or after one refusal, none is asked again
-// until Save, so an open tab cannot pile up refused requests.
-let denied = false;
+// Gated reads: a 401 to a request sent since the last Save stops them until Save.
+let denied = false, gen = 0;
 async function getGated(url) {
-  if (!tokenEl.value.trim() || denied) return null;
+  if (denied) return null;
+  const g = gen;
   try {
     const res = await fetch(url, { headers: authHeaders() });
-    if (res.status === 401) { denied = true; return null; }
+    if (res.status === 401) { if (g === gen) { denied = true; setStatus("Unauthorized — enter your API token above.", "err"); } return null; }
     return res.ok ? await res.json() : null;
   } catch (e) {
     return null;
@@ -399,8 +399,7 @@ document.getElementById("fno-sort").addEventListener("click", (e) => {
   renderFno();
 });
 
-// Speed and health: every label, number and colour is decided by the server;
-// this only paints the tiles it returns.
+// Speed and health: the server decides every label, number and colour.
 function renderSpeed(speed) {
   speedEl.replaceChildren();
   if (!speed || !speed.sections) {
@@ -425,6 +424,7 @@ function renderSpeed(speed) {
 
 document.getElementById("save").addEventListener("click", () => {
   denied = false;
+  gen++;
   sessionStorage.setItem("tv_api_token", tokenEl.value.trim());
   refresh();
 });
@@ -612,13 +612,15 @@ mod tests {
     fn test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal() {
         // Every 401 on a bearer-gated route counts toward the brute-force
         // page (Sum >= 25 per 5 min). A tab with no token, or a stale one,
-        // must not poll any of them every 5 s: no token, no request; one 401
-        // stops every gated read until Save. Both gated routes the page reads
-        // go through the one guarded helper.
+        // must not poll any of them every 5 s: the first 401 stops every
+        // gated read until Save (with auth off the read answers 200, so an
+        // empty token box is not a reason to skip it). A 401 for a request
+        // sent before the last Save does not lock the new token out. Both
+        // gated routes the page reads go through the one guarded helper.
         for marker in [
-            "if (!tokenEl.value.trim() || denied) return null;",
-            "if (res.status === 401) { denied = true; return null; }",
-            "  denied = false;\n  sessionStorage.setItem",
+            "  if (denied) return null;\n  const g = gen;",
+            "if (res.status === 401) { if (g === gen) { denied = true; setStatus(\"Unauthorized — enter your API token above.\", \"err\"); } return null; }",
+            "  denied = false;\n  gen++;\n  sessionStorage.setItem",
             "getGated(\"/api/fno-stocks\"),",
             "getGated(\"/api/debug/speed-health\"),",
         ] {
