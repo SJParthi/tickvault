@@ -772,7 +772,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## BENCHMARK BUDGETS
 
-`quality/benchmark-budgets.toml` is the executable source of truth (23 keys — 14 latency budgets + 7 per-element divisors + max_regression_pct + min_regression_delta_ns, the 1 ns noise floor added 2026-10-11 — enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
+`quality/benchmark-budgets.toml` is the executable source of truth (25 keys — 16 latency budgets + 7 per-element divisors + max_regression_pct + min_regression_delta_ns, the 1 ns noise floor added 2026-10-11 — enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
 
 | Budget key (benchmark-budgets.toml) | Real Criterion bench | Budget |
 |-------------------------------------|----------------------|--------|

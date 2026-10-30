@@ -991,22 +991,27 @@ jobs:
       # 2026-10-30: dhat_tick_row_append added (plan ITEM DT row stage), 6 -> 7.
       # It pins the per-tick ILP row build at zero allocations. Its flag shares
       # a line with two others, so the run: line count does not grow.
+      # 2026-10-30: dhat_seal_per_seal_path added (owner per-seal 1 us directive),
+      # 6 -> 7. It pins that the whole per-seal path after the fold (hand-off,
+      # take, ring, row build, ILP append, ledger probe) allocates nothing.
+      # Merged 2026-10-30: both targets added, 6 -> 8; the seal flag shares a line
+      # with two others, so the run: line count does not grow.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
             --test dhat_deferred_depth_note_shed --test dhat_depth_append_zero_alloc --test dhat_tick_row_append \
-            --test dhat_flush_buffer_recycle --test dhat_hot_path_telemetry \
-            --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog --test dhat_task_watch \
+            --test dhat_flush_buffer_recycle --test dhat_hot_path_telemetry --test dhat_seal_per_seal_path \
+            --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
             2>&1 | tee /tmp/dhat-storage.log
           if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
             echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 7 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 8 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step."
             exit 1
           fi
 
