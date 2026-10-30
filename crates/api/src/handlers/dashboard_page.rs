@@ -201,7 +201,7 @@ async function getJson(url) {
   }
 }
 
-// Gated reads: a 401 to a request sent since the last Save stops them until Save.
+// Gated reads: a 401 for a request sent after Save stops them until Save.
 let denied = false, gen = 0;
 async function getGated(url) {
   if (denied) return null;
@@ -235,7 +235,7 @@ async function refresh() {
     fnoData = fno;
     renderFno();
     renderSpeed(speed);
-    setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
+    if (!denied) setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
   } catch (e) {
     setStatus("Network error refreshing the dashboard.", "err");
   } finally {
@@ -404,7 +404,7 @@ function renderSpeed(speed) {
   speedEl.replaceChildren();
   if (!speed || !speed.sections) {
     speedEl.appendChild(el("div", "card", denied || !tokenEl.value.trim()
-      ? "— enter the API token above and press Save to see speed and health."
+      ? "— enter the API token above and press Save."
       : "— could not read speed and health."));
     return;
   }
@@ -621,6 +621,7 @@ mod tests {
             "  if (denied) return null;\n  const g = gen;",
             "if (res.status === 401) { if (g === gen) { denied = true; setStatus(\"Unauthorized — enter your API token above.\", \"err\"); } return null; }",
             "  denied = false;\n  gen++;\n  sessionStorage.setItem",
+            "if (!denied) setStatus(\"Updated \"",
             "getGated(\"/api/fno-stocks\"),",
             "getGated(\"/api/debug/speed-health\"),",
         ] {
