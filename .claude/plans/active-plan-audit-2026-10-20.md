@@ -1181,12 +1181,24 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
 
 Requested: owner brief relayed to this session on 2026-10-30 ("yes add the fno stocks page to dashboard dude"). The brief reached the session as an automated notification, so the owner's approval of the item and of the dashboard script growth is to be confirmed on the PR. Design: one read-only endpoint `GET /api/fno-stocks` (bearer-gated, on the shared public rate limiter, 2 s single-slot cache) runs ONE bounded QuestDB query in session only (`LATEST ON ts PARTITION BY security_id, segment` over the last 15 min of `ticks`, `segment = 'NSE_EQ'`, `feed = 'dhan'`, ids from today's F&O underlying list); the list file is read once per IST date. Change is against `ticks.close` (the previous session's close on Quote/Full packets); value is an estimate (volume x avg price). The dashboard gets one section in its existing script (no new tag, no new page). Edge cases: market closed, list missing, empty result, NULL/zero/NaN previous close, an id in two segments, QuestDB timeout or error, stale newest row. Failure modes: every failure is a named status, never an empty "no movers"; only `live` is shown as live. Rollback: revert the PR (no config, no table, no alarm). Observability: `tv_api_cache_hits_total{endpoint="fno_stocks"}`; the status field.
 
-- [x] DASH1. Endpoint, cache, route, page section, writer/reader pin
-  - Files: crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/api/src/handlers/dashboard_page.rs, crates/app/src/dhan_universe.rs
-  - Tests: test_build_fno_stocks_sql_is_bounded_keyed_and_constant, test_empty_result_is_no_data_not_live, test_one_row_is_live_with_change_and_value, test_zero_and_nan_prev_close_give_no_change, test_rows_sort_by_change_pct_with_no_change_last, test_same_security_id_in_two_segments_keeps_only_nse_eq, test_questdb_timeout_is_unreachable, test_fno_stocks_route_requires_the_bearer_token, test_get_fno_stocks_cache_hit_skips_the_query, test_dashboard_page_has_the_fno_stocks_movers_section, test_fno_list_path_tag_and_shape_match_the_dashboard_reader
-- [x] DASH2. Raise the dashboard's JS budgets in `browser_surface_and_toolchain_guard.rs` (235 → 301 lines, 8,781 → 12,194 bytes) after the owner's dated note is recorded in `rust-only-forever-lock-2026-07-19.md` (that guard requires the note first). Note recorded as §0.15 by the coordinator session (commit b06c382); numbers raised to the measured sizes.
-  - Files: crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
-  - Tests: javascript_volume_inside_script_tags_only_shrinks, javascript_bytes_inside_script_tags_stay_under_the_ceiling
+- [x] SP1. `seal_path` Criterion bench for the hand-off, take + ring push, row build, ILP append (with and without contract names), ring pop + append, ledger probe hit and miss, with its own p99 gate against the new `seal_path` budget (1,000 ns) for the sub-µs steps and `seal_ilp` (2,500 ns, measured ceiling, NOT the 1 µs target) for the three ILP-append steps
+  - Files: crates/storage/benches/seal_path.rs, crates/storage/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md
+  - Tests: every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count
+- [x] SP2. The live drain reuses one rescue buffer (`drain_once_reusing`, runner `drain_scratch`)
+  - Files: crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
+  - Tests: test_drain_once_reusing_keeps_its_scratch_capacity_across_cycles
+- [x] SP3. The production ring is prefaulted at construction (`prefault_ring`)
+  - Files: crates/storage/src/seal_absorption.rs
+  - Tests: test_prefault_ring_writes_every_slot_and_leaves_the_ring_empty, test_production_pipeline_is_prefaulted_at_construction
+- [x] SP4. Constant column names skip the per-call questdb-rs check; the delay text skips `fmt`; bytes identical
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/delay_render.rs
+  - Tests: proptest_write_row_is_byte_identical_to_the_validated_form, test_every_candle_ilp_column_name_passes_the_questdb_check, test_write_row_passes_only_named_constants_to_the_unchecked_names, proptest_render_delay_into_matches_the_fmt_version_byte_for_byte, test_render_delay_into_matches_the_fmt_version_at_every_edge
+- [x] SP5. DHAT: the whole per-seal path allocates nothing
+  - Files: crates/storage/tests/dhat_seal_per_seal_path.rs
+  - Tests: dhat_the_per_seal_path_after_the_fold_never_allocates
+- [x] SP6. Review fixes: the candle ILP buffer is presized and written once at construction (no regrowth on the append); a p99 tail miss defers to a step after the Criterion baseline save
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/benches/seal_path.rs, crates/app/benches/feed_drain.rs, .github/workflows/bench.yml, crates/common/tests/shell_budget_guard.rs, crates/storage/tests/bench_tail_gate_defer_guard.rs
+  - Tests: test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows, test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows, both_benches_print_the_marker_and_exit_unless_deferred, bench_yml_defers_and_fails_after_the_baseline_save, workflow_run_lines_never_grow
 
 ## Design
 
