@@ -49,6 +49,14 @@ RemainAfterExit=yes
 # Then: `systemctl restart tickvault-host-tuning` (and re-enable irqbalance if
 # it was stopped: `systemctl enable --now irqbalance`).
 EnvironmentFile=-/etc/tickvault/host-tuning.env
+# MONDAY 2 NOV 2026 MEASURED DAY (plan ITEM DT-S1; owner, Fri 30 Oct 2026
+# ~17:45 IST: "Own-core ON for Monday 2 Nov only, never-sleeping sorter OFF,
+# measured minute by minute"): QuestDB alone on core 0 on this 2-core box.
+# `host-tuning apply` writes the QuestDB cpuset into the compose .env at boot;
+# the app's boot compose-up recreates QuestDB with it. Read at unit start only,
+# never during a session. Review with the 16:15 IST verdict; delete this line
+# to switch off (the next boot restores the operator's previous values).
+Environment=TV_QDB_CORE_ISOLATION=1
 
 WorkingDirectory=/opt/tickvault
 
