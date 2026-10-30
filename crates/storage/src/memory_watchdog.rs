@@ -374,7 +374,6 @@ struct Handles {
     sheds: metrics::Counter,
     would_trim: metrics::Counter,
     would_shed: metrics::Counter,
-    probe_failed: metrics::Counter,
 }
 
 impl Handles {
@@ -387,14 +386,12 @@ impl Handles {
             sheds: metrics::counter!("tv_memory_watchdog_sheds_total"),
             would_trim: metrics::counter!("tv_memory_watchdog_would_act_total", "action" => "trim"),
             would_shed: metrics::counter!("tv_memory_watchdog_would_act_total", "action" => "shed"),
-            probe_failed: metrics::counter!("tv_memory_watchdog_probe_failed_total"),
         };
         // Registered at 0 so a reader sees "watching, never acted".
         h.trims.increment(0);
         h.sheds.increment(0);
         h.would_trim.increment(0);
         h.would_shed.increment(0);
-        h.probe_failed.increment(0);
         h
     }
 }
@@ -404,6 +401,8 @@ pub struct MemoryWatchdog {
     cfg: MemoryWatchdogConfig,
     ceiling_bytes: Option<u64>,
     state: LadderState,
+    /// Polls in a row with no usable reading (throttles the warning).
+    unreadable_streak: u64,
     handles: Handles,
 }
 
@@ -416,6 +415,7 @@ impl MemoryWatchdog {
             cfg,
             ceiling_bytes,
             state: LadderState::new(),
+            unreadable_streak: 0,
             handles: Handles::resolve(),
         }
     }
@@ -426,6 +426,23 @@ impl MemoryWatchdog {
         self.state.level
     }
 
+    /// A poll with no usable reading (resident memory or the ceiling could
+    /// not be read): counted, and logged at the 1st, 2nd, 4th, 8th... in a
+    /// row, so a host that can never be read (a dev box) does not log every
+    /// five seconds. The ladder holds its level and acts on nothing.
+    fn note_unreadable(&mut self) {
+        self.unreadable_streak = self.unreadable_streak.saturating_add(1);
+        metrics::counter!("tv_memory_watchdog_probe_failed_total").increment(1);
+        if self.unreadable_streak.is_power_of_two() {
+            warn!(
+                polls_in_a_row = self.unreadable_streak,
+                ceiling_known = self.ceiling_bytes.is_some(),
+                "memory watchdog: resident memory or its ceiling could not be read; the \
+                 ladder holds its level and acts on nothing until a reading succeeds"
+            );
+        }
+    }
+
     /// One poll at `rss_bytes`. Decides, then acts (`act`), counts
     /// (`shadow`), or does nothing (`off`). Publishes the level and usage.
     ///
@@ -434,7 +451,9 @@ impl MemoryWatchdog {
     pub fn step(&mut self, rss_bytes: Option<u64>, now_secs: u64, in_session: bool) -> Decision {
         let bp = usage_bp(rss_bytes, self.ceiling_bytes);
         if bp.is_none() {
-            self.handles.probe_failed.increment(1);
+            self.note_unreadable();
+        } else {
+            self.unreadable_streak = 0;
         }
         let decision = decide(&mut self.state, bp, now_secs, in_session, &self.cfg);
         self.handles.level.set(decision.level.gauge_value());
@@ -741,6 +760,17 @@ mod tests {
         let before = shed_generation();
         let _ = dog.step(Some(9 * GIB), 0, false);
         assert_eq!(shed_generation(), before);
+    }
+
+    #[test]
+    fn an_unreadable_streak_counts_up_and_resets_on_a_reading() {
+        let mut dog = MemoryWatchdog::new(cfg(MemoryWatchdogMode::Shadow), Some(10 * GIB));
+        let _ = dog.step(None, 0, false);
+        let _ = dog.step(None, 5, false);
+        let _ = dog.step(None, 10, false);
+        assert_eq!(dog.unreadable_streak, 3);
+        let _ = dog.step(Some(GIB), 15, false);
+        assert_eq!(dog.unreadable_streak, 0, "a good reading ends the streak");
     }
 
     #[test]

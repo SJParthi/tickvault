@@ -328,6 +328,9 @@ pub mod order_runtime;
 /// ADDITIVE forensic lane beside the lossy `order_audit` lane.
 pub mod order_update_events_boot;
 pub mod subsystem_memory;
+/// Plan item 4 (2026-10-30): boot wiring for the background-task heartbeats
+/// and the memory action ladder (`tv-task-watch`).
+pub mod task_watch_boot;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via
 // coordinator): `wal_reinject` module DELETED — its own PR-C2 comments

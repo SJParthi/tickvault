@@ -1263,23 +1263,8 @@ async fn async_main() -> Result<()> {
              heartbeat gauges will not publish (host thread or memory limit)"
         );
     }
-    // Plan item 4 (2026-10-30): the `tv-task-watch` thread publishes the
-    // background-task heartbeats every second and, unless
-    // `[memory_watchdog] mode = "off"` (the default), runs the memory action
-    // ladder. The respawn switch is set first so the supervisors spawned
-    // below read it.
-    tickvault_storage::task_heartbeat::set_respawn_on_missed_beats(
-        config.task_heartbeat.respawn_on_missed_beats,
-    );
-    if let Err(err) = tickvault_storage::memory_watchdog::spawn_watch_thread(config.memory_watchdog)
-    {
-        error!(
-            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
-            error = %err,
-            "the task-watch thread FAILED TO SPAWN — background-task heartbeats and the \
-             memory watchdog will not run (host thread or memory limit)"
-        );
-    }
+    // Plan item 4: task heartbeats + memory ladder, before the watched supervisors.
+    tickvault_app::task_watch_boot::start_task_watch(&config);
     tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
         tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
         tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
@@ -6245,33 +6230,6 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
-
-    /// Plan item 4: the watch thread is spawned at boot, after the metrics
-    /// recorder (so its handles are real) and after the respawn switch is
-    /// read from config (so the supervisors see it).
-    #[test]
-    fn test_main_spawns_the_task_watch_thread() {
-        let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let recorder = prod
-            .find("observability::init_metrics(&config.observability)")
-            .expect("recorder install");
-        let switch = prod
-            .find("set_respawn_on_missed_beats(")
-            .expect("respawn switch read from config");
-        let spawn = prod
-            .find("memory_watchdog::spawn_watch_thread(config.memory_watchdog)")
-            .expect("watch thread spawned");
-        let resource = prod
-            .find("spawn_supervised_resource_monitor(")
-            .expect("a watched supervisor");
-        assert!(recorder < switch && switch < spawn && spawn < resource);
-        assert_eq!(
-            prod.matches("spawn_watch_thread(").count(),
-            1,
-            "spawned once"
-        );
-    }
 
     /// Audit CONC-5 (2026-10-11): the shutdown-signal streams are created on
     /// the first wait and outlive it, so a SIGTERM delivered while no wait is

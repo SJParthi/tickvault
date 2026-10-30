@@ -141,7 +141,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
       (`dhan_feed_stack.rs` is owned by another session; proposed in the PR
       body), turning the switch on, and the page.
 
-- [ ] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
+- [~] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
   - Restart at 80% memory, before the kernel's killer decides.
   - Every long-lived task emits a heartbeat; a supervisor respawns after 3 missed beats and
     counts `tv_task_respawn_total{task}`.
@@ -149,6 +149,21 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     path must be the process supervisor, not an unwind handler.
   - Files: `crates/storage/src/oom_monitor.rs`, `crates/app/src/main.rs`
   - Tests: `task_heartbeat_guard.rs`
+  - **PARTIAL 2026-10-30 (owner: "fix resolve implement everything now itself parallelly").**
+    Landed, both switches OFF by default: (a) `memory_watchdog.rs` — an action ladder on
+    the RESOURCE-02 ceiling (70% trim free heap pages outside the session, 80% trim in
+    session too + empty opt-in caches, 90% same + one log line), 5-point hysteresis,
+    `[memory_watchdog] mode = "off" | "shadow" | "act"`; it never drops a received frame and
+    never stops capture. (b) `task_heartbeat.rs` — heartbeats for the six long-lived tasks
+    the hot-path telemetry does not watch, published on the `tv-task-watch` thread; the
+    supervisors await through `await_watched`, which aborts a task that missed 3 beats only
+    when `[task_heartbeat] respawn_on_missed_beats = true` (else counted on
+    `tv_task_heartbeat_would_respawn_total`), counting `tv_task_respawn_total{task,reason}`.
+    Tests: `task_heartbeat::tests`, `memory_watchdog::tests`,
+    `crates/storage/tests/dhat_task_watch.rs`, `task_watch_boot::tests`.
+    **NOT done, needs the owner:** the "restart at 80%" rung. It conflicts with the same
+    day's "never stop capture"; a restart costs seconds of capture, so it is not built.
+    Turning either switch on, and any alarm on the new counters, are owner calls too.
 
 - [~] **Item 5 — Disk: automatic purge + raw ticks off the database (#33, #55)**
   - Raw ticks stream to compressed object storage, never bulk-ingested. At the modelled
