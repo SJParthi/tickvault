@@ -82,12 +82,36 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root")
 }
 
+/// Adds `safe.directory=*` to `cmd` through git's environment config
+/// (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`),
+/// appended after any entries the caller's environment already carries.
+///
+/// In container CI jobs the checkout (or a temp dir) can be owned by a
+/// different uid than the test process, and git then refuses the repository
+/// as "dubious ownership". `tv-guarantees` runs `git ls-files` itself, so the
+/// setting must reach that child too, which an environment entry does and a
+/// `-c` flag on our own git calls would not.
+fn with_git_safe_directory(cmd: &mut Command) -> &mut Command {
+    let existing: usize = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    cmd.env(format!("GIT_CONFIG_KEY_{existing}"), "safe.directory")
+        .env(format!("GIT_CONFIG_VALUE_{existing}"), "*")
+        .env("GIT_CONFIG_COUNT", (existing + 1).to_string())
+}
+
 fn run(bin: &str, args: &[&str], cwd: &Path) -> Output {
-    Command::new(bin)
-        .args(args)
-        .current_dir(cwd)
+    with_git_safe_directory(Command::new(bin).args(args).current_dir(cwd))
         .output()
         .unwrap_or_else(|e| panic!("spawn {bin}: {e}"))
+}
+
+/// A `git` command in `dir` with `safe.directory=*` set.
+fn git(dir: &Path, args: &[&str]) -> Output {
+    with_git_safe_directory(Command::new("git").args(args).current_dir(dir))
+        .output()
+        .expect("git must be installed to run these tests")
 }
 
 fn stdout(o: &Output) -> String {
@@ -101,21 +125,26 @@ fn stderr(o: &Output) -> String {
 /// A git repository with exactly the given files tracked in its index.
 fn git_repo_with(files: &[(&str, &str)]) -> TempDir {
     let dir = TempDir::new("git");
-    let init = Command::new("git")
-        .args(["init", "-q", "."])
-        .current_dir(dir.path())
-        .output()
-        .expect("git must be installed to run these tests");
+    let init = git(dir.path(), &["init", "-q", "."]);
     assert!(init.status.success(), "git init failed: {}", stderr(&init));
     for (name, body) in files {
         std::fs::write(dir.path().join(name), body).expect("write file");
-        let add = Command::new("git")
-            .args(["add", name])
-            .current_dir(dir.path())
-            .output()
-            .expect("git add");
+        let add = git(dir.path(), &["add", name]);
         assert!(add.status.success(), "git add failed: {}", stderr(&add));
     }
+    // The fixture is readable by git with the same environment the
+    // tv-guarantees child gets.
+    let listed = git(dir.path(), &["ls-files"]);
+    assert!(
+        listed.status.success(),
+        "git ls-files failed: {}",
+        stderr(&listed)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).lines().count(),
+        files.len(),
+        "every fixture file is tracked"
+    );
     dir
 }
 
@@ -476,6 +505,29 @@ fn doctor_unknown_format_falls_back_to_plain() {
 }
 
 #[test]
+fn doctor_zero_journal_lines_still_reports_well_formed_output() {
+    // `--journal-lines 0` parses as 0 and is passed through; with no
+    // journalctl on PATH the section still carries its fallback, and both
+    // renderings stay well formed.
+    let md = doctor_without_tools(&["--journal-lines", "0"]);
+    assert!(md.status.success());
+    let text = stdout(&md);
+    assert!(text.starts_with("## tv-doctor report\n"));
+    assert_eq!(text.lines().filter(|l| l.starts_with("### ")).count(), 5);
+    assert_eq!(text.matches("```").count(), 10, "five fenced blocks");
+    assert!(
+        text.contains("### 5. Recent journal (last lines)\n```\njournalctl-not-available\n```")
+    );
+
+    let json = doctor_without_tools(&["--journal-lines=0", "--format=json"]);
+    assert!(json.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{}", stdout(&json)));
+    assert_eq!(v.as_object().expect("object").len(), 6);
+    assert_eq!(v["journal_tail"], "journalctl-not-available");
+}
+
+#[test]
 fn doctor_flag_without_a_value_uses_the_default_format() {
     // `--format` as the last argument has no value: markdown, not a crash.
     let out = doctor_without_tools(&["--format"]);
@@ -533,6 +585,33 @@ fn smoke_bad_duration_falls_back_to_the_default_budget() {
     let out = run(SMOKE, &["--duration", "soon"], dir.path());
     assert!(out.status.success());
     assert!(stderr(&out).contains("starting (budget 30s)"));
+}
+
+#[test]
+fn smoke_extreme_durations_parse_or_fall_back_to_the_default() {
+    // The budget is only reported, never enforced, so every case still runs
+    // all five steps. A value that fits a u64 (0 and u64::MAX included) is
+    // taken as given; one past u64::MAX does not parse and falls back to 30.
+    let dir = smoke_dir(&base_toml());
+    let cases: [(&[&str], &str); 4] = [
+        (&["--duration", "0"], "0"),
+        (&["--duration=0"], "0"),
+        (
+            &["--duration", "18446744073709551615"],
+            "18446744073709551615",
+        ),
+        (&["--duration", "99999999999999999999"], "30"),
+    ];
+    for (args, budget) in cases {
+        let out = run(SMOKE, args, dir.path());
+        let err = stderr(&out);
+        assert!(out.status.success(), "args {args:?}:\n{err}");
+        assert!(
+            err.contains(&format!("starting (budget {budget}s)\n")),
+            "args {args:?}: {err}"
+        );
+        assert!(err.contains("[5/5] Dhan locked facts: OK"), "args {args:?}");
+    }
 }
 
 #[test]

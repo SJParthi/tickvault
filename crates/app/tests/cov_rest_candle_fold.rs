@@ -50,6 +50,15 @@ fn harness() -> &'static PrometheusHandle {
     })
 }
 
+/// Serialises the tests that move `tv_rest_candle_fold_dropped_total
+/// {reason="bad_identity"}`. That series has no label but `reason`, so two
+/// tests running in parallel would each see the other's increments; holding
+/// this lock lets each assert an exact delta.
+fn bad_identity_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Sum of every series of `name` whose label set contains `label`.
 fn counter(name: &str, label: &str) -> f64 {
     harness()
@@ -585,8 +594,12 @@ async fn test_rest_candle_fold_run_discovery_and_body_failures_fold_nothing() {
         Resp::json(&json!({ "dataset": rows })),
     );
     let mock = spawn_mock(handler_for(fx)).await;
+    let _bad_identity_guard = bad_identity_lock().lock().await;
     let before_trunc = counter("tv_rest_candle_fold_errors_total", "discovery_truncated");
-    let before_bad = counter("tv_rest_candle_fold_dropped_total", "bad_identity");
+    let before_bad = counter(
+        "tv_rest_candle_fold_dropped_total",
+        "reason=\"bad_identity\"",
+    );
     let before_query = counter("tv_rest_candle_fold_errors_total", "catchup_query");
 
     let (tx, rx) = mpsc::channel(4);
@@ -625,7 +638,16 @@ async fn test_rest_candle_fold_run_discovery_and_body_failures_fold_nothing() {
         );
     }
     assert!(counter("tv_rest_candle_fold_errors_total", "discovery_truncated") > before_trunc);
-    assert!(counter("tv_rest_candle_fold_dropped_total", "bad_identity") > before_bad);
+    // Exactly one unrepresentable id (-5) in the truedata discovery; the
+    // poisoned segment is skipped without counting and the truncated dhan
+    // discovery is skipped before its rows are read.
+    assert_eq!(
+        counter(
+            "tv_rest_candle_fold_dropped_total",
+            "reason=\"bad_identity\""
+        ),
+        before_bad + 1.0
+    );
     assert!(counter("tv_rest_candle_fold_errors_total", "catchup_query") >= before_query + 2.0);
     // The receiver is re-parked for a respawn.
     assert!(slot.lock().expect("slot").is_some());
@@ -723,20 +745,24 @@ fn test_rest_candle_fold_send_confirmed_bars_full_then_closed_counts_drops() {
     );
 }
 
+/// The src unit test calls this with no recorder installed; what is new here
+/// is the counter: every call counts, past the one-shot warn latch.
 #[test]
 fn test_rest_candle_fold_note_unfoldable_identity_counts_every_occurrence() {
     harness();
+    let _guard = bad_identity_lock().blocking_lock();
     let before = counter(
         "tv_rest_candle_fold_dropped_total",
         "reason=\"bad_identity\"",
     );
     note_unfoldable_identity(Feed::Dhan, -1);
     note_unfoldable_identity(Feed::Truedata, i64::MIN);
-    assert!(
+    assert_eq!(
         counter(
             "tv_rest_candle_fold_dropped_total",
             "reason=\"bad_identity\""
-        ) >= before + 2.0
+        ),
+        before + 2.0
     );
 }
 
@@ -784,24 +810,36 @@ fn test_rest_candle_fold_fold_bar_beyond_u32_seconds_is_out_of_session() {
     assert_eq!(e.open_bucket_count(), 0);
 }
 
+/// The src unit test `test_volume_saturates_never_tears_the_fold` covers the
+/// saturated bucket values; it runs with no recorder, so the counter is the
+/// only new assertion here: one increment per open bucket whose sum
+/// overflowed, derived from the timeframe grid rather than hard-coded.
 #[test]
-fn test_rest_candle_fold_fold_bar_volume_saturation_counts_and_keeps_folding() {
+fn test_rest_candle_fold_volume_saturation_counts_each_overflowed_bucket() {
     harness();
     let before = counter("tv_rest_candle_fold_volume_saturated_total", "");
     let today = today_ist();
     let mut e = SidFoldState::new(Feed::Dhan, 3, IDX_I);
-    for minute in 0..3 {
-        let mut b = bar(Feed::Dhan, 3, today, minute, 10.0);
-        b.volume = i64::MAX;
-        assert!(matches!(e.fold_bar(&b), FoldOutcome::Folded(_)));
-    }
-    assert!(counter("tv_rest_candle_fold_volume_saturated_total", "") >= before + 2.0);
-    let sealed = e.force_seal_open();
-    let m5 = sealed
+    let mut first = bar(Feed::Dhan, 3, today, 0, 10.0);
+    first.volume = i64::MAX;
+    let mut second = bar(Feed::Dhan, 3, today, 1, 10.0);
+    second.volume = 1;
+    assert!(matches!(e.fold_bar(&first), FoldOutcome::Folded(_)));
+    assert!(matches!(e.fold_bar(&second), FoldOutcome::Folded(_)));
+    let secs = |b: &ConfirmedBar| -> u32 {
+        u32::try_from(b.minute_ts_ist_nanos / 1_000_000_000).expect("fits u32")
+    };
+    let shared = TfIndex::ALL
         .iter()
-        .find(|s| s.tf == TfIndex::M5)
-        .expect("the 5-minute bucket is still open");
-    assert_eq!(m5.bucket.volume, i64::MAX, "the sum saturates, never wraps");
+        .filter(|tf| {
+            !tf.is_second_scale() && tf.bucket_start(secs(&first)) == tf.bucket_start(secs(&second))
+        })
+        .count();
+    assert!(shared > 0, "minutes 0 and 1 share at least one bucket");
+    assert_eq!(
+        counter("tv_rest_candle_fold_volume_saturated_total", ""),
+        before + shared as f64
+    );
 }
 
 #[test]
@@ -831,21 +869,35 @@ fn test_rest_candle_fold_apply_bar_batch_classifies_every_refusal() {
     assert!(out.emissions.is_empty());
 }
 
+/// The fail-closed behaviour itself is pinned by the src unit tests
+/// `test_fold_slots_capacity_exhaustion_fails_closed` and
+/// `test_apply_bar_batch_counts_slot_exhaustion_and_drops_the_bar`, which
+/// run with no recorder. What is new here: each refusal, through each of the
+/// three entry points, counts exactly once on BOTH counters, and a lookup or
+/// an existing identity at capacity counts nothing.
 #[test]
-fn test_rest_candle_fold_fold_slots_at_capacity_fail_closed() {
+fn test_rest_candle_fold_fold_slots_capacity_refusals_count_exactly() {
     harness();
-    let before = counter("tv_rest_candle_fold_slots_exhausted_total", "");
     let mut slots = FoldSlots::new();
     for sid in 0..FOLD_MAX_SLOTS as u64 {
         assert!(slots.slot_mut(Feed::Dhan, sid, IDX_I).is_some());
     }
-    assert_eq!(slots.len(), FOLD_MAX_SLOTS);
+    let exhausted = || counter("tv_rest_candle_fold_slots_exhausted_total", "");
+    let dropped = || {
+        counter(
+            "tv_rest_candle_fold_dropped_total",
+            "reason=\"slot_capacity\"",
+        )
+    };
+    let (exhausted_before, dropped_before) = (exhausted(), dropped());
     let newcomer = FOLD_MAX_SLOTS as u64 + 7;
+    // Neither a read-only lookup nor an already-known identity counts.
+    assert!(slots.lookup(Feed::Dhan, newcomer, IDX_I).is_none());
+    assert!(slots.slot_mut(Feed::Dhan, 5, IDX_I).is_some());
+    assert_eq!(exhausted(), exhausted_before);
+    // One refusal through each entry point.
     assert!(slots.slot_mut(Feed::Dhan, newcomer, IDX_I).is_none());
     assert!(!slots.replace_or_insert(SidDayFold::new(Feed::Dhan, newcomer, IDX_I)));
-    // An existing identity still resolves at capacity.
-    assert!(slots.slot_mut(Feed::Dhan, 5, IDX_I).is_some());
-    assert!(slots.replace_or_insert(SidDayFold::new(Feed::Dhan, 5, IDX_I)));
     let today = today_ist();
     let out = apply_bar_batch(
         &mut slots,
@@ -853,8 +905,52 @@ fn test_rest_candle_fold_fold_slots_at_capacity_fail_closed() {
         today,
     );
     assert_eq!(out.slot_exhausted, 1);
-    assert!(out.emissions.is_empty());
-    assert_eq!(slots.len(), FOLD_MAX_SLOTS, "never grows past the cap");
-    assert!(slots.lookup(Feed::Dhan, newcomer, IDX_I).is_none());
-    assert!(counter("tv_rest_candle_fold_slots_exhausted_total", "") >= before + 3.0);
+    assert_eq!(exhausted(), exhausted_before + 3.0);
+    assert_eq!(dropped(), dropped_before + 3.0);
+}
+
+/// I-P1-11 + feed-in-key: one batch carrying the same security id in two
+/// segments and two feeds folds four separate instruments, never one merged
+/// bar. Each emission carries its own identity and its own close.
+#[test]
+fn test_rest_candle_fold_apply_bar_batch_keeps_composite_identities_apart() {
+    harness();
+    const SID: u64 = 77;
+    const SEG_B: u8 = 1;
+    let today = today_ist();
+    let identities = [
+        (Feed::Dhan, IDX_I, 10.0),
+        (Feed::Dhan, SEG_B, 20.0),
+        (Feed::Truedata, IDX_I, 30.0),
+        (Feed::Truedata, SEG_B, 40.0),
+    ];
+    let batch: Vec<ConfirmedBar> = identities
+        .iter()
+        .map(|&(feed, segment, close)| ConfirmedBar {
+            exchange_segment_code: segment,
+            ..bar(feed, SID, today, 0, close)
+        })
+        .collect();
+    let mut slots = FoldSlots::new();
+    let out = apply_bar_batch(&mut slots, &batch, today);
+    assert_eq!(out.duplicates, 0, "no identity is mistaken for another");
+    assert_eq!(slots.len(), 4, "one slot per (feed, id, segment)");
+    assert_eq!(out.emissions.len(), 4, "one emission per identity");
+    let mut indices = std::collections::HashSet::new();
+    for (emission, &(feed, segment, close)) in out.emissions.iter().zip(identities.iter()) {
+        assert_eq!(
+            (emission.feed, emission.security_id, emission.segment_code),
+            (feed, SID, segment)
+        );
+        assert!(!emission.is_refold);
+        let m1: Vec<f64> = emission
+            .sealed
+            .iter()
+            .filter(|s| s.tf == TfIndex::M1)
+            .map(|s| s.bucket.close)
+            .collect();
+        assert_eq!(m1, [close], "{feed:?}/{segment}: its own minute, unmerged");
+        indices.insert(slots.lookup(feed, SID, segment).expect("slot allocated"));
+    }
+    assert_eq!(indices.len(), 4, "four distinct slots");
 }

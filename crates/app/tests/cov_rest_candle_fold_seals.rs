@@ -7,6 +7,7 @@
 //! in ONE sequential test in this binary of their own.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -137,6 +138,36 @@ async fn spawn_mock(discovery: Value, bars: HashMap<(i64, i64), Value>) -> u16 {
     port
 }
 
+/// A fresh directory under the system temp dir, unique per process, instant
+/// and call (pid + nanos + counter), removed on drop, so a panicking test
+/// leaves nothing behind.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("tv-cov-{tag}-{}-{nanos}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 const SESSION_OPEN_SOD: i64 = 33_300;
 
 fn minute_nanos(date: NaiveDate, minute: i64) -> i64 {
@@ -194,12 +225,10 @@ async fn run_fold(port: u16, catchup_days: u32, live: &[ConfirmedBar]) {
 #[tokio::test(start_paused = true)]
 async fn test_rest_candle_fold_seal_emission_delivered_full_and_closed_arms() {
     harness();
-    let dir = std::env::temp_dir().join(format!(
-        "tv-cov-rest-candle-fold-seals-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let runner = SealWriterRunner::for_test(dir.join("spill"), dir.join("dlq"), 64, 4, 64);
+    // Declared before the runner, so it is dropped after it (removed last).
+    let dir = TempDir::new("rest-candle-fold-seals");
+    let runner =
+        SealWriterRunner::for_test(dir.path().join("spill"), dir.path().join("dlq"), 64, 4, 64);
     assert!(
         set_global_seal_sender(runner.sender()),
         "first install wins"
@@ -259,6 +288,4 @@ async fn test_rest_candle_fold_seal_emission_delivered_full_and_closed_arms() {
         delivered_before + 4.0,
         "nothing is delivered to a closed queue"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
