@@ -6578,7 +6578,7 @@ mod tests {
             "the downgrade lands on the persisted row"
         );
         assert!(run_once.contains(".and_then(|()| coverage_refusal(coverage));"));
-        let spawn = fn_body(prod, "pub fn spawn_dhan_live_crossverify(");
+        let spawn = fn_body(prod, "fn spawn_dhan_live_crossverify(");
         assert!(
             spawn.contains("record_boot_set(boot_day, &boot_set, boot_secs, deps.universe_basis);")
         );
