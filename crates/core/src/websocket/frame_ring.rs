@@ -642,7 +642,7 @@ mod tests {
     /// as before; while set, pushes skip the `Notify`; cleared, they notify
     /// again. Nothing is lost either way.
     #[test]
-    fn test_try_send_skips_the_wake_only_while_the_drain_busy_polls() {
+    fn test_set_busy_polling_skips_the_wake_only_while_set() {
         let (tx, mut rx) = frame_ring::<u32>(16);
         assert!(!rx.is_busy_polling(), "default off: today's behaviour");
         tx.try_send(1).expect("room");
@@ -667,7 +667,7 @@ mod tests {
     /// `recv` left with the flag set cannot hang: it clears the flag before
     /// it registers to sleep, so the next push wakes it.
     #[test]
-    fn test_recv_clears_busy_polling_before_it_parks() {
+    fn test_is_busy_polling_reads_false_once_recv_parks() {
         let (tx, mut rx) = frame_ring::<u32>(16);
         rx.set_busy_polling(true);
         let shared = Arc::clone(&rx.shared);
