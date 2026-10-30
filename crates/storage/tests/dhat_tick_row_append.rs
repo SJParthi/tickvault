@@ -37,7 +37,7 @@ const SESSION_IST_SECS: u32 = 1_793_268_000;
 
 fn tick(i: usize) -> ParsedTick {
     let ltt = SESSION_IST_SECS + (i as u32 / 10);
-    let fno = i % 2 == 0;
+    let fno = i.is_multiple_of(2);
     ParsedTick {
         security_id: 40_000 + (i as u64 % 64),
         exchange_segment_code: if fno { 2 } else { 1 },
