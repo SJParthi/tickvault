@@ -330,9 +330,142 @@ mod affinity {
         }
     }
 
+    /// Puts the calling thread on `SCHED_FIFO` at `priority` (2026-10-30,
+    /// plan ITEM DT). `Err` carries the OS error number, usually `EPERM`
+    /// when the process has neither `CAP_SYS_NICE` nor an `RLIMIT_RTPRIO`.
+    pub(super) fn set_current_thread_fifo(priority: i32) -> Result<(), i32> {
+        // SAFETY: `sched_param` is a plain C struct of integers (musl adds
+        // reserved fields); all-zero is a valid value we then fill.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() }; // SAFETY: see above
+        param.sched_priority = priority;
+        // RESET_ON_FORK: a thread this one spawns (a blocking-pool thread) starts
+        // back on SCHED_OTHER instead of inheriting the real-time policy.
+        let policy = libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK;
+        // The raw syscall, not libc's `sched_setscheduler` wrapper: musl (the
+        // prod target) stubs that wrapper to return ENOSYS, because POSIX
+        // defines it per process while Linux applies it per thread. The
+        // kernel reads only `sched_priority`, the first field on both libcs.
+        // SAFETY: `param` is a valid, initialised `sched_param` that outlives the call; pid 0 is this thread.
+        let rc =
+            unsafe { libc::syscall(libc::SYS_sched_setscheduler, 0, policy, &raw const param) }; // SAFETY: see above
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL))
+        }
+    }
+
+    /// The calling thread's scheduling policy (`SCHED_OTHER` = 0,
+    /// `SCHED_FIFO` = 1), or -1 when the kernel would not say.
+    pub(super) fn current_thread_policy() -> i32 {
+        // The raw syscall, for the same reason as above (musl stubs the wrapper).
+        // SAFETY: no pointer arguments; pid 0 is this thread.
+        let rc = unsafe { libc::syscall(libc::SYS_sched_getscheduler, 0) }; // SAFETY: see above
+        i32::try_from(rc).unwrap_or(-1)
+    }
+
     fn empty_set() -> libc::cpu_set_t {
         // SAFETY: `cpu_set_t` is a plain array of integers; all-zero is the valid empty set.
         unsafe { std::mem::zeroed() } // SAFETY: see above
+    }
+}
+
+/// Pins the calling thread to `core` (2026-10-30, plan ITEM DT: the frame
+/// drain's own thread and the background threads use the same call the
+/// readers do). `Err` carries the OS error number; not Linux: `ENOSYS`.
+///
+/// # Errors
+/// The kernel refused the mask (a core outside the cpuset), or the core is
+/// above [`MAX_WS_READER_CORE`].
+pub fn pin_current_thread_to_core(core: usize) -> Result<(), i32> {
+    #[cfg(target_os = "linux")]
+    {
+        affinity::pin_current_thread(core)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core;
+        Err(libc::ENOSYS)
+    }
+}
+
+/// True when this thread may run on `core` (its current allowed set).
+/// Not Linux: always false, so nothing is pinned blind.
+#[must_use]
+pub fn current_thread_allows_core(core: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        affinity::allowed_cpu_set().is_some_and(|set| affinity::cpu_in_set(&set, core))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core;
+        false
+    }
+}
+
+/// Puts the calling thread on `SCHED_FIFO` at `priority` (plan ITEM DT).
+/// Call it only after [`super::hot_thread_placement::decide_hot_rt`] said
+/// the kernel's real-time throttle is active.
+///
+/// # Errors
+/// The OS error number (`EPERM` without `CAP_SYS_NICE` / `RLIMIT_RTPRIO`,
+/// `EINVAL` for a priority outside 1..=99); not Linux: `ENOSYS`.
+pub fn set_current_thread_fifo(priority: u8) -> Result<(), i32> {
+    #[cfg(target_os = "linux")]
+    {
+        affinity::set_current_thread_fifo(i32::from(priority))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = priority;
+        Err(libc::ENOSYS)
+    }
+}
+
+/// True when the calling thread runs on `SCHED_FIFO`. Not Linux: false.
+#[must_use]
+pub fn current_thread_is_fifo() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        (affinity::current_thread_policy() & !libc::SCHED_RESET_ON_FORK) == libc::SCHED_FIFO
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Reader threads now on `SCHED_FIFO`.
+static RT_APPLIED: AtomicU64 = AtomicU64::new(0);
+/// Reader threads whose `SCHED_FIFO` call failed, and the last error number.
+static RT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static RT_LAST_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// How many reader threads took `SCHED_FIFO`, how many failed, and the last
+/// OS error number, for the boot log.
+#[must_use]
+pub fn reader_rt_outcome() -> (u64, u64, i32) {
+    (
+        RT_APPLIED.load(Ordering::Relaxed),
+        RT_FAILURES.load(Ordering::Relaxed),
+        RT_LAST_ERRNO.load(Ordering::Relaxed),
+    )
+}
+
+/// Applies the reader `SCHED_FIFO` priority to the calling worker. Runs in
+/// `on_thread_start`: no logging, no panic.
+fn apply_reader_rt_priority(priority: u8) {
+    match set_current_thread_fifo(priority) {
+        Ok(()) => {
+            RT_APPLIED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(errno) => {
+            RT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            RT_LAST_ERRNO.store(errno, Ordering::Relaxed);
+        }
     }
 }
 
@@ -368,11 +501,17 @@ pub fn resolve_ws_reader_threads(raw: Option<&str>) -> usize {
 /// Separate from [`install_reader_runtime`] so a test can build one without
 /// touching the process-global slot.
 ///
+/// `rt_priority` (plan ITEM DT, 2026-10-30): a `SCHED_FIFO` priority each
+/// worker takes at start, `None` for normal (the default). Set only when
+/// [`super::hot_thread_placement::HOT_RT_PRIORITY_ENV`] asks and the kernel's
+/// real-time throttle is active. Blocking-pool threads never take it.
+///
 /// # Errors
 /// The OS refused to create a thread.
 pub fn build_reader_runtime(
     threads: usize,
     pin_core: Option<usize>,
+    rt_priority: Option<u8>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
     let workers = threads.max(1);
     let named = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -389,16 +528,22 @@ pub fn build_reader_runtime(
             }
         })
         .enable_all();
-    if let Some(core) = pin_core {
+    let rt_priority = rt_priority.filter(|p| *p > 0);
+    if pin_core.is_some() || rt_priority.is_some() {
         #[cfg(target_os = "linux")]
         let unpinned_set = affinity::allowed_cpu_set();
         builder.on_thread_start(move || {
             if std::thread::current().name() == Some(WS_READER_THREAD_NAME) {
-                pin_this_reader_thread(core);
+                if let Some(core) = pin_core {
+                    pin_this_reader_thread(core);
+                }
+                if let Some(priority) = rt_priority {
+                    apply_reader_rt_priority(priority);
+                }
                 // DT0 (2026-10-29): the worker's thread id, once, so the
                 // telemetry thread can read its scheduling wait.
                 let _slot = tickvault_storage::hot_thread_sched::register_ws_reader_thread();
-            } else {
+            } else if pin_core.is_some() {
                 // Best effort: on failure the thread stays on the reader's
                 // core, which is the behaviour before this fix, not a fault.
                 #[cfg(target_os = "linux")]
@@ -452,12 +597,16 @@ pub enum ReaderRuntimeInstall {
 /// empty task to completion so a worker has passed its pin before the boot
 /// log reads [`reader_pinned_core`]).
 ///
+/// `rt_priority`: the workers' `SCHED_FIFO` priority, `None` for normal
+/// (plan ITEM DT; see [`build_reader_runtime`]).
+///
 /// # Errors
 /// The OS refused to create a thread. The caller logs it and boots on the
 /// shared runtime — a slower reader is better than no feed.
 pub fn install_reader_runtime(
     threads: usize,
     pin_core: Option<usize>,
+    rt_priority: Option<u8>,
 ) -> std::io::Result<ReaderRuntimeInstall> {
     if threads == 0 {
         return Ok(ReaderRuntimeInstall::Disabled);
@@ -466,7 +615,7 @@ pub fn install_reader_runtime(
         return Ok(ReaderRuntimeInstall::AlreadyInstalled);
     }
     let attempts_before = PIN_ATTEMPTS.load(Ordering::Acquire);
-    let runtime = build_reader_runtime(threads, pin_core)?;
+    let runtime = build_reader_runtime(threads, pin_core, rt_priority)?;
     // APPROVED-BLOCKING: runs once in `main`, before any runtime or socket exists, and waits only for one empty task on a fresh worker.
     let _warmed = runtime.block_on(runtime.spawn(async {}));
     if pin_core.is_some() {
@@ -539,7 +688,7 @@ mod tests {
     #[test]
     fn install_reader_runtime_with_zero_threads_is_disabled_and_installs_nothing() {
         assert_eq!(
-            install_reader_runtime(0, None).expect("zero never touches the OS"),
+            install_reader_runtime(0, None, None).expect("zero never touches the OS"),
             ReaderRuntimeInstall::Disabled
         );
     }
@@ -561,7 +710,7 @@ mod tests {
 
     #[test]
     fn build_reader_runtime_names_its_threads_and_runs_tasks() {
-        let rt = build_reader_runtime(1, None).expect("one thread");
+        let rt = build_reader_runtime(1, None, None).expect("one thread");
         let name = rt.block_on(async {
             tokio::spawn(async {
                 std::thread::current()
@@ -682,7 +831,7 @@ mod tests {
         let Some(core) = (1..=MAX_WS_READER_CORE).find(|c| affinity::cpu_in_set(&set, *c)) else {
             return; // a one-core box: nothing to pin to but core 0
         };
-        let rt = build_reader_runtime(1, Some(core)).expect("one thread");
+        let rt = build_reader_runtime(1, Some(core), None).expect("one thread");
         let only_that_core = rt.block_on(async move {
             tokio::spawn(async move {
                 let mine = affinity::allowed_cpu_set().expect("own mask");
@@ -712,7 +861,7 @@ mod tests {
         if allowed < 2 {
             return; // one allowed core: pinned and unpinned look the same
         }
-        let rt = build_reader_runtime(1, Some(core)).expect("one thread");
+        let rt = build_reader_runtime(1, Some(core), None).expect("one thread");
         let blocking_allowed = rt.block_on(async {
             // The worker is itself a task on the blocking pool's FIFO queue.
             // If this `spawn_blocking` is queued before the worker's thread
@@ -739,6 +888,68 @@ mod tests {
             blocking_allowed, allowed,
             "a blocking-pool thread must keep the process's whole core set"
         );
+    }
+
+    /// Plan ITEM DT: a reader runtime built with a priority puts its workers
+    /// on SCHED_FIFO, and a blocking-pool thread a worker spawns does NOT
+    /// inherit it (SCHED_RESET_ON_FORK). Where this host refuses SCHED_FIFO
+    /// (no CAP_SYS_NICE / RLIMIT_RTPRIO), the refusal is counted instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_set_current_thread_fifo_reader_rt_outcome_current_thread_is_fifo_on_reader_workers_only()
+     {
+        let probe = std::thread::spawn(|| set_current_thread_fifo(1))
+            .join()
+            .expect("probe thread");
+        if probe.is_err() {
+            let (_, failures_before, _) = reader_rt_outcome();
+            let rt = build_reader_runtime(1, None, Some(1)).expect("one thread");
+            rt.block_on(async { tokio::spawn(async {}).await.expect("worker ran") });
+            assert!(
+                reader_rt_outcome().1 > failures_before,
+                "a refused SCHED_FIFO must be counted"
+            );
+            return;
+        }
+        let rt = build_reader_runtime(1, None, Some(2)).expect("one thread");
+        let (worker_fifo, blocking_fifo) = rt.block_on(async {
+            tokio::spawn(async {
+                let worker = current_thread_is_fifo();
+                let blocking = tokio::task::spawn_blocking(current_thread_is_fifo)
+                    .await
+                    .expect("blocking task ran");
+                (worker, blocking)
+            })
+            .await
+            .expect("worker ran")
+        });
+        assert!(worker_fifo, "the reader worker must run on SCHED_FIFO");
+        assert!(
+            !blocking_fifo,
+            "a blocking-pool thread must start back on SCHED_OTHER"
+        );
+        assert!(reader_rt_outcome().0 >= 1);
+    }
+
+    #[test]
+    fn test_build_reader_runtime_without_rt_priority_stays_normal() {
+        let rt = build_reader_runtime(1, None, None).expect("one thread");
+        let fifo = rt.block_on(async {
+            tokio::spawn(async { current_thread_is_fifo() })
+                .await
+                .expect("worker ran")
+        });
+        assert!(!fifo, "no priority asked: the worker stays SCHED_OTHER");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pin_current_thread_to_core_current_thread_allows_core_refuse_an_impossible_core() {
+        let err = std::thread::spawn(|| pin_current_thread_to_core(MAX_WS_READER_CORE + 1))
+            .join()
+            .expect("thread");
+        assert_eq!(err, Err(libc::EINVAL));
+        assert!(!current_thread_allows_core(MAX_WS_READER_CORE + 1));
     }
 
     #[test]

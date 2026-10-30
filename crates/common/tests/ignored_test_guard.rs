@@ -62,6 +62,20 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/core/tests/receipt_to_fold_harness.rs",
         "receipt_to_fold_cost_with_and_without_cpu_competition",
     ),
+    // Added 2026-10-30 with plan item DT-S1: a wall-clock harness for the
+    // hot-thread placement switches (consumer pick-up delay with a busy
+    // neighbour on the hot core, three placements). It prints percentiles
+    // and gates nothing; it needs two otherwise idle cores and (for its
+    // third row) SCHED_FIFO, which a shared CI runner cannot promise. The
+    // behaviour is pinned by the ordinary tests in
+    // `crates/app/src/drain_thread.rs`, `dhan_feed_stack/drain_thread_tests.rs`
+    // and `crates/core/src/websocket/hot_thread_placement.rs`. Run it with:
+    //
+    //   taskset -c 0,1 cargo test --release -p tickvault-app --test drain_placement_harness -- --ignored --nocapture
+    (
+        "crates/app/tests/drain_placement_harness.rs",
+        "drain_placement_wait_for_cpu_three_ways",
+    ),
     // Added 2026-10-26 with audit M4: a wall-clock timing harness for the
     // socket hand-off stage (frames 400 us apart so the WAL writer and the
     // drain are parked). It prints percentiles and gates nothing, the same
