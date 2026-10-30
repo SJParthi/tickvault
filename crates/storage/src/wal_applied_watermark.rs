@@ -3514,17 +3514,6 @@ mod tests {
         assert!(!wm.snapshot().range_has_unapplied(new, new));
     }
 
-    /// The 2026-09-05 loss, pinned. An adversarial sweep found this on the day
-    /// the module landed and reproduced it before it was fixed.
-    ///
-    /// The chain: a bucket-id collision makes `note_unapplied` set `overflowed`
-    /// and store NOTHING. `reset_unapplied_below` then clears `overflowed`
-    /// because `kept == 0` — but `kept` counts only buckets it DID record, and
-    /// the collided frame is by definition not among them. With the only trace
-    /// erased, a later ack lifts the high-water mark past the frame,
-    /// `range_has_unapplied` answers false, and the replay renames the whole
-    /// segment to `archive/` unread. Every tick and depth row in it is gone,
-    /// permanently, with no counter anywhere.
     /// Audit PR32: overflow episodes are counted once per false-to-true
     /// transition, not once per lost frame, and count again after a reset.
     #[test]
@@ -3552,6 +3541,17 @@ mod tests {
         assert!(!wm.raise_overflow());
     }
 
+    /// The 2026-09-05 loss, pinned. An adversarial sweep found this on the day
+    /// the module landed and reproduced it before it was fixed.
+    ///
+    /// The chain: a bucket-id collision makes `note_unapplied` set `overflowed`
+    /// and store NOTHING. `reset_unapplied_below` then clears `overflowed`
+    /// because `kept == 0` — but `kept` counts only buckets it DID record, and
+    /// the collided frame is by definition not among them. With the only trace
+    /// erased, a later ack lifts the high-water mark past the frame,
+    /// `range_has_unapplied` answers false, and the replay renames the whole
+    /// segment to `archive/` unread. Every tick and depth row in it is gone,
+    /// permanently, with no counter anywhere.
     #[test]
     fn a_collided_bucket_survives_a_reset_that_has_not_passed_it() {
         let wm = AppliedWatermark::new_for_tests();

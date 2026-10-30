@@ -414,6 +414,10 @@ pub fn spawn_dhan_order_push_consumer(
                 // The inner loop is infinite while the supervisor holds a
                 // sender clone — a clean return is abnormal.
                 Ok(()) => "clean_exit",
+                // Unwind builds only: release builds abort on panic
+                // (`panic = "abort"`, deep audit SUP-10), so in prod a panic
+                // stops the process and systemd restarts it; this respawn
+                // arm never sees "panic" there.
                 Err(err) if err.is_panic() => "panic",
                 // Cancelled = runtime shutdown — exit quietly, never
                 // respawn onto a dying runtime.

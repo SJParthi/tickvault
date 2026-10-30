@@ -434,6 +434,10 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 // while this supervisor holds a sender clone, so treat it
                 // as an abnormal exit (WS-GAP-05 semantics).
                 Ok(()) => "clean_exit",
+                // Unwind builds only: release builds abort on panic
+                // (`panic = "abort"`, deep audit SUP-10), so in prod a panic
+                // stops the process and systemd restarts it; this respawn
+                // arm never sees "panic" there.
                 Err(err) if err.is_panic() => "panic",
                 // Cancelled = the runtime is shutting down — exit quietly,
                 // never respawn onto a dying runtime.

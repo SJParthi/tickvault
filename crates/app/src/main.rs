@@ -3418,7 +3418,8 @@ async fn async_main() -> Result<()> {
     }
     info!(
         "DayOhlcTracker boot wired at process scope (IST-midnight reset only; no tick \
-         consumer is wired, so day high/low stay empty until a tick source feeds it)"
+         consumer is wired, so the day open/high/low/close stay empty until a tick \
+         source feeds it)"
     );
 
     // =======================================================================
