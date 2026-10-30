@@ -80,7 +80,7 @@ use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqWriter;
 use crate::seal_spill::SealSpillWriter;
 use crate::seal_writer_task::{
-    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once,
+    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once_reusing,
     drain_recovered_seals_for_replay,
 };
 use crate::shadow_candle_writer::ShadowCandleWriter;
@@ -1119,6 +1119,10 @@ pub struct SealWriterRunner {
     /// The cycle second (`now_unix_secs`) of the live cycle's last flush;
     /// `None` before the first. Paces the live flush ([`seal_flush_due`]).
     last_live_flush: Option<i64>,
+    /// The live drain's rescue buffer, kept across cycles so a flush
+    /// allocates nothing (see [`drain_once_reusing`]). Holds the capacity of
+    /// the largest batch drained, at most `max_drain_per_cycle` seals.
+    drain_scratch: Vec<BufferedSeal>,
 }
 
 /// Seals waiting in the ring at which the live cycle flushes at once,
@@ -1171,6 +1175,7 @@ impl SealWriterRunner {
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
             last_live_flush: None,
+            drain_scratch: Vec::new(),
             spill,
         })
     }
@@ -1226,6 +1231,7 @@ impl SealWriterRunner {
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
             last_live_flush: None,
+            drain_scratch: Vec::new(),
             spill,
         }
     }
@@ -1366,11 +1372,12 @@ impl SealWriterRunner {
                 now_unix_secs,
             );
         if due {
-            outcome.drain = drain_once(
+            outcome.drain = drain_once_reusing(
                 &mut self.pipeline,
                 &mut self.writer,
                 self.max_drain_per_cycle,
                 now_unix_secs,
+                &mut self.drain_scratch,
             );
             if outcome.drain.ring_seals_popped > 0 {
                 self.last_live_flush = Some(now_unix_secs);

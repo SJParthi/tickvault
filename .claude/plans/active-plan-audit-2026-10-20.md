@@ -1177,16 +1177,25 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
-### ITEM SH — speed and health on the operator dashboard (owner 2026-10-30; read-only, no live change)
+### ITEM SP — the sealed-candle path under 1 µs per seal (owner directive 2026-10-30; storage)
 
-Approved by: Parthiban, 2026-10-30, "always ensure saving into db, auditing, logging, tracking, capturing, debugging, finding, searching, monitoring, dashboard visualising" (wave brief: make every speed and health number visible on our own dashboard pages from data already stored). Design: a bearer-gated read-only endpoint `GET /api/debug/speed-health` (crates/api) builds plain-English tiles with a green / amber / red / grey verdict in Rust from (a) the in-process step-latency counters (`hot_path_telemetry::stage_snapshot`, read only), (b) the app's own metrics page (address from `[observability]`, set once in crates/app main.rs), (c) bounded QuestDB reads: `ticks` / `tick_quotes` per minute for the last 15 full minutes, `tick_conservation_audit` last 14 days, `feed_gap_audit` since IST midnight, and `hot_path_latency_minute` when it exists ("not yet available" when it does not). Body cached 5 s in one slot. The `/dashboard` page paints the tiles generically; its script shrinks (235 → 192 lines, 8,781 → 6,971 bytes), so the browser-surface ceilings go down, never up. Edge cases: every source down reads grey, never green; NaN metric values skipped; a table with no designated timestamp is not read; a stored column name is used in a query only if it is letters/digits/underscore. Failure modes: database down or slow (3 s timeout per query, grey tiles), metrics page down or over 16 MiB (grey). Rollback: remove the route and the panel (no state, no writes). Observability: `tv_api_cache_hits_total{endpoint="speed_health"}`. Not on the feed path; no new table, alarm, page, EMF name or switch.
+Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 microsecond at p99, proven by benches that fail the build if it slips, with identical output; use only max"). Scope: what happens to a sealed candle after the fold produces it, in `crates/storage` only (the fold, `crates/trading/src/candles`, belongs to another session). Design: measure each per-seal step with a new Criterion bench, fix what is over 1,000 ns or allocates, keep the ILP bytes identical. Edge cases: a ring that already holds seals is never prefaulted; a refused row still rewinds to its marker; the `contract` name is looked up once per row by the caller. Failure modes: an invalid constant column name would reach QuestDB unchecked (test runs the library check over every name and a source scan refuses a literal); the reused drain buffer is cleared on every return path. Rollback: revert the commit (no schema, config or wire change). Observability: the bench prints p50/p99/p99.9/max per step; no new metric.
 
-- [x] SH1. Speed-and-health endpoint, tiles and verdicts, query builders, metrics-text reader, 5 s cache, metrics address set at boot
-  - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/app/src/main.rs
-  - Tests: test_ticks_per_minute_sql_covers_the_last_15_full_minutes, test_every_unreadable_source_is_grey_never_green, test_parse_metrics_text_reads_wanted_series_in_one_pass, test_handler_reads_every_source_and_a_second_call_is_a_cache_hit, test_stage_light_honours_bucket_resolution
-- [x] SH2. Dashboard panel painting the server's tiles; script compacted under the existing ceilings; ceilings lowered to the new size
-  - Files: crates/api/src/handlers/dashboard_page.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs
-  - Tests: test_dashboard_page_paints_the_speed_panel_from_server_verdicts, test_dashboard_page_fetches_all_required_endpoints
+- [x] SP1. `seal_path` Criterion bench for the hand-off, take + ring push, row build, ILP append (with and without contract names), ring pop + append, ledger probe hit and miss, with its own p99 gate against the new `seal_path` budget (1,000 ns) for the sub-µs steps and `seal_ilp` (2,500 ns, measured ceiling, NOT the 1 µs target) for the three ILP-append steps
+  - Files: crates/storage/benches/seal_path.rs, crates/storage/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md
+  - Tests: every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count
+- [x] SP2. The live drain reuses one rescue buffer (`drain_once_reusing`, runner `drain_scratch`)
+  - Files: crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
+  - Tests: test_drain_once_reusing_keeps_its_scratch_capacity_across_cycles
+- [x] SP3. The production ring is prefaulted at construction (`prefault_ring`)
+  - Files: crates/storage/src/seal_absorption.rs
+  - Tests: test_prefault_ring_writes_every_slot_and_leaves_the_ring_empty, test_production_pipeline_is_prefaulted_at_construction
+- [x] SP4. Constant column names skip the per-call questdb-rs check; the delay text skips `fmt`; bytes identical
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/delay_render.rs
+  - Tests: proptest_write_row_is_byte_identical_to_the_validated_form, test_every_candle_ilp_column_name_passes_the_questdb_check, test_write_row_passes_only_named_constants_to_the_unchecked_names, proptest_render_delay_into_matches_the_fmt_version_byte_for_byte, test_render_delay_into_matches_the_fmt_version_at_every_edge
+- [x] SP5. DHAT: the whole per-seal path allocates nothing
+  - Files: crates/storage/tests/dhat_seal_per_seal_path.rs
+  - Tests: dhat_the_per_seal_path_after_the_fold_never_allocates
 
 ## Design
 
