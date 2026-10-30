@@ -3365,6 +3365,7 @@ static RECEIPT_ANCHOR: std::sync::OnceLock<AnchorCell> = std::sync::OnceLock::ne
 /// refresh caller stopped and the anchor is aging.
 pub const RECEIPT_ANCHOR_REFRESH_COUNTER: &str = "tv_wal_receipt_anchor_refresh_total";
 
+#[inline]
 fn anchor_cell() -> &'static AnchorCell {
     RECEIPT_ANCHOR.get_or_init(|| AnchorCell::new(take_anchor()))
 }
@@ -13887,6 +13888,12 @@ mod receipt_anchor_cell_tests {
     /// A reader racing a writer that republishes as fast as it can always
     /// gets a pair that some single publish wrote. Each publish writes
     /// `nanos = 7 × offset`, so a torn pair breaks the relation.
+    ///
+    /// Honest limit: on x86 (strongly ordered) this passes even without the
+    /// fences, so it catches a broken version protocol, not a missing fence.
+    /// The fence placement is Boehm's seqlock pattern and was reviewed for
+    /// the C++20 model (the ARM64 production target); it is not tested on
+    /// aarch64 here.
     #[test]
     fn test_anchor_cell_reader_never_sees_a_torn_pair() {
         let base = Instant::now();

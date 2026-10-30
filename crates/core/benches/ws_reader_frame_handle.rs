@@ -24,6 +24,13 @@
 //! production-spaced p50/p99/max of this path are in
 //! `crates/core/tests/socket_read_in_memory_harness.rs`.
 //!
+//! One wake can land inside the timed region: after an untimed gap longer
+//! than the WAL writer's 50 ms busy window (warm-up, Criterion's analysis) the
+//! writer has parked in `recv_timeout`, and the first frame of the next batch
+//! pays its wake. Spread over a 512-frame batch that is tens of ns on the
+//! mean of that batch. The supervisor's own `Stage::SocketToWal` clock read
+//! and telemetry atomics around `accept` are not timed here.
+//!
 //! Budget: `quality/benchmark-budgets.toml::ws_reader_frame_handle` = 1,000 ns
 //! (matches `ws_reader/frame_handle_ns`; bench-gate reads Criterion's median).
 
@@ -91,7 +98,9 @@ impl Drop for TempDirGuard {
 
 /// Waits (untimed) until the WAL writer has taken every queued record.
 fn wait_wal_empty(spill: &WsFrameSpill) {
+    let deadline = Instant::now() + Duration::from_secs(30);
     while spill.queued_records() > 0 {
+        assert!(Instant::now() < deadline, "the WAL writer stopped draining");
         std::hint::spin_loop();
     }
 }
