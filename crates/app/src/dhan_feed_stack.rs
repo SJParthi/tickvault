@@ -18053,7 +18053,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         close_lane_before_dial(&mut ingest, &params.feed_health);
         return;
     }
-    let drain = tokio::spawn(run_frame_drain(
+    // Plan ITEM DT (2026-10-30): the drain runs where `main` placed it, the
+    // shared runtime by default or its own pinned thread when switched on.
+    // Same future, same output; only the executor moves.
+    let drain = crate::drain_thread::spawn_frame_drain(run_frame_drain(
         frame_rx,
         ingest,
         Arc::clone(&main_feed_budget),
@@ -18257,7 +18260,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         Arc::clone(&deferred_depth_cancel),
         depth_book_since,
     );
-    let drain_outcome = drain.await;
+    let drain_outcome = drain.join().await;
     deferred_depth_cancel.store(true, std::sync::atomic::Ordering::Release);
     deferred_depth_task.abort();
 
@@ -27100,7 +27103,7 @@ mod wal_refold_tests {
             .find("refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until)")
             .expect("catch-up refold present");
         let spawn = prod
-            .find("tokio::spawn(run_frame_drain(")
+            .find("crate::drain_thread::spawn_frame_drain(run_frame_drain(")
             .expect("drain spawn present");
         assert!(
             catch_up < finish && finish < spawn,
@@ -28623,6 +28626,9 @@ mod tick_quotes_route_tests;
 
 #[cfg(test)]
 mod seed_step_tests;
+
+#[cfg(test)]
+mod drain_thread_tests;
 
 #[cfg(test)]
 mod alive_connection_guard_tests {
@@ -32459,7 +32465,7 @@ mod shutdown_before_dial_tests {
             .find("ingest.finish_wal_replay(replay_ended_on_gap);")
             .expect("hand-over present");
         let spawn = lane
-            .find("tokio::spawn(run_frame_drain(")
+            .find("crate::drain_thread::spawn_frame_drain(run_frame_drain(")
             .expect("drain spawn present");
         let between = &lane[finish..spawn];
         let check = between
