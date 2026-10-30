@@ -467,6 +467,16 @@ jobs:
     needs: [preflight, terraform-plan]
     if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     steps:
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Check current IST time against market window
         # SEC-7 (2026-10-12): a dispatch input reaches the script through env,
         # never as an inline expression the runner pastes into the script.
@@ -478,11 +488,11 @@ jobs:
           # app OR infra, during 09:00 till 3.45 pm IST).
           # 1=Mon, 7=Sun. One line since 2026-10-26 (audit PR L4): the lines
           # saved pay for the same check re-run right before `terraform apply`.
-          UTC_HOUR=$(date -u +%H); UTC_MINUTE=$(date -u +%M); UTC_DOW=$(date -u +%u); UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
+          UTC_HOUR=$(date -u +%H); UTC_MINUTE=$(date -u +%M); UTC_DOW=$(date -u +%u); UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE)); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
 
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
-          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
+          if [ "$MUHURAT" = "yes" ] || { [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; }; then
             if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
               echo "WARNING: applying infra changes during market hours with explicit override"
             else
@@ -658,8 +668,8 @@ jobs:
         env:
           CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
-          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ] && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]; then echo "::error::BLOCK: it is $HHMM IST, inside the 09:00-15:45 IST no-deploy band, at apply time. Re-run after 15:45 IST or with confirm_market_hours=yes."; exit 1; fi
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM)); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
+          if { [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; }; } && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]; then echo "::error::BLOCK: it is $HHMM IST, inside the 09:00-15:45 IST no-deploy band, at apply time. Re-run after 15:45 IST or with confirm_market_hours=yes."; exit 1; fi
           terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color
 
       - name: Capture outputs

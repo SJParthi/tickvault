@@ -194,3 +194,165 @@ fn curfew_and_hard_stop_guard_treat_the_window_as_in_hours() {
         "the hard-stop guard must treat a Muhurat window as in-window"
     );
 }
+
+/// `(date, start, end)` for every `[[trading.muhurat_trading_dates]]` entry in
+/// `config/base.toml`; missing times read as empty strings.
+fn config_muhurat_sessions() -> BTreeSet<(String, String, String)> {
+    let toml = read("config/base.toml");
+    let mut out = BTreeSet::new();
+    let mut current: Option<(String, String, String)> = None;
+    let mut in_block = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            if let Some(entry) = current.take() {
+                out.insert(entry);
+            }
+            in_block = t == "[[trading.muhurat_trading_dates]]";
+            if in_block {
+                current = Some((String::new(), String::new(), String::new()));
+            }
+            continue;
+        }
+        let Some(entry) = current.as_mut().filter(|_| in_block) else {
+            continue;
+        };
+        let value = t.split('"').nth(1).unwrap_or("").to_string();
+        if t.starts_with("date") {
+            entry.0 = value;
+        } else if t.starts_with("session_start_ist") {
+            entry.1 = value;
+        } else if t.starts_with("session_end_ist") {
+            entry.2 = value;
+        }
+    }
+    if let Some(entry) = current.take() {
+        out.insert(entry);
+    }
+    out
+}
+
+/// `(date, start, end)` for every entry of terraform's `muhurat_sessions`
+/// default (one `{ date = .., session_start_ist = .., session_end_ist = .. }`
+/// per line).
+fn terraform_muhurat_sessions() -> BTreeSet<(String, String, String)> {
+    let tf = code_only(&read("deploy/aws/terraform/variables.tf"));
+    let mut out = BTreeSet::new();
+    let mut inside = false;
+    for line in tf.lines() {
+        if line.contains("variable \"muhurat_sessions\" {") {
+            inside = true;
+            continue;
+        }
+        if inside && line.trim_start().starts_with("variable ") {
+            break;
+        }
+        if inside && line.contains("date =") && line.contains("session_start_ist =") {
+            let parts: Vec<&str> = line.split('"').collect();
+            assert!(
+                parts.len() >= 7,
+                "variables.tf muhurat_sessions entry `{line}` is not one-line date/start/end"
+            );
+            out.insert((
+                parts[1].to_string(),
+                parts[3].to_string(),
+                parts[5].to_string(),
+            ));
+        }
+    }
+    out
+}
+
+/// 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the session
+/// TIMES, not only the dates, have one source. Terraform starts the box and
+/// arms the liveness gate from its copy; the app calendar and the build
+/// checks read config/base.toml. A drift between them starts the box, or arms
+/// the alarms, at an hour the app does not consider the session.
+#[test]
+fn terraform_session_times_equal_the_app_calendars_times() {
+    let config = config_muhurat_sessions();
+    let tf = terraform_muhurat_sessions();
+    assert!(
+        !config.is_empty(),
+        "config/base.toml lists no Muhurat entry"
+    );
+    assert_eq!(
+        tf, config,
+        "terraform var.muhurat_sessions (date, start, end) must equal config/base.toml \
+         [[trading.muhurat_trading_dates]] (date, session_start_ist, session_end_ist)"
+    );
+}
+
+/// The workflows' deploy freeze reads the line right after the header
+/// (`grep -A1`), so the date must stay first in every Muhurat block.
+#[test]
+fn config_muhurat_blocks_put_the_date_first() {
+    let toml = read("config/base.toml");
+    let lines: Vec<&str> = toml.lines().collect();
+    let mut blocks = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "[[trading.muhurat_trading_dates]]" {
+            blocks += 1;
+            // The workflows match both lines EXACTLY (`grep -xF`): no indent,
+            // no trailing comment. A looser check here would let an edit pass
+            // that makes every guard read the date as an ordinary day.
+            assert_eq!(
+                *line, "[[trading.muhurat_trading_dates]]",
+                "a Muhurat header must have no indent or trailing text (grep -xF)"
+            );
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            let date = next
+                .strip_prefix("date = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or("");
+            let b = date.as_bytes();
+            assert!(
+                b.len() == 10
+                    && b[4] == b'-'
+                    && b[7] == b'-'
+                    && date.bytes().filter(u8::is_ascii_digit).count() == 8,
+                "the line after a [[trading.muhurat_trading_dates]] header must be exactly \
+                 `date = \"YYYY-MM-DD\"` (no indent, no trailing comment): the workflows read \
+                 it with grep -A1 | grep -xF; found `{next}`"
+            );
+        }
+    }
+    assert!(blocks > 0, "no Muhurat block found");
+}
+
+/// The dated liveness arming: one open (session start + 20 min) and one close
+/// (session end) per date, on the SAME gate Lambda, leaving the three
+/// weekday-only did-it-run alarms disarmed.
+#[test]
+fn each_muhurat_date_arms_and_disarms_the_liveness_gate() {
+    let tf = code_only(&read("deploy/aws/terraform/market-hours-liveness-alarm.tf"));
+    for needle in [
+        "muhurat_liveness_open_offset_minutes = 20",
+        "for s in var.muhurat_sessions : s.date => {",
+        "} if s.session_start_ist != \"\"",
+        "resource \"aws_cloudwatch_event_rule\" \"tv_market_hours_liveness_muhurat_open\" {",
+        "resource \"aws_cloudwatch_event_rule\" \"tv_market_hours_liveness_muhurat_close\" {",
+        "\"cron(%d %d %d %d ? %s)\",",
+        "arn = aws_lambda_function.tv_market_hours_liveness_gate.arn",
+        "input = jsonencode({ mode = \"close\" })",
+        "skip_alarms = [",
+        "aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,",
+        "aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,",
+        "aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,",
+        "resource \"aws_lambda_permission\" \"tv_market_hours_liveness_muhurat_open\" {",
+        "resource \"aws_lambda_permission\" \"tv_market_hours_liveness_muhurat_close\" {",
+    ] {
+        assert!(
+            tf.contains(needle),
+            "market-hours-liveness-alarm.tf is missing `{needle}`"
+        );
+    }
+    let gate = read("crates/aws-lambdas/src/market_hours_gate.rs");
+    let open = gate
+        .find("// --- mode == open ---")
+        .expect("market_hours_gate.rs open arm");
+    assert!(
+        gate[open..].contains("let alarm_names = alarms_to_open(&alarm_names, &event);"),
+        "the gate's open arm must apply the event's skip list"
+    );
+}

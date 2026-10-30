@@ -58,6 +58,16 @@ jobs:
       AWS_RETRY_MODE: adaptive
       AWS_MAX_ATTEMPTS: '10'
     steps:
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Check confirmation and the trading window
         env:
           CONFIRM: ${{ inputs.confirm }}
@@ -69,10 +79,10 @@ jobs:
           fi
           # The logs of a live session are the only record of what it did.
           # Never wipe them while the market is open.
-          DOW=$(TZ=Asia/Kolkata date +%u)
+          DOW=$(TZ=Asia/Kolkata date +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
           HM=$(TZ=Asia/Kolkata date +%H%M)
-          if [ "$DOW" -le 5 ] && [ "$HM" -ge 0900 ] && [ "$HM" -lt 1545 ]; then
-            echo "::error::refused: it is $(TZ=Asia/Kolkata date '+%a %H:%M') IST, inside the 09:00-15:45 weekday session."
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HM" -ge 0900 ] && [ "$HM" -lt 1545 ]; }; then
+            echo "::error::refused: it is $(TZ=Asia/Kolkata date '+%a %H:%M') IST, inside the 09:00-15:45 weekday session or on a Muhurat date."
             exit 1
           fi
           echo "confirmed; outside the session window"
@@ -129,7 +139,7 @@ jobs:
           # group can take minutes, and a run that crosses 09:00 must stop.
           in_session() {
             local dow hm
-            dow=$(TZ=Asia/Kolkata date +%u)
+            dow=$(TZ=Asia/Kolkata date +%u); grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && return 0
             hm=$(TZ=Asia/Kolkata date +%H%M)
             [ "$dow" -le 5 ] && [ "$hm" -ge 0900 ] && [ "$hm" -lt 1545 ]
           }
