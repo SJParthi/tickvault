@@ -31,6 +31,7 @@ fn expected_asked(today: chrono::NaiveDate) -> Option<chrono::NaiveDate> {
 
 #[tokio::test]
 async fn test_holiday_gate_run_trading_day_lets_the_app_start_and_asks_today() {
+    cov_xvs_support::init_no_proxy();
     cov_xvs_support::init_tracing();
     let (before, _) = cov_xvs_support::ist_now();
     let (code, asked) = run_with(CalendarDay::TradingDay).await;
@@ -43,16 +44,23 @@ async fn test_holiday_gate_run_trading_day_lets_the_app_start_and_asks_today() {
 
 #[tokio::test]
 async fn test_holiday_gate_run_weekend_lets_the_app_start() {
+    cov_xvs_support::init_no_proxy();
     cov_xvs_support::init_tracing();
+    let (before, _) = cov_xvs_support::ist_now();
     let (code, asked) = run_with(CalendarDay::Weekend).await;
+    let (after, _) = cov_xvs_support::ist_now();
     assert_eq!(code, 0, "a weekend boot is a deploy or manual start");
-    if !Path::new(OVERRIDE_MARKER).exists() {
-        assert!(asked.is_some(), "the calendar is asked about today");
+    // The gate asks the calendar about TODAY's IST date (or not at all when
+    // the override marker is present); only a run that straddled IST
+    // midnight has no single expected date.
+    if before == after {
+        assert_eq!(asked, expected_asked(before));
     }
 }
 
 #[tokio::test]
 async fn test_holiday_gate_run_special_session_lets_the_app_start() {
+    cov_xvs_support::init_no_proxy();
     cov_xvs_support::init_tracing();
     let (code, _) = run_with(CalendarDay::SpecialSession).await;
     assert_eq!(code, 0, "a Muhurat or mock session must start the app");
@@ -60,6 +68,7 @@ async fn test_holiday_gate_run_special_session_lets_the_app_start() {
 
 #[tokio::test]
 async fn test_holiday_gate_run_unreadable_calendar_fails_open() {
+    cov_xvs_support::init_no_proxy();
     cov_xvs_support::init_tracing();
     let (code, _) = run_with(CalendarDay::Unreadable).await;
     assert_eq!(code, 0, "an unreadable calendar must fail open");
@@ -67,6 +76,7 @@ async fn test_holiday_gate_run_unreadable_calendar_fails_open() {
 
 #[test]
 fn test_holiday_gate_is_invocation_matches_only_the_subcommand_argument() {
+    cov_xvs_support::init_no_proxy();
     use tickvault_app::holiday_gate::{HOLIDAY_GATE_SUBCOMMAND, is_invocation};
     let args = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     assert!(is_invocation(&args(&[

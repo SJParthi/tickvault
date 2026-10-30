@@ -15,7 +15,10 @@ mod cov_xvs_support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cov_xvs_support::{FakeQuestDb, TempRoot, init_tracing, is_weekday, ist_now, weekday_calendar};
+use cov_xvs_support::{
+    CwdGuard, FakeQuestDb, captured_events, drive_paused, init_no_proxy, init_tracing, is_weekday,
+    ist_now, lock_cwd, weekday_calendar,
+};
 use tickvault_app::daily_task_marker::daily_marker_path;
 use tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig;
 use tickvault_app::dhan_live_crossverify_boot::{
@@ -37,7 +40,10 @@ fn midnight_ist_fold_nanos(day: chrono::NaiveDate) -> i64 {
 #[tokio::test(start_paused = true)]
 async fn test_dhan_live_crossverify_boot_live_side_readiness_past_day_with_no_progress_reads_unknown()
  {
+    init_no_proxy();
     init_tracing();
+    // It lists the seal spill folder by a relative path.
+    let _cwd_lock = lock_cwd().await;
     let srv = FakeQuestDb::start(Arc::new(|_q: &str| {
         (200, r#"{"columns":[],"dataset":[]}"#.to_owned())
     }));
@@ -64,7 +70,10 @@ async fn test_dhan_live_crossverify_boot_live_side_readiness_past_day_with_no_pr
 #[tokio::test(start_paused = true)]
 async fn test_dhan_live_crossverify_boot_live_side_readiness_deadline_already_passed_returns_at_once()
  {
+    init_no_proxy();
     init_tracing();
+    // It lists the seal spill folder by a relative path.
+    let _cwd_lock = lock_cwd().await;
     let srv = FakeQuestDb::start_default();
     let day = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).expect("date");
     let deadline = tokio::time::Instant::now();
@@ -74,12 +83,35 @@ async fn test_dhan_live_crossverify_boot_live_side_readiness_deadline_already_pa
     assert!(matches!(readiness.durability, Durability::NotReady(_)));
 }
 
+/// `error!` sources the day's final failure pages on (the three alarmed
+/// `xverify_*` sources).
+const PAGE_SOURCES: [&str; 3] = ["xverify_failed", "xverify_vacuous", "xverify_diverged"];
+
+fn page_lines() -> usize {
+    captured_events()
+        .iter()
+        .filter(|e| {
+            e.level == tracing::Level::ERROR
+                && e.field("source").is_some_and(|s| PAGE_SOURCES.contains(&s))
+        })
+        .count()
+}
+
+fn armed_lines() -> usize {
+    captured_events()
+        .iter()
+        .filter(|e| e.message().contains("cross-verification armed"))
+        .count()
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_once_on_a_weekday() {
+    init_no_proxy();
     init_tracing();
-    let original_cwd = std::env::current_dir().expect("cwd");
-    let root = TempRoot::new("crossverify-spawn");
-    std::env::set_current_dir(&root.path).expect("chdir temp");
+    let _cwd_lock = lock_cwd().await;
+    let cwd = CwdGuard::enter("crossverify-spawn");
+    let pages_before = page_lines();
+    let armed_before = armed_lines();
 
     let srv = FakeQuestDb::start_default();
     let deps = CrossverifyBootDeps {
@@ -106,21 +138,18 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
         },
     ];
     let (today, _) = ist_now();
-    let paged = root
-        .path
+    let paged = cwd
+        .path()
         .join(daily_marker_path(CROSSVERIFY_PAGED_MARKER_TASK, today));
-    let recorded = root
-        .path
+    let recorded = cwd
+        .path()
         .join(daily_marker_path(CROSSVERIFY_MARKER_TASK, today));
 
     let handle = spawn_dhan_live_crossverify(deps, &main_feed);
-    let real_start = std::time::Instant::now();
-    while real_start.elapsed() < Duration::from_secs(3) {
-        tokio::time::sleep(Duration::from_secs(600)).await;
-        if paged.exists() {
-            break;
-        }
-    }
+    // 20 h of virtual time reaches the day's last attempt (the run starts at
+    // 15:41 IST and every attempt ends by 16:23) from any start; the loop
+    // stops as soon as the paged marker shows.
+    let paged_seen = drive_paused(&srv, Duration::from_secs(20 * 3_600), || paged.exists()).await;
     assert!(
         !handle.is_finished(),
         "the daily loop never ends on its own"
@@ -129,16 +158,14 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
     let join = handle.await.expect_err("aborted task");
     assert!(join.is_cancelled(), "the task was cancelled, not panicked");
 
-    let paged_exists = paged.exists();
     let recorded_exists = recorded.exists();
-    let requests = srv
-        .seen
-        .lock()
-        .map(|s| s.request_lines.clone())
-        .unwrap_or_default();
-    std::env::set_current_dir(&original_cwd).expect("chdir back");
-    root.cleanup();
+    let requests = srv.request_lines();
+    let pages = page_lines() - pages_before;
+    let armed = armed_lines() - armed_before;
+    drop(cwd);
 
+    // Every day: armed once, nothing recorded, the vendor never called.
+    assert_eq!(armed, 1, "the task logs that it is armed exactly once");
     assert!(
         !recorded_exists,
         "with no token nothing is compared, so the day is never recorded"
@@ -147,13 +174,17 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
         !requests.iter().any(|r| r.contains("/v2/charts/intraday")),
         "the vendor is never called without a token: {requests:?}"
     );
+    // Whatever the day, the page happens at most once (the paged marker).
+    assert!(pages <= 1, "at most one page per day: {pages}");
     let (end_day, _) = ist_now();
     if end_day != today {
         return; // crossed IST midnight during the test
     }
     if is_weekday(today) {
-        assert!(paged_exists, "a failed weekday pages once and notes it");
+        assert!(paged_seen, "a failed weekday pages once and notes it");
+        assert_eq!(pages, 1, "exactly one page line on a failed weekday");
     } else {
-        assert!(!paged_exists, "a weekend is skipped, nothing is paged");
+        assert!(!paged_seen, "a weekend is skipped, nothing is paged");
+        assert_eq!(pages, 0, "no page line on a weekend");
     }
 }
