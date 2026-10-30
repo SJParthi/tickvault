@@ -130,9 +130,10 @@ tick_row_append          = 1000         # <1us per row — matches tick_row_appe
 # the gate also covers the span formatting production pays; the PAPER TRADE
 # line itself is written by a helper thread after the order (owner
 # 2026-10-30). Medians measured 2026-10-30 on the x86 dev container:
-# 1-370 ns per step, paper placement ~700 ns into a warm book. This gate reads
-# the Criterion MEDIAN; the per-call p99 is in the ignored harness
-# crates/app/tests/order_path_p99_harness.rs. NOT measured on the prod host.
+# 1-370 ns per step. bench-gate.sh reads the Criterion MEDIAN; the bench also
+# runs a per-call p99 gate (the house tail_gate) on the same key and exits 1
+# when any step's p99 is over it: paper placement p99 ~0.9 us, fill update
+# p99 ~0.4 us, every other step under 0.6 us. NOT measured on the prod host.
 order_path               = 1000         # <1us per step — matches order_path/*
 
 # Common crate

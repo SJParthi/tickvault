@@ -37,6 +37,15 @@
 //! `correlation_generate_id` gates that extra cost (about 290 ns of OS random
 //! call plus one allocation).
 //!
+//! # The p99 gate
+//!
+//! Criterion and `bench-gate.sh` read the MEDIAN. After Criterion, under
+//! `cargo bench` only, `order_path_tail_gate` times the steady-state steps
+//! one call at a time (the house `tail_gate`, also used by the side-store
+//! benches) and exits 1 when any p99 is over the `order_path` budget times
+//! `BENCH_BUDGET_MULTIPLIER`. Every timed call must give its case's outcome,
+//! so a case cannot quietly time a refusal.
+//!
 //! Run: `cargo bench --bench order_path -p tickvault-app`
 
 use std::future::Future;
@@ -45,7 +54,10 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+#[path = "../../core/benches/support/tail_gate.rs"]
+mod tail_gate;
+
+use criterion::{BatchSize, Criterion, criterion_group};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 use tickvault_common::order_types::{
@@ -76,11 +88,14 @@ impl TokenProvider for BenchTokenProvider {
 }
 
 fn make_oms() -> OrderManagementSystem {
-    let api_client = OrderApiClient::new(
-        reqwest::Client::new(),
-        "https://api.dhan.co/v2".to_owned(),
-        "100".to_owned(),
-    );
+    make_oms_with(reqwest::Client::new())
+}
+
+/// A paper book over a shared HTTP client (a clone is an `Arc` bump), so the
+/// p99 gate can build its thousand books without a thousand TLS setups.
+fn make_oms_with(http: reqwest::Client) -> OrderManagementSystem {
+    let api_client =
+        OrderApiClient::new(http, "https://api.dhan.co/v2".to_owned(), "100".to_owned());
     OrderManagementSystem::new(
         api_client,
         OrderRateLimiter::new(u32::MAX),
@@ -382,6 +397,134 @@ fn bench_oms_engine(c: &mut Criterion) {
     });
 }
 
+/// The per-call p99 gate (the house `tail_gate`, also used by the
+/// side-store benches): each case is timed one call at a time over
+/// `tail_gate::PERCENTILE_SAMPLES` calls with the production recorder
+/// installed, and a p99 over the `order_path` budget (1,000 ns, times
+/// `BENCH_BUDGET_MULTIPLIER`) exits 1. Each timed call must also give its
+/// case's outcome, so a case cannot quietly time a refusal.
+fn order_path_tail_gate() -> Result<(), String> {
+    install_production_recorder();
+    let mut gate = tail_gate::Gate::new("order_path", "order_path")?;
+
+    let limiter = OrderRateLimiter::new(u32::MAX);
+    gate.case("rate_limiter_admit", |_| limiter.check().is_ok());
+    let breaker = OrderCircuitBreaker::new();
+    gate.case("circuit_breaker_check_closed", |_| breaker.check().is_ok());
+    let fresh = OrderBudget::new();
+    gate.case("order_budget_admit", |_| {
+        let mut budget = black_box(fresh);
+        budget.try_consume(1_000).is_ok()
+    });
+    gate.case("transition_valid", |_| {
+        is_valid_transition(
+            black_box(OrderStatus::Pending),
+            black_box(OrderStatus::Traded),
+        )
+    });
+
+    let mut risk = RiskEngine::new(2.0, 1_000_000, 1_000_000_000.0);
+    for sid in 0..1_000_u64 {
+        risk.record_fill_in_segment(sid, ExchangeSegment::NseFno, 1, 100.0, 25);
+        risk.update_market_price_in_segment(sid, ExchangeSegment::NseFno, 101.0);
+    }
+    gate.case("risk_check_approved", |_| {
+        risk.check_order_in_segment(500, ExchangeSegment::NseFno, 1)
+            .is_approved()
+    });
+    gate.case("risk_record_fill_held", |n| {
+        let lots = if n % 2 == 0 { 1 } else { -1 };
+        risk.record_fill_in_segment(500, ExchangeSegment::NseFno, lots, 100.5, 25);
+        true
+    });
+    gate.case("risk_mark_held", |n| {
+        let price = 100.0 + (n % 200) as f64 * 0.05;
+        risk.update_market_price_in_segment(500, ExchangeSegment::NseFno, price);
+        true
+    });
+    gate.case("risk_daily_loss_eval", |_| !risk.evaluate_daily_loss_halt());
+
+    // Paper placement and its fill update, one book at a time. Each book is
+    // built before its timing, takes PLACEMENTS_PER_BOOK - 1 timed
+    // placements (below the broker's per-minute tier, so none is refused)
+    // and then a timed TRADED update for each, and is freed before the next
+    // book is built, so the next one reuses that memory: the steady state of
+    // a long-running process. The first placement into each book is made
+    // before the timing: it first-touches the book's fresh heap memory, a
+    // cost production pays once per process.
+    let http = reqwest::Client::new();
+    let per_book = PLACEMENTS_PER_BOOK as usize - 1;
+    let mut place = Vec::with_capacity(tail_gate::PERCENTILE_SAMPLES + per_book);
+    let mut fill = Vec::with_capacity(tail_gate::PERCENTILE_SAMPLES + per_book);
+    let mut off_path = 0_u64;
+    let mut ids: Vec<String> = Vec::with_capacity(per_book);
+    while place.len() < tail_gate::PERCENTILE_SAMPLES {
+        let mut oms = make_oms_with(http.clone());
+        off_path += u64::from(poll_ready(oms.place_order(paper_request(13))).is_err());
+        ids.clear();
+        for _ in 0..per_book {
+            let request = paper_request(13);
+            let start = Instant::now();
+            let placed = poll_ready(oms.place_order(request));
+            place.push(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            match placed {
+                Ok(order_id) => ids.push(order_id),
+                Err(_) => off_path += 1,
+            }
+        }
+        let updates: Vec<OrderUpdate> = ids.iter().map(|id| traded_update(id, 1)).collect();
+        for update in &updates {
+            let start = Instant::now();
+            let outcome = oms.handle_order_update(update);
+            fill.push(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            off_path += u64::from(!matches!(outcome, Ok(Some(_))));
+        }
+        drop(updates);
+        drop(oms);
+        tickvault_trading::oms::placement_telemetry::flush_paper_trade_log();
+    }
+    let mut failures = Vec::new();
+    if off_path > 0 {
+        failures.push(format!(
+            "{off_path} placement or fill calls took another path"
+        ));
+    }
+    let ceiling = tail_gate::ceiling_ns("order_path")?;
+    for (name, mut samples) in [
+        ("oms_place_paper_warm_book", place),
+        ("oms_order_update_fill", fill),
+    ] {
+        samples.sort_unstable();
+        let p99 = tail_gate::quantile(&samples, 99, 100);
+        let ok = tail_gate::within(&samples, ceiling);
+        println!(
+            "order_path/{name}: p50 = {} ns, p99 = {p99} ns, p99.9 = {} ns, max = {} ns over {} \
+             calls (one Instant pair inside each sample); p99 ceiling {ceiling:.0} ns: {}",
+            tail_gate::quantile(&samples, 1, 2),
+            tail_gate::quantile(&samples, 999, 1_000),
+            samples.last().copied().unwrap_or(0),
+            samples.len(),
+            if ok { "PASS" } else { "FAIL" },
+        );
+        if !ok {
+            failures.push(format!("{name} p99 {p99} ns"));
+        }
+    }
+    let book_cases = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "order_path over {ceiling:.0} ns: {}",
+            failures.join(", ")
+        ))
+    };
+    match (gate.finish(), book_cases) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(a), Ok(())) | (Ok(()), Err(a)) => Err(a),
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    }
+}
+
 criterion_group!(
     benches,
     bench_oms_gates,
@@ -389,4 +532,9 @@ criterion_group!(
     bench_risk,
     bench_oms_engine
 );
-criterion_main!(benches);
+
+fn main() {
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    tail_gate::run_under_bench("order_path", order_path_tail_gate);
+}

@@ -535,6 +535,10 @@ by cross-reference, as for the clusters above.
   - Files: crates/trading/src/oms/placement_telemetry.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/mod.rs, crates/app/src/order_runtime.rs (once-a-second publish)
   - Tests: fixed_placement_buckets_render_what_the_recorder_histogram_rendered, test_helper_line_is_identical_to_the_old_inline_line, dhat_order_path_with_the_production_recorder, test_apply_fill_counts_paper_and_live_under_their_literal_labels, test_track_ref_matches_track_outcomes_and_keeps_the_callers_id
 
+- [x] Per-call p99 gate in the bench (house `tail_gate`): exits 1 when any order-path step's p99 is over 1,000 ns; book tables prefaulted at construction; `ahash` on the order book, alias map and correlation index; paper id written without `format!`; old-vs-new decisions proptest
+  - Files: crates/app/benches/order_path.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/idempotency.rs, crates/trading/src/oms/reconciliation.rs
+  - Tests: proptest_pooled_ids_decide_exactly_like_on_demand_ids, proptest_paper_order_id_matches_format, test_paper_order_id_matches_format_at_the_extremes
+
 Design: no output changes beyond the two the owner chose above; ids, metric names, labels and counts are the same.
 Edge cases: pool empty (falls back to `generate_id`), recorder installed after
 first use (handle stays bound to the earlier one; production installs at boot),

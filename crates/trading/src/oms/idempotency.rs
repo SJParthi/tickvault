@@ -165,7 +165,7 @@ impl CorrelationKey {
 /// refuse-never-evict rationale.
 pub struct CorrelationTracker {
     /// Maps correlation_id (our UUID, inline) → order_id (Dhan's ID).
-    index: HashMap<CorrelationKey, String>,
+    index: HashMap<CorrelationKey, String, ahash::RandomState>,
     /// Ids drawn ahead of use; see [`CORRELATION_ID_POOL_SIZE`].
     id_pool: Vec<[u8; DHAN_CORRELATION_ID_MAX_LENGTH]>,
 }
@@ -180,11 +180,28 @@ impl CorrelationTracker {
     /// Creates a new empty tracker.
     pub fn new() -> Self {
         let mut tracker = Self {
-            index: HashMap::with_capacity(256),
+            index: HashMap::with_capacity_and_hasher(256, ahash::RandomState::new()),
             id_pool: Vec::with_capacity(CORRELATION_ID_POOL_SIZE),
         };
         tracker.refill_id_pool();
+        tracker.prefault_index();
         tracker
+    }
+
+    /// Writes every page of the index's hash table once (cold, at
+    /// construction), so a placement's `track` never takes a first-touch page
+    /// fault; the same reason as the order book's prefault in `engine.rs`.
+    /// The index is empty again afterwards, with the same capacity.
+    // O(1) EXEMPT: bounded at CORRELATION_ID_POOL_SIZE inserts, cold path (construction only)
+    fn prefault_index(&mut self) {
+        let capacity = self.index.capacity().min(CORRELATION_ID_POOL_SIZE);
+        for index in 0..capacity {
+            let mut bytes = [0u8; DHAN_CORRELATION_ID_MAX_LENGTH];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            self.index
+                .insert(CorrelationKey { len: 8, bytes }, String::new());
+        }
+        self.index.clear();
     }
 
     /// Generates a new correlation ID from UUID v4, truncated to 30 chars.

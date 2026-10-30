@@ -23,7 +23,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{
-    OrderStatus, OrderType, OrderUpdate, OrderValidity, TransactionType,
+    OrderStatus, OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::types::ExchangeSegment;
@@ -169,7 +169,7 @@ pub trait OmsAlertSink: Send + Sync {
 /// This ensures the system NEVER touches real money during development.
 pub struct OrderManagementSystem {
     /// Order state keyed by Dhan order ID.
-    orders: HashMap<String, ManagedOrder>,
+    orders: HashMap<String, ManagedOrder, ahash::RandomState>,
     /// Broker `order_no` -> the canonical key in [`Self::orders`].
     ///
     /// Exists because a WebSocket update can arrive carrying a broker
@@ -194,7 +194,7 @@ pub struct OrderManagementSystem {
     /// nothing to diverge. The obvious alternative — moving the record to the
     /// new key — would break every caller holding the id `place_order`
     /// returned, cancellation included.
-    order_no_aliases: HashMap<String, String>,
+    order_no_aliases: HashMap<String, String, ahash::RandomState>,
     /// Correlation ID tracker for idempotency.
     correlations: CorrelationTracker,
     /// Dhan REST API client.
@@ -409,9 +409,12 @@ impl OrderManagementSystem {
         // Cold: the "PAPER TRADE" helper thread starts here (once per
         // process), so no placement pays for it.
         placement_telemetry::ensure_paper_trade_logger();
-        Self {
-            orders: HashMap::with_capacity(256),
-            order_no_aliases: HashMap::with_capacity(64),
+        let mut oms = Self {
+            orders: HashMap::with_capacity_and_hasher(
+                ORDER_BOOK_PREFAULT_ORDERS,
+                ahash::RandomState::new(),
+            ),
+            order_no_aliases: HashMap::with_capacity_and_hasher(64, ahash::RandomState::new()),
             correlations: CorrelationTracker::new(),
             api_client,
             rate_limiter,
@@ -432,7 +435,58 @@ impl OrderManagementSystem {
             verify_states: HashMap::with_capacity(16),
             paper_placed_total: OnceLock::new(),
             placement_latency: PlacementLatency::new(),
+        };
+        oms.prefault_order_book();
+        oms
+    }
+
+    /// Writes every page of the order book's hash table once, at construction
+    /// (cold), so no placement takes a first-touch page fault.
+    ///
+    /// # Why (2026-10-30, the order-path sub-microsecond work)
+    ///
+    /// `HashMap::with_capacity` reserves the table but the kernel maps its
+    /// pages only when they are first written, and a hash spreads the first
+    /// orders over all of them: the first few dozen placements of a process
+    /// each wrote a fresh page. Measured on the x86 dev container: placement
+    /// p50 about 1 µs, p99 about 7.2 µs. This fills the table with
+    /// placeholder orders and clears it: the map is empty again, keeps its
+    /// capacity, and every page it will use is already mapped. The freed key
+    /// strings also leave warm heap memory behind for the first orders' ids.
+    ///
+    /// Cold: `ORDER_BOOK_PREFAULT_ORDERS` inserts once per book (once per
+    /// process in production). The daily reset clears the map in place, so
+    /// the pages stay mapped.
+    fn prefault_order_book(&mut self) {
+        // O(1) EXEMPT: bounded at ORDER_BOOK_PREFAULT_ORDERS, cold path (construction only)
+        for index in 0..ORDER_BOOK_PREFAULT_ORDERS {
+            let key = format!("PREFAULT-{index}");
+            self.orders.insert(
+                key,
+                ManagedOrder {
+                    order_id: String::new(),
+                    correlation_id: String::new(),
+                    security_id: 0,
+                    exchange_segment: ExchangeSegment::IdxI,
+                    transaction_type: TransactionType::Buy,
+                    order_type: OrderType::Market,
+                    product_type: ProductType::Intraday,
+                    validity: OrderValidity::Day,
+                    quantity: 0,
+                    price: 0.0,
+                    trigger_price: 0.0,
+                    status: OrderStatus::Transit,
+                    traded_qty: 0,
+                    avg_traded_price: 0.0,
+                    lot_size: 0,
+                    created_at_us: 0,
+                    updated_at_us: 0,
+                    needs_reconciliation: false,
+                    modification_count: 0,
+                },
+            );
         }
+        self.orders.clear();
     }
 
     /// Publishes `tv_order_placement_duration_ns_{bucket,count,sum}` from the
@@ -772,7 +826,7 @@ impl OrderManagementSystem {
         // ---- DRY-RUN: simulate order without any HTTP call ----
         if self.dry_run {
             self.paper_order_counter = self.paper_order_counter.saturating_add(1);
-            let paper_order_id = format!("PAPER-{}", self.paper_order_counter);
+            let paper_order_id = paper_order_id_string(self.paper_order_counter);
 
             let order = ManagedOrder {
                 order_id: paper_order_id.clone(),
@@ -1733,7 +1787,7 @@ impl OrderManagementSystem {
     }
 
     /// Returns all orders (active + terminal).
-    pub fn all_orders(&self) -> &HashMap<String, ManagedOrder> {
+    pub fn all_orders(&self) -> &HashMap<String, ManagedOrder, ahash::RandomState> {
         &self.orders
     }
 
@@ -3842,6 +3896,42 @@ fn halt_error_code(cause: &'static str) -> ErrorCode {
         _ => ErrorCode::Dh910Other,
     }
 }
+
+/// `PAPER-<counter>`, the paper order id, in one exactly-sized allocation.
+///
+/// Same text as `format!("PAPER-{counter}")` (pinned by
+/// `proptest_paper_order_id_matches_format`), without the formatting
+/// machinery: the decimal digits are written into a stack buffer and the
+/// string is allocated once at its final length (2026-10-30, the order-path
+/// sub-microsecond work).
+///
+/// # Performance
+/// O(digits), at most 20 divisions by 10, one allocation.
+fn paper_order_id_string(counter: u64) -> String {
+    const PREFIX: &str = "PAPER-";
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let mut rest = counter;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut id = String::with_capacity(PREFIX.len() + digits.len() - start);
+    id.push_str(PREFIX);
+    for &digit in &digits[start..] {
+        id.push(char::from(digit));
+    }
+    id
+}
+
+/// Orders the book is pre-sized for, and the placeholder count
+/// [`OrderManagementSystem::prefault_order_book`] writes once at construction
+/// so every page of the table is mapped before the first real order.
+const ORDER_BOOK_PREFAULT_ORDERS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -6775,6 +6865,213 @@ mod tests {
             oms.reset_daily();
             assert!(oms.all_orders().is_empty());
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-10-30: old vs new decisions on the paper order path.
+    //
+    // Two books see the same random sequence of placements and broker
+    // updates. Book A takes its correlation ids from the pre-drawn pool (the
+    // 2026-10-30 path); book B has its pool drained first, so every id is
+    // drawn on demand, which is how every placement worked before. Every
+    // outcome, fill and order record must match, the random correlation id
+    // and the wall-clock stamps aside.
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    enum PaperOp {
+        Place {
+            security_id: u64,
+            buy: bool,
+            limit: bool,
+            quantity: i64,
+        },
+        Update {
+            target: usize,
+            status: &'static str,
+            traded_qty: i64,
+            avg_price: f64,
+        },
+    }
+
+    fn paper_op() -> impl proptest::strategy::Strategy<Value = PaperOp> {
+        use proptest::prelude::*;
+        let statuses = prop_oneof![
+            Just("PENDING"),
+            Just("TRADED"),
+            Just("PART_TRADED"),
+            Just("CANCELLED"),
+            Just("REJECTED"),
+            Just("EXPIRED"),
+            Just("NOT_A_STATUS"),
+        ];
+        prop_oneof![
+            (0_u64..4, any::<bool>(), any::<bool>(), 1_i64..6).prop_map(
+                |(security_id, buy, limit, quantity)| PaperOp::Place {
+                    security_id,
+                    buy,
+                    limit,
+                    quantity
+                }
+            ),
+            (
+                0_usize..12,
+                statuses,
+                0_i64..8,
+                prop_oneof![Just(0.0), Just(101.5), Just(-1.0)]
+            )
+                .prop_map(|(target, status, traded_qty, avg_price)| PaperOp::Update {
+                    target,
+                    status,
+                    traded_qty,
+                    avg_price
+                }),
+        ]
+    }
+
+    fn paper_book() -> OrderManagementSystem {
+        OrderManagementSystem::new(
+            OrderApiClient::new(
+                reqwest::Client::new(),
+                "https://api.dhan.co/v2".to_owned(),
+                "100".to_owned(),
+            ),
+            OrderRateLimiter::new(1_000),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        )
+    }
+
+    /// Runs one op and returns its outcome as text; ids are deterministic
+    /// (`PAPER-<n>`), so the text compares across books.
+    fn run_paper_op(
+        oms: &mut OrderManagementSystem,
+        placed: &mut Vec<String>,
+        op: &PaperOp,
+    ) -> String {
+        use std::future::Future as _;
+        match *op {
+            PaperOp::Place {
+                security_id,
+                buy,
+                limit,
+                quantity,
+            } => {
+                let request = PlaceOrderRequest {
+                    security_id,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    transaction_type: if buy {
+                        TransactionType::Buy
+                    } else {
+                        TransactionType::Sell
+                    },
+                    order_type: if limit {
+                        OrderType::Limit
+                    } else {
+                        OrderType::Market
+                    },
+                    product_type: ProductType::Intraday,
+                    validity: OrderValidity::Day,
+                    quantity,
+                    price: if limit { 100.0 } else { 0.0 },
+                    trigger_price: 0.0,
+                    lot_size: 25,
+                    expiry_date: None,
+                };
+                let mut future = std::pin::pin!(oms.place_order(request));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                match future.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(Ok(order_id)) => {
+                        placed.push(order_id.clone());
+                        format!("placed {order_id}")
+                    }
+                    std::task::Poll::Ready(Err(err)) => format!("refused {err:?}"),
+                    std::task::Poll::Pending => "awaited".to_owned(),
+                }
+            }
+            PaperOp::Update {
+                target,
+                status,
+                traded_qty,
+                avg_price,
+            } => {
+                let order_no = placed
+                    .get(target % placed.len().max(1))
+                    .cloned()
+                    .unwrap_or_else(|| "PAPER-UNKNOWN".to_owned());
+                let mut update: OrderUpdate =
+                    serde_json::from_str("{}").expect("OrderUpdate fields are serde-default"); // APPROVED: test
+                update.exchange = "NSE".to_owned();
+                update.segment = "D".to_owned();
+                update.order_no = order_no;
+                update.status = status.to_owned();
+                update.traded_qty = traded_qty;
+                update.avg_traded_price = avg_price;
+                update.source = "P".to_owned();
+                format!("{:?}", oms.handle_order_update(&update))
+            }
+        }
+    }
+
+    /// Every order record with the random and wall-clock fields blanked.
+    fn comparable_book(oms: &OrderManagementSystem) -> Vec<(String, ManagedOrder)> {
+        let mut rows: Vec<(String, ManagedOrder)> = oms
+            .all_orders()
+            .iter()
+            .map(|(key, order)| {
+                let mut order = order.clone();
+                order.correlation_id = String::new();
+                order.created_at_us = 0;
+                order.updated_at_us = 0;
+                (key.clone(), order)
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_paper_order_id_matches_format(counter in proptest::prelude::any::<u64>()) {
+            proptest::prop_assert_eq!(paper_order_id_string(counter), format!("PAPER-{counter}"));
+        }
+    }
+
+    #[test]
+    fn test_paper_order_id_matches_format_at_the_extremes() {
+        for counter in [0_u64, 1, 9, 10, 99, 100, 12_345, u64::MAX - 1, u64::MAX] {
+            let id = paper_order_id_string(counter);
+            assert_eq!(id, format!("PAPER-{counter}"));
+            assert_eq!(id.capacity(), id.len(), "one exactly-sized allocation");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        #[test]
+        fn proptest_pooled_ids_decide_exactly_like_on_demand_ids(
+            ops in proptest::collection::vec(paper_op(), 1..40)
+        ) {
+            let mut pooled = paper_book();
+            let mut on_demand = paper_book();
+            // Drain book B's pool, so each of its ids is drawn on demand.
+            for _ in 0..super::super::idempotency::CORRELATION_ID_POOL_SIZE {
+                let _ = on_demand.correlations.next_id();
+            }
+            let (mut placed_a, mut placed_b) = (Vec::new(), Vec::new());
+            for op in &ops {
+                let a = run_paper_op(&mut pooled, &mut placed_a, op);
+                let b = run_paper_op(&mut on_demand, &mut placed_b, op);
+                proptest::prop_assert_eq!(&a, &b, "op {:?}", op);
+            }
+            proptest::prop_assert_eq!(comparable_book(&pooled), comparable_book(&on_demand));
+            proptest::prop_assert_eq!(pooled.total_placed(), on_demand.total_placed());
+            proptest::prop_assert_eq!(pooled.total_updates(), on_demand.total_updates());
+            // Every placed order is still matched back by its correlation id.
+            for order in pooled.all_orders().values().chain(on_demand.all_orders().values()) {
+                proptest::prop_assert_eq!(order.correlation_id.len(), 30);
+            }
+        }
     }
 
     #[test]
