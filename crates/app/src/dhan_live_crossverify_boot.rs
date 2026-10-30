@@ -1441,9 +1441,11 @@ fn day_key(day: chrono::NaiveDate) -> i64 {
         .num_days()
 }
 
-/// The worker reported `day`. O(1).
+/// The worker reported `day`. A maximum, never a plain store: a past day the
+/// catch-up reports after today must not hide today's report from the
+/// supervisor. O(1).
 fn note_worker_reported(day: chrono::NaiveDate) {
-    WORKER_REPORTED_DAY.store(day_key(day), Ordering::Relaxed);
+    WORKER_REPORTED_DAY.fetch_max(day_key(day), Ordering::Relaxed);
 }
 
 /// Whether the worker reported `day` in this process. O(1).
@@ -6537,10 +6539,15 @@ mod tests {
     /// 51g: the worker's report is per IST day.
     #[test]
     fn test_worker_reported_is_per_day() {
-        let d = chrono::NaiveDate::from_ymd_opt(2001, 2, 3).unwrap_or_default();
+        // A day far in the future, so a parallel test noting an earlier day
+        // cannot move the maximum past it.
+        let d = chrono::NaiveDate::from_ymd_opt(2999, 2, 3).unwrap_or_default();
         note_worker_reported(d);
         assert!(worker_reported(d));
         assert!(!worker_reported(d.succ_opt().unwrap_or_default()));
+        // A past day reported after it never hides it.
+        note_worker_reported(d.pred_opt().unwrap_or_default());
+        assert!(worker_reported(d));
         assert_eq!(day_key(chrono::NaiveDate::default()), 0);
         assert_eq!(
             day_start_ist_nanos_of(chrono::NaiveDate::from_ymd_opt(1970, 1, 2).unwrap_or_default()),
