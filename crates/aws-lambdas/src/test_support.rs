@@ -31,14 +31,16 @@ pub(crate) struct LoopbackRequest {
 
 impl LoopbackRequest {
     /// The `Action=` of a query-protocol (EC2 / SNS) request, if any.
-    pub fn query_action(&self) -> Option<String> {
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn query_action(&self) -> Option<String> {
         form_urlencoded::parse(self.body.as_bytes())
             .find(|(k, _)| k == "Action")
             .map(|(_, v)| v.into_owned())
     }
 
     /// The value of one form field of a query-protocol request.
-    pub fn form_value(&self, key: &str) -> Option<String> {
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn form_value(&self, key: &str) -> Option<String> {
         form_urlencoded::parse(self.body.as_bytes())
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.into_owned())
@@ -54,7 +56,8 @@ pub(crate) struct LoopbackResponse {
 
 impl LoopbackResponse {
     /// An `awsJson1_1` (SSM) reply.
-    pub fn json(status: u16, body: impl Into<String>) -> Self {
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn json(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
             content_type: "application/x-amz-json-1.1",
@@ -63,7 +66,8 @@ impl LoopbackResponse {
     }
 
     /// A query-protocol (EC2 / SNS) XML reply.
-    pub fn xml(status: u16, body: impl Into<String>) -> Self {
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn xml(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
             content_type: "text/xml",
@@ -117,6 +121,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<LoopbackRequ
 
 /// Starts the loopback endpoint. Returns `(endpoint_url, recorded_requests)`.
 /// The server lives until the test's runtime shuts down.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) async fn start_loopback_aws<F>(
     responder: F,
 ) -> (String, Arc<Mutex<Vec<LoopbackRequest>>>)
@@ -166,6 +171,7 @@ where
 /// An SDK config aimed at the loopback endpoint: fixed region and static
 /// test credentials (so nothing probes IMDS or a profile), retries off (so an
 /// error reply is seen once, not three times after back-off).
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) async fn loopback_sdk_config(endpoint: &str) -> aws_config::SdkConfig {
     aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new("ap-south-1"))
@@ -183,6 +189,7 @@ pub(crate) async fn loopback_sdk_config(endpoint: &str) -> aws_config::SdkConfig
 }
 
 /// A snapshot of what the server recorded so far.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn recorded(requests: &Arc<Mutex<Vec<LoopbackRequest>>>) -> Vec<LoopbackRequest> {
     requests
         .lock()
@@ -191,6 +198,7 @@ pub(crate) fn recorded(requests: &Arc<Mutex<Vec<LoopbackRequest>>>) -> Vec<Loopb
 }
 
 /// The awsJson error shape the SDK maps to a modelled (non-retryable) error.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn json_error(type_name: &str, message: &str) -> LoopbackResponse {
     LoopbackResponse::json(
         400,
@@ -199,6 +207,7 @@ pub(crate) fn json_error(type_name: &str, message: &str) -> LoopbackResponse {
 }
 
 /// The EC2 query-protocol error envelope.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn ec2_error(code: &str, message: &str) -> LoopbackResponse {
     LoopbackResponse::xml(
         400,
@@ -209,6 +218,7 @@ pub(crate) fn ec2_error(code: &str, message: &str) -> LoopbackResponse {
 }
 
 /// The SNS query-protocol error envelope.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn sns_error(code: &str, message: &str) -> LoopbackResponse {
     LoopbackResponse::xml(
         400,
@@ -225,6 +235,7 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Takes [`ENV_LOCK`], recovering from a poisoned lock (a failed test must
 /// not fail every later one).
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
         .lock()
@@ -239,7 +250,8 @@ pub(crate) struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
-    pub fn set(key: &str, value: Option<&str>) -> Self {
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn set(key: &str, value: Option<&str>) -> Self {
         let previous = std::env::var(key).ok();
         match value {
             // SAFETY: every caller holds ENV_LOCK; restored on drop.
@@ -267,6 +279,7 @@ impl Drop for EnvVarGuard {
 /// `handle` uses) at the loopback endpoint through the environment, the way
 /// a Lambda's execution environment supplies region and credentials: static
 /// keys, a fixed region, one attempt, no IMDS, no profile files.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn aws_env_guards(endpoint: &str) -> Vec<EnvVarGuard> {
     vec![
         EnvVarGuard::set("AWS_ENDPOINT_URL", Some(endpoint)),
@@ -331,7 +344,8 @@ fn ec2_instances_reply(action: &str, previous: &str, current: &str) -> LoopbackR
 
 impl Fleet {
     /// Answers one request as this account would.
-    pub fn respond(&self, req: &LoopbackRequest) -> LoopbackResponse {
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn respond(&self, req: &LoopbackRequest) -> LoopbackResponse {
         let op = if req.target.is_empty() {
             req.query_action().unwrap_or_default()
         } else {
@@ -406,11 +420,13 @@ impl Fleet {
 }
 
 /// Starts a loopback endpoint backed by `fleet`.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) async fn start_fleet(fleet: Fleet) -> (String, Arc<Mutex<Vec<LoopbackRequest>>>) {
     start_loopback_aws(move |req| fleet.respond(req)).await
 }
 
 /// The operation names of every recorded request, in arrival order.
+// TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn operations(requests: &Arc<Mutex<Vec<LoopbackRequest>>>) -> Vec<String> {
     recorded(requests)
         .iter()
