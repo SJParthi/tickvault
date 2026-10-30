@@ -3896,6 +3896,8 @@ mod tests {
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
             raw_frame_archive: RawFrameArchiveConfig::default(),
+            memory_watchdog: MemoryWatchdogConfig::default(),
+            task_heartbeat: TaskHeartbeatConfig::default(),
         }
     }
 
