@@ -65,6 +65,32 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/app/tests/chaos_combined_evening_drain.rs",
         "a_torn_file_from_last_evening_does_not_block_tonight",
     ),
+    // Added 2026-10-30 with plan ITEM DT-SOCK (owner: every in-memory step
+    // under 1 us at p99): wall-clock harnesses for the socket read path's
+    // in-memory work per frame (production spacing, bursts, a per-step
+    // breakdown, a live drain, the drain's recv over a backlog). They print
+    // percentiles and gate nothing, like the harness above: a wall-clock
+    // number must not become a flaky CI gate. The gate is the Criterion
+    // budget `ws_reader_frame_handle` (bench-gate); the behaviour is pinned
+    // by the ordinary tests in `frame_ring.rs` and `ws_frame_spill/receipt_anchor.rs`.
+    //
+    //   cargo test --release -p tickvault-core --test socket_read_in_memory_harness -- --ignored --nocapture --test-threads=1
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_in_memory_cost_per_frame",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_in_memory_cost_breakdown",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_cost_with_a_live_drain_in_a_burst",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "ring_recv_cost_over_a_queued_backlog",
+    ),
     // Added 2026-10-30 with plan item DT-S1: a wall-clock harness for the
     // hot-thread placement switches (consumer pick-up delay with a busy
     // neighbour on the hot core, three placements). It prints percentiles
