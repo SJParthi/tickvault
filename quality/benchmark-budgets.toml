@@ -35,7 +35,7 @@ token_handle             = 50           # <50ns  — matches token_handle/load (
 # its Criterion bench lived in the deleted crates/storage/benches/
 # tick_persistence.rs (the dead tick chain). The primitive itself is
 # unchanged in tickvault_common::price_precision (unit + wiring tested).
-ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump + WAL append + dispatch per frame. Generous ceiling because WAL append includes one heap alloc + one crossbeam try_send; measured ~1-3μs in criterion, budget gives 2× headroom for noisy CI runners.
+ws_reader_frame_handle   = 1000         # <1μs  — the socket read path per frame (plan ITEM DT, 2026-10-30; was 5000): classify_frame + note_depth200_frame + WalRingSink::accept (receipt stamp, sequence, WAL hand-off to a real writer, ring budget, ring push), consumer awake. Measured median 255 ns (x86 dev VM). Excludes the wake of a PARKED drain (a futex/eventfd syscall, ~18 μs on the dev VM), measured by crates/core/tests/socket_to_wal_tail_harness.rs; spaced p50/p99 in socket_read_in_memory_harness.rs.
 # tick_gap_record_tick_steady_state / tick_gap_scan_gaps_full_universe budgets
 # removed in PR-C3 (2026-07-14) with the deleted tick-gap detector
 # (operator Q4-ii 2026-07-13).
