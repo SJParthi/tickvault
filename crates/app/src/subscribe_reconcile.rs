@@ -872,9 +872,11 @@ async fn unsubscribe_half(
     let mut half = UnsubscribeHalf::default();
     let mut work: Vec<Vec<SubscribeInstrument>> = vec![instruments];
     let mut commands = 0usize;
+    let mut cap_reported = false;
     while let Some(batch) = work.pop() {
         if half.halted || commands >= RECONCILE_MAX_UNSUBSCRIBE_COMMANDS {
-            if !half.halted {
+            if !half.halted && !cap_reported {
+                cap_reported = true;
                 count_round("split_cap_reached");
             }
             half.untouched.extend(batch);
@@ -972,14 +974,18 @@ where
     let not_held_list = half.not_held;
     let not_held = not_held_list.len();
     counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "not_held").increment(not_held as u64);
-    // Phase one puts back what this round took off (and what may have left
-    // unanswered): each freed its own slot, so it fits whatever the socket's
-    // cap. Phase two places the not-held ones on their own, so one that finds
-    // no room never fails the first group.
-    let mut first = half.removed;
-    first.extend(half.unknown);
-    let first_len = first.len();
-    if first_len == 0 && not_held == 0 {
+    // Three subscribe phases, so a group that may need room nobody freed never
+    // fails one that freed its own:
+    // 1. `removed`: this round took them off, each freed its own slot, so they
+    //    fit whatever the socket's cap; one still off at the end is `lost`;
+    // 2. `unknown`: the unsubscribe got no answer, so each may still be held
+    //    (a duplicate, dropped by the socket) or may need a slot; one not
+    //    placed is `unknown`, never `lost`;
+    // 3. `not_held`: never on the socket; one that finds no room is
+    //    `unplaceable`. Runs only when 1 and 2 placed everything.
+    let removed_len = half.removed.len();
+    let unknown_len = half.unknown.len();
+    if removed_len == 0 && unknown_len == 0 && not_held == 0 {
         finished(&half.untouched);
         return RoundOutcome::Resubscribed {
             resent: 0,
@@ -988,23 +994,38 @@ where
         };
     }
     let mut refund = half.untouched;
-    let lost = match subscribe_with_retries(tx, first).await {
+    let lost = match subscribe_with_retries(tx, half.removed).await {
         SubscribeEnd::Done => Vec::new(),
         SubscribeEnd::Remaining(remaining) => remaining,
-        SubscribeEnd::Unknown(unknown) => {
+        SubscribeEnd::Unknown(mut unanswered) => {
             counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent")
-                .increment(first_len.saturating_sub(unknown.len()) as u64);
-            // Phase two never ran: the not-held ones get their round back.
+                .increment(removed_len.saturating_sub(unanswered.len()) as u64);
+            // Nothing after phase one was tried: the not-held ones get their
+            // round back; the unknown ones may be off the socket, so they are
+            // reported with the unanswered ones.
+            counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "unknown")
+                .increment(unknown_len as u64);
+            unanswered.extend(half.unknown);
             refund.extend(not_held_list);
             finished(&refund);
-            return RoundOutcome::Unknown(unknown);
+            return RoundOutcome::Unknown(unanswered);
         }
     };
-    let mut resent = first_len.saturating_sub(lost.len());
+    let mut resent = removed_len.saturating_sub(lost.len());
+    let uncertain = match subscribe_with_retries(tx, half.unknown).await {
+        SubscribeEnd::Done => Vec::new(),
+        SubscribeEnd::Remaining(remaining) => {
+            counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "unknown")
+                .increment(remaining.len() as u64);
+            remaining
+        }
+        SubscribeEnd::Unknown(unanswered) => unanswered,
+    };
+    resent = resent.saturating_add(unknown_len.saturating_sub(uncertain.len()));
     let mut unplaced = 0;
-    if !lost.is_empty() {
-        // The socket had no room even for what it held a moment ago; placing
-        // more would compete for the same room. Not tried, so refunded.
+    if !lost.is_empty() || !uncertain.is_empty() {
+        // The socket had no room, or did not answer: placing more would compete
+        // for the same room or send blind. Not tried, so refunded.
         refund.extend(not_held_list);
     } else if !not_held_list.is_empty() {
         match subscribe_with_retries(tx, not_held_list).await {
@@ -1023,28 +1044,30 @@ where
                      found no room on it after every attempt - nothing else was taken off"
                 );
             }
-            SubscribeEnd::Unknown(unknown) => {
+            SubscribeEnd::Unknown(unanswered) => {
                 counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent").increment(
-                    resent.saturating_add(not_held.saturating_sub(unknown.len())) as u64,
+                    resent.saturating_add(not_held.saturating_sub(unanswered.len())) as u64,
                 );
                 finished(&refund);
-                return RoundOutcome::Unknown(unknown);
+                return RoundOutcome::Unknown(unanswered);
             }
         }
     }
     counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent").increment(resent as u64);
     finished(&refund);
-    if lost.is_empty() {
+    if !lost.is_empty() {
+        count_round("lost");
+        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "lost").increment(lost.len() as u64);
+        RoundOutcome::Lost(lost)
+    } else if !uncertain.is_empty() {
+        RoundOutcome::Unknown(uncertain)
+    } else {
         count_round("resubscribed");
         RoundOutcome::Resubscribed {
             resent,
             not_held,
             unplaced,
         }
-    } else {
-        count_round("lost");
-        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "lost").increment(lost.len() as u64);
-        RoundOutcome::Lost(lost)
     }
 }
 
@@ -1706,14 +1729,17 @@ mod tests {
         mpsc::Sender<LiveSubscriptionCommand>,
         tokio::task::JoinHandle<(Vec<SubscribeInstrument>, usize, usize)>,
     ) {
-        capped_guard_socket(held, usize::MAX)
+        capped_guard_socket(held, usize::MAX, 0)
     }
 
     /// [`guard_socket`] with the real per-socket cap check: a command whose
-    /// result would hold more than `cap` instruments is refused whole.
+    /// result would hold more than `cap` instruments is refused whole. The
+    /// first `unanswered` commands are applied (or refused) but never
+    /// answered, as when the ack is lost.
     fn capped_guard_socket(
         held: Vec<SubscribeInstrument>,
         cap: usize,
+        unanswered: usize,
     ) -> (
         mpsc::Sender<LiveSubscriptionCommand>,
         tokio::task::JoinHandle<(Vec<SubscribeInstrument>, usize, usize)>,
@@ -1755,7 +1781,9 @@ mod tests {
                     }
                     ResubscribeOutcome::Applied
                 };
-                if let Some(ack) = ack {
+                if commands > unanswered
+                    && let Some(ack) = ack
+                {
                     let _ = ack.send(outcome);
                 }
             }
@@ -1823,7 +1851,7 @@ mod tests {
     async fn test_regression_a_not_held_instrument_never_costs_the_held_ones_their_slots() {
         tokio::time::pause();
         // A full socket of 5: holds 1, 2, 4, 9, 10 and not 3.
-        let (tx, handle) = capped_guard_socket(sis(&[1, 2, 4, 9, 10]), 5);
+        let (tx, handle) = capped_guard_socket(sis(&[1, 2, 4, 9, 10]), 5, 0);
         let (outcome, refunded) = run_round(tx, &[1, 2, 3, 4]).await;
         assert_eq!(
             outcome,
@@ -1845,7 +1873,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_round_with_room_places_the_not_held_one() {
-        let (tx, handle) = capped_guard_socket(sis(&[1, 2]), 3);
+        let (tx, handle) = capped_guard_socket(sis(&[1, 2]), 3, 0);
         let (outcome, _) = run_round(tx, &[1, 2, 3]).await;
         assert_eq!(
             outcome,
@@ -1857,6 +1885,27 @@ mod tests {
         );
         let (held, _, _) = handle.await.expect("guard socket");
         assert_eq!(held, sis(&[1, 2, 3]));
+    }
+
+    // Regression: 2026-10-30 (final review, second pass) — an unsubscribe the
+    // socket refused as not-held but never answered put a not-held instrument
+    // in the `unknown` group, which then pushed phase one over the cap, and
+    // held instruments that never left were reported lost.
+    #[tokio::test]
+    async fn test_regression_an_unanswered_unsubscribe_never_reports_held_ones_lost() {
+        tokio::time::pause();
+        // Full socket of 5: holds 1, 2, 4, 9, 10, not 3. The first command
+        // (the unsubscribe of 1..4) is refused as not-held and never answered.
+        let (tx, handle) = capped_guard_socket(sis(&[1, 2, 4, 9, 10]), 5, 1);
+        let (outcome, refunded) = run_round(tx, &[1, 2, 3, 4]).await;
+        assert_eq!(
+            outcome,
+            RoundOutcome::Unknown(sis(&[1, 2, 3, 4])),
+            "may or may not be on the socket; never lost"
+        );
+        assert!(refunded.is_empty());
+        let (held, _, _) = handle.await.expect("guard socket");
+        assert_eq!(held, sis(&[1, 2, 4, 9, 10]), "nothing left the socket");
     }
 
     #[tokio::test]
