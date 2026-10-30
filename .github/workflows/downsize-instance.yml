@@ -400,6 +400,16 @@ jobs:
           # non-fatal by design.
 
       # ── STEP 1: post-market guard (aws-upgrade-instance.sh style, IST math from deploy-aws.yml) ──
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Post-market guard — refuse 09:00-15:40 IST Mon-Fri
         env:
           FORCE_MARKET_HOURS: ${{ github.event.inputs.force_market_hours }}
@@ -407,9 +417,9 @@ jobs:
           if [ "$FORCE_MARKET_HOURS" = "yes" ]; then
             echo "operator force override — proceeding despite market hours"; exit 0
           fi
-          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; then
-            echo "::error::Refusing: within 09:00-15:40 IST Mon-Fri (a stop interrupts the live session). Re-run post-market or set force_market_hours=yes."
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM)); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; }; then
+            echo "::error::Refusing: within 09:00-15:40 IST Mon-Fri or on a Muhurat date (a stop interrupts the live session). Re-run post-market or set force_market_hours=yes."
             exit 1
           fi
           echo "outside the market window (dow=$DOW $HHMM IST) — safe"
