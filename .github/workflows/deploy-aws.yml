@@ -455,7 +455,7 @@ jobs:
               # An explicit human/dispatcher action asked for an in-window
               # deploy WITHOUT the override — keep the loud red signal so the
               # asker learns immediately that nothing was deployed.
-              echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
+              echo "BLOCK: deploying during 09:00-15:45 IST on a weekday, or on a calendar Muhurat date (MUHURAT=$MUHURAT), is forbidden without override."
               echo "Re-run with confirm_market_hours=yes if this is an emergency fix."
               exit 1
             elif [ "${{ github.event_name }}" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
@@ -483,7 +483,7 @@ jobs:
               # TAG pushes still block red below (the after-close cron
               # delivers main HEAD only).
               echo "deploy_allowed=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::Deploy of ${{ github.sha }} deferred: inside 09:00-15:45 IST market window; the after-close redeploy cron (15:46 IST, deploy-aws-after-close.yml) will deliver it. Immediate delivery remains available via workflow_dispatch with confirm_market_hours=yes."
+              echo "::notice::Deploy of ${{ github.sha }} deferred: inside the 09:00-15:45 IST weekday market window, or on a calendar Muhurat date (MUHURAT=$MUHURAT); the next weekday after-close redeploy cron (deploy-aws-after-close.yml: 15:46 IST, or the next weekday morning after a Muhurat date) will deliver it. Immediate delivery remains available via workflow_dispatch with confirm_market_hours=yes."
               exit 0
             else
               # HOSTILE-REVIEW FIX 2026-07-17: the green defer above is
@@ -492,7 +492,7 @@ jobs:
               # in-window TAG push (v*.*.*, possibly on a non-HEAD commit)
               # would be a SILENT never-deploy. Tags and any other in-window
               # non-override shape keep the original loud red block.
-              echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
+              echo "BLOCK: deploying during 09:00-15:45 IST on a weekday, or on a calendar Muhurat date (MUHURAT=$MUHURAT), is forbidden without override."
               echo "This event (${{ github.event_name }} on $GITHUB_REF) cannot be green-deferred: the after-close cron redeploys main HEAD only."
               exit 1
             fi
@@ -897,7 +897,7 @@ jobs:
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
           if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; }; then
             echo "DEPLOY_SKIP_REASON=market_hours_swap_abort" >> "$GITHUB_ENV"
-            echo "::warning::Market is OPEN ($HHMM IST) at swap time — the build crossed into the 09:00-15:45 IST no-deploy band. ABORTING the binary swap to avoid a mid-session restart. The 15:46 IST post-market cron will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
+            echo "::warning::Market is OPEN ($HHMM IST, MUHURAT=$MUHURAT) at swap time — the build crossed into the 09:00-15:45 IST weekday no-deploy band or a calendar Muhurat date. ABORTING the binary swap to avoid a mid-session restart. The next weekday after-close cron (15:46 IST) will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
             exit 1
           fi
           echo "outside market hours ($HHMM IST, dow=$DOW) — safe to swap"

@@ -293,11 +293,27 @@ fn config_muhurat_blocks_put_the_date_first() {
     for (i, line) in lines.iter().enumerate() {
         if line.trim() == "[[trading.muhurat_trading_dates]]" {
             blocks += 1;
-            let next = lines.get(i + 1).map_or("", |l| l.trim());
+            // The workflows match both lines EXACTLY (`grep -xF`): no indent,
+            // no trailing comment. A looser check here would let an edit pass
+            // that makes every guard read the date as an ordinary day.
+            assert_eq!(
+                *line, "[[trading.muhurat_trading_dates]]",
+                "a Muhurat header must have no indent or trailing text (grep -xF)"
+            );
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            let date = next
+                .strip_prefix("date = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or("");
+            let b = date.as_bytes();
             assert!(
-                next.starts_with("date = \""),
-                "the line after a [[trading.muhurat_trading_dates]] header must be its date \
-                 (the workflows read it with grep -A1); found `{next}`"
+                b.len() == 10
+                    && b[4] == b'-'
+                    && b[7] == b'-'
+                    && date.bytes().filter(u8::is_ascii_digit).count() == 8,
+                "the line after a [[trading.muhurat_trading_dates]] header must be exactly \
+                 `date = \"YYYY-MM-DD\"` (no indent, no trailing comment): the workflows read \
+                 it with grep -A1 | grep -xF; found `{next}`"
             );
         }
     }
