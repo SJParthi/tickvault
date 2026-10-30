@@ -932,7 +932,7 @@ mod tests {
     /// Review round 2: a failed write is noted per IST day, read back for
     /// that day only, and cleared only for that day.
     #[test]
-    fn test_note_record_write_failed_then_clear_record_write_failed() {
+    fn test_note_record_write_failed_record_write_failed_for_and_clear_record_write_failed() {
         // Far-future days, so no other test's day collides.
         let day = NaiveDate::from_ymd_opt(2998, 1, 5).expect("date");
         let other = NaiveDate::from_ymd_opt(2998, 1, 6).expect("date");
