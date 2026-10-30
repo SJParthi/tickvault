@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn test_build_reader_runtime_registers_the_worker_thread_id() {
         use tickvault_storage::hot_thread_sched::{HotThread, registered_thread_id};
-        let rt = build_reader_runtime(1, None).expect("one thread");
+        let rt = build_reader_runtime(1, None, None).expect("one thread");
         rt.block_on(async { tokio::spawn(async {}).await.expect("task ran") });
         if std::path::Path::new("/proc/thread-self").exists() {
             assert!(
