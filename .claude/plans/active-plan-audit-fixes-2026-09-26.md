@@ -177,6 +177,12 @@ inline (PR2, PR8, PR14).
   - `clippy::arithmetic_side_effects` denied in `crates/core/src/parser/` (fixed-offset decode),
     with each unavoidable site `checked_*`/`saturating_*`. Other crates: follow-up, flagged.
 - [ ] **PR6 — O(1) active-order count.** (`trading`)
+  - **Status 2026-10-30 (first-34 sweep): OPEN.** `OrderManagementSystem::active_order_count`
+    and `active_orders` (oms/engine.rs) still scan `orders`; no active counter, no composite
+    active index, no proptest. The folded pending-paper rebuild (`rebuild_pending_paper`) is
+    kept as a full rebuild on purpose (CLAUDE.md O(1) table, audit Z12 row), so that fold is
+    closed by that decision unless reopened. Size: ~150-250 lines in engine.rs plus a proptest
+    (OMS path, Heavy tier).
   - Correction: there is no `ActiveOrderBook`; the O(n) scans are OMS
     `active_order_count()` (engine.rs:1660) and `active_orders()` (:1650), called on every
     order-runtime event arm (order_runtime.rs:1749, :1808). Maintain an `active` counter updated
@@ -184,6 +190,16 @@ inline (PR2, PR8, PR14).
     per-`(security_id, segment)` active index; the existing scan stays as a `debug_assert`
     cross-check. Public signatures unchanged, so exit-order callers are not edited.
 - [ ] **PR7 — benches for the paths with none.** (`trading`, `storage`)
+  - **Status 2026-10-30 (first-34 sweep): PARTIAL.** Done: `consume_tick` hit bench
+    (`trading/benches/candle_fold.rs`); the seal channel no longer allocates on the drain
+    (crossbeam `SealSender`, `dhat_seal_queue_backlog`, audit N2); the capture-log wake was
+    measured and removed while frames flow (`wal_writer_wait::next_record`, PR M/M4); the
+    unmeasured ~50 ns price claim was replaced by a measured 17 ns (2026-10-09), though no
+    per-call bench backs it. Open: new-slot and seal-crossing fold benches, seal ring push/pop,
+    tick and candle ILP append (no `crates/storage/benches`), the 162-byte full-packet bench,
+    a seal ring DHAT test (owned `trading/candles`), budgets from a first run, and the
+    `dispatch_frame` 10 ns budget vs the reported 14.6 ns (needs a budget decision; existing
+    budget lines are owned). Size: ~500 lines over 3-4 PRs.
   - Criterion benches: `MultiTfAggregator::consume_tick` (hit, new slot, seal-crossing),
     seal ring push/pop, tick ILP append, candle ILP append. Budgets added to
     `quality/benchmark-budgets.toml` from the first measured run (never guessed).
@@ -193,6 +209,14 @@ inline (PR2, PR8, PR14).
     conversion figure is unmeasured, so restore the per-call bench or delete the claim
     (common/src/price_precision.rs:44-50).
 - [ ] **PR8 — `block_in_place` on shared runtimes.** (`app`, `storage`)
+  - **Status 2026-10-30 (first-34 sweep): PARTIAL.** Done: label half closed with no change;
+    the steady-state tick and depth flushes no longer `block_in_place` on the drain
+    (`off_worker`, S1; guard `every_blocking_writer_step_runs_off_the_worker`). Open:
+    `blocking_flush` still covers the boot, refold and catch-up flushes, not only shutdown
+    (owned `dhan_feed_stack.rs`); `block_in_place` remains at `dhan_universe.rs`,
+    `order_update_events_boot.rs`, `order_observability.rs`,
+    `dhan_order_push_observability.rs`, `order_leg_pnl_boot.rs` and the seal writer cycle in
+    `seal_writer_loop.rs`; no source guard. Size: ~500 lines over several PRs.
   - Correction: no per-tick dynamic metric label exists on the drain (checked 7403-8285; all
     handles pre-built), so the "label cache" half is closed with no change.
   - Six `block_in_place` sites (dhan_universe.rs:1040, order_update_events_boot.rs:113,
@@ -210,6 +234,15 @@ inline (PR2, PR8, PR14).
     `MAX_PACKETS_PER_FRAME`.
   - New fuzz target `main_feed_frame_walk` (stacked frames, truncated tails, unknown codes).
 - [ ] **PR10 — faster hashing on per-tick maps.** (`trading`, `app`)
+  - **Status 2026-10-30 (first-34 sweep): PARTIAL, all remaining work in owned files.** Done:
+    ahash on the per-tick maps (`per_tick_maps_use_ahash`), fast price widening, depth buffer
+    pre-size (`DepthLayout::row_buffer_presize_bytes`, DT-small A2), tick buffer pre-size
+    (`TICK_ROW_BUFFER_PRESIZE_BYTES`, K6), tick column names checked once
+    (`tick_ilp_column`, DA-12), label table on ahash (`CandleContractLabels`). Superseded: the
+    per-seal board lookup (top_volume deleted 2026-10-22); the spot price pre-size was
+    declined on purpose at its site. Open: the depth writer still passes `&str` column names
+    per row (owned `depth_persistence.rs`), a miss counter on depth buffer regrowth, and the
+    keepalive counters and delay timer (owned, unverified). Size: ~200 lines, owned files.
   - `MultiTfAggregator.index` (multi_tf_aggregator.rs:382), `PrevCloseStore.closes`
     (prev_close_store.rs:94) and `SpotPriceStore` papaya map (spot_price_store.rs:297) use
     SipHash. Switch to `ahash::RandomState` — `ahash =0.8.12` is ALREADY a workspace dependency
@@ -241,6 +274,12 @@ inline (PR2, PR8, PR14).
     test_f32_to_f64_clean_matches_text_path_on_a_stride_of_all_f32,
     test_f32_to_f64_clean_boundary_values_match_text_path.
 - [ ] **PR11 — disk ballast and token recovery without a restart.** (`storage`, `core`, `app`)
+  - **Status 2026-10-30 (first-34 sweep): OPEN, nothing built.** No ballast anywhere
+    (`grep -ri ballast crates deploy` is empty); `token_manager.rs` `renewal_loop` still halts
+    after `TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES` with "manual restart required", with no
+    SSM poll and no IST-day reset; the folded seal free-space floor is not built. Size: ballast
+    ~200-300 lines (behind a default-off switch), post-breaker SSM poll ~150-200 lines (auth,
+    Heavy tier), seal floor ~80 lines.
   - Disk headroom gauges and alarms already exist (disk_pressure_boot.rs:242, app-alarms.tf:312,
     :376). Missing: an ENOSPC ballast — a pre-allocated reserve file on the data volume, released
     automatically when the disk-pressure shed reaches its last level so the spill tier has room to
@@ -251,10 +290,21 @@ inline (PR2, PR8, PR14).
     accept a token that passes the JWT shape and expiry check and is newer than the held one, then
     re-arm the breaker. The breaker also resets at the IST day rollover.
 - [ ] **PR12 — mid-session WAL catch-up.** (`app`, `storage`)
+  - **Status 2026-10-30 (first-34 sweep): OPEN.** The only WAL catch-up runs once per lane
+    start (`run_dhan_feed_stack`, `WAL_CATCHUP_MAX_ROUNDS`; 20 s in-session budget); the
+    after-close path is a planned restart (`evening_drain::evening_step`), not a background
+    task. No 60 s-healthy trigger, no own rate-capped sender, no idempotency test; the folded
+    tick-spill replay rate cap is not built (it holds while suspect and posts 8 MiB chunks, but
+    has no bytes/s cap). Size: ~600-1,500 lines, mostly owned `dhan_feed_stack.rs`; needs the
+    owning session.
   - WAL replay runs only at boot (main.rs:1001; catch-up drain dhan_feed_stack.rs:13808).
     After QuestDB is healthy again for 60 s, a background task replays un-applied WAL ranges on
     its own ILP sender, rate-capped, never on the drain. DEDUP keys make replay idempotent.
-- [ ] **PR13 — no JavaScript left in CI.** (`.github/workflows/`)
+- [x] **PR13 — no JavaScript left in CI.** (`.github/workflows/`)
+  - **Done (verified 2026-10-30, first-34 sweep):** `grep -rn 'uses:.*github-script' .github/`
+    is empty; the 12 safety.yml uses and the dep-freshness ones went in 4e2194a (#2084, DA-19);
+    `rust_only_guard.rs` `GITHUB_SCRIPT_BUDGET = &[]` with `github_script_usage_only_shrinks`
+    fails the build on any new use (stands in for the planned `no_github_script_in_workflows`).
   - 14 `actions/github-script` steps: safety.yml (12) and dep-freshness-nightly.yml (2). Port each
     to the `gh` CLI with identical inputs/outputs, the way fuzz.yml / chaos-nightly.yml already were.
 - [x] **PR14 — order-update receiver cannot silently skip.** (`app`, `core`)
@@ -277,7 +327,15 @@ inline (PR2, PR8, PR14).
     limiter's comment claims a rolling, never-looser daily window (row 162, rate_limiter.rs:114):
     make the code match it or correct the comment.
 - [ ] **D2 — covered by PR3 + PR12.**
+  - **Status 2026-10-30 (first-34 sweep): waits on PR12.** PR3 is done (ticked above); PR12
+    is open, so D2 closes when PR12 does. Nothing D2-specific to build.
 - [ ] **D3 — no silent instrument drop.** (`app`, `core`)
+  - **Status 2026-10-30 (first-34 sweep): PARTIAL.** D3a, D3b, D3c-1 and D8 are done (ticked
+    below, symbols verified in code). Superseded: the depth-200 "dials nothing" page and the
+    depth-20 index legs (depth sockets off since 2026-10-21) and "top_volume stays empty"
+    (deleted 2026-10-22). Open: the rest of D3c (see D3c), and row 153 (ship
+    `tv_dhan_live_universe_instruments` to CloudWatch), which adds an EMF name and needs a
+    dated noise-lock row from the owner.
   - Universe over capacity (dhan_live_universe.rs:280-287): today the WHOLE widened set is
     replaced by the 4 index SIDs. Missing/unreadable master (:565-576, :706-720) does the same.
   - A parked main-feed socket (pool_supervisor.rs:2211-2269, after 805/806/808/810 or a second
@@ -427,7 +485,15 @@ inline (PR2, PR8, PR14).
     the loss (risk/engine.rs:852-869); count it and alarm, since the gate covers entries only.
 - [ ] **D5 — headroom alarms.** Already present for disk (used %, fill rate) and host memory
   (app-alarms.tf:535). Only the ballast-released signal from PR11 is new; it rides that PR.
+  - **Status 2026-10-30 (first-34 sweep): waits on PR11.** Disk and memory alarms are present
+    (`app-alarms.tf`); no ballast exists yet, so the released signal cannot. A page on the
+    release would need a dated noise-lock row; a log-only coded error would not.
 - [ ] **D6 — the two remaining shell scripts become Rust.** (`app`)
+  - **Status 2026-10-30 (first-34 sweep): PARTIAL.** D6a-D6d done (ticked below;
+    `shell_budget_guard.rs`, `host_tuning.rs`, `holiday_gate.rs`, `ensure_questdb.rs`); 96
+    tracked shell files remain (105 at D6a). Open: D6e onward and the per-row
+    product-path verdicts on the inventory (no such table in rust-only lock §0.10). The All
+    Green matrix script stays rule-locked to shell (merge-gate lock §5.1).
   - `deploy/aws/holiday-gate.sh` (132 lines, tickvault-holiday-gate.service:36) and
     `scripts/ensure-questdb.sh` (230 lines, tickvault.service:106 `ExecStartPre=-`) become
     subcommands of the app binary; the unit files call them; `rust_only_guard.rs` allowlist shrinks.
@@ -466,6 +532,13 @@ inline (PR2, PR8, PR14).
     - [ ] D6e onward — the rest by risk: SSM command strings and `sh -c` spawns in Rust get a
       budget, then workflow `run:` steps and the Makefile get a budget, then operator scripts
       are ported or deleted (orphans first), each PR lowering the D6a lists.
+      - **Status 2026-10-30 (first-34 sweep): PARTIAL.** Every budget step is done
+        (`console_embedded_shell_never_grows`, `ssm_shell_senders_are_enumerated_and_only_shrink`,
+        `rust_shell_spawns_are_allowlisted`, `workflow_run_lines_never_grow`,
+        `makefile_recipe_lines_never_grow`; rust-only lock §0.10 "2026-10-12 — the rest is
+        budgeted"); two orphans deleted, five kept on purpose (§0.10). Open: the porting phase
+        (96 files; the console SSM shell and `user-data.sh.tftpl` are the largest). Deleting a
+        "kept on purpose" script needs the owner. Size: weeks of serial PRs.
 
 
 ### Added 2026-09-26 (second re-check, 26 new open gaps), riskiest first
@@ -595,6 +668,14 @@ folded into them below), then PR18, PR19 and the decisions.
     capture log segment can lose up to 1 s of records on power loss (`WAL_FSYNC_INTERVAL_MS_DEFAULT`
     = 1,000), and an environment value of 0 turns syncing off.
 - [ ] **Folded into existing PRs:**
+  - **Status 2026-10-30 (first-34 sweep), per fold line:** PR5 sites relabelled in this sweep
+    where not already (see PR5; `order_readiness.rs` no longer exists). PR6 open (see PR6;
+    pending-paper rebuild kept by the Z12 decision). PR7 open (no full-packet bench, no seal
+    ring DHAT test). PR10 done: `contract_underlying_map.rs` `OwnerMap` hashes with ahash;
+    the `volume_leaderboard` map is superseded (module deleted 2026-10-22). PR12 partial (the
+    tick-spill replay holds while suspect and chunks at 8 MiB; no rate cap yet). D6 partial
+    (host-tuning scripts gone in D6b; `user-data.sh.tftpl` and the console SSM shell are
+    budgeted, not ported).
   - PR5: seven more dead crash-recovery sites under `panic = "abort"` (order_leg_pnl_boot.rs:221,
     day_ohlc_orchestrator.rs:315, tf_consistency_boot.rs:2287, order_runtime.rs:437,
     dhan_order_push_observability.rs:390, disk_health_watcher.rs:302, order_readiness.rs:346).
@@ -645,6 +726,18 @@ folded into them below), then PR18, PR19 and the decisions.
     cloud-log retention comment that says cold storage keeps older logs is false (logs expire after
     14 days and nothing exports them): fix the comment; an export is the owner's cost call.
 - [ ] **D7 — every socket refused at once (805, second login).** (`core`) All sockets park together
+  - **Status 2026-10-30 (first-34 sweep): MOSTLY DONE; one gap in an owned file.** Built: the
+    805 episode with probe-then-release for main feed and depth (`pool_supervisor.rs`
+    `OVERFLOW_EPISODES`, `OverflowEpisodeKind`, `take_overflow_grant`,
+    `proptest_window_bound_holds_from_the_grant_across_restarts`), every socket watched over the
+    window (`overflow_note_dial_*`, `OVERFLOW_SUSPECT_MASK`, 740 s bound), the 808 policy
+    (`test_first_808_refreshes_then_dials_with_the_token_floor` and siblings), depth dials
+    refused after an 805 (`dial_planned_connections`); re-check 6's depth-resume question was
+    decided by the scope-lock section "2026-10-02 DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805",
+    and depth is off since 2026-10-21. Open: the contract attach's contract-half dial sizes with
+    `remaining_main_feed_capacity()` rather than `widen_pool_room()`, so after an 805 it can
+    still open new main-feed sockets (owned `dhan_feed_stack.rs`, ~80-150 lines plus a test).
+    The plan's "D7 (808 policy open)" status row is stale.
   and D3 has no spare to move to (pool_supervisor.rs:738-748, :1786-1832). Owner asked
   2026-09-26; the recommended option is: wait 5 minutes, redial one socket as a test, bring the
   rest back only if Dhan accepts it, critical alert either way. Until the owner picks another option, that default is what gets built.
@@ -668,6 +761,11 @@ folded into them below), then PR18, PR19 and the decisions.
   Tests: `test_regression_d8_india_vix_missing_from_the_master_is_kept_and_reported` (bite-checked),
   `test_d8_*`, `test_seed_names_for_*`, property `master_indices_replace_the_seeds_rather_than_joining_them`.
 - [ ] **D9 — a second Dhan account for the depth sockets only.** (`core`, `app`, `aws-lambdas`,
+  - **Status 2026-10-30 (first-34 sweep): D9a, D9b-1, D9b-2 done; D9b-3 blocked on the
+    owner.** Depth sockets are switched off (2026-10-21, `depth_sockets_enabled = false`), the
+    second account is not confirmed to exist, and D9b-3 was already paused on the owner's
+    rotation decision. Not superseded (the code is kept and depth can be switched back on), but
+    nothing more can ship until the owner decides.
   terraform) Owner, 2026-09-26 13:05 UTC: "i will get my friends accoutn as the seocnd accoputn
   oen and only to haev this extra depth 20 and dpeth 200 websockets alone"; 13:09 UTC: "yes dhan
   said go ahead with the secodn accoutn dude okay?". Not started until the
@@ -689,6 +787,9 @@ folded into them below), then PR18, PR19 and the decisions.
     `ROTATION_HALTED` kept process-wide) and `groww-shared-token-minter-2026-07-02.md` §10.9 (one
     minter per account). Both summary stubs updated.
   - [ ] **D9b — the code, in three PRs.**
+    - **Status 2026-10-30 (first-34 sweep):** D9b-1 and D9b-2 verified in code
+      (`parse_ssm_service`, `dhan-depth-token-minter-lambda.tf`, `pool_budget::slot_owner`,
+      `try_open_on`, `release_on`); only D9b-3 is left, blocked as under D9.
     - [x] **D9b-1 — the depth account's minter (this PR).** `dhan_token_minter.rs` reads
       `SSM_SERVICE` against a closed list of two (`dhan`, `dhan-depth`; unset = `dhan`, anything
       else fails the mint) and threads the segment through the read and the write. New
@@ -714,6 +815,11 @@ folded into them below), then PR18, PR19 and the decisions.
       a READ-ONLY token source re-read from `/dhan-depth/access-token` (an 807 on the depth account
       re-reads, never mints: minting from the box would fight its Lambda); `account` label on
       every depth log, counter and alarm; the second pool static (no steering) until measured.
+      - **Status 2026-10-30 (first-34 sweep): OPEN, blocked on the owner.** No
+        `[dhan_depth_account]` section or struct, no read-only depth token source; slots
+        16..25 exist but nothing opens them. Needs: the account confirmed, depth switched back
+        on (a dated quote, scope lock 2026-10-21), and the rotation decision. Size: ~800-1,500
+        lines, mostly owned `dhan_feed_stack.rs`.
 - [x] **D10 — no depth path relies on unsubscribe.** **OBSOLETE 2026-10-04:** the design reversed. #1994 swaps depth-200 in place (code 25 then 23), the owner ruled for unsubscribe/subscribe on 2026-10-01, and Dhan's 2026-09-30 reply confirms code 25; a ghost is answered by `request_ghost_unsubscribe`. Original text kept below. (`core`) Dhan depth unsubscribe (codes 25
   and 24) takes no effect and gets no reply (madefortrade topic 94234; Dhan "reviewing" as of
   2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but
@@ -777,11 +883,28 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     Not changed: the mid-session watchdog's `force_renewal()` (not an 807 path; sockets now
     re-dial instead of renewing if it replaces a fresh token).
 - [ ] **PR23 — the day's last candles are sealed at the close, not at shutdown.** (`app`, `trading`)
+  - **Status 2026-10-30 (first-34 sweep): OPEN.** `LiveIngest::seal_open_buckets_at_close` is
+    still called only from the midnight roll and the shutdown path; the catch-up cutoff
+    (watermark capped at the wall, less `CATCHUP_LATENESS_MARGIN_SECS`) never reaches buckets
+    ending after ~15:36 once ticks stop, so the 15:15-15:45 30m and 15:15-16:15 60m bars wait
+    for shutdown. No session-close trigger, no crash-case test. Size: ~150-300 lines, all in
+    owned files (`dhan_feed_stack.rs`, `trading/candles`); it must run before the 15:44:05
+    cross-check barrier.
   - Candles after ~15:36 and the day's last 15/30/60-minute candles are sealed only at shutdown
     (dhan_feed_stack.rs:6125, :4361-4365, :7668); a crash loses them unless the next boot's WAL
     replay rebuilds them (Assumed, not verified). Seal every open bar at the session close on
     the drain's idle arm, the PR4b catch-up shape, and test the crash case.
-- [ ] **PR24 — a future-dated timestamp cannot move a watermark past what is durable.**
+- [x] **PR24 — a future-dated timestamp cannot move a watermark past what is durable.**
+  - **Done (verified 2026-10-30, first-34 sweep):** candle watermark capped at the wall
+    (`catch_up_cutoff`, `test_regression_a_future_stamped_tick_cannot_close_buckets_early`,
+    `test_finish_wal_replay_caps_the_first_catch_up_sweep_at_the_wall_clock`); spot store held
+    time capped at receipt + `FUTURE_TRADE_TIME_SKEW_SECS`; the WAL applied watermark lives in
+    capture-sequence space minted from our own clock (`ws_frame_spill::next_frame_seq`), so no
+    vendor stamp is an input, and it is held back by `WATERMARK_DURABILITY_LAG_SECS`; the archive
+    exports or drops only when QuestDB's WAL is applied (`WalApplyVerdict`,
+    `test_wal_apply_verdict_only_exact_txn_equality_is_applied`, R3-4). Row 101's close-clock
+    half is superseded (top_volume deleted 2026-10-22). The 2026-10-11 note further down that
+    says the WAL cap and the archive gate stay open is stale.
   (`storage`, `trading`)
   - One future-dated vendor timestamp can push the WAL "applied" watermark ahead of what is
     durable, and the archive ignores apply lag. Cap each watermark at the wall clock (the
@@ -916,6 +1039,16 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
 - [ ] **PR28b — never-delete data does not live on one disk, and nobody can delete the cloud
   copy.** (`storage`, deploy) Waits on the owner's typed choice of lock strength
   (compliance or governance, asked 2026-09-27) and on a measured size for the budget rule.
+  - **Status 2026-10-30 (first-34 sweep): PARTIAL, owner-gated.** Done: versioning on
+    `tv-prod-cold` (`main.tf` `aws_s3_bucket_versioning.tv_cold`); the "short non-current
+    expiry" is superseded by Quote 27 (zero loss), which forbids `noncurrent_version_expiration`.
+    Superseded: the `instrument_lifecycle` export (Quote 44 stopped the writer; daily
+    instrument snapshots go to `instrument-snapshots/` via `instrument_snapshot_upload.rs`).
+    Open: a verified daily `index_constituency` export, and the Object Lock bucket for the SEBI
+    archive, which waits on the owner's lock-mode choice recorded first in the daily-universe
+    rule file (Object Lock cannot be switched off and terraform applies on merge). Note:
+    Quote 46/46b/46c (2026-10-28) deleted the SEBI tables and the bucket once; never-delete
+    binds again after it. Size after the decision: ~300-500 lines.
   - `instrument_lifecycle` and `index_constituency` are pinned to ts=0, exempt from the sweep,
     and exist only on the server disk. A daily export of both to the locked location, verified
     by row count, with a coded error and a page on failure.
