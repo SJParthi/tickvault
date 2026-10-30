@@ -84,6 +84,23 @@ unpinned with an `info!` line, not this code.
 (`resolve_ws_reader_core`, `build_reader_runtime`) and
 `crates/app/src/main.rs::report_reader_core_pin`.
 
+**2026-10-30 (plan ITEM DT) — the same code covers the other hot-thread
+placements.** Each switch is off by default (see the "Hot-thread placement"
+block in `deploy/systemd/tickvault.service`); a requested placement that was
+not applied logs this code once, with a `source` field, and boot continues:
+
+| `source` | Meaning | Fix |
+|---|---|---|
+| `hot_rt_refused` | `TICKVAULT_HOT_RT_PRIORITY` asked for real-time priority and the kernel's RT throttle is off (`sched_rt_runtime_us` = -1 or ≥ the period) or unreadable, or the value is not 1 to 49. Readers and drain stay at normal priority, on purpose: without the throttle a stuck thread could hold its core forever. | Restore `kernel.sched_rt_runtime_us=950000`, or set the variable to `off`. |
+| `hot_rt_reader_failed` | The kernel refused `SCHED_FIFO` for a reader (`os_errno` 1 = EPERM). | Add `LimitRTPRIO=2` to the unit's drop-in. |
+| `drain_thread_invalid` | `TICKVAULT_DRAIN_THREAD` is not `off`, `on` or a core id other than 0. The drain runs on the shared runtime. | Fix the value. |
+| `drain_thread_runtime_refused` / `drain_thread_spawn_refused` | The drain's own runtime or thread could not be created. The drain runs on the shared runtime, as before the switch. | Check memory and thread limits (`LimitNPROC`). |
+| `drain_thread_placement_refused` | The drain runs on its own thread but its core pin or `SCHED_FIFO` was refused (`pin_ok`, `fifo_ok`, `os_errno`). | As for the reader rows above. |
+| `background_core_refused` / `background_core_pin_failed` | `TICKVAULT_BACKGROUND_CORE` named the readers' core, a core the process may not use, or not a core id; or the kernel refused it. Background threads run unpinned. | Name core 0 on the 2-core box. |
+
+Source for these: `crates/core/src/websocket/hot_thread_placement.rs`,
+`crates/app/src/drain_thread.rs`, `crates/app/src/main.rs::report_hot_thread_placement`.
+
 ## PHASE2-01 — Phase 2 dispatch failed (LTPs absent or empty plan)
 
 **Trigger:** `run_phase2_scheduler` emitted `Phase2Failed` after one
