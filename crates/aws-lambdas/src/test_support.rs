@@ -27,6 +27,9 @@ pub(crate) struct LoopbackRequest {
     pub target: String,
     /// The request body, decoded as UTF-8 (lossy).
     pub body: String,
+    /// The request path (`/service/.../operation/SetAlarmState` for the
+    /// CBOR protocol CloudWatch speaks).
+    pub path: String,
 }
 
 impl LoopbackRequest {
@@ -51,7 +54,7 @@ impl LoopbackRequest {
 pub(crate) struct LoopbackResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub body: String,
+    pub body: Vec<u8>,
 }
 
 impl LoopbackResponse {
@@ -61,7 +64,7 @@ impl LoopbackResponse {
         Self {
             status,
             content_type: "application/x-amz-json-1.1",
-            body: body.into(),
+            body: body.into().into_bytes(),
         }
     }
 
@@ -71,7 +74,18 @@ impl LoopbackResponse {
         Self {
             status,
             content_type: "text/xml",
-            body: body.into(),
+            body: body.into().into_bytes(),
+        }
+    }
+
+    /// An `rpcv2Cbor` (CloudWatch) reply carrying an empty structure.
+    // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
+    pub(crate) fn cbor_empty(status: u16) -> Self {
+        Self {
+            status,
+            content_type: "application/cbor",
+            // CBOR: a map with zero entries.
+            body: vec![0xA0],
         }
     }
 }
@@ -95,6 +109,12 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<LoopbackRequ
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut content_length = 0usize;
     let mut target = String::new();
+    let path = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_string();
     for line in head.lines() {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -115,6 +135,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<LoopbackRequ
     let end = buf.len().min(header_end + content_length);
     Some(LoopbackRequest {
         target,
+        path,
         body: String::from_utf8_lossy(&buf[header_end..end]).to_string(),
     })
 }
@@ -153,14 +174,19 @@ where
                 sink.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(request);
-                let wire = format!(
-                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nx-amzn-requestid: loopback\r\nConnection: close\r\n\r\n{}",
+                let protocol = if reply.content_type == "application/cbor" {
+                    "smithy-protocol: rpc-v2-cbor\r\n"
+                } else {
+                    ""
+                };
+                let head = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n{protocol}x-amzn-requestid: loopback\r\nConnection: close\r\n\r\n",
                     reply.status,
                     reply.content_type,
                     reply.body.len(),
-                    reply.body
                 );
-                let _ = stream.write_all(wire.as_bytes()).await;
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&reply.body).await;
                 let _ = stream.shutdown().await;
             });
         }
@@ -346,6 +372,18 @@ impl Fleet {
     /// Answers one request as this account would.
     // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
     pub(crate) fn respond(&self, req: &LoopbackRequest) -> LoopbackResponse {
+        // CloudWatch (rpcv2Cbor) names the operation in the path.
+        if let Some(cbor_op) = cbor_operation(req) {
+            return if self.fail.iter().any(|f| *f == cbor_op) {
+                LoopbackResponse {
+                    status: 400,
+                    content_type: "application/cbor",
+                    body: vec![0xA0],
+                }
+            } else {
+                LoopbackResponse::cbor_empty(200)
+            };
+        }
         let op = if req.target.is_empty() {
             req.query_action().unwrap_or_default()
         } else {
@@ -419,6 +457,13 @@ impl Fleet {
     }
 }
 
+/// The operation of an rpcv2Cbor request (`/service/X/operation/Op`).
+fn cbor_operation(req: &LoopbackRequest) -> Option<String> {
+    req.path
+        .split_once("/operation/")
+        .map(|(_, op)| op.to_string())
+}
+
 /// Starts a loopback endpoint backed by `fleet`.
 // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) async fn start_fleet(fleet: Fleet) -> (String, Arc<Mutex<Vec<LoopbackRequest>>>) {
@@ -431,7 +476,9 @@ pub(crate) fn operations(requests: &Arc<Mutex<Vec<LoopbackRequest>>>) -> Vec<Str
     recorded(requests)
         .iter()
         .map(|r| {
-            if r.target.is_empty() {
+            if let Some(op) = cbor_operation(r) {
+                op
+            } else if r.target.is_empty() {
                 r.query_action().unwrap_or_default()
             } else {
                 r.target.clone()

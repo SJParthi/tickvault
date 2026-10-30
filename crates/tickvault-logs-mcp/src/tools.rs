@@ -3211,3 +3211,251 @@ mod tests {
         assert_eq!(out["error"], API_BASE_OVERRIDE_REFUSAL);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Failure arms of the file and HTTP tools that the parity tests above do not
+// reach: a log path that cannot be read, a summary past the read ceiling, and
+// the two CloudWatch readers' refusals. Every case asserts the tool answers
+// `ok:false` / `error` instead of panicking, and that no credential travels.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod failure_arm_tests {
+    use super::*;
+    use crate::config::MapEnv;
+
+    /// A throwaway repo root with `data/logs/` (and `data/logs/machine/`).
+    fn scratch_root(tag: &str) -> (PathBuf, Ctx) {
+        let base = std::env::temp_dir().join(format!(
+            "tv-mcp-arm-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(base.join("data").join("logs").join("machine")).unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        (base, ctx)
+    }
+
+    fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
+        MapEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn summary_snapshot_refuses_a_file_past_the_read_ceiling() {
+        let (base, ctx) = scratch_root("summary-big");
+        let path = ctx.machine_logs_dir().join(SUMMARY_FILENAME);
+        // Sparse: one byte past the ceiling, no disk spent.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(LOG_READ_MAX_BYTES + 1)
+            .unwrap();
+        let out = tool_summary_snapshot(&ctx);
+        assert_eq!(out["exists"], json!(true));
+        assert_eq!(out["markdown"], json!(""));
+        assert!(
+            out["error"].as_str().unwrap_or("").contains("read ceiling"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn summary_snapshot_reports_an_unreadable_path_as_an_error() {
+        let (base, ctx) = scratch_root("summary-dir");
+        std::fs::create_dir_all(ctx.machine_logs_dir().join(SUMMARY_FILENAME)).unwrap();
+        let out = tool_summary_snapshot(&ctx);
+        assert_eq!(out["exists"], json!(true));
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{out}"
+        );
+        assert_eq!(out["markdown"], json!(""));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn summary_snapshot_falls_back_to_the_legacy_top_level_file() {
+        let (base, ctx) = scratch_root("summary-legacy");
+        std::fs::remove_dir_all(base.join("data").join("logs").join("machine")).unwrap();
+        std::fs::write(ctx.logs_dir().join(SUMMARY_FILENAME), "# ok\nline\n").unwrap();
+        let out = tool_summary_snapshot(&ctx);
+        assert_eq!(out["markdown"], json!("# ok\nline\n"));
+        assert_eq!(out["line_count"], json!(2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn triage_log_tail_reports_an_unreadable_path_as_an_error() {
+        let (base, ctx) = scratch_root("triage-dir");
+        std::fs::create_dir_all(ctx.logs_dir().join(AUTO_FIX_LOG)).unwrap();
+        let out = tool_triage_log_tail(&ctx, 5);
+        assert_eq!(out["exists"], json!(true));
+        assert_eq!(out["lines"], json!([]));
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_reports_an_unreadable_path_as_an_error() {
+        let (base, ctx) = scratch_root("applog-dir");
+        std::fs::create_dir_all(ctx.logs_dir().join("app.2026-10-30.log")).unwrap();
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-10-30"));
+        assert_eq!(out["ok"], json!(false), "{out}");
+        assert!(out["error"].as_str().is_some_and(|e| !e.is_empty()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_refuses_a_path_shaped_date_and_a_missing_file() {
+        let (base, ctx) = scratch_root("applog-date");
+        let out = tool_app_log_tail(&ctx, 5, Some("x/../../etc/passwd"));
+        assert_eq!(out["ok"], json!(false));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("date must be YYYY-MM-DD")
+        );
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-01-01"));
+        assert_eq!(out["ok"], json!(false));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("log file not found")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_keeps_only_whole_lines_of_a_file_past_the_ceiling() {
+        use std::io::{Seek, SeekFrom, Write};
+        let (base, ctx) = scratch_root("applog-big");
+        let path = ctx.logs_dir().join("app.2026-10-30.log");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // A sparse head of NULs (no newline) then two real lines at the end:
+        // the cut lands inside the head, so only the two lines come back.
+        file.seek(SeekFrom::Start(LOG_READ_MAX_BYTES + 10)).unwrap();
+        file.write_all(b"\ntail-one\ntail-two\n").unwrap();
+        drop(file);
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-10-30"));
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["truncated"], json!(true));
+        let lines = out["lines"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            lines.last(),
+            Some(&json!("tail-two")),
+            "the last whole line survives the cut: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cloudwatch_sigv4_refuses_an_invalid_region_before_any_request() {
+        let env = map_env(&[
+            ("AWS_REGION", "AP_SOUTH_1"),
+            ("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "never-sent-secret"),
+        ]);
+        let out = cloudwatch_via_sigv4(&env, 5, Some("ERROR"), 10);
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["source"], json!("cloudwatch_sigv4"));
+        assert_eq!(out["log_group"], json!("/tickvault/prod/app"));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("invalid AWS region")
+        );
+        assert!(!out.to_string().contains("never-sent-secret"));
+    }
+
+    #[test]
+    fn cloudwatch_region_falls_back_through_the_default_region() {
+        assert_eq!(aws_region(&map_env(&[])), "ap-south-1");
+        assert_eq!(
+            aws_region(&map_env(&[("AWS_DEFAULT_REGION", "us-east-1")])),
+            "us-east-1"
+        );
+        assert_eq!(
+            aws_region(&map_env(&[
+                ("AWS_REGION", "eu-west-1"),
+                ("AWS_DEFAULT_REGION", "us-east-1")
+            ])),
+            "eu-west-1"
+        );
+        assert_eq!(
+            cloudwatch_log_group(&map_env(&[("TICKVAULT_CLOUDWATCH_LOG_GROUP", "/g")])),
+            "/g"
+        );
+        let (key, secret, token) = aws_credentials(&map_env(&[("AWS_SESSION_TOKEN", "")]));
+        assert_eq!((key.as_str(), secret.as_str(), token), ("", "", None));
+    }
+
+    #[test]
+    fn cloudwatch_portal_refuses_plaintext_http() {
+        let env = map_env(&[
+            ("TICKVAULT_PORTAL_URL", "http://portal.example/"),
+            ("TICKVAULT_PORTAL_TOKEN", "never-sent-token"),
+        ]);
+        let out = cloudwatch_via_portal(&env, None, 10);
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["source"], json!("portal"));
+        assert_eq!(out["portal_url"], json!("http://portal.example"));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("must use https://")
+        );
+        assert!(!out.to_string().contains("never-sent-token"));
+    }
+
+    #[test]
+    fn cloudwatch_portal_reports_an_unreachable_host_without_the_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("https://127.0.0.1:{port}/logs");
+        let env = map_env(&[
+            ("TICKVAULT_PORTAL_URL", url.as_str()),
+            ("TICKVAULT_PORTAL_TOKEN", "never-sent-token"),
+        ]);
+        let out = cloudwatch_via_portal(&env, Some("ERROR"), 10);
+        assert_eq!(out["ok"], json!(false), "{out}");
+        assert_eq!(out["source"], json!("portal"));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("portal logs call failed"),
+            "{out}"
+        );
+        assert!(!out.to_string().contains("never-sent-token"));
+    }
+
+    #[test]
+    fn legacy_truthy_matches_the_reference_truthiness() {
+        assert!(!legacy_truthy(&Value::Null));
+        assert!(!legacy_truthy(&json!(false)));
+        assert!(legacy_truthy(&json!(true)));
+        assert!(!legacy_truthy(&json!(0)));
+        assert!(legacy_truthy(&json!(1.5)));
+        assert!(!legacy_truthy(&json!("")));
+        assert!(legacy_truthy(&json!("x")));
+        assert!(!legacy_truthy(&json!([])));
+        assert!(legacy_truthy(&json!([0])));
+        assert!(!legacy_truthy(&json!({})));
+        assert!(legacy_truthy(&json!({"a": 1})));
+    }
+}
