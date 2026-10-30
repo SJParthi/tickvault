@@ -305,7 +305,8 @@ impl Default for MemoryWatchdogConfig {
 impl MemoryWatchdogConfig {
     /// Rejects a ladder whose lines are out of order or out of range:
     /// `0 < hysteresis_pct <= 10`, `hysteresis_pct < trim_pct < shed_pct <
-    /// critical_pct <= 99`.
+    /// critical_pct <= 99`, and `hysteresis_pct` smaller than both gaps
+    /// between rungs.
     ///
     /// # Errors
     /// Any bound above is broken.
@@ -330,6 +331,20 @@ impl MemoryWatchdogConfig {
                 self.critical_pct
             );
         }
+        // Hostile review 2026-10-30: a band wider than the gap below a rung
+        // would hold that rung while usage is under the next lower rung's
+        // line too (shed held at 72% with trim 70, shed 80, hysteresis 9).
+        if self.hysteresis_pct >= self.shed_pct - self.trim_pct
+            || self.hysteresis_pct >= self.critical_pct - self.shed_pct
+        {
+            bail!(
+                "memory_watchdog.hysteresis_pct ({}) must be smaller than every gap between \
+                 rungs (shed_pct - trim_pct = {}, critical_pct - shed_pct = {})",
+                self.hysteresis_pct,
+                self.shed_pct - self.trim_pct,
+                self.critical_pct - self.shed_pct
+            );
+        }
         Ok(())
     }
 }
@@ -339,8 +354,9 @@ impl MemoryWatchdogConfig {
 /// whether a stuck task is aborted for its supervisor to respawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 pub struct TaskHeartbeatConfig {
-    /// Abort a watched task that missed three heartbeats so its supervisor
-    /// respawns it. Default `false`: counted on
+    /// Abort the API token reload (the one watched task safe to restart)
+    /// after three missed heartbeats so its supervisor respawns it. Every other
+    /// watched task is watch-only. Default `false`: counted on
     /// `tv_task_heartbeat_would_respawn_total` only.
     #[serde(default)]
     pub respawn_on_missed_beats: bool,
@@ -5071,7 +5087,22 @@ mod tests {
             with(70, 80, 90, 11).validate().is_err(),
             "hysteresis over 10"
         );
-        assert!(with(70, 80, 90, 10).validate().is_ok());
+        assert!(
+            with(70, 80, 90, 9).validate().is_ok(),
+            "band 9 < gaps of 10"
+        );
+        assert!(
+            with(70, 80, 90, 10).validate().is_err(),
+            "band equal to a gap"
+        );
+        assert!(
+            with(70, 72, 90, 5).validate().is_err(),
+            "band wider than shed - trim"
+        );
+        assert!(
+            with(70, 80, 83, 5).validate().is_err(),
+            "band wider than critical - shed"
+        );
         assert!(with(80, 80, 90, 5).validate().is_err(), "trim == shed");
         assert!(with(70, 90, 90, 5).validate().is_err(), "shed == critical");
         assert!(with(70, 80, 100, 5).validate().is_err(), "critical over 99");
@@ -5080,7 +5111,11 @@ mod tests {
             with(5, 80, 90, 5).validate().is_err(),
             "trim must exceed hysteresis"
         );
-        assert!(with(6, 7, 8, 5).validate().is_ok(), "tight but ordered");
+        assert!(with(6, 8, 10, 1).validate().is_ok(), "tight but ordered");
+        assert!(
+            with(6, 7, 8, 5).validate().is_err(),
+            "band wider than both gaps"
+        );
     }
 
     #[test]

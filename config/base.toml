@@ -448,9 +448,10 @@ require_upload_before_prune = true
 [memory_watchdog]
 mode = "off"
 
-# Plan item 4: background tasks publish heartbeats always; with this on, a
-# task that missed three heartbeats is aborted so its supervisor respawns it.
-# Off = counted only (tv_task_heartbeat_would_respawn_total).
+# Plan item 4: background tasks publish heartbeats always; with this on, the
+# API token reload (the only task safe to restart) is aborted after three
+# missed heartbeats so its supervisor respawns it. Every other watched task is
+# watch-only. Off = counted only (tv_task_heartbeat_would_respawn_total).
 [task_heartbeat]
 respawn_on_missed_beats = false
 

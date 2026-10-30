@@ -25,10 +25,11 @@
 //! so usage hovering on a line cannot flap.
 //!
 //! **What the ladder never does:** it never drops a received frame, never
-//! stops or pauses capture, never touches the WAL, the frame ring, the
-//! candle fold or the writers, and never restarts the process. Both actions
-//! release only memory nothing is using (free heap pages, and read caches
-//! that are rebuilt on demand).
+//! touches the WAL, the frame ring, the candle fold or the writers, and never
+//! restarts the process. Both actions release only memory nothing is using
+//! (free heap pages, and read caches that are rebuilt on demand). It CAN
+//! delay: a heap trim makes any thread that allocates during the walk wait
+//! for it, socket readers included (see the honest limits).
 //!
 //! `mode = "off"` (the default) runs no memory poll at all. `"shadow"`
 //! classifies and counts what it WOULD do on
@@ -36,21 +37,28 @@
 //!
 //! # Honest limits
 //!
-//! * `malloc_trim` walks the heap holding each arena's lock in turn. A
-//!   thread that allocates during the walk waits for it. On a multi-GiB heap
-//!   the walk can take milliseconds (UNMEASURED on the production host; the
+//! * **The production build has no trim.** It is a static musl binary
+//!   (`aarch64-unknown-linux-musl`, deploy-aws.yml), and `malloc_trim` exists
+//!   only in glibc. There every trim is counted on
+//!   `tv_memory_watchdog_trims_total{outcome="not_available"}`, one warning is
+//!   logged when an `act` watchdog starts, and only the shed signal acts. A
+//!   working trim needs a glibc build or an allocator with a purge call, an
+//!   owner decision; not taken here.
+//! * Where it exists (glibc), `malloc_trim` walks the heap holding each
+//!   arena's lock in turn. A thread that allocates during the walk waits for
+//!   it. On a multi-GiB heap the walk can take milliseconds (UNMEASURED; the
 //!   last walk's duration is published as `tv_memory_watchdog_trim_last_us`).
 //!   That is why the `trim` rung stays out of the market session and only
 //!   `shed` (where the alternative is the OOM killer) trims in session.
 //! * The one cache that opts into the shed signal today is the API quote
 //!   cache (at most 2,048 entries, 1 s TTL), so shedding frees little. The
-//!   real lever is the trim. The big resident structures (the candle fold,
+//!   big resident structures (the candle fold,
 //!   the seal ring, the frame ring, the WAL buffers) are pre-sized for the
 //!   session and are deliberately not shed: shedding them would lose data.
 //! * With no readable ceiling (non-Linux dev box) the ladder never leaves
-//!   `normal`; counted on `tv_memory_watchdog_probe_failed_total`.
-//! * `trim` and `malloc_trim` exist only on glibc Linux; elsewhere the trim
-//!   is a no-op that reports "not available".
+//!   `normal`; counted on `tv_memory_watchdog_probe_failed_total`, logged at
+//!   the 1st, 2nd, 4th... unreadable poll in a row, and `usage_pct` reads
+//!   [`USAGE_PCT_UNKNOWN`] (-1) instead of the last good value.
 
 use std::io::Read;
 use std::path::Path;
@@ -87,6 +95,10 @@ pub const SHED_MIN_INTERVAL_SECS: u64 = 60;
 /// Bytes read from `/proc/self/status`. The file is about 1.5 KiB; 8 KiB
 /// leaves room and lives on the stack (no allocation per poll).
 const STATUS_READ_BYTES: usize = 8 * 1024;
+
+/// `tv_memory_watchdog_usage_pct` while no reading is available: a value no
+/// real usage can take, so a held level never passes for a fresh reading.
+pub const USAGE_PCT_UNKNOWN: f64 = -1.0;
 
 /// Basis points per percent.
 const BP_PER_PCT: u64 = 100;
@@ -268,9 +280,9 @@ pub fn decide(
     };
     let trim = trim_rung && due(state.last_trim_secs, now_secs, TRIM_MIN_INTERVAL_SECS);
     let shed_rung = level >= PressureLevel::Shed;
-    let shed = shed_rung
-        && (prev < PressureLevel::Shed
-            || due(state.last_shed_secs, now_secs, SHED_MIN_INTERVAL_SECS));
+    // Rate-limited on every entry too (hostile review 2026-10-30): usage
+    // crossing the shed line and back every poll must not shed every poll.
+    let shed = shed_rung && due(state.last_shed_secs, now_secs, SHED_MIN_INTERVAL_SECS);
     if trim {
         state.last_trim_secs = Some(now_secs);
     }
@@ -326,6 +338,12 @@ pub enum TrimOutcome {
     NotAvailable,
 }
 
+/// Whether this build can trim the heap at all (glibc Linux only).
+#[must_use]
+pub const fn trim_available() -> bool {
+    cfg!(all(target_os = "linux", target_env = "gnu"))
+}
+
 /// Runs one heap trim. See the module's honest limits for its cost.
 #[must_use]
 pub fn trim_heap() -> TrimOutcome {
@@ -369,7 +387,9 @@ pub fn read_vmrss_bytes(status_path: &Path) -> Option<u64> {
 struct Handles {
     level: metrics::Gauge,
     usage_pct: metrics::Gauge,
-    trims: metrics::Counter,
+    trims_released: metrics::Counter,
+    trims_nothing: metrics::Counter,
+    trims_not_available: metrics::Counter,
     trim_last_us: metrics::Gauge,
     sheds: metrics::Counter,
     would_trim: metrics::Counter,
@@ -381,14 +401,18 @@ impl Handles {
         let h = Self {
             level: metrics::gauge!("tv_memory_watchdog_level"),
             usage_pct: metrics::gauge!("tv_memory_watchdog_usage_pct"),
-            trims: metrics::counter!("tv_memory_watchdog_trims_total"),
+            trims_released: metrics::counter!("tv_memory_watchdog_trims_total", "outcome" => "released"),
+            trims_nothing: metrics::counter!("tv_memory_watchdog_trims_total", "outcome" => "nothing_to_release"),
+            trims_not_available: metrics::counter!("tv_memory_watchdog_trims_total", "outcome" => "not_available"),
             trim_last_us: metrics::gauge!("tv_memory_watchdog_trim_last_us"),
             sheds: metrics::counter!("tv_memory_watchdog_sheds_total"),
             would_trim: metrics::counter!("tv_memory_watchdog_would_act_total", "action" => "trim"),
             would_shed: metrics::counter!("tv_memory_watchdog_would_act_total", "action" => "shed"),
         };
         // Registered at 0 so a reader sees "watching, never acted".
-        h.trims.increment(0);
+        h.trims_released.increment(0);
+        h.trims_nothing.increment(0);
+        h.trims_not_available.increment(0);
         h.sheds.increment(0);
         h.would_trim.increment(0);
         h.would_shed.increment(0);
@@ -403,6 +427,14 @@ pub struct MemoryWatchdog {
     state: LadderState,
     /// Polls in a row with no usable reading (throttles the warning).
     unreadable_streak: u64,
+    /// `tv_memory_watchdog_probe_failed_total`, resolved on the first
+    /// unreadable poll and reused after (no lookup per poll).
+    probe_failed: Option<metrics::Counter>,
+    /// Shed signals this watchdog sent (act mode). Per instance, so tests
+    /// never read the process-global generation other tests also move.
+    sheds_sent: u64,
+    /// Trims this watchdog attempted (act mode), whatever the outcome.
+    trims_run: u64,
     handles: Handles,
 }
 
@@ -411,11 +443,22 @@ impl MemoryWatchdog {
     /// ceiling; `None` when it could not be read).
     #[must_use]
     pub fn new(cfg: MemoryWatchdogConfig, ceiling_bytes: Option<u64>) -> Self {
+        if cfg.mode == MemoryWatchdogMode::Act && !trim_available() {
+            warn!(
+                "memory watchdog: this build has no malloc_trim (musl), so the trim rung \
+                 does nothing here and is counted as outcome=not_available; only the shed \
+                 signal acts. A working trim needs a glibc build or another allocator, \
+                 which is the owner's call"
+            );
+        }
         Self {
             cfg,
             ceiling_bytes,
             state: LadderState::new(),
             unreadable_streak: 0,
+            probe_failed: None,
+            sheds_sent: 0,
+            trims_run: 0,
             handles: Handles::resolve(),
         }
     }
@@ -432,7 +475,12 @@ impl MemoryWatchdog {
     /// five seconds. The ladder holds its level and acts on nothing.
     fn note_unreadable(&mut self) {
         self.unreadable_streak = self.unreadable_streak.saturating_add(1);
-        metrics::counter!("tv_memory_watchdog_probe_failed_total").increment(1);
+        self.probe_failed
+            .get_or_insert_with(|| metrics::counter!("tv_memory_watchdog_probe_failed_total"))
+            .increment(1);
+        // No reading: publish the "unknown" sentinel, never the last good
+        // value, which would read as current.
+        self.handles.usage_pct.set(USAGE_PCT_UNKNOWN);
         if self.unreadable_streak.is_power_of_two() {
             warn!(
                 polls_in_a_row = self.unreadable_streak,
@@ -478,15 +526,25 @@ impl MemoryWatchdog {
             MemoryWatchdogMode::Act => {
                 if decision.shed {
                     bump_shed_generation();
+                    self.sheds_sent = self.sheds_sent.saturating_add(1);
                     self.handles.sheds.increment(1);
                 }
                 if decision.trim {
+                    self.trims_run = self.trims_run.saturating_add(1);
                     let started = Instant::now();
-                    let _outcome = trim_heap();
+                    match trim_heap() {
+                        TrimOutcome::Released => self.handles.trims_released.increment(1),
+                        TrimOutcome::NothingToRelease => self.handles.trims_nothing.increment(1),
+                        // The production musl build has no malloc_trim: count it
+                        // as not done, and leave the walk-time gauge alone.
+                        TrimOutcome::NotAvailable => {
+                            self.handles.trims_not_available.increment(1);
+                            return decision;
+                        }
+                    }
                     let micros = u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX);
                     // APPROVED: a duration in whole microseconds (u32), not an f32 price
                     self.handles.trim_last_us.set(f64::from(micros));
-                    self.handles.trims.increment(1);
                 }
             }
         }
@@ -502,9 +560,10 @@ fn report_level_change(decision: &Decision, bp: Option<u64>, mode: MemoryWatchdo
             prev = decision.prev.as_str(),
             usage_pct = pct,
             mode = mode.as_str(),
-            "memory watchdog: resident memory is high; releasing free heap pages and caches \
-             (capture continues untouched). If it reaches the kernel's limit the process is \
-             killed: whether to restart earlier is the owner's call"
+            "memory watchdog: resident memory is high; releasing free heap pages (where this \
+             build can) and opt-in caches. No received frame is dropped; a heap trim can make \
+             threads that allocate wait for its walk. If memory reaches the kernel's limit the \
+             process is killed: whether to restart earlier is the owner's call"
         );
     } else {
         info!(
@@ -723,25 +782,50 @@ mod tests {
     }
 
     #[test]
-    fn re_entering_shed_sheds_at_once_even_inside_the_minute() {
+    fn re_entering_shed_inside_the_minute_is_rate_limited() {
+        // Hostile review 2026-10-30: usage crossing the shed line and back
+        // every poll must not shed every poll.
         let c = cfg(MemoryWatchdogMode::Act);
         let mut s = LadderState::new();
-        assert!(decide(&mut s, Some(8_000), 0, true, &c).shed);
+        assert!(
+            decide(&mut s, Some(8_000), 0, true, &c).shed,
+            "first entry sheds"
+        );
         assert_eq!(
             decide(&mut s, Some(6_000), 10, true, &c).level,
             PressureLevel::Normal
         );
-        assert!(decide(&mut s, Some(8_000), 20, true, &c).shed);
+        assert!(
+            !decide(&mut s, Some(8_000), 20, true, &c).shed,
+            "inside the minute"
+        );
+        assert_eq!(
+            decide(&mut s, Some(6_000), 30, true, &c).level,
+            PressureLevel::Normal
+        );
+        assert!(
+            decide(&mut s, Some(8_000), 60, true, &c).shed,
+            "a minute later"
+        );
+        let mut flapping = 0;
+        let mut s2 = LadderState::new();
+        for i in 0..120u64 {
+            let bp = if i % 2 == 0 { 8_000 } else { 6_000 };
+            if decide(&mut s2, Some(bp), i * 5, true, &c).shed {
+                flapping += 1;
+            }
+        }
+        assert_eq!(flapping, 10, "10 minutes of flapping sheds once a minute");
     }
 
     #[test]
     fn shadow_never_moves_the_shed_signal() {
         let mut dog = MemoryWatchdog::new(cfg(MemoryWatchdogMode::Shadow), Some(10 * GIB));
-        let before = shed_generation();
         let d = dog.step(Some(9 * GIB + GIB / 2), 0, true);
         assert_eq!(d.level, PressureLevel::Critical);
-        assert!(d.shed);
-        assert_eq!(shed_generation(), before, "shadow decides, never acts");
+        assert!(d.shed && d.trim);
+        assert_eq!(dog.sheds_sent, 0, "shadow decides, never acts");
+        assert_eq!(dog.trims_run, 0);
     }
 
     #[test]
@@ -750,6 +834,9 @@ mod tests {
         let before = shed_generation();
         let d = dog.step(Some(8 * GIB + GIB / 2), 0, false);
         assert!(d.shed && d.trim);
+        assert_eq!(dog.sheds_sent, 1);
+        assert_eq!(dog.trims_run, 1, "attempted whatever the outcome");
+        // Monotonic: other tests can only move it further.
         assert!(shed_generation() > before);
         assert_eq!(dog.level(), PressureLevel::Shed);
     }
@@ -757,9 +844,10 @@ mod tests {
     #[test]
     fn off_mode_still_tracks_the_level_but_never_acts() {
         let mut dog = MemoryWatchdog::new(cfg(MemoryWatchdogMode::Off), Some(10 * GIB));
-        let before = shed_generation();
-        let _ = dog.step(Some(9 * GIB), 0, false);
-        assert_eq!(shed_generation(), before);
+        let d = dog.step(Some(9 * GIB), 0, false);
+        assert_eq!(d.level, PressureLevel::Critical);
+        assert_eq!(dog.sheds_sent, 0);
+        assert_eq!(dog.trims_run, 0);
     }
 
     #[test]
@@ -782,8 +870,9 @@ mod tests {
     }
 
     #[test]
-    fn trim_heap_never_panics() {
+    fn test_trim_available_matches_what_trim_heap_reports() {
         let outcome = trim_heap();
+        assert_eq!(outcome == TrimOutcome::NotAvailable, !trim_available());
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         assert_ne!(outcome, TrimOutcome::NotAvailable);
         #[cfg(not(all(target_os = "linux", target_env = "gnu")))]

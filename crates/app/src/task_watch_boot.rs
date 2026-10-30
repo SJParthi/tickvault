@@ -8,14 +8,16 @@
 //! respawn switch as configured).
 
 use tickvault_common::config::ApplicationConfig;
-use tracing::error;
+use tracing::warn;
 
 /// Sets the missed-heartbeat respawn switch from `[task_heartbeat]` and
 /// starts the `tv-task-watch` thread with `[memory_watchdog]`.
 ///
-/// Returns `true` when the thread started. A refused thread is logged as a
-/// coded `error!` and boot continues: nothing on the capture path depends on
-/// this thread.
+/// Returns `true` when the thread started. A refused thread is logged as an
+/// uncoded, log-only `warn!` and boot continues: nothing on the capture path
+/// depends on this thread. Deliberately NOT `BOOT-02` (hostile review
+/// 2026-10-30): that code pages "boot is blocked, the app is not running",
+/// which would be false here, and this change adds no page.
 pub fn start_task_watch(config: &ApplicationConfig) -> bool {
     tickvault_storage::task_heartbeat::set_respawn_on_missed_beats(
         config.task_heartbeat.respawn_on_missed_beats,
@@ -23,11 +25,11 @@ pub fn start_task_watch(config: &ApplicationConfig) -> bool {
     match tickvault_storage::memory_watchdog::spawn_watch_thread(config.memory_watchdog) {
         Ok(_detached) => true,
         Err(err) => {
-            error!(
-                code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+            warn!(
                 error = %err,
                 "the task-watch thread FAILED TO SPAWN — background-task heartbeats and the \
-                 memory watchdog will not run (host thread or memory limit)"
+                 memory watchdog will not run this session (host thread or memory limit); \
+                 capture is unaffected"
             );
             false
         }
