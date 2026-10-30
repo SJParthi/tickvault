@@ -140,6 +140,20 @@ order_path               = 1000         # <1us per step — matches order_path/*
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
 
+# Storage crate — the sealed-candle path (owner directive 2026-10-30: every
+# in-memory step under 1 us at p99). Matches every seal_path/* bench (crate
+# bench `seal_path`): the drain's hand-off, the writer's take into the ring,
+# the row build and the live-commit ledger probe. That bench ALSO holds each
+# step's p99 to its key (its own gate, exit 1 when over). Network flush and disk writes are
+# not in it and are never under 1 us. NOT measured on the prod host.
+seal_path                = 1000         # <1us per seal, p99 and median
+# The three ILP-append steps (seal_ilp/append_unlabelled, append_labelled,
+# pop_append) do NOT meet 1 us: one candle row through questdb-rs's Buffer API
+# measured median ~1.06 us, p99 1.8-2.4 us on the x86 dev container after the
+# 2026-10-30 fix (was median 1.95 us, p99 3.6-4.3 us). The library's own row
+# writing is ~650-850 ns with no validation at all, so 1 us needs the row
+# encoded outside that API (owner decision). This key holds the measured ceiling.
+seal_ilp                 = 2500         # <2.5us per seal row, p99 and median (NOT the 1us target)
 # Per-tick side stores (plan ITEM DT, 2026-10-30)
 tick_gap_detector        = 400          # <400ns per call (measured 2026-10-30, x86 dev container: median 42 ns hit, p99 198 ns with the clock pair) — matches tick_gap_detector/observe_hit, observe_refused_full, observe_tracked_hit, observe_tracked_miss (full at 25,000). The same value is the per-call p99 ceiling in the bench (plan ITEM DT, side stores, 2026-10-30)
 spot_price_store         = 250          # <250ns per call (measured: median 27 ns, p99 157 ns with the clock pair) — matches spot_price_store/record_* (full at 25,000) and its p99 gate (plan ITEM DT, 2026-10-30)
