@@ -80,10 +80,10 @@ harness = false
 # [[bench]] tick_persistence removed in the stage-2 dead-WS sweep
 # (2026-07-17) with the deleted tick_persistence.rs (the dead tick chain).
 
-# Per-seal cost of the sealed-candle path (owner directive 2026-10-30:
-# every in-memory step under 1 us at p99). Carries its own p99 gate.
+# The per-row conservation ledger on the frame drain (plan ITEM DT, side
+# stores, 2026-10-30), with a p99 gate.
 [[bench]]
-name = "seal_path"
+name = "tick_conservation_ledger"
 harness = false
 
 [package.metadata.cargo-machete]

@@ -405,6 +405,50 @@ fn dotenv_upsert(text: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// Compose `.env` switch (plan ITEM DT, 2026-10-30, off by default): `1` or
+/// `on` puts QuestDB on core 0 alone on a 2- or 3-core host, so the readers
+/// and the frame drain have core 1 to themselves. Set by the operator.
+pub const QDB_CORE_ISOLATION_KEY: &str = "TV_QDB_CORE_ISOLATION";
+
+/// Marker host-tuning writes beside the values below, so turning the switch
+/// off removes them and the host's shared set is planned again.
+const QDB_CORE_ISOLATION_APPLIED_KEY: &str = "TV_QDB_CORE_ISOLATION_APPLIED";
+
+/// What the switch sets: one core, a one-core quota, one WAL-apply and one
+/// shared worker (more workers than cores buy throttling, the compose file
+/// records the measurement), and the marker last.
+const QDB_CORE_ISOLATION_VALUES: [(&str, &str); 5] = [
+    ("TV_QDB_CPUSET", "0"),
+    ("TV_QDB_CPUS", "1.0"),
+    ("TV_QDB_WAL_WORKERS", "1"),
+    ("TV_QDB_SHARED_WORKERS", "1"),
+    (QDB_CORE_ISOLATION_APPLIED_KEY, "1"),
+];
+
+/// Where the operator's own value of `key` is kept while isolation is on.
+fn saved_key(key: &str) -> String {
+    format!("{QDB_CORE_ISOLATION_SAVED_PREFIX}{key}")
+}
+
+/// Prefix of the keys that hold the operator's values while isolation is on.
+const QDB_CORE_ISOLATION_SAVED_PREFIX: &str = "TV_QDB_CORE_ISOLATION_WAS_";
+
+/// `text` with every line for `key` removed.
+fn dotenv_remove(text: &str, key: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let is_key = line
+            .trim()
+            .strip_prefix(key)
+            .is_some_and(|r| r.starts_with('='));
+        if !is_key {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Plan the QuestDB lines of the compose `.env` for a host with `cores` CPUs
 /// and `mem_g` GiB (plan item 66, the r8g.large rebuild: 2 vCPU / 16 GiB).
 ///
@@ -433,7 +477,47 @@ pub fn plan_questdb_host_env(
         text.push('\n');
     }
     let mut changed = false;
-    if cores > 0 && cores < QDB_DEFAULT_CPUSET_MIN_CORES {
+    // Plan ITEM DT (2026-10-30): QuestDB alone on core 0, off unless the
+    // operator sets the switch. Removing the switch undoes exactly what it set.
+    // Compose strips surrounding quotes from a value, so this reads the switch
+    // the same way (`TV_QDB_CORE_ISOLATION="1"` is on).
+    let isolation_on = dotenv_value(&text, QDB_CORE_ISOLATION_KEY)
+        .map(|v| v.trim_matches(['"', '\'']))
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("on"));
+    let isolation_fits = (2..QDB_DEFAULT_CPUSET_MIN_CORES).contains(&cores);
+    let applied = dotenv_value(&text, QDB_CORE_ISOLATION_APPLIED_KEY).is_some();
+    if isolation_on && isolation_fits {
+        if !applied {
+            // First apply: keep the operator's own values, so turning the
+            // switch off restores them instead of the compose defaults.
+            for (key, _) in &QDB_CORE_ISOLATION_VALUES[..QDB_CORE_ISOLATION_VALUES.len() - 1] {
+                if let Some(old) = dotenv_value(&text, key).map(str::to_owned) {
+                    text = dotenv_upsert(&text, &saved_key(key), &old);
+                }
+            }
+        }
+        for (key, want) in QDB_CORE_ISOLATION_VALUES {
+            if dotenv_value(&text, key) != Some(want) {
+                text = dotenv_upsert(&text, key, want);
+                changed = true;
+            }
+        }
+    } else if applied && cores > 0 {
+        // Switched off (or the host no longer fits): undo exactly what was
+        // set and put back what was there. Never on an unknown core count,
+        // which skips the plan below and would leave no cpuset at all.
+        for (key, _) in QDB_CORE_ISOLATION_VALUES {
+            let saved = saved_key(key);
+            let old = dotenv_value(&text, &saved).map(str::to_owned);
+            text = dotenv_remove(&text, key);
+            text = dotenv_remove(&text, &saved);
+            if let Some(old) = old {
+                text = dotenv_upsert(&text, key, &old);
+            }
+        }
+        changed = true;
+    }
+    if cores > 0 && cores < QDB_DEFAULT_CPUSET_MIN_CORES && !(isolation_on && isolation_fits) {
         let satisfiable = dotenv_value(&text, "TV_QDB_CPUSET")
             .and_then(cpuset_cpus)
             .is_some_and(|cpus| cpus.iter().all(|c| *c < cores));
@@ -1168,6 +1252,125 @@ mod tests {
         let wide = plan_questdb_host_env(2, 15, "TV_QDB_CPUSET=0-1\nTV_QDB_CPUS=3.0\n", false)
             .expect("change");
         assert!(wide.contains("TV_QDB_CPUS=2.0\n"));
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_core_isolation_puts_questdb_on_core_zero() {
+        // Plan ITEM DT: the operator sets the switch; QuestDB gets core 0
+        // alone and one worker of each kind.
+        let env = "TV_QDB_CORE_ISOLATION=1\nTV_QDB_CPUSET=0-1\nTV_QDB_CPUS=2.0\n";
+        let next = plan_questdb_host_env(2, 15, env, false).expect("change");
+        for want in [
+            "TV_QDB_CPUSET=0\n",
+            "TV_QDB_CPUS=1.0\n",
+            "TV_QDB_WAL_WORKERS=1\n",
+            "TV_QDB_SHARED_WORKERS=1\n",
+            "TV_QDB_CORE_ISOLATION_APPLIED=1\n",
+        ] {
+            assert!(next.contains(want), "{want} missing from {next}");
+        }
+        assert_eq!(dotenv_value(&next, "TV_QDB_CPUSET"), Some("0"));
+        // The operator's own value is kept for the undo.
+        assert_eq!(
+            dotenv_value(&next, "TV_QDB_CORE_ISOLATION_WAS_TV_QDB_CPUSET"),
+            Some("0-1")
+        );
+        // Idempotent.
+        assert_eq!(plan_questdb_host_env(2, 15, &next, false), None);
+        // `on` works the same.
+        let on = plan_questdb_host_env(2, 15, "TV_QDB_CORE_ISOLATION=on\n", false).expect("change");
+        assert!(on.contains("TV_QDB_CPUSET=0\n"));
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_core_isolation_off_undoes_what_it_set() {
+        let on = plan_questdb_host_env(2, 15, "TV_QDB_CORE_ISOLATION=1\n", false).expect("on");
+        // The operator removes the switch: the applied values go and the
+        // shared two-core set is planned again.
+        let switched_off = on.replace("TV_QDB_CORE_ISOLATION=1\n", "");
+        let back = plan_questdb_host_env(2, 15, &switched_off, false).expect("undo");
+        assert!(back.contains("TV_QDB_CPUSET=0-1\n"), "{back}");
+        assert!(back.contains("TV_QDB_CPUS=2.0\n"), "{back}");
+        for gone in [
+            "TV_QDB_WAL_WORKERS",
+            "TV_QDB_SHARED_WORKERS",
+            "TV_QDB_CORE_ISOLATION_APPLIED",
+            "TV_QDB_CPUSET=0\n",
+        ] {
+            assert!(!back.contains(gone), "{gone} left in {back}");
+        }
+        assert_eq!(plan_questdb_host_env(2, 15, &back, false), None);
+        // `0` means off too.
+        let zero = switched_off.clone() + "TV_QDB_CORE_ISOLATION=0\n";
+        assert!(plan_questdb_host_env(2, 15, &zero, false).is_some());
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_core_isolation_off_restores_the_operators_own_values() {
+        // The compose file documents rollbacks such as WAL_WORKERS=3 and
+        // SHARED_WORKERS=0; switching isolation on and off must give them back.
+        let before = "TV_QDB_HTTP_BIND=0.0.0.0\nTV_QDB_CPUSET=1\nTV_QDB_CPUS=1.0\n\
+                      TV_QDB_WAL_WORKERS=3\nTV_QDB_SHARED_WORKERS=0\n";
+        let on = plan_questdb_host_env(2, 15, &format!("{before}TV_QDB_CORE_ISOLATION=1\n"), false)
+            .expect("on");
+        assert!(on.contains("TV_QDB_WAL_WORKERS=1\n"), "{on}");
+        assert!(
+            on.contains("TV_QDB_CORE_ISOLATION_WAS_TV_QDB_WAL_WORKERS=3\n"),
+            "{on}"
+        );
+        // A second pass while on keeps the saved values (not the applied ones).
+        let again = plan_questdb_host_env(2, 15, &on, false);
+        assert_eq!(again, None, "idempotent while on");
+        let off = on.replace("TV_QDB_CORE_ISOLATION=1\n", "");
+        let back = plan_questdb_host_env(2, 15, &off, false).expect("undo");
+        for want in [
+            "TV_QDB_HTTP_BIND=0.0.0.0\n",
+            "TV_QDB_CPUSET=1\n",
+            "TV_QDB_CPUS=1.0\n",
+            "TV_QDB_WAL_WORKERS=3\n",
+            "TV_QDB_SHARED_WORKERS=0\n",
+        ] {
+            assert!(back.contains(want), "{want} missing from {back}");
+        }
+        assert!(!back.contains("TV_QDB_CORE_ISOLATION_"), "{back}");
+        assert_eq!(plan_questdb_host_env(2, 15, &back, false), None);
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_core_isolation_never_undone_on_an_unknown_core_count() {
+        let on = plan_questdb_host_env(2, 15, "TV_QDB_CORE_ISOLATION=1\n", false).expect("on");
+        let off = on.replace("TV_QDB_CORE_ISOLATION=1\n", "");
+        // cores == 0: the host could not be read; removing the cpuset here
+        // would leave compose's `2,3` default on a 2-core host.
+        assert_eq!(plan_questdb_host_env(0, 15, &off, false), None);
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_core_isolation_reads_a_quoted_switch() {
+        for quoted in ["\"1\"", "'on'"] {
+            let env = format!("TV_QDB_CORE_ISOLATION={quoted}\n");
+            let next = plan_questdb_host_env(2, 15, &env, false).expect("on");
+            assert!(next.contains("TV_QDB_CPUSET=0\n"), "{quoted}: {next}");
+        }
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_core_isolation_ignored_off_two_or_three_cores() {
+        // A 4-core host is already partitioned by the compose default.
+        assert_eq!(
+            plan_questdb_host_env(4, 30, "TV_QDB_CORE_ISOLATION=1\n", false),
+            None
+        );
+        // One core: there is no second core to isolate on; the normal plan.
+        let one = plan_questdb_host_env(1, 4, "TV_QDB_CORE_ISOLATION=1\n", false).expect("plan");
+        assert!(one.contains("TV_QDB_CPUSET=0\n"));
+        assert!(!one.contains("TV_QDB_CORE_ISOLATION_APPLIED"));
+    }
+
+    #[test]
+    fn test_dotenv_remove_removes_only_that_key() {
+        let text = "A=1\nAB=2\nA=3\nB=4\n";
+        assert_eq!(dotenv_remove(text, "A"), "AB=2\nB=4\n");
     }
 
     #[test]

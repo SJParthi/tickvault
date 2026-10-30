@@ -84,39 +84,22 @@ unpinned with an `info!` line, not this code.
 (`resolve_ws_reader_core`, `build_reader_runtime`) and
 `crates/app/src/main.rs::report_reader_core_pin`.
 
-## HOT-PATH-04 — the hot-path telemetry thread did not start
+**2026-10-30 (plan ITEM DT) — the same code covers the other hot-thread
+placements.** Each switch is off by default (see the "Hot-thread placement"
+block in `deploy/systemd/tickvault.service`); a requested placement that was
+not applied logs this code once, with a `source` field, and boot continues:
 
-**Added 2026-10-30** (plan ITEM 52f). **Severity:** Medium. **Pages:** nothing
-(log-sink-only; boot never fails over it). Logged ONCE at boot as a coded
-`error!` (`ErrorCode::HotPath04TelemetryNotStarted`).
+| `source` | Meaning | Fix |
+|---|---|---|
+| `hot_rt_refused` | `TICKVAULT_HOT_RT_PRIORITY` asked for real-time priority and the kernel's RT throttle is off (`sched_rt_runtime_us` = -1 or ≥ the period), below half the period (real-time threads would be held off the CPU most of each period), or unreadable, or the value is not 1 to 49. Readers and drain stay at normal priority, on purpose: without the throttle a stuck thread could hold its core forever. | Restore `kernel.sched_rt_runtime_us=950000`, or set the variable to `off`. |
+| `hot_rt_reader_failed` | The kernel refused `SCHED_FIFO` for a reader (`os_errno` 1 = EPERM, or 38 = ENOSYS). The call is the raw `sched_setscheduler` syscall, because musl stubs the libc wrapper to ENOSYS. | EPERM: add `LimitRTPRIO=2` to the unit's drop-in. |
+| `drain_thread_invalid` | `TICKVAULT_DRAIN_THREAD` is not `off`, `on` or a core id other than 0. The drain runs on the shared runtime. | Fix the value. |
+| `drain_thread_runtime_refused` / `drain_thread_spawn_refused` | The drain's own runtime or thread could not be created. The drain runs on the shared runtime, as before the switch. | Check memory and thread limits (`LimitNPROC`). |
+| `drain_thread_placement_refused` | The drain runs on its own thread but its core pin or `SCHED_FIFO` was refused (`pin_ok`, `fifo_ok`, `os_errno`). | As for the reader rows above. |
+| `background_core_refused` / `background_core_pin_failed` | `TICKVAULT_BACKGROUND_CORE` named the readers' core, a core the process may not use, or not a core id; or the readers are not pinned to a core of their own (`plan = ReadersNotPinned`: pinning main would move them, or an unpinned drain thread, onto the background core); or the kernel refused it. Background threads run unpinned. | Name core 0 on the 2-core box; keep the reader runtime on and pinned (`TICKVAULT_WS_READER_THREADS` ≥ 1, `TICKVAULT_WS_READER_CORE` unset or 1). |
 
-**Before this code:** the same failure was tagged BOOT-02, which pages and
-means "the QuestDB boot probe ran out of time". That was wrong in two ways.
-It named the wrong thing, and the line was written before the log was set up,
-so nobody ever saw it. The spawn now runs right after the log is set up.
-
-**Trigger:** `hot_path_telemetry::spawn_publisher` could not start the
-`tv-telemetry` OS thread. The host refused a new thread: a thread or memory
-limit (`TasksMax` in the systemd unit, `ulimit -u`, or low memory).
-
-**What is lost:** for this process, the stage latency gauges
-(`tv_hot_path_stage_*`), the task heartbeat gauges, and the
-HOT-PATH-STALL-01 page. Ticks, candles and the WAL are not touched. The
-runtime lateness probes still run; they just have nobody to publish them.
-
-**Check:** `tv_hot_path_stage_max_ns` and `tv_hot_path_stage_ns_bucket` are
-missing from `/metrics` for the whole process.
-
-**Triage:**
-1. Read the line's `error` field (the OS reason).
-2. Check the unit's `TasksMax` and the box's memory. Raise the limit or free
-   memory, then restart in the next safe window (after 15:45 IST).
-3. Until then, treat a quiet HOT-PATH-STALL-01 as "not watched", not as
-   "healthy".
-
-**Source:** `crates/storage/src/hot_path_telemetry.rs::spawn_publisher`,
-called from `crates/app/src/main.rs` right after the tracing subscriber
-`init()`. Ratchet: `crates/app/tests/hot_path_telemetry_boot_wiring_guard.rs`.
+Source for these: `crates/core/src/websocket/hot_thread_placement.rs`,
+`crates/app/src/drain_thread.rs`, `crates/app/src/main.rs::report_hot_thread_placement`.
 
 ## PHASE2-01 — Phase 2 dispatch failed (LTPs absent or empty plan)
 

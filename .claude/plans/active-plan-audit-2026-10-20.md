@@ -1177,7 +1177,7 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
-### ITEM SH — speed and health on the operator dashboard (owner 2026-10-30; read-only, no live change)
+### Muhurat 2026-11-08 (Sunday) — the weekday-only protections
 
 Approved by: Parthiban, 2026-10-30 ~12:00 IST, "go ahead and fix the muhurat risk dude" (recorded as `daily-universe-scope-expansion-2026-05-27.md` Quote 49 and noise lock §2.15). Design: `[[trading.muhurat_trading_dates]]` in `config/base.toml` gains the session times and becomes the one source (calendar `is_session_day`, `muhurat_session_secs`); terraform's copy is pinned equal; the workflow guards read the date from the same file; the liveness gate gets dated open/close rules. Edge cases: an ordinary Sunday and a weekday holiday stay closed; times empty = box not started (unchanged); an evening session must fit 18:00–19:30 (build check); the did-it-run alarms are never armed on a weekend. Failure modes: config file missing in a guard job reads "not Muhurat" (fail-open), so every guard job checks the file out and a ratchet pins it; reported times wrong: the box still runs from start − 60 min and the arming offset absorbs a later first tick. Rollback: revert the PR (no data or schema change). Observability: no new page; the gate Lambda logs its armed list.
 
@@ -1190,13 +1190,6 @@ Approved by: Parthiban, 2026-10-30 ~12:00 IST, "go ahead and fix the muhurat ris
 - [x] MU3. Every workflow market-hours guard refuses the whole Muhurat date (workflows)
   - Files: .github/workflows/deploy-aws.yml, .github/workflows/terraform-apply.yml, .github/workflows/aws-control.yml, .github/workflows/downsize-instance.yml, .github/workflows/emergency-fs-recover.yml, .github/workflows/wipe-log-streams.yml, crates/common/tests/muhurat_workflow_freeze_guard.rs, crates/common/tests/aws_infra_wiring.rs
   - Tests: every_weekday_market_check_also_closes_on_a_muhurat_date, every_guard_job_has_the_calendar_file
-
-- [x] SH1. Speed-and-health endpoint, tiles and verdicts, query builders, metrics-text reader, 5 s cache, metrics address set at boot
-  - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/app/src/main.rs
-  - Tests: test_ticks_per_minute_sql_and_tick_window_cover_the_last_15_full_minutes, test_every_unreadable_source_is_grey_never_green, test_parse_metrics_text_reads_wanted_series_in_one_pass, test_handler_reads_every_source_and_a_second_call_is_a_cache_hit, test_stage_light_honours_bucket_resolution
-- [x] SH2. Dashboard panel painting the server's tiles; script compacted under the existing ceilings; ceilings lowered to the new size
-  - Files: crates/api/src/handlers/dashboard_page.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs
-  - Tests: test_dashboard_page_paints_the_speed_panel_from_server_verdicts, test_dashboard_page_fetches_all_required_endpoints
 
 ### ITEM DASH — F&O stocks price movers on the dashboard (api; 2026-10-30)
 
