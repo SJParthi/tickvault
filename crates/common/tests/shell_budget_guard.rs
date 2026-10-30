@@ -130,7 +130,7 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/bench-gate.sh", 440),
     ("scripts/bootstrap.sh", 323),
     ("scripts/claude-session-bootstrap.sh", 199),
-    ("scripts/clippy-local.sh", 92),
+    ("scripts/clippy-local.sh", 89),
     ("scripts/count-current-expiry-universe.sh", 128),
     ("scripts/coverage-gate.sh", 372),
     ("scripts/diagnose-write-amplification.sh", 99),
