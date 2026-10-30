@@ -116,6 +116,7 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # field set, inline depth book rows), added the same day.
 feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
 feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
+tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass.
 
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
@@ -141,3 +142,4 @@ feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PR
 feed_drain_main_feed_frame_4_full   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29)
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet
+tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
