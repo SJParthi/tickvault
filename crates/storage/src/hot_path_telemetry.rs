@@ -93,7 +93,16 @@
 //! and `tv_hot_path_receipt_to_fold_fine_{p50,p99,p999}_ns`) and
 //! `metrics_upkeep` (one run of the Prometheus exporter's upkeep on the main
 //! runtime). The publisher thread also publishes the hot threads'
-//! scheduling wait (`crate::hot_thread_sched`).
+//! scheduling wait (`crate::hot_thread_sched`). `receipt_to_fold` covers
+//! frames that took the live path only; ring-refused frames are on the ring
+//! counters (see [`Stage::ReceiptToFold`]).
+//!
+//! These series are never paged and have no EMF name or metric filter, but
+//! they are not confined to the box: the CloudWatch agent scrapes all of
+//! `/metrics` once a minute, with no relabel filter, into the metrics log
+//! group. DT0 added about 143 series (two stages of ~35 each, the 61 fine
+//! ones, 12 scheduling ones); at ~150 bytes a line and ~8 hours a day that
+//! is ~0.25 GB a month, about $0.15 to $0.30 (Assumed, not billed yet).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -135,10 +144,19 @@ pub enum Stage {
     /// One main-feed frame, end to end inside this process: the read task's
     /// receipt instant → the drain finished folding it (plan item DT0,
     /// 2026-10-29). It spans `socket_to_wal`, `ring_dwell` and
-    /// `drain_main_frame`, so a tick that took over 1 ms to reach RAM shows
-    /// here once, whichever step held it. Recorded once per main-feed frame
-    /// by [`record_receipt_to_fold_nanos`], which also fills the finer
-    /// quarter-octave histogram below. Never paged.
+    /// `drain_main_frame`, so a frame that took the LIVE path and took over
+    /// 1 ms to reach RAM shows here once, whichever step held it. Recorded
+    /// once per main-feed frame by [`record_receipt_to_fold_nanos`], which
+    /// also fills the finer quarter-octave histogram below. Never paged.
+    ///
+    /// Not every tick: a frame the ring refused (frame-count or byte budget
+    /// full, or the drain gone) is kept only in the WAL and reaches the fold
+    /// later through refold or catch-up, the slowest path a tick can take,
+    /// and records nothing here. Those frames are counted on
+    /// `tv_dhan_ws_ring_full_total` and `tv_dhan_ws_ring_closed_total`
+    /// (`endpoint="main_feed"`); read them beside this stage. In a window
+    /// where either rose the tail is partly unmeasured, so this stage's
+    /// p99.9 reads low for that window.
     ReceiptToFold = 5,
     /// One run of the Prometheus exporter's upkeep (it drains every
     /// histogram), which runs every 5 s on the MAIN tokio runtime, the one
@@ -702,6 +720,7 @@ fn step_p99_latch(latched: &mut bool, over: Option<bool>) -> bool {
 
 /// What one stage's window produced.
 struct WindowOutcome {
+    window: [u64; STAGE_BUCKETS],
     quantiles: Option<StageQuantiles>,
     over_budget: u64,
     starts_p99_episode: bool,
@@ -750,6 +769,7 @@ impl QuantileWindows {
             .map(|q| p99_over_budget(q.samples, over_budget));
         let starts_p99_episode = step_p99_latch(&mut self.p99_over[i], verdict);
         WindowOutcome {
+            window,
             quantiles,
             over_budget,
             starts_p99_episode,
@@ -817,6 +837,33 @@ pub struct TelemetryHandles {
     windows: QuantileWindows,
     rolling: [RollingMax; STAGE_COUNT],
     fine: FineHandles,
+    last_second: SecondWindow,
+}
+
+/// What the last [`publish_once`] read, per stage: the window's per-bucket
+/// (NOT cumulative) counts and its maximum, plus the fine `receipt_to_fold`
+/// window. The per-minute proof table ([`crate::hot_path_latency_minute`])
+/// sums these. Fixed arrays, copied, never allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecondWindow {
+    /// Per stage (index = [`Stage`] discriminant), per-bucket counts.
+    pub stage_buckets: [[u64; STAGE_BUCKETS]; STAGE_COUNT],
+    /// Per stage, the largest sample of the window, nanoseconds.
+    pub stage_max_nanos: [u64; STAGE_COUNT],
+    /// The fine `receipt_to_fold` window, per-bucket counts.
+    pub receipt_to_fold_fine: [u64; FINE_BUCKETS],
+}
+
+impl SecondWindow {
+    /// An empty window.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            stage_buckets: [[0; STAGE_BUCKETS]; STAGE_COUNT],
+            stage_max_nanos: [0; STAGE_COUNT],
+            receipt_to_fold_fine: [0; FINE_BUCKETS],
+        }
+    }
 }
 
 /// How many one-second maxima [`RollingMax`] keeps: one scrape interval of
@@ -893,7 +940,7 @@ impl FineHandles {
     /// Publishes the cumulative fine buckets and this window's quantiles
     /// (NaN for an empty window, `+Inf` above the top bound). O(58), no
     /// allocation.
-    fn publish(&mut self) {
+    fn publish(&mut self) -> [u64; FINE_BUCKETS] {
         let now = receipt_to_fold_fine_snapshot();
         let mut window = [0u64; FINE_BUCKETS];
         let mut cumulative = 0u64;
@@ -921,6 +968,7 @@ impl FineHandles {
                 self.p999.set(f64::NAN);
             }
         }
+        window
     }
 }
 
@@ -1010,7 +1058,14 @@ impl TelemetryHandles {
             windows: QuantileWindows::new(),
             rolling: [RollingMax::new(); STAGE_COUNT],
             fine: FineHandles::resolve(),
+            last_second: SecondWindow::empty(),
         }
+    }
+
+    /// What the last [`publish_once`] read (empty before the first).
+    #[must_use]
+    pub const fn last_second(&self) -> &SecondWindow {
+        &self.last_second
     }
 }
 
@@ -1047,7 +1102,9 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         let max_rolling = handles.rolling[*stage as usize].push(max);
         h.max_rolling.set(nanos_to_f64(max_rolling));
         readings.stage_max_nanos[*stage as usize] = max;
+        handles.last_second.stage_max_nanos[*stage as usize] = max;
         let outcome = handles.windows.advance(*stage, &snap);
+        handles.last_second.stage_buckets[*stage as usize] = outcome.window;
         match outcome.quantiles {
             Some(q) => {
                 h.p50.set(q.p50.as_gauge_value());
@@ -1073,7 +1130,7 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         }
         h.busy.set(busy_seconds_at(*task, now));
     }
-    handles.fine.publish();
+    handles.last_second.receipt_to_fold_fine = handles.fine.publish();
     readings
 }
 
@@ -1091,9 +1148,18 @@ pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
         .spawn(move || {
             let mut alarm = StallAlarm::new();
             let mut sched = crate::hot_thread_sched::SchedPublisher::new();
+            let mut minute = crate::hot_path_latency_minute::MinuteAccumulator::new();
             loop {
                 let now = Instant::now();
                 let readings = publish_once(&mut handles, now);
+                // 2026-10-30: the second just read joins its minute; a closed
+                // minute's rows go to the writer thread without waiting.
+                if let Some(rows) = minute.absorb(
+                    crate::hot_path_latency_minute::wall_ist_nanos_now(),
+                    handles.last_second(),
+                ) {
+                    let _outcome = crate::hot_path_latency_minute::offer(&rows);
+                }
                 // DT0 (2026-10-29): the hot threads' scheduling wait, from
                 // /proc, on this thread only (cold, once a second).
                 let _published = sched.publish();

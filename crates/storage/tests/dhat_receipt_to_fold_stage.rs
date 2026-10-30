@@ -3,11 +3,19 @@
 //!
 //! `record_receipt_to_fold_nanos` runs on the frame drain once per main-feed
 //! frame: the stage record plus the fine quarter-octave histogram, five
-//! relaxed atomics in all. `note_frame_drain_thread` runs on the drain's
-//! 500 ms flush arm; after its first call on a thread (which reads the
-//! thread id once) it is a thread-local read and one store. Both must stay
-//! allocation-free. `fine_quantiles` runs on the publisher thread once a
-//! second forever, so it is held to zero as well.
+//! relaxed atomics in all. `register_main_worker_thread` runs from the main
+//! runtime's `on_thread_park` hook on every worker park; after its first
+//! call on a thread it is one thread-local read. Both must stay
+//! allocation-free.
+//!
+//! What this test does NOT measure: the FIRST call of
+//! `register_main_worker_thread` on each thread reads `/proc/thread-self`
+//! (one syscall and one small `PathBuf`). That is paid once per worker
+//! thread, at its first park (an idle moment, never on the frame path);
+//! the warm-up below pays it on the measuring thread before measuring.
+//!
+//! `fine_quantiles` runs on the publisher thread once a second forever, so it is
+//! held to zero as well.
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -15,7 +23,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use tickvault_storage::hot_path_telemetry::{
     FINE_BUCKETS, Stage, fine_quantiles, record_receipt_to_fold_nanos, record_stage_nanos,
 };
-use tickvault_storage::hot_thread_sched::note_frame_drain_thread;
+use tickvault_storage::hot_thread_sched::{
+    register_main_worker_thread, release_main_worker_thread,
+};
 
 mod dhat_support;
 
@@ -27,7 +37,7 @@ fn dhat_receipt_to_fold_stage_zero_alloc() {
     // Warm up: touch every static and read this thread's id once.
     record_stage_nanos(Stage::ReceiptToFold, 1);
     record_receipt_to_fold_nanos(1);
-    note_frame_drain_thread();
+    let _slot = register_main_worker_thread();
     let warm = [1u64; FINE_BUCKETS];
     assert!(fine_quantiles(&warm).is_some());
 
@@ -48,7 +58,7 @@ fn dhat_receipt_to_fold_stage_zero_alloc() {
                 };
                 record_receipt_to_fold_nanos(nanos);
                 if i % 100 == 0 {
-                    note_frame_drain_thread();
+                    let _slot = register_main_worker_thread();
                 }
             }
         },
@@ -56,7 +66,7 @@ fn dhat_receipt_to_fold_stage_zero_alloc() {
     assert_eq!(
         (bytes, blocks),
         (0, 0),
-        "record_receipt_to_fold_nanos / note_frame_drain_thread allocated on the drain"
+        "record_receipt_to_fold_nanos allocated on the drain, or register_main_worker_thread on a worker park"
     );
 
     let mut window = [0u64; FINE_BUCKETS];
@@ -80,4 +90,5 @@ fn dhat_receipt_to_fold_stage_zero_alloc() {
         (0, 0),
         "fine_quantiles allocated on the publisher thread"
     );
+    release_main_worker_thread();
 }

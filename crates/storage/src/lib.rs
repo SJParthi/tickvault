@@ -316,6 +316,9 @@ pub mod market_data_floor;
 // Plan item DT0 (2026-10-29): per-hot-thread scheduling-wait evidence,
 // read once a second on the `tv-telemetry` thread.
 pub mod hot_thread_sched;
+// Owner 2026-10-30: one row per hot-path stage per minute (p50/p99/p99.9,
+// max, samples over 1,024 ns), the live proof table, written off the hot path.
+pub mod hot_path_latency_minute;
 // Moves the current tokio worker aside for one blocking step (sweep S1/S5).
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
