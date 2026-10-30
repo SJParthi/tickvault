@@ -201,14 +201,14 @@ async function getJson(url) {
   }
 }
 
-// The speed panel needs the token. With none, or after one refusal, it is not
-// asked again until Save, so an open tab cannot pile up refused requests.
-let speedDenied = false;
-async function getSpeed() {
-  if (!tokenEl.value.trim() || speedDenied) return null;
+// Token-gated reads. With no token, or after one refusal, none is asked again
+// until Save, so an open tab cannot pile up refused requests.
+let denied = false;
+async function getGated(url) {
+  if (!tokenEl.value.trim() || denied) return null;
   try {
-    const res = await fetch("/api/debug/speed-health", { headers: authHeaders() });
-    if (res.status === 401) { speedDenied = true; return null; }
+    const res = await fetch(url, { headers: authHeaders() });
+    if (res.status === 401) { denied = true; return null; }
     return res.ok ? await res.json() : null;
   } catch (e) {
     return null;
@@ -226,8 +226,8 @@ async function refresh() {
       getJson("/api/feeds"),
       getJson("/api/feeds/health"),
       getJson("/api/stats"),
-      getJson("/api/fno-stocks"),
-      getSpeed(),
+      getGated("/api/fno-stocks"),
+      getGated("/api/debug/speed-health"),
     ]);
     renderOverall(health);
     renderFeeds(feeds, feedsHealth);
@@ -404,7 +404,7 @@ document.getElementById("fno-sort").addEventListener("click", (e) => {
 function renderSpeed(speed) {
   speedEl.replaceChildren();
   if (!speed || !speed.sections) {
-    speedEl.appendChild(el("div", "card", speedDenied || !tokenEl.value.trim()
+    speedEl.appendChild(el("div", "card", denied || !tokenEl.value.trim()
       ? "— enter the API token above and press Save to see speed and health."
       : "— could not read speed and health."));
     return;
@@ -424,7 +424,7 @@ function renderSpeed(speed) {
 }
 
 document.getElementById("save").addEventListener("click", () => {
-  speedDenied = false;
+  denied = false;
   sessionStorage.setItem("tv_api_token", tokenEl.value.trim());
   refresh();
 });
@@ -610,23 +610,29 @@ mod tests {
 
     #[test]
     fn test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal() {
-        // Every 401 on the bearer-gated route counts toward the brute-force
+        // Every 401 on a bearer-gated route counts toward the brute-force
         // page (Sum >= 25 per 5 min). A tab with no token, or a stale one,
-        // must not poll it every 5 s: no token, no request; one 401 stops it
-        // until Save.
+        // must not poll any of them every 5 s: no token, no request; one 401
+        // stops every gated read until Save. Both gated routes the page reads
+        // go through the one guarded helper.
         for marker in [
-            "if (!tokenEl.value.trim() || speedDenied) return null;",
-            "if (res.status === 401) { speedDenied = true; return null; }",
-            "  speedDenied = false;\n  sessionStorage.setItem",
-            "getSpeed(),",
+            "if (!tokenEl.value.trim() || denied) return null;",
+            "if (res.status === 401) { denied = true; return null; }",
+            "  denied = false;\n  sessionStorage.setItem",
+            "getGated(\"/api/fno-stocks\"),",
+            "getGated(\"/api/debug/speed-health\"),",
         ] {
             assert!(DASHBOARD_HTML.contains(marker), "missing: {marker}");
         }
-        assert_eq!(
-            DASHBOARD_HTML.matches("/api/debug/speed-health").count(),
-            1,
-            "the gated route is fetched in exactly one place, behind the token check"
-        );
+        // Only two fetch sites exist (the open getJson and the guarded
+        // getGated), and neither gated route goes through the open one.
+        assert_eq!(DASHBOARD_HTML.matches("fetch(").count(), 2);
+        for gated in ["/api/fno-stocks", "/api/debug/speed-health"] {
+            assert!(
+                !DASHBOARD_HTML.contains(&format!("getJson(\"{gated}\")")),
+                "{gated} must be fetched only through the token-guarded helper"
+            );
+        }
     }
 
     #[test]

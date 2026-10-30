@@ -1177,7 +1177,7 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
-### ITEM SP — the sealed-candle path under 1 µs per seal (owner directive 2026-10-30; storage)
+### ITEM SH — speed and health on the operator dashboard (owner 2026-10-30; read-only, no live change)
 
 Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 microsecond at p99, proven by benches that fail the build if it slips, with identical output; use only max"). Scope: what happens to a sealed candle after the fold produces it, in `crates/storage` only (the fold, `crates/trading/src/candles`, belongs to another session). Design: measure each per-seal step with a new Criterion bench, fix what is over 1,000 ns or allocates, keep the ILP bytes identical. Edge cases: a ring that already holds seals is never prefaulted; a refused row still rewinds to its marker; the `contract` name is looked up once per row by the caller. Failure modes: an invalid constant column name would reach QuestDB unchecked (test runs the library check over every name and a source scan refuses a literal); the reused drain buffer is cleared on every return path. Rollback: revert the commit (no schema, config or wire change). Observability: the bench prints p50/p99/p99.9/max per step; no new metric.
 
@@ -1199,6 +1199,16 @@ Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 micr
 - [x] SP6. Review fixes: the candle ILP buffer is presized and written once at construction (no regrowth on the append); a p99 tail miss defers to a step after the Criterion baseline save
   - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/benches/seal_path.rs, crates/app/benches/feed_drain.rs, .github/workflows/bench.yml, crates/common/tests/shell_budget_guard.rs, crates/storage/tests/bench_tail_gate_defer_guard.rs
   - Tests: test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows, test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows, both_benches_print_the_marker_and_exit_unless_deferred, bench_yml_defers_and_fails_after_the_baseline_save, workflow_run_lines_never_grow
+
+- [x] SH1. Speed-and-health endpoint, tiles and verdicts, query builders, metrics-text reader, 5 s cache, metrics address set at boot
+  - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/app/src/main.rs
+  - Tests: test_ticks_per_minute_sql_and_tick_window_cover_the_last_15_full_minutes, test_every_unreadable_source_is_grey_never_green, test_parse_metrics_text_reads_wanted_series_in_one_pass, test_handler_reads_every_source_and_a_second_call_is_a_cache_hit, test_stage_light_honours_bucket_resolution
+- [x] SH2. Dashboard panel painting the server's tiles; script compacted under the existing ceilings; ceilings lowered to the new size
+  - Files: crates/api/src/handlers/dashboard_page.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs
+  - Tests: test_dashboard_page_paints_the_speed_panel_from_server_verdicts, test_dashboard_page_fetches_all_required_endpoints
+- [x] SH3. Second hostile review round (3 reviewers, 2 refuters each): sockets tile reads per-socket last-frame stamps (a task in backoff is not "connected"); a stopped database table reads red and blocks "caught up"; a database-check reading older than 150 s reads unknown; pinned bytes at zero carry no verdict; both token-gated reads share one stop-after-refusal guard; worst refresh cost corrected to about 6 s
+  - Files: crates/api/src/handlers/speed_health.rs, crates/api/src/handlers/dashboard_page.rs, crates/common/src/ingest_shed.rs
+  - Tests: test_sockets_delivering_counts_only_stamps_inside_the_window, test_sockets_now_tile_every_case, test_fresh_wal_reading_withdraws_a_reading_older_than_two_and_a_half_polls, test_apply_lag_tile_database_caught_up_and_database_not_answering, test_wal_apply_lag_published_at_unix_secs_is_never_zero_or_negative, test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal
 
 ### Muhurat 2026-11-08 (Sunday) — the weekday-only protections
 
