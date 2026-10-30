@@ -3198,8 +3198,10 @@ struct ReceiptAnchor {
     nanos: i64,
 }
 
-static RECEIPT_ANCHOR: std::sync::OnceLock<arc_swap::ArcSwap<ReceiptAnchor>> =
-    std::sync::OnceLock::new();
+mod receipt_anchor;
+use receipt_anchor::AnchorCell;
+
+static RECEIPT_ANCHOR: std::sync::OnceLock<AnchorCell> = std::sync::OnceLock::new();
 
 /// Counter: how many times the receipt anchor was re-taken from the wall clock.
 ///
@@ -3208,8 +3210,9 @@ static RECEIPT_ANCHOR: std::sync::OnceLock<arc_swap::ArcSwap<ReceiptAnchor>> =
 /// refresh caller stopped and the anchor is aging.
 pub const RECEIPT_ANCHOR_REFRESH_COUNTER: &str = "tv_wal_receipt_anchor_refresh_total";
 
-fn anchor_cell() -> &'static arc_swap::ArcSwap<ReceiptAnchor> {
-    RECEIPT_ANCHOR.get_or_init(|| arc_swap::ArcSwap::from_pointee(take_anchor()))
+#[inline]
+fn anchor_cell() -> &'static AnchorCell {
+    RECEIPT_ANCHOR.get_or_init(|| AnchorCell::new(take_anchor()))
 }
 
 fn take_anchor() -> ReceiptAnchor {
@@ -3250,8 +3253,6 @@ fn take_anchor() -> ReceiptAnchor {
 /// capture path.
 pub fn refresh_receipt_anchor() {
     let cell = anchor_cell();
-    let old = cell.load();
-    let new = take_anchor();
     // MONOTONIC RATCHET (2026-08-28, round-2 fix).
     //
     // Re-anchoring bounds the drift, and taken naively it also introduces a way
@@ -3281,9 +3282,8 @@ pub fn refresh_receipt_anchor() {
     // It is counted (`outcome = "adopted_backward_step"`) and logged. A small
     // rewind (slew) is still refused, and repeated refusals now end too: once
     // the accumulated slew passes the threshold it is adopted as a step.
-    match anchor_refresh_decision(**old, new) {
+    match cell.refresh_with(take_anchor) {
         AnchorRefresh::Adopt => {
-            cell.store(std::sync::Arc::new(new));
             metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
         }
         AnchorRefresh::RefuseBackward => {
@@ -3291,7 +3291,6 @@ pub fn refresh_receipt_anchor() {
                 .increment(1);
         }
         AnchorRefresh::AdoptBackwardStep { rewind_nanos } => {
-            cell.store(std::sync::Arc::new(new));
             metrics::counter!(
                 RECEIPT_ANCHOR_REFRESH_COUNTER,
                 "outcome" => "adopted_backward_step"
@@ -3352,12 +3351,11 @@ fn anchor_refresh_decision(old: ReceiptAnchor, new: ReceiptAnchor) -> AnchorRefr
 /// flattening of at most a handful of frames, and it is the right trade against
 /// a panic or a negative timestamp.
 #[must_use]
+#[inline]
 pub fn receipt_nanos_from(captured_at: Instant) -> i64 {
-    let anchor = anchor_cell().load();
-    let delta = captured_at.saturating_duration_since(anchor.instant);
-    let delta_nanos = i64::try_from(delta.as_nanos()).unwrap_or(i64::MAX);
-    anchor.nanos.saturating_add(delta_nanos)
+    anchor_cell().receipt_nanos(captured_at)
 }
+
 /// The exclusive lock file held for the lifetime of the process that owns a
 /// WAL directory.
 ///
