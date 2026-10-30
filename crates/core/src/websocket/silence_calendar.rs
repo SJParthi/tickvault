@@ -267,8 +267,12 @@ mod tests {
             data_collection_end: "15:30:00".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
+            // The calendar refuses a holiday listed on a weekend, so a test that
+            // lists today as its holiday would fail every Saturday and Sunday.
+            // A weekend is a non-trading day anyway, so skip it.
             nse_holidays: dates
                 .iter()
+                .filter(|d| !is_weekend_date(d))
                 .map(|d| NseHolidayEntry {
                     date: (*d).to_string(),
                     name: "Holiday".to_string(),
@@ -278,6 +282,14 @@ mod tests {
             nse_mock_trading_dates: vec![],
         };
         TradingCalendar::from_config(&cfg).expect("test calendar builds")
+    }
+
+    /// Whether `date` (YYYY-MM-DD) is a Saturday or Sunday. Unparseable
+    /// dates are kept, so the calendar still rejects them loudly.
+    fn is_weekend_date(date: &str) -> bool {
+        use chrono::Datelike;
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .is_ok_and(|d| matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
     }
 
     fn today_ist() -> String {
