@@ -981,16 +981,16 @@ jobs:
       # 2026-10-30: dhat_tick_row_append added (plan ITEM DT row stage), 6 -> 7.
       # It pins the per-tick ILP row build at zero allocations. Its flag shares
       # a line with two others, so the run: line count does not grow.
-      # 2026-10-30: with PR #2146's two (hot_path_latency_minute, receipt_to_fold) -> 9.
+      # 2026-10-30: with PR #2146's two (hot_path_latency_minute, receipt_to_fold) -> 9;
+      # the flags are packed three per line so the run: line count stays at its ceiling.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
-            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute \
-            --test dhat_depth_append_zero_alloc --test dhat_receipt_to_fold_stage --test dhat_tick_row_append \
-            --test dhat_flush_buffer_recycle --test dhat_hot_path_telemetry \
-            --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
+            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc \
+            --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle \
+            --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
             2>&1 | tee /tmp/dhat-storage.log
           if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
             echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
