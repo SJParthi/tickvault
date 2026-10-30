@@ -55,6 +55,38 @@ fn read(rel: &str) -> String {
 /// script is no longer a stand-in for the gate and the parity claim is void.
 const CI_CLIPPY_INVOCATION: &str = "cargo clippy --workspace --no-deps -- -D warnings";
 
+/// The tail of CI's second clippy step (2026-10-30, plan item 12b), which lints
+/// every target of the crates named before it with `-p`.
+const CI_ALL_TARGETS_TAIL: &str = "--all-targets --no-deps -- -D warnings";
+
+/// Lines of `text` that are not `#` comments.
+fn code_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect()
+}
+
+/// The crates (`-p <name>`) on CI's `--all-targets` clippy line, in order.
+fn ci_all_targets_crates() -> Vec<String> {
+    let ci = read(".github/workflows/ci.yml");
+    let line = code_lines(&ci)
+        .into_iter()
+        .find(|l| l.contains("cargo clippy") && l.contains(CI_ALL_TARGETS_TAIL))
+        .unwrap_or_else(|| {
+            panic!(
+                "clippy_local_parity_guard: ci.yml has no `cargo clippy ... \
+                 {CI_ALL_TARGETS_TAIL}` step to mirror"
+            )
+        })
+        .to_string();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words
+        .windows(2)
+        .filter(|w| w[0] == "-p")
+        .map(|w| w[1].to_string())
+        .collect()
+}
+
 #[test]
 fn ci_still_runs_the_invocation_the_local_script_mirrors() {
     let ci = read(".github/workflows/ci.yml");
@@ -66,6 +98,51 @@ fn ci_still_runs_the_invocation_the_local_script_mirrors() {
          changed, change the script and this constant in the SAME commit — a \
          local gate that checks a different scope than CI reads green and still \
          ships red, which is the exact failure this guard was created for."
+    );
+    let crates = ci_all_targets_crates();
+    assert!(
+        !crates.is_empty(),
+        "clippy_local_parity_guard: ci.yml's --all-targets clippy step names no `-p` crate"
+    );
+}
+
+/// 2026-10-30 (plan item 12b review): CI gained a second clippy step that lints
+/// tests and benches of the clean crates. The local script must run the same
+/// crates with `--all-targets`, or `make clippy-ci` reads green on a test-code
+/// lint that CI then fails on.
+#[test]
+fn the_local_script_lints_all_targets_of_exactly_the_crates_ci_does() {
+    let script = read("scripts/clippy-local.sh");
+    let code = code_lines(&script);
+    let crate_line = code
+        .iter()
+        .find(|l| l.trim_start().starts_with("CLEAN_CRATES=("))
+        .expect(
+            "clippy_local_parity_guard: scripts/clippy-local.sh must define CLEAN_CRATES=(...)",
+        );
+    let local: Vec<String> = crate_line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0] == "-p" || w[0] == "CLEAN_CRATES=(-p")
+        .map(|w| w[1].trim_end_matches(')').to_string())
+        .collect();
+    let ci = ci_all_targets_crates();
+    assert_eq!(
+        local, ci,
+        "clippy_local_parity_guard: CLEAN_CRATES in scripts/clippy-local.sh must name \
+         the same crates, in the same order, as ci.yml's --all-targets clippy step"
+    );
+    // Both branches (the shim and the clippy-driver fallback) use the list
+    // with --all-targets.
+    let uses = code
+        .iter()
+        .filter(|l| l.contains("\"${CLEAN_CRATES[@]}\" --all-targets"))
+        .count();
+    assert!(
+        uses >= 2,
+        "clippy_local_parity_guard: both the cargo-clippy branch and the clippy-driver \
+         fallback must lint \"${{CLEAN_CRATES[@]}}\" --all-targets; found {uses} use(s)"
     );
 }
 
@@ -97,20 +174,23 @@ fn the_local_script_mirrors_ci_scope_and_never_widens_or_narrows_it() {
          with CI. RUSTC_WORKSPACE_WRAPPER already restricts linting to workspace \
          members, but the flag must stay visible so the parity is readable."
     );
-    // NOT wider than CI. `--all-targets` would surface lints CI never runs,
-    // training the reader to ignore local output. Comments are stripped first:
-    // the script DOCUMENTS why it avoids --all-targets, and a naive substring
-    // scan would trip on that explanation.
-    let code_only: String = script
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // NOT wider than CI. CI runs `--all-targets` only for the clean crates
+    // (2026-10-30); `--all-targets` on the whole workspace would surface lints
+    // CI never runs, training the reader to ignore local output. Comments are
+    // stripped first: the script DOCUMENTS its scope.
+    // Judged per COMMAND, not per line: the fallback runs both checks on one
+    // line joined by `&&`.
+    let widened: Vec<&str> = code_lines(&script)
+        .into_iter()
+        .flat_map(|l| l.split("&&").flat_map(|c| c.split(';')))
+        .filter(|c| c.contains("--all-targets") && c.contains("--workspace"))
+        .collect();
     assert!(
-        !code_only.contains("--all-targets"),
-        "clippy_local_parity_guard: the local script must NOT use --all-targets. \
-         CI checks libs + bins only; a wider local gate produces findings CI will \
-         never enforce, and a gate people learn to ignore is worse than no gate."
+        widened.is_empty(),
+        "clippy_local_parity_guard: the local script must NOT run --all-targets on the \
+         whole workspace: {widened:?}. CI lints test targets of the clean crates only; \
+         a wider local gate produces findings CI will never enforce, and a gate people \
+         learn to ignore is worse than no gate."
     );
     // The fallback must be the wrapper, not a silent skip.
     assert!(

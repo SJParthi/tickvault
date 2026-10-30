@@ -2481,6 +2481,21 @@ fn ci_clippy_gate_stays_armed() {
             step.trim()
         );
     }
+    // The floor armed on 2026-10-30, written out here so that dropping a crate
+    // takes a second, visible edit in this test and not only in the list.
+    for armed in [
+        "tickvault-common",
+        "tickvault-storage",
+        "tickvault-api",
+        "tickvault-aws-lambdas",
+        "tickvault-logs-mcp",
+    ] {
+        assert!(
+            CLIPPY_ALL_TARGETS_CRATES.contains(&armed),
+            "CI TEST-TARGET LINT GATE NARROWED: `{armed}` was armed on 2026-10-30 \
+             and left CLIPPY_ALL_TARGETS_CRATES. The list may only grow."
+        );
+    }
     for krate in CLIPPY_ALL_TARGETS_CRATES {
         let flag = format!("-p {krate} ");
         assert!(

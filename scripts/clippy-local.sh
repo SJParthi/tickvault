@@ -27,18 +27,13 @@
 # directly. clippy-driver is invoked ONLY for workspace members (that is what
 # WORKSPACE_WRAPPER means), which is the same scope as `--no-deps`.
 #
-# SCOPE PARITY WITH CI
-# --------------------
-# ci.yml "Build & Verify" runs:
-#     cargo clippy --workspace --no-deps -- -D warnings
-# i.e. libs + bins (NOT --all-targets), workspace members only, warnings fatal.
-# This script reproduces that scope. Pinned against drift by
-# crates/common/tests/clippy_local_parity_guard.rs.
+# SCOPE PARITY WITH CI (two steps in ci.yml "Build & Verify", both here):
+#     cargo clippy --workspace --no-deps -- -D warnings          (libs + bins)
+#     cargo clippy <CLEAN_CRATES> --all-targets --no-deps -- -D warnings
+# The second (2026-10-30, plan 12b) also lints tests and benches of the crates
+# that measured clean. Pinned by crates/common/tests/clippy_local_parity_guard.rs.
 #
 # HONEST LIMITS
-# -------------
-#   * CI checks libs + bins. Lints that only appear in test/bench/example
-#     targets are NOT covered here, exactly as they are not covered in CI.
 #   * clippy.toml is honoured (it is found by walking up from the crate dir),
 #     so thresholds are the project's, not clippy's defaults. Verified
 #     2026-09-01: too-many-arguments-threshold = 8, and a 9-argument probe
@@ -49,11 +44,13 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+CLEAN_CRATES=(-p tickvault-common -p tickvault-storage -p tickvault-api -p tickvault-aws-lambdas -p tickvault-logs-mcp)
 
 # Prefer the real subcommand whenever the toolchain actually has it.
 if cargo clippy --version >/dev/null 2>&1; then
     echo "clippy-local: cargo-clippy shim present -- using it directly"
-    exec cargo clippy --workspace --no-deps -- -D warnings
+    cargo clippy --workspace --no-deps -- -D warnings
+    exec cargo clippy "${CLEAN_CRATES[@]}" --all-targets --no-deps -- -D warnings
 fi
 
 DRIVER="$(rustup which clippy-driver 2>/dev/null || true)"
@@ -69,8 +66,8 @@ OUT="$(mktemp)"
 trap 'rm -f "${OUT}"' EXIT
 
 set +e
-CLIPPY_ARGS="--no-deps" RUSTC_WORKSPACE_WRAPPER="${DRIVER}" \
-    cargo check --workspace >"${OUT}" 2>&1
+export CLIPPY_ARGS="--no-deps" RUSTC_WORKSPACE_WRAPPER="${DRIVER}"
+{ cargo check --workspace && cargo check "${CLEAN_CRATES[@]}" --all-targets; } >"${OUT}" 2>&1
 CARGO_STATUS=$?
 set -e
 
@@ -89,4 +86,4 @@ if grep -qE '^(warning|error)' "${OUT}"; then
     exit 1
 fi
 
-echo "clippy-local: PASS -- zero diagnostics across the workspace (libs + bins)"
+echo "clippy-local: PASS -- zero diagnostics (workspace libs + bins; all targets of the clean crates)"
