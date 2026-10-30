@@ -609,51 +609,45 @@ pub enum TickRowBuffer {
     Own(OwnIlpBuffer),
 }
 
+/// What a row buffer is: which encoder, and which protocol its bytes speak.
+/// A recycled spare is installed only when its kind matches the writer's, so
+/// the next batch always speaks what the sender expects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TickRowBufferKind {
+    /// The library buffer of this protocol version.
+    Library(ProtocolVersion),
+    /// Our encoder (protocol version 1).
+    Own,
+}
+
+impl TickRowBufferKind {
+    /// An empty buffer of this kind. Allocates nothing.
+    #[must_use]
+    pub fn empty_buffer(self) -> TickRowBuffer {
+        match self {
+            Self::Library(protocol) => TickRowBuffer::Library(Buffer::new(protocol)),
+            Self::Own => TickRowBuffer::Own(OwnIlpBuffer::new()),
+        }
+    }
+}
+
 impl TickRowBuffer {
-    /// An empty buffer for `encoder`. Allocates nothing.
+    /// An empty buffer for `encoder` (protocol version 1). Allocates nothing.
     #[must_use]
     pub fn new(encoder: TickIlpEncoder) -> Self {
         match encoder {
-            TickIlpEncoder::Library => Self::Library(Buffer::new(ProtocolVersion::V1)),
-            TickIlpEncoder::Own => Self::Own(OwnIlpBuffer::new()),
+            TickIlpEncoder::Library => TickRowBufferKind::Library(ProtocolVersion::V1),
+            TickIlpEncoder::Own => TickRowBufferKind::Own,
         }
+        .empty_buffer()
     }
 
-    /// An empty buffer of the same kind and protocol. Allocates nothing.
+    /// This buffer's kind.
     #[must_use]
-    pub fn empty_like(&self) -> Self {
+    pub fn kind(&self) -> TickRowBufferKind {
         match self {
-            Self::Library(b) => Self::Library(Buffer::new(b.protocol_version())),
-            Self::Own(_) => Self::Own(OwnIlpBuffer::new()),
-        }
-    }
-
-    /// Whether `other` is a buffer this one may be swapped with (same kind,
-    /// same protocol): a spare of another kind or protocol is never installed.
-    #[must_use]
-    pub fn same_kind(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Library(a), Self::Library(b)) => a.protocol_version() == b.protocol_version(),
-            (Self::Own(_), Self::Own(_)) => true,
-            _ => false,
-        }
-    }
-
-    /// The encoder this buffer belongs to.
-    #[must_use]
-    pub fn encoder(&self) -> TickIlpEncoder {
-        match self {
-            Self::Library(_) => TickIlpEncoder::Library,
-            Self::Own(_) => TickIlpEncoder::Own,
-        }
-    }
-
-    /// The protocol the bytes speak (always version 1 for our encoder).
-    #[must_use]
-    pub fn protocol_version(&self) -> ProtocolVersion {
-        match self {
-            Self::Library(b) => b.protocol_version(),
-            Self::Own(_) => ProtocolVersion::V1,
+            Self::Library(b) => TickRowBufferKind::Library(b.protocol_version()),
+            Self::Own(_) => TickRowBufferKind::Own,
         }
     }
 
@@ -730,6 +724,53 @@ impl TickRowBuffer {
         match self {
             Self::Library(b) => b.clear_marker(),
             Self::Own(b) => b.clear_marker(),
+        }
+    }
+}
+
+/// One predictable branch per call: the kind never changes after
+/// construction.
+impl IlpLine for TickRowBuffer {
+    #[inline]
+    fn table(&mut self, table: &'static str) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::table(b, table),
+            Self::Own(b) => IlpLine::table(b, table),
+        }
+    }
+    #[inline]
+    fn symbol(&mut self, name: &'static str, value: &str) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::symbol(b, name, value),
+            Self::Own(b) => IlpLine::symbol(b, name, value),
+        }
+    }
+    #[inline]
+    fn column_i64(&mut self, name: &'static str, value: i64) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::column_i64(b, name, value),
+            Self::Own(b) => IlpLine::column_i64(b, name, value),
+        }
+    }
+    #[inline]
+    fn column_f64(&mut self, name: &'static str, value: f64) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::column_f64(b, name, value),
+            Self::Own(b) => IlpLine::column_f64(b, name, value),
+        }
+    }
+    #[inline]
+    fn column_ts_nanos(&mut self, name: &'static str, nanos: i64) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::column_ts_nanos(b, name, nanos),
+            Self::Own(b) => IlpLine::column_ts_nanos(b, name, nanos),
+        }
+    }
+    #[inline]
+    fn at_nanos(&mut self, nanos: i64) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::at_nanos(b, nanos),
+            Self::Own(b) => IlpLine::at_nanos(b, nanos),
         }
     }
 }

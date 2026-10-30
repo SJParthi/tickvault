@@ -92,7 +92,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use questdb::ingress::Sender;
+
+use crate::tick_ilp::{
+    IlpLine, TickIlpEncoder, TickIlpError, TickIlpSender, TickRowBuffer, TickRowBufferKind,
+};
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -399,23 +403,6 @@ pub fn count_nonfinite_tick_floats(row: &TickRow) -> u64 {
         + optional.iter().flatten().filter(|v| !v.is_finite()).count() as u64
 }
 
-/// A `ticks` column name, handed to the ILP buffer without re-validation.
-///
-/// Deep audit DA-12 (2026-10-12): every name passed here is a string literal
-/// written in this file, so `questdb-rs` re-checking its characters on every
-/// row of the busiest write repeated work fixed when the literal was typed.
-/// The check moved: a debug assertion runs the library's own validator on
-/// every call in tests and debug builds (the full-row tests write every
-/// column), and release builds skip it. O(1), no allocation.
-#[inline]
-fn tick_ilp_column(name: &'static str) -> questdb::ingress::ColumnName<'static> {
-    debug_assert!(
-        questdb::ingress::ColumnName::new(name).is_ok(),
-        "ticks column name {name:?} is not a valid ILP column name"
-    );
-    questdb::ingress::ColumnName::new_unchecked(name)
-}
-
 /// Every feed label is ILP-safe, proven at COMPILE TIME (the depth writer's
 /// pattern), so `write_tick_line` passes `feed` through without
 /// `sanitize_ilp_symbol`. Adding a label with a comma, an equals sign, a
@@ -440,8 +427,8 @@ const _: () = {
 /// both errors are returned; the half line then fails the next flush, whose
 /// rescue keeps every buffered row. O(1) around `write`, no allocation.
 fn append_within_marker(
-    buffer: &mut Buffer,
-    write: impl FnOnce(&mut Buffer) -> Result<()>,
+    buffer: &mut TickRowBuffer,
+    write: impl FnOnce(&mut TickRowBuffer) -> Result<()>,
 ) -> Result<()> {
     buffer.set_marker().context("marker")?;
     if let Err(err) = write(buffer) {
@@ -458,7 +445,7 @@ fn append_within_marker(
 
 /// Writes one `ticks` line. Only [`TickWriter::append_row`] calls it, inside
 /// a marker.
-fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Result<()> {
+fn write_tick_line(buffer: &mut TickRowBuffer, feed: &'static str, row: &TickRow) -> Result<()> {
     write_tick_line_into(buffer, TICKS_TABLE, feed, row, None)
 }
 
@@ -467,7 +454,7 @@ fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Re
 /// `ticks` passes `None` and has no such column. Only the two append paths
 /// call it, each inside a marker. O(1), no allocation.
 fn write_tick_line_into(
-    buffer: &mut Buffer,
+    buffer: &mut TickRowBuffer,
     table: &'static str,
     feed: &'static str,
     row: &TickRow,
@@ -480,26 +467,29 @@ fn write_tick_line_into(
         .map_err(anyhow::Error::from)
 }
 
-/// The body of [`write_tick_line_into`]: every column through the questdb
-/// buffer with plain `?`, so the happy path pays no per-column `anyhow`
-/// wrapping (plan ITEM DT, 2026-10-30). The caller converts the questdb
+/// The body of [`write_tick_line_into`], written ONCE over [`IlpLine`] so the
+/// library buffer and our own encoder (`[tick_storage] own_ilp_encoder`,
+/// plan ITEM DT, 2026-10-30) write the same columns in the same order: only
+/// the primitive encoders differ, and each is tested against the library. The
+/// happy path pays no per-column `anyhow` wrapping; the caller converts the
 /// error unchanged, so its message (the refused call and why) is what the
 /// append-failure log prints. O(1), no allocation.
-fn write_tick_line_columns(
-    buffer: &mut Buffer,
+///
+/// Every column name is a literal of this function. A debug assertion in each
+/// encoder checks it against the library's validator on every call (the
+/// full-row tests write every column); release builds skip it (deep audit
+/// DA-12, 2026-10-12).
+fn write_tick_line_columns<B: IlpLine>(
+    buffer: &mut B,
     table: &'static str,
     feed: &'static str,
     row: &TickRow,
     exchange_ts_ist_nanos: Option<i64>,
-) -> questdb::Result<()> {
+) -> Result<(), TickIlpError> {
     debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
-    buffer
-        .table(questdb::ingress::TableName::new_unchecked(table))?
-        .symbol(
-            tick_ilp_column("segment"),
-            ilp_segment_symbol(row.segment).as_ref(),
-        )?
-        .symbol(tick_ilp_column("feed"), feed)?;
+    buffer.table(table)?;
+    buffer.symbol("segment", ilp_segment_symbol(row.segment).as_ref())?;
+    buffer.symbol("feed", feed)?;
     // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
     // SAME table the candle writer reads (operator 2026-09-22: "put either
     // contract or symbol name right in each and every table"). One ArcSwap
@@ -514,65 +504,59 @@ fn write_tick_line_columns(
     let labels = crate::candle_contract_labels::candle_contract_labels();
     if let Some(name) = labels.get(&(row.security_id, row.segment)) {
         debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
-        buffer.symbol(tick_ilp_column("contract"), &**name)?;
+        buffer.symbol("contract", name)?;
     }
-    buffer
-        .column_i64(tick_ilp_column("security_id"), row.security_id)?
-        .column_f64(tick_ilp_column("ltp"), row.ltp)?;
+    buffer.column_i64("security_id", row.security_id)?;
+    buffer.column_f64("ltp", row.ltp)?;
 
     // Per-feed OPTIONAL columns — omitted (NULL) when None.
     if let Some(v) = row.open {
-        buffer.column_f64(tick_ilp_column("open"), v)?;
+        buffer.column_f64("open", v)?;
     }
     if let Some(v) = row.high {
-        buffer.column_f64(tick_ilp_column("high"), v)?;
+        buffer.column_f64("high", v)?;
     }
     if let Some(v) = row.low {
-        buffer.column_f64(tick_ilp_column("low"), v)?;
+        buffer.column_f64("low", v)?;
     }
     if let Some(v) = row.close {
-        buffer.column_f64(tick_ilp_column("close"), v)?;
+        buffer.column_f64("close", v)?;
     }
-    buffer.column_i64(tick_ilp_column("volume"), row.volume)?;
+    buffer.column_i64("volume", row.volume)?;
     if let Some(v) = row.oi {
-        buffer.column_i64(tick_ilp_column("oi"), v)?;
+        buffer.column_i64("oi", v)?;
     }
     if let Some(v) = row.oi_day_high {
-        buffer.column_i64(tick_ilp_column("oi_day_high"), v)?;
+        buffer.column_i64("oi_day_high", v)?;
     }
     if let Some(v) = row.oi_day_low {
-        buffer.column_i64(tick_ilp_column("oi_day_low"), v)?;
+        buffer.column_i64("oi_day_low", v)?;
     }
     if let Some(v) = row.avg_price {
-        buffer.column_f64(tick_ilp_column("avg_price"), v)?;
+        buffer.column_f64("avg_price", v)?;
     }
     if let Some(v) = row.last_trade_qty {
-        buffer.column_i64(tick_ilp_column("last_trade_qty"), v)?;
+        buffer.column_i64("last_trade_qty", v)?;
     }
     if let Some(v) = row.total_buy_qty {
-        buffer.column_i64(tick_ilp_column("total_buy_qty"), v)?;
+        buffer.column_i64("total_buy_qty", v)?;
     }
     if let Some(v) = row.total_sell_qty {
-        buffer.column_i64(tick_ilp_column("total_sell_qty"), v)?;
+        buffer.column_i64("total_sell_qty", v)?;
     }
     if let Some(v) = row.received_at_ist_nanos {
-        buffer.column_ts(tick_ilp_column("received_at"), TimestampNanos::new(v))?;
+        buffer.column_ts_nanos("received_at", v)?;
     }
     if let Some(v) = row.payload_hash {
-        buffer.column_i64(tick_ilp_column("payload_hash"), v)?;
+        buffer.column_i64("payload_hash", v)?;
     }
     if let Some(v) = exchange_ts_ist_nanos {
-        buffer.column_ts(
-            tick_ilp_column("exchange_timestamp"),
-            TimestampNanos::new(v),
-        )?;
+        buffer.column_ts_nanos("exchange_timestamp", v)?;
     }
 
     // capture_seq is the LAST column before the designated timestamp.
-    buffer
-        .column_i64(tick_ilp_column("capture_seq"), row.capture_seq)?
-        .at(TimestampNanos::new(row.ts_ist_nanos))?;
-    Ok(())
+    buffer.column_i64("capture_seq", row.capture_seq)?;
+    buffer.at_nanos(row.ts_ist_nanos)
 }
 
 /// One `ticks` row, ready for ILP append. Feed-agnostic and `Copy`.
@@ -2347,8 +2331,8 @@ pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: O
 /// HTTP ACK — and the pending buffer is discarded LOUDLY so one poisoned row
 /// can never wedge the rest of the session.
 pub struct TickWriter {
-    sender: Option<Sender>,
-    buffer: Buffer,
+    sender: Option<TickIlpSender>,
+    buffer: TickRowBuffer,
     pending: usize,
     /// Lowest / highest `capture_seq` among the pending rows (`0` = none).
     /// Carried on every hand-off and rescue so the WAL applied-watermark can
@@ -2421,7 +2405,7 @@ pub struct TickWriter {
     /// Cleared buffers the writer thread hands back for reuse, so a hand-off
     /// does not start the next batch from a zero-capacity buffer. `None`
     /// until [`TickWriter::split_for_offload`] runs (item 44g).
-    spare_buffers: Option<std::sync::mpsc::Receiver<Buffer>>,
+    spare_buffers: Option<std::sync::mpsc::Receiver<TickRowBuffer>>,
     /// `tv_feed_aux_rows_total{kind}` handles, one per
     /// [`AuxPacketKind`], resolved once so an append is a counter increment
     /// and never a label-vector allocation (plan item 45h).
@@ -2724,73 +2708,76 @@ fn register_drop_baseline(feed: Feed) {
 }
 
 impl TickWriter {
-    /// Production constructor — ILP-over-HTTP, lazy on connect failure.
+    /// Production constructor — ILP-over-HTTP through the library, lazy on
+    /// connect failure. Same as [`TickWriter::new_with_encoder`] with
+    /// [`TickIlpEncoder::Library`].
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor; the lazy-build contract is
     // exercised by tick_writer_new_is_lazy_and_buffers_without_network, and every
     // append/flush path is covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
+        Self::new_with_encoder(config, feed, TickIlpEncoder::Library)
+    }
+
+    /// Production constructor with the row encoder chosen by
+    /// `[tick_storage] own_ilp_encoder` (plan ITEM DT, 2026-10-30; default
+    /// OFF = [`TickIlpEncoder::Library`]). [`TickIlpEncoder::Own`] writes rows
+    /// with our encoder and POSTs them with our sender; every flush, retry,
+    /// rescue, spill and replay path is the same code for both. A sender that
+    /// cannot be built leaves the writer buffering locally, as before.
+    #[must_use]
+    pub fn new_with_encoder(config: &QuestDbConfig, feed: Feed, encoder: TickIlpEncoder) -> Self {
         register_drop_baseline(feed);
         crate::tick_ts_placement::register_baseline();
-        match Sender::from_conf(ticks_ilp_http_conf(config)) {
-            Ok(s) => {
-                let mut b = s.new_buffer();
-                // K6: reserved up front, so no batch regrows on the drain.
-                b.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
-                Self {
-                    sender: Some(s),
-                    buffer: b,
-                    pending: 0,
-                    pending_min_seq: 0,
-                    pending_max_seq: 0,
-                    pending_unbacked: false,
-                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
-                    feed,
-                    out_of_window: tick_out_of_window_counters(feed),
-                    last_capture_seq: 0,
-                    spill_dir: PathBuf::from(TICK_SPILL_DIR),
-                    offload: None,
-                    rescue: None,
-                    parked_rescue: std::collections::VecDeque::new(),
-                    parked_rescue_bytes: 0,
-                    retained_spans: 0,
-                    flush_counters: TickFlushCounters::new(feed),
-                    spare_buffers: None,
-                    aux_counters: aux_row_counters(),
-                    aux_rows_appended: 0,
-                    quote_rows_appended: 0,
-                }
+        let sender = match encoder {
+            TickIlpEncoder::Library => Sender::from_conf(ticks_ilp_http_conf(config))
+                .map(TickIlpSender::Library)
+                .map_err(|err| err.to_string()), // APPROVED: once at construction, error path only
+            TickIlpEncoder::Own => {
+                crate::tick_ilp::RawIlpSender::new(&config.host, config.http_port)
+                    .map(TickIlpSender::Own)
             }
+        };
+        // K6: reserved up front, so no batch regrows on the drain.
+        let buffer = presized_row_buffer(encoder);
+        match sender {
+            Ok(sender) => Self::from_parts(feed, Some(sender), buffer),
             Err(err) => {
                 warn!(
-                    ?err,
+                    %err,
                     feed = feed.as_str(),
+                    encoder = ?encoder,
                     "ticks writer: QuestDB unreachable — buffering locally"
                 );
-                Self {
-                    sender: None,
-                    buffer: presized_row_buffer(ProtocolVersion::V1),
-                    pending: 0,
-                    pending_min_seq: 0,
-                    pending_max_seq: 0,
-                    pending_unbacked: false,
-                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
-                    feed,
-                    out_of_window: tick_out_of_window_counters(feed),
-                    last_capture_seq: 0,
-                    spill_dir: PathBuf::from(TICK_SPILL_DIR),
-                    offload: None,
-                    rescue: None,
-                    parked_rescue: std::collections::VecDeque::new(),
-                    parked_rescue_bytes: 0,
-                    retained_spans: 0,
-                    flush_counters: TickFlushCounters::new(feed),
-                    spare_buffers: None,
-                    aux_counters: aux_row_counters(),
-                    aux_rows_appended: 0,
-                    quote_rows_appended: 0,
-                }
+                Self::from_parts(feed, None, buffer)
             }
+        }
+    }
+
+    /// Every field but the sender and the buffer at its starting value.
+    fn from_parts(feed: Feed, sender: Option<TickIlpSender>, buffer: TickRowBuffer) -> Self {
+        Self {
+            sender,
+            buffer,
+            pending: 0,
+            pending_min_seq: 0,
+            pending_max_seq: 0,
+            pending_unbacked: false,
+            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
+            feed,
+            out_of_window: tick_out_of_window_counters(feed),
+            last_capture_seq: 0,
+            spill_dir: PathBuf::from(TICK_SPILL_DIR),
+            offload: None,
+            rescue: None,
+            parked_rescue: std::collections::VecDeque::new(),
+            parked_rescue_bytes: 0,
+            retained_spans: 0,
+            flush_counters: TickFlushCounters::new(feed),
+            spare_buffers: None,
+            aux_counters: aux_row_counters(),
+            aux_rows_appended: 0,
+            quote_rows_appended: 0,
         }
     }
 
@@ -2823,30 +2810,16 @@ impl TickWriter {
     }
 
     pub fn for_test(feed: Feed) -> Self {
+        Self::for_test_with_encoder(feed, TickIlpEncoder::Library)
+    }
+
+    /// [`TickWriter::for_test`] with the row encoder chosen, so the bench and
+    /// the zero-allocation test measure both encoders through the production
+    /// append path. Disconnected, like `for_test`.
+    #[must_use]
+    pub fn for_test_with_encoder(feed: Feed, encoder: TickIlpEncoder) -> Self {
         register_drop_baseline(feed);
-        Self {
-            sender: None,
-            buffer: presized_row_buffer(ProtocolVersion::V1),
-            pending: 0,
-            pending_min_seq: 0,
-            pending_max_seq: 0,
-            pending_unbacked: false,
-            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
-            feed,
-            out_of_window: tick_out_of_window_counters(feed),
-            last_capture_seq: 0,
-            spill_dir: PathBuf::from(TICK_SPILL_DIR),
-            offload: None,
-            rescue: None,
-            parked_rescue: std::collections::VecDeque::new(),
-            parked_rescue_bytes: 0,
-            retained_spans: 0,
-            flush_counters: TickFlushCounters::new(feed),
-            spare_buffers: None,
-            aux_counters: aux_row_counters(),
-            aux_rows_appended: 0,
-            quote_rows_appended: 0,
-        }
+        Self::from_parts(feed, None, presized_row_buffer(encoder))
     }
 
     /// Rows appended but not yet flushed.
@@ -3707,10 +3680,10 @@ impl TickWriter {
         // Read the protocol version BEFORE the replace: a fresh buffer must
         // speak the same protocol the sender negotiated, and borrowing rules
         // will not let both happen in one expression.
-        let protocol = self.buffer.protocol_version();
+        let kind = self.buffer.kind();
         let (min_seq, max_seq) = self.take_pending_range();
         let batch = FlushBatch {
-            buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+            buffer: std::mem::replace(&mut self.buffer, kind.empty_buffer()),
             rows,
             min_seq,
             max_seq,
@@ -3738,7 +3711,7 @@ impl TickWriter {
                 // Only NOW take a recycled spare: taking it before the send
                 // would drop it on the QueueFull arm, which puts the retained
                 // buffer back in place.
-                self.install_spare_buffer(protocol);
+                self.install_spare_buffer(kind);
                 OffloadOutcome::Sent(rows)
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -3799,10 +3772,10 @@ impl TickWriter {
     /// `recv`. With no spare (or one under [`TICK_ROW_BUFFER_PRESIZE_BYTES`])
     /// the buffer is reserved to that size here, on the flush arm (K6), so
     /// the next batch does not regrow inside the frames that append it.
-    fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
+    fn install_spare_buffer(&mut self, kind: TickRowBufferKind) {
         if let Some(spares) = self.spare_buffers.as_ref()
             && let Ok(mut spare) = spares.try_recv()
-            && spare.protocol_version() == protocol
+            && spare.kind() == kind
         {
             spare.clear();
             self.buffer = spare;
@@ -3874,7 +3847,7 @@ impl TickWriter {
         let unbacked = std::mem::take(&mut self.pending_unbacked);
         let mut rescue_unavailable = false;
         if let Some(tx) = self.rescue.as_ref() {
-            let protocol = self.buffer.protocol_version();
+            let kind = self.buffer.kind();
             // Z7 (2026-10-02): a queued batch is neither acked nor marked
             // unapplied while the writer keeps acking LATER batches, so the
             // PERSISTED watermark is held below it until the rescue thread
@@ -3888,7 +3861,7 @@ impl TickWriter {
                 range.1,
             );
             let batch = RescueBatch {
-                buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+                buffer: std::mem::replace(&mut self.buffer, kind.empty_buffer()),
                 rows: dropped,
                 min_seq: range.0,
                 max_seq: range.1,
@@ -3903,7 +3876,7 @@ impl TickWriter {
                     // not yet in any file.
                     wm.note_ticks_handed_off();
                     self.pending = 0;
-                    self.install_spare_buffer(protocol);
+                    self.install_spare_buffer(kind);
                     return dropped;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -3916,7 +3889,7 @@ impl TickWriter {
                         self.park_rescue(returned);
                         wm.note_ticks_handed_off();
                         self.pending = 0;
-                        self.install_spare_buffer(protocol);
+                        self.install_spare_buffer(kind);
                         return dropped;
                     }
                     // The rescue thread is behind. Take the buffer BACK and
@@ -4261,7 +4234,7 @@ pub const TICK_RESCUE_ABANDONED_COUNTER: &str = "tv_tick_rescue_abandoned_total"
 /// Carries the `Buffer` by move, so the hand-off costs a pointer write on the
 /// drain rather than a copy of up to [`MAX_PRODUCER_BUFFER_BYTES`].
 pub struct RescueBatch {
-    buffer: Buffer,
+    buffer: TickRowBuffer,
     rows: usize,
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
@@ -4389,11 +4362,11 @@ const _: () = assert!(
     "a pre-sized buffer must be one the spare lane will take back"
 );
 
-/// An empty row buffer of `protocol`, with [`TICK_ROW_BUFFER_PRESIZE_BYTES`]
+/// An empty row buffer for `encoder` (protocol version 1), with [`TICK_ROW_BUFFER_PRESIZE_BYTES`]
 /// reserved. One allocation, at construction or on a flush arm; never per
 /// tick.
-fn presized_row_buffer(protocol: ProtocolVersion) -> Buffer {
-    let mut buffer = Buffer::new(protocol);
+fn presized_row_buffer(encoder: TickIlpEncoder) -> TickRowBuffer {
+    let mut buffer = TickRowBuffer::new(encoder);
     buffer.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
     buffer
 }
@@ -4450,7 +4423,7 @@ pub const MAX_RETAINED_FLUSH_SPANS: u32 = 2;
 /// partially consume a batch, because the only correct thing to do with it is
 /// hand it to the network or rescue the whole thing to disk.
 pub struct FlushBatch {
-    buffer: Buffer,
+    buffer: TickRowBuffer,
     rows: usize,
     /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
     min_seq: u64,
@@ -4609,11 +4582,11 @@ impl TickSinkCounters {
 /// five-second ILP timeout now blocks a thread whose only job is waiting, not
 /// the thread that must keep emptying the socket.
 pub struct TickWriterSink {
-    sender: Option<Sender>,
+    sender: Option<TickIlpSender>,
     feed: Feed,
     spill_dir: PathBuf,
     /// Return lane for spent buffers — see [`TickWriterSink::return_spare_buffer`].
-    spare_return: Option<std::sync::mpsc::SyncSender<Buffer>>,
+    spare_return: Option<std::sync::mpsc::SyncSender<TickRowBuffer>>,
     /// Rescue-arm counter handles, resolved once at the split (item 44g).
     counters: TickSinkCounters,
 }
@@ -4661,9 +4634,9 @@ impl TickWriterSink {
         let Some(spare_return) = self.spare_return.as_ref() else {
             return;
         };
-        let protocol = batch.buffer.protocol_version();
+        let kind = batch.buffer.kind();
         // `Buffer::new` does not allocate (its `Vec` starts empty).
-        let mut spent = std::mem::replace(&mut batch.buffer, Buffer::new(protocol));
+        let mut spent = std::mem::replace(&mut batch.buffer, kind.empty_buffer());
         if spent.capacity() > MAX_PRODUCER_BUFFER_BYTES {
             return;
         }
@@ -4718,7 +4691,7 @@ impl TickWriterSink {
         let outcome = match first {
             Ok(()) => Ok(()),
             Err(err)
-                if crate::depth_persistence::flush_failure_is_retryable(&err)
+                if err.is_retryable()
                     && first_elapsed
                         < crate::depth_persistence::DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
             {
@@ -4730,7 +4703,7 @@ impl TickWriterSink {
                 sender.flush(&mut batch.buffer)
             }
             Err(err) => {
-                if crate::depth_persistence::flush_failure_is_retryable(&err) {
+                if err.is_retryable() {
                     // Retryable in class but SLOW: not retried, and counted so
                     // "the retry is not firing" is answerable without a guess.
                     metrics::counter!(
@@ -4835,6 +4808,7 @@ impl TickWriterSink {
 
 #[cfg(test)]
 mod tests {
+    use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
     // ---- J1 (2026-10-26): the deferral needs the WAL to have the frames ----
 
     /// The WAL flushed everything and lost nothing: deferral as before.
@@ -6921,7 +6895,7 @@ mod tests {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         buffer.reserve(capacity);
         FlushBatch {
-            buffer,
+            buffer: TickRowBuffer::Library(buffer),
             rows: 0,
             min_seq: 0,
             max_seq: 0,
@@ -7062,7 +7036,7 @@ mod tests {
     #[test]
     fn a_spare_of_another_protocol_is_never_installed() {
         let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
-        let mut foreign = Buffer::new(ProtocolVersion::V2);
+        let mut foreign = TickRowBuffer::Library(Buffer::new(ProtocolVersion::V2));
         foreign.reserve(4096);
         sink.spare_return
             .as_ref()
@@ -7076,8 +7050,8 @@ mod tests {
         producer.flush().expect("hand off");
 
         assert_eq!(
-            producer.buffer.protocol_version(),
-            ProtocolVersion::V1,
+            producer.buffer.kind(),
+            TickRowBufferKind::Library(ProtocolVersion::V1),
             "the next batch must speak the protocol the sender negotiated"
         );
         // The foreign spare (4,096 bytes) was dropped; the buffer in its

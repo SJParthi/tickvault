@@ -7,6 +7,7 @@
 
 use super::*;
 use proptest::prelude::*;
+use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
 
 /// Ids no other test publishes a contract name for, so the global name table
 /// (which another test may replace at any moment) never names these rows and
@@ -99,6 +100,12 @@ fn assert_same_row(new: &TickRow, old: &TickRow) {
 /// on every column.
 mod legacy {
     use super::*;
+
+    /// The column-name helper the legacy writer used (deleted from the writer
+    /// 2026-10-30, kept here so the oracle stays verbatim).
+    fn tick_ilp_column(name: &'static str) -> questdb::ingress::ColumnName<'static> {
+        questdb::ingress::ColumnName::new_unchecked(name)
+    }
 
     pub(super) fn legacy_write_tick_line_into(
         buffer: &mut Buffer,
@@ -229,9 +236,26 @@ mod legacy {
 }
 
 fn new_line(table: &'static str, row: &TickRow, exchange_ts: Option<i64>) -> Vec<u8> {
-    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    encoder_line(TickIlpEncoder::Library, table, row, exchange_ts)
+}
+
+/// The same line through our own encoder (`[tick_storage] own_ilp_encoder`).
+fn own_line(table: &'static str, row: &TickRow, exchange_ts: Option<i64>) -> Vec<u8> {
+    encoder_line(TickIlpEncoder::Own, table, row, exchange_ts)
+}
+
+fn encoder_line(
+    encoder: TickIlpEncoder,
+    table: &'static str,
+    row: &TickRow,
+    exchange_ts: Option<i64>,
+) -> Vec<u8> {
+    let mut buffer = TickRowBuffer::new(encoder);
     let result = write_tick_line_into(&mut buffer, table, "dhan", row, exchange_ts);
-    assert!(result.is_ok(), "new writer refused a line: {result:?}");
+    assert!(
+        result.is_ok(),
+        "{encoder:?} writer refused a line: {result:?}"
+    );
     buffer.as_bytes().to_vec()
 }
 
@@ -420,7 +444,9 @@ proptest! {
         } else {
             (TICKS_TABLE, None)
         };
-        prop_assert_eq!(new_line(table, &row, ts), legacy_line(table, &row, ts));
+        let legacy = legacy_line(table, &row, ts);
+        prop_assert_eq!(new_line(table, &row, ts), legacy.clone());
+        prop_assert_eq!(own_line(table, &row, ts), legacy);
     }
 
     /// End to end through the writer: every accepted tick's bytes, `ticks` or
@@ -439,6 +465,16 @@ proptest! {
         };
         let old = legacy_row(&tick, seq);
         prop_assert_eq!(appended.is_ok(), old.is_some(), "accept/refuse differs");
+        // Our own encoder writes the same bytes for the same tick, whichever
+        // row it became (`ticks`, `tick_quotes` or `feed_aux_packets`).
+        let mut own = TickWriter::for_test_with_encoder(Feed::Dhan, TickIlpEncoder::Own);
+        let own_appended = if quotes {
+            own.append_tick_quote_with_seq(&tick, seq)
+        } else {
+            own.append_tick_with_seq(&tick, seq)
+        };
+        prop_assert_eq!(own_appended.is_ok(), appended.is_ok(), "own encoder accept differs");
+        prop_assert_eq!(own.buffer.as_bytes(), writer.buffer.as_bytes(), "own encoder bytes differ");
         let Some(old) = old else { return Ok(()) };
         // Only a row the window and band gates accepted is a `ticks` /
         // `tick_quotes` line; a refused one is a `feed_aux_packets` row.
