@@ -1252,31 +1252,12 @@ async fn async_main() -> Result<()> {
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
 
-    // Live proof that nothing on the live path is waiting (2026-10-02):
-    // the publisher thread, plus one lateness probe per tokio runtime. AFTER
-    // the recorder install, like every pre-resolved handle above.
-    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
-        error!(
-            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
-            error = %err,
-            "the hot-path telemetry thread FAILED TO SPAWN — stage latency and task \
-             heartbeat gauges will not publish (host thread or memory limit)"
-        );
-    }
-    tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
-        tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
-        tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
-        u64::MAX,
-    ));
-    if tickvault_core::websocket::reader_runtime::reader_runtime_handle().is_some() {
-        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(
-            tickvault_storage::hot_path_telemetry::run_runtime_probe(
-                tickvault_storage::hot_path_telemetry::HotTask::ReaderRuntime,
-                tickvault_storage::hot_path_telemetry::Stage::ReaderRuntimeLag,
-                u64::MAX,
-            ),
-        );
-    }
+    // The hot-path telemetry block (publisher thread + runtime lateness
+    // probes) used to start here. It now starts right after the tracing
+    // subscriber `init()` below (plan ITEM 52f): started here, its spawn
+    // failure `error!` went nowhere, and a stall page raised before `init()`
+    // was lost. No socket, lane or frame drain starts before `init()`, so
+    // nothing live goes unwatched by the move.
 
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
@@ -2329,6 +2310,39 @@ async fn async_main() -> Result<()> {
     // PR W review round 6: the WAL boot fold ran before this subscriber
     // existed; write what it recorded (and any failed fold persist) now.
     let _boot_fold_logged = tickvault_storage::wal_unapplied_ranges::log_boot_fold_summary();
+
+    // Live proof that nothing on the live path is waiting (2026-10-02):
+    // the publisher thread, plus one lateness probe per tokio runtime.
+    // Plan ITEM 52f (2026-10-30): this runs AFTER the subscriber `init()`
+    // above, so a spawn failure and any stall page reach the log. It is
+    // still after the metrics recorder install (Step 2), so every handle it
+    // resolves is live. No WebSocket, Dhan lane or frame drain starts
+    // before this point. Ratchet:
+    // crates/app/tests/hot_path_telemetry_boot_wiring_guard.rs.
+    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath04TelemetryNotStarted
+                .code_str(),
+            error = %err,
+            "the hot-path telemetry thread did not start: stage latency and task \
+             heartbeat gauges will not publish and the stall page cannot fire \
+             (host thread or memory limit)"
+        );
+    }
+    tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
+        tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
+        tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
+        u64::MAX,
+    ));
+    if tickvault_core::websocket::reader_runtime::reader_runtime_handle().is_some() {
+        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(
+            tickvault_storage::hot_path_telemetry::run_runtime_probe(
+                tickvault_storage::hot_path_telemetry::HotTask::ReaderRuntime,
+                tickvault_storage::hot_path_telemetry::Stage::ReaderRuntimeLag,
+                u64::MAX,
+            ),
+        );
+    }
 
     // Phase 5: background summary_writer task. Emits a human + Claude
     // readable `data/logs/machine/errors.summary.md` every 60s so `/loop` polling

@@ -76,6 +76,10 @@ const LOG_ONLY_CODES: &[&str] = &[
     "GAP-NET-01",
     "HOT-PATH-01",
     "HOT-PATH-03",
+    // 2026-10-30 (plan ITEM 52f): the telemetry thread did not start. One
+    // boot line; nothing is lost, only the stall page goes dark. Log only,
+    // like HOT-PATH-03.
+    "HOT-PATH-04",
     "HTTP-CLIENT-01",
     "I-P0-03",
     "I-P1-05",

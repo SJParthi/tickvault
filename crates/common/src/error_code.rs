@@ -172,6 +172,11 @@ pub enum ErrorCode {
     /// requested core pin was refused (core 0, a core outside the allowed
     /// set, an unparseable value, or the kernel said no). Boot continues.
     HotPath03ReaderPinNotApplied,
+    /// HOT-PATH-04: the hot-path telemetry thread did not start (the host
+    /// refused a new thread). Stage latency, task heartbeats and the
+    /// HOT-PATH-STALL-01 page stay dark for this process. Boot continues.
+    /// Log-only, one line per boot.
+    HotPath04TelemetryNotStarted,
     /// HOT-PATH-STALL-01: in session, a hot task (a tokio runtime, the frame
     /// drain) made no progress for at least two seconds, or one hot-path step
     /// took that long. Socket reads may have waited and Dhan may have skipped
@@ -1162,6 +1167,7 @@ impl ErrorCode {
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
             Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
+            Self::HotPath04TelemetryNotStarted => "HOT-PATH-04",
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             Self::DrainHold01NotWritten => "DRAIN-HOLD-01",
@@ -1449,6 +1455,9 @@ impl ErrorCode {
             // DRAIN-HOLD-01: the box may stop with work left; the work stays on
             // disk and is done the next evening.
             Self::DrainHold01NotWritten => Severity::Medium,
+            // HOT-PATH-04: the stall page and the stage gauges are dark for
+            // this process; nothing is lost, but nothing would warn either.
+            Self::HotPath04TelemetryNotStarted => Severity::Medium,
             Self::HotPathStall01 => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
@@ -1631,6 +1640,7 @@ impl ErrorCode {
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
             | Self::HotPath03ReaderPinNotApplied
+            | Self::HotPath04TelemetryNotStarted
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
@@ -1939,6 +1949,7 @@ impl ErrorCode {
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
             Self::HotPath03ReaderPinNotApplied,
+            Self::HotPath04TelemetryNotStarted,
             Self::HotPathStall01,
             Self::TickSpill01FileQuarantined,
             Self::DrainHold01NotWritten,
