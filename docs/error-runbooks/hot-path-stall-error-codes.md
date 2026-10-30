@@ -28,6 +28,13 @@ in session (09:00–15:40 IST), seven signals:
 | `main_runtime_lag` / `reader_runtime_lag` | stage | a probe woke 2 s late |
 | `drain_main_frame` | stage | the drain took 2 s to decode, fold and append ONE main-feed frame (added 2026-10-26, plan item K6; its 1 ms stall budget is dashboard-only) |
 
+Not signals (plan item DT0, 2026-10-29): the stages `receipt_to_fold` (a
+main-feed frame's socket receipt → folded) and `metrics_upkeep` (one run of
+the metrics exporter's upkeep) and the per-thread scheduling-wait series
+`tv_hot_thread_run_delay_ns_total` / `tv_hot_thread_involuntary_switches_total`
+are measurement only and never page. Read them beside a page to tell whether
+the stall was a thread waiting for a CPU.
+
 A signal that becomes stalled starts an episode; the first line names the
 worst newly stalled signal. The signal is silent until it clears, then
 re-arms. At most one line a minute: episodes that started and ended while the
