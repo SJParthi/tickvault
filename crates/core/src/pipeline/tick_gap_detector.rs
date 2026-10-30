@@ -725,7 +725,6 @@ impl TickGapDetector {
 
     /// The in-place update shared by [`Self::observe`] and
     /// [`Self::observe_tracked`]. O(1), allocation-free.
-    #[inline]
     fn observe_slot(&mut self, slot: u32, obs: TickObservation) -> TickAssessment {
         let warmup = self.config.baseline_warmup_samples;
         let multiplier = self.config.volume_jump_multiplier;
@@ -1860,8 +1859,12 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Old-vs-new equality (plan ITEM DT, 2026-10-30). `observe` now probes the
-    // index itself and assigns or refuses out of line; this is the body it
-    // replaced, verbatim, driven side by side over random operation sequences.
+    // index itself and assigns or refuses out of line; `reference_observe` is
+    // the body it replaced, driven side by side over random operation
+    // sequences. The reference reaches assignment and refusal through
+    // `slot_for`, which shares `assign_slot` with the new path, so this pins
+    // `observe`'s own routing (hit, assign, refuse); what `assign_slot` does is
+    // pinned by the refusal-count and capacity tests above.
     // -----------------------------------------------------------------------
 
     fn reference_observe(d: &mut TickGapDetector, obs: TickObservation) -> TickAssessment {

@@ -117,10 +117,10 @@ fn tail_gate() -> Result<(), String> {
     let (mut detector, keys) = full_detector();
     gate.case("observe_hit", |n| {
         let k = keys[(n as usize) % CAPACITY];
-        black_box(detector.observe(black_box(observation(k, n))));
+        !black_box(detector.observe(black_box(observation(k, n)))).refused
     });
     gate.case("observe_refused_full", |n| {
-        black_box(detector.observe(black_box(observation(UNTRACKED, n))));
+        black_box(detector.observe(black_box(observation(UNTRACKED, n)))).refused
     });
     gate.finish()
 }

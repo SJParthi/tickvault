@@ -32,8 +32,8 @@ use tickvault_storage::tick_conservation_ledger::{LEDGER_DAY_SLOTS, TickConserva
 /// Budget key in `quality/benchmark-budgets.toml`.
 const BUDGET_KEY: &str = "tick_conservation_ledger";
 const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
-/// 2026-10-30 10:00 IST as IST-epoch nanoseconds (IST day 20,391).
-const TS: i64 = 20_391 * NANOS_PER_DAY + 36_000 * 1_000_000_000;
+/// 2026-10-30 10:00 IST as IST-epoch nanoseconds (IST day 20,756).
+const TS: i64 = 20_756 * NANOS_PER_DAY + 36_000 * 1_000_000_000;
 
 fn same_day(n: u64) -> i64 {
     TS + (n % 1_000_000) as i64
@@ -68,11 +68,23 @@ fn bench_ledger(c: &mut Criterion) {
 fn tail_gate() -> Result<(), String> {
     let mut gate = tail_gate::Gate::new("tick_conservation_ledger", BUDGET_KEY)?;
     let ledger = TickConservationLedger::new();
+    // `note_row_appended` returns nothing; every call is its own path, so
+    // the path check is the day's count after the same-day case.
     gate.case("note_row_appended_same_day", |n| {
         ledger.note_row_appended(black_box(same_day(n)));
+        true
     });
+    let day = TickConservationLedger::ist_day_of(TS);
+    let counted = ledger.accepted_rows_on(day);
+    if counted != tail_gate::PERCENTILE_SAMPLES as u64 {
+        return Err(format!(
+            "note_row_appended_same_day counted {counted} rows, expected {}",
+            tail_gate::PERCENTILE_SAMPLES
+        ));
+    }
     gate.case("note_row_appended_day_rollover", |n| {
         ledger.note_row_appended(black_box(rolling_day(n)));
+        true
     });
     gate.finish()
 }

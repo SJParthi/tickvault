@@ -10,6 +10,9 @@
 //! over the bench's `[budgets]` value in `quality/benchmark-budgets.toml`
 //! times `BENCH_BUDGET_MULTIPLIER` (the same multiplier `bench-gate.sh` uses).
 //! It checks first that an over-budget sample set fails, so the gate can fail.
+//! Every timed call also reports whether it took its case's path (the call
+//! returns `true` when the store gave the expected outcome); one call that
+//! did not fails the gate, so a case cannot quietly time a cheaper path.
 
 use std::time::Instant;
 
@@ -33,16 +36,19 @@ pub fn quantile(sorted: &[u64], num: usize, den: usize) -> u64 {
 }
 
 /// Times `call(n)` once per sample for `n` in `0..PERCENTILE_SAMPLES`;
-/// returns the samples sorted ascending. The `Vec` is sized before the loop.
-pub fn samples(mut call: impl FnMut(u64)) -> Vec<u64> {
+/// returns the samples sorted ascending and how many calls returned `false`
+/// (took another path than the case's). The `Vec` is sized before the loop.
+pub fn samples(mut call: impl FnMut(u64) -> bool) -> (Vec<u64>, u64) {
     let mut out = Vec::with_capacity(PERCENTILE_SAMPLES);
+    let mut off_path = 0u64;
     for n in 0..PERCENTILE_SAMPLES as u64 {
         let start = Instant::now();
-        call(n);
+        let on_path = call(n);
         out.push(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        off_path += u64::from(!on_path);
     }
     out.sort_unstable();
-    out
+    (out, off_path)
 }
 
 /// The ceiling in nanoseconds: `key`'s budget times the multiplier.
@@ -116,9 +122,14 @@ impl Gate {
         })
     }
 
-    /// Times `call` and records its verdict.
-    pub fn case(&mut self, name: &str, call: impl FnMut(u64)) {
-        let s = samples(call);
+    /// Times `call` and records its verdict. `call` returns whether the
+    /// store took the case's path; any `false` fails the gate.
+    pub fn case(&mut self, name: &str, call: impl FnMut(u64) -> bool) {
+        let (s, off_path) = samples(call);
+        if off_path > 0 {
+            self.failures
+                .push(format!("{name}: {off_path} calls took another path"));
+        }
         let p99 = quantile(&s, 99, 100);
         let ok = within(&s, self.ceiling);
         println!(

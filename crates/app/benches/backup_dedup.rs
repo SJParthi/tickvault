@@ -177,15 +177,15 @@ fn tail_gate() -> Result<(), String> {
     let mut packet = [0u8; FULL_PACKET_BYTES];
     let mut d = full_dedup();
     gate.case("admit_tick_not_backup", |n| {
-        black_box(not_backup(&mut d, &mut packet, n));
+        black_box(not_backup(&mut d, &mut packet, n)) == BackupVerdict::NotBackup
     });
     let mut d = full_dedup();
     gate.case("admit_tick_accept", |n| {
-        black_box(accept(&mut d, &mut packet, n));
+        black_box(accept(&mut d, &mut packet, n)) == BackupVerdict::Accept
     });
     let (mut d, mut seeded_packet) = seeded_dedup(2);
     gate.case("admit_tick_older", |n| {
-        black_box(older(&mut d, &mut seeded_packet, n));
+        black_box(older(&mut d, &mut seeded_packet, n)) == BackupVerdict::DropOlder
     });
     gate.finish()
 }
