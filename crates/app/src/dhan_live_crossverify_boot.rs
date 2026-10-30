@@ -234,7 +234,8 @@ pub fn crossverify_targets_with_skipped(
 /// target's first second; `known` is `true`. Without one (absent or
 /// unreadable): the boot set, `covered` 0, `known` `false`. Returns the
 /// targets, the instruments that cannot be targeted (F&O), and the coverage.
-/// O(instruments).
+/// O(n log n) for the record's sorted order plus two `Vec`s, then O(n); cold,
+/// once per day checked.
 #[must_use]
 pub fn targets_from_day_record(
     record: Option<&SpotDayRecord>,
@@ -1493,6 +1494,10 @@ pub const fn past_day_worst_case_secs(run_budget_secs: u64) -> u64 {
         .saturating_add(XVERIFY_RETRY_INTERVAL_SECS.saturating_mul(attempts.saturating_sub(1)))
 }
 
+/// The most past days one IST day can run: the hold window.
+const MAX_PAST_DAYS_TRIED: usize =
+    tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS as usize;
+
 /// Slack between a past day's worst-case end and 15:41 (review round 1).
 pub const PAST_DAY_FIT_MARGIN_SECS: u64 = 60;
 
@@ -1587,13 +1592,16 @@ async fn run_supervisor(calendar: Arc<TradingCalendar>, started: (chrono::NaiveD
 /// Runs the past-day catch-up (plan item 51g): each day from
 /// [`past_days_to_check`], oldest first, through [`run_day`]. With `before_run`
 /// it starts a day only when [`past_day_fits_before_run`]; it returns `false`
-/// when it left a day for later. Cold, at most `MAX_CROSSVERIFY_HOLD_DAYS`
-/// days.
+/// when it left a day for later. A day in `tried` already ran in this
+/// process on `pass_day` and is skipped, so a past day gets at most one
+/// run per IST day per process (§12.15.15, review round 2). Cold, at most
+/// `MAX_CROSSVERIFY_HOLD_DAYS` days.
 async fn run_past_days(
     deps: &CrossverifyBootDeps,
     boot_set: &[SubscribeInstrument],
     pass_day: chrono::NaiveDate,
     before_run: bool,
+    tried: &mut Vec<chrono::NaiveDate>,
 ) -> bool {
     let calendar = Arc::clone(&deps.calendar);
     let days = past_days_to_check(
@@ -1603,6 +1611,10 @@ async fn run_past_days(
         |d| daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, d),
     );
     for day in days {
+        // O(1) EXEMPT: at most MAX_CROSSVERIFY_HOLD_DAYS (3) entries.
+        if tried.contains(&day) {
+            continue;
+        }
         if before_run
             && !past_day_fits_before_run(now_ist_secs_of_day(), deps.config.run_budget_secs)
         {
@@ -1621,6 +1633,7 @@ async fn run_past_days(
             "Dhan 1-minute cross-verification: checking a past trading day that was never \
              recorded, before the S3 archive releases it unverified"
         );
+        tried.push(day);
         run_day(deps, boot_set, day, day_start_ist_nanos_of(day), pass_day).await;
     }
     true
@@ -1675,9 +1688,16 @@ pub fn spawn_dhan_live_crossverify(
              against Dhan's own record after the close, and today's S3 archive waits for it"
         );
         let mut state = WorkerDay::default();
+        // Past days already run in this process on `tried_on` (review round 2).
+        let mut tried_on: Option<chrono::NaiveDate> = None;
+        let mut tried: Vec<chrono::NaiveDate> = Vec::with_capacity(MAX_PAST_DAYS_TRIED);
         loop {
             let (today, day_start_ist_nanos) = today_ist();
             let now = now_ist_secs_of_day();
+            if tried_on != Some(today) {
+                tried_on = Some(today);
+                tried.clear();
+            }
             match worker_step(now, state.for_day(today)) {
                 WorkerStep::WaitUntil(target_secs) => {
                     tokio::time::sleep(Duration::from_secs(target_secs.saturating_sub(now))).await;
@@ -1685,7 +1705,7 @@ pub fn spawn_dhan_live_crossverify(
                 WorkerStep::PastBeforeRun => {
                     state.before_run_tried = Some(today);
                     // §12.15.15: past days first when they fit before 15:41.
-                    if run_past_days(&deps, &boot_set, today, true).await {
+                    if run_past_days(&deps, &boot_set, today, true, &mut tried).await {
                         state.past_done = Some(today);
                     }
                 }
@@ -1697,6 +1717,15 @@ pub fn spawn_dhan_live_crossverify(
                     } else if daily_marker_exists(CROSSVERIFY_MARKER_TASK, today) {
                         info!(%today, "Dhan 1-minute cross-verification already recorded for today");
                         note_worker_reported(today);
+                    } else if daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, today) {
+                        // §12.15.14 (review round 2): a terminal refusal is never
+                        // retried, by this process or a restarted one.
+                        info!(
+                            %today,
+                            "Dhan 1-minute cross-verification refused today for coverage; \
+                             not run again"
+                        );
+                        note_worker_reported(today);
                     } else {
                         run_day(&deps, &boot_set, today, day_start_ist_nanos, today).await;
                     }
@@ -1704,7 +1733,7 @@ pub fn spawn_dhan_live_crossverify(
                 WorkerStep::PastAfterRun => {
                     // §12.15.15: whatever today's marker says.
                     state.past_done = Some(today);
-                    run_past_days(&deps, &boot_set, today, false).await;
+                    run_past_days(&deps, &boot_set, today, false, &mut tried).await;
                 }
                 WorkerStep::WaitTomorrow => {
                     let secs = SECS_PER_DAY
@@ -1815,26 +1844,40 @@ pub const fn worker_step(now_secs_of_day: u64, flags: WorkerFlags) -> WorkerStep
     }
 }
 
-/// Records the process's held main-feed set in the day's subscribe record
+/// Records the process's held main-feed sets in the day's subscribe record
 /// once per IST day, at 08:00 at the earliest and only before the close
 /// (§12.15.13, review round 1): a process alive before 08:00 waits, one that
 /// is stopped first records nothing, a process alive across midnight records
 /// the new day too, and a boot after the close records nothing (it could only
-/// add instruments it never captured in the session). One small file write a
-/// day, cold.
+/// add instruments it never captured in the session). A failed write (here
+/// or at the end of a widen) is retried every [`DAY_RECORD_POLL_SECS`] until
+/// every held set lands (review round 2); the retry keeps the day's first
+/// stamp, so a set already on the wire never reads later than it was. One
+/// small file write a day, plus a one-load poll a minute while the session
+/// runs; cold.
 async fn run_day_recorder() {
-    let mut recorded_for: Option<chrono::NaiveDate> = None;
+    let mut recorded_for: Option<(chrono::NaiveDate, u64)> = None;
     loop {
         let (today, _) = today_ist();
         let now = now_ist_secs_of_day();
-        match day_record_step(now, recorded_for == Some(today)) {
+        let stamp_today = recorded_for.and_then(|(d, s)| (d == today).then_some(s));
+        let failed = crate::xverify_day_record::record_write_failed_for(today);
+        match day_record_step(now, stamp_today.is_some(), failed) {
             DayRecordStep::WaitUntil(target_secs) => {
                 tokio::time::sleep(Duration::from_secs(target_secs.saturating_sub(now))).await;
             }
             DayRecordStep::Record => {
-                recorded_for = Some(today);
+                let stamp = stamp_today.unwrap_or(now);
+                recorded_for = Some((today, stamp));
+                let mut all_written = true;
                 for (_, held, basis) in crate::xverify_day_record::process_held() {
-                    record_held_set(today, &held, now, basis);
+                    all_written &= record_held_set(today, &held, stamp, basis);
+                }
+                if all_written {
+                    crate::xverify_day_record::clear_record_write_failed(today);
+                } else {
+                    crate::xverify_day_record::note_record_write_failed(today);
+                    tokio::time::sleep(Duration::from_secs(DAY_RECORD_POLL_SECS)).await;
                 }
             }
             DayRecordStep::WaitTomorrow => {
@@ -1847,61 +1890,78 @@ async fn run_day_recorder() {
     }
 }
 
+/// How often the day recorder looks for a failed write to redo while the
+/// session runs (review round 2).
+pub const DAY_RECORD_POLL_SECS: u64 = 60;
+
 /// The day recorder's next step (§12.15.13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DayRecordStep {
     /// Sleep until this second of the IST day, then decide again.
     WaitUntil(u64),
-    /// Record the held set now.
+    /// Record the held sets now.
     Record,
     /// Nothing to record today: sleep until tomorrow's 08:00.
     WaitTomorrow,
 }
 
 /// The day recorder's next step. Pure, total, O(1): before 08:00 wait; from
-/// 08:00 to the close record once; after the close, or once recorded, wait
+/// 08:00 to the close record once, then again whenever a write failed, and
+/// otherwise look again every [`DAY_RECORD_POLL_SECS`]; after the close wait
 /// for tomorrow.
 #[must_use]
-pub const fn day_record_step(now_secs_of_day: u64, recorded_today: bool) -> DayRecordStep {
+pub const fn day_record_step(
+    now_secs_of_day: u64,
+    recorded_today: bool,
+    write_failed_today: bool,
+) -> DayRecordStep {
     if now_secs_of_day < XVERIFY_MORNING_SECS_OF_DAY_IST {
         DayRecordStep::WaitUntil(XVERIFY_MORNING_SECS_OF_DAY_IST)
-    } else if !recorded_today && now_secs_of_day < SESSION_CLOSE_SECS_OF_DAY_IST as u64 {
+    } else if now_secs_of_day >= SESSION_CLOSE_SECS_OF_DAY_IST as u64 {
+        DayRecordStep::WaitTomorrow
+    } else if !recorded_today || write_failed_today {
         DayRecordStep::Record
     } else {
-        DayRecordStep::WaitTomorrow
+        DayRecordStep::WaitUntil(now_secs_of_day.saturating_add(DAY_RECORD_POLL_SECS))
     }
 }
 
-/// Records one held set in the day's subscribe record (plan item 51e). A
-/// failed write is one coded `warn!` on a source no alarm filter matches; the
-/// day's check then reads what the record holds, or reports its coverage
-/// unknown (§12.15.14). Cold, at most once per held set per day.
+/// Records one held set in the day's subscribe record (plan item 51e) and
+/// returns whether it landed. A failed write is one coded `warn!` on a
+/// source no alarm filter matches; the caller notes it, so the day's check
+/// reads its coverage as unknown until a retry lands (§12.15.14). Cold.
 fn record_held_set(
     day: chrono::NaiveDate,
     boot_set: &[SubscribeInstrument],
     secs_of_day: u64,
     basis: UniverseBasis,
-) {
+) -> bool {
     let secs = u32::try_from(secs_of_day).unwrap_or(u32::MAX);
     match crate::xverify_day_record::record_spot_subscribed(day, boot_set, secs, basis) {
-        Ok(outcome) => info!(
-            %day,
-            added = outcome.merge.added,
-            recorded = outcome.recorded,
-            basis = basis.as_str(),
-            replaced_unreadable = outcome.replaced_unreadable,
-            "a held main-feed spot set is recorded for the 1-minute cross-check"
-        ),
-        Err(err) => warn!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            source = "xverify_day_record_write_failed",
-            %day,
-            %err,
-            instruments = boot_set.len(),
-            path = %crate::xverify_day_record::day_record_path(day).display(),
-            "could not save a held main-feed spot set for the 1-minute cross-check; \
-             the check covers only what its day record holds, and reports the shortfall"
-        ),
+        Ok(outcome) => {
+            info!(
+                %day,
+                added = outcome.merge.added,
+                recorded = outcome.recorded,
+                basis = basis.as_str(),
+                replaced_unreadable = outcome.replaced_unreadable,
+                "a held main-feed spot set is recorded for the 1-minute cross-check"
+            );
+            true
+        }
+        Err(err) => {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_day_record_write_failed",
+                %day,
+                %err,
+                instruments = boot_set.len(),
+                path = %crate::xverify_day_record::day_record_path(day).display(),
+                "could not save a held main-feed spot set for the 1-minute cross-check; \
+                 it is retried, and until it lands the day's coverage reads unknown"
+            );
+            false
+        }
     }
 }
 
@@ -2205,6 +2265,18 @@ async fn run_day(
             %today,
             "today's spot-list widen never finished, so the 1-minute cross-check \
              cannot tell which instruments were on the wire; coverage is unknown"
+        );
+    }
+    // Review round 2: a held set this process could not save to the record
+    // (and no retry landed) is on the wire but not in the record.
+    if today == pass_day && crate::xverify_day_record::record_write_failed_for(today) {
+        coverage.known = false;
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_day_record_write_failed",
+            %today,
+            "a held spot set never reached today's subscribe record, so the 1-minute \
+             cross-check cannot tell which instruments were on the wire; coverage is unknown"
         );
     }
     let targets = owned_targets.as_slice();
@@ -6833,31 +6905,80 @@ mod tests {
         assert_eq!(state.for_day(tuesday), WorkerFlags::default());
     }
 
-    /// Review round 1: the day recorder writes once a day, from 08:00 and
-    /// before the close only, so a night-time process never records the next
-    /// trading day early and a post-close boot records nothing.
+    /// Review rounds 1 and 2: the day recorder writes from 08:00 and before
+    /// the close only (a night-time process never records the next trading
+    /// day early; a post-close boot records nothing), once, again after a
+    /// failed write, and otherwise looks again a minute later.
     #[test]
     fn test_day_record_step_table() {
         let morning = XVERIFY_MORNING_SECS_OF_DAY_IST;
         let close = SESSION_CLOSE_SECS_OF_DAY_IST as u64;
         for recorded in [false, true] {
-            assert_eq!(
-                day_record_step(3 * 3_600, recorded),
-                DayRecordStep::WaitUntil(morning)
-            );
-            assert_eq!(
-                day_record_step(close, recorded),
-                DayRecordStep::WaitTomorrow
-            );
-            assert_eq!(
-                day_record_step(SECS_PER_DAY - 1, recorded),
-                DayRecordStep::WaitTomorrow
-            );
+            for failed in [false, true] {
+                assert_eq!(
+                    day_record_step(3 * 3_600, recorded, failed),
+                    DayRecordStep::WaitUntil(morning)
+                );
+                assert_eq!(
+                    day_record_step(close, recorded, failed),
+                    DayRecordStep::WaitTomorrow
+                );
+                assert_eq!(
+                    day_record_step(SECS_PER_DAY - 1, recorded, failed),
+                    DayRecordStep::WaitTomorrow
+                );
+            }
         }
-        assert_eq!(day_record_step(morning, false), DayRecordStep::Record);
-        assert_eq!(day_record_step(close - 1, false), DayRecordStep::Record);
-        assert_eq!(day_record_step(morning, true), DayRecordStep::WaitTomorrow);
+        assert_eq!(
+            day_record_step(morning, false, false),
+            DayRecordStep::Record
+        );
+        assert_eq!(
+            day_record_step(close - 1, false, false),
+            DayRecordStep::Record
+        );
+        assert_eq!(day_record_step(morning, true, true), DayRecordStep::Record);
+        assert_eq!(
+            day_record_step(morning, true, false),
+            DayRecordStep::WaitUntil(morning + DAY_RECORD_POLL_SECS)
+        );
         assert!(morning < SESSION_OPEN_SECS_OF_DAY_IST as u64);
+    }
+
+    /// Review round 2: a terminal refusal is never run again today, by this
+    /// process or a restarted one; a past day runs at most once per IST day
+    /// per process; a failed record write makes today's coverage unknown and
+    /// is retried at the day's first stamp.
+    #[test]
+    fn test_round2_refusal_retry_and_write_failure_wiring() {
+        let prod = prod_src();
+        let spawn = fn_body(prod, "fn spawn_dhan_live_crossverify(");
+        let recorded_at = spawn
+            .find("daily_marker_exists(CROSSVERIFY_MARKER_TASK, today)")
+            .expect("the recorded-day skip");
+        let refused_at = spawn
+            .find("daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, today)")
+            .expect("the refused-day skip");
+        let run_at = spawn
+            .find("run_day(&deps, &boot_set, today, day_start_ist_nanos, today)")
+            .expect("today's run");
+        assert!(recorded_at < refused_at && refused_at < run_at);
+        assert!(spawn.contains("tried.clear();"));
+        let past = fn_body(prod, "async fn run_past_days(");
+        let skip_at = past
+            .find("if tried.contains(&day) {")
+            .expect("the tried skip");
+        let push_at = past.find("tried.push(day);").expect("the tried push");
+        let day_at = past.find("run_day(deps, boot_set, day,").expect("the run");
+        assert!(skip_at < push_at && push_at < day_at);
+        let run_day = fn_body(prod, "async fn run_day(");
+        assert!(run_day.contains(
+            "if today == pass_day && crate::xverify_day_record::record_write_failed_for(today) {"
+        ));
+        let recorder = fn_body(prod, "async fn run_day_recorder(");
+        assert!(recorder.contains("let stamp = stamp_today.unwrap_or(now);"));
+        assert!(recorder.contains("crate::xverify_day_record::clear_record_write_failed(today);"));
+        assert!(recorder.contains("crate::xverify_day_record::note_record_write_failed(today);"));
     }
 
     /// Review round 1: the supervisor re-sleeps while the wall clock still
@@ -6954,8 +7075,8 @@ mod tests {
         assert_eq!(spawn.matches("run_past_days(").count(), 2);
         assert!(run_day.contains("widen_unfinished_for(today)"));
         let recorder = fn_body(prod, "async fn run_day_recorder(");
-        assert!(recorder.contains("match day_record_step(now, recorded_for == Some(today)) {"));
-        assert!(recorder.contains("record_held_set(today, &held, now, basis);"));
+        assert!(recorder.contains("match day_record_step(now, stamp_today.is_some(), failed) {"));
+        assert!(recorder.contains("record_held_set(today, &held, stamp, basis);"));
         let supervisor = fn_body(prod, "async fn run_supervisor(");
         assert!(
             supervisor

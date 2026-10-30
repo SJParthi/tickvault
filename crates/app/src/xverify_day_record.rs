@@ -26,8 +26,10 @@
 //! # Cost
 //!
 //! Cold path only: one read, one merge and at most one write per recording
-//! (the boot, and the end of a widen), **O(instruments)** with one hash probe
-//! each, plus an O(files) sweep of old day files after a write. Never per tick.
+//! (the daily recorder, and the end of a widen): **O(file bytes)** to parse,
+//! O(instruments) to merge (one hash probe each), **O(n log n)** to write (the
+//! entries are sorted so the file is stable), plus an O(files) sweep of old day
+//! files after a write. Never per tick.
 //! The write is a temp file, `sync_all`, `rename` and a folder `sync_all`, run
 //! through `off_worker` so a slow disk never holds a shared runtime worker.
 //! SPACE: at most [`DAY_RECORD_MAX_INSTRUMENTS`] keys (the main-feed capacity);
@@ -51,8 +53,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
@@ -131,6 +134,39 @@ pub fn process_held() -> Vec<HeldSet> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
+}
+
+/// The IST day (days from CE, 0 = none) on which a day-record write failed
+/// in this process and no later write of every held set succeeded (review
+/// round 2). The check reads it as coverage unknown: the record may lack a
+/// set that is on the wire.
+static WRITE_FAILED_DAY: AtomicI64 = AtomicI64::new(0);
+
+fn day_number(date_ist: NaiveDate) -> i64 {
+    i64::from(date_ist.num_days_from_ce())
+}
+
+/// Notes that a write into `date_ist`'s record failed. One store, O(1).
+pub fn note_record_write_failed(date_ist: NaiveDate) {
+    WRITE_FAILED_DAY.store(day_number(date_ist), Ordering::Release);
+}
+
+/// Clears a failure noted for `date_ist` once every held set was written
+/// again. One compare-and-swap, O(1); a failure noted for another day stays.
+pub fn clear_record_write_failed(date_ist: NaiveDate) {
+    let _was = WRITE_FAILED_DAY.compare_exchange(
+        day_number(date_ist),
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Whether a write into `date_ist`'s record failed and was not yet redone.
+/// One load, O(1).
+#[must_use]
+pub fn record_write_failed_for(date_ist: NaiveDate) -> bool {
+    WRITE_FAILED_DAY.load(Ordering::Acquire) == day_number(date_ist)
 }
 
 /// Where one recording's set came from (plan item 51f).
@@ -400,7 +436,7 @@ fn read_record_in(base: &Path, date_ist: NaiveDate) -> std::io::Result<Option<Sp
 /// Writes `record` atomically: temp file, `sync_all`, `rename`, folder
 /// `sync_all`; then removes record files older than
 /// [`DAY_RECORD_KEEP_DAYS`]. A folder sync failure after the rename is not an
-/// error (the file is in place). O(instruments + files), cold.
+/// error (the file is in place). O(n log n) (sorted entries) + O(files), cold.
 fn write_record_in(base: &Path, record: &SpotDayRecord) -> std::io::Result<()> {
     let mut instruments: Vec<DayRecordEntry> = record
         .first_secs
@@ -495,8 +531,8 @@ pub struct RecordOutcome {
 
 /// Records `instruments` as subscribed at `secs_of_day` on `date_ist`, under
 /// `base`. Read, merge, and write only when something changed. A file that
-/// cannot be read is replaced (reported in the outcome). O(instruments),
-/// cold.
+/// cannot be read is replaced (reported in the outcome). O(file bytes +
+/// instruments + n log n), cold.
 fn record_in(
     base: &Path,
     date_ist: NaiveDate,
@@ -891,5 +927,21 @@ mod tests {
         assert_eq!(held.len(), 2);
         assert!(held.contains(&(HeldOrigin::Boot, vec![a], UniverseBasis::IndexFallback)));
         assert!(held.contains(&(HeldOrigin::Widen, vec![a, b], UniverseBasis::MasterList)));
+    }
+
+    /// Review round 2: a failed write is noted per IST day, read back for
+    /// that day only, and cleared only for that day.
+    #[test]
+    fn test_note_record_write_failed_then_clear_record_write_failed() {
+        // Far-future days, so no other test's day collides.
+        let day = NaiveDate::from_ymd_opt(2998, 1, 5).expect("date");
+        let other = NaiveDate::from_ymd_opt(2998, 1, 6).expect("date");
+        note_record_write_failed(day);
+        assert!(record_write_failed_for(day));
+        assert!(!record_write_failed_for(other));
+        clear_record_write_failed(other);
+        assert!(record_write_failed_for(day), "another day's clear keeps it");
+        clear_record_write_failed(day);
+        assert!(!record_write_failed_for(day));
     }
 }

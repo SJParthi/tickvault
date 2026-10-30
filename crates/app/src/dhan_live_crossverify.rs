@@ -1657,9 +1657,12 @@ pub struct XverifyCoverage {
     pub planned_instrument_minutes: i64,
     /// Session minutes each target was subscribed for, summed.
     pub covered_instrument_minutes: i64,
-    /// The targets came from the day's own record. `false` when the record
-    /// was absent or unreadable: the targets are then the boot set and
-    /// `covered_instrument_minutes` is 0.
+    /// The targets came from the day's own record and it can be trusted.
+    /// `false` when the record was absent or unreadable (the targets are then
+    /// the boot set and `covered_instrument_minutes` is 0), and also when a
+    /// widen did not finish or a record write failed (the minutes then still
+    /// count the record as read, and mean nothing on their own). Read the
+    /// minutes only when this is `true`.
     pub known: bool,
     /// The day's record holds only the four-index fallback (plan item 51f).
     pub index_fallback_day: bool,

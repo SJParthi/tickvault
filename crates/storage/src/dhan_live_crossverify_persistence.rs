@@ -111,6 +111,8 @@
 //! the DEDUP key: how much of the session the run's targets were subscribed for,
 //! from the day's own subscribe record. Plan item 51f reads them to hold the S3
 //! archive and to keep a `clean` day at `partial`; they never touch `diverged`.
+//! The two minute counts mean something only when `coverage_known` is true: a
+//! row with it false may still carry the record's counts (review round 2).
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};

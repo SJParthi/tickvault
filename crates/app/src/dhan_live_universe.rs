@@ -950,15 +950,21 @@ fn record_widened_list_for_crossverify(truncated: bool) {
             truncated,
             "today's widened spot list recorded for the 1-minute cross-check"
         ),
-        Err(err) => tracing::warn!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            source = "xverify_day_record_write_failed",
-            %date,
-            %err,
-            instruments = list.len(),
-            "could not save today's widened spot list for the 1-minute cross-check; the \
-             check covers only what its day record holds, and reports the shortfall"
-        ),
+        Err(err) => {
+            // Review round 2: the daily recorder retries the held sets, and
+            // until one write of all of them lands the check reads this day's
+            // coverage as unknown.
+            crate::xverify_day_record::note_record_write_failed(date);
+            tracing::warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_day_record_write_failed",
+                %date,
+                %err,
+                instruments = list.len(),
+                "could not save today's widened spot list for the 1-minute cross-check; it is \
+                 retried, and until it lands the day's coverage reads unknown"
+            );
+        }
     }
 }
 
