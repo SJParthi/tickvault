@@ -11,6 +11,7 @@
 > are retained; nothing writes new ones. Content below is historical.
 > **Code (historical):** `cross_verify_1m_boot.rs` (deleted),
 > `feed_parity_1m_audit_persistence.rs` (storage crate — DELETED 2026-07-15).
+> **⚠ 2026-10-30:** the make targets `cross-verify-show` and `cross-verify-now` and the shell script behind them are DELETED (rust-only audit): the feature is retired, nothing writes new files, and nothing reads `TICKVAULT_CROSS_VERIFY_NOW`. Read the kept CSVs with `GET /api/debug/cross-verify/latest` (Rust) or open `data/cross-verify/` directly.
 
 ## TL;DR
 
@@ -18,8 +19,8 @@
 |---|---|
 | Pre-market historical fetch? | **Removed on purpose** (operator directive 2026-05-26, spot-only). It does not run. |
 | Post-market cross-verification? | **Runs at 15:31 IST every trading day** — 1-minute OHLCV, exact match, per subscribed spot SID. |
-| Fastest way to see it? | `make cross-verify-show` |
-| See it without waiting for 15:31? | `make cross-verify-now` (needs a booted app: live auth + QuestDB) |
+| Fastest way to see it? | ~~`make cross-verify-show`~~ (deleted 2026-10-30: `GET /api/debug/cross-verify/latest`) |
+| See it without waiting for 15:31? | ~~`make cross-verify-now`~~ (deleted 2026-10-30; nothing read its switch) (needs a booted app: live auth + QuestDB) |
 
 ## What it does
 
@@ -39,7 +40,7 @@ table + CSV. It never writes to `ticks` (live-feed-purity stands).
 
 | Surface | How | Note |
 |---|---|---|
-| 📄 **CSV** | `make cross-verify-show` (or open `data/cross-verify/cross-verify-1m-YYYY-MM-DD.csv`) | Easiest. One row per mismatching `(SID, minute, field)`. |
+| 📄 **CSV** | ~~`make cross-verify-show`~~ (deleted 2026-10-30: `GET /api/debug/cross-verify/latest`) (or open `data/cross-verify/cross-verify-1m-YYYY-MM-DD.csv`) | Easiest. One row per mismatching `(SID, minute, field)`. |
 | 📊 **QuestDB** | `make questdb` → `localhost:9000` → `SELECT * FROM cross_verify_1m_audit WHERE trading_date_ist = today()` | Full, queryable, trendable across days. |
 | 📱 **Telegram** | per-day summary at ~15:31 IST: *compared / mismatches / missing* | Pushed to you. |
 | 📝 **Logs** | `CROSS-VERIFY-1M-01` (mismatch) / `-02` (fetch degraded) in `data/logs/errors.jsonl.*`, plus a `"PROOF: cross_verify_1m fired"` info line | Forensic. |
@@ -48,16 +49,16 @@ table + CSV. It never writes to `ticks` (live-feed-purity stands).
 
 1. **It only fires at 15:31 IST on a trading day, with the app running.**
    If the app wasn't up through a trading-day close, there is no report — that
-   is correct, not a bug. `make cross-verify-show` says so plainly.
+   is correct, not a bug. ~~`make cross-verify-show`~~ (deleted 2026-10-30: `GET /api/debug/cross-verify/latest`) says so plainly.
 2. **Dev box without live Dhan + QuestDB candles** produces nothing real — and
-   the tooling will not fabricate a sample. `make cross-verify-now` will boot
+   the tooling will not fabricate a sample. ~~`make cross-verify-now`~~ (deleted 2026-10-30; nothing read its switch) will boot
    and stop at auth if there are no live credentials; that is expected.
 3. **Booted late (after 15:31)** → the scheduled run skips ("mid-evening
-   boot"). Use `make cross-verify-now` to force it for today's data.
+   boot"). Use ~~`make cross-verify-now`~~ (deleted 2026-10-30; nothing read its switch) to force it for today's data.
 
 ## On-demand run (prove it works)
 
-`make cross-verify-now` sets `TICKVAULT_CROSS_VERIFY_NOW=1`, which makes the
+~~`make cross-verify-now`~~ (deleted 2026-10-30; nothing read its switch) sets `TICKVAULT_CROSS_VERIFY_NOW=1`, which makes the
 boot-time task run the verification **immediately** instead of sleeping to
 15:31. It overrides the trading-day + schedule gates (so you can run it any
 time) but **not** correctness: on a quiet day with no `candles_1m`, it
