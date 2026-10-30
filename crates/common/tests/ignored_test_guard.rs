@@ -49,6 +49,19 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-30 with plan item DT0: a wall-clock yardstick for the
+    // ring-dwell + decode part of the `receipt_to_fold` stage, quiet and with
+    // two busy threads competing for the CPUs (the r8g.large has two). It
+    // prints percentiles and gates nothing, like the harness below; the
+    // stage's behaviour is pinned by
+    // `dhan_feed_stack/receipt_to_fold_tests.rs` and
+    // `crates/storage/tests/dhat_receipt_to_fold_stage.rs`. Re-run it with:
+    //
+    //   cargo test --release -p tickvault-core --test receipt_to_fold_harness -- --ignored --nocapture
+    (
+        "crates/core/tests/receipt_to_fold_harness.rs",
+        "receipt_to_fold_cost_with_and_without_cpu_competition",
+    ),
     // Added 2026-10-30 with plan ITEM DT-SOCK (owner: every in-memory step
     // under 1 us at p99): wall-clock harnesses for the socket read path's
     // in-memory work per frame (production spacing, bursts, a per-step

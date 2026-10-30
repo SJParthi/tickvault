@@ -156,6 +156,16 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // its underlying's nearest real expiry. Same SEBI-audit class + DAY
     // partitioning; `feed` is in the DEDUP key.
     "expiry_scope_audit",
+    // (2026-10-30, owner: real-time proof that every in-memory step is under
+    // 1 µs) one row per hot-path stage per minute, written by the
+    // `tv-latency-minute` thread. Measurement, not SEBI audit: swept on the
+    // same DAY window as the audit tables (archived to S3 before detach);
+    // `feed` is in the DEDUP key.
+    "hot_path_latency_minute",
+    // (2026-10-30) the per-minute host capacity row and the daily "is the
+    // 4-core box needed" verdict, same writer thread and window.
+    "host_capacity_minute",
+    "capacity_verdict_daily",
     // (2026-08-29, per-table disk-footprint measurement): one row per
     // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
     // class + DAY partitioning as the scoreboard tables above. Swept with
