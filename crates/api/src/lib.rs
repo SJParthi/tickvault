@@ -167,8 +167,8 @@ pub fn build_router_with_auth(
             require_bearer_auth,
         ));
 
-    // Security trim 2026-07-04 (operator directive, Session A): the 4 read-only
-    // `/api/debug/*` routes move OFF the public router and behind the SAME
+    // Security trim 2026-07-04 (operator directive, Session A): the read-only (4 then,
+    // 5 with speed-health) `/api/debug/*` routes move OFF the public router and behind the SAME
     // bearer-auth middleware — applied UNCONDITIONALLY (deliberately NOT gated
     // on `feed_toggle_public`).
     //
