@@ -65,7 +65,7 @@ fn base_toml_muhurat_entries() -> Vec<MuhuratTradingEntry> {
 }
 
 #[test]
-fn test_sunday_muhurat_is_a_session_day_with_its_times() {
+fn test_is_session_day_sunday_muhurat_with_its_times() {
     let cal = TradingCalendar::from_config(&config(vec![muhurat("2026-11-08", "14:05", "15:40")]))
         .expect("valid");
     let sunday = day(2026, 11, 8);
@@ -84,7 +84,7 @@ fn test_sunday_muhurat_is_a_session_day_with_its_times() {
 }
 
 #[test]
-fn test_ordinary_sunday_and_weekday_holiday_stay_closed() {
+fn test_muhurat_session_secs_ordinary_sunday_and_weekday_holiday_stay_closed() {
     let cal = TradingCalendar::from_config(&config(vec![muhurat("2026-11-08", "14:05", "15:40")]))
         .expect("valid");
     let ordinary_sunday = day(2026, 11, 15);

@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn session_capture_windows_refuse_a_session_the_writers_would_cut() {
+    fn test_session_is_inside_capture_windows_refuses_a_session_the_writers_would_cut() {
         // Runs past the evening window's 19:30 end.
         assert!(!session_is_inside_capture_windows(hm(18, 15), hm(19, 45)));
         // Starts before the evening window opens.
