@@ -858,6 +858,13 @@ frame_silence_fast_path = "shadow"
 # Bounds 10..=600, checked at boot.
 depth200_silent_swap_resubscribe_secs = 90
 
+# Plan item 3b (2026-10-30): a main-feed instrument subscribed over 120 s ago
+# that has sent nothing, on a socket that delivers others, is offered again IN
+# PLACE (unsubscribe, then subscribe, same socket, never a redial), at most 3
+# rounds a day. false = the delta is found and counted as "would_resubscribe"
+# (local /metrics only) and nothing is sent. Turning it on is the owner's call.
+subscribe_reconcile_auto_resubscribe = false
+
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are

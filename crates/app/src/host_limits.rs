@@ -30,6 +30,14 @@
 //! refusing to start over a tuning miss would trade a real outage for a
 //! theoretical one. It reports loudly and keeps going; the operator decides.
 //!
+//! ⚠ CORRECTED 2026-10-30 (plan item 2): "today the runtime is REST-only" is
+//! stale. The live Dhan main feed has run since 2026-08-09, so a short receive
+//! buffer matters now. Plan item 2 asks for a refusal on mismatch, and its
+//! own failure-mode row says "warn for one release, then enforce". This
+//! release still warns: refusing to start is a boot-blocker the owner decides,
+//! not this module. Since 2026-10-30 the check also reads `vm.max_map_count`
+//! and this process's soft open-file limit (`LimitNOFILE`).
+//!
 //! It also does not TUNE anything. Raising limits is the provisioner's job and
 //! requires privileges the service user deliberately does not have.
 //!
@@ -59,12 +67,57 @@ pub const REQUIRED_NETDEV_MAX_BACKLOG: u64 = 65_536;
 /// Listen backlog. Small, but a stock 128 is a real ceiling on reconnect churn.
 pub const REQUIRED_SOMAXCONN: u64 = 4_096;
 
+/// Memory-map areas per process (plan item 2, 2026-10-30). QuestDB maps every
+/// column file of every open partition, and the stock 65,530 is a real
+/// ceiling on a box holding weeks of hour-partitioned tables: past it the
+/// database fails its next `mmap` and the WAL apply stalls. QuestDB shares the
+/// host kernel with this process, so this process reading it checks the
+/// database's limit too.
+///
+/// Must stay in lockstep with `vm.max_map_count` in
+/// `deploy/aws/sysctl/99-tickvault-net.conf`. Pinned by
+/// `crates/app/tests/host_limits_lockstep_guard.rs`.
+pub const REQUIRED_MAX_MAP_COUNT: u64 = 1_048_576;
+
+/// Open files THIS process may hold (soft `RLIMIT_NOFILE`, plan item 2,
+/// 2026-10-30): up to 26 sockets, the WAL segments, the spill and log files,
+/// the QuestDB HTTP pool. A stock 1,024 runs out under a reconnect storm and
+/// every new socket or file then fails with `EMFILE`.
+///
+/// Must stay in lockstep with `LimitNOFILE=` in
+/// `deploy/systemd/tickvault.service`. Pinned by
+/// `crates/app/tests/host_limits_lockstep_guard.rs`.
+pub const REQUIRED_OPEN_FILES: u64 = 65_536;
+
+/// The `/proc/self/limits` row that carries the open-file limit.
+const OPEN_FILES_LIMITS_ROW: &str = "Max open files";
+
+/// Where one limit's current value is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitSource {
+    /// A single-integer file under `/proc/sys`.
+    ProcSysScalar(&'static str),
+    /// The SOFT open-file limit of this process, from `/proc/self/limits`.
+    /// The soft value is the one `open`/`socket` are refused against.
+    OpenFilesSoft,
+}
+
+impl LimitSource {
+    /// The file this limit is read from, for the "unreadable" log line.
+    const fn path(self) -> &'static str {
+        match self {
+            Self::ProcSysScalar(path) => path,
+            Self::OpenFilesSoft => "/proc/self/limits",
+        }
+    }
+}
+
 /// One kernel limit and the value the feed needs it to be at least.
 struct LimitSpec {
-    /// `/proc/sys` path, read at boot.
-    proc_path: &'static str,
-    /// Human-facing name used in the log line — the sysctl name the operator
-    /// would type, never the file path.
+    /// Where the value is read from at boot.
+    source: LimitSource,
+    /// Human-facing name used in the log line — the sysctl (or systemd
+    /// directive) name the operator would type, never the file path.
     sysctl_name: &'static str,
     minimum: u64,
 }
@@ -75,21 +128,31 @@ struct LimitSpec {
 /// properties of the feed's sizing arithmetic, not operator preferences, and a
 /// configurable minimum would let the check be quietly tuned down to whatever
 /// the box happens to have — which is the same as not checking.
-const CHECKED_LIMITS: [LimitSpec; 3] = [
+const CHECKED_LIMITS: [LimitSpec; 5] = [
     LimitSpec {
-        proc_path: "/proc/sys/net/core/rmem_max",
+        source: LimitSource::ProcSysScalar("/proc/sys/net/core/rmem_max"),
         sysctl_name: "net.core.rmem_max",
         minimum: REQUIRED_RMEM_MAX_BYTES,
     },
     LimitSpec {
-        proc_path: "/proc/sys/net/core/netdev_max_backlog",
+        source: LimitSource::ProcSysScalar("/proc/sys/net/core/netdev_max_backlog"),
         sysctl_name: "net.core.netdev_max_backlog",
         minimum: REQUIRED_NETDEV_MAX_BACKLOG,
     },
     LimitSpec {
-        proc_path: "/proc/sys/net/core/somaxconn",
+        source: LimitSource::ProcSysScalar("/proc/sys/net/core/somaxconn"),
         sysctl_name: "net.core.somaxconn",
         minimum: REQUIRED_SOMAXCONN,
+    },
+    LimitSpec {
+        source: LimitSource::ProcSysScalar("/proc/sys/vm/max_map_count"),
+        sysctl_name: "vm.max_map_count",
+        minimum: REQUIRED_MAX_MAP_COUNT,
+    },
+    LimitSpec {
+        source: LimitSource::OpenFilesSoft,
+        sysctl_name: "LimitNOFILE",
+        minimum: REQUIRED_OPEN_FILES,
     },
 ];
 
@@ -161,6 +224,36 @@ fn read_proc_scalar(path: &Path) -> Option<u64> {
         .and_then(parse_proc_scalar)
 }
 
+/// Parse the SOFT open-file limit out of a `/proc/self/limits` dump.
+///
+/// The row reads `Max open files  <soft>  <hard>  files`. `unlimited` reads as
+/// `u64::MAX` (it meets any minimum). A missing row, a short row or a value
+/// that is not a number parses to `None`, which classifies as `Unknown`
+/// rather than guessing. Pure; O(lines) over a ~17-line file, boot only.
+#[must_use]
+pub fn parse_open_files_soft_limit(raw: &str) -> Option<u64> {
+    let row = raw.lines().find_map(|line| {
+        line.strip_prefix(OPEN_FILES_LIMITS_ROW)
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })?;
+    let soft = row.split_whitespace().next()?;
+    if soft == "unlimited" {
+        return Some(u64::MAX);
+    }
+    soft.parse::<u64>().ok()
+}
+
+/// Read one limit's current value, `None` when it cannot be read.
+fn read_limit(source: LimitSource) -> Option<u64> {
+    match source {
+        LimitSource::ProcSysScalar(path) => read_proc_scalar(Path::new(path)),
+        LimitSource::OpenFilesSoft => std::fs::read_to_string(source.path())
+            .ok()
+            .as_deref()
+            .and_then(parse_open_files_soft_limit),
+    }
+}
+
 /// Check every limit, log the verdict, and publish gauges.
 ///
 /// Called once during boot, after the metrics recorder is installed so the
@@ -172,7 +265,7 @@ pub fn check_and_report_host_limits() -> usize {
     let mut unmet = 0_usize;
 
     for spec in &CHECKED_LIMITS {
-        let status = classify(read_proc_scalar(Path::new(spec.proc_path)), spec.minimum);
+        let status = classify(read_limit(spec.source), spec.minimum);
 
         match status {
             LimitStatus::Met { actual } => {
@@ -188,16 +281,17 @@ pub fn check_and_report_host_limits() -> usize {
                     actual,
                     required,
                     "host limit BELOW the market-data feed requirement — the kernel \
-                     may discard incoming data under load, and no downstream buffer \
-                     can recover it. Apply deploy/aws/sysctl/99-tickvault-net.conf \
-                     and run `sysctl --system`."
+                     may discard incoming data, or refuse a socket or file, under \
+                     load, and no downstream buffer can recover it. Apply \
+                     deploy/aws/sysctl/99-tickvault-net.conf and run `sysctl \
+                     --system` (LimitNOFILE: the tickvault systemd unit)."
                 );
             }
             LimitStatus::Unknown => {
                 unmet += 1;
                 warn!(
                     sysctl = spec.sysctl_name,
-                    path = spec.proc_path,
+                    path = spec.source.path(),
                     "host limit UNREADABLE — cannot verify the market-data feed \
                      requirement. Expected on non-Linux hosts; on the trading box \
                      this means the check is blind, not that the limit is fine."
@@ -357,17 +451,81 @@ mod tests {
     #[test]
     fn every_checked_limit_has_a_distinct_sysctl_name_and_path() {
         for (i, a) in CHECKED_LIMITS.iter().enumerate() {
-            assert!(
-                a.proc_path.starts_with("/proc/sys/"),
-                "{} must read from /proc/sys",
-                a.sysctl_name
-            );
+            if let LimitSource::ProcSysScalar(path) = a.source {
+                assert!(
+                    path.starts_with("/proc/sys/"),
+                    "{} must read from /proc/sys",
+                    a.sysctl_name
+                );
+            }
             assert!(a.minimum > 0, "{} needs a real minimum", a.sysctl_name);
             for b in CHECKED_LIMITS.iter().skip(i + 1) {
                 assert_ne!(a.sysctl_name, b.sysctl_name, "duplicate sysctl name");
-                assert_ne!(a.proc_path, b.proc_path, "duplicate proc path");
+                assert_ne!(a.source, b.source, "duplicate source");
             }
         }
+    }
+
+    #[test]
+    fn test_plan_item_2_limits_are_all_checked() {
+        // Plan item 2 names the open-file limit and the map count beside the
+        // receive buffer. Each must be one row of the boot check.
+        let names: Vec<&str> = CHECKED_LIMITS.iter().map(|s| s.sysctl_name).collect();
+        for wanted in ["net.core.rmem_max", "vm.max_map_count", "LimitNOFILE"] {
+            assert!(names.contains(&wanted), "{wanted} is not checked at boot");
+        }
+        assert_eq!(REQUIRED_MAX_MAP_COUNT, 1_048_576);
+        assert_eq!(REQUIRED_OPEN_FILES, 65_536);
+    }
+
+    #[test]
+    fn test_parse_open_files_soft_limit_reads_the_soft_column() {
+        let raw = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                   Max cpu time              unlimited            unlimited            seconds   \n\
+                   Max open files            1024                 524288               files     \n\
+                   Max locked memory         8388608              8388608              bytes     \n";
+        assert_eq!(parse_open_files_soft_limit(raw), Some(1_024));
+        assert!(
+            !classify(parse_open_files_soft_limit(raw), REQUIRED_OPEN_FILES).is_met(),
+            "the stock 1,024 soft limit must read as below, even with a high hard limit"
+        );
+    }
+
+    #[test]
+    fn test_parse_open_files_soft_limit_unlimited_and_junk() {
+        assert_eq!(
+            parse_open_files_soft_limit("Max open files  unlimited  unlimited  files\n"),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            parse_open_files_soft_limit("Max open files  65536  65536  files\n"),
+            Some(65_536)
+        );
+        assert_eq!(parse_open_files_soft_limit(""), None, "no row");
+        assert_eq!(
+            parse_open_files_soft_limit("Max open files\n"),
+            None,
+            "row with no value"
+        );
+        assert_eq!(
+            parse_open_files_soft_limit("Max open files  lots  more  files\n"),
+            None,
+            "non-numeric soft value"
+        );
+        assert_eq!(
+            parse_open_files_soft_limit("Max open filesystems  5\n"),
+            None,
+            "a different row that shares the prefix must not be read"
+        );
+    }
+
+    #[test]
+    fn test_limit_source_path_names_the_file_read() {
+        assert_eq!(
+            LimitSource::ProcSysScalar("/proc/sys/vm/max_map_count").path(),
+            "/proc/sys/vm/max_map_count"
+        );
+        assert_eq!(LimitSource::OpenFilesSoft.path(), "/proc/self/limits");
     }
 
     #[test]
