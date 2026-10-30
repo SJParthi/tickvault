@@ -45,6 +45,13 @@
 //! notifications coalesce into one permit, which is safe because the consumer
 //! always drains before it sleeps; a stale permit costs one extra loop pass.
 //!
+//! The consumer first takes a queued item WITHOUT registering (ITEM DT1,
+//! 2026-10-30) and registers only when the queue looks empty, so the order
+//! above (register, then check, then sleep) still holds for every sleep. While
+//! frames are queued the drain therefore takes no waiter lock, and a producer
+//! never finds it registered, so the reader pays the wake only for a drain
+//! that is about to sleep.
+//!
 //! # Complexity
 //!
 //! `try_send`, `try_recv`, a ready `recv`: O(1), lock-free, zero allocation.
@@ -52,7 +59,7 @@
 //! parked. Construction: O(capacity), once at boot.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_channel::{TryRecvError, TrySendError};
 use tokio::sync::Notify;
@@ -64,6 +71,18 @@ struct Shared {
     notify: Notify,
     /// Live STRONG senders. Weak senders are not counted.
     senders: AtomicUsize,
+    /// Set while the consumer busy-polls with `try_recv` and never sleeps
+    /// (owner decision 2026-10-30, "Build it, test live on 2 cores": a
+    /// never-sleeping drain behind a switch, default off). While set,
+    /// `try_send` skips the `Notify` wake. See
+    /// [`FrameRingReceiver::set_busy_polling`] for why no frame can be stranded.
+    busy_polling: AtomicBool,
+    /// Test-only: how many times `try_send` called `notify_one`.
+    #[cfg(test)]
+    notifies: AtomicUsize,
+    /// Test-only: how many times the consumer called `enable()` on `notify`.
+    #[cfg(test)]
+    registrations: AtomicUsize,
 }
 
 /// Why [`FrameRingSender::try_send`] refused an item. The item is handed back.
@@ -108,6 +127,11 @@ pub fn frame_ring<T>(capacity: usize) -> (FrameRingSender<T>, FrameRingReceiver<
     let shared = Arc::new(Shared {
         notify: Notify::new(),
         senders: AtomicUsize::new(1),
+        busy_polling: AtomicBool::new(false),
+        #[cfg(test)]
+        notifies: AtomicUsize::new(0),
+        #[cfg(test)]
+        registrations: AtomicUsize::new(0),
     });
     (
         FrameRingSender {
@@ -129,7 +153,14 @@ impl<T> FrameRingSender<T> {
     pub fn try_send(&self, item: T) -> Result<(), FrameRingTrySendError<T>> {
         match self.tx.try_send(item) {
             Ok(()) => {
-                self.shared.notify.notify_one();
+                // SeqCst, not Relaxed: paired with the consumer's SeqCst clear
+                // in `set_busy_polling(false)` (see there). A plain load on
+                // x86, `ldar` on ARM; no read-modify-write either way.
+                if !self.shared.busy_polling.load(Ordering::SeqCst) {
+                    #[cfg(test)]
+                    self.shared.notifies.fetch_add(1, Ordering::Relaxed);
+                    self.shared.notify.notify_one();
+                }
                 Ok(())
             }
             Err(TrySendError::Full(item)) => Err(FrameRingTrySendError::Full(item)),
@@ -206,10 +237,32 @@ impl<T> FrameRingReceiver<T> {
 
     async fn recv_uncharged(&mut self) -> Option<T> {
         loop {
+            // Fast path (ITEM DT1, 2026-10-30): take a queued item WITHOUT
+            // registering. Registering costs the drain a waiter-list lock to
+            // add itself and another to remove itself, and while it is
+            // registered a producer's `notify_one` finds the state WAITING and
+            // pays that lock plus a task wake for a drain that is already
+            // running. Registration is only needed before SLEEPING, so it now
+            // happens only once the queue looks empty, and the queue is
+            // checked again after it (below), which is what keeps every wake.
+            match self.rx.try_recv() {
+                Ok(item) => return Some(item),
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            // About to sleep: a busy-poll flag left set would let producers
+            // skip the wake this sleep depends on. Clearing it here (the same
+            // SeqCst clear as `set_busy_polling(false)`) happens before the
+            // re-check below, so `recv` can never hang on it.
+            if self.shared.busy_polling.load(Ordering::Relaxed) {
+                self.set_busy_polling(false);
+            }
             let notified = self.shared.notify.notified();
             tokio::pin!(notified);
             // Register BEFORE checking, so a push that lands after the check
             // wakes this waiter (see the module docs).
+            #[cfg(test)]
+            self.shared.registrations.fetch_add(1, Ordering::Relaxed);
             notified.as_mut().enable();
             match self.rx.try_recv() {
                 Ok(item) => return Some(item),
@@ -222,6 +275,38 @@ impl<T> FrameRingReceiver<T> {
             }
             notified.await;
         }
+    }
+
+    /// Declares that the consumer busy-polls with [`Self::try_recv`] and
+    /// never sleeps (`true`), or that it may sleep in [`Self::recv`] again
+    /// (`false`). Default `false`, which is the behaviour before this flag.
+    ///
+    /// While set, `try_send` skips the `Notify` wake: the reader pays no
+    /// waiter check and no cross-thread wake for a drain that is not asleep.
+    ///
+    /// # Why clearing it strands no frame
+    ///
+    /// A producer pushes (crossbeam's tail compare-and-swap, `SeqCst`), then
+    /// loads this flag (`SeqCst`). Clearing it is a `SeqCst` store, and the
+    /// consumer's next `try_recv` declares the ring empty only after a `SeqCst`
+    /// fence and a tail load (crossbeam-channel 0.5.17, `array.rs`
+    /// `start_recv`, pinned). If a producer still read the flag as set, its
+    /// load comes before the clear in the single total order of `SeqCst`
+    /// operations, so its tail update comes before that fence, and the tail
+    /// load sees the frame: the consumer takes it instead of sleeping. A
+    /// producer that reads the flag as clear wakes the consumer as before.
+    /// `recv` also clears the flag itself before it registers to sleep.
+    ///
+    /// O(1): one `SeqCst` store.
+    // WIRING-EXEMPT: called by the busy-poll drain (owner 2026-10-30, "Build it, test live on 2 cores"), built behind a default-off switch by the core-placement session; until then the flag stays false and nothing changes.
+    pub fn set_busy_polling(&self, on: bool) {
+        self.shared.busy_polling.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the consumer has declared it busy-polls. One load.
+    #[must_use]
+    pub fn is_busy_polling(&self) -> bool {
+        self.shared.busy_polling.load(Ordering::Relaxed)
     }
 
     /// The next item if one is queued now. O(1).
@@ -245,6 +330,7 @@ impl<T> FrameRingReceiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::time::Duration;
 
     #[tokio::test]
@@ -408,6 +494,281 @@ mod tests {
             }
         }
         assert_eq!(got, (0..1_000).collect::<Vec<_>>());
+    }
+
+    /// A waker that counts how many times it was woken.
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// ITEM DT1 (2026-10-30): while frames are queued the drain never touches
+    /// the `Notify`, so it takes no waiter lock, and a producer pushing at the
+    /// same time never finds it registered and never pays a waiter lock and a
+    /// task wake for a drain that is already running.
+    ///
+    /// Bite: before the fast path every `recv` called `enable()` first. With a
+    /// stored permit that consumed it; without one (every pop once the
+    /// producer below has finished) it took the waiter lock to register and
+    /// again to deregister on return, and a push landing in that window woke
+    /// this waker. `registrations` counts the `enable()` calls: the old `recv`
+    /// makes one per pop (300,000), the new one makes none while an item is
+    /// queued. Then, once the queue IS empty, the drain parks and the next push
+    /// wakes it exactly once.
+    #[test]
+    fn test_reader_wakes_the_drain_only_when_it_is_parked() {
+        const PREFILL: u64 = 400_000;
+        const CONCURRENT: u64 = 200_000;
+        const POPS: u64 = 300_000;
+        let (tx, mut rx) = frame_ring::<u64>(1 << 20);
+        for i in 0..PREFILL {
+            tx.try_send(i).expect("room");
+        }
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let producer = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for i in 0..CONCURRENT {
+                    tx.try_send(PREFILL + i).expect("room");
+                }
+            })
+        };
+        for expected in 0..POPS {
+            let mut fut = std::pin::pin!(rx.recv());
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(Some(v)) => assert_eq!(v, expected, "in order"),
+                other => panic!("an item was queued, got {other:?}"),
+            }
+        }
+        producer.join().expect("producer");
+        assert_eq!(
+            rx.shared.registrations.load(Ordering::Relaxed),
+            0,
+            "the drain registered on the Notify although frames were queued"
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a producer woke a drain that had frames queued"
+        );
+        // Drain the rest, then the drain parks: the next push wakes it once.
+        while rx.try_recv().is_some() {}
+        let mut fut = std::pin::pin!(rx.recv());
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "empty: the drain parks"
+        );
+        tx.try_send(7).expect("room");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "a parked drain is woken"
+        );
+        tx.try_send(8).expect("room");
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1, "wakes coalesce");
+        assert_eq!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Some(7)));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// ITEM DT1: with the fast path, no interleaving of producers and a
+        /// parking drain loses a wake: every item is received and the drain
+        /// ends. Producers push with random pauses so the drain parks and
+        /// wakes many times per case.
+        #[test]
+        fn proptest_frame_ring_sleeping_consumer_never_loses_a_wake(
+            producers in 1_u64..5,
+            per_producer in 1_u64..3_000,
+            pause_every in 1_u64..64,
+            pause_spins in 0_u32..20_000,
+            capacity in 1_usize..256,
+        ) {
+            // The drain runs on this thread (`block_on`); the producers are
+            // their own OS threads.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let (tx, mut rx) = frame_ring::<u64>(capacity);
+            let mut handles = Vec::new();
+            for p in 0..producers {
+                let tx = tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut sent = 0;
+                    while sent < per_producer {
+                        match tx.try_send(p * per_producer + sent) {
+                            Ok(()) => {
+                                sent += 1;
+                                if sent % pause_every == 0 {
+                                    for _ in 0..pause_spins {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                            Err(FrameRingTrySendError::Full(_)) => std::thread::yield_now(),
+                            Err(FrameRingTrySendError::Closed(_)) => panic!("receiver alive"),
+                        }
+                    }
+                }));
+            }
+            drop(tx);
+            let total = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut total = 0_u64;
+                    while rx.recv().await.is_some() {
+                        total += 1;
+                    }
+                    total
+                })
+                .await
+            });
+            for h in handles {
+                h.join().expect("producer");
+            }
+            proptest::prop_assert_eq!(total, Ok(producers * per_producer), "a lost wake hangs or drops");
+        }
+    }
+
+    /// Busy-poll flag (owner 2026-10-30): default off, so every push notifies
+    /// as before; while set, pushes skip the `Notify`; cleared, they notify
+    /// again. Nothing is lost either way.
+    #[test]
+    fn test_set_busy_polling_skips_the_wake_only_while_set() {
+        let (tx, mut rx) = frame_ring::<u32>(16);
+        assert!(!rx.is_busy_polling(), "default off: today's behaviour");
+        tx.try_send(1).expect("room");
+        assert_eq!(rx.shared.notifies.load(Ordering::Relaxed), 1);
+        rx.set_busy_polling(true);
+        assert!(rx.is_busy_polling());
+        for i in 2..=4 {
+            tx.try_send(i).expect("room");
+        }
+        assert_eq!(
+            rx.shared.notifies.load(Ordering::Relaxed),
+            1,
+            "a busy-polling drain is not notified"
+        );
+        rx.set_busy_polling(false);
+        tx.try_send(5).expect("room");
+        assert_eq!(rx.shared.notifies.load(Ordering::Relaxed), 2);
+        let got: Vec<u32> = std::iter::from_fn(|| rx.try_recv()).collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 5], "every frame, in order");
+    }
+
+    /// `recv` left with the flag set cannot hang: it clears the flag before
+    /// it registers to sleep, so the next push wakes it.
+    #[test]
+    fn test_is_busy_polling_reads_false_once_recv_parks() {
+        let (tx, mut rx) = frame_ring::<u32>(16);
+        rx.set_busy_polling(true);
+        let shared = Arc::clone(&rx.shared);
+        let busy_flag = &shared.busy_polling;
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(rx.recv());
+        assert!(fut.as_mut().poll(&mut cx).is_pending(), "empty: parks");
+        tx.try_send(9).expect("room");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the parked drain is woken"
+        );
+        assert_eq!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Some(9)));
+        assert!(!busy_flag.load(Ordering::Relaxed), "recv cleared the flag");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// The consumer switches between busy-polling (`try_recv` spin, flag
+        /// set) and sleeping in `recv` (flag cleared) at random while several
+        /// producers push with random pauses. A frame stranded by a skipped
+        /// wake would hang the sleeping phase into the timeout.
+        #[test]
+        fn proptest_busy_poll_switches_never_strand_a_frame(
+            producers in 1_u64..5,
+            per_producer in 1_u64..3_000,
+            pause_every in 1_u64..64,
+            pause_spins in 0_u32..20_000,
+            phase_len in 1_u64..200,
+            capacity in 1_usize..256,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let (tx, mut rx) = frame_ring::<u64>(capacity);
+            let mut handles = Vec::new();
+            for p in 0..producers {
+                let tx = tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut sent = 0;
+                    while sent < per_producer {
+                        match tx.try_send(p * per_producer + sent) {
+                            Ok(()) => {
+                                sent += 1;
+                                if sent % pause_every == 0 {
+                                    for _ in 0..pause_spins {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                            Err(FrameRingTrySendError::Full(_)) => std::thread::yield_now(),
+                            Err(FrameRingTrySendError::Closed(_)) => panic!("receiver alive"),
+                        }
+                    }
+                }));
+            }
+            drop(tx);
+            let total = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut total = 0_u64;
+                    let mut busy = false;
+                    let mut in_phase = 0_u64;
+                    loop {
+                        in_phase += 1;
+                        if in_phase >= phase_len {
+                            in_phase = 0;
+                            busy = !busy;
+                            rx.set_busy_polling(busy);
+                        }
+                        if busy {
+                            if rx.try_recv().is_some() {
+                                total += 1;
+                            } else if rx.shared.senders.load(Ordering::Acquire) == 0
+                                && rx.is_empty()
+                            {
+                                break;
+                            } else {
+                                std::hint::spin_loop();
+                            }
+                        } else {
+                            rx.set_busy_polling(false);
+                            match rx.recv().await {
+                                Some(_) => total += 1,
+                                None => break,
+                            }
+                        }
+                    }
+                    total
+                })
+                .await
+            });
+            for h in handles {
+                h.join().expect("producer");
+            }
+            proptest::prop_assert_eq!(total, Ok(producers * per_producer), "a stranded frame hangs or drops");
+        }
     }
 
     /// A full backlog must not hold a current-thread runtime: the cooperative
