@@ -101,6 +101,12 @@
 //!   happened: its instruments are subscribed again once. If it had in fact
 //!   not happened, the socket's duplicate check drops them and logs its own
 //!   WS-GAP-02 line.
+//! - Putting back what a round took off is one all-or-nothing command (the
+//!   socket checks its cap on the whole change). If another change on the
+//!   same socket takes even one of the freed slots in between, the socket
+//!   refuses the whole command, and after three attempts every one of them is
+//!   reported lost (coded `error!`), not only the one that no longer fits.
+//!   They return at the next attach or redial.
 //! - The lane must call [`SubscribeReconcile::forget`] for any instrument it
 //!   deliberately removes from a socket, or a round would subscribe it again.
 //! - Local `/metrics` only: no alarm, no page, no CloudWatch metric.
@@ -1026,9 +1032,12 @@ where
         }
     };
     let mut resent = removed_len.saturating_sub(lost.len());
+    // A refusal is counted here; a missing answer is counted inside the helper.
+    let mut uncertain_refused = false;
     let uncertain = match subscribe_with_retries(tx, half.unknown).await {
         SubscribeEnd::Done => Vec::new(),
         SubscribeEnd::Remaining(remaining) => {
+            uncertain_refused = true;
             counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "unknown")
                 .increment(remaining.len() as u64);
             remaining
@@ -1086,6 +1095,9 @@ where
         counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "lost").increment(lost.len() as u64);
         RoundOutcome::Lost(lost)
     } else if !uncertain.is_empty() {
+        if uncertain_refused {
+            count_round("subscribe_unknown");
+        }
         RoundOutcome::Unknown(uncertain)
     } else {
         count_round("resubscribed");
