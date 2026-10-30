@@ -8773,7 +8773,7 @@ pub fn drain_main_feed_frame(
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
-                let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);
+                let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);
                 // Delivery lag, per SOCKET — see the note above the spot-price
                 // arm for why it now sits after the fold. Only packet types
                 // that carry an LTT reach this arm (OI, PrevClose and
@@ -8794,7 +8794,7 @@ pub fn drain_main_feed_frame(
                         repeat_quote: true, ..
                     } => record_ws_lag_repeat_excluded(),
                     IngestOutcome::Folded { .. } => {
-                        record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                        record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
                         // frame (`u8::MAX`) carries its replay time.
                         if frame.connection_index != u8::MAX {
@@ -19838,13 +19838,13 @@ mod tests {
         let src = include_str!("dhan_feed_stack.rs");
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let fold = prod
-            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let excluded = prod
             .find("=> record_ws_lag_repeat_excluded(),")
             .expect("the drain must count repeats as excluded");
         let measured = prod
-            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
             .expect("the drain must still record real lag");
         assert!(
             fold < excluded && fold < measured,
@@ -19878,14 +19878,14 @@ mod tests {
 
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let fold = prod
-            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let arm = &prod[fold..];
         let folded_arm = arm
             .find("IngestOutcome::Folded { .. } => {")
             .expect("lag must be recorded inside the accepted-trade arm");
         let measured = arm
-            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
             .expect("the drain must still record real lag");
         let other = arm
             .find("_ => record_ws_lag_not_a_trade_excluded(),")
