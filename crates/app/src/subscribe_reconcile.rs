@@ -52,8 +52,10 @@
 //!   confirmed-silence close, trading days, the same clock the frame-silence
 //!   redials read.
 //! - The whole feed must be delivering NOW: at least one expected instrument
-//!   reads `Live` or `Warming`. An instrument that ticked earlier and has gone
-//!   quiet (`Exceeded`) does not count, so a halt is not a partial subscribe.
+//!   reads `Live`, or `Warming` with its quiet stretch inside the expected gap
+//!   (`Warming` alone never looks at how long it has been quiet). An
+//!   instrument that ticked earlier and has gone quiet (`Exceeded`, or a
+//!   stale `Warming`) does not count, so a halt is not a partial subscribe.
 //! - The socket must be delivering now for at least one other expected
 //!   instrument; a socket where nothing is live is the frame-silence redial's
 //!   job, counted here as `skipped_silent_socket` once per episode.
@@ -237,7 +239,8 @@ struct Socket {
     last_round_at: Option<Instant>,
     /// A round for this socket is queued or running.
     in_flight: bool,
-    /// Expected instruments delivering now (`Live` or `Warming`) this sweep.
+    /// Expected instruments delivering now (`Live`, or a recent `Warming`) this
+    /// sweep.
     delivering: u32,
     candidates: Vec<SubscribeInstrument>,
     silent_reported: bool,
@@ -471,8 +474,19 @@ impl ReconcileSweep<'_> {
         };
         match report.verdict {
             SilenceVerdict::NeverTicked => {}
-            SilenceVerdict::Live | SilenceVerdict::Warming => {
+            SilenceVerdict::Live => {
                 socket.delivering = socket.delivering.saturating_add(1);
+                mark_recovered(entry);
+                return;
+            }
+            // Ticked, but too few gaps for a baseline. `Warming` never looks at
+            // how long it has been quiet, so a thin contract that ticked at
+            // 09:05 still reads `Warming` hours later: it counts as delivering
+            // only while its quiet stretch is inside the expected gap.
+            SilenceVerdict::Warming => {
+                if report.silent_millis <= report.expected_millis {
+                    socket.delivering = socket.delivering.saturating_add(1);
+                }
                 mark_recovered(entry);
                 return;
             }
@@ -1056,6 +1070,18 @@ where
     counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "resent").increment(resent as u64);
     finished(&refund);
     if !lost.is_empty() {
+        if !uncertain.is_empty() {
+            // The outcome carries the lost ones; name the uncertain ones here
+            // so none is off the socket without a report.
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "subscribe_reconcile_unknown",
+                instruments = uncertain.len(),
+                first = %NamedInstruments(&uncertain),
+                "subscribe reconcile: the socket did not take these back in the same round \
+                 that lost others - they may be off the socket; the next sweep judges them again"
+            );
+        }
         count_round("lost");
         counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "lost").increment(lost.len() as u64);
         RoundOutcome::Lost(lost)
@@ -1500,7 +1526,10 @@ mod tests {
         book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
         let mut at = t0 + delta();
         let mut spent = 0;
-        for _ in 0..5 {
+        // Exactly the three rounds, so the rollover sweep below is the first
+        // one where the last round has settled: it WOULD report instrument 2
+        // exhausted, and only the rollover stops it.
+        for _ in 0..RECONCILE_MAX_ROUNDS {
             one_sweep(&book, at, IN_SESSION, &[1], &[2]);
             spent += finish_queued(&book, &mut rx, at);
             at += delta();
@@ -1907,6 +1936,89 @@ mod tests {
         let (held, _, _) = handle.await.expect("guard socket");
         assert_eq!(held, sis(&[1, 2, 4, 9, 10]), "nothing left the socket");
     }
+
+    /// Counts `warn!` events on the thread it is the default subscriber of.
+    struct WarnEvents(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Regression: 2026-10-30 (final review, third pass) — when phase one lost
+    // instruments and phase two left others uncertain, the round returned
+    // Lost with the lost ones only and nothing named the uncertain ones.
+    #[tokio::test]
+    async fn test_regression_uncertain_ones_are_named_when_others_are_lost() {
+        use tracing_subscriber::layer::SubscriberExt;
+        tokio::time::pause();
+        let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(WarnEvents(Arc::clone(&warns))),
+        );
+        let refused = |reason| Some(ResubscribeOutcome::Refused { reason });
+        let (tx, handle) = fake_socket(vec![
+            // The unsubscribe of [5, 6] is refused whole, so it is split.
+            refused(ResubscribeOutcome::REASON_NOT_HELD),
+            // One half leaves the socket; the other is never answered.
+            Some(ResubscribeOutcome::Applied),
+            None,
+            // Phase one (the one that left) finds the slot taken, three times.
+            refused(ResubscribeOutcome::REASON_OVER_CAP),
+            refused(ResubscribeOutcome::REASON_OVER_CAP),
+            refused(ResubscribeOutcome::REASON_OVER_CAP),
+            // Phase two (the unanswered one) is refused too.
+            refused(ResubscribeOutcome::REASON_OVER_CAP),
+            refused(ResubscribeOutcome::REASON_OVER_CAP),
+            refused(ResubscribeOutcome::REASON_OVER_CAP),
+        ]);
+        let (outcome, refunded) = run_round(tx, &[5, 6]).await;
+        let RoundOutcome::Lost(lost) = outcome else {
+            panic!("expected Lost, got {outcome:?}");
+        };
+        assert_eq!(lost.len(), 1, "only the one that left is lost");
+        assert!(refunded.is_empty());
+        assert_eq!(
+            warns.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the uncertain one is named in its own warn"
+        );
+        assert_eq!(handle.await.expect("fake").len(), 9);
+    }
+
+    // Regression: 2026-10-30 (final review, third pass) — `Warming` never
+    // looks at how long an instrument has been quiet, so a thin contract that
+    // ticked at 09:05 counted as "delivering" hours later and let a round
+    // through during a halt.
+    #[test]
+    fn test_regression_a_stale_warming_instrument_is_not_delivering() {
+        let judge = |silent_millis: u64| {
+            let (book, _rx) = SubscribeReconcile::new(true);
+            let (tx, _sock) = socket();
+            let t0 = Instant::now();
+            book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
+            let mut sweep = book.sweep_at(t0 + delta());
+            sweep.note(&SilenceReport {
+                silent_millis,
+                expected_millis: DEFAULT_WARMING_EXPECTED_MILLIS,
+                ..report(1, SilenceVerdict::Warming)
+            });
+            sweep.note(&report(2, SilenceVerdict::NeverTicked));
+            sweep.finish_at(IN_SESSION, DAY).dispatched
+        };
+        assert_eq!(judge(4 * 3_600_000), 0, "quiet for 4 h: not delivering");
+        assert_eq!(judge(10_000), 1, "ticked 10 s ago: delivering");
+    }
+
+    /// The detector's silence floor, the least `expected_millis` can be.
+    const DEFAULT_WARMING_EXPECTED_MILLIS: u64 = 30_000;
 
     #[tokio::test]
     async fn test_execute_round_split_stops_at_the_command_cap_and_refunds_the_rest() {
