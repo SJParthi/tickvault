@@ -528,8 +528,22 @@ pub(crate) fn in_continuous_trading(minute_start: i64) -> bool {
         minute_start,
         tickvault_common::constants::MARKET_OPEN_IST_NANOS / NANOS_PER_SEC,
     );
-    let close = ist_day_at(minute_start, CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST);
+    let close = ist_day_at(minute_start, continuous_trading_close_secs_of_day());
     (open..close).contains(&minute_start)
+}
+
+/// End of continuous trading as seconds of the IST day, read from the shared
+/// `MARKET_CLOSE_TIME_IST_EXCLUSIVE` ("15:30:00") so the two cannot drift;
+/// [`CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST`] only if that text ever stops
+/// parsing (a test pins that it parses to the same value).
+pub(crate) fn continuous_trading_close_secs_of_day() -> i64 {
+    chrono::NaiveTime::parse_from_str(
+        tickvault_common::constants::MARKET_CLOSE_TIME_IST_EXCLUSIVE,
+        "%H:%M:%S",
+    )
+    .map_or(CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST, |t| {
+        i64::from(chrono::Timelike::num_seconds_from_midnight(&t))
+    })
 }
 
 /// The verdict on the trade counts. Grey when the counts are unreadable, the
@@ -1674,7 +1688,11 @@ mod tests {
     }
 
     #[test]
-    fn test_in_continuous_trading_edges_and_close_constant() {
+    fn test_in_continuous_trading_edges_and_continuous_trading_close_secs_of_day() {
+        assert_eq!(
+            continuous_trading_close_secs_of_day(),
+            CONTINUOUS_TRADING_CLOSE_SECS_OF_DAY_IST
+        );
         let day = ist_day_at(IST_0930_25, 0);
         assert!(!in_continuous_trading(day + 9 * 3_600 + 14 * 60));
         assert!(in_continuous_trading(day + 9 * 3_600 + 15 * 60));
