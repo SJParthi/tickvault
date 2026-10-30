@@ -80,7 +80,7 @@
 //! flush faster, and it does not remove backpressure; it arms the existing
 //! relief valve early enough to matter instead of after the volume is full.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Free-space fraction below which inline depth stops being captured.
 pub const SHED_INLINE_DEPTH_BELOW_FREE: f64 = 0.15;
@@ -303,6 +303,7 @@ pub fn publish_wal_apply_lag_max(max_lag: i64, suspended_tables: usize) {
     WAL_APPLY_LAG_MAX.store(u64::try_from(max_lag).unwrap_or(0), Ordering::Relaxed);
     let suspended = u64::try_from(suspended_tables).unwrap_or(WAL_APPLY_LAG_UNKNOWN);
     WAL_SUSPENDED_TABLES.store(suspended, Ordering::Relaxed);
+    WAL_APPLY_LAG_PUBLISHED_AT_UNIX_SECS.store(unix_now_secs(), Ordering::Relaxed);
 }
 
 /// Marks both readings unknown. Called when the watcher's probe goes blind.
@@ -310,6 +311,28 @@ pub fn publish_wal_apply_lag_max(max_lag: i64, suspended_tables: usize) {
 pub fn publish_wal_apply_lag_unknown() {
     WAL_APPLY_LAG_MAX.store(WAL_APPLY_LAG_UNKNOWN, Ordering::Relaxed);
     WAL_SUSPENDED_TABLES.store(WAL_APPLY_LAG_UNKNOWN, Ordering::Relaxed);
+    WAL_APPLY_LAG_PUBLISHED_AT_UNIX_SECS.store(0, Ordering::Relaxed);
+}
+
+/// Wall-clock second (Unix) of the last [`publish_wal_apply_lag_max`], 0 when
+/// none or withdrawn. The watcher keeps its last reading through up to four
+/// failed polls before it goes blind, so a reader that must not show a stale
+/// reading as current (the operator dashboard) checks this age. One store per
+/// watcher poll (60 s), cold.
+static WAL_APPLY_LAG_PUBLISHED_AT_UNIX_SECS: AtomicI64 = AtomicI64::new(0);
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// When the current apply-lag reading was published (Unix seconds), `None`
+/// when there is none. O(1).
+#[must_use]
+pub fn wal_apply_lag_published_at_unix_secs() -> Option<i64> {
+    let v = WAL_APPLY_LAG_PUBLISHED_AT_UNIX_SECS.load(Ordering::Relaxed);
+    (v > 0).then_some(v)
 }
 
 /// The largest apply lag at the last parsed poll, `None` when unknown. O(1).
@@ -1786,9 +1809,23 @@ mod tests {
         // A negative lag is never produced; if it were, it reads as caught up.
         publish_wal_apply_lag_max(-5, 0);
         assert_eq!(wal_apply_lag_max(), Some(0));
-        // A blind probe withdraws both readings.
+        // Every publish stamps when it was read.
+        assert!(wal_apply_lag_published_at_unix_secs().is_some_and(|s| s > 0));
+        // A blind probe withdraws both readings and the stamp.
         publish_wal_apply_lag_unknown();
         assert_eq!(wal_apply_lag_max(), None);
         assert_eq!(wal_suspended_tables(), None);
+        assert_eq!(wal_apply_lag_published_at_unix_secs(), None);
+    }
+
+    #[test]
+    fn test_wal_apply_lag_published_at_unix_secs_is_never_zero_or_negative() {
+        // The globals belong to the test above; this one only checks the
+        // sentinel never leaks out as a time, whatever that test is doing.
+        assert!(wal_apply_lag_published_at_unix_secs().is_none_or(|s| s > 0));
+        assert!(
+            unix_now_secs() > 1_700_000_000,
+            "the wall clock reads Unix seconds"
+        );
     }
 }

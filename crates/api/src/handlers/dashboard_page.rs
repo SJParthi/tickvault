@@ -11,12 +11,14 @@
 //! - QuestDB table row counts (`/api/stats`),
 //! - overall app health + subsystems (`/health`).
 //!
-//! It is a pure VIEW that client-side fetches the EXISTING JSON endpoints —
-//! `GET /health`, `GET /api/feeds`, `GET /api/feeds/health`, `GET /api/stats` —
-//! and renders them with ~5s auto-refresh. It adds NO new backend endpoint: the
-//! Groww/Dhan last-error reason, tick counts, candle counts and DB stats are all
-//! already first-class fields on those endpoints (so the page shows REAL values,
-//! never hardcoded/hallucinated numbers).
+//! It is a pure VIEW that client-side fetches the JSON endpoints —
+//! `GET /health`, `GET /api/feeds`, `GET /api/feeds/health`, `GET /api/stats`,
+//! and (owner 2026-10-30) the bearer-gated `GET /api/debug/speed-health` —
+//! and renders them with ~5s auto-refresh. The page shows REAL values, never
+//! hardcoded numbers. The speed-and-health panel is painted generically: the
+//! server decides every label, number and green / amber / red / grey verdict
+//! (`handlers::speed_health`, where it is tested), so the page's script stays
+//! inside the browser-surface guard's size ceilings.
 //!
 //! The HTML shell carries no secrets, so it is a PUBLIC route; every data read it
 //! performs goes through the same `/api/*` endpoints as `/feeds`. The page keeps
@@ -109,7 +111,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
   <h1>TickVault — Operator Dashboard</h1>
-  <p class="sub">Everything at a glance — feeds, live ticks, candles, database and
+  <p class="sub">Everything at a glance — feeds, live ticks, candles, database, speed and
      overall health. Updates automatically every few seconds.</p>
 
   <div class="token-row">
@@ -143,6 +145,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </table></div>
   </div>
 
+  <h2>Speed and health</h2>
+  <p class="sub">How fast each step runs, ticks saved per minute, the daily tick check,
+     backlog, connections and candle overflow. Green is good, amber needs a look,
+     red needs action, grey means no verdict.</p>
+  <div id="speed"></div>
+
   <div id="status"></div>
 
   <div class="links">
@@ -151,13 +159,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
 <script>
-// Every value rendered below is built with createElement + textContent (never
-// innerHTML) so no fetched value can ever be interpreted as markup — XSS-proof by
-// construction even though some strings (feed reason) come from the server.
+// Every fetched value is rendered with createElement + textContent, never
+// innerHTML, so nothing from the server can become markup.
 const tokenEl   = document.getElementById("token");
 const overallEl = document.getElementById("overall");
 const feedsEl   = document.getElementById("feeds");
 const statsEl   = document.getElementById("stats");
+const speedEl   = document.getElementById("speed");
 const statusEl  = document.getElementById("status");
 
 tokenEl.value = sessionStorage.getItem("tv_api_token") || "";
@@ -177,19 +185,11 @@ function setStatus(msg, cls) {
   statusEl.className = cls || "";
 }
 
-// Emoji status, operator-readable. No library names, no file paths, no versions.
-function emojiFor(verdict) {
-  switch (verdict) {
-    case "ok":       return "✅"; // green check
-    case "degraded": return "⚠️"; // warning
-    case "down":     return "🆘"; // SOS
-    case "disabled": return "⭕"; // off circle
-    default:         return "❔"; // unknown
-  }
-}
+const VERDICT_EMOJI = { ok: "✅", degraded: "⚠️", down: "🆘", disabled: "⭕" };
+function emojiFor(verdict) { return VERDICT_EMOJI[verdict] || "❔"; }
+const LIGHT_EMOJI = { green: "🟢", amber: "🟠", red: "🔴" };
 
-// Best-effort fetch helper: returns parsed JSON or null on any failure, so one
-// dead endpoint degrades a single panel to "—" instead of breaking the page.
+// Returns parsed JSON or null, so one dead endpoint blanks one panel only.
 async function getJson(url) {
   try {
     const res = await fetch(url, { headers: authHeaders() });
@@ -201,25 +201,41 @@ async function getJson(url) {
   }
 }
 
-// SP6-style in-flight guard so the 5s auto-refresh + a manual Save can't overlap.
+// Gated reads: a 401 for a request sent after Save stops them until Save.
+let denied = false, gen = 0;
+async function getGated(url) {
+  if (denied) return null;
+  const g = gen;
+  try {
+    const res = await fetch(url, { headers: authHeaders() });
+    if (res.status === 401) { if (g === gen) { denied = true; setStatus("Unauthorized — enter your API token above.", "err"); } return null; }
+    return res.ok ? await res.json() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// In-flight guard: the 5s auto-refresh and a manual Save never overlap.
 let refreshing = false;
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
-    const [health, feeds, feedsHealth, stats, fno] = await Promise.all([
+    const [health, feeds, feedsHealth, stats, fno, speed] = await Promise.all([
       getJson("/health"),
       getJson("/api/feeds"),
       getJson("/api/feeds/health"),
       getJson("/api/stats"),
-      getJson("/api/fno-stocks"),
+      getGated("/api/fno-stocks"),
+      getGated("/api/debug/speed-health"),
     ]);
     renderOverall(health);
     renderFeeds(feeds, feedsHealth);
     renderStats(stats);
     fnoData = fno;
     renderFno();
-    setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
+    renderSpeed(speed);
+    if (!denied) setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
   } catch (e) {
     setStatus("Network error refreshing the dashboard.", "err");
   } finally {
@@ -227,40 +243,34 @@ async function refresh() {
   }
 }
 
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
 function appendKV(parent, label, value) {
-  const span = document.createElement("span");
-  const b = document.createElement("b");
-  b.textContent = value;
+  const span = el("span");
   span.appendChild(document.createTextNode(label + ": "));
-  span.appendChild(b);
+  span.appendChild(el("b", "", value));
   parent.appendChild(span);
+}
+
+function cardHead(parent, nameText, verdictText, verdictCls) {
+  const head = el("div", "head");
+  head.appendChild(el("div", "name", nameText));
+  head.appendChild(el("div", "verdict " + (verdictCls || ""), verdictText));
+  parent.appendChild(head);
 }
 
 function renderOverall(health) {
   overallEl.replaceChildren();
-  const head = document.createElement("div");
-  head.className = "head";
-  const name = document.createElement("div");
-  name.className = "name";
-  name.textContent = "Application";
-  const verdict = document.createElement("div");
-  verdict.className = "verdict";
-  if (!health) {
-    verdict.textContent = "❔ could not read health";
-    head.appendChild(name); head.appendChild(verdict);
-    overallEl.appendChild(head);
-    return;
-  }
+  if (!health) { cardHead(overallEl, "Application", "❔ could not read health"); return; }
   const healthy = health.status === "healthy";
-  verdict.textContent = (healthy ? "✅ " : "⚠️ ") + health.status;
-  verdict.className = "verdict " + (healthy ? "ok" : "warn");
-  head.appendChild(name); head.appendChild(verdict);
-  overallEl.appendChild(head);
-
-  // Subsystems — one short labelled chip per subsystem, real status text.
+  cardHead(overallEl, "Application", (healthy ? "✅ " : "⚠️ ") + health.status, healthy ? "ok" : "warn");
   const sub = health.subsystems || {};
-  const row = document.createElement("div");
-  row.className = "subsys metrics";
+  const row = el("div", "subsys metrics");
   for (const key of ["websocket", "order_update", "questdb", "token", "pipeline", "tick_persistence"]) {
     const s = sub[key];
     if (!s) continue;
@@ -272,48 +282,24 @@ function renderOverall(health) {
 function renderFeeds(feeds, feedsHealth) {
   feedsEl.replaceChildren();
   feeds = feeds || {};
-  feedsHealth = feedsHealth || {};
-  const rows = (feedsHealth.feeds || []);
+  const rows = ((feedsHealth || {}).feeds || []);
   if (rows.length === 0) {
-    const card = document.createElement("div");
-    card.className = "card";
-    card.textContent = "— could not read feed health.";
-    feedsEl.appendChild(card);
+    feedsEl.appendChild(el("div", "card", "— could not read feed health."));
     return;
   }
   for (const hv of rows) {
     const key = hv.feed;
-    const card = document.createElement("div");
-    card.className = "card";
-
-    const head = document.createElement("div");
-    head.className = "head";
-    const name = document.createElement("div");
-    name.className = "name";
-    // ON/OFF from /api/feeds (enabled flag), health verdict from /api/feeds/health.
+    const card = el("div", "card");
+    // ON/OFF from /api/feeds, the verdict from /api/feeds/health.
     const enabled = !!feeds[key + "_enabled"];
-    name.textContent = key + " — " + (enabled ? "ON" : "OFF");
-    const verdict = document.createElement("div");
-    verdict.className = "verdict";
-    verdict.textContent = emojiFor(hv.verdict) + " " + (hv.verdict || "unknown").toUpperCase();
-    head.appendChild(name); head.appendChild(verdict);
-    card.appendChild(head);
-
-    // Plain-English last-error / status reason — prominent for the bad cases
-    // (esp. Groww connected-but-0-ticks or an auth/entitlement rejection).
+    cardHead(card, key + " — " + (enabled ? "ON" : "OFF"),
+      emojiFor(hv.verdict) + " " + (hv.verdict || "unknown").toUpperCase());
     if (hv.reason) {
-      const reason = document.createElement("div");
       const bad = (hv.verdict === "down") || hv.auth_rejected;
       const warn = (hv.verdict === "degraded");
-      reason.className = "reason" + (bad ? " bad" : (warn ? " warn" : ""));
-      reason.textContent = hv.reason;
-      card.appendChild(reason);
+      card.appendChild(el("div", "reason" + (bad ? " bad" : (warn ? " warn" : "")), hv.reason));
     }
-
-    // Live tick counts, candles, last tick time, subscribe/decode proof — real
-    // registry-backed numbers (never hardcoded).
-    const m = document.createElement("div");
-    m.className = "metrics";
+    const m = el("div", "metrics");
     appendKV(m, "connected", hv.connected ? "yes" : "no");
     appendKV(m, "ticks", String(hv.ticks_total || 0));
     if (hv.last_tick_age_secs === null || hv.last_tick_age_secs === undefined) {
@@ -327,53 +313,26 @@ function renderFeeds(feeds, feedsHealth) {
     if ((hv.decoded_dropped || 0) > 0) appendKV(m, "unmatched", String(hv.decoded_dropped));
     if ((hv.drops_total || 0) > 0) appendKV(m, "dropped", String(hv.drops_total));
     card.appendChild(m);
-
     feedsEl.appendChild(card);
   }
 }
 
+function tile(label, value, sub) {
+  const cell = el("div", "stat");
+  cell.appendChild(el("div", "num", value));
+  cell.appendChild(el("div", "lbl", label));
+  if (sub) cell.appendChild(el("div", "lbl", sub));
+  return cell;
+}
+
 function renderStats(stats) {
   statsEl.replaceChildren();
-  if (!stats) {
-    statsEl.textContent = "— could not read database stats.";
-    return;
-  }
-  const head = document.createElement("div");
-  head.className = "head";
-  const name = document.createElement("div");
-  name.className = "name";
-  name.textContent = "QuestDB";
-  const verdict = document.createElement("div");
-  verdict.className = "verdict " + (stats.questdb_reachable ? "ok" : "warn");
-  verdict.textContent = stats.questdb_reachable ? "✅ reachable" : "⚠️ unreachable";
-  head.appendChild(name); head.appendChild(verdict);
-  statsEl.appendChild(head);
-
-  const grid = document.createElement("div");
-  grid.className = "grid";
+  if (!stats) { statsEl.textContent = "— could not read database stats."; return; }
+  cardHead(statsEl, "QuestDB", stats.questdb_reachable ? "✅ reachable" : "⚠️ unreachable",
+    stats.questdb_reachable ? "ok" : "warn");
+  const grid = el("div", "grid");
   grid.style.marginTop = "10px";
-  // ticks / underlyings / derivatives (contracts) / indices tiles RETIRED
-  // 2026-07-19 (BATCH-5): the `ticks` writer was deleted 2026-07-17 and the
-  // instrument-master tables (fno_underlyings / derivative_contracts /
-  // subscribed_indices) are in the boot-time RETIRED_QUESTDB_TABLES DROP list,
-  // so all four rendered a permanently-0 placeholder (false-OK). Only the live
-  // `tables` (SHOW TABLES) count remains. Live per-feed tick/candle counts are
-  // still shown in the per-feed section above (hv.ticks_total / hv.candles_total).
-  const cells = [
-    ["tables", stats.tables],
-  ];
-  for (const [lbl, val] of cells) {
-    const cell = document.createElement("div");
-    cell.className = "stat";
-    const num = document.createElement("div");
-    num.className = "num";
-    num.textContent = String(val === null || val === undefined ? 0 : val);
-    const l = document.createElement("div");
-    l.className = "lbl";
-    l.textContent = lbl;
-    cell.appendChild(num); cell.appendChild(l);
-    grid.appendChild(cell);
-  }
+  grid.appendChild(tile("tables", String(stats.tables === null || stats.tables === undefined ? 0 : stats.tables)));
   statsEl.appendChild(grid);
 }
 
@@ -440,15 +399,38 @@ document.getElementById("fno-sort").addEventListener("click", (e) => {
   renderFno();
 });
 
+// Speed and health: the server decides every label, number and colour.
+function renderSpeed(speed) {
+  speedEl.replaceChildren();
+  if (!speed || !speed.sections) {
+    speedEl.appendChild(el("div", "card", denied || !tokenEl.value.trim()
+      ? "— enter the API token above and press Save."
+      : "— could not read speed and health."));
+    return;
+  }
+  for (const s of speed.sections) {
+    const card = el("div", "card");
+    card.appendChild(el("div", "name", s.title));
+    if (s.note) card.appendChild(el("div", "reason", s.note));
+    const grid = el("div", "grid");
+    grid.style.marginTop = "10px";
+    for (const t of (s.tiles || [])) {
+      grid.appendChild(tile(t.label, (LIGHT_EMOJI[t.status] || "⚪") + " " + t.value, t.detail));
+    }
+    card.appendChild(grid);
+    speedEl.appendChild(card);
+  }
+}
+
 document.getElementById("save").addEventListener("click", () => {
+  denied = false;
+  gen++;
   sessionStorage.setItem("tv_api_token", tokenEl.value.trim());
   refresh();
 });
 
 refresh();
-// Auto-refresh every 5s so the operator watches everything live. Skip polling when
-// the tab is hidden (no needless load on a backgrounded tab); a manual Save still
-// refreshes immediately.
+// Every 5s; skipped while the tab is hidden. Save still refreshes at once.
 setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 </script>
 </body>
@@ -521,12 +503,14 @@ mod tests {
         // ALL the endpoints it depends on. Re-uses existing endpoints — there is
         // deliberately NO /api/dashboard aggregate; /api/fno-stocks (2026-10-30)
         // feeds only the F&O stocks section.
+        // /api/debug/speed-health (2026-10-30) feeds only the speed panel.
         for endpoint in [
             "/health",
             "/api/feeds",
             "/api/feeds/health",
             "/api/stats",
             "/api/fno-stocks",
+            "/api/debug/speed-health",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(endpoint),
@@ -598,6 +582,60 @@ mod tests {
             DASHBOARD_HTML.contains("auth_rejected"),
             "page highlights an auth/entitlement rejection"
         );
+    }
+
+    #[test]
+    fn test_dashboard_page_paints_the_speed_panel_from_server_verdicts() {
+        // Owner 2026-10-30: the speed and health numbers appear on this page.
+        // The page must not compute verdicts itself: it reads each tile's
+        // `status` (green / amber / red, anything else grey) as sent.
+        for marker in [
+            "Speed and health",
+            "id=\"speed\"",
+            "renderSpeed(speed)",
+            "speed.sections",
+            "t.status",
+            "t.detail",
+            "green: \"🟢\"",
+            "amber: \"🟠\"",
+            "red: \"🔴\"",
+            "\"⚪\"",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(marker),
+                "speed panel marker missing: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal() {
+        // Every 401 on a bearer-gated route counts toward the brute-force
+        // page (Sum >= 25 per 5 min). A tab with no token, or a stale one,
+        // must not poll any of them every 5 s: the first 401 stops every
+        // gated read until Save (with auth off the read answers 200, so an
+        // empty token box is not a reason to skip it). A 401 for a request
+        // sent before the last Save does not lock the new token out. Both
+        // gated routes the page reads go through the one guarded helper.
+        for marker in [
+            "  if (denied) return null;\n  const g = gen;",
+            "if (res.status === 401) { if (g === gen) { denied = true; setStatus(\"Unauthorized — enter your API token above.\", \"err\"); } return null; }",
+            "  denied = false;\n  gen++;\n  sessionStorage.setItem",
+            "if (!denied) setStatus(\"Updated \"",
+            "getGated(\"/api/fno-stocks\"),",
+            "getGated(\"/api/debug/speed-health\"),",
+        ] {
+            assert!(DASHBOARD_HTML.contains(marker), "missing: {marker}");
+        }
+        // Only two fetch sites exist (the open getJson and the guarded
+        // getGated), and neither gated route goes through the open one.
+        assert_eq!(DASHBOARD_HTML.matches("fetch(").count(), 2);
+        for gated in ["/api/fno-stocks", "/api/debug/speed-health"] {
+            assert!(
+                !DASHBOARD_HTML.contains(&format!("getJson(\"{gated}\")")),
+                "{gated} must be fetched only through the token-guarded helper"
+            );
+        }
     }
 
     #[test]
