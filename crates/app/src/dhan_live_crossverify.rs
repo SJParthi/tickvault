@@ -6092,6 +6092,34 @@ mod tests {
         }
     }
 
+    /// Plan item 51e: full coverage needs a known record and every planned
+    /// minute covered.
+    #[test]
+    fn test_is_full_needs_a_known_record_and_every_minute() {
+        let full = XverifyCoverage {
+            planned_instrument_minutes: 385,
+            covered_instrument_minutes: 385,
+            known: true,
+            index_fallback_day: false,
+        };
+        assert!(full.is_full());
+        assert!(
+            !XverifyCoverage {
+                known: false,
+                ..full
+            }
+            .is_full()
+        );
+        assert!(
+            !XverifyCoverage {
+                covered_instrument_minutes: 384,
+                ..full
+            }
+            .is_full()
+        );
+        assert!(XverifyCoverage::default().is_full() == false);
+    }
+
     /// Plan item 51f (§12.15.14): only `clean` is ever downgraded, and only to
     /// `partial`; `diverged` is never touched, over every coverage shape.
     #[test]

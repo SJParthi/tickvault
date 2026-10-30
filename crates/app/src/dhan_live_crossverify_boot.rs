@@ -6310,7 +6310,7 @@ mod tests {
     /// 51e: with no record the boot set is checked and coverage is unknown;
     /// F&O instruments are counted as untargetable in both paths.
     #[test]
-    fn test_no_record_checks_the_boot_set_with_coverage_unknown() {
+    fn test_targets_from_day_record_without_a_record_checks_the_boot_set() {
         let boot = [
             spot(13, ExchangeSegment::IdxI),
             spot(52_175, ExchangeSegment::NseFno),
@@ -6391,7 +6391,7 @@ mod tests {
 
     /// 51f: the coverage failures are terminal, every other one is not.
     #[test]
-    fn test_only_the_coverage_failures_are_terminal() {
+    fn test_is_terminal_only_for_the_coverage_failures() {
         let terminal = [
             AttemptFailure::CoverageShort,
             AttemptFailure::CoverageUnknown,
@@ -6477,6 +6477,17 @@ mod tests {
         assert!(!refused.contains(&yesterday), "refused days are not re-run");
     }
 
+    /// 51g: a past day's worst case is every attempt at its worst plus the
+    /// sleeps between them.
+    #[test]
+    fn test_past_day_worst_case_secs_is_every_attempt_and_sleep() {
+        assert_eq!(
+            past_day_worst_case_secs(600),
+            4 * attempt_max_secs(600) + 3 * XVERIFY_RETRY_INTERVAL_SECS
+        );
+        assert_eq!(past_day_worst_case_secs(u64::MAX), u64::MAX);
+    }
+
     /// 51g: before today's run a past day starts only when its worst case
     /// ends by 15:41; after it, always.
     #[test]
@@ -6500,7 +6511,7 @@ mod tests {
     /// 51g: the supervisor pages only on a trading day, when the worker
     /// started in time, and when nothing reported today.
     #[test]
-    fn test_supervisor_fires_only_without_a_worker_report() {
+    fn test_supervisor_should_page_only_without_a_worker_report() {
         for trading in [false, true] {
             for in_time in [false, true] {
                 for reported in [false, true] {

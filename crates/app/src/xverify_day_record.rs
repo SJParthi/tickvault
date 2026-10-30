@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_keys_on_the_composite_identity() {
+    fn test_first_secs_of_day_keys_on_the_composite_identity() {
         let mut r = SpotDayRecord::new(day());
         let idx = inst(27, ExchangeSegment::IdxI);
         let eq = inst(27, ExchangeSegment::NseEquity);
@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_day_needs_a_fallback_and_no_master_list() {
+    fn test_is_index_fallback_day_needs_a_fallback_and_no_master_list() {
         let mut r = SpotDayRecord::new(day());
         assert!(!r.is_index_fallback_day());
         r.merge(&indices(), 15_000, UniverseBasis::IndexFallback);
@@ -798,18 +798,22 @@ mod tests {
     }
 
     #[test]
-    fn test_public_paths_and_clock_helpers() {
+    fn test_day_record_path_names_the_day() {
         assert!(
             day_record_path(day())
                 .to_string_lossy()
                 .ends_with("data/instrument-cache/main-feed-spot-2026-10-30.json")
         );
+    }
+
+    #[test]
+    fn test_ist_secs_of_day_now_and_ist_date_now_read_the_ist_clock() {
         assert!(ist_secs_of_day_now() < 86_400);
         assert!(ist_date_now() > day() - chrono::Duration::days(3650));
     }
 
     #[test]
-    fn test_public_record_and_read_run_off_the_worker_against_the_fixed_dir() {
+    fn test_record_spot_subscribed_then_read_spot_day_record_in_the_fixed_dir() {
         // A date far in the past so the fixed folder holds nothing of the
         // live day; the sweep only removes files older than this date.
         let d = NaiveDate::from_ymd_opt(1999, 1, 4).unwrap_or_default();
