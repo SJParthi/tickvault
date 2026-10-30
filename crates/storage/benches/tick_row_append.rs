@@ -21,20 +21,34 @@
 //! Companion zero-allocation evidence: `tests/dhat_tick_row_append.rs`.
 //! Byte-identity evidence: the proptests in `src/tick_row_identity_tests.rs`.
 //!
+//! Both encoders run: the questdb-rs library (`full_row`, `quote_row`,
+//! `tick_quotes_row`) and our own (`own_*`, `[tick_storage] own_ilp_encoder`,
+//! owner 2026-10-30). After the Criterion medians, a per-row p99 gate times
+//! single appends through OUR encoder and exits 1 when any case is over the
+//! budget
+//! (`../../core/benches/support/tail_gate.rs`).
+//!
 //! Run: `cargo bench --bench tick_row_append -p tickvault-storage`
 
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group};
 
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_storage::candle_contract_labels::{
     CandleContractLabels, publish_candle_contract_labels,
 };
+use tickvault_storage::tick_ilp::TickIlpEncoder;
 use tickvault_storage::tick_persistence::TickWriter;
+
+#[path = "../../core/benches/support/tail_gate.rs"]
+mod tail_gate;
+
+/// The `[budgets]` key: one row, both encoders, median and p99.
+const BUDGET_KEY: &str = "tick_row_append";
 
 /// Rows appended per timed iteration; the `[elements]` divisor.
 const ROWS_PER_ITER: usize = 1_000;
@@ -117,19 +131,25 @@ fn publish_bench_labels() {
     assert!(publish_candle_contract_labels(labels) > 0);
 }
 
-fn bench_rows(c: &mut Criterion, name: &str, ticks: &[ParsedTick], to_quotes: bool) {
+fn bench_rows(
+    c: &mut Criterion,
+    name: &str,
+    encoder: TickIlpEncoder,
+    ticks: &[ParsedTick],
+    to_quotes: bool,
+) {
     let mut group = c.benchmark_group("tick_row_append");
     group.throughput(Throughput::Elements(ROWS_PER_ITER as u64));
     group.bench_function(name, |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
-            let mut writer = TickWriter::for_test(Feed::Dhan);
+            let mut writer = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
             for n in 0..iters {
                 if n > 0 && n % BATCHES_PER_WRITER == 0 {
                     // Rebuilt outside the timed region. The allocator hands
                     // back the memory the old buffer used, so the new buffer's
                     // pages are already mapped, as a production spare is.
-                    writer = TickWriter::for_test(Feed::Dhan);
+                    writer = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
                 }
                 let base_seq = 1_000_000 + (n as i64) * ROWS_PER_ITER as i64;
                 let start = Instant::now();
@@ -147,9 +167,22 @@ fn tick_row_append(c: &mut Criterion) {
     publish_bench_labels();
     let full: Vec<ParsedTick> = (0..ROWS_PER_ITER).map(full_tick).collect();
     let quote: Vec<ParsedTick> = (0..ROWS_PER_ITER).map(quote_tick).collect();
-    // Non-vacuity: every bench tick must land as a row, not be refused by the
-    // session window (a refused tick would time a cheaper path).
-    let mut probe = TickWriter::for_test(Feed::Dhan);
+    for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+        probe_encoder(encoder, &full, &quote);
+    }
+
+    bench_rows(c, "full_row", TickIlpEncoder::Library, &full, false);
+    bench_rows(c, "own_full_row", TickIlpEncoder::Own, &full, false);
+    bench_rows(c, "quote_row", TickIlpEncoder::Library, &quote, false);
+    bench_rows(c, "own_quote_row", TickIlpEncoder::Own, &quote, false);
+    bench_rows(c, "tick_quotes_row", TickIlpEncoder::Library, &full, true);
+    bench_rows(c, "own_tick_quotes_row", TickIlpEncoder::Own, &full, true);
+}
+
+/// Non-vacuity, per encoder: every bench tick must land as a row, not be
+/// refused by the session window (a refused tick would time a cheaper path).
+fn probe_encoder(encoder: TickIlpEncoder, full: &[ParsedTick], quote: &[ParsedTick]) {
+    let mut probe = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
     for (i, t) in full.iter().chain(quote.iter()).enumerate() {
         assert!(probe.append_tick_with_seq(t, i as i64 + 1).is_ok());
     }
@@ -176,11 +209,79 @@ fn tick_row_append(c: &mut Criterion) {
         "a bench tick did not reach tick_quotes"
     );
     assert_eq!(probe.aux_rows_appended(), 0, "a quote tick was refused");
+}
 
-    bench_rows(c, "full_row", &full, false);
-    bench_rows(c, "quote_row", &quote, false);
-    bench_rows(c, "tick_quotes_row", &full, true);
+/// Rows a gated writer takes before it hands its buffer off and gets a
+/// recycled one back, as the drain's 500 ms flush does in production. Each
+/// hand-off is one sample; the p99 is over 2,000 samples, so it is never one.
+const GATE_ROWS_PER_HAND_OFF: u64 = 2_000;
+
+/// One gated case: `PERCENTILE_SAMPLES` single appends through the
+/// production entry point, each timed alone. The buffer is handed off every
+/// [`GATE_ROWS_PER_HAND_OFF`] rows and a recycled one comes back (the
+/// production spare lane), so appends write into warm pages as they do live,
+/// never into a buffer that keeps growing. The case passes only when every
+/// call appended (`true`) and the p99 is under the budget.
+fn gate_case(
+    gate: &mut tail_gate::Gate,
+    name: &str,
+    encoder: TickIlpEncoder,
+    ticks: &[ParsedTick],
+    to_quotes: bool,
+) {
+    let (mut writer, sink, rx) =
+        TickWriter::for_test_with_encoder(Feed::Dhan, encoder).split_for_offload();
+    let recycle = |writer: &mut TickWriter| {
+        let flushed = writer.flush().is_ok();
+        while let Ok(mut batch) = rx.try_recv() {
+            sink.return_spare_buffer(&mut batch);
+        }
+        flushed
+    };
+    // Warm up: fill and recycle every buffer in the lane once.
+    for round in 0..4_u64 {
+        for (i, t) in ticks.iter().enumerate() {
+            let _ = writer.append_tick_with_seq(t, (round * 10_000 + i as u64 + 1) as i64);
+        }
+        recycle(&mut writer);
+    }
+    let base = 1_000_000_i64;
+    gate.case(name, |n| {
+        let tick = &ticks[(n as usize) % ticks.len()];
+        let seq = base + n as i64;
+        let appended = if to_quotes {
+            writer.append_tick_quote_with_seq(black_box(tick), seq)
+        } else {
+            writer.append_tick_with_seq(black_box(tick), seq)
+        }
+        .is_ok();
+        if n % GATE_ROWS_PER_HAND_OFF == GATE_ROWS_PER_HAND_OFF - 1 {
+            return appended && recycle(&mut writer);
+        }
+        appended
+    });
+}
+
+/// The per-row p99 gate (plan ITEM DT, 2026-10-30): our own encoder, all
+/// three row shapes, against the `tick_row_append` budget. The library cases
+/// keep only their median gate: their per-row p99 was never under the budget
+/// (measured 2.0 to 2.5 microseconds), which is why the owner approved our
+/// own encoder, and gating them would only fail every run.
+fn tail_gate() -> Result<(), String> {
+    let mut gate = tail_gate::Gate::new("tick_row_append", BUDGET_KEY)?;
+    let full: Vec<ParsedTick> = (0..ROWS_PER_ITER).map(full_tick).collect();
+    let quote: Vec<ParsedTick> = (0..ROWS_PER_ITER).map(quote_tick).collect();
+    let own = TickIlpEncoder::Own;
+    gate_case(&mut gate, "own_full_row", own, &full, false);
+    gate_case(&mut gate, "own_quote_row", own, &quote, false);
+    gate_case(&mut gate, "own_tick_quotes_row", own, &full, true);
+    gate.finish()
 }
 
 criterion_group!(benches, tick_row_append);
-criterion_main!(benches);
+
+fn main() {
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    tail_gate::run_under_bench("tick_row_append", tail_gate);
+}

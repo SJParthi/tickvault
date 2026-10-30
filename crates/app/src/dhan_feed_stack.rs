@@ -11403,6 +11403,9 @@ pub struct DhanFeedStackParams {
     /// `[depth_storage]` (plan item 49e step 3): whether depth is written as
     /// array rows into `market_depth_book`. Off by default.
     pub depth_storage: tickvault_common::config::DepthStorageConfig,
+    /// `[tick_storage]` (plan ITEM DT, owner 2026-10-30): build and send tick
+    /// rows with our own ILP encoder instead of the library. Off by default.
+    pub tick_storage: tickvault_common::config::TickStorageConfig,
     /// `[dhan_universe] backup_top_n` (scope lock 2026-10-02): near-the-money
     /// contracts given a second copy on another main-feed socket. 0 = off.
     pub main_feed_backup_top_n: usize,
@@ -17014,7 +17017,15 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         )
     };
     let mut ingest = LiveIngest::new(
-        TickWriter::new(&params.questdb, Feed::Dhan),
+        TickWriter::new_with_encoder(
+            &params.questdb,
+            Feed::Dhan,
+            if params.tick_storage.own_ilp_encoder {
+                tickvault_storage::tick_ilp::TickIlpEncoder::Own
+            } else {
+                tickvault_storage::tick_ilp::TickIlpEncoder::Library
+            },
+        ),
         capacity.max(1),
     )
     // The DETECTOR gets the authorized ceiling (and, since DT-A6 below, so
@@ -21234,6 +21245,7 @@ mod tests {
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             depth_unsubscribe_probe: Default::default(),
             depth_storage: Default::default(),
+            tick_storage: Default::default(),
             main_feed_backup_top_n: 0,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
             dhan_enabled: false,

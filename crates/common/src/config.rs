@@ -115,6 +115,11 @@ pub struct ApplicationConfig {
     /// `market_depth`. Turning it on is the operator step (step 4).
     #[serde(default)]
     pub depth_storage: DepthStorageConfig,
+    /// `[tick_storage]` — which ILP encoder writes tick rows (plan ITEM DT,
+    /// owner 2026-10-30). DEFAULT OFF: an absent section keeps the
+    /// questdb-rs library encoder and sender.
+    #[serde(default)]
+    pub tick_storage: TickStorageConfig,
     // `[top_volume]` (the boards' spill tier, 2026-10-13) REMOVED 2026-10-22
     // (plan item 62, operator Quote 34) with the top_volume writer. An old
     // config file that still carries the section is ignored, never refused.
@@ -1150,6 +1155,23 @@ pub struct DepthStorageConfig {
     /// Write depth as array rows into `market_depth_book`.
     #[serde(default)]
     pub array_rows: bool,
+}
+
+/// `[tick_storage]` — the tick writer's row encoder (plan ITEM DT, owner
+/// decision 2026-10-30: "Yes, build our own").
+///
+/// `own_ilp_encoder = false` (the default, and what an absent section means)
+/// builds `ticks`, `tick_quotes` and `feed_aux_packets` rows with the
+/// questdb-rs buffer and sends them with its HTTP sender, as before. `true`
+/// uses our own encoder (byte-identical lines, proven against the library)
+/// and posts the bytes to the same `/write` endpoint with the same timeout,
+/// retry, rescue, spill and replay. Turning it on in production is a
+/// separate owner step after a measured live day.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub struct TickStorageConfig {
+    /// Build and send tick rows with our own ILP encoder.
+    #[serde(default)]
+    pub own_ilp_encoder: bool,
 }
 
 /// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
@@ -3363,6 +3385,28 @@ mod tests {
         assert!(!section.contains("array_rows = true"), "{section}");
     }
 
+    // Plan ITEM DT (owner 2026-10-30): our own ILP encoder stays off unless
+    // the owner turns it on after a measured live day.
+    #[test]
+    fn test_tick_storage_config_own_ilp_encoder_is_off_by_default_and_when_absent() {
+        assert!(!TickStorageConfig::default().own_ilp_encoder);
+        let empty: TickStorageConfig = toml::from_str("").expect("empty section must parse");
+        assert!(!empty.own_ilp_encoder);
+        let on: TickStorageConfig = toml::from_str("own_ilp_encoder = true").expect("must parse");
+        assert!(on.own_ilp_encoder);
+    }
+
+    #[test]
+    fn test_tick_storage_config_ships_off_in_base_toml() {
+        let base = include_str!("../../../config/base.toml");
+        let section = base
+            .split_once("\n[tick_storage]")
+            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(""))
+            .expect("base.toml must carry a [tick_storage] section");
+        assert!(section.contains("own_ilp_encoder = false"), "{section}");
+        assert!(!section.contains("own_ilp_encoder = true"), "{section}");
+    }
+
     #[test]
     fn test_top_volume_section_is_gone_from_base_toml() {
         // 2026-10-22 (plan item 62): the `[top_volume]` section is removed from
@@ -3936,6 +3980,7 @@ mod tests {
             dhan_data_api: DhanDataApiConfig::default(),
             depth_unsubscribe_probe: DepthUnsubscribeProbeConfig::default(),
             depth_storage: DepthStorageConfig::default(),
+            tick_storage: TickStorageConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),

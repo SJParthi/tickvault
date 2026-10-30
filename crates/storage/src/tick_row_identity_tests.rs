@@ -7,6 +7,7 @@
 
 use super::*;
 use proptest::prelude::*;
+use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
 
 /// Ids no other test publishes a contract name for, so the global name table
 /// (which another test may replace at any moment) never names these rows and
@@ -99,6 +100,12 @@ fn assert_same_row(new: &TickRow, old: &TickRow) {
 /// on every column.
 mod legacy {
     use super::*;
+
+    /// The column-name helper the legacy writer used (deleted from the writer
+    /// 2026-10-30, kept here so the oracle stays verbatim).
+    fn tick_ilp_column(name: &'static str) -> questdb::ingress::ColumnName<'static> {
+        questdb::ingress::ColumnName::new_unchecked(name)
+    }
 
     pub(super) fn legacy_write_tick_line_into(
         buffer: &mut Buffer,
@@ -229,9 +236,26 @@ mod legacy {
 }
 
 fn new_line(table: &'static str, row: &TickRow, exchange_ts: Option<i64>) -> Vec<u8> {
-    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    encoder_line(TickIlpEncoder::Library, table, row, exchange_ts)
+}
+
+/// The same line through our own encoder (`[tick_storage] own_ilp_encoder`).
+fn own_line(table: &'static str, row: &TickRow, exchange_ts: Option<i64>) -> Vec<u8> {
+    encoder_line(TickIlpEncoder::Own, table, row, exchange_ts)
+}
+
+fn encoder_line(
+    encoder: TickIlpEncoder,
+    table: &'static str,
+    row: &TickRow,
+    exchange_ts: Option<i64>,
+) -> Vec<u8> {
+    let mut buffer = TickRowBuffer::new(encoder);
     let result = write_tick_line_into(&mut buffer, table, "dhan", row, exchange_ts);
-    assert!(result.is_ok(), "new writer refused a line: {result:?}");
+    assert!(
+        result.is_ok(),
+        "{encoder:?} writer refused a line: {result:?}"
+    );
     buffer.as_bytes().to_vec()
 }
 
@@ -420,7 +444,9 @@ proptest! {
         } else {
             (TICKS_TABLE, None)
         };
-        prop_assert_eq!(new_line(table, &row, ts), legacy_line(table, &row, ts));
+        let legacy = legacy_line(table, &row, ts);
+        prop_assert_eq!(new_line(table, &row, ts), legacy.clone());
+        prop_assert_eq!(own_line(table, &row, ts), legacy);
     }
 
     /// End to end through the writer: every accepted tick's bytes, `ticks` or
@@ -439,6 +465,16 @@ proptest! {
         };
         let old = legacy_row(&tick, seq);
         prop_assert_eq!(appended.is_ok(), old.is_some(), "accept/refuse differs");
+        // Our own encoder writes the same bytes for the same tick, whichever
+        // row it became (`ticks`, `tick_quotes` or `feed_aux_packets`).
+        let mut own = TickWriter::for_test_with_encoder(Feed::Dhan, TickIlpEncoder::Own);
+        let own_appended = if quotes {
+            own.append_tick_quote_with_seq(&tick, seq)
+        } else {
+            own.append_tick_with_seq(&tick, seq)
+        };
+        prop_assert_eq!(own_appended.is_ok(), appended.is_ok(), "own encoder accept differs");
+        prop_assert_eq!(own.buffer.as_bytes(), writer.buffer.as_bytes(), "own encoder bytes differ");
         let Some(old) = old else { return Ok(()) };
         // Only a row the window and band gates accepted is a `ticks` /
         // `tick_quotes` line; a refused one is a `feed_aux_packets` row.
@@ -550,4 +586,61 @@ fn legacy_oracle_is_not_vacuous() {
         "{line}"
     );
     assert!(line.ends_with('\n'));
+}
+
+#[test]
+fn test_new_with_encoder_own_has_our_sender_and_buffer() {
+    let config = tickvault_common::config::QuestDbConfig {
+        host: "127.0.0.1".to_owned(),
+        http_port: 9,
+        pg_port: 8812,
+        ilp_port: 9009,
+    };
+    // Building a sender never dials, for either encoder.
+    let own = TickWriter::new_with_encoder(&config, Feed::Dhan, TickIlpEncoder::Own);
+    assert!(matches!(own.sender, Some(TickIlpSender::Own(_))));
+    assert_eq!(own.buffer.kind(), TickRowBufferKind::Own);
+    assert!(own.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES);
+    let lib = TickWriter::new(&config, Feed::Dhan);
+    assert!(matches!(lib.sender, Some(TickIlpSender::Library(_))));
+    assert_eq!(
+        lib.buffer.kind(),
+        TickRowBufferKind::Library(ProtocolVersion::V1)
+    );
+}
+
+#[test]
+fn test_for_test_with_encoder_is_disconnected_and_presized() {
+    for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+        let w = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
+        assert!(w.sender.is_none());
+        assert_eq!(w.buffer.kind(), TickRowBuffer::new(encoder).kind());
+        assert!(w.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES);
+    }
+}
+
+/// The offload path recycles our buffers too, and never installs a spare of
+/// the other encoder.
+#[test]
+fn test_own_encoder_offload_recycles_only_own_spares() {
+    let (mut producer, sink, _rx) =
+        TickWriter::for_test_with_encoder(Feed::Dhan, TickIlpEncoder::Own).split_for_offload();
+    let mut foreign = TickRowBuffer::new(TickIlpEncoder::Library);
+    foreign.reserve(4_096);
+    assert!(
+        sink.spare_return
+            .as_ref()
+            .is_some_and(|lane| lane.try_send(foreign).is_ok())
+    );
+    let tick = ParsedTick {
+        security_id: RESERVED_ID_BASE + 3,
+        exchange_segment_code: 2,
+        last_traded_price: 245.35,
+        exchange_timestamp: DAY_IST_SECS + 36_000,
+        received_at_nanos: (i64::from(DAY_IST_SECS + 36_000) - 19_800) * 1_000_000_000,
+        ..ParsedTick::default()
+    };
+    assert!(producer.append_tick_with_seq(&tick, 1).is_ok());
+    assert!(producer.flush().is_ok());
+    assert_eq!(producer.buffer.kind(), TickRowBufferKind::Own);
 }
