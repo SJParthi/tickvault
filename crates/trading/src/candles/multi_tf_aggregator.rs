@@ -1459,6 +1459,8 @@ impl MultiTfAggregator {
         // keep the small constructor, exactly as the paragraph above wanted,
         // and still take this one-time reserve. Measured that day: 2,816 B a
         // slot, so the ceiling is 70.4 MB of address space, not ~135 MB.
+        // (2026-10-30, plan ITEM DT: the 48 B `WidenMemo` made it 2,864 B a
+        // slot, 71.6 MB at the ceiling, measured by the same test.)
         //
         // `reserve_exact` and not `reserve`: the amount asked for IS the final
         // size, so the growth-amortisation `reserve` would add on top is pure

@@ -2053,6 +2053,9 @@ pub(crate) fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bo
     // bucket CONTAINS the market open - 09:15 for 1m/3m/5m/15m, and 09:00 for
     // the 30m/60m frames whose bucket spans it. That is correct in both
     // cases: the official open belongs to the bar it actually falls inside.
+    // (⚠ 2026-10-30: stale since the 2026-10-05 move back to a 09:15 grid
+    // (`CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = 33,300): every frame's bucket
+    // holding the open now starts at 09:15, the 30m and 60m frames included.)
     //
     // 2026-10-30 (plan ITEM DT): the expression above was
     // `tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))`.

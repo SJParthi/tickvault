@@ -116,7 +116,7 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # field set, inline depth book rows), added the same day.
 feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
 feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
-candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: hit path about 200 ns, live mix in the PR body.
+candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
 
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day

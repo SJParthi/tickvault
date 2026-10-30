@@ -505,6 +505,7 @@ fn the_streams_reach_every_fold_outcome() {
         total.out_of_session,
         total.future_trading_day,
         total.untraded_sentinel,
+        total.untraded_timestamp,
         total.out_of_band_timestamp,
         total.refused_timestamp,
         total.stale_trading_day,
