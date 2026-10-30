@@ -357,8 +357,12 @@ impl SealDiskFloor {
 /// `SEAL_MAX_DRAIN_PER_CYCLE` lines per failed 100 ms cycle for the whole
 /// outage, the shape the floor-refusal branch already closed in DA-14. Now the
 /// first failure of an episode logs, the rest are counted, and the episode
-/// closes with the count on the next successful write of that tier or the
-/// next committed candle flush (`note_clean_flush`), whichever comes first.
+/// closes with the count on the first of: the next seal that tier accepts, the
+/// next committed live candle flush (`note_clean_flush`), or, for the DLQ
+/// episode only, the next seal the spill accepts (the DLQ is then no longer
+/// reached). "Accepts" includes a seal the spill skips because it already
+/// holds a fuller copy of that bar, so an episode can end on a seal that
+/// wrote nothing; the next real failure then opens a new episode and logs.
 /// O(1): one relaxed add and one relaxed swap per failure, one relaxed load
 /// per success in the common case.
 /// No allocation outside the one line per episode edge.
@@ -568,11 +572,13 @@ impl SealAbsorptionPipeline {
     /// (2026-10-30 review). Without it an episode whose tier never wrote
     /// again through this pipeline (QuestDB recovered first, so no later seal
     /// was escalated) stayed latched, and the next, unrelated failure logged
-    /// nothing and its error was never written. Called by the seal writer on
-    /// every flush that committed; two relaxed loads when nothing is open.
+    /// nothing and its error was never written. Called by the live drain on
+    /// every candle flush that committed (`drain_once_into`; the boot drain
+    /// and the mid-session replay flushes do not call it); two relaxed loads
+    /// when nothing is open.
     pub(crate) fn note_clean_flush(&self) {
-        self.close_spill_episode("a candle flush committed");
-        self.close_dlq_episode("a candle flush committed");
+        self.close_spill_episode("a live candle flush committed");
+        self.close_dlq_episode("a live candle flush committed");
     }
 
     /// Closes the spill failure episode, if one is open, with its count.
@@ -639,11 +645,13 @@ impl SealAbsorptionPipeline {
         self.floor.note_cleared();
         match self.spill.append_seal(&serialised, now_unix_secs) {
             Ok(()) => {
-                self.close_spill_episode("a spill write succeeded");
+                self.close_spill_episode(
+                    "the spill accepted a seal (written, or already held in a fuller copy)",
+                );
                 // The chain no longer reaches tier 3, so a DLQ episode left open
                 // by this spill outage ends here; a later outage that fails the
                 // DLQ again then logs its own cause (2026-10-30 review).
-                self.close_dlq_episode("the spill is writing again, so the DLQ is not reached");
+                self.close_dlq_episode("the spill accepted a seal, so the DLQ is not reached");
                 SubmitOutcome::Spilled
             }
             Err(spill_err) => {
@@ -657,8 +665,8 @@ impl SealAbsorptionPipeline {
                         security_id = evicted.security_id,
                         exchange_segment_code = evicted.exchange_segment_code,
                         "tier-2 spill failed — escalating to tier-3 DLQ; later spill failures \
-                         of this episode are counted, not logged, until a spill write succeeds \
-                         or a candle flush commits"
+                         of this episode are counted, not logged, until the spill accepts a seal \
+                         or a live candle flush commits"
                     );
                 }
                 let dlq_record = SealDlqRecord::from(&serialised);
@@ -679,8 +687,8 @@ impl SealAbsorptionPipeline {
                                 security_id = evicted.security_id,
                                 exchange_segment_code = evicted.exchange_segment_code,
                                 "tier-3 DLQ also failed — caller MUST fire AGGREGATOR-DROP-01; \
-                                 later DLQ failures of this episode are counted, not logged, until a DLQ \
-                                 write succeeds or a candle flush commits"
+                                 later DLQ failures of this episode are counted, not logged, until the DLQ or \
+                                 the spill accepts a seal or a live candle flush commits"
                             );
                         }
                         SubmitOutcome::Dropped(evicted)
