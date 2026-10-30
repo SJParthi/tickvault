@@ -199,6 +199,16 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/app/src/dhan_depth_universe.rs",
         "select_depth_universe_cost_at_the_authorized_ceiling",
     ),
+    // Added 2026-10-30 with plan item 3b: times the subscribe reconcile's
+    // share of the drain's 30 s silence scan at 25,000 expected instruments
+    // and prints the number. Same shape as the harnesses above: a wall-clock
+    // figure on a shared CI runner is a flake, so it is run in release by
+    // hand and never gates a merge. The behaviour is gated by the ordinary
+    // tests in the same file.
+    (
+        "crates/app/src/subscribe_reconcile.rs",
+        "sweep_cost_at_the_authorized_ceiling",
+    ),
     (
         "crates/storage/tests/critical_errcode_alarm_coverage_guard.rs",
         "report_critical_paging_coverage",

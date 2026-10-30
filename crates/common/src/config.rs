@@ -1168,6 +1168,14 @@ pub struct DhanUniverseConfig {
     /// [`DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS`]..=[`DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS`].
     #[serde(default = "default_depth200_silent_swap_resubscribe_secs")]
     pub depth200_silent_swap_resubscribe_secs: u64,
+
+    /// Whether main-feed instruments that were subscribed over 120 s ago and
+    /// have sent nothing, on a socket that delivers others, are offered again
+    /// in place (unsubscribe, then subscribe, on the same socket; plan item 3b,
+    /// 2026-10-30). Default `false`: the delta is found and counted as
+    /// `would_resubscribe` and nothing is sent. Never a redial.
+    #[serde(default)]
+    pub subscribe_reconcile_auto_resubscribe: bool,
 }
 
 /// Default and starting value of `depth200_silent_swap_resubscribe_secs`.
@@ -1239,6 +1247,7 @@ impl Default for DhanUniverseConfig {
             depth_sockets_enabled: false,
             frame_silence_fast_path: FrameSilenceFastPath::Shadow,
             depth200_silent_swap_resubscribe_secs: default_depth200_silent_swap_resubscribe_secs(),
+            subscribe_reconcile_auto_resubscribe: false,
         }
     }
 }
