@@ -1096,6 +1096,27 @@ async fn probe_wal_tables(base_url: &str) -> Result<(Vec<WalTableRow>, usize), W
 /// are at their ceiling. The `source` field is what separates the two on
 /// triage.
 // TEST-EXEMPT: pure log/metric side effects over the fully-tested WalLagTracker output; no branch here is reachable without a verdict the tracker tests already pin.
+/// The applied watermark's verdict on one parsed poll (plan item W4,
+/// 2026-10-30): `Clean` when every row parsed, none is suspended and no table
+/// is latched untrusted; `LagOnly` when the only fault is a table latched
+/// untrusted for apply lag; `Unsafe` for any unparsed row or suspended table.
+/// O(1).
+#[must_use]
+pub(crate) const fn probe_verdict(
+    skipped_rows: usize,
+    currently_suspended: usize,
+    untrusted_tables: usize,
+) -> crate::wal_applied_watermark::ProbeVerdict {
+    use crate::wal_applied_watermark::ProbeVerdict;
+    if skipped_rows != 0 || currently_suspended != 0 {
+        ProbeVerdict::Unsafe
+    } else if untrusted_tables != 0 {
+        ProbeVerdict::LagOnly
+    } else {
+        ProbeVerdict::Clean
+    }
+}
+
 fn emit_wal_lag(fired: &[(String, i64)]) {
     for (name, lag) in fired {
         let table = capture_rest_error_body(name);
@@ -1329,17 +1350,18 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // watermark was told the database was clean while the
                     // backlog stood exactly where it was. An ack trusted on
                     // such a poll archives frames that were never applied.
-                    // PR W4: the full verdict, so an episode made only of
-                    // lag-only probes can later have its parked acks confirmed.
-                    crate::wal_applied_watermark::applied_watermark()
-                        .note_questdb_probe_verdict_with_basis(
-                            crate::wal_parked_confirm::ProbeVerdict::from_readings(
-                                skipped == 0,
-                                delta.currently_suspended,
-                                lag_tracker.untrusted_count(),
-                            ),
-                            probe_basis,
-                        );
+                    //
+                    // W4 (2026-10-30): the verdict also says whether the only
+                    // fault is apply lag, so an episode that never saw worse
+                    // can have its parked acks confirmed once the lag clears.
+                    crate::wal_applied_watermark::applied_watermark().note_questdb_probe_verdict(
+                        probe_verdict(
+                            skipped,
+                            delta.currently_suspended,
+                            lag_tracker.untrusted_count(),
+                        ),
+                        probe_basis,
+                    );
                     // DA-13c: archive acked replay segments once they are past
                     // the durability lag and two clean probes. A few renames at
                     // most, off the runtime worker; a join error only defers.
@@ -2417,6 +2439,29 @@ mod tests {
             })
             .sum();
         assert_eq!(fired, 1, "a second episode pages");
+    }
+
+    #[test]
+    fn test_probe_verdict_every_combination() {
+        use crate::wal_applied_watermark::ProbeVerdict;
+        for skipped in [0usize, 1] {
+            for suspended in [0usize, 1] {
+                for untrusted in [0usize, 1, 3] {
+                    let expected = if skipped != 0 || suspended != 0 {
+                        ProbeVerdict::Unsafe
+                    } else if untrusted != 0 {
+                        ProbeVerdict::LagOnly
+                    } else {
+                        ProbeVerdict::Clean
+                    };
+                    assert_eq!(
+                        probe_verdict(skipped, suspended, untrusted),
+                        expected,
+                        "skipped={skipped} suspended={suspended} untrusted={untrusted}"
+                    );
+                }
+            }
+        }
     }
 
     /// Second hostile review 2026-10-20 (MEDIUM): a staircase release still has

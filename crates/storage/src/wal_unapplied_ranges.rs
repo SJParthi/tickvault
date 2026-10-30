@@ -617,20 +617,20 @@ impl UnappliedRanges {
         changed
     }
 
-    /// Removes every sequence in `[lo, hi]` (2026-10-27, plan item PR W4): a
-    /// range inside it goes, one straddling an edge is cut, one around it is
-    /// split in two. When a split would need more than
-    /// [`UNAPPLIED_RANGE_SLOTS`] ranges, the lowest two neighbours merge, as in
-    /// [`Self::add_range`], which only covers MORE (it may re-cover part of the
-    /// hole). Returns whether coverage changed. O(32), no allocation. Its one
-    /// production caller is the parked-ack confirmation, which removes only
-    /// sequences an episode itself added.
-    pub fn remove_range(&mut self, lo: u64, hi: u64) -> bool {
-        if lo > hi || !self.intersects(lo, hi) {
-            return false;
+    /// Removes every sequence in `[lo, hi]` (inclusive): a range wholly
+    /// inside goes, a range straddling one end is cut, a range around the
+    /// whole span splits in two. Returns `Some(changed)`, or `None` when the
+    /// split would need more than [`UNAPPLIED_RANGE_SLOTS`] ranges, in which
+    /// case nothing is changed (the caller keeps the span, which only keeps
+    /// more). Plan item W4 (2026-10-30): the confirmation of a lag-only
+    /// suspicion episode's parked acks. O(32), no allocation.
+    pub fn remove_span(&mut self, lo: u64, hi: u64) -> Option<bool> {
+        if lo > hi {
+            return Some(false);
         }
         let mut out = [(0u64, 0u64); UNAPPLIED_RANGE_SLOTS + 1];
         let mut n = 0usize;
+        let mut changed = false;
         // O(1) EXEMPT: bounded by UNAPPLIED_RANGE_SLOTS (32), cold path
         for &(a, b) in self.as_slice() {
             if b < lo || hi < a {
@@ -638,6 +638,7 @@ impl UnappliedRanges {
                 n += 1;
                 continue;
             }
+            changed = true;
             if a < lo {
                 out[n] = (a, lo - 1);
                 n += 1;
@@ -648,14 +649,12 @@ impl UnappliedRanges {
             }
         }
         if n > UNAPPLIED_RANGE_SLOTS {
-            out[0].1 = out[1].1;
-            out.copy_within(2..n, 1);
-            n -= 1;
+            return None;
         }
         self.slots = [(0, 0); UNAPPLIED_RANGE_SLOTS];
         self.slots[..n].copy_from_slice(&out[..n]);
         self.len = n;
-        true
+        Some(changed)
     }
 
     /// `true` when every sequence covered by `other` is covered by `self`.
@@ -2011,6 +2010,35 @@ mod tests {
         assert!(!r.is_empty());
         assert_eq!(r.as_slice(), &[(10, 20)]);
         assert_eq!(UnappliedRanges::default(), UnappliedRanges::new());
+    }
+
+    #[test]
+    fn test_remove_span_cuts_splits_and_refuses_past_the_slots() {
+        let mut r = UnappliedRanges::new();
+        r.add_range(10, 20);
+        r.add_range(30, 40);
+        r.add_range(50, 60);
+        assert_eq!(r.remove_span(5, 8), Some(false), "a span over no range");
+        assert_eq!(r.remove_span(9, 8), Some(false), "an empty span");
+        assert_eq!(r.remove_span(15, 35), Some(true));
+        assert_eq!(r.as_slice(), &[(10, 14), (36, 40), (50, 60)]);
+        assert_eq!(r.remove_span(53, 55), Some(true), "a split in two");
+        assert_eq!(r.as_slice(), &[(10, 14), (36, 40), (50, 52), (56, 60)]);
+        assert_eq!(r.remove_span(36, 40), Some(true), "a whole range goes");
+        assert_eq!(r.as_slice(), &[(10, 14), (50, 52), (56, 60)]);
+        assert_eq!(r.remove_span(1, u64::MAX), Some(true));
+        assert!(r.is_empty());
+        // A full set: a split of one range would need a 33rd slot.
+        let mut full = UnappliedRanges::new();
+        for i in 0..UNAPPLIED_RANGE_SLOTS as u64 {
+            full.add_range(i * 100 + 1, i * 100 + 50);
+        }
+        assert_eq!(full.len(), UNAPPLIED_RANGE_SLOTS);
+        let before = full;
+        assert_eq!(full.remove_span(10, 20), None, "refused, nothing changed");
+        assert_eq!(full, before);
+        assert_eq!(full.remove_span(1, 50), Some(true), "no split needed");
+        assert_eq!(full.len(), UNAPPLIED_RANGE_SLOTS - 1);
     }
 
     #[test]
@@ -3711,7 +3739,9 @@ mod tests {
         // counted; moving one add out of its closure kept both counts.
         assert_eq!(
             off_worker_nesting(body),
-            Some((4, 4, 2)),
+            // W4 (2026-10-30): the exit adds its ranges through one
+            // `add_exit_ranges` call (both sinks, one sidecar write).
+            Some((3, 3, 2)),
             "every range add and a persist inside one of the two off_worker closures"
         );
         let bitten = "pub fn note_questdb_probe(&self) {\n    self.add_unapplied_range(a, b);\n    \
@@ -3749,7 +3779,8 @@ mod tests {
             }
             let close = close?;
             let closure = &rest[open..=close];
-            inside += closure.matches("add_unapplied_range(").count();
+            inside += closure.matches("add_unapplied_range(").count()
+                + closure.matches("add_exit_ranges(").count();
             if closure.contains("persist_now()") {
                 persisting += 1;
             }
@@ -3757,7 +3788,7 @@ mod tests {
         }
         Some((
             inside,
-            body.matches("add_unapplied_range(").count(),
+            body.matches("add_unapplied_range(").count() + body.matches("add_exit_ranges(").count(),
             persisting,
         ))
     }
