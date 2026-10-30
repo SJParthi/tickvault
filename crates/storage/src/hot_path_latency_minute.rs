@@ -19,11 +19,11 @@
 //!     ts                  TIMESTAMP,  -- minute start (IST nanos)
 //!     stage               SYMBOL,     -- hot-path stage label
 //!     feed                SYMBOL,     -- dhan / ...
-//!     histogram           SYMBOL,     -- log2 / quarter_octave (the bound's resolution)
+//!     histogram           SYMBOL,     -- log2 / quarter_octave / quarter_octave+log2 (resolution)
 //!     samples             LONG,       -- samples recorded in the minute
-//!     p50_ns              LONG,       -- upper bound of the p50 bucket; null above the top bound
-//!     p99_ns              LONG,       -- upper bound of the p99 bucket; null above the top bound
-//!     p999_ns             LONG,       -- upper bound of the p99.9 bucket; null above the top bound
+//!     p50_ns              LONG,       -- upper bound of the p50 bucket; null = no samples
+//!     p99_ns              LONG,       -- upper bound of the p99 bucket (i64::MAX = above every bound)
+//!     p999_ns             LONG,       -- upper bound of the p99.9 bucket
 //!     max_ns              LONG,       -- the minute's largest sample (exact)
 //!     samples_over_1024ns LONG,       -- samples above 1,024 ns (exact count)
 //!     publishes           LONG        -- one-second windows folded into the row
@@ -42,6 +42,13 @@
 //!   `(bound / 2, bound]`, bucket 0 is `[0, 1,024]`); `receipt_to_fold` uses
 //!   its quarter-octave histogram (`'quarter_octave'`: at most 25% above).
 //!   So "p99_ns = 1024" proves the minute's p99 was at most 1,024 ns.
+//!   A `receipt_to_fold` percentile above the fine histogram's 16.8 ms top
+//!   takes the log2 bound (`histogram = 'quarter_octave+log2'`). Above every
+//!   bound it is `i64::MAX`, never NULL: NULL means only "no samples", so a
+//!   `max(p99_ns)` never skips the worst minute.
+//! * **Frames the ring refused are not in any stage** (they wait in the WAL
+//!   for refold). Their per-minute count is `ring_refused_frames` in
+//!   `host_capacity_minute`; read it beside these rows.
 //! * **"Over 1 µs" is over 1,024 ns.** Both histograms' first bucket ends at
 //!   1,024 ns, and counting exactly 1,000 would need one more compare on the
 //!   recording path, which the owner ruled must stay untouched. The column is
@@ -109,6 +116,15 @@ pub const HISTOGRAM_LOG2: &str = "log2";
 
 /// `histogram` value for the finer `receipt_to_fold` histogram.
 pub const HISTOGRAM_QUARTER_OCTAVE: &str = "quarter_octave";
+
+/// `histogram` value when a `receipt_to_fold` percentile was above the fine
+/// histogram's 16.8 ms top and took the log2 bound instead.
+pub const HISTOGRAM_QUARTER_OCTAVE_LOG2: &str = "quarter_octave+log2";
+
+/// A percentile above the log2 histogram's top bound (2^36 ns, ~68.7 s) is
+/// written as this (`i64::MAX` in the table), never NULL: NULL means only
+/// "no samples", so a `max(p99_ns)` never skips the worst minutes.
+pub const OVERFLOW_BOUND_NANOS: u64 = i64::MAX as u64;
 
 const NANOS_PER_MINUTE: i64 = 60 * 1_000_000_000;
 
@@ -275,28 +291,41 @@ impl MinuteAccumulator {
 
     fn row(&self, minute: i64, stage: Stage) -> LatencyMinuteRow {
         let i = stage as usize;
-        let (histogram, samples, first, p50, p99, p999) = if stage == Stage::ReceiptToFold {
-            let q = fine_quantiles(&self.fine);
-            (
-                HISTOGRAM_QUARTER_OCTAVE,
-                sum(&self.fine),
-                self.fine[0],
-                q.and_then(|q| q.p50),
-                q.and_then(|q| q.p99),
-                q.and_then(|q| q.p999),
-            )
+        let buckets = &self.buckets[i];
+        let coarse = stage_quantiles(buckets).map(|q| [q.p50, q.p99, q.p999].map(bound_of));
+        let (histogram, samples, first, bounds) = if stage == Stage::ReceiptToFold {
+            match fine_quantiles(&self.fine) {
+                // The fine histogram tops out at 2^24 ns (16.8 ms): a
+                // percentile above it takes the log2 bound of the same stage
+                // instead of reading as NULL, which a `max()` would skip
+                // (hostile review, 2026-10-30).
+                Some(q) => {
+                    let fine = [q.p50, q.p99, q.p999];
+                    let fell_back = fine.iter().any(Option::is_none);
+                    let mut bounds = [None; 3];
+                    for (k, slot) in bounds.iter_mut().enumerate() {
+                        *slot = Some(
+                            fine[k]
+                                .or_else(|| coarse.and_then(|c| c[k]))
+                                .unwrap_or(OVERFLOW_BOUND_NANOS),
+                        );
+                    }
+                    let histogram = if fell_back {
+                        HISTOGRAM_QUARTER_OCTAVE_LOG2
+                    } else {
+                        HISTOGRAM_QUARTER_OCTAVE
+                    };
+                    (histogram, sum(&self.fine), self.fine[0], bounds)
+                }
+                None => (HISTOGRAM_QUARTER_OCTAVE, 0, 0, [None; 3]),
+            }
         } else {
-            let buckets = &self.buckets[i];
-            let q = stage_quantiles(buckets);
-            (
-                HISTOGRAM_LOG2,
-                sum(buckets),
-                buckets[0],
-                q.and_then(|q| bound_of(q.p50)),
-                q.and_then(|q| bound_of(q.p99)),
-                q.and_then(|q| bound_of(q.p999)),
-            )
+            let bounds = coarse.map_or([None; 3], |c| {
+                c.map(|b| Some(b.unwrap_or(OVERFLOW_BOUND_NANOS)))
+            });
+            (HISTOGRAM_LOG2, sum(buckets), buckets[0], bounds)
         };
+        let [p50, p99, p999] = bounds;
         LatencyMinuteRow {
             minute_ist_nanos: minute,
             stage,
@@ -339,17 +368,35 @@ impl OfferOutcome {
     }
 }
 
-static SINK: OnceLock<crossbeam_channel::Sender<LatencyMinuteRows>> = OnceLock::new();
+/// One item of the hand-off queue: a closed minute (latency rows and the
+/// host row, [`crate::host_capacity_minute`]) or a day's capacity verdict.
+/// `Copy`, fixed size, so the pre-allocated queue never allocates.
+// The variants differ in size on purpose: boxing the minute would allocate on
+// the telemetry thread once a minute, and the pre-allocated queue slots are
+// sized to the largest variant either way.
+#[allow(clippy::large_enum_variant)] // APPROVED: see the three lines above
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProofMessage {
+    /// One closed minute.
+    Minute(
+        LatencyMinuteRows,
+        crate::host_capacity_minute::HostMinuteRow,
+    ),
+    /// One day's verdict.
+    Verdict(crate::host_capacity_minute::CapacityVerdictRow),
+}
+
+static SINK: OnceLock<crossbeam_channel::Sender<ProofMessage>> = OnceLock::new();
 
 /// Hands one minute's rows to the writer thread without waiting. O(1),
 /// no allocation (the queue is a pre-allocated array of `Copy` rows). A
 /// minute that cannot be queued is counted on
 /// `tv_hot_path_latency_minute_dropped_total{reason}` (local `/metrics`
 /// only, no alarm).
-pub fn offer(rows: &LatencyMinuteRows) -> OfferOutcome {
+pub fn offer(message: &ProofMessage) -> OfferOutcome {
     let outcome = match SINK.get() {
         None => OfferOutcome::NoSink,
-        Some(tx) => match tx.try_send(*rows) {
+        Some(tx) => match tx.try_send(*message) {
             Ok(()) => OfferOutcome::Queued,
             Err(crossbeam_channel::TrySendError::Full(_)) => OfferOutcome::QueueFull,
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => OfferOutcome::Closed,
@@ -413,11 +460,17 @@ pub fn hot_path_latency_minute_ddl_statements() -> Vec<String> {
     statements
 }
 
-/// Ensures the table (idempotent, self-healing). Failures are logged with a
-/// code and never block the caller; a failed ensure leaves the first ILP
-/// write to create the table without DEDUP until a later ensure succeeds.
+/// Ensures the latency table and the two capacity tables (idempotent,
+/// self-healing). Returns true when every statement succeeded. Failures are
+/// logged with a code only when `report` is set (the caller's last
+/// attempt), so a retry loop that succeeds later logs nothing. A table not
+/// yet ensured would be created by the first ILP write without DEDUP, which
+/// is why the caller retries.
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL strings unit-tested below); the unreachable path is tested.
-pub async fn ensure_hot_path_latency_minute_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_hot_path_latency_minute_table(
+    questdb_config: &QuestDbConfig,
+    report: bool,
+) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -429,16 +482,24 @@ pub async fn ensure_hot_path_latency_minute_table(questdb_config: &QuestDbConfig
     {
         Ok(c) => c,
         Err(err) => {
-            error!(
-                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                stage = "hot_path_latency_minute_ensure_client_build",
-                ?err,
-                "hot_path_latency_minute: HTTP client build failed — table not ensured"
-            );
-            return;
+            if report {
+                error!(
+                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                    stage = "hot_path_latency_minute_ensure_client_build",
+                    ?err,
+                    "hot_path_latency_minute: HTTP client build failed — table not ensured"
+                );
+            }
+            return false;
         }
     };
-    for ddl in &hot_path_latency_minute_ddl_statements() {
+    // The latency table and the two capacity tables (2026-10-30), one pass.
+    let statements = hot_path_latency_minute_ddl_statements()
+        .into_iter()
+        .chain(crate::host_capacity_minute::host_capacity_minute_ddl_statements())
+        .chain(crate::host_capacity_minute::capacity_verdict_daily_ddl_statements());
+    let mut all_ok = true;
+    for ddl in statements {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -447,25 +508,41 @@ pub async fn ensure_hot_path_latency_minute_table(questdb_config: &QuestDbConfig
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
+                all_ok = false;
                 let status = resp.status();
-                error!(
-                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                    stage = "hot_path_latency_minute_ensure_ddl",
-                    %status,
-                    ddl = ddl.as_str(),
-                    "hot_path_latency_minute: DDL returned non-2xx"
-                );
+                if report {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "hot_path_latency_minute_ensure_ddl",
+                        %status,
+                        ddl = ddl.as_str(),
+                        "hot_path_latency_minute: DDL returned non-2xx"
+                    );
+                }
             }
-            Err(err) => error!(
-                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                stage = "hot_path_latency_minute_ensure_ddl",
-                ?err,
-                ddl = ddl.as_str(),
-                "hot_path_latency_minute: DDL request failed"
-            ),
+            Err(err) => {
+                all_ok = false;
+                if report {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "hot_path_latency_minute_ensure_ddl",
+                        ?err,
+                        ddl = ddl.as_str(),
+                        "hot_path_latency_minute: DDL request failed"
+                    );
+                }
+            }
         }
     }
+    all_ok
 }
+
+/// Ensure attempts at boot before giving up (with the last one reported).
+pub const ENSURE_ATTEMPTS: u32 = 10;
+
+/// Spacing between ensure attempts at boot.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const ENSURE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Lazy ILP-over-HTTP writer. An unreachable QuestDB still builds
 /// (`sender = None`); `flush` returns `Err` until it is reachable.
@@ -561,6 +638,49 @@ impl HotPathLatencyMinuteWriter {
         Ok(())
     }
 
+    /// Appends one queued item whole: a minute's seven latency rows and its
+    /// host row, or a day's verdict row. A failure part-way rewinds the
+    /// buffer to before the item, so a half-built row can never poison later
+    /// flushes (hostile review, 2026-10-30). Writer thread only.
+    ///
+    /// # Errors
+    /// The item could not be built; nothing of it stays in the buffer.
+    pub fn append_message(&mut self, message: &ProofMessage) -> Result<()> {
+        let pending_before = self.pending;
+        self.buffer.set_marker().context("set_marker")?;
+        let result = match message {
+            ProofMessage::Minute(rows, host) => rows
+                .iter()
+                .try_for_each(|row| self.append_row(row))
+                .and_then(|()| {
+                    crate::host_capacity_minute::append_host_row(&mut self.buffer, host)?;
+                    self.pending = self.pending.saturating_add(1);
+                    Ok(())
+                }),
+            ProofMessage::Verdict(v) => {
+                crate::host_capacity_minute::append_verdict_row(&mut self.buffer, v).map(|()| {
+                    self.pending = self.pending.saturating_add(1);
+                })
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.buffer.clear_marker();
+                Ok(())
+            }
+            Err(err) => {
+                // The marker was set above, so the rewind cannot fail on a
+                // missing marker; its result is folded into the error.
+                let rewound = self.buffer.rewind_to_marker();
+                self.pending = pending_before;
+                Err(match rewound {
+                    Ok(()) => err,
+                    Err(rewind) => err.context(format!("rewind_to_marker: {rewind}")),
+                })
+            }
+        }
+    }
+
     /// Flushes buffered rows over ILP-HTTP.
     ///
     /// # Errors
@@ -621,6 +741,23 @@ impl FlushEpisode {
     }
 }
 
+/// One `info!` line per day with the capacity verdict (log sink only: no
+/// page, no alarm, no metric filter). Writer thread only.
+fn log_verdict(v: &crate::host_capacity_minute::CapacityVerdictRow) {
+    info!(
+        source = "capacity_verdict",
+        verdict = v.verdict.as_str(),
+        session_minutes = v.session_minutes,
+        tick_step_p99 = v.tick_step.0.as_str(),
+        ticks_over_1ms = v.ticks_over_1ms.0.as_str(),
+        cpu_wait = v.cpu_wait.0.as_str(),
+        disk = v.disk.0.as_str(),
+        backlog = v.backlog.0.as_str(),
+        reasons = crate::host_capacity_minute::verdict_reasons(v).as_str(),
+        "capacity verdict for the day: is the 4-core server needed"
+    );
+}
+
 /// Installs the process-wide hand-off queue [`offer`] sends into, with room
 /// for `capacity` minutes, and returns its receiving end. The writer thread
 /// calls it once ([`spawn_hot_path_latency_minute_writer`]); the DHAT test
@@ -628,10 +765,8 @@ impl FlushEpisode {
 ///
 /// # Errors
 /// A queue was already installed in this process.
-pub fn install_sink(
-    capacity: usize,
-) -> std::io::Result<crossbeam_channel::Receiver<LatencyMinuteRows>> {
-    let (tx, rx) = crossbeam_channel::bounded::<LatencyMinuteRows>(capacity.max(1));
+pub fn install_sink(capacity: usize) -> std::io::Result<crossbeam_channel::Receiver<ProofMessage>> {
+    let (tx, rx) = crossbeam_channel::bounded::<ProofMessage>(capacity.max(1));
     if SINK.set(tx).is_err() {
         return Err(std::io::Error::other(
             "hot_path_latency_minute queue already installed",
@@ -660,16 +795,20 @@ pub fn spawn_hot_path_latency_minute_writer(
             let mut episode = FlushEpisode::default();
             // Ends when every sender is gone (never, in production: the
             // sender lives in a static).
-            while let Ok(rows) = rx.recv() {
-                for row in &rows {
-                    if let Err(err) = writer.append_row(row) {
-                        error!(
-                            code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                            stage = "hot_path_latency_minute_append",
-                            ?err,
-                            "hot_path_latency_minute: a row could not be built — skipped"
-                        );
-                    }
+            let mut append_episode = FlushEpisode::default();
+            while let Ok(message) = rx.recv() {
+                let appended = writer.append_message(&message);
+                if let (Some(true), Err(err)) = (append_episode.step(appended.is_ok()), &appended) {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "hot_path_latency_minute_append",
+                        error = %err,
+                        "hot_path_latency_minute: a queued item could not be built — \
+                         skipped whole (logged once per failure episode)"
+                    );
+                }
+                if let (Ok(()), ProofMessage::Verdict(v)) = (&appended, &message) {
+                    log_verdict(v);
                 }
                 let result = writer.flush();
                 match (episode.step(result.is_ok()), &result) {
@@ -819,22 +958,42 @@ mod tests {
     /// Edge case: samples in the unbounded top bucket give a NULL
     /// percentile (never a made-up bound), and the exact max still shows it.
     #[test]
-    fn test_top_bucket_overflow_is_null_with_exact_max() {
+    fn test_regression_top_bucket_overflow_is_the_sentinel_never_null() {
         let huge = u64::MAX / 2;
         let mut acc = MinuteAccumulator::new();
         let _ = acc.absorb(minute(0), &window_with(Stage::MainRuntimeLag, huge, 5));
         let r = row_of(&acc.rows().expect("rows"), Stage::MainRuntimeLag);
         assert_eq!(r.samples, 5);
-        assert_eq!((r.p50_ns, r.p99_ns, r.p999_ns), (None, None, None));
+        // Regression (hostile review, 2026-10-30): NULL meant both "empty"
+        // and "overflow", so `max(p99_ns)` skipped the worst minutes.
+        let sentinel = Some(OVERFLOW_BOUND_NANOS);
+        assert_eq!(
+            (r.p50_ns, r.p99_ns, r.p999_ns),
+            (sentinel, sentinel, sentinel)
+        );
         assert_eq!(r.max_ns, huge);
         assert_eq!(r.samples_over_1024ns, 5);
-        // The fine histogram's top bound (2^24 ns) on receipt_to_fold.
+        // Above the fine histogram's top bound (2^24 ns) on receipt_to_fold:
+        // the log2 bound of the same stage (2^26 ns for 50 ms), not NULL.
         let mut acc = MinuteAccumulator::new();
         let _ = acc.absorb(minute(0), &window_with(Stage::ReceiptToFold, 50_000_000, 3));
         let r = row_of(&acc.rows().expect("rows"), Stage::ReceiptToFold);
-        assert_eq!(r.histogram, HISTOGRAM_QUARTER_OCTAVE);
-        assert_eq!(r.p99_ns, None);
+        assert_eq!(r.histogram, HISTOGRAM_QUARTER_OCTAVE_LOG2);
+        assert_eq!(r.p99_ns, Some(1 << 26));
         assert_eq!(r.max_ns, 50_000_000);
+        // A minute where the fine histogram holds samples but the log2 one
+        // does not (a read race) takes the sentinel, never a made-up bound.
+        let mut w = SecondWindow::empty();
+        w.receipt_to_fold_fine[FINE_BUCKETS - 1] = 2;
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &w);
+        let r = row_of(&acc.rows().expect("rows"), Stage::ReceiptToFold);
+        assert_eq!(r.p99_ns, Some(OVERFLOW_BOUND_NANOS));
+        // Empty stays NULL.
+        assert_eq!(
+            row_of(&acc.rows().expect("rows"), Stage::RingDwell).p99_ns,
+            None
+        );
     }
 
     /// `receipt_to_fold` reads its finer histogram: 1,100 ns is reported at
@@ -948,7 +1107,10 @@ mod tests {
     fn test_install_sink_then_offer_queues_fills_and_refuses_a_second_install() {
         let mut acc = MinuteAccumulator::new();
         let _ = acc.absorb(minute(0), &SecondWindow::empty());
-        let built = acc.rows().expect("rows");
+        let built = ProofMessage::Minute(
+            acc.rows().expect("rows"),
+            crate::host_capacity_minute::HostMinuteRow::default(),
+        );
         assert_eq!(
             offer(&built),
             OfferOutcome::NoSink,
@@ -1052,6 +1214,36 @@ mod tests {
         assert!(empty.contains("samples=0i"));
         assert!(!empty.contains("p99_ns"), "a null percentile is omitted");
         assert!(w.flush().is_err(), "no sender: flush reports the failure");
+    }
+
+    /// A minute is appended whole (7 latency rows + 1 host row); a host row
+    /// that fails (negative timestamp) rewinds all eight, so no half-built
+    /// row is left to poison later flushes (hostile review, 2026-10-30).
+    #[test]
+    fn test_append_message_appends_whole_or_rewinds_whole() {
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &window_with(Stage::DrainMainFrame, 700, 4));
+        let rows = acc.rows().expect("rows");
+        let host = crate::host_capacity_minute::HostMinuteRow {
+            minute_ist_nanos: minute(0),
+            ..Default::default()
+        };
+        let mut w = HotPathLatencyMinuteWriter::for_test();
+        w.append_message(&ProofMessage::Minute(rows, host))
+            .expect("whole minute");
+        assert_eq!(w.pending(), STAGES_PER_MINUTE + 1);
+        let len = w.buffer.len();
+        let bad = crate::host_capacity_minute::HostMinuteRow {
+            minute_ist_nanos: -1,
+            ..Default::default()
+        };
+        assert!(w.append_message(&ProofMessage::Minute(rows, bad)).is_err());
+        assert_eq!(w.buffer.len(), len, "the failed minute left nothing");
+        assert_eq!(w.pending(), STAGES_PER_MINUTE + 1);
+        // The buffer still takes the next good item.
+        w.append_message(&ProofMessage::Minute(rows, host))
+            .expect("next minute");
+        assert_eq!(w.pending(), 2 * (STAGES_PER_MINUTE + 1));
     }
 
     #[test]

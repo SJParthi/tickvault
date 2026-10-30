@@ -1279,10 +1279,20 @@ async fn async_main() -> Result<()> {
     {
         let questdb = config.questdb.clone();
         tokio::spawn(async move {
-            tickvault_storage::hot_path_latency_minute::ensure_hot_path_latency_minute_table(
-                &questdb,
-            )
-            .await;
+            use tickvault_storage::hot_path_latency_minute::{
+                ENSURE_ATTEMPTS, ENSURE_RETRY_INTERVAL, ensure_hot_path_latency_minute_table,
+            };
+            // Retried quietly until every table exists with its DEDUP key
+            // (QuestDB may still be starting); only the last attempt logs.
+            for attempt in 1..=ENSURE_ATTEMPTS {
+                if ensure_hot_path_latency_minute_table(&questdb, attempt == ENSURE_ATTEMPTS).await
+                {
+                    break;
+                }
+                if attempt < ENSURE_ATTEMPTS {
+                    tokio::time::sleep(ENSURE_RETRY_INTERVAL).await;
+                }
+            }
         });
     }
     if let Err(err) =

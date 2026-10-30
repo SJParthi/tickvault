@@ -292,6 +292,49 @@ async fn run_timed_metrics_upkeep(handle: metrics_exporter_prometheus::Prometheu
     }
 }
 
+/// How often the ticks-lost tally renders this process's own `/metrics`.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const TICKS_LOST_TALLY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One tally: the sum of every `tv_ticks_lost_total` series in this
+/// process's own `/metrics`, published for the per-minute capacity row
+/// (2026-10-30). Returns the sum, or `None` when no series exists yet.
+pub fn tally_ticks_lost_once(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+) -> Option<u64> {
+    let text = handle.render();
+    let total = tickvault_storage::host_capacity_minute::prometheus_counter_sum(
+        &text,
+        "tv_ticks_lost_total",
+    );
+    if let Some(total) = total {
+        tickvault_storage::host_capacity_minute::publish_ticks_lost_total(total);
+    }
+    total
+}
+
+/// Starts the `tv-metrics-tally` thread: every [`TICKS_LOST_TALLY_INTERVAL`]
+/// one [`tally_ticks_lost_once`]. Its own OS thread, never the main runtime
+/// the frame drain shares; cold (one render every 30 s, the same work the
+/// CloudWatch agent's scrape already causes once a minute).
+fn spawn_ticks_lost_tally(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("tv-metrics-tally".to_owned())
+        .spawn(move || {
+            loop {
+                let _total = tally_ticks_lost_once(&handle);
+                // APPROVED-BLOCKING: this is the tally's own dedicated OS thread; sleeping here blocks nothing else.
+                std::thread::sleep(TICKS_LOST_TALLY_INTERVAL);
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(
+            error = %err,
+            "the ticks-lost tally thread did not start: host_capacity_minute.ticks_lost stays NULL"
+        );
+    }
+}
+
 /// `PrometheusBuilder::install`, with the upkeep loop replaced by the timed
 /// one (DT0). Same two shapes as the library: inside a tokio runtime the
 /// exporter and the upkeep are spawned on it (production: the main
@@ -305,6 +348,7 @@ fn install_with_timed_upkeep(builder: PrometheusBuilder) -> Result<()> {
         };
         let handle = recorder.handle();
         rt.spawn(exporter);
+        spawn_ticks_lost_tally(handle.clone());
         rt.spawn(run_timed_metrics_upkeep(handle));
         metrics::set_global_recorder(recorder)?;
     } else {
@@ -316,6 +360,7 @@ fn install_with_timed_upkeep(builder: PrometheusBuilder) -> Result<()> {
             builder.build()?
         };
         let handle = recorder.handle();
+        spawn_ticks_lost_tally(handle.clone());
         std::thread::Builder::new()
             .name("metrics-exporter-prometheus-http".to_owned())
             .spawn(move || {
@@ -1726,6 +1771,28 @@ mod tests {
         // Subsequent calls may fail because the global recorder is already set.
         // Either outcome is acceptable.
         let _ = result;
+    }
+
+    /// 2026-10-30: the tally sums every `tv_ticks_lost_total` series of the
+    /// process's own `/metrics`; with no series yet it publishes nothing.
+    #[test]
+    fn test_tally_ticks_lost_once_sums_every_series() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        assert_eq!(tally_ticks_lost_once(&handle), None);
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("tv_ticks_lost_total", "source" => "a").increment(2);
+            metrics::counter!("tv_ticks_lost_total", "source" => "b").increment(3);
+        });
+        assert_eq!(tally_ticks_lost_once(&handle), Some(5));
+        assert_eq!(
+            tickvault_storage::host_capacity_minute::ticks_lost_total(),
+            Some(5)
+        );
+        assert_eq!(
+            TICKS_LOST_TALLY_INTERVAL,
+            std::time::Duration::from_secs(30)
+        );
     }
 
     /// DT0 (2026-10-29): one timed upkeep records one `metrics_upkeep`

@@ -1105,6 +1105,12 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         handles.last_second.stage_max_nanos[*stage as usize] = max;
         let outcome = handles.windows.advance(*stage, &snap);
         handles.last_second.stage_buckets[*stage as usize] = outcome.window;
+        if *stage == Stage::ReceiptToFold {
+            // Read the fine histogram right after this stage's max swap and
+            // bucket read, so the two disagree only for samples recorded in
+            // this short gap (hot-path review, 2026-10-30).
+            handles.last_second.receipt_to_fold_fine = handles.fine.publish();
+        }
         match outcome.quantiles {
             Some(q) => {
                 h.p50.set(q.p50.as_gauge_value());
@@ -1130,7 +1136,6 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         }
         h.busy.set(busy_seconds_at(*task, now));
     }
-    handles.last_second.receipt_to_fold_fine = handles.fine.publish();
     readings
 }
 
@@ -1149,20 +1154,31 @@ pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
             let mut alarm = StallAlarm::new();
             let mut sched = crate::hot_thread_sched::SchedPublisher::new();
             let mut minute = crate::hot_path_latency_minute::MinuteAccumulator::new();
+            let mut host = crate::host_capacity_minute::HostSampler::new();
+            let mut day = crate::host_capacity_minute::DayVerdict::new();
             loop {
                 let now = Instant::now();
                 let readings = publish_once(&mut handles, now);
                 // 2026-10-30: the second just read joins its minute; a closed
-                // minute's rows go to the writer thread without waiting.
-                if let Some(rows) = minute.absorb(
-                    crate::hot_path_latency_minute::wall_ist_nanos_now(),
-                    handles.last_second(),
-                ) {
-                    let _outcome = crate::hot_path_latency_minute::offer(&rows);
+                // minute's latency rows, its host row (read from /proc once a
+                // minute) and, after 15:40 IST, the day's verdict go to the
+                // writer thread without waiting.
+                let wall = crate::hot_path_latency_minute::wall_ist_nanos_now();
+                if let Some(rows) = minute.absorb(wall, handles.last_second()) {
+                    let host_row = host.close_minute(rows[0].minute_ist_nanos, wall);
+                    if let Some(verdict) = day.observe(&rows, &host_row) {
+                        let _outcome = crate::hot_path_latency_minute::offer(
+                            &crate::hot_path_latency_minute::ProofMessage::Verdict(verdict),
+                        );
+                    }
+                    let _outcome = crate::hot_path_latency_minute::offer(
+                        &crate::hot_path_latency_minute::ProofMessage::Minute(rows, host_row),
+                    );
                 }
                 // DT0 (2026-10-29): the hot threads' scheduling wait, from
                 // /proc, on this thread only (cold, once a second).
                 let _published = sched.publish();
+                host.absorb_second(&sched);
                 let in_session = in_session_now() && !is_shutting_down();
                 if let Some(line) = alarm.observe(now, in_session, &readings) {
                     report_stall(&line);

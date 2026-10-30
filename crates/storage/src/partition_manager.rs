@@ -162,6 +162,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // same DAY window as the audit tables (archived to S3 before detach);
     // `feed` is in the DEDUP key.
     "hot_path_latency_minute",
+    // (2026-10-30) the per-minute host capacity row and the daily "is the
+    // 4-core box needed" verdict, same writer thread and window.
+    "host_capacity_minute",
+    "capacity_verdict_daily",
     // (2026-08-29, per-table disk-footprint measurement): one row per
     // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
     // class + DAY partitioning as the scoreboard tables above. Swept with

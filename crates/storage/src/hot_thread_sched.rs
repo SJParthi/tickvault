@@ -85,6 +85,11 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
+/// Pre-sized read buffer for `/proc` files, so a long `/proc/stat` (its
+/// `intr` line grows with the IRQ count) never regrows it on the telemetry
+/// thread (hot-path review, 2026-10-30).
+const PROC_READ_BUF_BYTES: usize = 65_536;
+
 /// Reader worker slots. Matches `reader_runtime::MAX_WS_READER_THREADS` (4);
 /// a reader past this is not measured.
 pub const MAX_WS_READER_SLOTS: usize = 4;
@@ -109,15 +114,19 @@ pub enum HotThread {
     /// Every thread acting as a main-runtime worker (the drain's runtime),
     /// summed.
     MainWorkers = 4,
+    /// The WAL writer thread (`ws-frame-spill-writer`), one thread
+    /// (2026-10-30, for the per-minute capacity row).
+    WalWriter = 5,
 }
 
 /// Every published series, in index order.
-pub const ALL_HOT_THREADS: [HotThread; 5] = [
+pub const ALL_HOT_THREADS: [HotThread; 6] = [
     HotThread::WsReader0,
     HotThread::WsReader1,
     HotThread::WsReader2,
     HotThread::WsReader3,
     HotThread::MainWorkers,
+    HotThread::WalWriter,
 ];
 
 const SERIES_COUNT: usize = ALL_HOT_THREADS.len();
@@ -136,6 +145,7 @@ impl HotThread {
             Self::WsReader2 => "ws_reader_2",
             Self::WsReader3 => "ws_reader_3",
             Self::MainWorkers => "main_workers",
+            Self::WalWriter => "wal_writer",
         }
     }
 }
@@ -146,6 +156,9 @@ static READER_TIDS: [AtomicI64; MAX_WS_READER_SLOTS] =
 
 /// Reader slots handed out so far.
 static NEXT_READER_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+/// The WAL writer thread id; 0 = not registered.
+static WAL_WRITER_TID: AtomicI64 = AtomicI64::new(0);
 
 /// Main-runtime worker thread id per slot; 0 = free.
 static MAIN_TIDS: [AtomicI64; MAX_MAIN_WORKER_SLOTS] =
@@ -223,6 +236,19 @@ pub fn register_ws_reader_thread() -> Option<HotThread> {
     Some(thread)
 }
 
+/// Registers the calling thread as the WAL writer. Call once, at the start of
+/// the `ws-frame-spill-writer` thread (cold). A later call (a writer
+/// respawned on a new thread) replaces the id; the series re-baselines.
+/// Returns false where the thread id cannot be read.
+pub fn register_wal_writer_thread() -> bool {
+    let tid = current_thread_id();
+    if tid == 0 {
+        return false;
+    }
+    WAL_WRITER_TID.store(tid, Ordering::Relaxed);
+    true
+}
+
 /// Registers the calling thread as a main-runtime worker. Call from the main
 /// runtime's `on_thread_park` hook (tokio runs it only on worker threads).
 /// After the first call on a thread it is one thread-local read, zero
@@ -297,6 +323,9 @@ pub fn main_workers_registered() -> usize {
 /// 0 for [`HotThread::MainWorkers`] (a sum over many threads).
 #[must_use]
 pub fn registered_thread_id(thread: HotThread) -> i64 {
+    if thread == HotThread::WalWriter {
+        return WAL_WRITER_TID.load(Ordering::Relaxed);
+    }
     READER_TIDS
         .get(thread as usize)
         .map_or(0, |slot| slot.load(Ordering::Relaxed))
@@ -371,6 +400,7 @@ impl SlotState {
 pub struct SchedPublisher {
     readers: [SlotState; MAX_WS_READER_SLOTS],
     mains: [SlotState; MAX_MAIN_WORKER_SLOTS],
+    wal: SlotState,
     /// Accumulated `(run_delay_ns, involuntary_switches)` per series.
     totals: [(u64, u64); SERIES_COUNT],
     delay: [Option<metrics::Counter>; SERIES_COUNT],
@@ -379,6 +409,9 @@ pub struct SchedPublisher {
     steal: Option<metrics::Counter>,
     path: String,
     buf: String,
+    /// Each series' `run_delay` growth at the last publish; `None` when no
+    /// thread of the series was read then.
+    second: [Option<u64>; SERIES_COUNT],
 }
 
 impl Default for SchedPublisher {
@@ -394,13 +427,15 @@ impl SchedPublisher {
         Self {
             readers: [SlotState::default(); MAX_WS_READER_SLOTS],
             mains: [SlotState::default(); MAX_MAIN_WORKER_SLOTS],
+            wal: SlotState::default(),
             totals: [(0, 0); SERIES_COUNT],
             delay: [const { None }; SERIES_COUNT],
             switches: [const { None }; SERIES_COUNT],
             registered: None,
             steal: None,
             path: String::with_capacity(64),
-            buf: String::with_capacity(4_096),
+            buf: String::with_capacity(PROC_READ_BUF_BYTES),
+            second: [None; SERIES_COUNT],
         }
     }
 
@@ -431,6 +466,8 @@ impl SchedPublisher {
 
     /// Adds one slot's growth to `series`.
     fn add(&mut self, series: HotThread, growth: (u64, u64)) {
+        let s = &mut self.second[series as usize];
+        *s = Some(s.unwrap_or(0).saturating_add(growth.0));
         let t = &mut self.totals[series as usize];
         t.0 = t.0.saturating_add(growth.0);
         t.1 = t.1.saturating_add(growth.1);
@@ -463,6 +500,7 @@ impl SchedPublisher {
     /// Returns how many thread slots were read. Never logs and never errors:
     /// an unreadable file leaves its series as it was.
     pub fn publish(&mut self) -> usize {
+        self.second = [None; SERIES_COUNT];
         let mut read = 0usize;
         for (slot, thread) in ALL_HOT_THREADS
             .iter()
@@ -501,6 +539,15 @@ impl SchedPublisher {
                 .set(main_workers_registered() as f64);
         }
         read += mains_read;
+        let wal_tid = WAL_WRITER_TID.load(Ordering::Relaxed);
+        if wal_tid != 0
+            && let Some((delay, switches)) = self.read_thread(wal_tid)
+        {
+            let growth = self.wal.observe(wal_tid, delay, switches);
+            self.add(HotThread::WalWriter, growth);
+            self.publish_series(HotThread::WalWriter);
+            read += 1;
+        }
         self.path.clear();
         self.path.push_str("/proc/stat");
         if self.read_into_buf()
@@ -511,6 +558,14 @@ impl SchedPublisher {
                 .absolute(steal);
         }
         read
+    }
+
+    /// `series`' run-delay growth (ns spent waiting for a CPU) over the
+    /// last [`SchedPublisher::publish`]: `None` when no thread of the series
+    /// was read then. A thread's first reading is its baseline (0). O(1).
+    #[must_use]
+    pub fn last_second_run_delay_ns(&self, series: HotThread) -> Option<u64> {
+        self.second[series as usize]
     }
 
     /// The accumulated `(run_delay_ns, involuntary_switches)` of `series`.
@@ -761,6 +816,33 @@ mod tests {
         })
         .join()
         .expect("test thread");
+    }
+
+    /// 2026-10-30: the WAL writer registers once and its per-second growth is
+    /// read by the next publish; a series with no thread reads `None`.
+    #[test]
+    fn test_register_wal_writer_thread_feeds_last_second_run_delay_ns() {
+        let _g = lock();
+        let mut p = SchedPublisher::new();
+        assert_eq!(p.last_second_run_delay_ns(HotThread::WalWriter), None);
+        if !proc_readable() {
+            assert!(!register_wal_writer_thread());
+            return;
+        }
+        assert!(register_wal_writer_thread());
+        assert_eq!(
+            registered_thread_id(HotThread::WalWriter),
+            current_thread_id()
+        );
+        let _ = p.publish();
+        assert_eq!(
+            p.last_second_run_delay_ns(HotThread::WalWriter),
+            Some(0),
+            "the first reading is a baseline"
+        );
+        let _ = p.publish();
+        assert!(p.last_second_run_delay_ns(HotThread::WalWriter).is_some());
+        WAL_WRITER_TID.store(0, Ordering::Relaxed);
     }
 
     /// A reader registration takes a slot on Linux; past the reader slots it
