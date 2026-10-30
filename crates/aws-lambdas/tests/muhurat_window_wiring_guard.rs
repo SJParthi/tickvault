@@ -272,7 +272,10 @@ fn terraform_muhurat_sessions() -> BTreeSet<(String, String, String)> {
 fn terraform_session_times_equal_the_app_calendars_times() {
     let config = config_muhurat_sessions();
     let tf = terraform_muhurat_sessions();
-    assert!(!config.is_empty(), "config/base.toml lists no Muhurat entry");
+    assert!(
+        !config.is_empty(),
+        "config/base.toml lists no Muhurat entry"
+    );
     assert_eq!(
         tf, config,
         "terraform var.muhurat_sessions (date, start, end) must equal config/base.toml \

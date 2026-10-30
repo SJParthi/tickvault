@@ -6,7 +6,9 @@
 //! - Default value correctness for optional config sections
 
 use chrono::NaiveDate;
-use tickvault_common::config::{ApplicationConfig, MuhuratTradingEntry, NseHolidayEntry, TradingConfig};
+use tickvault_common::config::{
+    ApplicationConfig, MuhuratTradingEntry, NseHolidayEntry, TradingConfig,
+};
 use tickvault_common::trading_calendar::TradingCalendar;
 
 // ---------------------------------------------------------------------------
