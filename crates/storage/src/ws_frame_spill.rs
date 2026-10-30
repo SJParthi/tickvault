@@ -1197,8 +1197,6 @@ impl WsFrameSpill {
         let writer = thread::Builder::new()
             .name(WAL_WRITER_THREAD_NAME.to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
-                // 2026-10-30: this thread's id, once, so the telemetry thread
-                // can read its CPU wait for the per-minute capacity row.
                 let _registered = crate::hot_thread_sched::register_wal_writer_thread();
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
                 // DISK-WATCHER-01). A fatal RETURN from the writer must NOT

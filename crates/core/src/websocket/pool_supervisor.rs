@@ -99,6 +99,7 @@ use bytes::Bytes;
 use tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
+use tickvault_storage::host_capacity_minute::note_ring_refused;
 use tickvault_storage::ws_frame_spill::{
     AppendOutcome, WalEndpoint, WsFrameSpill, WsType, next_frame_seq,
 };
@@ -8441,17 +8442,6 @@ impl WalRingSink {
         tickvault_storage::wal_frame_fate::pre_register();
     }
 
-    /// Counts a main-feed frame the ring refused, for the per-minute capacity
-    /// row (2026-10-30): such a frame bypasses every live stage, so a
-    /// minute's latency rows read fast without it. One compare and one
-    /// relaxed add, on the refusal arms only.
-    #[inline]
-    fn note_main_feed_ring_refused(&self) {
-        if self.endpoint == DhanEndpointType::MainFeed {
-            tickvault_storage::host_capacity_minute::note_main_feed_ring_refused();
-        }
-    }
-
     /// Audit M1 (2026-10-04): records that this frame was shed at the ring
     /// while its only other copy is a WAL record still QUEUED for the writer.
     /// If the writer then fails to write it, `wal_frame_fate` counts the frame
@@ -8460,6 +8450,7 @@ impl WalRingSink {
     /// one load and a CAS on one slot, shed arm only.
     #[inline]
     fn note_ring_shed(&self, seq: u64) {
+        note_ring_refused(self.endpoint == DhanEndpointType::MainFeed);
         let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
             seq,
             tickvault_storage::wal_frame_fate::ShedKind::Ring,
@@ -8578,7 +8569,6 @@ impl FrameSink for WalRingSink {
             RingReserve::Granted => {}
             RingReserve::BytesFull => {
                 self.ring_full.increment(1);
-                self.note_main_feed_ring_refused();
                 self.ring_bytes_full.increment(1);
                 // Captured to the WAL, never folded by this session: the next
                 // replay must re-offer it. Three atomics, on the shed arm only.
@@ -8600,7 +8590,6 @@ impl FrameSink for WalRingSink {
             // instead of to whoever happened to reach the shared pool first.
             RingReserve::SlotsFull => {
                 self.ring_full.increment(1);
-                self.note_main_feed_ring_refused();
                 if wal_refused {
                     return FrameSinkOutcome::WalDropped;
                 }
@@ -8635,7 +8624,6 @@ impl FrameSink for WalRingSink {
                 refused,
                 crate::websocket::frame_ring::FrameRingTrySendError::Closed(_)
             );
-            self.note_main_feed_ring_refused();
             if closed {
                 self.ring_closed.increment(1);
             } else {

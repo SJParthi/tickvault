@@ -539,29 +539,6 @@ fn host_cpu_allowance() -> (usize, &'static str) {
 fn clamp_worker_threads(host: usize) -> usize {
     host.clamp(MIN_TOKIO_WORKER_THREADS, HOST_DERIVED_WORKER_CEILING)
 }
-
-/// The main tokio runtime (the one the frame drain runs on).
-///
-/// `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
-/// Named threads so `top -H` / `perf` on the box can tell a runtime worker
-/// apart from a blocking-pool thread while attributing a stall.
-///
-/// DT0 review (2026-10-29): every thread that acts as a worker registers its
-/// thread id from `on_thread_park` (tokio runs that hook only on worker
-/// threads; after the first park it is one thread-local read), and gives its
-/// slot back from `on_thread_stop`, so the telemetry thread can read the
-/// scheduling wait of every worker, whichever one hosts the drain.
-fn build_main_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .thread_name("tv-worker")
-        .enable_all()
-        .on_thread_park(|| {
-            let _slot = tickvault_storage::hot_thread_sched::register_main_worker_thread();
-        })
-        .on_thread_stop(tickvault_storage::hot_thread_sched::release_main_worker_thread)
-        .build()
-}
 /// Resolve the runtime width from the raw environment value.
 ///
 /// Fail-SAFE by construction: absent, empty, non-numeric, zero, or absurd all
@@ -720,8 +697,8 @@ fn main() -> Result<()> {
         },
     );
 
-    let runtime =
-        build_main_runtime(worker_threads).context("failed to build the tokio runtime")?;
+    let runtime = tickvault_app::hot_path_proof_boot::build_main_runtime(worker_threads)
+        .context("failed to build the tokio runtime")?;
 
     let outcome = runtime.block_on(async_main());
     // RUNTIME-NOT-DROPPED-AT-EXIT (2026-10-10). The runtime is leaked, not
@@ -1271,42 +1248,8 @@ async fn async_main() -> Result<()> {
     // Live proof that nothing on the live path is waiting (2026-10-02):
     // the publisher thread, plus one lateness probe per tokio runtime. AFTER
     // the recorder install, like every pre-resolved handle above.
-    //
-    // 2026-10-30 (owner: real-time proof that every in-memory step is under
-    // 1 µs): the per-minute latency table. Its writer thread and queue start
-    // BEFORE the publisher so the first closed minute has somewhere to go;
-    // the DDL runs on the runtime meanwhile (the first row is a minute away).
-    {
-        let questdb = config.questdb.clone();
-        tokio::spawn(async move {
-            use tickvault_storage::hot_path_latency_minute::{
-                ENSURE_ATTEMPTS, ENSURE_RETRY_INTERVAL, ensure_hot_path_latency_minute_table,
-            };
-            // Retried quietly until every table exists with its DEDUP key
-            // (QuestDB may still be starting); only the last attempt logs.
-            for attempt in 1..=ENSURE_ATTEMPTS {
-                if ensure_hot_path_latency_minute_table(&questdb, attempt == ENSURE_ATTEMPTS).await
-                {
-                    break;
-                }
-                if attempt < ENSURE_ATTEMPTS {
-                    tokio::time::sleep(ENSURE_RETRY_INTERVAL).await;
-                }
-            }
-        });
-    }
-    if let Err(err) =
-        tickvault_storage::hot_path_latency_minute::spawn_hot_path_latency_minute_writer(
-            &config.questdb,
-        )
-    {
-        error!(
-            code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-            error = %err,
-            "the hot-path latency minute writer FAILED TO START — the per-minute \
-             latency table will not be written (minutes counted as dropped)"
-        );
-    }
+    // 2026-10-30: the per-minute latency proof tables, writer before publisher.
+    let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
     if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
         error!(
             code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
@@ -6391,35 +6334,6 @@ mod tests {
     // clamped. Every case below must yield a width the runtime builder
     // accepts — a malformed tuning hint, or an unreadable host, must never be
     // able to stop the app from starting.
-
-    /// DT0 review (2026-10-29): the main runtime's workers register for the
-    /// scheduling-wait series when they park and give the slot back when
-    /// the runtime stops, so the series follows every worker instead of the
-    /// drain's last host.
-    #[test]
-    fn test_build_main_runtime_registers_its_workers_for_the_sched_series() {
-        use tickvault_storage::hot_thread_sched::main_workers_registered;
-        let rt = build_main_runtime(2).expect("runtime");
-        let name = rt.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            tokio::spawn(async {
-                std::thread::current()
-                    .name()
-                    .map(str::to_owned)
-                    .unwrap_or_default()
-            })
-            .await
-            .expect("task ran")
-        });
-        assert_eq!(name, "tv-worker");
-        if std::path::Path::new("/proc/thread-self").exists() {
-            assert!(
-                main_workers_registered() >= 1,
-                "an idle worker parked and registered"
-            );
-        }
-        drop(rt);
-    }
 
     #[test]
     fn test_clamp_worker_threads_never_returns_zero() {

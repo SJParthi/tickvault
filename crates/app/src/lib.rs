@@ -235,6 +235,9 @@ pub mod host_limits;
 /// the host-tuning systemd unit runs as root before the app (audit D6b; replaced
 /// two shell scripts and an inline `/bin/sh -c`).
 pub mod host_tuning;
+/// Boot wiring for the per-minute hot-path latency proof tables and the main
+/// runtime whose workers report their scheduling wait (2026-10-30, plan DT).
+pub mod hot_path_proof_boot;
 pub mod infra;
 /// Cold 1 s sampler of the kernel receive queue on our Dhan :443 sockets
 /// (`/proc/net/tcp` and `/proc/net/tcp6`), published as gauges with one

@@ -131,6 +131,12 @@ fn summarise(mut nanos: Vec<u64>) -> Summary {
 }
 
 fn report(name: &str, s: &Summary) {
+    assert!(s.samples > 0, "{name}: no frame was timed");
+    assert!(
+        s.p50 <= s.p99 && s.p99 <= s.p999 && s.p999 <= s.max,
+        "{name}: percentiles out of order"
+    );
+    assert!(s.over_target <= s.samples, "{name}: more over than timed");
     println!(
         "{name:<34} p50 {:>8} ns  p99 {:>8} ns  p99.9 {:>9} ns  max {:>10} ns  over 1ms {}/{}",
         s.p50, s.p99, s.p999, s.max, s.over_target, s.samples
@@ -265,4 +271,8 @@ fn receipt_to_fold_cost_with_and_without_cpu_competition() {
     report("400us spacing, contended", &busy);
     let burst = run_scenario("burst", FRAMES_BURST, GAP_BURST, true);
     report("12,500/s burst, contended", &burst);
+    assert!(
+        quiet.samples > 0 && busy.samples > 0 && burst.samples > 0,
+        "every scenario timed at least one frame"
+    );
 }

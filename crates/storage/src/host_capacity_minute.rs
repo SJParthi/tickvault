@@ -237,11 +237,14 @@ const UNKNOWN: u64 = u64::MAX;
 static MAIN_FEED_RING_REFUSED: AtomicU64 = AtomicU64::new(0);
 static TICKS_LOST_TOTAL: AtomicU64 = AtomicU64::new(UNKNOWN);
 
-/// Counts one main-feed frame the ring refused. O(1), one relaxed add; called
-/// on the socket read task's refusal arms only, never on the normal path.
+/// Counts one frame the ring refused when `main_feed` is true (depth frames
+/// are not counted). O(1): one branch and at most one relaxed add; called
+/// on the socket read task's ring-shed path only, never on the normal path.
 #[inline]
-pub fn note_main_feed_ring_refused() {
-    MAIN_FEED_RING_REFUSED.fetch_add(1, Ordering::Relaxed);
+pub fn note_ring_refused(main_feed: bool) {
+    if main_feed {
+        MAIN_FEED_RING_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Main-feed ring refusals over this process's life. O(1).
@@ -1829,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn test_note_main_feed_ring_refused_raises_main_feed_ring_refused_total_and_publish_ticks_lost_total_reads_back()
+    fn test_note_ring_refused_raises_main_feed_ring_refused_total_and_publish_ticks_lost_total_reads_back()
      {
         publish_ticks_lost_total(42);
         assert_eq!(ticks_lost_total(), Some(42));
@@ -1840,8 +1843,14 @@ mod tests {
             "never the unknown sentinel"
         );
         let before = main_feed_ring_refused_total();
-        note_main_feed_ring_refused();
+        note_ring_refused(true);
         assert!(main_feed_ring_refused_total() > before);
+        let after_main = main_feed_ring_refused_total();
+        note_ring_refused(false);
+        assert!(
+            main_feed_ring_refused_total() >= after_main,
+            "depth adds nothing"
+        );
     }
 
     fn counters(at_s: i64, jiffies: u64, host: (u64, u64, u64), disk: DiskReading) -> HostCounters {

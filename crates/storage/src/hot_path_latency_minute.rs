@@ -77,6 +77,7 @@
 //! nothing goes to `/metrics` except one drop counter.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -392,7 +393,7 @@ static SINK: OnceLock<crossbeam_channel::Sender<ProofMessage>> = OnceLock::new()
 /// no allocation (the queue is a pre-allocated array of `Copy` rows). A
 /// minute that cannot be queued is counted on
 /// `tv_hot_path_latency_minute_dropped_total{reason}` (local `/metrics`
-/// only, no alarm).
+/// only, no alarm) and logged with one `warn!` per episode of drops.
 pub fn offer(message: &ProofMessage) -> OfferOutcome {
     let outcome = match SINK.get() {
         None => OfferOutcome::NoSink,
@@ -405,21 +406,42 @@ pub fn offer(message: &ProofMessage) -> OfferOutcome {
     // One literal label per arm: a runtime label value makes the macro build
     // a label `Vec` on every call (found by the DHAT test).
     match outcome {
-        OfferOutcome::Queued => {}
+        OfferOutcome::Queued => DROP_EPISODE.store(false, Ordering::Relaxed),
         OfferOutcome::QueueFull => {
             metrics::counter!("tv_hot_path_latency_minute_dropped_total", "reason" => "queue_full")
                 .increment(1);
+            if first_drop_of_episode() {
+                warn!(reason = "queue_full", "{DROPPED_MINUTE_LINE}");
+            }
         }
         OfferOutcome::NoSink => {
             metrics::counter!("tv_hot_path_latency_minute_dropped_total", "reason" => "no_writer")
                 .increment(1);
+            if first_drop_of_episode() {
+                warn!(reason = "no_writer", "{DROPPED_MINUTE_LINE}");
+            }
         }
         OfferOutcome::Closed => {
             metrics::counter!("tv_hot_path_latency_minute_dropped_total", "reason" => "writer_gone")
                 .increment(1);
+            if first_drop_of_episode() {
+                warn!(reason = "writer_gone", "{DROPPED_MINUTE_LINE}");
+            }
         }
     }
     outcome
+}
+
+/// Set from the first dropped proof message until the next one queues, so a
+/// writer that stays stuck logs one line, not one a minute.
+static DROP_EPISODE: AtomicBool = AtomicBool::new(false);
+
+const DROPPED_MINUTE_LINE: &str = "hot-path proof: a minute or verdict could not be queued \
+     for the database writer and is lost (logged once until one queues again)";
+
+/// `true` for the first drop of an episode. One atomic swap, no allocation.
+fn first_drop_of_episode() -> bool {
+    !DROP_EPISODE.swap(true, Ordering::Relaxed)
 }
 
 /// The idempotent `CREATE TABLE` DDL. Pure.

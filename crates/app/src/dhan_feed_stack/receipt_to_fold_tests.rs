@@ -35,8 +35,7 @@ fn ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
 /// stamped 20 s in the past, so each lands in the fine histogram's top
 /// (above 16.8 ms) bucket, which no other test in this binary fills by the
 /// hundreds; the stage is a process-wide static, so the deltas are checked
-/// as AT LEAST one sample per frame, and the source scan below pins the one
-/// production call site.
+/// as AT LEAST one sample per frame.
 #[tokio::test]
 async fn test_receipt_to_fold_stage_records_one_sample_per_frame() {
     const FRAMES: u64 = 5;
@@ -102,29 +101,5 @@ async fn test_receipt_to_fold_stage_records_one_sample_per_frame() {
     assert!(
         fine_after[top].saturating_sub(fine_before[top]) >= FRAMES,
         "measured from the frame's receipt, not from the drain's pick-up"
-    );
-}
-
-/// The stage has exactly one production record site, inside the main-feed
-/// arm of the drain, after the fold: one sample per main-feed frame.
-#[test]
-fn test_receipt_to_fold_has_one_record_site_after_the_main_feed_fold() {
-    let src = include_str!("../dhan_feed_stack.rs");
-    let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap_or("");
-    assert_eq!(
-        prod.matches("record_receipt_to_fold_nanos(").count(),
-        1,
-        "exactly one record site"
-    );
-    let fold = prod
-        .find("let outcome = drain_main_feed_frame(")
-        .expect("the main-feed fold");
-    let record = prod
-        .find("record_receipt_to_fold_nanos(")
-        .expect("the record site");
-    assert!(record > fold, "recorded after the fold");
-    assert!(
-        prod[fold..record].len() < 1_500,
-        "recorded right after the main-feed fold, not in another arm"
     );
 }

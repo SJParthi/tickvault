@@ -302,8 +302,12 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // its own writer task before the first row, like ws_event_audit.
         ("ensure_feed_gap_audit_table", "src/ws_audit_consumer.rs"),
         // hot_path_latency_minute — one row per hot-path stage per minute
-        // (2026-10-30), ensured beside its writer thread at boot.
-        ("ensure_hot_path_latency_minute_table", "src/main.rs"),
+        // (2026-10-30), ensured beside its writer thread at boot (main.rs
+        // calls `start_hot_path_proof`).
+        (
+            "ensure_hot_path_latency_minute_table",
+            "src/hot_path_proof_boot.rs",
+        ),
         // expiry_scope_audit — the 15:50 IST daily expiry-scope check
         // (2026-10-28), ensured by its own task before the first row.
         (
