@@ -132,7 +132,7 @@ fn the_up_gauge_is_cleared_outside_the_error_arm() {
     // same day it was written — a guard that cannot fail is worse than none,
     // because it advertises coverage it does not provide.
     let await_idx = text
-        .find("let drain_outcome = drain.await;")
+        .find("let drain_outcome = drain.join().await;")
         .expect("the drain await is missing — this guard needs updating");
     let err_arm_idx = text
         .find("if let Err(err) = drain_outcome")
