@@ -46,7 +46,9 @@ use tickvault_common::constants::{IST_UTC_OFFSET_NANOS, MAX_PLAUSIBLE_LTP};
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
-use crate::candles::tf_index::{MARKET_OPEN_SECS_OF_DAY_IST, fold_clock_ist_secs};
+#[cfg(test)]
+use crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST;
+use crate::candles::tf_index::fold_clock_ist_secs;
 use crate::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
@@ -1535,8 +1537,8 @@ impl AggregatorCell {
             // disarms only once it has used the open or moved past the
             // bucket that owns it.
             let day_start = bucket_start - (bucket_start % 86_400);
-            let first_session_start =
-                tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST));
+            // The same table form as `is_days_first_session_bucket` (plan ITEM DT).
+            let first_session_start = day_start.saturating_add(tf.first_session_bucket_offset());
             let use_day_open = self.armed_for_day_open[ord]
                 && prices.day_open > 0.0
                 && bucket_start == first_session_start;
@@ -1921,6 +1923,23 @@ pub(crate) fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bo
     // bucket CONTAINS the market open - 09:15 for 1m/3m/5m/15m, and 09:00 for
     // the 30m/60m frames whose bucket spans it. That is correct in both
     // cases: the official open belongs to the bar it actually falls inside.
+    //
+    // 2026-10-30 (plan ITEM DT): the expression above was
+    // `tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))`.
+    // `bucket_start` of a day start plus a constant is that day start plus
+    // the same bucket on day 0, so the offset is now a compile-time table
+    // (`TfIndex::first_session_bucket_offset`). The saturating day near
+    // `u32::MAX` gives `u32::MAX` both ways. Pinned by
+    // `test_first_session_bucket_matches_the_grid_on_every_day`, which checks
+    // every day start that fits a `u32` against the old expression.
+    bucket_start == day_start.saturating_add(tf.first_session_bucket_offset())
+}
+
+/// The pre-2026-10-30 form of [`is_days_first_session_bucket`], kept as the
+/// test reference the table form is checked against.
+#[cfg(test)]
+fn is_days_first_session_bucket_by_grid(tf: TfIndex, bucket_start: u32) -> bool {
+    let day_start = bucket_start - (bucket_start % 86_400);
     bucket_start == tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))
 }
 
@@ -2655,6 +2674,43 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (plan ITEM DT, 2026-10-30): the table form of
+    /// `is_days_first_session_bucket` equals the grid form for EVERY day start
+    /// that fits a `u32`, including the saturating last day, at the bucket
+    /// itself and around it.
+    #[test]
+    fn test_first_session_bucket_matches_the_grid_on_every_day() {
+        let last_day = (u32::MAX / 86_400) * 86_400;
+        let mut day = 0u32;
+        loop {
+            for tf in TfIndex::ALL {
+                let grid = tf.bucket_start(day.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST));
+                assert_eq!(
+                    day.saturating_add(tf.first_session_bucket_offset()),
+                    grid,
+                    "{tf:?} on day {day}"
+                );
+                for probe in [
+                    day,
+                    grid,
+                    grid.saturating_sub(1),
+                    grid.saturating_add(1),
+                    day.saturating_add(86_399),
+                ] {
+                    assert_eq!(
+                        is_days_first_session_bucket(tf, probe),
+                        is_days_first_session_bucket_by_grid(tf, probe),
+                        "{tf:?} at {probe}"
+                    );
+                }
+            }
+            if day == last_day {
+                break;
+            }
+            day += 86_400;
+        }
+    }
 
     /// An exact multiple of 86_400 so `DAY + 33_300` is the 09:15 open.
     pub(super) const DAY: u32 = 1_779_321_600;
