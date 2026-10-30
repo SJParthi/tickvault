@@ -1100,8 +1100,7 @@ jobs:
           # gates the order path with the production recorder installed.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
           if [ "$ran" -ne 9 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."
-            exit 1
+            echo "::error::app DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------
