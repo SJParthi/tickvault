@@ -167,6 +167,11 @@ pub mod oom_monitor;
 // BP-08 (2026-07-01): RESOURCE-01/02/03 fd / RSS / spill-free early-warning
 // monitors — supervised poll mirroring oom_monitor + disk_health_watcher.
 pub mod resource_monitor;
+// Plan item 4 (2026-10-30): heartbeats for the long-lived background tasks the
+// hot-path telemetry does not watch, and the memory action ladder that
+// publishes them on the `tv-task-watch` thread.
+pub mod memory_watchdog;
+pub mod task_heartbeat;
 // W2 PR#6 (2026-07-10, audit follow-up row 10): WAL-SUSPEND-01 per-table
 // QuestDB WAL-apply suspension probe — supervised 60s wal_tables() poll
 // mirroring disk_health_watcher / oom_monitor / resource_monitor. A
