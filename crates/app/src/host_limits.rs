@@ -299,8 +299,9 @@ pub fn check_and_report_host_limits() -> usize {
             }
         }
 
-        // Per-limit gauge. Static label set (one per spec, known at compile
-        // time), so this allocates nothing per emission.
+        // Per-limit gauge, one per spec. The label value is a field, not a
+        // literal, so the macro takes its allocating arm; this runs once at
+        // boot, so that is fine.
         metrics::gauge!("tv_host_limit_met", "sysctl" => spec.sysctl_name)
             .set(if status.is_met() { 1.0 } else { 0.0 });
     }
