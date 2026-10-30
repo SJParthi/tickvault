@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn silence_bound_is_three_cadences_plus_slack() {
+    fn test_cadence_secs_work_slack_secs_max_silence_secs_bound() {
         assert_eq!(WatchedTask::OomMonitor.max_silence_secs(), 3 * 60 + 60);
         assert_eq!(WatchedTask::ApiTokenReload.max_silence_secs(), 3 * 300 + 60);
         assert_eq!(WatchedTask::SealWriter.max_silence_secs(), 3 + 30);
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_seal_writer_is_never_respawned() {
+    fn test_respawnable_is_false_only_for_the_seal_writer() {
         for task in ALL_WATCHED_TASKS {
             assert_eq!(task.respawnable(), task != WatchedTask::SealWriter);
         }
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn age_from_stamps_is_whole_seconds_and_saturates() {
+    fn test_age_secs_from_whole_seconds_and_saturates() {
         assert_eq!(age_secs_from(0, 99), None, "stamp 0 = unarmed");
         assert_eq!(age_secs_from(1, 1), Some(0));
         assert_eq!(age_secs_from(1, 1 + 4_999_999_999), Some(4));
@@ -593,8 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn respawn_flag_defaults_off() {
-        // Nothing in this crate's tests turns the switch on.
+    fn test_set_respawn_on_missed_beats_and_respawn_on_missed_beats_default_off() {
+        // Nothing in this crate's tests turns the switch on (it is
+        // process-global, so the tests below pass it explicitly instead).
+        assert!(!respawn_on_missed_beats());
+        set_respawn_on_missed_beats(false);
         assert!(!respawn_on_missed_beats());
     }
 
@@ -620,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stuck_task_is_aborted_when_respawn_is_on() {
+    async fn test_await_watched_with_aborts_a_stuck_task_when_respawn_is_on() {
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             // Held until the task is dropped by the abort.
@@ -687,6 +690,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(!watched.is_finished());
         watched.abort();
+    }
+
+    #[test]
+    fn test_arm_at_age_secs_at_is_stale_at_on_the_real_slot() {
+        // SealWriter: no test in this binary spawns the seal writer loop
+        // against this slot's timing assumptions (a stray beat only makes
+        // the slot fresher, which these asserts tolerate).
+        let task = WatchedTask::SealWriter;
+        let t0 = Instant::now();
+        arm_at(task, t0);
+        assert!(age_secs_at(task, t0).is_some());
+        let stuck = t0 + Duration::from_secs(task.max_silence_secs() + 60);
+        assert!(is_stale_at(task, stuck));
+        beat(task);
+        assert!(!is_stale_at(task, Instant::now()));
     }
 
     #[test]

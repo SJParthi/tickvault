@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn act_moves_the_shed_signal() {
+    fn test_shed_generation_moves_only_in_act() {
         let mut dog = MemoryWatchdog::new(cfg(MemoryWatchdogMode::Act), Some(10 * GIB));
         let before = shed_generation();
         let d = dog.step(Some(8 * GIB + GIB / 2), 0, false);
@@ -789,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn level_labels_and_gauge_values() {
+    fn test_gauge_value_and_level_labels() {
         assert_eq!(PressureLevel::Normal.as_str(), "normal");
         assert_eq!(PressureLevel::Critical.as_str(), "critical");
         assert!((PressureLevel::Shed.gauge_value() - 2.0).abs() < f64::EPSILON);
