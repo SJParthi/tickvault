@@ -383,12 +383,14 @@ impl SealAbsorptionPipeline {
     #[must_use]
     pub fn new() -> Self {
         let spill = Arc::new(SealSpillWriter::new());
-        Self {
+        let mut pipeline = Self {
             ring: SealRing::new(),
             floor: SealDiskFloor::new(spill.spill_dir().to_path_buf()),
             spill,
             dlq: Arc::new(SealDlqWriter::new()),
-        }
+        };
+        pipeline.prefault_ring();
+        pipeline
     }
 
     /// Test constructor. Tests inject isolated `tempdir` paths so they
@@ -593,6 +595,47 @@ impl SealAbsorptionPipeline {
         self.ring.capacity()
     }
 
+    /// Write every slot of an EMPTY ring once (fill it with a placeholder
+    /// seal, then pop it empty), so its memory is mapped before the first
+    /// real seal. Returns the slots written; `0` (and nothing done) when the
+    /// ring holds anything.
+    ///
+    /// # Why (owner directive 2026-10-30: per-seal p99 under 1 µs)
+    /// The ring reserves `SEAL_BUFFER_CAPACITY` slots at construction, but
+    /// the kernel maps a page only when it is first written, and the ring
+    /// walks its whole buffer before it wraps. So the first pass of the
+    /// day paid a page fault about every 23 seals (4 KiB / ~176 B): the
+    /// `seal_path/take_submit` bench measured p50 61 ns, p99 1,979 ns on a
+    /// fresh ring. Paying it once at boot moves no seal and changes no
+    /// order: the placeholder never leaves this function.
+    ///
+    /// # Cost
+    /// O(capacity) once (about 200,000 pushes and pops, a few milliseconds),
+    /// at construction, on the writer's boot path. SPACE: makes the ring's
+    /// full buffer resident from boot (~35 MB at 200,000 × 176 B), which it
+    /// becomes anyway once one capacity of seals has passed through it.
+    pub fn prefault_ring(&mut self) -> usize {
+        if self.ring.len() != 0 {
+            return 0;
+        }
+        let placeholder = BufferedSeal::new(
+            0,
+            0,
+            tickvault_trading::candles::TfIndex::M1,
+            tickvault_trading::candles::LiveCandleState::empty(),
+            tickvault_common::feed::Feed::Dhan,
+        );
+        let capacity = self.ring.capacity();
+        let mut written = 0usize;
+        while written < capacity
+            && matches!(self.ring.try_buffer(placeholder), BufferOutcome::Buffered)
+        {
+            written += 1;
+        }
+        while self.ring.pop_oldest().is_some() {}
+        written
+    }
+
     /// Pop the oldest buffered seal. Used by the future writer task
     /// (item 1.2f) to drain the ring and ILP-send to the
     /// `candles_*_shadow` tables. Returns `None` if the ring is
@@ -649,6 +692,46 @@ mod tests {
     fn cleanup(spill: &PathBuf, dlq: &PathBuf) {
         let _ = std::fs::remove_dir_all(spill);
         let _ = std::fs::remove_dir_all(dlq);
+    }
+
+    #[test]
+    fn test_prefault_ring_writes_every_slot_and_leaves_the_ring_empty() {
+        // 2026-10-30: the ring is walked once at construction so its pages
+        // are mapped before the first real seal. Nothing is left behind,
+        // nothing escalates, and a real seal afterwards goes through as on a
+        // fresh ring.
+        let (spill, dlq) = temp_pair("prefault");
+        let mut pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            1_000,
+            spill.clone(),
+            dlq.clone(),
+        );
+        assert_eq!(pipeline.prefault_ring(), 1_000);
+        assert_eq!(pipeline.ring_len(), 0);
+        assert_eq!(pipeline.ring_capacity(), 1_000);
+        let seal = mk_buffered_seal(7, 2, TfIndex::M1, 1_780_000_000, 101.0);
+        assert!(matches!(pipeline.submit(seal, 0), SubmitOutcome::Buffered));
+        // A ring that holds anything is left alone.
+        assert_eq!(pipeline.prefault_ring(), 0);
+        assert_eq!(pipeline.ring_len(), 1);
+        assert_eq!(pipeline.pop_oldest(), Some(seal));
+        assert_eq!(pipeline.pop_oldest(), None);
+        // No placeholder reached the spill: nothing was escalated.
+        let on_disk = std::fs::read_dir(&spill).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(on_disk, 0, "the prefault wrote to the spill");
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_production_pipeline_is_prefaulted_at_construction() {
+        // Source scan: `new()` (the production constructor) runs the prefault.
+        let src = include_str!("seal_absorption.rs");
+        let start = src.find("    pub fn new() -> Self {").expect("new()");
+        let body = &src[start..start + 600];
+        assert!(
+            body.contains("pipeline.prefault_ring();"),
+            "new() no longer prefaults the ring"
+        );
     }
 
     fn mk_buffered_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
