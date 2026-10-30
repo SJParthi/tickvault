@@ -1177,6 +1177,17 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
+### ITEM DASH — F&O stocks price movers on the dashboard (api; 2026-10-30)
+
+Requested: owner brief relayed to this session on 2026-10-30 ("yes add the fno stocks page to dashboard dude"). The brief reached the session as an automated notification, so the owner's approval of the item and of the dashboard script growth is to be confirmed on the PR. Design: one read-only endpoint `GET /api/fno-stocks` (bearer-gated, on the shared public rate limiter, 2 s single-slot cache) runs ONE bounded QuestDB query in session only (`LATEST ON ts PARTITION BY security_id, segment` over the last 15 min of `ticks`, `segment = 'NSE_EQ'`, `feed = 'dhan'`, ids from today's F&O underlying list); the list file is read once per IST date. Change is against `ticks.close` (the previous session's close on Quote/Full packets); value is an estimate (volume x avg price). The dashboard gets one section in its existing script (no new tag, no new page). Edge cases: market closed, list missing, empty result, NULL/zero/NaN previous close, an id in two segments, QuestDB timeout or error, stale newest row. Failure modes: every failure is a named status, never an empty "no movers"; only `live` is shown as live. Rollback: revert the PR (no config, no table, no alarm). Observability: `tv_api_cache_hits_total{endpoint="fno_stocks"}`; the status field.
+
+- [x] DASH1. Endpoint, cache, route, page section, writer/reader pin
+  - Files: crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/mod.rs, crates/api/src/state.rs, crates/api/src/lib.rs, crates/api/src/handlers/dashboard_page.rs, crates/app/src/dhan_universe.rs
+  - Tests: test_build_fno_stocks_sql_is_bounded_keyed_and_constant, test_empty_result_is_no_data_not_live, test_one_row_is_live_with_change_and_value, test_zero_and_nan_prev_close_give_no_change, test_rows_sort_by_change_pct_with_no_change_last, test_same_security_id_in_two_segments_keeps_only_nse_eq, test_questdb_timeout_is_unreachable, test_fno_stocks_route_requires_the_bearer_token, test_get_fno_stocks_cache_hit_skips_the_query, test_dashboard_page_has_the_fno_stocks_movers_section, test_fno_list_path_tag_and_shape_match_the_dashboard_reader
+- [ ] DASH2. Raise the dashboard's JS budgets in `browser_surface_and_toolchain_guard.rs` (235 → 301 lines, 8,781 → 12,194 bytes) after the owner's dated note is recorded in `rust-only-forever-lock-2026-07-19.md` (that guard requires the note first)
+  - Files: crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
+  - Tests: javascript_volume_inside_script_tags_only_shrinks, javascript_bytes_inside_script_tags_stay_under_the_ceiling
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the
