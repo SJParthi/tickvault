@@ -214,8 +214,9 @@ impl CorrelationTracker {
         }
     }
 
-    /// Ids left in the pool (for tests and the operator surface).
-    pub fn pooled_ids(&self) -> usize {
+    /// Ids left in the pool (tests only).
+    #[cfg(test)]
+    fn pooled_ids(&self) -> usize {
         self.id_pool.len()
     }
 
