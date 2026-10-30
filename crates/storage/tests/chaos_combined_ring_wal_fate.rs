@@ -39,24 +39,32 @@
 //!   this file, fixed 2026-10-30 in `FrameFate::note_shed`): the shed now
 //!   counts it on `tv_wal_lost_fate_unknown_total`. Unreachable at the
 //!   production table size; see the test.
-//! - **S1 reconnect storm.** 16 producer threads append to one `WsFrameSpill`,
-//!   each dropping and re-taking its handle every 250 frames (a socket
-//!   redialling), while the writer drains. After shutdown, `replay_all`
-//!   returns every `Spilled` frame exactly once, each producer's frames in
-//!   append order, every sequence unique.
+//! - **S1 sixteen concurrent producers into one WAL.** 16 threads append to
+//!   one `WsFrameSpill` at once (no socket or reconnect is modelled). After a
+//!   clean shutdown, `replay_all` returns every `Spilled` frame exactly once,
+//!   each producer's frames in append order, every sequence unique; appends
+//!   into the closed WAL are `Dropped`, counted, and never replayed (the drop
+//!   branch is driven for real, not compared 0 with 0).
+//! - **S1b shutdown mid-storm.** `shutdown` with a 1 ms budget while 8
+//!   producers still append: it reports records it did not see written, the
+//!   detached writer finishes draining, and every `Spilled` frame replays
+//!   exactly once (`lost` errs toward loss, never hides one).
 //! - **OOB rescue floors saturated under advancing acks.** 40 holders, 20 per sink
 //!   (each sink has `RESCUE_FLOOR_SLOTS` = 16), hold floors while ackers advance both
 //!   watermarks past them and holders persist and reload the file: the
 //!   persisted watermark never reaches a held floor, every refused hold marks
 //!   its range unapplied (still unapplied in the file after the acks pass it)
 //!   and is counted on `tv_wal_rescue_floor_full_total`, and once every floor
-//!   is released the persisted watermark passes the last batch.
+//!   is released the persisted watermark passes the last batch. Phase 1
+//!   refuses exactly `HOLDERS / 2 - RESCUE_FLOOR_SLOTS` holds per sink; a
+//!   separate deterministic test pins the exact per-sink cap and the reuse
+//!   of a released slot.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -669,12 +677,14 @@ fn s6f_lost_then_slot_reused_then_ring_shed_is_counted_as_unknown() {
 }
 
 // ---------------------------------------------------------------------------
-// S1 — reconnect storm into one WAL
+// S1 — sixteen concurrent producers into one WAL
 // ---------------------------------------------------------------------------
 
 const PRODUCERS: usize = 16;
 const PER_PRODUCER: u32 = 3_000;
-const REDIAL_EVERY: u32 = 250;
+/// Appends tried after a clean shutdown, per producer: the writer is gone, so
+/// each must be refused and counted.
+const AFTER_SHUTDOWN: u32 = 4;
 
 fn storm_frame(producer: usize, n: u32) -> Vec<u8> {
     let mut buf = vec![0u8; 16];
@@ -687,14 +697,52 @@ fn storm_frame(producer: usize, n: u32) -> Vec<u8> {
     buf
 }
 
+/// What the replay returned, checked: every sequence unique, every frame
+/// well-formed, per producer the frame numbers in append order with strictly
+/// increasing sequences. Returns the frame numbers per producer.
+fn replayed_per_producer(dir: &std::path::Path) -> Vec<Vec<u32>> {
+    let replayed = replay_all(dir).expect("replay_all");
+    let mut seqs = std::collections::HashSet::with_capacity(replayed.len());
+    let mut per_producer: Vec<Vec<(u32, u64)>> = vec![Vec::new(); PRODUCERS];
+    for rec in &replayed {
+        assert_eq!(rec.ws_type, WsType::LiveFeed);
+        assert_eq!(rec.frame.len(), 16);
+        assert!(
+            seqs.insert(rec.frame_seq),
+            "sequence {} replayed twice",
+            rec.frame_seq
+        );
+        let p = u32::from_le_bytes(rec.frame[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(rec.frame[8..12].try_into().unwrap());
+        assert!(p < PRODUCERS, "corrupt producer id {p}");
+        per_producer[p].push((n, rec.frame_seq));
+    }
+    per_producer
+        .into_iter()
+        .enumerate()
+        .map(|(p, got)| {
+            assert!(
+                got.windows(2).all(|w| w[0].1 < w[1].1),
+                "producer {p}: its sequences must strictly increase"
+            );
+            got.into_iter().map(|(n, _)| n).collect()
+        })
+        .collect()
+}
+
+/// S1: 16 producer threads append to one `WsFrameSpill` at once (honest
+/// scope: no socket and no reconnect is modelled; a producer is one thread
+/// calling `append`). After a clean shutdown, `replay_all` returns every
+/// `Spilled` frame exactly once, each producer's frames in append order,
+/// every sequence unique. Then every producer appends again into the closed
+/// WAL: the writer is gone, so each append is `Dropped`, counted on the drop
+/// counter, and never replayed, which drives the drop branch for real.
 #[test]
-fn s1_reconnect_storm_every_spilled_frame_replays_once_in_producer_order() {
+fn s1_sixteen_concurrent_producers_into_one_wal_replay_every_spilled_frame_once() {
     recorder();
     let dir = tmp_dir("storm");
     let spilled = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
-    let redials = Arc::new(AtomicUsize::new(0));
-    // (producer, n) -> spilled? per producer.
     let accepted: Arc<Vec<Mutex<Vec<u32>>>> =
         Arc::new((0..PRODUCERS).map(|_| Mutex::new(Vec::new())).collect());
     {
@@ -702,29 +750,18 @@ fn s1_reconnect_storm_every_spilled_frame_replays_once_in_producer_order() {
         let start = Arc::new(Barrier::new(PRODUCERS));
         let mut handles = Vec::new();
         for p in 0..PRODUCERS {
-            let root = Arc::clone(&root);
-            let (spilled, dropped, redials, accepted, start) = (
+            let (root, spilled, dropped, accepted, start) = (
+                Arc::clone(&root),
                 Arc::clone(&spilled),
                 Arc::clone(&dropped),
-                Arc::clone(&redials),
                 Arc::clone(&accepted),
                 Arc::clone(&start),
             );
             handles.push(std::thread::spawn(move || {
                 start.wait();
-                let mut handle = Some(Arc::clone(&root));
                 let mut mine = Vec::with_capacity(PER_PRODUCER as usize);
                 for n in 0..PER_PRODUCER {
-                    if n > 0 && n % REDIAL_EVERY == 0 {
-                        // The socket drops: its handle goes, frames already
-                        // queued stay in flight, then it redials.
-                        drop(handle.take());
-                        redials.fetch_add(1, Ordering::SeqCst);
-                        std::thread::yield_now();
-                        handle = Some(Arc::clone(&root));
-                    }
-                    let h = handle.as_ref().expect("handle held");
-                    match h.append(WsType::LiveFeed, storm_frame(p, n)) {
+                    match root.append(WsType::LiveFeed, storm_frame(p, n)) {
                         AppendOutcome::Spilled => {
                             spilled.fetch_add(1, Ordering::SeqCst);
                             mine.push(n);
@@ -752,49 +789,171 @@ fn s1_reconnect_storm_every_spilled_frame_replays_once_in_producer_order() {
         );
         let lost = root.shutdown(Duration::from_secs(10));
         assert_eq!(lost, 0, "a clean shutdown loses no queued record");
+
+        // The writer has exited: appends now find no writer.
+        let drops_before = root.drop_critical_count();
+        for p in 0..PRODUCERS {
+            for k in 0..AFTER_SHUTDOWN {
+                let outcome = root.append(WsType::LiveFeed, storm_frame(p, PER_PRODUCER + k));
+                assert_eq!(
+                    outcome,
+                    AppendOutcome::Dropped,
+                    "producer {p}: an append after the writer exited is refused"
+                );
+                dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let forced = u64::from(AFTER_SHUTDOWN) * PRODUCERS as u64;
+        assert_eq!(
+            root.drop_critical_count() - drops_before,
+            forced,
+            "every refused append after shutdown is counted"
+        );
+        assert_eq!(root.drop_critical_count(), dropped.load(Ordering::SeqCst));
         drop(root);
     }
-    assert_eq!(
-        redials.load(Ordering::SeqCst),
-        PRODUCERS * ((PER_PRODUCER as usize - 1) / REDIAL_EVERY as usize)
-    );
 
-    let replayed = replay_all(&dir).expect("replay_all");
-    let total_spilled = spilled.load(Ordering::SeqCst);
+    let per_producer = replayed_per_producer(&dir);
+    let total: u64 = per_producer.iter().map(|v| v.len() as u64).sum();
     assert_eq!(
-        replayed.len() as u64,
-        total_spilled,
+        total,
+        spilled.load(Ordering::SeqCst),
         "replay must return exactly the Spilled frames ({} dropped)",
         dropped.load(Ordering::SeqCst)
     );
-
-    let mut seqs = std::collections::HashSet::with_capacity(replayed.len());
-    let mut per_producer: Vec<Vec<(u32, u64)>> = vec![Vec::new(); PRODUCERS];
-    for rec in &replayed {
-        assert_eq!(rec.ws_type, WsType::LiveFeed);
-        assert_eq!(rec.frame.len(), 16);
-        assert!(
-            seqs.insert(rec.frame_seq),
-            "sequence {} replayed twice",
-            rec.frame_seq
-        );
-        let p = u32::from_le_bytes(rec.frame[4..8].try_into().unwrap()) as usize;
-        let n = u32::from_le_bytes(rec.frame[8..12].try_into().unwrap());
-        assert!(p < PRODUCERS, "corrupt producer id {p}");
-        per_producer[p].push((n, rec.frame_seq));
-    }
-    for (p, got) in per_producer.iter().enumerate() {
+    for (p, ns) in per_producer.iter().enumerate() {
         let expected = accepted[p].lock().unwrap().clone();
-        let ns: Vec<u32> = got.iter().map(|(n, _)| *n).collect();
         assert_eq!(
-            ns, expected,
+            *ns, expected,
             "producer {p}: replay must hold every Spilled frame once, in append order"
         );
         assert!(
-            got.windows(2).all(|w| w[0].1 < w[1].1),
-            "producer {p}: its sequences must strictly increase"
+            ns.iter().all(|n| *n < PER_PRODUCER),
+            "producer {p}: a frame refused after shutdown was replayed"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S1b: shutdown called while 8 producers are still appending, with a budget
+/// too short to drain the queue. `shutdown` returns the records it could not
+/// see written (`lost > 0`: the case was reached). The writer, abandoned and
+/// still running detached, keeps draining while the producers stop; once it
+/// has written everything, replay returns every `Spilled` frame exactly once
+/// (none replayed twice, none missing), so `lost` errs toward loss and never
+/// hides one: `replayed + lost >= spilled` holds at the moment shutdown
+/// returns, and `replayed == spilled` once the detached writer is done.
+/// Honest limit: the documented contract is to close the sockets first; an
+/// append arriving after the detached writer's final empty poll would be out
+/// of contract, so the producers here stop the instant shutdown returns, well
+/// inside the writer's 200 ms stop poll.
+#[test]
+fn s1b_shutdown_mid_storm_every_spilled_frame_replays_or_is_counted_lost() {
+    const STORM_PRODUCERS: usize = 8;
+    recorder();
+    // The abandoned-writer path runs the shutdown scan on the global fate
+    // table, which moves the fate counters other tests here assert on.
+    let _fate = fate_lock();
+    let dir = tmp_dir("storm-shutdown");
+    let spilled = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accepted: Arc<Vec<Mutex<Vec<u32>>>> =
+        Arc::new((0..PRODUCERS).map(|_| Mutex::new(Vec::new())).collect());
+    let root = Arc::new(WsFrameSpill::new(&dir).expect("spill"));
+    let started = Arc::new(Barrier::new(STORM_PRODUCERS + 1));
+    let mut handles = Vec::new();
+    for p in 0..STORM_PRODUCERS {
+        let (root, spilled, dropped, closing, accepted, started) = (
+            Arc::clone(&root),
+            Arc::clone(&spilled),
+            Arc::clone(&dropped),
+            Arc::clone(&closing),
+            Arc::clone(&accepted),
+            Arc::clone(&started),
+        );
+        handles.push(std::thread::spawn(move || {
+            started.wait();
+            let mut mine = Vec::new();
+            let mut n = 0u32;
+            while !closing.load(Ordering::SeqCst) && n < u32::MAX / 2 {
+                match root.append(WsType::LiveFeed, storm_frame(p, n)) {
+                    AppendOutcome::Spilled => {
+                        spilled.fetch_add(1, Ordering::SeqCst);
+                        mine.push(n);
+                    }
+                    AppendOutcome::Dropped => {
+                        dropped.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                n += 1;
+            }
+            *accepted[p].lock().unwrap() = mine;
+        }));
+    }
+    started.wait();
+    // Let the storm build a queue, then shut down under it.
+    std::thread::sleep(Duration::from_millis(50));
+    let lost = root.shutdown(Duration::from_millis(1));
+    let spilled_at_return = spilled.load(Ordering::SeqCst);
+    closing.store(true, Ordering::SeqCst);
+    for h in handles {
+        h.join().expect("producer");
+    }
+    let total_spilled = spilled.load(Ordering::SeqCst);
+    assert!(
+        lost > 0,
+        "a 1 ms budget under a running storm must report records it did not see written"
+    );
+    assert!(
+        lost as u64 <= spilled_at_return,
+        "lost {lost} cannot exceed the {spilled_at_return} frames spilled when shutdown returned"
+    );
+    assert_eq!(
+        root.drop_critical_count(),
+        dropped.load(Ordering::SeqCst),
+        "every refused append is counted"
+    );
+    // The detached writer drains what is queued, then exits after its stop
+    // poll; wait for every Spilled frame to be written and the segment closed.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while (root.persisted_count() < total_spilled || root.queued_records() > 0)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        root.persisted_count() >= total_spilled,
+        "the detached writer wrote {} of {total_spilled}",
+        root.persisted_count()
+    );
+    // Past the writer's 200 ms stop poll, so its last segment is flushed.
+    std::thread::sleep(Duration::from_millis(1_000));
+    drop(root);
+
+    let per_producer = replayed_per_producer(&dir);
+    let replayed: u64 = per_producer.iter().map(|v| v.len() as u64).sum();
+    assert!(
+        replayed + lost as u64 >= spilled_at_return,
+        "replayed {replayed} + lost {lost} under the {spilled_at_return} spilled at return: \
+         a frame vanished uncounted"
+    );
+    assert_eq!(
+        replayed, total_spilled,
+        "once the detached writer is done, every Spilled frame replays exactly once"
+    );
+    for (p, ns) in per_producer.iter().enumerate() {
+        assert_eq!(
+            *ns,
+            *accepted[p].lock().unwrap(),
+            "producer {p}: every Spilled frame once, in append order"
+        );
+    }
+    eprintln!(
+        "s1b: spilled {total_spilled} ({spilled_at_return} at return), shutdown reported \
+         {lost} lost, replayed {replayed}, dropped {}",
+        dropped.load(Ordering::SeqCst)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -803,6 +962,16 @@ fn s1_reconnect_storm_every_spilled_frame_replays_once_in_producer_order() {
 // ---------------------------------------------------------------------------
 
 const HOLDERS: usize = 2 * RESCUE_FLOOR_SLOTS + 8;
+
+/// `tv_wal_rescue_floor_full_total` is process-wide: the floor tests run
+/// under this lock so each reads only its own refusals.
+static FLOOR_LOCK: Mutex<()> = Mutex::new(());
+
+fn floor_lock() -> std::sync::MutexGuard<'static, ()> {
+    FLOOR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 const CHURN_BATCHES_PER_HOLDER: usize = 30;
 /// One batch = 64 frame bases, the floor at its first.
 const BATCH_STEP: u64 = 64 << PACKET_INDEX_BITS;
@@ -891,6 +1060,7 @@ impl FloorRig {
 #[test]
 fn oob_rescue_floor_table_saturated_while_watermarks_advance() {
     recorder();
+    let _floors = floor_lock();
     const {
         assert!(
             HOLDERS > 2 * RESCUE_FLOOR_SLOTS,
@@ -954,11 +1124,23 @@ fn oob_rescue_floor_table_saturated_while_watermarks_advance() {
         h.join().expect("phase 1 holder");
     }
     let saturated = rig.overflowed.lock().unwrap().len();
-    assert!(
-        saturated >= HOLDERS - 2 * RESCUE_FLOOR_SLOTS,
-        "phase 1 must refuse at least {} holds, refused {saturated}",
-        HOLDERS - 2 * RESCUE_FLOOR_SLOTS
-    );
+    // Every phase-1 holder holds its floor until all have tried, ids alternate
+    // sinks, so each sink saw exactly HOLDERS / 2 holds at once: exactly
+    // HOLDERS / 2 - RESCUE_FLOOR_SLOTS of them are refused, per sink.
+    for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+        let refused = rig
+            .overflowed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| sink_of(**id) == sink)
+            .count();
+        assert_eq!(
+            refused,
+            HOLDERS / 2 - RESCUE_FLOOR_SLOTS,
+            "{sink:?}: phase 1 refusals per sink"
+        );
+    }
 
     // Phase 2: churn. Holders hold, persist and reload, release, repeat,
     // while the ackers keep moving the watermarks.
@@ -1022,4 +1204,67 @@ fn oob_rescue_floor_table_saturated_while_watermarks_advance() {
         overflowed.len()
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The exact boundary of the rescue-floor table, per sink: `RESCUE_FLOOR_SLOTS`
+/// holds all succeed, the next is refused (counted once, its range marked
+/// unapplied), the other sink is unaffected, and one release frees exactly
+/// one slot.
+#[test]
+fn rescue_floor_table_exactly_at_cap_per_sink() {
+    recorder();
+    let _floors = floor_lock();
+    let wm = AppliedWatermark::new();
+    let range = |i: u64| {
+        let lo = FLOOR_BASE + i * BATCH_STEP;
+        (lo, lo + BATCH_STEP / 2)
+    };
+    let full_before = counter(RESCUE_FLOOR_FULL_COUNTER, &[]);
+    let mut held = Vec::with_capacity(RESCUE_FLOOR_SLOTS);
+    for i in 0..RESCUE_FLOOR_SLOTS as u64 {
+        let (lo, hi) = range(i);
+        held.push(
+            wm.hold_rescue_floor(AppliedSink::Ticks, lo, hi)
+                .unwrap_or_else(|| panic!("hold {i} of {RESCUE_FLOOR_SLOTS} must succeed")),
+        );
+    }
+    assert_eq!(counter(RESCUE_FLOOR_FULL_COUNTER, &[]), full_before);
+    let (lo, hi) = range(RESCUE_FLOOR_SLOTS as u64);
+    assert!(!wm.snapshot().range_has_unapplied(lo, hi));
+    assert!(
+        wm.hold_rescue_floor(AppliedSink::Ticks, lo, hi).is_none(),
+        "hold {} is one past the table",
+        RESCUE_FLOOR_SLOTS + 1
+    );
+    assert_eq!(
+        counter(RESCUE_FLOOR_FULL_COUNTER, &[]) - full_before,
+        1,
+        "the refusal is counted once"
+    );
+    assert!(
+        wm.snapshot().range_has_unapplied(lo, hi),
+        "the refused range is marked unapplied"
+    );
+    // The depth sink has its own table.
+    let (dlo, dhi) = range(100);
+    let depth = wm
+        .hold_rescue_floor(AppliedSink::Depth, dlo, dhi)
+        .expect("a full ticks table does not refuse a depth hold");
+    // One release frees exactly one slot.
+    wm.release_rescue_floor(held.pop().unwrap());
+    let (lo2, hi2) = range(RESCUE_FLOOR_SLOTS as u64 + 1);
+    let again = wm
+        .hold_rescue_floor(AppliedSink::Ticks, lo2, hi2)
+        .expect("a released slot is reused");
+    let (lo3, hi3) = range(RESCUE_FLOOR_SLOTS as u64 + 2);
+    assert!(
+        wm.hold_rescue_floor(AppliedSink::Ticks, lo3, hi3).is_none(),
+        "only one slot was freed"
+    );
+    assert_eq!(counter(RESCUE_FLOOR_FULL_COUNTER, &[]) - full_before, 2);
+    wm.release_rescue_floor(again);
+    wm.release_rescue_floor(depth);
+    for f in held {
+        wm.release_rescue_floor(f);
+    }
 }

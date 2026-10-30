@@ -1020,14 +1020,15 @@ fn a_single_flipped_bit_never_lets_more_restarts_through() {
 /// which is the contract. Nothing ever rewrites it (the decision path only
 /// writes from a state it could read, and `budget_or` returns before its
 /// write), so it also stops every LATER evening until someone deletes it.
+/// `drain_hold.rs` maps an unreadable state to Idle and writes nothing; the
+/// error is logged once per process, log-sink only. Proposed fix: when the
+/// content does not parse and the file was last written before this
+/// evening's 15:40 IST start, rename it aside (`evening-drain.state.bad-<unix>`)
+/// and read the default; a file damaged tonight stays fail-closed.
 #[test]
 #[ignore = "DEFECT: an unparseable evening-drain.state is never rewritten, so one torn write \
-            disables the evening drain for every later evening, not only the one it belongs \
-            to (drain_hold.rs maps None to Idle and writes nothing; budget_or returns before \
-            its store). The error is logged once per process, log-sink only. Fix: when the \
-            content does not parse and the file's mtime is before this evening's 15:40 IST \
-            start, rename it aside (evening-drain.state.bad-<unix>) and read the default; \
-            a file damaged tonight stays fail-closed."]
+            disables the evening drain on every later evening too. Root cause and fix in the \
+            doc comment above."]
 fn a_torn_file_from_last_evening_does_not_block_tonight() {
     let d = TempDir::new("torn-yesterday");
     let p = d.state_path();
