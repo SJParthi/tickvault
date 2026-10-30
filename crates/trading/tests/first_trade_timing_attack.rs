@@ -278,9 +278,9 @@ fn s04_pre_open_stamp_is_refused_by_the_fold() {
 #[test]
 fn s05_duplicate_first_trade_is_not_double_counted() {
     let a = tk(FNO, OPEN + 2, 13.0, 650, 650, OPEN + 2);
-    let mut b = a.clone();
+    let mut b = a;
     b.received_at_nanos += 300_000_000;
-    let got = run(&[stale(FNO, OPEN - 10), a.clone(), b, a]);
+    let got = run(&[stale(FNO, OPEN - 10), a, b, a]);
     let t = [(OPEN + 2, 650)];
     assert_bars(&got, &t, &t);
 }
@@ -844,7 +844,7 @@ mod randomized {
             let rec = (i64::from(ts) + i64::from(skew) + i64::from(delay)) as u32;
             let price = 13.0 + (k as f32) * 0.05;
             let t = tk(seg, ts, price, cum, tr.qty, rec);
-            packets.push((i64::from(rec) * 1_000 + k as i64, t.clone()));
+            packets.push((i64::from(rec) * 1_000 + k as i64, t));
             if tr.dup {
                 packets.push((i64::from(rec) * 1_000 + 500 + k as i64, t));
             }

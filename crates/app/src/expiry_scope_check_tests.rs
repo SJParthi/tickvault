@@ -7,10 +7,10 @@ use proptest::prelude::*;
 use super::*;
 use crate::dhan_contract_universe::select_contract_universe;
 
-const TODAY: u32 = 2026_10_28;
-const CURRENT: u32 = 2026_11_23;
-const NEXT: u32 = 2026_12_29;
-const NIFTY_WEEKLY: u32 = 2026_11_03;
+const TODAY: u32 = 20261028;
+const CURRENT: u32 = 20261123;
+const NEXT: u32 = 20261229;
+const NIFTY_WEEKLY: u32 = 20261103;
 
 fn opt(id: u64, class: &str, u: &str, e: u32, strike_rupees: i64, leg: &str) -> ContractRow {
     ContractRow {
@@ -57,8 +57,8 @@ fn candle(id: i64, seg: &str, contract: Option<&str>) -> CandleContractRow {
 /// 100..), the 29 Dec chain (ids 200..), and one expired 27 Oct leg (id 300).
 fn havells_file() -> Vec<ContractRow> {
     let mut rows = vec![
-        opt(10, "OPTSTK", "HAVELLS", 2026_10_30, 1260, "CE"),
-        opt(11, "OPTSTK", "HAVELLS", 2026_10_30, 1260, "PE"),
+        opt(10, "OPTSTK", "HAVELLS", 20261030, 1260, "CE"),
+        opt(11, "OPTSTK", "HAVELLS", 20261030, 1260, "PE"),
     ];
     rows.extend(chain(
         100,
@@ -68,7 +68,7 @@ fn havells_file() -> Vec<ContractRow> {
         &[1240, 1260, 1280],
     ));
     rows.extend(chain(200, "OPTSTK", "HAVELLS", NEXT, &[1240, 1260, 1280]));
-    rows.push(opt(300, "OPTSTK", "HAVELLS", 2026_10_27, 1260, "CE"));
+    rows.push(opt(300, "OPTSTK", "HAVELLS", 20261027, 1260, "CE"));
     rows
 }
 
@@ -78,7 +78,7 @@ fn havells_file() -> Vec<ContractRow> {
 fn test_parse_contract_label_reads_a_plain_name() {
     let p = parse_contract_label("SBIN-23Nov2026-1040-PE").expect("parses");
     assert_eq!(p.underlying, "SBIN");
-    assert_eq!(p.expiry_ymd, 2026_11_23);
+    assert_eq!(p.expiry_ymd, 20261123);
     assert_eq!(p.strike_paise, 104_000);
     assert_eq!(p.leg, "PE");
 }
@@ -145,7 +145,7 @@ fn test_parse_contract_label_refuses_every_malformed_shape() {
 fn test_parse_contract_label_accepts_a_leap_day() {
     assert_eq!(
         parse_contract_label("NIFTY-29Feb2028-24000-CE").map(|p| p.expiry_ymd),
-        Some(2028_02_29)
+        Some(20280229)
     );
 }
 
@@ -212,7 +212,7 @@ fn test_build_expiry_index_counts_the_expiry_day_itself_as_current() {
 #[test]
 fn test_build_expiry_index_on_yesterdays_file_finds_nothing_current() {
     // Yesterday's file read after its last expiry: every row is expired.
-    let rows = chain(1, "OPTSTK", "SBIN", 2026_10_27, &[1000, 1020, 1040]);
+    let rows = chain(1, "OPTSTK", "SBIN", 20261027, &[1000, 1020, 1040]);
     let index = build_expiry_index(&rows, TODAY, None);
     assert!(index.nearest.is_empty());
     assert_eq!(index.by_key.len(), rows.len(), "expired rows still resolve");
@@ -376,8 +376,8 @@ fn test_enforce_subscribe_expiry_scope_agrees_with_the_real_selector() {
     // passes. On a file with a stub, a weekly, a monthly and an expired row
     // they must agree: the selector's output is refused nothing.
     let mut rows = vec![
-        opt(1, "OPTIDX", "NIFTY", 2026_10_30, 24_000, "CE"),
-        opt(2, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "CE"),
+        opt(1, "OPTIDX", "NIFTY", 20261030, 24_000, "CE"),
+        opt(2, "OPTIDX", "NIFTY", 20261027, 24_000, "CE"),
     ];
     // Ids clear of `havells_file`'s (10, 11, 100.., 200.., 300): a shared id
     // on two contracts is ambiguous and refused by design.
@@ -411,11 +411,11 @@ proptest! {
     #[test]
     fn proptest_selector_output_always_passes_the_expiry_scope_check(
         expiries in proptest::collection::vec(
-            (prop_oneof![Just(2026_10_27_u32), Just(TODAY), Just(2026_10_30), Just(NIFTY_WEEKLY), Just(CURRENT), Just(NEXT)], 1_usize..6),
+            (prop_oneof![Just(20261027_u32), Just(TODAY), Just(20261030), Just(NIFTY_WEEKLY), Just(CURRENT), Just(NEXT)], 1_usize..6),
             1..6,
         ),
         stock_legs in proptest::collection::vec(
-            (prop_oneof![Just(TODAY), Just(2026_10_30), Just(CURRENT), Just(NEXT)], 1_usize..5),
+            (prop_oneof![Just(TODAY), Just(20261030), Just(CURRENT), Just(NEXT)], 1_usize..5),
             1..5,
         ),
     ) {
@@ -449,7 +449,7 @@ fn test_record_subscribe_expiry_scope_and_subscribe_refused_for_day() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A day no other test uses (the memory is process-wide).
-    let day = 1_998_01_01;
+    let day = 19980101;
     assert_eq!(subscribe_refused_for_day(day), None);
     let mut report = SubscribeScopeReport {
         checked: 3,
@@ -684,7 +684,7 @@ fn test_classify_candle_contracts_counts_what_it_cannot_judge() {
 fn test_classify_candle_contracts_with_yesterdays_file_reports_expired() {
     // Today's file missing and yesterday's used by mistake would read every
     // stored contract as expired, never as clean.
-    let file = chain(1, "OPTSTK", "SBIN", 2026_10_27, &[1000, 1020]);
+    let file = chain(1, "OPTSTK", "SBIN", 20261027, &[1000, 1020]);
     let index = build_expiry_index(&file, TODAY, None);
     let (counts, _) = classify_candle_contracts(&[candle(1, "NSE_FNO", None)], &index, TODAY);
     assert_eq!(counts.expired, 1);
@@ -1084,11 +1084,11 @@ fn test_classify_candle_contracts_hyphenated_underlying_name_only_is_judged() {
 #[test]
 fn test_ymd_of_edges() {
     let leap = NaiveDate::from_ymd_opt(2028, 2, 29).expect("date");
-    assert_eq!(ymd_of(leap), 2028_02_29);
+    assert_eq!(ymd_of(leap), 20280229);
     let first = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");
-    assert_eq!(ymd_of(first), 2026_01_01);
+    assert_eq!(ymd_of(first), 20260101);
     let last = NaiveDate::from_ymd_opt(2026, 12, 31).expect("date");
-    assert_eq!(ymd_of(last), 2026_12_31);
+    assert_eq!(ymd_of(last), 20261231);
 }
 
 #[test]
@@ -1364,7 +1364,7 @@ fn test_build_expiry_index_an_expired_duplicate_never_makes_a_selected_contract_
     // contract made the id "ambiguous", so the subscribe check refused a
     // contract the selector rightly picked. Both file orders.
     for expired_first in [true, false] {
-        let expired = opt(1, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE");
+        let expired = opt(1, "OPTIDX", "NIFTY", 20261027, 24_000, "PE");
         let mut rows = Vec::new();
         if expired_first {
             rows.push(expired.clone());
@@ -1412,7 +1412,7 @@ fn test_option_labels_from_names_a_reused_id_as_the_row_the_selector_admits() {
     // file. The candle name for the id must be the current SBIN contract the
     // selector subscribed, not the expired NIFTY row.
     let mut rows = chain(1001, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]);
-    rows.push(opt(1001, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE"));
+    rows.push(opt(1001, "OPTIDX", "NIFTY", 20261027, 24_000, "PE"));
     let names = crate::dhan_contract_universe::option_labels_from(&rows, TODAY);
     assert_eq!(
         names.get(&(1001, "NSE_FNO")).map(|s| &**s),
@@ -1428,7 +1428,7 @@ fn test_preferred_option_rows_keeps_one_row_per_key_as_by_key_does() {
     // admissible twin) keeps exactly the row `build_expiry_index` keeps.
     let base = chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]);
     let twins = [
-        opt(1, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE"),
+        opt(1, "OPTIDX", "NIFTY", 20261027, 24_000, "PE"),
         opt(1, "OPTSTK", "OTHER", NEXT, 1000, ""),
         opt(1, "OPTSTK", "SBIN", NEXT, 1000, "CE"),
     ];
@@ -1472,7 +1472,7 @@ fn test_preferred_option_rows_maps_a_reused_id_to_the_admissible_underlying() {
     // raw file maps the reused id to the expired NIFTY row (last wins); the
     // preferred rows map it to SBIN, the contract the selector subscribed.
     let mut rows = chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]);
-    rows.push(opt(1, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "PE"));
+    rows.push(opt(1, "OPTIDX", "NIFTY", 20261027, 24_000, "PE"));
     let symbols: HashMap<String, (u64, u8)> = [
         (
             "SBIN".to_string(),
@@ -1546,7 +1546,7 @@ fn test_build_expiry_index_two_admissible_rows_stay_ambiguous_beside_an_unusable
     // The other direction: two contracts the selector could pick under one
     // id are still ambiguous (refused, never judged), whatever unusable row
     // sits between them.
-    let mut rows = vec![opt(1, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE")];
+    let mut rows = vec![opt(1, "OPTSTK", "SBIN", 20261027, 1000, "CE")];
     rows.extend(chain(1, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]));
     rows.extend(chain(50, "OPTSTK", "SBIN", NEXT, &[1000, 1020]));
     rows.push(opt(1, "OPTSTK", "SBIN", NEXT, 1000, "CE"));
@@ -1563,16 +1563,16 @@ fn test_build_expiry_index_a_key_with_only_unusable_rows_keeps_the_old_rule() {
     // its unusable rows costs no selected contract and keeps the daily check
     // fail-closed (unresolved, never judged).
     let mut rows = vec![
-        opt(1, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE"),
-        opt(1, "OPTSTK", "SBIN", 2026_10_20, 1000, "CE"),
+        opt(1, "OPTSTK", "SBIN", 20261027, 1000, "CE"),
+        opt(1, "OPTSTK", "SBIN", 20261020, 1000, "CE"),
     ];
     rows.extend(chain(10, "OPTSTK", "SBIN", CURRENT, &[1000, 1020]));
     let index = build_expiry_index(&rows, TODAY, None);
     assert!(index.ambiguous.contains(&(1, ExchangeSegment::NseFno)));
     // Two unusable rows naming ONE contract are not ambiguous.
     let same = vec![
-        opt(2, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE"),
-        opt(2, "OPTSTK", "SBIN", 2026_10_27, 1000, "CE"),
+        opt(2, "OPTSTK", "SBIN", 20261027, 1000, "CE"),
+        opt(2, "OPTSTK", "SBIN", 20261027, 1000, "CE"),
     ];
     assert!(build_expiry_index(&same, TODAY, None).ambiguous.is_empty());
 }
@@ -1582,7 +1582,7 @@ fn test_enforce_subscribe_expiry_scope_agrees_with_the_real_selector_on_a_reused
     // The real selector picks the current SBIN chain; an expired NIFTY row in
     // the same file reuses one of its ids. The selector admits only the
     // current row, so the check must refuse nothing.
-    let mut rows = vec![opt(1_001, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "CE")];
+    let mut rows = vec![opt(1_001, "OPTIDX", "NIFTY", 20261027, 24_000, "CE")];
     rows.extend(chain(1_000, "OPTSTK", "SBIN", CURRENT, &[1000, 1020, 1040]));
     let master: Vec<_> = rows.iter().map(ContractRow::to_master_row).collect();
     let spot: HashMap<String, i64> = [("SBIN".to_owned(), 102_000_i64)].into_iter().collect();
@@ -1604,7 +1604,7 @@ fn test_enforce_subscribe_expiry_scope_counts_a_refusal_under_its_admissible_cla
     // INDEX row also uses, listed after it. The refusal lowers the stock
     // count the selector raised, never the index count.
     let mut rows = havells_file();
-    rows.push(opt(200, "OPTIDX", "NIFTY", 2026_10_27, 24_000, "CE"));
+    rows.push(opt(200, "OPTIDX", "NIFTY", 20261027, 24_000, "CE"));
     let mut selection = ContractSelection {
         instruments: vec![inst(100), inst(200)],
         stock_options: 2,
