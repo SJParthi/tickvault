@@ -183,6 +183,9 @@ pub fn build_router_with_auth(
     // (curl, MCP `tool_tickvault_api` without TICKVAULT_API_BEARER_TOKEN) get
     // 401 here even on localhost; the tickvault-logs MCP LOG tools are
     // unaffected because they read the local filesystem, never these routes.
+    // Kept for the F&O stocks route below; `auth_config` itself moves into
+    // `debug_routes`.
+    let fno_auth_config = auth_config.clone();
     let debug_routes: Router<SharedAppState> = Router::new()
         // Autonomous-ops Layer 1 (observability): read-only log access
         // for Claude MCP / remote sessions.
@@ -295,8 +298,27 @@ pub fn build_router_with_auth(
             axum::routing::get(handlers::board::board_data),
         )
         .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&public_limiter),
+            public_rate_limit,
+        ));
+    // Owner 2026-10-30 ("yes add the fno stocks page to dashboard dude"): the
+    // F&O stocks movers JSON the /dashboard page polls. One bounded QuestDB
+    // query per miss (2 s cache), so it is bearer-gated AND on the SAME
+    // shared limiter as the three routes above (one budget, not a second).
+    // `route_layer` order: the last one added runs first, so a request
+    // without a valid token is refused before it spends rate budget.
+    let fno_stocks_routes: Router<SharedAppState> = Router::new()
+        .route(
+            "/api/fno-stocks",
+            axum::routing::get(handlers::fno_stocks::get_fno_stocks),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
             public_limiter,
             public_rate_limit,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            fno_auth_config,
+            require_bearer_auth,
         ));
     // The 4 `/api/debug/*` routes live on `debug_routes` above (bearer-auth
     // gated, security trim 2026-07-04) — no longer on the public router.
@@ -310,6 +332,7 @@ pub fn build_router_with_auth(
     // on the merged routes block.
     public_routes
         .merge(limited_public_routes)
+        .merge(fno_stocks_routes)
         .merge(debug_routes)
         .merge(protected_routes)
         .layer(axum::middleware::from_fn(request_tracing))

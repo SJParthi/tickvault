@@ -192,7 +192,10 @@ pub fn plan_backup_set(
 /// off the drain (by the publisher) and shared read-only.
 struct BackupTable {
     filter: Box<[u64; FILTER_WORDS]>,
-    index: HashMap<(u64, u8), u32>,
+    /// Keyed with `ahash` (as `PrevCloseStore` and the detector are): the
+    /// drain probes it for every pre-filter hit. Iteration order is never
+    /// relied on (plan ITEM DT, 2026-10-30).
+    index: HashMap<(u64, u8), u32, ahash::RandomState>,
     len: usize,
 }
 
@@ -200,7 +203,7 @@ impl BackupTable {
     /// Cold: allocates for the set. A repeated key is held once.
     fn build(set: &[(u64, u8)]) -> Self {
         let mut filter = Box::new([0u64; FILTER_WORDS]);
-        let mut index = HashMap::with_capacity(set.len());
+        let mut index = HashMap::with_capacity_and_hasher(set.len(), ahash::RandomState::new());
         for &(security_id, segment) in set {
             if index.contains_key(&(security_id, segment)) {
                 continue;
