@@ -61,9 +61,10 @@
 //! ## Complexity
 //!
 //! `note` is O(1) per report: one SipHash probe into a map of at most
-//! [`RECONCILE_MAX_EXPECTED`] entries, no allocation until a socket's
-//! candidate list passes its pre-sized capacity (never, at the per-round
-//! cap). It runs inside the drain's existing 30 s O(n) silence scan, so it
+//! [`RECONCILE_MAX_EXPECTED`] entries, and no allocation: the per-socket
+//! candidate lists are pre-sized to the per-round cap and never pushed past
+//! it, and the exhausted instruments are a count plus the first
+//! `NAMED_IN_LOG` in a list pre-sized once. It runs inside the drain's existing 30 s O(n) silence scan, so it
 //! adds O(n) probes to that scan, never per tick: measured by
 //! `sweep_cost_at_the_authorized_ceiling` (`#[ignore]`d, run it for the
 //! number). `finish` is O(sockets + candidates), except once per IST day,
@@ -71,7 +72,13 @@
 //! `record_subscribed` is O(instruments) once per subscribe command, cold.
 //! The sweep holds the book's `std::sync::Mutex` for the whole scan; the
 //! other takers are cold (a subscribe record, the executor finishing a round),
-//! and each holds it for O(its instruments). Space is bounded: at most
+//! and each holds it for O(its instruments). A cold taker that arrives during
+//! a sweep waits for the rest of it, blocking its own tokio worker for up to
+//! one sweep (the harness above measures that). No await happens under the
+//! lock. Also under it, all rare: the edge-latched skip logs, the exhausted
+//! log line and counter (at most once per instrument per day), and the
+//! non-blocking `try_send` that hands a round to the executor (at most one
+//! per socket per 120 s). Space is bounded: at most
 //! [`RECONCILE_MAX_EXPECTED`] instruments (past it a new one is refused and
 //! counted) and [`RECONCILE_MAX_SOCKETS`] sockets. The executor runs on its
 //! own task: O(instruments) per round plus at most
@@ -239,6 +246,10 @@ struct Socket {
 struct Inner {
     sockets: Vec<Socket>,
     expected: HashMap<Key, Expected>,
+    /// The first [`NAMED_IN_LOG`] instruments that used their last round in
+    /// the current sweep, for the log line. Pre-sized once and cleared per
+    /// sweep, so `note` never allocates; the full count is kept apart.
+    exhausted_named: Vec<SubscribeInstrument>,
     ist_day: i64,
     feed_silent_reported: bool,
 }
@@ -290,6 +301,7 @@ impl SubscribeReconcile {
             inner: Mutex::new(Inner {
                 sockets: Vec::with_capacity(RECONCILE_MAX_SOCKETS),
                 expected: HashMap::with_capacity(RECONCILE_MAX_EXPECTED),
+                exhausted_named: Vec::with_capacity(NAMED_IN_LOG),
                 ist_day: ist_day_now(),
                 feed_silent_reported: false,
             }),
@@ -407,12 +419,13 @@ impl SubscribeReconcile {
             socket.delivering = 0;
             socket.candidates.clear();
         }
+        inner.exhausted_named.clear();
         ReconcileSweep {
             book: self,
             inner,
             now,
             missing: 0,
-            exhausted: Vec::new(),
+            exhausted: 0,
         }
     }
 
@@ -439,7 +452,9 @@ pub struct ReconcileSweep<'a> {
     inner: MutexGuard<'a, Inner>,
     now: Instant,
     missing: u32,
-    exhausted: Vec<SubscribeInstrument>,
+    /// Instruments that used their last round in this sweep (the first
+    /// [`NAMED_IN_LOG`] are named in `Inner::exhausted_named`).
+    exhausted: u32,
 }
 
 impl ReconcileSweep<'_> {
@@ -481,7 +496,10 @@ impl ReconcileSweep<'_> {
                 });
             if last_round_settled && !entry.exhausted_reported {
                 entry.exhausted_reported = true;
-                self.exhausted.push(entry.instrument);
+                self.exhausted = self.exhausted.saturating_add(1);
+                if inner.exhausted_named.len() < NAMED_IN_LOG {
+                    inner.exhausted_named.push(entry.instrument);
+                }
             }
             return;
         }
@@ -502,7 +520,7 @@ impl ReconcileSweep<'_> {
     pub fn finish_at(mut self, secs_of_day_ist: u32, ist_day: i64) -> SweepSummary {
         let mut summary = SweepSummary {
             missing: self.missing,
-            newly_exhausted: u32::try_from(self.exhausted.len()).unwrap_or(u32::MAX),
+            newly_exhausted: self.exhausted,
             ..SweepSummary::default()
         };
         gauge!(RECONCILE_MISSING_GAUGE).set(f64::from(self.missing));
@@ -523,7 +541,8 @@ impl ReconcileSweep<'_> {
                 socket.last_round_at = None;
                 socket.silent_reported = false;
             }
-            self.exhausted.clear();
+            self.exhausted = 0;
+            inner.exhausted_named.clear();
             summary.newly_exhausted = 0;
         }
         // The continuous session, and not its first 120 s: an instrument that has
@@ -637,16 +656,16 @@ impl Drop for ReconcileSweep<'_> {
     /// Reports instruments that used their last round, once each, whether or
     /// not the pass reached `finish` (a skipped gate must not hide them).
     fn drop(&mut self) {
-        if self.exhausted.is_empty() {
+        if self.exhausted == 0 {
             return;
         }
-        let n = self.exhausted.len();
-        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "exhausted").increment(n as u64);
+        let n = self.exhausted;
+        counter!(RECONCILE_INSTRUMENTS_METRIC, "outcome" => "exhausted").increment(u64::from(n));
         warn!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
             source = "subscribe_reconcile_exhausted",
             instruments = n,
-            first = %NamedInstruments(&self.exhausted),
+            first = %NamedInstruments(&self.inner.exhausted_named),
             "subscribe reconcile: instruments still sent nothing after the last resend round - \
              either they do not trade or the vendor is not serving them; not resent again today"
         );
@@ -1306,6 +1325,41 @@ mod tests {
         let e = entry(&book, 2);
         assert_eq!(e.rounds, RECONCILE_MAX_ROUNDS);
         assert!(e.exhausted_reported);
+    }
+
+    // Regression: 2026-10-30 — `note` pushed every exhausted instrument into
+    // an empty Vec under the book's lock, allocating on the drain.
+    #[test]
+    fn test_regression_exhausted_past_the_named_cap_counts_all_and_never_grows() {
+        let (book, mut rx) = SubscribeReconcile::new(true);
+        let (tx, _sock) = socket();
+        let t0 = Instant::now();
+        let missing: Vec<u64> = (2..2 + 3 * NAMED_IN_LOG as u64).collect();
+        let mut all = vec![1];
+        all.extend_from_slice(&missing);
+        book.record_subscribed_at(&tx, &sis(&all), t0);
+        let capacity = book.lock().exhausted_named.capacity();
+        assert!(capacity >= NAMED_IN_LOG);
+        let mut at = t0 + delta();
+        let mut exhausted = 0;
+        for _ in 0..40 {
+            let s = one_sweep(&book, at, IN_SESSION, &[1], &missing);
+            exhausted += s.newly_exhausted;
+            finish_queued(&book, &mut rx, at);
+            at += Duration::from_secs(30);
+        }
+        assert_eq!(
+            exhausted as usize,
+            missing.len(),
+            "every exhausted instrument is counted"
+        );
+        let inner = book.lock();
+        assert!(inner.exhausted_named.len() <= NAMED_IN_LOG);
+        assert_eq!(
+            inner.exhausted_named.capacity(),
+            capacity,
+            "the named list is never grown"
+        );
     }
 
     #[test]
