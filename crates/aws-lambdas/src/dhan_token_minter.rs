@@ -1338,7 +1338,9 @@ mod tests {
     // test threads flipped an asserted branch.
     // -----------------------------------------------------------------------
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // One crate-wide lock: the SDK loopback tests in other modules set the
+    // same AWS_* variables.
+    use crate::test_support::ENV_LOCK;
 
     struct EnvGuard {
         key: &'static str,
@@ -2420,6 +2422,453 @@ mod tests {
                 life_left >= MIN_CODE_LIFE_SECS,
                 "t={t} left only {life_left}s of code life after the wait"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The live-AWS and live-HTTP shells, driven through the REAL SDK and the
+    // REAL reqwest client against loopback servers (crate::test_support).
+    // These cover the adapters every fake-driven test above stands in for:
+    // `SsmSecretStore`, `run_mint_and_publish`, `handle`, and the transport
+    // classifier — and they check, on the wire, that no secret travels
+    // anywhere it should not.
+    // -----------------------------------------------------------------------
+    mod sdk_loopback {
+        use super::*;
+        use crate::test_support::{
+            LoopbackResponse, aws_env_guards, json_error, loopback_sdk_config, recorded,
+            start_loopback_aws,
+        };
+
+        const PIN: &str = "918273";
+        const FAKE_DHAN_ACCOUNT: &str = "loopback-account";
+        const TOTP_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+        fn get_parameter_reply(value: &str) -> LoopbackResponse {
+            LoopbackResponse::json(
+                200,
+                format!(
+                    r#"{{"Parameter":{{"Name":"/x","Type":"SecureString","Value":"{value}","Version":1}}}}"#
+                ),
+            )
+        }
+
+        /// An SSM endpoint holding the three Dhan credentials and accepting
+        /// one `PutParameter`.
+        fn credential_ssm(req: &crate::test_support::LoopbackRequest) -> LoopbackResponse {
+            if req.target.ends_with("PutParameter") {
+                return LoopbackResponse::json(200, r#"{"Version":2,"Tier":"Standard"}"#);
+            }
+            if req.body.contains("/client-id") {
+                get_parameter_reply(FAKE_DHAN_ACCOUNT)
+            } else if req.body.contains("/client-secret") {
+                get_parameter_reply(PIN)
+            } else if req.body.contains("/totp-secret") {
+                get_parameter_reply(TOTP_SECRET)
+            } else {
+                json_error("ParameterNotFound", "no such parameter")
+            }
+        }
+
+        async fn ssm_client(endpoint: &str) -> SsmClient {
+            aws_sdk_ssm::Client::new(&loopback_sdk_config(endpoint).await)
+        }
+
+        #[test]
+        fn test_mint_error_display_names_every_stage() {
+            let cases = [
+                (MintError::Configuration("x".into()), "misconfigured: x"),
+                (
+                    MintError::CredentialRead("x".into()),
+                    "could not read Dhan credentials from SSM: x",
+                ),
+                (
+                    MintError::TotpGeneration("x".into()),
+                    "TOTP generation failed: x",
+                ),
+                (
+                    MintError::Transport("x".into()),
+                    "generateAccessToken request failed: x",
+                ),
+                (
+                    MintError::HttpStatus {
+                        status: 503,
+                        body: "x".into(),
+                    },
+                    "generateAccessToken HTTP 503: x",
+                ),
+                (
+                    MintError::DhanError("x".into()),
+                    "Dhan rejected the mint: x",
+                ),
+                (
+                    MintError::NoToken("x".into()),
+                    "mint response carried no accessToken: x",
+                ),
+                (
+                    MintError::MalformedToken("x".into()),
+                    "refusing to publish a malformed token: x",
+                ),
+            ];
+            for (err, expected) in cases {
+                assert_eq!(err.to_string(), expected, "stage {}", err.stage());
+            }
+            assert!(MintError::Publish("x".into()).to_string().contains('x'));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_reads_a_secure_parameter_with_decryption() {
+            let (endpoint, requests) = start_loopback_aws(|_| get_parameter_reply(PIN)).await;
+            let client = ssm_client(&endpoint).await;
+            let store = SsmSecretStore::new(&client);
+            let value = store
+                .read("/tickvault/prod/dhan/client-secret".to_string())
+                .await
+                .expect("a present value must read");
+            assert_eq!(value.expose_secret(), PIN);
+            let seen = recorded(&requests);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].target, "AmazonSSM.GetParameter");
+            assert!(seen[0].body.contains("\"WithDecryption\":true"));
+            assert!(seen[0].body.contains("/tickvault/prod/dhan/client-secret"));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_refuses_a_blank_value() {
+            let (endpoint, _) = start_loopback_aws(|_| get_parameter_reply("   ")).await;
+            let client = ssm_client(&endpoint).await;
+            let err = SsmSecretStore::new(&client)
+                .read("/p".to_string())
+                .await
+                .expect_err("a blank value must be refused");
+            assert_eq!(err, MintError::CredentialRead("/p: value is empty".into()));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_refuses_a_parameter_with_no_value() {
+            let (endpoint, _) = start_loopback_aws(|_| {
+                LoopbackResponse::json(200, r#"{"Parameter":{"Name":"/p"}}"#)
+            })
+            .await;
+            let client = ssm_client(&endpoint).await;
+            let err = SsmSecretStore::new(&client)
+                .read("/p".to_string())
+                .await
+                .expect_err("a value-less parameter must be refused");
+            assert_eq!(
+                err,
+                MintError::CredentialRead("/p: parameter has no value".into())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_maps_an_sdk_error_to_credential_read() {
+            let (endpoint, _) =
+                start_loopback_aws(|_| json_error("ParameterNotFound", "missing")).await;
+            let client = ssm_client(&endpoint).await;
+            let err = SsmSecretStore::new(&client)
+                .read("/p".to_string())
+                .await
+                .expect_err("an SDK error must surface");
+            assert_eq!(err.stage(), "credential_read");
+            assert!(
+                err.to_string().contains("/p"),
+                "the path names the parameter: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_writes_a_secure_string_with_overwrite() {
+            let (endpoint, requests) = start_loopback_aws(|_| {
+                LoopbackResponse::json(200, r#"{"Version":2,"Tier":"Standard"}"#)
+            })
+            .await;
+            let client = ssm_client(&endpoint).await;
+            let token = sample_jwt();
+            SsmSecretStore::new(&client)
+                .write_secure(
+                    "/tickvault/prod/dhan/access-token".to_string(),
+                    SecretString::from(token.clone()),
+                )
+                .await
+                .expect("the write must succeed");
+            let seen = recorded(&requests);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].target, "AmazonSSM.PutParameter");
+            assert!(seen[0].body.contains("\"Type\":\"SecureString\""));
+            assert!(seen[0].body.contains("\"Overwrite\":true"));
+            assert!(seen[0].body.contains(&token));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_write_failure_is_a_publish_error_without_the_token() {
+            let (endpoint, _) =
+                start_loopback_aws(|_| json_error("AccessDeniedException", "denied")).await;
+            let client = ssm_client(&endpoint).await;
+            let token = sample_jwt();
+            let err = SsmSecretStore::new(&client)
+                .write_secure("/p".to_string(), SecretString::from(token.clone()))
+                .await
+                .expect_err("a refused write must surface");
+            assert_eq!(err.stage(), "publish");
+            assert!(
+                !err.to_string().contains(&token),
+                "a publish error must never echo the token"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_run_mint_and_publish_reads_mints_and_publishes_end_to_end() {
+            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+            let token: &'static str = Box::leak(sample_jwt().into_boxed_str());
+            let body: &'static str =
+                Box::leak(format!(r#"{{"accessToken":"{token}"}}"#).into_boxed_str());
+            let (dhan_url, dhan_requests) = start_mint_server("200 OK", body).await;
+            let client = ssm_client(&ssm_endpoint).await;
+            let http = build_http_client().expect("client builds");
+
+            let path = run_mint_and_publish(&client, &http, "prod", SSM_DHAN_SERVICE, &dhan_url)
+                .await
+                .expect("the full job must succeed");
+            assert_eq!(path, "/tickvault/prod/dhan/access-token");
+
+            let seen = recorded(&ssm_requests);
+            let puts: Vec<_> = seen
+                .iter()
+                .filter(|r| r.target == "AmazonSSM.PutParameter")
+                .collect();
+            assert_eq!(puts.len(), 1, "exactly one publish");
+            assert!(puts[0].body.contains(token));
+            assert!(puts[0].body.contains("/tickvault/prod/dhan/access-token"));
+            for get in seen.iter().filter(|r| r.target == "AmazonSSM.GetParameter") {
+                assert!(!get.body.contains(token), "a read never carries the token");
+            }
+            assert_eq!(seen.len(), 4, "three reads and one write");
+
+            let mint = dhan_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(mint.len(), 1);
+            assert!(mint[0].contains(&format!("pin={PIN}")));
+            assert!(mint[0].contains(&format!("dhanClientId={FAKE_DHAN_ACCOUNT}")));
+        }
+
+        #[tokio::test]
+        async fn test_run_mint_and_publish_never_writes_after_a_dhan_rejection() {
+            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+            let (dhan_url, _) =
+                start_mint_server("200 OK", r#"{"status":"error","message":"Invalid Pin"}"#).await;
+            let client = ssm_client(&ssm_endpoint).await;
+            let http = build_http_client().expect("client builds");
+
+            let err = run_mint_and_publish(&client, &http, "prod", SSM_DHAN_SERVICE, &dhan_url)
+                .await
+                .expect_err("a PIN rejection must fail the job");
+            assert_eq!(err, MintError::DhanError("Invalid Pin".into()));
+            assert!(
+                recorded(&ssm_requests)
+                    .iter()
+                    .all(|r| r.target != "AmazonSSM.PutParameter"),
+                "a failed mint must leave the old token in place"
+            );
+            assert!(
+                !err.to_string().contains(PIN),
+                "the PIN never reaches the error"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_mints_and_reports_the_parameter_it_wrote() {
+            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+            let token: &'static str = Box::leak(sample_jwt().into_boxed_str());
+            let body: &'static str =
+                Box::leak(format!(r#"{{"accessToken":"{token}"}}"#).into_boxed_str());
+            let (dhan_url, _) = start_mint_server("200 OK", body).await;
+
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _aws = aws_env_guards(&ssm_endpoint);
+            let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
+            let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("dhan-depth"));
+            let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+
+            let reply = handle(serde_json::json!({}))
+                .await
+                .expect("handle must succeed");
+            assert_eq!(reply["status"], "ok");
+            assert_eq!(reply["service"], "dhan-depth");
+            assert_eq!(
+                reply["parameter"],
+                "/tickvault/prod/dhan-depth/access-token"
+            );
+            let reply_text = reply.to_string();
+            assert!(
+                !reply_text.contains(token),
+                "the reply never carries the token"
+            );
+            assert!(
+                recorded(&ssm_requests)
+                    .iter()
+                    .any(|r| r.target == "AmazonSSM.PutParameter" && r.body.contains(token))
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_fails_loudly_and_publishes_nothing_on_a_rejected_mint() {
+            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+            let (dhan_url, _) =
+                start_mint_server("401 Unauthorized", r#"{"errorMessage":"bad client"}"#).await;
+
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _aws = aws_env_guards(&ssm_endpoint);
+            let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
+            let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
+            let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+
+            let err = handle(serde_json::json!({}))
+                .await
+                .expect_err("a rejected mint must fail the invocation");
+            let text = err.to_string();
+            assert!(text.contains("HTTP 401"), "{text}");
+            assert!(
+                !text.contains(PIN),
+                "the PIN never reaches the Lambda error"
+            );
+            assert!(
+                recorded(&ssm_requests)
+                    .iter()
+                    .all(|r| r.target != "AmazonSSM.PutParameter")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_refuses_an_unknown_service_before_any_call() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("groww"));
+            let err = handle(serde_json::json!({}))
+                .await
+                .expect_err("an unknown namespace must be refused");
+            assert!(
+                err.to_string()
+                    .contains("refusing to mint into an unknown namespace")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_refuses_to_guess_the_auth_host() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
+            let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, None);
+            let err = handle(serde_json::json!({}))
+                .await
+                .expect_err("an unset auth host must be refused");
+            assert!(err.to_string().contains(DHAN_AUTH_BASE_URL_ENV));
+        }
+
+        // ---- describe_transport_error, on real reqwest errors -------------
+
+        /// A loopback listener that accepts and then does `behaviour` with
+        /// the socket, for a single connection.
+        async fn one_shot_server<F, Fut>(behaviour: F) -> String
+        where
+            F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()> + Send,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    behaviour(stream).await;
+                }
+            });
+            format!("http://127.0.0.1:{port}/app/generateAccessToken?pin={PIN}")
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_timeout_without_the_url() {
+            let url = one_shot_server(|stream| async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(stream);
+            })
+            .await;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .expect("client");
+            let err = client.post(&url).send().await.expect_err("must time out");
+            let described = describe_transport_error(&err);
+            assert_eq!(described, "timed out");
+            assert!(!described.contains(PIN));
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_refused_connection() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            drop(listener);
+            let err = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/?pin={PIN}"))
+                .send()
+                .await
+                .expect_err("a closed port must refuse");
+            assert_eq!(describe_transport_error(&err), "connection failed");
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_dropped_request() {
+            let url = one_shot_server(|stream| async move { drop(stream) }).await;
+            let err = reqwest::Client::new()
+                .post(&url)
+                .send()
+                .await
+                .expect_err("a connection closed before any reply must fail");
+            let described = describe_transport_error(&err);
+            assert!(
+                [
+                    "request could not be sent",
+                    "transport error",
+                    "connection failed"
+                ]
+                .contains(&described.as_str()),
+                "unexpected class {described}"
+            );
+            assert!(!described.contains(PIN));
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_truncated_body() {
+            let url = one_shot_server(|mut stream| async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\nshort")
+                    .await;
+                let _ = stream.shutdown().await;
+            })
+            .await;
+            let response = reqwest::Client::new()
+                .post(&url)
+                .send()
+                .await
+                .expect("the headers arrive");
+            let err = response.text().await.expect_err("the body is cut short");
+            assert_eq!(
+                describe_transport_error(&err),
+                "response body could not be read"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_falls_back_for_a_builder_error() {
+            let err = reqwest::Client::new()
+                .post("not a url")
+                .send()
+                .await
+                .expect_err("an unparsable URL must fail");
+            assert_eq!(describe_transport_error(&err), "transport error");
         }
     }
 }

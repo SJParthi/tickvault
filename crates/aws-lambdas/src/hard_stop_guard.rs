@@ -2999,3 +2999,337 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(ec2.stopped.borrow().len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The live SDK adapters, the env wiring and `handle`, driven through the REAL
+// AWS SDK against a loopback account (crate::test_support).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod sdk_loopback_tests {
+    use super::*;
+    use crate::budget_spend::{BUDGET_ACCOUNT_ID_ENV, BUDGET_NAME_ENV, BudgetCoordinates};
+    use crate::test_support::{
+        EnvVarGuard, Fleet, aws_env_guards, env_lock, loopback_sdk_config, operations, recorded,
+        start_fleet,
+    };
+
+    async fn config_for(
+        fleet: Fleet,
+    ) -> (
+        aws_config::SdkConfig,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::test_support::LoopbackRequest>>>,
+    ) {
+        let (endpoint, requests) = start_fleet(fleet).await;
+        (loopback_sdk_config(&endpoint).await, requests)
+    }
+
+    fn coords() -> BudgetCoordinates {
+        BudgetCoordinates {
+            account_id: "123456789012".to_string(),
+            budget_name: "tv-prod-monthly".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_describe_and_stop() {
+        let (config, requests) = config_for(Fleet::default()).await;
+        let ec2 = SdkEc2 {
+            client: aws_sdk_ec2::Client::new(&config),
+        };
+        let inst = ec2
+            .describe("i-0loopback")
+            .await
+            .expect("describe succeeds")
+            .expect("one instance");
+        assert_eq!(inst.state, "running");
+        assert!(inst.launch_time.is_some());
+        ec2.stop_instances("i-0loopback")
+            .await
+            .expect("stop succeeds");
+        assert_eq!(
+            operations(&requests),
+            vec!["DescribeInstances", "StopInstances"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_not_found_and_errors() {
+        let (config, _) = config_for(Fleet {
+            instance_state: None,
+            fail: vec!["StopInstances"],
+            ..Fleet::default()
+        })
+        .await;
+        let ec2 = SdkEc2 {
+            client: aws_sdk_ec2::Client::new(&config),
+        };
+        assert!(
+            ec2.describe("i-0gone")
+                .await
+                .expect("describe succeeds")
+                .is_none()
+        );
+        assert!(ec2.stop_instances("i-0gone").await.is_err());
+
+        let (config, _) = config_for(Fleet {
+            fail: vec!["DescribeInstances"],
+            ..Fleet::default()
+        })
+        .await;
+        let ec2 = SdkEc2 {
+            client: aws_sdk_ec2::Client::new(&config),
+        };
+        assert!(ec2.describe("i-0x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sns_publish_and_failure() {
+        let (config, requests) = config_for(Fleet::default()).await;
+        let sns = SdkSns {
+            client: aws_sdk_sns::Client::new(&config),
+        };
+        sns.publish("arn:t", "sub", "msg")
+            .await
+            .expect("publish succeeds");
+        assert_eq!(
+            recorded(&requests)[0].form_value("Subject").as_deref(),
+            Some("sub")
+        );
+
+        let (config, _) = config_for(Fleet {
+            fail: vec!["Publish"],
+            ..Fleet::default()
+        })
+        .await;
+        let sns = SdkSns {
+            client: aws_sdk_sns::Client::new(&config),
+        };
+        assert!(sns.publish("arn:t", "sub", "msg").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_events_disable_and_enable_name_the_rule() {
+        let (config, requests) = config_for(Fleet::default()).await;
+        let events = SdkEvents {
+            client: aws_sdk_eventbridge::Client::new(&config),
+        };
+        events
+            .disable_rule("tv-prod-start")
+            .await
+            .expect("disable succeeds");
+        events
+            .enable_rule("tv-prod-start")
+            .await
+            .expect("enable succeeds");
+        let seen = recorded(&requests);
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0].target.ends_with("DisableRule"),
+            "{}",
+            seen[0].target
+        );
+        assert!(seen[1].target.ends_with("EnableRule"), "{}", seen[1].target);
+        assert!(seen.iter().all(|r| r.body.contains("tv-prod-start")));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_events_failures_are_errors() {
+        let (config, _) = config_for(Fleet {
+            fail: vec!["AWSEvents.DisableRule", "AWSEvents.EnableRule"],
+            ..Fleet::default()
+        })
+        .await;
+        let events = SdkEvents {
+            client: aws_sdk_eventbridge::Client::new(&config),
+        };
+        assert!(events.disable_rule("r").await.is_err());
+        assert!(events.enable_rule("r").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_budgets_reads_the_actual_spend_or_refuses_missing_coordinates() {
+        let (config, requests) = config_for(Fleet {
+            spend_usd: "157.18",
+            ..Fleet::default()
+        })
+        .await;
+        let budgets = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        assert_eq!(budgets.actual_spend_usd().await, Ok(157.18));
+        let seen = recorded(&requests);
+        assert!(seen[0].body.contains("123456789012"));
+        assert!(seen[0].body.contains("tv-prod-monthly"));
+
+        let missing = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Err("BUDGET_NAME env var is missing or empty".to_string()),
+        };
+        assert_eq!(
+            missing.actual_spend_usd().await,
+            Err("BUDGET_NAME env var is missing or empty".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_budgets_api_failure_is_unknown_spend() {
+        let (config, _) = config_for(Fleet {
+            fail: vec!["AWSBudgetServiceGateway.DescribeBudget"],
+            ..Fleet::default()
+        })
+        .await;
+        let budgets = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        let err = budgets
+            .actual_spend_usd()
+            .await
+            .expect_err("a refusal is unknown spend");
+        assert!(err.contains("budgets:DescribeBudget failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ssm_get_and_put_a_plain_string() {
+        let mut ssm_values = std::collections::HashMap::new();
+        ssm_values.insert(DEFAULT_PING_STATE_PARAM.to_string(), "3".to_string());
+        let (config, requests) = config_for(Fleet {
+            ssm: ssm_values,
+            ..Fleet::default()
+        })
+        .await;
+        let ssm = SdkSsm {
+            client: aws_sdk_ssm::Client::new(&config),
+        };
+        assert_eq!(
+            ssm.get_parameter(DEFAULT_PING_STATE_PARAM).await.as_deref(),
+            Ok("3")
+        );
+        assert!(ssm.get_parameter("/absent").await.is_err());
+        ssm.put_parameter(DEFAULT_PING_STATE_PARAM, "4")
+            .await
+            .expect("put succeeds");
+        let put = recorded(&requests)
+            .into_iter()
+            .find(|r| r.target == "AmazonSSM.PutParameter")
+            .expect("one put");
+        assert!(put.body.contains("\"Type\":\"String\""), "{}", put.body);
+        assert!(put.body.contains("\"Overwrite\":true"));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ssm_put_failure_is_an_error() {
+        let (config, _) = config_for(Fleet {
+            fail: vec!["AmazonSSM.PutParameter"],
+            ..Fleet::default()
+        })
+        .await;
+        let ssm = SdkSsm {
+            client: aws_sdk_ssm::Client::new(&config),
+        };
+        assert!(ssm.put_parameter("/p", "v").await.is_err());
+    }
+
+    const GUARD_KEYS: [&str; 9] = [
+        "INSTANCE_ID",
+        "ALERTS_TOPIC_ARN",
+        "START_RULE_NAME",
+        "BUDGET_KILL_USD",
+        "PING_STATE_PARAM",
+        "KEEP_ALIVE_PARAM",
+        "BUDGET_STOP_PARAM",
+        "DRAIN_HOLD_PARAM",
+        crate::muhurat_window::MUHURAT_SESSIONS_ENV,
+    ];
+
+    #[test]
+    fn test_guard_env_from_process_env_defaults_when_unset() {
+        let _lock = env_lock();
+        let _unset: Vec<EnvVarGuard> = GUARD_KEYS
+            .iter()
+            .map(|k| EnvVarGuard::set(k, None))
+            .collect();
+        let env = GuardEnv::from_process_env();
+        assert_eq!(env.instance_id, "");
+        assert_eq!(env.alerts_topic_arn, "");
+        assert_eq!(env.start_rule_name, "");
+        assert_eq!(env.budget_kill_usd, DEFAULT_BUDGET_KILL_USD);
+        assert_eq!(env.ping_state_param, DEFAULT_PING_STATE_PARAM);
+        assert_eq!(
+            env.keep_alive_param,
+            crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM
+        );
+        assert_eq!(
+            env.budget_stop_param,
+            crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM
+        );
+        assert_eq!(
+            env.drain_hold_param,
+            crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM
+        );
+        assert_eq!(env.muhurat_sessions, "");
+    }
+
+    #[test]
+    fn test_guard_env_from_process_env_reads_every_override() {
+        let _lock = env_lock();
+        let _set: Vec<EnvVarGuard> = GUARD_KEYS
+            .iter()
+            .map(|k| {
+                let value = if *k == "BUDGET_KILL_USD" {
+                    "75".to_string()
+                } else {
+                    format!("v-{k}")
+                };
+                EnvVarGuard::set(k, Some(&value))
+            })
+            .collect();
+        let env = GuardEnv::from_process_env();
+        assert_eq!(env.instance_id, "v-INSTANCE_ID");
+        assert_eq!(env.alerts_topic_arn, "v-ALERTS_TOPIC_ARN");
+        assert_eq!(env.start_rule_name, "v-START_RULE_NAME");
+        assert_eq!(env.budget_kill_usd, 75.0);
+        assert_eq!(env.ping_state_param, "v-PING_STATE_PARAM");
+        assert_eq!(env.keep_alive_param, "v-KEEP_ALIVE_PARAM");
+        assert_eq!(env.budget_stop_param, "v-BUDGET_STOP_PARAM");
+        assert_eq!(env.drain_hold_param, "v-DRAIN_HOLD_PARAM");
+    }
+
+    #[test]
+    fn test_guard_env_unparsable_budget_falls_back_to_the_compiled_default() {
+        // A fat-fingered value must not kill the guard: it falls back to the
+        // compiled default, which `effective_budget_kill_usd` then clamps.
+        let _lock = env_lock();
+        let _bad = EnvVarGuard::set("BUDGET_KILL_USD", Some("seventy-five"));
+        assert_eq!(
+            GuardEnv::from_process_env().budget_kill_usd,
+            DEFAULT_BUDGET_KILL_USD
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_runs_the_guard_against_a_stopped_box_without_stopping_it() {
+        let (endpoint, requests) = start_fleet(Fleet {
+            instance_state: Some("stopped"),
+            ..Fleet::default()
+        })
+        .await;
+        let _lock = env_lock();
+        let _aws = aws_env_guards(&endpoint);
+        let _id = EnvVarGuard::set("INSTANCE_ID", Some("i-0loopback"));
+        let _topic = EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
+        let _rule = EnvVarGuard::set("START_RULE_NAME", Some("tv-prod-start"));
+        let _acct = EnvVarGuard::set(BUDGET_ACCOUNT_ID_ENV, Some("123456789012"));
+        let _name = EnvVarGuard::set(BUDGET_NAME_ENV, Some("tv-prod-monthly"));
+
+        let out = handle(json!({})).await.expect("the guard runs");
+        assert!(out.is_object(), "{out}");
+        let ops = operations(&requests);
+        assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+        assert!(
+            !ops.iter().any(|o| o == "StopInstances"),
+            "a stopped box is never stopped again: {ops:?}"
+        );
+    }
+}
