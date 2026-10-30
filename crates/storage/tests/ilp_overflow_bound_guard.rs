@@ -37,7 +37,7 @@ const USER_DATA: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json"
 /// comparator read a table only the Groww feed could fill, so with one broker
 /// it could only ever compare against nothing. A retention bound on a writer
 /// that no longer exists is not coverage.
-const BOUNDED_WRITERS: [(&str, &str); 7] = [
+const BOUNDED_WRITERS: [(&str, &str); 8] = [
     (
         "ws_event_audit_persistence",
         include_str!("../src/ws_event_audit_persistence.rs"),
@@ -70,6 +70,11 @@ const BOUNDED_WRITERS: [(&str, &str); 7] = [
     (
         "expiry_scope_audit_persistence",
         include_str!("../src/expiry_scope_audit_persistence.rs"),
+    ),
+    // 2026-10-30: the per-minute hot-path latency proof rows.
+    (
+        "hot_path_latency_minute",
+        include_str!("../src/hot_path_latency_minute.rs"),
     ),
 ];
 
