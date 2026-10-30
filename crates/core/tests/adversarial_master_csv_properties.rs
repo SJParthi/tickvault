@@ -28,7 +28,9 @@
 //!    arithmetic for paise and lots) on generated numeric strings, and on
 //!    arbitrary strings never panic and never return a value outside their
 //!    contract (a real calendar date in 1970..=2999 or 0; paise >= 0 and
-//!    below 2^53; a lot that the text actually spells, or 0).
+//!    below 2^53; for lots, exactly what `ref_exact_lot` reads: an exact
+//!    digit-shift over the decimal text, with no `f64`, so a fraction below
+//!    `f64` resolution or behind an exponent is refused, or 0).
 //!
 //! Honest limits: a field containing a raw newline is out of the parser's
 //! contract (documented) and is not generated in the round trip. Each
@@ -373,6 +375,59 @@ fn with_filler(records: Vec<Record>) -> Vec<Record> {
 // References for the scalar parsers
 // ---------------------------------------------------------------------------
 
+/// Exact reference for `parse_lot_size`, independent of the parser: the
+/// decimal text (optional `+`, digits with at most one `.`, optional
+/// exponent) is shifted by its exponent over its digit string; a lot is the
+/// integer before the point when every digit after it is `0` and it lies in
+/// `1..=u32::MAX`. No `f64` anywhere, so a fraction below `f64` resolution
+/// or hidden behind an exponent is seen.
+fn ref_exact_lot(text: &str) -> u64 {
+    let unsigned = text.trim().strip_prefix('+').unwrap_or(text.trim());
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], &unsigned[at + 1..]),
+        None => (unsigned, "0"),
+    };
+    let Ok(exponent) = exponent.parse::<i64>() else {
+        return 0;
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits: String = format!("{integer}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return 0;
+    }
+    // Position of the point in `digits` after the shift.
+    let point = i64::try_from(integer.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    let len = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+    if point < len
+        && digits[usize::try_from(point.max(0)).unwrap_or(0)..]
+            .bytes()
+            .any(|b| b != b'0')
+    {
+        return 0;
+    }
+    // A whole number: its digits, then zeros up to the point. Anything
+    // longer than 11 significant places is beyond u32.
+    let whole_len = point.saturating_sub(len - i64::try_from(significant.len()).unwrap_or(0));
+    if whole_len > 11 {
+        return 0;
+    }
+    let kept = usize::try_from(point.min(len)).unwrap_or(0);
+    let mut whole = digits[..kept].to_owned();
+    for _ in 0..point.saturating_sub(len) {
+        whole.push('0');
+    }
+    match whole.parse::<u64>() {
+        Ok(lot) if (1..=u64::from(u32::MAX)).contains(&lot) => lot,
+        _ => 0,
+    }
+}
+
 /// `YYYYMMDD` when (y, m, d) is a real date in 1970..=2999, else 0 (chrono's
 /// calendar, independent of the module's own `days_in_month`).
 fn ref_ymd(y: i64, m: i64, d: i64) -> u32 {
@@ -572,7 +627,7 @@ proptest! {
     /// Property 1: arbitrary text never panics; an `Ok` is never smaller
     /// than the floor.
     #[test]
-    fn prop_arbitrary_text_never_panics(text in "\\PC{0,400}") {
+    fn prop_arbitrary_text_never_panics(text in "(?s).{0,400}") {
         if let Ok(rows) = parse_master_csv(&text) {
             prop_assert!(rows.len() >= MIN_PLAUSIBLE_MASTER_ROWS);
         }
@@ -740,15 +795,21 @@ proptest! {
         prop_assert_eq!(u64::from(parse_lot_size(&text)), want, "{:?}", text);
     }
 
-    /// Arbitrary strings: never a panic; a non-zero lot is a number the text
-    /// spells.
+    /// Arbitrary strings, long fraction tails and exponent spellings: never a
+    /// panic, and the lot is exactly what the exact decimal reference reads
+    /// (0 = refused). Catches a fraction below `f64` resolution and any
+    /// off-by-one in the exponent shift.
     #[test]
-    fn prop_parse_lot_size_never_fabricates(text in "\\PC{0,30}|[0-9.eE+ -]{0,24}") {
-        let lot = parse_lot_size(&text);
-        if lot > 0 {
-            let spelled: f64 = text.trim().parse().expect("a lot spells a number");
-            prop_assert_eq!(spelled, f64::from(lot), "{:?}", text);
-        }
+    fn prop_parse_lot_size_matches_exact_decimal_reference(text in prop_oneof![
+        "\\PC{0,30}",
+        any::<String>(),
+        "[0-9.eE+ -]{0,24}",
+        "[0-9]{1,4}\\.0{10,24}[0-9]",
+        "[0-9]{1,6}(\\.[0-9]{0,8})?[eE][+-]?[0-9]{1,2}",
+        "0{0,15}[1-9][0-9]{0,10}(\\.0{0,5})?",
+        "[0-9]{1,3}\\.[0-9]{0,30}[eE]-?[0-9]{1,3}",
+    ]) {
+        prop_assert_eq!(u64::from(parse_lot_size(&text)), ref_exact_lot(&text), "{:?}", text);
     }
 }
 

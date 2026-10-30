@@ -112,10 +112,11 @@ fn golden() -> &'static Golden {
                 let (ws_type, frame) = golden_frame(i);
                 assert_eq!(spill.append(ws_type, frame), AppendOutcome::Spilled);
             }
-            // The writer thread drains the queue; drop joins it.
-            std::thread::sleep(Duration::from_millis(200));
+            // Deterministic drain: wait for the writer to put every queued
+            // record in the file (0 lost), never a fixed sleep.
+            let lost = spill.shutdown(Duration::from_secs(10));
+            assert_eq!(lost, 0, "golden WAL writer did not drain");
             drop(spill);
-            std::thread::sleep(Duration::from_millis(50));
         }
         let segments: Vec<PathBuf> = std::fs::read_dir(&dir.0)
             .expect("read golden dir")

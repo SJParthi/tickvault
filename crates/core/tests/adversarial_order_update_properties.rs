@@ -21,8 +21,8 @@
 //!    integers past i64/u64, `NaN`, `inf`, padded spellings) never panic,
 //!    only ever fail with `JsonError`, and when they decode they decode to a
 //!    value checked against a reference written here: an Int field holds
-//!    exactly the integer spelled (never a neighbouring one), a Float field
-//!    holds the finite number spelled.
+//!    exactly the integer spelled, a Float field holds the finite number
+//!    spelled (for the generated spellings; see the known limit below).
 //! 5. A fill-critical field (`Quantity`, `TradedQty`, `RemainingQuantity`,
 //!    `Price`, `TradedPrice`, `AvgTradedPrice`) that is null, empty or
 //!    whitespace, in either casing, is refused with `JsonError`; `OrderNo`
@@ -31,15 +31,22 @@
 //!    fields are only Unicode `White_Space`), and `unreadable_order_frame_type`
 //!    agrees with a reference written from its doc comment.
 //! 7. Arbitrary JSON-shaped frames that decode re-serialize to a frame that
-//!    decodes to the same order (floats within one ULP: serde_json here is
-//!    built without `float_roundtrip`, which the module documents).
+//!    decodes to the same order (floats within one ULP inside
+//!    [1e-22, 1e22] and within a relative 1e-14 outside it: serde_json here
+//!    is built without `float_roundtrip`, which the module documents).
 //!
 //! Honest limits: the field table (accepted key, other casing, type) is
 //! private to the module, so it is restated below; a drift would show up as
 //! a property failure, not silently. Generated floats are `paise / 100`
 //! values, which serde_json reads back exactly; floats with 17 significant
-//! digits are compared within one ULP (property 7). The decode-quirk
-//! counters are not observed here (no metrics recorder is installed).
+//! digits are compared as in property 7. The decode-quirk counters are not
+//! observed here (no metrics recorder is installed).
+//!
+//! KNOWN OPEN LIMIT (owner decision): a fractional JSON number on an Int
+//! field can decode as an integer (`"Quantity": 100.00000000000001` reads as
+//! 100), pinned by
+//! `test_known_limit_fractional_json_number_on_int_field_reads_as_integer`,
+//! which fails the day the decoder refuses it.
 
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
@@ -1022,7 +1029,7 @@ proptest! {
     /// Arbitrary text (not JSON-shaped) never panics, only yields `Ok` or
     /// the typed `JsonError` (all inputs here are under the size cap).
     #[test]
-    fn prop_arbitrary_text_is_ok_or_json_error(text in "\\PC{0,200}") {
+    fn prop_arbitrary_text_is_ok_or_json_error(text in "(?s).{0,200}") {
         let result = parse_order_update(&text);
         prop_assert!(result.is_ok() || is_json_error(&result), "{:?}", result);
         if let Ok(update) = &result {

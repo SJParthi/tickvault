@@ -76,6 +76,7 @@ proptest! {
     #[test]
     fn prop_only_a_canonical_name_maps_to_a_code(text in prop_oneof![
         "\\PC{0,24}",
+        "(?s).{0,24}",
         "[A-Z_]{0,14}",
         "(IDX|NSE|BSE|MCX)_(I|EQ|FNO|CURRENCY|COMM)[ -~]{0,2}",
     ]) {
