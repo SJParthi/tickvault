@@ -138,10 +138,11 @@ impl DrainOutcome {
 /// loop on whatever cadence is appropriate (the future tokio task in
 /// item 1.2f.4 sleeps `SEAL_DRAIN_INTERVAL` between cycles).
 ///
-/// Allocates one rescue buffer of up to `max_drain` seals per call. The
-/// live runner calls [`drain_once_reusing`] with a buffer it keeps, so the
-/// live cycle allocates nothing here; this form is for tests and one-off
-/// callers.
+/// **Cold path.** Allowed to allocate; allocates one rescue buffer of up to
+/// `max_drain` seals per call. The seal writer runner calls
+/// [`drain_once_into`] with a buffer it keeps across cycles instead
+/// (2026-10-30 O(1) sweep): it allocates only on a cycle that pops more
+/// seals than any cycle before it.
 ///
 /// **No FIFO inversion on rescue.** Popped seals are NOT pushed back
 /// into the ring (which would put them at the BACK and invert
@@ -157,26 +158,18 @@ pub fn drain_once(
     now_unix_secs: i64,
 ) -> DrainOutcome {
     let mut popped = Vec::new();
-    drain_once_reusing(pipeline, writer, max_drain, now_unix_secs, &mut popped)
+    drain_once_into(pipeline, writer, max_drain, now_unix_secs, &mut popped)
 }
 
-/// [`drain_once`] with a caller-owned rescue buffer, cleared on entry and
-/// on return, whose capacity is kept across calls.
+/// [`drain_once`] with a caller-owned rescue buffer (2026-10-30 O(1) sweep).
 ///
-/// # Why (owner directive 2026-10-30: per-seal work under 1 µs, no
-/// allocation per seal)
-/// `drain_once` reserved a fresh buffer every flush: up to
-/// `max_drain` (16,384) seals of ~176 bytes, about 2.9 MB. Anything past
-/// the allocator's mmap threshold (128 KiB, ~740 seals) was a fresh
-/// mapping per flush, so every page of it faulted in on first write and
-/// was unmapped again at return. The runner keeps one buffer; after the
-/// largest batch it has seen, the live cycle allocates nothing here.
-///
-/// # Complexity
-/// O(seals popped). SPACE: the buffer keeps the capacity of the largest
-/// batch drained, at most `max_drain` seals (~2.9 MB at 16,384), for the
-/// life of the runner.
-pub fn drain_once_reusing(
+/// The seal writer runner keeps one buffer across cycles, so a cycle no
+/// longer allocates up to `max_drain` seals (about 2.9 MB at 16,384) every
+/// time it flushes. The buffer is cleared on entry and on exit and never
+/// shrunk: it allocates only when a cycle pops more seals than any cycle
+/// before it. Same seals, same order, same rows and outcomes as
+/// [`drain_once`], which is this function with a fresh buffer.
+pub fn drain_once_into(
     pipeline: &mut SealAbsorptionPipeline,
     writer: &mut ShadowCandleWriter,
     max_drain: usize,
@@ -201,8 +194,6 @@ pub fn drain_once_reusing(
     // seals. `ring_len` is the real bound on how many `pop_oldest` can yield
     // this cycle, and the `.min` keeps the reservation exact in both
     // directions — no over-reserve when idle, no re-alloc when saturated.
-    // `reserve` on a cleared buffer that already holds this capacity is a
-    // compare, no allocation.
     popped.reserve(max_drain.min(pipeline.ring_len()));
     while popped.len() < max_drain {
         match pipeline.pop_oldest() {
@@ -267,8 +258,7 @@ pub fn drain_once_reusing(
             // Audit PR41a: an amended bar committed live while its original
             // waits in the spill. Append the fuller copy behind it, so no
             // replay ends on the original.
-            pipeline.note_live_commits(popped.as_slice(), now_unix_secs);
-            popped.clear();
+            pipeline.note_live_commits(popped, now_unix_secs);
         }
         Err(flush_err) => {
             // Finding S3: seal-time ILP flush failure is a persist
@@ -312,6 +302,8 @@ pub fn drain_once_reusing(
         }
     }
 
+    // Committed or rescued: nothing in the buffer is needed past the cycle.
+    popped.clear();
     outcome
 }
 
@@ -3075,6 +3067,59 @@ mod tests {
         assert!(!outcome.flushed_ok);
         assert!(!outcome.has_rescues());
         cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_drain_once_into_matches_drain_once_and_reuses_its_buffer() {
+        // 2026-10-30 O(1) sweep: the runner's kept buffer must give the same
+        // outcome as a fresh one, leave nothing behind, and not grow again on
+        // a cycle no bigger than the largest before it.
+        let now = jan1_noon_utc();
+        let (spill_a, dlq_a) = temp_pair("into-a");
+        let (spill_b, dlq_b) = temp_pair("into-b");
+        let mut fresh = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            16,
+            spill_a.clone(),
+            dlq_a.clone(),
+        );
+        let mut kept = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            16,
+            spill_b.clone(),
+            dlq_b.clone(),
+        );
+        let mut writer_a = ShadowCandleWriter::for_test();
+        let mut writer_b = ShadowCandleWriter::for_test();
+        let mut buffer: Vec<BufferedSeal> = Vec::new();
+        let mut capacity_after_first = 0;
+        for (round, count) in [5_u64, 3, 5].into_iter().enumerate() {
+            for i in 0..count {
+                let seal = mk_seal(
+                    100 + i,
+                    0,
+                    TfIndex::M1,
+                    1_716_023_700 + (round as u32) * 60,
+                    100.0 + i as f64,
+                );
+                fresh.submit(seal, now);
+                kept.submit(seal, now);
+            }
+            let a = drain_once(&mut fresh, &mut writer_a, 8, now);
+            let b = drain_once_into(&mut kept, &mut writer_b, 8, now, &mut buffer);
+            assert_eq!(a, b, "round {round}: same outcome with a kept buffer");
+            assert!(buffer.is_empty(), "round {round}: the buffer is cleared");
+            if round == 0 {
+                capacity_after_first = buffer.capacity();
+                assert!(capacity_after_first >= 5);
+            } else {
+                assert_eq!(
+                    buffer.capacity(),
+                    capacity_after_first,
+                    "round {round}: no regrowth on a cycle no bigger than the first"
+                );
+            }
+        }
+        cleanup(&spill_a, &dlq_a);
+        cleanup(&spill_b, &dlq_b);
     }
 
     #[test]

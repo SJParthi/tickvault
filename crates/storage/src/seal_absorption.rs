@@ -67,7 +67,7 @@ use tracing::{error, info, warn};
 use tickvault_trading::candles::{BufferOutcome, BufferedSeal, SealRing};
 
 use crate::seal_dlq::{SealDlqRecord, SealDlqWriter};
-use crate::seal_spill::{SealSpillWriter, SerializedSeal};
+use crate::seal_spill::{SEAL_SPILL_RECORD_SIZE, SealSpillWriter, SerializedSeal};
 use crate::tick_persistence::{
     BlindWritePolicy, DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES, SPILL_MIN_FREE_HEADROOM_BYTES,
     SpillFloorVerdict, classify_spill_floor, spill_free_bytes,
@@ -254,8 +254,10 @@ impl SealDiskFloor {
             SpillFloorVerdict::AllowProbeFailed => {
                 // Deep audit DA-14: a seal written without a free-space
                 // answer is counted, as the tick tier's blind writes are.
-                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => SEAL_BLIND_PROBE_TIER)
-                    .increment(1);
+                // A literal label value (2026-10-30 O(1) sweep): the `SEAL_BLIND_PROBE_TIER`
+                // const took the macro's allocating label arm on every call.
+                // Pinned equal to the const by a test.
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(1);
                 true
             }
             SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed => false,
@@ -348,6 +350,40 @@ impl SealDiskFloor {
     }
 }
 
+/// Edge latch for one failing escalation tier (2026-10-30 O(1) sweep).
+///
+/// A tier-2 spill write that fails (EIO, read-only volume, quota) used to log
+/// one `warn!` per seal, Debug-formatting the error chain each time: up to
+/// `SEAL_MAX_DRAIN_PER_CYCLE` lines per failed 100 ms cycle for the whole
+/// outage, the shape the floor-refusal branch already closed in DA-14. Now the
+/// first failure of an episode logs, the rest are counted, and the next
+/// success closes the episode with the count. O(1): one relaxed add and one
+/// relaxed swap per failure, one relaxed load per success in the common case.
+/// No allocation outside the one line per episode edge.
+#[derive(Debug, Default)]
+struct FailureEpisode {
+    failing: AtomicBool,
+    failed_in_episode: AtomicU64,
+}
+
+impl FailureEpisode {
+    /// Counts one failure. True only for the first failure of an episode.
+    fn open(&self) -> bool {
+        self.failed_in_episode.fetch_add(1, Ordering::Relaxed);
+        !self.failing.swap(true, Ordering::Relaxed)
+    }
+
+    /// Closes the episode on a success. `Some(failures in the episode)` only
+    /// when an episode was open; one relaxed load otherwise.
+    fn close(&self) -> Option<u64> {
+        if self.failing.load(Ordering::Relaxed) && self.failing.swap(false, Ordering::Relaxed) {
+            Some(self.failed_in_episode.swap(0, Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+}
+
 /// Three-tier absorption pipeline for sealed candles.
 ///
 /// Single-threaded by design — the future writer task (item 1.2f)
@@ -375,6 +411,11 @@ pub struct SealAbsorptionPipeline {
     /// audit DA-14). Its own type since 2026-10-26 (audit PR L, L2) so the
     /// producer-side escalator and its thread check the same floor.
     floor: SealDiskFloor,
+    /// Tier-2 (spill) failure episode: one log line per episode, not per
+    /// seal (2026-10-30 O(1) sweep).
+    spill_failure: FailureEpisode,
+    /// Tier-3 (DLQ) failure episode, latched the same way.
+    dlq_failure: FailureEpisode,
 }
 
 impl SealAbsorptionPipeline {
@@ -388,9 +429,9 @@ impl SealAbsorptionPipeline {
             floor: SealDiskFloor::new(spill.spill_dir().to_path_buf()),
             spill,
             dlq: Arc::new(SealDlqWriter::new()),
-        };
-        pipeline.prefault_ring();
-        pipeline
+            spill_failure: FailureEpisode::default(),
+            dlq_failure: FailureEpisode::default(),
+        }
     }
 
     /// Test constructor. Tests inject isolated `tempdir` paths so they
@@ -403,6 +444,8 @@ impl SealAbsorptionPipeline {
             floor: SealDiskFloor::new(spill_dir.clone()),
             spill: Arc::new(SealSpillWriter::with_spill_dir_for_test(spill_dir)),
             dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
+            spill_failure: FailureEpisode::default(),
+            dlq_failure: FailureEpisode::default(),
         }
     }
 
@@ -421,6 +464,8 @@ impl SealAbsorptionPipeline {
             floor: SealDiskFloor::new(spill_dir.clone()),
             spill: Arc::new(SealSpillWriter::with_spill_dir_for_test(spill_dir)),
             dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
+            spill_failure: FailureEpisode::default(),
+            dlq_failure: FailureEpisode::default(),
         }
     }
 
@@ -541,24 +586,54 @@ impl SealAbsorptionPipeline {
         // overflow at the floor is one line per seal, up to the ring's
         // capacity), and the cycle's page then said "ring+spill+DLQ all
         // failed" about seals nothing had even tried to write.
-        if !self.has_room_to_escalate(serialised.to_bytes().len() as u64, now_unix_secs) {
+        //
+        // The record length is the constant `SEAL_SPILL_RECORD_SIZE`
+        // (2026-10-30 O(1) sweep): building the record with `to_bytes()` to
+        // read its length ran the 124-byte CRC once more per seal, and
+        // `append_seal` builds it again. Same value, same verdict.
+        if !self.has_room_to_escalate(SEAL_SPILL_RECORD_SIZE as u64, now_unix_secs) {
             self.floor
                 .note_refusal(evicted.security_id, evicted.exchange_segment_code);
             return SubmitOutcome::DroppedBelowFloor(evicted);
         }
         self.floor.note_cleared();
         match self.spill.append_seal(&serialised, now_unix_secs) {
-            Ok(()) => SubmitOutcome::Spilled,
+            Ok(()) => {
+                if let Some(failed) = self.spill_failure.close() {
+                    info!(
+                        source = "seal_spill_failed",
+                        failed,
+                        "sealed-candle spill is writing again; spill writes that failed in \
+                         the episode: failed (each went on to the DLQ)"
+                    );
+                }
+                SubmitOutcome::Spilled
+            }
             Err(spill_err) => {
-                warn!(
-                    ?spill_err,
-                    security_id = evicted.security_id,
-                    exchange_segment_code = evicted.exchange_segment_code,
-                    "tier-2 spill failed — escalating to tier-3 DLQ"
-                );
+                // One line per episode, not per seal (2026-10-30 O(1) sweep):
+                // the outcome of every seal is still returned and counted by
+                // the caller exactly as before.
+                if self.spill_failure.open() {
+                    warn!(
+                        ?spill_err,
+                        source = "seal_spill_failed",
+                        security_id = evicted.security_id,
+                        exchange_segment_code = evicted.exchange_segment_code,
+                        "tier-2 spill failed — escalating to tier-3 DLQ; later spill failures \
+                         of this episode are counted, not logged, until a spill write succeeds"
+                    );
+                }
                 let dlq_record = SealDlqRecord::from(&serialised);
                 match self.dlq.append_record(&dlq_record, now_unix_secs) {
                     Ok(()) => {
+                        if let Some(failed) = self.dlq_failure.close() {
+                            info!(
+                                source = "seal_dlq_failed",
+                                failed,
+                                "sealed-candle DLQ is writing again; DLQ writes that failed in \
+                                 the episode: failed"
+                            );
+                        }
                         // Z6: the spill ledger records the dead-lettered
                         // copy, so a fuller copy committed later is mirrored
                         // to the spill and the boot drain ends on it.
@@ -566,12 +641,16 @@ impl SealAbsorptionPipeline {
                         SubmitOutcome::DlqWritten
                     }
                     Err(dlq_err) => {
-                        warn!(
-                            ?dlq_err,
-                            security_id = evicted.security_id,
-                            exchange_segment_code = evicted.exchange_segment_code,
-                            "tier-3 DLQ also failed — caller MUST fire AGGREGATOR-DROP-01"
-                        );
+                        if self.dlq_failure.open() {
+                            warn!(
+                                ?dlq_err,
+                                source = "seal_dlq_failed",
+                                security_id = evicted.security_id,
+                                exchange_segment_code = evicted.exchange_segment_code,
+                                "tier-3 DLQ also failed — caller MUST fire AGGREGATOR-DROP-01; \
+                                 later DLQ failures of this episode are counted, not logged"
+                            );
+                        }
                         SubmitOutcome::Dropped(evicted)
                     }
                 }
@@ -842,6 +921,81 @@ mod tests {
         assert_eq!(drained[0].close, 100.0);
         let _ = std::fs::remove_file(&spill_as_file);
         cleanup(&spill_as_file, &dlq);
+    }
+
+    #[test]
+    fn test_failure_episode_opens_once_and_closes_with_its_count() {
+        let episode = FailureEpisode::default();
+        assert_eq!(episode.close(), None, "no episode open yet");
+        assert!(episode.open(), "the first failure opens the episode");
+        assert!(!episode.open(), "a second failure is counted, not logged");
+        assert!(!episode.open());
+        assert_eq!(episode.close(), Some(3), "the close reports every failure");
+        assert_eq!(episode.close(), None, "a closed episode closes once");
+        assert!(episode.open(), "the next failure opens a new episode");
+        assert_eq!(episode.close(), Some(1), "the count restarts per episode");
+    }
+
+    #[test]
+    fn test_repeated_spill_failures_keep_every_outcome_and_latch_one_episode() {
+        // 2026-10-30 O(1) sweep: the spill-failure line is latched per
+        // episode, but every seal must still reach the DLQ and report
+        // DlqWritten, and the first successful spill closes the episode.
+        let (_unused_spill, dlq) = temp_pair("spill-fail-latch");
+        let mut spill_as_file = std::env::temp_dir();
+        spill_as_file.push(format!(
+            "tickvault-seal-pipeline-spill-latch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&spill_as_file);
+        let _ = std::fs::remove_dir_all(&spill_as_file);
+        std::fs::write(&spill_as_file, b"blocker").expect("create blocker");
+        let p = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            1,
+            spill_as_file.clone(),
+            dlq.clone(),
+        );
+        let now = jan1_noon_utc();
+        for i in 0..5_u64 {
+            let s = mk_buffered_seal(100 + i, 0, TfIndex::M1, 1_716_023_700, 100.0);
+            assert_eq!(p.rescue_in_flight(s, now), SubmitOutcome::DlqWritten);
+        }
+        assert!(p.spill_failure.failing.load(Ordering::Relaxed));
+        assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 5);
+        let dlq_writer = SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
+        assert_eq!(dlq_writer.read_all(now).expect("read dlq").len(), 5);
+        // Clear the blocker: the next spill succeeds and closes the episode.
+        std::fs::remove_file(&spill_as_file).expect("remove blocker");
+        let s = mk_buffered_seal(200, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        assert_eq!(p.rescue_in_flight(s, now), SubmitOutcome::Spilled);
+        assert!(!p.spill_failure.failing.load(Ordering::Relaxed));
+        assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 0);
+        cleanup(&spill_as_file, &dlq);
+    }
+
+    #[test]
+    fn test_floor_payload_constant_equals_the_serialised_record_length() {
+        // The floor check reads SEAL_SPILL_RECORD_SIZE instead of building
+        // the record: the two must stay equal or the verdict would move.
+        let s = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        assert_eq!(
+            SerializedSeal::from(&s).to_bytes().len(),
+            SEAL_SPILL_RECORD_SIZE
+        );
+    }
+
+    #[test]
+    fn test_blind_probe_tier_label_literal_matches_the_const() {
+        // `has_room` writes the label as the literal "seal" so the metrics
+        // macro takes its static arm; the const that seeds the series must
+        // name the same value, and the source must keep the literal.
+        assert_eq!(SEAL_BLIND_PROBE_TIER, "seal");
+        let src = include_str!("seal_absorption.rs");
+        let needle = concat!(
+            "counter!(\"tv_spill_free_probe_blind_total\", \"tier\" => ",
+            "SEAL_BLIND_PROBE_TIER"
+        );
+        assert!(!src.contains(needle), "the allocating const label is back");
     }
 
     #[test]
