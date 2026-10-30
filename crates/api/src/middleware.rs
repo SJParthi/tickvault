@@ -556,7 +556,12 @@ pub async fn require_bearer_auth(
     // (URI path only — NEVER the query string, which could carry tokens)
     // and a sanitized peer label, so the operator can distinguish their own
     // browser from a credential probe. Header VALUES are never logged.
-    let request_path = request.uri().path().to_string();
+    //
+    // Borrowed, not copied (2026-10-30 O(1) sweep): the path is read only
+    // by the three 401 arms, and `.to_string()` allocated it on every
+    // request, accepted ones included. The borrow ends before the accept
+    // arm moves `request` into `next.run`, so the logged text is unchanged.
+    let request_path = request.uri().path();
 
     // Extract Authorization header
     let auth_header = request

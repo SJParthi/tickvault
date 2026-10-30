@@ -1202,6 +1202,23 @@ Requested: owner brief relayed to this session on 2026-10-30 ("yes add the fno s
   - Files: crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
   - Tests: javascript_volume_inside_script_tags_only_shrinks, javascript_bytes_inside_script_tags_stay_under_the_ceiling
 
+### ITEM O1S — per-event O(1) / allocation sweep outside the owned files (storage, core, api; 2026-10-30)
+
+Requested: owner, 2026-10-30, relayed by the coordinator session ("O(1) at p99 everywhere", "use only max"). Scope: find every per-event path (tick, frame, seal, order, request, alert) that is not O(1) or allocates and is not in CLAUDE.md's non-O(1) table; fix it in files no other session owns with byte-identical output, else add an honest row. No new page, alarm, EMF name, config switch or cost change. Design, failure modes, rollback and observability for these edits follow the plan sections below: each fix is local, keeps every outcome and written byte unchanged, and reverts with one commit.
+
+- [x] O1S1. Seal escalation fault path: constant record length for the floor, per-episode spill/DLQ failure lines (`FailureEpisode`), literal blind-probe label; seal writer keeps its rescue buffer across cycles (`drain_once_into`)
+  - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
+  - Tests: test_failure_episode_opens_once_and_closes_with_its_count, test_repeated_spill_failures_keep_every_outcome_and_latch_one_episode, test_floor_payload_constant_equals_the_serialised_record_length, test_blind_probe_tier_label_literal_matches_the_const, test_drain_once_into_matches_drain_once_and_reuses_its_buffer, test_note_clean_flush_ends_an_episode_so_the_next_failure_logs_again, test_spill_recovery_ends_the_dlq_episode_so_a_later_double_failure_logs
+- [x] O1S2. Telegram coalescer renders a body only when the bucket keeps it, one entry match instead of clone-per-fold (crates/core)
+  - Files: crates/core/src/notification/coalescer.rs
+  - Tests: test_payload_rendered_only_while_the_bucket_keeps_samples, test_sample_cap_at_10
+- [x] O1S3. `require_bearer_auth` borrows the request path; `classify_auth_response` comment corrected (crates/api, crates/core)
+  - Files: crates/api/src/middleware.rs, crates/core/src/websocket/order_update_connection.rs
+  - Tests: test_classify_auth_response_dhan_error_code, test_classify_auth_response_error_code_without_message
+- [x] O1S4. CLAUDE.md O(1) table: nine new rows plus the `active_order_count` correction; owned-file findings recorded as proposals
+  - Files: CLAUDE.md
+  - Tests: every_rs_file_named_in_claude_md_table_exists
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the

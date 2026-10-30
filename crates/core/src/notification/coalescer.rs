@@ -42,6 +42,7 @@
 //! zero-alloc-pinned by `crates/core/tests/dhat_telegram_dispatcher.rs`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -239,12 +240,17 @@ impl BucketState {
         }
     }
 
-    fn fold(&mut self, now_ms: u64, payload: String) -> bool {
+    /// Folds one more event into the bucket. `payload` is called only when
+    /// the sample is kept (2026-10-30 O(1) sweep): past
+    /// `MAX_SAMPLES_PER_BUCKET` the body is never rendered or copied, only
+    /// counted. O(1).
+    fn fold(&mut self, now_ms: u64, payload: impl FnOnce() -> String) -> bool {
         self.count = self.count.saturating_add(1);
         self.last_ts_ms = now_ms;
         // Only retain up to MAX_SAMPLES_PER_BUCKET payloads verbatim.
-        // Beyond that, the count is authoritative but the string is dropped.
+        // Beyond that, the count is authoritative and the string is never built.
         if self.samples.len() < MAX_SAMPLES_PER_BUCKET {
+            let payload = payload();
             // SAFETY: length checked above; try_push handles the cap defensively.
             // The Result is intentionally discarded — the cap is the contract,
             // a full ArrayVec on this path is not an error.
@@ -388,10 +394,11 @@ impl TelegramCoalescer {
     /// the Digest/Coalesce60 lanes); this severity match is the defensive
     /// second layer keeping High/Critical unrepresentable in a bucket.
     ///
-    /// `payload` is consumed only when the event is coalesced; for the
-    /// Bypass path it is borrowed (no allocation). The string-typed
-    /// argument is intentional — the dispatcher already allocated the
-    /// rendered message; this method just owns it on coalesce.
+    /// `payload` is called at most once, and only when the event is coalesced
+    /// AND its bucket still keeps samples (fewer than
+    /// `MAX_SAMPLES_PER_BUCKET`); a bypassed event or one past the cap never
+    /// renders it (2026-10-30 O(1) sweep). O(1): one map probe under the
+    /// bucket lock.
     pub fn observe(
         &self,
         topic: &'static str,
@@ -403,7 +410,6 @@ impl TelegramCoalescer {
             Severity::Medium | Severity::Low | Severity::Info => {
                 let key = BucketKey { topic, severity };
                 let now_ms = now_ms();
-                let p = payload();
                 let mut guard = match self.buckets.lock() {
                     Ok(g) => g,
                     Err(poisoned) => {
@@ -414,10 +420,13 @@ impl TelegramCoalescer {
                         poisoned.into_inner()
                     }
                 };
-                guard
-                    .entry(key)
-                    .and_modify(|state| {
-                        let pushed = state.fold(now_ms, p.clone());
+                // One `match` on the entry so the payload is rendered at most
+                // once, and only when it is kept (2026-10-30 O(1) sweep): the
+                // `and_modify` + `or_insert_with` pair cloned it on every
+                // fold, and it was rendered even for a full bucket.
+                match guard.entry(key) {
+                    Entry::Occupied(mut occupied) => {
+                        let pushed = occupied.get_mut().fold(now_ms, payload);
                         if !pushed {
                             counter!(
                                 "tv_telegram_dropped_total",
@@ -425,8 +434,11 @@ impl TelegramCoalescer {
                             )
                             .increment(1);
                         }
-                    })
-                    .or_insert_with(|| BucketState::new(now_ms, p));
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(BucketState::new(now_ms, payload()));
+                    }
+                }
                 CoalesceDecision::Coalesced
             }
         }
@@ -819,6 +831,38 @@ mod tests {
         assert!(msg.contains("Spammy x25"));
         assert!(msg.contains("(+15 more)"));
         assert!(!msg.contains("not retained"));
+    }
+
+    #[test]
+    fn test_payload_rendered_only_while_the_bucket_keeps_samples() {
+        // 2026-10-30 O(1) sweep: the body closure runs exactly once per kept
+        // sample and never for an event past the cap, while the count and
+        // the kept samples stay the same as before.
+        let c = make_coalescer(60_000);
+        let rendered = std::cell::Cell::new(0_u32);
+        for i in 0..25 {
+            let decision = c.observe("Counted", Severity::Info, || {
+                rendered.set(rendered.get() + 1);
+                format!("evt #{i}")
+            });
+            assert_eq!(decision, CoalesceDecision::Coalesced);
+        }
+        assert_eq!(rendered.get(), MAX_SAMPLES_PER_BUCKET as u32);
+        let summaries = c.drain_all();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].count, 25);
+        let expected: Vec<String> = (0..MAX_SAMPLES_PER_BUCKET)
+            .map(|i| format!("evt #{i}"))
+            .collect();
+        assert_eq!(summaries[0].samples, expected);
+        // A bypassed severity never renders the body.
+        let before = rendered.get();
+        let decision = c.observe("Counted", Severity::High, || {
+            rendered.set(rendered.get() + 1);
+            String::new()
+        });
+        assert_eq!(decision, CoalesceDecision::Bypass);
+        assert_eq!(rendered.get(), before);
     }
 
     #[test]
