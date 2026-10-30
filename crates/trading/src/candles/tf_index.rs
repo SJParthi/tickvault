@@ -575,15 +575,45 @@ impl TfIndex {
     #[inline]
     #[must_use]
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
-        let secs = self.seconds_per_bucket();
-        let day_start = (tick_ist_secs / 86_400) * 86_400;
-        // 2026-08-28: anchored on the CANDLE session open (09:00), not the
-        // market open (09:15) — see CANDLE_SESSION_OPEN_SECS_OF_DAY_IST.
-        let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
-        if tick_ist_secs <= session_open {
-            return session_open;
+        // One arm per frame, so each division below is by a COMPILE-TIME
+        // constant: the compiler turns it into a multiply and a shift instead
+        // of a hardware divide (about 25 cycles each on x86). The fold calls
+        // this several times per timeframe per tick (plan ITEM DT, 2026-10-30).
+        // The arithmetic is unchanged: `bucket_start_every` is the old body.
+        match self {
+            Self::M1 => bucket_start_every(tick_ist_secs, const { Self::M1.seconds_per_bucket() }),
+            Self::M3 => bucket_start_every(tick_ist_secs, const { Self::M3.seconds_per_bucket() }),
+            Self::M5 => bucket_start_every(tick_ist_secs, const { Self::M5.seconds_per_bucket() }),
+            Self::M15 => {
+                bucket_start_every(tick_ist_secs, const { Self::M15.seconds_per_bucket() })
+            }
+            Self::S1 => bucket_start_every(tick_ist_secs, const { Self::S1.seconds_per_bucket() }),
+            Self::M30 => {
+                bucket_start_every(tick_ist_secs, const { Self::M30.seconds_per_bucket() })
+            }
+            Self::M60 => {
+                bucket_start_every(tick_ist_secs, const { Self::M60.seconds_per_bucket() })
+            }
+            Self::M10 => {
+                bucket_start_every(tick_ist_secs, const { Self::M10.seconds_per_bucket() })
+            }
         }
-        session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
+    }
+
+    /// Start of the day's first SESSION bucket of this frame (the bucket that
+    /// holds the 09:15 market open), as seconds after 00:00 of the day.
+    ///
+    /// A per-frame constant, read from a table built at compile time from
+    /// [`Self::bucket_start`] itself, so it cannot disagree with the grid.
+    /// `aggregator_cell::is_days_first_session_bucket` adds it to a day start
+    /// instead of re-deriving the bucket per call (plan ITEM DT).
+    ///
+    /// # Complexity
+    /// O(1) — one array read.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn first_session_bucket_offset(self) -> u32 {
+        FIRST_SESSION_BUCKET_OFFSET[self.as_ordinal()]
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.
@@ -598,6 +628,38 @@ impl TfIndex {
         bucket_start.saturating_add(self.seconds_per_bucket())
     }
 }
+
+/// The body of [`TfIndex::bucket_start`] for one bucket width. Always
+/// inlined, so every caller passes a constant `secs` and the divide becomes
+/// a multiply. Saturating for the reasons on [`TfIndex::bucket_start`].
+#[inline(always)]
+const fn bucket_start_every(tick_ist_secs: u32, secs: u32) -> u32 {
+    let day_start = (tick_ist_secs / 86_400) * 86_400;
+    // 2026-08-28: anchored on the CANDLE session open (09:00), not the
+    // market open (09:15) — see CANDLE_SESSION_OPEN_SECS_OF_DAY_IST.
+    let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
+    if tick_ist_secs <= session_open {
+        return session_open;
+    }
+    session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
+}
+
+/// Per frame, [`TfIndex::bucket_start`] of the 09:15 open on day 0, i.e. the
+/// offset from 00:00 of the bucket holding the market open. Built at compile
+/// time from the grid function itself. See
+/// [`TfIndex::first_session_bucket_offset`].
+const FIRST_SESSION_BUCKET_OFFSET: [u32; TF_COUNT] = {
+    let mut table = [0u32; TF_COUNT];
+    let mut ord = 0;
+    while ord < TF_COUNT {
+        table[ord] = match TfIndex::from_ordinal(ord) {
+            Some(tf) => tf.bucket_start(MARKET_OPEN_SECS_OF_DAY_IST),
+            None => 0,
+        };
+        ord += 1;
+    }
+    table
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1153,6 +1215,76 @@ mod tests {
                  in shadow_persistence::RETIRED_CANDLE_TABLES would have to \
                  move with it"
             );
+        }
+    }
+
+    /// The pre-2026-10-30 body of `bucket_start`, dividing by a width read at
+    /// run time (`black_box` keeps the compiler from folding it). The
+    /// constant-divisor form must agree with it on every input.
+    fn bucket_start_by_runtime_width(tf: TfIndex, tick_ist_secs: u32) -> u32 {
+        let secs = std::hint::black_box(tf.seconds_per_bucket());
+        let day_start = (tick_ist_secs / 86_400) * 86_400;
+        let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
+        if tick_ist_secs <= session_open {
+            return session_open;
+        }
+        session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
+    }
+
+    /// Regression (plan ITEM DT, 2026-10-30): the constant-divisor
+    /// `bucket_start` equals the runtime-width body at the edges of the
+    /// `u32` range, around every session boundary of a day, and on a dense
+    /// sweep of one trading day.
+    #[test]
+    fn test_bucket_start_constant_divisor_matches_runtime_width_at_edges() {
+        let day = 1_779_321_600u32;
+        let mut inputs: Vec<u32> = vec![0, 1, 59, 60, 86_399, 86_400, u32::MAX, u32::MAX - 1];
+        let last_day = (u32::MAX / 86_400) * 86_400;
+        for base in [0u32, day, last_day] {
+            for off in [
+                0u32, 1, 32_399, 32_400, 33_299, 33_300, 33_301, 55_799, 55_800, 86_399,
+            ] {
+                inputs.push(base.saturating_add(off));
+            }
+        }
+        for secs in 0..86_400u32 {
+            inputs.push(day + secs);
+        }
+        for tf in TfIndex::ALL {
+            for &t in &inputs {
+                assert_eq!(
+                    tf.bucket_start(t),
+                    bucket_start_by_runtime_width(tf, t),
+                    "{tf:?} at {t}"
+                );
+            }
+        }
+    }
+
+    /// The first-session table holds the grid's own bucket for 09:15 on day 0.
+    #[test]
+    fn test_first_session_bucket_offset_is_the_grid_bucket_of_the_open() {
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                tf.first_session_bucket_offset(),
+                tf.bucket_start(MARKET_OPEN_SECS_OF_DAY_IST),
+                "{tf:?}"
+            );
+            assert!(tf.first_session_bucket_offset() < 86_400, "{tf:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(20_000))]
+        /// Any `u32` instant, any frame: the constant-divisor form equals the
+        /// runtime-width body.
+        #[test]
+        fn proptest_bucket_start_constant_divisor_matches_runtime_width(
+            t in proptest::prelude::any::<u32>(),
+            ord in 0usize..TF_COUNT,
+        ) {
+            let tf = TfIndex::from_ordinal(ord).unwrap_or(TfIndex::M1);
+            proptest::prop_assert_eq!(tf.bucket_start(t), bucket_start_by_runtime_width(tf, t));
         }
     }
 }

@@ -213,6 +213,9 @@ pub mod drain_hold;
 /// The p99 tail check the main-feed drain bench runs after Criterion's
 /// median check (plan item K6, 2026-10-26).
 pub mod drain_tail_gate;
+/// Where the frame drain runs: the shared runtime (default) or its own
+/// pinned thread (plan ITEM DT, 2026-10-30, off by default).
+pub mod drain_thread;
 /// `tickvault ensure-questdb`: bring the QuestDB container up (boot self-heal
 /// and the console's restart actions; audit D6d, replaced
 /// `scripts/ensure-questdb.sh`).
@@ -235,6 +238,9 @@ pub mod host_limits;
 /// the host-tuning systemd unit runs as root before the app (audit D6b; replaced
 /// two shell scripts and an inline `/bin/sh -c`).
 pub mod host_tuning;
+/// Hot-thread placement at boot: real-time priority, the drain placement and
+/// the background core (plan ITEM DT, 2026-10-30, every switch off by default).
+pub mod hot_thread_boot;
 pub mod infra;
 /// Cold 1 s sampler of the kernel receive queue on our Dhan :443 sockets
 /// (`/proc/net/tcp` and `/proc/net/tcp6`), published as gauges with one

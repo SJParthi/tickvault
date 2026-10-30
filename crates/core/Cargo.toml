@@ -93,8 +93,13 @@ harness = false
 # [[bench]] prev_close_writer removed in the stage-2 dead-WS sweep
 # (2026-07-17) with the deleted pipeline/prev_close_writer.rs module.
 
-# [[bench]] tick_gap_detector removed in PR-C3 (2026-07-14) with the
-# deleted tick-gap detector module (operator Q4-ii 2026-07-13).
+# [[bench]] tick_gap_detector was removed in PR-C3 (2026-07-14) with the
+# deleted tick-gap detector module (operator Q4-ii 2026-07-13). The module
+# came back with the live lane; its per-tick `observe` is benched again from
+# 2026-10-30 (plan ITEM DT, side stores), with a p99 gate.
+[[bench]]
+name = "tick_gap_detector"
+harness = false
 
 # [[bench]] slo_score removed in the C4 sweep (2026-07-15) with the deleted
 # slo_score.rs contract stub + the SLO-01/02/03 variants (wave-3-d PARK
