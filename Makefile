@@ -14,7 +14,7 @@
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
         lambda-test \
         dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
-        cross-verify-show cross-verify-now prev-day-show wave-guarantee-check \
+        wave-guarantee-check \
 
 # ---- Configuration ----
 APP_NAME       := tickvault
@@ -526,17 +526,3 @@ dispatch-audit: ## Common preset — ask Claude to run the 100% audit
 
 wave-guarantee-check: ## 15-row + 7-row guarantee matrix check over every active plan (per-wave-guarantee-matrix.md)
 	@bash .claude/hooks/per-item-guarantee-check.sh
-
-# ---- Post-market 1-minute cross-verification (operator visibility) ----
-cross-verify-show: ## Show the latest post-market cross-verify CSV (where a human looks)
-	@bash scripts/cross-verify-show.sh
-
-cross-verify-now: ## Run the post-market cross-verify NOW (on-demand, needs live auth + QuestDB)
-	@echo "  Running post-market 1-minute cross-verify on-demand (TICKVAULT_CROSS_VERIFY_NOW=1)."
-	@echo "  Requires a booted app: Dhan auth + QuestDB + today's candles_1m."
-	@echo "  On a dev box without live credentials this will stop at auth — that is expected."
-	@TICKVAULT_CROSS_VERIFY_NOW=1 $(MAKE) run
-
-# ---- Pre-market prev-day OHLCV fetch coverage (operator visibility) ----
-prev-day-show: ## Show the latest pre-market prev-day fetch coverage report
-	@bash scripts/prev-day-show.sh
