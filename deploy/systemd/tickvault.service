@@ -281,6 +281,29 @@ AllowedCPUs=1-2
 Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
 
 # ---------------------------------------------------------------------------
+# MONDAY 2 NOV 2026 MEASURED DAY — own-core placement ON (plan ITEM DT-S1)
+# ---------------------------------------------------------------------------
+# Owner decision, Fri 30 Oct 2026 ~17:45 IST (card in the coordinator
+# session): "Yes, Monday live test (Recommended)" — "Own-core ON for Monday
+# 2 Nov only, never-sleeping sorter OFF, measured minute by minute."
+#
+# What is ON: the frame drain on its own thread pinned to the readers' core
+# (core 1), and every other app thread on core 0. QuestDB moves to core 0 by
+# TV_QDB_CORE_ISOLATION=1 in tickvault-host-tuning.service. What stays OFF:
+# real-time priority (TICKVAULT_HOT_RT_PRIORITY) and the busy-poll drain.
+#
+# When it takes effect: both variables are read ONCE, in `main`, before any
+# runtime exists. A deploy never runs inside 09:00–15:45 IST (the deploy
+# guard), so the first process to read them is the after-close restart, and
+# Monday's 08:30 boot runs the measured session with them.
+#
+# REVIEW with the 16:15 IST verdict on Mon 2 Nov. To switch off: delete these
+# two lines (and the host-tuning one) in an after-close update; the defaults
+# are off, so nothing else changes.
+Environment=TICKVAULT_DRAIN_THREAD=on
+Environment=TICKVAULT_BACKGROUND_CORE=0
+
+# ---------------------------------------------------------------------------
 # Hot-thread placement (plan ITEM DT, 2026-10-30) — ALL OFF by default
 # ---------------------------------------------------------------------------
 #

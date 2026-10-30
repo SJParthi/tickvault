@@ -549,6 +549,48 @@ pub fn plan_questdb_host_env(
     changed.then_some(text)
 }
 
+/// [`plan_questdb_host_env`] with [`QDB_CORE_ISOLATION_KEY`] also taken from
+/// the host-tuning unit's own environment (`unit_switch`), so the switch can
+/// live in the tracked unit file instead of the box-local `.env` (plan ITEM
+/// DT-S1, the Monday 2 Nov measured day).
+///
+/// The unit's value is used only when the `.env` does not name the switch
+/// itself (an operator line in the file wins), and it is NEVER written into
+/// the file: removing the unit line therefore switches isolation off at the
+/// next host-tuning run, which undoes exactly what it set.
+#[must_use]
+pub fn plan_questdb_host_env_with_unit_switch(
+    cores: usize,
+    mem_g: u64,
+    env_text: &str,
+    set_mem_if_absent: bool,
+    unit_switch: Option<&str>,
+) -> Option<String> {
+    let from_unit = unit_switch
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|_| dotenv_value(env_text, QDB_CORE_ISOLATION_KEY).is_none());
+    let Some(value) = from_unit else {
+        return plan_questdb_host_env(cores, mem_g, env_text, set_mem_if_absent);
+    };
+    let mut input = env_text.to_string();
+    if !input.is_empty() && !input.ends_with('\n') {
+        input.push('\n');
+    }
+    input = dotenv_upsert(&input, QDB_CORE_ISOLATION_KEY, value);
+    let next = plan_questdb_host_env(cores, mem_g, &input, set_mem_if_absent)?;
+    let next = dotenv_remove(&next, QDB_CORE_ISOLATION_KEY);
+    // Only the switch line differed: nothing to write.
+    let unchanged = {
+        let mut original = env_text.to_string();
+        if !original.is_empty() && !original.ends_with('\n') {
+            original.push('\n');
+        }
+        original == next
+    };
+    (!unchanged).then_some(next)
+}
+
 /// Reads this host's cores and RAM, plans the compose `.env` QuestDB lines
 /// ([`plan_questdb_host_env`]) and writes the file (temp, rename) when they
 /// change. Returns the line to log. Never fails the caller: a host it cannot
@@ -561,7 +603,14 @@ pub fn apply_questdb_host_env(set_mem_if_absent: bool) -> String {
         .and_then(|m| meminfo_total_kib(&m))
         .map_or(0, |kib| kib / KIB_PER_GIB);
     let current = std::fs::read_to_string(COMPOSE_ENV_PATH).unwrap_or_default();
-    let Some(next) = plan_questdb_host_env(cores, mem_g, &current, set_mem_if_absent) else {
+    let unit_switch = std::env::var(QDB_CORE_ISOLATION_KEY).ok();
+    let Some(next) = plan_questdb_host_env_with_unit_switch(
+        cores,
+        mem_g,
+        &current,
+        set_mem_if_absent,
+        unit_switch.as_deref(),
+    ) else {
         return format!("host-tuning: {cores} cores, {mem_g}G — QuestDB compose env unchanged");
     };
     let tmp = format!("{COMPOSE_ENV_PATH}.tmp");
@@ -1365,6 +1414,48 @@ mod tests {
         let one = plan_questdb_host_env(1, 4, "TV_QDB_CORE_ISOLATION=1\n", false).expect("plan");
         assert!(one.contains("TV_QDB_CPUSET=0\n"));
         assert!(!one.contains("TV_QDB_CORE_ISOLATION_APPLIED"));
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_with_unit_switch_applies_without_writing_the_switch() {
+        let base = "TV_QDB_HTTP_BIND=0.0.0.0\nTV_QDB_CPUSET=0-1\nTV_QDB_CPUS=2.0\n";
+        let on = plan_questdb_host_env_with_unit_switch(2, 15, base, false, Some("1")).expect("on");
+        assert_eq!(dotenv_value(&on, "TV_QDB_CPUSET"), Some("0"));
+        assert_eq!(dotenv_value(&on, QDB_CORE_ISOLATION_KEY), None, "{on}");
+        assert!(on.contains("TV_QDB_HTTP_BIND=0.0.0.0\n"));
+        // Idempotent while the unit keeps the switch.
+        assert_eq!(
+            plan_questdb_host_env_with_unit_switch(2, 15, &on, false, Some("1")),
+            None
+        );
+        // The unit line removed: the next run undoes exactly what it set.
+        let off = plan_questdb_host_env_with_unit_switch(2, 15, &on, false, None).expect("undo");
+        assert_eq!(off, base);
+        // A `0` in the unit is off too.
+        assert_eq!(
+            plan_questdb_host_env_with_unit_switch(2, 15, &on, false, Some("0")).as_deref(),
+            Some(base)
+        );
+    }
+
+    #[test]
+    fn test_plan_questdb_host_env_with_unit_switch_an_env_file_line_wins() {
+        let base = "TV_QDB_CPUSET=0-1\nTV_QDB_CPUS=2.0\nTV_QDB_CORE_ISOLATION=0\n";
+        assert_eq!(
+            plan_questdb_host_env_with_unit_switch(2, 15, base, false, Some("1")),
+            None,
+            "an operator's own line in the .env overrides the unit"
+        );
+        // No unit value: exactly the plain planner.
+        assert_eq!(
+            plan_questdb_host_env_with_unit_switch(2, 15, "", true, None),
+            plan_questdb_host_env(2, 15, "", true)
+        );
+        // A 4-core host ignores it.
+        assert_eq!(
+            plan_questdb_host_env_with_unit_switch(4, 30, "", false, Some("1")),
+            None
+        );
     }
 
     #[test]
