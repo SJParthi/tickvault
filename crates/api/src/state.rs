@@ -391,6 +391,9 @@ struct AppStateInner {
     board_cache: crate::response_cache::SingleSlotTtlCache,
     /// TTL cache for the `/api/debug/speed-health` body. Single slot, 5 s TTL.
     speed_health_cache: crate::response_cache::SingleSlotTtlCache,
+    /// Single-flight lock for a speed-health cache miss, so concurrent misses
+    /// run one pass instead of one each.
+    speed_health_refresh: tokio::sync::Mutex<()>,
     /// Address of this process's own metrics page, set once at boot from
     /// `[observability]` when metrics are on; unset in tests and when off, in
     /// which case the speed-health figures read from it show "not available".
@@ -481,6 +484,7 @@ impl SharedAppState {
                     std::time::Duration::from_secs(SPEED_HEALTH_CACHE_TTL_SECS),
                 ),
                 metrics_scrape_url: std::sync::OnceLock::new(),
+                speed_health_refresh: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -553,6 +557,12 @@ impl SharedAppState {
     // TEST-EXEMPT: trivial accessor; exercised by the speed-health handler cache test.
     pub fn speed_health_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
         &self.inner.speed_health_cache
+    }
+
+    /// The single-flight lock a speed-health cache miss holds while it
+    /// computes (owner 2026-10-30).
+    pub fn speed_health_refresh(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.speed_health_refresh
     }
 
     /// Sets the address of this process's own metrics page. The first call
