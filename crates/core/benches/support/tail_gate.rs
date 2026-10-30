@@ -163,12 +163,24 @@ impl Gate {
     }
 }
 
-/// Runs `gate` only under `cargo bench` (`--bench`) and exits 1 on failure.
+/// Set to `1` by `bench.yml`: a p99 miss prints [`TAIL_GATE_FAILED_MARKER`]
+/// and exits 0, so the median gate and the Criterion baseline save still run;
+/// a step after the save fails the job on the marker. Unset (a local
+/// `cargo bench`), a miss exits 1 as before.
+const TAIL_GATE_DEFER_ENV: &str = "BENCH_TAIL_GATE_DEFER";
+
+/// The line `bench.yml` greps for after the baseline save.
+const TAIL_GATE_FAILED_MARKER: &str = "BENCH-TAIL-GATE-FAILED";
+
+/// Runs `gate` only under `cargo bench` (`--bench`). On failure it prints
+/// the marker, then exits 1 unless `BENCH_TAIL_GATE_DEFER=1`.
 pub fn run_under_bench(name: &str, gate: impl FnOnce() -> Result<(), String>) {
     if std::env::args().any(|a| a == "--bench")
         && let Err(why) = gate()
     {
-        eprintln!("{name} p99 gate FAILED: {why}");
-        std::process::exit(1);
+        eprintln!("{TAIL_GATE_FAILED_MARKER} {name} p99 gate: {why}");
+        if std::env::var(TAIL_GATE_DEFER_ENV).as_deref() != Ok("1") {
+            std::process::exit(1);
+        }
     }
 }
