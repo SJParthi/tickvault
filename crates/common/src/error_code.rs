@@ -172,6 +172,11 @@ pub enum ErrorCode {
     /// requested core pin was refused (core 0, a core outside the allowed
     /// set, an unparseable value, or the kernel said no). Boot continues.
     HotPath03ReaderPinNotApplied,
+    /// HOT-PATH-04: the hot-path telemetry thread did not start (the host
+    /// refused a new thread). Stage latency, task heartbeats and the
+    /// HOT-PATH-STALL-01 page stay dark for this process. Boot continues.
+    /// Log-only, one line per boot.
+    HotPath04TelemetryNotStarted,
     /// HOT-PATH-STALL-01: in session, a hot task (a tokio runtime, the frame
     /// drain) made no progress for at least two seconds, or one hot-path step
     /// took that long. Socket reads may have waited and Dhan may have skipped
@@ -1176,6 +1181,7 @@ impl ErrorCode {
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
             Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
+            Self::HotPath04TelemetryNotStarted => "HOT-PATH-04",
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
             Self::Boot04WalInitFailed => "BOOT-04",
             Self::Proc02Panic => "PROC-02",
@@ -1466,6 +1472,9 @@ impl ErrorCode {
             // DRAIN-HOLD-01: the box may stop with work left; the work stays on
             // disk and is done the next evening.
             Self::DrainHold01NotWritten => Severity::Medium,
+            // HOT-PATH-04: the stall page and the stage gauges are dark for
+            // this process; nothing is lost, but nothing would warn either.
+            Self::HotPath04TelemetryNotStarted => Severity::Medium,
             Self::HotPathStall01 => Severity::High,
             // BOOT-04 halts boot, PROC-02 is a crash, API-SERVER-01 leaves the
             // feed running. High, not Critical: each is already seen by another
@@ -1656,6 +1665,7 @@ impl ErrorCode {
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
             | Self::HotPath03ReaderPinNotApplied
+            | Self::HotPath04TelemetryNotStarted
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
@@ -1967,6 +1977,7 @@ impl ErrorCode {
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
             Self::HotPath03ReaderPinNotApplied,
+            Self::HotPath04TelemetryNotStarted,
             Self::HotPathStall01,
             Self::Boot04WalInitFailed,
             Self::Proc02Panic,
