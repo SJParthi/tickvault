@@ -7,7 +7,9 @@
 //! pre-sized buffer. None of it may allocate: at ~5,000 ticks a second an
 //! allocation per row would be millions per session on the task that empties
 //! the sockets. Pinned at zero across `ticks` rows (Full and Quote shapes, a
-//! named and an unnamed contract) and `tick_quotes` rows.
+//! named and an unnamed contract) and `tick_quotes` rows, for BOTH encoders:
+//! the questdb-rs library and our own (`[tick_storage] own_ilp_encoder`,
+//! plan ITEM DT, owner 2026-10-30).
 //!
 //! Companion bench: `benches/tick_row_append.rs`.
 
@@ -21,6 +23,7 @@ use tickvault_common::tick_types::ParsedTick;
 use tickvault_storage::candle_contract_labels::{
     CandleContractLabels, publish_candle_contract_labels,
 };
+use tickvault_storage::tick_ilp::TickIlpEncoder;
 use tickvault_storage::tick_persistence::TickWriter;
 
 mod dhat_support;
@@ -60,33 +63,11 @@ fn tick(i: usize) -> ParsedTick {
     }
 }
 
-#[test]
-fn dhat_tick_row_append_is_zero_allocation() {
-    // Names for half the instruments, so both the named and the unnamed
-    // `contract` arm run. Published before the window opens.
-    let mut labels = CandleContractLabels::default();
-    for id in (40_000_i64..40_064).step_by(2) {
-        labels.insert((id, "NSE_FNO"), Arc::from("NIFTY-25Nov2026-24500-CE"));
-    }
-    assert!(publish_candle_contract_labels(labels) > 0);
-
-    let ticks: Vec<ParsedTick> = (0..ROWS_PER_ATTEMPT).map(tick).collect();
-    let mut writer = TickWriter::for_test(Feed::Dhan);
-    // Warm-up outside the window: first-use statics (counters, the label
-    // snapshot) are initialised here, not inside the measurement.
-    for (i, t) in ticks.iter().take(16).enumerate() {
-        writer
-            .append_tick_with_seq(t, 1 + i as i64)
-            .expect("warm-up row");
-        writer
-            .append_tick_quote_with_seq(t, 100 + i as i64)
-            .expect("warm-up quote row");
-    }
-    let before = writer.pending();
-
-    let _profiler = dhat::Profiler::builder().testing().build();
-    let mut seq = 1_000_i64;
-    let (bytes, blocks) = dhat_support::measure_with_phantom_retry(
+/// Appends `ticks` through `writer`, a third on the `tick_quotes` route,
+/// inside the measured window; returns (bytes, blocks).
+fn measure_rows(writer: &mut TickWriter, ticks: &[ParsedTick], seq_base: i64) -> (u64, u64) {
+    let mut seq = seq_base;
+    dhat_support::measure_with_phantom_retry(
         BUDGET_BYTES,
         BUDGET_BLOCKS,
         || {},
@@ -101,28 +82,73 @@ fn dhat_tick_row_append_is_zero_allocation() {
                 std::hint::black_box(appended.is_ok());
             }
         },
-    );
+    )
+}
 
-    assert!(
-        bytes == BUDGET_BYTES && blocks == BUDGET_BLOCKS,
-        "the tick row build allocated {bytes} bytes / {blocks} blocks over \
-         {ROWS_PER_ATTEMPT} rows. It runs on the frame drain for every tick and must \
-         write into the pre-sized buffer only — no String, no Vec, no format!."
-    );
-    // Non-vacuity: every measured tick became a `ticks` or `tick_quotes` row
-    // (none was refused to `feed_aux_packets`, which also counts as pending),
-    // and the `tick_quotes` route really ran.
+/// A writer warmed outside the window: first-use statics (counters, the
+/// label snapshot, our encoder's f64 scratch buffer) are initialised here,
+/// not inside the measurement.
+fn warmed_writer(encoder: TickIlpEncoder, ticks: &[ParsedTick]) -> TickWriter {
+    let mut writer = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
+    for (i, t) in ticks.iter().take(16).enumerate() {
+        writer
+            .append_tick_with_seq(t, 1 + i as i64)
+            .expect("warm-up row");
+        writer
+            .append_tick_quote_with_seq(t, 100 + i as i64)
+            .expect("warm-up quote row");
+    }
+    writer
+}
+
+/// Non-vacuity: every measured tick became a `ticks` or `tick_quotes` row
+/// (none was refused to `feed_aux_packets`, which also counts as pending),
+/// and the `tick_quotes` route really ran.
+fn assert_rows_landed(writer: &TickWriter, before: usize, encoder: TickIlpEncoder) {
     assert!(
         writer.pending() >= before + ROWS_PER_ATTEMPT,
-        "the measured appends wrote no rows"
+        "{encoder:?}: the measured appends wrote no rows"
     );
     assert_eq!(
         writer.aux_rows_appended(),
         0,
-        "a tick was refused by the window"
+        "{encoder:?}: a tick was refused by the window"
     );
     assert!(
         writer.quote_rows_appended() >= (ROWS_PER_ATTEMPT / 3) as u64,
-        "the tick_quotes route wrote no rows"
+        "{encoder:?}: the tick_quotes route wrote no rows"
     );
+}
+
+#[test]
+fn dhat_tick_row_append_is_zero_allocation() {
+    // Names for half the instruments, so both the named and the unnamed
+    // `contract` arm run. Published before the window opens.
+    let mut labels = CandleContractLabels::default();
+    for id in (40_000_i64..40_064).step_by(2) {
+        labels.insert((id, "NSE_FNO"), Arc::from("NIFTY-25Nov2026-24500-CE"));
+    }
+    assert!(publish_candle_contract_labels(labels) > 0);
+
+    let ticks: Vec<ParsedTick> = (0..ROWS_PER_ATTEMPT).map(tick).collect();
+    // Both encoders: the questdb-rs library (default) and our own
+    // (`[tick_storage] own_ilp_encoder`, plan ITEM DT, owner 2026-10-30).
+    let mut library = warmed_writer(TickIlpEncoder::Library, &ticks);
+    let mut own = warmed_writer(TickIlpEncoder::Own, &ticks);
+    let (lib_before, own_before) = (library.pending(), own.pending());
+
+    let _profiler = dhat::Profiler::builder().testing().build();
+    for (encoder, writer, before) in [
+        (TickIlpEncoder::Library, &mut library, lib_before),
+        (TickIlpEncoder::Own, &mut own, own_before),
+    ] {
+        let (bytes, blocks) = measure_rows(writer, &ticks, 1_000);
+        assert!(
+            bytes == BUDGET_BYTES && blocks == BUDGET_BLOCKS,
+            "{encoder:?}: the tick row build allocated {bytes} bytes / {blocks} blocks over \
+             {ROWS_PER_ATTEMPT} rows. It runs on the frame drain for every tick and must \
+             write into the pre-sized buffer only — no String, no Vec, no format!."
+        );
+        assert_rows_landed(writer, before, encoder);
+    }
 }

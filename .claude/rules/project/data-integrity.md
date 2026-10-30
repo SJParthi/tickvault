@@ -133,6 +133,24 @@ SEPARATE follow-up, so no per-feed duplicate rows appear until then.
 - Materialized views use exact aggregations (first/max/min/last/sum) — corruption enters at input only
 - Enforced mechanically: `banned-pattern-scanner.sh` blocks `f64::from()` in `crates/storage/`
 
+### 2026-10-30 — our own ILP encoder writes the same text (plan ITEM DT)
+
+`[tick_storage] own_ilp_encoder` (default false) builds `ticks`, `tick_quotes`
+and `feed_aux_packets` rows with our encoder (`crates/storage/src/tick_ilp.rs`)
+instead of the questdb-rs buffer. It changes no stored value:
+- The prices it receives are the same `f64`s (`tick_price_f64`, unchanged), and
+  the text it writes for each is the library's: a whole number of paise is
+  written from that count (the shortest round-trip text, proven in the module
+  docs), every other value is printed by a library buffer.
+- DEDUP keys, column names, column order, timestamps (`ts`, `received_at`,
+  `exchange_timestamp`) and the `feed` symbol are unchanged; both encoders write
+  each row through one shared layout.
+- Proof: line-for-line and writer-for-writer proptests against the library,
+  random `f64` bit patterns, every paise count up to ten lakh rupees at a
+  stride, an exhaustive `#[ignore]`d sweep of every `f32` price below 2^17, and
+  a local-server test that our HTTP request (path, query, content type, body)
+  equals the library's.
+
 ## WebSocket Timestamp Rule — NEVER ADD +5:30 TO ts
 
 **THIS IS THE SINGLE MOST CRITICAL DATA INTEGRITY RULE.**
