@@ -3,7 +3,7 @@
 //! The app crate is a binary-only crate (no lib.rs), so these tests
 //! verify that key types from dependencies compile and behave as expected.
 
-use tickvault_common::config::NseHolidayEntry;
+use tickvault_common::config::{MuhuratTradingEntry, NseHolidayEntry};
 use tickvault_common::constants::{DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS};
 use tickvault_common::trading_calendar::TradingCalendar;
 
@@ -133,9 +133,10 @@ fn test_trading_config() -> tickvault_common::config::TradingConfig {
         timezone: "Asia/Kolkata".to_string(),
         max_orders_per_second: 10,
         nse_holidays: standard_2026_holidays(),
-        muhurat_trading_dates: vec![NseHolidayEntry {
+        muhurat_trading_dates: vec![MuhuratTradingEntry {
             date: "2026-11-08".to_string(),
             name: "Diwali 2026".to_string(),
+            ..Default::default()
         }],
         nse_mock_trading_dates: vec![],
     }

@@ -35,7 +35,7 @@ token_handle             = 50           # <50ns  — matches token_handle/load (
 # its Criterion bench lived in the deleted crates/storage/benches/
 # tick_persistence.rs (the dead tick chain). The primitive itself is
 # unchanged in tickvault_common::price_precision (unit + wiring tested).
-ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump + WAL append + dispatch per frame. Generous ceiling because WAL append includes one heap alloc + one crossbeam try_send; measured ~1-3μs in criterion, budget gives 2× headroom for noisy CI runners.
+ws_reader_frame_handle   = 1000         # <1μs  — the socket read path per frame (plan ITEM DT, 2026-10-30; was 5000): classify_frame + note_depth200_frame + WalRingSink::accept (receipt stamp, sequence, WAL hand-off to a real writer, ring budget, ring push), consumer awake. Measured median 255 ns (x86 dev VM). Excludes the wake of a PARKED drain (a futex/eventfd syscall, ~18 μs on the dev VM), measured by crates/core/tests/socket_to_wal_tail_harness.rs; spaced p50/p99 in socket_read_in_memory_harness.rs.
 # tick_gap_record_tick_steady_state / tick_gap_scan_gaps_full_universe budgets
 # removed in PR-C3 (2026-07-14) with the deleted tick-gap detector
 # (operator Q4-ii 2026-07-13).
@@ -104,12 +104,30 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # cost at ~24x the tick volume. Budgets are ~2x the measured figure; CI
 # multiplies them again for shared runners. NOT measured on the prod host.
 # Companion zero-alloc evidence: dhat_live_ingest_seam.rs, dhat_depth_drain.rs.
-feed_drain_main_feed     = 2500         # <2.5us per tick — matches feed_drain/main_feed_frame_4_quotes
+# 2026-10-29 (plan ITEM DT step 0, owner "go ahead with your recommendation",
+# sub-microsecond per-tick target): 2500 -> 1000. The CI median on 7cacc0e83
+# was 768.7 ns per tick and the CI p99 922 ns per tick (job 123319329443,
+# x86 GitHub runner), so the median under 1 us is now a gate instead of a
+# claim on dev hardware (multiplier 1.0). On CI the absolute arm is
+# multiplied by BENCH_BUDGET_MULTIPLIER (2.5), so the CI ceiling is 2.5 us
+# per tick for the median AND for the feed_drain p99 tail gate (was 6.25 us);
+# the 5% regression arm is what holds the CI median near 769 ns. The same key
+# also gates feed_drain/main_feed_frame_4_full (Full packets, every price
+# field set, inline depth book rows), added the same day.
+feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
 feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
+candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
+tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass.
 
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
+
+# Per-tick side stores (plan ITEM DT, 2026-10-30)
+tick_gap_detector        = 400          # <400ns per call (measured 2026-10-30, x86 dev container: median 42 ns hit, p99 198 ns with the clock pair) — matches tick_gap_detector/observe_hit, observe_refused_full, observe_tracked_hit, observe_tracked_miss (full at 25,000). The same value is the per-call p99 ceiling in the bench (plan ITEM DT, side stores, 2026-10-30)
+spot_price_store         = 250          # <250ns per call (measured: median 27 ns, p99 157 ns with the clock pair) — matches spot_price_store/record_* (full at 25,000) and its p99 gate (plan ITEM DT, 2026-10-30)
+backup_dedup             = 400          # <400ns per packet (measured: median 55 ns accept, p99 153 ns with the clock pair) — matches backup_dedup/admit_* (set full at 5,000) and its p99 gate (plan ITEM DT, 2026-10-30)
+tick_conservation_ledger = 100          # <100ns per row (measured: median 8 ns, p99 58 ns with the clock pair) — matches tick_conservation_ledger/note_row_appended_* and its p99 gate (plan ITEM DT, 2026-10-30)
 
 # =============================================================================
 # Per-element counts for BATCH benchmarks (2026-06-02)
@@ -128,5 +146,9 @@ config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches confi
 pipeline_batch_100_mixed  = 100   # 100 mixed packets per iter
 pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
 feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PROOF-9)
+feed_drain_main_feed_frame_4_full   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29)
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet
+backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)
+candles_consume_tick_hit            = 500  # 500 ticks per hit batch (candle_fold TICKS_PER_BATCH)
+tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)

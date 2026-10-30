@@ -49,6 +49,46 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-30 with plan ITEM DT-SOCK (owner: every in-memory step
+    // under 1 us at p99): wall-clock harnesses for the socket read path's
+    // in-memory work per frame (production spacing, bursts, a per-step
+    // breakdown, a live drain, the drain's recv over a backlog). They print
+    // percentiles and gate nothing, like the harness above: a wall-clock
+    // number must not become a flaky CI gate. The gate is the Criterion
+    // budget `ws_reader_frame_handle` (bench-gate); the behaviour is pinned
+    // by the ordinary tests in `frame_ring.rs` and `ws_frame_spill/receipt_anchor.rs`.
+    //
+    //   cargo test --release -p tickvault-core --test socket_read_in_memory_harness -- --ignored --nocapture --test-threads=1
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_in_memory_cost_per_frame",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_in_memory_cost_breakdown",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_cost_with_a_live_drain_in_a_burst",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "ring_recv_cost_over_a_queued_backlog",
+    ),
+    // Added 2026-10-30 with plan item DT-S1: a wall-clock harness for the
+    // hot-thread placement switches (consumer pick-up delay with a busy
+    // neighbour on the hot core, three placements). It prints percentiles
+    // and gates nothing; it needs two otherwise idle cores and (for its
+    // third row) SCHED_FIFO, which a shared CI runner cannot promise. The
+    // behaviour is pinned by the ordinary tests in
+    // `crates/app/src/drain_thread.rs`, `dhan_feed_stack/drain_thread_tests.rs`
+    // and `crates/core/src/websocket/hot_thread_placement.rs`. Run it with:
+    //
+    //   taskset -c 0,1 cargo test --release -p tickvault-app --test drain_placement_harness -- --ignored --nocapture
+    (
+        "crates/app/tests/drain_placement_harness.rs",
+        "drain_placement_wait_for_cpu_three_ways",
+    ),
     // Added 2026-10-26 with audit M4: a wall-clock timing harness for the
     // socket hand-off stage (frames 400 us apart so the WAL writer and the
     // drain are parked). It prints percentiles and gates nothing, the same
@@ -103,6 +143,20 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     (
         "crates/common/src/price_precision.rs",
         "test_f32_to_f64_clean_matches_text_path_for_every_f32",
+    ),
+    // Added 2026-10-30 with the tick row fast price path (plan ITEM DT): the
+    // same shape as the entry above. It checks `tick_price_f64` against
+    // `round_to_2dp(f32_to_f64_clean(v))` for every f32 below 2^17, both
+    // signs (about 2.2 billion inputs). Measured: 0 differences, 265 s in
+    // release on the dev container; a debug CI build would take hours. It is
+    // not the gate: the proptests beside it (any bit pattern, price-like
+    // values, edge values, rows and ILP bytes against the legacy writer) run
+    // in every suite. Re-run it whenever `tick_price_f64` changes:
+    //
+    //   cargo test -p tickvault-storage --release --lib -- --ignored every_fast_path_f32
+    (
+        "crates/storage/src/tick_row_identity_tests.rs",
+        "tick_price_f64_matches_legacy_for_every_fast_path_f32",
     ),
     // Added 2026-10-03 with sweep S1 (the drain flush no longer hands over
     // its worker): the same wall-clock shape as the harnesses below -- it

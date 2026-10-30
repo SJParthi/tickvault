@@ -117,13 +117,23 @@ jobs:
       # market-data tables; both are removed, see the note at the top.) deploy-aws.yml has
       # refused the same window since 2026-07-04; this mirrors that guard exactly
       # (09:00-15:45 IST = 03:30-10:15 UTC, Mon-Fri) behind an explicit override.
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Refuse to run inside the trading session unless forced
         env:
           FORCE: ${{ inputs.force_market_hours }}
         run: |
           set -euo pipefail
-          HHMM=$(date -u +%H%M); DOW=$(date -u +%u)
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0330 ] && [ "$HHMM" -lt 1015 ]; then
+          HHMM=$(date -u +%H%M); DOW=$(date -u +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0330 ] && [ "$HHMM" -lt 1015 ]; }; then
             if [ "$FORCE" = "yes" ]; then
               echo "::warning::running INSIDE 09:00-15:45 IST on operator override — the app will stop"
             else
