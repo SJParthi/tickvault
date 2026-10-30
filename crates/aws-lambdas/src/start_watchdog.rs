@@ -3395,3 +3395,233 @@ mod tests {
         assert_eq!(out["stopped"], json!(true));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The live SDK adapters and `handle`, driven through the REAL AWS SDK against
+// a loopback account (crate::test_support). The decision logic above is
+// covered with fakes; these prove the adapters turn real EC2 / SSM / SNS
+// replies into the values that logic reads.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod sdk_loopback_tests {
+    use super::*;
+    use crate::test_support::{
+        EnvVarGuard, Fleet, aws_env_guards, env_lock, loopback_sdk_config, operations, recorded,
+        start_fleet,
+    };
+
+    async fn adapters(
+        fleet: Fleet,
+    ) -> (
+        SdkEc2,
+        SdkSsm,
+        SdkSns,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::test_support::LoopbackRequest>>>,
+    ) {
+        let (endpoint, requests) = start_fleet(fleet).await;
+        let config = loopback_sdk_config(&endpoint).await;
+        (
+            SdkEc2 {
+                client: aws_sdk_ec2::Client::new(&config),
+            },
+            SdkSsm {
+                client: aws_sdk_ssm::Client::new(&config),
+            },
+            SdkSns {
+                client: aws_sdk_sns::Client::new(&config),
+            },
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_describe_reads_state_launch_time_and_public_ip() {
+        let (ec2, _, _, requests) = adapters(Fleet::default()).await;
+        let desc = ec2
+            .describe("i-0loopback")
+            .await
+            .expect("describe succeeds")
+            .expect("one instance");
+        assert_eq!(desc.state, "running");
+        assert_eq!(desc.public_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            desc.launch_time.map(|t| t.to_rfc3339()),
+            Some("2026-10-30T03:00:00+00:00".to_string())
+        );
+        let seen = recorded(&requests);
+        assert_eq!(
+            seen[0].form_value("InstanceId.1").as_deref(),
+            Some("i-0loopback")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_describe_with_no_reservation_is_not_found() {
+        let (ec2, _, _, _) = adapters(Fleet {
+            instance_state: None,
+            ..Fleet::default()
+        })
+        .await;
+        assert!(
+            ec2.describe("i-0gone")
+                .await
+                .expect("describe succeeds")
+                .is_none()
+        );
+        assert_eq!(instance_info(&ec2, "i-0gone").await.0, "not-found");
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_errors_surface_as_text() {
+        let (ec2, _, _, _) = adapters(Fleet {
+            fail: vec!["DescribeInstances", "StartInstances", "StopInstances"],
+            ..Fleet::default()
+        })
+        .await;
+        assert!(ec2.describe("i-0x").await.is_err());
+        assert!(ec2.start_instances("i-0x").await.is_err());
+        assert!(ec2.stop_instances("i-0x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_start_and_stop_send_the_instance_id() {
+        let (ec2, _, _, requests) = adapters(Fleet::default()).await;
+        ec2.start_instances("i-0loopback")
+            .await
+            .expect("start succeeds");
+        ec2.stop_instances("i-0loopback")
+            .await
+            .expect("stop succeeds");
+        assert_eq!(
+            operations(&requests),
+            vec!["StartInstances", "StopInstances"]
+        );
+        assert!(
+            recorded(&requests)
+                .iter()
+                .all(|r| r.form_value("InstanceId.1").as_deref() == Some("i-0loopback"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ssm_get_parameter_reads_the_value_and_surfaces_a_miss() {
+        let mut ssm_values = std::collections::HashMap::new();
+        ssm_values.insert(
+            DEFAULT_KEEP_ALIVE_PARAM.to_string(),
+            "2026-10-30T18:00:00+05:30".to_string(),
+        );
+        let (_, ssm, _, _) = adapters(Fleet {
+            ssm: ssm_values,
+            ..Fleet::default()
+        })
+        .await;
+        assert_eq!(
+            ssm.get_parameter(DEFAULT_KEEP_ALIVE_PARAM).await.as_deref(),
+            Ok("2026-10-30T18:00:00+05:30")
+        );
+        assert!(ssm.get_parameter("/tickvault/prod/absent").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sns_publish_sends_topic_subject_and_message() {
+        let (_, _, sns, requests) = adapters(Fleet::default()).await;
+        sns.publish("arn:aws:sns:ap-south-1:1:tv", "subject line", "body text")
+            .await
+            .expect("publish succeeds");
+        let seen = recorded(&requests);
+        assert_eq!(
+            seen[0].form_value("TopicArn").as_deref(),
+            Some("arn:aws:sns:ap-south-1:1:tv")
+        );
+        assert_eq!(
+            seen[0].form_value("Subject").as_deref(),
+            Some("subject line")
+        );
+        assert_eq!(seen[0].form_value("Message").as_deref(), Some("body text"));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sns_publish_failure_is_an_error() {
+        let (_, _, sns, _) = adapters(Fleet {
+            fail: vec!["Publish"],
+            ..Fleet::default()
+        })
+        .await;
+        assert!(sns.publish("arn:x", "s", "m").await.is_err());
+    }
+
+    #[test]
+    fn test_watchdog_env_from_process_env_reads_overrides_and_defaults() {
+        let _lock = env_lock();
+        let keys = [
+            "EC2_INSTANCE_ID",
+            "ALERTS_TOPIC_ARN",
+            "DASHBOARD_PORT",
+            "KEEP_ALIVE_PARAM",
+            "HOLIDAY_STOP_PARAM",
+            "BUDGET_STOP_PARAM",
+            "DRAIN_HOLD_PARAM",
+            crate::muhurat_window::MUHURAT_SESSIONS_ENV,
+        ];
+        {
+            let _unset: Vec<EnvVarGuard> = keys.iter().map(|k| EnvVarGuard::set(k, None)).collect();
+            let env = WatchdogEnv::from_process_env();
+            assert_eq!(env.instance_id, "");
+            assert_eq!(env.alerts_topic_arn, "");
+            assert_eq!(env.dashboard_port, "3001");
+            assert_eq!(env.keep_alive_param, DEFAULT_KEEP_ALIVE_PARAM);
+            assert_eq!(env.holiday_stop_param, DEFAULT_HOLIDAY_STOP_PARAM);
+            assert_eq!(
+                env.budget_stop_param,
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM
+            );
+            assert_eq!(
+                env.drain_hold_param,
+                crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM
+            );
+            assert_eq!(env.muhurat_sessions, "");
+        }
+        let _set: Vec<EnvVarGuard> = keys
+            .iter()
+            .map(|k| EnvVarGuard::set(k, Some(&format!("v-{k}"))))
+            .collect();
+        let env = WatchdogEnv::from_process_env();
+        assert_eq!(env.instance_id, "v-EC2_INSTANCE_ID");
+        assert_eq!(env.alerts_topic_arn, "v-ALERTS_TOPIC_ARN");
+        assert_eq!(env.dashboard_port, "v-DASHBOARD_PORT");
+        assert_eq!(env.keep_alive_param, "v-KEEP_ALIVE_PARAM");
+        assert_eq!(env.holiday_stop_param, "v-HOLIDAY_STOP_PARAM");
+        assert_eq!(env.budget_stop_param, "v-BUDGET_STOP_PARAM");
+        assert_eq!(env.drain_hold_param, "v-DRAIN_HOLD_PARAM");
+        assert_eq!(
+            env.muhurat_sessions,
+            format!("v-{}", crate::muhurat_window::MUHURAT_SESSIONS_ENV)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_ping_describes_the_instance_and_publishes_the_dashboard_link() {
+        let (endpoint, requests) = start_fleet(Fleet::default()).await;
+        let _lock = env_lock();
+        let _aws = aws_env_guards(&endpoint);
+        let _id = EnvVarGuard::set("EC2_INSTANCE_ID", Some("i-0loopback"));
+        let _topic = EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
+        let _port = EnvVarGuard::set("DASHBOARD_PORT", Some("3001"));
+
+        let out = handle(json!({"mode": "ping"}))
+            .await
+            .expect("ping succeeds");
+        assert!(out.is_object(), "{out}");
+        let ops = operations(&requests);
+        assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+        let publish = recorded(&requests)
+            .into_iter()
+            .find(|r| r.query_action().as_deref() == Some("Publish"))
+            .expect("the ping publishes");
+        let message = publish.form_value("Message").unwrap_or_default();
+        assert!(
+            message.contains("http://203.0.113.7:3001/feeds"),
+            "the start message carries the dashboard link: {message}"
+        );
+    }
+}

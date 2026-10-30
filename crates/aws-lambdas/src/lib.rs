@@ -47,4 +47,6 @@ pub mod qdb_console_front;
 pub mod qdb_console_proxy;
 pub mod start_watchdog;
 pub mod telegram_webhook;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod time;
