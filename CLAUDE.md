@@ -770,7 +770,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## BENCHMARK BUDGETS
 
-`quality/benchmark-budgets.toml` is the executable source of truth (20 keys — 13 latency budgets + 5 per-element divisors + max_regression_pct + min_regression_delta_ns, the 1 ns noise floor added 2026-10-11 — enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
+`quality/benchmark-budgets.toml` is the executable source of truth (21 keys — 13 latency budgets + 6 per-element divisors + max_regression_pct + min_regression_delta_ns, the 1 ns noise floor added 2026-10-11 — enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
 
 | Budget key (benchmark-budgets.toml) | Real Criterion bench | Budget |
 |-------------------------------------|----------------------|--------|
@@ -782,7 +782,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 | config_toml_load | `config/toml_load` | 10 ms |
 | ~~composite_quote_tick_compute_only~~ | ~~`composite/quote_tick_compute_only`~~ | ~~10 μs~~ |
 | ~~composite_quote_tick_full_chain~~ | ~~`composite/quote_tick_full_chain`~~ | ~~10 μs~~ |
-| feed_drain_main_feed | `feed_drain/main_feed_frame_4_quotes` | 2.5 μs/tick |
+| feed_drain_main_feed | `feed_drain/main_feed_frame_4_quotes`, `feed_drain/main_feed_frame_4_full` | 1 μs/tick (2.5 μs until 2026-10-29, plan ITEM DT step 0; CI multiplies by 2.5) |
 | feed_drain_depth | `feed_drain/depth20_frame_4x20`, `feed_drain/depth200_packet` | 1.5 μs/level |
 
 > **⚠ CORRECTED 2026-10-20 (audit item D3) — the two struck rows gate nothing.**

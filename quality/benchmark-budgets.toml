@@ -104,7 +104,17 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # cost at ~24x the tick volume. Budgets are ~2x the measured figure; CI
 # multiplies them again for shared runners. NOT measured on the prod host.
 # Companion zero-alloc evidence: dhat_live_ingest_seam.rs, dhat_depth_drain.rs.
-feed_drain_main_feed     = 2500         # <2.5us per tick — matches feed_drain/main_feed_frame_4_quotes
+# 2026-10-29 (plan ITEM DT step 0, owner "go ahead with your recommendation",
+# sub-microsecond per-tick target): 2500 -> 1000. The CI median on 7cacc0e83
+# was 768.7 ns per tick and the CI p99 922 ns per tick (job 123319329443,
+# x86 GitHub runner), so the median under 1 us is now a gate instead of a
+# claim on dev hardware (multiplier 1.0). On CI the absolute arm is
+# multiplied by BENCH_BUDGET_MULTIPLIER (2.5), so the CI ceiling is 2.5 us
+# per tick for the median AND for the feed_drain p99 tail gate (was 6.25 us);
+# the 5% regression arm is what holds the CI median near 769 ns. The same key
+# also gates feed_drain/main_feed_frame_4_full (Full packets, every price
+# field set, inline depth book rows), added the same day.
+feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
 feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
 
 # Common crate
@@ -128,5 +138,6 @@ config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches confi
 pipeline_batch_100_mixed  = 100   # 100 mixed packets per iter
 pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
 feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PROOF-9)
+feed_drain_main_feed_frame_4_full   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29)
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet

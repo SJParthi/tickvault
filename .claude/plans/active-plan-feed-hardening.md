@@ -7089,6 +7089,10 @@ Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.
   - Files: crates/trading/src/candles/multi_tf_aggregator.rs (read-only view only; no indicator/strategy code, §28), crates/app/src/dhan_feed_stack.rs
   - Tests: test_period_end_view_reads_the_open_bucket_without_sealing, test_late_print_after_period_end_view_still_amends_the_stored_bar
 
+- [x] DT-S0. Sub-microsecond per-tick target, step 0 (owner 2026-10-29: "go ahead with your recommendation"): lock in what is already true. `feed_drain_main_feed` 2500 → 1000 ns per tick (CI median 768.7 ns, p99 922 ns per tick on 7cacc0e83, job 123319329443; CI multiplies by 2.5, so the CI ceiling is 2.5 µs for both the median and the p99 tail gate). New bench `feed_drain/main_feed_frame_4_full`: four NSE_FNO Full packets per frame with every price field set (LTP, ATP, day OHLC, ten depth prices) and inline depth book rows (production shape), a non-vacuity check before timing (every packet folds, ten levels stored), `[elements]` divisor 4. No production code changed; no stored row changed.
+  - Files: quality/benchmark-budgets.toml, crates/app/benches/feed_drain.rs, CLAUDE.md (key count 20 → 21, headline row)
+  - Tests: benchmark_budget_reaches_a_bench_guard (every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count), bench_budget_elements_guard, the feed_drain bench itself (cargo bench --bench feed_drain)
+
 ### Design (Item DT)
 The drain's per-frame work is O(packets) ≤ 0.26 ms worst; the tail is scheduling wait. A dedicated thread removes the wait behind ~117 tasks; core placement and priority remove CPU contention; the sleeping-consumer flag keeps the reader's hand-off O(1) and wake-free while the drain is busy. Each step lands as its own PR, measured live before the next (DT0 first).
 
