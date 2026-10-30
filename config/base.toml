@@ -104,11 +104,23 @@ date = "2026-12-25"
 name = "Christmas"
 
 # Special trading sessions (market normally closed but opens for limited hours).
-# Muhurat Trading: ~1 hour evening session on Diwali.
+# Muhurat Trading: ~1 hour special session on Diwali (2024 was evening, 2025
+# afternoon). session_start_ist / session_end_ist (HH:MM IST) are the ONE
+# source of the session: the box schedule (terraform var.muhurat_sessions,
+# pinned equal by crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs),
+# the workflows' deploy freeze (they read the date line below, which must stay
+# the first line after the header) and the liveness alarm arming all follow
+# them. Empty times = NSE has not published them: the box is not started.
+# 2026-11-08 (set 2026-10-30, Assumed): press reports of NSE circular
+# NSE/CMTR/76941 (19 Oct 2026) give pre-open from 14:05 and normal trading
+# 14:20-15:30; the end is the app's own 15:40 capture end. Confirm against
+# the circular on nseindia.com and correct here if it differs.
 
 [[trading.muhurat_trading_dates]]
 date = "2026-11-08"
 name = "Diwali 2026 (Sunday — special session)"
+session_start_ist = "14:05"
+session_end_ist = "15:40"
 
 # ---------------------------------------------------------------------------
 # NSE Mock Trading Sessions — Contingency Drill Calendar 2026

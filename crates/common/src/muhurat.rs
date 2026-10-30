@@ -43,6 +43,16 @@
 //! module makes the DATA path correct; the SCHEDULE remains an operator
 //! decision, and it is the binding constraint.
 //!
+//! **⚠ CORRECTED 2026-10-30 — the schedule half is no longer missing.** Plan
+//! item J8 (2026-10-26) starts the box for a calendar Muhurat date
+//! (`aws-lambdas` `muhurat_window`), and the 2026-10-30 change (owner: "go
+//! ahead and fix the muhurat risk dude") moves the session TIMES into
+//! `[[trading.muhurat_trading_dates]]` as the one source the box schedule,
+//! the deploy freeze and the liveness alarm arming are pinned to.
+//! [`session_is_inside_capture_windows`] checks those times against this
+//! module's fixed windows, and `tests/muhurat_session_calendar.rs` fails the
+//! build when a configured session would be cut by them.
+//!
 //! ## Why a process-global transport
 //!
 //! The flag is computed ONCE at boot but the writers are constructed in deep,
@@ -90,9 +100,72 @@ pub fn current() -> bool {
     MUHURAT_ACTIVE.get().copied().unwrap_or(false)
 }
 
+/// True when a whole Muhurat session `[start, end)` (IST seconds of day, end
+/// exclusive) lies inside ONE window the tick, depth and candle writers accept
+/// on a Muhurat day: the regular session window
+/// `[TICK_PERSIST_START_SECS_OF_DAY_IST, TICK_PERSIST_END_SECS_OF_DAY_IST)`
+/// (09:00–15:40), or the fixed Muhurat evening window
+/// `[MUHURAT_PERSIST_START_SECS_OF_DAY_IST, MUHURAT_PERSIST_END_SECS_OF_DAY_IST)`
+/// (18:00–19:30).
+///
+/// The session times come from config (`[[trading.muhurat_trading_dates]]`)
+/// while the writers' windows are constants, so this is the check that the
+/// two agree: a session that straddles 15:40–18:00 or runs past 19:30 would
+/// be partly refused by the writers. Pinned against `config/base.toml` by
+/// `tests/muhurat_session_calendar.rs`, so such a session fails the build
+/// instead of losing ticks on the day. Pure, O(1).
+#[must_use]
+pub const fn session_is_inside_capture_windows(start_secs: u32, end_secs: u32) -> bool {
+    use crate::constants::{
+        MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
+        TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    };
+    if start_secs >= end_secs {
+        return false;
+    }
+    let in_regular = start_secs >= TICK_PERSIST_START_SECS_OF_DAY_IST
+        && end_secs <= TICK_PERSIST_END_SECS_OF_DAY_IST;
+    let in_evening = start_secs >= MUHURAT_PERSIST_START_SECS_OF_DAY_IST
+        && end_secs <= MUHURAT_PERSIST_END_SECS_OF_DAY_IST;
+    in_regular || in_evening
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const fn hm(h: u32, m: u32) -> u32 {
+        h * 3600 + m * 60
+    }
+
+    #[test]
+    fn session_capture_windows_accept_afternoon_and_evening_sessions() {
+        // 2026 (reported): pre-open 14:05, close by 15:40.
+        assert!(session_is_inside_capture_windows(hm(14, 5), hm(15, 40)));
+        // 2025: 13:45-14:45.
+        assert!(session_is_inside_capture_windows(hm(13, 45), hm(14, 45)));
+        // 2024: 18:00-19:00, and an 18:00-19:15 style evening window.
+        assert!(session_is_inside_capture_windows(hm(18, 0), hm(19, 0)));
+        assert!(session_is_inside_capture_windows(hm(18, 0), hm(19, 15)));
+        // Exact window edges are inside (end is exclusive on both sides).
+        assert!(session_is_inside_capture_windows(hm(9, 0), hm(15, 40)));
+        assert!(session_is_inside_capture_windows(hm(18, 0), hm(19, 30)));
+    }
+
+    #[test]
+    fn session_capture_windows_refuse_a_session_the_writers_would_cut() {
+        // Runs past the evening window's 19:30 end.
+        assert!(!session_is_inside_capture_windows(hm(18, 15), hm(19, 45)));
+        // Starts before the evening window opens.
+        assert!(!session_is_inside_capture_windows(hm(17, 45), hm(19, 0)));
+        // Straddles the 15:40-18:00 gap.
+        assert!(!session_is_inside_capture_windows(hm(15, 0), hm(16, 0)));
+        // Before 09:00.
+        assert!(!session_is_inside_capture_windows(hm(8, 30), hm(9, 30)));
+        // Empty or reversed.
+        assert!(!session_is_inside_capture_windows(hm(14, 0), hm(14, 0)));
+        assert!(!session_is_inside_capture_windows(hm(15, 0), hm(14, 0)));
+    }
 
     #[test]
     fn current_before_init_is_false_then_reflects_init() {

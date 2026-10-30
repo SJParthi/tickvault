@@ -734,6 +734,119 @@ resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_close" {
   input     = jsonencode({ mode = "close" })
 }
 
+# NSE Muhurat session arming — 2026-10-30 (owner: "go ahead and fix the
+# muhurat risk dude"; dated record in dhan-rest-only-noise-lock-2026-07-14.md
+# full text §2.15). The open/close crons above are MON-FRI, so on a weekend
+# Muhurat date (2026: Sunday 2026-11-08) the gated alarms stayed disarmed and a
+# dead app during the session reached nobody. Each Muhurat date with published
+# times (config/base.toml [[trading.muhurat_trading_dates]], mirrored in
+# var.muhurat_sessions and pinned equal by
+# crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs) gets ONE dated open
+# and ONE dated close rule on the SAME gate Lambda, same ALARM_NAMES, same
+# holiday-marker and instance-state checks. No new alarm, no new page.
+#
+# Why session start + 20 minutes: the regular day opens at 09:20 for a 09:00
+# capture start; the same offset after the Muhurat pre-open start keeps the
+# no-ticks alarm from reading the app's uptime before the first tick (the
+# 2026-10-26 L4 reason arming at the old 13:30 placeholder was skipped as
+# unsafe: the reported pre-open is 14:05). Close at the configured session end.
+# Times stay on the same UTC date because var.muhurat_sessions refuses a
+# session outside 06:00-23:00 IST. Cost: 2 invokes per Muhurat date, free tier.
+locals {
+  muhurat_liveness_open_offset_minutes = 20
+  muhurat_liveness_windows = {
+    for s in var.muhurat_sessions : s.date => {
+      open_utc_minutes = (
+        tonumber(substr(s.session_start_ist, 0, 2)) * 60
+        + tonumber(substr(s.session_start_ist, 3, 2))
+        + local.muhurat_liveness_open_offset_minutes - 330
+      )
+      close_utc_minutes = (
+        tonumber(substr(s.session_end_ist, 0, 2)) * 60
+        + tonumber(substr(s.session_end_ist, 3, 2)) - 330
+      )
+      day   = tonumber(split("-", s.date)[2])
+      month = tonumber(split("-", s.date)[1])
+      year  = split("-", s.date)[0]
+    } if s.session_start_ist != ""
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_muhurat_open" {
+  for_each    = local.muhurat_liveness_windows
+  name        = "tv-${var.environment}-market-hours-liveness-muhurat-open-${each.key}"
+  description = "NSE Muhurat ${each.key}: enable market-hours liveness alarm actions 20 min after the session start"
+  schedule_expression = format(
+    "cron(%d %d %d %d ? %s)",
+    each.value.open_utc_minutes % 60,
+    floor(each.value.open_utc_minutes / 60),
+    each.value.day,
+    each.value.month,
+    each.value.year,
+  )
+  state = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_muhurat_close" {
+  for_each    = local.muhurat_liveness_windows
+  name        = "tv-${var.environment}-market-hours-liveness-muhurat-close-${each.key}"
+  description = "NSE Muhurat ${each.key}: disable market-hours liveness alarm actions at the session end"
+  schedule_expression = format(
+    "cron(%d %d %d %d ? %s)",
+    each.value.close_utc_minutes % 60,
+    floor(each.value.close_utc_minutes / 60),
+    each.value.day,
+    each.value.month,
+    each.value.year,
+  )
+  state = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_muhurat_open" {
+  for_each  = local.muhurat_liveness_windows
+  rule      = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_open[each.key].name
+  target_id = "tv-market-hours-liveness-muhurat-open"
+  arn       = aws_lambda_function.tv_market_hours_liveness_gate.arn
+  # The three did-it-run alarms watch MON-FRI Lambdas (Invocations < 1 over a
+  # day, breaching): armed on a weekend Muhurat date they would page for a
+  # check that correctly did not run, so the gate leaves them disarmed
+  # (market_hours_gate::alarms_to_open, a subset only).
+  input = jsonencode({
+    mode = "open"
+    skip_alarms = [
+      aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,
+      aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,
+      aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
+    ]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_muhurat_close" {
+  for_each  = local.muhurat_liveness_windows
+  rule      = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_close[each.key].name
+  target_id = "tv-market-hours-liveness-muhurat-close"
+  arn       = aws_lambda_function.tv_market_hours_liveness_gate.arn
+  input     = jsonencode({ mode = "close" })
+}
+
+resource "aws_lambda_permission" "tv_market_hours_liveness_muhurat_open" {
+  for_each      = local.muhurat_liveness_windows
+  statement_id  = "AllowExecutionFromEventBridgeMuhuratOpen${replace(each.key, "-", "")}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.tv_market_hours_liveness_gate.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_open[each.key].arn
+}
+
+resource "aws_lambda_permission" "tv_market_hours_liveness_muhurat_close" {
+  for_each      = local.muhurat_liveness_windows
+  statement_id  = "AllowExecutionFromEventBridgeMuhuratClose${replace(each.key, "-", "")}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.tv_market_hours_liveness_gate.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_close[each.key].arn
+}
+
 resource "aws_lambda_permission" "tv_market_hours_liveness_open" {
   statement_id  = "AllowExecutionFromEventBridgeOpen"
   action        = "lambda:InvokeFunction"

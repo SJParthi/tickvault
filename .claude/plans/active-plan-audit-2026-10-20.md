@@ -1177,28 +1177,19 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
-### ITEM SP — the sealed-candle path under 1 µs per seal (owner directive 2026-10-30; storage)
+### Muhurat 2026-11-08 (Sunday) — the weekday-only protections
 
-Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 microsecond at p99, proven by benches that fail the build if it slips, with identical output; use only max"). Scope: what happens to a sealed candle after the fold produces it, in `crates/storage` only (the fold, `crates/trading/src/candles`, belongs to another session). Design: measure each per-seal step with a new Criterion bench, fix what is over 1,000 ns or allocates, keep the ILP bytes identical. Edge cases: a ring that already holds seals is never prefaulted; a refused row still rewinds to its marker; the `contract` name is looked up once per row by the caller. Failure modes: an invalid constant column name would reach QuestDB unchecked (test runs the library check over every name and a source scan refuses a literal); the reused drain buffer is cleared on every return path. Rollback: revert the commit (no schema, config or wire change). Observability: the bench prints p50/p99/p99.9/max per step; no new metric.
+Approved by: Parthiban, 2026-10-30 ~12:00 IST, "go ahead and fix the muhurat risk dude" (recorded as `daily-universe-scope-expansion-2026-05-27.md` Quote 49 and noise lock §2.15). Design: `[[trading.muhurat_trading_dates]]` in `config/base.toml` gains the session times and becomes the one source (calendar `is_session_day`, `muhurat_session_secs`); terraform's copy is pinned equal; the workflow guards read the date from the same file; the liveness gate gets dated open/close rules. Edge cases: an ordinary Sunday and a weekday holiday stay closed; times empty = box not started (unchanged); an evening session must fit 18:00–19:30 (build check); the did-it-run alarms are never armed on a weekend. Failure modes: config file missing in a guard job reads "not Muhurat" (fail-open), so every guard job checks the file out and a ratchet pins it; reported times wrong: the box still runs from start − 60 min and the arming offset absorbs a later first tick. Rollback: revert the PR (no data or schema change). Observability: no new page; the gate Lambda logs its armed list.
 
-- [x] SP1. `seal_path` Criterion bench for the hand-off, take + ring push, row build, ILP append (with and without contract names), ring pop + append, ledger probe hit and miss, with its own p99 gate against the new `seal_path` budget (1,000 ns) for the sub-µs steps and `seal_ilp` (2,500 ns, measured ceiling, NOT the 1 µs target) for the three ILP-append steps
-  - Files: crates/storage/benches/seal_path.rs, crates/storage/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md
-  - Tests: every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count
-- [x] SP2. The live drain reuses one rescue buffer (`drain_once_reusing`, runner `drain_scratch`)
-  - Files: crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
-  - Tests: test_drain_once_reusing_keeps_its_scratch_capacity_across_cycles
-- [x] SP3. The production ring is prefaulted at construction (`prefault_ring`)
-  - Files: crates/storage/src/seal_absorption.rs
-  - Tests: test_prefault_ring_writes_every_slot_and_leaves_the_ring_empty, test_production_pipeline_is_prefaulted_at_construction
-- [x] SP4. Constant column names skip the per-call questdb-rs check; the delay text skips `fmt`; bytes identical
-  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/delay_render.rs
-  - Tests: proptest_write_row_is_byte_identical_to_the_validated_form, test_every_candle_ilp_column_name_passes_the_questdb_check, test_write_row_passes_only_named_constants_to_the_unchecked_names, proptest_render_delay_into_matches_the_fmt_version_byte_for_byte, test_render_delay_into_matches_the_fmt_version_at_every_edge
-- [x] SP5. DHAT: the whole per-seal path allocates nothing
-  - Files: crates/storage/tests/dhat_seal_per_seal_path.rs
-  - Tests: dhat_the_per_seal_path_after_the_fold_never_allocates
-- [x] SP6. Review fixes: the candle ILP buffer is presized and written once at construction (no regrowth on the append); a p99 tail miss defers to a step after the Criterion baseline save
-  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/benches/seal_path.rs, crates/app/benches/feed_drain.rs, .github/workflows/bench.yml, crates/common/tests/shell_budget_guard.rs, crates/storage/tests/bench_tail_gate_defer_guard.rs
-  - Tests: test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows, test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows, both_benches_print_the_marker_and_exit_unless_deferred, bench_yml_defers_and_fails_after_the_baseline_save, workflow_run_lines_never_grow
+- [x] MU1. Calendar session times + session-day check + capture-window build check (crates/common)
+  - Files: config/base.toml, crates/common/src/config.rs, crates/common/src/trading_calendar.rs, crates/common/src/muhurat.rs, crates/common/tests/muhurat_session_calendar.rs, crates/common/tests/config_round_trip.rs, crates/common/benches/calendar.rs, crates/app/tests/pipeline_smoke.rs
+  - Tests: test_sunday_muhurat_is_a_session_day_with_its_times, test_ordinary_sunday_and_weekday_holiday_stay_closed, test_muhurat_on_a_weekday_holiday_is_a_session_day, test_malformed_session_times_refuse_the_calendar, every_configured_muhurat_session_is_inside_the_capture_windows, session_capture_windows_accept_afternoon_and_evening_sessions
+- [x] MU2. Terraform times pinned to the config; liveness gate armed on the Muhurat date without the weekday did-it-run alarms (crates/aws-lambdas, terraform)
+  - Files: deploy/aws/terraform/variables.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, crates/aws-lambdas/src/market_hours_gate.rs, crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs
+  - Tests: terraform_session_times_equal_the_app_calendars_times, each_muhurat_date_arms_and_disarms_the_liveness_gate, test_alarms_to_open_muhurat_event_leaves_the_skipped_alarms_disarmed, test_alarms_to_open_never_widens_the_list
+- [x] MU3. Every workflow market-hours guard refuses the whole Muhurat date (workflows)
+  - Files: .github/workflows/deploy-aws.yml, .github/workflows/terraform-apply.yml, .github/workflows/aws-control.yml, .github/workflows/downsize-instance.yml, .github/workflows/emergency-fs-recover.yml, .github/workflows/wipe-log-streams.yml, crates/common/tests/muhurat_workflow_freeze_guard.rs, crates/common/tests/aws_infra_wiring.rs
+  - Tests: every_weekday_market_check_also_closes_on_a_muhurat_date, every_guard_job_has_the_calendar_file
 
 ### ITEM DASH — F&O stocks price movers on the dashboard (api; 2026-10-30)
 

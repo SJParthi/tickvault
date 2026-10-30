@@ -5101,3 +5101,35 @@ depth pages and the four selector names in the same change.
   dated row).
 - Re-adds `order-fill-lag-high` without a production emitter for its metric.
 - Deletes the depth-account minter's errors alarm instead of gating it.
+
+## §2.15 — 2026-10-30: the market-hours gate also arms on a calendar Muhurat date (no new page)
+
+Owner, Fri 2026-10-30 ~12:00 IST, verbatim (relayed by the coordinator
+session): *"go ahead and fix the muhurat risk dude"*. The risk named: the
+2026-11-08 Muhurat session is a SUNDAY, and the market-hours gate's open
+(09:20 IST) and close (15:40 IST) crons are MON-FRI, so every gated alarm
+(`ALARM_NAMES`, including `market-hours-liveness-missing` and
+`dhan-no-ticks-flowing`) stayed disarmed through the session: a dead app
+reached nobody.
+
+| Item | What §2.15 does |
+|---|---|
+| Source of the session | `config/base.toml` `[[trading.muhurat_trading_dates]]` `session_start_ist` / `session_end_ist` (the one source); terraform `var.muhurat_sessions` must equal it (`muhurat_window_wiring_guard.rs`) |
+| Arming | per Muhurat date with published times: ONE dated EventBridge open at session start + 20 min (the regular day's 09:00 → 09:20 offset, so the no-ticks alarm never reads the app's uptime before the first tick, the reason the 2026-10-26 L4 pass left this undone) and ONE dated close at the session end, on the SAME gate Lambda, same holiday-marker and instance-state checks |
+| What the Muhurat open arms | `ALARM_NAMES` less the three weekday-only did-it-run alarms (`deploy-watchdog-not-invoked`, `market-open-readiness-not-invoked`, `boot-heartbeat-gate-not-invoked`), passed as the event's `skip_alarms` (`market_hours_gate::alarms_to_open`, a subset only, never a widening): their Lambdas run MON-FRI, so on a Sunday their `Invocations < 1`, breaching, would page for a check that correctly did not run |
+| Pages | none new: the same alarms, the same Telegram path, the same wording |
+| Cost | 2 Lambda invokes per Muhurat date (free tier); no alarm, metric, filter or EMF name added |
+
+2026-11-08 (times Assumed from press reports of NSE/CMTR/76941): session
+14:05–15:40 IST, so the gate arms at 14:25 IST and disarms at 15:40 IST.
+
+**What a PR that violates §2.15 looks like (REJECT):**
+- Adds an alarm family, a page, an `ok_actions`, a metric filter or an EMF
+  name under cover of the Muhurat arming.
+- Arms on an ordinary weekend or a weekday holiday (only a date listed in
+  `[[trading.muhurat_trading_dates]]` with published times), or by a weekly
+  weekend cron instead of a dated rule.
+- Arms the three weekday-only did-it-run alarms on a Muhurat date, or lets
+  `skip_alarms` add a name that is not in `ALARM_NAMES`.
+- Opens earlier than session start + 20 minutes, or types the session times in
+  terraform without the same change in `config/base.toml`.
