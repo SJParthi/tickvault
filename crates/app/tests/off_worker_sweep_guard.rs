@@ -106,6 +106,12 @@ const WRAPPED: &[(&str, &str)] = &[
         "crates/storage/src/partition_archive.rs",
         "crate::off_worker::off_worker(|| sender.flush(buffer))",
     ),
+    // Seal writer boot drain (audit PR16): spill-file reads and ILP flushes
+    // before the first tick, on a worker the live lane already shares.
+    (
+        "crates/storage/src/seal_writer_loop.rs",
+        "crate::off_worker::off_worker(|| runner.boot_drain())",
+    ),
     // Per uncached `/board` request.
     (
         "crates/api/src/handlers/board.rs",

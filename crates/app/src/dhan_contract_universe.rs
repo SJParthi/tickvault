@@ -489,6 +489,18 @@ pub const CONTRACT_FAILURE_REASONS: [&str; 9] = [
     "window_shrunk",
 ];
 
+/// Gauge: the stock-option underlyings the last contract attach could not
+/// price (no spot row joined), set beside the `contract universe resolved`
+/// line (D3c-2). Local `/metrics` only: no EMF selector names it.
+pub const CONTRACT_UNDERLYINGS_WITHOUT_SPOT_GAUGE: &str =
+    "tv_dhan_contract_underlyings_without_spot";
+
+/// Gauge: the stock-option underlyings the last contract attach saw in the
+/// day's file, the denominator for [`CONTRACT_UNDERLYINGS_WITHOUT_SPOT_GAUGE`].
+/// Local `/metrics` only.
+pub const CONTRACT_STOCK_OPTION_UNDERLYINGS_GAUGE: &str =
+    "tv_dhan_contract_stock_option_underlyings";
+
 /// Publish a 0 baseline for every reason. Call ONCE, before the first attempt.
 pub fn pre_register_contract_failure_counters() {
     for reason in CONTRACT_FAILURE_REASONS {
@@ -2493,6 +2505,14 @@ pub async fn load_contract_universe(
         refused_off_expiry = selection.refused_off_expiry,
         "contract universe resolved"
     );
+    // D3c-2: the same two counts as local gauges, so the unpriced share is
+    // readable without the log line.
+    // APPROVED: cast — underlying counts are a few hundred, exact in f64.
+    metrics::gauge!(CONTRACT_UNDERLYINGS_WITHOUT_SPOT_GAUGE)
+        .set(selection.underlyings_without_spot as f64);
+    // APPROVED: cast — underlying counts are a few hundred, exact in f64.
+    metrics::gauge!(CONTRACT_STOCK_OPTION_UNDERLYINGS_GAUGE)
+        .set(selection.stock_option_underlyings as f64);
     selection
 }
 
@@ -2643,6 +2663,42 @@ mod tests {
             "the capped ranking table must never feed the candle names again"
         );
     }
+    /// D3c-2: the two underlying counts on the `contract universe resolved`
+    /// line are also local gauges, set inside `load_contract_universe` beside
+    /// that line, under names no EMF selector picks up.
+    #[test]
+    fn test_contract_underlying_gauges_set_beside_resolved_line() {
+        assert_eq!(
+            super::CONTRACT_UNDERLYINGS_WITHOUT_SPOT_GAUGE,
+            "tv_dhan_contract_underlyings_without_spot"
+        );
+        assert_eq!(
+            super::CONTRACT_STOCK_OPTION_UNDERLYINGS_GAUGE,
+            "tv_dhan_contract_stock_option_underlyings"
+        );
+        let src = include_str!("dhan_contract_universe.rs");
+        let body = src
+            .split("pub async fn load_contract_universe(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .unwrap_or("");
+        let resolved = body.find("\"contract universe resolved\"");
+        let without_spot = body.find(
+            "metrics::gauge!(CONTRACT_UNDERLYINGS_WITHOUT_SPOT_GAUGE)\n        .set(selection.underlyings_without_spot as f64)",
+        );
+        let total = body.find(
+            "metrics::gauge!(CONTRACT_STOCK_OPTION_UNDERLYINGS_GAUGE)\n        .set(selection.stock_option_underlyings as f64)",
+        );
+        assert!(
+            resolved.is_some() && without_spot.is_some() && total.is_some(),
+            "both gauges must be set inside load_contract_universe"
+        );
+        assert!(
+            without_spot > resolved && total > resolved,
+            "the gauges must be set beside (after) the resolved line"
+        );
+    }
+
     /// The cache is a process-global single slot, so these tests must not run
     /// concurrently with each other — one storing while another reads would
     /// make a genuine failure look like a flake and vice versa. Poisoning is

@@ -1898,6 +1898,11 @@ async fn async_main() -> Result<()> {
         .increment(0);
     metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_SECONDS_COUNTER)
         .increment(0);
+    // Audit PR32: bucket-table overflow episodes, local `/metrics` only.
+    metrics::counter!(
+        tickvault_storage::wal_applied_watermark::UNAPPLIED_OVERFLOW_EPISODES_COUNTER
+    )
+    .increment(0);
     // PR W review round 5: every trim refusal reason exists from boot, so a
     // trim refused all session is visible. The pinned gauges are NOT set to 0
     // here on purpose: 0 would read "nothing pinned" while the trim never ran.
@@ -3412,8 +3417,8 @@ async fn async_main() -> Result<()> {
             );
     }
     info!(
-        "DayOhlcTracker boot wired at process scope (tick consumer + midnight reset; \
-         day_open = first live tick LTP)"
+        "DayOhlcTracker boot wired at process scope (IST-midnight reset only; no tick \
+         consumer is wired, so day high/low stay empty until a tick source feeds it)"
     );
 
     // =======================================================================
@@ -3775,6 +3780,13 @@ async fn async_main() -> Result<()> {
     // 4,565, silently. This wait is bounded and fail-soft: on timeout the
     // resolve below takes its existing, loudly-logged fallback.
     let universe_date_ist = tickvault_app::dhan_universe::today_ist_date();
+    // D11: a Muhurat session (Sunday 2026-11-08) is a session day although it
+    // is not a regular trading day, so the wait and the widen gate below must
+    // still fetch today's list on it. The collapse verdicts keep the regular
+    // trading-day input: a pre-rider fallback on a Muhurat day stays expected
+    // (no page).
+    let universe_session_day =
+        trading_calendar.is_trading_day_today() || trading_calendar.is_muhurat_trading_today();
     // Off-session boots (non-trading day, or before the rider's build hour)
     // fall back to the index universe BY DESIGN — the artifact cannot exist
     // yet. Judged ONCE here so the wait and the resolve agree, and so the
@@ -3789,7 +3801,7 @@ async fn async_main() -> Result<()> {
         &config.dhan_universe,
         &universe_date_ist,
         universe_collapse_expected,
-        trading_calendar.is_trading_day_today(),
+        universe_session_day,
     )
     .await;
     // Judged AGAIN after the wait (audit re-check 7). A boot between 07:10
@@ -3937,17 +3949,18 @@ async fn async_main() -> Result<()> {
             // than let one writer silently overwrite the other.
             rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
             // Audit D3b: a boot that did not get today's spot list adds it
-            // once the rider writes it, without a restart. Trading days only:
-            // a holiday has no session to widen, and waiting would keep the late
-            // attach polling until 15:30 for nothing.
+            // once the rider writes it, without a restart. Session days only
+            // (trading days plus a Muhurat day, D11): a holiday has no session
+            // to widen, and waiting would keep the late attach polling until
+            // 15:30 for nothing.
             widen_universe: (tickvault_app::dhan_live_universe::live_universe_widen_pending()
-                && trading_calendar.is_trading_day_today())
-            .then(|| tickvault_app::dhan_live_universe::TodaysUniverseSource {
-                cfg: config.dhan_universe.clone(),
-                index_universe: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-                capacity: tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
-                    .subscription_capacity(),
-            }),
+                && universe_session_day)
+                .then(|| tickvault_app::dhan_live_universe::TodaysUniverseSource {
+                    cfg: config.dhan_universe.clone(),
+                    index_universe: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                    capacity: tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
+                        .subscription_capacity(),
+                }),
         },
     );
 
@@ -6971,6 +6984,9 @@ fn spawn_feed_scoreboard_tasks(
         let boot_reconciled_rows = match reconcile_handle.await {
             Ok(rows) => rows,
             Err(join_err) => {
+                // Unwind builds only: release builds abort on panic
+                // (`panic = "abort"`, deep audit SUP-10), so in prod a panic
+                // stops the process before this arm can run.
                 if join_err.is_panic() {
                     error!(
                         code = tickvault_common::error_code::ErrorCode::
@@ -7152,6 +7168,9 @@ fn spawn_feed_scoreboard_tasks(
                 sb_notifier.notify(NotificationEvent::DualFeedScorecardAborted { detail: reason });
             }
             Err(join_err) if join_err.is_panic() => {
+                // Unwind builds only: release builds abort on panic
+                // (`panic = "abort"`, deep audit SUP-10), so in prod a panic
+                // stops the process before this arm can run.
                 error!(
                     code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
                         .code_str(),

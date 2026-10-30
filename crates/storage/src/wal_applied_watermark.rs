@@ -243,6 +243,16 @@ pub const WAL_SUSPECT_EPISODES_COUNTER: &str = "tv_wal_suspect_episodes_total";
 /// this, read beside `tv_wal_unapplied_pinned_bytes`, is what shows whether
 /// pinned bytes grow with lag-latched days. Local `/metrics` only, as above.
 pub const WAL_SUSPECT_SECONDS_COUNTER: &str = "tv_wal_suspect_seconds_total";
+/// Counter: bucket-table overflow EPISODES (audit PR32). One per false-to-true
+/// transition of the table's overflow flag, set by the two arms that lose a
+/// frame from the table: a bucket-id collision in `note_unapplied` and a range
+/// wider than the table in `note_unapplied_range`. A flag inherited from the
+/// file at boot is not counted (it is an earlier process's episode), and the
+/// persist's own re-raise after a racing bound (`bound_known_overflow_locked`)
+/// is not a new episode. Once the persist or a drained reset clears the flag,
+/// the next overflow counts again. Local `/metrics` only: no CloudWatch
+/// filter, no EMF name, no alarm. Registered at 0 at boot.
+pub const UNAPPLIED_OVERFLOW_EPISODES_COUNTER: &str = "tv_wal_unapplied_overflow_episodes_total";
 
 /// A queued rescue batch's hold on the persisted watermark (Z7). Returned by
 /// [`AppliedWatermark::hold_rescue_floor`], carried with the batch, and handed
@@ -1081,6 +1091,9 @@ pub struct AppliedWatermark {
     hwm_depth: AtomicU64,
     depth_untracked: AtomicBool,
     overflowed: AtomicBool,
+    /// Overflow episodes this process counted (audit PR32), the same count
+    /// [`UNAPPLIED_OVERFLOW_EPISODES_COUNTER`] carries. Read by tests only.
+    overflow_episodes: AtomicU64,
     /// Conservative upper bound on the sequences the bucket table FAILED to
     /// record. `overflowed` alone says "something is unprotected"; without a
     /// height there is no way to tell whether a later confirmed drain covered
@@ -1385,6 +1398,7 @@ impl AppliedWatermark {
             hwm_depth: AtomicU64::new(0),
             depth_untracked: AtomicBool::new(false),
             overflowed: AtomicBool::new(false),
+            overflow_episodes: AtomicU64::new(0),
             overflow_high_seq: AtomicU64::new(0),
             overflow_low_seq: AtomicU64::new(u64::MAX),
             bucket_ids: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
@@ -1928,7 +1942,7 @@ impl AppliedWatermark {
                 .fetch_min(id << UNAPPLIED_BUCKET_SHIFT, Ordering::AcqRel);
             self.overflow_high_seq
                 .fetch_max(bucket_top, Ordering::AcqRel);
-            self.overflowed.store(true, Ordering::Release);
+            self.raise_overflow();
         }
     }
 
@@ -1944,6 +1958,22 @@ impl AppliedWatermark {
         if self.bucket_counts[slot].load(Ordering::Relaxed) == 0 {
             self.bucket_counts[slot].store(1, Ordering::Relaxed);
         }
+    }
+
+    /// Sets the overflow flag after an arm recorded its bounds, and counts an
+    /// episode on [`UNAPPLIED_OVERFLOW_EPISODES_COUNTER`] only when the flag
+    /// was clear (audit PR32). The swap writes `true` with Release, as the
+    /// store it replaces did, so a reader that sees the flag still sees the
+    /// bounds written before it. Overflow arms only: the per-frame shed path
+    /// that records its bucket never reaches here. Returns `true` on a new
+    /// episode.
+    fn raise_overflow(&self) -> bool {
+        let new_episode = !self.overflowed.swap(true, Ordering::AcqRel);
+        if new_episode {
+            self.overflow_episodes.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!(UNAPPLIED_OVERFLOW_EPISODES_COUNTER).increment(1);
+        }
+        new_episode
     }
 
     /// Every bucket touched by `[lo, hi]` is marked unapplied — a whole batch
@@ -1969,7 +1999,7 @@ impl AppliedWatermark {
             // Low before high, as in `note_unapplied`.
             self.overflow_low_seq.fetch_min(lo, Ordering::AcqRel);
             self.overflow_high_seq.fetch_max(hi, Ordering::AcqRel);
-            self.overflowed.store(true, Ordering::Release);
+            self.raise_overflow();
             return;
         }
         // O(1) EXEMPT: bounded by UNAPPLIED_BUCKETS, cold failure arm
@@ -3495,6 +3525,33 @@ mod tests {
     /// `range_has_unapplied` answers false, and the replay renames the whole
     /// segment to `archive/` unread. Every tick and depth row in it is gone,
     /// permanently, with no counter anywhere.
+    /// Audit PR32: overflow episodes are counted once per false-to-true
+    /// transition, not once per lost frame, and count again after a reset.
+    #[test]
+    fn test_overflow_episodes_count_each_false_to_true_transition_once() {
+        let wm = AppliedWatermark::new_for_tests();
+        let first = seq(10);
+        let stride = (UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT;
+        wm.note_unapplied(first);
+        assert_eq!(wm.overflow_episodes.load(Ordering::Relaxed), 0);
+        // Two colliding buckets (and repeats of them) are ONE episode.
+        wm.note_unapplied(first + stride);
+        wm.note_unapplied(first + 2 * stride);
+        wm.note_unapplied(first + stride);
+        assert!(wm.snapshot().overflowed);
+        assert_eq!(wm.overflow_episodes.load(Ordering::Relaxed), 1);
+        // A range wider than the table while still overflowed: same episode.
+        wm.note_unapplied_range(seq(1), seq(1) + stride);
+        assert_eq!(wm.overflow_episodes.load(Ordering::Relaxed), 1);
+        // A drained reset clears the flag; the next overflow is a new episode.
+        wm.reset_unapplied();
+        assert!(!wm.snapshot().overflowed);
+        wm.note_unapplied_range(seq(1), seq(1) + stride);
+        assert_eq!(wm.overflow_episodes.load(Ordering::Relaxed), 2);
+        // The helper reports a new episode only on the transition.
+        assert!(!wm.raise_overflow());
+    }
+
     #[test]
     fn a_collided_bucket_survives_a_reset_that_has_not_passed_it() {
         let wm = AppliedWatermark::new_for_tests();

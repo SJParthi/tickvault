@@ -3577,6 +3577,37 @@ mod tests {
         assert!(main.contains("trading_calendar.is_trading_day_today()"));
     }
 
+    /// D11 (Muhurat Sunday 2026-11-08): the mapping wait and the widen gate
+    /// take a session-day verdict that counts a Muhurat day, so the boot waits
+    /// for and widens to today's list on it. The collapse verdicts keep the
+    /// regular trading-day input.
+    #[test]
+    fn main_passes_muhurat_aware_session_day_to_wait_and_widen() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains(
+                "let universe_session_day =\n        trading_calendar.is_trading_day_today() || trading_calendar.is_muhurat_trading_today();"
+            ),
+            "the session-day verdict must count a Muhurat day"
+        );
+        assert!(
+            main.contains(
+                "universe_collapse_expected,\n        universe_session_day,\n    )\n    .await;"
+            ),
+            "await_mapping_artifact must take the session-day verdict"
+        );
+        assert!(
+            main.contains(
+                "live_universe_widen_pending()\n                && universe_session_day)"
+            ),
+            "the widen gate must take the session-day verdict"
+        );
+        assert!(
+            !main.contains("live_universe_widen_pending()\n                && trading_calendar.is_trading_day_today())"),
+            "the widen gate must not fall back to the regular trading-day check"
+        );
+    }
+
     /// Audit re-check 7: a boot between 07:10 and the rider hour waits past
     /// the hour, so a verdict frozen before the wait would log a real miss as
     /// the expected pre-rider warning and page nobody.

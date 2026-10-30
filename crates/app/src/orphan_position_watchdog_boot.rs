@@ -249,6 +249,10 @@ pub fn spawn_supervised_orphan_position_watchdog(
                     );
                 }
                 Err(join_err) if join_err.is_panic() => {
+                    // Unwind-build self-heal only: release builds abort on
+                    // panic (`panic = "abort"`, deep audit SUP-10), so this
+                    // arm serves dev/test unwinds; prod recovery is the
+                    // systemd restart.
                     error!(
                         code = ErrorCode::FeedSupervisor01Respawned.code_str(),
                         source = "orphan_watchdog_panicked",

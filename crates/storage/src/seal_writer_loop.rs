@@ -1391,7 +1391,9 @@ pub async fn run_seal_writer_loop(
     let _ = mark.sample(runner.unwritten_seals(), boot_now);
     let unwritten_gauge = metrics::gauge!(SEAL_UNWRITTEN_GAUGE);
 
-    let boot = runner.boot_drain();
+    // Audit PR16: the boot drain reads spill files and runs ILP flushes, so it
+    // runs off the shared tokio worker (inline on a current-thread runtime).
+    let boot = crate::off_worker::off_worker(|| runner.boot_drain());
     record_boot_drain_observability(&boot);
     if !boot.is_clean() {
         info!(

@@ -302,6 +302,9 @@ pub fn spawn_midnight_reset_task(tracker: Arc<DayOhlcTracker>) -> tokio::task::J
 /// instantly on every start cannot busy-spin the CPU — it respawns at most
 /// once per this interval, and the `tv_day_ohlc_reset_failures_total{reason}`
 /// counter rate surfaces the flap to the operator (INDEX-OHLC-02).
+/// Release builds abort on panic (`panic = "abort"`, deep audit SUP-10), so a
+/// panic respawn through this backoff happens only in dev/test builds; in
+/// prod only a clean or cancelled exit reaches it.
 pub const DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS: u64 = 5;
 
 /// Classify why the supervised midnight-reset task's `JoinHandle` resolved,
@@ -312,6 +315,8 @@ pub const DAY_OHLC_RESET_RESPAWN_BACKOFF_SECS: u64 = 5;
 pub fn classify_reset_task_exit(join_result: &Result<(), tokio::task::JoinError>) -> &'static str {
     match join_result {
         Ok(()) => "clean_exit",
+        // Unwind builds only: release builds abort on panic
+        // (`panic = "abort"`, deep audit SUP-10), so prod never sees "panic".
         Err(e) if e.is_panic() => "panic",
         Err(e) if e.is_cancelled() => "cancelled",
         Err(_) => "unknown",

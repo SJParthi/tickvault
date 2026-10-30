@@ -2421,6 +2421,9 @@ pub fn spawn_tf_consistency_tasks(
                 tf_notifier.notify(NotificationEvent::TfConsistencyAborted { detail: reason });
             }
             Err(join_err) if join_err.is_panic() => {
+                // Unwind builds only: release builds abort on panic
+                // (`panic = "abort"`, deep audit SUP-10), so in prod a panic
+                // stops the process before this arm can run.
                 error!(
                     code = ErrorCode::TfVerify02RunDegraded.code_str(),
                     stage = "daily_panic",
