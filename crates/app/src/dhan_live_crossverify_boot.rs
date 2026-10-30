@@ -6860,6 +6860,17 @@ mod tests {
         assert!(morning < SESSION_OPEN_SECS_OF_DAY_IST as u64);
     }
 
+    /// Review round 1: the supervisor re-sleeps while the wall clock still
+    /// reads before 16:24 after its monotonic sleep.
+    #[test]
+    fn test_supervisor_shortfall_secs() {
+        let at = XVERIFY_SUPERVISOR_SECS_OF_DAY_IST;
+        assert_eq!(supervisor_shortfall_secs(at), 0);
+        assert_eq!(supervisor_shortfall_secs(at + 1), 0);
+        assert_eq!(supervisor_shortfall_secs(at - 30), 30);
+        assert_eq!(supervisor_shortfall_secs(0), at);
+    }
+
     /// 51g: the supervisor pages only on a trading day, when the worker
     /// started in time, and when nothing reported today.
     #[test]

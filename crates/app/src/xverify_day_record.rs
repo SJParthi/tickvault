@@ -875,7 +875,7 @@ mod tests {
     /// Review round 1: a noted set replaces only the earlier set of the same
     /// origin, so the boot set and the widened list are both recorded.
     #[test]
-    fn note_process_held_keeps_one_set_per_origin_and_process_held_returns_them() {
+    fn test_note_process_held_keeps_one_set_per_origin_and_process_held_returns_them() {
         let a = SubscribeInstrument {
             security_id: 13,
             segment: ExchangeSegment::IdxI,
