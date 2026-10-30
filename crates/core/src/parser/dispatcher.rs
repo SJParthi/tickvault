@@ -1246,7 +1246,7 @@ mod uncounted_dispatch_tests {
 
     proptest! {
         #[test]
-        fn proptest_uncounted_dispatch_parses_like_dispatch_frame(
+        fn test_dispatch_frame_uncounted_parses_like_dispatch_frame(
             bytes in prop_oneof![known_packet(), proptest::collection::vec(any::<u8>(), 0..200)],
             received_at_nanos in any::<i64>(),
         ) {
