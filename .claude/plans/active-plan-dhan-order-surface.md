@@ -508,3 +508,44 @@ letter registrar — please confirm.
 - [x] F3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert 🔷 DHAN attribution
   - Files: crates/common/src/error_code.rs, docs/error-runbooks/order-readiness-error-codes.md, engine.rs
   - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge
+
+## Cluster G — order decision path under 1 µs in memory (branch claude/order-path-sub-us, 2026-10-30)
+
+Owner (Parthiban), 30 Oct 2026, relayed by the coordinator: every in-memory
+step of the order path under 1 µs at p99, proven by benches that fail the
+build if it slips, with identical behaviour. Network calls, `dry_run`, the
+indicator and strategy trees, and the REST surface are out of scope. Matrices:
+by cross-reference, as for the clusters above.
+
+- [x] Criterion bench `crates/app/benches/order_path.rs` (production Prometheus recorder installed) + budget key `order_path = 1000` and elements row in `quality/benchmark-budgets.toml`
+  - Files: crates/app/benches/order_path.rs, crates/app/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md (key count)
+  - Tests: benchmark_budget_reaches_a_bench_guard, claude_md_states_the_real_budget_key_count
+- [x] Per-call p50/p99 harness (ignored, wall clock): crates/app/tests/order_path_p99_harness.rs
+  - Tests: order_path_per_call_latency_distribution
+- [x] Correlation ids drawn ahead of use (pool of 256, cold refill at construction and the daily reset; on-demand fallback) and one-allocation encoder
+  - Files: crates/trading/src/oms/idempotency.rs, crates/trading/src/oms/engine.rs
+  - Tests: proptest_encoder_matches_the_legacy_two_allocation_form, test_next_id_is_a_v4_prefix_of_the_dhan_length_and_never_repeats, test_clear_refills_the_pool_for_the_next_day
+- [x] Metric handles cached at first use (rate limiter allowed counter, breaker state gauge, paper placed counter, placement histogram); literal labels where a label variable allocated (order budget refusal, rejected mark, fills recorded); `track_ref` removes one String copy per paper placement
+  - Files: crates/trading/src/oms/rate_limiter.rs, crates/trading/src/oms/circuit_breaker.rs, crates/trading/src/oms/engine.rs, crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
+  - Tests: order_path_metrics_keep_their_names_labels_and_counts
+
+- [x] Owner decisions, Fri 30 Oct 2026 ~16:50 IST, relayed by the coordinator session (card answered there):
+  (1) Q: "Fix it the way we already fixed the tick-delay measurement: fixed counters set up at startup, same metric name, nothing new to read?" A: "Yes, fixed counters (Recommended)" — "Same name on the dashboard and alerts; the internal bucket layout changes slightly. Removes about 400 ns from the slowest orders."
+  (2) Q: the per-placement "PAPER TRADE" INFO line (~2.5 µs). A: "Write it after the order (Recommended)" — "Same log line, same content, but written by a background helper right after the order is placed, so it no longer slows the order step. Nothing is lost."
+  - Files: crates/trading/src/oms/placement_telemetry.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/mod.rs, crates/app/src/order_runtime.rs (once-a-second publish)
+  - Tests: fixed_placement_buckets_render_what_the_recorder_histogram_rendered, test_helper_line_is_identical_to_the_old_inline_line, dhat_order_path_with_the_production_recorder, test_apply_fill_counts_paper_and_live_under_their_literal_labels, test_track_ref_matches_track_outcomes_and_keeps_the_callers_id
+
+- [x] Per-call p99 gate in the bench (house `tail_gate`): exits 1 when any order-path step's p99 is over 1,000 ns; book tables prefaulted at construction; `ahash` on the order book, alias map and correlation index; paper id written without `format!`; old-vs-new decisions proptest
+  - Files: crates/app/benches/order_path.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/idempotency.rs, crates/trading/src/oms/reconciliation.rs
+  - Tests: proptest_pooled_ids_decide_exactly_like_on_demand_ids, proptest_paper_order_id_matches_format, test_paper_order_id_matches_format_at_the_extremes
+
+Design: no output changes beyond the two the owner chose above; ids, metric names, labels and counts are the same.
+Edge cases: pool empty (falls back to `generate_id`), recorder installed after
+first use (handle stays bound to the earlier one; production installs at boot),
+log queue full or helper thread not started (the line is written inline and
+counted on `tv_oms_paper_trade_log_inline_total{reason}`), abrupt process stop
+(at most one 20 ms poll of PAPER TRADE lines unwritten; the orders themselves
+are in the book and the audit).
+Failure modes: none new; a refused order is refused exactly as before.
+Rollback: revert the PR; no data or config change.
+Observability: unchanged series (pinned by the parity test).

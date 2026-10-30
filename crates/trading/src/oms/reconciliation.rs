@@ -67,8 +67,8 @@ pub fn prices_equal_within_paise(a: f64, b: f64) -> bool {
 ///
 /// # Side Effects
 /// Logs ERROR for each mismatch (triggers Telegram alert via tracing).
-pub fn reconcile_orders(
-    oms_orders: &HashMap<String, ManagedOrder>,
+pub fn reconcile_orders<S: std::hash::BuildHasher>(
+    oms_orders: &HashMap<String, ManagedOrder, S>,
     dhan_orders: &[DhanOrderResponse],
 ) -> (ReconciliationReport, Vec<ReconciliationUpdate>) {
     let mut report = ReconciliationReport::default();
