@@ -243,6 +243,48 @@ pub const WAL_SUSPECT_EPISODES_COUNTER: &str = "tv_wal_suspect_episodes_total";
 /// this, read beside `tv_wal_unapplied_pinned_bytes`, is what shows whether
 /// pinned bytes grow with lag-latched days. Local `/metrics` only, as above.
 pub const WAL_SUSPECT_SECONDS_COUNTER: &str = "tv_wal_suspect_seconds_total";
+/// Counter: what happened to a lag-only suspicion episode's parked acks
+/// (plan item W4, 2026-10-30), labelled `outcome`:
+/// `confirmed` (their range above the episode's entry window was trimmed
+/// after the durability lag and [`PARKED_CONFIRM_CLEAN_PROBES`] more clean
+/// probes), `held_episode` (a new episode began first: the range stays),
+/// `held_unsafe` (the episode saw a suspended table, an unparsed row or a
+/// blind probe: never confirmed), `held_contaminated` (another reason
+/// marked part of the span: never confirmed), `held_full` (the trim would
+/// need a 33rd range: retried at the next clean probe). Local `/metrics`
+/// only: no CloudWatch filter, no EMF name, no alarm.
+pub const WAL_PARKED_CONFIRM_COUNTER: &str = "tv_wal_parked_confirm_total";
+/// Clean probes that must follow a lag-only episode's exit probe before its
+/// parked acks are confirmed: the replay settle step's rule
+/// (`wal_replay_settle::WAL_REPLAY_SETTLE_CLEAN_PROBES`), counted from the
+/// exit probe itself, so the exit probe does not count.
+pub const PARKED_CONFIRM_CLEAN_PROBES: u64 =
+    crate::wal_replay_settle::WAL_REPLAY_SETTLE_CLEAN_PROBES;
+
+/// What one QuestDB probe found, for the applied watermark (plan item W4,
+/// 2026-10-30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// Every row parsed, no table suspended, none latched untrusted.
+    Clean,
+    /// Every row parsed and no table suspended, but at least one table is
+    /// latched untrusted for apply lag: the rows are in QuestDB's WAL and
+    /// not yet applied. An episode that only ever sees this verdict may
+    /// have its parked acks confirmed once the lag clears.
+    LagOnly,
+    /// A table is suspended, a row did not parse, or the probe could not
+    /// see. An episode that sees this even once is never confirmed.
+    Unsafe,
+}
+
+impl ProbeVerdict {
+    /// `true` → [`Self::Clean`], `false` → [`Self::Unsafe`]: a caller that
+    /// cannot tell apply lag from a worse fault is never trusted to confirm.
+    #[must_use]
+    pub const fn from_clean(clean: bool) -> Self {
+        if clean { Self::Clean } else { Self::Unsafe }
+    }
+}
 
 /// A queued rescue batch's hold on the persisted watermark (Z7). Returned by
 /// [`AppliedWatermark::hold_rescue_floor`], carried with the batch, and handed
@@ -1147,6 +1189,10 @@ pub struct AppliedWatermark {
     /// Highest ack received while suspect, per sink.
     suspect_max_ticks: AtomicU64,
     suspect_max_depth: AtomicU64,
+    /// `true` while the current suspicion episode has only ever seen
+    /// [`ProbeVerdict::LagOnly`] probes (plan item W4). Written only by the
+    /// watcher task, at the probe report.
+    episode_lag_only: AtomicBool,
     /// Clean probes reported so far this process (audit PR41b). Monotone. The
     /// mid-session seal replay reads it to reopen its gate without live
     /// traffic and to archive a file only after a whole clean probe ran
@@ -1244,6 +1290,11 @@ struct RangesState {
     /// that never fully drains kept an older binary's overflow bit set for
     /// ever.
     migrated_span: Option<(u64, u64)>,
+    /// Plan item W4 (2026-10-30): the parked acks of the last lag-only
+    /// suspicion episode, waiting to be confirmed; `None` when nothing
+    /// waits. RAM only: a restart drops it and the range stays in the
+    /// sidecar (keeps more).
+    parked_confirm: Option<ParkedConfirm>,
     /// Generation of the sidecar on disk that holds exactly `ranges`; `0`
     /// while the RAM ranges are not yet durable (the persist then writes the
     /// file's pad as `0`, which loads as an unbounded overflow).
@@ -1257,6 +1308,7 @@ impl RangesState {
         Self {
             ranges: UnappliedRanges::new(),
             migrated_span: None,
+            parked_confirm: None,
             durable_gen: 0,
             next_gen: 0,
         }
@@ -1281,6 +1333,86 @@ impl RangesState {
             _ => false,
         }
     }
+}
+
+/// A lag-only suspicion episode's parked acks, waiting to be confirmed (plan
+/// item W4, 2026-10-30). Built at the clean probe that ends the episode, under
+/// the ranges lock, beside the exit range it may later trim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkedConfirm {
+    /// The span the confirmation trims: from one past the episode's entry
+    /// window (the higher sink watermark at the exit plus one reorder slack,
+    /// where the entry range ends) to the top of the exit range. Only the
+    /// exit range covered it when it was built.
+    lo: u64,
+    hi: u64,
+    /// The highest parked ack per sink, raised into the watermark at the
+    /// confirmation (0 = nothing parked above that sink's watermark).
+    parked_ticks: u64,
+    parked_depth: u64,
+    /// Monotonic instant from which the durability lag has passed.
+    ready_mono: u64,
+    /// The clean-probe count the confirmation waits for.
+    probes_needed: u64,
+    /// The episode count at the exit; a different count means a new episode
+    /// began and the range stays.
+    episodes_at: u64,
+    /// Another reason marked part of the span (before the exit, or by an add
+    /// since): never confirmed.
+    contaminated: bool,
+}
+
+impl ParkedConfirm {
+    /// Marks the record contaminated when `[lo, hi]` shares a sequence with
+    /// its span. O(1).
+    fn note_add(&mut self, lo: u64, hi: u64) {
+        if lo <= hi && lo <= self.hi && self.lo <= hi {
+            self.contaminated = true;
+        }
+    }
+}
+
+/// The span a lag-only episode's confirmation may trim, or `None` when no
+/// sink parked an ack above its watermark (plan item W4). `hwm_*` are the
+/// watermarks at the exit (frozen through the episode), `parked_*` the highest
+/// parked acks. The span starts one past the higher entry-range top
+/// (`hwm + REPLAY_REORDER_SLACK_SEQ`), so no frame acked before the episode,
+/// on either sink, is ever inside it, and ends at the higher exit-range top.
+/// O(1).
+const fn parked_confirm_span(
+    hwm_ticks: u64,
+    hwm_depth: u64,
+    parked_ticks: u64,
+    parked_depth: u64,
+) -> Option<(u64, u64)> {
+    let parked_t = if parked_ticks > hwm_ticks {
+        parked_ticks
+    } else {
+        0
+    };
+    let parked_d = if parked_depth > hwm_depth {
+        parked_depth
+    } else {
+        0
+    };
+    let top = if parked_t > parked_d {
+        parked_t
+    } else {
+        parked_d
+    };
+    if top == 0 {
+        return None;
+    }
+    let entry_top = if hwm_ticks > hwm_depth {
+        hwm_ticks
+    } else {
+        hwm_depth
+    };
+    let lo = entry_top
+        .saturating_add(REPLAY_REORDER_SLACK_SEQ)
+        .saturating_add(1);
+    let hi = top.saturating_add(REPLAY_REORDER_SLACK_SEQ);
+    if lo > hi { None } else { Some((lo, hi)) }
 }
 
 impl Default for AppliedWatermark {
@@ -1404,6 +1536,7 @@ impl AppliedWatermark {
             healthy_depth: AtomicU64::new(0),
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
+            episode_lag_only: AtomicBool::new(false),
             clean_probes: AtomicU64::new(0),
             suspect_episodes: AtomicU64::new(0),
             suspect_accounted_nanos: AtomicU64::new(0),
@@ -1694,19 +1827,38 @@ impl AppliedWatermark {
     /// vouched for by it, and recording them as healthy put them in no
     /// episode range when the next probe failed.
     pub fn note_questdb_probe_with_basis(&self, clean: bool, basis: (u64, u64)) {
-        self.note_questdb_probe_full(clean, Some(basis), mono_nanos());
+        self.note_questdb_probe_full(ProbeVerdict::from_clean(clean), Some(basis), mono_nanos());
+    }
+
+    /// [`Self::note_questdb_probe_with_basis`] with the probe's full
+    /// [`ProbeVerdict`] (plan item W4, 2026-10-30), so an episode that only
+    /// ever saw apply lag can have its parked acks confirmed once the lag
+    /// clears ([`Self::confirm_parked_if_due`]). The watcher's parsed-poll
+    /// arm calls this; a blind probe still calls
+    /// [`Self::note_questdb_probe`]`(false)`, which is
+    /// [`ProbeVerdict::Unsafe`].
+    pub fn note_questdb_probe_verdict(&self, verdict: ProbeVerdict, basis: (u64, u64)) {
+        self.note_questdb_probe_full(verdict, Some(basis), mono_nanos());
     }
 
     /// [`Self::note_questdb_probe`] at monotonic instant `now`.
     fn note_questdb_probe_at(&self, clean: bool, now: u64) {
-        self.note_questdb_probe_full(clean, None, now);
+        self.note_questdb_probe_full(ProbeVerdict::from_clean(clean), None, now);
     }
 
     /// The probe report: `basis` = the marks when the query was sent, or
     /// `None` for the marks now.
-    fn note_questdb_probe_full(&self, clean: bool, basis: Option<(u64, u64)>, now: u64) {
-        if clean {
-            self.clean_probes.fetch_add(1, Ordering::AcqRel);
+    ///
+    /// **ADDED 2026-10-30 (plan item W4):** the exit of an episode that only
+    /// ever saw [`ProbeVerdict::LagOnly`] records its parked acks
+    /// ([`ParkedConfirm`]) beside the exit range, and every later clean probe
+    /// asks [`Self::confirm_parked_if_due`] whether they may be confirmed.
+    fn note_questdb_probe_full(&self, verdict: ProbeVerdict, basis: Option<(u64, u64)>, now: u64) {
+        if verdict == ProbeVerdict::Clean {
+            let clean_count = self
+                .clean_probes
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
             // Round 6: the flip and the reads under the ack gate, so an ack
             // either parked before it (and is read here) or raises the
             // watermark after it; none can park into the drained slot.
@@ -1723,25 +1875,56 @@ impl AppliedWatermark {
             };
             if let Some((parked_ticks, parked_depth, hwm_ticks, hwm_depth)) = exited {
                 self.account_suspect_time_at(now);
+                let lag_only = self.episode_lag_only.swap(false, Ordering::AcqRel);
                 if parked_ticks > hwm_ticks || parked_depth > hwm_depth {
                     // The top carries one reorder slack too (PR W review
                     // round 3), mirroring the start-of-episode mark: a frame
                     // acked under suspicion can sit in a segment whose first
                     // record is above `parked`, and only a range reaching
                     // that first record keeps the segment.
+                    let pending = lag_only
+                        .then(|| {
+                            parked_confirm_span(hwm_ticks, hwm_depth, parked_ticks, parked_depth)
+                        })
+                        .flatten()
+                        .map(|(lo, hi)| ParkedConfirm {
+                            lo,
+                            hi,
+                            parked_ticks: if parked_ticks > hwm_ticks {
+                                parked_ticks
+                            } else {
+                                0
+                            },
+                            parked_depth: if parked_depth > hwm_depth {
+                                parked_depth
+                            } else {
+                                0
+                            },
+                            ready_mono: now.saturating_add(WATERMARK_DURABILITY_LAG_NANOS),
+                            probes_needed: clean_count.saturating_add(PARKED_CONFIRM_CLEAN_PROBES),
+                            episodes_at: self.suspect_episodes.load(Ordering::Acquire),
+                            contaminated: false,
+                        });
+                    if !lag_only {
+                        metrics::counter!(WAL_PARKED_CONFIRM_COUNTER, "outcome" => "held_unsafe")
+                            .increment(1);
+                    }
                     crate::off_worker::off_worker(|| {
+                        // An empty pair (lo > hi) is skipped by `add_exit_ranges`.
+                        let mut ranges = [(1u64, 0u64); 2];
                         if parked_ticks > hwm_ticks {
-                            self.add_unapplied_range(
+                            ranges[0] = (
                                 suspension_range_lo(hwm_ticks),
                                 parked_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
                             );
                         }
                         if parked_depth > hwm_depth {
-                            self.add_unapplied_range(
+                            ranges[1] = (
                                 suspension_range_lo(hwm_depth),
                                 parked_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
                             );
                         }
+                        self.add_exit_ranges(&ranges, pending);
                         self.persist_now();
                     });
                 }
@@ -1754,6 +1937,7 @@ impl AppliedWatermark {
             });
             self.healthy_ticks.store(healthy_ticks, Ordering::Release);
             self.healthy_depth.store(healthy_depth, Ordering::Release);
+            self.confirm_parked_if_due(now);
         } else {
             // Round 6: the flip and the watermark reads under the ack gate,
             // so an ack either raised the watermark before it (and is
@@ -1768,9 +1952,14 @@ impl AppliedWatermark {
                 })
             };
             let Some((hwm_ticks, hwm_depth)) = entered else {
+                if verdict == ProbeVerdict::Unsafe {
+                    self.episode_lag_only.store(false, Ordering::Release);
+                }
                 self.account_suspect_time_at(now);
                 return;
             };
+            self.episode_lag_only
+                .store(verdict == ProbeVerdict::LagOnly, Ordering::Release);
             self.suspect_accounted_nanos.store(now, Ordering::Release);
             metrics::counter!(WAL_SUSPECT_EPISODES_COUNTER).increment(1);
             // Record where this episode begins BEFORE its number is published
@@ -1788,6 +1977,9 @@ impl AppliedWatermark {
             self.episode_start_tag.store(episode, Ordering::SeqCst);
             self.suspect_episodes.fetch_add(1, Ordering::AcqRel);
             crate::off_worker::off_worker(|| {
+                // W4: a new episode began before the last one's parked acks
+                // were confirmed, so they stay unapplied.
+                self.drop_parked_confirm("held_episode");
                 self.add_unapplied_range(
                     suspension_range_lo(self.healthy_ticks.load(Ordering::Acquire)),
                     hwm_ticks.saturating_add(REPLAY_REORDER_SLACK_SEQ),
@@ -1799,6 +1991,137 @@ impl AppliedWatermark {
                 self.persist_now();
             });
         }
+    }
+
+    /// Adds an episode's exit ranges and records `pending` (plan item W4)
+    /// under one ranges lock, then writes the sidecar once. The pending
+    /// record starts contaminated when another range already covers part of
+    /// its span: that part was marked for some other reason, which a trim
+    /// would erase. O(32 × ranges), cold: once per episode exit, on the
+    /// watcher task.
+    fn add_exit_ranges(&self, ranges: &[(u64, u64)], pending: Option<ParkedConfirm>) {
+        let mut state = self.lock_ranges();
+        let mut pending = pending;
+        if let Some(p) = pending.as_mut()
+            && state.ranges.intersects(p.lo, p.hi)
+        {
+            p.contaminated = true;
+        }
+        let mut changed = false;
+        // O(1) EXEMPT: at most two ranges (one per sink), cold
+        for &(lo, hi) in ranges {
+            if lo <= hi {
+                changed |= state.ranges.add_range(frame_floor(lo), hi);
+            }
+        }
+        state.parked_confirm = pending;
+        if changed {
+            self.write_ranges_locked(&mut state);
+        }
+    }
+
+    /// Drops a waiting [`ParkedConfirm`] (its range stays unapplied) and
+    /// counts it under `outcome`. O(1) under the ranges lock, cold.
+    fn drop_parked_confirm(&self, outcome: &'static str) {
+        let dropped = self.lock_ranges().parked_confirm.take();
+        if dropped.is_some() {
+            metrics::counter!(WAL_PARKED_CONFIRM_COUNTER, "outcome" => outcome).increment(1);
+        }
+    }
+
+    /// Confirms a lag-only episode's parked acks once the replay settle
+    /// step's rule holds for them (plan item W4, 2026-10-30): the durability
+    /// lag ([`WATERMARK_DURABILITY_LAG_SECS`]) has passed since the clean
+    /// probe that ended the episode, at least [`PARKED_CONFIRM_CLEAN_PROBES`]
+    /// more clean probes have reported, and no suspicion episode has begun
+    /// since. Then the span above the episode's entry window is removed from
+    /// the unapplied ranges and each sink's watermark is raised to its
+    /// highest parked ack, so the session's WAL becomes prunable instead of
+    /// staying pinned until a later replay reads it.
+    ///
+    /// Never confirmed: an episode that saw a suspended table, an unparsed
+    /// row or a blind probe (an ack from a suspended table may never be
+    /// applied, for example after a resume from a later transaction); a span
+    /// another reason also marked (`contaminated`); the entry window, the
+    /// acks taken in the probe interval before the episode was seen, which
+    /// stay in their own range exactly as a settled replay batch acked before
+    /// an episode stays in `settling/`. A trim that would need a 33rd range
+    /// is retried at the next clean probe.
+    ///
+    /// Why a lag-only episode can be trusted after this: a latched table was
+    /// still acking into its WAL with nothing suspended; the latch releases
+    /// only when its apply lag has stopped growing (the staircase rule,
+    /// `WalLagTracker::untrusted_count`), and the two later clean probes and
+    /// the lag are the same evidence the settle step archives a replayed
+    /// batch on.
+    ///
+    /// Returns whether it confirmed. Called after every clean probe, on the
+    /// watcher task (the only caller of the probe report, so nothing else
+    /// moves the episode count meanwhile). O(32) plus one sidecar write and
+    /// one persist when it confirms; otherwise a lock and a few compares.
+    fn confirm_parked_if_due(&self, now: u64) -> bool {
+        let confirmed = crate::off_worker::off_worker(|| {
+            let mut state = self.lock_ranges();
+            let Some(pending) = state.parked_confirm else {
+                return None;
+            };
+            let outcome = if self.suspect_episodes.load(Ordering::Acquire) != pending.episodes_at {
+                Some("held_episode")
+            } else if pending.contaminated {
+                Some("held_contaminated")
+            } else {
+                None
+            };
+            if let Some(outcome) = outcome {
+                state.parked_confirm = None;
+                metrics::counter!(WAL_PARKED_CONFIRM_COUNTER, "outcome" => outcome).increment(1);
+                return None;
+            }
+            if self.sink_suspect.load(Ordering::Acquire)
+                || now < pending.ready_mono
+                || self.clean_probes.load(Ordering::Acquire) < pending.probes_needed
+            {
+                return None;
+            }
+            match state.ranges.remove_span(pending.lo, pending.hi) {
+                None => {
+                    metrics::counter!(WAL_PARKED_CONFIRM_COUNTER, "outcome" => "held_full")
+                        .increment(1);
+                    return None;
+                }
+                Some(changed) => {
+                    state.parked_confirm = None;
+                    let migrated = state.settle_migrated();
+                    if changed || migrated {
+                        self.write_ranges_locked(&mut state);
+                    }
+                }
+            }
+            Some(pending)
+        });
+        let Some(pending) = confirmed else {
+            return false;
+        };
+        if pending.parked_ticks != 0 {
+            self.hwm_ticks
+                .fetch_max(pending.parked_ticks, Ordering::AcqRel);
+        }
+        if pending.parked_depth != 0 {
+            self.hwm_depth
+                .fetch_max(pending.parked_depth, Ordering::AcqRel);
+        }
+        metrics::counter!(WAL_PARKED_CONFIRM_COUNTER, "outcome" => "confirmed").increment(1);
+        tracing::info!(
+            span_lo = pending.lo,
+            span_hi = pending.hi,
+            parked_ticks = pending.parked_ticks,
+            parked_depth = pending.parked_depth,
+            "WAL parked acks confirmed: the apply-lag episode ended, the durability lag and two \
+             more clean QuestDB probes followed with no new episode, so the session's WAL above \
+             the episode's entry window is no longer pinned"
+        );
+        crate::off_worker::off_worker(|| self.persist_now());
+        true
     }
 
     /// Counts the whole seconds since the last counted instant on
@@ -2118,6 +2441,11 @@ impl AppliedWatermark {
             return false;
         }
         let mut state = self.lock_ranges();
+        // W4: a range added for any other reason over a waiting parked
+        // confirmation keeps that span for good.
+        if let Some(p) = state.parked_confirm.as_mut() {
+            p.note_add(frame_floor(lo), hi);
+        }
         let changed = state.ranges.add_range(frame_floor(lo), hi);
         if changed {
             self.write_ranges_locked(&mut state);
@@ -2764,10 +3092,14 @@ impl AppliedWatermark {
             // record is above `high` (see `AppliedSnapshot::segment_is_applied`).
             // And one on the bottom (PR W review round 5): a frame at `low`
             // can sit in a segment whose range ends below it.
-            changed |= state.ranges.add_range(
+            let (bound_lo, bound_hi) = (
                 frame_floor(lo.saturating_sub(REPLAY_REORDER_SLACK_SEQ)),
                 high.saturating_add(REPLAY_REORDER_SLACK_SEQ),
             );
+            if let Some(p) = state.parked_confirm.as_mut() {
+                p.note_add(bound_lo, bound_hi);
+            }
+            changed |= state.ranges.add_range(bound_lo, bound_hi);
             self.overflowed.store(false, Ordering::SeqCst);
             match self.overflow_high_seq.compare_exchange(
                 high,
@@ -4860,5 +5192,360 @@ mod tests {
             seeded.overflowed.load(Ordering::Acquire),
             "unknown height: still the bit"
         );
+    }
+}
+
+/// Plan item W4 (2026-10-30): a lag-only suspicion episode's parked acks are
+/// confirmed only after the durability lag and two more clean probes with no
+/// new episode; nothing acked before an episode, in an unsafe episode, or
+/// under another mark is ever trimmed.
+#[cfg(test)]
+mod w4_parked_confirm_tests {
+    use super::*;
+
+    const SEC_NS: u64 = 1_000_000_000;
+
+    fn seq(secs: u64) -> u64 {
+        ((1_780_000_000 + secs) * 1_000_000_000) >> 17 << 17
+    }
+
+    fn covered(wm: &AppliedWatermark, f: u64) -> bool {
+        wm.lock_ranges().ranges.intersects(f, f)
+    }
+
+    fn probe(wm: &AppliedWatermark, verdict: ProbeVerdict, now: u64) {
+        wm.note_questdb_probe_full(verdict, None, now);
+    }
+
+    fn ack_both(wm: &AppliedWatermark, f: u64) {
+        wm.note_ticks_acked(f);
+        wm.note_depth_acked(f);
+    }
+
+    /// Clean at t0 with acks to seq(10), apply lag from t0+60 s, frames
+    /// seq(100)..=seq(200) parked, clean again at `exit`. Returns `exit`.
+    fn lag_only_episode(wm: &AppliedWatermark, t0: u64) -> u64 {
+        ack_both(wm, seq(10));
+        probe(wm, ProbeVerdict::Clean, t0);
+        ack_both(wm, seq(20)); // the entry window: acked before suspicion is seen
+        probe(wm, ProbeVerdict::LagOnly, t0 + 60 * SEC_NS);
+        for s in (100..=200).step_by(25) {
+            ack_both(wm, seq(s));
+            probe(wm, ProbeVerdict::LagOnly, t0 + (60 + s) * SEC_NS);
+        }
+        let exit = t0 + 400 * SEC_NS;
+        probe(wm, ProbeVerdict::Clean, exit);
+        exit
+    }
+
+    #[test]
+    fn test_parked_ack_is_confirmed_after_lag_and_two_clean_probes() {
+        let wm = AppliedWatermark::new_for_tests();
+        let exit = lag_only_episode(&wm, 1_000 * SEC_NS);
+        assert!(
+            covered(&wm, seq(150)),
+            "parked frames are unapplied at the exit"
+        );
+        assert_eq!(
+            wm.hwm_ticks.load(Ordering::Acquire),
+            seq(20),
+            "watermark frozen"
+        );
+        assert!(wm.lock_ranges().parked_confirm.is_some());
+        // One more clean probe, lag not yet passed: still pinned.
+        probe(&wm, ProbeVerdict::Clean, exit + 30 * SEC_NS);
+        assert!(covered(&wm, seq(150)));
+        // Lag passed but only one clean probe after the exit: still pinned.
+        let wm2 = AppliedWatermark::new_for_tests();
+        let exit2 = lag_only_episode(&wm2, 1_000 * SEC_NS);
+        probe(&wm2, ProbeVerdict::Clean, exit2 + 61 * SEC_NS);
+        assert!(covered(&wm2, seq(150)), "one clean probe is not two");
+        assert!(wm2.lock_ranges().parked_confirm.is_some());
+        // Second clean probe after the lag: confirmed.
+        probe(&wm, ProbeVerdict::Clean, exit + 61 * SEC_NS);
+        assert!(!covered(&wm, seq(150)), "parked frames confirmed");
+        assert!(!covered(&wm, seq(200)), "the top parked frame too");
+        assert!(wm.lock_ranges().parked_confirm.is_none());
+        assert_eq!(wm.hwm_ticks.load(Ordering::Acquire), seq(200));
+        assert_eq!(wm.hwm_depth.load(Ordering::Acquire), seq(200));
+        // The entry window stays: acked before the episode was seen.
+        assert!(covered(&wm, seq(20)), "the entry window is never confirmed");
+        assert!(
+            covered(&wm, seq(20) + REPLAY_REORDER_SLACK_SEQ),
+            "nor the slack above it"
+        );
+        let snap = wm.snapshot();
+        assert!(snap.frame_is_applied(AppliedSink::Ticks, seq(150)));
+        assert!(!snap.frame_is_applied(AppliedSink::Ticks, seq(20)));
+    }
+
+    #[test]
+    fn test_episode_before_confirmation_keeps_the_range() {
+        let wm = AppliedWatermark::new_for_tests();
+        let exit = lag_only_episode(&wm, 1_000 * SEC_NS);
+        probe(&wm, ProbeVerdict::Clean, exit + 30 * SEC_NS);
+        // A new episode begins before the rule holds.
+        probe(&wm, ProbeVerdict::LagOnly, exit + 50 * SEC_NS);
+        assert!(wm.lock_ranges().parked_confirm.is_none());
+        probe(&wm, ProbeVerdict::Clean, exit + 100 * SEC_NS);
+        for k in 1..=4 {
+            probe(&wm, ProbeVerdict::Clean, exit + (100 + 70 * k) * SEC_NS);
+        }
+        assert!(
+            covered(&wm, seq(150)),
+            "the first episode's parked frames stay"
+        );
+        assert!(covered(&wm, seq(200)));
+        assert_eq!(wm.hwm_ticks.load(Ordering::Acquire), seq(20));
+    }
+
+    #[test]
+    fn test_unsafe_episode_is_never_confirmed() {
+        for unsafe_at in [0u64, 1, 2] {
+            let wm = AppliedWatermark::new_for_tests();
+            let t0 = 1_000 * SEC_NS;
+            ack_both(&wm, seq(10));
+            probe(&wm, ProbeVerdict::Clean, t0);
+            let entry = if unsafe_at == 0 {
+                ProbeVerdict::Unsafe
+            } else {
+                ProbeVerdict::LagOnly
+            };
+            probe(&wm, entry, t0 + 60 * SEC_NS);
+            ack_both(&wm, seq(100));
+            let mid = if unsafe_at == 1 {
+                ProbeVerdict::Unsafe
+            } else {
+                ProbeVerdict::LagOnly
+            };
+            probe(&wm, mid, t0 + 120 * SEC_NS);
+            ack_both(&wm, seq(150));
+            let late = if unsafe_at == 2 {
+                ProbeVerdict::Unsafe
+            } else {
+                ProbeVerdict::LagOnly
+            };
+            probe(&wm, late, t0 + 180 * SEC_NS);
+            let exit = t0 + 240 * SEC_NS;
+            probe(&wm, ProbeVerdict::Clean, exit);
+            assert!(
+                wm.lock_ranges().parked_confirm.is_none(),
+                "case {unsafe_at}"
+            );
+            for k in 1..=5 {
+                probe(&wm, ProbeVerdict::Clean, exit + 61 * k * SEC_NS);
+            }
+            assert!(covered(&wm, seq(100)), "case {unsafe_at}: kept");
+            assert!(covered(&wm, seq(150)), "case {unsafe_at}: kept");
+            assert_eq!(wm.hwm_ticks.load(Ordering::Acquire), seq(10));
+        }
+    }
+
+    #[test]
+    fn test_another_mark_over_the_span_keeps_it() {
+        // Added after the exit (a reorder-guard range, say).
+        let wm = AppliedWatermark::new_for_tests();
+        let exit = lag_only_episode(&wm, 1_000 * SEC_NS);
+        wm.add_unapplied_range(seq(140), seq(141));
+        for k in 1..=3 {
+            probe(&wm, ProbeVerdict::Clean, exit + 61 * k * SEC_NS);
+        }
+        assert!(covered(&wm, seq(140)), "the other mark survives");
+        assert!(covered(&wm, seq(180)), "and the whole span with it");
+        // Present before the exit (added during the episode).
+        let wm = AppliedWatermark::new_for_tests();
+        ack_both(&wm, seq(10));
+        probe(&wm, ProbeVerdict::Clean, 1_000 * SEC_NS);
+        probe(&wm, ProbeVerdict::LagOnly, 1_060 * SEC_NS);
+        wm.add_unapplied_range(seq(120), seq(121));
+        ack_both(&wm, seq(150));
+        let exit = 1_200 * SEC_NS;
+        probe(&wm, ProbeVerdict::Clean, exit);
+        for k in 1..=3 {
+            probe(&wm, ProbeVerdict::Clean, exit + 61 * k * SEC_NS);
+        }
+        assert!(covered(&wm, seq(120)));
+        assert!(covered(&wm, seq(150)));
+    }
+
+    #[test]
+    fn test_parked_confirm_span_starts_above_both_entry_windows() {
+        let s = REPLAY_REORDER_SLACK_SEQ;
+        assert_eq!(parked_confirm_span(10, 20, 10, 20), None, "nothing parked");
+        assert_eq!(parked_confirm_span(10, 20, 5, 0), None, "parked below");
+        assert_eq!(
+            parked_confirm_span(100, 50, 300, 0),
+            Some((100 + s + 1, 300 + s))
+        );
+        assert_eq!(
+            parked_confirm_span(100, 500, 300, 0),
+            None,
+            "depth's entry window reaches past the parked ticks"
+        );
+        assert_eq!(
+            parked_confirm_span(100, 50, 300, 400),
+            Some((100 + s + 1, 400 + s))
+        );
+        assert_eq!(
+            parked_confirm_span(0, 0, u64::MAX, 0),
+            Some((s + 1, u64::MAX))
+        );
+    }
+
+    #[test]
+    fn test_probe_verdict_from_clean() {
+        assert_eq!(ProbeVerdict::from_clean(true), ProbeVerdict::Clean);
+        assert_eq!(ProbeVerdict::from_clean(false), ProbeVerdict::Unsafe);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Ack { ticks: bool, depth: bool },
+        Probe(ProbeVerdict),
+        Wait(u64),
+        Foreign,
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => (any::<bool>(), any::<bool>()).prop_map(|(t, d)| Op::Ack { ticks: t || !d, depth: d }),
+            3 => Just(Op::Probe(ProbeVerdict::Clean)),
+            2 => Just(Op::Probe(ProbeVerdict::LagOnly)),
+            1 => Just(Op::Probe(ProbeVerdict::Unsafe)),
+            2 => (1u64..90).prop_map(Op::Wait),
+            1 => Just(Op::Foreign),
+        ]
+    }
+
+    /// One acked frame as the model sees it.
+    struct Acked {
+        frame: u64,
+        /// Acked while not suspect, after the last clean probe: in the
+        /// window the next episode's entry range covers.
+        in_entry_window: bool,
+        /// Parked under this episode number (0 = not parked).
+        episode: u64,
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+        /// No frame acked inside or before an episode is ever trimmed unless
+        /// the episode was lag-only and, after its exit probe, the lag
+        /// passed and two more clean probes reported with no new episode;
+        /// no other mark is ever trimmed.
+        #[test]
+        fn proptest_w4_no_frame_is_trimmed_outside_the_rule(
+            ops in proptest::collection::vec(op(), 1..120),
+        ) {
+            let wm = AppliedWatermark::new_for_tests();
+            let mut now = 1_000 * SEC_NS;
+            let mut next_secs = 10u64;
+            let mut acked: Vec<Acked> = Vec::new();
+            let mut foreign: Vec<u64> = Vec::new();
+            let mut suspect = false;
+            let mut episode = 0u64;
+            // Per episode: lag-only so far, exit instant, clean probes since exit,
+            // and whether the rule has held at some clean probe (confirmable).
+            let mut lag_only: Vec<bool> = vec![false];
+            let mut exit_at: Vec<Option<u64>> = vec![None];
+            let mut cleans_since_exit: Vec<u64> = vec![0];
+            let mut confirmable: Vec<bool> = vec![false];
+            let mut interrupted: Vec<bool> = vec![false];
+            for op in ops {
+                match op {
+                    Op::Ack { ticks, depth } => {
+                        next_secs += 3;
+                        let f = seq(next_secs);
+                        if ticks { wm.note_ticks_acked(f); }
+                        if depth { wm.note_depth_acked(f); }
+                        acked.push(Acked {
+                            frame: f,
+                            in_entry_window: !suspect,
+                            episode: if suspect { episode } else { 0 },
+                        });
+                    }
+                    Op::Wait(secs) => now += secs * SEC_NS,
+                    Op::Foreign => {
+                        next_secs += 3;
+                        let f = seq(next_secs);
+                        // A mark over a frame already acked, as a reorder guard would.
+                        let target = acked.last().map_or(f, |a| a.frame);
+                        wm.add_unapplied_range(target, target);
+                        foreign.push(target);
+                    }
+                    Op::Probe(v) => {
+                        now += SEC_NS;
+                        if v == ProbeVerdict::Clean {
+                            if suspect {
+                                suspect = false;
+                                exit_at[episode as usize] = Some(now);
+                            } else {
+                                // Every open exit record counts this probe.
+                                for e in 1..=episode as usize {
+                                    if exit_at[e].is_some() && !interrupted[e] {
+                                        cleans_since_exit[e] += 1;
+                                        if lag_only[e]
+                                            && cleans_since_exit[e] >= PARKED_CONFIRM_CLEAN_PROBES
+                                            && now >= exit_at[e].unwrap_or(u64::MAX)
+                                                + WATERMARK_DURABILITY_LAG_NANOS
+                                        {
+                                            confirmable[e] = true;
+                                        }
+                                    }
+                                }
+                            }
+                            // Frames acked from here on are past this clean probe.
+                            for a in &mut acked { a.in_entry_window = false; }
+                        } else if !suspect {
+                            suspect = true;
+                            episode += 1;
+                            for e in 1..episode as usize { interrupted[e] = true; }
+                            lag_only.push(v == ProbeVerdict::LagOnly);
+                            exit_at.push(None);
+                            cleans_since_exit.push(0);
+                            confirmable.push(false);
+                            interrupted.push(false);
+                            // Frames acked before this entry since the last
+                            // clean probe are this episode's entry window;
+                            // mark them so they are checked forever.
+                            for a in &mut acked {
+                                if a.in_entry_window && a.episode == 0 {
+                                    a.episode = u64::MAX; // entry-window sentinel
+                                }
+                            }
+                        } else if v == ProbeVerdict::Unsafe {
+                            lag_only[episode as usize] = false;
+                        }
+                        wm.note_questdb_probe_full(v, None, now);
+                    }
+                }
+                // The invariant, after every step.
+                for a in &acked {
+                    let must_stay = match a.episode {
+                        0 => false,
+                        // The entry range covers the window from the last
+                        // clean probe (from sequence 1 when there was none).
+                        u64::MAX => true,
+                        // A parked frame is held by the frozen watermark until
+                        // the exit, and by the exit range after it.
+                        e => exit_at[e as usize].is_some() && !confirmable[e as usize],
+                    };
+                    if must_stay {
+                        proptest::prop_assert!(
+                            wm.lock_ranges().ranges.intersects(a.frame, a.frame),
+                            "frame {} (episode tag {}) was trimmed outside the rule",
+                            a.frame, a.episode
+                        );
+                    }
+                }
+                for &f in &foreign {
+                    proptest::prop_assert!(
+                        wm.lock_ranges().ranges.intersects(f, f),
+                        "a foreign mark at {f} was trimmed"
+                    );
+                }
+            }
+        }
     }
 }
