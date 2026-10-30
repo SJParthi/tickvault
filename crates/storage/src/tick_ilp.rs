@@ -845,7 +845,9 @@ impl RawIlpSender {
         // APPROVED: the URL, once per writer
         let url = format!("http://{host}:{http_port}/write");
         let (jobs, rx) = mpsc::sync_channel::<RawJob>(1);
+        // QuestDB is always reached directly: no proxy from the environment.
         let client = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(|err| format!("ILP HTTP client: {err}"))?;
         let thread_url = url.clone(); // APPROVED: once per writer
@@ -1060,3 +1062,7 @@ impl TickIlpSender {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tick_ilp_tests.rs"]
+mod tick_ilp_tests;

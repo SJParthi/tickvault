@@ -587,3 +587,60 @@ fn legacy_oracle_is_not_vacuous() {
     );
     assert!(line.ends_with('\n'));
 }
+
+#[test]
+fn test_new_with_encoder_own_has_our_sender_and_buffer() {
+    let config = tickvault_common::config::QuestDbConfig {
+        host: "127.0.0.1".to_owned(),
+        http_port: 9,
+        pg_port: 8812,
+        ilp_port: 9009,
+    };
+    // Building a sender never dials, for either encoder.
+    let own = TickWriter::new_with_encoder(&config, Feed::Dhan, TickIlpEncoder::Own);
+    assert!(matches!(own.sender, Some(TickIlpSender::Own(_))));
+    assert_eq!(own.buffer.kind(), TickRowBufferKind::Own);
+    assert!(own.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES);
+    let lib = TickWriter::new(&config, Feed::Dhan);
+    assert!(matches!(lib.sender, Some(TickIlpSender::Library(_))));
+    assert_eq!(
+        lib.buffer.kind(),
+        TickRowBufferKind::Library(ProtocolVersion::V1)
+    );
+}
+
+#[test]
+fn test_for_test_with_encoder_is_disconnected_and_presized() {
+    for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+        let w = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
+        assert!(w.sender.is_none());
+        assert_eq!(w.buffer.kind(), TickRowBuffer::new(encoder).kind());
+        assert!(w.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES);
+    }
+}
+
+/// The offload path recycles our buffers too, and never installs a spare of
+/// the other encoder.
+#[test]
+fn test_own_encoder_offload_recycles_only_own_spares() {
+    let (mut producer, sink, _rx) =
+        TickWriter::for_test_with_encoder(Feed::Dhan, TickIlpEncoder::Own).split_for_offload();
+    let mut foreign = TickRowBuffer::new(TickIlpEncoder::Library);
+    foreign.reserve(4_096);
+    assert!(
+        sink.spare_return
+            .as_ref()
+            .is_some_and(|lane| lane.try_send(foreign).is_ok())
+    );
+    let tick = ParsedTick {
+        security_id: RESERVED_ID_BASE + 3,
+        exchange_segment_code: 2,
+        last_traded_price: 245.35,
+        exchange_timestamp: DAY_IST_SECS + 36_000,
+        received_at_nanos: (i64::from(DAY_IST_SECS + 36_000) - 19_800) * 1_000_000_000,
+        ..ParsedTick::default()
+    };
+    assert!(producer.append_tick_with_seq(&tick, 1).is_ok());
+    assert!(producer.flush().is_ok());
+    assert_eq!(producer.buffer.kind(), TickRowBufferKind::Own);
+}

@@ -2186,7 +2186,7 @@ pub const QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER: &str =
 /// ILP-over-HTTP conf: per-flush server ACK (the 2026-07-05 fire-and-forget
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
-fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
+pub(crate) fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
     // APPROVED: ILP conf string, once per TickWriter::new
     format!(
         "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
