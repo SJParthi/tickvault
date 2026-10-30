@@ -22272,11 +22272,8 @@ mod tests {
         let start = t0();
         let mut ep = episode_after_805(&[0], start);
         let mut wait_from = start;
-        for (attempt, &delay_secs) in OVERFLOW_PROBE_DELAYS_SECS
-            .iter()
-            .enumerate()
-            .take(usize::from(OVERFLOW_PROBE_MAX_ATTEMPTS))
-        {
+        // DELAYS has exactly MAX_ATTEMPTS entries (compile-time assert above).
+        for (attempt, &delay_secs) in OVERFLOW_PROBE_DELAYS_SECS.iter().enumerate() {
             let delay = secs(delay_secs);
             assert_eq!(
                 ep.poll(wait_from + delay - secs(1), true),

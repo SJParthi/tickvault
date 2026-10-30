@@ -2504,6 +2504,43 @@ fn ci_clippy_gate_stays_armed() {
              `--all-targets` in ci.yml. The crate list may only grow."
         );
     }
+
+    // 2026-10-30 (12b review): a clippy step can also be switched off without
+    // touching the flags: `|| true`, a later `-A warnings`, or
+    // `continue-on-error` on the step. Refuse all three on every clippy step.
+    let lines: Vec<&str> = ci.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if is_comment_line(line) || !line.contains("cargo clippy") {
+            continue;
+        }
+        assert!(
+            !line.contains("||") && !line.contains(" -A ") && !line.contains("--cap-lints"),
+            "CI LINT GATE DISARMED: `{}` can no longer fail the job \
+             (`||`, `-A` or `--cap-lints` on the line).",
+            line.trim()
+        );
+        let start = (0..=i)
+            .rev()
+            .find(|&j| lines[j].trim_start().starts_with("- name:"))
+            .unwrap_or(i);
+        let step_indent = lines[start].len() - lines[start].trim_start().len();
+        let end = (i + 1..lines.len())
+            .find(|&j| {
+                let t = lines[j].trim_start();
+                !t.is_empty() && (lines[j].len() - t.len()) <= step_indent
+            })
+            .unwrap_or(lines.len());
+        let soft = lines[start..end]
+            .iter()
+            .filter(|l| !is_comment_line(l))
+            .any(|l| l.contains("continue-on-error"));
+        assert!(
+            !soft,
+            "CI LINT GATE DISARMED: the step running `{}` sets continue-on-error, so a \
+             clippy failure no longer fails Build & Verify.",
+            line.trim()
+        );
+    }
 }
 
 /// Crates whose every target (tests and benches included) measured clippy-clean

@@ -133,6 +133,18 @@ fn the_local_script_lints_all_targets_of_exactly_the_crates_ci_does() {
         "clippy_local_parity_guard: CLEAN_CRATES in scripts/clippy-local.sh must name \
          the same crates, in the same order, as ci.yml's --all-targets clippy step"
     );
+    // The shim branch runs CI's two commands with CI's exact flags: it has no
+    // grep gate, so `-- -D warnings` is the only thing that makes a warning
+    // fail there (12b review).
+    let all_targets_cmd = format!("cargo clippy \"${{CLEAN_CRATES[@]}}\" {CI_ALL_TARGETS_TAIL}");
+    for cmd in [CI_CLIPPY_INVOCATION, all_targets_cmd.as_str()] {
+        assert!(
+            code.iter()
+                .any(|l| l.trim_start().trim_start_matches("exec ") == cmd),
+            "clippy_local_parity_guard: scripts/clippy-local.sh must run `{cmd}` as its own \
+             line in the cargo-clippy branch, flags exactly as CI passes them"
+        );
+    }
     // Both branches (the shim and the clippy-driver fallback) use the list
     // with --all-targets.
     let uses = code
