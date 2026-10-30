@@ -675,6 +675,26 @@ mod tests {
         assert!(parse_fno_underlyings(br#"{"mappings":7}"#).is_none());
     }
 
+    #[test]
+    fn test_fno_underlying_artifact_path_is_dir_prefix_date_json() {
+        assert_eq!(
+            fno_underlying_artifact_path(Path::new(FNO_UNDERLYING_ARTIFACT_DIR), "2026-10-30"),
+            PathBuf::from("data/instrument-cache/dhan-fno-underlyings-2026-10-30.json")
+        );
+    }
+
+    #[test]
+    fn test_name_of_needs_the_full_composite_key() {
+        let list = parse_fno_underlyings(
+            br#"{"mappings":[{"index_name":"FNO_UNDERLYING","symbol":"ABC","isin":"","security_id":5,"exchange_segment":1}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(list.name_of(5, EXCHANGE_SEGMENT_NSE_EQ), Some("ABC"));
+        assert_eq!(list.name_of(5, 2), None, "same id, other segment");
+        assert_eq!(list.name_of(6, EXCHANGE_SEGMENT_NSE_EQ), None);
+        assert!(!list.is_empty());
+    }
+
     // ---- the handler computation ----
 
     #[tokio::test]
