@@ -508,3 +508,30 @@ letter registrar — please confirm.
 - [x] F3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert 🔷 DHAN attribution
   - Files: crates/common/src/error_code.rs, docs/error-runbooks/order-readiness-error-codes.md, engine.rs
   - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge
+
+## Cluster G — order decision path under 1 µs in memory (branch claude/order-path-sub-us, 2026-10-30)
+
+Owner (Parthiban), 30 Oct 2026, relayed by the coordinator: every in-memory
+step of the order path under 1 µs at p99, proven by benches that fail the
+build if it slips, with identical behaviour. Network calls, `dry_run`, the
+indicator and strategy trees, and the REST surface are out of scope. Matrices:
+by cross-reference, as for the clusters above.
+
+- [x] Criterion bench `crates/app/benches/order_path.rs` (production Prometheus recorder installed) + budget key `order_path = 1000` and elements row in `quality/benchmark-budgets.toml`
+  - Files: crates/app/benches/order_path.rs, crates/app/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md (key count)
+  - Tests: benchmark_budget_reaches_a_bench_guard, claude_md_states_the_real_budget_key_count
+- [x] Per-call p50/p99 harness (ignored, wall clock): crates/app/tests/order_path_p99_harness.rs
+  - Tests: order_path_per_call_latency_distribution
+- [x] Correlation ids drawn ahead of use (pool of 256, cold refill at construction and the daily reset; on-demand fallback) and one-allocation encoder
+  - Files: crates/trading/src/oms/idempotency.rs, crates/trading/src/oms/engine.rs
+  - Tests: proptest_encoder_matches_the_legacy_two_allocation_form, test_next_id_is_a_v4_prefix_of_the_dhan_length_and_never_repeats, test_clear_refills_the_pool_for_the_next_day
+- [x] Metric handles cached at first use (rate limiter allowed counter, breaker state gauge, paper placed counter, placement histogram); literal labels where a label variable allocated (order budget refusal, rejected mark, fills recorded); `track_ref` removes one String copy per paper placement
+  - Files: crates/trading/src/oms/rate_limiter.rs, crates/trading/src/oms/circuit_breaker.rs, crates/trading/src/oms/engine.rs, crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
+  - Tests: order_path_metrics_keep_their_names_labels_and_counts
+
+Design: no output changes; ids, metric names, labels and counts are the same.
+Edge cases: pool empty (falls back to `generate_id`), recorder installed after
+first use (handle stays bound to the earlier one; production installs at boot).
+Failure modes: none new; a refused order is refused exactly as before.
+Rollback: revert the PR; no data or config change.
+Observability: unchanged series (pinned by the parity test).

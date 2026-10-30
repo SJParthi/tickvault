@@ -111,6 +111,10 @@ harness = false
 name = "feed_drain"
 harness = false
 
+[[bench]]
+name = "order_path"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]
 

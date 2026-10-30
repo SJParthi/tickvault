@@ -11,7 +11,7 @@
 //! Token access is via a callback trait to decouple from the core crate.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use metrics::counter;
@@ -247,6 +247,13 @@ pub struct OrderManagementSystem {
     /// MPP verify-ladder bookkeeping keyed by order id (a separate map so
     /// the `ManagedOrder` struct stays untouched for Cluster A).
     verify_states: HashMap<String, VerifyState>,
+    /// `tv_orders_placed_total{mode="paper"}` and
+    /// `tv_order_placement_duration_ns`, resolved once at first use instead of
+    /// a registry lookup per placement (about 40 ns and 130 ns with the
+    /// production recorder, measured 2026-10-30). Resolved at first USE, not
+    /// at construction, so they bind to the recorder installed at boot.
+    paper_placed_total: OnceLock<metrics::Counter>,
+    placement_duration_ns: OnceLock<metrics::Histogram>,
 }
 
 /// Cluster F: order-path halt record. Set idempotently; cleared only by an
@@ -417,7 +424,16 @@ impl OrderManagementSystem {
             stop_all_alert_latched: false,
             super_orders: HashMap::with_capacity(16),
             verify_states: HashMap::with_capacity(16),
+            paper_placed_total: OnceLock::new(),
+            placement_duration_ns: OnceLock::new(),
         }
+    }
+
+    /// The cached `tv_order_placement_duration_ns` handle (same name, no
+    /// labels) for the paper placement arm.
+    fn placement_duration_histogram(&self) -> &metrics::Histogram {
+        self.placement_duration_ns
+            .get_or_init(|| metrics::histogram!("tv_order_placement_duration_ns"))
     }
 
     /// Returns whether the OMS is in dry-run (paper trading) mode.
@@ -744,7 +760,7 @@ impl OrderManagementSystem {
         }
 
         // Step 3: Generate correlation ID
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: simulate order without any HTTP call ----
@@ -754,7 +770,9 @@ impl OrderManagementSystem {
 
             let order = ManagedOrder {
                 order_id: paper_order_id.clone(),
-                correlation_id: correlation_id.clone(),
+                // Moved, not cloned: the tracker below borrows it from the
+                // record (2026-10-30, one allocation fewer per placement).
+                correlation_id,
                 security_id: request.security_id,
                 exchange_segment: request.exchange_segment,
                 transaction_type: request.transaction_type,
@@ -775,12 +793,14 @@ impl OrderManagementSystem {
             };
 
             self.correlations
-                .track(correlation_id, paper_order_id.clone());
+                .track_ref(&order.correlation_id, paper_order_id.clone());
             self.orders.insert(paper_order_id.clone(), order);
             self.total_placed = self.total_placed.saturating_add(1);
 
-            counter!("tv_orders_placed_total", "mode" => "paper").increment(1);
-            metrics::histogram!("tv_order_placement_duration_ns")
+            self.paper_placed_total
+                .get_or_init(|| counter!("tv_orders_placed_total", "mode" => "paper"))
+                .increment(1);
+            self.placement_duration_histogram()
                 .record(start.elapsed().as_nanos() as f64);
 
             info!(
@@ -1813,7 +1833,7 @@ impl OrderManagementSystem {
         self.check_order_gates()?;
 
         // Step 3: correlation ID.
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: simulate the 3-leg bracket without any HTTP call ----
@@ -2446,7 +2466,7 @@ impl OrderManagementSystem {
         self.check_order_gates()?;
 
         // Step 3: correlation ID.
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: simulate without any HTTP call ----
@@ -2613,7 +2633,7 @@ impl OrderManagementSystem {
         self.check_order_gates()?;
 
         // Step 3: ONE correlation ID shared by every slice.
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: N paper orders, one per computed slice ----

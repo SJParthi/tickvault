@@ -1232,12 +1232,14 @@ fn apply_fill(
         .mirror
         .entry((fill.security_id, fill_segment))
         .or_insert(0) += i64::from(fill.fill_lots);
-    let kind = if fill.order_id.starts_with("PAPER-") {
-        "paper"
+    // Literal labels on both arms: a non-literal label value sends the macro
+    // down its allocating arm (a label `Vec` per fill, 2026-10-30). Same
+    // metric name and labels as before.
+    if fill.order_id.starts_with("PAPER-") {
+        metrics::counter!("tv_risk_fills_recorded_total", "kind" => "paper").increment(1);
     } else {
-        "live"
-    };
-    metrics::counter!("tv_risk_fills_recorded_total", "kind" => kind).increment(1);
+        metrics::counter!("tv_risk_fills_recorded_total", "kind" => "live").increment(1);
+    }
     emit_leg_pnl(
         leg_pnl_tx,
         risk,

@@ -638,7 +638,19 @@ impl RiskEngine {
             } else {
                 "non_positive"
             };
-            metrics::counter!(MARK_REJECTED_COUNTER, "reason" => reason).increment(1);
+            // One literal label per arm: a non-literal label value sends the
+            // macro down its allocating arm (a label `Vec` per call), so a NaN
+            // storm allocated per mark (2026-10-30). Same name and labels.
+            match reason {
+                "nan" => metrics::counter!(MARK_REJECTED_COUNTER, "reason" => "nan").increment(1),
+                "infinite" => {
+                    metrics::counter!(MARK_REJECTED_COUNTER, "reason" => "infinite").increment(1);
+                }
+                _ => {
+                    metrics::counter!(MARK_REJECTED_COUNTER, "reason" => "non_positive")
+                        .increment(1);
+                }
+            }
             self.marks_rejected = self.marks_rejected.saturating_add(1);
             if self.marks_rejected.is_power_of_two() {
                 tracing::error!(
