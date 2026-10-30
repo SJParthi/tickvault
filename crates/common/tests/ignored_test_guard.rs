@@ -49,6 +49,19 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-30 with plan item DT0: a wall-clock yardstick for the
+    // ring-dwell + decode part of the `receipt_to_fold` stage, quiet and with
+    // two busy threads competing for the CPUs (the r8g.large has two). It
+    // prints percentiles and gates nothing, like the harness below; the
+    // stage's behaviour is pinned by
+    // `dhan_feed_stack/receipt_to_fold_tests.rs` and
+    // `crates/storage/tests/dhat_receipt_to_fold_stage.rs`. Re-run it with:
+    //
+    //   cargo test --release -p tickvault-core --test receipt_to_fold_harness -- --ignored --nocapture
+    (
+        "crates/core/tests/receipt_to_fold_harness.rs",
+        "receipt_to_fold_cost_with_and_without_cpu_competition",
+    ),
     // Added 2026-10-30 with plan ITEM DT-SOCK (owner: every in-memory step
     // under 1 us at p99): wall-clock harnesses for the socket read path's
     // in-memory work per frame (production spacing, bursts, a per-step
@@ -74,6 +87,18 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     (
         "crates/core/tests/socket_read_in_memory_harness.rs",
         "ring_recv_cost_over_a_queued_backlog",
+    ),
+    // Added 2026-10-30 with the order-path work (owner: every in-memory
+    // order-path step under 1 us at p99): a wall-clock harness that prints
+    // the per-call p50 / p99 / p99.9 / max of each step, with and without a
+    // JSON log subscriber. It gates nothing; the gates are the per-call p99
+    // gate inside `crates/app/benches/order_path.rs`, the Criterion budget
+    // `order_path` (bench-gate) and `dhat_order_path_recorder`. Run it with:
+    //
+    //   cargo test --profile bench -p tickvault-app --test order_path_p99_harness -- --ignored --nocapture --test-threads=1
+    (
+        "crates/app/tests/order_path_p99_harness.rs",
+        "order_path_per_call_latency_distribution",
     ),
     // Added 2026-10-30 with plan item DT-S1: a wall-clock harness for the
     // hot-thread placement switches (consumer pick-up delay with a busy

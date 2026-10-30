@@ -267,8 +267,19 @@ mod tests {
             data_collection_end: "15:30:00".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
+            // A weekend date is already a non-trading day and the calendar
+            // refuses it as a holiday, so tests that mark "today" a holiday
+            // would fail whenever the IST date is a Saturday or Sunday.
             nse_holidays: dates
                 .iter()
+                .filter(|d| {
+                    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_or(true, |date| {
+                        !matches!(
+                            chrono::Datelike::weekday(&date),
+                            chrono::Weekday::Sat | chrono::Weekday::Sun
+                        )
+                    })
+                })
                 .map(|d| NseHolidayEntry {
                     date: (*d).to_string(),
                     name: "Holiday".to_string(),

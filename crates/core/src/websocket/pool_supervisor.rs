@@ -99,6 +99,7 @@ use bytes::Bytes;
 use tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
+use tickvault_storage::host_capacity_minute::note_ring_refused;
 use tickvault_storage::ws_frame_spill::{
     AppendOutcome, WalEndpoint, WsFrameSpill, WsType, next_frame_seq,
 };
@@ -8449,6 +8450,7 @@ impl WalRingSink {
     /// one load and a CAS on one slot, shed arm only.
     #[inline]
     fn note_ring_shed(&self, seq: u64) {
+        note_ring_refused(self.endpoint == DhanEndpointType::MainFeed);
         let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
             seq,
             tickvault_storage::wal_frame_fate::ShedKind::Ring,
