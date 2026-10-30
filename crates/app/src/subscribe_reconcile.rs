@@ -913,11 +913,10 @@ pub async fn execute_round(book: &SubscribeReconcile, round: PlannedRound) -> Ro
         socket,
         instruments,
     } = round;
-    let outcome = execute_round_on(&tx, instruments, |refund| {
+    execute_round_on(&tx, instruments, |refund| {
         book.round_finished(socket, refund, Instant::now());
     })
-    .await;
-    outcome
+    .await
 }
 
 async fn execute_round_on<F>(
