@@ -653,3 +653,63 @@ fn test_push_u64_digits_matches_the_standard_formatter_at_every_length() {
         assert_eq!(&out[2..], v.to_string().as_bytes(), "{v}");
     }
 }
+
+/// Each kind of refusal QuestDB can send, through the library sender and
+/// ours against the same local server: the same error text, the same
+/// retry class (none of them is retried), the bytes kept.
+#[test]
+fn test_send_error_text_matches_the_library_for_every_refusal() {
+    const JSON: &str = "Content-Type: application/json\r\n";
+    let cases: [(&'static str, &'static str, &'static str); 7] = [
+        (
+            "400 Bad Request",
+            JSON,
+            r#"{"code":"invalid","message":"bad line","line":3,"errorId":"ab-12"}"#,
+        ),
+        ("400 Bad Request", JSON, r#"{"message":"only a message"}"#),
+        ("400 Bad Request", JSON, r#"{"no":"message field"}"#),
+        ("400 Bad Request", "", "plain text refusal"),
+        ("401 Unauthorized", "", "nope"),
+        ("403 Forbidden", "", ""),
+        ("500 Internal Server Error", "", "disk full"),
+    ];
+    for (status, headers, body) in cases {
+        let (port, _seen) = serve(vec![(status, headers, body), (status, headers, body)]);
+        let conf = crate::tick_persistence::ticks_ilp_http_conf(&config(port));
+        let mut library = questdb::ingress::Sender::from_conf(conf).expect("library sender");
+        let mut lib_buffer = library.new_buffer();
+        sample_lines(&mut lib_buffer);
+        let lib_err = library.flush(&mut lib_buffer).expect_err("refused");
+
+        let ours = RawIlpSender::new("127.0.0.1", port).expect("our sender");
+        let mut own = OwnIlpBuffer::new();
+        sample_lines(&mut own);
+        let bytes = own.as_bytes().to_vec();
+        let our_err = ours.send(&mut own).expect_err("refused");
+
+        assert_eq!(our_err.message, lib_err.msg(), "{status} {body}");
+        assert_eq!(
+            our_err.retryable,
+            crate::depth_persistence::flush_failure_is_retryable(&lib_err),
+            "{status} {body}"
+        );
+        assert_eq!(own.as_bytes(), &bytes[..], "the bytes stay for the rescue");
+    }
+}
+
+/// An oversized error body is cut at 64 KiB, not held or logged whole.
+#[test]
+fn test_send_caps_an_oversized_error_body() {
+    let huge: &'static str = Box::leak("x".repeat(1_000_000).into_boxed_str());
+    let (port, _seen) = serve(vec![("500 Internal Server Error", "", huge)]);
+    let ours = RawIlpSender::new("127.0.0.1", port).expect("sender");
+    let mut b = OwnIlpBuffer::new();
+    sample_lines(&mut b);
+    let err = ours.send(&mut b).expect_err("refused");
+    assert!(!err.retryable);
+    assert!(
+        err.message.len() <= "Could not flush buffer: ".len() + MAX_ERROR_BODY_BYTES,
+        "message is {} bytes",
+        err.message.len()
+    );
+}

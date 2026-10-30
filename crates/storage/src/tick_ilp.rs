@@ -853,6 +853,20 @@ type RawJob = (
 /// tokio worker inside `off_worker`) without nesting runtimes. The bytes
 /// travel to the thread by move and come back by move, so a failed send still
 /// holds them for the rescue tier.
+///
+/// # Where it deliberately differs from the library
+///
+/// * No proxy: the library's HTTP client reads `HTTP_PROXY` from the
+///   environment; ours never does, because QuestDB is always reached directly.
+/// * No redirects: QuestDB never sends one, and following one would re-send
+///   tick rows to another host.
+/// * An error body is read up to 64 KiB (the library reads up to 10 MB).
+///
+/// # Honest limit
+///
+/// If the sender thread died while holding a batch, that batch's bytes are
+/// gone and the rescue would spill an empty payload. Release builds abort on
+/// any panic, so this is reachable only in debug and test builds.
 #[derive(Debug)]
 pub struct RawIlpSender {
     jobs: mpsc::SyncSender<RawJob>,
@@ -871,6 +885,9 @@ impl RawIlpSender {
         // QuestDB is always reached directly: no proxy from the environment.
         let client = reqwest::Client::builder()
             .no_proxy()
+            // QuestDB never redirects; a redirect would re-send tick rows to
+            // another host (security review, 2026-10-30).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| format!("ILP HTTP client: {err}"))?;
         let thread_url = url.clone(); // APPROVED: once per writer
@@ -992,7 +1009,57 @@ async fn post_once(
     (Vec::from(payload), outcome)
 }
 
-/// The library's reading of an HTTP answer (`parse_http_error`).
+/// Bytes of an error answer's body read into the message. The library reads
+/// up to 10 MB; a QuestDB error body is a short JSON object, so the rest of an
+/// oversized body is dropped rather than held and logged (security review,
+/// 2026-10-30).
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Reads at most [`MAX_ERROR_BODY_BYTES`] of the body, invalid UTF-8 replaced
+/// (the library reads it lossily too).
+async fn read_error_body(mut response: reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let room = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+        if body.len() >= MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The library's text for a JSON error body (`parse_json_error`): the
+/// message, then `[id: …, code: …, line: …]` for whichever are present.
+fn json_error_description(json: &serde_json::Value, message: &str) -> String {
+    let mut description = message.to_owned();
+    let error_id = json.get("errorId").and_then(serde_json::Value::as_str);
+    let code = json.get("code").and_then(serde_json::Value::as_str);
+    let line = json.get("line").and_then(serde_json::Value::as_i64);
+    if error_id.is_none() && code.is_none() && line.is_none() {
+        return description;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if let Some(id) = error_id {
+        parts.push(format!("id: {id}")); // APPROVED: failure path only
+    }
+    if let Some(code) = code {
+        parts.push(format!("code: {code}")); // APPROVED: failure path only
+    }
+    if let Some(line) = line {
+        parts.push(format!("line: {line}")); // APPROVED: failure path only
+    }
+    description.push_str(" [");
+    description.push_str(&parts.join(", "));
+    description.push(']');
+    description
+}
+
+/// The library's reading of an HTTP answer (`parse_http_error`): 404 is
+/// "does not support ILP", 401/403 an authentication error, any other error
+/// status the server's message (a JSON body's `message` plus its id, code and
+/// line, as the library prints it). None is retried; a body that cannot be
+/// read is the transport class, as in the library.
 async fn classify_response(response: reqwest::Response) -> Result<(), RawSendError> {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error()) {
@@ -1013,22 +1080,11 @@ async fn classify_response(response: reqwest::Response) -> Result<(), RawSendErr
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.eq_ignore_ascii_case("application/json"));
-    let body = match response.text().await {
-        Ok(text) => text,
-        Err(err) => {
-            return Err(RawSendError {
-                // APPROVED: failure path only
-                message: format!("Could not flush buffer: {err}"),
-                status: Some(code),
-                retryable: true,
-            });
-        }
-    };
+    let body = read_error_body(response).await;
     if [401, 403].contains(&code) {
-        let detail = if body.is_empty() {
-            String::new()
-        } else {
-            format!(": {body}") // APPROVED: failure path only
+        let detail = match &body {
+            Ok(text) if !text.is_empty() => format!(": {text}"), // APPROVED: failure path only
+            _ => String::new(),
         };
         return Err(RawSendError {
             // APPROVED: failure path only
@@ -1039,13 +1095,29 @@ async fn classify_response(response: reqwest::Response) -> Result<(), RawSendErr
             retryable: false,
         });
     }
-    let message = if is_json {
-        serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
-            .unwrap_or_else(|| body.clone())
+    let body = match body {
+        Ok(text) => text,
+        Err(err) => {
+            return Err(RawSendError {
+                // APPROVED: failure path only
+                message: format!("Could not flush buffer: {err}"),
+                status: Some(code),
+                retryable: true,
+            });
+        }
+    };
+    let json = if is_json {
+        serde_json::from_str::<serde_json::Value>(&body).ok()
     } else {
-        body
+        None
+    };
+    let message = match json.as_ref().and_then(|j| {
+        j.get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(|m| (j, m))
+    }) {
+        Some((json, message)) => json_error_description(json, message),
+        None => body,
     };
     Err(RawSendError {
         // APPROVED: failure path only
