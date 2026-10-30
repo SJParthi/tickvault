@@ -143,6 +143,11 @@ fn run(plan: DrainThreadPlan, rt: Option<(u8, u8)>, neighbour_core: usize) -> Su
     stop.store(true, Ordering::Relaxed);
     neighbour.join().expect("neighbour");
     shared.shutdown_background();
+    assert_eq!(
+        samples.len(),
+        FRAMES,
+        "every frame the reader sent must reach the consumer in this placement"
+    );
     summarise(samples)
 }
 
@@ -157,11 +162,10 @@ fn drain_placement_wait_for_cpu_three_ways() {
         "{FRAMES} frames, {} us apart, neighbour on core {HOT_CORE}",
         GAP.as_micros()
     );
-    report("today", &run(DrainThreadPlan::Shared, None, HOT_CORE));
-    report(
-        "own_thread",
-        &run(DrainThreadPlan::Own(Some(HOT_CORE)), None, HOT_CORE),
-    );
+    let today = run(DrainThreadPlan::Shared, None, HOT_CORE);
+    report("today", &today);
+    let own = run(DrainThreadPlan::Own(Some(HOT_CORE)), None, HOT_CORE);
+    report("own_thread", &own);
     match decide_hot_rt(HotRtPlan::Fifo(1), read_rt_throttle) {
         HotRtDecision::Apply { reader, drain } => {
             report(
@@ -176,8 +180,10 @@ fn drain_placement_wait_for_cpu_three_ways() {
         other => println!("own_thread_rt    skipped: {other:?}"),
     }
     // The full plan: the neighbour moved off the hot core (background core 0).
-    report(
-        "own_thread_iso",
-        &run(DrainThreadPlan::Own(Some(HOT_CORE)), None, BACKGROUND_CORE),
-    );
+    let iso = run(DrainThreadPlan::Own(Some(HOT_CORE)), None, BACKGROUND_CORE);
+    report("own_thread_iso", &iso);
+    // Non-vacuity: every placement measured every frame.
+    for s in [&today, &own, &iso] {
+        assert_eq!(s.n, FRAMES, "a placement lost frames");
+    }
 }

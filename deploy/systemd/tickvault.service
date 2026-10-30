@@ -294,7 +294,8 @@ Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
 #   TICKVAULT_BACKGROUND_CORE=0      every other app thread on core 0
 #   TICKVAULT_HOT_RT_PRIORITY=1      readers SCHED_FIFO 2, drain SCHED_FIFO 1;
 #                                     refused unless kernel.sched_rt_runtime_us
-#                                     is below its period (default 950000 of
+#                                     is below its period and at least half of
+#                                     it (default 950000 of
 #                                     1000000), so a stuck thread can never
 #                                     freeze the box. Needs LimitRTPRIO below.
 #   TV_QDB_CORE_ISOLATION=1          (in deploy/docker/.env, not here)

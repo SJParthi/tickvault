@@ -28,7 +28,9 @@
 //! period) caps real-time threads at 95% of each period, so a stuck reader
 //! or drain still leaves 50 ms a second for everything else, and the box can
 //! be reached. With the throttle off (`-1`), or equal to the period, nothing
-//! caps it: we refuse and log a coded line instead.
+//! caps it: we refuse and log a coded line instead. A runtime under half the
+//! period is refused too: it would hold the hot threads off the CPU for
+//! most of each period, worse than normal priority.
 //!
 //! # Why the reader is one above the drain
 //!
@@ -97,6 +99,15 @@ pub enum RtThrottle {
     },
     /// `-1`, or a runtime at or above the period: nothing caps them.
     Unlimited,
+    /// Below half the period: real-time threads would be held off the CPU
+    /// for most of each period (a runtime of 0 blocks them entirely), so the
+    /// hot threads would run worse than at normal priority.
+    TooSmall {
+        /// `sched_rt_runtime_us`.
+        runtime_us: u64,
+        /// `sched_rt_period_us`.
+        period_us: u64,
+    },
     /// A file was missing or did not parse.
     Unreadable,
 }
@@ -117,6 +128,11 @@ pub fn classify_rt_throttle(runtime_raw: Option<&str>, period_raw: Option<&str>)
             let runtime_us = r.unsigned_abs();
             if period_us == 0 || runtime_us >= period_us {
                 RtThrottle::Unlimited
+            } else if runtime_us.saturating_mul(2) < period_us {
+                RtThrottle::TooSmall {
+                    runtime_us,
+                    period_us,
+                }
             } else {
                 RtThrottle::Active {
                     runtime_us,
@@ -155,6 +171,9 @@ pub enum HotRtDecision {
     RefusedThrottleUnlimited,
     /// Asked for, refused: the throttle could not be read.
     RefusedThrottleUnreadable,
+    /// Asked for, refused: the throttle leaves real-time threads under half
+    /// of each period.
+    RefusedThrottleTooSmall,
     /// The value was not `off` or a priority in range.
     RefusedInvalid,
 }
@@ -183,7 +202,10 @@ impl HotRtDecision {
     pub const fn is_refusal(self) -> bool {
         matches!(
             self,
-            Self::RefusedThrottleUnlimited | Self::RefusedThrottleUnreadable | Self::RefusedInvalid
+            Self::RefusedThrottleUnlimited
+                | Self::RefusedThrottleUnreadable
+                | Self::RefusedThrottleTooSmall
+                | Self::RefusedInvalid
         )
     }
 }
@@ -202,6 +224,7 @@ pub fn decide_hot_rt(plan: HotRtPlan, throttle: impl FnOnce() -> RtThrottle) -> 
             },
             RtThrottle::Unlimited => HotRtDecision::RefusedThrottleUnlimited,
             RtThrottle::Unreadable => HotRtDecision::RefusedThrottleUnreadable,
+            RtThrottle::TooSmall { .. } => HotRtDecision::RefusedThrottleTooSmall,
         },
     }
 }
@@ -221,6 +244,11 @@ pub enum BackgroundCorePlan {
     SameAsReaders(usize),
     /// Not `off` and not a core id.
     Invalid,
+    /// The readers are not pinned to a core of their own (dedicated runtime
+    /// off, pin refused, or not yet reported). Pinning the main thread then
+    /// would put the readers, or an unpinned drain thread spawned from a
+    /// main-runtime worker, on the background core: worse than no pin.
+    ReadersNotPinned,
 }
 
 impl BackgroundCorePlan {
@@ -229,7 +257,7 @@ impl BackgroundCorePlan {
     pub const fn is_refusal(self) -> bool {
         matches!(
             self,
-            Self::NotAllowed(_) | Self::SameAsReaders(_) | Self::Invalid
+            Self::NotAllowed(_) | Self::SameAsReaders(_) | Self::Invalid | Self::ReadersNotPinned
         )
     }
 }
@@ -250,7 +278,10 @@ pub fn resolve_background_core(
     }
     match value.parse::<usize>() {
         Ok(core) if core <= super::reader_runtime::MAX_WS_READER_CORE => {
-            if reader_core == Some(core) {
+            let Some(reader_core) = reader_core else {
+                return BackgroundCorePlan::ReadersNotPinned;
+            };
+            if reader_core == core {
                 BackgroundCorePlan::SameAsReaders(core)
             } else if core_allowed(core) {
                 BackgroundCorePlan::Pin(core)
@@ -316,13 +347,23 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_rt_throttle_zero_runtime_is_active_and_blocks_rt_entirely() {
-        // 0 µs per period: real-time threads cannot run at all; the kernel
-        // refuses SCHED_FIFO (EPERM/EINVAL), which the apply path reports.
+    fn test_classify_rt_throttle_under_half_the_period_is_too_small_and_refused() {
+        // 0 µs would hold real-time threads off the CPU entirely; anything
+        // under half the period starves them for most of each period.
+        for runtime in ["0", "1", "499999"] {
+            let t = classify_rt_throttle(Some(runtime), Some("1000000"));
+            assert!(matches!(t, RtThrottle::TooSmall { .. }), "{runtime}: {t:?}");
+            assert_eq!(
+                decide_hot_rt(HotRtPlan::Fifo(1), || t),
+                HotRtDecision::RefusedThrottleTooSmall
+            );
+            assert!(HotRtDecision::RefusedThrottleTooSmall.is_refusal());
+        }
+        // Exactly half is the floor and is accepted.
         assert_eq!(
-            classify_rt_throttle(Some("0"), Some("1000000")),
+            classify_rt_throttle(Some("500000"), Some("1000000")),
             RtThrottle::Active {
-                runtime_us: 0,
+                runtime_us: 500_000,
                 period_us: 1_000_000
             }
         );
@@ -441,10 +482,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_background_core_without_pinned_readers_pins_any_allowed_core() {
+    fn test_resolve_background_core_without_pinned_readers_is_refused() {
+        // Readers on the main runtime (or unpinned) would follow main onto the
+        // background core, so the switch is refused instead.
+        let p = resolve_background_core(Some("0"), None, |_| true);
+        assert_eq!(p, BackgroundCorePlan::ReadersNotPinned);
+        assert!(p.is_refusal());
+        // Off stays off without pinned readers.
         assert_eq!(
-            resolve_background_core(Some("1"), None, |_| true),
-            BackgroundCorePlan::Pin(1)
+            resolve_background_core(None, None, |_| true),
+            BackgroundCorePlan::Off
         );
     }
 }

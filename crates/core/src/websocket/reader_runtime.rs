@@ -341,8 +341,13 @@ mod affinity {
         // RESET_ON_FORK: a thread this one spawns (a blocking-pool thread) starts
         // back on SCHED_OTHER instead of inheriting the real-time policy.
         let policy = libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK;
-        // SAFETY: `param` is a valid, initialised `sched_param`; pid 0 is this thread.
-        let rc = unsafe { libc::sched_setscheduler(0, policy, &param) }; // SAFETY: see above
+        // The raw syscall, not libc's `sched_setscheduler` wrapper: musl (the
+        // prod target) stubs that wrapper to return ENOSYS, because POSIX
+        // defines it per process while Linux applies it per thread. The
+        // kernel reads only `sched_priority`, the first field on both libcs.
+        // SAFETY: `param` is a valid, initialised `sched_param` that outlives the call; pid 0 is this thread.
+        let rc =
+            unsafe { libc::syscall(libc::SYS_sched_setscheduler, 0, policy, &raw const param) }; // SAFETY: see above
         if rc == 0 {
             Ok(())
         } else {
@@ -355,8 +360,10 @@ mod affinity {
     /// The calling thread's scheduling policy (`SCHED_OTHER` = 0,
     /// `SCHED_FIFO` = 1), or -1 when the kernel would not say.
     pub(super) fn current_thread_policy() -> i32 {
+        // The raw syscall, for the same reason as above (musl stubs the wrapper).
         // SAFETY: no pointer arguments; pid 0 is this thread.
-        unsafe { libc::sched_getscheduler(0) } // SAFETY: see above
+        let rc = unsafe { libc::syscall(libc::SYS_sched_getscheduler, 0) }; // SAFETY: see above
+        i32::try_from(rc).unwrap_or(-1)
     }
 
     fn empty_set() -> libc::cpu_set_t {

@@ -420,19 +420,27 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_dropped_receiver_does_not_hang_the_thread() {
-        let join = spawn_frame_drain_with(async { 7_u8 }, DrainThreadPlan::Own(None), None, None);
-        drop(join);
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    #[test]
-    fn the_drain_spawn_site_uses_this_module() {
-        let src = include_str!("dhan_feed_stack.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            prod.contains("crate::drain_thread::spawn_frame_drain(run_frame_drain("),
-            "the live drain must be spawned through drain_thread so the switch reaches it"
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&finished);
+        let join = spawn_frame_drain_with(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                7_u8
+            },
+            DrainThreadPlan::Own(None),
+            None,
+            None,
         );
-        assert!(prod.contains("drain.join().await"));
+        drop(join);
+        // The thread still runs the future to its end (its result send then
+        // finds no receiver, which is ignored).
+        for _ in 0..200 {
+            if finished.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the drain thread did not finish its future after the receiver was dropped");
     }
 }

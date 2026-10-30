@@ -92,7 +92,8 @@ pub fn report_hot_thread_placement() {
             failed_threads = rt_failed,
             os_errno = rt_errno,
             "socket reader threads run at NORMAL priority — the kernel refused real-time \
-             priority (EPERM = 1: the unit needs LimitRTPRIO or CAP_SYS_NICE)"
+             priority (os_errno 1 = EPERM: the unit needs LimitRTPRIO; 38 = ENOSYS: the kernel \
+             lacks the call)"
         );
     } else if let HotRtDecision::Apply { reader, drain } = decision {
         info!(
@@ -121,7 +122,8 @@ pub fn report_hot_thread_placement() {
             source = "background_core_refused",
             plan = ?plan,
             "background threads run UNPINNED — TICKVAULT_BACKGROUND_CORE named the readers' \
-             core, a core this process may not use, or is not a core id"
+             core, a core this process may not use, or is not a core id; or the readers are not \
+             pinned to a core of their own, so pinning would move them onto the background core"
         ),
         _ => {}
     }
