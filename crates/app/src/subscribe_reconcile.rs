@@ -106,8 +106,9 @@ pub const RECONCILE_ROUND_INTERVAL_SECS: u64 = 120;
 /// messages each way). A larger delta is taken over several rounds.
 pub const RECONCILE_MAX_PER_SOCKET_PER_ROUND: usize = 1_000;
 
-/// Most expected instruments held: 5 main-feed sockets × 5,000.
-pub const RECONCILE_MAX_EXPECTED: usize = 25_000;
+/// Most expected instruments held: the daily universe ceiling (5 main-feed
+/// sockets × 5,000), tied to it so a universe raise moves this too.
+pub const RECONCILE_MAX_EXPECTED: usize = tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE;
 
 /// Most sockets tracked (the 16-connection authorization, rounded up).
 pub const RECONCILE_MAX_SOCKETS: usize = 32;
