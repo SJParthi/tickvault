@@ -113,7 +113,10 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// `instrument_lifecycle` writer, and two assertion-free tests of it (the
 /// `ensure_*` / `append_*` reachability probes) went with it. Nothing was
 /// rewritten to reach it.
-const ASSERTION_FREE_BUDGET: usize = 146;
+/// 146 -> 145 on 2026-10-30: the order-path work gave `oms::engine`'s
+/// `test_order_latency_metric` a real check (the fixed placement buckets
+/// publish every recorded sample), so it left the count.
+const ASSERTION_FREE_BUDGET: usize = 145;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [

@@ -88,6 +88,18 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/core/tests/socket_read_in_memory_harness.rs",
         "ring_recv_cost_over_a_queued_backlog",
     ),
+    // Added 2026-10-30 with the order-path work (owner: every in-memory
+    // order-path step under 1 us at p99): a wall-clock harness that prints
+    // the per-call p50 / p99 / p99.9 / max of each step, with and without a
+    // JSON log subscriber. It gates nothing; the gates are the per-call p99
+    // gate inside `crates/app/benches/order_path.rs`, the Criterion budget
+    // `order_path` (bench-gate) and `dhat_order_path_recorder`. Run it with:
+    //
+    //   cargo test --profile bench -p tickvault-app --test order_path_p99_harness -- --ignored --nocapture --test-threads=1
+    (
+        "crates/app/tests/order_path_p99_harness.rs",
+        "order_path_per_call_latency_distribution",
+    ),
     // Added 2026-10-30 with plan item DT-S1: a wall-clock harness for the
     // hot-thread placement switches (consumer pick-up delay with a busy
     // neighbour on the hot core, three placements). It prints percentiles

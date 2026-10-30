@@ -119,6 +119,23 @@ feed_drain_depth         = 1500         # <1.5us per level — matches feed_drai
 candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
 tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass.
 
+# Order decision path in memory (2026-10-30, owner: every in-memory step under
+# 1 us, gated). crates/app/benches/order_path.rs, run with the production
+# Prometheus recorder installed. One key, substring-matches every
+# order_path/* id: OMS gates (transition, status parse, rate limiter,
+# OrderBudget, circuit breaker), correlation tracker (incl. the on-demand id
+# draw a day's 257th placement onward makes), risk engine (check, fill, mark,
+# unrealized, daily-loss), paper placement and order update. The two
+# `_with_info_log` ids run with a JSON INFO subscriber writing to a sink, so
+# the gate also covers the span formatting production pays; the PAPER TRADE
+# line itself is written by a helper thread after the order (owner
+# 2026-10-30). Medians measured 2026-10-30 on the x86 dev container:
+# 1-370 ns per step. bench-gate.sh reads the Criterion MEDIAN; the bench also
+# runs a per-call p99 gate (the house tail_gate) on the same key and exits 1
+# when any step's p99 is over it: paper placement p99 ~0.9 us, fill update
+# p99 ~0.4 us, every other step under 0.6 us. NOT measured on the prod host.
+order_path               = 1000         # <1us per step — matches order_path/*
+
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
@@ -166,3 +183,4 @@ feed_drain_depth200_packet          = 200  # 200 levels per packet
 backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)
 candles_consume_tick_hit            = 500  # 500 ticks per hit batch (candle_fold TICKS_PER_BATCH)
 tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
+order_path_risk_record_fill_held    = 2    # 2 fills per iter (add then reduce: net lots return each iter; avg price and realized P&L drift, bounded)

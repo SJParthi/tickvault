@@ -815,6 +815,7 @@ jobs:
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_main_feed_backup_dedup.rs
           crates/app/tests/dhat_mark_forward.rs
+          crates/app/tests/dhat_order_path_recorder.rs
           crates/app/tests/dhat_wal_ring_sink_accept.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/app/tests/dhat_ws_lag_recorder.rs
@@ -1049,7 +1050,7 @@ jobs:
             --test dhat_depth_drain --test dhat_idle_seed_step \
             --test dhat_live_ingest_seam \
             --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
-            --test dhat_wal_ring_sink_accept \
+            --test dhat_order_path_recorder --test dhat_wal_ring_sink_accept \
             --test dhat_ws_lag --test dhat_ws_lag_recorder \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
@@ -1080,10 +1081,11 @@ jobs:
           # with the top-volume sweep it gated (operator Quote 34).
           # 8 since 2026-10-28 (follow-up bundle): dhat_idle_seed_step gates the
           # idle seed step and the depth row pre-size.
+          # 9 since 2026-10-30 (order path under 1 us): dhat_order_path_recorder
+          # gates the order path with the production recorder installed.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 8 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step."
-            exit 1
+          if [ "$ran" -ne 9 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------
