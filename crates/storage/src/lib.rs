@@ -316,6 +316,8 @@ pub mod market_data_floor;
 // Moves the current tokio worker aside for one blocking step (sweep S1/S5).
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
+/// Our own ILP encoder and sender for the tick writer (plan ITEM DT).
+pub mod tick_ilp;
 pub mod tick_persistence;
 // Plan item M5 (2026-10-27, owner Quote 41): repeat quotes (no new trade) go
 // to `tick_quotes`, stamped at arrival; same tick writer and buffer.
