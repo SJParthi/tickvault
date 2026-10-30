@@ -697,7 +697,7 @@ fn test_regression_workflow_stop_guards_cover_the_capture_window() {
     // The deploy failure auto-stop skips the capture window before it stops.
     let deploy = read(".github/workflows/deploy-aws.yml");
     let check = deploy
-        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; then echo "::warning::Deploy failed inside"#)
+        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; }; then echo "::warning::Deploy failed inside"#)
         .expect("deploy-aws.yml auto-stop must skip 09:00-15:40 IST"); // APPROVED: test
     let stop = deploy
         .find("tickvault auto-stop on deploy failure")
@@ -709,7 +709,7 @@ fn test_regression_workflow_stop_guards_cover_the_capture_window() {
     // terraform-apply re-checks the band in the apply step itself.
     let tf = read(".github/workflows/terraform-apply.yml");
     let recheck = tf
-        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ] && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]"#)
+        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; }; } && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]"#)
         .expect("terraform-apply.yml must re-check IST at apply time"); // APPROVED: test
     let apply = tf
         .find("apply -auto-approve -no-color")
