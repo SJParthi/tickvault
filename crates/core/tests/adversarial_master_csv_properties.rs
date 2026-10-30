@@ -34,10 +34,10 @@
 //! contract (documented) and is not generated in the round trip. Each
 //! round-trip case pads to the 1,000-row floor with fixed filler rows, so a
 //! case is ~1,000 rows; case counts are set to keep the file fast in debug.
-//! `parse_lot_size` accepts a decimal spelling whose fraction is below
-//! `f64` resolution (`75.000000000000001` reads as 75); generated spellings
-//! stay within 6 fractional digits, and that edge is pinned by the ignored
-//! `bug_parse_lot_size_refuses_every_non_zero_fraction`.
+//! `parse_lot_size` once accepted a decimal spelling whose fraction is below
+//! `f64` resolution (`75.000000000000001` read as 75); fixed 2026-10-30 and
+//! pinned by `test_regression_parse_lot_size_refuses_every_non_zero_fraction`.
+//! Generated spellings stay within 6 fractional digits.
 
 use chrono::{Datelike, NaiveDate};
 use proptest::prelude::*;
@@ -810,28 +810,37 @@ fn test_scalar_parsers_hostile_table() {
     }
 }
 
-/// BUG (low; found 2026-10-30): `parse_lot_size` documents "Only a value
-/// whose fraction is exactly zero is a lot size" and "a fractional lot is
-/// refused rather than truncated", but it decides the fraction on the `f64`
-/// the text rounds to, so a fraction below `f64` resolution is truncated
-/// away and the lot is accepted.
-///
-/// Minimal input: `"75.000000000000001"` returns 75 (the nearest `f64` is
-/// exactly 75.0). Real vendor files carry `75.0`, so this is not reachable
-/// from today's master; it is a contract gap, not a live loss.
-///
-/// Proposed fix: before the `f64` path, when the trimmed text has a `.`,
-/// require every digit after it (up to an optional exponent) to be `0`, or
-/// parse the decimal exactly (integer part, fraction digits, exponent) the
-/// way `order_update::exact_decimal_i64` does.
+// Regression: 2026-10-30 — parse_lot_size truncated a fraction below f64 resolution.
+/// `parse_lot_size` documents "Only a value whose fraction is exactly zero is
+/// a lot size", but decided the fraction on the `f64` the text rounds to, so
+/// a fraction below `f64` resolution was truncated away: `"75.000000000000001"`
+/// returned 75 (its nearest `f64` is exactly 75.0). Fixed 2026-10-30 by
+/// reading the decimal text digit by digit (`decimal_text_is_whole`). Real
+/// vendor files carry `75.0`, so this was a contract gap, not a live loss.
+/// Whole values written with trailing zeros or an exponent stay accepted.
 #[test]
-#[ignore = "BUG: parse_lot_size truncates a fraction below f64 resolution (75.000000000000001 -> 75)"]
-fn bug_parse_lot_size_refuses_every_non_zero_fraction() {
+fn test_regression_parse_lot_size_refuses_every_non_zero_fraction() {
     for text in [
         "75.000000000000001",
         "1.0000000000000001",
         "250.00000000000001",
+        "7.50000000000000000001e1",
+        "-75.0",
     ] {
-        assert_eq!(parse_lot_size(text), 0, "{text:?} has a non-zero fraction");
+        assert_eq!(
+            parse_lot_size(text),
+            0,
+            "{text:?} is not a whole positive lot"
+        );
+    }
+    for (text, want) in [
+        ("75.000000000000000", 75),
+        ("7.5e1", 75),
+        ("750e-1", 75),
+        ("+75", 75),
+        (" 75.0 ", 75),
+        ("1.000e3", 1000),
+    ] {
+        assert_eq!(parse_lot_size(text), want, "{text:?}");
     }
 }
