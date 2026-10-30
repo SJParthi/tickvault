@@ -1,5 +1,6 @@
-//! Security trim 2026-07-04: router-level tests proving the 4 read-only
-//! `/api/debug/*` routes are gated behind the bearer-auth middleware.
+//! Security trim 2026-07-04: router-level tests proving the read-only
+//! `/api/debug/*` routes are gated behind the bearer-auth middleware (four
+//! routes then; `/api/debug/speed-health` joined them 2026-10-30).
 //!
 //! Contract (operator directive, Session A, 2026-07-04):
 //! - auth ENABLED + no `Authorization` header  → 401
@@ -20,11 +21,12 @@ use tickvault_api::middleware::ApiAuthConfig;
 use tickvault_api::state::{SharedAppState, SystemHealthStatus};
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
-const DEBUG_PATHS: [&str; 4] = [
+const DEBUG_PATHS: [&str; 5] = [
     "/api/debug/logs/summary",
     "/api/debug/logs/jsonl/latest",
     "/api/debug/spill/status",
     "/api/debug/cross-verify/latest",
+    "/api/debug/speed-health",
 ];
 
 const TEST_TOKEN: &str = "debug-gate-test-token";
