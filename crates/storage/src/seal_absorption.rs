@@ -615,7 +615,7 @@ impl SealAbsorptionPipeline {
     /// full buffer resident from boot (~35 MB at 200,000 × 176 B), which it
     /// becomes anyway once one capacity of seals has passed through it.
     pub fn prefault_ring(&mut self) -> usize {
-        if self.ring.len() != 0 {
+        if !self.ring.is_empty() {
             return 0;
         }
         let placeholder = BufferedSeal::new(
