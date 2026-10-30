@@ -199,6 +199,7 @@ fn socket_read_in_memory_cost_per_frame() {
         let started = Instant::now();
         floor.push(started.elapsed().as_nanos() as u64);
     }
+    assert_eq!(floor.len(), FRAMES, "one sample per frame");
     report("timer floor (empty region, spaced)", floor);
     for packets in [1_u32, 4, 64] {
         let frame = stacked_frame(packets);
