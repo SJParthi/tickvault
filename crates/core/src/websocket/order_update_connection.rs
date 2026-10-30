@@ -652,8 +652,6 @@ async fn order_update_post_close_sleep(
     }
 }
 
-/// Single connection lifecycle: connect → login → read loop.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal + 2026-07-06 stability flag
 /// Dials the order-update socket, giving up after `limit`.
 ///
 /// A timeout maps to `Connect`, so the caller treats it like any refused dial.
@@ -684,6 +682,8 @@ async fn connect_order_update_socket(
     Ok(ws_stream)
 }
 
+/// Single connection lifecycle: connect → login → read loop.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal + 2026-07-06 stability flag
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
