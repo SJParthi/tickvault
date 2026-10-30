@@ -221,10 +221,10 @@ jobs:
         # stale. Measured before arming: `cargo clippy --workspace --no-deps
         # -- -D warnings` exits 0 on this tree.
         #
-        # `--all-targets` is STILL deliberately omitted, and that is a real
-        # remaining gap, not an oversight: test code legitimately uses
-        # `eprintln!` (calibration output) and the workspace does not
-        # currently build clean in that mode.
+        # `--all-targets` is NOT on this workspace step. Since 2026-10-30 it is
+        # on the NEXT step for the crates that measure clean (plan item 12b);
+        # see that step for the measurement and what is still open. The
+        # history below is kept as written.
         #
         # MEASURED 2026-08-26 (this comment said "its true warning count is
         # UNMEASURED" until now, and an unmeasured gap is indistinguishable
@@ -253,6 +253,20 @@ jobs:
         # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
         # dropped again.
         run: cargo clippy --workspace --no-deps -- -D warnings
+
+      - name: cargo clippy (test targets, crates that measure clean)
+        # ARMED 2026-10-30 (plan item 12b). Lints tests, benches and examples
+        # as well as libs and bins, warnings fatal, for the five crates whose
+        # every target measured clean:
+        #   `cargo clippy --workspace --all-targets --no-deps --keep-going`
+        #   on origin/main (c309f59): 276 findings (250 warnings + 26 errors),
+        #   all in test code. 234 were fixed; the 42 left are all in files
+        #   other sessions were editing at the time, in app (9), core (17) and
+        #   trading (16), so those three crates are NOT on this line yet.
+        # Adding app, core and trading here, once their count is zero, closes
+        # the gap. Removing a crate from this line, or dropping `--all-targets`
+        # or `-D warnings`, fails `rust_only_guard.rs::ci_clippy_gate_stays_armed`.
+        run: cargo clippy -p tickvault-common -p tickvault-storage -p tickvault-api -p tickvault-aws-lambdas -p tickvault-logs-mcp --all-targets --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a

@@ -2270,9 +2270,7 @@ fn is_emitted_as(first_arg_matches: &dyn Fn(&str) -> bool, sources: &[(PathBuf, 
             for (at, _) in compact.match_indices(macro_name) {
                 let rest = &compact[at + macro_name.len()..];
                 // The first argument ends at the first `,` or the closing `)`.
-                let stop = rest
-                    .find(|c| c == ',' || c == ')')
-                    .unwrap_or(rest.len().min(120));
+                let stop = rest.find([',', ')']).unwrap_or(rest.len().min(120));
                 if first_arg_matches(&rest[..stop]) {
                     return true;
                 }
@@ -2565,10 +2563,11 @@ fn lambdas_with_errors_alarm(bodies: &[(String, String)]) -> Vec<String> {
                         let t = l.trim();
                         t.starts_with("alarm_actions") && !t.contains("= []") && !t.ends_with('[')
                     });
-                    if is_lambda_errors && has_route {
-                        if let Some(name) = function_name_ref(&block) {
-                            out.push(name);
-                        }
+                    if is_lambda_errors
+                        && has_route
+                        && let Some(name) = function_name_ref(&block)
+                    {
+                        out.push(name);
                     }
                 }
             }
@@ -2709,10 +2708,12 @@ fn lambdas_with_invocations_alarm(bodies: &[(String, String)]) -> Vec<String> {
                     // it as coverage is the false-OK this file polices
                     // everywhere else.
                     let breaches_on_missing = block.contains("\"breaching\"");
-                    if is_lambda_invocations && has_route && breaches_on_missing {
-                        if let Some(name) = function_name_ref(&block) {
-                            out.push(name);
-                        }
+                    if is_lambda_invocations
+                        && has_route
+                        && breaches_on_missing
+                        && let Some(name) = function_name_ref(&block)
+                    {
+                        out.push(name);
                     }
                 }
             }
@@ -3218,7 +3219,7 @@ fn alarm_eval_windows(bodies: &[(String, String)]) -> Vec<(String, u64, u64, boo
                     let Some(rest) = rest.trim_start().strip_prefix('=') else {
                         continue;
                     };
-                    match rest.trim().split_whitespace().next().map(str::parse::<u64>) {
+                    match rest.split_whitespace().next().map(str::parse::<u64>) {
                         Some(Ok(v)) => best = Some(best.map_or(v, |b: u64| b.max(v))),
                         // A `period = local.six_hours` or `= var.x` parsed to
                         // None and then `unwrap_or(0)` reported a ZERO-second

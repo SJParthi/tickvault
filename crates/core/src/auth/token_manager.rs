@@ -2259,7 +2259,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let offloaded = runtime.block_on(async move {
             offload_blocking(move || {
-                drop(tx.send(std::thread::current().id()));
+                let _ = tx.send(std::thread::current().id());
             })
         });
         assert!(offloaded, "inside a runtime the write is handed off");

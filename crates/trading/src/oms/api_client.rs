@@ -5457,10 +5457,7 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 // Read until the head AND the Content-Length body arrived —
                 // reqwest may split head/body across writes.
-                loop {
-                    let Ok(read_len) = stream.read(&mut buf).await else {
-                        break;
-                    };
+                while let Ok(read_len) = stream.read(&mut buf).await {
                     if read_len == 0 {
                         break;
                     }

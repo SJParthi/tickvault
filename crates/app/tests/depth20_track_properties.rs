@@ -38,7 +38,7 @@ fn key_of(i: SubscribeInstrument) -> Key {
 /// a tracker that keyed on the id alone would collapse two real instruments
 /// into one and unsubscribe a contract it still holds.
 fn segment(n: u8) -> ExchangeSegment {
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         ExchangeSegment::NseFno
     } else {
         ExchangeSegment::BseFno

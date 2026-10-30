@@ -99,10 +99,9 @@ fn strip_hcl_comments(src: &str) -> String {
                 escaped = true;
             } else if c == b'"' {
                 in_str = !in_str;
-            } else if !in_str && c == b'#' {
-                cut = i;
-                break;
-            } else if !in_str && c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            } else if !in_str
+                && (c == b'#' || (c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/'))
+            {
                 cut = i;
                 break;
             }

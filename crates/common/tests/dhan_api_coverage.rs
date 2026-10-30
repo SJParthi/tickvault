@@ -1168,7 +1168,7 @@ fn production_region(source: &str) -> &str {
 
 /// Pins the ORPHAN status of the two depth WebSocket URL constants
 /// (round-8 ledger truth-sync, 2026-07-15): `DHAN_TWENTY_DEPTH_WS_BASE_URL`
-/// + `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` are RETAINED pub consts
+/// and `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` are RETAINED pub consts
 /// (constants.rs) whose consumers were deleted by AWS-lifecycle PR #4
 /// (2026-05-19, the depth-20/200 infrastructure removal). The prior ledger
 /// narrated the CONSTANTS THEMSELVES deleted — the mirror image of the

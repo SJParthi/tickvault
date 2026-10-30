@@ -669,6 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn logs_summary_returns_404_when_file_missing() {
         let _env = env_guard();
         unsafe {
@@ -682,6 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn logs_jsonl_latest_returns_404_when_dir_empty() {
         let _env = env_guard();
         let tmp = mktemp("test");
@@ -742,6 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn logs_jsonl_latest_answers_404_when_the_newest_entry_cannot_be_read() {
         // A directory carrying the file prefix is found by `newest_jsonl` but
         // fails to read; the handler answers 404 naming the path, never 500.
@@ -771,6 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn logs_jsonl_latest_serves_a_small_file_untruncated() {
         let _env = env_guard();
         let tmp = mktemp("jsonl-small");
@@ -795,6 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn logs_jsonl_latest_marks_a_file_over_the_cap_as_truncated() {
         let _env = env_guard();
         let tmp = mktemp("jsonl-big");
@@ -879,6 +884,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn spill_status_returns_200_with_categories_even_when_dir_missing() {
         let _env = env_guard();
         unsafe {
@@ -931,6 +937,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn cross_verify_latest_returns_404_when_missing() {
         let _env = env_guard();
         unsafe {
@@ -952,6 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn cross_verify_latest_returns_200_with_content() {
         let _env = env_guard();
         let tmp = mktemp("cv_latest");
@@ -977,6 +985,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn cross_verify_latest_merges_summary_json() {
         let _env = env_guard();
         let tmp = mktemp("cv_summary");
@@ -1027,6 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // APPROVED: ENV_LOCK must cover the await that reads the env var; each tokio::test is its own current-thread runtime, so no other task on this runtime can wait on it.
     async fn spill_status_reports_real_counts_when_dir_populated() {
         let _env = env_guard();
         let tmp = mktemp("spill_status");

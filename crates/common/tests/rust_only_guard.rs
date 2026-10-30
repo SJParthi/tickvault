@@ -657,6 +657,7 @@ fn banned_token() -> String {
 ///     than a silent guard edit. Note `node` is additionally ambiguous: AWS's
 ///     own "SSM managed node" wording appears in `scripts/aws-autopilot.sh`,
 ///     so a bare `node` token would false-positive on prose about AWS.
+///
 /// Both are recorded in `rust-only-forever-lock-2026-07-19.md`.
 fn banned_tokens() -> Vec<String> {
     let mut tokens = vec![banned_token()];
@@ -1336,13 +1337,24 @@ fn is_command_position(line: &str, at: usize) -> bool {
     // earlier in the line is what keeps the false-positive rate at zero,
     // and this guard survives only while its first act is never a false
     // positive.
-    if before.contains('[') {
-        if let Some(i) = before.rfind(',') {
-            sep_end = sep_end.max(i + 1);
-        }
+    if before.contains('[')
+        && let Some(i) = before.rfind(',')
+    {
+        sep_end = sep_end.max(i + 1);
     }
 
     let mut seg = before[sep_end..].trim();
+
+    // True when the first word of `seg` is a duration (`30`, `5m`): the
+    // numeric-argument arm below.
+    fn starts_with_duration(seg: &str) -> bool {
+        let head = seg.split_once(' ').map_or(seg, |(h, _)| h);
+        !head.is_empty()
+            && head.starts_with(|c: char| c.is_ascii_digit())
+            && head
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h'))
+    }
 
     // Bounded: every arm strictly shortens `seg`, and the loop returns the
     // moment it cannot.
@@ -1373,9 +1385,7 @@ fn is_command_position(line: &str, at: usize) -> bool {
             &seg[..seg.len() - 1]
         } else if let Some(rest) = seg.strip_prefix(['"', '\'']) {
             rest
-        } else if seg.ends_with(':') && !seg.contains("//") {
-            ""
-        } else if seg.ends_with('=') {
+        } else if (seg.ends_with(':') && !seg.contains("//")) || seg.ends_with('=') {
             ""
         } else if seg.ends_with('/')
             && seg
@@ -1426,16 +1436,8 @@ fn is_command_position(line: &str, at: usize) -> bool {
             // Safe for the same reason every other arm is: consuming a flag
             // only helps when the REST of the prefix is also consumable, so
             // `echo --version node` still returns false.
-            let rest = seg.split_once(' ').map_or("", |(_, t)| t);
-            rest
-        } else if {
-            let head = seg.split_once(' ').map_or(seg, |(h, _)| h);
-            !head.is_empty()
-                && head.starts_with(|c: char| c.is_ascii_digit())
-                && head
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h'))
-        } {
+            seg.split_once(' ').map_or("", |(_, t)| t)
+        } else if starts_with_duration(seg) {
             // A NUMERIC argument: `timeout 30 node app.js`, `timeout 5m node`.
             //
             // Deliberately numeric-only. Accepting an arbitrary bare word here
@@ -2426,8 +2428,14 @@ fn node_family_invocations_only_shrink() {
 /// --no-deps -- -D warnings` exits 0.
 ///
 /// HONEST SCOPE: this pins the FLAG, not the lint result — CI itself is what
-/// actually runs clippy. It also does NOT require `--all-targets`, which is
-/// deliberately still absent (test-target warnings are unmeasured).
+/// actually runs clippy.
+///
+/// 2026-10-30 (plan item 12b): a second clippy step lints EVERY target
+/// (`--all-targets`: tests, benches, examples) of the crates in
+/// [`CLIPPY_ALL_TARGETS_CRATES`]. This test now also fails if that step loses
+/// `--all-targets` or `-D warnings`, or stops naming one of those crates. The
+/// list may only grow: app, core and trading join once their test code
+/// measures clean.
 #[test]
 fn ci_clippy_gate_stays_armed() {
     let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -2453,7 +2461,47 @@ fn ci_clippy_gate_stays_armed() {
             step.trim()
         );
     }
+
+    let all_targets = ci
+        .lines()
+        .filter(|l| !is_comment_line(l))
+        .filter(|l| l.contains("cargo clippy") && l.contains("--all-targets"))
+        .collect::<Vec<_>>();
+    assert!(
+        !all_targets.is_empty(),
+        "CI TEST-TARGET LINT GATE REMOVED: ci.yml has no `cargo clippy ... \
+         --all-targets` step, so clippy findings in tests and benches can no \
+         longer fail Build & Verify. It was armed on 2026-10-30 (plan item 12b) \
+         after the clean crates measured zero findings. Restore it."
+    );
+    for step in &all_targets {
+        assert!(
+            step.contains("-D warnings"),
+            "CI TEST-TARGET LINT GATE DISARMED: `{}` dropped `-D warnings`.",
+            step.trim()
+        );
+    }
+    for krate in CLIPPY_ALL_TARGETS_CRATES {
+        let flag = format!("-p {krate} ");
+        assert!(
+            all_targets.iter().any(|s| s.contains(&flag)),
+            "CI TEST-TARGET LINT GATE NARROWED: `{krate}` is no longer linted with \
+             `--all-targets` in ci.yml. The crate list may only grow."
+        );
+    }
 }
+
+/// Crates whose every target (tests and benches included) measured clippy-clean
+/// on 2026-10-30 and is linted with `--all-targets -D warnings` in CI. May only
+/// grow; `tickvault-app`, `tickvault-core` and `tickvault-trading` join once
+/// their remaining test-code findings are fixed.
+const CLIPPY_ALL_TARGETS_CRATES: &[&str] = &[
+    "tickvault-common",
+    "tickvault-storage",
+    "tickvault-api",
+    "tickvault-aws-lambdas",
+    "tickvault-logs-mcp",
+];
 
 /// 2026-08-10. The rust-only lock claims a "HARD ZERO floor" for both allowlists.
 /// Until this test, that floor was enforced by REVIEWER DISCIPLINE ONLY: a PR could
@@ -4139,11 +4187,11 @@ fn every_lambda_declares_the_rust_runtime() {
                 if probe.contains("resource \"") {
                     break;
                 }
-                if let Some(rest) = probe.split_once("runtime") {
-                    if rest.1.trim_start().starts_with('=') {
-                        runtime = Some(probe.trim());
-                        break;
-                    }
+                if let Some(rest) = probe.split_once("runtime")
+                    && rest.1.trim_start().starts_with('=')
+                {
+                    runtime = Some(probe.trim());
+                    break;
                 }
             }
             match runtime {

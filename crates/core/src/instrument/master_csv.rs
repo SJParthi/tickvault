@@ -1177,7 +1177,7 @@ mod tests {
         );
         let r = rows_by_id(&body, 44311);
         assert_eq!(r.class, InstrumentClass::IndexOption);
-        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.expiry_ymd, 20260828);
         assert_eq!(r.strike_paise, 2_450_000, "24500 rupees is 2,450,000 paise");
         assert_eq!(r.option_leg, OptionLeg::Call);
         assert_eq!(r.underlying_symbol, "NIFTY");
@@ -1332,10 +1332,10 @@ mod tests {
 
     #[test]
     fn test_parse_expiry_ymd_accepts_both_vendor_forms_and_refuses_the_rest() {
-        assert_eq!(parse_expiry_ymd("2026-08-28"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 2026_08_28);
+        assert_eq!(parse_expiry_ymd("2026-08-28"), 20260828);
+        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 20260828);
+        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 20260828);
+        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 20260828);
         // Refusals — every one of these must read as "no expiry", never as a
         // date that could win the nearest-expiry slot.
         assert_eq!(parse_expiry_ymd(""), 0);
@@ -1358,12 +1358,12 @@ mod tests {
         assert_eq!(parse_expiry_ymd("2026-09-31"), 0);
         assert_eq!(parse_expiry_ymd("2026-11-31"), 0);
         // Real dates still pass, leap years included.
-        assert_eq!(parse_expiry_ymd("2026-02-28"), 2026_02_28);
-        assert_eq!(parse_expiry_ymd("2028-02-29"), 2028_02_29, "leap year");
+        assert_eq!(parse_expiry_ymd("2026-02-28"), 20260228);
+        assert_eq!(parse_expiry_ymd("2028-02-29"), 20280229, "leap year");
         assert_eq!(parse_expiry_ymd("2026-02-29"), 0, "not a leap year");
-        assert_eq!(parse_expiry_ymd("2000-02-29"), 2000_02_29, "400-year rule");
+        assert_eq!(parse_expiry_ymd("2000-02-29"), 20000229, "400-year rule");
         assert_eq!(parse_expiry_ymd("1900-02-29"), 0, "100-year rule");
-        assert_eq!(parse_expiry_ymd("2026-12-31"), 2026_12_31);
+        assert_eq!(parse_expiry_ymd("2026-12-31"), 20261231);
     }
 
     #[test]
@@ -1381,7 +1381,7 @@ mod tests {
         );
         let r = rows_by_id(&body, 44311);
         assert_eq!(r.class, InstrumentClass::IndexOption);
-        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.expiry_ymd, 20260828);
         assert_eq!(r.strike_paise, 2_450_000);
         assert_eq!(r.option_leg, OptionLeg::Call);
     }
@@ -1398,7 +1398,7 @@ mod tests {
             parse_expiry_ymd("2026-12-31"),
         ];
         days.sort_unstable();
-        assert_eq!(days, [2026_08_28, 2026_09_01, 2026_12_31, 2027_01_01]);
+        assert_eq!(days, [20260828, 20260901, 20261231, 20270101]);
     }
 
     #[test]

@@ -287,7 +287,8 @@ fn the_emf_declaration_still_folds_labels_to_host() {
     // file into place after the Step 5 clone, so this IS the config the box
     // loads. That the copy still happens is pinned by
     // `cw_agent_selector_lockstep_guard.rs`.
-    for rel in ["deploy/aws/cloudwatch-agent.json"] {
+    {
+        let rel = "deploy/aws/cloudwatch-agent.json";
         let text = fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
         let declarations = text.matches("\"dimensions\":").count();
         assert_eq!(
