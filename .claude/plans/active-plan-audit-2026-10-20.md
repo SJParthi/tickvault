@@ -1208,7 +1208,7 @@ Requested: owner, 2026-10-30, relayed by the coordinator session ("O(1) at p99 e
 
 - [x] O1S1. Seal escalation fault path: constant record length for the floor, per-episode spill/DLQ failure lines (`FailureEpisode`), literal blind-probe label; seal writer keeps its rescue buffer across cycles (`drain_once_into`)
   - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
-  - Tests: test_failure_episode_opens_once_and_closes_with_its_count, test_repeated_spill_failures_keep_every_outcome_and_latch_one_episode, test_floor_payload_constant_equals_the_serialised_record_length, test_blind_probe_tier_label_literal_matches_the_const, test_drain_once_into_matches_drain_once_and_reuses_its_buffer
+  - Tests: test_failure_episode_opens_once_and_closes_with_its_count, test_repeated_spill_failures_keep_every_outcome_and_latch_one_episode, test_floor_payload_constant_equals_the_serialised_record_length, test_blind_probe_tier_label_literal_matches_the_const, test_drain_once_into_matches_drain_once_and_reuses_its_buffer, test_clean_flush_ends_an_episode_so_the_next_failure_logs_again, test_spill_recovery_ends_the_dlq_episode_so_a_later_double_failure_logs
 - [x] O1S2. Telegram coalescer renders a body only when the bucket keeps it, one entry match instead of clone-per-fold (crates/core)
   - Files: crates/core/src/notification/coalescer.rs
   - Tests: test_payload_rendered_only_while_the_bucket_keeps_samples, test_sample_cap_at_10

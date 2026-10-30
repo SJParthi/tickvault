@@ -194,7 +194,10 @@ pub fn drain_once_into(
     // seals. `ring_len` is the real bound on how many `pop_oldest` can yield
     // this cycle, and the `.min` keeps the reservation exact in both
     // directions — no over-reserve when idle, no re-alloc when saturated.
-    popped.reserve(max_drain.min(pipeline.ring_len()));
+    // `reserve_exact` on the kept buffer (2026-10-30): plain `reserve` may
+    // double, which would let the runner keep up to twice `max_drain` seals
+    // for the process lifetime; exact growth keeps it at most `max_drain`.
+    popped.reserve_exact(max_drain.min(pipeline.ring_len()));
     while popped.len() < max_drain {
         match pipeline.pop_oldest() {
             Some(seal) => {
@@ -255,6 +258,9 @@ pub fn drain_once_into(
     match writer.flush() {
         Ok(()) => {
             outcome.flushed_ok = true;
+            // A committed flush ends any open spill/DLQ failure episode, so the
+            // next unrelated failure logs its cause (2026-10-30 review).
+            pipeline.note_clean_flush();
             // Audit PR41a: an amended bar committed live while its original
             // waits in the spill. Append the fuller copy behind it, so no
             // replay ends on the original.
