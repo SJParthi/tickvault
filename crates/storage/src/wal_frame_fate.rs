@@ -58,6 +58,11 @@
 //!   every shed above the writer's last flushed sequence as lost. A record
 //!   minted below that sequence but appended after it (two sockets racing for
 //!   a few microseconds) is not counted.
+//! - A ring shed that finds its slot held by a newer frame cannot be recorded.
+//!   If its record was already lost (lost, slot reused, then shed) the slot no
+//!   longer says so, so the shed is counted as fate unknown whenever any loss
+//!   at or above the frame has been reported; that can count one frame too
+//!   many, never one too few (2026-10-30).
 //! - Space: the table is `N × 8` bytes = 32 MiB of address space in `.bss`.
 //!   Only the pages a shed or a loss touches become resident.
 
@@ -360,6 +365,9 @@ impl<const N: usize> FrameFate<N> {
                 // An older frame (or nothing) holds the slot: claim it.
                 (base << FLAG_BITS) | kind.bit()
             } else {
+                if kind == ShedKind::Ring {
+                    note_unrecordable_ring_shed(base);
+                }
                 return ShedMark::Unrecordable;
             };
             match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
@@ -488,6 +496,28 @@ impl<const N: usize> FrameFate<N> {
 impl<const N: usize> Default for FrameFate<N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A ring shed of the frame at `base` that found its slot held by a newer
+/// frame. The slot no longer says whether this frame's WAL record was lost,
+/// and the ring shed dropped the frame's only in-memory copy. When the writer
+/// has lost any record at or above this frame (`lost_high_seq`), this frame
+/// may be one of them (lost, then its slot reused, then shed: the loss saw no
+/// shed and counted nothing), so the shed is counted on
+/// [`FATE_UNKNOWN_COUNTER`] (chaos test
+/// `s6f_lost_then_slot_reused_then_ring_shed_is_counted_as_unknown`,
+/// 2026-10-30). A later loss of this frame finds the newer tag and counts
+/// unknown again, so when the high mark came from another frame the count
+/// can run one high; it errs toward counting, never toward silence. With no
+/// loss at or above the frame (the usual case) nothing is counted: a later
+/// loss of it is counted unknown by [`FrameFate::note_lost`]. O(1): one
+/// relaxed load, at most one counter increment, no allocation. Cold.
+#[cold]
+fn note_unrecordable_ring_shed(base: u64) {
+    let lost_high = lost_high_seq();
+    if lost_high != 0 && (lost_high >> PACKET_INDEX_BITS) >= base {
+        counters().unknown.increment(1);
     }
 }
 

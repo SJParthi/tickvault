@@ -34,9 +34,10 @@
 //! - **S6e a WAL loss blocks the rescue deferral.** After the writer loses a
 //!   record, `rescue_may_defer_to_wal` refuses any batch at or below it, even
 //!   when the flushed mark is past the batch.
-//! - **S6f (ignored, DEFECT) lost, slot reused, then ring shed.** The one
-//!   ordering in which a frame shed by the ring after its WAL loss is counted
-//!   nowhere (neither as lost nor as fate unknown). Unreachable at the
+//! - **S6f lost, slot reused, then ring shed.** The one ordering in which a
+//!   frame shed by the ring after its WAL loss was counted nowhere (found by
+//!   this file, fixed 2026-10-30 in `FrameFate::note_shed`): the shed now
+//!   counts it on `tv_wal_lost_fate_unknown_total`. Unreachable at the
 //!   production table size; see the test.
 //! - **S1 reconnect storm.** 16 producer threads append to one `WsFrameSpill`,
 //!   each dropping and re-taking its handle every 250 frames (a socket
@@ -467,6 +468,8 @@ fn s6c_colliding_slots_never_double_count_and_unknown_fates_are_counted() {
 
         let mut counted = 0u64;
         let mut unknown = 0u64;
+        let mut unrecordable = 0u64;
+        let mut asymmetric = 0u64;
         for f in 0..FRAMES {
             let shed = sheds[f].lock().unwrap().expect("shed ran");
             let lost = losses[f].lock().unwrap().expect("loss ran");
@@ -486,9 +489,12 @@ fn s6c_colliding_slots_never_double_count_and_unknown_fates_are_counted() {
             if lost == LostFate::Unknown {
                 unknown += 1;
             }
-            if shed == ShedMark::Unrecordable && lost == LostFate::NotShed {
-                // Counted nowhere: see s6f (the ignored DEFECT test).
-                asymmetric_total += 1;
+            if shed == ShedMark::Unrecordable {
+                unrecordable += 1;
+                if lost == LostFate::NotShed {
+                    // Lost, slot reused, then shed (s6f): the shed must count it.
+                    asymmetric += 1;
+                }
             }
         }
         let d = delta(fate_counters(), before);
@@ -497,10 +503,22 @@ fn s6c_colliding_slots_never_double_count_and_unknown_fates_are_counted() {
             "round {round}: ring counter equals outcomes"
         );
         assert_eq!(d.ticks_lost, counted, "round {round}");
-        assert_eq!(
-            d.unknown, unknown,
-            "round {round}: every Unknown moved the counter"
+        // Every Unknown loss moved the counter, and every lost-then-reused-
+        // then-shed frame was counted by its shed (the s6f fix); an
+        // unrecordable shed counts at most once more (it may also be counted
+        // when some loss at or above it has been reported: errs high).
+        assert!(
+            d.unknown >= unknown + asymmetric,
+            "round {round}: unknown counter {} below {unknown} unknown losses + {asymmetric} \
+             lost-then-shed frames",
+            d.unknown
         );
+        assert!(
+            d.unknown <= unknown + unrecordable,
+            "round {round}: unknown counter {} above {unknown} + {unrecordable} unrecordable sheds",
+            d.unknown
+        );
+        asymmetric_total += asymmetric;
         unknown_total += unknown;
     }
     // Non-vacuous: collisions really happened.
@@ -510,7 +528,7 @@ fn s6c_colliding_slots_never_double_count_and_unknown_fates_are_counted() {
     );
     eprintln!(
         "s6c: {unknown_total} unknown fates counted; {asymmetric_total} lost-then-reused-then-shed \
-         frames counted nowhere (s6f)"
+         frames counted by their shed (s6f)"
     );
 }
 
@@ -615,16 +633,17 @@ fn s6e_wal_loss_after_ring_shed_blocks_rescue_deferral_to_the_wal() {
 }
 
 // ---------------------------------------------------------------------------
-// S6f — DEFECT: lost, slot reused, then shed = counted nowhere
+// S6f — lost, slot reused, then shed (was counted nowhere; fixed 2026-10-30)
 // ---------------------------------------------------------------------------
 
 /// The module contract: a frame whose shed state cannot be known because the
 /// slot moved on is counted on `tv_wal_lost_fate_unknown_total`, never as
-/// "not shed". In this one ordering it is counted nowhere: the writer loses
-/// frame A first (`NotShed`, slot = A|LOST), a newer frame claims the slot,
-/// then the ring sheds A, which reads `Unrecordable` and returns without a
-/// counter. The ring shed caller (`WalRingSink::note_ring_shed`) discards the
-/// mark. A was shed AND lost, so it is a real, uncounted loss.
+/// "not shed". In this one ordering it was counted nowhere until 2026-10-30:
+/// the writer loses frame A first (`NotShed`, slot = A|LOST), a newer frame
+/// claims the slot, then the ring sheds A, which reads `Unrecordable`; the
+/// ring shed caller (`WalRingSink::note_ring_shed`) discards the mark. A was
+/// shed AND lost. `note_shed` now counts such a shed as fate unknown whenever
+/// a loss at or above A has been reported (`lost_high_seq`).
 ///
 /// Reachability: at the production size (2^22 slots, at least ~5.5 minutes of
 /// sequences) this needs the reader to stall that long between queueing A for
@@ -632,7 +651,6 @@ fn s6e_wal_loss_after_ring_shed_blocks_rescue_deferral_to_the_wal() {
 /// with a small table it is reached deterministically below (s6c counts any
 /// it meets in its random races; in measured runs it met none).
 #[test]
-#[ignore = "DEFECT: a ring shed that finds its slot taken by a newer frame (Unrecordable) after the WAL lost it is counted nowhere"]
 fn s6f_lost_then_slot_reused_then_ring_shed_is_counted_as_unknown() {
     recorder();
     let _g = fate_lock();
