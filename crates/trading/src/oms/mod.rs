@@ -41,6 +41,7 @@ pub mod exit_rules;
 pub mod idempotency;
 pub mod margin_gate;
 pub mod order_readiness;
+pub mod placement_telemetry;
 pub mod rate_limiter;
 pub mod reconciliation;
 pub mod state_machine;
