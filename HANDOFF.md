@@ -132,7 +132,7 @@ Notes: commit with `git commit -F <file>` (double-quoted `-m` mangles `§` citat
 
 ## 10. Session checkpoint replies
 
-Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: plan leftovers (asked to push to `handoff/plan-leftovers`; that branch did not exist on origin at 06:41 UTC).
+Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). All sessions have now replied; the last (plan leftovers) pushed `handoff/plan-leftovers` at 07:33 UTC. Every worker session is stopped and will not push again.
 
 ### #2149 depth row path — branch `perf/sub-us-depth`, head `0e1f0f60f` (draft)
 - **CI**: All Green on `0e1f0f6`, every job green; Enable Auto-Merge skipped only because the PR is a draft.
@@ -341,6 +341,17 @@ Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by
   - Real bug: an order-update `Quantity` of `100.00000000000001` decodes as `Ok(100)` (serde_json without `float_roundtrip`). Pinned by `test_known_limit_fractional_json_number_on_int_field_reads_as_integer` (asserts today's behaviour; fails once fixed). Fix needs either an edit to `crates/core/src/parser/order_update.rs` (refuse an integer field whose raw text has a non-zero fraction digit) or enabling serde_json `float_roundtrip` (a dependency feature change).
   - Optional: `parse_strike_paise` rounds sub-paisa text (`"0.005"` becomes 1 paisa); refuse or round?
 - **Notes**: the container disk fills fast (`cargo clean` freed 22 GB; builds used `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`). Running targets needs cargo-fuzz and `nightly-2026-03-15`. The ignored-test guard forbids new `#[ignore]`; the assertion-free ratchet forbids tests with no assertion.
+- **CI update (07:27 UTC, head `fd6ff357f`, CI complete)**: three checks red, two causes, both in this PR. (1) Test (common) and Coverage & Perf: the only failing target is `-p tickvault-common --test assertion_free_test_ratchet`, which flags `prop_recipe_with_one_byte_removed`; adding an assertion clears both. Every other suite passed. (2) Commit Lint: the handoff commit's type `wip` is not allowed; reword it, or merge with a proper squash title. All Green is red only because of these.
+
+### Plan leftovers W4/M6/EX1/S1/DT-small (no PR) — branch `handoff/plan-leftovers`, head `3e7c98e6b` (Verified on origin, 07:33 UTC)
+- **Commits**: `cedab1a3c` W4 test fixes (also on `claude/audit-five-items`; its type `wip` would fail Commit Lint in a PR), `3a5938254` W4 review fix, `3e7c98e6b` test pinning `take_forgot_untrusted`.
+- **Done**:
+  - W4 is built, with its review fixes. The HIGH finding is fixed: a table the lag tracker forgets while untrusted is no longer read as a clean probe.
+  - Storage lib: 2,260 passed / 0 failed before the last commit; after it only the new test was re-run (1 passed). The 6 related storage integration tests pass; clippy is clean on the storage lib.
+  - EX1, S1 and DT-small were already on main (#2134, #2135) and are ticked in the plan. S1's 2 core tests pass.
+- **Partial**: the app-crate tests for EX1, S1 and DT-small were not re-run locally (disk full), so CI must run them. W4's second review round never ran. The live measurement W4 asks for was not done (no AWS access).
+- **Pending**: M6 is not built (`ws_frame_spill.rs` belonged to another session). The proposal, from the session's scratchpad only (not in git): a settable frame cap in `ws_frame_spill.rs`, `evening_drain::frame_cap_for` / `peek_frame_cap`, and a `main.rs` call before STAGE-C.
+- **Known**: no failing test reported. `clippy --all-targets` fails only in older untouched test files (`partition_archive`, `seal_dlq`, `seal_writer_task`, `spill_ceiling_is_free_space_based_guard`).
 
 ### #2158 test-target clippy (12b) — branch `claude/clippy-all-targets`, head `2b6279bac` (draft)
 - **CI**: All Green passed on `2b6279bac`, but the branch is now behind main.
