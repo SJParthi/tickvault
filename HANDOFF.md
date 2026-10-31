@@ -132,4 +132,153 @@ Notes: commit with `git commit -F <file>` (double-quoted `-m` mangles `§` citat
 
 ## 10. Session checkpoint replies
 
-(Appended as replies arrive.)
+Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2144 (feed hardening 2/3b), #2158 (12b), #2159 (fuzz), lambdas/logs-mcp coverage, audit triage part 2, plan leftovers.
+
+### #2149 depth row path — branch `perf/sub-us-depth`, head `0e1f0f60f` (draft)
+- **CI**: All Green on `0e1f0f6`, every job green; Enable Auto-Merge skipped only because the PR is a draft.
+- **Done**:
+  - Depth ILP names are pre-checked (`ColumnName`/`TableName::new_unchecked`, with a `debug_assert` on QuestDB's own check). Bytes are unchanged, proven by a proptest and an edge test.
+  - `feed_drain` per level: depth20 531 → 366 nanoseconds, depth200 638 → 437 nanoseconds.
+  - New bench `crates/storage/benches/depth_row_append.rs` with a p99 gate: median about 390 nanoseconds, p99 671–866 nanoseconds.
+  - Budgets: `feed_drain_depth` 1500 → 1000, new `depth_row_append` = 1000. CLAUDE.md key count 30 → 32.
+  - Plan line DT-DEPTH added.
+- **Pending**: merge main in (main moved), mark ready.
+- **Notes**:
+  - Two source-scan guards cut `depth_persistence.rs` at the first `#[cfg(test)]`; never put that string above production code.
+  - The app bench needs `CARGO_BUILD_JOBS=1` on a 15 GB box.
+  - `parser/depth.rs` is unchanged.
+
+### #2152 speed and health panel — branch `claude/speed-health-dashboard`, head `2ec6b8f0f` (draft)
+- **Done**:
+  - Bearer-gated `GET /api/debug/speed-health` plus a dashboard panel. Script 275 lines / 10,953 bytes; the guard ceilings were lowered to match.
+  - `ingest_shed.rs` publish stamp.
+  - Five hostile review rounds; the last two were clean.
+  - Local: api lib 428 passed.
+- **Failing**: CI run 41099003362, Coverage & Perf: `api 98.55% (threshold 98.6%)`.
+- **Fix**: add api tests for the uncovered branches in `speed_health.rs`:
+  - a metrics body over 16 MiB;
+  - a non-200 response;
+  - `metrics_scrape_url` unset;
+  - `read_minute_table` with no designated column.
+  - Never lower the floor.
+- **Then**: All Green, mark ready.
+
+### #2161 app coverage — branch `claude/app-coverage`, head `09bfaea6b` (draft)
+- **Done**:
+  - 16 new `crates/app/tests/*` files.
+  - App coverage 81.31% → 86.29% locally (3,757 tests passed).
+  - One hostile round; every finding fixed.
+- **Failing on `09bfaea`**, CI run 41101268515:
+  - (1) DHAT runner out of disk before any test ran: re-run once.
+  - (2) Coverage & Perf `-p tickvault-core --lib` failed. This is not this diff; read job 124235413500's full log for the test name.
+- **Pending**:
+  - Raise the app floor (72.6) only after a green CI coverage figure.
+  - Second refuter round.
+  - Fill in the PR body.
+- **Notes**:
+  - Run `cargo clean --profile dev` before coverage, and use `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
+  - `dhat_idle_seed_step.rs::test_depth_row_buffer_presize_holds_inline_book_rows_without_regrowing` fails under llvm-cov locally (its name lacks `dhat_`); it passed in CI.
+
+### #2162 O(1) per-event sweep — branch `claude/o1-per-event-sweep`, head `1d37c7e` (draft)
+- **Done**:
+  - `seal_absorption` once-per-episode failure logs.
+  - The seal runner keeps its rescue buffer across cycles.
+  - The coalescer builds an alert body only when it keeps it.
+  - The middleware borrows the request path.
+  - 9 CLAUDE.md O(1) rows; plan item O1S.
+  - Three review rounds; the 2-clean-rounds bar is not met.
+- **Failing**: Coverage & Perf (job 124225167770), `-p tickvault-core --lib` under llvm-cov. Plain Test (core) passed on the same head.
+- **Next**: find "FAILED" in that log, check whether the test touches `coalescer.rs` or `order_update_connection.rs`, and re-run once if it is timing-sensitive. The session has unsubscribed, so the next engineer owns it.
+- **Note**: the same `-p tickvault-core --lib` coverage failure also hit #2161. It may be one shared core test failing under instrumentation. Check both logs together.
+
+### #2164 cross-verify 51e/51f/51g — branch `claude/xverify-51efg`, head `57de60ae7` (draft)
+- **Done**:
+  - Per-IST-day target record, coverage hold, past-day catch-up, and a 16:24 supervisor.
+  - Rule §12.15.13–15, runbook §6, CLAUDE.md row, plan ticks.
+  - The noise-lock note (four `xverify_failed` reasons) is commit 6122eacbc.
+  - Review rounds 1–3 fixed. Round 4 is not valid: its refuters died on the usage limit.
+- **Failing (caused by this PR, small fixes)**:
+  1. `error_level_meta_guard.rs:427`: 4 new `warn!` sites pairing "write" with a failure need `REVIEWED_WARN_SITES` entries, with the reason that the failure is not a loss:
+     - `dhan_live_crossverify_boot.rs` :1965, :2286, :2975;
+     - `dhan_live_universe.rs:961`.
+     - Do not make them `error!` without a noise-lock row.
+  2. `per_entity_ceiling_lockstep_guard.rs:302`: write `DAY_RECORD_MAX_INSTRUMENTS` as `= MAX_DAILY_UNIVERSE_SIZE`.
+  3. Coverage & Perf: re-check after 1 and 2.
+- **Pending**: two clean hostile rounds, then mark ready.
+- **Owner items** (in the PR body): 51i/51j alarms need dated noise-lock sections; a proposal to record the widen's actually-placed set.
+
+### Core coverage (no PR) — branch `claude/core-coverage`, head `c65ac9f0d`
+- **Done**:
+  - Baseline: core 93.71% (49,960 / 53,311).
+  - Two test files: `pool_supervisor/cov_part1_tests.rs` and `order_update_connection_run_loop_cov_tests.rs`; 66 passed. Not reviewed yet.
+- **Pending**:
+  - pool_supervisor part 2, plus about 30 more files.
+  - Owned files covered only through new `crates/core/tests/cov_*.rs`.
+  - Re-measure, raise the floor (91.6), draft PR.
+
+### Storage coverage (no PR, nothing preserved)
+- **State**: no branch. The unpushed WIP tests were lost when the container reset on 30 Oct with a full disk.
+- **Baseline**: storage 92.587% (59,101 / 63,833).
+- **Top uncovered files**:
+  - tick_spill_replay 285
+  - partition_archive 245
+  - wal_suspension_watcher 208
+  - seal_spill 195
+  - seal_writer_task 182
+  - contract_name_repair 143
+  - partition_manager 137
+  - raw_frame_upload 119
+  - s3_cold 116
+  - shadow_persistence 113
+  - audit_spill 103
+  - seal_writer_runner 98
+  - seal_dlq 90
+  - fresh_start_reset 89
+  - depth_spill_frame 86
+- **Pending**:
+  - Write every test, as new `crates/storage/tests/cov_<stem>.rs` files.
+  - Raise the floor (90.1) and update the two 90.1 boundary tests in `coverage_gate_guard.rs`.
+
+### Trading / api / common coverage (no PR) — branch `claude/coverage-trading-api-common`, head `f67a7912a`
+- **Done**:
+  - `crates/api/tests/coverage_gaps_api.rs` (7 passed)
+  - `crates/common/tests/coverage_gaps_common.rs` (17 passed)
+  - `crates/trading/tests/coverage_gaps_brutex_host.rs` (31 passed)
+  - Not reviewed yet.
+- **Baseline**: common 99.47, api 98.66, trading 97.11.
+- **Pending**:
+  - oms/api_client (~192 lines), oms/engine (~148), other oms (~120), risk/in_mem/orphan watchdog (~75), strategy/indicator through tests only (~58).
+  - Reviews, re-measure, floor raise, PR.
+- **Note**: 5 active plans are at the plan-gate cap, so tests go only in new `tests/` files.
+
+### Audit-fix triage part 1 (no PR) — branch `claude/audit-plan-first34`, head `e9c5082`
+- **Done**:
+  - All 34 items checked; plan notes for 22 (commit ad1f3fd).
+  - PR13 and PR24 ticked done with evidence.
+- **Partial (NOT compiled, tested or reviewed)**:
+  - storage: PR16 boot_drain off_worker, PR31c, PR32 (half-finished).
+  - app: PR5, D3c, D11 Muhurat session_day, PR19.
+  - **Run `cargo check -p tickvault-storage -p tickvault-app` first.**
+- **Pending code**:
+  - D1 rate_limiter comment
+  - D4 counter
+  - PR19 debug.rs
+  - logs-mcp grep path refusal
+  - PR27 publisher timeout
+  - PR26 `maximum_retry_attempts=0` on both minters
+  - PR25 delete `max_position_lots` and the `[cross_verify]` stub
+  - PR9 fuzz target
+- **Then**: notes, review, gates, PR.
+
+### Feed hardening 52 (no PR) — branch `claude/fl52-measurements`, head `ac5e44019`
+- **Done**: 52b is already on main (#2057); only its plan tick remains.
+- **Partial, UNVERIFIED**:
+  - 52j phase A: `/proc/net/netstat` TcpExt counters plus the guard `kernel_tcp_ext_local_only_guard.rs`. `cargo clippy -p tickvault-app --all-targets -D warnings` reports 122 errors; re-check first.
+  - 52c: DHAT reader-memory harness, unfinished.
+  - 52f: new ErrorCode HOT-PATH-04 (log-only) plus moving the telemetry block after subscriber init; confirm the move, and write `hot_path_telemetry_boot_wiring_guard.rs`.
+- **Pending**: 52o, a default-off NDJSON WAL replay log (design in the session's lost workflow output).
+- **Needs the owner**:
+  - 52k/l/m/n cards;
+  - 52j phase B (unsafe allowlist);
+  - a TLS test key;
+  - the watchdog-beacon spawn failure tagged BOOT-02.
