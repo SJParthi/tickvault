@@ -27,6 +27,10 @@ const BENCHES: [&str; 2] = [
     "crates/app/benches/feed_drain.rs",
 ];
 
+/// The shared p99 gate the side-store and order-path benches include by
+/// `#[path]`; its `run_under_bench` is the only exit in it.
+const SHARED_GATE: &str = "crates/core/benches/support/tail_gate.rs";
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -75,6 +79,86 @@ fn both_benches_print_the_marker_and_exit_unless_deferred() {
             "{rel}: main must print the marker, then exit 1 unless deferred"
         );
     }
+}
+
+#[test]
+fn shared_gate_prints_the_marker_and_exits_unless_deferred() {
+    let src = read(SHARED_GATE);
+    assert!(
+        src.contains(&format!(
+            "const TAIL_GATE_FAILED_MARKER: &str = \"{MARKER}\";"
+        )),
+        "{SHARED_GATE}: the marker constant is missing or changed"
+    );
+    assert!(
+        src.contains(&format!(
+            "const TAIL_GATE_DEFER_ENV: &str = \"{DEFER_ENV}\";"
+        )),
+        "{SHARED_GATE}: the defer variable constant is missing or changed"
+    );
+    let at = src
+        .find("pub fn run_under_bench(")
+        .expect("shared gate has run_under_bench");
+    let body = &src[at..];
+    let print = body
+        .find("eprintln!(\"{TAIL_GATE_FAILED_MARKER}")
+        .unwrap_or_else(|| panic!("{SHARED_GATE}: run_under_bench no longer prints the marker"));
+    let gate = body
+        .find("std::env::var(TAIL_GATE_DEFER_ENV).as_deref() != Ok(\"1\")")
+        .unwrap_or_else(|| {
+            panic!("{SHARED_GATE}: run_under_bench no longer checks the defer variable")
+        });
+    let exit = body.find("std::process::exit(1)").unwrap_or_else(|| {
+        panic!("{SHARED_GATE}: run_under_bench no longer exits 1 when not deferred")
+    });
+    assert!(
+        print < gate && gate < exit,
+        "{SHARED_GATE}: run_under_bench must print the marker, then exit 1 unless deferred"
+    );
+    assert_eq!(
+        src.matches("std::process::exit(").count(),
+        1,
+        "{SHARED_GATE}: an exit outside run_under_bench would bypass the defer"
+    );
+}
+
+/// Every bench that includes the shared gate reaches it through
+/// `run_under_bench`, never its own exit.
+#[test]
+fn shared_gate_users_exit_only_through_run_under_bench() {
+    let root = repo_root();
+    let mut users = 0;
+    for krate in std::fs::read_dir(root.join("crates")).expect("crates dir") {
+        let benches = krate.expect("crate entry").path().join("benches");
+        let Ok(entries) = std::fs::read_dir(&benches) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("bench entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            if !src.contains("support/tail_gate.rs") {
+                continue;
+            }
+            users += 1;
+            assert!(
+                src.contains("tail_gate::run_under_bench("),
+                "{}: includes the shared gate but never calls run_under_bench",
+                path.display()
+            );
+            assert!(
+                !src.contains("std::process::exit("),
+                "{}: exits on its own, bypassing the defer",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        users >= 6,
+        "expected at least 6 users of the shared gate, found {users}"
+    );
 }
 
 #[test]
