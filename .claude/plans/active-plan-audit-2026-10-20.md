@@ -1501,3 +1501,35 @@ read-only and distinct from intercepted browser fixtures.
   - The unchanged bcf8dc7 diagnostic completed 15,445 passed / 6 failed / 33
     ignored across 460 harnesses. These six failures are preserved as failed
     evidence; the corrected candidate still requires its own validation.
+
+
+### 2026-10-31: isolate the idle-seed and depth pre-size allocation gates
+
+- [ ] Complete exact-source validation of the allocation-test isolation below.
+  Source is prepared; this checkbox does not claim a passed suite or publication.
+  - The 12f9632 full run completed 15,450 passed / 1 failed / 33 ignored across
+    460 harnesses. The book pre-size case reached 16,000 levels, 1,600 ticks and
+    966,368 book bytes, but process-global DHAT measured 6 blocks / 389 bytes
+    against the unchanged 0-block / 0-byte ceiling. Preserve this failed result.
+  - The test file is byte-identical on main, bcf8 and 12f. Pinned DHAT 0.3.3
+    documents that a lock between test bodies does not exclude allocations by
+    parallel libtest bookkeeping. The original failure has no saved stacks, so
+    its specific allocation source remains unproven. Passing later nocapture
+    diagnostics do not erase the captured full-suite failure.
+  - Keep each of the three original heap cases in its own integration-test
+    binary: dhat_idle_seed_step, dhat_depth_level_row_presize and
+    dhat_depth_book_row_presize. Retain all original function names, bodies,
+    warm-up, nonvacuity and zero-allocation assertions; no feature gating/skips.
+  - Keep explicit CI commands, exact app target count 11, the zero-test refusal
+    and sorted expected/actual target equality. Extract only the fixed app
+    expected inventory into .github/dhat-app-targets.txt, with missing/invalid
+    inventory refusal. Do not derive expected names from discovered files or
+    raise the existing shell ceiling. Other crate lists/counts are unchanged.
+  - Before final validation, run the predeclared five captured parallel
+    stack-attribution diagnostics with temporary DHAT-aware assertions and
+    retained profiles; restore exact source. If they all pass, attribution
+    remains unknown. They are diagnostics, not replacement acceptance evidence.
+  - Then run all three isolated positive targets, the book-reserve removal
+    control (which must fail the allocation assertion after meaningful appends),
+    exact restoration and final positives. Static/canonical guards, all-target
+    lint, exact-commit full/native/CI gates remain required and pending.
