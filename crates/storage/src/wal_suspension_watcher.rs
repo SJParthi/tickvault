@@ -626,6 +626,13 @@ pub struct WalLagTracker {
     /// non-decreasing above the floor, and whether it has already been
     /// reported for this episode.
     state: std::collections::BTreeMap<String, LagState>,
+    /// Plan item W4 review (2026-10-30): set when a table still untrusted
+    /// (latched, or held by `watermark_hold`) was dropped from the map by a
+    /// complete-view eviction, a partial-view absence streak or a row with no
+    /// lag columns. Forgetting a table is not evidence that its lag cleared,
+    /// so the watcher reports that probe to the applied watermark as
+    /// `Unsafe` ([`Self::take_forgot_untrusted`]).
+    forgot_untrusted: bool,
 }
 
 /// Per-table lag bookkeeping. Private — the tracker's API is the contract.
@@ -783,8 +790,15 @@ impl WalLagTracker {
             // A complete view is first-hand evidence about every table the
             // server has. A tracked name missing from it no longer exists,
             // so its latch is stale by construction.
-            self.state.retain(|name, _| present.contains(name.as_str()));
+            let mut forgot = false;
+            self.state.retain(|name, entry| {
+                let keep = present.contains(name.as_str());
+                forgot |= !keep && (entry.reported || entry.watermark_hold);
+                keep
+            });
+            self.forgot_untrusted |= forgot;
         } else {
+            let mut forgot = false;
             // A partial view cannot tell "gone" from "skipped". Count the
             // absence instead of acting on it, and evict only once it has
             // outlasted the arming window — see WAL_LAG_ABSENT_POLLS_TO_EVICT.
@@ -793,8 +807,11 @@ impl WalLagTracker {
                     return true;
                 }
                 entry.absent_polls = entry.absent_polls.saturating_add(1);
-                entry.absent_polls < WAL_LAG_ABSENT_POLLS_TO_EVICT
+                let keep = entry.absent_polls < WAL_LAG_ABSENT_POLLS_TO_EVICT;
+                forgot |= !keep && (entry.reported || entry.watermark_hold);
+                keep
             });
+            self.forgot_untrusted |= forgot;
         }
         self.observe_inner(rows)
     }
@@ -833,7 +850,13 @@ impl WalLagTracker {
                 // armed with nothing anywhere saying why. Unknown is not
                 // stuck. The entry is dropped and rebuilt from the next poll
                 // that carries a reading.
-                self.state.remove(&row.name);
+                if self
+                    .state
+                    .remove(&row.name)
+                    .is_some_and(|gone| gone.reported || gone.watermark_hold)
+                {
+                    self.forgot_untrusted = true;
+                }
                 continue;
             };
             let lag = seq.saturating_sub(writer);
@@ -1001,6 +1024,14 @@ impl WalLagTracker {
             .filter(|s| s.reported || s.watermark_hold)
             .count()
     }
+
+    /// Whether a still-untrusted table was dropped from the map since the
+    /// last call, clearing the flag (plan item W4 review, 2026-10-30). The
+    /// watcher calls it once per parsed poll, after `observe_with_completeness`.
+    /// O(1).
+    pub fn take_forgot_untrusted(&mut self) -> bool {
+        std::mem::take(&mut self.forgot_untrusted)
+    }
 }
 
 /// One probe attempt: GET `/exec?query=select * from wal_tables()` via the
@@ -1086,6 +1117,32 @@ async fn probe_wal_tables(base_url: &str) -> Result<(Vec<WalTableRow>, usize), W
     parse_wal_tables_response(&body)
 }
 
+/// The applied watermark's verdict on one parsed poll (plan item W4,
+/// 2026-10-30): `Clean` when every row parsed, none is suspended and no table
+/// is latched untrusted; `LagOnly` when the only fault is a table latched
+/// untrusted for apply lag; `Unsafe` for any unparsed row or suspended table,
+/// and for a poll on which the lag tracker dropped a table it still did not
+/// trust (`forgot_untrusted`, review 2026-10-30): an empty or partial reply
+/// from a restarting QuestDB evicts the latch without the lag having cleared,
+/// and a confirmation built on that would trim a stretch still unapplied.
+/// O(1).
+#[must_use]
+pub(crate) const fn probe_verdict(
+    skipped_rows: usize,
+    currently_suspended: usize,
+    untrusted_tables: usize,
+    forgot_untrusted: bool,
+) -> crate::wal_applied_watermark::ProbeVerdict {
+    use crate::wal_applied_watermark::ProbeVerdict;
+    if skipped_rows != 0 || currently_suspended != 0 || forgot_untrusted {
+        ProbeVerdict::Unsafe
+    } else if untrusted_tables != 0 {
+        ProbeVerdict::LagOnly
+    } else {
+        ProbeVerdict::Clean
+    }
+}
+
 /// Emit the growing-lag pages. One `error!` per table per episode.
 ///
 /// Reuses `WAL-SUSPEND-01` deliberately rather than minting a new code: the
@@ -1096,27 +1153,6 @@ async fn probe_wal_tables(base_url: &str) -> Result<(Vec<WalTableRow>, usize), W
 /// are at their ceiling. The `source` field is what separates the two on
 /// triage.
 // TEST-EXEMPT: pure log/metric side effects over the fully-tested WalLagTracker output; no branch here is reachable without a verdict the tracker tests already pin.
-/// The applied watermark's verdict on one parsed poll (plan item W4,
-/// 2026-10-30): `Clean` when every row parsed, none is suspended and no table
-/// is latched untrusted; `LagOnly` when the only fault is a table latched
-/// untrusted for apply lag; `Unsafe` for any unparsed row or suspended table.
-/// O(1).
-#[must_use]
-pub(crate) const fn probe_verdict(
-    skipped_rows: usize,
-    currently_suspended: usize,
-    untrusted_tables: usize,
-) -> crate::wal_applied_watermark::ProbeVerdict {
-    use crate::wal_applied_watermark::ProbeVerdict;
-    if skipped_rows != 0 || currently_suspended != 0 {
-        ProbeVerdict::Unsafe
-    } else if untrusted_tables != 0 {
-        ProbeVerdict::LagOnly
-    } else {
-        ProbeVerdict::Clean
-    }
-}
-
 fn emit_wal_lag(fired: &[(String, i64)]) {
     for (name, lag) in fired {
         let table = capture_rest_error_body(name);
@@ -1359,6 +1395,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                             skipped,
                             delta.currently_suspended,
                             lag_tracker.untrusted_count(),
+                            lag_tracker.take_forgot_untrusted(),
                         ),
                         probe_basis,
                     );
@@ -2447,21 +2484,74 @@ mod tests {
         for skipped in [0usize, 1] {
             for suspended in [0usize, 1] {
                 for untrusted in [0usize, 1, 3] {
-                    let expected = if skipped != 0 || suspended != 0 {
-                        ProbeVerdict::Unsafe
-                    } else if untrusted != 0 {
-                        ProbeVerdict::LagOnly
-                    } else {
-                        ProbeVerdict::Clean
-                    };
-                    assert_eq!(
-                        probe_verdict(skipped, suspended, untrusted),
-                        expected,
-                        "skipped={skipped} suspended={suspended} untrusted={untrusted}"
-                    );
+                    for forgot in [false, true] {
+                        let expected = if skipped != 0 || suspended != 0 || forgot {
+                            ProbeVerdict::Unsafe
+                        } else if untrusted != 0 {
+                            ProbeVerdict::LagOnly
+                        } else {
+                            ProbeVerdict::Clean
+                        };
+                        assert_eq!(
+                            probe_verdict(skipped, suspended, untrusted, forgot),
+                            expected,
+                            "skipped={skipped} suspended={suspended} untrusted={untrusted} forgot={forgot}"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// Latches `name` (five non-decreasing polls above the floor).
+    fn latched_tracker(name: &str) -> WalLagTracker {
+        let mut t = WalLagTracker::new();
+        for i in 0..WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row(name, 10_000 + i64::from(i), 0)]);
+        }
+        assert_eq!(t.untrusted_count(), 1, "precondition: latched");
+        assert!(!t.take_forgot_untrusted(), "nothing forgotten yet");
+        t
+    }
+
+    /// W4 review (2026-10-30, HIGH): forgetting an untrusted table is not
+    /// evidence its lag cleared. Every removal path sets the flag once.
+    #[test]
+    fn test_forgetting_an_untrusted_table_is_reported_on_every_removal_path() {
+        // A complete view that no longer names it (an empty reply included).
+        let mut t = latched_tracker("candles_1m");
+        t.observe_with_completeness(&[], true);
+        assert_eq!(t.untrusted_count(), 0);
+        assert!(t.take_forgot_untrusted(), "complete-view eviction");
+        assert!(!t.take_forgot_untrusted(), "taken once");
+        // A partial-view absence streak that outlasts the window.
+        let mut t = latched_tracker("candles_1m");
+        for _ in 0..WAL_LAG_ABSENT_POLLS_TO_EVICT {
+            t.observe_with_completeness(&[lag_row("ticks", 0, 0)], false);
+        }
+        assert_eq!(t.untrusted_count(), 0);
+        assert!(t.take_forgot_untrusted(), "partial-view eviction");
+        // A row that lost its lag columns.
+        let mut t = latched_tracker("candles_1m");
+        let mut row = lag_row("candles_1m", 0, 0);
+        row.sequencer_txn = None;
+        t.observe(&[row]);
+        assert_eq!(t.untrusted_count(), 0);
+        assert!(t.take_forgot_untrusted(), "no-lag-column removal");
+        // A healthy table dropped is not a forgotten untrusted one.
+        let mut t = WalLagTracker::new();
+        t.observe(&[lag_row("ticks", 10, 0)]);
+        t.observe_with_completeness(&[], true);
+        assert!(
+            !t.take_forgot_untrusted(),
+            "a trusted table forgotten is fine"
+        );
+        // A table released below the floor is trusted, so dropping it is fine.
+        let mut t = latched_tracker("candles_1m");
+        t.observe(&[lag_row("candles_1m", 10, 0)]);
+        assert_eq!(t.untrusted_count(), 0);
+        t.observe_with_completeness(&[], true);
+        assert!(!t.take_forgot_untrusted(), "released below the floor first");
     }
 
     /// Second hostile review 2026-10-20 (MEDIUM): a staircase release still has

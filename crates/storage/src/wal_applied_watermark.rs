@@ -2062,9 +2062,7 @@ impl AppliedWatermark {
     fn confirm_parked_if_due(&self, now: u64) -> bool {
         let confirmed = crate::off_worker::off_worker(|| {
             let mut state = self.lock_ranges();
-            let Some(pending) = state.parked_confirm else {
-                return None;
-            };
+            let pending = state.parked_confirm?;
             let outcome = if self.suspect_episodes.load(Ordering::Acquire) != pending.episodes_at {
                 Some("held_episode")
             } else if pending.contaminated {
@@ -5526,7 +5524,9 @@ mod w4_parked_confirm_tests {
                         } else if !suspect {
                             suspect = true;
                             episode += 1;
-                            for e in 1..episode as usize { interrupted[e] = true; }
+                            for flag in interrupted.iter_mut().skip(1) {
+                                *flag = true;
+                            }
                             lag_only.push(v == ProbeVerdict::LagOnly);
                             exit_at.push(None);
                             cleans_since_exit.push(0);
