@@ -123,9 +123,6 @@ pub use strict_threshold::{
 };
 use strict_threshold::{legacy_buckets, raw_bucket_index, strict_window};
 
-#[cfg(test)]
-mod strict_tests;
-
 /// Number of historical exported latency buckets per stage. Bucket `k` holds samples in
 /// `(2^(k+9), 2^(k+10)]` nanoseconds; bucket 0 holds everything up to
 /// 1,024 ns and the last bucket holds everything above ~68.7 s (it is
@@ -1477,6 +1474,9 @@ pub async fn run_runtime_probe(task: HotTask, stage: Stage, iterations: u64) {
         beat_at(task, woke);
     }
 }
+
+#[cfg(test)]
+mod strict_tests;
 
 #[cfg(test)]
 mod tests {

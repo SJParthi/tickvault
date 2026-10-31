@@ -130,8 +130,6 @@ use crate::hot_path_telemetry::Stage;
 use crate::hot_thread_sched::{HotThread, SchedPublisher};
 
 mod coverage;
-#[cfg(test)]
-mod coverage_tests;
 pub use coverage::DayCoverage;
 use coverage::SessionPlan;
 
@@ -1584,6 +1582,9 @@ pub fn append_verdict_row(buffer: &mut Buffer, r: &CapacityVerdictRow) -> Result
         .context("designated timestamp")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod coverage_tests;
 
 #[cfg(test)]
 mod tests {
