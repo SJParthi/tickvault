@@ -2514,6 +2514,14 @@ mod tests {
         t
     }
 
+    #[test]
+    fn test_take_forgot_untrusted_reads_once_and_clears() {
+        let mut t = latched_tracker("ticks");
+        t.observe_with_completeness(&[], true);
+        assert!(t.take_forgot_untrusted());
+        assert!(!t.take_forgot_untrusted(), "cleared by the first read");
+    }
+
     /// W4 review (2026-10-30, HIGH): forgetting an untrusted table is not
     /// evidence its lag cleared. Every removal path sets the flag once.
     #[test]
