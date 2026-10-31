@@ -1,6 +1,6 @@
 //! `hot_path_latency_minute` — one row per hot-path stage per minute: the
-//! live proof that every in-memory step a tick passes through stays under
-//! 1 µs (owner, 2026-10-30).
+//! evidence for the recorded stage populations. The owner's target is strict
+//! p99 below 1,000 ns; this does not time every individual in-memory step.
 //!
 //! ## What it records
 //!
@@ -10,7 +10,8 @@
 //! ([`MinuteAccumulator`]); when the wall-clock minute changes, the minute's
 //! rows are built (p50, p99, p99.9, max and the count of samples over
 //! 1,024 ns, per stage) and handed to a dedicated writer thread through a
-//! bounded queue. The recording path (`record_stage_nanos`) is untouched.
+//! bounded queue. Version 1 strict counts additionally classify samples at
+//! 1,000 ns using the split raw histogram, with one event-bin increment.
 //!
 //! ## Table
 //!
@@ -26,7 +27,10 @@
 //!     p999_ns             LONG,       -- upper bound of the p99.9 bucket
 //!     max_ns              LONG,       -- the minute's largest sample (exact)
 //!     samples_over_1024ns LONG,       -- samples above 1,024 ns (exact count)
-//!     publishes           LONG        -- one-second windows folded into the row
+//!     publishes           LONG,       -- one-second windows folded into the row
+//!     strict_version      LONG,       -- 1 = disjoint raw threshold counts; historical null
+//!     strict_samples      LONG,       -- same raw-window denominator; independent of fine samples
+//!     strict_samples_at_or_above_1000ns LONG -- equality at 1,000 violates; null = unknown
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, stage, feed);
 //! ```
@@ -46,19 +50,22 @@
 //!   takes the log2 bound (`histogram = 'quarter_octave+log2'`). Above every
 //!   bound it is `i64::MAX`, never NULL: NULL means only "no samples", so a
 //!   `max(p99_ns)` never skips the worst minute.
-//! * **Frames the ring refused are not in any stage** (they wait in the WAL
-//!   for refold). Their per-minute count is `ring_refused_frames` in
-//!   `host_capacity_minute`; read it beside these rows.
-//! * **"Over 1 µs" is over 1,024 ns.** Both histograms' first bucket ends at
-//!   1,024 ns, and counting exactly 1,000 would need one more compare on the
-//!   recording path, which the owner ruled must stay untouched. The column is
-//!   named for the bound it really counts.
-//! * **Minute alignment is ±1 s.** A one-second window is credited to the
-//!   minute in which the publisher READ it, so the last second of a minute
-//!   can land in the next row. A stage's per-second maximum is swapped
-//!   separately from its buckets, so at a minute boundary the max can be
-//!   credited to the other minute. Both are measurement-boundary effects; no
-//!   sample is lost or counted twice.
+//! * **Ring refusals omit downstream live-path timings.** `socket_to_wal`
+//!   still records a refused hand-off; ring dwell, drain and receipt-to-fold
+//!   do not record that later path. Read `host_capacity_minute`'s main-feed
+//!   `ring_refused_frames` beside these differently scoped populations.
+//! * **Historical bounds keep their meaning.** `samples_over_1024ns` still
+//!   counts above 1,024 ns. Only version 1 `strict_samples` and
+//!   `strict_samples_at_or_above_1000ns` classify the strict target; equality
+//!   violates it. Both counts come from the same raw-stage snapshot/window,
+//!   never from the independently sampled receipt fine histogram. Legacy,
+//!   partial, invalid or overflowed strict evidence stays NULL/UNKNOWN.
+//! * **Minute attribution is by read time.** A window joins the minute in
+//!   which the publisher READ it. Sleep-after-work cadence and scheduling do
+//!   not guarantee an exact one-second interval or ±1 s alignment. Atomic
+//!   bins are read individually; the independently swapped maximum can land
+//!   on the other side of a boundary. Exact observation envelopes and
+//!   freshness remain required for a whole-session claim.
 //! * **The wall clock going backwards** (a time step) never reopens an
 //!   earlier minute: the accumulator keeps adding into its current minute
 //!   until the clock passes it again (`publishes` then exceeds 60). A forward
@@ -91,8 +98,8 @@ use tickvault_common::feed::Feed;
 mod proof_table_readiness;
 
 use crate::hot_path_telemetry::{
-    ALL_STAGES, FINE_BUCKETS, QuantileBound, STAGE_BUCKETS, SecondWindow, Stage, fine_quantiles,
-    stage_quantiles,
+    ALL_STAGES, FINE_BUCKETS, QuantileBound, STAGE_BUCKETS, STRICT_MEASUREMENT_VERSION,
+    SecondWindow, Stage, StrictSampleCounts, fine_quantiles, stage_quantiles,
 };
 
 /// QuestDB table name.
@@ -147,6 +154,9 @@ pub const HOT_PATH_LATENCY_MINUTE_COLUMNS: &[(&str, &str)] = &[
     ("max_ns", "LONG"),
     ("samples_over_1024ns", "LONG"),
     ("publishes", "LONG"),
+    ("strict_version", "LONG"),
+    ("strict_samples", "LONG"),
+    ("strict_samples_at_or_above_1000ns", "LONG"),
 ];
 
 /// One stage's minute. `Copy`; building one allocates nothing.
@@ -172,6 +182,26 @@ pub struct LatencyMinuteRow {
     pub samples_over_1024ns: u64,
     /// One-second windows folded into this minute.
     pub publishes: u64,
+    /// Version of the exact threshold evidence; historical NULL is unknown.
+    pub strict_version: Option<i64>,
+    /// Exact raw-stage denominator, separate from fine-histogram `samples`.
+    pub strict_samples: Option<i64>,
+    /// Raw-stage samples at or above 1,000 ns in that same window.
+    pub strict_samples_at_or_above_1000ns: Option<i64>,
+}
+
+impl LatencyMinuteRow {
+    /// Validated exact threshold counts, or None for legacy, partial,
+    /// unsupported-version or malformed evidence. This checks counts only;
+    /// it does not establish freshness or continuous interval coverage.
+    #[must_use]
+    pub fn strict_counts(&self) -> Option<StrictSampleCounts> {
+        StrictSampleCounts::from_columns(
+            self.strict_version,
+            self.strict_samples,
+            self.strict_samples_at_or_above_1000ns,
+        )
+    }
 }
 
 /// One minute's rows, one per stage in [`ALL_STAGES`] order.
@@ -219,6 +249,7 @@ pub struct MinuteAccumulator {
     buckets: [[u64; STAGE_BUCKETS]; STAGES_PER_MINUTE],
     max: [u64; STAGES_PER_MINUTE],
     fine: [u64; FINE_BUCKETS],
+    strict: [Option<StrictSampleCounts>; STAGES_PER_MINUTE],
 }
 
 impl Default for MinuteAccumulator {
@@ -237,6 +268,10 @@ impl MinuteAccumulator {
             buckets: [[0; STAGE_BUCKETS]; STAGES_PER_MINUTE],
             max: [0; STAGES_PER_MINUTE],
             fine: [0; FINE_BUCKETS],
+            strict: [Some(StrictSampleCounts {
+                samples: 0,
+                samples_at_or_above_1000ns: 0,
+            }); STAGES_PER_MINUTE],
         }
     }
 
@@ -276,6 +311,9 @@ impl MinuteAccumulator {
             *into = (*into).max(*from);
         }
         add_into(&mut self.fine, &second.receipt_to_fold_fine);
+        for (into, from) in self.strict.iter_mut().zip(second.stage_strict.iter()) {
+            *into = into.and_then(|counts| from.and_then(|next| counts.checked_add(next)));
+        }
         self.publishes = self.publishes.saturating_add(1);
         closed
     }
@@ -329,6 +367,7 @@ impl MinuteAccumulator {
             (HISTOGRAM_LOG2, sum(buckets), buckets[0], bounds)
         };
         let [p50, p99, p999] = bounds;
+        let strict = self.strict[i].and_then(StrictSampleCounts::ilp_counts);
         LatencyMinuteRow {
             minute_ist_nanos: minute,
             stage,
@@ -340,6 +379,9 @@ impl MinuteAccumulator {
             max_ns: self.max[i],
             samples_over_1024ns: samples.saturating_sub(first),
             publishes: self.publishes,
+            strict_version: strict.map(|_| STRICT_MEASUREMENT_VERSION),
+            strict_samples: strict.map(|(n, _)| n),
+            strict_samples_at_or_above_1000ns: strict.map(|(_, n)| n),
         }
     }
 }
@@ -449,7 +491,7 @@ fn first_drop_of_episode() -> bool {
 /// The idempotent `CREATE TABLE` DDL. Pure.
 #[must_use]
 pub fn hot_path_latency_minute_create_ddl() -> String {
-    // O(1) EXEMPT: begin — boot-time DDL build over a fixed 11-column list
+    // O(1) EXEMPT: begin — boot-time DDL build over the fixed column manifest
     let cols = HOT_PATH_LATENCY_MINUTE_COLUMNS
         .iter()
         .map(|(name, ty)| format!("{name} {ty}"))
@@ -468,7 +510,7 @@ pub fn hot_path_latency_minute_create_ddl() -> String {
 #[must_use]
 pub fn hot_path_latency_minute_ddl_statements() -> Vec<String> {
     let mut statements = vec![hot_path_latency_minute_create_ddl()];
-    // O(1) EXEMPT: begin — boot-time DDL build over a fixed 11-column list
+    // O(1) EXEMPT: begin — boot-time DDL build over the fixed column manifest
     for (col, ty) in HOT_PATH_LATENCY_MINUTE_COLUMNS {
         if *col == "ts" {
             continue;
@@ -666,6 +708,18 @@ impl HotPathLatencyMinuteWriter {
         };
         let row = match r.p999_ns {
             Some(n) => row.column_i64("p999_ns", to_i64(n)).context("p999_ns")?,
+            None => row,
+        };
+        let row = match r.strict_counts().and_then(StrictSampleCounts::ilp_counts) {
+            Some((samples, at_or_above)) => row
+                .column_i64("strict_version", STRICT_MEASUREMENT_VERSION)
+                .context("strict_version")?
+                .column_i64("strict_samples", samples)
+                .context("strict_samples")?
+                .column_i64("strict_samples_at_or_above_1000ns", at_or_above)
+                .context("strict_samples_at_or_above_1000ns")?,
+            // Never write a version with a missing/invalid count, or saturate
+            // the two counts independently into a different percentile.
             None => row,
         };
         row.column_i64("max_ns", to_i64(r.max_ns))
@@ -1512,3 +1566,6 @@ mod tests {
 
 #[cfg(test)]
 mod readiness_tests;
+
+#[cfg(test)]
+mod strict_tests;

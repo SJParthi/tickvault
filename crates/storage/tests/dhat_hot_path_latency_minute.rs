@@ -166,6 +166,10 @@ fn dhat_publish_window_with_minute_accumulator_is_zero_allocation() {
             for (row, stage) in rows.iter().zip(ALL_STAGES.iter()) {
                 assert_eq!(row.stage, *stage);
                 assert_eq!(row.minute_ist_nanos, host.minute_ist_nanos);
+                let counts = row
+                    .strict_counts()
+                    .expect("publisher supplied exact raw counts");
+                assert!(counts.samples_at_or_above_1000ns <= counts.samples);
             }
         }
         ProofMessage::Verdict(_) => panic!("the first item is the warm-up minute"),

@@ -2,7 +2,7 @@
 //!
 //! Three instruments, all Prometheus-only, plus one phone page (below):
 //!
-//! 1. **Per-stage latency** — a fixed power-of-two histogram per hot-path
+//! 1. **Per-stage latency** — a fixed histogram per hot-path
 //!    stage, recorded with four relaxed atomic operations and ZERO heap
 //!    allocation, published as `tv_hot_path_stage_ns_bucket{stage,le}` /
 //!    `_count` / `_sum` so `histogram_quantile()` works on it unchanged.
@@ -61,10 +61,10 @@
 //! # Complexity
 //! | Path | Cost |
 //! |---|---|
-//! | [`record_stage_nanos`] | O(1): one `leading_zeros`, four relaxed atomics |
+//! | [`record_stage_nanos`] | O(1): fixed threshold classification, one bin increment, sum/max and optional stall atomics |
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
 //! | [`record_receipt_to_fold_nanos`] | O(1): the stage record plus one more relaxed add into the fine histogram |
-//! | [`publish_once`] | O(stages × buckets + tasks) = O(7 × 28 + 6), plus O(58) for the fine `receipt_to_fold` histogram, once a second, on its own thread; the percentile windows add the same again and keep the previous read in fixed arrays (no allocation) |
+//! | [`publish_once`] | O(stages × buckets + tasks): 7 × 29 raw bins projected to 28 historical bins, plus 6 tasks and 58 fine bins; fixed arrays on the publisher thread, no allocation |
 //! | [`stage_quantiles`] / [`fine_quantiles`] | O(buckets) = O(28) / O(58), on the publisher thread only, never on the frame path |
 //! | [`RollingMax::push`] | O(window) = O(75) per stage, once a second, on the publisher thread only; a fixed array, no allocation |
 //!
@@ -103,12 +103,30 @@
 //! group. DT0 added about 143 series (two stages of ~35 each, the 61 fine
 //! ones, 12 scheduling ones); at ~150 bytes a line and ~8 hours a day that
 //! is ~0.25 GB a month, about $0.15 to $0.30 (Assumed, not billed yet).
+//!
+//! # Strict 1,000 ns evidence (2026-10-31)
+//!
+//! The first raw bin is now split into [0,999] and [1000,1024]. Each event
+//! still increments exactly one histogram bin. Both exact strict counts
+//! come from one raw snapshot difference; the historical exporter sums the
+//! split bins back together. No metric name/label or stall budget changes.
+//! Nullable versioned minute-table counts describe that recorded population,
+//! not complete elapsed intervals, source freshness or uninstrumented steps.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Number of latency buckets per stage. Bucket `k` holds samples in
+mod strict_threshold;
+pub use strict_threshold::{
+    RAW_STAGE_BUCKETS, STRICT_MEASUREMENT_VERSION, STRICT_THRESHOLD_NANOS, StrictSampleCounts,
+};
+use strict_threshold::{legacy_buckets, raw_bucket_index, strict_window};
+
+#[cfg(test)]
+mod strict_tests;
+
+/// Number of historical exported latency buckets per stage. Bucket `k` holds samples in
 /// `(2^(k+9), 2^(k+10)]` nanoseconds; bucket 0 holds everything up to
 /// 1,024 ns and the last bucket holds everything above ~68.7 s (it is
 /// published as `le="+Inf"`).
@@ -285,7 +303,7 @@ impl HotTask {
 /// arrays, a few KiB in all.
 #[repr(align(64))]
 struct StageStats {
-    buckets: [AtomicU64; STAGE_BUCKETS],
+    buckets: [AtomicU64; RAW_STAGE_BUCKETS],
     sum_nanos: AtomicU64,
     max_nanos: AtomicU64,
     over_budget: AtomicU64,
@@ -294,10 +312,34 @@ struct StageStats {
 impl StageStats {
     const fn new() -> Self {
         Self {
-            buckets: [const { AtomicU64::new(0) }; STAGE_BUCKETS],
+            buckets: [const { AtomicU64::new(0) }; RAW_STAGE_BUCKETS],
             sum_nanos: AtomicU64::new(0),
             max_nanos: AtomicU64::new(0),
             over_budget: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn record(&self, stage: Stage, nanos: u64) {
+        self.buckets[raw_bucket_index(nanos)].fetch_add(1, Ordering::Relaxed);
+        self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+        if nanos > stage.stall_budget_nanos() {
+            self.over_budget.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> StageSnapshot {
+        // Load each disjoint bin once. The legacy projection and strict
+        // window use this same array, never an independently read total.
+        let raw_buckets = std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
+        let buckets = legacy_buckets(&raw_buckets);
+        StageSnapshot {
+            raw_buckets,
+            buckets,
+            count: buckets.iter().fold(0u64, |sum, n| sum.saturating_add(*n)),
+            sum_nanos: self.sum_nanos.load(Ordering::Relaxed),
+            over_budget: self.over_budget.load(Ordering::Relaxed),
         }
     }
 }
@@ -386,13 +428,7 @@ pub const fn bucket_upper_bound_nanos(k: usize) -> Option<u64> {
 /// Records one sample. O(1), zero allocation, lock-free.
 #[inline]
 pub fn record_stage_nanos(stage: Stage, nanos: u64) {
-    let s = &STAGES[stage as usize];
-    s.buckets[bucket_index(nanos)].fetch_add(1, Ordering::Relaxed);
-    s.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
-    s.max_nanos.fetch_max(nanos, Ordering::Relaxed);
-    if nanos > stage.stall_budget_nanos() {
-        s.over_budget.fetch_add(1, Ordering::Relaxed);
-    }
+    STAGES[stage as usize].record(stage, nanos);
 }
 
 /// Records one sample given as a `Duration`.
@@ -515,11 +551,16 @@ pub fn busy_end_at(task: HotTask, at: Instant) {
     t.last.store(stamp(at), Ordering::Relaxed);
 }
 
-/// A point-in-time copy of one stage, for tests and the publisher.
+/// One bounded read of a stage, for tests and the publisher. Atomic bins
+/// are read individually; concurrent recording can cross its read envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StageSnapshot {
-    /// Per-bucket (NOT cumulative) counts.
+    /// Historical per-bucket (NOT cumulative) counts, first bin ≤1,024 ns.
     pub buckets: [u64; STAGE_BUCKETS],
+    /// Disjoint raw counts: first two bins are [0,999] and [1000,1024].
+    /// Read once, then projected into `buckets`; a cross-bin read is not an
+    /// instantaneous global snapshot while recording continues.
+    pub raw_buckets: [u64; RAW_STAGE_BUCKETS],
     /// Total samples.
     pub count: u64,
     /// Sum of every sample, nanoseconds.
@@ -531,19 +572,7 @@ pub struct StageSnapshot {
 /// Reads one stage without resetting anything.
 #[must_use]
 pub fn stage_snapshot(stage: Stage) -> StageSnapshot {
-    let s = &STAGES[stage as usize];
-    let mut buckets = [0u64; STAGE_BUCKETS];
-    let mut count = 0u64;
-    for (out, b) in buckets.iter_mut().zip(s.buckets.iter()) {
-        *out = b.load(Ordering::Relaxed);
-        count = count.saturating_add(*out);
-    }
-    StageSnapshot {
-        buckets,
-        count,
-        sum_nanos: s.sum_nanos.load(Ordering::Relaxed),
-        over_budget: s.over_budget.load(Ordering::Relaxed),
-    }
+    STAGES[stage as usize].snapshot()
 }
 
 /// The quantiles published per stage, as `(numerator, denominator)` of the
@@ -721,6 +750,7 @@ fn step_p99_latch(latched: &mut bool, over: Option<bool>) -> bool {
 /// What one stage's window produced.
 struct WindowOutcome {
     window: [u64; STAGE_BUCKETS],
+    strict: Option<StrictSampleCounts>,
     quantiles: Option<StageQuantiles>,
     over_budget: u64,
     starts_p99_episode: bool,
@@ -732,6 +762,7 @@ struct WindowOutcome {
 /// the publisher thread only.
 struct QuantileWindows {
     prev_buckets: [[u64; STAGE_BUCKETS]; STAGE_COUNT],
+    prev_raw_buckets: [[u64; RAW_STAGE_BUCKETS]; STAGE_COUNT],
     prev_over_budget: [u64; STAGE_COUNT],
     p99_over: [bool; STAGE_COUNT],
 }
@@ -740,6 +771,7 @@ impl QuantileWindows {
     const fn new() -> Self {
         Self {
             prev_buckets: [[0; STAGE_BUCKETS]; STAGE_COUNT],
+            prev_raw_buckets: [[0; RAW_STAGE_BUCKETS]; STAGE_COUNT],
             prev_over_budget: [0; STAGE_COUNT],
             p99_over: [false; STAGE_COUNT],
         }
@@ -761,6 +793,8 @@ impl QuantileWindows {
             *out = now.saturating_sub(*before);
         }
         self.prev_buckets[i] = snap.buckets;
+        let strict = strict_window(&snap.raw_buckets, &self.prev_raw_buckets[i]);
+        self.prev_raw_buckets[i] = snap.raw_buckets;
         let over_budget = snap.over_budget.saturating_sub(self.prev_over_budget[i]);
         self.prev_over_budget[i] = snap.over_budget;
         let quantiles = stage_quantiles(&window);
@@ -770,6 +804,7 @@ impl QuantileWindows {
         let starts_p99_episode = step_p99_latch(&mut self.p99_over[i], verdict);
         WindowOutcome {
             window,
+            strict,
             quantiles,
             over_budget,
             starts_p99_episode,
@@ -848,6 +883,9 @@ pub struct TelemetryHandles {
 pub struct SecondWindow {
     /// Per stage (index = [`Stage`] discriminant), per-bucket counts.
     pub stage_buckets: [[u64; STAGE_BUCKETS]; STAGE_COUNT],
+    /// Exact strict counts derived from the same disjoint raw-bin window.
+    /// None means unknown (including reset/wrap), not a measured zero.
+    pub stage_strict: [Option<StrictSampleCounts>; STAGE_COUNT],
     /// Per stage, the largest sample of the window, nanoseconds.
     pub stage_max_nanos: [u64; STAGE_COUNT],
     /// The fine `receipt_to_fold` window, per-bucket counts.
@@ -860,6 +898,9 @@ impl SecondWindow {
     pub const fn empty() -> Self {
         Self {
             stage_buckets: [[0; STAGE_BUCKETS]; STAGE_COUNT],
+            // An empty synthetic/legacy window has no exact classification.
+            // The publisher replaces every slot, including measured zeros.
+            stage_strict: [None; STAGE_COUNT],
             stage_max_nanos: [0; STAGE_COUNT],
             receipt_to_fold_fine: [0; FINE_BUCKETS],
         }
@@ -1105,6 +1146,7 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
         handles.last_second.stage_max_nanos[*stage as usize] = max;
         let outcome = handles.windows.advance(*stage, &snap);
         handles.last_second.stage_buckets[*stage as usize] = outcome.window;
+        handles.last_second.stage_strict[*stage as usize] = outcome.strict;
         if *stage == Stage::ReceiptToFold {
             // Read the fine histogram right after this stage's max swap and
             // bucket read, so the two disagree only for samples recorded in
@@ -1888,6 +1930,7 @@ mod tests {
         let stage = Stage::SocketToWal;
         let mut snap = StageSnapshot {
             buckets: [0; STAGE_BUCKETS],
+            raw_buckets: [0; RAW_STAGE_BUCKETS],
             count: 0,
             sum_nanos: 0,
             over_budget: 0,

@@ -161,6 +161,30 @@ pub(super) async fn verify_all(client: &reqwest::Client, url: &str) -> Result<()
             .with_context(|| format!("proof table {table} columns"))?;
         validate(&flags, &columns, keys)
             .with_context(|| format!("proof table {table} is not ready"))?;
+        if table == super::HOT_PATH_LATENCY_MINUTE_TABLE {
+            validate_strict_columns(&columns)
+                .context("latency table strict evidence columns are not ready")?;
+        }
+    }
+    Ok(())
+}
+
+/// The additive strict schema must exist with exact LONG types before a
+/// versioned row can be written. Existing identity checks remain separate.
+pub(super) fn validate_strict_columns(columns: &Value) -> Result<()> {
+    let rows = dataset(columns)?;
+    for (name, expected_type) in super::HOT_PATH_LATENCY_MINUTE_COLUMNS
+        .iter()
+        .filter(|(name, _)| name.starts_with("strict_"))
+    {
+        let column = rows
+            .iter()
+            .find(|row| row.get(0).and_then(Value::as_str) == Some(*name))
+            .with_context(|| format!("missing strict evidence column {name}"))?;
+        ensure!(
+            column.get(1).and_then(Value::as_str) == Some(*expected_type),
+            "strict evidence column {name} has the wrong type"
+        );
     }
     Ok(())
 }
