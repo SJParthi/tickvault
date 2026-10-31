@@ -1199,6 +1199,9 @@ Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 micr
 - [x] SP6. Review fixes: the candle ILP buffer is presized and written once at construction (no regrowth on the append); a p99 tail miss defers to a step after the Criterion baseline save
   - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/benches/seal_path.rs, crates/app/benches/feed_drain.rs, .github/workflows/bench.yml, crates/common/tests/shell_budget_guard.rs, crates/storage/tests/bench_tail_gate_defer_guard.rs
   - Tests: test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows, test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows, both_benches_print_the_marker_and_exit_unless_deferred, bench_yml_defers_and_fails_after_the_baseline_save, workflow_run_lines_never_grow
+- [x] SP7. The candle row through #2163's own ILP encoder, behind `[tick_storage] own_ilp_encoder` (default off): `IlpLine` gains `column_str` (the library's quoted escape), the candle writer's buffer and sender become `TickRowBuffer` / `TickIlpSender`, byte-identical to the validated library form, zero allocation; own-encoder steps held to `seal_path` = 1,000 ns at p99 (measured p99 780 to 825 ns)
+  - Files: crates/storage/src/tick_ilp.rs, crates/storage/src/tick_ilp_tests.rs, crates/storage/src/shadow_candle_writer.rs, crates/storage/src/seal_writer_runner.rs, crates/app/src/main.rs, crates/storage/benches/seal_path.rs, crates/storage/tests/dhat_seal_per_seal_path.rs
+  - Tests: proptest_own_encoder_candle_rows_are_byte_identical_to_the_validated_form, test_own_encoder_writer_appends_the_same_bytes_as_the_library_writer, test_flush_error_is_connection_matches_each_encoder, test_own_encoder_test_writer_flush_fails_and_keeps_rows, test_column_str_matches_the_library, test_column_str_before_table_is_refused_like_the_library, dhat_the_per_seal_path_after_the_fold_never_allocates
 
 ### Muhurat 2026-11-08 (Sunday) — the weekday-only protections
 
