@@ -132,7 +132,7 @@ Notes: commit with `git commit -F <file>` (double-quoted `-m` mangles `§` citat
 
 ## 10. Session checkpoint replies
 
-Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2144 (feed hardening 2/3b), #2158 (12b), #2159 (fuzz), lambdas/logs-mcp coverage, audit triage part 2, plan leftovers.
+Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2144 (feed hardening 2/3b), #2159 (fuzz), lambdas/logs-mcp coverage, audit triage part 2, plan leftovers.
 
 ### #2149 depth row path — branch `perf/sub-us-depth`, head `0e1f0f60f` (draft)
 - **CI**: All Green on `0e1f0f6`, every job green; Enable Auto-Merge skipped only because the PR is a draft.
@@ -269,6 +269,24 @@ Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by
   - PR25 delete `max_position_lots` and the `[cross_verify]` stub
   - PR9 fuzz target
 - **Then**: notes, review, gates, PR.
+
+### #2158 test-target clippy (12b) — branch `claude/clippy-all-targets`, head `2b6279bac` (draft)
+- **CI**: All Green passed on `2b6279bac`, but the branch is now behind main.
+- **Done**:
+  - A new Build & Verify step runs `cargo clippy -p tickvault-common -p tickvault-storage -p tickvault-api -p tickvault-aws-lambdas -p tickvault-logs-mcp --all-targets --no-deps -- -D warnings`.
+  - 234 of 276 test-code findings fixed; production code untouched.
+  - Guards: `rust_only_guard::ci_clippy_gate_stays_armed` and `clippy_local_parity_guard`; `scripts/clippy-local.sh` (`make clippy-ci`).
+  - Five review rounds; the last two were clean.
+- **Partial**: app, core and trading are not gated yet. Their 42 findings are all in owned files; the PR body lists them per file.
+- **Pending**:
+  - Merge main in.
+  - Re-run the gate command plus `clippy_local_parity_guard`, `rust_only_guard`, `shell_budget_guard` and `source_size_ratchet_guard`.
+  - Push, wait for All Green, mark ready.
+  - Follow-up: fix the 42 findings, then add the three crates to the step and to `CLIPPY_ALL_TARGETS_CRATES`.
+- **Notes**:
+  - Once this is on main, storage test code is under `-D warnings`, so a merge of main can turn Build & Verify red.
+  - `pool_supervisor.rs` is at 26,182 lines against its pin of 26,184.
+  - `ci.yml` is at its 293-line shell ceiling.
 
 ### Feed hardening 52 (no PR) — branch `claude/fl52-measurements`, head `ac5e44019`
 - **Done**: 52b is already on main (#2057); only its plan tick remains.
