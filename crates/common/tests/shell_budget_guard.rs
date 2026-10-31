@@ -2269,6 +2269,10 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     it.next().is_none().then_some(v)
 }
 
+/// The only keys a per-test nextest override may set: which test, and a
+/// longer timeout for it.
+const NEXTEST_OVERRIDE_ALLOWED_KEYS: &[&str] = &["filter", "slow-timeout"];
+
 /// Problems with a nextest config's flaky handling (empty = OK).
 fn nextest_flaky_problems(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2314,10 +2318,25 @@ fn nextest_flaky_problems(text: &str) -> Vec<String> {
                  so a test that passes on retry would go green"
             ));
         }
-        if profile.contains_key("overrides") {
-            out.push(format!(
-                "profile `{name}` has per-test overrides; one could set `flaky-result = \"pass\"`"
-            ));
+        // An override may only lengthen a named test's timeout (2026-10-31,
+        // the WAL lifetime property test). Any other key, `flaky-result` and
+        // `retries` included, could let a flaky test pass, so it is refused.
+        if let Some(overrides) = profile.get("overrides") {
+            let entries = overrides.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let malformed = overrides.as_array().is_none();
+            let bad_key = entries.iter().any(|entry| {
+                entry.as_table().is_none_or(|t| {
+                    !t.contains_key("filter")
+                        || t.keys()
+                            .any(|k| !NEXTEST_OVERRIDE_ALLOWED_KEYS.contains(&k.as_str()))
+                })
+            });
+            if malformed || bad_key {
+                out.push(format!(
+                    "profile `{name}` has a per-test override that sets more than \
+                     `filter` and `slow-timeout`; one could set `flaky-result = \"pass\"`"
+                ));
+            }
         }
     }
     out
@@ -2350,6 +2369,21 @@ fn nextest_flaky_self_test() {
     let overrides = "nextest-version = \"0.9.131\"\n[profile.ci]\n\
                      [[profile.ci.overrides]]\nfilter = 'all()'\nflaky-result = \"pass\"\n";
     assert_eq!(nextest_flaky_problems(overrides).len(), 1);
+    // A timeout-only override for a named test is allowed; anything more,
+    // or an override with no filter, is refused.
+    let timeout_only = "nextest-version = \"0.9.131\"\n[profile.ci]\n\
+                        [[profile.ci.overrides]]\nfilter = 'test(=slow)'\n\
+                        slow-timeout = { period = \"300s\", terminate-after = 2 }\n";
+    assert!(nextest_flaky_problems(timeout_only).is_empty());
+    let timeout_and_retry = "nextest-version = \"0.9.131\"\n[profile.ci]\n\
+                             [[profile.ci.overrides]]\nfilter = 'test(=slow)'\n\
+                             slow-timeout = \"300s\"\nretries = 3\n";
+    assert_eq!(nextest_flaky_problems(timeout_and_retry).len(), 1);
+    let no_filter = "nextest-version = \"0.9.131\"\n[profile.ci]\n\
+                     [[profile.ci.overrides]]\nslow-timeout = \"300s\"\n";
+    assert_eq!(nextest_flaky_problems(no_filter).len(), 1);
+    let not_array = "nextest-version = \"0.9.131\"\n[profile.ci]\noverrides = 1\n";
+    assert_eq!(nextest_flaky_problems(not_array).len(), 1);
     assert_eq!(parse_version("0.9.131"), Some((0, 9, 131)));
     assert_eq!(parse_version("0.9"), None);
     assert_eq!(parse_version("0.9.1.2"), None);
