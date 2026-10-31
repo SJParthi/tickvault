@@ -343,14 +343,14 @@ Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by
 - **Notes**: the container disk fills fast (`cargo clean` freed 22 GB; builds used `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`). Running targets needs cargo-fuzz and `nightly-2026-03-15`. The ignored-test guard forbids new `#[ignore]`; the assertion-free ratchet forbids tests with no assertion.
 - **CI update (07:27 UTC, head `fd6ff357f`, CI complete)**: three checks red, two causes, both in this PR. (1) Test (common) and Coverage & Perf: the only failing target is `-p tickvault-common --test assertion_free_test_ratchet`, which flags `prop_recipe_with_one_byte_removed`; adding an assertion clears both. Every other suite passed. (2) Commit Lint: the handoff commit's type `wip` is not allowed; reword it, or merge with a proper squash title. All Green is red only because of these.
 
-### Plan leftovers W4/M6/EX1/S1/DT-small (no PR) — branch `handoff/plan-leftovers`, head `3e7c98e6b` (Verified on origin, 07:33 UTC)
-- **Commits**: `cedab1a3c` W4 test fixes (also on `claude/audit-five-items`; its type `wip` would fail Commit Lint in a PR), `3a5938254` W4 review fix, `3e7c98e6b` test pinning `take_forgot_untrusted`.
+### Plan leftovers W4/M6/EX1/S1/DT-small (no PR) — branch `handoff/plan-leftovers`, head `2a4a91610` (Verified on origin, 07:40 UTC)
+- **Commits**: `cedab1a3c` W4 test fixes (also on `claude/audit-five-items`; its type `wip` would fail Commit Lint in a PR), `3a5938254` W4 review fix, `3e7c98e6b` test pinning `take_forgot_untrusted`, `2a4a91610` handoff note `.claude/plans/handoff-plan-leftovers-2026-10-31.md` (draft PR body and the M6 proposal).
 - **Done**:
   - W4 is built, with its review fixes. The HIGH finding is fixed: a table the lag tracker forgets while untrusted is no longer read as a clean probe.
   - Storage lib: 2,260 passed / 0 failed before the last commit; after it only the new test was re-run (1 passed). The 6 related storage integration tests pass; clippy is clean on the storage lib.
   - EX1, S1 and DT-small were already on main (#2134, #2135) and are ticked in the plan. S1's 2 core tests pass.
 - **Partial**: the app-crate tests for EX1, S1 and DT-small were not re-run locally (disk full), so CI must run them. W4's second review round never ran. The live measurement W4 asks for was not done (no AWS access).
-- **Pending**: M6 is not built (`ws_frame_spill.rs` belonged to another session). The proposal, from the session's scratchpad only (not in git): a settable frame cap in `ws_frame_spill.rs`, `evening_drain::frame_cap_for` / `peek_frame_cap`, and a `main.rs` call before STAGE-C.
+- **Pending**: M6 is not built (`ws_frame_spill.rs` belonged to another session). The proposal is in `.claude/plans/handoff-plan-leftovers-2026-10-31.md` on that branch: a settable frame cap in `ws_frame_spill.rs`, `evening_drain::frame_cap_for` / `peek_frame_cap`, and a `main.rs` call before STAGE-C.
 - **Known**: no failing test reported. `clippy --all-targets` fails only in older untouched test files (`partition_archive`, `seal_dlq`, `seal_writer_task`, `spill_ceiling_is_free_space_based_guard`).
 
 ### #2158 test-target clippy (12b) — branch `claude/clippy-all-targets`, head `2b6279bac` (draft)
