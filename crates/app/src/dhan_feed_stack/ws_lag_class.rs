@@ -90,11 +90,12 @@ impl LagMaxByClass {
     }
 
     /// Folds one positive lag into its class's window maximum. O(1): one
-    /// compare chain on the segment byte and one relaxed `fetch_max`.
+    /// compare chain on the segment byte, one relaxed load and, only when the
+    /// lag raises the maximum, one relaxed `fetch_max`.
     #[inline]
     pub(super) fn note(&self, segment_code: u8, lag_ms: i64) {
         let class = LagClass::of_segment_code(segment_code);
-        self.max_millis[class as usize].fetch_max(lag_ms, Ordering::Relaxed);
+        super::fetch_max_if_above(&self.max_millis[class as usize], lag_ms);
     }
 
     /// Takes one class's window maximum (reset on read), folds it into that
