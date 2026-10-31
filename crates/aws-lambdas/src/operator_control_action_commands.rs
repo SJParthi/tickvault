@@ -4,6 +4,10 @@
 //! `_ssm_shell` (`scratchpad/w4-dump-actions.py`), NEVER hand-transcribed.
 //! Byte-exact with the SSM command lists each action dispatches.
 
+/// Read-only Top Movers action. Fixed Rust executable, no app startup or shell logic.
+/// Counted inside this file's existing shell literal ceiling.
+pub const MOVERS_COMMAND: &str = "/opt/tickvault/bin/tv-movers";
+
 /// Checked on the box, before the first `systemctl stop`, by every action
 /// that deletes data (wipe, reset, nuke).
 ///

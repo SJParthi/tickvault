@@ -681,7 +681,8 @@ const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
     ("crates/api/src/handlers/dashboard_page.rs", 301),
     ("crates/api/src/handlers/feeds_page.rs", 226),
-    ("crates/aws-lambdas/src/operator_control_console.html", 319),
+    // Public portal Top Movers, user-requested 2026-10-31; scope/measurement in §0.16.
+    ("crates/aws-lambdas/src/operator_control_console.html", 350),
 ];
 
 /// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
@@ -1124,7 +1125,7 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        26_601,
+        31_671,
     ),
 ];
 

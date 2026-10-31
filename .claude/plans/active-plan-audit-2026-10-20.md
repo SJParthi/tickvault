@@ -1410,3 +1410,59 @@ OE1: no new counter or alarm; new `kind` labels on `tv_order_update_decode_quirk
 Carries the 15-row + 7-row matrix by reference to
 `.claude/rules/project/per-wave-guarantee-matrix.md`; per-PR specifics are in each
 PR body.
+
+
+### Public operator portal Top Movers — 2026-10-31 continuation
+
+Requested by the owner in the Codex continuation: add Top Movers to the supplied
+API Gateway dashboard and verify the actual page. Source implementation and
+focused checks are complete; full validation and live deployment are separate steps.
+
+Design: the existing operator authentication gate dispatches one fixed standalone
+Rust reader through the existing SSM sender. The reader fetches the same server-side
+API credential as app startup and calls only the fixed loopback F&O endpoint. It
+preserves canonical prices and selects at most 20 gainers and 20 losers. The input,
+transport, request time and per-container cache are bounded; this cold control path
+does not claim constant time or submicrosecond latency.
+
+Edge Cases / Failure Modes: missing helper, stopped instance, invalid credentials,
+database failures, malformed or truncated responses, incomplete stock coverage,
+stale data, redirect attempts, oversized streaming bodies, overlapping requests,
+late replies after locking and background-tab expiry produce explicit states.
+Conservative browser age includes request duration and two seconds for integer
+timestamp precision. An upper estimate beyond the freshness limit is unconfirmed,
+not proof that the source is stale; the newest trade may be outside displayed movers.
+
+Rollback: revert the app helper packaging and operator Lambda together through the
+existing deployment process. Missing or incompatible helper output fails closed.
+The three-file swap is not atomic and existing automatic rollback restores only
+the main app; no stronger rollback guarantee is introduced.
+
+Observability: show captured time, conservative age, source state, priced/universe
+counts and selected/total counts. Errors are typed codes; helper output never
+contains credentials or raw SDK diagnostics. Actual live browser verification is
+read-only and distinct from intercepted browser fixtures.
+
+- [x] Connect the authenticated operator action to one standalone Rust read-only
+  helper, with canonical app prices, bounded top20 selections, explicit errors,
+  timeout, age and per-container cache.
+  - Files: crates/app/src/operator_movers.rs, crates/app/src/bin/tickvault_operator_read.rs,
+    crates/common/src/operator_movers_wire.rs, crates/aws-lambdas/src/operator_movers.rs,
+    crates/aws-lambdas/src/operator_control.rs
+  - Tests: canonical_large_universe_selects_complete_top_twenty_each_way,
+    closed_is_preserved_with_no_invented_prices,
+    malformed_or_inconsistent_source_is_refused_as_a_whole,
+    movers_authentication_and_stopped_state_precede_any_private_request,
+    movers_fixed_command_cache_expires_and_never_forwards_user_input,
+    movers_concurrent_refresh_is_bounded_and_does_not_dispatch_twice
+- [x] Add the accessible portal table with explicit closed/stale/expired/error
+  states and package the helper through the existing deployment workflow.
+  - Files: crates/aws-lambdas/src/operator_control_console.html,
+    crates/aws-lambdas/src/operator_control_action_commands.rs,
+    .github/workflows/deploy-aws.yml, crates/app/Cargo.toml,
+    crates/common/tests/browser_surface_and_toolchain_guard.rs
+  - Tests: console_embedded_shell_never_grows, ssm_workflow_shell_never_grows,
+    workflow_run_lines_never_grow, javascript_bytes_inside_script_tags_stay_under_the_ceiling
+  - Browser: real Chromium fixtures for rows, closed, errors, malicious symbol text,
+    expiry, refresh in flight, lock, visibility and mobile layout; actual live
+    portal re-check only after an explicitly reviewed deployment.

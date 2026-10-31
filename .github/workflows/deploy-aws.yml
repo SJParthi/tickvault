@@ -315,7 +315,7 @@ jobs:
           # review HIGH fix — a rerun-if-env-changed on GITHUB_SHA killed the
           # Build & Verify cache on every commit).
           TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
-        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault -p tickvault-app
+        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault --bin tv-movers -p tickvault-app
 
       - name: Build smoke_test binary (ARM64 musl static)
         # Separate binary at crates/app/src/bin/smoke_test.rs — exits 0/1
@@ -333,6 +333,8 @@ jobs:
           BIN_DIR=target/aarch64-unknown-linux-musl/release
           file "$BIN_DIR/tickvault"
           file "$BIN_DIR/smoke_test"
+          file "$BIN_DIR/tv-movers" | grep -q 'aarch64\|ARM'
+          file "$BIN_DIR/tv-movers" | grep -q 'statically linked'
           # Confirm the file command reports ARM aarch64 (not x86)
           file "$BIN_DIR/tickvault" | grep -q 'aarch64\|ARM' \
             || (echo "FAIL: tickvault is not ARM64 — arch mismatch with Graviton box"; exit 1)
@@ -359,14 +361,13 @@ jobs:
             exit 1
           fi
 
-      - name: Stage both binaries for upload
+      - name: Stage app, smoke test and read-only operator helper
         run: |
           mkdir -p dist
           BIN_DIR=target/aarch64-unknown-linux-musl/release
-          cp "$BIN_DIR/tickvault"   dist/tickvault
-          cp "$BIN_DIR/smoke_test"  dist/smoke_test
+          cp "$BIN_DIR/tickvault" "$BIN_DIR/smoke_test" "$BIN_DIR/tv-movers" dist/
 
-      - name: Upload artifact (both binaries)
+      - name: Upload artifact (all three binaries)
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -851,16 +852,13 @@ jobs:
             echo "::warning::$MISSING /tickvault/prod/* keys are missing — app boot may HALT. Populate them MANUALLY via aws ssm put-parameter (operator-owned; the deploy never auto-seeds prod)."
           fi
 
-      - name: Upload both binaries to S3 deploy bucket
+      - name: Upload app, smoke test and read-only helper to S3
         # Skipped on an intentional off-hours skip — no deploy is happening.
         if: env.DEPLOY_SKIP_REASON == ''
         run: |
-          chmod +x ./dist/tickvault ./dist/smoke_test
-          aws s3 cp ./dist/tickvault \
-            s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }}
-          aws s3 cp ./dist/smoke_test \
-            s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
+          chmod +x ./dist/tickvault ./dist/smoke_test ./dist/tv-movers
+          aws s3 cp ./dist/ \
+            s3://tv-prod-cold/deploys/${{ github.sha }}/ --recursive --exclude '*' --include tickvault --include smoke_test --include tv-movers \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
       - name: Re-gate market hours at SWAP time (no mid-session restart)
@@ -1130,7 +1128,7 @@ jobs:
               "if docker compose version >/dev/null 2>&1; then echo COMPOSE-PLUGIN-OK: already present - skipping install; else sudo timeout 180 dnf install -y docker-compose-plugin || sudo timeout 180 yum install -y docker-compose-plugin || echo compose plugin not in distro repos - falling back to pinned static binary; fi",
               "if ! docker compose version >/dev/null 2>&1; then COMPOSE_ARCH=$(uname -m); case \"$COMPOSE_ARCH\" in aarch64) COMPOSE_SHA256=\"$COMPOSE_SHA256_AARCH64\";; x86_64) COMPOSE_SHA256=\"$COMPOSE_SHA256_X86_64\";; *) COMPOSE_SHA256=\"\";; esac; if [ -z \"$COMPOSE_SHA256\" ]; then echo WARN: no pinned compose sha256 for arch $COMPOSE_ARCH - skipping static install; else timeout 150 curl -fsSL --max-time 120 https://github.com/docker/compose/releases/download/$COMPOSE_PIN/docker-compose-linux-$COMPOSE_ARCH -o /tmp/docker-compose.dl && echo \"$COMPOSE_SHA256  /tmp/docker-compose.dl\" | sha256sum -c - && sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo install -m 0755 -o root -g root /tmp/docker-compose.dl /usr/local/lib/docker/cli-plugins/docker-compose || echo WARN: pinned compose plugin download or sha256 verification FAILED - nothing installed - final verify below decides; rm -f /tmp/docker-compose.dl; fi; fi",
               "docker compose version || (echo FATAL: docker compose plugin still unavailable after distro package + pinned sha256-verified static binary attempts - boot path would BOOT-02 on the next nuke; exit 1)",
-              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
+              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin/.next",
               "chown -R ec2-user:ec2-user /opt/tickvault",
               "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user git clone --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
               "cd /opt/tickvault",
@@ -1140,18 +1138,18 @@ jobs:
               "chown -R ec2-user:ec2-user config/",
               "echo ===== deployed config/production.toml line count + head =====",
               "wc -l config/production.toml repo/config/production.toml",
-              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
+              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config differs from repo after copy; diff config/production.toml repo/config/production.toml; exit 1)",
               "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -f repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service; fi",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
               "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
-              "chmod +x bin/tickvault.new bin/smoke_test.new",
-              "timeout 40 bin/smoke_test.new --duration 30",
-              "mv bin/tickvault.new   bin/tickvault",
-              "mv bin/smoke_test.new  bin/smoke_test",
-              "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
+              "cd bin/.next; TVS3=s3://tv-prod-cold/deploys/${{ github.sha }}; timeout 300 aws s3 cp \"$TVS3/tickvault\" tickvault",
+              "timeout 300 aws s3 cp \"$TVS3/smoke_test\" smoke_test",
+              "timeout 300 aws s3 cp \"$TVS3/tv-movers\" tv-movers",
+              "chmod +x tickvault smoke_test tv-movers",
+              "(cd ../..; timeout 40 bin/.next/smoke_test --duration 30)",
+              "chown ec2-user:ec2-user tickvault smoke_test tv-movers",
+              "mv tickvault smoke_test tv-movers ..; cd ../..",
               "install -m 0755 -o root -g root bin/tickvault bin/tickvault-host",
               "cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service",
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",

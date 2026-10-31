@@ -1299,3 +1299,28 @@ are unchanged, no new `<script>` tag, no new page, no new HTML file.
 - growing any other row of either budget under this section;
 - using this section for anything but the F&O stocks movers section of the
   dashboard.
+
+
+## §0.16. 2026-10-31 — public operator portal Top Movers
+
+Current user request: "so whva you added the dashbaord webpage to see to pmovers dude"
+and "so ypu will evrufy automaticlaly from the real lvie webpage right dude".
+The standing request explicitly permits the frontend exception while requiring Rust
+for backend logic. This addition implements that requested view in the existing
+operator portal; it does not authorize deployment, a new browser surface or an
+interpreted backend.
+
+The existing portal script grows from 319 to 350 lines and 26,601 to 31,671 UTF-8 bytes
+(measured by the guard, including script-tag lines and their newlines). Its exact frontend rows are updated for this
+feature only; script-tag and inline-handler counts are unchanged. New cells use
+textContent. The app secret stays on the server.
+
+The read-only standalone Rust helper is `tv-movers`; its fixed launcher is counted
+in the existing action-command literal budget. The actual sender remains in
+operator_control.rs. No shell ceiling, sender allowlist, unsafe exemption or new
+interpreted program is added. Existing deploy glue stages all three binaries in
+bin/.next, reads each exact S3 object with fail-fast behavior, runs the smoke gate
+before swapping, and moves the three files together. The fixed prefix and working
+directory reduce repetition while preserving the existing ceilings. The swap is
+not a filesystem transaction: its partial-failure behavior is still subject to
+the existing app rollback workflow.
