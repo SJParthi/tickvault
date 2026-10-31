@@ -132,7 +132,7 @@ Notes: commit with `git commit -F <file>` (double-quoted `-m` mangles `§` citat
 
 ## 10. Session checkpoint replies
 
-Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2144 (feed hardening 2/3b), #2159 (fuzz), lambdas/logs-mcp coverage, audit triage part 2, plan leftovers.
+Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2159 (fuzz), lambdas/logs-mcp coverage, plan leftovers.
 
 ### #2149 depth row path — branch `perf/sub-us-depth`, head `0e1f0f60f` (draft)
 - **CI**: All Green on `0e1f0f6`, every job green; Enable Auto-Merge skipped only because the PR is a draft.
@@ -269,6 +269,45 @@ Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by
   - PR25 delete `max_position_lots` and the `[cross_verify]` stub
   - PR9 fuzz target
 - **Then**: notes, review, gates, PR.
+
+### #2144 feed hardening items 2 and 3b — branch `claude/feed-hardening-items-2-3`, head `38898defa` (draft)
+- **CI**: run 41092332796 on `38898de` succeeded, All Green included.
+- **Done**:
+  - Item 2: `host_limits` also checks `vm.max_map_count` and the soft open-file limit (warn only); `host_limits_lockstep_guard` pins both.
+  - Item 3b: new `crates/app/src/subscribe_reconcile.rs`.
+    - Re-subscribes main-feed instruments still silent 120 s after subscribe, in place, never by a redial.
+    - At most 3 rounds per instrument per day, 120 s spacing.
+    - Switch `[dhan_universe] subscribe_reconcile_auto_resubscribe`, default false (count only).
+  - Four review rounds (10 defects fixed); the last two clean.
+  - 57 tests passed.
+- **Partial**: not wired into the drain. `dhan_feed_stack.rs` is owned by another session; the PR body's "Wiring proposal" lists the exact call sites.
+- **Pending**: mark ready, then tick the plan boxes after merge.
+- **Needs the owner**:
+  - make the boot refuse a limit mismatch;
+  - turn on auto-resubscribe after one shadow session;
+  - a page for instruments still silent after 3 rounds (needs a noise-lock row).
+
+### Audit-fix triage part 2 (no PR) — branch `claude/audit-plan-tail`, head `b471896fe`
+- **Done**:
+  - All 34 tail items of `active-plan-audit-fixes-2026-09-26.md` checked, each with a dated note.
+  - Ticked done: DA-13, DA-13b, DA-13c, R3-13. Ticked superseded: PR52.
+  - PR44 and PR48 left unticked: inert while depth and console wipes are off.
+- **Partial (unreviewed WIP, 8 files)**:
+  - `aws-control.yml`: market-hours guard and restart-questdb gating.
+  - `emergency-fs-recover.yml`: re-enable the app on exit.
+  - terraform `main.tf`: scheduler PassRole scope.
+  - common guards: `aws_infra_wiring.rs`, `github_workflow_guard.rs`.
+  - core: `token_cache.rs` 0o600 create_new, the `order_update_connection.rs` timeouts, an `instance_lock.rs` comment.
+  - Only `cargo check -p tickvault-core -p tickvault-common --tests` was run; no tests, clippy, fmt or gates.
+- **Pending (approved, not started)**:
+  - PR33 depth_seed NSE-only index
+  - PR34 and PR19 infra timeouts
+  - PR50 calendar coverage per year
+  - PR37 doc
+  - PR39 literal error-code guard
+  - row 110 seal stall throttle
+  - PR38 OMS expiry vs IST date
+  - DA-17/PR36 qdb_console_proxy repeated param (its plan note already names this fix, so land it or correct the note)
 
 ### #2158 test-target clippy (12b) — branch `claude/clippy-all-targets`, head `2b6279bac` (draft)
 - **CI**: All Green passed on `2b6279bac`, but the branch is now behind main.
