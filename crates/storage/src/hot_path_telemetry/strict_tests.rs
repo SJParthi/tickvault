@@ -130,7 +130,7 @@ fn test_strict_window_regression_is_unknown_and_next_window_recovers() {
 }
 
 #[test]
-fn test_strict_counts_overflow_and_signed_storage_limit_fail_closed() {
+fn test_checked_add_and_ilp_counts_enforce_overflow_and_signed_limits() {
     let mut raw = [0; RAW_STAGE_BUCKETS];
     raw[0] = u64::MAX;
     raw[1] = 1;

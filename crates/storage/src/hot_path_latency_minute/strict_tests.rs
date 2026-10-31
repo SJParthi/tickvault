@@ -119,7 +119,7 @@ fn test_minute_missing_or_overflowed_strict_window_stays_unknown_until_rollover(
 }
 
 #[test]
-fn test_latency_minute_row_strict_counts_reject_legacy_partial_version_and_bad_counts() {
+fn test_from_columns_and_strict_counts_reject_legacy_partial_and_bad_counts() {
     let original = one_row(Stage::DrainMainFrame, &[999]);
     for (version, samples, violations) in [
         (None, None, None),
