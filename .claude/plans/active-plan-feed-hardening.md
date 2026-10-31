@@ -1,5 +1,95 @@
 # Implementation Plan: Feed Hardening — bound the limits, alarm the silence, automate the recovery
 
+## Item 3b continuation — Codex source integration, 2026-10-31
+
+### Design
+
+Connect the preserved #2144 reconciliation component to one live lane: one
+book/executor, main-feed dial and successful queued Extend paths, and the existing
+30-second silence sweep before its alarm filter. Pass owned state explicitly;
+do not add a global registry or per-tick bookkeeping. Keep
+`subscribe_reconcile_auto_resubscribe = false` by default. Queue acceptance records
+an expected subscription, not proof of a wire ACK or a received market packet.
+The default-false setting still installs the observer/book and retains command
+receivers; it disables automatic resend, not the observation cost. The cold sweep
+retains its vector, mutex and metrics work. No per-call latency guarantee follows.
+
+### Edge Cases
+
+Refused, truncated and closed acknowledgement paths must remove only the entries
+owned by that command's socket. A backup copy must not remove the primary entry.
+A later successful subscription may replace a closed primary sender; an existing
+live primary retains its original timestamp/round budget. Depth channels are not
+members of this main-feed book. Restart creates a fresh process-local book.
+
+### Failure Modes
+
+Failed queue sends record nothing. The existing bounded executor handles its own
+unsubscribe/subscribe outcomes; existing connection replay remains authoritative.
+No new socket is opened and no automatic resend is enabled by this integration.
+The 30-second sweep may briefly contend with cold attach bookkeeping under the
+book's mutex; no additional universe scan is introduced.
+
+### Test Plan
+
+- [x] Exercise sparse expected and untracked NeverTicked reports through the real sweep before alarm filtering.
+  - Files: `crates/app/src/dhan_feed_stack/subscribe_reconcile_tests.rs`
+  - Tests: `real_silence_sweep_observes_sparse_expected_reports_before_alarm_filtering`
+- [x] Exercise boot/dial and Extend registration, refusal/truncation/closed ACK
+      removal, backup ownership, closed-primary rebinding and depth exclusion.
+  - Files: `crates/app/src/dhan_feed_stack/subscribe_reconcile_tests.rs`, `crates/app/src/subscribe_reconcile.rs`
+  - Tests: `main_feed_commands_registers_without_a_topup_collector`, `a_refused_topup_is_removed_from_both_expected_sets`, `a_truncated_topup_removes_only_the_unheld_tail`, `a_closed_ack_removes_the_unconfirmed_offer`, `main_feed_commands_preserves_topup_room_and_excludes_depth`, `test_closed_primary_rebinds_without_refunding_daily_rounds`, `test_backup_refusal_keeps_the_primary_timestamp_and_expected_entry`
+- [ ] Run component, wiring, size, allocation and full applicable app/common
+      validation, normal native gates and independent source review.
+
+### Rollback
+
+Revert the wiring commit while retaining the preserved component history. The
+default-false resend switch remains unchanged; no live setting or deploy is part
+of this source continuation. Boot refusal and paging remain separate owner scope.
+
+### Observability
+
+Use the component's existing expected/missing/round counters and coded warnings.
+Tests distinguish expected queued work from confirmed held/wire/received data.
+No new alarm, metric export selection, latency guarantee or live proof is claimed.
+
+### Independent review correction — stale queued rounds
+
+The first wired snapshot is blocked by independent review: enqueue-time eligibility
+can become stale before the sequential executor reaches the round. Add a unique
+round reservation and originating IST day, validate ownership/membership and a
+fresh session gate after obtaining command-channel capacity but before every new
+unsubscribe, and cancel stale work without changing another reservation's budget.
+Refund only the matching current-day reservation. Rebinding or forgetting clears
+the prior reservation identity; day rollover clears it with the daily count.
+Once an unsubscribe may have happened, restoration remains mandatory even if the
+window closes. Tests must cover queue-to-forget, closed-owner rebind, window-close,
+same-day cancellation refund, and an old-day refund arriving after new ownership
+has reserved a new-day round. This is cold-path work only, with no timing claim.
+
+The v3 review closed that unsubscribe/refund race but found that a known-not-held
+reply could still cause a stale new subscription in phase three. Recheck that
+placement and every retry through the same capacity-first atomic enqueue gate;
+only removed or uncertain members bypass it for mandatory restoration. Cancel and
+refund only an unplaced matching reservation tail. Added controls cover a forget
+or close during the not-held ACK, a placement retry crossing close, and partial
+placement whose canceled tail alone is refunded. The restored component/wiring
+filter passed 62 tests with no failures; the manual wall-clock harness remains
+ignored. Six ordinary mutations detected the intended executed failures in the
+membership, session, not-held placement, restoration and refund contracts, then
+the original component was restored byte-for-byte. Pure configuration parsing
+passed three tests, host-limit logic 15, deployment lockstep eight and selected
+repository guards 20. Full lint, committed-head workspace, native gates and remote
+CI remain pending at this pre-commit checkpoint. Validation occurs before enqueue, not at the later
+socket write; delivering and first-packet evidence is the latest sweep's state.
+
+The unchanged full public-function scanner measured its existing 311 baseline.
+The test-count guard measured 15,598 source attributes, so its tracked floor is
+raised from 13,559 to 15,598 as that guard requests. This mechanical inventory is
+not an executed-test count or a code-coverage percentage; no scanner, exemption,
+coverage floor or deadline is relaxed.
+
 **Status:** IN_PROGRESS
 **Date:** 2026-08-10
 **Approved by:** Parthiban (operator) — "approve the plan", 2026-08-10 in-session, given in
@@ -65,6 +155,21 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `deploy/docker/docker-compose.yml`, `deploy/aws/terraform/user-data.sh.tftpl`,
     `deploy/systemd/tickvault.service`
   - Tests: `boot_limit_assertion_guard.rs`
+  - **PROGRESS 2026-10-30 (owner: "fix resolve implement everything now"), NOT ticked.**
+    Verified already on main before this change: `LimitNOFILE=65536` in
+    `deploy/systemd/tickvault.service`; `vm.max_map_count = 1048576` and
+    `net.core.rmem_max = 67108864` (64 MiB since Quote 38, not the 128 MiB above)
+    in `deploy/aws/sysctl/99-tickvault-net.conf`; the QuestDB cap DERIVED from host
+    MemTotal on every deploy (`deploy-aws.yml` questdb-mem step, 40%, floor 1g) —
+    the trap above is closed. Added in PR #2144: `crates/app/src/host_limits.rs`
+    also reads `vm.max_map_count` and this process's soft open-file limit
+    (`/proc/self/limits`), and `crates/app/tests/host_limits_lockstep_guard.rs`
+    pins both to the deploy files (the ratchet this item names). **Still open:**
+    the check WARNS and does not refuse to start. The Failure Modes row below says
+    "warn for one release, then enforce"; enforcing is a boot-blocker the owner
+    decides.
+    **Scope clarification 2026-10-31:** this process reads its local `/proc`
+    settings. It cannot establish a QuestDB limit on a separate host.
 
 - [ ] **Item 3 — Empty-subscription + partial-subscribe detectors (scenario #75, #62)**
   — **HALF DONE 2026-08-25.** Split below rather than ticked whole: the detection
@@ -110,6 +215,28 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
       with a detector.
     - Files: `crates/core/src/websocket/pool_supervisor.rs`
     - Tests: `subscribe_ack_reconciliation_guard.rs`
+    - **PROGRESS 2026-10-30 (owner: "fix resolve implement everything now"), NOT
+      ticked.** Built in PR #2144 as `crates/app/src/subscribe_reconcile.rs`
+      instead of `pool_supervisor.rs`: the delta is judged from the drain's
+      existing 30 s silence sweep (no per-tick work) and the resend is IN PLACE
+      through the existing `LiveSubscriptionCommand::Resubscribe` on the SAME
+      socket (unsubscribe, then subscribe), never a spare slot and never a redial
+      (owner instruction and scope lock 2026-10-02). This changes the plan text
+      above ("auto-resubscribe the delta on a spare slot"). Max 3 rounds per
+      instrument per IST day, 120 s apart per socket; continuous session only,
+      from 09:17; skipped when the socket or the whole feed delivers nothing.
+      Switch `[dhan_universe] subscribe_reconcile_auto_resubscribe`, default
+      false (count only). Counters local `/metrics` only; the exhausted list is a
+      coded `warn!`, NOT a page ("then page with the list" needs a dated quote in
+      the noise lock first). Tests: the module's own unit tests (no separate
+      `subscribe_ack_reconciliation_guard.rs`). **Still open:** the drain wiring
+      (`dhan_feed_stack.rs` is owned by another session; proposed in the PR
+      body), turning the switch on, and the page.
+      **Continuation 2026-10-31:** the source above now wires the existing raw
+      drain sweep and primary/Extend acknowledgement paths into the book, with
+      focused tests and independent source reviews. The default-false switch,
+      live shadow-session proof and paging policy remain separate; the parent
+      item is not complete, and broader publication gates are still pending.
 
 - [~] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
   - Restart at 80% memory, before the kernel's killer decides.

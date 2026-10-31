@@ -3900,6 +3900,9 @@ async fn async_main() -> Result<()> {
             // A second copy of the top contracts on another main-feed socket
             // (scope lock 2026-10-02). 0 turns it off.
             main_feed_backup_top_n: config.dhan_universe.backup_top_n,
+            subscribe_reconcile_auto_resubscribe: config
+                .dhan_universe
+                .subscribe_reconcile_auto_resubscribe,
             // Frame-silence fast paths (scope lock 2026-10-10): shadow by
             // default, so they count would-redials before anything acts.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,

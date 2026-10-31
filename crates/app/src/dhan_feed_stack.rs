@@ -1505,6 +1505,7 @@ pub struct LiveIngest {
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
+    subscribe_reconcile: Option<Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
     /// Per slot, the depth-200 baseline the cross-feed check last acted on
     /// (requested, refused or counted in shadow), so one silent stretch is
     /// reported once. 0 = none. Indexed by global connection slot.
@@ -2005,6 +2006,7 @@ impl LiveIngest {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            subscribe_reconcile: None,
             depth200_cross_feed_latched: [0; MAX_TOTAL_DHAN_CONNECTIONS as usize],
             dead_class_latch: AtomicU8::new(0),
             dead_class_dead_scans: [const { AtomicU8::new(0) }; SEGMENT_CLASS_COUNT],
@@ -3735,9 +3737,9 @@ impl LiveIngest {
     /// alarm-worthy reports.
     ///
     /// # Complexity
-    /// O(n) in tracked instruments, allocation-free (the sink is a closure
-    /// over stack locals, not a `Vec`). COLD — every
-    /// [`SILENCE_SCAN_INTERVAL`], never per tick.
+    /// O(n) in tracked instruments. The detector and ranking use stack state;
+    /// configured subscription reconciliation may allocate one bounded candidate
+    /// list per socket per round. COLD — every [`SILENCE_SCAN_INTERVAL`], never per tick.
     pub fn scan_silence(&self, now_millis: u64) -> (u64, u64) {
         let mut discard = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
         let (silent, never, _) = self.scan_silence_named(now_millis, &mut discard);
@@ -3912,17 +3914,36 @@ impl LiveIngest {
     /// O(n) in tracked instruments — unchanged, and inherent: "which are
     /// silent?" is a question about all of them at once. The ranking adds a
     /// bounded insertion into a `WORST_SILENT_NAMED`-element array per
-    /// alarm-worthy report, so it is O(n × K) with K = 8 and no allocation.
+    /// alarm-worthy report, so it is O(n × K) with K = 8. The optional reconcile
+    /// observer has the bounded cold-round allocation described by `scan_silence`.
     pub fn scan_silence_named(
         &self,
         now_millis: u64,
         worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
     ) -> (u64, u64, usize) {
+        self.scan_silence_named_at(now_millis, worst, Instant::now())
+    }
+
+    /// Inject the same monotonic instant for the whole cold sweep. Keeping this
+    /// seam private lets tests age queued subscriptions without wall-clock sleeps.
+    fn scan_silence_named_at(
+        &self,
+        now_millis: u64,
+        worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
+        reconcile_now: Instant,
+    ) -> (u64, u64, usize) {
         let mut silent = 0u64;
         let mut never = 0u64;
         let mut named = 0usize;
         let mut classes = ClassLiveness::default();
+        let mut reconcile = self
+            .subscribe_reconcile
+            .as_ref()
+            .map(|book| book.sweep_at(reconcile_now));
         self.detector.scan_silence(now_millis, |report| {
+            if let Some(sweep) = reconcile.as_mut() {
+                sweep.note(&report);
+            }
             // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
             // deliberately not behind `counts_toward_alarm()`.
             //
@@ -3974,6 +3995,9 @@ impl LiveIngest {
                 },
             );
         });
+        if let Some(sweep) = reconcile {
+            sweep.finish_now();
+        }
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
         // CORRECTED 2026-09-10: the class verdict is judged ONLY inside the
@@ -11537,6 +11561,8 @@ pub struct DhanFeedStackParams {
     /// `[dhan_universe] backup_top_n` (scope lock 2026-10-02): near-the-money
     /// contracts given a second copy on another main-feed socket. 0 = off.
     pub main_feed_backup_top_n: usize,
+    /// Item 3b: count missing first packets; resend only when explicitly enabled.
+    pub subscribe_reconcile_auto_resubscribe: bool,
     /// `[dhan_universe] frame_silence_fast_path` (scope lock 2026-10-10):
     /// whether the evidence-confirmed frame-silence redials count only
     /// (`shadow`, the default), act, or are off.
@@ -12039,7 +12065,36 @@ pub(crate) fn ist_second_of_day_now() -> u32 {
 /// once per attempt, never per tick.
 struct PendingTopUp {
     ack: tokio::sync::oneshot::Receiver<ExtendOutcome>,
-    offered: Vec<(u64, u8)>,
+    offered: Vec<SubscribeInstrument>,
+    reconciliation: Option<(
+        Arc<crate::subscribe_reconcile::SubscribeReconcile>,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+    )>,
+}
+
+impl PendingTopUp {
+    fn queued(
+        ack: tokio::sync::oneshot::Receiver<ExtendOutcome>,
+        offered: Vec<SubscribeInstrument>,
+        reconcile: Option<&Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
+        tx: &tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+    ) -> Self {
+        let reconciliation = reconcile.map(|book| {
+            book.record_subscribed(tx, &offered);
+            (Arc::clone(book), tx.clone())
+        });
+        Self {
+            ack,
+            offered,
+            reconciliation,
+        }
+    }
+
+    fn forget(&self, instruments: &[SubscribeInstrument]) {
+        if let Some((book, tx)) = &self.reconciliation {
+            book.forget_on(tx, instruments);
+        }
+    }
 }
 
 /// Fold every answered top-up acknowledgement back into `sent`.
@@ -12071,8 +12126,9 @@ fn reconcile_pending_topups(
     pending.retain_mut(|p| match p.ack.try_recv() {
         Ok(ExtendOutcome::Held) => false,
         Ok(ExtendOutcome::Refused) => {
-            for identity in &p.offered {
-                if sent.remove(identity) {
+            p.forget(&p.offered);
+            for instrument in &p.offered {
+                if sent.remove(&contract_identity(instrument)) {
                     freed = freed.saturating_add(1);
                 }
             }
@@ -12088,6 +12144,7 @@ fn reconcile_pending_topups(
             false
         }
         Ok(ExtendOutcome::Truncated { not_held }) => {
+            p.forget(&not_held);
             for instrument in &not_held {
                 if sent.remove(&contract_identity(instrument)) {
                     freed = freed.saturating_add(1);
@@ -12108,8 +12165,9 @@ fn reconcile_pending_topups(
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-            for identity in &p.offered {
-                if sent.remove(identity) {
+            p.forget(&p.offered);
+            for instrument in &p.offered {
+                if sent.remove(&contract_identity(instrument)) {
                     freed = freed.saturating_add(1);
                 }
             }
@@ -12181,6 +12239,7 @@ fn top_up_late_contracts_acked(
     pending: &mut Vec<PendingTopUp>,
     attempts: u32,
     budget: usize,
+    reconcile: Option<&Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
 ) -> usize {
     let candidate: Vec<_> = selection
         .iter()
@@ -12223,7 +12282,7 @@ fn top_up_late_contracts_acked(
         );
         return 0;
     }
-    let placed = send_extend_chunks(&delta, sent, slots, pending, attempts);
+    let placed = send_extend_chunks(&delta, sent, slots, pending, attempts, reconcile);
     let unplaced = delta.len().saturating_sub(placed);
     if unplaced > 0 {
         // TWO causes, one message until 2026-08-22 — and they send triage in
@@ -12285,6 +12344,7 @@ fn send_extend_chunks(
     )],
     pending: &mut Vec<PendingTopUp>,
     attempts: u32,
+    reconcile: Option<&Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
 ) -> usize {
     let mut cursor = 0usize;
     let mut placed = 0usize;
@@ -12303,17 +12363,11 @@ fn send_extend_chunks(
             ack: Some(ack_tx),
         }) {
             Ok(()) => {
-                let offered: Vec<(u64, u8)> = delta[cursor..cursor + take]
-                    .iter()
-                    .map(contract_identity)
-                    .collect();
-                for identity in &offered {
-                    sent.insert(*identity);
+                let offered = delta[cursor..cursor + take].to_vec();
+                for instrument in &offered {
+                    sent.insert(contract_identity(instrument));
                 }
-                pending.push(PendingTopUp {
-                    ack: ack_rx,
-                    offered,
-                });
+                pending.push(PendingTopUp::queued(ack_rx, offered, reconcile, tx));
                 *room = room.saturating_sub(take);
                 placed = placed.saturating_add(take);
                 cursor += take;
@@ -12674,6 +12728,7 @@ struct WidenCtx<'a> {
     contract_capacity: &'a mut Option<usize>,
     /// R7 (2026-10-01): the dual-instance lock flag, for the widen's dials.
     instance_lock_held: &'a Arc<AtomicBool>,
+    subscribe_reconcile: Option<&'a Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
 }
 
 /// Room for NEW main-feed connections the widen may open. Zero from the moment
@@ -12774,6 +12829,7 @@ fn widen_running_session(
             &mut slots,
             &mut widen.acks,
             attempts,
+            ctx.subscribe_reconcile,
         );
         write_back_widen_rooms(slots, spot_first, ctx.spot_topup, ctx.live_topups);
         offered.extend(
@@ -12822,6 +12878,7 @@ fn widen_running_session(
                                     out_topups: Some(ctx.live_topups),
                                     out_depth_commands: None,
                                     instance_lock_held: ctx.instance_lock_held,
+                                    subscribe_reconcile: ctx.subscribe_reconcile,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
@@ -13023,6 +13080,7 @@ async fn attach_depth_when_available(
     // near-the-money contracts get a second copy on the spot socket once this
     // attach finishes. 0 = off.
     backup_top_n: usize,
+    subscribe_reconcile: Arc<crate::subscribe_reconcile::SubscribeReconcile>,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -13272,6 +13330,7 @@ async fn attach_depth_when_available(
                         main_feed_connections_used: &mut main_feed_connections_used,
                         contract_capacity: &mut contract_capacity,
                         instance_lock_held: &instance_lock_held,
+                        subscribe_reconcile: Some(&subscribe_reconcile),
                     },
                     &today_date,
                     attempts,
@@ -13597,6 +13656,7 @@ async fn attach_depth_when_available(
                     main_feed_connections_used: &mut main_feed_connections_used,
                     contract_capacity: &mut contract_capacity,
                     instance_lock_held: &instance_lock_held,
+                    subscribe_reconcile: Some(&subscribe_reconcile),
                 },
                 &today_date,
                 attempts.saturating_add(1),
@@ -13773,18 +13833,19 @@ async fn attach_depth_when_available(
                             }) {
                                 Ok(()) => {
                                     spot_topup_used = true;
-                                    let offered: Vec<(u64, u8)> =
-                                        overflow.iter().map(contract_identity).collect();
-                                    for identity in &offered {
-                                        sent_contracts.insert(*identity);
+                                    let offered = overflow.to_vec();
+                                    for instrument in &offered {
+                                        sent_contracts.insert(contract_identity(instrument));
                                     }
                                     // Same reconciliation as the late top-up:
                                     // the overflow is a chunk the socket may
                                     // only partly take.
-                                    pending_topups.push(PendingTopUp {
-                                        ack: ack_rx,
+                                    pending_topups.push(PendingTopUp::queued(
+                                        ack_rx,
                                         offered,
-                                    });
+                                        Some(&subscribe_reconcile),
+                                        tx,
+                                    ));
                                     // Whatever this connection still holds
                                     // after the overflow is real, already-paid
                                     // room. Offering it to the late top-up is
@@ -13861,6 +13922,7 @@ async fn attach_depth_when_available(
                                 out_topups: Some(&mut live_topups),
                                 out_depth_commands: None,
                                 instance_lock_held: &instance_lock_held,
+                                subscribe_reconcile: Some(&subscribe_reconcile),
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -14050,6 +14112,7 @@ async fn attach_depth_when_available(
                                     out_topups: None,
                                     out_depth_commands: Some(&mut depth_commands),
                                     instance_lock_held: &instance_lock_held,
+                                    subscribe_reconcile: Some(&subscribe_reconcile),
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_DEPTH, planned, dialed, attempts);
@@ -14278,6 +14341,7 @@ async fn attach_depth_when_available(
                     &mut pending_topups,
                     attempts,
                     newly_priced.saturating_mul(MAX_CONTRACTS_PER_LATE_UNDERLYING),
+                    Some(&subscribe_reconcile),
                 ));
             }
         }
@@ -14967,6 +15031,29 @@ struct DialContext<'a> {
     /// keeps it checked for the life of the socket. Depth-account sockets are
     /// gated too: same process, same lock.
     instance_lock_held: &'a Arc<AtomicBool>,
+    subscribe_reconcile: Option<&'a Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
+}
+
+/// One command channel per main-feed socket, retained by the book even when
+/// that socket has no spare capacity for a later top-up. Depth has its own path.
+fn main_feed_commands(
+    endpoint: DhanEndpointType,
+    guard: &SubscribeGuard,
+    out_topups: Option<&mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>>,
+    reconcile: Option<&Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
+) -> Option<tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>> {
+    if endpoint != DhanEndpointType::MainFeed || (out_topups.is_none() && reconcile.is_none()) {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    if let Some(book) = reconcile {
+        let held: Vec<_> = guard.batches().flatten().copied().collect();
+        book.record_subscribed(&tx, &held);
+    }
+    if let Some(sink) = out_topups {
+        sink.push((tx, guard.spare_capacity()));
+    }
+    Some(rx)
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -14982,6 +15069,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         mut out_topups,
         mut out_depth_commands,
         instance_lock_held,
+        subscribe_reconcile,
     } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -15132,20 +15220,14 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
         let alive = AliveConnectionGuard::acquire();
-        // A top-up channel only for MAIN-FEED connections whose caller asked
-        // for one. Capacity 1: the attach sends at most one overflow batch per
-        // session, and a bounded channel means a wedged connection task
-        // surfaces as a refused `try_send` the attach LOGS, never as an
-        // unbounded queue that hides it.
-        let topup_rx = match (endpoint, out_topups.as_deref_mut()) {
-            (DhanEndpointType::MainFeed, Some(sink_vec)) => {
-                let spare = guard.spare_capacity();
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                sink_vec.push((tx, spare));
-                Some(rx)
-            }
-            _ => None,
-        };
+        // Capacity remains one: a wedged connection refuses queued work.
+        // The book also retains full sockets, so they can be judged later.
+        let topup_rx = main_feed_commands(
+            endpoint,
+            &guard,
+            out_topups.as_deref_mut(),
+            subscribe_reconcile,
+        );
         // Depth sockets get their OWN channel, and it stays open for the
         // session rather than being consumed once. A top-up is a single event
         // — the contract overflow — so its channel is depth 1 and its sender
@@ -17144,6 +17226,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
         )
     };
+    let (subscribe_reconcile, reconcile_rounds) =
+        crate::subscribe_reconcile::SubscribeReconcile::new(
+            params.subscribe_reconcile_auto_resubscribe,
+        );
+    tokio::spawn(crate::subscribe_reconcile::run_reconcile_executor(
+        Arc::downgrade(&subscribe_reconcile),
+        reconcile_rounds,
+    ));
     let mut ingest = LiveIngest::new(
         TickWriter::new_with_encoder(
             &params.questdb,
@@ -17166,6 +17256,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // frame. Address space only; see `with_fold_capacity` for the bytes.
     .with_fold_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since));
+    ingest.subscribe_reconcile = Some(Arc::clone(&subscribe_reconcile));
     info!(
         boot_instruments = capacity,
         fold_slots = ingest.fold_slot_capacity(),
@@ -18267,6 +18358,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             out_topups: Some(&mut main_feed_topups),
             out_depth_commands: None,
             instance_lock_held: &params.instance_lock_held,
+            subscribe_reconcile: Some(&subscribe_reconcile),
         },
     );
     // `attempts = 0`: the boot dial happens once and has no retry loop behind
@@ -18326,6 +18418,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 .map(|source| RunningWiden::new(source, &params.main_feed_instruments)),
             Arc::clone(&params.instance_lock_held),
             params.main_feed_backup_top_n,
+            Arc::clone(&subscribe_reconcile),
         ));
     }
 
@@ -18587,6 +18680,10 @@ const SESSION_0916_IST_MILLIS: u64 = (3 * 3_600 + 46 * 60) * 1_000;
 /// 10:00 IST — a plain in-session instant.
 #[cfg(test)]
 const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
+
+#[cfg(test)]
+#[path = "dhan_feed_stack/subscribe_reconcile_tests.rs"]
+mod subscribe_reconcile_tests;
 
 #[cfg(test)]
 mod tests {
@@ -20067,7 +20164,7 @@ mod tests {
         budget: usize,
     ) -> usize {
         let mut pending = Vec::new();
-        top_up_late_contracts_acked(selection, sent, slots, &mut pending, attempts, budget)
+        top_up_late_contracts_acked(selection, sent, slots, &mut pending, attempts, budget, None)
     }
 
     fn topup_slot(
@@ -20218,7 +20315,7 @@ mod tests {
             .collect();
         let mut sent = std::collections::HashSet::new();
         let mut pending = Vec::new();
-        let placed = send_extend_chunks(&delta, &mut sent, &mut slots, &mut pending, 1);
+        let placed = send_extend_chunks(&delta, &mut sent, &mut slots, &mut pending, 1, None);
         assert_eq!(placed, 6);
         assert_eq!(
             pending.len(),
@@ -20310,8 +20407,15 @@ mod tests {
             inst(3, ExchangeSegment::NseFno),
         ];
 
-        let placed =
-            top_up_late_contracts_acked(&selection, &mut sent, &mut slots, &mut pending, 1, 10_000);
+        let placed = top_up_late_contracts_acked(
+            &selection,
+            &mut sent,
+            &mut slots,
+            &mut pending,
+            1,
+            10_000,
+            None,
+        );
         assert_eq!(placed, 3);
         assert_eq!(sent.len(), 3, "marked optimistically at queue time");
         assert_eq!(pending.len(), 1);
@@ -20338,8 +20442,15 @@ mod tests {
         assert!(!sent.contains(&contract_identity(&inst(3, ExchangeSegment::NseFno))));
 
         // And the NEXT top-up offers exactly the freed two — the whole point.
-        let placed =
-            top_up_late_contracts_acked(&selection, &mut sent, &mut slots, &mut pending, 4, 10_000);
+        let placed = top_up_late_contracts_acked(
+            &selection,
+            &mut sent,
+            &mut slots,
+            &mut pending,
+            4,
+            10_000,
+            None,
+        );
         assert_eq!(
             placed, 2,
             "the truncated tail is re-offered, the held one is not"
@@ -20362,7 +20473,15 @@ mod tests {
             inst(7, ExchangeSegment::NseFno),
             inst(8, ExchangeSegment::NseFno),
         ];
-        top_up_late_contracts_acked(&selection, &mut sent, &mut slots, &mut pending, 1, 10_000);
+        top_up_late_contracts_acked(
+            &selection,
+            &mut sent,
+            &mut slots,
+            &mut pending,
+            1,
+            10_000,
+            None,
+        );
         let (_, ack) = extended_with_ack(rx.try_recv().expect("queued"));
         ack.send(ExtendOutcome::Held).expect("alive");
         assert_eq!(reconcile_pending_topups(&mut pending, &mut sent, 2), 0);
@@ -20373,7 +20492,15 @@ mod tests {
         let (slot2, mut rx2) = topup_slot(100);
         let mut slots2 = [slot2];
         let selection2 = [inst(9, ExchangeSegment::NseFno)];
-        top_up_late_contracts_acked(&selection2, &mut sent, &mut slots2, &mut pending, 3, 10_000);
+        top_up_late_contracts_acked(
+            &selection2,
+            &mut sent,
+            &mut slots2,
+            &mut pending,
+            3,
+            10_000,
+            None,
+        );
         let (_, ack) = extended_with_ack(rx2.try_recv().expect("queued"));
         ack.send(ExtendOutcome::Refused).expect("alive");
         assert_eq!(reconcile_pending_topups(&mut pending, &mut sent, 4), 1);
@@ -20395,7 +20522,15 @@ mod tests {
             inst(11, ExchangeSegment::NseFno),
             inst(12, ExchangeSegment::NseFno),
         ];
-        top_up_late_contracts_acked(&selection, &mut sent, &mut slots, &mut pending, 1, 10_000);
+        top_up_late_contracts_acked(
+            &selection,
+            &mut sent,
+            &mut slots,
+            &mut pending,
+            1,
+            10_000,
+            None,
+        );
         assert_eq!(sent.len(), 2);
         // The "task" ends without answering: the command (and its ack
         // sender) is dropped with the receiver.
@@ -21375,6 +21510,7 @@ mod tests {
             depth_storage: Default::default(),
             tick_storage: Default::default(),
             main_feed_backup_top_n: 0,
+            subscribe_reconcile_auto_resubscribe: false,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
