@@ -132,7 +132,7 @@ Notes: commit with `git commit -F <file>` (double-quoted `-m` mangles `§` citat
 
 ## 10. Session checkpoint replies
 
-Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2159 (fuzz, branch `claude/adversarial-input-coverage`, last known head `968fd6066`), plan leftovers (asked to push to `handoff/plan-leftovers`).
+Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: plan leftovers (asked to push to `handoff/plan-leftovers`; that branch did not exist on origin at 06:41 UTC).
 
 ### #2149 depth row path — branch `perf/sub-us-depth`, head `0e1f0f60f` (draft)
 - **CI**: All Green on `0e1f0f6`, every job green; Enable Auto-Merge skipped only because the PR is a draft.
@@ -322,6 +322,25 @@ Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by
   - Re-measure (aws-lambdas baseline 86.36%) and raise the floors (aws-lambdas 81.1, logs-mcp 87.3).
   - Review, draft PR.
 - **Note**: the secret scanner rejects 10-digit client-id literals in tests.
+
+### #2159 adversarial input coverage — branch `claude/adversarial-input-coverage`, head `fd6ff357f` (draft, Verified on origin)
+- **CI**: red on `968fd60`; CI on `fd6ff357f` was still queued at handoff. All Green is red.
+  - Test (common): `assertion_free_test_ratchet::assertion_free_tests_may_only_shrink` fails on the new assertion-free test `crates/trading/tests/adversarial_strategy_recipe_properties.rs::prop_recipe_with_one_byte_removed` (it only calls `parse_recipe`). Fix: assert the result is `Ok(same recipe)` or a typed refusal variant.
+  - Coverage & Perf failed on the same head; log not read (likely the same test).
+- **Done** (each file run locally, green; clippy `-D warnings` clean):
+  - New property test files: core `adversarial_feed_frames_properties.rs` (14), `adversarial_order_update_properties.rs` (15), `adversarial_master_csv_properties.rs` (18); common `adversarial_config_toml_properties.rs` (7), `adversarial_segment_query_properties.rs` (3); storage `adversarial_spill_record_properties.rs` (10), `adversarial_wal_segment_properties.rs` (5), `adversarial_applied_watermark_properties.rs` (5); trading `adversarial_strategy_recipe_properties.rs` (18); app `adversarial_intraday_properties.rs` (6).
+  - New fuzz targets (in `fuzz/Cargo.toml` and the `fuzz.yml` matrix), each run 60 s locally with 0 crashes: `main_feed_stacked_frame` (305,771 runs), `order_update_json` (3,165,233), `instrument_master_csv` (1,069,528), `seal_spill_record` (5,841,519), `strategy_recipe_files` (840,570), `segment_query` (27,725,308). `dhan_intraday_json` builds but has NOT been run. `fuzz/Cargo.toml` adds `tickvault-trading`, `tickvault-app` (path) and `serde_json =1.0.154`.
+  - Bug fixed: `crates/core/src/instrument/master_csv.rs` `parse_lot_size("75.000000000000001")` returned 75; `decimal_text_is_whole` now reads the text exactly (regression test, exact-reference proptest, fuzz oracle).
+  - Hostile review round 1 (3 reviewers); its MEDIUM/LOW findings in these files fixed.
+- **Pending**:
+  - Fix the ratchet failure above, re-check Coverage & Perf, drive All Green, mark ready.
+  - Run `dhan_intraday_json` for 60 s; update the PR body table (it predates the intraday and watermark files).
+  - Hostile review round 2 (two clean rounds were requested).
+  - LOW gaps: DLQ NDJSON and audit spill readers, TrueData touchline/timestamp parsers, other boot state files (`boot-committed.summary`, `evening-drain.state`, depth seed, backup history).
+- **Needs the owner**:
+  - Real bug: an order-update `Quantity` of `100.00000000000001` decodes as `Ok(100)` (serde_json without `float_roundtrip`). Pinned by `test_known_limit_fractional_json_number_on_int_field_reads_as_integer` (asserts today's behaviour; fails once fixed). Fix needs either an edit to `crates/core/src/parser/order_update.rs` (refuse an integer field whose raw text has a non-zero fraction digit) or enabling serde_json `float_roundtrip` (a dependency feature change).
+  - Optional: `parse_strike_paise` rounds sub-paisa text (`"0.005"` becomes 1 paisa); refuse or round?
+- **Notes**: the container disk fills fast (`cargo clean` freed 22 GB; builds used `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`). Running targets needs cargo-fuzz and `nightly-2026-03-15`. The ignored-test guard forbids new `#[ignore]`; the assertion-free ratchet forbids tests with no assertion.
 
 ### #2158 test-target clippy (12b) — branch `claude/clippy-all-targets`, head `2b6279bac` (draft)
 - **CI**: All Green passed on `2b6279bac`, but the branch is now behind main.
