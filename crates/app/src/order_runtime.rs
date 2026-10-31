@@ -2593,7 +2593,7 @@ mod tests {
         let mut book = BookState::new();
         book.observe_segment(13, SEGMENT_CODE_UNKNOWN);
         assert!(
-            book.tripwire.get(&13).is_none(),
+            !book.tripwire.contains_key(&13),
             "an unknown code must not become the first-seen segment"
         );
         book.observe_segment(13, 0);

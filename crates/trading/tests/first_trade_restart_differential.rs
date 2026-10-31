@@ -444,7 +444,7 @@ fn s6_feed_reconnect_snapshot_without_restart() {
         let t2 = ltq(trade(seg, OPEN + 30, 13.1, 650, OPEN + 30), 250);
         let t2_snapshot = ltq(trade(seg, OPEN + 30, 13.1, 650, OPEN + 40), 250);
         let t3 = ltq(trade(seg, OPEN + 45, 13.2, 700, OPEN + 45), 50);
-        let truth_w = truth(&[p.clone(), t1, t2, t3.clone()]);
+        let truth_w = truth(&[p, t1, t2, t3]);
         let mut out = Written::default();
         let mut a = agg();
         a.set_live_capture_start(EARLY_CAPTURE);

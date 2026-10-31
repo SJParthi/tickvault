@@ -712,9 +712,9 @@ mod tests {
         // and have been filtered out as not-a-gainer. Sign of the percentage
         // IS the verdict.
         for (spot_paise, close_rupees) in [
-            (110_00_i64, 100.0_f64), // up
+            (11_000_i64, 100.0_f64), // up
             (90_00, 100.0),          // down
-            (100_00, 100.0),         // flat
+            (10_000, 100.0),         // flat
         ] {
             let pct = underlying_gain_pct(Some(spot_paise), Some(close_rupees));
             let verdict = underlying_gainer_verdict(Some(spot_paise), Some(close_rupees));
@@ -738,11 +738,11 @@ mod tests {
         // carry a number for a row the filter could not judge.
         for (spot, close) in [
             (None, Some(100.0_f64)),
-            (Some(110_00_i64), None),
+            (Some(11_000_i64), None),
             (Some(0), Some(100.0)),
             (Some(-1), Some(100.0)),
-            (Some(110_00), Some(0.0)),
-            (Some(110_00), Some(f64::NAN)),
+            (Some(11_000), Some(0.0)),
+            (Some(11_000), Some(f64::NAN)),
         ] {
             assert_eq!(
                 underlying_gainer_verdict(spot, close),
@@ -760,7 +760,7 @@ mod tests {
     fn underlying_gain_pct_computes_the_same_percent_the_rupee_form_would() {
         // Paise on both sides of the ratio; a ratio is scale-invariant, so the
         // answer must equal the rupee computation to the last bit.
-        let paise = underlying_gain_pct(Some(112_35_i64), Some(100.0)).expect("finite");
+        let paise = underlying_gain_pct(Some(11_235_i64), Some(100.0)).expect("finite");
         let rupees = eligible_gain_pct(112.35, 100.0).expect("finite");
         assert!(
             (paise - rupees).abs() < 1e-9,

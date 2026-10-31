@@ -4036,8 +4036,10 @@ mod tests {
         // "Current day only" means the floor, because a day-partitioned
         // table's current partition cannot be dropped while rows still land
         // in it. Configuring 0 must not be able to express something unsafe.
-        let mut cfg = PartitionRetentionConfig::default();
-        cfg.intraday_hot_days = 0;
+        let cfg = PartitionRetentionConfig {
+            intraday_hot_days: 0,
+            ..PartitionRetentionConfig::default()
+        };
         assert_eq!(
             hot_window_days("ticks", &cfg),
             MIN_HOT_DAYS_MARKET_DATA,

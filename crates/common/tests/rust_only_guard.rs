@@ -657,6 +657,7 @@ fn banned_token() -> String {
 ///     than a silent guard edit. Note `node` is additionally ambiguous: AWS's
 ///     own "SSM managed node" wording appears in `scripts/aws-autopilot.sh`,
 ///     so a bare `node` token would false-positive on prose about AWS.
+///
 /// Both are recorded in `rust-only-forever-lock-2026-07-19.md`.
 fn banned_tokens() -> Vec<String> {
     let mut tokens = vec![banned_token()];
@@ -1336,13 +1337,24 @@ fn is_command_position(line: &str, at: usize) -> bool {
     // earlier in the line is what keeps the false-positive rate at zero,
     // and this guard survives only while its first act is never a false
     // positive.
-    if before.contains('[') {
-        if let Some(i) = before.rfind(',') {
-            sep_end = sep_end.max(i + 1);
-        }
+    if before.contains('[')
+        && let Some(i) = before.rfind(',')
+    {
+        sep_end = sep_end.max(i + 1);
     }
 
     let mut seg = before[sep_end..].trim();
+
+    // True when the first word of `seg` is a duration (`30`, `5m`): the
+    // numeric-argument arm below.
+    fn starts_with_duration(seg: &str) -> bool {
+        let head = seg.split_once(' ').map_or(seg, |(h, _)| h);
+        !head.is_empty()
+            && head.starts_with(|c: char| c.is_ascii_digit())
+            && head
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h'))
+    }
 
     // Bounded: every arm strictly shortens `seg`, and the loop returns the
     // moment it cannot.
@@ -1373,9 +1385,7 @@ fn is_command_position(line: &str, at: usize) -> bool {
             &seg[..seg.len() - 1]
         } else if let Some(rest) = seg.strip_prefix(['"', '\'']) {
             rest
-        } else if seg.ends_with(':') && !seg.contains("//") {
-            ""
-        } else if seg.ends_with('=') {
+        } else if (seg.ends_with(':') && !seg.contains("//")) || seg.ends_with('=') {
             ""
         } else if seg.ends_with('/')
             && seg
@@ -1426,16 +1436,8 @@ fn is_command_position(line: &str, at: usize) -> bool {
             // Safe for the same reason every other arm is: consuming a flag
             // only helps when the REST of the prefix is also consumable, so
             // `echo --version node` still returns false.
-            let rest = seg.split_once(' ').map_or("", |(_, t)| t);
-            rest
-        } else if {
-            let head = seg.split_once(' ').map_or(seg, |(h, _)| h);
-            !head.is_empty()
-                && head.starts_with(|c: char| c.is_ascii_digit())
-                && head
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h'))
-        } {
+            seg.split_once(' ').map_or("", |(_, t)| t)
+        } else if starts_with_duration(seg) {
             // A NUMERIC argument: `timeout 30 node app.js`, `timeout 5m node`.
             //
             // Deliberately numeric-only. Accepting an arbitrary bare word here
@@ -2426,8 +2428,12 @@ fn node_family_invocations_only_shrink() {
 /// --no-deps -- -D warnings` exits 0.
 ///
 /// HONEST SCOPE: this pins the FLAG, not the lint result — CI itself is what
-/// actually runs clippy. It also does NOT require `--all-targets`, which is
-/// deliberately still absent (test-target warnings are unmeasured).
+/// actually runs clippy.
+///
+/// Plan item 12b: the 2026-10-30 five-crate checkpoint was expanded on
+/// 2026-10-31 to EVERY target of EVERY workspace crate. This test fails if
+/// the step loses `--all-targets`, `--workspace` or `-D warnings`; the
+/// separately checked crate floor includes app, core and trading.
 #[test]
 fn ci_clippy_gate_stays_armed() {
     let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -2453,6 +2459,135 @@ fn ci_clippy_gate_stays_armed() {
             step.trim()
         );
     }
+
+    let all_targets = ci
+        .lines()
+        .filter(|l| !is_comment_line(l))
+        .filter(|l| l.contains("cargo clippy") && l.contains("--all-targets"))
+        .collect::<Vec<_>>();
+    assert!(
+        !all_targets.is_empty(),
+        "CI TEST-TARGET LINT GATE REMOVED: ci.yml has no `cargo clippy ... \
+         --all-targets` step, so clippy findings in tests and benches can no \
+         longer fail Build & Verify. It was armed on 2026-10-30 (plan item 12b) \
+         after the clean crates measured zero findings. Restore it."
+    );
+    for step in &all_targets {
+        assert!(
+            step.contains("--workspace") && step.contains("-D warnings"),
+            "CI TEST-TARGET LINT GATE DISARMED: `{}` dropped `--workspace` or `-D warnings`.",
+            step.trim()
+        );
+    }
+    // The floor expanded on 2026-10-31, written out here so that dropping a crate
+    // takes a second, visible edit in this test and not only in the list.
+    for armed in [
+        "tickvault-common",
+        "tickvault-storage",
+        "tickvault-api",
+        "tickvault-aws-lambdas",
+        "tickvault-logs-mcp",
+        "tickvault-app",
+        "tickvault-core",
+        "tickvault-trading",
+    ] {
+        assert!(
+            CLIPPY_ALL_TARGETS_CRATES.contains(&armed),
+            "CI TEST-TARGET LINT GATE NARROWED: `{armed}` is in the 2026-10-31 floor \
+             and left CLIPPY_ALL_TARGETS_CRATES. The list may only grow."
+        );
+    }
+    // 2026-10-30 (12b review): a clippy step can also be switched off without
+    // touching the flags: `|| true`, a later `-A warnings`, or
+    // `continue-on-error` on the step. Refuse all three on every clippy step.
+    let lines: Vec<&str> = ci.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if is_comment_line(line) || !line.contains("cargo clippy") {
+            continue;
+        }
+        assert!(
+            !line.contains("||") && !line.contains(" -A ") && !line.contains("--cap-lints"),
+            "CI LINT GATE DISARMED: `{}` can no longer fail the job \
+             (`||`, `-A` or `--cap-lints` on the line).",
+            line.trim()
+        );
+        let start = (0..=i)
+            .rev()
+            .find(|&j| lines[j].trim_start().starts_with("- name:"))
+            .unwrap_or(i);
+        let step_indent = lines[start].len() - lines[start].trim_start().len();
+        let end = (i + 1..lines.len())
+            .find(|&j| {
+                let t = lines[j].trim_start();
+                !t.is_empty() && (lines[j].len() - t.len()) <= step_indent
+            })
+            .unwrap_or(lines.len());
+        let soft = lines[start..end]
+            .iter()
+            .filter(|l| !is_comment_line(l))
+            .any(|l| l.contains("continue-on-error"));
+        assert!(
+            !soft,
+            "CI LINT GATE DISARMED: the step running `{}` sets continue-on-error, so a \
+             clippy failure no longer fails Build & Verify.",
+            line.trim()
+        );
+    }
+}
+
+/// Every workspace crate is linted with `--all-targets -D warnings` in CI.
+/// Expanded from five to eight on 2026-10-31; the floor may only grow.
+const CLIPPY_ALL_TARGETS_CRATES: &[&str] = &[
+    "tickvault-common",
+    "tickvault-storage",
+    "tickvault-api",
+    "tickvault-aws-lambdas",
+    "tickvault-logs-mcp",
+    "tickvault-app",
+    "tickvault-core",
+    "tickvault-trading",
+];
+
+#[test]
+fn clippy_all_targets_covers_every_workspace_member() {
+    // Ask Cargo to resolve member globs/exclusions instead of maintaining a
+    // second manifest parser. No dependencies are fetched or compiled here.
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("inspect Cargo workspace members");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse Cargo workspace metadata");
+    let members = workspace["workspace_members"]
+        .as_array()
+        .expect("workspace member ids");
+    let mut packages: Vec<&str> = workspace["packages"]
+        .as_array()
+        .expect("workspace package metadata")
+        .iter()
+        .filter(|package| members.contains(&package["id"]))
+        .map(|package| package["name"].as_str().expect("package name"))
+        .collect();
+    let mut linted: Vec<&str> = CLIPPY_ALL_TARGETS_CRATES.to_vec();
+    packages.sort_unstable();
+    linted.sort_unstable();
+    assert_eq!(
+        packages, linted,
+        "every workspace member must enter the all-targets lint gate"
+    );
 }
 
 /// 2026-08-10. The rust-only lock claims a "HARD ZERO floor" for both allowlists.
@@ -4139,11 +4274,11 @@ fn every_lambda_declares_the_rust_runtime() {
                 if probe.contains("resource \"") {
                     break;
                 }
-                if let Some(rest) = probe.split_once("runtime") {
-                    if rest.1.trim_start().starts_with('=') {
-                        runtime = Some(probe.trim());
-                        break;
-                    }
+                if let Some(rest) = probe.split_once("runtime")
+                    && rest.1.trim_start().starts_with('=')
+                {
+                    runtime = Some(probe.trim());
+                    break;
                 }
             }
             match runtime {

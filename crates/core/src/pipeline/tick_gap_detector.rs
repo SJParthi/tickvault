@@ -983,6 +983,7 @@ mod tests {
     ///       scan_silence_sweep_cost -- --ignored --nocapture
     #[test]
     #[ignore = "measurement harness, not a gate — see doc comment"]
+    #[allow(clippy::print_stdout)] // APPROVED: plan item 12b preserves calibration output; this ignored harness's printed timing is its result.
     fn scan_silence_sweep_cost_at_the_authorized_ceiling() {
         const N: usize = 25_000;
         let mut d = TickGapDetector::with_capacity(N, DetectorConfig::default());

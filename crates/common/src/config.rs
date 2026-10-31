@@ -4537,8 +4537,10 @@ mod tests {
 
     #[test]
     fn test_notification_digest_window_secs_clamped_to_60_3600() {
-        let mut config = NotificationConfig::default();
-        config.digest_window_secs = 0;
+        let mut config = NotificationConfig {
+            digest_window_secs: 0,
+            ..NotificationConfig::default()
+        };
         assert_eq!(
             config.digest_window_secs_clamped(),
             NOTIFICATION_DIGEST_WINDOW_MIN_SECS,
