@@ -441,6 +441,20 @@ depth_hot_hours = 4
 [raw_frame_archive]
 require_upload_before_prune = true
 
+# Plan item 4 (2026-10-30): the memory action ladder. "off" runs no memory
+# poll; "shadow" counts what it WOULD do; "act" returns free heap pages to the
+# OS and empties opt-in caches. It never drops a received frame and never
+# stops capture. Turning it on needs the owner.
+[memory_watchdog]
+mode = "off"
+
+# Plan item 4: background tasks publish heartbeats always; with this on, the
+# API token reload (the only task safe to restart) is aborted after three
+# missed heartbeats so its supervisor respawns it. Every other watched task is
+# watch-only. Off = counted only (tv_task_heartbeat_would_respawn_total).
+[task_heartbeat]
+respawn_on_missed_beats = false
+
 [websocket]
 ping_interval_secs = 10
 pong_timeout_secs = 10

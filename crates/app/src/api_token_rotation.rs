@@ -35,7 +35,6 @@
 use std::time::Duration;
 
 use tickvault_api::middleware::{ApiAuthConfig, TokenReloadOutcome};
-use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tracing::{debug, info, warn};
 
 /// Periodic SSM re-read cadence. 5 minutes keeps the worst-case rotation
@@ -61,7 +60,7 @@ fn should_warn_failure_streak(consecutive_failures: u32, already_warned: bool) -
 /// WS-GAP-05 / DISK-WATCHER-01 pattern: whenever the inner loop's
 /// `JoinHandle` resolves (panic in unwind builds / cancel / impossible
 /// clean return), it classifies the exit via the shared
-/// `classify_join_exit`, increments
+/// `WatchedExit::reason` (plan item 4: `task_heartbeat::await_watched`), increments
 /// `tv_api_token_reload_respawn_total{reason}`, backs off 5s, and respawns
 /// — so token rotation can never die silently. Auth itself is unaffected
 /// while the loop is down: requests keep validating against the current
@@ -75,8 +74,17 @@ pub fn spawn_supervised_api_token_reload(config: ApiAuthConfig) -> tokio::task::
         loop {
             let loop_config = config.clone();
             let inner = tokio::spawn(run_api_token_reload_loop(loop_config));
-            let join_result = inner.await;
-            let reason = classify_join_exit(&join_result);
+            // Plan item 4: also watches the reload loop's heartbeat.
+            let exit = tickvault_storage::task_heartbeat::await_watched(
+                tickvault_storage::task_heartbeat::WatchedTask::ApiTokenReload,
+                inner,
+            )
+            .await;
+            let reason = exit.reason();
+            tickvault_storage::task_heartbeat::note_respawn(
+                tickvault_storage::task_heartbeat::WatchedTask::ApiTokenReload,
+                reason,
+            );
             metrics::counter!("tv_api_token_reload_respawn_total", "reason" => reason).increment(1);
             // Degraded-not-broken: auth keeps serving from the current
             // token, so this is a warn! (visibility), not an error! page.
@@ -126,6 +134,9 @@ async fn run_api_token_reload_loop(config: ApiAuthConfig) {
                 debug!("GAP-SEC-01: out-of-band token re-read hint received (mismatched bearer)");
             }
         }
+        tickvault_storage::task_heartbeat::beat(
+            tickvault_storage::task_heartbeat::WatchedTask::ApiTokenReload,
+        );
 
         match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
             Ok(token) => {
@@ -208,6 +219,20 @@ async fn run_api_token_reload_loop(config: ApiAuthConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_heartbeat_cadence_matches_the_reload_interval() {
+        // Plan item 4: the heartbeat module mirrors this cadence (it sits
+        // below this crate); the two must stay equal.
+        assert_eq!(
+            tickvault_storage::task_heartbeat::API_TOKEN_RELOAD_CADENCE_SECS,
+            API_TOKEN_RELOAD_INTERVAL_SECS
+        );
+        assert_eq!(
+            tickvault_storage::task_heartbeat::WatchedTask::ApiTokenReload.cadence_secs(),
+            API_TOKEN_RELOAD_INTERVAL_SECS
+        );
+    }
 
     #[test]
     fn test_reload_constants_pinned() {
