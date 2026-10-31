@@ -131,9 +131,12 @@ pub struct FnoStocksResponse {
     pub status: &'static str,
     /// Trading session open right now (weekend and holiday aware).
     pub market_open: bool,
+    /// UTC epoch seconds of the original observation, before the query.
+    /// Retained in cached bodies so callers can age `data_age_secs` correctly.
+    pub observed_at_epoch_secs: i64,
     /// Time of the newest row, `HH:MM:SS` IST; `None` without rows.
     pub as_of_ist: Option<String>,
-    /// Seconds between the newest row and now; `None` without rows.
+    /// Seconds between the newest row and the original observation; `None` without rows.
     pub data_age_secs: Option<i64>,
     /// F&O stocks on today's list (0 when the list is missing).
     pub fno_stocks_total: usize,
@@ -148,10 +151,16 @@ pub struct FnoStocksResponse {
 }
 
 impl FnoStocksResponse {
-    fn empty(status: &'static str, market_open: bool, fno_stocks_total: usize) -> Self {
+    fn empty(
+        status: &'static str,
+        market_open: bool,
+        fno_stocks_total: usize,
+        observed_at_epoch_secs: i64,
+    ) -> Self {
         Self {
             status,
             market_open,
+            observed_at_epoch_secs,
             as_of_ist: None,
             data_age_secs: None,
             fno_stocks_total,
@@ -428,22 +437,28 @@ struct FnoStocksInputs<'a> {
 
 /// Computes the answer. Never panics; every failure is a status.
 async fn compute_fno_stocks(inputs: FnoStocksInputs<'_>) -> FnoStocksResponse {
+    // `now_ist` is UTC shifted into a naive IST clock, not a UTC instant.
+    // Keep this same pre-query anchor through both successful and empty replies.
+    let observed_at_epoch_secs = inputs.now_ist.and_utc().timestamp()
+        - chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS).num_seconds();
     let date = inputs.now_ist.format("%Y-%m-%d").to_string();
     let list = load_fno_underlyings(&fno_underlying_artifact_path(inputs.artifact_dir, &date));
     let total = list.as_ref().map_or(0, |l| l.len());
     if !inputs.market_open {
-        return FnoStocksResponse::empty("closed", false, total);
+        return FnoStocksResponse::empty("closed", false, total, observed_at_epoch_secs);
     }
     let Some(list) = list else {
-        return FnoStocksResponse::empty("no_fno_list", true, 0);
+        return FnoStocksResponse::empty("no_fno_list", true, 0, observed_at_epoch_secs);
     };
     let sql = build_fno_stocks_sql(&list.sorted_ids(), window_start(inputs.now_ist));
     let rows = match query_fno_rows(inputs.client, inputs.base_url, &sql, inputs.timeout).await {
         Ok(rows) => rows,
         Err(QueryFailure::Unreachable) => {
-            return FnoStocksResponse::empty("unreachable", true, total);
+            return FnoStocksResponse::empty("unreachable", true, total, observed_at_epoch_secs);
         }
-        Err(QueryFailure::Refused) => return FnoStocksResponse::empty("query_failed", true, total),
+        Err(QueryFailure::Refused) => {
+            return FnoStocksResponse::empty("query_failed", true, total, observed_at_epoch_secs);
+        }
     };
     let newest = rows
         .iter()
@@ -452,7 +467,7 @@ async fn compute_fno_stocks(inputs: FnoStocksInputs<'_>) -> FnoStocksResponse {
         .max();
     let stocks = build_rows(&list, rows);
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
-        return FnoStocksResponse::empty("no_data", true, total);
+        return FnoStocksResponse::empty("no_data", true, total, observed_at_epoch_secs);
     };
     let age = (inputs.now_ist - newest).num_seconds();
     FnoStocksResponse {
@@ -462,6 +477,7 @@ async fn compute_fno_stocks(inputs: FnoStocksInputs<'_>) -> FnoStocksResponse {
             "stale"
         },
         market_open: true,
+        observed_at_epoch_secs,
         as_of_ist: Some(newest.format("%H:%M:%S").to_string()),
         data_age_secs: Some(age),
         fno_stocks_total: total,
@@ -735,6 +751,13 @@ mod tests {
         assert_eq!(r.stocks_priced, 1);
         assert_eq!(r.as_of_ist.as_deref(), Some("11:15:20"));
         assert_eq!(r.data_age_secs, Some(10));
+        assert_eq!(
+            r.observed_at_epoch_secs,
+            chrono::DateTime::parse_from_rfc3339("2026-10-30T05:45:30Z")
+                .unwrap()
+                .timestamp(),
+            "age must retain its original pre-query UTC clock, with the IST offset removed"
+        );
         let s = &r.stocks[0];
         assert_eq!((s.name.as_str(), s.segment), ("RELIANCE", "NSE_EQ"));
         assert!((s.change.expect("change") - 50.5).abs() < 1e-9);
@@ -864,15 +887,20 @@ mod tests {
     #[tokio::test]
     async fn test_get_fno_stocks_cache_hit_skips_the_query() {
         let state = mock_state(1);
-        state
-            .fno_stocks_cache()
-            .put(r#"{"status":"live","sentinel":true}"#.to_string());
+        state.fno_stocks_cache().put(
+            r#"{"status":"live","observed_at_epoch_secs":1800000000,"sentinel":true}"#.to_string(),
+        );
         let resp = get_fno_stocks(State(state)).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("body");
         assert!(String::from_utf8_lossy(&body).contains("sentinel"));
+        let cached: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            cached["observed_at_epoch_secs"], 1_800_000_000_i64,
+            "a cache hit must not refresh the original observation clock"
+        );
     }
 
     #[tokio::test]

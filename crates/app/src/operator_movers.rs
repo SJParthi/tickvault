@@ -16,6 +16,7 @@ const CAPTURE_TIMEOUT_SECS: u64 = 12;
 struct Source {
     status: SourceStatus,
     market_open: bool,
+    observed_at_epoch_secs: i64,
     as_of_ist: Option<String>,
     data_age_secs: Option<i64>,
     fno_stocks_total: usize,
@@ -88,9 +89,14 @@ fn select_source(body: &[u8], now: i64) -> Result<Reply, BridgeError> {
     }
     let reply = Reply {
         version: PROTOCOL_VERSION,
-        captured_at_epoch_secs: now,
+        // The API can return a cached body whose age was measured before its
+        // original query. Re-anchoring at helper completion would hide that delay.
+        captured_at_epoch_secs: source.observed_at_epoch_secs,
         outcome: Outcome::Snapshot { snapshot },
     };
+    if !reply.valid_at(now) {
+        return Err(BridgeError::InvalidResponse);
+    }
     // SSM returns at most 24,000 characters; stay below that with a byte budget.
     if serde_json::to_vec(&reply)
         .map_err(|_| BridgeError::InvalidResponse)?
@@ -207,6 +213,7 @@ mod tests {
         serde_json::to_value(tickvault_api::handlers::fno_stocks::FnoStocksResponse {
             status: if rows == 0 { "closed" } else { "live" },
             market_open: rows != 0,
+            observed_at_epoch_secs: 1_800_000_000,
             as_of_ist: (rows != 0).then(|| "10:15:00".into()),
             data_age_secs: (rows != 0).then_some(2),
             fno_stocks_total: rows.max(236),
@@ -332,6 +339,50 @@ mod tests {
         assert!(!reply.valid_at(1_799_999_994));
         reply.version += 1;
         assert!(!reply.valid_at(1_800_000_000));
+    }
+
+    #[test]
+    fn cached_source_keeps_original_clock_instead_of_helper_completion_time() {
+        let mut input = source(5);
+        input["observed_at_epoch_secs"] = json!(1_799_999_995_i64);
+        input["data_age_secs"] = json!(55);
+        let reply = selected(&input).unwrap();
+        assert_eq!(reply.captured_at_epoch_secs, 1_799_999_995);
+        let Outcome::Snapshot { snapshot } = reply.outcome else {
+            panic!("expected snapshot")
+        };
+        // A later cached reply must retain the five seconds already spent
+        // computing/transporting the original API response. Browser rounding
+        // and request time add further conservative age, not a fresh clock.
+        assert_eq!(
+            snapshot.data_age_secs.unwrap() + 1_800_000_000 - reply.captured_at_epoch_secs,
+            60
+        );
+        assert_eq!(snapshot.gainers[0].ltp, 100.0);
+    }
+
+    #[test]
+    fn source_clock_missing_malformed_future_or_expired_is_not_replaced_with_now() {
+        let mut legacy = source(5);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_at_epoch_secs");
+        assert_eq!(selected(&legacy), Err(BridgeError::InvalidResponse));
+        for invalid in [
+            Value::Null,
+            json!("1800000000"),
+            json!(0),
+            json!(-1),
+            json!(1_800_000_006_i64),
+            json!(1_799_999_939_i64),
+            json!(i64::MIN),
+            json!(i64::MAX),
+        ] {
+            let mut input = source(5);
+            input["observed_at_epoch_secs"] = invalid;
+            assert_eq!(selected(&input), Err(BridgeError::InvalidResponse));
+        }
     }
 
     struct HttpFixture {

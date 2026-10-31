@@ -1415,8 +1415,8 @@ PR body.
 ### Public operator portal Top Movers — 2026-10-31 continuation
 
 Requested by the owner in the Codex continuation: add Top Movers to the supplied
-API Gateway dashboard and verify the actual page. Source implementation and
-focused checks are complete; full validation and live deployment are separate steps.
+API Gateway dashboard and verify the actual page. The prepared implementation
+is undergoing validation; full validation and live deployment are separate steps.
 
 Design: the existing operator authentication gate dispatches one fixed standalone
 Rust reader through the existing SSM sender. The reader fetches the same server-side
@@ -1432,6 +1432,11 @@ late replies after locking and background-tab expiry produce explicit states.
 Conservative browser age includes request duration and two seconds for integer
 timestamp precision. An upper estimate beyond the freshness limit is unconfirmed,
 not proof that the source is stale; the newest trade may be outside displayed movers.
+The canonical API now carries the UTC epoch of the same original observation used
+to compute its row age. Both serialized API caching and the helper/Lambda bridge
+must preserve that anchor: stamping helper completion could hide original query
+time on a later cache hit. Missing or invalid legacy anchors fail closed. The
+naive IST source clock must have its IST offset removed before becoming Unix time.
 
 Rollback: revert the app helper packaging and operator Lambda together through the
 existing deployment process. Missing or incompatible helper output fails closed.
@@ -1466,3 +1471,18 @@ read-only and distinct from intercepted browser fixtures.
   - Browser: real Chromium fixtures for rows, closed, errors, malicious symbol text,
     expiry, refresh in flight, lock, visibility and mobile layout; actual live
     portal re-check only after an explicitly reviewed deployment.
+- [x] Validate the corrected source timestamp through API and Lambda caches.
+  - Files: crates/api/src/handlers/fno_stocks.rs,
+    crates/app/src/operator_movers.rs
+  - Tests: test_one_row_is_live_with_change_and_value,
+    test_get_fno_stocks_cache_hit_skips_the_query,
+    cached_source_keeps_original_clock_instead_of_helper_completion_time,
+    source_clock_missing_malformed_future_or_expired_is_not_replaced_with_now
+  - Controls: re-anchoring at helper completion and omitting the IST conversion
+    must fail their intended assertions; restore exact source afterward.
+  - The former c5 workspace compile was deliberately interrupted before any
+    tests after an independent cache-age counterexample; it is not a passed suite.
+  - Corrected source: ten helper and twenty API tests passed before and after
+    both effective fault controls. All fixed source hashes were restored;
+    23 browser fixtures and 46 pure verifier checks passed. Full workspace,
+    all-target lint, native publication and live deployment remain separate.
