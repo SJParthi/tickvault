@@ -8,6 +8,7 @@
 //! If rate limit hit: reject immediately, do NOT retry.
 
 use std::num::NonZeroU32;
+use std::sync::OnceLock;
 
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::InMemoryState, state::NotKeyed};
 use tickvault_common::error_code::ErrorCode;
@@ -25,6 +26,12 @@ use super::types::OmsError;
 /// Cold path — checked before each order submission (~1-100/day).
 pub struct OrderRateLimiter {
     limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    /// `tv_rate_limiter_allowed_total`, resolved once on the first admitted
+    /// order instead of a registry lookup per order (about 40 ns each with
+    /// the production recorder, measured 2026-10-30). Resolved at first USE,
+    /// not at construction, so it binds to the recorder installed at boot
+    /// even if this limiter was built before it.
+    allowed_total: OnceLock<metrics::Counter>,
 }
 
 impl OrderRateLimiter {
@@ -45,6 +52,7 @@ impl OrderRateLimiter {
 
         Self {
             limiter: RateLimiter::direct(quota),
+            allowed_total: OnceLock::new(),
         }
     }
 
@@ -59,7 +67,9 @@ impl OrderRateLimiter {
     pub fn check(&self) -> Result<(), OmsError> {
         match self.limiter.check() {
             Ok(()) => {
-                metrics::counter!("tv_rate_limiter_allowed_total").increment(1);
+                self.allowed_total
+                    .get_or_init(|| metrics::counter!("tv_rate_limiter_allowed_total"))
+                    .increment(1);
                 Ok(())
             }
             Err(_) => {
@@ -207,7 +217,24 @@ impl OrderBudget {
                 let retry_after_secs = window
                     .window_secs
                     .saturating_sub(now_secs.saturating_sub(window.window_start_secs));
-                metrics::counter!("tv_oms_order_budget_refused_total", "tier" => tier).increment(1);
+                // One literal label per tier: a non-literal label value sends the
+                // macro down its allocating arm (a label `Vec` per call), so a
+                // refusal storm would allocate per order. `tier` is one of the
+                // three literals in the array above; `_` is the "day" entry.
+                match tier {
+                    "minute" => {
+                        metrics::counter!("tv_oms_order_budget_refused_total", "tier" => "minute")
+                            .increment(1);
+                    }
+                    "hour" => {
+                        metrics::counter!("tv_oms_order_budget_refused_total", "tier" => "hour")
+                            .increment(1);
+                    }
+                    _ => {
+                        metrics::counter!("tv_oms_order_budget_refused_total", "tier" => "day")
+                            .increment(1);
+                    }
+                }
                 warn!(
                     code = ErrorCode::OmsGapRateLimit.code_str(),
                     tier,

@@ -28,7 +28,7 @@ use super::oi::parse_oi_packet;
 use super::previous_close::parse_previous_close_packet;
 use super::quote::parse_quote_packet;
 use super::ticker::parse_ticker_packet;
-use super::types::{ParseError, ParsedFrame};
+use super::types::{PacketHeader, ParseError, ParsedFrame};
 
 // O(1) hot-path Counter handles. The `metrics::counter!()` macro with
 // labels allocates a Vec<Label> per invocation; caching the resolved
@@ -164,6 +164,54 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
     // path zero-allocation (Principle #1) — see `dispatcher_counter`.
     dispatcher_counter(header.response_code).increment(1);
 
+    dispatch_parsed_header(raw, header, received_at_nanos)
+}
+
+/// [`dispatch_frame`] without its per-packet response-code counter.
+///
+/// For a caller that counts packets itself in batches through
+/// [`count_packets_by_response_code`] (the live main-feed drain counts one
+/// run of equal codes per frame, plan ITEM DT sub-µs drain, 2026-10-30): a
+/// `metrics` counter increment is an atomic read-modify-write once a recorder
+/// is installed, and the drain paid one per packet. The parse is identical.
+/// To keep the totals, the caller counts exactly the packets `dispatch_frame`
+/// would have: every input of at least `BINARY_HEADER_SIZE` bytes, whatever
+/// the parse result (the unknown-code counter is still incremented here, as
+/// `dispatch_frame` does). The drain only dispatches packets sized by
+/// [`main_feed_packet_len`], every one of which is at least that long
+/// (`test_every_main_feed_packet_size_has_a_header`).
+///
+/// # Performance
+/// O(1) — header parse + single packet parse. No heap allocation.
+#[inline]
+pub fn dispatch_frame_uncounted(
+    raw: &[u8],
+    received_at_nanos: i64,
+) -> Result<ParsedFrame, ParseError> {
+    let header = parse_header(raw)?;
+    dispatch_parsed_header(raw, header, received_at_nanos)
+}
+
+/// Adds `packets` to the `tv_packets_by_response_code` series of `code`, the
+/// same series [`dispatch_frame`] increments by one per packet.
+///
+/// # Performance
+/// O(1): one `OnceLock` read and one counter increment, no allocation.
+#[inline]
+pub fn count_packets_by_response_code(code: u8, packets: u64) {
+    if packets > 0 {
+        dispatcher_counter(code).increment(packets);
+    }
+}
+
+/// The body shared by [`dispatch_frame`] and [`dispatch_frame_uncounted`]:
+/// everything after the header parse and the packet count.
+#[inline]
+fn dispatch_parsed_header(
+    raw: &[u8],
+    header: PacketHeader,
+    received_at_nanos: i64,
+) -> Result<ParsedFrame, ParseError> {
     match header.response_code {
         RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => {
             let tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
@@ -1164,5 +1212,75 @@ mod stacked_disconnect_tests {
             main_feed_packet_len(&[RESPONSE_CODE_INDEX_TICKER]),
             Some(TICKER_PACKET_SIZE)
         );
+    }
+}
+
+/// `dispatch_frame_uncounted` is `dispatch_frame` minus its packet count
+/// (plan ITEM DT, sub-µs drain, 2026-10-30): the two must parse every input
+/// to the same result, or the drain that switched to the uncounted one would
+/// fold different ticks.
+#[cfg(test)]
+mod uncounted_dispatch_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A packet of a known code and its exact size, with arbitrary body bytes.
+    fn known_packet() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just((RESPONSE_CODE_INDEX_TICKER, TICKER_PACKET_SIZE)),
+            Just((RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE)),
+            Just((RESPONSE_CODE_QUOTE, QUOTE_PACKET_SIZE)),
+            Just((RESPONSE_CODE_OI, OI_PACKET_SIZE)),
+            Just((RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE)),
+            Just((RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE)),
+            Just((RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE)),
+            Just((RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE)),
+        ]
+        .prop_flat_map(|(code, size)| {
+            proptest::collection::vec(any::<u8>(), size).prop_map(move |mut bytes| {
+                bytes[0] = code;
+                bytes
+            })
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn test_dispatch_frame_uncounted_parses_like_dispatch_frame(
+            bytes in prop_oneof![known_packet(), proptest::collection::vec(any::<u8>(), 0..200)],
+            received_at_nanos in any::<i64>(),
+        ) {
+            let counted = format!("{:?}", dispatch_frame(&bytes, received_at_nanos));
+            let uncounted = format!("{:?}", dispatch_frame_uncounted(&bytes, received_at_nanos));
+            prop_assert_eq!(counted, uncounted);
+        }
+    }
+
+    /// The drain counts every packet it dispatches, which matches the
+    /// counted `dispatch_frame` only while every size `main_feed_packet_len`
+    /// returns holds a full header (`parse_header` counts nothing shorter).
+    #[test]
+    fn test_every_main_feed_packet_size_has_a_header() {
+        let mut known = 0;
+        for code in 0..=u8::MAX {
+            if let Some(size) = main_feed_packet_len(&[code]) {
+                known += 1;
+                assert!(
+                    size >= tickvault_common::constants::BINARY_HEADER_SIZE,
+                    "code {code}: size {size} is shorter than the header"
+                );
+            }
+        }
+        assert_eq!(known, 8, "the eight main-feed codes the walk knows");
+    }
+
+    #[test]
+    fn test_count_packets_by_response_code_with_any_code_or_zero_never_panics() {
+        // No recorder: the handles are no-ops; this pins that every code,
+        // known or not, and a zero count are accepted without a panic.
+        for code in 0..=u8::MAX {
+            count_packets_by_response_code(code, 0);
+            count_packets_by_response_code(code, 3);
+        }
     }
 }

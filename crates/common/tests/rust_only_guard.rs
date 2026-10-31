@@ -2430,12 +2430,10 @@ fn node_family_invocations_only_shrink() {
 /// HONEST SCOPE: this pins the FLAG, not the lint result — CI itself is what
 /// actually runs clippy.
 ///
-/// 2026-10-30 (plan item 12b): a second clippy step lints EVERY target
-/// (`--all-targets`: tests, benches, examples) of the crates in
-/// [`CLIPPY_ALL_TARGETS_CRATES`]. This test now also fails if that step loses
-/// `--all-targets` or `-D warnings`, or stops naming one of those crates. The
-/// list may only grow: app, core and trading join once their test code
-/// measures clean.
+/// Plan item 12b: the 2026-10-30 five-crate checkpoint was expanded on
+/// 2026-10-31 to EVERY target of EVERY workspace crate. This test fails if
+/// the step loses `--all-targets`, `--workspace` or `-D warnings`; the
+/// separately checked crate floor includes app, core and trading.
 #[test]
 fn ci_clippy_gate_stays_armed() {
     let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -2476,12 +2474,12 @@ fn ci_clippy_gate_stays_armed() {
     );
     for step in &all_targets {
         assert!(
-            step.contains("-D warnings"),
-            "CI TEST-TARGET LINT GATE DISARMED: `{}` dropped `-D warnings`.",
+            step.contains("--workspace") && step.contains("-D warnings"),
+            "CI TEST-TARGET LINT GATE DISARMED: `{}` dropped `--workspace` or `-D warnings`.",
             step.trim()
         );
     }
-    // The floor armed on 2026-10-30, written out here so that dropping a crate
+    // The floor expanded on 2026-10-31, written out here so that dropping a crate
     // takes a second, visible edit in this test and not only in the list.
     for armed in [
         "tickvault-common",
@@ -2489,22 +2487,16 @@ fn ci_clippy_gate_stays_armed() {
         "tickvault-api",
         "tickvault-aws-lambdas",
         "tickvault-logs-mcp",
+        "tickvault-app",
+        "tickvault-core",
+        "tickvault-trading",
     ] {
         assert!(
             CLIPPY_ALL_TARGETS_CRATES.contains(&armed),
-            "CI TEST-TARGET LINT GATE NARROWED: `{armed}` was armed on 2026-10-30 \
+            "CI TEST-TARGET LINT GATE NARROWED: `{armed}` is in the 2026-10-31 floor \
              and left CLIPPY_ALL_TARGETS_CRATES. The list may only grow."
         );
     }
-    for krate in CLIPPY_ALL_TARGETS_CRATES {
-        let flag = format!("-p {krate} ");
-        assert!(
-            all_targets.iter().any(|s| s.contains(&flag)),
-            "CI TEST-TARGET LINT GATE NARROWED: `{krate}` is no longer linted with \
-             `--all-targets` in ci.yml. The crate list may only grow."
-        );
-    }
-
     // 2026-10-30 (12b review): a clippy step can also be switched off without
     // touching the flags: `|| true`, a later `-A warnings`, or
     // `continue-on-error` on the step. Refuse all three on every clippy step.
@@ -2543,17 +2535,60 @@ fn ci_clippy_gate_stays_armed() {
     }
 }
 
-/// Crates whose every target (tests and benches included) measured clippy-clean
-/// on 2026-10-30 and is linted with `--all-targets -D warnings` in CI. May only
-/// grow; `tickvault-app`, `tickvault-core` and `tickvault-trading` join once
-/// their remaining test-code findings are fixed.
+/// Every workspace crate is linted with `--all-targets -D warnings` in CI.
+/// Expanded from five to eight on 2026-10-31; the floor may only grow.
 const CLIPPY_ALL_TARGETS_CRATES: &[&str] = &[
     "tickvault-common",
     "tickvault-storage",
     "tickvault-api",
     "tickvault-aws-lambdas",
     "tickvault-logs-mcp",
+    "tickvault-app",
+    "tickvault-core",
+    "tickvault-trading",
 ];
+
+#[test]
+fn clippy_all_targets_covers_every_workspace_member() {
+    // Ask Cargo to resolve member globs/exclusions instead of maintaining a
+    // second manifest parser. No dependencies are fetched or compiled here.
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("inspect Cargo workspace members");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse Cargo workspace metadata");
+    let members = workspace["workspace_members"]
+        .as_array()
+        .expect("workspace member ids");
+    let mut packages: Vec<&str> = workspace["packages"]
+        .as_array()
+        .expect("workspace package metadata")
+        .iter()
+        .filter(|package| members.contains(&package["id"]))
+        .map(|package| package["name"].as_str().expect("package name"))
+        .collect();
+    let mut linted: Vec<&str> = CLIPPY_ALL_TARGETS_CRATES.to_vec();
+    packages.sort_unstable();
+    linted.sort_unstable();
+    assert_eq!(
+        packages, linted,
+        "every workspace member must enter the all-targets lint gate"
+    );
+}
 
 /// 2026-08-10. The rust-only lock claims a "HARD ZERO floor" for both allowlists.
 /// Until this test, that floor was enforced by REVIEWER DISCIPLINE ONLY: a PR could

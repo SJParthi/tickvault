@@ -76,8 +76,8 @@
 //! for several tables). Appending is O(1) and allocation-free apart from the
 //! buffer's amortised growth, which the tick rows already pay.
 
+use crate::tick_ilp::IlpLine;
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, TimestampNanos};
 use tracing::error;
 
 use tickvault_common::config::QuestDbConfig;
@@ -315,14 +315,21 @@ impl AuxPacketRow {
 ///
 /// # Errors
 /// Propagates ILP buffer errors.
-pub(crate) fn append_aux_row(buffer: &mut Buffer, feed: &str, row: &AuxPacketRow) -> Result<()> {
+/// Generic over [`IlpLine`] (plan ITEM DT, 2026-10-30), so the tick writer's
+/// library buffer and our own encoder write this row through one layout.
+pub(crate) fn append_aux_row<B: IlpLine>(
+    buffer: &mut B,
+    feed: &str,
+    row: &AuxPacketRow,
+) -> Result<()> {
+    buffer.table(FEED_AUX_PACKETS_TABLE).context("table")?;
     buffer
-        .table(FEED_AUX_PACKETS_TABLE)
-        .context("table")?
         .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
-        .context("segment")?
+        .context("segment")?;
+    buffer
         .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
-        .context("feed")?
+        .context("feed")?;
+    buffer
         .symbol("kind", sanitize_ilp_symbol(row.kind.as_str()).as_ref())
         .context("kind")?;
     let labels = crate::candle_contract_labels::candle_contract_labels();
@@ -348,7 +355,7 @@ pub(crate) fn append_aux_row(buffer: &mut Buffer, feed: &str, row: &AuxPacketRow
     }
     if let Some(v) = row.exchange_ts_ist_nanos {
         buffer
-            .column_ts("exchange_ts", TimestampNanos::new(v))
+            .column_ts_nanos("exchange_ts", v)
             .context("exchange_ts")?;
     }
     if let Some(v) = row.volume {
@@ -377,13 +384,14 @@ pub(crate) fn append_aux_row(buffer: &mut Buffer, feed: &str, row: &AuxPacketRow
     }
     if let Some(v) = row.received_at_ist_nanos {
         buffer
-            .column_ts("received_at", TimestampNanos::new(v))
+            .column_ts_nanos("received_at", v)
             .context("received_at")?;
     }
     buffer
         .column_i64("capture_seq", row.capture_seq)
-        .context("capture_seq")?
-        .at(TimestampNanos::new(row.ts_ist_nanos))
+        .context("capture_seq")?;
+    buffer
+        .at_nanos(row.ts_ist_nanos)
         .context("designated timestamp")?;
     Ok(())
 }
@@ -554,7 +562,7 @@ mod tests {
     }
 
     fn line(row: &AuxPacketRow) -> String {
-        let mut buf = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+        let mut buf = questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1);
         append_aux_row(&mut buf, "dhan", row).expect("append");
         String::from_utf8(buf.as_bytes().to_vec()).expect("utf8")
     }

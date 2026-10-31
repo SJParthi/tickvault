@@ -208,7 +208,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
-      - name: cargo clippy (workspace, libs + bins only)
+      - name: cargo clippy (all workspace targets)
+        # Plan item 12b (2026-10-31): every workspace crate's libs, bins,
+        # tests, benches and examples are linted with warnings fatal. One
+        # command replaces the redundant five-crate checkpoint's two passes,
+        # keeping workflow shell within its existing ceiling. The original
+        # dated measurements below explain why all-targets was deferred.
         # THE GATE IS ARMED (2026-08-11). `-D warnings` is ON: any clippy
         # warning in lib+bin code now FAILS this job, and Build & Verify is
         # a needed job of All Green, so it blocks the merge.
@@ -221,10 +226,8 @@ jobs:
         # stale. Measured before arming: `cargo clippy --workspace --no-deps
         # -- -D warnings` exits 0 on this tree.
         #
-        # `--all-targets` is NOT on this workspace step. Since 2026-10-30 it is
-        # on the NEXT step for the crates that measure clean (plan item 12b);
-        # see that step for the measurement and what is still open. The
-        # history below is kept as written.
+        # `--all-targets` is now on this step for every workspace crate
+        # (plan item 12b, expanded 2026-10-31). The history below is kept as written.
         #
         # MEASURED 2026-08-26 (this comment said "its true warning count is
         # UNMEASURED" until now, and an unmeasured gap is indistinguishable
@@ -252,21 +255,7 @@ jobs:
         # Ratcheted by `crates/common/tests/rust_only_guard.rs::
         # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
         # dropped again.
-        run: cargo clippy --workspace --no-deps -- -D warnings
-
-      - name: cargo clippy (test targets, crates that measure clean)
-        # ARMED 2026-10-30 (plan item 12b). Lints tests, benches and examples
-        # as well as libs and bins, warnings fatal, for the five crates whose
-        # every target measured clean:
-        #   `cargo clippy --workspace --all-targets --no-deps --keep-going`
-        #   on origin/main (c309f59): 276 findings (250 warnings + 26 errors),
-        #   all in test code. 234 were fixed; the 42 left are all in files
-        #   other sessions were editing at the time, in app (9), core (17) and
-        #   trading (16), so those three crates are NOT on this line yet.
-        # Adding app, core and trading here, once their count is zero, closes
-        # the gap. Removing a crate from this line, or dropping `--all-targets`
-        # or `-D warnings`, fails `rust_only_guard.rs::ci_clippy_gate_stays_armed`.
-        run: cargo clippy -p tickvault-common -p tickvault-storage -p tickvault-api -p tickvault-aws-lambdas -p tickvault-logs-mcp --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a
@@ -829,6 +818,7 @@ jobs:
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_main_feed_backup_dedup.rs
           crates/app/tests/dhat_mark_forward.rs
+          crates/app/tests/dhat_order_path_recorder.rs
           crates/app/tests/dhat_wal_ring_sink_accept.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/app/tests/dhat_ws_lag_recorder.rs
@@ -844,9 +834,13 @@ jobs:
           crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
           crates/storage/tests/dhat_flush_buffer_recycle.rs
+          crates/storage/tests/dhat_hot_path_latency_minute.rs
           crates/storage/tests/dhat_hot_path_telemetry.rs
+          crates/storage/tests/dhat_receipt_to_fold_stage.rs
           crates/storage/tests/dhat_rescue_floor_zero_alloc.rs
+          crates/storage/tests/dhat_seal_per_seal_path.rs
           crates/storage/tests/dhat_seal_queue_backlog.rs
+          crates/storage/tests/dhat_task_watch.rs
           crates/storage/tests/dhat_tick_row_append.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
           crates/trading/tests/dhat_risk_engine.rs
@@ -858,8 +852,7 @@ jobs:
           # not silently break the comparison.
           expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
           if ! diff <(echo "$expected") <(echo "$actual"); then
-            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."
-            exit 1
+            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
           fi
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
@@ -986,27 +979,35 @@ jobs:
       # watermark durability-lag ring stay allocation-free.
       # 2026-10-26: dhat_hot_path_telemetry added (audit K5), 5 -> 6. It pins
       # that record_stage_nanos, beat_at and stage_quantiles allocate nothing.
+      # 2026-10-30: dhat_hot_path_latency_minute (the per-minute proof and
+      # capacity window on the telemetry thread) and dhat_receipt_to_fold_stage
+      # (DT0) added, 6 -> 8, each sharing an existing --test line.
       # Two --test flags share a line so the run: line count does not grow.
       # 2026-10-30: dhat_tick_row_append added (plan ITEM DT row stage), 6 -> 7.
       # It pins the per-tick ILP row build at zero allocations. Its flag shares
       # a line with two others, so the run: line count does not grow.
+      # 2026-10-30: with PR #2146's two (hot_path_latency_minute, receipt_to_fold) -> 9;
+      # the flags are packed three per line so the run: line count stays at its ceiling.
+      # Merged with PR #2143: dhat_seal_per_seal_path (the whole per-seal path after
+      # the fold allocates nothing) shares the second flag line, 9 -> 10; its drift-list
+      # line is paid for by joining the zero-tests echo and exit 1 below.
+      # 2026-10-30: dhat_task_watch added (plan item 4: heartbeat beat/publish and one
+      # memory-ladder poll allocate nothing), packed onto the third flag line, 10 -> 11.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
-            --test dhat_deferred_depth_note_shed --test dhat_depth_append_zero_alloc --test dhat_tick_row_append \
-            --test dhat_flush_buffer_recycle --test dhat_hot_path_telemetry \
-            --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
+            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc \
+            --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle --test dhat_seal_per_seal_path \
+            --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog --test dhat_task_watch \
             2>&1 | tee /tmp/dhat-storage.log
           if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
-            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
-            exit 1
+            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."; exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 7 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step."
-            exit 1
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step."; exit 1
           fi
 
       - name: DHAT (trading)
@@ -1054,7 +1055,7 @@ jobs:
             --test dhat_depth_drain --test dhat_idle_seed_step \
             --test dhat_live_ingest_seam \
             --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
-            --test dhat_wal_ring_sink_accept \
+            --test dhat_order_path_recorder --test dhat_wal_ring_sink_accept \
             --test dhat_ws_lag --test dhat_ws_lag_recorder \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
@@ -1085,10 +1086,11 @@ jobs:
           # with the top-volume sweep it gated (operator Quote 34).
           # 8 since 2026-10-28 (follow-up bundle): dhat_idle_seed_step gates the
           # idle seed step and the depth row pre-size.
+          # 9 since 2026-10-30 (order path under 1 us): dhat_order_path_recorder
+          # gates the order path with the production recorder installed.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 8 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step."
-            exit 1
+          if [ "$ran" -ne 9 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------

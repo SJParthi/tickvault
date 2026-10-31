@@ -38,3 +38,18 @@ failure-output = "immediate-final"
 success-output = "never"
 status-level = "fail"
 final-status-level = "slow"
+
+# One test gets a longer limit, on purpose (2026-10-31). The WAL lifetime
+# property test runs 256 randomized multi-boot lifetimes; it took about 326 s
+# locally and the 90 s x 2 = 180 s kill above failed PRs at random (#2145's
+# first run). Its cases must not be cut, skipped or ignored: it is the test
+# that proves no unapplied frame is skipped or pruned across restarts. The
+# override is in both profiles because an override beats a profile's own
+# slow-timeout; every other test keeps the limits above.
+[[profile.default.overrides]]
+filter = "binary_id(tickvault-storage::wal_unapplied_ranges_properties) & test(=proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "binary_id(tickvault-storage::wal_unapplied_ranges_properties) & test(=proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame)"
+slow-timeout = { period = "300s", terminate-after = 2 }

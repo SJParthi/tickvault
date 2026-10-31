@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
-use crate::disk_health_watcher::{DiskHealthOutcome, classify_join_exit, probe_disk_free_bytes};
+use crate::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 
 /// Cadence of the resource probe. 60s matches the OOM + disk watchers; slow-
 /// moving resource pressure needs no tighter sampling and the cost is
@@ -486,6 +486,9 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Plan item 4: one beat per pass; a pass stuck past three cadences
+            // reads as missed on tv_task_heartbeat_missed_total.
+            crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::ResourceMonitor);
 
             // Every read below is blocking: `/proc` and cgroup files, an
             // O(open fds) directory listing, and a `statvfs` call that can hang
@@ -694,8 +697,18 @@ pub fn spawn_supervised_resource_monitor(
     tokio::spawn(async move {
         loop {
             let handle = spawn_resource_monitor(paths.clone());
-            let join_result = handle.await;
-            let reason = classify_join_exit(&join_result);
+            // Plan item 4: also watches the heartbeat; with
+            // respawn_on_missed_beats on, a stuck task is aborted here.
+            let exit = crate::task_heartbeat::await_watched(
+                crate::task_heartbeat::WatchedTask::ResourceMonitor,
+                handle,
+            )
+            .await;
+            let reason = exit.reason();
+            crate::task_heartbeat::note_respawn(
+                crate::task_heartbeat::WatchedTask::ResourceMonitor,
+                reason,
+            );
             warn!(
                 reason,
                 backoff_secs = RESOURCE_MONITOR_RESPAWN_BACKOFF_SECS,

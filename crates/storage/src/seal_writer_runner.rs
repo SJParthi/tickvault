@@ -80,7 +80,7 @@ use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqWriter;
 use crate::seal_spill::SealSpillWriter;
 use crate::seal_writer_task::{
-    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once,
+    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once_reusing,
     drain_recovered_seals_for_replay,
 };
 use crate::shadow_candle_writer::ShadowCandleWriter;
@@ -1119,6 +1119,11 @@ pub struct SealWriterRunner {
     /// The cycle second (`now_unix_secs`) of the live cycle's last flush;
     /// `None` before the first. Paces the live flush ([`seal_flush_due`]).
     last_live_flush: Option<i64>,
+    /// The live drain's rescue buffer, kept across cycles so a flush
+    /// allocates nothing (see [`drain_once_reusing`]). Holds the capacity of
+    /// the largest batch drained, at most `max_drain_per_cycle` seals (it grows
+    /// by `reserve_exact`, never by doubling).
+    drain_scratch: Vec<BufferedSeal>,
 }
 
 /// Seals waiting in the ring at which the live cycle flushes at once,
@@ -1156,7 +1161,25 @@ impl SealWriterRunner {
         questdb_config: &tickvault_common::config::QuestDbConfig,
         max_drain_per_cycle: usize,
     ) -> anyhow::Result<Self> {
-        let writer = ShadowCandleWriter::new(questdb_config)?;
+        Self::new_with_encoder(
+            questdb_config,
+            max_drain_per_cycle,
+            crate::tick_ilp::TickIlpEncoder::Library,
+        )
+    }
+
+    /// [`Self::new`] with the candle writer's ILP encoder chosen by
+    /// `[tick_storage] own_ilp_encoder` (default off: the library), the same
+    /// switch as the tick writer.
+    ///
+    /// # Errors
+    /// The candle writer could not be built.
+    pub fn new_with_encoder(
+        questdb_config: &tickvault_common::config::QuestDbConfig,
+        max_drain_per_cycle: usize,
+        encoder: crate::tick_ilp::TickIlpEncoder,
+    ) -> anyhow::Result<Self> {
+        let writer = ShadowCandleWriter::new_with_encoder(questdb_config, encoder)?;
         let pipeline = SealAbsorptionPipeline::new();
         let spill = pipeline.spill_handle();
         let (sender, receiver) = crossbeam_channel::bounded(SEAL_MPSC_CAPACITY);
@@ -1171,6 +1194,7 @@ impl SealWriterRunner {
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
             last_live_flush: None,
+            drain_scratch: Vec::new(),
             spill,
         })
     }
@@ -1226,6 +1250,7 @@ impl SealWriterRunner {
             replay: MidSessionReplay::default(),
             escalation_pending: spill.escalation_pending(),
             last_live_flush: None,
+            drain_scratch: Vec::new(),
             spill,
         }
     }
@@ -1366,11 +1391,12 @@ impl SealWriterRunner {
                 now_unix_secs,
             );
         if due {
-            outcome.drain = drain_once(
+            outcome.drain = drain_once_reusing(
                 &mut self.pipeline,
                 &mut self.writer,
                 self.max_drain_per_cycle,
                 now_unix_secs,
+                &mut self.drain_scratch,
             );
             if outcome.drain.ring_seals_popped > 0 {
                 self.last_live_flush = Some(now_unix_secs);

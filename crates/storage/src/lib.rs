@@ -167,6 +167,11 @@ pub mod oom_monitor;
 // BP-08 (2026-07-01): RESOURCE-01/02/03 fd / RSS / spill-free early-warning
 // monitors — supervised poll mirroring oom_monitor + disk_health_watcher.
 pub mod resource_monitor;
+// Plan item 4 (2026-10-30): heartbeats for the long-lived background tasks the
+// hot-path telemetry does not watch, and the memory action ladder that
+// publishes them on the `tv-task-watch` thread.
+pub mod memory_watchdog;
+pub mod task_heartbeat;
 // W2 PR#6 (2026-07-10, audit follow-up row 10): WAL-SUSPEND-01 per-table
 // QuestDB WAL-apply suspension probe — supervised 60s wal_tables() poll
 // mirroring disk_health_watcher / oom_monitor / resource_monitor. A
@@ -313,9 +318,20 @@ pub mod hot_path_telemetry;
 // Live audit F2/F5/F6 (2026-10-29): the durable market-data floor. Spill
 // replay sets aside rows older than the last reset instead of posting them.
 pub mod market_data_floor;
+// Plan item DT0 (2026-10-29): per-hot-thread scheduling-wait evidence,
+// read once a second on the `tv-telemetry` thread.
+pub mod hot_thread_sched;
+// Owner 2026-10-30: per-minute host evidence (CPU wait, CPU, disk, QuestDB
+// backlog, ticks) and the daily "is the 4-core box needed" verdict.
+pub mod host_capacity_minute;
+// Owner 2026-10-30: one row per hot-path stage per minute (p50/p99/p99.9,
+// max, samples over 1,024 ns), the live proof table, written off the hot path.
+pub mod hot_path_latency_minute;
 // Moves the current tokio worker aside for one blocking step (sweep S1/S5).
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
+/// Our own ILP encoder and sender for the tick writer (plan ITEM DT).
+pub mod tick_ilp;
 pub mod tick_persistence;
 // Plan item M5 (2026-10-27, owner Quote 41): repeat quotes (no new trade) go
 // to `tick_quotes`, stamped at arrival; same tick writer and buffer.

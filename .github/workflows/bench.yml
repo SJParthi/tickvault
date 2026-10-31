@@ -152,6 +152,10 @@ jobs:
         id: bench
         env:
           BENCH_BUDGET_MULTIPLIER: '2.5'
+          # A p99 tail-gate miss prints BENCH-TAIL-GATE-FAILED and exits 0, so
+          # the gate and the baseline save below still run; a later step
+          # fails the run on that line (PR #2143 review, 2026-10-30).
+          BENCH_TAIL_GATE_DEFER: '1'
         run: |
           set -o pipefail
           cargo bench --workspace --bench '*' 2>&1 | tee bench-output.log
@@ -171,12 +175,7 @@ jobs:
           rc=0
           bash scripts/bench-gate.sh | tee gate-output.log || rc=$?
           echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
-          {
-            echo '## Bench Gate Results'
-            echo '```'
-            cat gate-output.log
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf '## Bench Gate Results\n```\n%s\n```\n' "$(cat gate-output.log)" >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
       # Save the baseline whenever the benches completed and there was NO
@@ -198,6 +197,13 @@ jobs:
         with:
           path: target/criterion
           key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
+
+      # The p99 tail gates (seal_path, feed_drain) defer a miss to here under
+      # BENCH_TAIL_GATE_DEFER, after the baseline save, so a tail miss fails
+      # the run without stopping the benches, the gate or the save.
+      - name: Fail on a p99 tail-gate miss
+        if: always() && steps.bench.outcome == 'success'
+        run: "! grep -n 'BENCH-TAIL-GATE-FAILED' bench-output.log"
 
       - name: Upload bench + gate logs
         if: always()

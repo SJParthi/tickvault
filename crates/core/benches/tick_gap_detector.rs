@@ -22,7 +22,9 @@
 //! `observe_refused_full` are timed one call at a time over 200,000 calls
 //! with one `Instant` pair per call (the pair is inside every sample, so the
 //! figures read high), and a p99 above the `tick_gap_detector` budget (times
-//! `BENCH_BUDGET_MULTIPLIER`) exits 1, which fails the bench job. A synthetic
+//! `BENCH_BUDGET_MULTIPLIER`) exits 1 (under `BENCH_TAIL_GATE_DEFER=1`, set by
+//! `bench.yml`, it prints `BENCH-TAIL-GATE-FAILED` and a later step fails the
+//! job after the baseline save). A synthetic
 //! over-budget sample set is checked to fail first, so the gate can fail.
 //! Only under `cargo bench` (`--bench`).
 

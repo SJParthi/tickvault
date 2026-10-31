@@ -222,9 +222,30 @@ fn ticks_dropped_baseline_is_reachable_from_both_constructors() {
          labelled series."
     );
 
+    // Plan ITEM DT (2026-10-30): `new` and `for_test` delegate to the
+    // encoder-choosing constructors, which register. Pin the delegation AND
+    // the registration, so neither half can be dropped.
+    for (ctor, delegate) in [
+        (
+            "pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {",
+            "Self::new_with_encoder(config,feed,",
+        ),
+        (
+            "pub fn for_test(feed: Feed) -> Self {",
+            "Self::for_test_with_encoder(feed,",
+        ),
+    ] {
+        let body = compact(fn_body(&text, ctor, "tick_persistence.rs"));
+        assert!(
+            body.contains(delegate),
+            "`{ctor}` no longer delegates to `{delegate}`; re-point this guard \
+             at the constructor that now registers the drop baseline."
+        );
+    }
+
     for ctor in [
-        "pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {",
-        "pub fn for_test(feed: Feed) -> Self {",
+        "pub fn new_with_encoder(config: &QuestDbConfig, feed: Feed, encoder: TickIlpEncoder) -> Self {",
+        "pub fn for_test_with_encoder(feed: Feed, encoder: TickIlpEncoder) -> Self {",
     ] {
         let body = compact(fn_body(&text, ctor, "tick_persistence.rs"));
         assert!(

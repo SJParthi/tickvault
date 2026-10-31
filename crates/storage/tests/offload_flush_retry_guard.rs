@@ -62,9 +62,12 @@ fn assert_carries_bounded_retry(body: &str, who: &str, counter: &str) {
          58,746 rescued tick batches on 2026-09-03."
     );
 
-    // Gated on the transport class, never on every error.
+    // Gated on the transport class, never on every error. The tick sink
+    // (plan ITEM DT) asks `TickIlpError::is_retryable`, whose library arm is
+    // the shared classifier itself; that delegation is pinned by
+    // `the_tick_ilp_error_retry_class_is_the_shared_classifier`.
     assert!(
-        body.contains("flush_failure_is_retryable"),
+        body.contains("flush_failure_is_retryable") || body.contains("err.is_retryable()"),
         "{who}: the retry must be gated on the transport failure class. \
          Retrying a rejected payload re-sends bytes the server already refused."
     );
@@ -146,5 +149,32 @@ fn the_retryable_class_is_transport_only() {
         "the classifier must match EXACTLY ONE error code. Widening it retries \
          payloads QuestDB refused on their merits, which turns one rejection \
          into two."
+    );
+}
+
+/// The tick sink's retry class (plan ITEM DT) is `TickIlpError::is_retryable`.
+/// Its library arm must stay the shared transport classifier, an encoder
+/// refusal must never retry, and our own sender's arm must read the flag set
+/// only for a transport failure.
+#[test]
+fn the_tick_ilp_error_retry_class_is_the_shared_classifier() {
+    let source = include_str!("../src/tick_ilp.rs");
+    let start = source
+        .find("pub fn is_retryable(&self) -> bool {")
+        .expect("TickIlpError::is_retryable must exist");
+    let body = &source[start..start + 400];
+    assert!(
+        body.contains(
+            "Self::Library(err) => crate::depth_persistence::flush_failure_is_retryable(err)"
+        ),
+        "TickIlpError::is_retryable: the library arm must be the shared transport classifier."
+    );
+    assert!(
+        body.contains("Self::Encoder(_) => false"),
+        "TickIlpError::is_retryable: an encoder refusal must never be retried."
+    );
+    assert!(
+        body.contains("Self::Send(err) => err.retryable"),
+        "TickIlpError::is_retryable: our sender's arm must read its transport flag."
     );
 }

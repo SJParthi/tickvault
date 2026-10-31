@@ -27,11 +27,10 @@
 # directly. clippy-driver is invoked ONLY for workspace members (that is what
 # WORKSPACE_WRAPPER means), which is the same scope as `--no-deps`.
 #
-# SCOPE PARITY WITH CI (two steps in ci.yml "Build & Verify", both here):
-#     cargo clippy --workspace --no-deps -- -D warnings          (libs + bins)
-#     cargo clippy <CLEAN_CRATES> --all-targets --no-deps -- -D warnings
-# The second (2026-10-30, plan 12b) also lints tests and benches of the crates
-# that measured clean. Pinned by crates/common/tests/clippy_local_parity_guard.rs.
+# SCOPE PARITY WITH CI (ci.yml "Build & Verify", plan item 12b):
+#     cargo clippy --workspace --all-targets --no-deps -- -D warnings
+# Every target of every workspace crate, including tests and benches.
+# Pinned by crates/common/tests/clippy_local_parity_guard.rs.
 #
 # HONEST LIMITS
 #   * clippy.toml is honoured (it is found by walking up from the crate dir),
@@ -44,13 +43,11 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-CLEAN_CRATES=(-p tickvault-common -p tickvault-storage -p tickvault-api -p tickvault-aws-lambdas -p tickvault-logs-mcp)
 
 # Prefer the real subcommand whenever the toolchain actually has it.
 if cargo clippy --version >/dev/null 2>&1; then
     echo "clippy-local: cargo-clippy shim present -- using it directly"
-    cargo clippy --workspace --no-deps -- -D warnings
-    exec cargo clippy "${CLEAN_CRATES[@]}" --all-targets --no-deps -- -D warnings
+    exec cargo clippy --workspace --all-targets --no-deps -- -D warnings
 fi
 
 DRIVER="$(rustup which clippy-driver 2>/dev/null || true)"
@@ -67,7 +64,7 @@ trap 'rm -f "${OUT}"' EXIT
 
 set +e
 export CLIPPY_ARGS="--no-deps" RUSTC_WORKSPACE_WRAPPER="${DRIVER}"
-{ cargo check --workspace && cargo check "${CLEAN_CRATES[@]}" --all-targets; } >"${OUT}" 2>&1
+cargo check --workspace --all-targets >"${OUT}" 2>&1
 CARGO_STATUS=$?
 set -e
 
@@ -86,4 +83,4 @@ if grep -qE '^(warning|error)' "${OUT}"; then
     exit 1
 fi
 
-echo "clippy-local: PASS -- zero diagnostics (workspace libs + bins; all targets of the clean crates)"
+echo "clippy-local: PASS -- zero diagnostics (all targets of every workspace crate)"

@@ -1177,6 +1177,32 @@ Approved by: Parthiban, 2026-10-29, the brief "MY DECISIONS (29 Oct 2026). They 
   - Files: crates/app/src/strategy_dry_run.rs, crates/app/src/main.rs, crates/trading/src/brutex_host/fixture.rs
   - Tests: test_dry_run_on_fixture_accepts, test_dry_run_on_tampered_fixture_refuses
 
+### ITEM SP — the sealed-candle path under 1 µs per seal (owner directive 2026-10-30; storage)
+
+Approved by: Parthiban, 2026-10-30 ("every in-memory step must take under 1 microsecond at p99, proven by benches that fail the build if it slips, with identical output; use only max"). Scope: what happens to a sealed candle after the fold produces it, in `crates/storage` only (the fold, `crates/trading/src/candles`, belongs to another session). Design: measure each per-seal step with a new Criterion bench, fix what is over 1,000 ns or allocates, keep the ILP bytes identical. Edge cases: a ring that already holds seals is never prefaulted; a refused row still rewinds to its marker; the `contract` name is looked up once per row by the caller. Failure modes: an invalid constant column name would reach QuestDB unchecked (test runs the library check over every name and a source scan refuses a literal); the reused drain buffer is cleared on every return path. Rollback: revert the commit (no schema, config or wire change). Observability: the bench prints p50/p99/p99.9/max per step; no new metric.
+
+- [x] SP1. `seal_path` Criterion bench for the hand-off, take + ring push, row build, ILP append (with and without contract names), ring pop + append, ledger probe hit and miss, with its own p99 gate against the new `seal_path` budget (1,000 ns) for the sub-µs steps and `seal_ilp` (2,500 ns, measured ceiling, NOT the 1 µs target) for the three ILP-append steps
+  - Files: crates/storage/benches/seal_path.rs, crates/storage/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md
+  - Tests: every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count
+- [x] SP2. The live drain reuses one rescue buffer (`drain_once_reusing`, runner `drain_scratch`)
+  - Files: crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
+  - Tests: test_drain_once_reusing_keeps_its_scratch_capacity_across_cycles
+- [x] SP3. The production ring is prefaulted at construction (`prefault_ring`)
+  - Files: crates/storage/src/seal_absorption.rs
+  - Tests: test_prefault_ring_writes_every_slot_and_leaves_the_ring_empty, test_production_pipeline_is_prefaulted_at_construction
+- [x] SP4. Constant column names skip the per-call questdb-rs check; the delay text skips `fmt`; bytes identical
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/delay_render.rs
+  - Tests: proptest_write_row_is_byte_identical_to_the_validated_form, test_every_candle_ilp_column_name_passes_the_questdb_check, test_write_row_passes_only_named_constants_to_the_unchecked_names, proptest_render_delay_into_matches_the_fmt_version_byte_for_byte, test_render_delay_into_matches_the_fmt_version_at_every_edge
+- [x] SP5. DHAT: the whole per-seal path allocates nothing
+  - Files: crates/storage/tests/dhat_seal_per_seal_path.rs
+  - Tests: dhat_the_per_seal_path_after_the_fold_never_allocates
+- [x] SP6. Review fixes: the candle ILP buffer is presized and written once at construction (no regrowth on the append); a p99 tail miss defers to a step after the Criterion baseline save
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/benches/seal_path.rs, crates/app/benches/feed_drain.rs, .github/workflows/bench.yml, crates/common/tests/shell_budget_guard.rs, crates/storage/tests/bench_tail_gate_defer_guard.rs
+  - Tests: test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows, test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows, both_benches_print_the_marker_and_exit_unless_deferred, bench_yml_defers_and_fails_after_the_baseline_save, workflow_run_lines_never_grow
+- [x] SP7. The candle row through #2163's own ILP encoder, behind `[tick_storage] own_ilp_encoder` (default off): `IlpLine` gains `column_str` (the library's quoted escape), the candle writer's buffer and sender become `TickRowBuffer` / `TickIlpSender`, byte-identical to the validated library form, zero allocation; own-encoder steps held to `seal_path` = 1,000 ns at p99 (measured p99 780 to 825 ns)
+  - Files: crates/storage/src/tick_ilp.rs, crates/storage/src/tick_ilp_tests.rs, crates/storage/src/shadow_candle_writer.rs, crates/storage/src/seal_writer_runner.rs, crates/app/src/main.rs, crates/storage/benches/seal_path.rs, crates/storage/tests/dhat_seal_per_seal_path.rs
+  - Tests: proptest_own_encoder_candle_rows_are_byte_identical_to_the_validated_form, test_own_encoder_writer_appends_the_same_bytes_as_the_library_writer, test_flush_error_is_connection_matches_each_encoder, test_own_encoder_test_writer_flush_fails_and_keeps_rows, test_column_str_matches_the_library, test_column_str_before_table_is_refused_like_the_library, dhat_the_per_seal_path_after_the_fold_never_allocates
+
 ### Muhurat 2026-11-08 (Sunday) — the weekday-only protections
 
 Approved by: Parthiban, 2026-10-30 ~12:00 IST, "go ahead and fix the muhurat risk dude" (recorded as `daily-universe-scope-expansion-2026-05-27.md` Quote 49 and noise lock §2.15). Design: `[[trading.muhurat_trading_dates]]` in `config/base.toml` gains the session times and becomes the one source (calendar `is_session_day`, `muhurat_session_secs`); terraform's copy is pinned equal; the workflow guards read the date from the same file; the liveness gate gets dated open/close rules. Edge cases: an ordinary Sunday and a weekday holiday stay closed; times empty = box not started (unchanged); an evening session must fit 18:00–19:30 (build check); the did-it-run alarms are never armed on a weekend. Failure modes: config file missing in a guard job reads "not Muhurat" (fail-open), so every guard job checks the file out and a ratchet pins it; reported times wrong: the box still runs from start − 60 min and the arming offset absorbs a later first tick. Rollback: revert the PR (no data or schema change). Observability: no new page; the gate Lambda logs its armed list.
