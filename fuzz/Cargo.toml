@@ -15,6 +15,7 @@ tickvault-core = { path = "../crates/core" }
 tickvault-common = { path = "../crates/common" }
 tickvault-storage = { path = "../crates/storage" }
 tickvault-trading = { path = "../crates/trading" }
+tickvault-app = { path = "../crates/app" }
 serde_json = "=1.0.154"
 
 [[bin]]
@@ -87,4 +88,10 @@ doc = false
 [[bin]]
 name = "segment_query"
 path = "fuzz_targets/segment_query.rs"
+doc = false
+
+# Dhan intraday REST body: the outside record the daily cross-check reads.
+[[bin]]
+name = "dhan_intraday_json"
+path = "fuzz_targets/dhan_intraday_json.rs"
 doc = false
