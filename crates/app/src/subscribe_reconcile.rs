@@ -1019,7 +1019,7 @@ enum CommandAttempt {
     Reply(Option<Option<ResubscribeOutcome>>),
 }
 
-async fn send_command_checked<V>(
+async fn dispatch_reconcile_checked<V>(
     tx: &mpsc::Sender<LiveSubscriptionCommand>,
     instruments: &[SubscribeInstrument],
     kind: RoundCommand,
@@ -1121,7 +1121,9 @@ where
         }
         commands += 1;
         let reply =
-            match send_command_checked(tx, &batch, RoundCommand::Unsubscribe, checked_send).await {
+            match dispatch_reconcile_checked(tx, &batch, RoundCommand::Unsubscribe, checked_send)
+                .await
+            {
                 CommandAttempt::Canceled => {
                     half.canceled = true;
                     half.untouched.extend(batch);
@@ -1442,7 +1444,7 @@ where
             counter!(RECONCILE_ROUNDS_METRIC, "outcome" => "subscribe_retried").increment(1);
             tokio::time::sleep(Duration::from_secs(RECONCILE_SUBSCRIBE_RETRY_SECS)).await;
         }
-        let reply = match send_command_checked(tx, &pending, kind, checked_send).await {
+        let reply = match dispatch_reconcile_checked(tx, &pending, kind, checked_send).await {
             CommandAttempt::Canceled => return SubscribeEnd::Canceled(pending),
             CommandAttempt::Reply(reply) => reply,
         };

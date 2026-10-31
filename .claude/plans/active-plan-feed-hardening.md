@@ -90,6 +90,41 @@ raised from 13,559 to 15,598 as that guard requests. This mechanical inventory i
 not an executed-test count or a code-coverage percentage; no scanner, exemption,
 coverage floor or deadline is relaxed.
 
+### Committed validation follow-up — channel helper naming
+
+Normal merge commit `dd5a9d0a` preserves both the green, unmerged #2158 prerequisite
+and the original #2144 history. Its first full run stopped after 6,665 passed,
+one failed and seven ignored tests. The unchanged `--no-fail-fast` diagnostic
+then completed all 460 harnesses: 15,504 passed, one failed and 34 ignored. The
+only failure was the shell guard's SSM sender inventory: its literal marker
+matched the private channel helper name `send_command_checked`, which performs
+bounded Tokio channel dispatch and acknowledgement waiting, with no SSM call.
+
+Rename that helper and its two callers to `dispatch_reconcile_checked` without
+changing its behavior, tests, constants or public declarations. The SSM scanner,
+actual sender inventory and every threshold remain unchanged. An independent
+source review verified inverse rename/formatting equivalence and the corrected
+marker inventory. Corrected-source focused guards, normal follow-up commit and
+fresh final-head workspace, lint, native push and CI results remain pending at
+this checkpoint; the failed committed-head runs remain part of the evidence.
+
+The unchanged full public-function scanner passed the corrected feed source in
+248 seconds under its existing standalone 300-second command; normal native
+publication still requires its unchanged 120-second limit. Compose the separately
+reviewed per-invocation crate-inventory optimization and its Git-isolated Rust
+fixtures before final validation. It retains the matching/verdict rules,
+baselines, wrapper deadlines and exemptions, adds no quality-state cache, and
+does not turn heuristic name matching into proof of behavioral coverage. Its
+integrated fixtures, repository guards and final native gates remain required.
+
+The exact scanner proposal passed all 14 integrated fixture tests, but the
+unchanged assertion-free ratchet counted ten helper-based bodies and failed at
+155 versus 145. Name their real asserting helper `assert_outcome` and update its
+call sites; preserve its assertions and every test body apart from that name.
+Do not change the ratchet, production hook, baseline or deadline. Retain the
+failed predecessor and rerun all 14 fixtures plus the actual ratchet before the
+normal follow-up commit.
+
 **Status:** IN_PROGRESS
 **Date:** 2026-08-10
 **Approved by:** Parthiban (operator) — "approve the plan", 2026-08-10 in-session, given in
