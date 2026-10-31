@@ -90,8 +90,6 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
 
-use crate::disk_health_watcher::classify_join_exit;
-
 /// Cadence of the WAL-suspension probe. 60s mirrors the sibling
 /// process-global monitors (disk / OOM / resource) — a suspension pages
 /// within one poll + the ≤5-min alarm evaluation, while one tiny SELECT
@@ -1213,6 +1211,9 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Plan item 4: one beat per pass; a pass stuck past three cadences
+            // reads as missed on tv_task_heartbeat_missed_total.
+            crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::WalSuspensionWatcher);
             // PR W review round 7: the marks a clean reply vouches for are
             // the ones before the query left, not after it came back.
             let probe_basis = crate::wal_applied_watermark::applied_watermark().probe_basis();
@@ -1582,8 +1583,18 @@ pub fn spawn_supervised_wal_suspension_watcher(
     tokio::spawn(async move {
         loop {
             let handle = spawn_wal_suspension_watcher(questdb.clone());
-            let join_result = handle.await;
-            let reason = classify_join_exit(&join_result);
+            // Plan item 4: also watches the heartbeat; with
+            // respawn_on_missed_beats on, a stuck task is aborted here.
+            let exit = crate::task_heartbeat::await_watched(
+                crate::task_heartbeat::WatchedTask::WalSuspensionWatcher,
+                handle,
+            )
+            .await;
+            let reason = exit.reason();
+            crate::task_heartbeat::note_respawn(
+                crate::task_heartbeat::WatchedTask::WalSuspensionWatcher,
+                reason,
+            );
             warn!(
                 reason,
                 backoff_secs = WAL_WATCHER_RESPAWN_BACKOFF_SECS,

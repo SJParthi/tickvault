@@ -1266,6 +1266,8 @@ async fn async_main() -> Result<()> {
              heartbeat gauges will not publish (host thread or memory limit)"
         );
     }
+    // Plan item 4: task heartbeats + memory ladder, before the watched supervisors.
+    tickvault_app::task_watch_boot::start_task_watch(&config);
     tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
         tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
         tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
