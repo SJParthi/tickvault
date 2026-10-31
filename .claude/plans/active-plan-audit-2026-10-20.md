@@ -80,16 +80,23 @@ Local validation on this exact base: eight focused positives; seven intended
 original-behavior regression failures, followed by restored positives; 100 common
 guards, 27 lifecycle guards and 118 order-connection tests; all-target workspace
 Clippy with warnings denied; full workspace 15,441 passed, zero failed, 33 existing
-ignores. Commands used Rust 1.95.0, offline/locked, one build job and one test thread.
+ignores; 11 dedicated Loom tests. That full-workspace run precedes the final
+test-module packaging below; production source is byte-identical. Commands used
+Rust 1.95.0, offline/locked, one build job and one test thread.
 The first workspace attempt could not bind sandbox loopback sockets. The permitted
 rerun exposed the production-panic guard's classification of the external fixture
-filename. Moving the unchanged test bytes to canonical `tests.rs` preserves its
-`#[cfg(test)]` boundary; no guard or allowlist changed. Three panic-guard tests and
-the five positive/negative/restored lifecycle tests then passed as intended before
-the final broad pass. Both earlier failures remain recorded in external artifacts.
+filename. The fixture moved to canonical `tests.rs`. The native banned-pattern
+scanner then required the real test boundary to be visible inside that file, so
+the fixture now also sits in an explicit `#[cfg(test)] mod tests`. Its body is
+byte-identical after removing indentation and adjusting the parent-import depth;
+all assertions and production logic are unchanged. No guard or allowlist changed.
+After the final wrapper, all five lifecycle tests pass, original behavior fails
+all five, and restored behavior passes all five again; 63 panic/Rust-only/shell/
+source-size guard tests and workspace all-targets Clippy pass. The actual banned
+scanner now passes too. Earlier failures remain recorded in external artifacts.
 
 Independent source review found no blocker, including the canonical test-layout
-follow-up. Dedicated Loom checks and normal commit/push gates precede publication;
+follow-up. Normal commit/push gates precede publication;
 record their actual results and any optional-tool skips in the PR. Keep logs
 bounded and never print matched secret source. S1–S3 remain open as merge-completion
 items; their local implementation and tests are complete. The draft targets `main`

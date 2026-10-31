@@ -753,14 +753,83 @@ async fn connect_and_listen(
         );
     }
 
-    let m_active = metrics::gauge!("tv_order_update_ws_active");
+    let _ = calendar; // market-hours flag no longer needed in the read loop
+    listen_on_connected_order_stream(
+        ws_stream,
+        metrics::gauge!("tv_order_update_ws_active"),
+        OrderUpdateSession {
+            client_id,
+            access_token: &access_token,
+            order_sender,
+            wal_spill,
+            authenticated_signal,
+            authenticated_latch,
+            notifier,
+            failures_before_attempt,
+            stability_reached,
+        },
+    )
+    .await
+}
+
+/// Owns the connected-socket gauge until login/read finishes or is dropped.
+/// A scope guard also clears it on early errors, task cancellation and unwind.
+struct OrderUpdateActiveGuard(metrics::Gauge);
+
+impl OrderUpdateActiveGuard {
+    fn new(gauge: metrics::Gauge) -> Self {
+        gauge.set(1.0);
+        Self(gauge)
+    }
+}
+
+impl Drop for OrderUpdateActiveGuard {
+    fn drop(&mut self) {
+        self.0.set(0.0);
+    }
+}
+
+/// Borrowed inputs for one connected login/read session.
+struct OrderUpdateSession<'a> {
+    client_id: &'a str,
+    access_token: &'a str,
+    order_sender: &'a broadcast::Sender<OrderUpdate>,
+    wal_spill: Option<&'a Arc<WsFrameSpill>>,
+    authenticated_signal: Option<&'a Arc<tokio::sync::Notify>>,
+    authenticated_latch: Option<&'a Arc<std::sync::atomic::AtomicBool>>,
+    notifier: Option<&'a Arc<crate::notification::NotificationService>>,
+    failures_before_attempt: u32,
+    stability_reached: &'a mut bool,
+}
+
+/// Runs the same login/read lifecycle for any connected WebSocket transport.
+/// Keeping the transport boundary here allows in-memory failure tests.
+async fn listen_on_connected_order_stream<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    m_active: metrics::Gauge,
+    session: OrderUpdateSession<'_>,
+) -> Result<(), OrderUpdateConnectionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let OrderUpdateSession {
+        client_id,
+        access_token,
+        order_sender,
+        wal_spill,
+        authenticated_signal,
+        authenticated_latch,
+        notifier,
+        failures_before_attempt,
+        stability_reached,
+    } = session;
     let m_messages = metrics::counter!("tv_order_update_messages_total");
-    m_active.set(1.0);
+    let _active = OrderUpdateActiveGuard::new(m_active);
 
     let (mut write, mut read) = ws_stream.split();
 
     // Send login message.
-    let login_msg = build_order_update_login(client_id, &access_token);
+    let login_msg = build_order_update_login(client_id, access_token);
     write
         .send(Message::Text(login_msg.into()))
         .await
@@ -784,7 +853,6 @@ async fn connect_and_listen(
     // only wakes on real data, real errors, or real stream closure.
     //
     // Stage C's watchdog provides a liveness backstop at 660s (11 min).
-    let _ = calendar; // market-hours flag no longer needed
     let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
 
     // STAGE-C.3: per-connection activity watchdog. 660s threshold (600s
@@ -825,7 +893,6 @@ async fn connect_and_listen(
         let frame_result = tokio::select! {
             biased;
             () = watchdog_notify.notified() => {
-                m_active.set(0.0);
                 break Err(OrderUpdateConnectionError::WatchdogFired(
                     WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
                 ));
@@ -865,13 +932,11 @@ async fn connect_and_listen(
         let msg = match frame_result {
             Some(Ok(msg)) => msg,
             Some(Err(err)) => {
-                m_active.set(0.0);
                 // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
                 break Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
             None => {
                 // Stream ended (server closed connection).
-                m_active.set(0.0);
                 break Ok(());
             }
         };
@@ -1042,7 +1107,6 @@ async fn connect_and_listen(
                                     reason = %reason,
                                     "order update WebSocket auth/API error from server"
                                 );
-                                m_active.set(0.0);
                                 break Err(OrderUpdateConnectionError::AuthFailed(reason));
                             }
                             // R4 (2026-10-01, reality check): a frame carrying the
@@ -1119,7 +1183,6 @@ async fn connect_and_listen(
             }
             Message::Close(frame) => {
                 info!(?frame, "order update WebSocket close frame received");
-                m_active.set(0.0);
                 break Ok(());
             }
             _ => {
@@ -1630,6 +1693,10 @@ enum OrderUpdateConnectionError {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "order_update_connection/tests.rs"]
+mod active_gauge_tests;
 
 #[cfg(test)]
 mod tests {
