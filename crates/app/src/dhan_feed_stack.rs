@@ -23329,9 +23329,9 @@ mod tests {
         assert_eq!(ingest.flush(), 0, "flushing an empty buffer is a no-op");
     }
 
-    /// A seeded-but-never-ticked instrument must be reported.
-    ///
-    /// This is the partial-subscribe detector's whole reason to exist: a
+    // A seeded-but-never-ticked instrument must be reported.
+    //
+    // This is the partial-subscribe detector's whole reason to exist: a
     // -----------------------------------------------------------------
     // Dead-instrument-class detector (Item 3)
     //
@@ -30758,16 +30758,15 @@ mod late_seed_tests {
         // The four snapshot timer arms this list was derived from went with
         // top_volume on 2026-10-22 (plan item 62); the silence read-out is
         // what must stay below the seed arm now.
-        for below in ["silence_timer.tick()"] {
-            let at = drain
-                .find(&below)
-                .unwrap_or_else(|| panic!("the drain must have a `{below}` arm"));
-            assert!(
-                seed_arm < at,
-                "`{below}` sits ABOVE the seed arm; if it is ever moved below one \
-                 that can go permanently ready, it stops running entirely"
-            );
-        }
+        let below = "silence_timer.tick()";
+        let at = drain
+            .find(below)
+            .unwrap_or_else(|| panic!("the drain must have a `{below}` arm"));
+        assert!(
+            seed_arm < at,
+            "`{below}` sits ABOVE the seed arm; if it is ever moved below one \
+             that can go permanently ready, it stops running entirely"
+        );
     }
 
     #[test]
@@ -31717,8 +31716,7 @@ mod item_44_tests {
             } else if secs < START {
                 WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
                     .saturating_sub(secs)
-                    .min(WAL_CATCHUP_BUDGET_SECS)
-                    .max(WAL_CATCHUP_IN_SESSION_BUDGET_SECS)
+                    .clamp(WAL_CATCHUP_IN_SESSION_BUDGET_SECS, WAL_CATCHUP_BUDGET_SECS)
             } else {
                 WAL_CATCHUP_BUDGET_SECS
             };

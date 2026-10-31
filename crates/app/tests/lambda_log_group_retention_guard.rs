@@ -44,10 +44,10 @@ fn lambda_names(sources: &[(String, String)]) -> Vec<String> {
             if !line.starts_with("function_name") {
                 continue;
             }
-            if let Some(rest) = line.split_once(PREFIX).map(|(_, r)| r) {
-                if let Some(name) = rest.split('"').next() {
-                    names.push(name.to_owned());
-                }
+            if let Some(rest) = line.split_once(PREFIX).map(|(_, r)| r)
+                && let Some(name) = rest.split('"').next()
+            {
+                names.push(name.to_owned());
             }
         }
     }

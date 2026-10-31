@@ -304,6 +304,7 @@ fn a_failed_free_space_probe_still_refuses() {
 /// consequence that day was a rescue success of 84.6% for ticks against 23.7%
 /// for depth -- the record-only lane starving the decision-critical one.
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn depth_refuses_while_ticks_are_still_rescued() {
     use tickvault_storage::tick_persistence::{
         DEPTH_SPILL_FREE_RESERVE_BYTES, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingVerdict,
@@ -382,6 +383,7 @@ fn depth_refuses_while_ticks_are_still_rescued() {
 /// would be the same figure with none of the reasoning, and the next person
 /// to change the tick reserve would silently break the ordering.
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn the_depth_reserve_is_derived_from_the_tick_reserve() {
     use tickvault_storage::tick_persistence::{
         DEPTH_SPILL_FREE_RESERVE_BYTES, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
@@ -491,6 +493,7 @@ fn guard_self_test() {
 /// because the defect lived in a band and any single sample outside it reads
 /// clean.
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn at_every_free_space_value_where_ticks_refuse_depth_has_already_refused() {
     use tickvault_storage::tick_persistence::{
         DEPTH_SPILL_FREE_RESERVE_BYTES, DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,

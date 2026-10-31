@@ -76,7 +76,7 @@ fn make_quote_bytes(security_id: u32) -> Vec<u8> {
 
 /// Simulate the full WS read loop per-frame tail: counter bump + WAL
 /// hand-off (`Bytes::clone`, the H1 zero-alloc replacement for `to_vec`)
-/// + dispatch. Returns the parsed frame wrapped in `black_box` so the
+/// and dispatch. Returns the parsed frame wrapped in `black_box` so the
 /// compiler cannot elide the work.
 #[inline(always)]
 fn ws_reader_tail(counter: &AtomicU64, frame: &Bytes) -> bool {
