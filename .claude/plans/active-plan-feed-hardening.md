@@ -125,6 +125,37 @@ Do not change the ratchet, production hook, baseline or deadline. Retain the
 failed predecessor and rerun all 14 fixtures plus the actual ratchet before the
 normal follow-up commit.
 
+### Shared fixture follow-up — Rust child deadline
+
+Follow-up commit `fe3b9c0d` passed the targeted fixture/ratchet checks and normal
+commit gates. Its fresh full-workspace attempt was explicitly stopped during
+compilation (exit 143, zero test harnesses) after a sibling's actual full run
+rejected the fixture's external timeout executable under the unchanged spawn
+allowlist. That interruption is not a test result or a successful full run.
+
+Use the existing Tokio dependency for a private fixture helper that concurrently
+captures both output streams and waits for the direct child under the original
+ten-second deadline. Each stream fails explicitly above 1 MiB rather than
+truncating a verdict. On deadline/read failure, drop the pipe futures before
+attempting termination and wait; preserve the primary error and report cleanup
+failures. Reaping depends on OS scheduling, and arbitrary descendants are not
+terminated as a process group. Existing Git isolation and all fourteen original
+assertions remain; five added cases cover deadlines/reaping, pipe saturation,
+output limits and nonzero exit preservation. Production hook, allowlists,
+baselines, native deadlines, dependencies and feed behavior remain unchanged.
+
+Independent source reviews cleared this bounded scope. The corrected fixture
+passed 19 cases, the browser/toolchain guard 16 and assertion ratchet two. Two
+ordinary controls removed the deadline or capture cap and each failed its
+intended assertion after compiling; neither reached its independent outer
+deadline. The exact source was restored and all 19 fixture cases passed again.
+The complete common-crate `--tests --no-fail-fast` run then passed 1,804 tests,
+with zero failures and one ignored test across 90 harnesses, using one build job
+and one test thread. Scoped fixture Clippy also passed. These are pre-commit
+source results; a normal commit, fresh final-head workspace, all-target Clippy,
+native publication and exact-head CI remain required. No activation, live proof
+or latency result is inferred.
+
 **Status:** IN_PROGRESS
 **Date:** 2026-08-10
 **Approved by:** Parthiban (operator) — "approve the plan", 2026-08-10 in-session, given in

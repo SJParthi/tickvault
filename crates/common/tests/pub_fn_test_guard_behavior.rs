@@ -3,11 +3,108 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const HOOK: &str = include_str!("../../../.claude/hooks/pub-fn-test-guard.sh");
+
+const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
+const CAPTURE_LIMIT: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct CaptureFailure {
+    cause: io::Error,
+    reaped: Option<ExitStatus>,
+    cleanup_errors: Vec<io::Error>,
+}
+
+impl From<io::Error> for CaptureFailure {
+    fn from(cause: io::Error) -> Self {
+        Self {
+            cause,
+            reaped: None,
+            cleanup_errors: Vec::new(),
+        }
+    }
+}
+
+async fn capture_stream(mut pipe: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = pipe.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if count > CAPTURE_LIMIT.saturating_sub(output.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture command output exceeds capture limit",
+            ));
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+}
+
+// Bounds waiting and both pipe reads, without detached readers or an external
+// timeout executable. Cancellation drops both pipe futures before cleanup.
+// Reaping the direct child still depends on OS scheduling; arbitrary descendants
+// are not terminated as a process group. These fixtures own finite child work.
+fn captured_output(command: Command, deadline: Duration) -> Result<Output, CaptureFailure> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut child = tokio::process::Command::from(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take().expect("captured stdout");
+        let stderr = child.stderr.take().expect("captured stderr");
+        let outcome = {
+            let wait = child.wait();
+            let capture = async move {
+                let (stdout, stderr, status) =
+                    tokio::try_join!(capture_stream(stdout), capture_stream(stderr), wait)?;
+                Ok::<_, io::Error>(Output {
+                    status,
+                    stdout,
+                    stderr,
+                })
+            };
+            tokio::time::timeout(deadline, capture).await
+        };
+        let cause = match outcome {
+            Ok(Ok(output)) => return Ok(output),
+            Ok(Err(error)) => error,
+            Err(_) => io::Error::new(io::ErrorKind::TimedOut, "fixture command deadline exceeded"),
+        };
+        // Preserve the primary deadline/read error even if cleanup also fails.
+        // Always attempt wait after start_kill, including an already-exited child.
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = child.start_kill() {
+            cleanup_errors.push(error);
+        }
+        let reaped = match child.wait().await {
+            Ok(status) => Some(status),
+            Err(error) => {
+                cleanup_errors.push(error);
+                None
+            }
+        };
+        Err(CaptureFailure {
+            cause,
+            reaped,
+            cleanup_errors,
+        })
+    })
+}
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -55,7 +152,7 @@ impl CaseDir {
             .current_dir(&self.0)
             .envs(environment.iter().map(|(key, value)| (*key, value)));
         self.isolate_git(&mut command);
-        let out = command.output().expect("fixture git");
+        let out = captured_output(command, COMMAND_DEADLINE).expect("fixture git");
         assert!(out.status.success(), "fixture git failed: {out:?}");
     }
 
@@ -96,7 +193,7 @@ impl CaseDir {
         } else {
             command.env_remove("CI");
         }
-        let output = command.output().expect("run real hook");
+        let output = captured_output(command, COMMAND_DEADLINE).expect("run real hook");
         Outcome {
             code: output.status.code().expect("hook exited normally"),
             stdout: output.stdout,
@@ -110,9 +207,8 @@ impl CaseDir {
     }
 
     fn command_with_environment(&self, mode: &str, environment: &[(&str, OsString)]) -> Command {
-        let mut command = Command::new("timeout");
+        let mut command = Command::new("bash");
         command
-            .args(["10", "bash"])
             .arg(self.0.join(".claude/hooks/pub-fn-test-guard.sh"))
             .arg(&self.0)
             .arg(mode)
@@ -361,13 +457,12 @@ fn inventory_is_evaluated_once_per_crate_including_empty_inventories() {
     // No guard verdict or matching content is synthesized by this wrapper.
     case.write("grep-count.env", "grep() {\n  if [ \"${1:-}\" = -r ]; then printf 'scan\\n' >> \"$PUBFN_INVENTORY_LOG\"; fi\n  command grep \"$@\"\n}\n");
     let log = case.0.join("inventory-count.txt");
-    let output: Output = case
-        .command("all")
+    let mut command = case.command("all");
+    command
         .env("CI", "true")
         .env("BASH_ENV", case.0.join("grep-count.env"))
-        .env("PUBFN_INVENTORY_LOG", &log)
-        .output()
-        .expect("instrumented real hook");
+        .env("PUBFN_INVENTORY_LOG", &log);
+    let output = captured_output(command, COMMAND_DEADLINE).expect("instrumented real hook");
     assert!(output.status.success(), "instrumented verdict: {output:?}");
     assert_eq!(
         fs::read_to_string(log)
@@ -522,11 +617,10 @@ fn hook_child_cannot_false_pass_through_a_poison_selected_clean_index() {
     case.git(&["add", "crates"]);
     case.write(".claude/hooks/pub-fn-test-guard.sh", HOOK);
     case.write(".claude/hooks/.untested-pubfn-baseline", "0\n");
-    let output = case
-        .command_with_environment("staged", &poisoned)
-        .env("CI", "true")
-        .output()
-        .expect("real hook with poisoned selectors");
+    let mut command = case.command_with_environment("staged", &poisoned);
+    command.env("CI", "true");
+    let output =
+        captured_output(command, COMMAND_DEADLINE).expect("real hook with poisoned selectors");
     assert_eq!(
         output.status.code(),
         Some(2),
@@ -537,4 +631,100 @@ fn hook_child_cannot_false_pass_through_a_poison_selected_clean_index() {
         snapshot_tree(&sentinel.0) == before,
         "hook child must leave the external sentinel repository unchanged"
     );
+}
+
+fn builtin_child(script: &str) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .args(["--noprofile", "--norc", "-c", script])
+        .env_remove("BASH_ENV")
+        .env_remove("ENV");
+    command
+}
+
+#[test]
+fn command_deadline_terminates_and_reaps_a_non_exiting_direct_child() {
+    let failure = captured_output(
+        builtin_child("while :; do :; done"),
+        Duration::from_millis(250),
+    )
+    .expect_err("non-exiting child must hit the Rust deadline");
+    assert_eq!(failure.cause.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        failure.reaped.is_some_and(|status| !status.success()),
+        "direct child was not reaped after termination: {failure:?}"
+    );
+    assert!(
+        failure.cleanup_errors.is_empty(),
+        "direct-child cleanup failed: {failure:?}"
+    );
+}
+
+#[test]
+fn command_deadline_refuses_a_finite_slow_child() {
+    // Finite even if the deadline is removed by an ordinary mutation control.
+    let failure = captured_output(
+        builtin_child("SECONDS=0; while (( SECONDS < 3 )); do :; done"),
+        Duration::from_millis(250),
+    )
+    .expect_err("finite slow child must hit the Rust deadline");
+    assert_eq!(failure.cause.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        failure.reaped.is_some(),
+        "direct child must be waited: {failure:?}"
+    );
+    assert!(
+        failure.cleanup_errors.is_empty(),
+        "direct-child cleanup failed: {failure:?}"
+    );
+}
+
+#[test]
+fn simultaneous_pipe_output_above_pipe_capacity_is_captured_exactly() {
+    let output = captured_output(
+        builtin_child("printf -v block '%4096s' ''; block=${block// /x}; for ((i=0;i<64;i++)); do printf '%s' \"$block\"; printf '%s' \"$block\" >&2; done"),
+        COMMAND_DEADLINE,
+    ).expect("both pipe readers must make progress");
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 256 * 1024);
+    assert_eq!(output.stderr.len(), 256 * 1024);
+    assert!(output.stdout.iter().all(|&byte| byte == b'x'));
+    assert!(output.stderr.iter().all(|&byte| byte == b'x'));
+}
+
+#[test]
+fn output_capture_limit_refuses_each_stream_without_truncating_a_verdict() {
+    for stream in ["stdout", "stderr"] {
+        let mut command = builtin_child(
+            "if [ \"$1\" = stderr ]; then exec 1>&2; fi; for ((i=0;i<257;i++)); do printf '%4096s' ''; done",
+        );
+        command.args(["fixture", stream]);
+        let failure = captured_output(command, COMMAND_DEADLINE)
+            .expect_err("oversized output must fail explicitly");
+        assert_eq!(failure.cause.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            failure.cause.to_string(),
+            "fixture command output exceeds capture limit"
+        );
+        assert!(
+            failure.reaped.is_some(),
+            "overflowing direct child must be waited: {failure:?}"
+        );
+        assert!(
+            failure.cleanup_errors.is_empty(),
+            "direct-child cleanup failed: {failure:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_preserves_nonzero_exit_and_both_output_streams() {
+    let output = captured_output(
+        builtin_child("printf standard; printf diagnostic >&2; exit 7"),
+        COMMAND_DEADLINE,
+    )
+    .expect("normal nonzero exit must remain a captured verdict");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"standard");
+    assert_eq!(output.stderr, b"diagnostic");
 }
