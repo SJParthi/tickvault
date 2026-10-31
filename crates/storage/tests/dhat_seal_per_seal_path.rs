@@ -40,6 +40,7 @@ use tickvault_storage::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_runner::SEAL_MPSC_CAPACITY;
 use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
+use tickvault_storage::tick_ilp::TickIlpEncoder;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
 mod dhat_support;
@@ -183,6 +184,27 @@ fn dhat_the_per_seal_path_after_the_fold_never_allocates() {
         "the per-seal path allocated {bytes} bytes / {blocks} blocks over {SEALS} seals \
          (hand-off, take, ring, row build, ILP append, ledger probe). Every one of these \
          runs once per sealed candle and must not allocate."
+    );
+
+    // The same walk with the candle row through our own encoder (#2163's
+    // `OwnIlpBuffer`, `[tick_storage] own_ilp_encoder`). Built and warmed
+    // outside the measurement, like the library writer above.
+    path.writer = ShadowCandleWriter::for_test_with_encoder(TickIlpEncoder::Own);
+    path.walk(from, BATCH);
+    from += BATCH;
+    let (own_bytes, own_blocks) = dhat_support::measure_with_phantom_retry(
+        BUDGET_BYTES,
+        BUDGET_BLOCKS,
+        || {},
+        || {
+            path.walk(from, SEALS);
+            from += SEALS;
+        },
+    );
+    assert!(
+        own_bytes == BUDGET_BYTES && own_blocks == BUDGET_BLOCKS,
+        "the per-seal path with our own ILP encoder allocated {own_bytes} bytes / \
+         {own_blocks} blocks over {SEALS} seals"
     );
 
     // Bite: a fresh String per delay column is what the reused scratch
