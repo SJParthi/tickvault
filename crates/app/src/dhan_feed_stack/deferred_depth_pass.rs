@@ -1206,8 +1206,8 @@ mod tests {
             disk_low in proptest::bool::ANY,
         ) {
             let step = after_close_step(secs, lag, backlog, suspect, disk_low, false);
-            let in_window = secs >= AFTER_CLOSE_DEPTH_START_SECS_IST
-                || secs < AFTER_CLOSE_DEPTH_STOP_SECS_IST;
+            let in_window = !(AFTER_CLOSE_DEPTH_STOP_SECS_IST..AFTER_CLOSE_DEPTH_START_SECS_IST)
+                .contains(&secs);
             let backlog_high = backlog.is_none_or(|b| b > AFTER_CLOSE_APPLY_LAG_CEILING);
             if !in_window {
                 proptest::prop_assert!(matches!(step, PassStep::Stop(_)));

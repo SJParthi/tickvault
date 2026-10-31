@@ -208,7 +208,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
-      - name: cargo clippy (workspace, libs + bins only)
+      - name: cargo clippy (all workspace targets)
+        # Plan item 12b (2026-10-31): every workspace crate's libs, bins,
+        # tests, benches and examples are linted with warnings fatal. One
+        # command replaces the redundant five-crate checkpoint's two passes,
+        # keeping workflow shell within its existing ceiling. The original
+        # dated measurements below explain why all-targets was deferred.
         # THE GATE IS ARMED (2026-08-11). `-D warnings` is ON: any clippy
         # warning in lib+bin code now FAILS this job, and Build & Verify is
         # a needed job of All Green, so it blocks the merge.
@@ -221,10 +226,8 @@ jobs:
         # stale. Measured before arming: `cargo clippy --workspace --no-deps
         # -- -D warnings` exits 0 on this tree.
         #
-        # `--all-targets` is STILL deliberately omitted, and that is a real
-        # remaining gap, not an oversight: test code legitimately uses
-        # `eprintln!` (calibration output) and the workspace does not
-        # currently build clean in that mode.
+        # `--all-targets` is now on this step for every workspace crate
+        # (plan item 12b, expanded 2026-10-31). The history below is kept as written.
         #
         # MEASURED 2026-08-26 (this comment said "its true warning count is
         # UNMEASURED" until now, and an unmeasured gap is indistinguishable
@@ -252,7 +255,7 @@ jobs:
         # Ratcheted by `crates/common/tests/rust_only_guard.rs::
         # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
         # dropped again.
-        run: cargo clippy --workspace --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a

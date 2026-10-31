@@ -1248,12 +1248,12 @@ mod tests {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let pairs = vec![
             StrikePair {
-                strike_paise: 24_000_00,
+                strike_paise: 2_400_000,
                 ce_security_id: 101,
                 pe_security_id: 102,
             },
             StrikePair {
-                strike_paise: 24_100_00,
+                strike_paise: 2_410_000,
                 ce_security_id: 111,
                 pe_security_id: 112,
             },
@@ -1291,7 +1291,7 @@ mod tests {
     fn an_unchanged_at_the_money_plans_no_wire_work_at_all() {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let pairs = vec![StrikePair {
-            strike_paise: 24_000_00,
+            strike_paise: 2_400_000,
             ce_security_id: 101,
             pe_security_id: 102,
         }];
@@ -1319,7 +1319,7 @@ mod tests {
     fn an_unnameable_segment_plans_nothing_rather_than_guessing() {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let pairs = vec![StrikePair {
-            strike_paise: 24_000_00,
+            strike_paise: 2_400_000,
             ce_security_id: 101,
             pe_security_id: 102,
         }];
@@ -1341,12 +1341,12 @@ mod tests {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let pairs = vec![
             StrikePair {
-                strike_paise: 24_000_00,
+                strike_paise: 2_400_000,
                 ce_security_id: 101,
                 pe_security_id: 102,
             },
             StrikePair {
-                strike_paise: 24_100_00,
+                strike_paise: 2_410_000,
                 ce_security_id: 111,
                 pe_security_id: 112,
             },
@@ -1382,12 +1382,12 @@ mod tests {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let pairs = vec![
             StrikePair {
-                strike_paise: 24_000_00,
+                strike_paise: 2_400_000,
                 ce_security_id: 101,
                 pe_security_id: 102,
             },
             StrikePair {
-                strike_paise: 24_100_00,
+                strike_paise: 2_410_000,
                 ce_security_id: -5,
                 pe_security_id: 112,
             },
@@ -1419,24 +1419,24 @@ mod tests {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let n = vec![
             StrikePair {
-                strike_paise: 24_000_00,
+                strike_paise: 2_400_000,
                 ce_security_id: 101,
                 pe_security_id: 102,
             },
             StrikePair {
-                strike_paise: 24_100_00,
+                strike_paise: 2_410_000,
                 ce_security_id: 111,
                 pe_security_id: 112,
             },
         ];
         let b = vec![
             StrikePair {
-                strike_paise: 57_000_00,
+                strike_paise: 5_700_000,
                 ce_security_id: 201,
                 pe_security_id: 202,
             },
             StrikePair {
-                strike_paise: 57_100_00,
+                strike_paise: 5_710_000,
                 ce_security_id: 211,
                 pe_security_id: 212,
             },

@@ -1014,6 +1014,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
     fn the_thresholds_leave_a_real_gap_in_both_directions() {
         // If a shed threshold ever met or crossed its restore partner, the
         // hysteresis is gone and the level chatters every poll.

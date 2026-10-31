@@ -15,7 +15,7 @@
 //!
 //! Surviving neighbours keep their own guards: the order-update WS outage
 //! paging is pinned by `crates/core/tests/ws_telegram_visibility_guard.rs`
-//! + the WS-GAP-10 tests; the Groww feed's stall detection is the
+//! and the WS-GAP-10 tests; the Groww feed's stall detection is the
 //! feed-stall watchdog (feed-stall-watchdog-error-codes.md).
 
 #[test]

@@ -2624,10 +2624,9 @@ mod tests {
         engine.update_market_price_in_segment(unheld, ExchangeSegment::NseFno, 99.0);
 
         assert!(
-            engine
+            !engine
                 .market_prices
-                .get(&(unheld, ExchangeSegment::NseFno))
-                .is_none(),
+                .contains_key(&(unheld, ExchangeSegment::NseFno)),
             "an unheld instrument's mark is refused once the map is full"
         );
         assert_eq!(

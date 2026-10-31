@@ -712,20 +712,20 @@ mod tests {
     use super::*;
 
     fn put_i32(f: &mut [u8], off: usize, v: i32) {
-        f[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        f[off..][..4].copy_from_slice(&v.to_le_bytes());
     }
     fn put_i64(f: &mut [u8], off: usize, v: i64) {
-        f[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        f[off..][..8].copy_from_slice(&v.to_le_bytes());
     }
     fn put_f32(f: &mut [u8], off: usize, v: f32) {
-        f[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        f[off..][..4].copy_from_slice(&v.to_le_bytes());
     }
     fn put_f64(f: &mut [u8], off: usize, v: f64) {
-        f[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        f[off..][..8].copy_from_slice(&v.to_le_bytes());
     }
     fn put_name(f: &mut [u8], off: usize, name: &str) {
         let bytes = name.as_bytes();
-        f[off..off + bytes.len()].copy_from_slice(bytes);
+        f[off..][..bytes.len()].copy_from_slice(bytes);
     }
 
     // --- B ---
@@ -863,21 +863,28 @@ mod tests {
     // --- S / L / R ---
 
     fn build_add_symbol_frame(code: u8, names: &[(&str, i32)]) -> Vec<u8> {
-        let mut f = vec![0_u8; TD_RECORD_LIST_HEADER_LEN + names.len() * TD_ADD_SYMBOL_RECORD_LEN];
+        let frame_len = names
+            .len()
+            .checked_mul(TD_ADD_SYMBOL_RECORD_LEN)
+            .and_then(|len| len.checked_add(TD_RECORD_LIST_HEADER_LEN))
+            .expect("test symbol frame length fits usize");
+        let mut f = vec![0_u8; frame_len];
         f[0] = code;
         f[OFF_RL_SUCCESS] = 1;
         let count = i32::try_from(names.len()).unwrap_or(i32::MAX);
         put_i32(&mut f, OFF_RL_COUNT, count);
         put_i32(&mut f, OFF_RL_TOTAL, count);
-        for (i, (name, id)) in names.iter().enumerate() {
-            let base = TD_RECORD_LIST_HEADER_LEN + i * TD_ADD_SYMBOL_RECORD_LEN;
-            put_name(&mut f, base, name);
-            put_i32(&mut f, base + OFF_AS_SYMBOL_ID, *id);
-            put_i32(&mut f, base + OFF_AS_TIMESTAMP, 1_700_000_000);
-            put_f32(&mut f, base + OFF_AS_LTP, 42.5);
-            put_i64(&mut f, base + OFF_AS_TOT_VOLUME, 999_999_999_999);
-            put_f64(&mut f, base + OFF_AS_TURNOVER, 1234.5);
-            put_i32(&mut f, base + OFF_AS_ASK_QTY, 7);
+        for (record, (name, id)) in f[TD_RECORD_LIST_HEADER_LEN..]
+            .chunks_exact_mut(TD_ADD_SYMBOL_RECORD_LEN)
+            .zip(names)
+        {
+            put_name(record, 0, name);
+            put_i32(record, OFF_AS_SYMBOL_ID, *id);
+            put_i32(record, OFF_AS_TIMESTAMP, 1_700_000_000);
+            put_f32(record, OFF_AS_LTP, 42.5);
+            put_i64(record, OFF_AS_TOT_VOLUME, 999_999_999_999);
+            put_f64(record, OFF_AS_TURNOVER, 1234.5);
+            put_i32(record, OFF_AS_ASK_QTY, 7);
         }
         f
     }
