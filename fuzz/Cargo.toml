@@ -14,6 +14,9 @@ toml = "1.0.4"
 tickvault-core = { path = "../crates/core" }
 tickvault-common = { path = "../crates/common" }
 tickvault-storage = { path = "../crates/storage" }
+tickvault-trading = { path = "../crates/trading" }
+tickvault-app = { path = "../crates/app" }
+serde_json = "=1.0.154"
 
 [[bin]]
 name = "tick_parser"
@@ -44,4 +47,51 @@ doc = false
 [[bin]]
 name = "truedata_frame_decoder"
 path = "fuzz_targets/truedata_frame_decoder.rs"
+doc = false
+
+# Adversarial input coverage (2026-10-30, owner: "every permutation",
+# "attack every extreme case"). Each target asserts a property, not only
+# no-panic; the matching property tests are crates/*/tests/adversarial_*.rs.
+
+# Main-feed frames with several packets stacked, plus the socket-side
+# frame classifier for every endpoint.
+[[bin]]
+name = "main_feed_stacked_frame"
+path = "fuzz_targets/main_feed_stacked_frame.rs"
+doc = false
+
+# Order-update WebSocket JSON.
+[[bin]]
+name = "order_update_json"
+path = "fuzz_targets/order_update_json.rs"
+doc = false
+
+# Dhan instrument master CSV and its cell parsers.
+[[bin]]
+name = "instrument_master_csv"
+path = "fuzz_targets/instrument_master_csv.rs"
+doc = false
+
+# Sealed-candle spill records read back from disk + the tick-spill line splitter.
+[[bin]]
+name = "seal_spill_record"
+path = "fuzz_targets/seal_spill_record.rs"
+doc = false
+
+# brutex strategy folder files (recipe, params, gates, universe, check CSVs).
+[[bin]]
+name = "strategy_recipe_files"
+path = "fuzz_targets/strategy_recipe_files.rs"
+doc = false
+
+# The quote endpoint's ?segment= value.
+[[bin]]
+name = "segment_query"
+path = "fuzz_targets/segment_query.rs"
+doc = false
+
+# Dhan intraday REST body: the outside record the daily cross-check reads.
+[[bin]]
+name = "dhan_intraday_json"
+path = "fuzz_targets/dhan_intraday_json.rs"
 doc = false

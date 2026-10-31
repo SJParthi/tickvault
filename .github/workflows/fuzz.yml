@@ -90,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [tick_parser, config_parser, ws_frame_wal_replay, dhan_depth_packet, truedata_frame_decoder]
+        target: [tick_parser, config_parser, ws_frame_wal_replay, dhan_depth_packet, truedata_frame_decoder, main_feed_stacked_frame, order_update_json, instrument_master_csv, seal_spill_record, strategy_recipe_files, segment_query, dhan_intraday_json]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

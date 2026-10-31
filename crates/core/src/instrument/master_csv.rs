@@ -447,7 +447,9 @@ pub fn parse_lot_size(value: &str) -> u32 {
     if !units.is_finite() || units <= 0.0 {
         return 0;
     }
-    if units.fract() != 0.0 {
+    // `fract()` alone misses a fraction below `f64` resolution:
+    // `75.000000000000001` rounds to exactly 75.0. The decimal text decides.
+    if units.fract() != 0.0 || !decimal_text_is_whole(trimmed) {
         return 0;
     }
     if units > f64::from(u32::MAX) {
@@ -459,6 +461,43 @@ pub fn parse_lot_size(value: &str) -> u32 {
     let units = units as u32;
     units
 }
+
+/// Whether a decimal number's TEXT is a whole number, read digit by digit so
+/// no `f64` rounding can hide a fraction (`75.000000000000001` is not whole).
+///
+/// Takes an optional sign, digits with at most one `.`, and an optional
+/// `e`/`E` exponent. Text it cannot read as that shape returns `false`.
+/// O(text length), no allocation; runs only on the cold CSV build.
+// O(1) EXEMPT: begin — one pass over one CSV cell, cold path
+fn decimal_text_is_whole(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], &unsigned[at + 1..]),
+        None => (unsigned, "0"),
+    };
+    let Ok(exponent) = exponent.parse::<i64>() else {
+        return false;
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    // The decimal point sits after `integer.len() + exponent` digits of
+    // `integer ++ fraction`; whole means every digit after it is zero.
+    let point = i64::try_from(integer.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    integer
+        .bytes()
+        .chain(fraction.bytes())
+        .enumerate()
+        .all(|(index, digit)| i64::try_from(index).unwrap_or(i64::MAX) < point || digit == b'0')
+}
+// O(1) EXEMPT: end
 
 /// `numerator / denominator` as an exact `f64`, with no lossy cast.
 ///
