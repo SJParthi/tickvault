@@ -3209,13 +3209,18 @@ mod tests {
         // RE-BLESSED 2026-10-22 (plan item 64, operator Quote 37) — 47,076
         // bytes, unchanged size: the stopped-box banner reads "auto-stops
         // 16:30 IST" (was 17:30), the daily stop's new time.
+        //
+        // RE-BLESSED 2026-10-31 (owner-requested Top Movers) — 47,076 ->
+        // 53,229 bytes: the reviewed fourth tab adds bounded gainers/losers
+        // tables with conservative source age and explicit unavailable states.
+        // Its 23 Chromium fixtures are separate from this exact-content pin.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "5c9d8633bebce1a8b0ca07ce3a9e8664acb3fd6a353dda2e8a9f23970e1f6203"
+            "4f835798d6f49db8211ac6a6d1cb831925e008906e5394e723744c0765c7a6ce"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_076);
+        assert_eq!(CONSOLE_HTML.len(), 53_229);
     }
 
     // ------------------------------------------------ audit L4 source scans
@@ -3547,15 +3552,15 @@ mod tests {
     }
 
     #[test]
-    fn test_html_has_exactly_three_tabs() {
-        // 2026-07-02 redesign (operator: "webpage looks completely messy, too
-        // many buttons"): exactly Overview / Data / Admin — nothing else.
+    fn test_html_has_exactly_four_ordered_tabs() {
+        // 2026-10-31 continuation: the owner explicitly requested Top Movers
+        // on this portal. Keep the complete ordered tab list pinned.
         let re = regex::Regex::new(r#"data-t="(\w+)""#).unwrap();
         let tabs: Vec<&str> = re
             .captures_iter(CONSOLE_HTML)
             .map(|c| c.get(1).unwrap().as_str())
             .collect();
-        assert_eq!(tabs, ["overview", "data", "admin"]);
+        assert_eq!(tabs, ["overview", "movers", "data", "admin"]);
     }
 
     #[test]

@@ -1486,3 +1486,18 @@ read-only and distinct from intercepted browser fixtures.
     both effective fault controls. All fixed source hashes were restored;
     23 browser fixtures and 46 pure verifier checks passed. Full workspace,
     all-target lint, native publication and live deployment remain separate.
+- [x] Reconcile existing deployment, crate-root and HTML guards with the new helper
+  and requested tab; retain the exact content hash, ordered tabs and smoke-before-
+  promotion-before-host-install assertions. Preserve the helper's production and
+  test lint denials. No deployment or helper runtime behavior changes here.
+  - Files: crates/app/tests/host_tuning_boot_wiring_guard.rs,
+    crates/app/src/bin/tickvault_operator_read.rs,
+    crates/aws-lambdas/src/operator_control.rs
+  - Tests: boot_units_never_run_the_rollback_restored_binary,
+    production_crate_roots_keep_the_deny_blanket,
+    every_crate_root_decides_about_silent_panics,
+    every_crate_root_denies_unsafe_code, console_html_content_pin,
+    test_html_has_exactly_four_ordered_tabs
+  - The unchanged bcf8dc7 diagnostic completed 15,445 passed / 6 failed / 33
+    ignored across 460 harnesses. These six failures are preserved as failed
+    evidence; the corrected candidate still requires its own validation.

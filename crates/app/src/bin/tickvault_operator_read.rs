@@ -1,5 +1,8 @@
 //! Dedicated read-only helper; it cannot start the trading application.
-#![deny(unsafe_code, clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(not(test), deny(unsafe_code))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![cfg_attr(test, deny(unsafe_code, clippy::unwrap_used, clippy::expect_used))]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 #![deny(unused_must_use)]
 
