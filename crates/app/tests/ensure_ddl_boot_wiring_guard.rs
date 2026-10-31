@@ -120,7 +120,7 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 
     // The CALL site (not the fn definition) — the argument form is unique
     // to the build_shared_infra call.
-    let seal_call = "spawn_seal_writer_loop(&config.questdb);";
+    let seal_call = "spawn_seal_writer_loop(&config.questdb, &config.tick_storage);";
     let seal_pos = main_src.find(seal_call).unwrap_or_else(|| {
         panic!("main.rs production region must call `{seal_call}` in build_shared_infra")
     });

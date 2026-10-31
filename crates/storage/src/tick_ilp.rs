@@ -13,8 +13,10 @@
 //!
 //! # What this module is
 //!
-//! * [`IlpLine`]: the six calls a row is built from (table, symbol, i64, f64,
-//!   timestamp column, designated timestamp). Every row layout in the tick
+//! * [`IlpLine`]: the seven calls a row is built from (table, symbol, i64,
+//!   f64, timestamp column, string column, designated timestamp; the string
+//!   column, added 2026-10-31, is written only by the candle writer's delay
+//!   text, which uses this trait too). Every row layout in the tick
 //!   writer is written ONCE, generic over this trait, so the column order and
 //!   separators of the library path and our path cannot drift apart: only the
 //!   primitive encoders differ, and each primitive is tested against the
@@ -136,6 +138,13 @@ pub trait IlpLine {
     /// # Errors
     /// Out of order.
     fn column_ts_nanos(&mut self, name: &'static str, nanos: i64) -> Result<(), TickIlpError>;
+    /// Writes one string column, quoted and escaped as the library does
+    /// (`\n \r " \\` each get a backslash). Used by the candle writer's
+    /// delay text; no tick layout writes one.
+    ///
+    /// # Errors
+    /// Out of order.
+    fn column_str(&mut self, name: &'static str, value: &str) -> Result<(), TickIlpError>;
     /// Ends the row with its designated timestamp in nanoseconds.
     ///
     /// # Errors
@@ -179,6 +188,11 @@ impl IlpLine for Buffer {
     #[inline]
     fn column_ts_nanos(&mut self, name: &'static str, nanos: i64) -> Result<(), TickIlpError> {
         Buffer::column_ts(self, library_column(name), TimestampNanos::new(nanos))?;
+        Ok(())
+    }
+    #[inline]
+    fn column_str(&mut self, name: &'static str, value: &str) -> Result<(), TickIlpError> {
+        Buffer::column_str(self, library_column(name), value)?;
         Ok(())
     }
     #[inline]
@@ -440,6 +454,12 @@ const fn must_escape_unquoted(b: u8) -> bool {
     matches!(b, b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\')
 }
 
+/// The library's quoted-escape set (string column values).
+#[inline]
+const fn must_escape_quoted(b: u8) -> bool {
+    matches!(b, b'\n' | b'\r' | b'"' | b'\\')
+}
+
 /// The two-digit decimal text of 00 to 99, so a number is written two digits
 /// per division.
 const DIGIT_PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819\
@@ -590,6 +610,25 @@ impl IlpLine for OwnIlpBuffer {
     }
 
     #[inline]
+    fn column_str(&mut self, name: &'static str, value: &str) -> Result<(), TickIlpError> {
+        self.begin_column(name)?;
+        self.bytes.push(b'"');
+        let raw = value.as_bytes();
+        if raw.iter().copied().any(must_escape_quoted) {
+            for &b in raw {
+                if must_escape_quoted(b) {
+                    self.bytes.push(b'\\');
+                }
+                self.bytes.push(b);
+            }
+        } else {
+            self.bytes.extend_from_slice(raw);
+        }
+        self.bytes.push(b'"');
+        Ok(())
+    }
+
+    #[inline]
     fn at_nanos(&mut self, nanos: i64) -> Result<(), TickIlpError> {
         if !matches!(self.state, LineState::Symbol | LineState::Column) {
             return Err(TickIlpError::Encoder(
@@ -704,6 +743,15 @@ impl TickRowBuffer {
         }
     }
 
+    /// Rows completed so far.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        match self {
+            Self::Library(b) => b.row_count(),
+            Self::Own(b) => b.row_count(),
+        }
+    }
+
     /// Reserves room for `additional` more bytes.
     pub fn reserve(&mut self, additional: usize) {
         match self {
@@ -787,6 +835,13 @@ impl IlpLine for TickRowBuffer {
         match self {
             Self::Library(b) => IlpLine::column_ts_nanos(b, name, nanos),
             Self::Own(b) => IlpLine::column_ts_nanos(b, name, nanos),
+        }
+    }
+    #[inline]
+    fn column_str(&mut self, name: &'static str, value: &str) -> Result<(), TickIlpError> {
+        match self {
+            Self::Library(b) => IlpLine::column_str(b, name, value),
+            Self::Own(b) => IlpLine::column_str(b, name, value),
         }
     }
     #[inline]

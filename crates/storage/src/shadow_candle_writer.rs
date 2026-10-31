@@ -40,7 +40,7 @@
 //! - Boot wiring + Prometheus counters.
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ColumnName, ProtocolVersion, Sender, TimestampNanos};
+use questdb::ingress::{Sender, TableName};
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info, warn};
@@ -50,6 +50,9 @@ use tickvault_trading::candles::BufferedSeal;
 
 use crate::delay_render::render_delay_into;
 use crate::shadow_seal_columns::ShadowSealRow;
+use crate::tick_ilp::{
+    IlpLine, RawIlpSender, TickIlpEncoder, TickIlpError, TickIlpSender, TickRowBuffer,
+};
 
 // The ILP column names every candle row writes, one constant each, so the
 // row writer can skip questdb-rs's per-call name check (see
@@ -77,13 +80,6 @@ const COL_CLOSE_LATENCY_NS: &str = "close_latency_ns";
 const COL_WINDOW_SPAN_LATENCY: &str = "window_span_latency";
 const COL_WINDOW_SPAN_LATENCY_NS: &str = "window_span_latency_ns";
 
-/// A column name from the `COL_*` constants above, unchecked. Only those
-/// are passed in (the test list `CANDLE_ILP_COLUMN_NAMES` checks each).
-#[inline]
-fn column(name: &'static str) -> ColumnName<'static> {
-    ColumnName::new_unchecked(name)
-}
-
 /// Bytes reserved in the candle ILP buffer when a writer is built: one full
 /// drain cycle (`SEAL_MAX_DRAIN_PER_CYCLE` in `main.rs`, 16,384 seals) of the
 /// largest realistic row (measured by
@@ -104,14 +100,27 @@ const PRESIZE_FILL_VALUE_BYTES: usize = 4_096;
 /// a row no larger than the measured one never regrows the buffer below a full
 /// drain. Placeholder rows are never flushed: the buffer is cleared here,
 /// before the writer exists. Cold: once per writer, a few milliseconds.
-fn presized_buffer(mut buffer: Buffer) -> Buffer {
+/// Whether a failed flush is worth a reconnect and a resend of the same
+/// bytes: the library's `SocketError` class exactly as before
+/// (`ilp_flush_reconnect::is_connection_error`), or our sender's transport
+/// failure. A server refusal or a malformed buffer would fail again. O(1).
+fn flush_error_is_connection(err: &TickIlpError) -> bool {
+    match err {
+        TickIlpError::Library(e) => crate::ilp_flush_reconnect::is_connection_error(e),
+        TickIlpError::Send(e) => e.retryable,
+        TickIlpError::Encoder(_) => false,
+    }
+}
+
+fn presized_buffer(encoder: TickIlpEncoder) -> TickRowBuffer {
+    let mut buffer = TickRowBuffer::new(encoder);
     buffer.reserve(CANDLE_ILP_BUFFER_PRESIZE_BYTES);
     let fill = "0".repeat(PRESIZE_FILL_VALUE_BYTES);
     while buffer.len() + PRESIZE_FILL_VALUE_BYTES * 2 <= buffer.capacity() {
         let written = buffer
             .table("tv_presize")
-            .and_then(|b| b.column_str("p", fill.as_str()))
-            .and_then(|b| b.at_now());
+            .and_then(|()| buffer.column_str("p", fill.as_str()))
+            .and_then(|()| buffer.at_nanos(0));
         if written.is_err() {
             break;
         }
@@ -355,10 +364,18 @@ pub struct ShadowCandleWriter {
     /// Production sender. `None` when QuestDB is unreachable; the
     /// writer task retries connection in a throttled loop. This
     /// slice only flips it from `Some → None` on flush failure.
-    sender: Option<Sender>,
+    sender: Option<TickIlpSender>,
     /// In-memory ILP wire-format buffer. Filled by `append_seal`,
-    /// drained by `flush`. Reused across batches to avoid alloc.
-    buffer: Buffer,
+    /// drained by `flush`. Reused across batches to avoid alloc. The
+    /// library's or ours, matching `sender` (`[tick_storage]
+    /// own_ilp_encoder`, default off).
+    buffer: TickRowBuffer,
+    /// Which encoder `buffer` and every rebuilt sender use, fixed at
+    /// construction.
+    encoder: TickIlpEncoder,
+    /// QuestDB host and HTTP port for rebuilding our own sender. `None` on a
+    /// test writer (nothing to reconnect to).
+    own_endpoint: Option<(String, u16)>,
     /// Number of seals appended since the last successful flush. Used
     /// by the writer task to drive batch-size-based flush triggers
     /// and by tests to verify append behaviour.
@@ -393,39 +410,55 @@ pub struct ShadowCandleWriter {
 }
 
 impl ShadowCandleWriter {
+    /// Production constructor with the library encoder and sender. See
+    /// [`Self::new_with_encoder`].
+    ///
+    /// # Errors
+    /// Never today: an unreachable QuestDB constructs a disconnected writer.
+    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+        Self::new_with_encoder(config, TickIlpEncoder::Library)
+    }
+
     /// Production constructor. Connects to QuestDB via **ILP-over-HTTP**
     /// (per-flush server ACK — see [`build_ilp_conf_string`] for the
-    /// 2026-07-06 silent-candle-persist rationale).
+    /// 2026-07-06 silent-candle-persist rationale), with the encoder
+    /// `[tick_storage] own_ilp_encoder` picks (default: the library).
     ///
-    /// `Sender::from_conf` with `http::` does not dial at construction, so
-    /// this normally succeeds with `sender = Some`; an unreachable QuestDB
-    /// surfaces at `flush()` as `Err` and routes through the reconnect +
-    /// rescue chain. If construction itself fails the writer still
-    /// constructs with `sender = None` and reconnects lazily on flush.
-    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+    /// Neither sender dials at construction, so this normally succeeds with
+    /// `sender = Some`; an unreachable QuestDB surfaces at `flush()` as `Err`
+    /// and routes through the reconnect + rescue chain. If construction
+    /// itself fails the writer still constructs with `sender = None` and
+    /// reconnects lazily on flush.
+    ///
+    /// # Errors
+    /// Never today: an unreachable QuestDB constructs a disconnected writer.
+    pub fn new_with_encoder(config: &QuestDbConfig, encoder: TickIlpEncoder) -> Result<Self> {
         let conf_string = build_ilp_conf_string(&config.host, config.http_port);
-        let (sender, buffer) = match Sender::from_conf(&conf_string) {
-            Ok(s) => {
-                let b = presized_buffer(s.new_buffer());
-                (Some(s), b)
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "shadow candle writer: QuestDB unreachable at startup — will buffer locally until reconnect"
-                );
-                (None, presized_buffer(Buffer::new(ProtocolVersion::V1)))
-            }
-        };
-        Ok(Self {
-            sender,
-            buffer,
+        let mut writer = Self::disconnected(encoder, SecretString::from(conf_string));
+        writer.own_endpoint = Some((config.host.clone(), config.http_port)); // APPROVED: once per writer
+        if let Err(err) = writer.reconnect() {
+            warn!(
+                ?err,
+                ?encoder,
+                "shadow candle writer: QuestDB unreachable at startup — will buffer locally until reconnect"
+            );
+        }
+        Ok(writer)
+    }
+
+    /// A writer with no sender and an empty presized buffer.
+    fn disconnected(encoder: TickIlpEncoder, ilp_conf_string: SecretString) -> Self {
+        Self {
+            sender: None,
+            buffer: presized_buffer(encoder),
+            encoder,
+            own_endpoint: None,
             pending_count: 0,
             delay_scratch: String::new(),
-            ilp_conf_string: SecretString::from(conf_string),
+            ilp_conf_string,
             out_of_window: CandleOutOfWindowCounters::new(),
             keyed: &crate::shadow_persistence::CANDLE_TABLES_KEYED,
-        })
+        }
     }
 
     /// Test constructor — disconnected writer with an empty buffer.
@@ -435,15 +468,14 @@ impl ShadowCandleWriter {
     #[must_use]
     // TEST-EXEMPT: test-only construction helper used by every test in this module (lazy-connect, append, row-count, byte-content, multi-TF dispatch, I-P1-11 isolation, flush-disconnected). Separate name-matched test would be redundant.
     pub fn for_test() -> Self {
-        Self {
-            sender: None,
-            buffer: presized_buffer(Buffer::new(ProtocolVersion::V1)),
-            pending_count: 0,
-            delay_scratch: String::new(),
-            ilp_conf_string: SecretString::from(String::new()),
-            out_of_window: CandleOutOfWindowCounters::new(),
-            keyed: &crate::shadow_persistence::CANDLE_TABLES_KEYED,
-        }
+        Self::for_test_with_encoder(TickIlpEncoder::Library)
+    }
+
+    /// [`Self::for_test`] with a chosen encoder (the `seal_path` bench and
+    /// the encoder identity tests).
+    #[must_use]
+    pub fn for_test_with_encoder(encoder: TickIlpEncoder) -> Self {
+        Self::disconnected(encoder, SecretString::from(String::new()))
     }
 
     /// Test-only: obey `keyed` instead of the process-wide latch, so a test
@@ -637,9 +669,11 @@ impl ShadowCandleWriter {
     /// caller (`None` omits the symbol, so the column reads NULL).
     ///
     /// # Cost (owner directive 2026-10-30: per-seal work under 1 µs at p99)
-    /// Every column name is one of the `COL_*` constants (listed in
-    /// `CANDLE_ILP_COLUMN_NAMES`)
-    /// and goes in through `ColumnName::new_unchecked`: questdb-rs otherwise
+    /// Written once over [`IlpLine`], so the library buffer and our own
+    /// encoder (`[tick_storage] own_ilp_encoder`, default off, #2163's
+    /// `OwnIlpBuffer`) write the same columns in the same order. Every column
+    /// name is one of the `COL_*` constants (listed in
+    /// `CANDLE_ILP_COLUMN_NAMES`) and goes in unchecked: questdb-rs otherwise
     /// re-validates the name character by character on every call, which a
     /// split-out bench measured at about 530 ns of a 1.38 µs row (22 names:
     /// 2 symbols and 20 columns). A production row writes 2 or 3 symbols
@@ -647,34 +681,45 @@ impl ShadowCandleWriter {
     /// (the six delay columns only with receipt stamps), from 21 constants.
     /// The names are validated once, by
     /// `test_every_candle_ilp_column_name_passes_the_questdb_check`, and every
-    /// key the row writes is re-checked by the old-vs-new proptest. The table
+    /// key the row writes is re-checked by the old-vs-new proptests. The table
     /// name is still validated per row: [`Self::append_row`] is public and
-    /// takes any row. The bytes are identical to the validated form
-    /// (`proptest_write_row_is_byte_identical_to_the_validated_form`).
-    fn write_row(
-        buffer: &mut Buffer,
+    /// takes any row. The bytes are identical to the validated form through
+    /// either encoder (`proptest_write_row_is_byte_identical_to_the_validated_form`,
+    /// `proptest_own_encoder_candle_rows_are_byte_identical_to_the_validated_form`).
+    /// Measured 2026-10-31 (x86 dev container, `seal_path` bench, one
+    /// `Instant` pair per sample): library p99 1.5 to 1.7 µs, ours p99 780 to
+    /// 825 ns, median 390 to 480 ns.
+    fn write_row<B: IlpLine>(
+        buffer: &mut B,
         delay_scratch: &mut String,
         row: &ShadowSealRow,
         contract: Option<&str>,
     ) -> Result<()> {
-        let buf = buffer
+        // The table name is still validated per row: `append_row` is public
+        // and takes any row, and both encoders write the name as given.
+        TableName::new(row.table_name)
+            .with_context(|| format!("candle append: invalid table name {}", row.table_name))?;
+        buffer
             .table(row.table_name)
-            .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
-            // Feed-provenance label (operator 2026-06-19, "same tables + feed
-            // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Truedata`
-            // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
-            // writer stamps whichever feed produced the seal, never a hardcoded
-            // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
-            // for the same minute/instrument never collide. Zero-alloc `&'static str`.
-            .symbol(column(COL_FEED), row.feed)
-            .with_context(|| "candle append: symbol(feed) failed")?
-            .symbol(column(COL_SEGMENT), row.segment)
+            .with_context(|| format!("candle append: table({}) failed", row.table_name))?;
+        // Feed-provenance label (operator 2026-06-19, "same tables + feed
+        // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Truedata`
+        // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
+        // writer stamps whichever feed produced the seal, never a hardcoded
+        // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
+        // for the same minute/instrument never collide. Zero-alloc `&'static str`.
+        buffer
+            .symbol(COL_FEED, row.feed)
+            .with_context(|| "candle append: symbol(feed) failed")?;
+        buffer
+            .symbol(COL_SEGMENT, row.segment)
             .with_context(|| "candle append: symbol(segment) failed")?;
         // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`). It
         // must sit here, among the symbols: ILP rejects a symbol after the
         // first column.
         if let Some(name) = contract {
-            buf.symbol(column(COL_CONTRACT), name)
+            buffer
+                .symbol(COL_CONTRACT, name)
                 .with_context(|| "candle append: symbol(contract) failed")?;
         }
         // Tripwire (2026-09-26 audit fix PR2). The fold refuses non-finite
@@ -687,42 +732,49 @@ impl ShadowCandleWriter {
         if nonfinite > 0 {
             metrics::counter!(CANDLE_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
         }
-        let buf = buf
-            .column_i64(column(COL_SECURITY_ID), row.security_id)
-            .with_context(|| "candle append: column_i64(security_id) failed")?
-            .column_f64(column(COL_OPEN), row.open)
-            .with_context(|| "candle append: column_f64(open) failed")?
-            .column_f64(column(COL_HIGH), row.high)
-            .with_context(|| "candle append: column_f64(high) failed")?
-            .column_f64(column(COL_LOW), row.low)
-            .with_context(|| "candle append: column_f64(low) failed")?
-            .column_f64(column(COL_CLOSE), row.close)
-            .with_context(|| "candle append: column_f64(close) failed")?
-            .column_i64(column(COL_VOLUME), row.volume)
-            .with_context(|| "candle append: column_i64(volume) failed")?
-            .column_i64(column(COL_OI), row.oi)
-            .with_context(|| "candle append: column_i64(oi) failed")?
-            .column_i64(column(COL_TICK_COUNT), row.tick_count)
-            .with_context(|| "candle append: column_i64(tick_count) failed")?
-            // The bar's headline move: close vs YESTERDAY's close. Renamed
-            // from `change_pct` 2026-09-19. Its byte-identical twin
-            // `close_pct_from_prev_day` is GONE — both were filled from the
-            // same `state.close_pct_from_prev_day`, so one name survives and
-            // the struct field keeps its original name.
-            .column_f64(column(COL_PERCENTAGE_CHANGE), row.change_pct)
-            .with_context(|| "candle append: column_f64(percentage_change) failed")?
-            // Close vs TODAY's 09:15 session open. Renamed from `open_pct`.
-            .column_f64(column(COL_OPEN_PERCENTAGE_CHANGE), row.open_pct)
-            .with_context(|| "candle append: column_f64(open_percentage_change) failed")?
-            // The vendor's PENDING order-book totals at this bar's last
-            // observed packet — resting orders, NOT executed volume. Written
-            // unconditionally, `0` included: the fold has already applied the
-            // last-non-zero rule, so a `0` here means the whole bar saw no
-            // book, which is a fact worth storing rather than a gap.
-            .column_i64(column(COL_TOTAL_BUY_QTY), row.total_buy_qty)
-            .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
-            .column_i64(column(COL_TOTAL_SELL_QTY), row.total_sell_qty)
-            .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
+        // The bar's headline move is `percentage_change` (close vs YESTERDAY's
+        // close, renamed from `change_pct` 2026-09-19); `open_percentage_change`
+        // is close vs TODAY's 09:15 session open. The book totals are the
+        // vendor's PENDING order-book totals at the bar's last packet (resting
+        // orders, not executed volume), written unconditionally, `0` included.
+        buffer
+            .column_i64(COL_SECURITY_ID, row.security_id)
+            .with_context(|| "candle append: column_i64(security_id) failed")?;
+        for (name, value) in [
+            (COL_OPEN, row.open),
+            (COL_HIGH, row.high),
+            (COL_LOW, row.low),
+            (COL_CLOSE, row.close),
+        ] {
+            buffer
+                .column_f64(name, value)
+                .with_context(|| format!("candle append: column_f64({name}) failed"))?;
+        }
+        for (name, value) in [
+            (COL_VOLUME, row.volume),
+            (COL_OI, row.oi),
+            (COL_TICK_COUNT, row.tick_count),
+        ] {
+            buffer
+                .column_i64(name, value)
+                .with_context(|| format!("candle append: column_i64({name}) failed"))?;
+        }
+        for (name, value) in [
+            (COL_PERCENTAGE_CHANGE, row.change_pct),
+            (COL_OPEN_PERCENTAGE_CHANGE, row.open_pct),
+        ] {
+            buffer
+                .column_f64(name, value)
+                .with_context(|| format!("candle append: column_f64({name}) failed"))?;
+        }
+        for (name, value) in [
+            (COL_TOTAL_BUY_QTY, row.total_buy_qty),
+            (COL_TOTAL_SELL_QTY, row.total_sell_qty),
+        ] {
+            buffer
+                .column_i64(name, value)
+                .with_context(|| format!("candle append: column_i64({name}) failed"))?;
+        }
         // The three receipt-delay pairs. Each is `Option`: a seal that came
         // back through the disk spill tier carries no receipt stamps (the
         // 128-byte record is byte-full and cannot hold them), and a bucket
@@ -756,13 +808,16 @@ impl ShadowCandleWriter {
         ] {
             if let Some(nanos) = value {
                 render_delay_into(scratch, nanos);
-                buf.column_str(column(readable), scratch.as_str())
+                buffer
+                    .column_str(readable, scratch.as_str())
                     .with_context(|| format!("candle append: column_str({readable}) failed"))?;
-                buf.column_i64(column(exact), nanos)
+                buffer
+                    .column_i64(exact, nanos)
                     .with_context(|| format!("candle append: column_i64({exact}) failed"))?;
             }
         }
-        buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
+        buffer
+            .at_nanos(row.timestamp_ist_nanos)
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         Ok(())
     }
@@ -882,7 +937,7 @@ impl ShadowCandleWriter {
                     // Drop the broken sender so the next iteration reconnects. The
                     // buffer is RETAINED (questdb `flush` does not clear it on err).
                     self.sender = None;
-                    if !crate::ilp_flush_reconnect::is_connection_error(&err) {
+                    if !flush_error_is_connection(&err) {
                         return Err(err).context("shadow flush: ILP send failed (non-connection)");
                     }
                     if attempt == crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
@@ -913,8 +968,19 @@ impl ShadowCandleWriter {
                 "shadow reconnect: no ILP conf (disconnected test writer)"
             ));
         }
-        let new_sender =
-            Sender::from_conf(conf).context("shadow reconnect: ILP sender rebuild failed")?;
+        let new_sender = match (self.encoder, &self.own_endpoint) {
+            (TickIlpEncoder::Library, _) => Sender::from_conf(conf)
+                .map(TickIlpSender::Library)
+                .context("shadow reconnect: ILP sender rebuild failed")?,
+            (TickIlpEncoder::Own, Some((host, port))) => RawIlpSender::new(host, *port)
+                .map(TickIlpSender::Own)
+                .map_err(|err| anyhow::anyhow!("shadow reconnect: own ILP sender: {err}"))?,
+            (TickIlpEncoder::Own, None) => {
+                return Err(anyhow::anyhow!(
+                    "shadow reconnect: own ILP sender has no endpoint (disconnected test writer)"
+                ));
+            }
+        };
         self.sender = Some(new_sender);
         Ok(())
     }
@@ -985,6 +1051,8 @@ mod tests {
         std::sync::atomic::AtomicBool::new(true);
 
     use super::*;
+    use crate::tick_ilp::OwnIlpBuffer;
+    use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
     use tickvault_common::constants::{EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ};
     use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
@@ -1285,10 +1353,12 @@ mod tests {
 
     #[test]
     fn test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows() {
-        let buffer = presized_buffer(Buffer::new(ProtocolVersion::V1));
-        assert!(buffer.capacity() >= CANDLE_ILP_BUFFER_PRESIZE_BYTES);
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.row_count(), 0);
+        for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+            let buffer = presized_buffer(encoder);
+            assert!(buffer.capacity() >= CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.row_count(), 0);
+        }
         let mut writer = ShadowCandleWriter::for_test();
         let capacity = writer.buffer.capacity();
         let seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, TfIndex::M1, 33_300, 22_500.5);
@@ -1393,6 +1463,101 @@ mod tests {
             let old = row_bytes(write_row_validated_reference, &rows);
             proptest::prop_assert_eq!(new, old);
         }
+
+        /// Our own encoder (#2163's `OwnIlpBuffer`, `[tick_storage]
+        /// own_ilp_encoder`) writes the same candle bytes as the validated
+        /// library writer, row for row, including the bytes before a refused
+        /// value; only the error text differs, so only refused-or-not is
+        /// compared there.
+        #[test]
+        fn proptest_own_encoder_candle_rows_are_byte_identical_to_the_validated_form(
+            rows in proptest::collection::vec(arb_row(), 1..8)
+        ) {
+            let (own_bytes, own_refused) = own_row_bytes(&rows);
+            let (old_bytes, old_error) = row_bytes(write_row_validated_reference, &rows);
+            proptest::prop_assert_eq!(own_bytes, old_bytes);
+            proptest::prop_assert_eq!(own_refused, old_error.is_some());
+        }
+    }
+
+    /// [`row_bytes`] through our own encoder: the bytes and whether a row was
+    /// refused.
+    fn own_row_bytes(rows: &[(ShadowSealRow, Option<String>)]) -> (Vec<u8>, bool) {
+        let mut buffer = OwnIlpBuffer::new();
+        let mut scratch = String::from("left over from an earlier row");
+        for (row, contract) in rows {
+            if ShadowCandleWriter::write_row(&mut buffer, &mut scratch, row, contract.as_deref())
+                .is_err()
+            {
+                return (buffer.as_bytes().to_vec(), true);
+            }
+        }
+        (buffer.as_bytes().to_vec(), false)
+    }
+
+    /// The own-encoder writer appends the same bytes as the library writer
+    /// for the same seals, and refuses a mid-row buffer the same way.
+    #[test]
+    fn test_own_encoder_writer_appends_the_same_bytes_as_the_library_writer() {
+        let mut library = ShadowCandleWriter::for_test();
+        let mut own = ShadowCandleWriter::for_test_with_encoder(TickIlpEncoder::Own);
+        for i in 0..40u32 {
+            let seal = mk_seal(
+                u64::from(13 + i),
+                EXCHANGE_SEGMENT_IDX_I,
+                TfIndex::M1,
+                1_716_023_700 + i * 60,
+                22_500.5 + f64::from(i) * 0.05,
+            );
+            library.append_seal(&seal).expect("library append");
+            own.append_seal(&seal).expect("own append");
+        }
+        assert_eq!(own.buffer_bytes(), library.buffer_bytes());
+        assert_eq!(own.buffer_row_count(), library.buffer_row_count());
+        assert_eq!(own.pending_count(), 40);
+        own.discard_pending();
+        assert_eq!(own.buffer_byte_count(), 0);
+    }
+
+    /// Only a transport failure is worth a reconnect, for either encoder.
+    #[test]
+    fn test_flush_error_is_connection_matches_each_encoder() {
+        let socket = questdb::Error::new(questdb::ErrorCode::SocketError, "Broken pipe");
+        assert!(flush_error_is_connection(&TickIlpError::Library(socket)));
+        let refused = questdb::Error::new(questdb::ErrorCode::ServerFlushError, "bad row");
+        assert!(!flush_error_is_connection(&TickIlpError::Library(refused)));
+        assert!(!flush_error_is_connection(&TickIlpError::Encoder("x")));
+        let transport = crate::tick_ilp::RawSendError {
+            message: "connection reset".to_owned(),
+            status: None,
+            retryable: true,
+        };
+        assert!(flush_error_is_connection(&TickIlpError::Send(transport)));
+        let rejected = crate::tick_ilp::RawSendError {
+            message: "400".to_owned(),
+            status: Some(400),
+            retryable: false,
+        };
+        assert!(!flush_error_is_connection(&TickIlpError::Send(rejected)));
+    }
+
+    /// A disconnected own-encoder writer cannot reconnect (no endpoint): the
+    /// flush fails and keeps the rows for the rescue tier.
+    #[test]
+    fn test_own_encoder_test_writer_flush_fails_and_keeps_rows() {
+        let mut w = ShadowCandleWriter::for_test_with_encoder(TickIlpEncoder::Own)
+            .with_keyed_for_test(&KEYED_FOR_TESTS);
+        let seal = mk_seal(
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            1_716_023_700,
+            22_500.5,
+        );
+        w.append_seal(&seal).expect("append");
+        assert!(w.flush().is_err());
+        assert_eq!(w.pending_count(), 1);
+        assert!(w.buffer_byte_count() > 0);
     }
 
     fn mk_seal_feed(

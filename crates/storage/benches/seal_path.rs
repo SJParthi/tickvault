@@ -11,6 +11,9 @@
 //! | `seal_ilp/append_unlabelled` | ILP row into the candle buffer, no contract name | seal writer task |
 //! | `seal_ilp/append_labelled` | the same, with the day's ~120,000-name table published | seal writer task |
 //! | `seal_ilp/pop_append` | ring pop + ILP append with the day's names published (what `drain_once` does per seal) | seal writer task |
+//! | `seal_path/own_append_unlabelled` | `seal_ilp/append_unlabelled` through our own ILP encoder (`[tick_storage] own_ilp_encoder`, default off) | seal writer task |
+//! | `seal_path/own_append_labelled` | `seal_ilp/append_labelled` through our own encoder | seal writer task |
+//! | `seal_path/own_pop_append` | `seal_ilp/pop_append` through our own encoder | seal writer task |
 //! | `seal_path/ledger_probe_miss` | live-commit ledger probe, bar not tracked | seal writer task |
 //! | `seal_path/ledger_probe_hit` | live-commit ledger probe, bar tracked | seal writer task |
 //!
@@ -70,6 +73,7 @@ use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_runner::{SEAL_MPSC_CAPACITY, SealSender};
 use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
 use tickvault_storage::shadow_seal_columns::ShadowSealRow;
+use tickvault_storage::tick_ilp::TickIlpEncoder;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
 /// Steps held to the owner's 1 µs: Criterion group and budget key (bench-gate.sh
@@ -175,6 +179,8 @@ struct Rig {
     rx: crossbeam_channel::Receiver<BufferedSeal>,
     pipeline: SealAbsorptionPipeline,
     writer: ShadowCandleWriter,
+    /// The same writer with our own ILP encoder (`[tick_storage] own_ilp_encoder`).
+    own_writer: ShadowCandleWriter,
     spill: SealSpillWriter,
     dirs: Vec<PathBuf>,
 }
@@ -203,6 +209,7 @@ impl Rig {
             rx,
             pipeline,
             writer: ShadowCandleWriter::for_test(),
+            own_writer: ShadowCandleWriter::for_test_with_encoder(TickIlpEncoder::Own),
             spill,
             dirs: vec![spill_dir, dlq_dir, ledger_dir],
         }
@@ -215,6 +222,7 @@ impl Rig {
     fn reset_writer_every_batch(&mut self, i: usize) {
         if i % APPEND_BATCH == APPEND_BATCH - 1 {
             self.writer.discard_pending();
+            self.own_writer.discard_pending();
         }
     }
 }
@@ -237,17 +245,23 @@ enum Step {
     IlpAppendUnlabelled,
     IlpAppendLabelled,
     DrainPopAppend,
+    OwnAppendUnlabelled,
+    OwnAppendLabelled,
+    OwnPopAppend,
     LedgerProbeMiss,
     LedgerProbeHit,
 }
 
-const STEPS: [Step; 8] = [
+const STEPS: [Step; 11] = [
     Step::HandoffTrySend,
     Step::TakeSubmit,
     Step::RowBuild,
     Step::IlpAppendUnlabelled,
     Step::IlpAppendLabelled,
     Step::DrainPopAppend,
+    Step::OwnAppendUnlabelled,
+    Step::OwnAppendLabelled,
+    Step::OwnPopAppend,
     Step::LedgerProbeMiss,
     Step::LedgerProbeHit,
 ];
@@ -261,6 +275,9 @@ impl Step {
             Self::IlpAppendUnlabelled => "append_unlabelled",
             Self::IlpAppendLabelled => "append_labelled",
             Self::DrainPopAppend => "pop_append",
+            Self::OwnAppendUnlabelled => "own_append_unlabelled",
+            Self::OwnAppendLabelled => "own_append_labelled",
+            Self::OwnPopAppend => "own_pop_append",
             Self::LedgerProbeMiss => "ledger_probe_miss",
             Self::LedgerProbeHit => "ledger_probe_hit",
         }
@@ -277,7 +294,10 @@ impl Step {
     /// Process-wide setup for this step (the contract-name table).
     fn install(self) {
         let labels = match self {
-            Self::IlpAppendLabelled | Self::DrainPopAppend => label_table(),
+            Self::IlpAppendLabelled
+            | Self::DrainPopAppend
+            | Self::OwnAppendLabelled
+            | Self::OwnPopAppend => label_table(),
             _ => CandleContractLabels::default(),
         };
         publish_candle_contract_labels(labels);
@@ -301,8 +321,11 @@ impl Step {
                     panic!("bench: the seal queue refused a send"); // APPROVED: bench setup
                 }
             }
-            Self::IlpAppendUnlabelled | Self::IlpAppendLabelled => rig.reset_writer_every_batch(i),
-            Self::DrainPopAppend => {
+            Self::IlpAppendUnlabelled
+            | Self::IlpAppendLabelled
+            | Self::OwnAppendUnlabelled
+            | Self::OwnAppendLabelled => rig.reset_writer_every_batch(i),
+            Self::DrainPopAppend | Self::OwnPopAppend => {
                 rig.reset_writer_every_batch(i);
                 let s = rig.seal_at(i);
                 if !matches!(
@@ -340,6 +363,15 @@ impl Step {
             Self::DrainPopAppend => {
                 if let Some(s) = rig.pipeline.pop_oldest() {
                     black_box(rig.writer.append_seal(&s).is_ok());
+                }
+            }
+            Self::OwnAppendUnlabelled | Self::OwnAppendLabelled => {
+                let s = &rig.seals[i % SEAL_POOL];
+                black_box(rig.own_writer.append_seal(black_box(s)).is_ok());
+            }
+            Self::OwnPopAppend => {
+                if let Some(s) = rig.pipeline.pop_oldest() {
+                    black_box(rig.own_writer.append_seal(&s).is_ok());
                 }
             }
             Self::LedgerProbeMiss => {

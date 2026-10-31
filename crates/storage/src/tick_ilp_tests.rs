@@ -233,6 +233,44 @@ proptest! {
             prop_assert_eq!(own.row_count(), 1);
         }
     }
+
+    /// A string column (the candle writer's delay text) with hostile text,
+    /// after a symbol and after another column: the library's quoted escape
+    /// (`\n \r " \`) byte for byte, through both buffers and the dispatch.
+    #[test]
+    fn test_column_str_matches_the_library(
+        first in any_text(),
+        second in any_text(),
+        quoted in "[\"\\\\\r\n a-z]{0,16}",
+    ) {
+        fn line<B: IlpLine>(b: &mut B, first: &str, second: &str, quoted: &str) -> Result<(), TickIlpError> {
+            b.table("candles_1m")?;
+            b.symbol("feed", "dhan")?;
+            b.column_str("open_latency", first)?;
+            b.column_i64("open_latency_ns", 7)?;
+            b.column_str("close_latency", second)?;
+            b.column_str("window_span_latency", quoted)?;
+            b.at_nanos(1)
+        }
+        let mut own = OwnIlpBuffer::new();
+        let mut lib = Buffer::new(ProtocolVersion::V1);
+        let mut dispatched = TickRowBuffer::new(TickIlpEncoder::Own);
+        line(&mut own, &first, &second, &quoted).map_err(|e| TestCaseError::fail(e.to_string()))?;
+        line(&mut lib, &first, &second, &quoted).map_err(|e| TestCaseError::fail(e.to_string()))?;
+        line(&mut dispatched, &first, &second, &quoted).map_err(|e| TestCaseError::fail(e.to_string()))?;
+        prop_assert_eq!(own.as_bytes(), lib.as_bytes());
+        prop_assert_eq!(dispatched.as_bytes(), lib.as_bytes());
+        prop_assert_eq!(dispatched.row_count(), 1);
+    }
+}
+
+/// A string column refused out of order by both buffers alike.
+#[test]
+fn test_column_str_before_table_is_refused_like_the_library() {
+    let mut own = OwnIlpBuffer::new();
+    let mut lib = Buffer::new(ProtocolVersion::V1);
+    assert!(own.column_str("open_latency", "x").is_err());
+    assert!(IlpLine::column_str(&mut lib, "open_latency", "x").is_err());
 }
 
 // ---------------------------------------------------------------------------

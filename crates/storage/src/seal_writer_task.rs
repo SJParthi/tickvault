@@ -5971,7 +5971,7 @@ mod tests {
             .find("applied_watermark().mark_probe_expected()")
             .expect("main.rs marks the watcher expected");
         let seal = main
-            .find("\n    spawn_seal_writer_loop(&config.questdb);")
+            .find("\n    spawn_seal_writer_loop(&config.questdb, &config.tick_storage);")
             .expect("main.rs spawns the seal writer");
         assert!(
             mark < seal,
