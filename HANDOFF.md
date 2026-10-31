@@ -132,7 +132,7 @@ Notes: commit with `git commit -F <file>` (double-quoted `-m` mangles `§` citat
 
 ## 10. Session checkpoint replies
 
-Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2159 (fuzz), lambdas/logs-mcp coverage, plan leftovers.
+Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by each session; branch heads Verified on `origin` where marked). Still awaited at the time of this commit: #2159 (fuzz, branch `claude/adversarial-input-coverage`, last known head `968fd6066`), plan leftovers (asked to push to `handoff/plan-leftovers`).
 
 ### #2149 depth row path — branch `perf/sub-us-depth`, head `0e1f0f60f` (draft)
 - **CI**: All Green on `0e1f0f6`, every job green; Enable Auto-Merge skipped only because the PR is a draft.
@@ -308,6 +308,20 @@ Replies from the worker sessions, received 31 Oct 06:35–06:36 UTC (Reported by
   - row 110 seal stall throttle
   - PR38 OMS expiry vs IST date
   - DA-17/PR36 qdb_console_proxy repeated param (its plan note already names this fix, so land it or correct the note)
+
+### Lambdas + logs-mcp coverage (no PR) — branch `claude/lambdas-mcp-coverage`, head `c4bde5b19`
+- **Done**:
+  - `crates/aws-lambdas/src/test_support.rs` (cfg(test) only): a loopback AWS endpoint that drives the real AWS SDK, plus env guards.
+  - 44 new aws-lambdas tests, all passing at c92447a: minter, start_watchdog, hard_stop_guard and budget_spend paths. No PIN or token appears in any error.
+  - 15 new logs-mcp tests; logs-mcp coverage 89.27 → 92.29%.
+  - `.untested-pubfn-baseline` 311 → 309.
+- **Partial**: the CloudWatch rpcv2Cbor extension in c4bde5b is committed but **not yet compiled**. Run `cargo test -p tickvault-aws-lambdas --lib` first.
+- **Pending**:
+  - alarm_gate, market_hours_gate and budget_killswitch `handle()` tests.
+  - An October $185 / November $75 clamp boundary test.
+  - Re-measure (aws-lambdas baseline 86.36%) and raise the floors (aws-lambdas 81.1, logs-mcp 87.3).
+  - Review, draft PR.
+- **Note**: the secret scanner rejects 10-digit client-id literals in tests.
 
 ### #2158 test-target clippy (12b) — branch `claude/clippy-all-targets`, head `2b6279bac` (draft)
 - **CI**: All Green passed on `2b6279bac`, but the branch is now behind main.
