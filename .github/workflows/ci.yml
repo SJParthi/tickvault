@@ -863,8 +863,7 @@ jobs:
           # not silently break the comparison.
           expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
           if ! diff <(echo "$expected") <(echo "$actual"); then
-            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."
-            exit 1
+            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
           fi
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
@@ -1003,6 +1002,8 @@ jobs:
       # Merged with PR #2143: dhat_seal_per_seal_path (the whole per-seal path after
       # the fold allocates nothing) shares the second flag line, 9 -> 10; its drift-list
       # line is paid for by joining the zero-tests echo and exit 1 below.
+      # 2026-10-30: dhat_task_watch added (plan item 4: heartbeat beat/publish and one
+      # memory-ladder poll allocate nothing), packed onto the third flag line, 10 -> 11.
       - name: DHAT (storage)
         shell: bash
         run: |
@@ -1010,14 +1011,14 @@ jobs:
           cargo test -p tickvault-storage \
             --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc \
             --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle --test dhat_seal_per_seal_path \
-            --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog \
+            --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog --test dhat_task_watch \
             2>&1 | tee /tmp/dhat-storage.log
           if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
             echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."; exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 10 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step."; exit 1
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step."; exit 1
           fi
 
       - name: DHAT (trading)
