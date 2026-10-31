@@ -1,5 +1,28 @@
 # Implementation Plan: Feed Hardening — bound the limits, alarm the silence, automate the recovery
 
+## Coverage continuation CI resource mitigation — 2026-10-31
+
+The combined coverage continuation also carries the independently reviewed
+Coverage & Perf workflow correction prepared after draft #2171 head 8f failed
+instrumented app links with SIGBUS. The failure-time resource cause is unresolved;
+disk pressure is plausible, not measured, and this is an unproven mitigation.
+The baseline workflow is byte-identical to that reviewed head.
+
+Set dev/test debug data to zero only in the coverage job, retaining LLVM coverage
+instrumentation, optimization/debug-assertion behavior and overflow checking.
+Record final filesystem, inode, memory and target sizes in a separate always-run
+step; a successful diagnostic step cannot erase a failed coverage result. Remove
+only the redundant workspace flag from raw-profile cleanup and correct the retry
+comment for pinned llvm-cov 0.9.1. Keep the same coverage command, dedicated DHAT
+split, one retry, failure exits, 60-minute timeout, report path, coverage floors,
+required checks and security gates. The shell ceiling remains 293 lines.
+
+Validate the real shell-budget/coverage guards and normal native gates before
+publication. The next exact-head GitHub run must produce a nonempty report and
+pass unchanged floors before this mitigation is reported successful. Reduced
+backtrace detail is the explicit tradeoff. No #2171 rerun, production action or
+coverage skip/floor change is authorized or performed by this continuation.
+
 **Status:** IN_PROGRESS
 **Date:** 2026-08-10
 **Approved by:** Parthiban (operator) — "approve the plan", 2026-08-10 in-session, given in
@@ -7233,3 +7256,48 @@ Each step behind a config switch defaulting to today's behaviour until its live 
 
 ### Observability (Item DT)
 New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
+
+## Coverage recovery — preserved Claude checkpoints (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed instruction to resume all unfinished work, relayed by the coordinator on 2026-10-31. This phase integrates and reviews preserved coverage sources using the assigned isolated Cargo target and one build job. Publication, merge and live configuration are separate gates.
+
+### Design (coverage recovery)
+
+Preserve the histories of app PR #2161 (`09bfaea6b`), core coverage (`c65ac9f0d`), trading/API/common coverage (`f67a7912a`) and lambdas/logs coverage (`c4bde5b19`) in an isolated integration based on green but unmerged #2158 (`0fd844582`). Keep existing production behavior, dependency pins and coverage thresholds. The four sources contribute 33 files: app integration fixtures, two core unit-test modules and their cfg-gated declarations, three public-surface coverage tests, and test-only Lambda/logs fixtures. Review actual test oracles and isolation, not only test counts. A reduced public-function baseline is retained only after its full scanner confirms the measured count.
+
+### Edge Cases (coverage recovery)
+
+Cover failure and boundary branches already selected by the preserved fixtures: malformed/empty inputs, restored environment values, missing files, finite loopback fixtures, cancellation and reconnect, cloud SDK response formats, budget month boundaries, stale/missing cache data and subprocess failure. A test must not accidentally use live credentials or the current wall date as its expected oracle. Test-only modules must remain visibly cfg-gated for both Rust and source guards. No new ignored test or assertion-free exception is allowed.
+
+### Failure Modes (coverage recovery)
+
+Fresh integration can expose API drift, Clippy findings, shared-global races, incomplete mock protocols or tests that merely exercise a path without checking its result. Repair concrete findings without weakening assertions, adding blanket lint allowances, widening guard baselines or lowering coverage floors. Keep initial failure evidence. The historical #2161 coverage/DHAT failures are not classified as fixed until the current combined source is tested; distinguish an actual failing test from infrastructure failure using its log.
+
+### Test Plan (coverage recovery)
+
+- [x] Preserve all four coverage histories and reconcile any source overlap with current main and the #2158 lint prerequisite.
+  - Files: crates/app/tests/cov_feed_scoreboard_boot.rs, crates/core/src/websocket/order_update_connection_run_loop_cov_tests.rs, crates/core/src/websocket/pool_supervisor/cov_part1_tests.rs, crates/api/tests/coverage_gaps_api.rs, crates/common/tests/coverage_gaps_common.rs, crates/trading/tests/coverage_gaps_brutex_host.rs, crates/aws-lambdas/src/test_support.rs, crates/tickvault-logs-mcp/src/tools.rs
+  - Validation: immutable input heads, per-file provenance and a combined external patch/manifest; independent source reviews.
+- [ ] Run meaningful combined tests and required guards when the coordinator grants a Cargo slot; repair findings without changing production behavior or guard policy.
+  - Files: crates/app/tests/bin_subprocess_reports.rs, crates/core/src/websocket/order_update_connection.rs, crates/core/src/websocket/pool_supervisor.rs, crates/aws-lambdas/src/dhan_token_minter.rs, crates/aws-lambdas/src/hard_stop_guard.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/tickvault-logs-mcp/src/selftest.rs, .claude/hooks/.untested-pubfn-baseline
+  - Validation: formatting, workspace all-targets Clippy with warnings denied, complete workspace tests because common and more than three crates are touched, assertion/ignore/production-panic/size/secret/plan/public-function guards and normal native commit/push gates. Record actual command exits and ignored tests. No build is claimed by source reconstruction.
+- [ ] Publish only after normal validation and review; measure exact-head coverage before proposing a ratchet increase in the same continuation.
+  - Files: quality/crate-coverage-thresholds.toml, .claude/plans/active-plan-feed-hardening.md
+  - Validation: unchanged floors during recovery; actual successful coverage per crate before any increase, exact-head All Green, and explicit unmerged #2158 dependency. No manual merge, force push or auto-merge arming.
+
+### Rollback (coverage recovery)
+
+The isolated branch and original remote heads remain preserved. A rejected test or integration can be corrected locally without changing the primary checkout or previously published branches. No environment, trading, feed, alarm or deployment setting changes in this work.
+
+### Observability (coverage recovery)
+
+Record original head, imported path, source review finding, fix, command and result in the external recovery manifest. Passing fixture tests establish only their tested inputs; coverage percentages, fresh production evidence and latency guarantees require separate measurements. Existing production metrics and logs are unchanged.
+
+The existing 15-row and 7-row guarantee matrices apply with this bounded envelope: executable assertions, retained branch history, existing source/coverage ratchets, no production behavior change and honest pending validation. Fuzz campaigns, sanitizers, live AWS/QuestDB actions and strict latency proof are not silently inferred from these coverage fixtures. Previously withheld parser probes and fuzz runs remain outside this recovery.
+
+Pre-commit source checkpoint (2026-10-31): the four preserved heads merged without conflicts onto `0fd844582cbdac209f54e4394459b799f2ba797a`. Source review corrected fixture ownership with exclusive create operations, API child-process CWD/token isolation and joined HTTP outcomes, scoped AWS endpoint overrides with exact restoration, six synchronous environment-lock/runtime boundaries, the missing `LoopbackRequest.path`, explicit core test-module boundaries and a bounded audit-row wait. One existing zero-cap batching test moved byte-for-byte into the external pool fixture so the parent stays at 26,178 lines under its unchanged 26,184 ceiling. The logs tail oracle now requires exactly both complete tail lines. The enabled rider fixture uses an explicitly never-due test target and checks the armed supervisor without entering the vendor downloader; this is wait-arm coverage, not a valid production configuration or download test. TF and REST response-cap fixtures now use valid JSON padded to the exact limit and one byte over, retaining their original assertions and adding a folded-row boundary oracle. REST's shared error stage does not independently distinguish its earlier header check. No production branch, dependency pin, coverage floor, source ceiling or live switch changed.
+
+Measured before the merge commit: Lambda library 745 passed; API/common/trading 10/18/32 passed; core fixture filter 67 passed; logs-MCP library 113 passed; repository guards 79 passed. All 16 original app integration targets passed 155 tests, followed by 35 passing tests in the two strengthened TF/REST targets; these overlapping runs are not a claimed complete 156-test rerun. All reported focused runs had zero failures and zero ignored tests after the recorded repairs. Workspace all-target Clippy with warnings denied passed on the same Rust sources. Initial failed compiles and fixture-path/schema corrections are retained in the external execution record. All 335 original branch-added names remain; name presence is not a coverage measurement.
+
+The normal native commit/push gates and fresh full-workspace tests on the resulting commit remain the next validation steps at this checkpoint. Exact command exits, final head and remote CI belong in the PR validation record. The unchanged full public-function scanner passed within its normal 120-second deadline and measured 307 mechanically unmatched public functions. Its baseline is deliberately ratcheted from main's 311 to that measured 307, strengthening the guard without changing exemptions; this is not a line-coverage percentage. Actual line coverage and the CI resource mitigation's effectiveness remain unmeasured here. Calendar-dependent fixtures only prove the branch exercised on their run date, and documented subprocess/listener lifetime limits are not promoted to cancellation guarantees.
