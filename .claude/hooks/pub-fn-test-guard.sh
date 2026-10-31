@@ -52,6 +52,7 @@ count_untested() {
   local scan_files="$1"
   local scan_mode="$2"
   local count=0
+  local test_files="" test_crate=""
 
   while IFS= read -r file; do
     [ -z "$file" ] && continue
@@ -81,9 +82,8 @@ count_untested() {
     while IFS= read -r line; do
       [ -z "$line" ] && continue
 
-      local fn_name
-      fn_name=$(echo "$line" | sed -n 's/.*fn \([a-z_][a-z0-9_]*\).*/\1/p')
-      [ -z "$fn_name" ] && continue
+      [[ "$line" =~ .*fn\ ([a-z_][a-z0-9_]*).* ]] || continue
+      local fn_name="${BASH_REMATCH[1]}"
 
       # Skip structural functions
       case "$fn_name" in
@@ -95,7 +95,7 @@ count_untested() {
       # Check for TEST-EXEMPT
       if [ "$scan_mode" = "all" ]; then
         local line_num
-        line_num=$(echo "$line" | cut -d: -f1)
+        line_num="${line%%:*}"
         if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
           local prev_line=$((line_num - 1))
           if sed -n "${prev_line}p" "$full_path" 2>/dev/null | grep -q 'TEST-EXEMPT:'; then
@@ -106,7 +106,13 @@ count_untested() {
 
       # Search for matching test
       local test_found
-      test_found=$(grep -r "#\[test\]" "$crate_dir" --include='*.rs' -l 2>/dev/null | \
+      # Both file enumerators group by crate. Reuse the inventory until it changes.
+      # Keep the legacy xargs splitting and matching expression unchanged.
+      if [ "$test_crate" != "$crate_dir" ]; then
+        test_files=$(grep -r "#\[test\]" "$crate_dir" --include='*.rs' -l 2>/dev/null || true)
+        test_crate="$crate_dir"
+      fi
+      test_found=$(printf '%s\n' "$test_files" | \
         xargs grep -l "fn test_.*${fn_name}\|fn ${fn_name}_\|test.*${fn_name}" 2>/dev/null || true)
 
       if [ -z "$test_found" ]; then

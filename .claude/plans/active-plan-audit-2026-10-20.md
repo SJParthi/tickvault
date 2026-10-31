@@ -1533,3 +1533,21 @@ read-only and distinct from intercepted browser fixtures.
     control (which must fail the allocation assertion after meaningful appends),
     exact restoration and final positives. Static/canonical guards, all-target
     lint, exact-commit full/native/CI gates remain required and pending.
+
+
+### 2026-10-31: retain scanner verdicts within the existing native deadline
+
+- [ ] Complete committed-head workspace/lint and native/CI validation after
+  importing the independently reviewed shared scanner correction.
+  - The portal ab5 workspace completed 15,451 passed / 0 failed / 33 ignored
+    across 462 harnesses. Keep its source and result attribution intact.
+  - Cache the existing test-file inventory per crate and use equivalent Bash
+    name/prefix extraction. Preserve all matching expressions, exclusions,
+    exemptions, baseline values, verdicts and existing 300/120-second deadlines.
+  - Import the reviewed 14 real-hook Rust fixtures, including contained Git
+    configuration/selector handling and the truthful assert-prefixed helper.
+    Prior author/peer fixture and control evidence is not a new portal run.
+  - Existing product Rust is byte-identical to ab5; the added common-crate
+    fixture still requires the new committed-head workspace validation.
+  - The 83.342-second full scan belongs to the earlier bd source observation.
+    Do not relabel it as a portal timing or bypass any normal publication gate.
