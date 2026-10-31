@@ -161,7 +161,8 @@ const DECODE_QUIRKS_COUNTER: &str = "tv_order_update_decode_quirks_total";
 /// (literal same-key duplicates collapse last-wins at this stage), the
 /// frame is normalized (both casings of every field and of the wrapper, null
 /// fields as absent, exact number/string coercion; see
-/// `normalize_order_update_frame`), then deserialized into the derived
+/// `normalize_order_update_frame`). Each winning numeric Int field is checked
+/// against its original decimal token before deserializing into the derived
 /// `OrderUpdateMessage` struct. Structural errors (malformed JSON,
 /// missing/null/non-object `Data`, a top-level array) keep failing; an
 /// array `Data` or top-level array is refused before the typed parse.
@@ -180,11 +181,215 @@ pub fn parse_order_update(json_str: &str) -> Result<OrderUpdate, OrderUpdatePars
             len: json_str.len(),
         });
     }
-    let mut value: serde_json::Value = serde_json::from_str(json_str)?;
+    let mut value = serde_json::from_str::<LiteralJsonValue>(json_str)?.0;
     normalize_order_update_frame(&mut value);
     refuse_array_frame(&value)?;
+    validate_raw_integer_winners(json_str, &value)?;
     let message: OrderUpdateMessage = serde_json::from_value(value)?;
     Ok(message.data)
+}
+
+/// A JSON tree whose object keys are always literal, including serde_json's
+/// private tags. The app enables `raw_value` through axum; ordinary `Value`
+/// deserialization can otherwise reinterpret a magic-key object as its string's
+/// JSON contents. Every nested map/sequence must use this visitor too.
+struct LiteralJsonValue(serde_json::Value);
+
+/// Reserve one small chunk only after observing a nonempty JSON array. This
+/// matches the usual first `Vec<Value>` growth without trusting a size hint or
+/// reserving a frame-sized buffer for every nested array. It is not a heap cap.
+const LITERAL_ARRAY_INITIAL_CAPACITY: usize = 4;
+
+impl<'de> serde::Deserialize<'de> for LiteralJsonValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LiteralVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LiteralVisitor {
+            type Value = serde_json::Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value with literal object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(value.into())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let Some(LiteralJsonValue(first)) = seq.next_element::<LiteralJsonValue>()? else {
+                    return Ok(serde_json::Value::Array(Vec::with_capacity(0)));
+                };
+                let mut values = Vec::with_capacity(LITERAL_ARRAY_INITIAL_CAPACITY);
+                values.push(first);
+                while let Some(LiteralJsonValue(value)) = seq.next_element::<LiteralJsonValue>()? {
+                    values.push(value);
+                }
+                Ok(serde_json::Value::Array(values))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, LiteralJsonValue(value))) =
+                    map.next_entry::<String, LiteralJsonValue>()?
+                {
+                    values.insert(key, value); // Decoded duplicate keys remain last-wins.
+                }
+                Ok(serde_json::Value::Object(values))
+            }
+        }
+
+        deserializer.deserialize_any(LiteralVisitor).map(Self)
+    }
+}
+
+fn raw_span_error() -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom("invalid prevalidated JSON object span")
+}
+
+/// Skips one token without materializing a `Value` or interpreting private tags.
+fn raw_token_len(text: &str) -> serde_json::Result<usize> {
+    let mut token = serde_json::Deserializer::from_str(text).into_iter::<serde::de::IgnoredAny>();
+    token.next().ok_or_else(raw_span_error)??;
+    Ok(token.byte_offset())
+}
+
+/// Visits immediate members of a syntax-validated object in wire order. Serde's
+/// IgnoredAny handles nested containers and escaped strings; byte offsets retain
+/// the original value token. Only escaped key names need an owned decoded string.
+fn visit_raw_object<'a>(
+    object: &'a str,
+    mut visit: impl FnMut(&str, &'a str),
+) -> serde_json::Result<()> {
+    let mut rest = object
+        .trim_start()
+        .strip_prefix('{')
+        .ok_or_else(raw_span_error)?;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('}') {
+            return Ok(());
+        }
+        let (key_token, after_key) = rest.split_at(raw_token_len(rest)?);
+        let key_body = key_token
+            .strip_prefix('"')
+            .and_then(|key| key.strip_suffix('"'))
+            .ok_or_else(raw_span_error)?;
+        let key = if key_body.contains('\\') {
+            std::borrow::Cow::Owned(serde_json::from_str::<String>(key_token)?)
+        } else {
+            std::borrow::Cow::Borrowed(key_body)
+        };
+        rest = after_key
+            .trim_start()
+            .strip_prefix(':')
+            .ok_or_else(raw_span_error)?
+            .trim_start();
+        let (value, after_value) = rest.split_at(raw_token_len(rest)?);
+        visit(&key, value);
+        rest = after_value.trim_start();
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma;
+        } else if rest.starts_with('}') {
+            return Ok(());
+        } else {
+            return Err(raw_span_error());
+        }
+    }
+}
+
+/// Checks winning numeric Int tokens before a rounded `Value` becomes an order.
+/// Two linear object scans retain borrowed token spans in a fixed field array;
+/// escaped key decoding and serde's skip scratch may allocate. The literal JSON
+/// parse already checked syntax/depth and the frame cap ran before any parsing.
+/// Wrapper presence wins even for null; an Int's null accepted key instead
+/// yields to its alternate. Duplicate keys remain last-wins. Discarded aliases,
+/// string coercion and the existing conservative float bound are unchanged.
+fn validate_raw_integer_winners(
+    json_str: &str,
+    normalized: &serde_json::Value,
+) -> Result<(), OrderUpdateParseError> {
+    let Some(normalized_data) = normalized
+        .get("Data")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(()); // The existing typed parse refuses non-object data.
+    };
+    let (mut accepted_data, mut alt_data) = (None, None);
+    visit_raw_object(json_str, |key, value| match key {
+        "Data" => accepted_data = Some(value),
+        "data" => alt_data = Some(value),
+        _ => {}
+    })?;
+    let data = accepted_data.or(alt_data).ok_or_else(raw_span_error)?;
+    let mut fields = [(None, None); ORDER_UPDATE_FIELDS.len()];
+    visit_raw_object(data, |key, value| {
+        for (index, &(accepted, alt, kind)) in ORDER_UPDATE_FIELDS.iter().enumerate() {
+            if kind == FieldKind::Int {
+                if key == accepted {
+                    fields[index].0 = Some(value);
+                } else if key == alt {
+                    fields[index].1 = Some(value);
+                }
+            }
+        }
+    })?;
+    for (&(accepted, _, kind), (primary, alternate)) in ORDER_UPDATE_FIELDS.iter().zip(fields) {
+        if kind != FieldKind::Int {
+            continue;
+        }
+        let winner = primary.filter(|value| *value != "null").or(alternate);
+        let Some(winner) = winner else { continue };
+        let literal = winner.trim();
+        if literal.starts_with('"') || literal == "null" {
+            continue; // Existing string coercion and null/default rules still apply.
+        }
+        let exact = exact_decimal_i64(literal);
+        if exact.is_none()
+            || exact
+                != normalized_data
+                    .get(accepted)
+                    .and_then(serde_json::Value::as_i64)
+        {
+            return Err(OrderUpdateParseError::JsonError(
+                <serde_json::Error as serde::de::Error>::custom(format_args!(
+                    "non-exact numeric value for integer order field {accepted}"
+                )),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a top-level array or an array `Data` (after the wrapper casing
@@ -449,16 +654,10 @@ fn is_blank_value(value: &serde_json::Value) -> bool {
 ///   out-of-range spelling is kept (loud), never rounded; an empty string →
 ///   remove.
 /// - Int field holding an integral float (`50.0`) with magnitude below 2^52
-///   → that integer. This serde_json build (no `float_roundtrip`) can read a
-///   JSON number up to about 1 off in absolute terms near 2^52; below 2^52
-///   the `f64` spacing is at most 0.5, so that error makes the value
-///   fractional (kept, loud), never a neighbouring integer. At or past 2^52
-///   the spacing is 1 or more and an error can land on another integer
-///   (`8000000000000007.0` reads as 8000000000000006), so it is kept (loud). Honest limit: serde has
-///   already rounded a JSON number to `f64` before this runs, so a
-///   fractional wire number whose nearest `f64` is integral
-///   (`1.00000000000000001`) reads as that integer; only a string spelling
-///   is judged digit by digit.
+///   → that candidate integer. This step alone cannot establish exactness:
+///   `validate_raw_integer_winners` also requires the original decimal token
+///   to spell that same integer, rejecting fractions rounded to integers and
+///   underflow rounded to zero. The existing refusal at or past 2^52 remains.
 /// - Float field holding a string → the finite number it spells; an empty
 ///   string → remove.
 /// - Anything else (a fractional quantity, `"ten"`, an object, an array, a
@@ -507,9 +706,8 @@ fn fix_for_field(key: &str, kind: FieldKind, value: &serde_json::Value) -> Field
             }
         }
         (FieldKind::Int, Value::Number(number)) if number.as_i64().is_none() => {
-            // Only below 2^52 (see F64_INT_COERCE_LIMIT): there a misread
-            // JSON number turns fractional and is refused; at or past it a
-            // misread can name a neighbouring integer, so it is refused.
+            // Retain the existing conservative bound. The raw winner check
+            // subsequently proves that this candidate matches the wire token.
             match number
                 .as_f64()
                 .filter(|float| float.abs() < F64_INT_COERCE_LIMIT)
@@ -554,18 +752,10 @@ fn exact_i64(float: f64) -> Option<i64> {
 
 /// 2^52, the magnitude below which a JSON-number Int is coerced.
 ///
-/// Being an exact `f64` is not enough (every integer below 2^53 is one):
-/// without serde_json `float_roundtrip`, a number such as `v.0` or `v0e-1`
-/// is read as an integer significand rounded to `f64`, then multiplied or
-/// divided by an exact power of ten (the significand keeps at most about 19
-/// digits, so an integral result below 2^52 needs a power of at most
-/// 10^19, inside the exact range up to 10^22) and rounded again. Two
-/// roundings of at most half a unit each put the result within
-/// `v x 2^-52` of `v`, which is under 1 for `v < 2^52`. There the `f64`
-/// spacing is at most 0.5, so a misread lands on a fraction (refused by
-/// `exact_i64`), never on another integer. In [2^52, 2^53) the spacing is 1
-/// and `8000000000000007.0` reads as 8000000000000006. Raising this needs
-/// `float_roundtrip` (owner approval). Order Int fields are far below it.
+/// This is the pre-existing acceptance bound, retained conservatively. A float
+/// appearing integral is not proof that the JSON token was integral, even below
+/// this limit; `validate_raw_integer_winners` now establishes that independently
+/// from the original digits. No serde_json floating-point mode is changed.
 const F64_INT_COERCE_LIMIT: f64 = 4_503_599_627_370_496.0;
 
 /// The `i64` a decimal string spells EXACTLY, never rounded: an optional
@@ -735,7 +925,11 @@ pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Opti
         return None;
     }
     let parsed = (json_str.len() <= ORDER_UPDATE_MAX_FRAME_BYTES)
-        .then(|| serde_json::from_str::<serde_json::Value>(json_str).ok())
+        .then(|| {
+            serde_json::from_str::<LiteralJsonValue>(json_str)
+                .map(|value| value.0)
+                .ok()
+        })
         .flatten();
     let tag = parsed
         .as_ref()
@@ -766,6 +960,49 @@ pub fn unreadable_order_frame_type(update: &OrderUpdate, json_str: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_literal_json_arrays_preserve_empty_first_nested_and_large_values() {
+        for expected in [
+            serde_json::json!([]),
+            serde_json::json!([null]),
+            serde_json::json!([true, false, 1, -2, 1.5, "text"]),
+            serde_json::json!([[], [0, [1]], {"x": [2, 3]}]),
+            serde_json::json!((0..1025).collect::<Vec<_>>()),
+        ] {
+            let text = expected.to_string();
+            assert!(text.len() < ORDER_UPDATE_MAX_FRAME_BYTES);
+            let actual = serde_json::from_str::<LiteralJsonValue>(&text)
+                .expect("valid literal array")
+                .0;
+            assert_eq!(
+                actual, expected,
+                "empty, first and subsequent values survive"
+            );
+        }
+        for text in ["[", "[0", "[0,]", "[,]", "[[],]", "[0]false"] {
+            assert!(
+                serde_json::from_str::<LiteralJsonValue>(text).is_err(),
+                "malformed or trailing JSON must fail: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_literal_json_value_preserves_private_tag_objects_recursively() {
+        let text = r#"{"x":{"$serde_json::private::RawValue":"true"},"y":[{"\u0024serde_json::private::RawValue":"100.00000000000001"}],"z":"$serde_json::private::RawValue"}"#;
+        let value = serde_json::from_str::<LiteralJsonValue>(text)
+            .expect("literal tree")
+            .0;
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "x": {"$serde_json::private::RawValue": "true"},
+                "y": [{"$serde_json::private::RawValue": "100.00000000000001"}],
+                "z": "$serde_json::private::RawValue",
+            })
+        );
+    }
 
     #[test]
     fn test_parse_order_update_full_message() {

@@ -7233,3 +7233,143 @@ Each step behind a config switch defaulting to today's behaviour until its live 
 
 ### Observability (Item DT)
 New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
+
+## ADVERSARIAL-2159 — retained input properties and exact order integers
+
+- [ ] Complete the preserved adversarial-input work and validate the integrated
+  replacement branch. Continuation requested by the owner on 2026-10-31 through
+  the coordinator; implementation and independent review are in progress.
+  Files: crates/core/src/parser/order_update.rs,
+  crates/core/src/instrument/master_csv.rs, crates/core/tests/, crates/common/tests/,
+  crates/trading/tests/, crates/storage/tests/, crates/app/tests/, fuzz/,
+  .github/workflows/fuzz.yml.
+
+### Design (ADVERSARIAL-2159)
+
+The original source is commit `fd6ff357f1ec3c9aa688f916e1ab5581f111743b`
+from PR #2159. Its branch and commits remain intact. The replacement starts at
+the all-targets Clippy prerequisite `0fd844582cbdac209f54e4394459b799f2ba797a`
+(main baseline `49dd25239bde21411008b11bd76c51d5e0f8284f`) and applies the
+original branch's net work as a new conventional commit. The old handoff
+commit's unsupported subject cannot be repaired by a later commit because
+CommitLint scans the whole PR range; no force push, history rewrite or lint
+exemption is used.
+
+Retain all original adversarial suites, saved proptest cases, the decimal
+lot-size fix, seven new fuzz targets and their workflow entries. Extend the
+order fuzz round-trip oracle to every integer and text field. State the config
+mutation grid's actual guarantee: panic freedom and aggregate rejection-path
+non-vacuity, with typed field-specific refusals in its separate guard tests.
+
+For order JSON, construct a literal recursive JSON tree before normalization,
+then inspect original token spans for the winning integer aliases. The tree
+visitor treats every decoded object key literally even when the app's existing
+serde_json feature graph enables `raw_value`. It recursively wraps both maps
+and arrays; no nested node delegates to ordinary Value deserialization. The
+span walker runs only after successful whole-frame syntax validation, uses
+serde's IgnoredAny skipping and byte offsets, and decodes escaped keys with
+serde. A winning numeric token must equal the digitwise exact decimal integer
+and the normalized integer; it never substitutes a rounded quantity.
+
+The added token scans are linear in bounded frame bytes; total tree parsing
+retains map insertion costs and allocations. The 256 KiB input cap is not a
+heap-byte ceiling or a constant-time guarantee. Keep syntax/depth checks, typed errors,
+existing conservative float-shaped integer magnitude limit and string behavior.
+No parser dependency, feature declaration, version pin or coverage floor changes.
+
+The literal array visitor consumes the first element before reserving a small
+named initial capacity. Empty arrays retain zero capacity; nonempty arrays
+reserve four entries, without trusting size hints or multiplying the frame
+limit by every nested array. This is explicit allocation policy within the
+existing allocating JSON path, not an allocation exemption or strict heap cap.
+The typed numeric error uses formatting arguments to avoid a temporary String.
+
+### Edge Cases (ADVERSARIAL-2159)
+
+Cover every integer field and both casings, tiny fractions, underflow, exponent
+forms, signed zero, i64 endpoints and values outside the accepted range.
+Accepted-key precedence, accepted null fallback, same-key last-wins and wrapper
+casing remain unchanged. Validate selected values only; discarded conflicting
+aliases do not poison a valid winner. Escaped keys and nested/text lookalikes
+must select the same fields as the literal tree. Ordinary unknown keys and text
+remain usable; objects that resemble dependency-private tags stay objects.
+
+For strategy recipes, random single-byte deletion may leave a different valid
+recipe, so keep that property's explicit no-panic contract. A separate oracle
+first accepts a complete valid recipe, then removes its guaranteed final object
+delimiter and requires the typed BadRecipe refusal. Do not inflate the
+assertion-free test budget or pretend arbitrary deletion always corrupts JSON.
+
+Arbitrary byte domains also contain valid recipes, snapshots and manifests.
+Seed those values explicitly: assert accepted snapshot values and documented
+recipe outcomes; a valid manifest naming an absent file yields MissingFile,
+while malformed manifest entries yield BadManifest. Keep every original random
+byte domain. Temporary case directories acquire ownership only after exclusive
+creation, retry collisions within a fixed bound, and preserve an existing
+owner's sentinel. The main-feed fuzz oracle shares the production packet cap;
+a Rust integration regression calls the very same oracle at the cap and cap+1.
+
+### Failure Modes (ADVERSARIAL-2159)
+
+Reject a fractional numeric quantity rather than silently fabricating a nearby
+integer. Malformed frames and selected wrong-type integer values retain typed
+refusal. Correctly discarded aliases and unknown keys remain accepted under the
+existing rules. A span/tree disagreement fails the numeric check; no permissive
+fallback is added. The existing frame cap bounds additional scan work but does
+not prove a latency target. The lot-size fix also consults decimal text so an
+f64-rounded fraction cannot become a valid contract lot.
+
+### Test Plan (ADVERSARIAL-2159)
+
+Run the integrated parser unit and adversarial-order suites with standalone-core
+defaults and with the production-relevant serde_json/raw_value feature. Run the
+ordinary fractional-number validator-removal negative control, restore the
+source, and rerun positive tests. Execute all retained adversarial suites,
+the actual assertion-free ratchet against the current 145 baseline, relevant
+source/ignored-test/coverage-floor/fuzz guards, formatting and full workspace
+all-targets Clippy. Normal commit/push hooks and independent performance,
+security and hostile correctness reviews remain required.
+
+For the repaired test oracles, restore the original universal-refusal assertions,
+directory pre-deletion and cap-blind fuzz condition individually. Each named
+regression must fail for its intended reason; restore the reviewed source and
+rerun its positive suite. Do not count compilation failures as killed mutants.
+
+Clean local workspace package artifacts before moving a shared build cache
+between archive/checkout sources; preserve named tests, compile paths and exit
+codes. A built fuzz target is not a completed fuzz run. Report any fuzz duration,
+execution count, feature-specific gap or unexecuted check separately. Measure
+the final combined head before stating coverage percentages or raising floors.
+
+### Rollback (ADVERSARIAL-2159)
+
+Before merge, discard only the replacement branch's changes; the original PR
+and immutable source remain available. After merge, revert the reviewed repair
+commit if compatibility regressions are demonstrated, explicitly reopening the
+fractional-number defect rather than silently weakening its regression oracle.
+No database, live configuration, deployment or external state migration is part
+of this change.
+
+### Observability (ADVERSARIAL-2159)
+
+Reuse existing typed order parse errors and caller reporting. New numeric
+refusals name the fixed field without logging its raw value or an entire frame.
+Fuzz crashes and property failures retain their existing local/CI artifacts.
+No new page, alarm, network endpoint or per-frame diagnostic is introduced.
+
+### Per-Item Guarantee Matrix (ADVERSARIAL-2159)
+
+All 15 coverage/checking demands and all seven resilience demands in
+`per-wave-guarantee-matrix.md` apply within their stated envelopes. The original
+input suites and their bounds are preserved. This item does not claim exhaustive
+inputs, 100% measured coverage, zero-allocation parsing, live losslessness or
+unchanged latency without measurement.
+
+| Area | Required proof | Current scope |
+| --- | --- | --- |
+| Exact quantities | All-field/casing refusal and acceptance oracles; ordinary validator-removal control | Order JSON and cold master CSV only |
+| Compatibility | Alias/null/duplicate/escaped-key/wrapper controls in both JSON feature graphs | Existing accepted field rules |
+| Test integrity | Recipe positive/refusal pair, assertion-free budget unchanged, every retained suite executed | Named tests and exit codes, not annotation counts |
+| Fuzz integrity | Workflow/manifest target agreement and actual run evidence | A build alone is not a campaign |
+| Security and resource bounds | Literal recursive objects, existing frame cap, independent review | No global serde_json behavior change |
+| CI and release | Full lint gate, normal hooks, exact-head CI | No exemption, floor decrease, merge or deployment implied |
