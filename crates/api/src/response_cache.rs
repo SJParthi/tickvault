@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::response::{IntoResponse, Response};
@@ -139,6 +140,9 @@ pub struct BoundedTtlCache {
     map: Mutex<HashMap<QuoteCacheKey, (Instant, String)>>,
     ttl: Duration,
     max_entries: usize,
+    /// The memory watchdog's shed signal last seen (plan item 4): when it
+    /// moves, the cache empties itself and gives its table back.
+    shed_seen: AtomicU64,
 }
 
 impl BoundedTtlCache {
@@ -148,6 +152,7 @@ impl BoundedTtlCache {
             map: Mutex::new(HashMap::new()),
             ttl,
             max_entries,
+            shed_seen: AtomicU64::new(tickvault_storage::memory_watchdog::shed_generation()),
         }
     }
 
@@ -155,6 +160,7 @@ impl BoundedTtlCache {
     /// expired entry for that key so dead entries free their slot.
     pub fn get(&self, key: QuoteCacheKey) -> Option<String> {
         let mut guard = lock_recovering(&self.map);
+        self.shed_if_signalled(&mut guard);
         match guard.get(&key) {
             Some((stored_at, body)) if stored_at.elapsed() < self.ttl => Some(body.clone()),
             Some(_) => {
@@ -188,6 +194,7 @@ impl BoundedTtlCache {
     /// read as covering it.
     pub fn put(&self, key: QuoteCacheKey, body: String) {
         let mut guard = lock_recovering(&self.map);
+        self.shed_if_signalled(&mut guard);
         if guard.len() >= self.max_entries && !guard.contains_key(&key) {
             let ttl = self.ttl;
             guard.retain(|_, (stored_at, _)| stored_at.elapsed() < ttl);
@@ -196,6 +203,18 @@ impl BoundedTtlCache {
             }
         }
         guard.insert(key, (Instant::now(), body));
+    }
+
+    /// Empties the map and frees its table when the memory watchdog has sent
+    /// a shed signal since the last look (plan item 4). One relaxed load per
+    /// call; the clear is O(entries) and runs at most once per signal.
+    fn shed_if_signalled(&self, map: &mut HashMap<QuoteCacheKey, (Instant, String)>) {
+        let generation = tickvault_storage::memory_watchdog::shed_generation();
+        if self.shed_seen.load(Ordering::Relaxed) != generation {
+            self.shed_seen.store(generation, Ordering::Relaxed);
+            map.clear();
+            map.shrink_to_fit();
+        }
     }
 
     /// Current entry count (tests + observability).
@@ -215,6 +234,29 @@ mod tests {
 
     /// The NSE_EQ segment code, for keys in the tests below.
     const NSE_EQ: u8 = tickvault_common::constants::EXCHANGE_SEGMENT_NSE_EQ;
+
+    #[test]
+    fn test_bounded_cache_empties_itself_on_a_shed_signal() {
+        // Plan item 4: a moved shed generation empties the cache on its
+        // next use, and only once per signal.
+        let cache = BoundedTtlCache::new(Duration::from_secs(60), 8);
+        cache.put((1, NSE_EQ), "a".to_string());
+        cache.put((2, NSE_EQ), "b".to_string());
+        assert_eq!(cache.len(), 2);
+        // Simulate a signal the cache has not seen yet.
+        let seen = cache.shed_seen.load(Ordering::Relaxed);
+        cache
+            .shed_seen
+            .store(seen.wrapping_add(1), Ordering::Relaxed);
+        assert_eq!(cache.get((1, NSE_EQ)), None, "shed on the next use");
+        assert_eq!(cache.len(), 0);
+        cache.put((3, NSE_EQ), "c".to_string());
+        assert_eq!(
+            cache.get((3, NSE_EQ)),
+            Some("c".to_string()),
+            "refills normally"
+        );
+    }
     /// The IDX_I segment code.
     const IDX_I: u8 = tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I;
 

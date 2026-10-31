@@ -221,6 +221,150 @@ pub struct ApplicationConfig {
     /// closed: the safe direction is keeping capture on disk).
     #[serde(default)]
     pub raw_frame_archive: RawFrameArchiveConfig,
+    /// `[memory_watchdog]` — the memory action ladder (plan item 4). Absent
+    /// section ⇒ `mode = "off"`: no memory poll, nothing acts.
+    #[serde(default)]
+    pub memory_watchdog: MemoryWatchdogConfig,
+    /// `[task_heartbeat]` — what a background task that misses its
+    /// heartbeats gets (plan item 4). Absent section ⇒ counted only.
+    #[serde(default)]
+    pub task_heartbeat: TaskHeartbeatConfig,
+}
+
+/// What the memory watchdog does (plan item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryWatchdogMode {
+    /// No memory poll. The default.
+    #[default]
+    Off,
+    /// The ladder is evaluated and what it WOULD do is counted; nothing acts.
+    Shadow,
+    /// The ladder trims the heap and sends the shed signal.
+    Act,
+}
+
+impl MemoryWatchdogMode {
+    /// The config spelling, for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Act => "act",
+        }
+    }
+}
+
+/// `[memory_watchdog]` — the memory action ladder (plan item 4, scenario
+/// #39). Percentages are of the RESOURCE-02 ceiling (the cgroup limit, else
+/// the machine's RAM). The ladder never drops a received frame and never
+/// stops capture; see `tickvault_storage::memory_watchdog`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct MemoryWatchdogConfig {
+    /// `off` (default), `shadow` or `act`.
+    #[serde(default)]
+    pub mode: MemoryWatchdogMode,
+    /// The `trim` rung: return free heap pages to the OS outside the session.
+    #[serde(default = "default_memory_trim_pct")]
+    pub trim_pct: u8,
+    /// The `shed` rung: trim in session too, and empty opt-in caches.
+    #[serde(default = "default_memory_shed_pct")]
+    pub shed_pct: u8,
+    /// The `critical` rung: the same actions, logged once per episode.
+    #[serde(default = "default_memory_critical_pct")]
+    pub critical_pct: u8,
+    /// Points below a rung's line before the ladder leaves it.
+    #[serde(default = "default_memory_hysteresis_pct")]
+    pub hysteresis_pct: u8,
+}
+
+const fn default_memory_trim_pct() -> u8 {
+    70
+}
+
+const fn default_memory_shed_pct() -> u8 {
+    80
+}
+
+const fn default_memory_critical_pct() -> u8 {
+    90
+}
+
+const fn default_memory_hysteresis_pct() -> u8 {
+    5
+}
+
+impl Default for MemoryWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            mode: MemoryWatchdogMode::Off,
+            trim_pct: default_memory_trim_pct(),
+            shed_pct: default_memory_shed_pct(),
+            critical_pct: default_memory_critical_pct(),
+            hysteresis_pct: default_memory_hysteresis_pct(),
+        }
+    }
+}
+
+impl MemoryWatchdogConfig {
+    /// Rejects a ladder whose lines are out of order or out of range:
+    /// `0 < hysteresis_pct <= 10`, `hysteresis_pct < trim_pct < shed_pct <
+    /// critical_pct <= 99`, and `hysteresis_pct` smaller than both gaps
+    /// between rungs.
+    ///
+    /// # Errors
+    /// Any bound above is broken.
+    pub fn validate(&self) -> Result<()> {
+        if self.hysteresis_pct == 0 || self.hysteresis_pct > 10 {
+            bail!(
+                "memory_watchdog.hysteresis_pct ({}) must be within 1..=10",
+                self.hysteresis_pct
+            );
+        }
+        if !(self.hysteresis_pct < self.trim_pct
+            && self.trim_pct < self.shed_pct
+            && self.shed_pct < self.critical_pct
+            && self.critical_pct <= 99)
+        {
+            bail!(
+                "memory_watchdog lines must rise strictly: hysteresis_pct ({}) < trim_pct ({}) \
+                 < shed_pct ({}) < critical_pct ({}) <= 99",
+                self.hysteresis_pct,
+                self.trim_pct,
+                self.shed_pct,
+                self.critical_pct
+            );
+        }
+        // Hostile review 2026-10-30: a band wider than the gap below a rung
+        // would hold that rung while usage is under the next lower rung's
+        // line too (shed held at 72% with trim 70, shed 80, hysteresis 9).
+        if self.hysteresis_pct >= self.shed_pct - self.trim_pct
+            || self.hysteresis_pct >= self.critical_pct - self.shed_pct
+        {
+            bail!(
+                "memory_watchdog.hysteresis_pct ({}) must be smaller than every gap between \
+                 rungs (shed_pct - trim_pct = {}, critical_pct - shed_pct = {})",
+                self.hysteresis_pct,
+                self.shed_pct - self.trim_pct,
+                self.critical_pct - self.shed_pct
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[task_heartbeat]` — background-task heartbeats (plan item 4, scenarios
+/// #57 and #58). The heartbeats are always published; this only decides
+/// whether a stuck task is aborted for its supervisor to respawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct TaskHeartbeatConfig {
+    /// Abort the API token reload (the one watched task safe to restart)
+    /// after three missed heartbeats so its supervisor respawns it. Every other
+    /// watched task is watch-only. Default `false`: counted on
+    /// `tv_task_heartbeat_would_respawn_total` only.
+    #[serde(default)]
+    pub respawn_on_missed_beats: bool,
 }
 
 /// `[raw_frame_archive]` — the raw WAL segment upload gate (plan item 45e-1).
@@ -3105,6 +3249,10 @@ impl ApplicationConfig {
         // store installs.
         self.market_ram_store.validate()?;
 
+        // Plan item 4: the memory ladder's lines must rise strictly, rejected
+        // at boot, before the watch thread starts.
+        self.memory_watchdog.validate()?;
+
         Ok(())
     }
 }
@@ -3835,6 +3983,8 @@ mod tests {
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
             raw_frame_archive: RawFrameArchiveConfig::default(),
+            memory_watchdog: MemoryWatchdogConfig::default(),
+            task_heartbeat: TaskHeartbeatConfig::default(),
         }
     }
 
@@ -4909,6 +5059,97 @@ mod tests {
             .extract()
             .expect("true parses");
         assert!(on.dhan_universe.depth_sockets_enabled);
+    }
+
+    #[test]
+    fn test_memory_watchdog_defaults_off_and_parses_every_mode() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            memory_watchdog: MemoryWatchdogConfig,
+            #[serde(default)]
+            task_heartbeat: TaskHeartbeatConfig,
+        }
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string(""))
+            .extract()
+            .expect("absent sections must default");
+        assert_eq!(absent.memory_watchdog, MemoryWatchdogConfig::default());
+        assert_eq!(absent.memory_watchdog.mode, MemoryWatchdogMode::Off);
+        assert!(!absent.task_heartbeat.respawn_on_missed_beats);
+        assert!(absent.memory_watchdog.validate().is_ok());
+        for (spelling, want) in [
+            ("off", MemoryWatchdogMode::Off),
+            ("shadow", MemoryWatchdogMode::Shadow),
+            ("act", MemoryWatchdogMode::Act),
+        ] {
+            let parsed: Wrapper = Figment::new()
+                .merge(Toml::string(&format!(
+                    "[memory_watchdog]\nmode = \"{spelling}\"\n"
+                )))
+                .extract()
+                .expect("every spelling parses");
+            assert_eq!(parsed.memory_watchdog.mode, want);
+            assert_eq!(want.as_str(), spelling);
+            assert_eq!(
+                parsed.memory_watchdog.trim_pct, 70,
+                "partial section keeps defaults"
+            );
+        }
+        let bad: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string("[memory_watchdog]\nmode = \"restart\"\n"))
+            .extract();
+        assert!(bad.is_err(), "an unknown mode must not silently become off");
+    }
+
+    #[test]
+    fn test_memory_watchdog_validate_rejects_disordered_lines() {
+        let ok = MemoryWatchdogConfig::default();
+        assert!(ok.validate().is_ok());
+        let with = |trim: u8, shed: u8, critical: u8, hysteresis: u8| MemoryWatchdogConfig {
+            trim_pct: trim,
+            shed_pct: shed,
+            critical_pct: critical,
+            hysteresis_pct: hysteresis,
+            ..ok
+        };
+        assert!(with(70, 80, 90, 0).validate().is_err(), "zero hysteresis");
+        assert!(
+            with(70, 80, 90, 11).validate().is_err(),
+            "hysteresis over 10"
+        );
+        assert!(
+            with(70, 80, 90, 9).validate().is_ok(),
+            "band 9 < gaps of 10"
+        );
+        assert!(
+            with(70, 80, 90, 10).validate().is_err(),
+            "band equal to a gap"
+        );
+        assert!(
+            with(70, 72, 90, 5).validate().is_err(),
+            "band wider than shed - trim"
+        );
+        assert!(
+            with(70, 80, 83, 5).validate().is_err(),
+            "band wider than critical - shed"
+        );
+        assert!(with(80, 80, 90, 5).validate().is_err(), "trim == shed");
+        assert!(with(70, 90, 90, 5).validate().is_err(), "shed == critical");
+        assert!(with(70, 80, 100, 5).validate().is_err(), "critical over 99");
+        assert!(with(70, 80, 99, 5).validate().is_ok());
+        assert!(
+            with(5, 80, 90, 5).validate().is_err(),
+            "trim must exceed hysteresis"
+        );
+        assert!(with(6, 8, 10, 1).validate().is_ok(), "tight but ordered");
+        assert!(
+            with(6, 7, 8, 5).validate().is_err(),
+            "band wider than both gaps"
+        );
     }
 
     #[test]
