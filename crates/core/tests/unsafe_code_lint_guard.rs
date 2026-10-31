@@ -140,9 +140,13 @@ fn allow_unsafe_code_appears_only_on_the_listed_modules() {
                 "crates/storage/src/disk_health_watcher.rs".to_string(),
                 "mod statvfs_probe {".to_string()
             ),
+            (
+                "crates/storage/src/memory_watchdog.rs".to_string(),
+                "mod trim_call {".to_string()
+            ),
         ],
-        "the only production opt-outs from deny(unsafe_code) are the affinity and \
-         statvfs_probe modules; a new one needs its own SAFETY notes and this test \
+        "the only production opt-outs from deny(unsafe_code) are the affinity, \
+         statvfs_probe and trim_call modules; a new one needs its own SAFETY notes and this test \
          updated in the same change"
     );
 }

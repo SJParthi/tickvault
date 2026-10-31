@@ -1430,6 +1430,10 @@ pub async fn run_seal_writer_loop(
     let mut progress = SealWriterProgress::default();
     let mut last_report = tokio::time::Instant::now();
     let report_every = Duration::from_secs(SEAL_WRITER_PROGRESS_REPORT_SECS);
+    // Plan item 4: the seal writer is watched by heartbeat (never respawned:
+    // this runner owns the sealed-candle ring). Armed here, after the boot
+    // drain, and beaten after every cycle.
+    crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::SealWriter);
 
     loop {
         tokio::select! {
@@ -1497,6 +1501,7 @@ pub async fn run_seal_writer_loop(
                 let now = utc_now_secs();
                 let (outcome, replay, unwritten) =
                     run_cycle_with_replay(&mut runner, &mut mark, now);
+                crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::SealWriter);
                 unwritten_gauge.set(unwritten as f64);
                 let dropped = progress.absorb(&outcome);
                 record_cycle_observability(&outcome, dropped);
