@@ -72,13 +72,19 @@ inline (PR2, PR8, PR14).
       baselines are rolled so the skipped window is dropped rather than merged (a merged
       window would publish a volume change over two windows under one cadence label),
       counted on `tv_top_volume_sweep_deferred_total` and logged.
-  - Files: volume_leaderboard.rs, top_volume_sweep.rs (new), dhan_feed_stack.rs, lib.rs,
+  - Historical files (retired 2026-10-22): volume_leaderboard.rs, top_volume_sweep.rs (new), dhan_feed_stack.rs, lib.rs,
     tests/dhat_top_volume_sweep.rs (new).
-  - Tests: `begin_sweep_and_sweep_step_rank_identically_to_rank` (proptest, = the planned
+  - Historical tests (retired 2026-10-22): `begin_sweep_and_sweep_step_rank_identically_to_rank` (proptest, = the planned
     `merged_cadence_buffers_rank_identically`), `drain_cadence_arm_does_no_sort`,
     `slice_sort_step_matches_sort_unstable_by` (proptest),
     `dhat_top_volume_sweep_begin_and_steps_zero_allocation`,
     `sliced_sweep_step_cost_at_the_authorized_ceiling` (ignored harness).
+  - **Retirement recorded 2026-10-31:** plan item 62 removed the top-volume
+    ranking/sweep on 2026-10-22 under owner Quote 34. The completed PR4 work above
+    is historical; its deleted code and tests are not current live-performance
+    evidence. Current verification pins that the retired modules remain absent.
+  - Files: crates/app/tests/top_volume_removed_guard.rs
+  - Tests: the_top_volume_modules_are_deleted
 - [x] **PR4b — the catch-up seal sweep and the baseline rolls run in slices too.** (`trading`,
   `app`) — found while doing PR4. DONE (as built):
   - `catch_up_seal_all` was O(slots × TF_COUNT) on the drain's 5 s `catchup_timer` arm
