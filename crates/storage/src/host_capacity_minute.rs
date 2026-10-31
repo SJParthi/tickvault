@@ -37,7 +37,7 @@
 //!     ticks_accepted                 LONG,       -- `ticks` rows appended this minute
 //!     ticks_not_landed               LONG,       -- rows spilled, failed or deferred to replay
 //!     ticks_lost                     LONG,       -- `tv_ticks_lost_total` growth
-//!     ring_refused_frames            LONG        -- main-feed frames the ring refused (they bypass every stage)
+//!     ring_refused_frames            LONG        -- main-feed frames missing downstream live-path timing
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, feed);
 //!
@@ -47,7 +47,7 @@
 //!     feed                             SYMBOL,
 //!     verdict                          SYMBOL,    -- UPGRADE_NEEDED / NOT_NEEDED / UNKNOWN
 //!     reasons                          VARCHAR,   -- why, one clause per signal
-//!     session_minutes                  LONG,      -- 09:15–15:30 minutes this process saw
+//!     session_minutes                  LONG,      -- distinct calendar-selected minutes this process saw
 //!     tick_step_p99_result             SYMBOL,    -- pass / fail / unknown
 //!     worst_tick_step                  SYMBOL,    -- stage of the worst p99
 //!     worst_tick_step_p99_ns           LONG,      -- its p99 bucket upper bound
@@ -76,14 +76,15 @@
 //!
 //! | Signal | Pass when |
 //! |---|---|
-//! | tick-step p99 | every minute's p99 bound ≤ 1,024 ns on `socket_to_wal`, `ring_dwell`, `drain_main_frame`, `receipt_to_fold` |
+//! | tick-step p99 | every sampled bound proves strictly <1,000 ns; the historical first bucket (≤1,024 ns) is UNKNOWN |
 //! | ticks over 1 ms | no session minute with a `receipt_to_fold` sample over 1 ms |
-//! | CPU wait | the reader and drain groups never waited ≥ 1 ms for a CPU within one second |
+//! | CPU wait | observed reader/drain scheduling deltas stayed below 1 ms, with every attempted read present |
 //! | disk | at most 5 minutes at or above 90% of 125 MiB/s (read + write; the gp3 cap counts both) |
-//! | backlog | at the first minute at or after 15:40, no table's apply lag growing and the backlog ≤ 500 transactions |
+//! | backlog | at the scheduled close-check minute, no table's apply lag growing and backlog ≤ 500 transactions |
 //!
-//! * **UNKNOWN** when fewer than 300 of the 375 session minutes were seen, or
-//!   any signal had no data. Never a green verdict on zero samples.
+//! * **UNKNOWN** when any distinct expected minute or required measurement is
+//!   missing, live-path exclusions were observed, or the strict latency target
+//!   is unresolved. Regular days require 375 minutes; Muhurat uses its calendar.
 //! * **UPGRADE_NEEDED** when the CPU-wait signal fails, or the backlog fails
 //!   while the host was at least 90% busy: those are the failures more cores
 //!   fix.
@@ -93,23 +94,26 @@
 //!
 //! ## Honest limits
 //!
-//! * The verdict covers the minutes THIS process saw; after a mid-session
-//!   restart each process sees part of the day and is likely UNKNOWN. A
-//!   process that saw no session minute writes no verdict, so a restart
-//!   after the close never overwrites the day's row.
-//! * "Over 1 µs" is over 1,024 ns (the histograms' first bucket bound);
-//!   counting exactly 1,000 would need one more compare on the recording
-//!   path, which stays untouched.
-//! * CPU wait per second is the kernel's `run_delay` growth between two
-//!   one-second reads; a thread's first reading is its baseline. The seal
-//!   writer runs as a task on the main runtime, so its wait is inside the
-//!   drain group, not a series of its own.
+//! * A post-close-only restart cannot overwrite the day's row. An overlapping
+//!   process with zero session rows emits UNKNOWN. No current-day row must be
+//!   displayed as insufficient, never replaced with yesterday's verdict.
+//! * Existing histogram recording is unchanged: the ≤1,024 ns first bucket
+//!   cannot prove the strict <1,000 ns goal. Exact classification is follow-up.
+//! * CPU wait is the kernel's `run_delay` growth between sampling attempts,
+//!   nominally one second apart; delayed attempts span longer intervals and
+//!   cannot establish hidden one-second maxima. A first reading is a baseline.
+//!   The dedicated drain's wait comes from its own thread when registered.
+//!   Shared mode uses the main-worker sum, including the seal writer and other
+//!   tasks, as a proxy; it does not isolate the drain task. Minute/publish
+//!   counts are not exact elapsed-time coverage, and aggregate readings do
+//!   not certify every registered member was readable.
 //! * Disk figures are minute averages from `/proc/diskstats`, so a burst
 //!   inside a minute reads lower than its peak.
 //! * `ticks_lost` sums the `tv_ticks_lost_total` series read from this
 //!   process's own `/metrics` once a minute by a separate thread; NULL until
 //!   the first read.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -117,10 +121,17 @@ use questdb::ingress::{Buffer, TimestampNanos};
 
 use tickvault_common::constants::SECONDS_PER_DAY;
 use tickvault_common::feed::Feed;
+use tickvault_common::trading_calendar::TradingCalendar;
 
 use crate::hot_path_latency_minute::LatencyMinuteRows;
 use crate::hot_path_telemetry::Stage;
 use crate::hot_thread_sched::{HotThread, SchedPublisher};
+
+mod coverage;
+#[cfg(test)]
+mod coverage_tests;
+pub use coverage::DayCoverage;
+use coverage::SessionPlan;
 
 /// Host table name.
 pub const HOST_CAPACITY_MINUTE_TABLE: &str = "host_capacity_minute";
@@ -196,8 +207,6 @@ pub const SESSION_START_SECS_OF_DAY_IST: u32 = 9 * 3_600 + 15 * 60;
 pub const SESSION_END_SECS_OF_DAY_IST: u32 = 15 * 3_600 + 30 * 60;
 /// The verdict is written at the first closed minute at or after this.
 pub const VERDICT_AT_SECS_OF_DAY_IST: u32 = 15 * 3_600 + 40 * 60;
-/// Fewer session minutes than this → UNKNOWN (80% of 375).
-pub const MIN_SESSION_MINUTES: u64 = 300;
 /// The tick steps judged against the 1 µs target. The runtime-lag probes
 /// (a 100 ms sleep's lateness) and the metrics upkeep are not tick steps.
 pub const TICK_STEP_STAGES: [Stage; 4] = [
@@ -206,9 +215,10 @@ pub const TICK_STEP_STAGES: [Stage; 4] = [
     Stage::DrainMainFrame,
     Stage::ReceiptToFold,
 ];
-/// A tick step passes when its p99 bucket bound is at most this (the
-/// histograms' first bucket, standing in for 1 µs).
-pub const TICK_STEP_P99_PASS_NS: u64 = 1_024;
+/// Strict target: the p99 must be BELOW this many nanoseconds.
+pub const TICK_STEP_P99_TARGET_NS: u64 = 1_000;
+/// Historical first-bucket bound. Its contents straddle the strict target.
+pub const LEGACY_FIRST_BUCKET_NS: u64 = 1_024;
 /// A `receipt_to_fold` sample above this counts its minute as "over 1 ms".
 pub const TICK_OVER_NS: u64 = 1_000_000;
 /// A hot group fails when it waited this long for a CPU within one second.
@@ -304,14 +314,6 @@ fn secs_of_day(ist_nanos: i64) -> u32 {
 fn ist_midnight(ist_nanos: i64) -> i64 {
     let day = i64::from(SECONDS_PER_DAY) * NANOS_PER_SECOND;
     ist_nanos - ist_nanos.rem_euclid(day)
-}
-
-/// True when the minute starting at `minute_ist_nanos` is a counted session
-/// minute.
-#[must_use]
-pub fn is_session_minute(minute_ist_nanos: i64) -> bool {
-    (SESSION_START_SECS_OF_DAY_IST..SESSION_END_SECS_OF_DAY_IST)
-        .contains(&secs_of_day(minute_ist_nanos))
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +435,7 @@ pub struct HostMinuteRow {
     pub sched_seconds: u64,
     /// Reader threads: total wait, and worst one-second wait.
     pub reader_wait: Option<(u64, u64)>,
-    /// Main-runtime workers (drain, seal writer): total and worst second.
+    /// Dedicated drain, or main-worker sum in shared mode: total and worst second.
     pub drain_wait: Option<(u64, u64)>,
     /// WAL writer: total and worst second.
     pub wal_wait: Option<(u64, u64)>,
@@ -479,6 +481,7 @@ impl HostMinuteRow {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WaitSum {
     seen: bool,
+    missing: bool,
     total: u64,
     max: u64,
 }
@@ -489,11 +492,13 @@ impl WaitSum {
             self.seen = true;
             self.total = self.total.saturating_add(ns);
             self.max = self.max.max(ns);
+        } else {
+            self.missing = true;
         }
     }
 
     fn take(&mut self) -> Option<(u64, u64)> {
-        let out = self.seen.then_some((self.total, self.max));
+        let out = (self.seen && !self.missing).then_some((self.total, self.max));
         *self = Self::default();
         out
     }
@@ -572,7 +577,7 @@ impl HostSampler {
         }
         self.absorb_second_values(
             readers,
-            sched.last_second_run_delay_ns(HotThread::MainWorkers),
+            sched.last_second_drain_run_delay_ns(),
             sched.last_second_run_delay_ns(HotThread::WalWriter),
         );
     }
@@ -809,12 +814,18 @@ pub struct CapacityVerdictRow {
     pub worst_host_cpu_busy_pct: Option<f64>,
     /// This process's first minute, IST nanos.
     pub process_start_ist_nanos: i64,
+    /// Fixed coverage diagnostics, serialized only into the existing reasons text.
+    pub coverage: DayCoverage,
+    /// Minutes with disk evidence (the persisted disk column counts hot minutes).
+    pub disk_minutes: u64,
 }
 
 /// What the day accumulated, before the decision. Pure input to
 /// [`decide_verdict`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DayEvidence {
+    /// Per-signal completeness and calendar diagnostics.
+    pub coverage: DayCoverage,
     /// Session minutes seen.
     pub session_minutes: u64,
     /// Worst p99 bound per tick step (index into [`TICK_STEP_STAGES`]);
@@ -839,16 +850,23 @@ pub struct DayEvidence {
 /// Pure: the five signals and the verdict from one day's evidence.
 #[must_use]
 pub fn decide_verdict(e: &DayEvidence) -> (Verdict, [SignalResult; 5]) {
-    let step = if e.worst_step_p99.iter().all(Option::is_some) {
-        if e.worst_step_p99
-            .iter()
-            .all(|p| p.is_some_and(|n| n <= TICK_STEP_P99_PASS_NS))
-        {
-            SignalResult::Pass
-        } else {
-            SignalResult::Fail
-        }
+    let step = if e
+        .worst_step_p99
+        .iter()
+        .any(|p| p.is_some_and(|n| n > LEGACY_FIRST_BUCKET_NS))
+    {
+        // Every historical bucket above the first has a lower endpoint >1024.
+        SignalResult::Fail
+    } else if e
+        .worst_step_p99
+        .iter()
+        .all(|p| p.is_some_and(|n| n < TICK_STEP_P99_TARGET_NS))
+    {
+        // A genuinely discriminating upper bound would prove the strict goal.
+        // The current live histograms cannot produce such a bound.
+        SignalResult::Pass
     } else {
+        // In particular, <=1024 says nothing about which side of 1000 the p99 is.
         SignalResult::Unknown
     };
     let over_1ms = match e.worst_step_p99[3] {
@@ -883,19 +901,43 @@ pub fn decide_verdict(e: &DayEvidence) -> (Verdict, [SignalResult; 5]) {
         }
         _ => SignalResult::Unknown,
     };
-    let results = [step, over_1ms, cpu, disk, backlog];
-    let verdict =
-        if e.session_minutes < MIN_SESSION_MINUTES || results.contains(&SignalResult::Unknown) {
-            Verdict::Unknown
-        } else if cpu == SignalResult::Fail
-            || (backlog == SignalResult::Fail
-                && e.worst_host_busy_pct
-                    .is_some_and(|p| p >= HOST_BUSY_UPGRADE_PCT))
-        {
-            Verdict::UpgradeNeeded
-        } else {
-            Verdict::NotNeeded
-        };
+    let seen = e.session_minutes;
+    let c = &e.coverage;
+    let observed_busy = e
+        .worst_host_busy_pct
+        .filter(|n| n.is_finite() && (0.0..=100.0).contains(n));
+    // Backlog failure needs host utilization to decide whether extra cores
+    // address it. An observed high utilization or CPU-wait failure is already
+    // sufficient; claiming no upgrade from low utilization requires full data.
+    let backlog_capacity_known = backlog != SignalResult::Fail
+        || cpu == SignalResult::Fail
+        || observed_busy.is_some_and(|n| n >= HOST_BUSY_UPGRADE_PCT)
+        || (c.all_minutes(seen) && c.host_busy_minutes == seen && observed_busy.is_some());
+    let coverage = [
+        (0..TICK_STEP_STAGES.len())
+            .all(|i| c.stage_complete(seen, i) && e.worst_step_p99[i].is_some()),
+        c.stage_complete(seen, 3),
+        c.all_minutes(seen) && c.reader_minutes == seen && c.drain_minutes == seen,
+        c.all_minutes(seen) && e.disk_minutes == seen,
+        e.backlog_at_close.0.is_some() && e.backlog_at_close.1.is_some() && backlog_capacity_known,
+    ];
+    let mut results = [step, over_1ms, cpu, disk, backlog];
+    for (result, complete) in results.iter_mut().zip(coverage) {
+        // Keep an actual observed breach visible, but never carry PASS over a gap.
+        if !complete && *result != SignalResult::Fail {
+            *result = SignalResult::Unknown;
+        }
+    }
+    let verdict = if coverage.contains(&false) || results.contains(&SignalResult::Unknown) {
+        Verdict::Unknown
+    } else if cpu == SignalResult::Fail
+        || (backlog == SignalResult::Fail
+            && observed_busy.is_some_and(|p| p >= HOST_BUSY_UPGRADE_PCT))
+    {
+        Verdict::UpgradeNeeded
+    } else {
+        Verdict::NotNeeded
+    };
     (verdict, results)
 }
 
@@ -910,13 +952,96 @@ pub fn verdict_reasons(row: &CapacityVerdictRow) -> String {
         }
         s.push_str(text);
     };
-    if row.session_minutes < MIN_SESSION_MINUTES {
+    let coverage = &row.coverage;
+    if let Some(reason) = coverage.calendar_issue {
+        push(&mut s, &format!("UNKNOWN {reason}"));
+    }
+    if !coverage.all_minutes(row.session_minutes) {
         push(
             &mut s,
             &format!(
-                "only {} of 375 session minutes seen (need {MIN_SESSION_MINUTES})",
-                row.session_minutes
+                "UNKNOWN session_minutes_incomplete: only {} of {} distinct session minutes seen; malformed {}",
+                row.session_minutes,
+                coverage
+                    .expected_minutes
+                    .map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+                coverage.malformed_minutes,
             ),
+        );
+    }
+    if coverage.malformed_minutes > 0 {
+        push(
+            &mut s,
+            "UNKNOWN minute_rows_invalid: timestamp, stage or observation-count mismatch",
+        );
+    }
+    for (stage, count) in TICK_STEP_STAGES.iter().zip(coverage.stage_minutes) {
+        if Some(count) != coverage.expected_minutes || count == 0 {
+            push(
+                &mut s,
+                &format!(
+                    "UNKNOWN stage_samples_incomplete: {} has {count} sampled minutes",
+                    stage.as_str()
+                ),
+            );
+        }
+    }
+    for (name, count) in [
+        ("reader_wait_incomplete", coverage.reader_minutes),
+        ("drain_wait_incomplete", coverage.drain_minutes),
+        ("disk_samples_incomplete", row.disk_minutes),
+    ] {
+        if Some(count) != coverage.expected_minutes || count == 0 {
+            push(&mut s, &format!("UNKNOWN {name}: {count} measured minutes"));
+        }
+    }
+    if !coverage.no_exclusions() {
+        push(
+            &mut s,
+            &format!(
+                "UNKNOWN live_path_incomplete: ring_refused_frames={}, ticks_not_landed={}, ticks_lost={}",
+                coverage.ring_refused_frames, coverage.ticks_not_landed, coverage.ticks_lost
+            ),
+        );
+    }
+    if coverage.exclusion_counter_minutes == 0
+        || Some(coverage.exclusion_counter_minutes) != coverage.expected_minutes
+    {
+        push(
+            &mut s,
+            &format!(
+                "UNKNOWN live_path_counters_incomplete: {} minutes with both counters measured",
+                coverage.exclusion_counter_minutes
+            ),
+        );
+    }
+    if row.backlog.0 == SignalResult::Fail
+        && row.cpu_wait.0 != SignalResult::Fail
+        && !row
+            .worst_host_cpu_busy_pct
+            .is_some_and(|n| n >= HOST_BUSY_UPGRADE_PCT)
+        && (coverage.host_busy_minutes == 0
+            || Some(coverage.host_busy_minutes) != coverage.expected_minutes)
+    {
+        push(
+            &mut s,
+            &format!(
+                "UNKNOWN host_busy_incomplete: {} measured minutes cannot rule out CPU pressure behind backlog",
+                coverage.host_busy_minutes
+            ),
+        );
+    }
+    if row.backlog.1.is_none() || row.backlog.2.is_none() {
+        push(&mut s, "UNKNOWN backlog_close_sample_missing");
+    }
+    if row
+        .tick_step
+        .2
+        .is_some_and(|n| (TICK_STEP_P99_TARGET_NS..=LEGACY_FIRST_BUCKET_NS).contains(&n))
+    {
+        push(
+            &mut s,
+            "UNKNOWN strict_1000ns_unresolved: historical first bucket straddles the strict target",
         );
     }
     let stage = row.tick_step.1.map_or("none", Stage::as_str);
@@ -927,7 +1052,7 @@ pub fn verdict_reasons(row: &CapacityVerdictRow) -> String {
     push(
         &mut s,
         &format!(
-            "tick-step p99 {}: worst {stage} at most {p99} ns (bound {TICK_STEP_P99_PASS_NS})",
+            "tick-step p99 {}: worst {stage} at most {p99} ns (strict target <{TICK_STEP_P99_TARGET_NS})",
             row.tick_step.0.as_str()
         ),
     );
@@ -960,10 +1085,13 @@ pub fn verdict_reasons(row: &CapacityVerdictRow) -> String {
     push(
         &mut s,
         &format!(
-            "questdb backlog {}: {} txns, {} growing tables at 15:40",
+            "questdb backlog {}: {} txns, {} growing tables at scheduled close check (IST seconds {})",
             row.backlog.0.as_str(),
             ns(row.backlog.1),
-            ns(row.backlog.2)
+            ns(row.backlog.2),
+            coverage
+                .verdict_at_secs
+                .map_or_else(|| "unknown".to_owned(), |n| n.to_string())
         ),
     );
     if row.verdict == Verdict::NotNeeded
@@ -977,14 +1105,18 @@ pub fn verdict_reasons(row: &CapacityVerdictRow) -> String {
     s
 }
 
-/// Accumulates one IST day from the closed minutes. Lives on the
-/// `tv-telemetry` thread. Fixed fields, no allocation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Accumulates one calendar-selected IST session. Fixed fields, no per-minute
+/// allocation; the calendar is installed once at boot and resolved once per day.
+#[derive(Debug, Clone)]
 pub struct DayVerdict {
+    calendar: Option<Arc<TradingCalendar>>,
+    plan: SessionPlan,
     day: Option<i64>,
     evidence: DayEvidence,
     emitted: bool,
     process_start: Option<i64>,
+    first_minute_today: Option<i64>,
+    last_minute: Option<i64>,
     skipped_backwards: u64,
 }
 
@@ -995,30 +1127,35 @@ impl Default for DayVerdict {
 }
 
 impl DayVerdict {
-    /// Nothing seen yet.
+    /// No calendar installed: evidence stays UNKNOWN. Production uses
+    /// [`Self::with_calendar`] with the same calendar used by app startup.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            calendar: None,
+            plan: SessionPlan::Unknown("calendar_missing"),
             day: None,
-            evidence: DayEvidence {
-                session_minutes: 0,
-                worst_step_p99: [None; 4],
-                minutes_over_1ms: 0,
-                worst_reader_wait: None,
-                worst_drain_wait: None,
-                disk_minutes: 0,
-                disk_hot_minutes: 0,
-                backlog_at_close: (None, None),
-                worst_host_busy_pct: None,
-            },
+            evidence: DayEvidence::default(),
             emitted: false,
             process_start: None,
+            first_minute_today: None,
+            last_minute: None,
             skipped_backwards: 0,
         }
     }
 
-    /// Minutes ignored because they belonged to an earlier day than the one
-    /// accumulating (a clock stepped back across midnight).
+    /// Install an explicit session calendar; no wall-clock or process-global
+    /// weekday/Muhurat fallback is used for historical minute rows.
+    #[must_use]
+    // TEST-EXEMPT: covered by coverage_tests::test_day_verdict_with_calendar_special_session_and_unknown_calendar.
+    pub fn with_calendar(calendar: Arc<TradingCalendar>) -> Self {
+        Self {
+            calendar: Some(calendar),
+            ..Self::new()
+        }
+    }
+
+    /// Minutes ignored because their timestamp did not advance.
     #[must_use]
     pub const fn skipped_backwards(&self) -> u64 {
         self.skipped_backwards
@@ -1030,10 +1167,12 @@ impl DayVerdict {
         &self.evidence
     }
 
-    /// Folds one closed minute. Returns a verdict row when this minute is the
-    /// first at or after 15:40 IST of a day this process saw session minutes
-    /// of, or when the day rolled over before that happened (the previous
-    /// day's verdict, decided on what it saw). O(stages), no allocation.
+    /// Fold one closed minute. Only unique, correctly aligned expected minutes
+    /// count. A process observed before the session ended emits UNKNOWN for an
+    /// empty/gapped session; a post-close-only restart never overwrites its row.
+    /// Calendar-unknown days report UNKNOWN at rollover, without guessing an
+    /// afternoon close that could preempt an unknown evening Muhurat session.
+    /// O(stages) per minute, plus the calendar horizon scan once per day.
     pub fn observe(
         &mut self,
         latency: &LatencyMinuteRows,
@@ -1049,7 +1188,7 @@ impl DayVerdict {
                 return None;
             }
             Some(current) if day > current => {
-                if !self.emitted && self.evidence.session_minutes > 0 {
+                if !self.emitted && self.should_emit(current) {
                     out = Some(self.row(current));
                 }
                 self.reset(day);
@@ -1057,52 +1196,94 @@ impl DayVerdict {
             Some(_) => {}
             None => self.reset(day),
         }
-        if is_session_minute(minute) {
-            self.fold_session_minute(latency, host);
+        if self.last_minute.is_some_and(|last| minute <= last) {
+            self.skipped_backwards = self.skipped_backwards.saturating_add(1);
+            return out;
         }
-        if out.is_none()
+        self.last_minute = Some(minute);
+        self.first_minute_today.get_or_insert(minute);
+        if self.plan.contains(secs_of_day(minute)) {
+            if valid_minute(latency, host) {
+                self.fold_session_minute(latency, host);
+            } else {
+                self.evidence.coverage.malformed_minutes =
+                    self.evidence.coverage.malformed_minutes.saturating_add(1);
+            }
+        }
+        if let SessionPlan::Open { due, .. } = self.plan
             && !self.emitted
-            && secs_of_day(minute) >= VERDICT_AT_SECS_OF_DAY_IST
-            && self.evidence.session_minutes > 0
+            && out.is_none()
+            && secs_of_day(minute) >= due
+            && self.should_emit(day)
         {
-            self.evidence.backlog_at_close = (
-                host.questdb_backlog_txns,
-                host.questdb_backlog_growing_tables,
-            );
+            // A much later poll is not the requested close sample. The watcher
+            // itself has no freshness timestamp here; that remains a separate
+            // limitation, not inferred from non-NULL cached backlog values.
+            if secs_of_day(minute) == due && valid_minute(latency, host) {
+                self.evidence.backlog_at_close = (
+                    host.questdb_backlog_txns,
+                    host.questdb_backlog_growing_tables,
+                );
+            }
             self.emitted = true;
             out = Some(self.row(day));
         }
         out
     }
 
+    fn should_emit(&self, day: i64) -> bool {
+        match self.plan {
+            SessionPlan::Closed => false,
+            // With unknown times, only a process observed before the earliest
+            // allowed capture start can safely emit at rollover. A later boot
+            // might be post-close and must not overwrite the shared daily key.
+            // Consumers treat absent current-day evidence as unknown.
+            SessionPlan::Unknown(_) => self.first_minute_today.is_some_and(|first| {
+                secs_of_day(first) < tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
+            }),
+            SessionPlan::Open { end, .. } => self
+                .first_minute_today
+                .is_some_and(|first| first < day + i64::from(end) * NANOS_PER_SECOND),
+        }
+    }
+
     fn reset(&mut self, day: i64) {
-        let start = self.process_start;
-        let skipped = self.skipped_backwards;
-        *self = Self::new();
+        self.plan = SessionPlan::for_day(self.calendar.as_deref(), day);
         self.day = Some(day);
-        self.process_start = start;
-        self.skipped_backwards = skipped;
+        self.evidence = DayEvidence {
+            coverage: self.plan.coverage(),
+            ..DayEvidence::default()
+        };
+        self.emitted = false;
+        self.first_minute_today = None;
+        self.last_minute = None;
     }
 
     fn fold_session_minute(&mut self, latency: &LatencyMinuteRows, host: &HostMinuteRow) {
         let e = &mut self.evidence;
         e.session_minutes = e.session_minutes.saturating_add(1);
-        for (slot, stage) in e.worst_step_p99.iter_mut().zip(TICK_STEP_STAGES.iter()) {
+        for (index, stage) in TICK_STEP_STAGES.iter().enumerate() {
             let row = &latency[*stage as usize];
             if row.samples == 0 {
                 continue;
             }
-            // A NULL p99 with samples is above the histogram's top bound.
+            e.coverage.stage_minutes[index] = e.coverage.stage_minutes[index].saturating_add(1);
+            // NULL with samples is overflow, never an empty/ignored observation.
             let p99 = row.p99_ns.unwrap_or(u64::MAX);
+            let slot = &mut e.worst_step_p99[index];
             *slot = Some(slot.map_or(p99, |w| w.max(p99)));
         }
-        if latency[Stage::ReceiptToFold as usize].max_ns > TICK_OVER_NS {
+        if latency[Stage::ReceiptToFold as usize].samples > 0
+            && latency[Stage::ReceiptToFold as usize].max_ns > TICK_OVER_NS
+        {
             e.minutes_over_1ms = e.minutes_over_1ms.saturating_add(1);
         }
         if let Some((_, max)) = host.reader_wait {
+            e.coverage.reader_minutes = e.coverage.reader_minutes.saturating_add(1);
             e.worst_reader_wait = Some(e.worst_reader_wait.map_or(max, |w| w.max(max)));
         }
         if let Some((_, max)) = host.drain_wait {
+            e.coverage.drain_minutes = e.coverage.drain_minutes.saturating_add(1);
             e.worst_drain_wait = Some(e.worst_drain_wait.map_or(max, |w| w.max(max)));
         }
         if let Some(total) = host.disk_total_bytes_per_s() {
@@ -1111,8 +1292,26 @@ impl DayVerdict {
                 e.disk_hot_minutes = e.disk_hot_minutes.saturating_add(1);
             }
         }
-        if let Some(busy) = host.host_cpu_busy_pct {
+        if let Some(busy) = host
+            .host_cpu_busy_pct
+            .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
+        {
+            e.coverage.host_busy_minutes = e.coverage.host_busy_minutes.saturating_add(1);
             e.worst_host_busy_pct = Some(e.worst_host_busy_pct.map_or(busy, |w| w.max(busy)));
+        }
+        e.coverage.ring_refused_frames = e
+            .coverage
+            .ring_refused_frames
+            .saturating_add(host.ring_refused_frames);
+        if host.ticks_not_landed.is_some() && host.ticks_lost.is_some() {
+            e.coverage.exclusion_counter_minutes =
+                e.coverage.exclusion_counter_minutes.saturating_add(1);
+        }
+        if let Some(count) = host.ticks_not_landed {
+            e.coverage.ticks_not_landed = e.coverage.ticks_not_landed.saturating_add(count);
+        }
+        if let Some(count) = host.ticks_lost {
+            e.coverage.ticks_lost = e.coverage.ticks_lost.saturating_add(count);
         }
     }
 
@@ -1137,8 +1336,22 @@ impl DayVerdict {
             backlog: (r[4], e.backlog_at_close.0, e.backlog_at_close.1),
             worst_host_cpu_busy_pct: e.worst_host_busy_pct,
             process_start_ist_nanos: self.process_start.unwrap_or(day),
+            coverage: e.coverage,
+            disk_minutes: e.disk_minutes,
         }
     }
+}
+
+fn valid_minute(latency: &LatencyMinuteRows, host: &HostMinuteRow) -> bool {
+    let minute = host.minute_ist_nanos;
+    minute >= 0
+        && minute == crate::hot_path_latency_minute::minute_floor_ist_nanos(minute)
+        && host.sched_seconds > 0
+        && latency.iter().enumerate().all(|(index, row)| {
+            row.stage as usize == index
+                && row.minute_ist_nanos == minute
+                && row.publishes == host.sched_seconds
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,6 +1553,7 @@ pub fn append_verdict_row(buffer: &mut Buffer, r: &CapacityVerdictRow) -> Result
 
 #[cfg(test)]
 mod tests {
+    use super::coverage_tests::calendar;
     use super::*;
     use crate::hot_path_latency_minute::{LatencyMinuteRow, minute_floor_ist_nanos};
     use crate::hot_path_telemetry::ALL_STAGES;
@@ -1347,13 +1561,13 @@ mod tests {
 
     const NS: i64 = 1_000_000_000;
     /// IST midnight of some day.
-    const DAY0: i64 = 20_000 * 86_400 * NS;
+    const DAY0: i64 = 1_793_577_600 * NS; // Monday 2026-11-02, IST-shifted epoch.
 
-    fn at(day: i64, h: i64, m: i64) -> i64 {
+    pub(super) fn at(day: i64, h: i64, m: i64) -> i64 {
         DAY0 + day * 86_400 * NS + (h * 3_600 + m * 60) * NS
     }
 
-    fn latency(minute: i64, p99: u64, max: u64) -> LatencyMinuteRows {
+    pub(super) fn latency(minute: i64, p99: u64, max: u64) -> LatencyMinuteRows {
         ALL_STAGES.map(|stage| LatencyMinuteRow {
             minute_ist_nanos: minute,
             stage,
@@ -1368,7 +1582,7 @@ mod tests {
         })
     }
 
-    fn host(minute: i64, wait: u64, disk_bps: u64, busy: f64) -> HostMinuteRow {
+    pub(super) fn host(minute: i64, wait: u64, disk_bps: u64, busy: f64) -> HostMinuteRow {
         HostMinuteRow {
             minute_ist_nanos: minute,
             sched_seconds: 60,
@@ -1385,7 +1599,7 @@ mod tests {
     }
 
     /// Runs a whole session (09:15–15:30) then the 15:40 minute.
-    fn run_day(
+    pub(super) fn run_day(
         v: &mut DayVerdict,
         day: i64,
         mut each: impl FnMut(i64) -> (LatencyMinuteRows, HostMinuteRow),
@@ -1404,14 +1618,29 @@ mod tests {
         v.observe(&l, &h).or(out)
     }
 
-    fn good(m: i64) -> (LatencyMinuteRows, HostMinuteRow) {
-        (latency(m, 1_024, 900), host(m, 10_000, 10_000_000, 50.0))
+    pub(super) fn good(m: i64) -> (LatencyMinuteRows, HostMinuteRow) {
+        let mut host = host(m, 10_000, 10_000_000, 50.0);
+        host.ticks_not_landed = Some(0);
+        host.ticks_lost = Some(0);
+        (latency(m, 1_024, 900), host)
     }
 
-    fn evidence_pass() -> DayEvidence {
+    pub(super) fn evidence_pass() -> DayEvidence {
         DayEvidence {
+            coverage: DayCoverage {
+                expected_minutes: Some(375),
+                verdict_at_secs: Some(VERDICT_AT_SECS_OF_DAY_IST),
+                stage_minutes: [375; 4],
+                reader_minutes: 375,
+                drain_minutes: 375,
+                host_busy_minutes: 375,
+                exclusion_counter_minutes: 375,
+                ..DayCoverage::default()
+            },
             session_minutes: 375,
-            worst_step_p99: [Some(1_024); 4],
+            // Pure decision fixture with discriminating bounds. Current live
+            // histograms cannot emit999ns; their1024ns case is tested separately.
+            worst_step_p99: [Some(999); 4],
             minutes_over_1ms: 0,
             worst_reader_wait: Some(10_000),
             worst_drain_wait: Some(10_000),
@@ -1553,9 +1782,9 @@ mod tests {
             "empty day"
         );
         let mut e = evidence_pass();
-        e.session_minutes = MIN_SESSION_MINUTES - 1;
+        e.session_minutes = 374;
         assert_eq!(decide_verdict(&e).0, Verdict::Unknown, "partial day");
-        e.session_minutes = MIN_SESSION_MINUTES;
+        e.session_minutes = 375;
         assert_eq!(decide_verdict(&e).0, Verdict::NotNeeded, "boundary");
         let mut e = evidence_pass();
         e.disk_minutes = 0;
@@ -1600,10 +1829,10 @@ mod tests {
     }
 
     #[test]
-    fn test_day_verdict_full_good_day_is_not_needed_at_1540() {
-        let mut v = DayVerdict::new();
+    fn test_day_verdict_complete_first_bucket_remains_unknown_at_1540() {
+        let mut v = DayVerdict::with_calendar(calendar());
         let row = run_day(&mut v, 0, good).expect("verdict at 15:40");
-        assert_eq!(row.verdict, Verdict::NotNeeded);
+        assert_eq!(row.verdict, Verdict::Unknown);
         assert_eq!(row.session_minutes, 375);
         assert_eq!(row.day_ist_nanos, at(0, 0, 0));
         assert_eq!(row.tick_step.2, Some(1_024));
@@ -1614,8 +1843,8 @@ mod tests {
     }
 
     #[test]
-    fn test_day_verdict_cpu_starved_day_is_upgrade_needed() {
-        let mut v = DayVerdict::new();
+    fn test_day_verdict_cpu_failure_is_visible_with_unresolved_strict_latency() {
+        let mut v = DayVerdict::with_calendar(calendar());
         let row = run_day(&mut v, 0, |m| {
             let (l, mut h) = good(m);
             if m == at(0, 11, 0) {
@@ -1624,7 +1853,7 @@ mod tests {
             (l, h)
         })
         .expect("verdict");
-        assert_eq!(row.verdict, Verdict::UpgradeNeeded);
+        assert_eq!(row.verdict, Verdict::Unknown);
         assert_eq!(
             row.cpu_wait,
             (SignalResult::Fail, Some(10_000), Some(3_000_000))
@@ -1633,11 +1862,12 @@ mod tests {
 
     #[test]
     fn test_day_verdict_counts_slow_minutes_and_disk_hot_minutes() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let row = run_day(&mut v, 0, |m| {
             let (mut l, mut h) = good(m);
             if m < at(0, 9, 22) {
                 l[Stage::ReceiptToFold as usize].max_ns = 3_000_000;
+                l[Stage::DrainMainFrame as usize].p99_ns = Some(2_048);
                 h.disk_write_bytes_per_s = Some(DISK_HOT_BYTES_PER_S);
             }
             (l, h)
@@ -1653,7 +1883,7 @@ mod tests {
     /// skipped.
     #[test]
     fn test_day_verdict_overflowed_p99_counts_as_worst() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let row = run_day(&mut v, 0, |m| {
             let (mut l, h) = good(m);
             if m == at(0, 10, 0) {
@@ -1668,19 +1898,11 @@ mod tests {
         );
     }
 
-    /// Minutes outside 09:15–15:30 never count, and a process that saw no
-    /// session minute writes no verdict (a restart after the close cannot
-    /// overwrite the day's row).
+    /// A process first observed after close cannot overwrite the day's row.
     #[test]
     fn test_day_verdict_no_session_minutes_writes_nothing() {
-        let mut v = DayVerdict::new();
-        for m in [
-            at(0, 8, 40),
-            at(0, 9, 14),
-            at(0, 15, 30),
-            at(0, 15, 45),
-            at(0, 16, 20),
-        ] {
+        let mut v = DayVerdict::with_calendar(calendar());
+        for m in [at(0, 15, 30), at(0, 15, 45), at(0, 16, 20)] {
             let (l, h) = good(m);
             assert!(v.observe(&l, &h).is_none());
         }
@@ -1691,7 +1913,7 @@ mod tests {
     /// reasons.
     #[test]
     fn test_day_verdict_partial_day_is_unknown() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let mut out = None;
         let mut m = at(0, 13, 0);
         while m <= at(0, 15, 40) {
@@ -1710,7 +1932,7 @@ mod tests {
     /// the next day accumulates from zero.
     #[test]
     fn test_day_verdict_rollover_writes_the_previous_day() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let mut m = at(0, 9, 15);
         while m < at(0, 15, 30) {
             let (l, h) = good(m);
@@ -1727,14 +1949,14 @@ mod tests {
         // Day 1 then runs normally.
         let row = run_day(&mut v, 1, good).expect("day 1");
         assert_eq!(row.day_ist_nanos, at(1, 0, 0));
-        assert_eq!(row.verdict, Verdict::NotNeeded);
+        assert_eq!(row.verdict, Verdict::Unknown);
     }
 
     /// Clock skew: a minute from an earlier day (clock stepped back across
     /// midnight) is skipped and counted, never reopening a written day.
     #[test]
     fn test_day_verdict_clock_back_across_midnight_is_skipped() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let _ = run_day(&mut v, 1, good).expect("day 1");
         let (l, h) = good(at(0, 15, 50));
         assert!(v.observe(&l, &h).is_none());
@@ -1744,11 +1966,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_session_minute_bounds() {
-        assert!(!is_session_minute(at(0, 9, 14)));
-        assert!(is_session_minute(at(0, 9, 15)));
-        assert!(is_session_minute(at(0, 15, 29)));
-        assert!(!is_session_minute(at(0, 15, 30)));
+    fn test_session_plan_regular_minute_bounds() {
+        let plan = SessionPlan::for_day(Some(&calendar()), at(0, 0, 0));
+        assert!(!plan.contains(9 * 3600 + 14 * 60));
+        assert!(plan.contains(9 * 3600 + 15 * 60));
+        assert!(plan.contains(15 * 3600 + 29 * 60));
+        assert!(!plan.contains(15 * 3600 + 30 * 60));
         assert_eq!(minute_floor_ist_nanos(at(0, 9, 15) + 59 * NS), at(0, 9, 15));
     }
 
@@ -1961,7 +2184,11 @@ mod tests {
         assert_eq!(s.seconds, 2);
         assert_eq!(s.reader.take(), Some((40, 30)));
         assert_eq!(s.drain.take(), None);
-        assert_eq!(s.wal.take(), Some((1, 1)));
+        assert_eq!(
+            s.wal.take(),
+            None,
+            "a missing attempted WAL read invalidates the minute"
+        );
         assert_eq!(s.reader.take(), None, "take resets");
         let c = s.read_counters(5 * NS);
         assert_eq!(c.at_ist_nanos, 5 * NS);
@@ -1974,11 +2201,11 @@ mod tests {
 
     #[test]
     fn test_verdict_reasons_names_every_signal() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let row = run_day(&mut v, 0, good).expect("verdict");
         let text = verdict_reasons(&row);
         for needle in [
-            "tick-step p99 pass",
+            "tick-step p99 unknown",
             "ticks over 1 ms pass",
             "cpu wait pass",
             "disk pass",
@@ -2076,13 +2303,13 @@ mod tests {
 
     #[test]
     fn test_append_verdict_row_writes_results_and_reasons() {
-        let mut v = DayVerdict::new();
+        let mut v = DayVerdict::with_calendar(calendar());
         let row = run_day(&mut v, 0, good).expect("verdict");
         let mut buf = Buffer::new(questdb::ingress::ProtocolVersion::V1);
         append_verdict_row(&mut buf, &row).expect("append");
         let text = String::from_utf8_lossy(buf.as_bytes()).into_owned();
         assert!(
-            text.starts_with("capacity_verdict_daily,feed=dhan,verdict=NOT_NEEDED,"),
+            text.starts_with("capacity_verdict_daily,feed=dhan,verdict=UNKNOWN,"),
             "{text}"
         );
         for col in [

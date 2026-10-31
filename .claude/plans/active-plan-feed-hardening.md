@@ -7233,3 +7233,73 @@ Each step behind a config switch defaulting to today's behaviour until its live 
 
 ### Observability (Item DT)
 New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
+
+## DT-PROOF integration — recoverable writes and honest daily evidence (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed continue-all-work request, relayed by the coordinator on 2026-10-31. Integrate the four tested proposals on `0fd844582`; no live database, production setting, merge or auto-merge action.
+
+When the evidence store is unavailable, keep a bounded set of rows and retry. When the evidence is incomplete, report UNKNOWN. A healthy-looking daily row must not stand in for observations that were never made or never persisted.
+
+| Problem | Integrated behavior | Remaining boundary |
+| --- | --- | --- |
+| Sender initialization failed once | Retry initialization with the same bounded pending rows | Queue and pending caps can still discard; no durable proof spool |
+| Successful DDL response without the required keys | Verify all three real metadata contracts before enabling writes; retry with bounded backoff | Gate is a boot latch, not continuous external-schema monitoring |
+| Dedicated drain CPU wait omitted | Register the actual drain thread for its lifetime and select its scheduler sample | Shared mode uses main-worker proxy; member/interval validity remains limited |
+| Partial day or ambiguous 1,024 ns bucket looked complete | Require distinct calendar minutes and known signal evidence; legacy strict-latency ambiguity remains UNKNOWN | Source freshness and persisted-row completeness require separate readback |
+
+- [x] Integrate retrying proof writer and strict schema readiness, preserving wire names, keys and pending-row caps.
+  - Files: crates/storage/src/hot_path_latency_minute.rs, crates/storage/src/hot_path_latency_minute/proof_table_readiness.rs, crates/storage/src/hot_path_latency_minute/readiness_tests.rs, crates/app/src/hot_path_proof_boot.rs
+  - Tests: test_writer_recovers_after_initialization_failure_without_replacing_rows, test_disconnected_flush_enforces_the_pending_row_cap, test_ensure_hot_path_latency_minute_table_rejects_missing_keys_and_recovers, test_rejected_writer_start_never_spawns_an_ensure_task, test_ensure_retries_past_ten_with_a_bounded_backoff
+- [x] Integrate dedicated-drain lifecycle attribution and daily/calendar coverage without discarding either proposal's tests or the all-targets Clippy cleanup.
+  - Files: crates/storage/src/hot_thread_sched.rs, crates/storage/src/host_capacity_minute.rs, crates/storage/src/host_capacity_minute/coverage.rs, crates/storage/src/host_capacity_minute/coverage_tests.rs, crates/storage/src/hot_path_telemetry.rs, crates/storage/tests/dhat_hot_path_latency_minute.rs, crates/app/src/drain_thread.rs, crates/app/src/main.rs, crates/app/tests/drain_scheduler_registration.rs
+  - Tests: test_register_drain_thread_unwind_releases_registration, test_last_second_drain_run_delay_ns_uses_own_wait_in_host_row, test_spawn_frame_drain_with_registers_scheduler_until_normal_or_panicking_exit, test_day_verdict_missing_exclusion_counters_are_unknown, test_decide_verdict_strict_target_never_accepts_ambiguous_legacy_bucket
+- [ ] Run combined scoped tests, schema/overflow/boot guards, allocation ratchet, warnings-denied all-targets Clippy, plan/normal commit gates, and independent reviews; record actual results and remaining limits.
+  - Files: docs/runbooks/hot-path-capacity-proof.md, .claude/plans/active-plan-feed-hardening.md
+  - Validation: one Cargo job, clean local-package artifacts before reusing the shared target; detailed execution manifest saved with the integration report. No live result is inferred from local tests.
+
+The separately tested scheduler and daily-coverage proposal plans are consolidated into this item; their implementation, tests, prior negative controls and stated limits are retained. The four input patch identities and combined source hashes belong in the integration evidence packet. The 15-row and 7-row matrices in `.claude/rules/project/per-wave-guarantee-matrix.md` apply to each item above, with the following concrete scope:
+
+| Review box | Evidence or scope |
+| --- | --- |
+| Behavior and scenarios | Sender initialization/flush failure, missing/wrong keys, timeout/oversized metadata, retry/cancellation, retained-row wakeup, scheduler lifetime and replacement, partial/empty/duplicate calendar minutes |
+| Audit and uniqueness | Existing proof table layouts/DEDUP identities retained; no new audit table or schema |
+| Monitoring and logging | Existing drop/discard counters and coded errors retained; existing daily reasons identify UNKNOWN |
+| Alerting | No new metric, EMF label, alarm, page or live switch authorized in this change |
+| Tests and code checks | Combined focused/scoped app-storage tests, DHAT, source/metadata guards, Clippy, native hooks and independent review; coverage CI remains separate evidence |
+| Performance | Per-event recording unchanged; bounded minute bookkeeping and cold thread/DDL work; no sub-microsecond or exact one-second claim |
+| Security | Fixed SQL/table names, bounded response accumulation, existing endpoint/auth configuration; no new dependency or live endpoint |
+| Recovery | Bounded in-memory retries only; shutdown ownership, crash/power-loss durability and proof spooling remain open |
+| Deployment and rollback | Local integration only; revert this correction to restore previous behavior; deployment and dated live readback require their own evidence |
+
+The following matrices apply to each of the three DT-PROOF items. Demand labels are the rule's labels; they do not assert universal coverage or a live pass. Pending checks remain pending.
+
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+| --- | --- | --- | --- |
+| 100% code coverage | Existing ratcheted coverage floors; no local llvm-cov percentage asserted | PR coverage job remains separate | No floor lowered; review coverage delta in CI |
+| 100% audit coverage | Existing three proof tables and unchanged DEDUP identities | Dated metadata and row readback required; not run in production here | Schema lockstep and actual-key fixtures pass |
+| 100% testing coverage | Unit, integration, existing property suites, DHAT and schema/boot/source guards; earlier proposal negative controls retained | Scoped app/storage suite in progress | Fuzz, mutation campaign, sanitizers and live chaos are not claimed by these focused tests |
+| 100% code checks | Fmt, Clippy, banned-pattern, public-function, plan and secret gates | Native commit/push evidence and CI remain separate | Warnings denied; no guard bypass |
+| 100% code performance | Existing zero-allocation publisher/accumulator DHAT ratchet | No live latency pass inferred | Per-event recording unchanged; bounded cold/minute work |
+| 100% monitoring | Existing rows, metrics and daily reasons | Check dated rows plus local drop/discard counters | No new telemetry layer claimed or metric added |
+| 100% logging | Existing coded error paths and bounded drop-episode warning | Log success is not row persistence | Error-level metadata guard; retained existing codes |
+| 100% alerting | Existing alert configuration remains unchanged by explicit scope | No new page or alarm authorized | Missing-row observation is a manual runbook check here |
+| 100% security | Fixed SQL names, 64 KiB response cap, existing endpoint config | No production credential or endpoint action | Independent security review and secret scan required |
+| 100% security hardening | No new dependency, dynamic SQL name or external service | Deployment/IP policy unchanged | Attack-surface delta limited to bounded metadata reads |
+| 100% bugs fixing | Recovery, readiness, scheduler and coverage regressions | Missing evidence reports UNKNOWN | Three independent review roles coordinated by root |
+| 100% scenarios covering | Initialization, failed DDL, wrong metadata, oversized responses, pressure, retry and calendar gaps | Actual Monday failure/readback evidence still pending | Concrete fixture cases and previously executed negative controls retained |
+| 100% functionalities covering | New public-function tests and production call sites | Startup result distinguishes spawned from ready | Public-function test and wiring guards pass |
+| 100% code review | Prior proposal reviews plus final integrated reviews | No live result attributed to source review | Root collects all final roles before draft PR |
+| 100% extreme check | Bounded cap, timeout and recovery regression cases | No claim for every failure combination | Scoped tests and unchanged ratchets must pass |
+
+| Demand | Honest envelope | Per-item proof |
+| --- | --- | --- |
+| Zero ticks lost | Proof delivery is bounded and can discard; tick persistence path is unchanged | No new tick drop path; proof cap/drop behavior tested and disclosed |
+| WS never disconnects | No WebSocket lifetime guarantee made by this work | Subscription guards and reconnect implementation unchanged |
+| Never slow/locked/hanged | Cold HTTP is timeout-bounded; per-event allocation unchanged; OS/disk stalls remain possible | Existing DHAT ratchet and source review; no latency benchmark claim |
+| QuestDB never fails | Failed ensure/write leaves bounded pending data and retries; shutdown/crash can lose proof rows | Real metadata fixture regressions and prior owned QuestDB contract evidence |
+| O(1) latency | Fixed stage/slot bookkeeping per observation; calendar lookup is once per date on the cold telemetry path | No unbounded per-event scan or new event allocation |
+| Uniqueness + dedup | Existing proof keys retained; feed/stage/date identity validated from metadata | Exact key/type/timestamp tests and schema lockstep guards |
+| Real-time proof | Local changes improve evidence honesty; persisted/fresh dated observations still required | Monday runbook and explicit UNKNOWN for missing/ambiguous data; no live pass here |
+
+Known limits remain: a registered scheduler member can be unreadable behind another readable aggregate member; calendar minute counts do not certify exact sampling intervals; cached backlog values have no successful-poll timestamp; a daily decision accumulates before downstream persistence and cannot certify that every proof row landed; HTTP acknowledgement is not a power-loss durability guarantee. The current legacy 1,024 ns histogram cannot certify strict p99 below 1,000 ns. Strict instrumentation is separate coordinated work, not silently folded into this validation claim.
