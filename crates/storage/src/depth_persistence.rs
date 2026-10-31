@@ -359,7 +359,7 @@ pub struct DepthRow {
 
 /// A depth column name, already proven valid by the test module's name list.
 ///
-/// Every debug and test build still runs QuestDB's own check on each call,
+/// Every build with debug assertions enabled runs QuestDB's own check on each call,
 /// so a name added at a call site without being valid fails every test that
 /// writes a row; a release build skips it.
 ///
@@ -4344,9 +4344,14 @@ mod tests {
     /// The release build's unchecked names would let an invalid literal
     /// through; the debug check in `depth_col` is what stops it in tests.
     #[test]
-    #[should_panic(expected = "fails QuestDB's own name check")]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "fails QuestDB's own name check")
+    )]
     fn a_bad_depth_column_name_fails_every_debug_build() {
-        let _ = depth_col("bad,name");
+        // Release intentionally skips validation; the valid-name and byte
+        // identity tests above still pin every production literal there.
+        assert_eq!(depth_col("bad,name").as_ref(), "bad,name");
     }
 
     #[test]

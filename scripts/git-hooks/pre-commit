@@ -103,10 +103,16 @@ fi
 # ─────────────────────────────────────────────
 echo "  [4/6] Secret scan..." >&2
 if [ -x "$CLAUDE_HOOKS/secret-scanner.sh" ]; then
-  SECRET_OUT=$(timeout 30 "$CLAUDE_HOOKS/secret-scanner.sh" "$PROJECT_DIR" "$ALL_STAGED" 2>&1)
+  # Match the 2026-07-16 approved deadline in pre-commit-gate.sh: the
+  # complete staged set can exceed 30s even when clean (107 files: 38.7s).
+  # Findings and timeouts still block; no file is excluded.
+  STAGED_COUNT=$(printf '%s\n' "$ALL_STAGED" | sed '/^$/d' | wc -l | tr -d ' ')
+  SECRET_TIMEOUT=$(( ${TICKVAULT_SECRET_SCAN_TIMEOUT_SECS:-60} + STAGED_COUNT / 8 ))
+  [ "$SECRET_TIMEOUT" -lt 60 ] && SECRET_TIMEOUT=60
+  SECRET_OUT=$(timeout "$SECRET_TIMEOUT" "$CLAUDE_HOOKS/secret-scanner.sh" "$PROJECT_DIR" "$ALL_STAGED" 2>&1)
   SECRET_EXIT=$?
   if [ "$SECRET_EXIT" -eq 124 ]; then
-    echo "  FAIL: Secret scanner timed out (30s)" >&2
+    echo "  FAIL: Secret scanner timed out (${SECRET_TIMEOUT}s)" >&2
     FAILED=1
   elif [ "$SECRET_EXIT" -ne 0 ]; then
     echo "$SECRET_OUT" >&2

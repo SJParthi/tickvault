@@ -455,6 +455,9 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Plan item 4: one beat per pass; a pass stuck past three cadences
+            // reads as missed on tv_task_heartbeat_missed_total.
+            crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::SpillDiskWatcher);
             // `statvfs` on a stalled or full volume (the moment this probe
             // matters) can hang. So both probes run on the blocking pool,
             // never on a shared tokio worker (O(1) sweep, 2026-10-03). One
@@ -603,8 +606,18 @@ pub fn spawn_supervised_spill_disk_health_watcher(
     tokio::spawn(async move {
         loop {
             let handle = spawn_spill_disk_health_watcher(spill_dir.clone());
-            let join_result = handle.await;
-            let reason = classify_join_exit(&join_result);
+            // Plan item 4: also watches the heartbeat; with
+            // respawn_on_missed_beats on, a stuck task is aborted here.
+            let exit = crate::task_heartbeat::await_watched(
+                crate::task_heartbeat::WatchedTask::SpillDiskWatcher,
+                handle,
+            )
+            .await;
+            let reason = exit.reason();
+            crate::task_heartbeat::note_respawn(
+                crate::task_heartbeat::WatchedTask::SpillDiskWatcher,
+                reason,
+            );
             error!(
                 reason,
                 code = tickvault_common::error_code::ErrorCode::DiskWatcher01Respawned.code_str(),

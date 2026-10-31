@@ -670,9 +670,6 @@ fn main() -> Result<()> {
         raw.as_deref().unwrap_or("unset")
     ));
 
-    // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
-    // Named threads so `top -H` / `perf` on the box can tell a runtime worker
-    // apart from a blocking-pool thread while attributing a stall.
     // The socket readers' own runtime (2026-10-02), built BEFORE the main
     // runtime's `block_on` so dropping a losing racer can never happen inside
     // async code. `0` in the env keeps the readers on the main runtime. The
@@ -708,11 +705,7 @@ fn main() -> Result<()> {
     // every thread it spawns, inherits it. Off by default; see hot_thread_boot.
     tickvault_app::hot_thread_boot::place_drain_and_background(rt_decision);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .thread_name("tv-worker")
-        .enable_all()
-        .build()
+    let runtime = tickvault_app::hot_path_proof_boot::build_main_runtime(worker_threads)
         .context("failed to build the tokio runtime")?;
 
     let outcome = runtime.block_on(async_main());
@@ -1263,6 +1256,8 @@ async fn async_main() -> Result<()> {
     // Live proof that nothing on the live path is waiting (2026-10-02):
     // the publisher thread, plus one lateness probe per tokio runtime. AFTER
     // the recorder install, like every pre-resolved handle above.
+    // 2026-10-30: the per-minute latency proof tables, writer before publisher.
+    let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
     if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
         error!(
             code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
@@ -1271,6 +1266,8 @@ async fn async_main() -> Result<()> {
              heartbeat gauges will not publish (host thread or memory limit)"
         );
     }
+    // Plan item 4: task heartbeats + memory ladder, before the watched supervisors.
+    tickvault_app::task_watch_boot::start_task_watch(&config);
     tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
         tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
         tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
@@ -3899,6 +3896,7 @@ async fn async_main() -> Result<()> {
             depth_unsubscribe_probe: config.depth_unsubscribe_probe,
             // Plan item 49e step 3: absent section = off (market_depth rows).
             depth_storage: config.depth_storage,
+            tick_storage: config.tick_storage, // ITEM DT: absent section = library encoder
             // A second copy of the top contracts on another main-feed socket
             // (scope lock 2026-10-02). 0 turns it off.
             main_feed_backup_top_n: config.dhan_universe.backup_top_n,
@@ -4395,7 +4393,10 @@ const SEAL_ESCALATION_SHUTDOWN_BUDGET: std::time::Duration =
 /// How often the shutdown poll re-checks whether the escalation thread is done.
 const SEAL_ESCALATION_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
 
-fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
+fn spawn_seal_writer_loop(
+    questdb_config: &tickvault_common::config::QuestDbConfig,
+    tick_storage: &tickvault_common::config::TickStorageConfig,
+) {
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
 
@@ -4437,7 +4438,14 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
     // by the saturation counter below, not by another guess.
     const SEAL_MAX_DRAIN_PER_CYCLE: usize = 16_384;
 
-    match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
+    // ITEM DT: the candle rows follow the tick writer's `[tick_storage]
+    // own_ilp_encoder` switch (default off, the library encoder).
+    let encoder = if tick_storage.own_ilp_encoder {
+        tickvault_storage::tick_ilp::TickIlpEncoder::Own
+    } else {
+        tickvault_storage::tick_ilp::TickIlpEncoder::Library
+    };
+    match SealWriterRunner::new_with_encoder(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE, encoder) {
         Ok(runner) => {
             // Audit PR31b-2: keep what the previous process's crash marker
             // said before the writer loop overwrites it. Published before the
@@ -5002,7 +5010,7 @@ async fn build_shared_infra(
     tickvault_storage::wal_applied_watermark::applied_watermark().mark_probe_expected();
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
-    spawn_seal_writer_loop(&config.questdb);
+    spawn_seal_writer_loop(&config.questdb, &config.tick_storage);
 
     // --- Scoreboard IST-midnight resets (RELOCATED, stage-3 sweep) ---
     spawn_scoreboard_midnight_reset_task();

@@ -138,11 +138,10 @@ impl DrainOutcome {
 /// loop on whatever cadence is appropriate (the future tokio task in
 /// item 1.2f.4 sleeps `SEAL_DRAIN_INTERVAL` between cycles).
 ///
-/// **Cold path.** Allowed to allocate; allocates one
-/// `Vec::with_capacity(max_drain)` rescue buffer per call. Reused
-/// across calls in the future tokio loop via a writer-task struct
-/// holding the buffer; this slice's pure function takes the simpler
-/// once-per-call allocation.
+/// Allocates one rescue buffer of up to `max_drain` seals per call. The
+/// live runner calls [`drain_once_reusing`] with a buffer it keeps, so the
+/// live cycle allocates nothing here; this form is for tests and one-off
+/// callers.
 ///
 /// **No FIFO inversion on rescue.** Popped seals are NOT pushed back
 /// into the ring (which would put them at the BACK and invert
@@ -157,7 +156,35 @@ pub fn drain_once(
     max_drain: usize,
     now_unix_secs: i64,
 ) -> DrainOutcome {
+    let mut popped = Vec::new();
+    drain_once_reusing(pipeline, writer, max_drain, now_unix_secs, &mut popped)
+}
+
+/// [`drain_once`] with a caller-owned rescue buffer, cleared on entry and
+/// on return, whose capacity is kept across calls.
+///
+/// # Why (owner directive 2026-10-30: per-seal work under 1 µs, no
+/// allocation per seal)
+/// `drain_once` reserved a fresh buffer every flush: up to
+/// `max_drain` (16,384) seals of ~176 bytes, about 2.9 MB. Anything past
+/// the allocator's mmap threshold (128 KiB, ~740 seals) was a fresh
+/// mapping per flush, so every page of it faulted in on first write and
+/// was unmapped again at return. The runner keeps one buffer; after the
+/// largest batch it has seen, the live cycle allocates nothing here.
+///
+/// # Complexity
+/// O(seals popped). SPACE: the buffer keeps the capacity of the largest
+/// batch drained, at most `max_drain` seals (~2.9 MB at 16,384; growth uses
+/// `reserve_exact`, never doubling), for the life of the runner.
+pub fn drain_once_reusing(
+    pipeline: &mut SealAbsorptionPipeline,
+    writer: &mut ShadowCandleWriter,
+    max_drain: usize,
+    now_unix_secs: i64,
+    popped: &mut Vec<BufferedSeal>,
+) -> DrainOutcome {
     let mut outcome = DrainOutcome::default();
+    popped.clear();
 
     // Idle short-circuit.
     if pipeline.ring_len() == 0 || max_drain == 0 {
@@ -174,7 +201,11 @@ pub fn drain_once(
     // seals. `ring_len` is the real bound on how many `pop_oldest` can yield
     // this cycle, and the `.min` keeps the reservation exact in both
     // directions — no over-reserve when idle, no re-alloc when saturated.
-    let mut popped: Vec<BufferedSeal> = Vec::with_capacity(max_drain.min(pipeline.ring_len()));
+    // `reserve_exact` on a cleared buffer that already holds this capacity
+    // is a compare, no allocation; when it must grow it grows to exactly
+    // the request (never the doubling `reserve` would take), so the kept
+    // buffer never exceeds `max_drain` seals.
+    popped.reserve_exact(max_drain.min(pipeline.ring_len()));
     while popped.len() < max_drain {
         match pipeline.pop_oldest() {
             Some(seal) => {
@@ -238,7 +269,8 @@ pub fn drain_once(
             // Audit PR41a: an amended bar committed live while its original
             // waits in the spill. Append the fuller copy behind it, so no
             // replay ends on the original.
-            pipeline.note_live_commits(&popped, now_unix_secs);
+            pipeline.note_live_commits(popped.as_slice(), now_unix_secs);
+            popped.clear();
         }
         Err(flush_err) => {
             // Finding S3: seal-time ILP flush failure is a persist
@@ -262,7 +294,7 @@ pub fn drain_once(
                     "candle flush failed — rescuing in-flight seals to spill/DLQ"
                 );
             }
-            for seal in popped {
+            for seal in popped.drain(..) {
                 rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
             }
             // Poison-buffer recovery (2026-07-06 hostile-review fix): the
@@ -3126,6 +3158,81 @@ mod tests {
         cleanup(&spill, &dlq);
     }
 
+    #[test]
+    fn test_drain_once_reusing_keeps_its_scratch_capacity_across_cycles() {
+        // 2026-10-30 (owner: per-seal work under 1 us, no allocation per
+        // seal): the live runner keeps one rescue buffer. Each call leaves it
+        // empty, and a second batch no larger than the first reuses the same
+        // memory. The failed flush (disconnected writer) also walks the rescue
+        // branch, which now drains the buffer instead of consuming it.
+        let (spill, dlq) = temp_pair("reusing-scratch");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(16, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        let mut writer = ShadowCandleWriter::for_test();
+        let mut scratch: Vec<BufferedSeal> = Vec::new();
+        let mut first_ptr = None;
+        for (cycle, batch) in [(0_u32, 6_usize), (1, 6), (2, 3)] {
+            for i in 0..batch {
+                pipeline.submit(
+                    mk_seal(
+                        100 + i as u64,
+                        0,
+                        TfIndex::M1,
+                        1_716_023_700 + cycle * 60 + i as u32,
+                        100.0,
+                    ),
+                    now,
+                );
+            }
+            let outcome = drain_once_reusing(&mut pipeline, &mut writer, 16, now, &mut scratch);
+            assert_eq!(outcome.ring_seals_popped, batch, "cycle {cycle}");
+            assert_eq!(outcome.rescued_to_spill, batch, "cycle {cycle}");
+            assert!(scratch.is_empty(), "cycle {cycle} left seals in the buffer");
+            assert!(
+                scratch.capacity() >= 6,
+                "cycle {cycle} dropped the capacity"
+            );
+            match first_ptr {
+                None => first_ptr = Some(scratch.as_ptr()),
+                Some(ptr) => assert_eq!(ptr, scratch.as_ptr(), "cycle {cycle} reallocated"),
+            }
+        }
+        // Idle: nothing popped, buffer untouched.
+        let outcome = drain_once_reusing(&mut pipeline, &mut writer, 16, now, &mut scratch);
+        assert!(outcome.is_idle());
+        assert_eq!(Some(scratch.as_ptr()), first_ptr);
+
+        // Growth past the kept capacity is exact, never a doubling: a buffer
+        // holding 6 that then takes a full 16-seal batch keeps 16, not 32.
+        // `Vec::reserve` would take max(2 x 6, 16) = 16 here too, so the case
+        // that tells them apart is next: 9 kept, then 16 wanted.
+        let mut grown: Vec<BufferedSeal> = Vec::with_capacity(9);
+        for (cycle, batch) in [(10_u32, 16_usize), (11, 16)] {
+            for i in 0..batch {
+                pipeline.submit(
+                    mk_seal(
+                        200 + i as u64,
+                        0,
+                        TfIndex::M1,
+                        1_716_023_700 + cycle * 60 + i as u32,
+                        100.0,
+                    ),
+                    now,
+                );
+            }
+            let outcome = drain_once_reusing(&mut pipeline, &mut writer, 16, now, &mut grown);
+            assert_eq!(outcome.ring_seals_popped, batch, "cycle {cycle}");
+            assert!(
+                grown.capacity() <= 16,
+                "cycle {cycle}: the kept buffer grew to {} seals, past max_drain = 16 \
+                 (a doubling reserve gives 18 from a capacity of 9)",
+                grown.capacity()
+            );
+        }
+        cleanup(&spill, &dlq);
+    }
+
     /// Deep audit DA-14: a flush-failure rescue refused at the seal disk
     /// floor is counted as a drop AND as a floor refusal, so the cycle page
     /// can say the disk is full rather than that two writes failed.
@@ -5864,7 +5971,7 @@ mod tests {
             .find("applied_watermark().mark_probe_expected()")
             .expect("main.rs marks the watcher expected");
         let seal = main
-            .find("\n    spawn_seal_writer_loop(&config.questdb);")
+            .find("\n    spawn_seal_writer_loop(&config.questdb, &config.tick_storage);")
             .expect("main.rs spawns the seal writer");
         assert!(
             mark < seal,

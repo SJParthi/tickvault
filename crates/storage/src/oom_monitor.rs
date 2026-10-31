@@ -33,8 +33,6 @@ use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
-use crate::disk_health_watcher::classify_join_exit;
-
 /// Cadence of the OOM probe. 60s matches the disk-health watcher — an OOM kill
 /// is a rare, already-happened event, so a minute of latency to the alert is
 /// immaterial while CPU cost stays negligible.
@@ -235,6 +233,9 @@ pub fn spawn_oom_monitor(memory_events_path: PathBuf) -> tokio::task::JoinHandle
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Plan item 4: one beat per pass; a pass stuck past three cadences
+            // reads as missed on tv_task_heartbeat_missed_total.
+            crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::OomMonitor);
             // Sweep S5: the cgroup read runs off the shared worker.
             match crate::off_worker::off_worker(|| probe_oom_kill_count(&memory_events_path)) {
                 OomProbeOutcome::Ok { oom_kill_count } => match baseline {
@@ -305,8 +306,18 @@ pub fn spawn_supervised_oom_monitor(memory_events_path: PathBuf) -> tokio::task:
     tokio::spawn(async move {
         loop {
             let handle = spawn_oom_monitor(memory_events_path.clone());
-            let join_result = handle.await;
-            let reason = classify_join_exit(&join_result);
+            // Plan item 4: also watches the heartbeat; with
+            // respawn_on_missed_beats on, a stuck task is aborted here.
+            let exit = crate::task_heartbeat::await_watched(
+                crate::task_heartbeat::WatchedTask::OomMonitor,
+                handle,
+            )
+            .await;
+            let reason = exit.reason();
+            crate::task_heartbeat::note_respawn(
+                crate::task_heartbeat::WatchedTask::OomMonitor,
+                reason,
+            );
             warn!(
                 reason,
                 backoff_secs = OOM_MONITOR_RESPAWN_BACKOFF_SECS,

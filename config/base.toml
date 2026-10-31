@@ -441,6 +441,20 @@ depth_hot_hours = 4
 [raw_frame_archive]
 require_upload_before_prune = true
 
+# Plan item 4 (2026-10-30): the memory action ladder. "off" runs no memory
+# poll; "shadow" counts what it WOULD do; "act" returns free heap pages to the
+# OS and empties opt-in caches. It never drops a received frame and never
+# stops capture. Turning it on needs the owner.
+[memory_watchdog]
+mode = "off"
+
+# Plan item 4: background tasks publish heartbeats always; with this on, the
+# API token reload (the only task safe to restart) is aborted after three
+# missed heartbeats so its supervisor respawns it. Every other watched task is
+# watch-only. Off = counted only (tv_task_heartbeat_would_respawn_total).
+[task_heartbeat]
+respawn_on_missed_beats = false
+
 [websocket]
 ping_interval_secs = 10
 pong_timeout_secs = 10
@@ -762,6 +776,12 @@ socket_close_arm = false
 # the production shape.
 [depth_storage]
 array_rows = false
+
+# Plan ITEM DT (owner 2026-10-30): our own ILP encoder for tick rows.
+# OFF = the questdb-rs library writes and sends them, as before. Turning it
+# on in production is a separate owner step after a measured live day.
+[tick_storage]
+own_ilp_encoder = false
 
 # `[top_volume]` (the busiest-contract boards' spill tier) REMOVED 2026-10-22
 # (plan item 62, operator Quote 34): nothing writes `top_volume_*` any more.

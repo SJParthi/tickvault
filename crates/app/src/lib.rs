@@ -238,6 +238,9 @@ pub mod host_limits;
 /// the host-tuning systemd unit runs as root before the app (audit D6b; replaced
 /// two shell scripts and an inline `/bin/sh -c`).
 pub mod host_tuning;
+/// Boot wiring for the per-minute hot-path latency proof tables and the main
+/// runtime whose workers report their scheduling wait (2026-10-30, plan DT).
+pub mod hot_path_proof_boot;
 /// Hot-thread placement at boot: real-time priority, the drain placement and
 /// the background core (plan ITEM DT, 2026-10-30, every switch off by default).
 pub mod hot_thread_boot;
@@ -326,6 +329,9 @@ pub mod order_runtime;
 /// ADDITIVE forensic lane beside the lossy `order_audit` lane.
 pub mod order_update_events_boot;
 pub mod subsystem_memory;
+/// Plan item 4 (2026-10-30): boot wiring for the background-task heartbeats
+/// and the memory action ladder (`tv-task-watch`).
+pub mod task_watch_boot;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via
 // coordinator): `wal_reinject` module DELETED — its own PR-C2 comments

@@ -49,6 +49,73 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-30 with the combined-fault chaos tests (PR #2157): two
+    // tests that expose real defects in the evening-drain state file and
+    // fail until those are fixed (the owner decides the fix; root cause and
+    // proposed fix are in each test's ignore reason and doc comment). They
+    // are kept, not deleted, so the defects stay visible and the fix PR only
+    // has to remove these two rows. Run them with:
+    //
+    //   cargo test -p tickvault-app --test chaos_combined_evening_drain -- --ignored
+    (
+        "crates/app/tests/chaos_combined_evening_drain.rs",
+        "a_single_flipped_bit_never_lets_more_restarts_through",
+    ),
+    (
+        "crates/app/tests/chaos_combined_evening_drain.rs",
+        "a_torn_file_from_last_evening_does_not_block_tonight",
+    ),
+    // Added 2026-10-30 with plan item DT0: a wall-clock yardstick for the
+    // ring-dwell + decode part of the `receipt_to_fold` stage, quiet and with
+    // two busy threads competing for the CPUs (the r8g.large has two). It
+    // prints percentiles and gates nothing, like the harness below; the
+    // stage's behaviour is pinned by
+    // `dhan_feed_stack/receipt_to_fold_tests.rs` and
+    // `crates/storage/tests/dhat_receipt_to_fold_stage.rs`. Re-run it with:
+    //
+    //   cargo test --release -p tickvault-core --test receipt_to_fold_harness -- --ignored --nocapture
+    (
+        "crates/core/tests/receipt_to_fold_harness.rs",
+        "receipt_to_fold_cost_with_and_without_cpu_competition",
+    ),
+    // Added 2026-10-30 with plan ITEM DT-SOCK (owner: every in-memory step
+    // under 1 us at p99): wall-clock harnesses for the socket read path's
+    // in-memory work per frame (production spacing, bursts, a per-step
+    // breakdown, a live drain, the drain's recv over a backlog). They print
+    // percentiles and gate nothing, like the harness above: a wall-clock
+    // number must not become a flaky CI gate. The gate is the Criterion
+    // budget `ws_reader_frame_handle` (bench-gate); the behaviour is pinned
+    // by the ordinary tests in `frame_ring.rs` and `ws_frame_spill/receipt_anchor.rs`.
+    //
+    //   cargo test --release -p tickvault-core --test socket_read_in_memory_harness -- --ignored --nocapture --test-threads=1
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_in_memory_cost_per_frame",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_in_memory_cost_breakdown",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "socket_read_cost_with_a_live_drain_in_a_burst",
+    ),
+    (
+        "crates/core/tests/socket_read_in_memory_harness.rs",
+        "ring_recv_cost_over_a_queued_backlog",
+    ),
+    // Added 2026-10-30 with the order-path work (owner: every in-memory
+    // order-path step under 1 us at p99): a wall-clock harness that prints
+    // the per-call p50 / p99 / p99.9 / max of each step, with and without a
+    // JSON log subscriber. It gates nothing; the gates are the per-call p99
+    // gate inside `crates/app/benches/order_path.rs`, the Criterion budget
+    // `order_path` (bench-gate) and `dhat_order_path_recorder`. Run it with:
+    //
+    //   cargo test --profile bench -p tickvault-app --test order_path_p99_harness -- --ignored --nocapture --test-threads=1
+    (
+        "crates/app/tests/order_path_p99_harness.rs",
+        "order_path_per_call_latency_distribution",
+    ),
     // Added 2026-10-30 with plan item DT-S1: a wall-clock harness for the
     // hot-thread placement switches (consumer pick-up delay with a busy
     // neighbour on the hot core, three placements). It prints percentiles
@@ -131,6 +198,14 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     (
         "crates/storage/src/tick_row_identity_tests.rs",
         "tick_price_f64_matches_legacy_for_every_fast_path_f32",
+    ),
+    // Added 2026-10-30 (plan item DT-OWN-ILP): every f32 price below 2^17,
+    // both signs, through both ILP encoders, about 2.2 billion values; minutes
+    // in release, far too slow for every PR. The sampled and proptest
+    // versions run on every PR.
+    (
+        "crates/storage/src/tick_ilp_tests.rs",
+        "test_exact_cents_every_f32_price_below_2_pow_17_matches_the_library",
     ),
     // Added 2026-10-03 with sweep S1 (the drain flush no longer hands over
     // its worker): the same wall-clock shape as the harnesses below -- it
