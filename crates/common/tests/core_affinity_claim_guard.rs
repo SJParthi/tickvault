@@ -127,7 +127,7 @@ fn core_affinity_is_wired_or_absent_never_declared_but_dead() {
     let sites = call_sites(&root);
 
     assert!(
-        !(!manifests.is_empty() && sites.is_empty()),
+        manifests.is_empty() || !sites.is_empty(),
         "DEAD CPU-PINNING CLAIM: `{PINNING_CRATE}` is declared in {manifests:?} but has \
          ZERO call sites in any crate's src. This is exactly the state the repo sat in \
          from 2026-05-01 to 2026-08-10, while the operator charter advertised \

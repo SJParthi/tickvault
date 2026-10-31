@@ -899,6 +899,7 @@ fn unpinned_action_lines(files: &[(String, String)], allow: &[&str]) -> Vec<Stri
 // the GitHub token) were pinned to movable tags, so whoever could move the
 // tag could run code with those credentials.
 #[test]
+#[allow(clippy::absurd_extreme_comparisons)] // APPROVED: the ceiling is 0 today, so `len() <= CEILING` reads as `is_empty()`; it is written against the constant so the check follows the ceiling it names.
 fn test_regression_every_remote_action_is_pinned_to_a_commit_sha() {
     assert!(
         UNPINNED_ACTION_ALLOWLIST.len() <= UNPINNED_ACTION_CEILING,
@@ -1227,4 +1228,74 @@ fn r_dispatch_input_scan_bites() {
     );
     assert!(hits[0].starts_with("x.yml:12:"), "{hits:?}");
     assert!(hits[1].starts_with("x.yml:15:"), "{hits:?}");
+}
+
+/// Exercise the workflow's actual GNU sed command on an inert template.
+/// No recovery command runs: only a temporary file is rewritten. The GitHub
+/// runner is Linux, where the workflow's `sed -i` syntax is supported.
+#[cfg(target_os = "linux")]
+#[test]
+fn emergency_fs_recover_normalises_force_disk_input() {
+    let workflow = read(".github/workflows/emergency-fs-recover.yml");
+    let commands: Vec<&str> = run_script_lines(&workflow)
+        .into_iter()
+        .map(|(_, line)| line.trim())
+        .filter(|line| line.starts_with("sed -i ") && line.contains("__FORCE_DISK__"))
+        .collect();
+    assert_eq!(commands.len(), 1, "expected one FORCE_DISK substitution");
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tv-force-disk-input-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).unwrap();
+    let cases = [
+        ("$(touch force-input-executed)", "no"),
+        ("yes", "yes"),
+        ("no", "no"),
+        ("", "no"),
+        ("YES", "no"),
+        (" yes", "no"),
+        ("yes\n", "no"),
+        ("`touch force-input-executed`", "no"),
+        ("\"; touch force-input-executed; #", "no"),
+        ("yes/; printf injected; #", "no"),
+        ("yes&__FORCE_DISK__", "no"),
+        ("yes\nFORCE_DISK=yes", "no"),
+    ];
+    let mut results = Vec::new();
+    for (input, expected) in cases {
+        fs::write(
+            dir.join("recover.sh"),
+            "before\nflag=\"__FORCE_DISK__\"\nafter\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-euo", "pipefail", "-c"])
+            .arg(commands[0])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("FORCE_DISK", input)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let rewritten = fs::read_to_string(dir.join("recover.sh")).unwrap();
+        results.push((input, expected, output.status.success(), rewritten));
+    }
+    let executed = dir.join("force-input-executed").exists();
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(!executed, "FORCE_DISK input must never execute a command");
+    for (input, expected, success, rewritten) in results {
+        assert!(success, "normalization must succeed for {input:?}");
+        assert_eq!(
+            rewritten,
+            format!("before\nflag=\"{expected}\"\nafter\n"),
+            "only exact yes may enable the disk-check override: {input:?}"
+        );
+    }
 }

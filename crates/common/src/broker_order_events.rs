@@ -913,6 +913,7 @@ mod tests {
     // --- push_active seam (Session-3 order-update PUSH flag) ---
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
     fn test_push_active_channel_defaults_false_and_flips() {
         // Seeded to the default: no push feed live at boot.
         assert!(!PUSH_ACTIVE_DEFAULT);
@@ -1073,6 +1074,7 @@ mod tests {
     // --- Dhan producer builder (build_dhan_order_event_record) ---
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
     fn test_order_update_events_channel_capacity_is_bounded_nonzero() {
         assert!(ORDER_UPDATE_EVENTS_CHANNEL_CAPACITY > 0);
         assert!(

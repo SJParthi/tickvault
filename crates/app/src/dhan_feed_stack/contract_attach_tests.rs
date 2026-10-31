@@ -399,7 +399,7 @@ fn the_two_helpers_can_never_together_exceed_the_authorized_pool() {
 
 #[test]
 fn ymd_from_ist_date_refuses_a_malformed_date_rather_than_selecting_an_expired_one() {
-    assert_eq!(ymd_from_ist_date("2026-08-19"), 2026_08_19);
+    assert_eq!(ymd_from_ist_date("2026-08-19"), 20260819);
     // Every refusal returns 0, and 0 makes every expiry compare as "before
     // today" — so the fail-closed direction is "no contracts", never "an
     // expired one", whose silence looks exactly like a quiet book.

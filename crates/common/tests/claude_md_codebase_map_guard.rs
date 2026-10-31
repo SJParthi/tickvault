@@ -26,7 +26,7 @@
 #![cfg(test)]
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -85,8 +85,8 @@ fn rs_files_named_in_table_rows(claude_md: &str) -> BTreeSet<String> {
 }
 
 /// Recursively test whether a file with this exact name exists under `crates/`.
-fn exists_under_crates(root: &PathBuf, filename: &str) -> bool {
-    fn walk(dir: &PathBuf, filename: &str, depth: usize) -> bool {
+fn exists_under_crates(root: &Path, filename: &str) -> bool {
+    fn walk(dir: &Path, filename: &str, depth: usize) -> bool {
         if depth > 12 {
             return false;
         }

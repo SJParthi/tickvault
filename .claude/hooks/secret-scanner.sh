@@ -113,10 +113,8 @@ scan_secret() {
     if [ -n "$matches" ]; then
       REPORT="${REPORT}\n  [SECRET] $description in $file:"
       while IFS= read -r match; do
-        # Truncate long lines to avoid leaking the secret
-        local truncated
-        truncated=$(echo "$match" | cut -c1-80)
-        REPORT="${REPORT}\n    ${truncated}..."
+        # Report the source location only; even a short snippet can expose a key.
+        REPORT="${REPORT}\n    line ${match%%:*} (source omitted)"
         VIOLATIONS=$((VIOLATIONS + 1))
       done <<< "$matches"
     fi
