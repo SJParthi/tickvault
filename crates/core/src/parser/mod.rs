@@ -104,7 +104,10 @@ pub use depth::{
     DepthSide, DepthSplitStop, depth_level_count, depth_packet_len, parse_depth_header,
     parse_depth_packet, split_depth_frame,
 };
-pub use dispatcher::{dispatch_depth_packet, dispatch_frame, prewarm_dispatcher_counters};
+pub use dispatcher::{
+    count_packets_by_response_code, dispatch_depth_packet, dispatch_frame,
+    dispatch_frame_uncounted, prewarm_dispatcher_counters,
+};
 pub use order_update::{
     OrderUpdateParseError, build_order_update_login, is_hollow_order_update, parse_order_update,
     unreadable_order_frame_type,
