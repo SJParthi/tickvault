@@ -47,6 +47,8 @@ const TUNING_UNIT: &str = "deploy/systemd/tickvault-host-tuning.service";
 /// `tickvault host-tuning apply` subcommand (audit D6b).
 const TUNING_SCRIPT: &str = "crates/app/src/host_tuning.rs";
 const MAIN_RS: &str = "crates/app/src/main.rs";
+/// Where `main.rs` builds the runtime since 2026-10-30 (`build_main_runtime`).
+const RUNTIME_BUILDER_RS: &str = "crates/app/src/hot_path_proof_boot.rs";
 
 /// The core the NIC interrupts are concentrated on. CLAUDE.md records that this
 /// is NOT a valid pin target for the decoder — pinning it beside the softirq it
@@ -206,9 +208,13 @@ fn tokio_worker_count_is_explicit_and_matches_the_app_core_set() {
          `worker_threads = num_cpus`. That is the setting this partition exists \
          to replace — the runtime must be built explicitly."
     );
+    // The builder lives in `hot_path_proof_boot.rs` since 2026-10-30; main.rs
+    // resolves the count and passes it in, and the builder must use it.
+    let builder_rs = read(RUNTIME_BUILDER_RS);
     assert!(
         main_rs.contains("fn resolve_tokio_worker_threads(")
-            && main_rs.contains(".worker_threads("),
+            && main_rs.contains("build_main_runtime(worker_threads)")
+            && builder_rs.contains(".worker_threads(worker_threads)"),
         "main.rs must build the runtime with an EXPLICIT worker_threads count"
     );
 

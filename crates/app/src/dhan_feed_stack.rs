@@ -117,7 +117,9 @@ use tickvault_core::parser::depth::{
     DepthFeedKind, DepthLevelBuffer, DepthPayload, DepthSide, DepthSplitStop, parse_depth_packet,
     split_depth_frame,
 };
-use tickvault_core::parser::dispatcher::dispatch_frame;
+use tickvault_core::parser::dispatcher::{
+    count_packets_by_response_code, dispatch_frame, dispatch_frame_uncounted,
+};
 use tickvault_core::pipeline::tick_gap_detector::{
     DetectorConfig, LttVerdict, SilenceVerdict, TickAssessment, TickGapDetector, TickObservation,
     VolumeVerdict,
@@ -316,7 +318,9 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// Records one NEW trade's delivery delay into the window maximum.
 ///
 /// The caller passes only folded, non-repeat ticks from a live socket. O(1):
-/// a few integer operations and one uncontended `fetch_max`; no allocation.
+/// a few integer operations, one relaxed load and, only when the lag raises
+/// the maximum, one uncontended `fetch_max` ([`fetch_max_if_above`]); no
+/// allocation.
 /// A non-positive lag (the ±1 s truncation floor) adds nothing to a maximum,
 /// so it is skipped rather than stored.
 ///
@@ -347,8 +351,30 @@ fn record_ws_lag_max_into(
     if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
         && lag_ms > 0
     {
-        max_millis.fetch_max(lag_ms, Ordering::Relaxed);
+        fetch_max_if_above(max_millis, lag_ms);
         by_class.note(segment_code, lag_ms);
+    }
+}
+
+/// `cell.fetch_max(value, Relaxed)`, skipped when a plain load already shows
+/// a value at or above `value` (plan ITEM DT, 2026-10-30).
+///
+/// `fetch_max` on x86-64 is a locked compare-exchange loop even when it
+/// changes nothing, and a window maximum is almost never raised by the next
+/// sample, so the drain paid two locked operations per new trade for no
+/// change. Skipping is the same result as the `fetch_max` it replaces: the
+/// skipped operation would have stored `max(seen, value) == seen`, and the
+/// value the load saw is one the cell held at that point of its modification
+/// order. Today the reset (`swap(0)` in `publish_fold_depth`) runs on the
+/// drain's own task, so it never races the load; were it moved to another
+/// thread, a reset is ordered either before the load (the load sees the reset
+/// value and the max is taken) or after it (the sample belonged to the window
+/// that already held a larger one), exactly as with the unconditional
+/// `fetch_max`. O(1), no allocation.
+#[inline]
+pub(crate) fn fetch_max_if_above(cell: &std::sync::atomic::AtomicI64, value: i64) {
+    if value > cell.load(Ordering::Relaxed) {
+        cell.fetch_max(value, Ordering::Relaxed);
     }
 }
 
@@ -7182,9 +7208,20 @@ async fn run_frame_drain(
                         // hot-path stage, so the live p99 covers the drain's
                         // own work. One clock read and four relaxed atomics,
                         // no allocation.
+                        let frame_work_end = std::time::Instant::now();
                         tickvault_storage::hot_path_telemetry::record_stage(
                             tickvault_storage::hot_path_telemetry::Stage::DrainMainFrame,
-                            frame_work_start.elapsed(),
+                            frame_work_end.saturating_duration_since(frame_work_start),
+                        );
+                        // DT0 (2026-10-29): socket receipt -> folded, on the
+                        // same clock read; five relaxed atomics.
+                        tickvault_storage::hot_path_telemetry::record_receipt_to_fold_nanos(
+                            u64::try_from(
+                                frame_work_end
+                                    .saturating_duration_since(frame.received_at)
+                                    .as_nanos(),
+                            )
+                            .unwrap_or(u64::MAX),
                         );
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
@@ -8364,6 +8401,95 @@ fn drain_may_shed_depth(frame: &CapturedFrame) -> bool {
             .allow_drain_shed(frame.seq, WsType::LiveFeed)
 }
 
+/// Per-frame counter sums for [`drain_main_feed_frame`] (plan ITEM DT,
+/// sub-µs drain, 2026-10-30), added to the shared counters once, when the
+/// tally drops at the end of the walk (every return path).
+///
+/// `metrics` counters are atomic read-modify-writes once a recorder is
+/// installed. The drain paid two per tick packet: the response-code count
+/// inside `dispatch_frame` and the `folded` outcome. Here the code count is
+/// kept as one run of equal codes (a frame is almost always one code
+/// throughout), flushed when the code changes, so a frame costs one increment
+/// per run and one for `folded`, whatever its packet count. The totals equal
+/// the per-packet increments exactly; only when they land moves, by at most
+/// one frame.
+///
+/// O(1) per packet: one compare and one add. No allocation.
+struct FrameTally<'c> {
+    counters: &'c DrainCounters,
+    /// Packets folded or written this frame (the `folded` outcome).
+    folded: u64,
+    /// The current run of one response code.
+    run: CodeRun,
+}
+
+impl<'c> FrameTally<'c> {
+    const fn new(counters: &'c DrainCounters) -> Self {
+        Self {
+            counters,
+            folded: 0,
+            run: CodeRun::new(),
+        }
+    }
+
+    /// Counts one dispatched packet under its response code.
+    #[inline]
+    fn count_packet(&mut self, code: u8) {
+        if let Some((done, packets)) = self.run.push(code) {
+            count_packets_by_response_code(done, packets);
+        }
+    }
+}
+
+impl Drop for FrameTally<'_> {
+    fn drop(&mut self) {
+        if let Some((code, packets)) = self.run.take() {
+            count_packets_by_response_code(code, packets);
+        }
+        if self.folded > 0 {
+            self.counters.folded.increment(self.folded);
+        }
+    }
+}
+
+/// One run of equal response codes, for [`FrameTally`]. Pure, so the "every
+/// packet counted once under its own code" rule is property-tested on its
+/// own (`frame_tally_tests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodeRun {
+    /// Response code of the run; meaningful only while `len > 0`.
+    code: u8,
+    /// Packets in the run.
+    len: u64,
+}
+
+impl CodeRun {
+    const fn new() -> Self {
+        Self { code: 0, len: 0 }
+    }
+
+    /// Adds one packet of `code`. Returns the run it ended, `(code, packets)`,
+    /// when `code` differs from the current run's. O(1).
+    #[inline]
+    fn push(&mut self, code: u8) -> Option<(u8, u64)> {
+        let ended = (self.len > 0 && code != self.code).then_some((self.code, self.len));
+        if ended.is_some() {
+            self.len = 0;
+        }
+        self.code = code;
+        self.len = self.len.saturating_add(1);
+        ended
+    }
+
+    /// Ends the current run, returning it when it holds any packet. O(1).
+    #[inline]
+    fn take(&mut self) -> Option<(u8, u64)> {
+        let run = (self.len > 0).then_some((self.code, self.len));
+        self.len = 0;
+        run
+    }
+}
+
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
 /// Decode one captured WebSocket frame and fold every packet it carries.
@@ -8408,6 +8534,13 @@ pub fn drain_main_feed_frame(
     // slow consumer forward -> silent upstream tick loss. Every other
     // high-rate arm here is throttled or counter-only for exactly this reason.
     let mut disconnect_logged = false;
+    // Plan ITEM DT (sub-µs drain, 2026-10-30): the two per-packet counter
+    // increments of the tick path (`tv_packets_by_response_code` and the
+    // `folded` outcome) are summed here and added once, when the walk ends
+    // on ANY return. Each was an atomic read-modify-write per packet once a
+    // recorder is installed. Totals are unchanged; only their timing moves to
+    // the end of the frame.
+    let mut tally = FrameTally::new(c);
     // 2026-10-02: a frame the WAL REFUSED (`CapturedLiveOnly`) has no record a
     // replay could re-offer. Mark both writers BEFORE any row is appended, so
     // a busy rescue spills these rows inline rather than "deferring" them to
@@ -8483,7 +8616,13 @@ pub fn drain_main_feed_frame(
             c.main_feed_length_mismatch.increment(1);
             out.length_mismatch = out.length_mismatch.saturating_add(1);
         }
-        match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
+        // Every packet the walk dispatches has a header (each known size is at
+        // least `BINARY_HEADER_SIZE`), so this counts exactly the packets the
+        // counted `dispatch_frame` would.
+        if let Some(&code) = frame.bytes.get(offset) {
+            tally.count_packet(code);
+        }
+        match dispatch_frame_uncounted(&frame.bytes[offset..end], received_at_nanos) {
             // The SECOND copy of a packet for a contract subscribed on two
             // main-feed sockets (scope lock 2026-10-02): the first copy was
             // folded and written; this one is counted and skipped whole — no
@@ -8502,7 +8641,7 @@ pub fn drain_main_feed_frame(
             {
                 out.backup_dropped = out.backup_dropped.saturating_add(1);
             }
-            Ok(parsed @ (ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
+            Ok(ref parsed @ (ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
                 // Full mode carries 5 levels of bid/ask in EVERY tick packet.
                 // Until 2026-08-19 this arm bound them to `_` and threw them
                 // away — the lane paid 3.24x the bandwidth of Quote mode for a
@@ -8528,7 +8667,7 @@ pub fn drain_main_feed_frame(
                 // the whole universe, on instruments the dedicated feeds
                 // already cover more deeply. The tick itself is NEVER shed.
                 if let (Some(sink), ParsedFrame::TickWithDepth(t, levels)) =
-                    (ingest.inline_depth.as_mut(), &parsed)
+                    (ingest.inline_depth.as_mut(), parsed)
                 {
                     // 2026-10-02: a frame the WAL refused is never shed — see
                     // `depth_shed_verdict`. Its rows are written, and the
@@ -8645,7 +8784,7 @@ pub fn drain_main_feed_frame(
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
-                let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);
+                let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);
                 // Delivery lag, per SOCKET — see the note above the spot-price
                 // arm for why it now sits after the fold. Only packet types
                 // that carry an LTT reach this arm (OI, PrevClose and
@@ -8666,7 +8805,7 @@ pub fn drain_main_feed_frame(
                         repeat_quote: true, ..
                     } => record_ws_lag_repeat_excluded(),
                     IngestOutcome::Folded { .. } => {
-                        record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                        record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
                         // frame (`u8::MAX`) carries its replay time.
                         if frame.connection_index != u8::MAX {
@@ -8681,7 +8820,7 @@ pub fn drain_main_feed_frame(
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
-                        c.folded.increment(1);
+                        tally.folded = tally.folded.saturating_add(1);
                         out.folded = out.folded.saturating_add(1);
                     }
                     IngestOutcome::WrittenOutOfSession => {
@@ -8691,7 +8830,7 @@ pub fn drain_main_feed_frame(
                         // that no candle opened, and double-counting the same
                         // tick as a failure here would make the drain's frame
                         // mix read as though the pre-open were broken.
-                        c.folded.increment(1);
+                        tally.folded = tally.folded.saturating_add(1);
                         out.folded = out.folded.saturating_add(1);
                     }
                     IngestOutcome::SeqUnrepresentable => c.seq_unrepresentable.increment(1),
@@ -11392,6 +11531,9 @@ pub struct DhanFeedStackParams {
     /// `[depth_storage]` (plan item 49e step 3): whether depth is written as
     /// array rows into `market_depth_book`. Off by default.
     pub depth_storage: tickvault_common::config::DepthStorageConfig,
+    /// `[tick_storage]` (plan ITEM DT, owner 2026-10-30): build and send tick
+    /// rows with our own ILP encoder instead of the library. Off by default.
+    pub tick_storage: tickvault_common::config::TickStorageConfig,
     /// `[dhan_universe] backup_top_n` (scope lock 2026-10-02): near-the-money
     /// contracts given a second copy on another main-feed socket. 0 = off.
     pub main_feed_backup_top_n: usize,
@@ -17003,7 +17145,15 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         )
     };
     let mut ingest = LiveIngest::new(
-        TickWriter::new(&params.questdb, Feed::Dhan),
+        TickWriter::new_with_encoder(
+            &params.questdb,
+            Feed::Dhan,
+            if params.tick_storage.own_ilp_encoder {
+                tickvault_storage::tick_ilp::TickIlpEncoder::Own
+            } else {
+                tickvault_storage::tick_ilp::TickIlpEncoder::Library
+            },
+        ),
         capacity.max(1),
     )
     // The DETECTOR gets the authorized ceiling (and, since DT-A6 below, so
@@ -19366,7 +19516,7 @@ mod tests {
         );
         let into = body_of(prod, "fn record_ws_lag_max_into(");
         assert!(
-            into.contains("max_millis.fetch_max(lag_ms, Ordering::Relaxed);")
+            into.contains("fetch_max_if_above(max_millis, lag_ms);")
                 && into.contains("by_class.note(segment_code, lag_ms);"),
             "both maxima must take every positive lag"
         );
@@ -19713,13 +19863,13 @@ mod tests {
         let src = include_str!("dhan_feed_stack.rs");
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let fold = prod
-            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let excluded = prod
             .find("=> record_ws_lag_repeat_excluded(),")
             .expect("the drain must count repeats as excluded");
         let measured = prod
-            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
             .expect("the drain must still record real lag");
         assert!(
             fold < excluded && fold < measured,
@@ -19753,14 +19903,14 @@ mod tests {
 
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let fold = prod
-            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .find("let outcome = ingest.ingest_tick_at(tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let arm = &prod[fold..];
         let folded_arm = arm
             .find("IngestOutcome::Folded { .. } => {")
             .expect("lag must be recorded inside the accepted-trade arm");
         let measured = arm
-            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .find("record_ws_lag(frame.connection_index, tick, received_at_nanos);")
             .expect("the drain must still record real lag");
         let other = arm
             .find("_ => record_ws_lag_not_a_trade_excluded(),")
@@ -21223,6 +21373,7 @@ mod tests {
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             depth_unsubscribe_probe: Default::default(),
             depth_storage: Default::default(),
+            tick_storage: Default::default(),
             main_feed_backup_top_n: 0,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
             dhan_enabled: false,
@@ -28622,6 +28773,8 @@ mod silence_latch_tests {
 mod contract_attach_tests;
 
 #[cfg(test)]
+mod frame_tally_tests;
+#[cfg(test)]
 mod tick_quotes_route_tests;
 
 #[cfg(test)]
@@ -28629,6 +28782,8 @@ mod seed_step_tests;
 
 #[cfg(test)]
 mod drain_thread_tests;
+#[cfg(test)]
+mod receipt_to_fold_tests;
 
 #[cfg(test)]
 mod alive_connection_guard_tests {

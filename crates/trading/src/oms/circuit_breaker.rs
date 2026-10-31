@@ -12,6 +12,7 @@
 //! - Failure threshold: consecutive failures before opening
 //! - Reset timeout: time before transitioning from Open to Half-Open
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::sync::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -58,6 +59,11 @@ pub struct OrderCircuitBreaker {
     reset_timeout: Duration,
     /// Gate for Half-Open: only one probe request allowed.
     half_open_probe_sent: AtomicBool,
+    /// `tv_circuit_breaker_state`, resolved once at first use instead of a
+    /// registry lookup on every `check()` (about 80 ns with the production
+    /// recorder, measured 2026-10-30). Resolved at first USE, not at
+    /// construction, so it binds to the recorder installed at boot.
+    state_gauge: OnceLock<metrics::Gauge>,
 }
 
 impl Default for OrderCircuitBreaker {
@@ -75,6 +81,7 @@ impl OrderCircuitBreaker {
             opened_at_secs: AtomicU64::new(0),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         }
     }
 
@@ -93,6 +100,7 @@ impl OrderCircuitBreaker {
             opened_at_secs: AtomicU64::new(1),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         }
     }
 
@@ -106,11 +114,11 @@ impl OrderCircuitBreaker {
     pub fn check(&self) -> Result<(), OmsError> {
         match self.state() {
             CircuitState::Closed => {
-                metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
+                self.state_gauge().set(0.0_f64);
                 Ok(())
             }
             CircuitState::HalfOpen => {
-                metrics::gauge!("tv_circuit_breaker_state").set(2.0_f64);
+                self.state_gauge().set(2.0_f64);
                 // Only allow one probe request in HalfOpen state.
                 if self
                     .half_open_probe_sent
@@ -136,7 +144,7 @@ impl OrderCircuitBreaker {
                 }
             }
             CircuitState::Open => {
-                metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
+                self.state_gauge().set(1.0_f64);
                 warn!("circuit breaker OPEN — Dhan API temporarily unavailable");
                 Err(OmsError::CircuitBreakerOpen)
             }
@@ -151,7 +159,7 @@ impl OrderCircuitBreaker {
         }
         self.opened_at_secs.store(0, Ordering::Relaxed);
         self.half_open_probe_sent.store(false, Ordering::Relaxed);
-        metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
+        self.state_gauge().set(0.0_f64);
     }
 
     /// Records a failed API call — increments the failure counter.
@@ -172,7 +180,7 @@ impl OrderCircuitBreaker {
                 .is_ok()
             {
                 self.half_open_probe_sent.store(false, Ordering::Relaxed);
-                metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
+                self.state_gauge().set(1.0_f64);
                 // OMS-GAP-03: circuit breaker opened; critical severity.
                 error!(
                     code = tickvault_common::error_code::ErrorCode::OmsGapCircuitBreaker.code_str(),
@@ -198,13 +206,19 @@ impl OrderCircuitBreaker {
                 // off while the new window is still open. O(1), three atomics.
                 self.opened_at_secs.store(now_secs, Ordering::Release);
                 self.half_open_probe_sent.store(false, Ordering::Release);
-                metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
+                self.state_gauge().set(1.0_f64);
                 warn!(
                     failures = new_count,
                     "circuit breaker half-open probe failed — staying OPEN for another reset timeout"
                 );
             }
         }
+    }
+
+    /// The cached `tv_circuit_breaker_state` handle (same name, no labels).
+    fn state_gauge(&self) -> &metrics::Gauge {
+        self.state_gauge
+            .get_or_init(|| metrics::gauge!("tv_circuit_breaker_state"))
     }
 
     /// Returns the current circuit state.
@@ -246,7 +260,7 @@ impl OrderCircuitBreaker {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.opened_at_secs.store(0, Ordering::Relaxed);
         self.half_open_probe_sent.store(false, Ordering::Relaxed);
-        metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
+        self.state_gauge().set(0.0_f64);
         info!("circuit breaker manually reset to CLOSED");
     }
 }
@@ -439,6 +453,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(1),
             reset_timeout: Duration::from_secs(0), // Immediate transition
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         assert_eq!(cb.state(), CircuitState::HalfOpen);
@@ -464,6 +479,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(1),
             reset_timeout: Duration::from_secs(0),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         assert_eq!(cb.state(), CircuitState::HalfOpen);
@@ -494,6 +510,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(1),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         assert!(cb.check().is_ok(), "the first probe is allowed");
@@ -544,6 +561,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(now_epoch_secs()),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         // Should be Open (not enough time elapsed)
@@ -559,6 +577,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(past),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         assert_eq!(cb.state(), CircuitState::HalfOpen);
@@ -576,6 +595,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(0), // zero despite high failures
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         // Should return Closed because opened_at is 0 (defensive fallback)
@@ -590,6 +610,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(1),
             reset_timeout: Duration::from_secs(0),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         assert_eq!(cb.state(), CircuitState::HalfOpen);
@@ -623,6 +644,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(now_epoch_secs().saturating_sub(100)),
             reset_timeout: Duration::from_secs(0),
             half_open_probe_sent: AtomicBool::new(true),
+            state_gauge: OnceLock::new(),
         };
 
         // Prev count was well above threshold — this triggers the recovery info! log
@@ -644,6 +666,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(0),
             reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         cb.record_success();
@@ -664,6 +687,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(1),
             reset_timeout: Duration::from_secs(0),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         // First check: CAS succeeds (false → true)
@@ -755,6 +779,7 @@ mod tests {
             opened_at_secs: AtomicU64::new(opened_at),
             reset_timeout: Duration::from_secs(reset_secs),
             half_open_probe_sent: AtomicBool::new(false),
+            state_gauge: OnceLock::new(),
         };
 
         // elapsed_secs >= reset_timeout → HalfOpen
@@ -799,8 +824,9 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_metric() {
-        metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
-        metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
-        metrics::gauge!("tv_circuit_breaker_state").set(2.0_f64);
+        let cb = OrderCircuitBreaker::new();
+        cb.state_gauge().set(0.0_f64);
+        cb.state_gauge().set(1.0_f64);
+        cb.state_gauge().set(2.0_f64);
     }
 }

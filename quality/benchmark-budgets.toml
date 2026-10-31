@@ -117,12 +117,43 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
 feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
 candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
-tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass.
+tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass. 2026-10-30 (DT-OWN-ILP): also matches tick_row_append/own_{full,quote,tick_quotes}_row (our own encoder, `[tick_storage] own_ilp_encoder`), and the bench holds those three to this key at p99 per row. Measured 2026-10-30 on the x86 dev container (busier than the row-stage run: main's own rows read 1.17-1.36 us there): ours 0.65-0.77 us per row median, per-call p50 0.57-0.66 us, p99 0.86-1.19 us across three runs.
+
+# Order decision path in memory (2026-10-30, owner: every in-memory step under
+# 1 us, gated). crates/app/benches/order_path.rs, run with the production
+# Prometheus recorder installed. One key, substring-matches every
+# order_path/* id: OMS gates (transition, status parse, rate limiter,
+# OrderBudget, circuit breaker), correlation tracker (incl. the on-demand id
+# draw a day's 257th placement onward makes), risk engine (check, fill, mark,
+# unrealized, daily-loss), paper placement and order update. The two
+# `_with_info_log` ids run with a JSON INFO subscriber writing to a sink, so
+# the gate also covers the span formatting production pays; the PAPER TRADE
+# line itself is written by a helper thread after the order (owner
+# 2026-10-30). Medians measured 2026-10-30 on the x86 dev container:
+# 1-370 ns per step. bench-gate.sh reads the Criterion MEDIAN; the bench also
+# runs a per-call p99 gate (the house tail_gate) on the same key and exits 1
+# when any step's p99 is over it: paper placement p99 ~0.9 us, fill update
+# p99 ~0.4 us, every other step under 0.6 us. NOT measured on the prod host.
+order_path               = 1000         # <1us per step — matches order_path/*
 
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
 
+# Storage crate — the sealed-candle path (owner directive 2026-10-30: every
+# in-memory step under 1 us at p99). Matches every seal_path/* bench (crate
+# bench `seal_path`): the drain's hand-off, the writer's take into the ring,
+# the row build and the live-commit ledger probe. That bench ALSO holds each
+# step's p99 to its key (its own gate, exit 1 when over). Network flush and disk writes are
+# not in it and are never under 1 us. NOT measured on the prod host.
+seal_path                = 1000         # <1us per seal, p99 and median
+# The three ILP-append steps (seal_ilp/append_unlabelled, append_labelled,
+# pop_append) do NOT meet 1 us: one candle row through questdb-rs's Buffer API
+# measured median ~1.06 us, p99 1.8-2.4 us on the x86 dev container after the
+# 2026-10-30 fix (was median 1.95 us, p99 3.6-4.3 us). The library's own row
+# writing is ~650-850 ns with no validation at all, so 1 us needs the row
+# encoded outside that API (owner decision). This key holds the measured ceiling.
+seal_ilp                 = 2500         # <2.5us per seal row, p99 and median (NOT the 1us target)
 # Per-tick side stores (plan ITEM DT, 2026-10-30)
 tick_gap_detector        = 400          # <400ns per call (measured 2026-10-30, x86 dev container: median 42 ns hit, p99 198 ns with the clock pair) — matches tick_gap_detector/observe_hit, observe_refused_full, observe_tracked_hit, observe_tracked_miss (full at 25,000). The same value is the per-call p99 ceiling in the bench (plan ITEM DT, side stores, 2026-10-30)
 spot_price_store         = 250          # <250ns per call (measured: median 27 ns, p99 157 ns with the clock pair) — matches spot_price_store/record_* (full at 25,000) and its p99 gate (plan ITEM DT, 2026-10-30)
@@ -152,3 +183,4 @@ feed_drain_depth200_packet          = 200  # 200 levels per packet
 backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)
 candles_consume_tick_hit            = 500  # 500 ticks per hit batch (candle_fold TICKS_PER_BATCH)
 tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
+order_path_risk_record_fill_held    = 2    # 2 fills per iter (add then reduce: net lots return each iter; avg price and realized P&L drift, bounded)

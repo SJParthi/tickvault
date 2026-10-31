@@ -777,6 +777,12 @@ socket_close_arm = false
 [depth_storage]
 array_rows = false
 
+# Plan ITEM DT (owner 2026-10-30): our own ILP encoder for tick rows.
+# OFF = the questdb-rs library writes and sends them, as before. Turning it
+# on in production is a separate owner step after a measured live day.
+[tick_storage]
+own_ilp_encoder = false
+
 # `[top_volume]` (the busiest-contract boards' spill tier) REMOVED 2026-10-22
 # (plan item 62, operator Quote 34): nothing writes `top_volume_*` any more.
 

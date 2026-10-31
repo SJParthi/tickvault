@@ -35,7 +35,9 @@
 //! 65,536 frames and divided by the four ticks in a frame; above the same
 //! `feed_drain_main_feed` per-tick budget the median is held to (times
 //! `BENCH_BUDGET_MULTIPLIER`, as the median arm), the run exits 1 and the
-//! bench job fails. The check lives in `tickvault_app::drain_tail_gate`,
+//! bench job fails. With `BENCH_TAIL_GATE_DEFER=1` (set by `bench.yml`) it
+//! prints `BENCH-TAIL-GATE-FAILED` and exits 0 instead, and a later step
+//! fails the run on that line after the Criterion baseline is saved. The check lives in `tickvault_app::drain_tail_gate`,
 //! whose self-test (an over-budget sample must fail) runs first. Only under
 //! `cargo bench` (`--bench`): a test-mode run of this binary is debug code
 //! and its timings mean nothing.
@@ -502,6 +504,13 @@ fn bench_feed_drain(c: &mut Criterion) {
 
 criterion_group!(benches, bench_feed_drain);
 
+/// Set to `1` by `bench.yml`: a p99 miss then prints [`TAIL_GATE_FAILED_MARKER`]
+/// and exits 0, and a later workflow step fails the run on that line after the
+/// Criterion baseline is saved. Unset (a local `cargo bench`), a miss exits 1.
+const TAIL_GATE_DEFER_ENV: &str = "BENCH_TAIL_GATE_DEFER";
+/// The line every failed p99 gate prints (same text in `seal_path`).
+const TAIL_GATE_FAILED_MARKER: &str = "BENCH-TAIL-GATE-FAILED";
+
 /// `criterion_main!` plus the p99 gate. The gate runs only under
 /// `cargo bench` (Criterion's `--bench` flag); a test-mode run of this
 /// binary is unoptimised and its timings mean nothing.
@@ -511,7 +520,9 @@ fn main() {
     if std::env::args().any(|a| a == "--bench")
         && let Err(why) = main_feed_drain_tail_gate()
     {
-        eprintln!("feed_drain p99 gate FAILED: {why}");
-        std::process::exit(1);
+        eprintln!("{TAIL_GATE_FAILED_MARKER} feed_drain p99 gate: {why}");
+        if std::env::var(TAIL_GATE_DEFER_ENV).as_deref() != Ok("1") {
+            std::process::exit(1);
+        }
     }
 }

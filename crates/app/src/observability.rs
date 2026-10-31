@@ -255,6 +255,125 @@ const SPOT1M_SERVING_LAG_MS_BUCKETS: &[f64] = &[
     21_600_000.0, // 6 h
 ];
 
+/// How often the Prometheus exporter's upkeep (it drains every histogram)
+/// runs: the library's default, unchanged by plan item DT0.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The library's own upkeep interval once DT0 runs the timed one: a year, so
+/// its loop is effectively idle (a second upkeep once a year is harmless).
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+const LIBRARY_UPKEEP_PUSHED_OUT: std::time::Duration =
+    std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Runs the exporter's upkeep once and records how long it took as the
+/// `metrics_upkeep` hot-path stage (plan item DT0, 2026-10-29). The upkeep
+/// runs on the MAIN tokio runtime, the one the frame drain shares, so its
+/// duration is time a main-runtime worker was not available to the drain.
+pub fn time_one_metrics_upkeep(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    handle.run_upkeep();
+    let took = started.elapsed();
+    tickvault_storage::hot_path_telemetry::record_stage(
+        tickvault_storage::hot_path_telemetry::Stage::MetricsUpkeep,
+        took,
+    );
+    took
+}
+
+/// The library's upkeep loop, timed: sleep [`METRICS_UPKEEP_INTERVAL`], then
+/// one [`time_one_metrics_upkeep`], forever.
+async fn run_timed_metrics_upkeep(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    loop {
+        tokio::time::sleep(METRICS_UPKEEP_INTERVAL).await;
+        let _took = time_one_metrics_upkeep(&handle);
+    }
+}
+
+/// How often the ticks-lost tally renders this process's own `/metrics`.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const TICKS_LOST_TALLY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One tally: the sum of every `tv_ticks_lost_total` series in this
+/// process's own `/metrics`, published for the per-minute capacity row
+/// (2026-10-30). Returns the sum, or `None` when no series exists yet.
+pub fn tally_ticks_lost_once(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+) -> Option<u64> {
+    let text = handle.render();
+    let total = tickvault_storage::host_capacity_minute::prometheus_counter_sum(
+        &text,
+        "tv_ticks_lost_total",
+    );
+    if let Some(total) = total {
+        tickvault_storage::host_capacity_minute::publish_ticks_lost_total(total);
+    }
+    total
+}
+
+/// Starts the `tv-metrics-tally` thread: every [`TICKS_LOST_TALLY_INTERVAL`]
+/// one [`tally_ticks_lost_once`]. Its own OS thread, never the main runtime
+/// the frame drain shares; cold (one render every 30 s, the same work the
+/// CloudWatch agent's scrape already causes once a minute).
+fn spawn_ticks_lost_tally(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("tv-metrics-tally".to_owned())
+        .spawn(move || {
+            loop {
+                let _total = tally_ticks_lost_once(&handle);
+                // APPROVED-BLOCKING: this is the tally's own dedicated OS thread; sleeping here blocks nothing else.
+                std::thread::sleep(TICKS_LOST_TALLY_INTERVAL);
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(
+            error = %err,
+            "the ticks-lost tally thread did not start: host_capacity_minute.ticks_lost stays NULL"
+        );
+    }
+}
+
+/// `PrometheusBuilder::install`, with the upkeep loop replaced by the timed
+/// one (DT0). Same two shapes as the library: inside a tokio runtime the
+/// exporter and the upkeep are spawned on it (production: the main
+/// runtime, as before); outside one they run on a dedicated thread with its
+/// own current-thread runtime.
+fn install_with_timed_upkeep(builder: PrometheusBuilder) -> Result<()> {
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let (recorder, exporter) = {
+            let _entered = rt.enter();
+            builder.build()?
+        };
+        let handle = recorder.handle();
+        rt.spawn(exporter);
+        spawn_ticks_lost_tally(handle.clone());
+        rt.spawn(run_timed_metrics_upkeep(handle));
+        metrics::set_global_recorder(recorder)?;
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (recorder, exporter) = {
+            let _entered = runtime.enter();
+            builder.build()?
+        };
+        let handle = recorder.handle();
+        spawn_ticks_lost_tally(handle.clone());
+        std::thread::Builder::new()
+            .name("metrics-exporter-prometheus-http".to_owned())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::spawn(run_timed_metrics_upkeep(handle));
+                    exporter.await
+                })
+            })?;
+        metrics::set_global_recorder(recorder)?;
+    }
+    Ok(())
+}
+
 /// Initializes the Prometheus metrics exporter.
 ///
 /// Starts an HTTP server on `0.0.0.0:{metrics_port}` that serves `/metrics`
@@ -273,7 +392,7 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
     // Previously hard-coded to `0.0.0.0` which exposed
     // `tv_subsystem_memory_estimated_bytes` (and every other gauge) to
     // any peer in the VPC.
-    PrometheusBuilder::new()
+    let builder = PrometheusBuilder::new()
         .with_http_listener(std::net::SocketAddr::new(
             config.metrics_bind_addr,
             config.metrics_port,
@@ -299,8 +418,11 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
             SPOT1M_SERVING_LAG_MS_BUCKETS,
         )
         .context("failed to set histogram buckets for tv_spot1m_serving_lag_ms")?
-        .install()
-        .context("failed to install Prometheus metrics exporter")?;
+        // DT0 (2026-10-29): the library's own upkeep loop is pushed out to
+        // once a year; `install_with_timed_upkeep` runs the same upkeep
+        // every `METRICS_UPKEEP_INTERVAL` (the library default) and times it.
+        .upkeep_timeout(LIBRARY_UPKEEP_PUSHED_OUT);
+    install_with_timed_upkeep(builder).context("failed to install Prometheus metrics exporter")?;
 
     info!(
         bind_addr = %config.metrics_bind_addr,
@@ -1649,6 +1771,42 @@ mod tests {
         // Subsequent calls may fail because the global recorder is already set.
         // Either outcome is acceptable.
         let _ = result;
+    }
+
+    /// 2026-10-30: the tally sums every `tv_ticks_lost_total` series of the
+    /// process's own `/metrics`; with no series yet it publishes nothing.
+    #[test]
+    fn test_tally_ticks_lost_once_sums_every_series() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        assert_eq!(tally_ticks_lost_once(&handle), None);
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("tv_ticks_lost_total", "source" => "a").increment(2);
+            metrics::counter!("tv_ticks_lost_total", "source" => "b").increment(3);
+        });
+        assert_eq!(tally_ticks_lost_once(&handle), Some(5));
+        assert_eq!(
+            tickvault_storage::host_capacity_minute::ticks_lost_total(),
+            Some(5)
+        );
+        assert_eq!(
+            TICKS_LOST_TALLY_INTERVAL,
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    /// DT0 (2026-10-29): one timed upkeep records one `metrics_upkeep`
+    /// sample and returns how long it took.
+    #[test]
+    fn test_time_one_metrics_upkeep_records_the_stage() {
+        use tickvault_storage::hot_path_telemetry::{Stage, stage_snapshot};
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let before = stage_snapshot(Stage::MetricsUpkeep).count;
+        let took = time_one_metrics_upkeep(&handle);
+        assert!(took < std::time::Duration::from_secs(5));
+        assert!(stage_snapshot(Stage::MetricsUpkeep).count > before);
+        assert_eq!(METRICS_UPKEEP_INTERVAL, std::time::Duration::from_secs(5));
     }
 
     #[test]

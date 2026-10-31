@@ -238,6 +238,9 @@ pub mod host_limits;
 /// the host-tuning systemd unit runs as root before the app (audit D6b; replaced
 /// two shell scripts and an inline `/bin/sh -c`).
 pub mod host_tuning;
+/// Boot wiring for the per-minute hot-path latency proof tables and the main
+/// runtime whose workers report their scheduling wait (2026-10-30, plan DT).
+pub mod hot_path_proof_boot;
 /// Hot-thread placement at boot: real-time priority, the drain placement and
 /// the background core (plan ITEM DT, 2026-10-30, every switch off by default).
 pub mod hot_thread_boot;

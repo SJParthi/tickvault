@@ -540,6 +540,9 @@ pub fn build_reader_runtime(
                 if let Some(priority) = rt_priority {
                     apply_reader_rt_priority(priority);
                 }
+                // DT0 (2026-10-29): the worker's thread id, once, so the
+                // telemetry thread can read its scheduling wait.
+                let _slot = tickvault_storage::hot_thread_sched::register_ws_reader_thread();
             } else if pin_core.is_some() {
                 // Best effort: on failure the thread stays on the reader's
                 // core, which is the behaviour before this fix, not a fault.
@@ -547,6 +550,13 @@ pub fn build_reader_runtime(
                 if let Some(set) = unpinned_set.as_ref() {
                     let _restored = affinity::set_current_thread_mask(set);
                 }
+            }
+        });
+    } else {
+        builder.on_thread_start(|| {
+            if std::thread::current().name() == Some(WS_READER_THREAD_NAME) {
+                // DT0 (2026-10-29): see the pinned branch above.
+                let _slot = tickvault_storage::hot_thread_sched::register_ws_reader_thread();
             }
         });
     }
@@ -681,6 +691,21 @@ mod tests {
             install_reader_runtime(0, None, None).expect("zero never touches the OS"),
             ReaderRuntimeInstall::Disabled
         );
+    }
+
+    /// DT0 (2026-10-29): a reader worker registers its thread id at start,
+    /// pinned or not, so the telemetry thread can read its scheduling wait.
+    #[test]
+    fn test_build_reader_runtime_registers_the_worker_thread_id() {
+        use tickvault_storage::hot_thread_sched::{HotThread, registered_thread_id};
+        let rt = build_reader_runtime(1, None, None).expect("one thread");
+        rt.block_on(async { tokio::spawn(async {}).await.expect("task ran") });
+        if std::path::Path::new("/proc/thread-self").exists() {
+            assert!(
+                registered_thread_id(HotThread::WsReader0) > 0,
+                "the first reader worker took slot 0"
+            );
+        }
     }
 
     #[test]

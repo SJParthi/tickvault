@@ -318,9 +318,20 @@ pub mod hot_path_telemetry;
 // Live audit F2/F5/F6 (2026-10-29): the durable market-data floor. Spill
 // replay sets aside rows older than the last reset instead of posting them.
 pub mod market_data_floor;
+// Plan item DT0 (2026-10-29): per-hot-thread scheduling-wait evidence,
+// read once a second on the `tv-telemetry` thread.
+pub mod hot_thread_sched;
+// Owner 2026-10-30: per-minute host evidence (CPU wait, CPU, disk, QuestDB
+// backlog, ticks) and the daily "is the 4-core box needed" verdict.
+pub mod host_capacity_minute;
+// Owner 2026-10-30: one row per hot-path stage per minute (p50/p99/p99.9,
+// max, samples over 1,024 ns), the live proof table, written off the hot path.
+pub mod hot_path_latency_minute;
 // Moves the current tokio worker aside for one blocking step (sweep S1/S5).
 // Public since S5 so the app's cold loops share the one helper.
 pub mod off_worker;
+/// Our own ILP encoder and sender for the tick writer (plan ITEM DT).
+pub mod tick_ilp;
 pub mod tick_persistence;
 // Plan item M5 (2026-10-27, owner Quote 41): repeat quotes (no new trade) go
 // to `tick_quotes`, stamped at arrival; same tick writer and buffer.
