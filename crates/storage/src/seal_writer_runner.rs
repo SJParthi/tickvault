@@ -1161,7 +1161,25 @@ impl SealWriterRunner {
         questdb_config: &tickvault_common::config::QuestDbConfig,
         max_drain_per_cycle: usize,
     ) -> anyhow::Result<Self> {
-        let writer = ShadowCandleWriter::new(questdb_config)?;
+        Self::new_with_encoder(
+            questdb_config,
+            max_drain_per_cycle,
+            crate::tick_ilp::TickIlpEncoder::Library,
+        )
+    }
+
+    /// [`Self::new`] with the candle writer's ILP encoder chosen by
+    /// `[tick_storage] own_ilp_encoder` (default off: the library), the same
+    /// switch as the tick writer.
+    ///
+    /// # Errors
+    /// The candle writer could not be built.
+    pub fn new_with_encoder(
+        questdb_config: &tickvault_common::config::QuestDbConfig,
+        max_drain_per_cycle: usize,
+        encoder: crate::tick_ilp::TickIlpEncoder,
+    ) -> anyhow::Result<Self> {
+        let writer = ShadowCandleWriter::new_with_encoder(questdb_config, encoder)?;
         let pipeline = SealAbsorptionPipeline::new();
         let spill = pipeline.spill_handle();
         let (sender, receiver) = crossbeam_channel::bounded(SEAL_MPSC_CAPACITY);
