@@ -1404,14 +1404,22 @@ fn fire_authenticated_signal_once(
 /// typically contains `"error"` or `"errorCode"` fields. If none are found,
 /// the response is treated as a success (could be an ack or the first order update).
 ///
-/// Pure function — no I/O, no allocation on success path when response is valid.
+/// Pure function, no I/O. **Not allocation-free and not once per connect**
+/// (corrected 2026-10-30, O(1) sweep): the read loop calls it for EVERY text
+/// frame that fails the typed order-update parse (the login ack and any
+/// other non-order JSON, for the life of the connection), and each call
+/// parses the frame into a `serde_json::Value` tree, O(frame bytes) with an
+/// allocation per node; a non-JSON frame also gets a lowercase copy. The
+/// cadence is the order-update socket's non-order traffic, which is sparse
+/// (orders are 1 to 100 a day), and the frame size cap bounds the bytes, so
+/// it is recorded in CLAUDE.md's O(1) table rather than reworked.
 fn classify_auth_response(response_text: &str) -> AuthResponseKind {
     // Try to parse as JSON to inspect for error fields.
     match serde_json::from_str::<serde_json::Value>(response_text) {
         Ok(value) => classify_auth_json(&value),
         Err(_) => {
             // Non-JSON text response — check for error keywords.
-            let lower = response_text.to_lowercase(); // O(1) EXEMPT: cold auth path, runs once per connect
+            let lower = response_text.to_lowercase(); // O(1) EXEMPT: per non-order text frame, sparse; see the doc above
             if lower.contains("error") || lower.contains("unauthorized") || lower.contains("denied")
             {
                 AuthResponseKind::Failed(
