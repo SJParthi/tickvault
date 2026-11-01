@@ -545,7 +545,7 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 - [x] C1. A spilled hour is set aside by the age of its END and gets a second
   evening; an unparseable spill name no longer holds every partition's archive.
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/partition_archive.rs
-  - Tests: test_spill_file_older_than_measures_a_top_volume_spill_from_the_hour_end,
+  - Tests: test_spill_file_older_than_counts_from_the_hour_end_and_saturates,
     test_unparseable_spill_name_does_not_hold_every_partition,
     test_undated_top_volume_spill_file_is_set_aside
 
@@ -764,7 +764,7 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   every CREATE TABLE literal (dated allowlist for the two scratch tables).
   - Files: crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
   - Note (2026-10-28): the J3 lifecycle half lived in the app lifecycle writer module, DELETED by owner Quote 44 with the daily lifecycle write (PR N below); the J3 ensure-and-hold pin was replaced by the no-writer guard.
-  - Tests: ensure-wiring source guard; create_table_has_dedup guard
+  - Tests: ensure-wiring source guard; every_create_table_carries_a_dedup_key guard
 - [x] J4 (core, api) Order-update WebSocket connects with explicit bounded
   limits; the connect-config guard scans every `connect_async*` site; the error
   summary writer streams and bounds its read; the ping/pong counter uses
@@ -862,7 +862,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   `tv_hot_path_stage_p99_ns{stage}` (and p50, p999) on local `/metrics` only,
   and log one coded `warn!` per episode when a stage's p99 passes its budget;
   plus a Criterion bench reading p99 from samples for the drain stage.
-  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches/ (existing bench file for the drain)
   - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
 
 - [x] K6 (app, storage, quality) Drain p99 tail (owner, 2026-10-26: "Always
@@ -980,7 +980,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   every attempt until 09:30 (find whether any subscribed or ranked contract
   loses its underlying, fix if so); two QuestDB console Lambda log groups
   keep logs forever (set retention).
-  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform/
   - Tests: DHAT on the socket path unchanged; regression test per change
   - Done 2026-10-26: the WAL writer polls for 50 ms after its last record (1 ms sleep) before its blocking wait, so the reader no longer pays a futex wake per frame (harness: WAL hand-off max 4.0 ms -> 22 us, 0 over budget; frames reach the WAL file up to about 1 ms later); the reserved-connections gauge follows the widen; contract-map refusals are counted only for subscribed contracts (none lose their underlying); the two QuestDB console log groups get 14-day retention in terraform (not applied, not validated locally). Live confirmation waits for the next session.
 
@@ -1042,7 +1042,7 @@ Approved by: owner Quote 44 (2026-10-28), recorded in the daily-universe rule fi
   path, one bounded pass at a time with a queued rerun; the 7-day sweep deletes
   a file (and a `.json.tmp` leftover) only after a verified copy exists.
   - Files: crates/app/src/instrument_snapshot_upload.rs, crates/app/src/dhan_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
-  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_build_once_counts_the_sweep_held_files_on_the_held_counter, the_snapshot_copy_uses_the_configured_cold_bucket
+  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_sweep_artifacts_after_verified_copies_counts_the_held_files, the_snapshot_copy_uses_the_configured_cold_bucket
 - [x] N3 (app) The 31 Oct wipe keeps every object under `instrument-snapshots/`.
   - Files: (crates/app/src/wipe_2026_10_31.rs, deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b)
   - Tests: (test_classify_s3_key_keeps_every_instrument_snapshot, deleted 2026-10-29 with the tool)
