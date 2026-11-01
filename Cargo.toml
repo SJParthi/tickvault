@@ -168,7 +168,7 @@ rustls-native-certs = "=0.8.5"
 # session-keypair generation + NATS nonce signing in
 # crates/core/src/feed/groww/native/. No new supply-chain root — same crate,
 # same version the workspace already compiles.
-aws-lc-rs = "=1.18.2"
+aws-lc-rs = "=1.19.0"
 
 # ---- Section 11: AWS SDK ----
 # 2026-05-23: opt out of each crate's legacy `rustls` feature (which pulls
