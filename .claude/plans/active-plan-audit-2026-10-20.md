@@ -1551,3 +1551,73 @@ read-only and distinct from intercepted browser fixtures.
     fixture still requires the new committed-head workspace validation.
   - The 83.342-second full scan belongs to the earlier bd source observation.
     Do not relabel it as a portal timing or bypass any normal publication gate.
+
+### 2026-11-01: diagnose and repair Portal #2178's actual coverage failures
+
+The operator-authorized recovery coordinator requested this isolated successor on
+`c2032ce28eb3c6c9be2fb2bbc742c37f246373da`; recovered-portal remains unchanged.
+This item carries the existing 15-row + 7-row guarantee matrix by reference to
+`.claude/rules/project/per-wave-guarantee-matrix.md`. The composed source retains
+both independently reviewed corrections and their separately attributed evidence;
+changed-head full/lint/native/CI validation remains pending at source freeze.
+
+| Observed failure | Cause and preserved safety check |
+|---|---|
+| External Git sentinel changed in both coverage attempts | Detached fixture maintenance removed its own lock; keep every snapshot entry and the full equality assertion |
+| WAL lifetime property overflowed on attempt two | Retained bucket ids collided after clock steps; require replay protection and retain strict no-overflow inside the collision-free envelope |
+
+- [ ] Complete the Git fixture correction and changed-head validation without
+  weakening external-repository isolation or the existing child deadline.
+  - Files: crates/common/tests/pub_fn_test_guard_behavior.rs
+  - Tests: fixture_git_children_cannot_mutate_a_poison_selected_external_repository,
+    hook_child_cannot_false_pass_through_a_poison_selected_clean_index
+  - Actual Git 2.56.0 with two libtest workers reproduced the original equality
+    failure: the sentinel's empty `.git/objects/maintenance.lock` disappeared
+    between snapshots. The fixed 20-run diagnostic matrix passed 19 runs and
+    failed one; a separate matrix also caught disappearance during a read.
+  - Keep complete snapshot equality, fatal read diagnostics, all Git-selector
+    isolation and the existing ten-second child limit. Set only the synthetic
+    fixture command's `maintenance.autoDetach=false` so automatic maintenance
+    completes before snapshots. Do not exclude the changing lock file.
+  - The exact corrected common source passed all 23 predeclared runs of the
+    same 19 fixtures: Git 2.56.0/two workers for 20 runs, plus Git 2.52.0 with
+    two/four workers and Git 2.56.0 with four workers. These are 23 repeated
+    passing runs, not 437 distinct tests or a combined workspace/CI result.
+- [ ] Complete the WAL property's retained-bucket envelope correction and
+  changed-head validation with unchanged safety assertions and property bounds.
+  - Files: crates/storage/tests/wal_unapplied_ranges_properties.rs
+  - Tests: test_regression_portal_2178_in_session_overflow_seed,
+    test_regression_portal_2178_exact_ring_wrap_replays_before_and_after_persist,
+    proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame
+  - Exact input: seed 11217553172582376467, start 1, stuck false, mirror true,
+    extra false, straddle false. Retain the original 256 property cases and
+    all no-skip/no-prune assertions; no seed ignore or arbitrary bound change.
+  - The isolated diagnostic reproduced the original assertion at lifetime 12,
+    frame 0: retained id 6479807 and new id 6479935 share slot 63, exactly
+    128 buckets apart. Production intentionally fails towards replay here;
+    the production watermark implementation remains byte-identical to c203.
+  - The R envelope uses actual retained ids and newly shed frame ids, including
+    mirror and inverted records. Collision-free steps retain strict no-overflow;
+    real collisions require finite known bounds and independent database-model
+    no-skip/no-prune decisions in RAM and after persist/reload. Probes may
+    legitimately persist an existing overflow into a protected range.
+  - Preserve all six inputs, RNG draws, persist timing, 256 cases and existing
+    Z/G/B/S/O/M3 assertions. The focused wrap fixture advances both sink HWMs
+    beyond both pending marks so low watermarks cannot conceal lost protection.
+  - The exact copied WAL source passed its complete ten-test property harness.
+    Separately omitting the collision flag and bounded-range insertion each
+    failed the intended replay assertion. Both exact restorations passed the
+    focused regression again. These scoped results belong to the preserved WAL
+    candidate; identical source justifies retaining them without new mutations.
+
+Preserve run 41266407564 / job 124730630660 raw evidence. The first built-in
+attempt failed the Git sentinel test; the second failed it again and the WAL
+seed. Coverage threshold enforcement did not run. No resource-cause attribution
+or blind rerun replaces these actual assertion failures. Original failure logs,
+input packets, independent reviews and positive/control results remain retained.
+
+Think of two alarms: keep both alarms working, record what set them off, then
+check that each correction addresses its cause. The composed repair now requires
+ordinary plan/common/property guards, a normal gated commit, exact new-head
+workspace and all-target lint, then coordinated fast/native/pre-PR and CI checks.
+No merge, deployment, coverage percentage or production latency result is claimed.

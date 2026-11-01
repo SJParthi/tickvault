@@ -147,6 +147,10 @@ impl CaseDir {
                 "commit.gpgSign=false",
                 "-c",
                 "tag.gpgSign=false",
+                // Finish automatic maintenance before snapshotting this fixture.
+                // Git 2.56 otherwise removes maintenance.lock after commit returns.
+                "-c",
+                "maintenance.autoDetach=false",
             ])
             .args(args)
             .current_dir(&self.0)
@@ -557,7 +561,9 @@ fn snapshot_tree(root: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
                         .strip_prefix(root)
                         .expect("sentinel-relative path")
                         .to_path_buf(),
-                    fs::read(entry.path()).expect("owned sentinel bytes"),
+                    fs::read(entry.path()).unwrap_or_else(|error| {
+                        panic!("owned sentinel bytes {}: {error}", entry.path().display())
+                    }),
                 );
             }
         }
@@ -593,8 +599,9 @@ fn fixture_git_children_cannot_mutate_a_poison_selected_external_repository() {
         ],
         &poisoned,
     );
-    assert!(
-        snapshot_tree(&sentinel.0) == before,
+    assert_eq!(
+        snapshot_tree(&sentinel.0),
+        before,
         "external sentinel repository must remain byte-identical"
     );
     assert!(

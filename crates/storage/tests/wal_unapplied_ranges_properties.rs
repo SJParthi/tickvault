@@ -64,10 +64,13 @@
 //! * **Z** — nothing is skipped by the replay (a whole segment, or one frame)
 //!   and nothing is pruned unless every frame it drops is applied in the
 //!   model.
-//! * **R** — the bucket table never overflows: not from the backlog guard
-//!   (it writes ranges now), not from a next-day shed colliding with an
-//!   earlier day's id (the boot fold empties the table), and not from a
-//!   suspension episode across a night (the probe writes ranges now).
+//! * **R** — the bucket table does not overflow without an occupied-slot
+//!   collision. The boot fold, backlog guard and suspension probe must not
+//!   introduce one themselves. A retained id and a new shed can be exactly
+//!   one 128-bucket ring apart after clock steps and an overnight jump,
+//!   including at the first frame of a lifetime. Such a collision must fail
+//!   towards replay with a known finite height, then become a bounded range
+//!   at persist. Z is checked in RAM and after reloading the persisted files.
 //! * **G** — after a clean stop, a session with no shed and no rescue failure
 //!   reads its own segments as applied at the next boot (below the last ack
 //!   and the reorder slack), so the prune can delete them. Round 5 costs it
@@ -609,6 +612,136 @@ fn persist(wm: &AppliedWatermark, mono: &mut u64, step: u64) {
     wm.persist_at(*mono);
 }
 
+/// R's collision-free envelope comes from the actual retained bucket ids
+/// and this step's newly shed frames, not elapsed time since this boot.
+/// Distinct ids share a ring slot iff their difference is a multiple of the
+/// table length. This single-threaded step has no reset, fold or persist;
+/// `shed` records every note_unapplied (including mirror/inverted records)
+/// and every single-frame note_unapplied_range in the generator.
+fn check_live_bucket_collision(
+    before: &AppliedSnapshot,
+    after: &AppliedSnapshot,
+    new_frames: &[Frame],
+) -> Result<(), TestCaseError> {
+    let mut slots: Vec<(u64, u64)> = before
+        .buckets
+        .iter()
+        .map(|&(id, _)| id)
+        .chain(
+            new_frames
+                .iter()
+                .filter(|frame| frame.shed)
+                .map(|frame| frame.seq >> UNAPPLIED_BUCKET_SHIFT),
+        )
+        .filter(|&id| id != 0)
+        .map(|id| (id % UNAPPLIED_BUCKETS as u64, id))
+        .collect();
+    slots.sort_unstable();
+    let collision = slots
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1);
+    if !before.overflowed && !collision {
+        prop_assert!(
+            !after.overflowed,
+            "R: no in-session overflow without an occupied-slot collision"
+        );
+    } else {
+        prop_assert!(
+            after.overflowed,
+            "R: a real collision must fail towards replay"
+        );
+        prop_assert!(
+            after.overflow_high_seq > 0 && after.overflow_high_seq < u64::MAX,
+            "R: the live collision has a known finite height"
+        );
+    }
+    Ok(())
+}
+
+/// A probe adds ranges and may persist an earlier collision. It never
+/// claims a bucket. Keep that distinct from the following mark-only window.
+fn check_probe_overflow_transition(
+    world: &World,
+    before: &AppliedSnapshot,
+    after: &AppliedSnapshot,
+) -> Result<(), TestCaseError> {
+    prop_assert!(
+        !after.overflowed || before.overflowed,
+        "R: suspension probes must not introduce bucket overflow"
+    );
+    check_replay_and_prune(world, after, "after probe transitions")?;
+    if before.overflowed && !after.overflowed {
+        let on_disk =
+            AppliedSnapshot::load(&world.dir).expect("probe persisted the bounded overflow");
+        prop_assert!(
+            !on_disk.overflowed,
+            "R: probe persist retains a bounded overflow"
+        );
+        check_replay_and_prune(world, &on_disk, "after probe persist/reload")?;
+    }
+    Ok(())
+}
+
+/// Z against the independent database model, including decisions that the
+/// random replay/prune schedule does not happen to visit on this step.
+fn check_replay_and_prune(
+    world: &World,
+    snapshot: &AppliedSnapshot,
+    phase: &str,
+) -> Result<(), TestCaseError> {
+    for (i, (lo, hi)) in world.bounds().into_iter().enumerate() {
+        let pending: Vec<&Frame> = world.waiting[i]
+            .frames
+            .iter()
+            .map(|&f| &world.frames[f])
+            .filter(|frame| !frame.applied)
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        if let Some(hi) = hi
+            && hi >= lo
+        {
+            prop_assert!(
+                !both_applied(snapshot, lo, hi),
+                "Z: {phase} must not skip or prune unapplied segment [{lo}, {hi}]"
+            );
+        }
+        for frame in pending {
+            for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+                prop_assert!(
+                    !snapshot.frame_is_applied(sink, frame.seq),
+                    "Z: {phase} must replay unapplied frame {}",
+                    frame.seq
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Preserve the generator's existing persist schedule and durability lag.
+/// Both the live view and a fresh decode must still protect every pending
+/// frame when a known overflow is converted into the persistent range set.
+fn persist_with_replay_checks(
+    world: &World,
+    wm: &AppliedWatermark,
+    mono: &mut u64,
+    step: u64,
+) -> Result<(), TestCaseError> {
+    check_replay_and_prune(world, &wm.snapshot(), "before persist")?;
+    persist(wm, mono, step);
+    let after = wm.snapshot();
+    prop_assert!(
+        !after.overflowed,
+        "R: known live overflow is bounded at persist"
+    );
+    check_replay_and_prune(world, &after, "after persist")?;
+    let on_disk = AppliedSnapshot::load(&world.dir).expect("persisted watermark must decode");
+    prop_assert!(!on_disk.overflowed, "R: persisted overflow remains bounded");
+    check_replay_and_prune(world, &on_disk, "after reload")
+}
+
 /// B: right after a trim, no range lies wholly inside a stretch no waiting
 /// segment can hold, and none starts below the oldest waiting segment less
 /// the slack.
@@ -1105,6 +1238,7 @@ fn run_case_full(
         let mut crashed = false;
         let mut session_first: Option<u64> = None;
         for k in 0..frames {
+            let before_probes = wm.snapshot();
             if suspect_until.is_none() && rng.chance(30) {
                 // Round 4: a routine clean probe moves the last clean
                 // watermark (the episode's range starts from it).
@@ -1151,6 +1285,9 @@ fn run_case_full(
                 suspect_until = None;
                 note_coarsening(&wm, &mut coarsened);
             }
+            let before = wm.snapshot();
+            check_probe_overflow_transition(&world, &before_probes, &before)?;
+            let new_frame_start = world.frames.len();
             // Round 4 (A): sometimes a new segment starts just above a bucket
             // boundary, and then always gets a record below its first.
             let at_boundary = k % seg_size == 0 && rng.chance(10);
@@ -1225,9 +1362,11 @@ fn run_case_full(
                     }
                 }
             }
-            prop_assert!(!wm.snapshot().overflowed, "R: no in-session overflow");
+            let snapshot = wm.snapshot();
+            check_live_bucket_collision(&before, &snapshot, &world.frames[new_frame_start..])?;
+            check_replay_and_prune(&world, &snapshot, "live step")?;
             if rng.chance(30) {
-                persist(&wm, &mut mono, SEC * (1 + rng.below(120)));
+                persist_with_replay_checks(&world, &wm, &mut mono, SEC * (1 + rng.below(120)))?;
             }
             if rng.chance(10) {
                 prune(&mut world, &mut rng)?;
@@ -1247,8 +1386,8 @@ fn run_case_full(
         {
             let h = straddle_at_stop(&mut world, &wm, lifetime);
             last_acked = last_acked.max(h);
-            persist(&wm, &mut mono, SEC);
-            persist(&wm, &mut mono, LAG + SEC);
+            persist_with_replay_checks(&world, &wm, &mut mono, SEC)?;
+            persist_with_replay_checks(&world, &wm, &mut mono, LAG + SEC)?;
             // The in-session prune reads the durable view, where `H` is
             // vouched for and `f` is not (`segment_is_applied`'s second
             // slack keeps the older segment).
@@ -1256,14 +1395,16 @@ fn run_case_full(
             crashed = rng.chance(50);
         }
         if !crashed && suspect_until.is_some() && rng.chance(50) {
+            let before = wm.snapshot();
             end_suspicion(&wm, &mut model_healthy);
-            prop_assert!(!wm.snapshot().overflowed, "R: a night-long episode");
+            let after = wm.snapshot();
+            check_probe_overflow_transition(&world, &before, &after)?;
             note_coarsening(&wm, &mut coarsened);
         }
         if !crashed {
             // Clean stop: a persist, then one past the durability lag.
-            persist(&wm, &mut mono, SEC);
-            persist(&wm, &mut mono, LAG + SEC);
+            persist_with_replay_checks(&world, &wm, &mut mono, SEC)?;
+            persist_with_replay_checks(&world, &wm, &mut mono, LAG + SEC)?;
             check_older_binary(&world)?;
             if clean_session && last_acked > 0 {
                 check_g(&world, own_floor, session_first, last_acked)?;
@@ -1697,6 +1838,85 @@ fn check_g(
         }
     }
     Ok(())
+}
+
+/// Exact minimized input from PR #2178 Coverage & Perf run 41266407564,
+/// attempt two. Keep all six inputs and every Z/G/B/S/O/M3 assertion; R now
+/// distinguishes a real occupied-slot wrap from a spurious overflow.
+#[test]
+fn test_regression_portal_2178_in_session_overflow_seed() {
+    run_case_full(11_217_553_172_582_376_467, 1, false, true, false, false)
+        .expect("CI seed must protect every unapplied frame across a real ring wrap");
+}
+
+/// The retained id and the first shed at lifetime 12/frame 0 of the CI seed
+/// differ by exactly the table length. Advance both acks beyond the marks
+/// so neither the RAM nor durable replay assertion can pass on a low HWM.
+#[test]
+fn test_regression_portal_2178_exact_ring_wrap_replays_before_and_after_persist() {
+    let old = 6_479_807u64 << UNAPPLIED_BUCKET_SHIFT;
+    let new = 1_781_191_003_173_839_892u64;
+    let new_id = new >> UNAPPLIED_BUCKET_SHIFT;
+    assert_eq!(
+        new_id - (old >> UNAPPLIED_BUCKET_SHIFT),
+        UNAPPLIED_BUCKETS as u64
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "tv-ranges-exact-wrap-{}-{}",
+        std::process::id(),
+        next_case_dir_serial()
+    ));
+    std::fs::create_dir(&dir).expect("exclusive case dir");
+    let wm = AppliedWatermark::new();
+    wm.bind(&dir);
+    let acked = new + (1 << UNAPPLIED_BUCKET_SHIFT) + 4 * SLACK;
+    ack(&wm, acked);
+    wm.note_unapplied(old);
+    let before = wm.snapshot();
+    wm.note_unapplied(new);
+    let collision = wm.snapshot();
+    let new_frames = [Frame {
+        seq: new,
+        applied: false,
+        shed: true,
+    }];
+    let check = |snapshot: &AppliedSnapshot, phase: &str| {
+        assert!(
+            snapshot.hwm_ticks > new + 2 * SLACK,
+            "{phase}: ticks HWM is non-vacuous"
+        );
+        assert!(
+            snapshot.hwm_depth > new + 2 * SLACK,
+            "{phase}: depth HWM is non-vacuous"
+        );
+        for seq in [old, new] {
+            for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+                assert!(
+                    !snapshot.frame_is_applied(sink, seq),
+                    "{phase}: exact-wrap unapplied frame must replay ({seq})"
+                );
+            }
+            assert!(
+                !both_applied(snapshot, seq, seq),
+                "{phase}: exact-wrap unapplied segment must not be pruned ({seq})"
+            );
+        }
+    };
+    check(&collision, "before persist");
+    check_live_bucket_collision(&before, &collision, &new_frames).expect("exact ring collision");
+    let mut mono = 1;
+    persist(&wm, &mut mono, SEC);
+    let bounded = wm.snapshot();
+    assert!(
+        !bounded.overflowed,
+        "known collision becomes a bounded range"
+    );
+    check(&bounded, "after persist");
+    persist(&wm, &mut mono, LAG + SEC);
+    let reloaded = AppliedSnapshot::load(&dir).expect("persisted exact-wrap watermark");
+    assert!(!reloaded.overflowed, "reload must retain the finite range");
+    check(&reloaded, "after reload");
+    std::fs::remove_dir_all(&dir).expect("remove owned exact-wrap fixture");
 }
 
 proptest! {
