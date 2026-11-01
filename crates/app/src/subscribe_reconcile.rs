@@ -1180,10 +1180,6 @@ where
 /// Always reports back to the book, which clears the socket's in-flight flag
 /// and refunds each untouched matching current-day reservation. A rebind or
 /// forgotten/recreated entry does not inherit a previous reservation refund.
-pub async fn execute_round(book: &SubscribeReconcile, round: PlannedRound) -> RoundOutcome {
-    execute_round_with_clock(book, round, &mut execution_clock).await
-}
-
 async fn execute_round_with_clock<C>(
     book: &SubscribeReconcile,
     round: PlannedRound,
