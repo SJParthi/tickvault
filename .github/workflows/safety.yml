@@ -108,7 +108,7 @@ jobs:
           prefix-key: safety-${{ env.NIGHTLY_VERSION }}
 
       - name: Install cargo-careful
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # cargo-careful
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # cargo-careful
         with:
           tool: cargo-careful
 
