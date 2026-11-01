@@ -7233,3 +7233,98 @@ Each step behind a config switch defaulting to today's behaviour until its live 
 
 ### Observability (Item DT)
 New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
+
+
+## ITEM 51-RECOVERY — full paused2164 source recovery on green2158 (2026-10-31)
+
+The user renewed the paused-work continuation; the coordinator assigned recovery of original57de60ae7 onto green0fd844 plus the reviewed record correction c0229b4b. Original refs and checked-item history are preserved. The assigned build slot has now produced the scoped local results recorded below. No old or sibling test result is inherited, no production request/activation/deployment is performed, and the five-active-plan cap is unchanged. Full workspace, remaining repository and native publication gates are still pending.
+
+### Design
+Replay the original seven Rust paths as deltas, retaining current main's newer code, and reconcile the seven documentation/plan paths separately. Preserve the existing `config.feeds.dhan_enabled` spawn gate, configuration defaults, vendor endpoint/pacing, archive hold ceiling and ungated disk-pressure path. The original51g adds past-day verification before15:41 when its bounded worst case fits; it is an explicit behavior expansion under the preserved Oct30 policy history, not restoration of the retired per-minute feeds. The new record integrity flag, strict read/write domain and corrupt-history preservation feed the actual coverage refusal. A separate historical-readiness correction must keep unknown/pending evidence from writing an archive-release marker.
+
+### Edge Cases
+Private fixture collisions, exact25,000/cap+1, duplicates and invalid IDs/seconds; legacy records without completeness, write failure and restart; calendar weekends/holidays, past-day age/marker/refusal filtering, backward wall-clock steps, stale worker state and duplicate pages. The original fixed09:15–15:40 comparison window and regular trading calendar remain; no Muhurat comparison or whole-session interval guarantee is introduced.
+
+### Failure Modes
+An incomplete persisted record stays unknown across successful reloads; a failure before persisting uncertainty can leave an older complete record after restart, and folder sync is best-effort. First-noted targets do not prove subsequent delivery. Historical readiness cannot be inferred from date alone; without an actual finality oracle, its marker must remain withheld. The existing bounded archive hold and disk-pressure exceptions remain explicit. The supervisor must recheck its actual deadline even after exhausting bounded re-sleeps. The worker and supervisor share one cold-path claim through paged-marker read, report and write; successful persistence suppresses a concurrent duplicate in this process. A failed marker write still permits a later page. The claim is not a cross-process transaction or bounded disk wait.
+
+### Test Plan
+Observed 2026-10-31 on candidate a2d8528b after byte-identical restoration: 120 comparator, 123 boot/readiness/paging, 21 day-record and 36 storage tests passed (300 unique, zero failures or ignores). Eleven independent controls each selected one test and failed its intended assertion with Cargo exit101: early supervisor clock, omitted historical marker veto, date-only historical readiness, removed page claim, replacement of corrupt history, omitted overflow persistence, missing legacy completeness treated as known, omitted writer input validation, removed cardinality check, removed duplicate check and ignored downstream knownness. Every control restored the fixed source; all four final positive suites passed afterward. Rust 1.95, offline/locked, one Cargo job and one test thread. Formatting passed. The initial plan verifier refused eight inherited stale references; the same reference-only corrections already reviewed in published2170 are applied here, without importing its separate security scope. Pending: remaining affected struct consumers and separately stacked coverage fixtures, repository guards, all-target Clippy, full workspace and native publication gates. Source/local fixture results do not establish live readiness, delivery or durability.
+
+### Rollback
+Revert only later-authorized focused commits. Original2164, green2158, green2170 and frozen ba44 audit remainder stay intact. No data repair, deletion, remote rollback or infrastructure change is part of this preparation.
+
+### Observability
+Retain only the four originally authorized reasons on the existing `xverify_failed` source; no new alarm, page family, filter, metric name, dimension or cadence is introduced. Ordinary absence of a proven historical oracle is not a fabricated final/applied observation. Live metrics/log publication and notification delivery remain unvalidated.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +7-row), applied as for ITEM45; the scoped tests above are current local evidence; full workspace, native/CI and live operational cells remain pending for this recovery.
+
+- [x] XVR-R1: reconcile original51e–51g and preserve retired-feed/default boundaries.
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_universe.rs, crates/storage/src/dhan_live_crossverify_persistence.rs
+  - Tests: test_past_days_to_check_last_chance_first, test_worker_step_table, coverage_columns_self_heal_reach_the_wire_and_stay_out_of_dedup
+- [x] XVR-R2: retain reviewed record-integrity fixes and isolated meaningful regressions.
+  - Files: crates/app/src/xverify_day_record.rs
+  - Tests: test_an_unreadable_record_is_retained_and_refused, test_coverage_known_stays_false_after_overflow_and_restart, test_legacy_record_without_completeness_stays_unknown_after_retry, test_invalid_recording_input_preserves_the_valid_prior_file, test_read_record_independently_refuses_distinct_over_cap_and_in_cap_duplicate
+- [x] XVR-R3: close early-supervisor and historical-readiness false-assurance paths within the documented boundaries.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs
+  - Tests: test_supervisor_never_pages_before_deadline_after_clock_steps, test_historical_unknown_readiness_cannot_release_a_fully_covered_archive, test_final_failure_page_claim_serializes_worker_and_supervisor, test_final_failure_page_claim_retries_after_marker_write_failure
+- [ ] XVR-R4: remaining exact-candidate repository/Clippy/full-workspace validation and native publication gates; independent source review and scoped tests above are complete.
+
+
+#### Full-workspace capacity inventory correction (2026-10-31)
+
+The normal full run on committed `5dac3fe1` stopped after 6,518 passes, one failure and six ignores. An unchanged-head `--no-fail-fast` diagnostic then completed 459 harnesses with 15,485 passes, one failure and 33 ignores, exit 101. Both failed only `every_literal_25000_usize_const_in_src_is_listed`: the existing day-record capacity was absent from the normal capacity inventory. These are preserved failed runs, not a full-workspace pass.
+
+`DAY_RECORD_MAX_INSTRUMENTS` is now registered in `crates/common/tests/per_entity_ceiling_lockstep_guard.rs` alongside the other main-feed capacity bounds; its deliberate list-count assertion moves from 16 to 17. No production cap, matcher, EXEMPT entry or existing assertion is weakened. Independent source review verified the original capacity meaning and exact guard-only delta. All five guard tests passed; temporarily changing only the local source cap to 25,001 made the actual equality guard fail its intended assertion (one selected test, exit 101). The source was restored byte-for-byte and all five tests passed again. This is one separate static guard control, not an additional runtime test or ten unique positive tests.
+
+The seven production Rust paths remain unchanged from the tested recovery. Final corrected-head full workspace, Clippy, native publication and exact-head CI remain pending; no live result, delivery or durability claim follows from these checks. The existing per-wave matrix and all earlier failure/coverage/calendar limits continue to apply.
+
+#### Public-function guard cost correction (2026-10-31)
+
+Committed `bd435277` subsequently passed the full workspace (15,486 passed, zero failed, 33 existing ignores), all-target Clippy and all 11 actual Loom cases. The genuine fast gate passed. The normal native push then failed because the required public-function test guard exceeded its unchanged 120-second deadline; no remote update or draft followed. Native hard audit/deny/Loom passed, and genuine fast-state dedup skipped heavy stages 1–5, which have the separate actual results above. That failed publication remains recorded.
+
+The independently reviewed shared scanner correction caches the existing test-file inventory once per current crate and replaces two per-declaration text-extraction subprocesses with equivalent Bash operations. It preserves function-name matching, duplicate counts, exemptions, baseline/report rules, staged behavior and the existing deadline. It introduces no cross-run cache or quality-state claim. Fourteen isolated Rust fixtures cover the retained matching/baseline behavior and poison-selected Git environments; two sanitizer-removal controls and the repeated-inventory control failed their intended assertions before exact restoration. The asserting helper is named `assert_outcome` so the existing assertion-free guard recognizes its real assertions; all fourteen tests and both canonical ratchet cases then passed, with its 145 ceiling unchanged.
+
+One bounded full scan on the earlier proposal tree completed in 83.342 seconds; its test-name corpus differs from `bd435277`, so neither its 310-versus-311 count nor that diagnostic time is an exact-head native gate result. The final two-file source is shared with the separately reviewed feed/strict continuations. Production application Rust remains unchanged. This composition and its new commit still require integrated fixtures, normal commit/full/Clippy/native gates and exact-head CI. The legacy name heuristic and stable-source assumption remain; no meaningful-coverage or live-performance guarantee is inferred.
+
+- Files: .claude/hooks/pub-fn-test-guard.sh, crates/common/tests/pub_fn_test_guard_behavior.rs
+- Tests: inventory_is_evaluated_once_per_crate_including_empty_inventories, fixture_git_children_cannot_mutate_a_poison_selected_external_repository, hook_child_cannot_false_pass_through_a_poison_selected_clean_index
+
+
+### 2026-10-31: shared public-function fixture deadline correction
+
+The scanner composition on `b37be277` passed 76 focused checks and normal
+commit gates. Its full-workspace attempt was stopped during compilation,
+before any test harness ran, after an actual sibling full run rejected the
+fixture's external timeout executable under the unchanged spawn allowlist.
+That interrupted attempt and the earlier `bd435277` native 120-second scanner
+failure remain separate; neither is a successful successor full run.
+
+The fixture now invokes visible Git/Bash commands and applies the existing
+ten-second bound in Rust while draining both output pipes concurrently.
+Per-stream overflow is an explicit error, not a truncated verdict. Cleanup
+attempts termination and direct-child reaping while preserving the original
+failure. Reaping depends on OS scheduling; arbitrary descendants are not
+terminated as a process group. Existing Git containment and all fourteen
+original test assertions remain; five new cases exercise deadlines, pipe
+backpressure, overflow and exit-status preservation. The production hook,
+allowlists, baseline, native deadlines and dependency graph are unchanged.
+
+Independent source review is complete within that direct-child scope.
+Actual corrected-source tests/controls and common guards remain pending,
+followed by a normal commit and exact-head workspace, Clippy, model and
+native/pre-PR validation. Earlier component passes are not substituted for
+those final checks. No publication, deployment or live result is claimed.
+
+Precommit validation follow-up: source `6aa7eddc` passed the complete common
+crate run with 1,805 passed, zero failures and one existing ignore across
+90 harnesses (offline/locked, one job and one test thread, 223.521 seconds
+including compilation). The actual browser spawn guard and all nineteen
+fixture cases passed. Separately, the helper author compiled deadline-removal
+and capture-cap-removal controls; each selected one test and failed its
+intended assertion with exit101, without an outer timeout. Restoring exact
+fixture `f55abd54` then passed all nineteen cases. These component results
+are independently hash-checked and remain attributed to their own sources.
+Only this evidence note changes after the common run; all Rust and hook
+bytes remain identical. Final committed-head workspace/Clippy/model/native
+checks are still pending, and the original failures remain preserved.

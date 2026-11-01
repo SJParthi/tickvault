@@ -287,3 +287,45 @@ is not checked and still reads as a judged missing minute. The `measured`
 runs counter counts an attempt that kept only Dhan's record and retried. The
 SQL and the `ls` line are Assumed: they were not run against the live box when
 written.
+
+## §6. 2026-10-30 — targets at fire, coverage, catch-up and supervisor (plan ITEMs 51e, 51f, 51g)
+
+Rule: `no-rest-except-live-feed-2026-06-27.md` §12.15.13 to §12.15.15; page
+approval: `dhan-rest-only-noise-lock-2026-07-14.md` §2.5, 2026-10-30 note.
+No new alarm, filter or EMF name: the four new `reason` values page through the
+existing `xverify_failed` filter, once per IST day.
+
+| Source / reason / column | Level | Means | Operator action |
+|---|---|---|---|
+| `source = "xverify_failed"`, `reason = "coverage_short"` | ERROR (pages, once a day) | the comparison ran and its rows landed, but some target was first subscribed after the session opened, so part of its day was never captured; the day is not recorded and its S3 archive is held to the ceiling | read the day record (below) for the late instruments; check why the widen or a restart came late |
+| same, `reason = "coverage_unknown"` | ERROR (pages, once a day) | the day's subscribe record was absent or unreadable, so the boot set was checked and coverage cannot be told, or a widen to today's list had not finished when the check fired (a `xverify_widen_unfinished` warn precedes it) | check `data/instrument-cache/` (disk space, permissions); a box that never booted that day has no record |
+| same, `reason = "fallback_universe"` | ERROR (pages, once a day) | the day ran only on the four index ids because the day list never reached the feed; the four were compared, the day is not recorded | look at the `live-universe-fallback` alarm and the daily instrument rider first; this is its second page |
+| same, `reason = "worker_never_reported"` | ERROR (pages, once a day) | at 16:24 IST nothing reported today: no record, no paged day, no report from the worker | read the app log for the cross-verification task after 15:41; a hung QuestDB read or disk is the usual cause |
+| `source = "xverify_day_record_write_failed"` | WARN | a held set (the boot set or a widened list) could not be saved to the day record; it is retried every minute until the close, and until one retry lands today's check reads coverage unknown (pages `coverage_unknown` once) | check disk space and permissions on `data/instrument-cache/` |
+| `source = "xverify_day_record_unreadable"` | WARN | the day's record exists but cannot be trusted (unreadable, over 4 MiB/25,000 entries, another day's, unparseable, duplicate or invalid entry); the boot set is checked and the day reads `coverage_unknown` | retain the original and diagnose it; a later boot refuses it rather than replacing prior history. Any repair must recover verified complete history, not delete the evidence to manufacture known coverage |
+| `source = "xverify_refused_marker_write_failed"` | WARN | a terminal refusal could not save its note; the past-day catch-up may check the day again and refuse it again (no second page) | check disk space and permissions on `data/state/daily/` |
+| `source = "xverify_widen_unfinished"` | WARN | the check fired while a widen to today's list was still running, so which instruments were on the wire is not known; coverage reads unknown and the day pages `coverage_unknown` | see why the widen did not finish (the `truncated_to_capacity` page, or a widen still waiting for room) |
+| `planned_instrument_minutes`, `covered_instrument_minutes` (LONG), `coverage_known` (BOOLEAN) | `dhan_live_crossverify_daily` | targets × 385 session minutes; first-noted target eligibility minutes, summed; whether the day record's coverage metadata is complete and trusted | `covered < planned` or `coverage_known = false` explains a `partial` day and a held archive; neither value proves continuous delivery |
+
+```sql
+-- How much of the session the day's check covered, newest attempt first.
+SELECT trading_date_ist, outcome, planned_instrument_minutes,
+       covered_instrument_minutes, coverage_known, attempt_at
+FROM dhan_live_crossverify_daily
+WHERE trading_date_ist IN '2026-10-30'
+ORDER BY attempt_at DESC;
+```
+
+The day record itself: `data/instrument-cache/main-feed-spot-<YYYY-MM-DD>.json`
+(one entry per instrument: `security_id`, `segment` byte, `first_secs_of_day` IST;
+plus `master_listed` and `index_fallback`). A past day is checked at the next
+boot within 3 days if it has no day marker and no refused marker
+(`data/state/daily/dhan_live_crossverify_refused-<date>.marker`).
+
+### 2026-10-31 recovery limits
+
+The record now includes `coverage_complete`; legacy files without it remain unknown. Successfully saved overflow remains incomplete across reloads. Failed writes before that state lands can still leave an older complete file after restart, and directory sync is best-effort. These columns describe the record's first-noted target eligibility, not continuous subscriptions, delivered ticks or complete capture.
+
+Historical readiness is no longer inferred from an older date (§12.15.16). No date-specific replay/finality oracle is wired, so historical reads report unknown/not applied and cannot write the archive-release marker even when their comparison and persistence otherwise succeed. Existing retry/final-failure handling is used, with no new reason or page family. The existing hold ceiling and disk-pressure exceptions remain; a hold is not indefinite. Existing markers are not removed or recertified. These are source changes awaiting exact-candidate tests and deployment; no live outcome is implied.
+
+The worker and supervisor serialize their paged-marker read, report and write within this process. A successful marker write suppresses a concurrent duplicate. Failure to save the marker still warns and permits a later page, so duplicate notifications remain possible after persistence failure, marker loss or separate processes. This correction adds no alarm, metric or suppression state and does not make disk I/O bounded. Authored concurrency/write-failure regressions still require execution.
