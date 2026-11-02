@@ -16,6 +16,9 @@
 //!     built with inline depth in array-row mode, the production shape
 //!     (`[depth_storage] array_rows` on). Budget per tick, the same
 //!     `feed_drain_main_feed` key (added 2026-10-29, plan ITEM DT step 0).
+//!   - `feed_drain/main_feed_frame_4_full_own`: identical Full bytes and
+//!     depth path through the existing Own tick encoder. The original Full
+//!     case remains Library; the production default remains unchanged.
 //!   - `feed_drain/depth20_frame_4x20`: one frame stacking four depth-20
 //!     packets (80 levels). Budget per level.
 //!   - `feed_drain/depth200_packet`: one depth-200 packet (200 levels).
@@ -31,13 +34,17 @@
 //!
 //! # The p99 gate (plan item K6, 2026-10-26)
 //!
-//! After Criterion, the main-feed drain's per-frame p99 is measured over
+//! After Criterion, Quote and both Full encoders have per-frame p99 measured over
 //! 65,536 frames and divided by the four ticks in a frame; above the same
 //! `feed_drain_main_feed` per-tick budget the median is held to (times
 //! `BENCH_BUDGET_MULTIPLIER`, as the median arm), the run exits 1 and the
-//! bench job fails. With `BENCH_TAIL_GATE_DEFER=1` (set by `bench.yml`) it
+//! bench job fails. Divided values are amortized frame cost, not tick p99. Full
+//! also reports the separate unscaled strict <1000 ns/frame diagnostic; that
+//! diagnostic does not replace or control the existing amortized gate. With
+//! `BENCH_TAIL_GATE_DEFER=1` (set by `bench.yml`) it
 //! prints `BENCH-TAIL-GATE-FAILED` and exits 0 instead, and a later step
-//! fails the run on that line after the Criterion baseline is saved. The check lives in `tickvault_app::drain_tail_gate`,
+//! fails the run on that line after the Criterion baseline is saved. The
+//! amortized check lives in `tickvault_app::drain_tail_gate`,
 //! whose self-test (an over-budget sample must fail) runs first. Only under
 //! `cargo bench` (`--bench`): a test-mode run of this binary is debug code
 //! and its timings mean nothing.
@@ -53,35 +60,20 @@ use tickvault_app::dhan_feed_stack::{
     DepthIngest, DrainCounters, LiveIngest, counters, drain_depth_frame, drain_main_feed_frame,
 };
 use tickvault_app::drain_tail_gate;
-use tickvault_common::constants::{
-    DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DEPTH_LEVEL_OFFSET_ASK_ORDERS,
-    DEPTH_LEVEL_OFFSET_ASK_PRICE, DEPTH_LEVEL_OFFSET_ASK_QTY, DEPTH_LEVEL_OFFSET_BID_ORDERS,
-    DEPTH_LEVEL_OFFSET_BID_PRICE, DEPTH_LEVEL_OFFSET_BID_QTY, FULL_OFFSET_CLOSE,
-    FULL_OFFSET_DEPTH_START, FULL_OFFSET_HIGH, FULL_OFFSET_LOW, FULL_OFFSET_OI,
-    FULL_OFFSET_OI_DAY_HIGH, FULL_OFFSET_OI_DAY_LOW, FULL_OFFSET_OPEN, FULL_QUOTE_PACKET_SIZE,
-    MARKET_DEPTH_LEVEL_SIZE, MARKET_DEPTH_LEVELS, QUOTE_OFFSET_ATP, QUOTE_OFFSET_LTP,
-    QUOTE_OFFSET_LTQ, QUOTE_OFFSET_LTT, QUOTE_OFFSET_TOTAL_BUY_QTY, QUOTE_OFFSET_TOTAL_SELL_QTY,
-    QUOTE_OFFSET_VOLUME, RESPONSE_CODE_FULL,
-};
+use tickvault_common::constants::{DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID};
 use tickvault_common::feed::Feed;
 use tickvault_core::parser::depth::DepthFeedKind;
 use tickvault_core::websocket::pool_budget::DhanEndpointType;
 use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+use tickvault_storage::tick_ilp::TickIlpEncoder;
 use tickvault_storage::tick_persistence::TickWriter;
 
-/// Distinct pre-built frames, in time order. One ingest drains the pool once
-/// from the start and is then rebuilt with the timer stopped, so every
-/// ingest sees rising exchange times and cumulative volumes (cycling one
-/// pool through one ingest would replay older trades and time the late-tick
-/// path instead).
-const FRAME_POOL: u64 = 1_024;
-
-/// An exchange time inside a trading session (epoch seconds, IST wall time
-/// as Dhan sends it), the same instant `dhat_live_ingest_seam.rs` uses.
-const SESSION_EPOCH_SECS: u32 = 1_786_800_000;
-
-/// A receipt instant inside the same session (UTC nanos): 13:20:00 IST.
-const SESSION_RECEIPT_NANOS: i64 = (SESSION_EPOCH_SECS as i64 - 19_800) * 1_000_000_000;
+#[path = "support/full_frame_fixture.rs"]
+mod full_frame_fixture;
+use full_frame_fixture::{
+    FRAME_POOL, FrameTailSummary, SESSION_EPOCH_SECS, SESSION_RECEIPT_NANOS, TICKS_PER_MAIN_FRAME,
+    assert_full_frames_fold, full_feed_frame, full_ingest, sample_full_frames,
+};
 
 /// A receipt instant the depth drain's own unit tests use.
 const DEPTH_RECEIPT_NANOS: i64 = 1_779_355_000_000_000_000;
@@ -201,122 +193,6 @@ fn main_feed_frame(n: u64) -> CapturedFrame {
     captured(bytes, DhanEndpointType::MainFeed, 1_000 + n)
 }
 
-/// One 162-byte Full packet in the wire layout `parser/full_packet.rs` reads,
-/// with every field set to a non-zero value. Prices move with `n` so no
-/// conversion is fed the same bits on consecutive frames; volume and the
-/// trade time rise like `quote_packet`'s.
-fn full_packet(security_id: u32, n: u64, ltt: u32, volume: u32) -> Vec<u8> {
-    fn put_f32(b: &mut [u8], at: usize, v: f32) {
-        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    fn put_u32(b: &mut [u8], at: usize, v: u32) {
-        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    fn put_u16(b: &mut [u8], at: usize, v: u16) {
-        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
-    }
-    let mut buf = vec![0u8; FULL_QUOTE_PACKET_SIZE];
-    buf[0] = RESPONSE_CODE_FULL;
-    put_u16(
-        &mut buf,
-        1,
-        u16::try_from(FULL_QUOTE_PACKET_SIZE).unwrap_or(u16::MAX),
-    );
-    buf[3] = 2; // NSE_FNO, the segment live option ticks carry
-    buf[4..8].copy_from_slice(&security_id.to_le_bytes());
-    let step = (n % 97) as f32 * 0.05;
-    let ltp = 245.35_f32 + step;
-    put_f32(&mut buf, QUOTE_OFFSET_LTP, ltp);
-    put_u16(&mut buf, QUOTE_OFFSET_LTQ, 75);
-    put_u32(&mut buf, QUOTE_OFFSET_LTT, ltt);
-    put_f32(&mut buf, QUOTE_OFFSET_ATP, ltp - 1.15);
-    put_u32(&mut buf, QUOTE_OFFSET_VOLUME, volume);
-    put_u32(&mut buf, QUOTE_OFFSET_TOTAL_SELL_QTY, 123_450 + volume);
-    put_u32(&mut buf, QUOTE_OFFSET_TOTAL_BUY_QTY, 98_760 + volume);
-    put_u32(&mut buf, FULL_OFFSET_OI, 1_500_000);
-    put_u32(&mut buf, FULL_OFFSET_OI_DAY_HIGH, 1_600_000);
-    put_u32(&mut buf, FULL_OFFSET_OI_DAY_LOW, 1_400_000);
-    put_f32(&mut buf, FULL_OFFSET_OPEN, 240.10 + step);
-    put_f32(&mut buf, FULL_OFFSET_CLOSE, 238.95);
-    put_f32(&mut buf, FULL_OFFSET_HIGH, 251.80 + step);
-    put_f32(&mut buf, FULL_OFFSET_LOW, 236.25 + step);
-    for level in 0..MARKET_DEPTH_LEVELS {
-        let base = FULL_OFFSET_DEPTH_START + level * MARKET_DEPTH_LEVEL_SIZE;
-        let k = u16::try_from(level).unwrap_or(0);
-        let tick = level as f32 * 0.05;
-        put_u32(
-            &mut buf,
-            base + DEPTH_LEVEL_OFFSET_BID_QTY,
-            75 * (u32::from(k) + 1),
-        );
-        put_u32(
-            &mut buf,
-            base + DEPTH_LEVEL_OFFSET_ASK_QTY,
-            150 * (u32::from(k) + 1),
-        );
-        put_u16(&mut buf, base + DEPTH_LEVEL_OFFSET_BID_ORDERS, 2 * k + 1);
-        put_u16(&mut buf, base + DEPTH_LEVEL_OFFSET_ASK_ORDERS, 3 * k + 1);
-        put_f32(
-            &mut buf,
-            base + DEPTH_LEVEL_OFFSET_BID_PRICE,
-            ltp - 0.05 - tick,
-        );
-        put_f32(
-            &mut buf,
-            base + DEPTH_LEVEL_OFFSET_ASK_PRICE,
-            ltp + 0.05 + tick,
-        );
-    }
-    buf
-}
-
-fn full_feed_frame(n: u64) -> CapturedFrame {
-    let mut bytes = Vec::with_capacity(4 * FULL_QUOTE_PACKET_SIZE);
-    for i in 0..4u32 {
-        bytes.extend_from_slice(&full_packet(
-            50_001 + i,
-            n,
-            // Same rising, never-ahead trade time as `main_feed_frame`.
-            SESSION_EPOCH_SECS - 300 + (n / 4) as u32,
-            2 + n as u32,
-        ));
-    }
-    captured(bytes, DhanEndpointType::MainFeed, 1_000 + n)
-}
-
-/// The Full bench's ingest: inline depth in array-row mode (`since` = 1 ns,
-/// so every frame takes the book path), as production boots it.
-fn full_ingest() -> LiveIngest {
-    LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
-        .with_inline_depth(DepthIngest::for_test_book(1))
-}
-
-/// Non-vacuity check for the Full bench, outside any timing: every packet
-/// of one pool must fold and store all ten depth levels, or the bench would
-/// time a refusal path while reading like the production one.
-fn assert_full_frames_fold(frames: &[CapturedFrame], drain_counters: &'static DrainCounters) {
-    let mut ingest = full_ingest();
-    let (mut folded, mut levels) = (0u64, 0u64);
-    for (i, frame) in (0u64..).zip(frames) {
-        let out = drain_main_feed_frame(
-            &mut ingest,
-            frame,
-            SESSION_RECEIPT_NANOS,
-            1_000 + i,
-            drain_counters,
-        );
-        folded += out.folded;
-        levels += out.inline_depth_rows;
-    }
-    let packets = TICKS_PER_MAIN_FRAME * frames.len() as u64;
-    assert_eq!(folded, packets, "every Full packet must fold");
-    assert_eq!(
-        levels,
-        packets * MARKET_DEPTH_LEVELS as u64 * 2,
-        "every Full packet must store its ten depth levels"
-    );
-}
-
 /// One depth packet: 12-byte header, then `rows` 16-byte levels.
 fn depth_packet(security_id: u32, feed_code: u8, rows: u32, depth200: bool, n: u64) -> Vec<u8> {
     let levels = rows as usize;
@@ -390,13 +266,10 @@ fn run_timed<I>(
     total
 }
 
-/// How many per-frame samples the percentile report below collects. One
-/// ingest drains the frame pool repeatedly; the pool is rebuilt with the
-/// ingest, as `run_timed` does, so the samples are all steady-state drains.
+/// Per-frame samples collected for each workload. A fresh ingest consumes
+/// each 1,024-frame pool in order, as `run_timed` does. Construction is outside
+/// the timer; initial state/cache/page touches inside a drain remain measured.
 const PERCENTILE_SAMPLES: usize = 64 * FRAME_POOL as usize;
-
-/// Ticks in one `main_feed_frame` (four stacked Quote packets).
-const TICKS_PER_MAIN_FRAME: u64 = 4;
 
 /// Measures the main-feed drain per frame and returns the samples sorted
 /// (plan item K5, 2026-10-26; gated since K6).
@@ -405,7 +278,8 @@ const TICKS_PER_MAIN_FRAME: u64 = 4;
 /// says nothing about the tail: a drain that is 2 µs almost always and
 /// 2 ms once in a hundred frames passes it. This reads the tail directly —
 /// one `Instant` pair per frame, into a `Vec` sized before the loop, sorted
-/// after it, so nothing allocates between the two clock reads.
+/// after it. Sample bookkeeping does not allocate between the clock reads;
+/// allocation inside the drain requires separate DHAT evidence.
 ///
 /// **What it is not:** the clock pair costs tens of nanoseconds per frame
 /// and is inside each sample, so these figures read slightly high; and this
@@ -450,7 +324,7 @@ fn main_feed_drain_samples(
 }
 
 /// The p99 gate (plan item K6). `Err` fails the bench run.
-fn main_feed_drain_tail_gate() -> Result<(), String> {
+fn main_feed_budget() -> Result<(u64, f64), String> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../quality/benchmark-budgets.toml"
@@ -472,6 +346,11 @@ fn main_feed_drain_tail_gate() -> Result<(), String> {
             drain_tail_gate::MAX_BUDGET_MULTIPLIER
         )
     })?;
+    Ok((budget, multiplier))
+}
+
+fn main_feed_drain_tail_gate() -> Result<(), String> {
+    let (budget, multiplier) = main_feed_budget()?;
     // A gate that can not fail proves nothing: check it fails first.
     drain_tail_gate::self_test(budget, TICKS_PER_MAIN_FRAME)?;
 
@@ -481,7 +360,7 @@ fn main_feed_drain_tail_gate() -> Result<(), String> {
     let verdict = drain_tail_gate::tail_verdict(&samples, TICKS_PER_MAIN_FRAME, budget, multiplier)
         .ok_or_else(|| "no samples".to_string())?;
     println!(
-        "feed_drain p99 gate: p99 = {} ns per frame = {:.0} ns per tick, ceiling {:.0} ns \
+        "feed_drain p99 gate: p99 = {} ns per frame; amortized {:.0} ns/tick (not tick p99), ceiling {:.0} ns \
          per tick (budget {budget} x {multiplier}): {}",
         verdict.p99_ns_per_frame,
         verdict.p99_ns_per_tick,
@@ -492,9 +371,77 @@ fn main_feed_drain_tail_gate() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "main-feed drain p99 {:.0} ns per tick is over the {:.0} ns ceiling",
+            "main-feed drain amortized frame cost {:.0} ns/tick (frame p99 / 4; not tick p99) is over the {:.0} ns ceiling",
             verdict.p99_ns_per_tick, verdict.ceiling_ns_per_tick
         ))
+    }
+}
+
+/// Full frame tails for both existing encoders on identical input bytes.
+/// The legacy budget still gates amortized frame cost; strict frame p99 is
+/// reported separately in its actual unit and never scaled by the CI factor.
+fn full_feed_drain_tail_gates() -> Result<(), String> {
+    let (budget, multiplier) = main_feed_budget()?;
+    drain_tail_gate::self_test(budget, TICKS_PER_MAIN_FRAME)?;
+    let frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(full_feed_frame).collect();
+    let mut failures = Vec::with_capacity(2);
+    let drain_counters = counters();
+    for (label, encoder) in [
+        ("library", TickIlpEncoder::Library),
+        ("own", TickIlpEncoder::Own),
+    ] {
+        let mut samples =
+            sample_full_frames(&frames, encoder, PERCENTILE_SAMPLES, |ingest, frame, i| {
+                let start = Instant::now();
+                let outcome = black_box(drain_main_feed_frame(
+                    ingest,
+                    black_box(frame),
+                    SESSION_RECEIPT_NANOS,
+                    1_000 + i,
+                    drain_counters,
+                ));
+                let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                (outcome, elapsed)
+            })?;
+        let summary = FrameTailSummary::from_samples(&mut samples)
+            .ok_or_else(|| "no Full-frame tail samples".to_string())?;
+        println!(
+            "feed_drain Full {label}: {} complete FRAME calls; p50={} ns/frame, p99={} ns/frame, \
+             p99.9={} ns/frame, max={} ns/frame; unscaled strict p99 <1000 ns/frame: {} \
+             (one Instant pair per frame; no individual-tick tail measurement)",
+            summary.samples,
+            summary.p50_ns,
+            summary.p99_ns,
+            summary.p999_ns,
+            summary.max_ns,
+            if summary.p99_below_one_microsecond() {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+        );
+        let verdict =
+            drain_tail_gate::tail_verdict(&samples, TICKS_PER_MAIN_FRAME, budget, multiplier)
+                .ok_or_else(|| "no Full-frame amortized verdict".to_string())?;
+        println!(
+            "feed_drain Full {label} legacy amortized-cost gate: frame p99 / {} = {:.3} ns/tick \
+             (not tick p99), ceiling {:.3} ns/tick (budget {budget} x {multiplier}): {}",
+            TICKS_PER_MAIN_FRAME,
+            verdict.p99_ns_per_tick,
+            verdict.ceiling_ns_per_tick,
+            if verdict.within { "PASS" } else { "FAIL" },
+        );
+        if !verdict.within {
+            failures.push(format!(
+                "Full {label} amortized frame cost {:.3} ns/tick exceeds {:.3}",
+                verdict.p99_ns_per_tick, verdict.ceiling_ns_per_tick
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -518,18 +465,43 @@ fn bench_feed_drain(c: &mut Criterion) {
     });
 
     let full_frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(full_feed_frame).collect();
-    assert_full_frames_fold(&full_frames, drain_counters);
+    assert_full_frames_fold(&full_frames, TickIlpEncoder::Library, drain_counters);
     c.bench_function("feed_drain/main_feed_frame_4_full", |b| {
         b.iter_custom(|iters| {
-            run_timed(iters, &full_frames, full_ingest, |ingest, frame, i| {
-                black_box(drain_main_feed_frame(
-                    ingest,
-                    black_box(frame),
-                    SESSION_RECEIPT_NANOS,
-                    1_000 + i,
-                    drain_counters,
-                ));
-            })
+            run_timed(
+                iters,
+                &full_frames,
+                || full_ingest(TickIlpEncoder::Library),
+                |ingest, frame, i| {
+                    black_box(drain_main_feed_frame(
+                        ingest,
+                        black_box(frame),
+                        SESSION_RECEIPT_NANOS,
+                        1_000 + i,
+                        drain_counters,
+                    ));
+                },
+            )
+        });
+    });
+
+    assert_full_frames_fold(&full_frames, TickIlpEncoder::Own, drain_counters);
+    c.bench_function("feed_drain/main_feed_frame_4_full_own", |b| {
+        b.iter_custom(|iters| {
+            run_timed(
+                iters,
+                &full_frames,
+                || full_ingest(TickIlpEncoder::Own),
+                |ingest, frame, i| {
+                    black_box(drain_main_feed_frame(
+                        ingest,
+                        black_box(frame),
+                        SESSION_RECEIPT_NANOS,
+                        1_000 + i,
+                        drain_counters,
+                    ));
+                },
+            )
         });
     });
 
@@ -589,11 +561,18 @@ const TAIL_GATE_FAILED_MARKER: &str = "BENCH-TAIL-GATE-FAILED";
 fn main() {
     benches();
     Criterion::default().configure_from_args().final_summary();
-    if std::env::args().any(|a| a == "--bench")
-        && let Err(why) = main_feed_drain_tail_gate()
-    {
-        eprintln!("{TAIL_GATE_FAILED_MARKER} feed_drain p99 gate: {why}");
-        if std::env::var(TAIL_GATE_DEFER_ENV).as_deref() != Ok("1") {
+    if std::env::args().any(|a| a == "--bench") {
+        // Evaluate both before deciding exit, so a Quote failure cannot hide
+        // either Full encoder's measurement. Existing defer behavior remains.
+        let results = [main_feed_drain_tail_gate(), full_feed_drain_tail_gates()];
+        let mut failed = false;
+        for result in results {
+            if let Err(why) = result {
+                failed = true;
+                eprintln!("{TAIL_GATE_FAILED_MARKER} feed_drain p99 gate: {why}");
+            }
+        }
+        if failed && std::env::var(TAIL_GATE_DEFER_ENV).as_deref() != Ok("1") {
             std::process::exit(1);
         }
     }

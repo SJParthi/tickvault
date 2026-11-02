@@ -179,6 +179,7 @@ pipeline_batch_100_mixed  = 100   # 100 mixed packets per iter
 pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
 feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PROOF-9)
 feed_drain_main_feed_frame_4_full   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29)
+feed_drain_main_feed_frame_4_full_own = 4  # identical four-Full frame, existing Own tick encoder comparison
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet
 backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)
