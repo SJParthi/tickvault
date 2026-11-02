@@ -76,8 +76,8 @@
 //! 7 rows a minute, ~3,400 rows a day at the box's ~8 hours. QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -87,6 +87,8 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
+
+mod proof_table_readiness;
 
 use crate::hot_path_telemetry::{
     ALL_STAGES, FINE_BUCKETS, QuantileBound, STAGE_BUCKETS, SecondWindow, Stage, fine_quantiles,
@@ -482,16 +484,23 @@ pub fn hot_path_latency_minute_ddl_statements() -> Vec<String> {
     statements
 }
 
-/// Ensures the latency table and the two capacity tables (idempotent,
-/// self-healing). Returns true when every statement succeeded. Failures are
-/// logged with a code only when `report` is set (the caller's last
-/// attempt), so a retry loop that succeeds later logs nothing. A table not
-/// yet ensured would be created by the first ILP write without DEDUP, which
-/// is why the caller retries.
-// TEST-EXEMPT: live-QuestDB DDL runner (DDL strings unit-tested below); the unreachable path is tested.
+/// One writer startup's schema gate. Only a successful DDL-and-metadata pass
+/// opens it; a second startup or an unrelated test cannot open this gate.
+///
+/// A boot gate assumes no later external table drop/replacement. It is not a
+/// database durability proof or an atomic guard against concurrent external DDL.
+#[derive(Debug, Default)]
+pub struct ProofTableReadiness {
+    keyed: AtomicBool,
+}
+
+/// Ensures all three proof tables, then reads back WAL, DEDUP, exact key
+/// membership and designated timestamp. Any failure leaves readiness closed.
+/// Reports one coded error only when `report` is set. No rows are sent here.
 pub async fn ensure_hot_path_latency_minute_table(
     questdb_config: &QuestDbConfig,
     report: bool,
+    readiness: &ProofTableReadiness,
 ) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -515,61 +524,55 @@ pub async fn ensure_hot_path_latency_minute_table(
             return false;
         }
     };
-    // The latency table and the two capacity tables (2026-10-30), one pass.
+    let result = ensure_proof_tables_once(&client, &base_url).await;
+    match result {
+        Ok(()) => {
+            readiness.keyed.store(true, Ordering::Release);
+            true
+        }
+        Err(err) => {
+            if report {
+                error!(
+                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                    stage = "hot_path_latency_minute_ensure_ddl",
+                    error = %err,
+                    "hot-path proof tables not confirmed keyed — writes remain buffered"
+                );
+            }
+            false
+        }
+    }
+}
+
+async fn ensure_proof_tables_once(client: &reqwest::Client, url: &str) -> Result<()> {
     let statements = hot_path_latency_minute_ddl_statements()
         .into_iter()
         .chain(crate::host_capacity_minute::host_capacity_minute_ddl_statements())
         .chain(crate::host_capacity_minute::capacity_verdict_daily_ddl_statements());
-    let mut all_ok = true;
+    // One shared gate requires all three tables. Stop on the first refusal:
+    // a down server must not consume every statement's timeout in one pass.
     for ddl in statements {
-        match client
-            .get(&base_url)
-            .query(&[("query", ddl.as_str())])
-            .send()
+        proof_table_readiness::exec(client, url, &ddl)
             .await
-        {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                all_ok = false;
-                let status = resp.status();
-                if report {
-                    error!(
-                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                        stage = "hot_path_latency_minute_ensure_ddl",
-                        %status,
-                        ddl = ddl.as_str(),
-                        "hot_path_latency_minute: DDL returned non-2xx"
-                    );
-                }
-            }
-            Err(err) => {
-                all_ok = false;
-                if report {
-                    error!(
-                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                        stage = "hot_path_latency_minute_ensure_ddl",
-                        ?err,
-                        ddl = ddl.as_str(),
-                        "hot_path_latency_minute: DDL request failed"
-                    );
-                }
-            }
-        }
+            .with_context(|| format!("proof-table DDL: {ddl}"))?;
     }
-    all_ok
+    proof_table_readiness::verify_all(client, url).await
 }
 
-/// Ensure attempts at boot before giving up (with the last one reported).
+/// Quiet attempts before reporting; background retries continue after this bound.
 pub const ENSURE_ATTEMPTS: u32 = 10;
 
-/// Spacing between ensure attempts at boot.
+/// Initial ensure spacing and the writer's cold-path retained-buffer retry interval.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
 pub const ENSURE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Lazy ILP-over-HTTP writer. An unreachable QuestDB still builds
-/// (`sender = None`); `flush` returns `Err` until it is reachable.
+/// ILP-over-HTTP writer. A failed sender initialization is retried on the
+/// next nonempty flush, with the buffered rows retained up to the shared cap.
 pub struct HotPathLatencyMinuteWriter {
     sender: Option<Sender>,
+    /// Kept after initialization fails so a later flush can rebuild the sender.
+    sender_conf: Option<String>,
+    readiness: Arc<ProofTableReadiness>,
     buffer: Buffer,
     pending: usize,
 }
@@ -577,35 +580,52 @@ pub struct HotPathLatencyMinuteWriter {
 impl HotPathLatencyMinuteWriter {
     /// Production constructor.
     #[must_use]
-    // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); append/flush covered via for_test()
-    pub fn new(config: &QuestDbConfig) -> Self {
+    // TEST-EXEMPT: delegates to the initialization path exercised by test_writer_recovers_after_initialization_failure_without_replacing_rows.
+    pub fn new(config: &QuestDbConfig, readiness: Arc<ProofTableReadiness>) -> Self {
+        Self::with_sender_builder(config, readiness, |conf| Sender::from_conf(conf))
+    }
+
+    /// The production initialization path with its fallible sender build
+    /// injected, so a startup failure and later recovery are testable.
+    fn with_sender_builder(
+        config: &QuestDbConfig,
+        readiness: Arc<ProofTableReadiness>,
+        build: impl FnOnce(&str) -> std::result::Result<Sender, questdb::Error>,
+    ) -> Self {
         crate::ilp_overflow::register_overflow_baseline(HOT_PATH_LATENCY_MINUTE_TABLE);
-        let conf = format!("http::addr={}:{};", config.host, config.http_port);
-        match Sender::from_conf(conf) {
-            Ok(s) => {
-                let buffer = s.new_buffer();
-                Self {
-                    sender: Some(s),
-                    buffer,
-                    pending: 0,
-                }
-            }
+        // The disconnected buffer and every rebuilt sender must use the
+        // same protocol, so reconnect never replaces or rejects retained rows.
+        let conf = format!(
+            "http::addr={}:{};protocol_version=1;",
+            config.host, config.http_port
+        );
+        let sender = match build(&conf) {
+            Ok(s) => Some(s),
             Err(err) => {
                 warn!(
                     ?err,
-                    "hot_path_latency_minute writer: QuestDB unreachable — buffering locally"
+                    "hot_path_latency_minute writer: ILP sender unavailable — buffering locally and retrying on flush"
                 );
-                Self::for_test()
+                None
             }
+        };
+        Self {
+            sender,
+            sender_conf: Some(conf),
+            readiness,
+            buffer: Buffer::new(ProtocolVersion::V1),
+            pending: 0,
         }
     }
 
     /// Disconnected writer with an empty buffer.
     #[must_use]
-    // TEST-EXEMPT: test helper and the unreachable-QuestDB fallback of `new`; exercised by the append tests below.
+    // TEST-EXEMPT: disconnected test helper; exercised by the append and pending-cap tests below.
     pub fn for_test() -> Self {
         Self {
             sender: None,
+            sender_conf: None,
+            readiness: Arc::new(ProofTableReadiness::default()),
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
         }
@@ -711,24 +731,45 @@ impl HotPathLatencyMinuteWriter {
         if self.pending == 0 {
             return Ok(());
         }
-        let Some(sender) = self.sender.as_mut() else {
-            anyhow::bail!("hot_path_latency_minute: no ILP sender (QuestDB unreachable)");
-        };
-        if let Err(err) = sender.flush(&mut self.buffer) {
+        if let Err(err) = self.flush_pending() {
             let dropped = crate::ilp_overflow::discard_if_overflowing(
                 &mut self.buffer,
                 &mut self.pending,
                 HOT_PATH_LATENCY_MINUTE_TABLE,
             );
-            return Err(anyhow::Error::new(err).context(
-                crate::ilp_overflow::flush_failure_context(
-                    "hot_path_latency_minute ILP flush",
-                    dropped,
-                ),
-            ));
+            return Err(err.context(crate::ilp_overflow::flush_failure_context(
+                "hot_path_latency_minute ILP flush",
+                dropped,
+            )));
         }
         self.pending = 0;
         Ok(())
+    }
+
+    /// One initialization attempt and one flush. Both failure paths return
+    /// through `flush`'s overflow policy; reconnect keeps the existing buffer.
+    fn flush_pending(&mut self) -> Result<()> {
+        // Keep this refusal inside flush's shared failure/overflow path.
+        // Loading once per flush adds nothing to the feed's per-event path.
+        anyhow::ensure!(
+            self.readiness.keyed.load(Ordering::Acquire),
+            "hot-path proof tables are not yet confirmed keyed"
+        );
+        if self.sender.is_none() {
+            let conf = self
+                .sender_conf
+                .as_deref()
+                .context("hot_path_latency_minute: no ILP sender configuration")?;
+            self.sender = Some(
+                Sender::from_conf(conf)
+                    .context("hot_path_latency_minute: ILP sender initialization failed")?,
+            );
+        }
+        self.sender
+            .as_mut()
+            .context("hot_path_latency_minute: no ILP sender")?
+            .flush(&mut self.buffer)
+            .context("hot_path_latency_minute: ILP send failed")
     }
 }
 
@@ -781,9 +822,9 @@ fn log_verdict(v: &crate::host_capacity_minute::CapacityVerdictRow) {
 }
 
 /// Installs the process-wide hand-off queue [`offer`] sends into, with room
-/// for `capacity` minutes, and returns its receiving end. The writer thread
-/// calls it once ([`spawn_hot_path_latency_minute_writer`]); the DHAT test
-/// calls it to measure [`offer`] against a real, pre-allocated queue.
+/// for `capacity` minutes, and returns its receiving end. The DHAT test
+/// calls it to measure [`offer`] against a real, pre-allocated queue; production
+/// installs its sender only after the writer thread has started successfully.
 ///
 /// # Errors
 /// A queue was already installed in this process.
@@ -805,20 +846,62 @@ pub fn install_sink(capacity: usize) -> std::io::Result<crossbeam_channel::Recei
 /// # Errors
 /// A writer was already installed in this process, or the OS refused to
 /// create the thread.
-// TEST-EXEMPT: spawns a real ILP writer thread against QuestDB; the queue, the rows and the flush latch are unit-tested below.
+// TEST-EXEMPT: thread-spawn wrapper; installation failures/races and the production receive loop are exercised in readiness_tests, and app startup exercises this wrapper.
 pub fn spawn_hot_path_latency_minute_writer(
     config: &QuestDbConfig,
+    readiness: Arc<ProofTableReadiness>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let rx = install_sink(LATENCY_MINUTE_QUEUE_MINUTES)?;
-    let mut writer = HotPathLatencyMinuteWriter::new(config);
-    std::thread::Builder::new()
-        .name("tv-latency-minute".to_owned())
-        .spawn(move || {
-            let mut episode = FlushEpisode::default();
-            // Ends when every sender is gone (never, in production: the
-            // sender lives in a static).
-            let mut append_episode = FlushEpisode::default();
-            while let Ok(message) = rx.recv() {
+    spawn_writer_into(&SINK, config, readiness, |rx, writer| {
+        std::thread::Builder::new()
+            .name("tv-latency-minute".to_owned())
+            .spawn(move || {
+                // The static sender keeps this worker alive in production.
+                // Graceful shutdown ownership and durable spill are separate.
+                let _residue = run_writer(rx, writer, ENSURE_RETRY_INTERVAL);
+            })
+    })
+}
+
+fn spawn_writer_into(
+    sink: &OnceLock<crossbeam_channel::Sender<ProofMessage>>,
+    config: &QuestDbConfig,
+    readiness: Arc<ProofTableReadiness>,
+    spawn: impl FnOnce(
+        crossbeam_channel::Receiver<ProofMessage>,
+        HotPathLatencyMinuteWriter,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    if sink.get().is_some() {
+        return Err(std::io::Error::other(
+            "hot_path_latency_minute queue already installed",
+        ));
+    }
+    let (tx, rx) = crossbeam_channel::bounded(LATENCY_MINUTE_QUEUE_MINUTES);
+    let writer = HotPathLatencyMinuteWriter::new(config, readiness);
+    // Publish only after thread creation succeeds: a spawn error must not
+    // poison the process-wide OnceLock with a disconnected sender.
+    let thread = spawn(rx, writer)?;
+    if let Err(uninstalled) = sink.set(tx) {
+        // A concurrent winner installed first. This worker has received no
+        // messages; dropping its only sender makes recv return Disconnected.
+        drop(uninstalled);
+        return Err(std::io::Error::other(
+            "hot_path_latency_minute queue already installed",
+        ));
+    }
+    Ok(thread)
+}
+
+fn run_writer(
+    rx: crossbeam_channel::Receiver<ProofMessage>,
+    mut writer: HotPathLatencyMinuteWriter,
+    retry_interval: std::time::Duration,
+) -> HotPathLatencyMinuteWriter {
+    let mut episode = FlushEpisode::default();
+    let mut append_episode = FlushEpisode::default();
+    loop {
+        match rx.recv_timeout(retry_interval) {
+            Ok(message) => {
                 let appended = writer.append_message(&message);
                 if let (Some(true), Err(err)) = (append_episode.step(appended.is_ok()), &appended) {
                     error!(
@@ -832,23 +915,28 @@ pub fn spawn_hot_path_latency_minute_writer(
                 if let (Ok(()), ProofMessage::Verdict(v)) = (&appended, &message) {
                     log_verdict(v);
                 }
-                let result = writer.flush();
-                match (episode.step(result.is_ok()), &result) {
-                    (Some(true), Err(err)) => error!(
-                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                        stage = "hot_path_latency_minute_flush",
-                        error = %err,
-                        pending = writer.pending(),
-                        "hot_path_latency_minute: flush failed — rows kept and retried \
-                         next minute (logged once per failure episode)"
-                    ),
-                    (Some(false), _) => {
-                        info!("hot_path_latency_minute: flush recovered — buffered minutes written")
-                    }
-                    _ => {}
-                }
             }
-        })
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if writer.pending() > 0 => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return writer,
+        }
+        // Also retries when readiness changes after the last producer item.
+        let result = writer.flush();
+        match (episode.step(result.is_ok()), &result) {
+            (Some(true), Err(err)) => error!(
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                stage = "hot_path_latency_minute_flush",
+                error = %err,
+                pending = writer.pending(),
+                "hot_path_latency_minute: flush failed — rows retained up to the shared cap \
+                 and retried on the writer interval (logged once per failure episode)"
+            ),
+            (Some(false), _) => {
+                info!("hot_path_latency_minute: flush recovered — buffered minutes written")
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1238,6 +1326,145 @@ mod tests {
         assert!(w.flush().is_err(), "no sender: flush reports the failure");
     }
 
+    #[test]
+    fn test_writer_recovers_after_initialization_failure_without_replacing_rows() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: listener.local_addr().expect("address").port(),
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let readiness = Arc::new(ProofTableReadiness::default());
+        readiness.keyed.store(true, Ordering::Release);
+        let mut w = HotPathLatencyMinuteWriter::with_sender_builder(&cfg, readiness, |_| {
+            Err(questdb::Error::new(
+                questdb::ErrorCode::SocketError,
+                "injected startup failure",
+            ))
+        });
+        assert!(w.sender.is_none(), "initialization really failed");
+        assert!(w.flush().is_ok(), "empty flush needs no sender");
+        assert!(w.sender.is_none(), "empty flush did not reconnect");
+
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &window_with(Stage::DrainMainFrame, 700, 4));
+        let host = crate::host_capacity_minute::HostMinuteRow {
+            minute_ist_nanos: minute(0),
+            ..Default::default()
+        };
+        w.append_message(&ProofMessage::Minute(acc.rows().expect("rows"), host))
+            .expect("buffer minute during outage");
+        let expected = w.buffer.as_bytes().to_vec();
+        assert_eq!(w.pending(), STAGES_PER_MINUTE + 1);
+
+        // Bound the server lifetime even if the regression prevents any
+        // request. Read the complete body, not just a single socket read.
+        listener.set_nonblocking(true).expect("nonblocking");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "writer never reconnected");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("accept: {err}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("read headers");
+                assert!(read > 0, "request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(at) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).expect("HTTP headers");
+            assert!(headers.starts_with("POST /write?"), "{headers}");
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .expect("content length")
+                .1
+                .trim()
+                .parse::<usize>()
+                .expect("numeric content length");
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).expect("read body");
+                assert!(read > 0, "request ended before body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("ack");
+            request[header_end..header_end + content_length].to_vec()
+        });
+
+        let flushed = w.flush();
+        let posted = server.join().expect("server");
+        flushed.expect("later flush rebuilds the sender");
+        assert_eq!(posted, expected, "reconnect preserves every buffered byte");
+        assert_eq!(w.pending(), 0);
+        assert!(w.buffer.as_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_disconnected_flush_enforces_the_pending_row_cap() {
+        let mut acc = MinuteAccumulator::new();
+        let _ = acc.absorb(minute(0), &window_with(Stage::DrainMainFrame, 700, 4));
+        let row = row_of(&acc.rows().expect("rows"), Stage::DrainMainFrame);
+        let cap = crate::ilp_overflow::MAX_PENDING_ROWS;
+        // Both absence of a configuration and repeated initialization
+        // failure must use the same cap as an established sender's failure.
+        for conf in [None, Some("invalid ILP configuration".to_owned())] {
+            let mut w = HotPathLatencyMinuteWriter::for_test();
+            w.sender_conf = conf;
+            w.readiness.keyed.store(true, Ordering::Release);
+            for _ in 0..cap - 1 {
+                w.append_row(&row).expect("append below cap");
+            }
+            let before = w.buffer.as_bytes().to_vec();
+            for _ in 0..2 {
+                assert!(w.flush().is_err());
+                assert_eq!(w.pending(), cap - 1);
+                assert_eq!(w.buffer.as_bytes(), before);
+            }
+            w.append_row(&row).expect("reach cap");
+            let error = w.flush().expect_err("unavailable sender");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{cap} row(s) were discarded"))
+            );
+            assert_eq!(
+                w.pending(),
+                0,
+                "initialization errors cannot bypass the cap"
+            );
+            assert!(w.buffer.as_bytes().is_empty());
+            w.append_row(&row).expect("append after discard");
+            assert!(w.flush().is_err());
+            assert_eq!(
+                w.pending(),
+                1,
+                "new rows remain eligible for later recovery"
+            );
+        }
+    }
+
     /// A minute is appended whole (7 latency rows + 1 host row); a host row
     /// that fails (negative timestamp) rewinds all eight, so no half-built
     /// row is left to poison later flushes (hostile review, 2026-10-30).
@@ -1282,3 +1509,6 @@ mod tests {
         assert!(diff.abs() < 5_000_000_000, "within 5 s: {diff}");
     }
 }
+
+#[cfg(test)]
+mod readiness_tests;

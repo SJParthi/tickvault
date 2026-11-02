@@ -1258,7 +1258,9 @@ async fn async_main() -> Result<()> {
     // the recorder install, like every pre-resolved handle above.
     // 2026-10-30: the per-minute latency proof tables, writer before publisher.
     let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
-    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
+    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher(std::sync::Arc::clone(
+        &trading_calendar,
+    )) {
         error!(
             code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
             error = %err,

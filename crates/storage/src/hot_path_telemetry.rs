@@ -1144,7 +1144,9 @@ pub fn publish_once(handles: &mut TelemetryHandles, now: Instant) -> StallReadin
 ///
 /// # Errors
 /// The OS refused to create the thread.
-pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
+pub fn spawn_publisher(
+    calendar: std::sync::Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     // Fix the anchor before any stamp is taken by a racing task.
     let _ = anchor();
     let mut handles = TelemetryHandles::resolve();
@@ -1155,7 +1157,7 @@ pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
             let mut sched = crate::hot_thread_sched::SchedPublisher::new();
             let mut minute = crate::hot_path_latency_minute::MinuteAccumulator::new();
             let mut host = crate::host_capacity_minute::HostSampler::new();
-            let mut day = crate::host_capacity_minute::DayVerdict::new();
+            let mut day = crate::host_capacity_minute::DayVerdict::with_calendar(calendar);
             loop {
                 let now = Instant::now();
                 let readings = publish_once(&mut handles, now);
@@ -1930,7 +1932,13 @@ mod tests {
 
     #[test]
     fn spawn_publisher_starts_a_named_thread() {
-        let handle = spawn_publisher().expect("thread");
+        let config: toml::Value =
+            toml::from_str(include_str!("../../../config/base.toml")).expect("config");
+        let trading: tickvault_common::config::TradingConfig =
+            config["trading"].clone().try_into().expect("trading");
+        let calendar = tickvault_common::trading_calendar::TradingCalendar::from_config(&trading)
+            .expect("calendar");
+        let handle = spawn_publisher(std::sync::Arc::new(calendar)).expect("thread");
         assert_eq!(handle.thread().name(), Some("tv-telemetry"));
     }
 
