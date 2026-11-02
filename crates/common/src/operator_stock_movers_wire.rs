@@ -4,12 +4,18 @@ use crate::operator_movers_wire::{
     BridgeError, MAX_SOURCE_ROWS, SELECTION_LIMIT, SourceStatus, Stock,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 pub const FILTERED_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_INDEX_NAMES: usize = 64;
 pub const MAX_INDEX_NAME_BYTES: usize = 96;
 pub const MAX_SEARCH_BYTES: usize = 32;
 pub const MAX_FILTER_HEX_BYTES: usize = 1024;
+pub const MAX_COMPANY_NAME_BYTES: usize = 128;
+pub const MAX_VOLUME_TEXT_BYTES: usize = 20;
+/// Browser watchlists use numeric identity; do not let distinct u64 IDs alias
+/// after JSON decoding as IEEE-754 numbers. Dhan's actual IDs fit below this.
+pub const MAX_BROWSER_SECURITY_ID: u64 = (1_u64 << 53) - 1;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +26,24 @@ pub enum Direction {
     Losers,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumn {
+    Name,
+    Ltp,
+    Change,
+    ChangePct,
+    ValueCr,
+    Volume,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
@@ -28,6 +52,11 @@ pub struct Filter {
     pub search: String,
     pub direction: Direction,
     pub offset: usize,
+    /// Both absent keeps the earlier change-% ordering for existing clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<SortColumn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<SortOrder>,
 }
 impl Default for Filter {
     fn default() -> Self {
@@ -37,6 +66,8 @@ impl Default for Filter {
             search: String::new(),
             direction: Direction::All,
             offset: 0,
+            sort_by: None,
+            sort_order: None,
         }
     }
 }
@@ -49,6 +80,7 @@ impl Filter {
             && !self.search.chars().any(char::is_control)
             && self.offset < MAX_SOURCE_ROWS
             && self.offset.is_multiple_of(SELECTION_LIMIT)
+            && self.sort_by.is_some() == self.sort_order.is_some()
     }
     /// Only lowercase hex reaches the shell, never a raw index or search term.
     pub fn to_hex(&self) -> Option<String> {
@@ -89,6 +121,53 @@ impl Filter {
                 Direction::Losers => stock.change_pct.is_some_and(|n| n < 0.0),
             }
     }
+
+    /// Shared ordering for the API selection and transport validation.
+    /// Explicit sorts keep missing numeric fields last and break ties by
+    /// identity. Omitted sort fields retain earlier v2 tie compatibility.
+    pub fn compare_rows(&self, left: &MemberStock, right: &MemberStock) -> Ordering {
+        let column = self.sort_by.unwrap_or(SortColumn::ChangePct);
+        let order = self
+            .sort_order
+            .unwrap_or(if self.direction == Direction::Losers {
+                SortOrder::Asc
+            } else {
+                SortOrder::Desc
+            });
+        let a = &left.price;
+        let b = &right.price;
+        let primary = match column {
+            SortColumn::Name => ordered_values(Some(a.name.as_str()), Some(b.name.as_str()), order),
+            SortColumn::Ltp => ordered_values(Some(a.ltp), Some(b.ltp), order),
+            SortColumn::Change => ordered_values(a.change, b.change, order),
+            SortColumn::ChangePct => ordered_values(a.change_pct, b.change_pct, order),
+            SortColumn::ValueCr => ordered_values(a.value_cr, b.value_cr, order),
+            // Compare u64 directly: f64 would collapse distinct volumes >2^53.
+            SortColumn::Volume => ordered_values(a.volume, b.volume, order),
+        };
+        if self.sort_by.is_none() {
+            return primary;
+        }
+        primary
+            .then_with(|| a.security_id.cmp(&b.security_id))
+            .then_with(|| a.segment.cmp(&b.segment))
+    }
+}
+
+fn ordered_values<T: PartialOrd>(left: Option<T>, right: Option<T>, order: SortOrder) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let value = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
+            if order == SortOrder::Desc {
+                value.reverse()
+            } else {
+                value
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 fn valid_label(value: &str, limit: usize) -> bool {
     !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
@@ -105,6 +184,13 @@ pub enum MembershipStatus {
 pub struct MemberStock {
     #[serde(flatten)]
     pub price: Stock,
+    /// Absent when the current daily mapping contains only a trading symbol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
+    /// Exact decimal volume for JavaScript clients; JSON numbers above 2^53
+    /// cannot preserve every u64. Older envelopes may omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_text: Option<String>,
     /// Positions in index_names, never inferred from the trading symbol.
     pub indices: Vec<usize>,
     /// Unknown when today's canonical F&O artifact cannot be read.
@@ -174,7 +260,18 @@ impl Snapshot {
         status_valid
             && self.rows.iter().all(|row| {
                 row.price.security_id != 0
+                    && row.price.security_id <= MAX_BROWSER_SECURITY_ID
                     && row.price.valid()
+                    && row
+                        .company_name
+                        .as_ref()
+                        .is_none_or(|name| valid_label(name, MAX_COMPANY_NAME_BYTES))
+                    && row.volume_text.as_ref().is_none_or(|text| {
+                        text.len() <= MAX_VOLUME_TEXT_BYTES
+                            && text.parse::<u64>().ok().is_some_and(|volume| {
+                                row.price.volume == Some(volume) && volume.to_string() == *text
+                            })
+                    })
                     && ids.insert(row.price.security_id)
                     && self.filter.matches_price(&row.price)
                     && (!self.filter.fno_only || row.fno == Some(true))
@@ -191,18 +288,7 @@ impl Snapshot {
             && self
                 .rows
                 .windows(2)
-                .all(|w| match (w[0].price.change_pct, w[1].price.change_pct) {
-                    (Some(a), Some(b)) => {
-                        if self.filter.direction == Direction::Losers {
-                            a <= b
-                        } else {
-                            a >= b
-                        }
-                    }
-                    (Some(_), None) => true,
-                    (None, None) => true,
-                    (None, Some(_)) => false,
-                })
+                .all(|pair| self.filter.compare_rows(&pair[0], &pair[1]) != Ordering::Greater)
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -333,6 +419,8 @@ mod tests {
                         value_cr: Some(0.1),
                         last_trade_ist: "10:15:00".into(),
                     },
+                    company_name: None,
+                    volume_text: None,
                     indices: vec![0],
                     fno: Some(true),
                 })
@@ -380,5 +468,184 @@ mod tests {
                 ..Filter::default()
             }
         ));
+    }
+
+    #[test]
+    fn explicit_sort_filters_round_trip_and_keep_legacy_omission_compatible() {
+        let legacy: Filter = serde_json::from_str(
+            r#"{"fno_only":false,"index":null,"search":"","direction":"all","offset":0}"#,
+        )
+        .unwrap();
+        assert!(legacy.valid());
+        assert!(legacy.sort_by.is_none() && legacy.sort_order.is_none());
+        let old_wire = serde_json::to_value(&legacy).unwrap();
+        assert!(old_wire.get("sort_by").is_none());
+        assert!(old_wire.get("sort_order").is_none());
+        for column in [
+            SortColumn::Name,
+            SortColumn::Ltp,
+            SortColumn::Change,
+            SortColumn::ChangePct,
+            SortColumn::ValueCr,
+            SortColumn::Volume,
+        ] {
+            for order in [SortOrder::Asc, SortOrder::Desc] {
+                let filter = Filter {
+                    sort_by: Some(column),
+                    sort_order: Some(order),
+                    index: Some("\\".repeat(MAX_INDEX_NAME_BYTES)),
+                    search: "\\".repeat(MAX_SEARCH_BYTES),
+                    offset: 980,
+                    ..legacy.clone()
+                };
+                assert!(filter.valid());
+                let encoded = filter.to_hex().unwrap();
+                assert!(encoded.len() <= MAX_FILTER_HEX_BYTES);
+                assert_eq!(Filter::from_hex(&encoded), Some(filter.clone()));
+                let echoed = serde_json::to_value(&filter).unwrap();
+                assert!(echoed.get("sort_by").is_some());
+                assert!(echoed.get("sort_order").is_some());
+                assert_ne!(filter, legacy, "cache identity must include sorting");
+                assert!(
+                    !Filter {
+                        sort_order: None,
+                        ..filter.clone()
+                    }
+                    .valid()
+                );
+                assert!(
+                    !Filter {
+                        sort_by: None,
+                        ..filter
+                    }
+                    .valid()
+                );
+            }
+        }
+        for bad in [
+            r#"{"sort_by":"turnover","sort_order":"desc"}"#,
+            r#"{"sort_by":"volume","sort_order":"sideways"}"#,
+            r#"{"sort_by":"volume","sort_order":"desc","sql":"SELECT 1"}"#,
+        ] {
+            assert!(serde_json::from_str::<Filter>(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn compare_rows_keeps_missing_numbers_last_and_compares_large_volumes_exactly() {
+        let mut low = snapshot().rows.remove(0);
+        low.price.security_id = 90;
+        low.price.name = "AAA".into();
+        low.price.ltp = 10.0;
+        low.price.change = Some(-2.0);
+        low.price.change_pct = Some(-20.0);
+        low.price.value_cr = Some(2.0);
+        low.price.volume = Some(u64::MAX - 1);
+        let mut high = low.clone();
+        high.price.security_id = 10;
+        high.price.name = "BBB".into();
+        high.price.ltp = 20.0;
+        high.price.change = Some(3.0);
+        high.price.change_pct = Some(30.0);
+        high.price.value_cr = Some(3.0);
+        high.price.volume = Some(u64::MAX);
+        let mut missing = low.clone();
+        missing.price.security_id = 1;
+        missing.price.name = "ZZZ".into();
+        missing.price.ltp = 30.0;
+        missing.price.change = None;
+        missing.price.change_pct = None;
+        missing.price.value_cr = None;
+        missing.price.volume = None;
+        for column in [
+            SortColumn::Name,
+            SortColumn::Ltp,
+            SortColumn::Change,
+            SortColumn::ChangePct,
+            SortColumn::ValueCr,
+            SortColumn::Volume,
+        ] {
+            for order in [SortOrder::Asc, SortOrder::Desc] {
+                let filter = Filter {
+                    sort_by: Some(column),
+                    sort_order: Some(order),
+                    ..Filter::default()
+                };
+                let mut rows = vec![missing.clone(), high.clone(), low.clone()];
+                rows.sort_unstable_by(|a, b| filter.compare_rows(a, b));
+                let expected = match (column, order) {
+                    (_, SortOrder::Asc) => [90, 10, 1],
+                    (SortColumn::Name | SortColumn::Ltp, SortOrder::Desc) => [1, 10, 90],
+                    (_, SortOrder::Desc) => [10, 90, 1],
+                };
+                assert_eq!(
+                    rows.iter().map(|r| r.price.security_id).collect::<Vec<_>>(),
+                    expected
+                );
+                let mut tie = low.clone();
+                tie.price.security_id = 2;
+                assert_eq!(filter.compare_rows(&tie, &low), Ordering::Less);
+                assert_eq!(filter.compare_rows(&low, &tie), Ordering::Greater);
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_snapshot_requires_matching_order_and_bounds_optional_company_names() {
+        let mut page = snapshot();
+        page.filter.sort_by = Some(SortColumn::Volume);
+        page.filter.sort_order = Some(SortOrder::Desc);
+        page.rows[0].price.volume = Some(1);
+        page.rows[1].price.volume = Some(2);
+        assert!(
+            !page.valid(),
+            "change-% order is wrong for a volume request"
+        );
+        page.rows.swap(0, 1);
+        assert!(page.valid());
+        page.rows[1].price.volume = Some(2);
+        assert!(
+            !page.valid(),
+            "equal values require deterministic ascending identity"
+        );
+        page.rows.swap(0, 1);
+        assert!(page.valid());
+        let legacy_row = serde_json::to_value(&page.rows[0]).unwrap();
+        assert!(legacy_row.get("company_name").is_none());
+        assert!(
+            serde_json::from_value::<MemberStock>(legacy_row)
+                .unwrap()
+                .company_name
+                .is_none()
+        );
+        for name in [
+            "".to_string(),
+            "bad\nname".into(),
+            "x".repeat(MAX_COMPANY_NAME_BYTES + 1),
+        ] {
+            page.rows[0].company_name = Some(name);
+            assert!(!page.valid());
+        }
+        page.rows[0].company_name = Some("Recorded Company Ltd".into());
+        assert!(page.valid());
+        page.rows[0].volume_text = Some("2".into());
+        assert!(page.valid());
+        for text in ["", "3", "+2", "02", "18446744073709551616", "2\n"] {
+            page.rows[0].volume_text = Some(text.into());
+            assert!(!page.valid(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn filtered_snapshot_refuses_ids_that_cannot_remain_exact_in_browser_watchlists() {
+        let mut page = snapshot();
+        for id in [1, MAX_BROWSER_SECURITY_ID] {
+            page.rows[0].price.security_id = id;
+            assert!(page.valid(), "safe positive identity {id}");
+        }
+        for id in [0, MAX_BROWSER_SECURITY_ID + 1, u64::MAX] {
+            page.rows[0].price.security_id = id;
+            assert!(!page.valid(), "unsafe browser identity {id}");
+        }
     }
 }

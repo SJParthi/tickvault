@@ -33,6 +33,8 @@ const CACHE_TTL_SECONDS: u64 = 2;
 const QUERY_TIMEOUT_SECONDS: u64 = 3;
 const CACHE_TTL: Duration = Duration::from_secs(CACHE_TTL_SECONDS);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(QUERY_TIMEOUT_SECONDS);
+const ACTUAL_VALUE_UNAVAILABLE: &str =
+    "Actual traded value is not captured; Value (Cr.) is unavailable.";
 
 #[derive(Default)]
 pub(crate) struct MoversCache {
@@ -166,8 +168,13 @@ fn stock(row: fno_stocks::FnoStockRow) -> Stock {
         prev_close: row.prev_close,
         change: row.change,
         change_pct: row.change_pct,
-        volume: row.volume,
-        value_cr: row.value_cr,
+        // Ticker packets persist their default zero without a packet-kind
+        // column. It cannot prove a reported zero, so preserve only positive
+        // cumulative values and leave the ambiguous zero/NULL unavailable.
+        volume: row.volume.filter(|volume| *volume > 0),
+        // The canonical F&O value is explicitly an estimate (volume x average
+        // price). Stocks' actual-Value column must not relabel that estimate.
+        value_cr: None,
         last_trade_ist: row.last_trade_ist,
     }
 }
@@ -228,13 +235,19 @@ fn finish(
             .cloned()
             .unwrap_or_default();
         let eligible = fno.map(|f| f.name_of(key.0, key.1).is_some());
+        let volume_text = price.volume.map(|volume| volume.to_string());
         selected.push(MemberStock {
             price,
+            // The canonical mapping persists the symbol, not the company name.
+            company_name: None,
+            volume_text,
             indices,
             fno: eligible,
         });
     }
-    if filter.direction == Direction::Losers {
+    if filter.sort_by.is_some() {
+        selected.sort_unstable_by(|left, right| filter.compare_rows(left, right));
+    } else if filter.direction == Direction::Losers {
         selected.reverse();
     }
     let matching_total = selected.len();
@@ -262,7 +275,7 @@ fn finish(
         matching_total,
         selection_limit: SELECTION_LIMIT,
         window_secs: prices.window_secs,
-        value_basis: prices.value_basis.into(),
+        value_basis: ACTUAL_VALUE_UNAVAILABLE.into(),
         index_names,
         membership_status,
         fno_list_available: fno.is_some(),
@@ -444,6 +457,7 @@ pub async fn get_stock_movers(
 mod tests {
     use super::*;
     use serde_json::json;
+    use tickvault_common::operator_stock_movers_wire::{SortColumn, SortOrder};
     const DATE: &str = "2026-10-30";
     fn at(text: &str) -> chrono::NaiveDateTime {
         chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap()
@@ -529,6 +543,225 @@ mod tests {
             Outcome::Snapshot { snapshot } => snapshot,
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stocks_columns_preserve_captured_values_without_relabeling_turnover_estimate() {
+        let fixture = Fixture::new(6);
+        let data = json!({"dataset":[
+            [2,"NSE_EQ",110.0,100.0,123456,108.0,"2026-10-30T11:15:10Z"],
+            [4,"NSE_EQ",90.0,null,null,null,"2026-10-30T11:15:10Z"],
+            [6,"NSE_EQ",100.0,100.0,0,100.0,"2026-10-30T11:15:10Z"]
+        ]})
+        .to_string();
+        let url = http("200 OK", data).await;
+        let result = snapshot(run(&fixture.0, &url, true, Filter::default()).await);
+        assert_eq!(result.value_basis, ACTUAL_VALUE_UNAVAILABLE);
+        assert_eq!(result.rows.len(), 3);
+        let known = &result.rows[0];
+        assert_eq!(known.price.name, "STOCK002");
+        assert_eq!(known.price.ltp, 110.0);
+        assert_eq!(known.price.prev_close, Some(100.0));
+        assert_eq!(known.price.change, Some(10.0));
+        assert_eq!(known.price.change_pct, Some(10.0));
+        assert_eq!(known.price.volume, Some(123456));
+        assert_eq!(known.volume_text.as_deref(), Some("123456"));
+        assert!(known.price.value_cr.is_none());
+        assert!(known.company_name.is_none());
+        let missing_row = result
+            .rows
+            .iter()
+            .find(|row| row.price.security_id == 4)
+            .unwrap();
+        let missing = &missing_row.price;
+        assert!(
+            missing.prev_close.is_none()
+                && missing.change.is_none()
+                && missing.change_pct.is_none()
+        );
+        assert!(missing.volume.is_none() && missing.value_cr.is_none());
+        assert!(missing_row.volume_text.is_none());
+        let zero = result
+            .rows
+            .iter()
+            .find(|row| row.price.security_id == 6)
+            .unwrap();
+        assert!(zero.price.volume.is_none() && zero.volume_text.is_none());
+        assert_eq!(
+            zero.price.change,
+            Some(0.0),
+            "a real zero change remains known"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_column_sort_runs_before_paging_the_full_eligible_universe() {
+        let fixture = Fixture::new(80);
+        for (column, order, offset, first, last) in [
+            (SortColumn::Name, SortOrder::Asc, 0, 1, 20),
+            (SortColumn::Ltp, SortOrder::Asc, 20, 21, 40),
+            (SortColumn::Change, SortOrder::Desc, 0, 80, 61),
+            (SortColumn::ChangePct, SortOrder::Asc, 0, 1, 20),
+            (SortColumn::Volume, SortOrder::Desc, 0, 1, 20),
+            // Actual value is unavailable for every row, so stable identity
+            // ordering applies rather than sorting an unlabelled estimate.
+            (SortColumn::ValueCr, SortOrder::Desc, 20, 21, 40),
+        ] {
+            let data = json!({"dataset":(1..=80).map(|id|json!([
+                id,"NSE_EQ",100.0+id as f64,100.0,10000-id,100.0,
+                "2026-10-30T11:15:10Z"
+            ])).collect::<Vec<_>>()})
+            .to_string();
+            let url = http("200 OK", data).await;
+            let filter = Filter {
+                fno_only: false,
+                sort_by: Some(column),
+                sort_order: Some(order),
+                offset,
+                ..Filter::default()
+            };
+            let result = snapshot(run(&fixture.0, &url, true, filter.clone()).await);
+            assert_eq!(result.filter, filter);
+            assert_eq!(
+                (
+                    result.universe_total,
+                    result.stocks_priced,
+                    result.matching_total,
+                    result.rows.len()
+                ),
+                (80, 80, 80, 20)
+            );
+            assert_eq!(
+                result.rows.first().unwrap().price.security_id,
+                first,
+                "{column:?}"
+            );
+            assert_eq!(
+                result.rows.last().unwrap().price.security_id,
+                last,
+                "{column:?}"
+            );
+            assert!(result.valid());
+        }
+    }
+
+    #[tokio::test]
+    async fn sorted_missing_fields_stay_last_and_equal_values_keep_page_identity() {
+        let fixture = Fixture::new(80);
+        for order in [SortOrder::Asc, SortOrder::Desc] {
+            let data = json!({"dataset":(1..=80).rev().map(|id|json!([
+                id,"NSE_EQ",100.0+id as f64,100.0,
+                if id > 40 {None} else {Some(7)},100.0,"2026-10-30T11:15:10Z"
+            ])).collect::<Vec<_>>()})
+            .to_string();
+            let url = http("200 OK", data).await;
+            let result = snapshot(
+                run(
+                    &fixture.0,
+                    &url,
+                    true,
+                    Filter {
+                        fno_only: false,
+                        sort_by: Some(SortColumn::Volume),
+                        sort_order: Some(order),
+                        offset: 20,
+                        ..Filter::default()
+                    },
+                )
+                .await,
+            );
+            assert_eq!(
+                result
+                    .rows
+                    .iter()
+                    .map(|r| r.price.security_id)
+                    .collect::<Vec<_>>(),
+                (21..=40).collect::<Vec<_>>()
+            );
+            assert!(result.rows.iter().all(|r| r.price.volume == Some(7)));
+        }
+    }
+
+    #[tokio::test]
+    async fn sort_filter_errors_are_rejected_by_router_before_capture() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+        let state = fno_stocks::tests::mock_state(1);
+        // Holding the capture slot would yield Busy if validation reached the
+        // query path. Each bad sort must instead fail with HTTP 400 first.
+        let _held = state.stock_movers_cache().slot.lock().await;
+        let router = crate::build_router_with_auth(
+            state.clone(),
+            &[],
+            crate::middleware::ApiAuthConfig::from_token(SecretString::from(
+                "mover-secret".to_owned(),
+            )),
+            false,
+        );
+        for query in [
+            "sort_by=volume",
+            "sort_order=asc",
+            "sort_by=turnover&sort_order=desc",
+            "sort_by=volume&sort_order=sideways",
+            "sort_by=volume&sort_order=asc&offset=1000",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/stock-movers?{query}"))
+                        .header("authorization", "Bearer mover-secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_cache_does_not_reuse_a_differently_sorted_snapshot() {
+        let state = fno_stocks::tests::mock_state(1);
+        let filter = Filter {
+            sort_by: Some(SortColumn::Volume),
+            sort_order: Some(SortOrder::Desc),
+            ..Filter::default()
+        };
+        let body = r#"{"sort_fixture":"volume_desc"}"#.to_owned();
+        *state.stock_movers_cache().slot.lock().await = Some((
+            Instant::now(),
+            filter.clone(),
+            body.clone(),
+            chrono::Utc::now().timestamp() + 60,
+            tickvault_common::market_hours::is_trading_session_now(),
+        ));
+        let hit = get_stock_movers(State(state.clone()), Query(filter.clone())).await;
+        assert_eq!(hit.headers()["x-tv-cache"], "hit");
+        assert_eq!(
+            axum::body::to_bytes(hit.into_body(), 1000)
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        let changed = Filter {
+            sort_order: Some(SortOrder::Asc),
+            ..filter
+        };
+        let miss = get_stock_movers(State(state), Query(changed)).await;
+        assert_eq!(miss.headers()["x-tv-cache"], "miss");
+        assert_ne!(
+            axum::body::to_bytes(miss.into_body(), MAX_WIRE_BYTES)
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
     }
 
     #[test]

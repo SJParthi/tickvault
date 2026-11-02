@@ -125,6 +125,9 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
         },
         questdb: srv.questdb_config(),
         calendar: weekday_calendar(),
+        // This fixture configures a static feed; no missing master-list
+        // fallback or successful master discovery is being simulated.
+        universe_basis: tickvault_app::xverify_day_record::UniverseBasis::ConfiguredIndices,
     };
     // One index target and one F&O contract, which cannot be targeted.
     let main_feed = [
