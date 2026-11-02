@@ -237,7 +237,35 @@ fn accepts(ddl_type: &str, method: &str) -> bool {
     }
 }
 
-/// Every `.method("name"` call in production source.
+/// A literal column argument, optionally wrapped in the depth writer's
+/// pre-checked name constructor. Require the argument's closing punctuation
+/// so an incomplete wrapper or a dynamic expression is never read as a name.
+fn literal_column_argument(src: &str) -> Option<&str> {
+    let src = src.trim_start();
+    let (src, wrapped) = match src
+        .strip_prefix("depth_col")
+        .and_then(|tail| tail.trim_start().strip_prefix('('))
+    {
+        Some(inner) => (inner.trim_start(), true),
+        None => (src, false),
+    };
+    let (name, tail) = src.strip_prefix('"')?.split_once('"')?;
+    let tail = tail.trim_start();
+    let tail = if wrapped {
+        tail.strip_prefix(')')?.trim_start()
+    } else {
+        tail
+    };
+    (tail.starts_with(',')
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+    .then_some(name)
+}
+
+/// Every `.method("name", ...)` or `.method(depth_col("name"), ...)`
+/// call in production source, including arguments split across lines.
 fn emitted_columns(src: &str) -> Vec<(String, String)> {
     const METHODS: &[&str] = &[
         "symbol",
@@ -253,23 +281,78 @@ fn emitted_columns(src: &str) -> Vec<(String, String)> {
         let mut rest = src;
         while let Some(i) = rest.find(&needle) {
             let after = &rest[i + needle.len()..];
-            let after = after.trim_start();
-            if let Some(stripped) = after.strip_prefix('"')
-                && let Some(close) = stripped.find('"')
-            {
-                let name = &stripped[..close];
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
-                {
-                    out.push(((*m).to_string(), name.to_string()));
-                }
+            if let Some(name) = literal_column_argument(after) {
+                out.push(((*m).to_string(), name.to_string()));
             }
             rest = &rest[i + needle.len()..];
         }
     }
     out
+}
+
+#[test]
+fn prechecked_depth_names_keep_both_writer_shapes_in_the_schema_scan() {
+    let src = std::fs::read_to_string(repo_root().join("crates/storage/src/depth_persistence.rs"))
+        .expect("depth writer must be readable");
+    let (_, prod) = split_module(&src);
+    let emitted = emitted_columns(&prod);
+    // Shared symbols/scalars must be seen in BOTH writers; `level` and
+    // `levels` independently pin the level-row and book-row shapes.
+    for (method, column, expected) in [
+        ("symbol", "segment", 2),
+        ("symbol", "contract", 2),
+        ("column_i64", "security_id", 2),
+        ("column_i64", "level", 1),
+        ("column_i64", "levels", 1),
+        ("column_f64", "price", 1),
+    ] {
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|(m, c)| m == method && c == column)
+                .count(),
+            expected,
+            "depth writer .{method}({column}) was lost from the schema scan: {emitted:?}"
+        );
+    }
+}
+
+#[test]
+fn prechecked_column_scan_detects_a_wrong_builder_and_refuses_incomplete_names() {
+    let declared =
+        create_table_columns("CREATE TABLE IF NOT EXISTS x (security_id LONG) timestamp(ts)");
+    let bad = emitted_columns("buf.column_f64(depth_col(\"security_id\"), value)?;");
+    assert_eq!(bad.len(), 1, "the wrong builder must remain visible");
+    assert!(!accepts(&declared[&bad[0].1], &bad[0].0));
+
+    for src in [
+        "buf.symbol(depth_col(name), value)",
+        "buf.symbol(depth_col(\"feed\", value)",
+        "buf.symbol(depth_col(\"feed\")",
+        "buf.symbol(depth_col(\"feed), value)",
+        "buf.symbol(depth_col(\"feed\") + suffix, value)",
+    ] {
+        assert!(emitted_columns(src).is_empty(), "not a literal name: {src}");
+    }
+
+    let actual = emitted_columns(
+        "buf.symbol(\"feed\", value)?.symbol(depth_col(\"feed\"), value)?\n\
+         .column_i64(depth_col(\"security_id\"), value)?\n\
+         .column_i64(\n depth_col( \"levels\" ), value)?;",
+    );
+    let expected = [
+        ("symbol", "feed"),
+        ("symbol", "feed"),
+        ("column_i64", "security_id"),
+        ("column_i64", "levels"),
+    ];
+    assert_eq!(
+        actual,
+        expected
+            .into_iter()
+            .map(|(method, name)| (method.to_string(), name.to_string()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

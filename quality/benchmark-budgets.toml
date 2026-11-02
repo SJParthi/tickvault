@@ -115,7 +115,7 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # also gates feed_drain/main_feed_frame_4_full (Full packets, every price
 # field set, inline depth book rows), added the same day.
 feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
-feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
+feed_drain_depth         = 1000         # <1us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet. Was 1500 until 2026-10-30 (plan ITEM DT, depth row stage): pre-checked ILP names on every depth row took the x86 dev container from 531 to 366 ns per level (depth-20 frame, 42.5 to 29.3 us per 80 levels) and from 638 to 437 ns per level (depth-200 packet, 127.6 to 87.5 us per 200 levels), byte-identical rows.
 candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
 tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass. 2026-10-30 (DT-OWN-ILP): also matches tick_row_append/own_{full,quote,tick_quotes}_row (our own encoder, `[tick_storage] own_ilp_encoder`), and the bench holds those three to this key at p99 per row. Measured 2026-10-30 on the x86 dev container (busier than the row-stage run: main's own rows read 1.17-1.36 us there): ours 0.65-0.77 us per row median, per-call p50 0.57-0.66 us, p99 0.86-1.19 us across three runs.
 
@@ -159,6 +159,7 @@ tick_gap_detector        = 400          # <400ns per call (measured 2026-10-30, 
 spot_price_store         = 250          # <250ns per call (measured: median 27 ns, p99 157 ns with the clock pair) — matches spot_price_store/record_* (full at 25,000) and its p99 gate (plan ITEM DT, 2026-10-30)
 backup_dedup             = 400          # <400ns per packet (measured: median 55 ns accept, p99 153 ns with the clock pair) — matches backup_dedup/admit_* (set full at 5,000) and its p99 gate (plan ITEM DT, 2026-10-30)
 tick_conservation_ledger = 100          # <100ns per row (measured: median 8 ns, p99 58 ns with the clock pair) — matches tick_conservation_ledger/note_row_appended_* and its p99 gate (plan ITEM DT, 2026-10-30)
+depth_row_append         = 1000         # <1us per row — matches depth_row_append/level_row (market_depth, one row per level) and depth_row_append/book_row_5 (market_depth_book, the inline five-level Full-packet book), and its p99 gate (plan ITEM DT, 2026-10-30). Measured on the x86 dev container: median 393 ns per level row, 378 ns per book row; per-call p99 671-866 ns over three runs (one Instant pair inside each sample).
 
 # =============================================================================
 # Per-element counts for BATCH benchmarks (2026-06-02)
@@ -183,4 +184,5 @@ feed_drain_depth200_packet          = 200  # 200 levels per packet
 backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)
 candles_consume_tick_hit            = 500  # 500 ticks per hit batch (candle_fold TICKS_PER_BATCH)
 tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
+depth_row_append                    = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
 order_path_risk_record_fill_held    = 2    # 2 fills per iter (add then reduce: net lots return each iter; avg price and realized P&L drift, bounded)
