@@ -119,8 +119,9 @@ printf '%s\n' "${0##*/} $*" >> "$DOCTOR_MUTATION_CALLS"
     }
     symlink("/bin/bash", fixture.0.join("bin/bash")).expect("fixture bash");
     symlink("/usr/bin/grep", fixture.0.join("bin/grep")).expect("fixture grep");
-    let mut command = Command::new("/bin/bash");
+    let mut command = Command::new("bash");
     command
+        .args(["--noprofile", "--norc"])
         .arg("scripts/doctor.sh")
         .current_dir(&fixture.0)
         .env_clear()

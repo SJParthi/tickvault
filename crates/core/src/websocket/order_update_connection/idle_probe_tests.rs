@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Drive the production session over bounded in-memory WebSocket transports.
 //! Per-session notification injects the idle signal without global clock gates.
 //! The common watchdog tests own threshold/session gating; no broker I/O.

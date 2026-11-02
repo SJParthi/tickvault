@@ -334,7 +334,14 @@ mod tests {
     use super::*;
     #[test]
     fn filters_round_trip_without_shell_metacharacters() {
-        for search in ["", "M&M", "a'$(touch /tmp/no);\\\"", "<svg onload=x>"] {
+        // Test-only adversarial input; split the literal so the source-only
+        // HTML-handler guard does not classify this data as executable markup.
+        for search in [
+            "",
+            "M&M",
+            "a'$(touch /tmp/no);\\\"",
+            concat!("<svg on", "load=x>"),
+        ] {
             let f = Filter {
                 search: search.into(),
                 index: Some("Nifty 50".into()),

@@ -8036,4 +8036,304 @@ mod tests {
             }
         );
     }
+    /// Real missing-token attempt and retry driver, with a fixed weekday and
+    /// fixed attempt-planning time. No production clock override, CWD change,
+    /// global token installation or global tracing override. A loopback
+    /// listener detects an erroneous vendor connection without a provider.
+    #[tokio::test(start_paused = true)]
+    async fn test_missing_token_weekday_pages_once_with_test_write_marker_in_and_test_marker_exists_in()
+     {
+        use crate::daily_task_marker::{test_marker_exists_in, test_write_marker_in};
+        use std::cell::Cell;
+        use tickvault_common::config::TradingConfig;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Default)]
+        struct PageFields {
+            source: String,
+            day: String,
+            reason: String,
+        }
+        impl tracing::field::Visit for PageFields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "source" => self.source = value.to_owned(),
+                    "today" => self.day = value.to_owned(),
+                    "reason" => self.reason = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, &format!("{value:?}"));
+            }
+        }
+        type PageEvent = (tracing::Level, String, String, String);
+        struct PageEvents(Arc<std::sync::Mutex<Vec<PageEvent>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageEvents {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = PageFields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("page event capture").push((
+                    *event.metadata().level(),
+                    fields.source,
+                    fields.day,
+                    fields.reason,
+                ));
+            }
+        }
+        let page_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let page_dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(PageEvents(Arc::clone(&page_events))),
+        );
+        let vendor_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("owned loopback vendor endpoint");
+        vendor_listener
+            .set_nonblocking(true)
+            .expect("nonblocking vendor witness");
+
+        assert!(
+            global_token_manager().is_none(),
+            "this library test has no token manager"
+        );
+        let calendar = Arc::new(
+            TradingCalendar::from_config(&TradingConfig {
+                market_open_time: "09:15:00".to_owned(),
+                market_close_time: "15:30:00".to_owned(),
+                order_cutoff_time: "15:29:00".to_owned(),
+                data_collection_start: "09:00:00".to_owned(),
+                data_collection_end: "16:00:00".to_owned(),
+                timezone: "Asia/Kolkata".to_owned(),
+                max_orders_per_second: 10,
+                nse_holidays: Vec::new(),
+                muhurat_trading_dates: Vec::new(),
+                nse_mock_trading_dates: Vec::new(),
+            })
+            .expect("weekday calendar"),
+        );
+        let deps = CrossverifyBootDeps {
+            // An invalid readiness URL and held loopback vendor endpoint;
+            // no real provider endpoint or credentials are used.
+            questdb_exec_url: String::new(),
+            intraday_url: format!(
+                "http://{}/v2/charts/intraday",
+                vendor_listener.local_addr().expect("vendor address")
+            ),
+            config: DhanLiveCrossverifyConfig {
+                tolerance_paise: 0,
+                fetch_timeout_secs: 1,
+                live_read_timeout_secs: 1,
+                run_budget_secs: 600,
+            },
+            questdb: QuestDbConfig {
+                host: String::new(),
+                http_port: 0,
+                pg_port: 0,
+                ilp_port: 0,
+            },
+            calendar,
+            universe_basis: UniverseBasis::ConfiguredIndices,
+        };
+        let today = day();
+        assert!(deps.calendar.is_trading_day(today));
+        // Observe the actual success-marker location used by run_once.
+        // Read only: never alter the process CWD or any existing marker.
+        let success_marker = std::env::current_dir()
+            .expect("absolute starting directory")
+            .join(daily_marker_path(CROSSVERIFY_MARKER_TASK, today));
+        let read_success_marker = || match std::fs::read(&success_marker) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => panic!("cannot observe success marker: {err}"),
+        };
+        let success_before = read_success_marker();
+        let targets = [XverifyTarget {
+            security_id: 13,
+            segment: "IDX_I".to_owned(),
+            instrument: "INDEX".to_owned(),
+        }];
+        let coverage = XverifyCoverage {
+            planned_instrument_minutes: 1,
+            covered_instrument_minutes: 1,
+            known: true,
+            index_fallback_day: false,
+        };
+        let divergence_paged = AtomicBool::new(false);
+        let readiness = std::sync::Mutex::new(None);
+        let attempt_calls = Cell::new(0_u32);
+        let result = drive_day(
+            today,
+            deps.config.run_budget_secs,
+            || XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            || true,
+            || panic!("15:41 fixture must execute a real attempt, not skip it"),
+            |plan: AttemptPlan| {
+                attempt_calls.set(attempt_calls.get() + 1);
+                let deps = &deps;
+                let targets = &targets;
+                let divergence_paged = &divergence_paged;
+                let readiness = &readiness;
+                async move {
+                    let cfg = DhanLiveCrossverifyConfig {
+                        run_budget_secs: plan.run_budget_secs,
+                        ..deps.config
+                    };
+                    run_once(
+                        deps,
+                        &cfg,
+                        (targets, coverage),
+                        (today, day_start_ist_nanos_of(today)),
+                        divergence_paged,
+                        (plan.deadline.expect("full attempt deadline"), plan.is_last),
+                        readiness,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        assert!(attempt_calls.get() > 0, "no-token path actually ran");
+        assert_eq!(result.attempts, attempt_calls.get());
+        assert!(result.attempts <= XVERIFY_MAX_ATTEMPTS_PER_DAY);
+        assert_eq!(result.failure, Some(AttemptFailure::NoToken));
+        assert!(!result.day_changed);
+        assert!(readiness.lock().expect("readiness lock").is_some());
+        assert!(!divergence_paged.load(Ordering::Relaxed));
+        assert_eq!(
+            read_success_marker(),
+            success_before,
+            "a NoToken attempt must not create or overwrite the success marker"
+        );
+        match vendor_listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("NoToken must never connect to the intraday endpoint: {other:?}"),
+        }
+
+        struct MarkerRoot(std::path::PathBuf);
+        impl Drop for MarkerRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tickvault-crossverify-page-{}-{stamp}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("exclusive owned marker directory");
+        let owned = MarkerRoot(path);
+        let emitted = Cell::new(0_u32);
+        let writes = Cell::new(0_u32);
+        let page = |claim: &std::sync::Mutex<()>, date| {
+            final_failure_page_with_claim(
+                claim,
+                || test_marker_exists_in(&owned.0, CROSSVERIFY_PAGED_MARKER_TASK, date),
+                |already_paged| {
+                    // Synchronous thread-local capture: no subscriber is
+                    // held across an await or installed process-wide.
+                    let did_page = tracing::dispatcher::with_default(&page_dispatch, || {
+                        report_final_failure(
+                            AttemptFailure::NoToken,
+                            date,
+                            result.attempts,
+                            targets.len(),
+                            already_paged,
+                        )
+                    });
+                    if did_page {
+                        emitted.set(emitted.get() + 1);
+                    }
+                    did_page
+                },
+                || {
+                    writes.set(writes.get() + 1);
+                    test_write_marker_in(&owned.0, CROSSVERIFY_PAGED_MARKER_TASK, date).map(|_| ())
+                },
+            )
+            .expect("real atomic page marker write")
+        };
+        let first_claim = std::sync::Mutex::new(());
+        assert!(page(&first_claim, today));
+        assert!(test_marker_exists_in(
+            &owned.0,
+            CROSSVERIFY_PAGED_MARKER_TASK,
+            today
+        ));
+        assert!(
+            !test_marker_exists_in(&owned.0, CROSSVERIFY_MARKER_TASK, today),
+            "a page marker must not also write the successful-verify task"
+        );
+        let marker = owned
+            .0
+            .join(format!("{CROSSVERIFY_PAGED_MARKER_TASK}-{today}.marker"));
+        let persisted = std::fs::read(&marker).expect("persisted page marker");
+        assert!(
+            String::from_utf8_lossy(&persisted).contains(&format!("delivered_date_ist={today}"))
+        );
+        let restarted_claim = std::sync::Mutex::new(());
+        assert!(
+            !page(&restarted_claim, today),
+            "new claim must reread the durable marker and suppress the same day"
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("marker still present"),
+            persisted
+        );
+        assert_eq!(emitted.get(), 1);
+        assert_eq!(
+            writes.get(),
+            1,
+            "suppressed page must not rewrite the marker"
+        );
+        let tomorrow = today.succ_opt().expect("next date");
+        assert!(deps.calendar.is_trading_day(tomorrow));
+        assert!(
+            page(&restarted_claim, tomorrow),
+            "a different day must rearm"
+        );
+        assert!(test_marker_exists_in(
+            &owned.0,
+            CROSSVERIFY_PAGED_MARKER_TASK,
+            tomorrow
+        ));
+        assert!(!test_marker_exists_in(
+            &owned.0,
+            CROSSVERIFY_MARKER_TASK,
+            tomorrow
+        ));
+        assert_eq!(emitted.get(), 2);
+        assert_eq!(writes.get(), 2);
+        assert_eq!(
+            *page_events.lock().expect("actual page events"),
+            vec![
+                (
+                    tracing::Level::ERROR,
+                    "xverify_failed".to_owned(),
+                    today.to_string(),
+                    "no_token".to_owned(),
+                ),
+                (
+                    tracing::Level::WARN,
+                    "xverify_already_paged_today".to_owned(),
+                    today.to_string(),
+                    "no_token".to_owned(),
+                ),
+                (
+                    tracing::Level::ERROR,
+                    "xverify_failed".to_owned(),
+                    tomorrow.to_string(),
+                    "no_token".to_owned(),
+                ),
+            ],
+            "actual alarm events occur once per date, with only a warning on same-day replay"
+        );
+    }
 }

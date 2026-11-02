@@ -1015,9 +1015,9 @@ pub(super) mod tests {
     #[test]
     fn test_handler_uses_the_shared_client_and_a_timeout() {
         let source = include_str!("fno_stocks.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .map_or(source, |(before, _)| before);
+        let (production, _) = source
+            .split_once("\n#[cfg(test)]\npub(super) mod tests {")
+            .expect("the shared F&O test-module boundary must remain explicit");
         assert!(production.contains("state.questdb_http_client()"));
         assert!(production.contains(".timeout(timeout)"));
         assert!(!production.contains(concat!("Client::", "builder")));

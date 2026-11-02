@@ -3622,9 +3622,9 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "6c394f93299e53e40e9598942df67fc4703fff31f7e0914f731ac4433d2fab14"
+            "4a86b97f90df048caf75f85470a9bdc8a630d9cf5c1efe4faf9aa642d78f270a"
         );
-        assert_eq!(CONSOLE_HTML.len(), 57_232);
+        assert_eq!(CONSOLE_HTML.len(), 84_476);
     }
 
     // ------------------------------------------------ audit L4 source scans

@@ -218,6 +218,68 @@ pub fn strip_rust_comments(src: &str) -> String {
     out
 }
 
+/// Bind an outer cfg attribute to this module, never to an earlier item or
+/// a nearby comment. Only the uninterrupted attribute cluster may gate it.
+fn has_test_module_attribute(src: &str, classes: &[ByteClass], mod_offset: usize) -> bool {
+    let bytes = src.as_bytes();
+    let skip_trivia = |mut cursor: usize| {
+        while cursor > 0
+            && (classes[cursor - 1] == ByteClass::Comment
+                || (classes[cursor - 1] == ByteClass::Code
+                    && bytes[cursor - 1].is_ascii_whitespace()))
+        {
+            cursor -= 1;
+        }
+        cursor
+    };
+    let mut cursor = mod_offset;
+    loop {
+        cursor = skip_trivia(cursor);
+        if cursor == 0 || bytes[cursor - 1] != b']' || classes[cursor - 1] != ByteClass::Code {
+            return false;
+        }
+        let end = cursor;
+        cursor -= 1;
+        let mut depth = 1usize;
+        loop {
+            if cursor == 0 {
+                return false;
+            }
+            cursor -= 1;
+            if classes[cursor] != ByteClass::Code {
+                continue;
+            }
+            match bytes[cursor] {
+                b']' => depth += 1,
+                b'[' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let before_bracket = skip_trivia(cursor);
+        if before_bracket == 0
+            || bytes[before_bracket - 1] != b'#'
+            || classes[before_bracket - 1] != ByteClass::Code
+        {
+            return false;
+        }
+        cursor = before_bracket - 1;
+        let attribute = (cursor..end)
+            .filter(|&index| {
+                classes[index] != ByteClass::Comment
+                    && !(classes[index] == ByteClass::Code && bytes[index].is_ascii_whitespace())
+            })
+            .map(|index| bytes[index]);
+        if attribute.eq(b"#[cfg(test)]".iter().copied()) {
+            return true;
+        }
+    }
+}
+
 /// Returns the PRODUCTION region of a Rust source file: the whole file
 /// with its `#[cfg(test)]`-gated top-level `mod tests { … }` block blanked
 /// out (spaces, newlines preserved) — INCLUDING any production code that
@@ -233,8 +295,8 @@ pub fn strip_rust_comments(src: &str) -> String {
 #[must_use]
 pub fn production_region(src: &str) -> Option<String> {
     let classes = classify_bytes(src);
-    // Find the first CODE occurrence of a top-level `mod tests {` that is
-    // #[cfg(test)]-gated within the preceding 300 bytes.
+    // Find the first CODE occurrence of a top-level `mod tests {` whose
+    // own uninterrupted outer-attribute cluster includes cfg(test).
     let needle = "\nmod tests {";
     let mut search_from = 0usize;
     let (mod_off, brace_off) = loop {
@@ -242,8 +304,7 @@ pub fn production_region(src: &str) -> Option<String> {
         let abs = search_from + rel;
         let brace = abs + needle.len() - 1; // the `{`
         let is_code = classes.get(brace) == Some(&ByteClass::Code);
-        let preamble_start = abs.saturating_sub(300);
-        let gated = src[preamble_start..abs].contains("#[cfg(test)]");
+        let gated = has_test_module_attribute(src, &classes, abs + 1);
         if is_code && gated {
             break (abs + 1, brace); // abs+1: skip the leading '\n'
         }
@@ -284,6 +345,53 @@ pub fn production_region(src: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_regression_production_region_cannot_borrow_another_items_test_gate() {
+        // Regression: 2026-11-02 — the old 300-byte look-behind borrowed
+        // cfg(test) from an earlier helper or comment and hid live code.
+        for preamble in [
+            "#[cfg(test)]\nfn helper() {}",
+            "// #[cfg(test)]",
+            "/* #[cfg(test)] */",
+            "const MENTION: &str = \"#[cfg(test)]\";",
+            "#[cfg_attr(test, allow(dead_code))]",
+            "#[cfg(not(test))]",
+            "#![cfg(test)]",
+        ] {
+            let src = format!("{preamble}\nmod tests {{ fn live() {{ production_bypass(); }} }}\n");
+            assert!(production_region(&src).is_none(), "{preamble}");
+        }
+        let src = "#[cfg(test)]\nfn helper() {}\n\
+                   mod tests { fn live() { production_bypass(); } }\n\
+                   #[cfg(test)]\nmod tests { fn fixture() { test_only(); } }\n";
+        let prod = production_region(src).expect("the later genuinely gated module exists");
+        assert!(prod.contains("production_bypass();"));
+        assert!(!prod.contains("test_only();"));
+    }
+
+    #[test]
+    fn test_regression_production_region_binds_the_real_outer_attribute_cluster() {
+        let src = "fn before() {}\n#[ cfg ( /* gate */ test ) ]\n\
+                   // A second attribute with string brackets must not confuse matching.\n\
+                   #[doc = \"[ ] #[cfg(not(test))]\"]\n#[allow(dead_code)]\n\
+                   mod tests { fn fixture() { test_only(); } }\n\
+                   fn after() { production_tail(); }\n";
+        let prod = production_region(src).expect("the adjacent outer cfg(test) gates the module");
+        assert!(prod.contains("fn before()"));
+        assert!(prod.contains("production_tail();"));
+        assert!(!prod.contains("test_only();"));
+        let unicode_preamble = format!(
+            "// {}\n#[cfg(test)]\nmod tests {{ fn fixture() {{ test_only(); }} }}",
+            "é".repeat(150)
+        );
+        assert!(
+            !production_region(&unicode_preamble)
+                .expect("Unicode prose before an adjacent gate is valid")
+                .contains("test_only();"),
+            "there must be no arbitrary byte slice through a UTF-8 character"
+        );
+    }
 
     #[test]
     fn strip_rust_comments_strips_line_and_doc_but_keeps_strings() {

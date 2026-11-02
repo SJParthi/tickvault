@@ -296,6 +296,22 @@ pub fn try_write_daily_marker_keeping(
     write_marker_in(Path::new(DAILY_MARKER_DIR), task, date_ist, keep_days)
 }
 
+// Test-only access to the same atomic writer and strict reader, with an
+// owned base path. Cross-module fixtures must not change the process CWD.
+#[cfg(test)]
+pub(crate) fn test_marker_exists_in(base: &Path, task: &str, day: NaiveDate) -> bool {
+    marker_exists_in(base, task, day)
+}
+
+#[cfg(test)]
+pub(crate) fn test_write_marker_in(
+    base: &Path,
+    task: &str,
+    day: NaiveDate,
+) -> std::io::Result<MarkerDurability> {
+    write_marker_in(base, task, day, DAILY_MARKER_SWEEP_DAYS)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

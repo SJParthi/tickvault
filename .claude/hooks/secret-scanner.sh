@@ -19,6 +19,12 @@ fi
 VIOLATIONS=0
 REPORT=""
 
+# Deduplicate exact paths once; a failed input pass must not report CLEAN.
+if ! STAGED_FILES=$(printf '%s\n' "$STAGED_FILES" | LC_ALL=C sort -u); then
+  echo "Secret scan: unable to deduplicate staged paths." >&2
+  exit 2
+fi
+
 # Preserve the same eligible files, but classify each path only once.
 ELIGIBLE_FILES=""
 while IFS= read -r file; do

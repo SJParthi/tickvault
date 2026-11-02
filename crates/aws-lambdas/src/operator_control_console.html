@@ -92,13 +92,117 @@
   .spin{ animation:spin 1s linear infinite; display:inline-block; } @keyframes spin{ to{transform:rotate(360deg)} }
   section[data-tab="movers"] .row>label{ min-width:0; max-width:100%; }
   section[data-tab="movers"] select{ max-width:100%; }
+/* Stocks terminal: fixed reference proportions, bounded controls, no external assets. */
+body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetica,sans-serif}
+.stocks-open .wrap{max-width:none;margin:0}
+.stocks-open .hdr{height:67px;padding:0 40px;margin:0;border-bottom:1px solid #242424;gap:20px;background:#080808}
+.stocks-open .logo{background:none;color:#00b386;font-size:22px;letter-spacing:-.6px}
+.stocks-open .live{font-size:13px;color:#999}
+.stocks-open .dot{width:8px;height:8px;background:#555}
+.stocks-open .dot.on{background:#00b386;animation:none}
+.stocks-open .tabs{position:absolute;left:230px;top:0;height:67px;align-items:center;gap:30px;margin:0}
+.stocks-open .tab{border:0;border-radius:0;background:none;color:#aaa;font:400 14px Arial;padding:24px 0}
+.stocks-open .tab.active{color:#00b386;border-bottom:2px solid #00b386;background:none}
+.stocks-open .toast{border-radius:3px;background:#242424;border-color:#444;color:#ddd}
+.market-ticker{height:48px;border-bottom:1px solid #242424;display:flex;align-items:stretch;overflow:hidden;background:#0a0a0a;padding:0 40px}
+.ticker-item{display:flex;align-items:center;gap:14px;min-width:245px;padding:0 24px 0 0;margin-right:24px;border-right:1px solid #252525;font-size:13px;white-space:nowrap}
+.ticker-item b{font-weight:400;color:#c6c6c6}.ticker-item span{color:#727272}.ticker-item small{font-size:10px;color:#666}
+.stocks-layout{display:grid;grid-template-columns:400px minmax(0,1fr);gap:24px;margin:34px 40px 0}
+.stocks-sidebar{min-width:0}.watch-search{position:relative;height:42px}
+.watch-search:before{content:'⌕';position:absolute;left:14px;top:6px;color:#888;font-size:25px}
+.stocks-open .watch-search input{height:42px;padding:0 42px;border:1px solid #242424;border-radius:3px;background:#111;font-size:13px}
+.watch-panel{margin-top:20px;background:#101010;border:1px solid #242424;min-height:calc(100vh - 235px);border-radius:3px}
+.watch-heading{height:52px;padding:0 16px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #242424;font-size:14px;color:#bbb}
+.watch-heading span{margin-left:auto;color:#6c6c6c;font-size:12px}
+.watch-hint{font-size:11px;line-height:17px;color:#777;padding:10px 16px;margin:0;border-bottom:1px solid #222}
+.watch-empty{padding:28px 18px;color:#777;font-size:13px;line-height:21px}
+.watch-row{display:flex;border-bottom:1px solid #242424;padding:0 14px;gap:10px;align-items:center;min-height:66px}
+.stocks-open .watch-open{flex:1;min-width:0;display:flex;justify-content:space-between;align-items:center;gap:12px;text-align:left;border-radius:0;background:none;color:#bcbcbc;font-weight:400;padding:16px 0;font-size:13px}
+.watch-open .watch-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.watch-open .watch-price{white-space:nowrap;font-variant-numeric:tabular-nums}
+.stocks-open .watch-remove{background:none;color:#777;border-radius:0;padding:4px;font-size:17px;font-weight:400}
+.stocks-main{min-width:0}.asset-tabs{height:41px;display:flex;gap:34px;align-items:start;overflow-x:auto;border-bottom:1px solid #242424;white-space:nowrap}
+.stocks-open .asset-tab{background:none;border:0;border-radius:0;color:#999;padding:0 0 19px;font-size:16px;font-weight:400}
+.stocks-open .asset-tab.selected{color:#00b386;border-bottom:2px solid #00b386}
+.stocks-open button:disabled{cursor:not-allowed}.stocks-open .asset-tab:disabled{opacity:.65}
+.mover-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:35px;margin-top:19px}
+.category-tabs{display:flex;align-items:center;gap:8px;min-width:0;overflow-x:auto;white-space:nowrap}
+.stocks-open .category-tab{border:1px solid #343434;border-radius:3px;background:#191919;color:#aaa;padding:8px 10px;font-size:11px;font-weight:400;line-height:17px;white-space:nowrap}
+.stocks-open .category-tab:disabled{opacity:.65}.stocks-open .category-tab.selected{background:#072e25;border-color:#00b386;color:#00bd91}
+.mover-filters{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.direction-toggle{display:flex;gap:0;border:1px solid #343434;border-radius:3px;overflow:hidden}
+.stocks-open .direction-toggle button{background:#1a1a1a;color:#aaa;border:0;border-radius:0;font-size:12px;font-weight:400;padding:9px 12px;line-height:15px}
+.stocks-open .direction-toggle button[aria-pressed="true"]{color:#00bd91;background:#063a2e}
+.stocks-open .mover-filters select{font-size:12px;height:35px;border:1px solid #343434;border-radius:3px;color:#aaa;background:#191919;padding:0 9px;max-width:110px}
+ .stocks-open .mover-filters select.universe-picker{appearance:base-select;min-width:119px;max-width:168px;height:35px;border:1px solid #343434;border-radius:3px;background:#191919;color:#bbb;padding:8px 12px;font-size:12px;line-height:17px;cursor:pointer}
+.universe-picker::picker(select){appearance:base-select;width:168px;max-height:457px;overflow-y:auto;background:#1b1b1b;border:1px solid #333;border-radius:3px;box-shadow:0 10px 25px #0008;padding:2px 0;top:anchor(bottom);left:anchor(right);translate:-100% 2px}
+.universe-picker option{height:39px;min-height:39px;padding:0 16px;color:#c1c1c1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.universe-picker option:hover,.universe-picker option:focus{background:#292929}.universe-picker option:checked{color:#00b386;background:#17322a}.universe-picker option:disabled{color:#666}.universe-picker option::checkmark{display:none}
+.stocks-table-scroll{margin-top:9px;overflow:auto;border:1px solid #242424;border-radius:3px}
+.stocks-table{width:100%;min-width:880px;table-layout:fixed;border-collapse:collapse;background:#101010;font-size:14px}
+.stocks-table th,.stocks-table td{padding:0 14px;height:48px;border-bottom:1px solid #242424;text-align:right;white-space:nowrap;font-weight:400}
+.stocks-table thead{background:#191919}.stocks-table th{color:#929292;font-size:13px}
+.stocks-table th:nth-child(1),.stocks-table td:nth-child(1){width:42px;padding:0 14px;text-align:left}
+.stocks-table th:nth-child(2),.stocks-table td:nth-child(2){width:34%;text-align:left;border-right:1px solid #242424}
+.stocks-table th:nth-child(3){width:7%}.stocks-table th:nth-child(4){width:12%}.stocks-table th:nth-child(5){width:14.5%}.stocks-table th:nth-child(6){width:14.5%}.stocks-table th:nth-child(7){width:auto}
+.stocks-open .stocks-table input{width:17px;height:17px;padding:0;margin:0;accent-color:#00b386;vertical-align:middle}
+.stocks-open .sort-button{width:100%;padding:0;border:0;border-radius:0;color:inherit;background:none;font-size:13px;font-weight:400;text-align:inherit;white-space:nowrap}
+.sort-indicator{display:inline-block;width:15px;color:#d6a64a;font-size:11px;margin-right:5px}
+.stock-name{overflow:hidden;text-overflow:ellipsis;color:#c3c3c3;font-size:14px;line-height:18px}
+.stock-detail{color:#656565;font-size:10px;line-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stocks-table .positive,.watch-price.positive{color:#69ae0c}.stocks-table .negative,.watch-price.negative{color:#ef4c4c}
+.stocks-table .unavailable{color:#686868}.stocks-table tbody tr:hover{background:#171717}
+.stocks-table tbody tr:last-child td{border-bottom:0}
+.mover-searchbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px;flex-wrap:wrap}
+.stock-query{display:flex;gap:7px;align-items:center;max-width:400px;flex:1 1 250px}
+.stocks-open .stock-query input{height:31px;background:#111;border:1px solid #303030;border-radius:3px;padding:0 10px;font-size:12px;min-width:0}
+.stocks-open .stock-query button,.stocks-open .movers-refresh,.stocks-open .mover-page button{height:31px;padding:0 11px;background:#191919;border:1px solid #343434;border-radius:3px;color:#aaa;font-size:12px;font-weight:400;white-space:nowrap}
+.stocks-open .stock-query button:hover,.stocks-open .movers-refresh:hover,.stocks-open .mover-page button:not(:disabled):hover{border-color:#00b386;color:#00b386}
+.mover-status{font-size:12px;line-height:18px;margin:11px 0 0;color:#aaa}
+.mover-meta{font-size:11px;line-height:17px;color:#686868;margin:5px 0}
+.mover-page{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:10px}
+.mover-page p{margin:0 auto 0 0;color:#777;font-size:11px}.stocks-open .mover-page button:disabled{opacity:.35}
+.stocks-note{font-size:10px;color:#656565;line-height:16px;margin:10px 0 20px}
+@media(max-width:1800px){.stocks-layout{grid-template-columns:330px minmax(0,1fr)}.asset-tabs{gap:27px}.category-tabs{gap:5px}.stocks-open .category-tab{padding:8px 7px;font-size:10px}.direction-toggle button{padding-left:8px!important;padding-right:8px!important}}
+@media(max-width:1450px){.stocks-layout{grid-template-columns:280px minmax(0,1fr);margin-left:24px;margin-right:24px;gap:20px}.mover-toolbar{flex-wrap:wrap;gap:10px}.mover-filters{margin-left:auto}.stocks-table th:nth-child(2),.stocks-table td:nth-child(2){width:29%}}
+@media(max-width:950px){.stocks-open .hdr{padding:0 16px;height:57px}.stocks-open .tabs{left:155px;height:57px;gap:17px}.stocks-open .tab{font-size:12px;padding:20px 0}.stocks-open .live{display:none}.market-ticker{height:42px;padding:0 16px}.ticker-item{min-width:190px}.stocks-layout{grid-template-columns:minmax(0,1fr);margin:22px 16px 0;gap:25px}.stocks-sidebar{grid-row:2}.watch-panel{min-height:150px;margin-top:12px}.stocks-main{grid-row:1}.asset-tabs{gap:24px}.stocks-open .asset-tab{font-size:14px}.stocks-open .category-tab{font-size:10px}.mover-filters{width:100%;justify-content:flex-end;gap:6px}.stocks-table{min-width:900px}.stocks-note{font-size:10px}.stocks-open .mover-filters select.universe-picker{min-width:119px;max-width:142px}.stocks-open .direction-toggle button{font-size:11px}.stocks-open .mover-filters select{max-width:70px}.mover-page{flex-wrap:wrap}.mover-page p{flex-basis:100%}}
+@media(prefers-reduced-motion:reduce){.stocks-open *{animation:none!important;transition:none!important}}
+/* Reference refinements: compact filled asset strip and a native direction state. */
+.asset-tabs{width:763px;max-width:100%;height:41px;padding:4px;gap:0;background:#191919;border:0;border-radius:8px;align-items:stretch}
+.stocks-open .asset-tab{flex:1;min-width:86px;height:33px;padding:0 10px;font-size:16px;line-height:33px;border:0;border-radius:5px}
+.stocks-open .asset-tab.selected{background:#18332b;color:#00b386;border:0}.stocks-open .asset-tab:disabled{opacity:1;color:#929292}
+.stocks-open .category-tab{font-size:14px;padding:8px 11px}.stocks-open .category-tab:disabled{opacity:1;color:#929292}
+.direction-toggle{position:relative;border:0;border-radius:0;background:none;gap:42px;overflow:visible}
+.direction-toggle:before{content:'';position:absolute;left:calc(50% - 16px);top:calc(50% - 6px);width:32px;height:12px;border-radius:8px;background:#153e32}
+.direction-toggle:after{content:'';position:absolute;left:calc(50% - 17px);top:calc(50% - 7px);width:14px;height:14px;background:#151515;border:2px solid #00a980;border-radius:50%;pointer-events:none}
+.direction-toggle:has([data-direction="losers"][aria-pressed="true"]):after{left:calc(50% + 3px)}
+.stocks-open .direction-toggle button,.stocks-open .direction-toggle button[aria-pressed="true"]{background:none;border:0;padding:9px 0!important;font-size:14px;color:#888}
+.stocks-open .direction-toggle button[aria-pressed="true"]{color:#00b386}
+.stocks-table{font-size:16px}.stocks-table th,.stocks-open .sort-button{font-size:15px}.stock-name{font-size:16px;line-height:20px}.stock-detail{font-size:11px}
+.stocks-table th:nth-child(2),.stocks-table td:nth-child(2){padding-left:2px}.sort-indicator:empty{width:0;margin:0}
+.universe-picker option{font-size:14px}.stocks-open .watch-open{font-size:16px}.watch-heading{font-size:15px}
+@media(max-width:1800px){.stocks-open .category-tab{font-size:12px;padding:8px 8px}}
+@media(max-width:950px){.stocks-open .tabs{flex-wrap:nowrap;right:8px;overflow-x:auto;white-space:nowrap;gap:16px}.stocks-open .tab{flex-shrink:0}.stocks-open .asset-tab{font-size:14px;min-width:83px}.stocks-open .category-tab{font-size:11px}.stocks-open .direction-toggle button{font-size:12px}.direction-toggle{gap:35px}}
+.stocks-open .category-tab{font-size:15px;line-height:20px;padding:4px 10px;background:#000;border-color:#292929}.stocks-open .category-tab.selected{background:none;border-color:#00b386}
+.mover-filters{gap:16px}.direction-toggle{width:150px;gap:0;justify-content:space-between;flex-shrink:0}.stocks-open .mover-filters select:not(.universe-picker){width:74px}
+.watch-heading:before{content:'▮';color:#c59f43;margin-right:3px;font-size:16px}.watch-name{display:block}.watch-market,.watch-change{display:block;font-size:11px;color:#727272;line-height:17px}.watch-quote{text-align:right;white-space:nowrap}.watch-quote.positive,.watch-quote.positive .watch-change{color:#69ae0c}.watch-quote.negative,.watch-quote.negative .watch-change{color:#ef4c4c}
+@media(max-width:1800px){.stocks-open .category-tab{font-size:13px;padding:4px 8px}}
+@media(max-width:950px){.mover-filters{gap:8px}.direction-toggle{width:130px}.stocks-open .mover-filters select:not(.universe-picker){width:62px}.stocks-open .category-tab{font-size:12px}}
+
+@media(max-width:950px){.mover-filters{flex-wrap:wrap}}
+
+/* The closed native picker must clip long canonical names; its popup remains scrollable. */
+.stocks-open .mover-filters select.universe-picker{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Shrink the watchlist flex text instead of allowing long names to widen the page. */
+.watch-open>span{min-width:0}.watch-open>span:first-child{flex:1;overflow:hidden}.watch-quote{max-width:55%}.watch-open .watch-price,.watch-open .watch-change{display:block;overflow:hidden;text-overflow:ellipsis}
+
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="hdr">
-    <div class="logo">🛰️ tickvault</div>
-    <div class="live"><span class="dot" id="livedot"></span><span id="livetxt">offline</span></div>
+    <div class="logo">tickvault</div>
+    <div class="live" title="Control service connection; stock freshness is shown below."><span class="dot" id="livedot"></span><span id="livetxt">offline</span></div>
   </div>
 
   <div class="card lock" id="lock">
@@ -114,26 +218,80 @@
   <div id="app" hidden>
     <div class="tabs">
       <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
-      <button type="button" class="tab" data-t="movers" id="movers-tab">Top Movers</button>
+      <button type="button" class="tab" data-t="movers" id="movers-tab">Markets</button>
       <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
       <div class="tab" data-t="admin" onclick="tab('admin')">🛠️ Admin</div>
     </div>
 
     <section data-tab="movers" hidden>
-      <div class="card">
-        <h2>Top Movers · stocks and their indices</h2>
-        <p class="muted">Captured prices and today's recorded index memberships. All mapped equities means stocks in the daily index artifact; it does not mean every exchange listing.</p>
-        <div class="row"><label>Universe <select id="movers-universe"><option value="fno">F&amp;O only</option><option value="all">All mapped equities</option></select></label><label>Index <select id="movers-index"><option value="">All recorded indices</option></select></label><label>Direction <select id="movers-direction"><option value="all">All</option><option value="gainers">Gainers</option><option value="losers">Losers</option></select></label></div>
-        <div class="row"><label>Symbol <input id="movers-search" maxlength="32" placeholder="e.g. RELIANCE"></label><button class="b-blu" id="movers-apply" type="button">Apply search</button><button class="b-blu" id="movers-refresh" type="button">Refresh movers</button></div>
-        <div id="movers-messages" hidden data-instance_stopped="The AWS instance is stopped. No prices can be read." data-instance_unavailable="AWS instance status could not be checked." data-bridge_unavailable="The private connection or installed movers helper is unavailable." data-credentials_unavailable="The app credential could not be loaded on the server." data-app_unauthorized="The app rejected its server-side credential." data-app_unavailable="The app could not serve movers." data-timeout="The movers request timed out." data-invalid_response="The server returned incomplete or invalid movers data." data-response_too_large="The response exceeded the safe transport size." data-busy="Another movers refresh is running. Try again shortly." data-closed="Market closed — no live movers." data-no_fno_list="Today's F&amp;O stock list is unavailable." data-no_index_list="Today's selected index membership is unavailable." data-no_data="No captured prices are available in this universe." data-unreachable="The price database is unreachable." data-query_failed="The price query failed." data-expired="Refresh required — snapshot freshness can no longer be confirmed." data-empty="No verified snapshot. Refresh to try again." data-locked="Unlock this tab to view movers." data-loading="Reading a verified snapshot…" data-stale="Source reports stale prices." data-fresh="Newest trade: at most 60s old. Individual stocks may be older." data-unknown="Freshness unconfirmed — refresh before using these prices."></div>
-        <p id="movers-status" role="status" aria-live="polite">Open this tab to load a snapshot.</p>
-        <p id="movers-meta" class="muted"></p>
-        <div style="overflow-x:auto"><table aria-label="Top stock movers with index membership"><thead><tr><th>Stock</th><th>Recorded indices</th><th>F&amp;O eligible</th><th>Price ₹</th><th>Change %</th><th>Last trade IST</th></tr></thead><tbody id="movers-rows"></tbody></table></div>
-        <p id="movers-selection" class="muted"></p><div class="row"><button id="movers-prev" type="button" disabled>Previous 20</button><button id="movers-next" type="button" disabled>Next 20</button></div>
-        <p class="muted">Filters apply to the full eligible universe before selecting a page. All includes unchanged stocks and missing previous closes.</p>
-        <p class="muted">Refreshes at most every 30 seconds while this tab is visible and auto-refresh is enabled. No historical prices are substituted when the market is closed.</p>
+      <div class="market-ticker" aria-label="Index price availability">
+        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty 50</b><span>—</span><small>Quote unavailable</small></div>
+        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty Next 50</b><span>—</span></div>
+        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty Bank</b><span>—</span></div>
+        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>India VIX</b><span>—</span></div>
+        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>FinNifty</b><span>—</span></div>
+        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>GIFT Nifty</b><span>—</span></div>
+      </div>
+      <div class="stocks-layout">
+        <aside class="stocks-sidebar" aria-label="Local stock watchlist">
+          <div class="watch-search"><input id="watch-search" type="search" maxlength="128" placeholder="Search this watchlist" aria-label="Search this watchlist"></div>
+          <div class="watch-panel">
+            <div class="watch-heading">Watchlist 1 <span id="watch-count">0 stocks</span></div>
+            <p class="watch-hint">Saved in this tab. Prices appear only for stocks in the current verified page.</p>
+            <div id="watch-rows"></div>
+          </div>
+        </aside>
+        <main class="stocks-main" aria-label="Stocks Price Movers">
+          <div class="asset-tabs" role="tablist" aria-label="Asset view">
+            <button class="asset-tab" type="button" disabled title="Live overview is not available in this Stocks view">Live</button>
+            <button class="asset-tab" type="button" disabled title="Options are not available in this Stocks view">Options</button>
+            <button class="asset-tab selected" type="button" role="tab" aria-selected="true">Stocks</button>
+            <button class="asset-tab" type="button" disabled title="Commodity is not available in this Stocks view">Commodity</button>
+            <button class="asset-tab" type="button" disabled title="Futures are not available in this Stocks view">Futures</button>
+            <button class="asset-tab" type="button" disabled title="ETFs are not available in this Stocks view">ETFs</button>
+            <button class="asset-tab" type="button" disabled title="Bonds are not available in this Stocks view">Bonds</button>
+            <button class="asset-tab" type="button" disabled title="Index quotes are not available in this stock snapshot">Index</button>
+          </div>
+          <div class="mover-toolbar">
+            <div class="category-tabs" aria-label="Stocks category">
+              <button type="button" class="category-tab" disabled title="Intraday comparison data is not available">Intraday Movers</button>
+              <button type="button" class="category-tab" disabled title="Benchmark comparison data is not available">Outperformers</button>
+              <button type="button" class="category-tab" disabled title="Margin funding data is not available">MTF</button>
+              <button type="button" class="category-tab" disabled title="Opening-range data is not available">Extreme Openings</button>
+              <button type="button" class="category-tab selected" aria-pressed="true">Price Movers</button>
+              <button type="button" class="category-tab" disabled title="Breakout data is not available">Breakouts</button>
+              <button type="button" class="category-tab" disabled title="Actual traded value is not captured">By Value</button>
+            </div>
+            <div class="mover-filters">
+              <div class="direction-toggle" aria-label="Price direction"><button type="button" data-direction="gainers" aria-pressed="true">Gainers</button><button type="button" data-direction="losers" aria-pressed="false">Losers</button></div>
+              <select id="movers-exchange" aria-label="Exchange: NSE equities only" title="This snapshot supports NSE equities only"><option>NSE</option></select>
+              <select class="universe-picker" id="universe-picker" aria-label="Stock universe"><option value="fno">F&amp;O Stocks</option></select>
+            </div>
+          </div>
+          <input type="hidden" id="movers-universe" value="fno"><input type="hidden" id="movers-index" value=""><input type="hidden" id="movers-direction" value="gainers">
+          <template id="stock-row-template"><tr><td><input type="checkbox"></td><td><div class="stock-name"></div><div class="stock-detail"></div></td><td data-field="ltp"></td><td data-field="change"></td><td data-field="change_pct"></td><td data-field="value_cr" title="Actual traded value is not captured."></td><td data-field="volume" title="Stored day volume; zero or absent values do not prove reported volume."></td></tr></template>
+          <template id="watch-row-template"><div class="watch-row"><button type="button" class="watch-open"><span><span class="watch-name"></span><small class="watch-market">NSE</small></span><span class="watch-quote"><span class="watch-price" title="Only current verified page prices are shown; individual stored ticks may be older."></span><small class="watch-change"></small></span></button><button type="button" class="watch-remove">×</button></div></template>
+          <div id="movers-messages" hidden data-instance_stopped="The AWS instance is stopped. No prices can be read." data-instance_unavailable="AWS instance status could not be checked." data-bridge_unavailable="The private connection or installed movers helper is unavailable." data-credentials_unavailable="The app credential could not be loaded on the server." data-app_unauthorized="The app rejected its server-side credential." data-app_unavailable="The app could not serve movers." data-timeout="The movers request timed out." data-invalid_response="The server returned incomplete or invalid movers data." data-response_too_large="The response exceeded the safe transport size." data-busy="Another movers refresh is running. Try again shortly." data-closed="Market closed — no live movers." data-no_fno_list="Today's F&amp;O stock list is unavailable." data-no_index_list="Today's selected index membership is unavailable." data-no_data="No captured prices are available in this universe." data-unreachable="The price database is unreachable." data-query_failed="The price query failed." data-expired="Refresh required — snapshot freshness can no longer be confirmed." data-empty="No verified snapshot. Refresh to try again." data-locked="Unlock this tab to view movers." data-loading="Reading a verified snapshot…" data-stale="Source reports stale prices." data-fresh="Newest stored tick: at most 60s old. Individual stocks may be older." data-unknown="Freshness unconfirmed — refresh before using these prices."></div>
+          <div class="stocks-table-scroll">
+            <table class="stocks-table" aria-label="Stocks price movers"><thead><tr>
+              <th><input id="stocks-select-all" type="checkbox" aria-label="Add or remove this page in watchlist"></th>
+              <th><button class="sort-button" type="button" data-sort="name"><span class="sort-indicator"></span>Name</button></th>
+              <th><button class="sort-button" type="button" data-sort="ltp"><span class="sort-indicator"></span>LTP</button></th>
+              <th><button class="sort-button" type="button" data-sort="change"><span class="sort-indicator"></span>Change</button></th>
+              <th><button class="sort-button" type="button" data-sort="change_pct"><span class="sort-indicator">▼</span>Change %</button></th>
+              <th><button class="sort-button" type="button" data-sort="value_cr" title="Actual traded value is not captured"><span class="sort-indicator"></span>Value (Cr.)</button></th>
+              <th><button class="sort-button" type="button" data-sort="volume"><span class="sort-indicator"></span>Volume</button></th>
+            </tr></thead><tbody id="movers-rows"></tbody></table>
+          </div>
+          <div class="mover-searchbar"><div class="stock-query"><input id="movers-search" type="search" maxlength="32" placeholder="Search stocks in this universe" aria-label="Search stocks in this universe"><button id="movers-apply" type="button">Search</button></div><button id="movers-refresh" class="movers-refresh" type="button">Refresh</button></div>
+          <p id="movers-status" class="mover-status" role="status" aria-live="polite">Open Stocks to load a snapshot.</p>
+          <p id="movers-meta" class="mover-meta"></p>
+          <div class="mover-page"><p id="movers-selection"></p><button id="movers-prev" type="button" disabled>Previous 20</button><button id="movers-next" type="button" disabled>Next 20</button></div>
+          <p class="stocks-note">NSE equities only. All = equities in today's recorded index mapping, not every exchange listing. Volume is stored day volume; zero or absent values are unavailable. <span id="movers-value-basis">Actual traded value is not captured; Value (Cr.) is unavailable.</span> Index membership and last-trade time are available on each stock name. Only Price Movers is available in this Stocks view. No order actions.</p>
+        </main>
       </div>
     </section>
+
     <!-- OVERVIEW -->
     <section data-tab="overview">
       <div class="card">
@@ -282,6 +440,69 @@ Stopped box → ONE calm banner + a greyed "—" shield instead of a scary
 "unreachable" warning. Gated STRICTLY on instance_state!=='running' — a
 RUNNING box with unreachable data keeps the real warnings below.
 -->
+<!-- Preserved console implementation notes; no executable code is relocated.
+// n === null means "count unreadable" — the bar renders '—' with an empty
+// track instead of a fabricated 0 (Rule 11, review fix M4).
+// Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
+// 'bad' red — so a critical state (red) is distinguishable from drift (amber).
+// Greyed "box stopped" shield: neither good nor bad — the box is off, so the
+// guarantee is neither proven nor violated. Used ONLY when instance_state is
+// not 'running' (a RUNNING box with unreachable data keeps the REAL warnings).
+  // ONE context-aware instance button: ▶ Start when stopped, ■ Stop when
+  // running. Server-side market-hours guard on 'stop' is unchanged; the
+  // force checkbox next to it feeds through act().
+  // Honest hero (Rule 11, review fix M4): rows_today_total === "" means the
+  // box/QuestDB was unreachable — render '—' and skip the count-up, never an
+  // animated fabricated 0 (the _sum_counts docstring contract).
+// The one context-aware instance action. 'start' is never market-hours
+// blocked server-side; 'stop' keeps the guard — force feeds through act().
+// FEEDS card. Rendered by ITERATING the app's own per-feed list — primarily the
+// health response's `feeds` array (one row per feed the app knows about), with
+// a generic fallback that derives feed names from the `<name>_enabled` keys of
+// GET /api/feeds. No feed name is hardcoded, so a future feed #3/#4 added to
+// the app automatically appears here with its own toggle. Errors are rendered
+// VERBATIM (esc()-wrapped) — never silent defaults.
+  // Prefer the /api/feeds runtime flags when both payloads are present.
+    // safe token for the onclick attribute (display uses esc()); the Lambda
+    // re-validates the same charset server-side before any shell command.
+    // The REST-pull line was REMOVED 2026-09-17 with its rest_fetch_audit
+    // source (the per-minute legs are gone; see operator_control.rs). It is
+    // not replaced: there is no per-minute fetch left to count or to time,
+    // and an always-empty "pulls today" line would read as a failure.
+        // live-trading guard ("refusing to disable the Dhan feed …").
+// SQL columns and rows are parsed and bounded in Rust.
+// QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
+// value is already IST (project storage convention); strip the noisy
+// microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
+// Escapes every cell and returns the data-row count.
+// ---- DB console (read-only, lives in the Data tab) ----
+// Writes are blocked SERVER-SIDE by the hardened _is_safe_sql gate (single
+// statement, no comments, banned mutators) + the 1000-row cap — the UI is a
+// convenience, never the security boundary.
+  // Click handlers pass an INDEX into the just-fetched list — the table name
+  // used in follow-up queries always comes from QuestDB's own tables() output,
+  // never from user-typed input (no injection surface).
+// AWS strip on Overview (spend $ · alarms firing · disk used %) — sourced from
+// the same aws_status action the old AWS tab used. The <details> expands to
+// the full alarm list + storage shields. Loaded once on first Overview load
+// (NOT on the 8s auto-refresh — aws_status does an SSM probe + an AWS Budgets
+// call) and on demand via the 🔄 Refresh AWS button.
+// Latency card. The REST per-(broker, pull type) table was REMOVED 2026-09-17
+// with its rest_fetch_audit source (see parse_latency in operator_control.rs).
+  // Live sockets: every socket the app tracks, what each holds on the wire, what it delivered, and how late.
+  // Rows come from the app's own counters.
+// forceId lets each tab keep its own force checkbox next to its own buttons:
+// Overview's instance button uses #force_inst, Admin's app controls use #force.
+// Danger-zone severity picker → the UNCHANGED per-action functions. Each still
+// asks for its OWN typed confirm token (WIPE / NUKE-DOCKER / ERASE) — the
+// picker only chooses WHICH prompt fires; there is no token bypass path.
+// Poll the REAL nuke outcome instead of claiming success the instant it is
+// dispatched. The teardown runs for a minute or two; we show the truthful
+// result: complete, FAILED/PARTIAL (something still in-use), or still-running.
+// A URL ending in #key=<secret> (or ?key=) keeps the key for this tab only, strips it from the
+// address bar and unlocks. No alert sends such a link since 2026-09-27 (audit PR36a:
+// the key reached email and SMS history); the paste form above is the normal path.
+-->
 <script>
 const $=id=>document.getElementById(id);
 let TOKEN=sessionStorage.getItem('tv_token')||''; try{ localStorage.removeItem('tv_token'); }catch(e){}
@@ -289,13 +510,13 @@ let timer=null, lastTicks=0, curTab='overview';
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
 function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
-function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'live':'offline'; }
+function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'Connected':'Offline'; }
 
 function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
-  TOKEN=v; sessionStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
+  TOKEN=v; sessionStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
 function lock(){ TOKEN=''; moversGeneration++; moversReply=null; renderMovers(); sessionStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten in this tab'); }
 
-function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
+function tab(name){ curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
   if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers') loadMovers(); }
 
@@ -314,30 +535,17 @@ function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''
   const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
     el.textContent=Math.round(from+(target-from)*(1-Math.pow(1-k,3))).toLocaleString(); if(k<1) requestAnimationFrame(step); } requestAnimationFrame(step); }
 
-// n === null means "count unreadable" — the bar renders '—' with an empty
-// track instead of a fabricated 0 (Rule 11, review fix M4).
 function bar(name,n,max){ const miss=(n==null); const pct=(!miss&&max>0)?Math.max(3,Math.round(100*n/max)):0;
   return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+(miss?'—':n.toLocaleString())+'</div></div>'; }
-// Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
-// 'bad' red — so a critical state (red) is distinguishable from drift (amber).
 function shield(t,s,good,cls){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
-// Greyed "box stopped" shield: neither good nor bad — the box is off, so the
-// guarantee is neither proven nor violated. Used ONLY when instance_state is
-// not 'running' (a RUNNING box with unreachable data keeps the REAL warnings).
 function shieldIdle(t){ return '<div class="shield idle"><div class="ttl">'+t+'</div><div class="st">—</div></div>'; }
 
 async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</span> Refreshing…'; const j=await call('view'); $('refbtn').textContent='🔄 Refresh now'; if(!j) return;
   const appOk=j.app==='active', running=j.instance_state==='running'; setLive(appOk&&running);
-  // ONE context-aware instance button: ▶ Start when stopped, ■ Stop when
-  // running. Server-side market-hours guard on 'stop' is unchanged; the
-  // force checkbox next to it feeds through act().
   instState=j.instance_state||'';
   const ib=$('instbtn'); ib.hidden=false;
   if(running){ ib.textContent='■ Stop instance'; ib.className='b-stop'; }
   else{ ib.textContent='▶ Start instance'; ib.className='b-go'; }
-  // Honest hero (Rule 11, review fix M4): rows_today_total === "" means the
-  // box/QuestDB was unreachable — render '—' and skip the count-up, never an
-  // animated fabricated 0 (the _sum_counts docstring contract).
   if(j.rows_today_total==null||j.rows_today_total===''){ $('ticksbig').textContent='—'; lastTicks=0; }
   else countUp($('ticksbig'), j.rows_today_total);
   $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+esc(j.instance_state||'?')+'</span>';
@@ -369,17 +577,9 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   if(!$('alarms').dataset.loaded) loadAws();
   $('updated').textContent='updated '+new Date().toLocaleTimeString(); }
 
-// The one context-aware instance action. 'start' is never market-hours
-// blocked server-side; 'stop' keeps the guard — force feeds through act().
 let instState='';
 function instAct(){ act(instState==='running'?'stop':'start','force_inst'); }
 
-// FEEDS card. Rendered by ITERATING the app's own per-feed list — primarily the
-// health response's `feeds` array (one row per feed the app knows about), with
-// a generic fallback that derives feed names from the `<name>_enabled` keys of
-// GET /api/feeds. No feed name is hardcoded, so a future feed #3/#4 added to
-// the app automatically appears here with its own toggle. Errors are rendered
-// VERBATIM (esc()-wrapped) — never silent defaults.
 async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML='<span class="muted">loading…</span>'; $('feedsmsg').textContent='';
   const j=await call('feeds-view'); if(!j){ $('feeds').innerHTML='<span class="warn">feeds-view request failed</span>'; return; }
   let list=[];
@@ -389,20 +589,13 @@ async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML=
     list=Object.keys(j.feeds).filter(k=>k.endsWith('_enabled')).map(k=>k.slice(0,-'_enabled'.length))
       .map(n=>({name:n, enabled:!!j.feeds[n+'_enabled'], lane:!!j.feeds[n+'_lane_running'], h:null}));
   }
-  // Prefer the /api/feeds runtime flags when both payloads are present.
   if(j.feeds && typeof j.feeds==='object'){ list.forEach(f=>{ if((f.name+'_enabled') in j.feeds){ f.enabled=!!j.feeds[f.name+'_enabled']; }
     if((f.name+'_lane_running') in j.feeds){ f.lane=!!j.feeds[f.name+'_lane_running']; } }); }
   if(!list.length){ $('feeds').innerHTML='<span class="warn">'+esc(j.feeds_error||j.health_error||'no feed data returned')+'</span>'; return; }
   const vb=v=>({ok:'success',down:'failure',disabled:'unknown',unknown:'unknown'})[v]||'pending';
   $('feeds').innerHTML=list.map(f=>{
-    // safe token for the onclick attribute (display uses esc()); the Lambda
-    // re-validates the same charset server-side before any shell command.
     const safeName=String(f.name).toLowerCase().replace(/[^a-z0-9_-]/g,'');
     const h=f.h; const badge=h?('<span class="badge '+vb(h.verdict)+'">'+esc(h.verdict||'?')+'</span>'):'<span class="badge unknown">no health</span>';
-    // The REST-pull line was REMOVED 2026-09-17 with its rest_fetch_audit
-    // source (the per-minute legs are gone; see operator_control.rs). It is
-    // not replaced: there is no per-minute fetch left to count or to time,
-    // and an always-empty "pulls today" line would read as a failure.
     const detail='<div class="muted">'+(h&&h.reason?esc(h.reason):'')+'</div>';
     return '<div class="pr"><div class="t"><b>'+esc(f.name)+'</b> — <span class="'+(f.enabled?'ok':'bad')+'">'+(f.enabled?'ENABLED':'disabled')+'</span>'
       +' · lane '+(f.lane?'<span class="ok">running</span>':'<span class="warn">not running</span>')+' '+badge+detail+'</div>'
@@ -415,35 +608,22 @@ async function feedToggle(feed,enabled){
   const j=await call('feed-toggle',{feed:feed,enabled:enabled}); if(!j) return;
   if(j.ok){ toast('✅ '+feed+' '+(enabled?'enabled':'disabled')); }
   else{ // Surface the APP's own message verbatim — incl. the 409 Dhan
-        // live-trading guard ("refusing to disable the Dhan feed …").
     const m=(j.app_response&&j.app_response.error)||j.error||('feed toggle failed (app status '+j.app_status+')');
     $('feedsmsg').textContent='⚠ '+m; toast('⚠ '+String(m).slice(0,120)); }
   setTimeout(loadFeeds,1200); }
 
-// SQL columns and rows are parsed and bounded in Rust.
 function sqlResult(j){return j&&j.ok===true&&typeof j.csv==='string'&&j.csv&&Array.isArray(j.columns)&&j.columns.length&&j.columns.every(c=>typeof c==='string')&&Array.isArray(j.rows)&&j.rows.every(r=>Array.isArray(r)&&r.length===j.columns.length&&r.every(c=>typeof c==='string'))?j:null;}
-// QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
-// value is already IST (project storage convention); strip the noisy
-// microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
 function tcell(c){ const m=/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$/.exec(c); return m? m[1]+' '+m[2]+' IST' : c; }
-// Escapes every cell and returns the data-row count.
 function renderGrid(el,j){let h='<table><tr>'+j.columns.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
   for(const row of j.rows)h+='<tr>'+row.map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
   el.innerHTML=h+'</table>';return j.rows.length;}
 
-// ---- DB console (read-only, lives in the Data tab) ----
-// Writes are blocked SERVER-SIDE by the hardened _is_safe_sql gate (single
-// statement, no comments, banned mutators) + the 1000-row cap — the UI is a
-// convenience, never the security boundary.
 let dbTables=[], dbCsv='';
 async function loadDbTables(){ $('dbtables').dataset.loaded='1'; $('dbtables').innerHTML='<span class="muted">loading…</span>';
   const j=sqlResult(await call('sql',{query:'SELECT table_name FROM tables() ORDER BY table_name'}));
   if(!j){ $('dbtables').innerHTML='<span class="warn">load failed</span>'; return; }
   dbTables=j.rows.map(r=>r[0]).filter(Boolean);
   if(!dbTables.length){ $('dbtables').innerHTML='<span class="warn">no tables returned — is the box running?</span>'; return; }
-  // Click handlers pass an INDEX into the just-fetched list — the table name
-  // used in follow-up queries always comes from QuestDB's own tables() output,
-  // never from user-typed input (no injection surface).
   $('dbtables').innerHTML=dbTables.map((t,i)=>'<div style="padding:6px 0;border-bottom:1px solid var(--line)"><a href="#" style="color:var(--cyan);text-decoration:none;font-size:13px" onclick="dbPick('+i+');return false">'+esc(t)+'</a></div>').join(''); }
 async function dbPick(i){ const t=dbTables[i]; if(t==null) return;
   $('dbcolname').textContent='— '+t; $('dbcols').innerHTML='<span class="muted">loading…</span>';
@@ -465,11 +645,6 @@ function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
 
-// AWS strip on Overview (spend $ · alarms firing · disk used %) — sourced from
-// the same aws_status action the old AWS tab used. The <details> expands to
-// the full alarm list + storage shields. Loaded once on first Overview load
-// (NOT on the 8s auto-refresh — aws_status does an SSM probe + an AWS Budgets
-// call) and on demand via the 🔄 Refresh AWS button.
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
   const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }
   const cwFail=(j.alarms_firing===null||j.alarms_firing===undefined), al=j.alarms_firing||[];
@@ -491,13 +666,9 @@ function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) ret
 function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
 function fmtLagMs(v){ if(v==null||v==='') return '-'; if(typeof v==='string'&&/inf/i.test(v)) return 'over 60 s (slower than the last bucket)'; v=Number(v); if(!isFinite(v)) return '-';
   if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; } function fmtAge(s){ s=Number(s); return s<60?s.toFixed(0)+' s ago':s<3600?(s/60).toFixed(1)+' min ago':(s/3600).toFixed(1)+' h ago'; }
-// Latency card. The REST per-(broker, pull type) table was REMOVED 2026-09-17
-// with its rest_fetch_audit source (see parse_latency in operator_control.rs).
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
   $('latws').innerHTML='<span class="muted">measuring…</span>';
   const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latws').innerHTML=''; return; }
-  // Live sockets: every socket the app tracks, what each holds on the wire, what it delivered, and how late.
-  // Rows come from the app's own counters.
   const ws=Array.isArray(j.ws_latency)?j.ws_latency:[]; const live=ws.filter(r=>Number(r.frames||0)>0).length;
   if(ws.length){
     let w='<div class="muted">'+live+' of '+ws.length+' sockets delivered data this session</div><table><tr><th>socket</th><th>pool</th><th>instruments on wire</th><th>frames delivered</th><th>last data</th><th>ticks timed</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
@@ -514,15 +685,10 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
     shield('Clock skew (box-wide)', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50)+
     shield('Order placement', fmtNs(j.order_place_avg_ns), true); }
 
-// forceId lets each tab keep its own force checkbox next to its own buttons:
-// Overview's instance button uses #force_inst, Admin's app controls use #force.
 async function act(action,forceId){ if(!confirm('Run "'+action+'" on the trading box?')) return;
   const fEl=$(forceId||'force'); const force=!!(fEl&&fEl.checked); toast(action+'…');
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
 
-// Danger-zone severity picker → the UNCHANGED per-action functions. Each still
-// asks for its OWN typed confirm token (WIPE / NUKE-DOCKER / ERASE) — the
-// picker only chooses WHICH prompt fires; there is no token bypass path.
 function dangerExecute(){ const sel=document.querySelector('input[name="danger"]:checked');
   if(!sel){ toast('Pick a danger-zone action first'); return; }
   const fn={wipe:wipeData, nuke:dockerReset, erase:bareNuke}[sel.value];
@@ -550,9 +716,6 @@ async function bareNuke(){
   if(!(j&&j.ok)){ toast((j&&j.error)||'bare-nuke failed — is the box running?'); return; }
   if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the box in ~1 min'); return; }
   pollNuke(j.command_id,0); }
-// Poll the REAL nuke outcome instead of claiming success the instant it is
-// dispatched. The teardown runs for a minute or two; we show the truthful
-// result: complete, FAILED/PARTIAL (something still in-use), or still-running.
 async function pollNuke(cid,n){
   if(n>40){ toast('⏳ still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
   const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
@@ -572,30 +735,58 @@ function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ 
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
 
-let moversReply=null,moversBusy=false,moversGeneration=0,moversReceived=0,moversObserved=0,moversRequestSeconds=0,moversLastAttempt=-Infinity,moversOffset=0;
+let moversReply=null,moversBusy=false,moversGeneration=0,moversReceived=0,moversObserved=0,moversRequestSeconds=0,moversLastAttempt=-Infinity,moversOffset=0,moversSort='change_pct',moversOrder='desc',moversVisible=[],watchPrices=[],moversNames=[],stockWatch=new Map();
+const watchKey=s=>s.segment+':'+s.security_id;
+function validWatch(s){return s&&Number.isSafeInteger(s.security_id)&&s.security_id>0&&s.segment==='NSE_EQ'&&typeof s.name==='string'&&s.name.length>0&&new TextEncoder().encode(s.name).length<=128&&!/[\x00-\x1f\x7f]/.test(s.name);}
+try{const raw=sessionStorage.getItem('tv_stock_watch')||'[]';if(raw.length<=20000){const saved=JSON.parse(raw);if(Array.isArray(saved)&&saved.length<=50)for(const s of saved)if(validWatch(s))stockWatch.set(watchKey(s),{security_id:s.security_id,segment:s.segment,name:s.name});}}catch(e){}
+function stockNode(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;}
+function stockSearchPrefix(name){let prefix='',bytes=0;const encoder=new TextEncoder();for(const point of name){const length=encoder.encode(point).length;if(bytes+length>32)break;prefix+=point;bytes+=length;}return prefix;}
+function stockNumber(n,signed=false){return typeof n!=='number'||!Number.isFinite(n)?'—':(signed&&n>0?'+':'')+n.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function stockVolume(s){const t=s.volume_text;if(typeof t==='string'&&/^[1-9]\d{0,19}$/.test(t)&&BigInt(t)<=18446744073709551615n)return BigInt(t).toLocaleString('en-IN');return Number.isSafeInteger(s.volume)&&s.volume>0?s.volume.toLocaleString('en-IN'):'—';}
+function saveWatch(){try{sessionStorage.setItem('tv_stock_watch',JSON.stringify([...stockWatch.values()]));}catch(e){toast('Watchlist works in this tab but could not be saved.');}}
+function setWatch(s,on){if(!validWatch(s))return;if(on&&stockWatch.size>=50&&!stockWatch.has(watchKey(s))){toast('This watchlist holds up to 50 stocks.');return;}if(on)stockWatch.set(watchKey(s),{security_id:s.security_id,segment:s.segment,name:s.name});else stockWatch.delete(watchKey(s));saveWatch();}
+function renderWatch(){
+  const root=$('watch-rows'),q=$('watch-search').value.trim().toLowerCase(),prices=new Map(watchPrices.map(s=>[watchKey(s),s]));root.replaceChildren();$('watch-count').textContent=stockWatch.size+' stocks';
+  for(const s of stockWatch.values()){if(!s.name.toLowerCase().includes(q))continue;const row=$('watch-row-template').content.firstElementChild.cloneNode(true),open=row.querySelector('.watch-open'),price=prices.get(watchKey(s));open.dataset.watch=watchKey(s);open.title='Search current filters for '+s.name;row.querySelector('.watch-name').textContent=s.name;const current=price&&price.name===s.name,tone=current?(price.change_pct>0?'positive':price.change_pct<0?'negative':''):'';row.querySelector('.watch-price').textContent=current?stockNumber(price.ltp):'—';row.querySelector('.watch-quote').className='watch-quote '+tone;row.querySelector('.watch-change').textContent=current&&price.change_pct!=null?stockNumber(price.change,true)+' ('+stockNumber(price.change_pct,true)+'%)':'—';const remove=row.querySelector('.watch-remove');remove.dataset.remove=watchKey(s);remove.setAttribute('aria-label','Remove '+s.name);root.appendChild(row);}
+  if(!root.children.length)root.appendChild(stockNode('p',stockWatch.size?'No matching selected stocks.':'Select a stock checkbox to add it to this tab’s watchlist.','watch-empty'));
+}
 function moversMessage(key){return $('movers-messages').getAttribute('data-'+key)||'Movers unavailable.';}
-function moversFilter(){return {fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset};}
-function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset'].every(k=>a[k]===b[k]);}
-function moversCell(row,value){const td=document.createElement('td');td.textContent=String(value);row.appendChild(td);}
-function moversIndices(s){const el=$('movers-index'),selected=s.filter.index||'';el.replaceChildren(new Option('All recorded indices',''));for(const name of s.index_names)el.add(new Option(name,name));if(selected&&!s.index_names.includes(selected))el.add(new Option(selected+' (unavailable)',selected));el.value=selected;}
+function moversFilter(){return {fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset,sort_by:moversSort,sort_order:moversOrder};}
+function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset','sort_by','sort_order'].every(k=>a[k]===b[k]);}
+function indexLabel(name){const aliases={'Nifty 50':'Nifty 50','Nifty Bank':'Nifty Bank','Nifty Financial Services':'Fin Nifty','Nifty Next 50':'Nifty Next 50','Nifty Smallcap 50':'Nifty Small Cap 50','Nifty Midcap 50':'Nifty Mid Cap 50','Nifty 100':'NIFTY 100','Nifty 200':'NIFTY 200'};return Object.hasOwn(aliases,name)?aliases[name]:name;}
+function moversIndices(s){
+  moversNames=s.index_names;const menu=$('universe-picker'),chosen=$('movers-index').value;menu.replaceChildren(new Option('All','all'),new Option('F&O Stocks','fno'));
+  for(const n of moversNames){const o=new Option(indexLabel(n),'index:'+n);o.title=n;menu.add(o);}if(!moversNames.includes('India VIX')){const o=new Option('India VIX — unavailable','');o.disabled=true;o.title='No recorded constituent basket';menu.add(o,Math.min(5,menu.options.length));}
+  if(chosen&&!moversNames.includes(chosen)){const o=new Option(chosen+' — unavailable','index:'+chosen);o.disabled=true;menu.add(o);}menu.value=chosen?'index:'+chosen:$('movers-universe').value;
+}
+function updateStockControls(){
+  document.querySelectorAll('[data-direction]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.direction===$('movers-direction').value)));
+  document.querySelectorAll('[data-sort]').forEach(b=>{const active=b.dataset.sort===moversSort;b.querySelector('.sort-indicator').textContent=active?(moversOrder==='asc'?'▲':'▼'):'';b.closest('th').setAttribute('aria-sort',active?(moversOrder==='asc'?'ascending':'descending'):'none');});
+}
 function renderMovers(){
-  const rows=$('movers-rows');rows.replaceChildren();$('movers-meta').textContent='';$('movers-selection').textContent='';$('movers-prev').disabled=true;$('movers-next').disabled=true;
+  const rows=$('movers-rows');rows.replaceChildren();moversVisible=[];watchPrices=[];renderWatch();$('movers-meta').textContent='';$('movers-selection').textContent='';$('movers-prev').disabled=true;$('movers-next').disabled=true;$('stocks-select-all').disabled=true;$('stocks-select-all').checked=false;updateStockControls();
   if(!moversReply){$('movers-status').textContent=moversMessage(TOKEN?'empty':'locked');return;}
   const reply=moversReply;if(reply.result==='error'){$('movers-status').textContent=moversMessage(reply.code);return;}
   const s=reply.snapshot,elapsed=Math.max(0,(performance.now()-moversReceived)/1000),transport=Math.max(0,moversObserved-reply.captured_at_epoch_secs)+moversRequestSeconds+2,age=s.data_age_secs===null?null:Math.ceil(s.data_age_secs+transport+elapsed);
   if(moversObserved+moversRequestSeconds+2+elapsed>=reply.valid_until_epoch_secs){$('movers-status').textContent=moversMessage('expired');return;}
-  const freshness=moversMessage(s.status==='live'?(age!==null&&age<=60?'fresh':'unknown'):s.status);
-  const partial=s.stocks_priced<s.universe_total||s.membership_status!=='available'||!s.fno_list_available;
-  $('movers-status').textContent=freshness+(partial?' Partial coverage — '+(s.membership_status==='unavailable'?'index memberships unavailable; ':s.membership_status==='partial'?'index membership incomplete; ':'')+(!s.fno_list_available?'F&O eligibility unknown; ':'')+(s.universe_available?`${s.universe_total-s.stocks_priced} eligible stocks unpriced.`:'eligible count unknown.'):'');
-  $('movers-meta').textContent=`${s.stocks_priced} of ${s.universe_available?s.universe_total:'unknown'} eligible ${s.filter.fno_only?'F&O stocks':'mapped equities'} priced · newest trade ${s.as_of_ist||'—'} IST · conservative age ${age===null?'unknown':age+'s'} · captured ${new Date(reply.captured_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST`;
-  for(const stock of s.rows){const row=document.createElement('tr');[stock.name,stock.indices.length?stock.indices.map(i=>s.index_names[i]).join(', '):s.membership_status==='unavailable'?'Unknown':'No recorded membership',stock.fno===null?'Unknown':stock.fno?'Yes':'No',stock.ltp.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}),stock.change_pct===null?'Previous close unavailable':(stock.change_pct>0?'+':'')+stock.change_pct.toFixed(2)+'%',stock.last_trade_ist].forEach(v=>moversCell(row,v));rows.appendChild(row);}
-  $('movers-selection').textContent=`Showing ${s.rows.length?s.filter.offset+1:0}–${s.rows.length?s.filter.offset+s.rows.length:0} of ${s.matching_total} matches.`;
+  const freshness=moversMessage(s.status==='live'?(age!==null&&age<=60?'fresh':'unknown'):s.status),partial=s.stocks_priced<s.universe_total||s.membership_status!=='available'||!s.fno_list_available;
+  $('movers-status').textContent=freshness+(partial?' Partial coverage — '+(s.membership_status==='unavailable'?'index memberships unavailable; ':s.membership_status==='partial'?'index membership incomplete; ':'')+(!s.fno_list_available?'F&O eligibility unknown; ':'')+(s.universe_available?s.universe_total-s.stocks_priced+' eligible stocks unpriced.':'eligible count unknown.'):'');
+  $('movers-meta').textContent=s.stocks_priced+' of '+(s.universe_available?s.universe_total:'unknown')+' eligible '+(s.filter.fno_only?'F&O stocks':'mapped equities')+' priced · newest stored tick '+(s.as_of_ist||'—')+' IST · conservative tick age '+(age===null?'unknown':age+'s')+' · snapshot '+new Date(reply.captured_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})+' IST';
+  $('movers-value-basis').textContent=s.value_basis||'Actual traded value is not captured; Value (Cr.) is unavailable.';
+  for(const stock of s.rows){
+    const row=$('stock-row-template').content.firstElementChild.cloneNode(true),check=row.querySelector('input'),name=row.cells[1],membership=stock.indices.length?stock.indices.map(i=>s.index_names[i]).join(', '):s.membership_status==='unavailable'?'Membership unknown':'No recorded membership',fno=stock.fno===null?'F&O unknown':stock.fno?'F&O':'Not F&O';
+    check.dataset.watchId=String(stock.security_id);check.checked=stockWatch.has(watchKey(stock));check.disabled=!validWatch(stock);check.setAttribute('aria-label','Watch '+stock.name);if(check.disabled)check.title='Identifier exceeds browser precision.';name.querySelector('.stock-name').textContent=stock.company_name||stock.name;name.querySelector('.stock-detail').textContent=(stock.company_name?stock.name+' · ':'')+fno+' · '+membership;name.title=stock.name+' · '+membership+' · stored tick '+stock.last_trade_ist+' IST; individual ticks may be older.';
+    const values=[stockNumber(stock.ltp),stockNumber(stock.change,true),stock.change_pct==null?'—':stockNumber(stock.change_pct,true)+'%',stockNumber(stock.value_cr),stockVolume(stock)];
+    values.forEach((value,i)=>{const td=row.cells[i+2];td.textContent=value;td.className=value==='—'?'unavailable':i===1||i===2?(stock.change_pct>0?'positive':stock.change_pct<0?'negative':''):'';});rows.appendChild(row);
+  }
+  moversVisible=s.rows;watchPrices=s.status==='live'&&age!==null&&age<=60?s.rows:[];renderWatch();$('stocks-select-all').disabled=!s.rows.some(validWatch);$('stocks-select-all').checked=s.rows.length>0&&s.rows.every(stock=>validWatch(stock)&&stockWatch.has(watchKey(stock)));
+  $('movers-selection').textContent='Showing '+(s.rows.length?s.filter.offset+1:0)+'–'+(s.rows.length?s.filter.offset+s.rows.length:0)+' of '+s.matching_total+' matches.';
   $('movers-prev').disabled=s.filter.offset===0;$('movers-next').disabled=s.filter.offset+s.rows.length>=s.matching_total;
 }
 async function loadMovers(){
-  if(moversBusy||!TOKEN||document.hidden)return;
-  moversBusy=true;moversReply=null;renderMovers();moversLastAttempt=performance.now();const generation=moversGeneration,filter=moversFilter();$('movers-refresh').disabled=true;$('movers-status').textContent=moversMessage('loading');
-  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),25000);
+  if(moversBusy||!TOKEN||document.hidden)return;const filter=moversFilter();moversReply=null;renderMovers();
+  if(new TextEncoder().encode(filter.search).length>32||/[\x00-\x1f\x7f]/.test(filter.search)){$('movers-status').textContent='Search is too long or contains unsupported characters. Use a shorter stock symbol.';return;}
+  moversBusy=true;moversLastAttempt=performance.now();const generation=moversGeneration;$('movers-refresh').disabled=true;$('movers-status').textContent=moversMessage('loading');const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),25000);
   try{const j=await call('stock-movers',{filter},controller.signal);if(generation!==moversGeneration||!TOKEN)return;const r=j&&j.movers;
     if(j&&j.ok===true&&r&&r.version===2&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&Number.isSafeInteger(r.valid_until_epoch_secs)&&r.valid_until_epoch_secs>j.observed_at_epoch_secs&&r.valid_until_epoch_secs<=r.captured_at_epoch_secs+60&&(r.result==='error'||r.result==='snapshot'&&sameMoversFilter(r.snapshot&&r.snapshot.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names))){moversReply=r;if(r.result==='snapshot')moversIndices(r.snapshot);}
     moversObserved=j&&j.observed_at_epoch_secs||0;moversReceived=performance.now();moversRequestSeconds=Math.max(0,(moversReceived-moversLastAttempt)/1000);renderMovers();
@@ -603,19 +794,22 @@ async function loadMovers(){
 }
 function changeMovers(offset=0){moversOffset=offset;moversGeneration++;moversReply=null;renderMovers();loadMovers();}
 $('movers-tab').addEventListener('click',()=>tab('movers'));$('movers-refresh').addEventListener('click',loadMovers);
-for(const id of ['movers-universe','movers-index','movers-direction'])$(id).addEventListener('change',()=>changeMovers());
 $('movers-apply').addEventListener('click',()=>changeMovers());$('movers-search').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();changeMovers();}});
 $('movers-prev').addEventListener('click',()=>changeMovers(Math.max(0,moversOffset-20)));$('movers-next').addEventListener('click',()=>changeMovers(moversOffset+20));
+document.querySelectorAll('[data-direction]').forEach(b=>b.addEventListener('click',()=>{$('movers-direction').value=b.dataset.direction;moversSort='change_pct';moversOrder=b.dataset.direction==='gainers'?'desc':'asc';changeMovers();}));
+document.querySelectorAll('[data-sort]').forEach(b=>b.addEventListener('click',()=>{moversOrder=moversSort===b.dataset.sort&&moversOrder==='desc'?'asc':'desc';moversSort=b.dataset.sort;changeMovers();}));
+$('universe-picker').addEventListener('change',e=>{const value=e.target.value;$('movers-universe').value=value==='fno'?'fno':'all';$('movers-index').value=value.startsWith('index:')?value.slice(6):'';changeMovers();});
+$('watch-search').addEventListener('input',renderWatch);$('watch-rows').addEventListener('click',e=>{const remove=e.target.closest('[data-remove]'),open=e.target.closest('[data-watch]');if(remove){stockWatch.delete(remove.dataset.remove);saveWatch();renderMovers();}else if(open){const s=stockWatch.get(open.dataset.watch);if(s){$('movers-search').value=stockSearchPrefix(s.name);changeMovers();}}});
+$('movers-rows').addEventListener('change',e=>{const id=Number(e.target.dataset.watchId),s=moversVisible.find(s=>s.security_id===id&&s.segment==='NSE_EQ');if(s){setWatch(s,e.target.checked);renderMovers();}});
+$('stocks-select-all').addEventListener('change',e=>{for(const s of moversVisible)setWatch(s,e.target.checked);renderMovers();});
 setInterval(()=>{if(curTab==='movers'&&!document.hidden&&!moversBusy)renderMovers();},1000);
 document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
+moversIndices({index_names:[]});renderWatch();
 
-// A URL ending in #key=<secret> (or ?key=) keeps the key for this tab only, strips it from the
-// address bar and unlocks. No alert sends such a link since 2026-09-27 (audit PR36a:
-// the key reached email and SMS history); the paste form above is the normal path.
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
   if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; sessionStorage.setItem('tv_token',TOKEN);
     try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
-if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
+if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
 </script>
 </body>
 </html>

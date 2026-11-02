@@ -1324,3 +1324,33 @@ before swapping, and moves the three files together. The fixed prefix and workin
 directory reduce repetition while preserving the existing ceilings. The swap is
 not a filesystem transaction: its partial-failure behavior is still subject to
 the existing app rollback workflow.
+
+
+## §0.17. 2026-11-02 — requested Stocks reference view in the existing portal
+
+The current user requests "i need this rpecise design webpage view and its
+slections dude okay?" and "just focus on this stocks webpage eviw alone dude
+okay? only focus on stocks dude okay?", with Dhan Stocks screenshots showing
+Price Movers, Gainers/Losers, NSE and the F&O/index selector. The standing
+request permits frontend code while requiring Rust for backend logic. The user
+subsequently asked to keep the other fixes progressing too.
+
+This implements that requested Stocks surface inside the existing operator
+portal: a left watchlist, one universe/index selector, sorting, bounded search,
+page selection and explicit stale/error/unknown-data states. The existing
+Overview, Data and Admin functions are retained. It adds no browser page,
+script tag, external script or interpreted backend.
+
+The coordinator's implementation decision is to set only this portal's
+JS_BYTE_BUDGET row to its measured **34,530 UTF-8 bytes**, from 31,671. This
+number was measured after implementation; it is not a separate numerical
+approval quoted from the user. The guard includes script-tag lines and their
+newlines. The final script has 308 lines within the unchanged 350-line ceiling,
+one script tag and the unchanged 21 source-scanner handler occurrences
+(19 parsed inline handler attributes). Every other byte/line, handler, shell,
+spawn, runtime and surface allowance remains unchanged.
+
+Scope is this requested Stocks feature only. This note does not authorize a
+new script/runtime/surface, another budget increase, order or depth activation,
+or deployment. Backend sorting and data transport remain Rust; this frontend
+measurement is not a latency, coverage, zero-loss or security guarantee.

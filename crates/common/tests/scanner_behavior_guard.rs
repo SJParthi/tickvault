@@ -28,7 +28,8 @@ impl Fixture {
 
     fn run(&self, scanner: &str, paths: &[&str]) -> Output {
         self.write("scanner.sh", scanner);
-        Command::new("/bin/bash")
+        Command::new("bash")
+            .args(["--noprofile", "--norc"])
             .arg(self.0.join("scanner.sh"))
             .arg(&self.0)
             .arg(paths.join("\n"))
@@ -177,7 +178,7 @@ access_token = "https://host.invalid/A1B2C3D4#fragment" // stub for tests
     assert_eq!(output.status.code(), Some(2), "{report}");
     assert!(output.stdout.is_empty());
     assert!(
-        report.contains("BLOCKED: 36 potential secret(s)"),
+        report.contains("BLOCKED: 19 potential secret(s)"),
         "{report}"
     );
     for family in [
@@ -199,10 +200,70 @@ access_token = "https://host.invalid/A1B2C3D4#fragment" // stub for tests
     ] {
         assert!(report.contains(family), "missing {family}: {report}");
     }
-    assert!(
-        report.contains("https://host.invalid/A1B2C3D4#fragment"),
-        "{report}"
+    // The URL and comment-bearing credentials must still be detected, but the
+    // security report must contain locations only, never matched source values.
+    let source = "crates/common/src/credentials.rs";
+    let mut expected: Vec<(&str, &str, usize)> = [
+        ("Hardcoded API key", 1),
+        ("Hardcoded API secret", 2),
+        ("Hardcoded access token", 3),
+        ("Hardcoded auth token", 4),
+        ("AWS Access Key ID", 5),
+        ("AWS Secret Access Key", 6),
+        ("Hardcoded Dhan client ID", 7),
+        ("Hardcoded Dhan JWT token", 8),
+        ("Hardcoded password", 9),
+        ("Hardcoded password", 10),
+        ("Hardcoded private key", 11),
+        ("Embedded private key", 12),
+        ("Hardcoded bearer token", 13),
+        ("Hardcoded Telegram bot token", 14),
+        ("Database connection string with password", 15),
+        ("Redis connection string with password", 16),
+        ("Hardcoded access token", 19),
+    ]
+    .into_iter()
+    .map(|(family, line)| (family, source, line))
+    .collect();
+    expected.extend([
+        ("Hardcoded password", "nested/Dockerfile", 1),
+        ("Hardcoded password", "spaced path/MakeFILE", 1),
+    ]);
+    let mut actual = Vec::new();
+    let mut context = None;
+    for line in report.lines().map(str::trim) {
+        if let Some(header) = line.strip_prefix("[SECRET] ") {
+            context = header.strip_suffix(':').and_then(|s| s.rsplit_once(" in "));
+        } else if let Some(location) = line
+            .strip_prefix("line ")
+            .and_then(|s| s.strip_suffix(" (source omitted)"))
+        {
+            let (family, file) = context.expect("each location has a category and path");
+            actual.push((
+                family,
+                file,
+                location.parse::<usize>().expect("source line"),
+            ));
+        }
+    }
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(
+        actual, expected,
+        "every unique finding appears exactly once"
     );
+    for canary in [
+        "A1B2C3D4E5",
+        "AKIA1234567890ABCDEF",
+        "eyJSyntheticCanary",
+        "AbCdEfGhIjKlMnOpQrStUvWxYz",
+        "synthetic-canary",
+        "postgresql://alice:canary@db:5432/db",
+        "redis://:canary@db:6379",
+        "https://host.invalid/A1B2C3D4#fragment",
+    ] {
+        assert!(!report.contains(canary), "source canary leaked: {report}");
+    }
     assert!(report.contains("spaced path/MakeFILE"), "{report}");
     assert!(!report.contains("REDACTED"), "{report}");
     assert!(!report.contains("allowlisted"), "{report}");

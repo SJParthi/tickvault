@@ -70,6 +70,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
+use tickvault_app::holiday_gate::trading_day_gate_exit_code;
 use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
@@ -119,19 +120,6 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-
-/// Exit code returned by the `--check-trading-day` gate.
-///
-/// The holiday gate (`tickvault holiday-gate`, `holiday_gate.rs`; a shell
-/// script until 2026-10-01) reads this code, as does any operator running
-/// `tickvault --check-trading-day` by hand. Contract:
-/// - `0`  = today (IST) is a trading day → let the app start.
-/// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
-///
-/// Pure so the contract is unit-testable without touching the clock/config.
-fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
-    if is_trading_day { 0 } else { 75 }
-}
 
 /// `--check-trading-day` short-circuit: load config → build the calendar →
 /// evaluate IST today → exit with [`trading_day_gate_exit_code`].
@@ -6563,20 +6551,6 @@ mod tests {
     #[test]
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
-    }
-
-    #[test]
-    fn test_trading_day_gate_exit_code_trading() {
-        // Trading day → 0 so the gate lets the app start.
-        assert_eq!(trading_day_gate_exit_code(true), 0);
-    }
-
-    #[test]
-    fn test_trading_day_gate_exit_code_non_trading() {
-        // Weekend/holiday → 75 so the gate self-stops the instance.
-        assert_eq!(trading_day_gate_exit_code(false), 75);
-        // 75 must be distinct from the fail-open load-error code 70.
-        assert_ne!(trading_day_gate_exit_code(false), 70);
     }
 
     #[test]

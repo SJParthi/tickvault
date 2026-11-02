@@ -1757,3 +1757,58 @@ check that each correction addresses its cause. The composed repair now requires
 ordinary plan/common/property guards, a normal gated commit, exact new-head
 workspace and all-target lint, then coordinated fast/native/pre-PR and CI checks.
 No merge, deployment, coverage percentage or production latency result is claimed.
+
+
+### 2026-11-02: preserve recovery and finish the requested Stocks surface
+
+The user authorized continuation and parallel repairs, supplied the Stocks
+reference screenshots, and asked that other fixes continue. Original unpublished
+refs, missing-a9b0e89c evidence and prior validation records remain preserved.
+Depth20, Depth200 and live order activation stay off.
+
+- [x] Implement the existing portal Stocks view with F&O/index selection,
+  watchlist, Gainers/Losers, full-universe backend sorting before paging,
+  bounded search and truthful unavailable/stale/error displays.
+  - Files: crates/aws-lambdas/src/operator_control_console.html,
+    crates/aws-lambdas/src/operator_control.rs,
+    crates/api/src/handlers/stock_movers.rs,
+    crates/common/src/operator_stock_movers_wire.rs
+  - Browser evidence: 28 passing Chromium controls on HTML SHA256
+    4a86b97f90df048caf75f85470a9bdc8a630d9cf5c1efe4faf9aa642d78f270a;
+    synthetic intercepted data only. Existing CSV functions remain preserved.
+  - Exact portal byte measurement and bounded frontend scope are recorded in
+    rust-only-forever-lock-2026-07-19.md §0.17; other allowances remain unchanged.
+- [x] Correct the failures found by the combined native run without discarding
+  their evidence or weakening the existing safety assertions.
+  - Files: crates/common/src/source_scan.rs,
+    crates/common/tests/production_panic_macro_guard.rs,
+    crates/core/tests/order_update_choke_point_guard.rs,
+    crates/core/tests/ws_telegram_visibility_guard.rs,
+    crates/app/tests/cov_xvs_crossverify_spawn.rs,
+    crates/app/src/dhan_live_crossverify_boot.rs,
+    crates/app/src/daily_task_marker.rs,
+    crates/app/src/holiday_gate.rs, crates/app/src/main.rs,
+    crates/api/src/handlers/fno_stocks.rs,
+    crates/common/tests/scanner_behavior_guard.rs,
+    crates/common/tests/doctor_read_only_guard.rs,
+    .claude/hooks/secret-scanner.sh
+  - Tests: test_regression_production_region_cannot_borrow_another_items_test_gate,
+    test_regression_panic_guard_requires_compiler_enforced_test_file_boundary,
+    test_regression_choke_point_guard_sees_bypass_after_test_only_field,
+    test_dhan_live_crossverify_boot_spawn_closed_calendar_never_pages_and_can_be_cancelled,
+    test_missing_token_weekday_pages_once_with_test_write_marker_in_and_test_marker_exists_in,
+    secret_scanner_preserves_all_families_and_comment_boundaries
+  - The prior full run is 16,312 passed / 13 failed / 32 ignored; these are
+    implementation corrections pending fresh combined native validation.
+- [ ] Complete fresh combined workspace, all-target lint and required native
+  guard/coverage validation; record exact scope and unresolved results.
+  - Real owned QuestDB execution at f521fb09: five round-trip tests passed,
+    then one restart readback passed using the same saved test binary.
+    This establishes neither production durability nor power-loss safety.
+
+Scenarios include long Unicode names at 320/390px, late/error/expired responses,
+full-universe sorting, unknown fields, duplicate scanner inputs, test-only
+fields before production code, fake cfg mentions, UTF-8 source boundaries and
+paused Tokio timers with unchanged wall time. Native regression assertions stay
+active. Rollback uses preserved refs/patches; no production deployment is part
+of this local implementation checkpoint.

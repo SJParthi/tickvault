@@ -1755,6 +1755,29 @@ mod idle_probe_tests;
 mod tests {
     use super::*;
 
+    fn production_source(src: &str) -> String {
+        tickvault_common::source_scan::production_region(src)
+            .expect("order-update source must retain its cfg(test) mod tests boundary")
+    }
+
+    #[test]
+    fn test_regression_order_source_guard_keeps_code_after_test_only_fields() {
+        // Regression: 2026-11-02 — the injected idle signal's cfg(test)
+        // field hid the entire read loop from first-attribute splitters.
+        let src = "struct Session {\n    #[cfg(test)]\n    signal: (),\n}\n\
+                   fn read_loop() { production_read(); }\n\
+                   #[cfg(test)]\nmod tests { fn fixture() { test_only_read(); } }\n\
+                   fn trailing() { production_tail(); }\n";
+        let prod = production_source(src);
+        assert!(prod.contains("production_read();"));
+        assert!(prod.contains("production_tail();"));
+        assert!(!prod.contains("test_only_read();"));
+        assert!(
+            std::panic::catch_unwind(|| production_source("fn no_test_module() {}")).is_err(),
+            "a missing test-module boundary must fail loudly"
+        );
+    }
+
     #[test]
     fn test_order_update_websocket_config_sets_every_bound_explicitly() {
         // Audit J4: the order-update dial used tungstenite's defaults (64 MiB
@@ -1793,8 +1816,7 @@ mod tests {
     #[test]
     fn test_order_update_dial_passes_the_explicit_config() {
         let src = include_str!("order_update_connection.rs");
-        let marker = concat!("#[cfg(", "test)]");
-        let production = src.split(marker).next().unwrap_or(src);
+        let production = production_source(src);
         assert!(production.contains("Some(order_update_websocket_config())"));
         assert!(!production.contains(concat!("request, ", "None, true")));
     }
@@ -1853,9 +1875,7 @@ mod tests {
     #[test]
     fn test_unparseable_order_arm_precedes_the_non_order_arm_and_counts_the_drop() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src
-            .find(concat!("#[cfg(", "test)]"))
-            .expect("test marker present")];
+        let prod = production_source(src);
         let arm = prod
             .find("AuthResponseKind::Success if looks_like_order_update(&text)")
             .expect("the envelope arm exists");
@@ -2986,7 +3006,7 @@ mod tests {
     #[test]
     fn test_frame_too_large_arm_precedes_auth_classification() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("test marker present")];
+        let prod = production_source(src);
         let arm_region = &prod[prod
             .find("match parse_order_update(&text)")
             .expect("frame parse match must exist in the read loop")..];
@@ -3154,9 +3174,7 @@ mod tests {
     #[test]
     fn test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src
-            .find(concat!("#[cfg(", "test)]"))
-            .expect("test marker present")];
+        let prod = production_source(src);
         let gate = prod
             .find("if let Some(msg_type) = unreadable_order_frame_type(&update, &text)")
             .expect("the ORDER-EVT-02 gate uses the parser's verdict");

@@ -1126,9 +1126,10 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // 11,014 → 10,953 on review: both token-gated reads share one guard.
     ("crates/api/src/handlers/dashboard_page.rs", 10_953),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
+    // Requested Stocks reference view, 2026-11-02; measured scope in §0.17.
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        31_671,
+        34_530,
     ),
 ];
 

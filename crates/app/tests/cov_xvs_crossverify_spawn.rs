@@ -2,13 +2,11 @@
 //! `live_side_readiness`, against a QuestDB-shaped server on 127.0.0.1 and a
 //! paused tokio clock.
 //!
-//! A test binary has no Dhan token manager, so every attempt of the day ends
-//! `no_token` (or is skipped for time after 16:23 IST) and the day's final
-//! failure pages once, which writes today's "paged" marker. That marker, in a
-//! temp working directory, is the observable effect asserted on a weekday; on
-//! a weekend the task skips the day and writes nothing. Nothing reaches Dhan:
-//! the intraday URL points at the local server and is never called without a
-//! token.
+//! Tokio's paused clock does not advance chrono wall time. The public-spawn
+//! fixture closes the calendar across the current/catch-up dates and verifies
+//! arming, no page/vendor call/success marker, and cancellation at any real
+//! time of day. The private fixed-time unit fixture exercises the real missing-
+//! token attempt, once-per-day page claim and durable marker separately.
 
 mod cov_xvs_support;
 
@@ -17,7 +15,7 @@ use std::time::Duration;
 
 use cov_xvs_support::{
     CwdGuard, FakeQuestDb, captured_events, drive_paused, init_no_proxy, init_tracing, is_weekday,
-    ist_now, lock_cwd, weekday_calendar,
+    ist_now, lock_cwd,
 };
 use tickvault_app::daily_task_marker::daily_marker_path;
 use tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig;
@@ -104,8 +102,41 @@ fn armed_lines() -> usize {
         .count()
 }
 
+fn calendar_closed_around(
+    today: chrono::NaiveDate,
+) -> Arc<tickvault_common::trading_calendar::TradingCalendar> {
+    use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+    let mut holidays = Vec::new();
+    for offset in -tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS..=1 {
+        let date = today
+            .checked_add_signed(chrono::TimeDelta::days(offset))
+            .expect("fixture date window");
+        if is_weekday(date) {
+            holidays.push(NseHolidayEntry {
+                date: date.to_string(),
+                name: "Crossverify fixture closed session".to_owned(),
+            });
+        }
+    }
+    Arc::new(
+        tickvault_common::trading_calendar::TradingCalendar::from_config(&TradingConfig {
+            market_open_time: "09:15:00".to_owned(),
+            market_close_time: "15:30:00".to_owned(),
+            order_cutoff_time: "15:29:00".to_owned(),
+            data_collection_start: "09:00:00".to_owned(),
+            data_collection_end: "16:00:00".to_owned(),
+            timezone: "Asia/Kolkata".to_owned(),
+            max_orders_per_second: 10,
+            nse_holidays: holidays,
+            muhurat_trading_dates: Vec::new(),
+            nse_mock_trading_dates: Vec::new(),
+        })
+        .expect("closed fixture calendar"),
+    )
+}
+
 #[tokio::test(start_paused = true)]
-async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_once_on_a_weekday() {
+async fn test_dhan_live_crossverify_boot_spawn_closed_calendar_never_pages_and_can_be_cancelled() {
     init_no_proxy();
     init_tracing();
     let _cwd_lock = lock_cwd().await;
@@ -114,6 +145,9 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
     let armed_before = armed_lines();
 
     let srv = FakeQuestDb::start_default();
+    let (today, _) = ist_now();
+    let calendar = calendar_closed_around(today);
+    assert!(!calendar.is_trading_day(today));
     let deps = CrossverifyBootDeps {
         questdb_exec_url: srv.exec_url(),
         intraday_url: format!("http://127.0.0.1:{}/v2/charts/intraday", srv.port),
@@ -124,7 +158,7 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
             run_budget_secs: 600,
         },
         questdb: srv.questdb_config(),
-        calendar: weekday_calendar(),
+        calendar,
         // This fixture configures a static feed; no missing master-list
         // fallback or successful master discovery is being simulated.
         universe_basis: tickvault_app::xverify_day_record::UniverseBasis::ConfiguredIndices,
@@ -140,7 +174,6 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
             segment: ExchangeSegment::NseFno,
         },
     ];
-    let (today, _) = ist_now();
     let paged = cwd
         .path()
         .join(daily_marker_path(CROSSVERIFY_PAGED_MARKER_TASK, today));
@@ -149,9 +182,9 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
         .join(daily_marker_path(CROSSVERIFY_MARKER_TASK, today));
 
     let handle = spawn_dhan_live_crossverify(deps, &main_feed);
-    // 20 h of virtual time reaches the day's last attempt (the run starts at
-    // 15:41 IST and every attempt ends by 16:23) from any start; the loop
-    // stops as soon as the paged marker shows.
+    // Exercise timer wakeups without pretending they advance chrono's wall
+    // clock. The explicitly closed calendar makes paging invalid both before
+    // and after 15:41, including the bounded past-day catch-up.
     let paged_seen = drive_paused(&srv, Duration::from_secs(20 * 3_600), || paged.exists()).await;
     assert!(
         !handle.is_finished(),
@@ -171,23 +204,15 @@ async fn test_dhan_live_crossverify_boot_spawn_without_a_token_pages_the_day_onc
     assert_eq!(armed, 1, "the task logs that it is armed exactly once");
     assert!(
         !recorded_exists,
-        "with no token nothing is compared, so the day is never recorded"
+        "a closed fixture day is never compared or recorded"
     );
     assert!(
         !requests.iter().any(|r| r.contains("/v2/charts/intraday")),
         "the vendor is never called without a token: {requests:?}"
     );
-    // Whatever the day, the page happens at most once (the paged marker).
-    assert!(pages <= 1, "at most one page per day: {pages}");
-    let (end_day, _) = ist_now();
-    if end_day != today {
-        return; // crossed IST midnight during the test
-    }
-    if is_weekday(today) {
-        assert!(paged_seen, "a failed weekday pages once and notes it");
-        assert_eq!(pages, 1, "exactly one page line on a failed weekday");
-    } else {
-        assert!(!paged_seen, "a weekend is skipped, nothing is paged");
-        assert_eq!(pages, 0, "no page line on a weekend");
-    }
+    assert!(!paged_seen, "an explicitly closed fixture day never pages");
+    assert_eq!(
+        pages, 0,
+        "closed current and catch-up days produce no failure page"
+    );
 }
