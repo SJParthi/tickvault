@@ -262,7 +262,7 @@ jobs:
           sleep 5; systemctl is-active amazon-ssm-agent || true
           echo "FINAL"; df -h / | tail -1
           EOS
-          sed -i "s/__FORCE_DISK__/${FORCE_DISK}/" recover.sh
+          sed -i "s/__FORCE_DISK__/$([ "$FORCE_DISK" = yes ] && echo yes || echo no)/" recover.sh
           echo "script written ($(wc -l < recover.sh) lines)"
 
       - name: Push a 60-second key via EC2 Instance Connect and run the recovery

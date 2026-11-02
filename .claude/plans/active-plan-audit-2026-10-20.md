@@ -13,6 +13,110 @@ Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-core` (
 (crates/storage), `tickvault-common` (crates/common/tests guards), `tickvault-trading`
 (crates/trading, risk only; indicator/ and strategy/ need their own §28 approval).
 
+## 2026-10-31: resumed security and order telemetry integration
+
+**Scope status:** IN_PROGRESS — local workspace checks passed; publication and merge pending.
+**Authorization:** the user's renewed instruction to resume paused work, relayed
+by the coordinator on 2026-10-31, explicitly names these three previously tested
+patches. This records existing session authorization; it does not invent a new
+exception, authorize a live recovery, or approve a deployment.
+
+Base: `0fd844582cbdac209f54e4394459b799f2ba797a`. Isolated independent checkout:
+`/tmp/tickvault-integrate-security`, branch `security/recovery-scanner-order-gauge`.
+The original checkout, original branches and saved component patches stay intact.
+This scope uses the existing active plan because the repository already has five
+active plans; no unrelated plan is archived and no plan ceiling is increased.
+
+### Design
+
+Integrate exactly the reviewed FORCE_DISK normalization, secret-scanner output
+redaction and order-update active-gauge lifetime fixes. Normalize the workflow's
+remote-template value to literal yes/no while preserving every existing market
+and Muhurat gate. Report scanner category/path/line while omitting matched source;
+retain every detection/filter/exit policy. Make a private Rust scope guard own the
+connected order socket's existing gauge through login/read and every future drop.
+Use the small borrowed session struct and generic in-memory transport boundary
+already validated in the component proposal; add no new lint exemption.
+
+Guarantee matrix: cross-reference the full 15-row and 7-row matrix in
+`.claude/rules/project/per-wave-guarantee-matrix.md`. For this scope, security is
+the three behavioral boundaries above; performance is constant work at connection
+entry/drop, not a per-frame addition; schemas, financial arithmetic, persistence,
+dependency pins, runtime ownership and alarm policy are unchanged. No universal
+coverage, losslessness, strict latency or future production guarantee is claimed.
+
+### Edge Cases
+
+Only exact lowercase yes opts into FORCE_DISK; empty, malformed and shell/sed
+metacharacter inputs become no. A scanner detection still blocks even if its
+matching line begins with a credential, contains colons or is short. Clean input
+still succeeds. The order gauge must clear after login-write error, dropping a
+pending login at the test deadline, task abort, unwind and sequential sessions. It stays one during
+a live connected session. Release panic=abort cannot execute destructors; process
+termination and overlapping independent sockets are outside the tested contract.
+
+### Failure Modes
+
+Patch drift must be resolved without copying an older workflow over the newer
+Muhurat logic. The scanner must not weaken a regex, exclusion or blocking exit to
+hide output. The gauge fix must not alter login, authentication, reconnect,
+watchdog or message handling. Missing external build resources leave validation
+pending; earlier component tests are evidence for those snapshots, not a pass on
+this integration. Source preparation runs no recovery, service, broker or AWS call.
+
+### Test Plan
+
+- [ ] S1. Normalize the actual workflow substitution and retain a Rust behavioral guard.
+  - Files: .github/workflows/emergency-fs-recover.yml, crates/common/tests/github_workflow_guard.rs
+  - Tests: emergency_fs_recover_normalises_force_disk_input
+- [ ] S2. Omit source snippets from scanner reports while preserving detection.
+  - Files: .claude/hooks/secret-scanner.sh, crates/common/tests/secret_scanner_redaction.rs
+  - Tests: secret_scanner_blocks_credentials_without_printing_source, secret_scanner_still_accepts_clean_input
+- [ ] S3. Own the active gauge for the complete connected order session.
+  - Files: crates/core/src/websocket/order_update_connection.rs, crates/core/src/websocket/order_update_connection/tests.rs
+  - Tests: test_regression_order_update_active_gauge_login_send_error, test_regression_order_update_active_gauge_login_timeout, test_regression_order_update_active_gauge_task_abort, test_regression_order_update_active_gauge_unwind, test_regression_order_update_active_gauge_sequential_sessions
+
+Local validation on this exact base: eight focused positives; seven intended
+original-behavior regression failures, followed by restored positives; 100 common
+guards, 27 lifecycle guards and 118 order-connection tests; all-target workspace
+Clippy with warnings denied; full workspace 15,441 passed, zero failed, 33 existing
+ignores; 11 dedicated Loom tests. That full-workspace run precedes the final
+test-module packaging below; production source is byte-identical. Commands used
+Rust 1.95.0, offline/locked, one build job and one test thread.
+The first workspace attempt could not bind sandbox loopback sockets. The permitted
+rerun exposed the production-panic guard's classification of the external fixture
+filename. The fixture moved to canonical `tests.rs`. The native banned-pattern
+scanner then required the real test boundary to be visible inside that file, so
+the fixture now also sits in an explicit `#[cfg(test)] mod tests`. Its body is
+byte-identical after removing indentation and adjusting the parent-import depth;
+all assertions and production logic are unchanged. No guard or allowlist changed.
+After the final wrapper, all five lifecycle tests pass, original behavior fails
+all five, and restored behavior passes all five again; 63 panic/Rust-only/shell/
+source-size guard tests and workspace all-targets Clippy pass. The actual banned
+scanner now passes too. Earlier failures remain recorded in external artifacts.
+
+Independent source review found no blocker, including the canonical test-layout
+follow-up. Normal commit/push gates precede publication;
+record their actual results and any optional-tool skips in the PR. Keep logs
+bounded and never print matched secret source. S1–S3 remain open as merge-completion
+items; their local implementation and tests are complete. The draft targets `main`
+for required CI, explicitly depends on unmerged #2158, and gives reviewers the
+focused `0fd844582..HEAD` range. Do not bypass hooks, merge, auto-merge or deploy.
+
+### Rollback
+
+Each component can be reverted through ordinary reviewed Git changes if needed;
+reverting any one reintroduces its documented bug, so assess that consequence.
+There is no infrastructure, deployment, credential rotation or live rollback in
+this task. The original saved component patches remain available outside Git.
+
+### Observability
+
+No new metric or alarm is added. `tv_order_update_ws_active` now returns to zero
+when its connected future exits or is dropped. Scanner findings retain their
+category, path, line and blocking status without source content. Workflow recovery
+behavior is only reviewed/tested on inert templates; no real recovery is run.
+
 ## Plan Items
 
 ### PR A — depth rows the WAL refused never wait past 500 ms, plus backup-dedup allocation proof (app)
@@ -545,7 +649,7 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 - [x] C1. A spilled hour is set aside by the age of its END and gets a second
   evening; an unparseable spill name no longer holds every partition's archive.
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/partition_archive.rs
-  - Tests: test_spill_file_older_than_measures_a_top_volume_spill_from_the_hour_end,
+  - Tests: test_spill_file_older_than_counts_from_the_hour_end_and_saturates,
     test_unparseable_spill_name_does_not_hold_every_partition,
     test_undated_top_volume_spill_file_is_set_aside
 
@@ -764,7 +868,7 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   every CREATE TABLE literal (dated allowlist for the two scratch tables).
   - Files: crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
   - Note (2026-10-28): the J3 lifecycle half lived in the app lifecycle writer module, DELETED by owner Quote 44 with the daily lifecycle write (PR N below); the J3 ensure-and-hold pin was replaced by the no-writer guard.
-  - Tests: ensure-wiring source guard; create_table_has_dedup guard
+  - Tests: ensure-wiring source guard; every_create_table_carries_a_dedup_key guard
 - [x] J4 (core, api) Order-update WebSocket connects with explicit bounded
   limits; the connect-config guard scans every `connect_async*` site; the error
   summary writer streams and bounds its read; the ping/pong counter uses
@@ -862,7 +966,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   `tv_hot_path_stage_p99_ns{stage}` (and p50, p999) on local `/metrics` only,
   and log one coded `warn!` per episode when a stage's p99 passes its budget;
   plus a Criterion bench reading p99 from samples for the drain stage.
-  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches/ (existing bench file for the drain)
   - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
 
 - [x] K6 (app, storage, quality) Drain p99 tail (owner, 2026-10-26: "Always
@@ -980,7 +1084,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   every attempt until 09:30 (find whether any subscribed or ranked contract
   loses its underlying, fix if so); two QuestDB console Lambda log groups
   keep logs forever (set retention).
-  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform/
   - Tests: DHAT on the socket path unchanged; regression test per change
   - Done 2026-10-26: the WAL writer polls for 50 ms after its last record (1 ms sleep) before its blocking wait, so the reader no longer pays a futex wake per frame (harness: WAL hand-off max 4.0 ms -> 22 us, 0 over budget; frames reach the WAL file up to about 1 ms later); the reserved-connections gauge follows the widen; contract-map refusals are counted only for subscribed contracts (none lose their underlying); the two QuestDB console log groups get 14-day retention in terraform (not applied, not validated locally). Live confirmation waits for the next session.
 
@@ -1042,7 +1146,7 @@ Approved by: owner Quote 44 (2026-10-28), recorded in the daily-universe rule fi
   path, one bounded pass at a time with a queued rerun; the 7-day sweep deletes
   a file (and a `.json.tmp` leftover) only after a verified copy exists.
   - Files: crates/app/src/instrument_snapshot_upload.rs, crates/app/src/dhan_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
-  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_build_once_counts_the_sweep_held_files_on_the_held_counter, the_snapshot_copy_uses_the_configured_cold_bucket
+  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_sweep_artifacts_after_verified_copies_counts_the_held_files, the_snapshot_copy_uses_the_configured_cold_bucket
 - [x] N3 (app) The 31 Oct wipe keeps every object under `instrument-snapshots/`.
   - Files: (crates/app/src/wipe_2026_10_31.rs, deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b)
   - Tests: (test_classify_s3_key_keeps_every_instrument_snapshot, deleted 2026-10-29 with the tool)
