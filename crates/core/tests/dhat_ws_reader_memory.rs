@@ -19,13 +19,16 @@
 //!
 //! ## What it measures, per endpoint (MainFeed, Depth20, Depth200)
 //!
-//! 1. **Idle.** Heap the socket keeps after `connect` (read buffer, stream
-//!    state, the writer task and its queue).
+//! 1. **Warmed idle.** Incremental heap the socket keeps after `connect`
+//!    (read buffer, stream state, writer task and queue), after initializing
+//!    every endpoint's shared connector/runtime state. First endpoint dials
+//!    separately report idle, connect allocations and process-retained bytes.
 //! 2. **Steady.** Blocks and bytes allocated per frame and per MiB received
 //!    while each frame is dropped at once.
-//! 3. **Held.** Heap kept while the newest K frames are held FIFO, the way the
-//!    ring and the WAL queue hold them, against the payload bytes held. The
-//!    ratio is the pinning amplification.
+//! 3. **Held.** Net process-heap growth while the newest K frames are held
+//!    FIFO, compared with their payload bytes. Actual retained counts, bytes
+//!    and marker order prove ownership independently of allocation growth.
+//!    The ratio is incremental, not total backing allocation or an RSS bound.
 //! 4. **Cap frame.** Heap while one frame at `max_frame_bytes(endpoint)` is
 //!    held, after it is dropped, and after later small frames.
 //!
@@ -415,6 +418,9 @@ impl Client {
 struct Window {
     frames: u64,
     payload_bytes: u64,
+    /// Observed FIFO ownership after the measurement, before releasing frames.
+    held_frames: usize,
+    held_payload_bytes: u64,
     alloc_blocks: u64,
     alloc_bytes: u64,
     /// `curr_bytes` at the end of the window minus at its start.
@@ -562,9 +568,28 @@ fn run_socket(
             .expect("scenario timed out"); // APPROVED: test
         });
         let end = stats();
+        // Observe actual ownership after the allocation window. A retained
+        // frame can reuse pre-existing capacity without positive net growth.
+        let held_frames = held.len();
+        let held_payload_bytes = held.iter().map(|frame| frame.len() as u64).sum();
+        let first_retained = plan
+            .count()
+            .checked_sub(held_frames)
+            .expect("held more frames than received"); // APPROVED: test
+        for (offset, frame) in held.iter().enumerate() {
+            assert_eq!(&frame[..4], &expected[..4], "retained header changed");
+            assert_eq!(
+                &frame[4..8],
+                &((first_retained + offset + 1) as u32).to_le_bytes(),
+                "retained FIFO order changed"
+            );
+            assert_eq!(&frame[8..], &expected[8..], "retained payload changed");
+        }
         windows.push(Window {
             frames,
             payload_bytes,
+            held_frames,
+            held_payload_bytes,
             alloc_blocks: end.total_blocks - start.total_blocks,
             alloc_bytes: end.total_bytes - start.total_bytes,
             kept_bytes: curr_delta(&end, &start),
@@ -612,18 +637,40 @@ fn held_payload(plan: Plan) -> u64 {
     }
 }
 
-/// One warm-up dial so lazy one-time state (TLS roots, runtime pieces) is
-/// built before anything is measured.
+/// Initialize each endpoint before the warmed per-socket gate. Depth200 has
+/// a separate process-wide no-ALPN config; warming MainFeed alone leaves its
+/// first roots/config allocation inside the otherwise-warmed comparison.
+/// These are first endpoint dials in process order, not three independent
+/// cold profiles: Depth20 shares MainFeed's already-initialized ALPN cache.
 fn warm_up(rt: &tokio::runtime::Runtime) {
-    let _ = run_socket(
-        rt,
+    for endpoint in [
         DhanEndpointType::MainFeed,
-        &[Plan::Drop {
-            frame_len: 162,
-            count: 256,
-        }],
-        None,
-    );
+        DhanEndpointType::Depth20,
+        DhanEndpointType::Depth200,
+    ] {
+        let before = stats();
+        let run = run_socket(
+            rt,
+            endpoint,
+            &[Plan::Drop {
+                frame_len: 162,
+                count: 256,
+            }],
+            None,
+        );
+        let idle = run.idle_kept_bytes;
+        let allocated = run.connect_alloc_bytes;
+        // run_socket joined the server and awaited writer-task completion.
+        // Drop its result buffers before observing process-retained state.
+        drop(run);
+        let retained = curr_delta(&stats(), &before);
+        eprintln!(
+            "first endpoint dial in process order, {}: idle {idle} B, connect allocated \
+             {allocated} B, process retained after close {retained} B; includes any \
+             shared initialization, not TLS-only bytes or the warmed socket budget",
+            endpoint.as_str()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +788,8 @@ fn reader_memory_report(rt: &tokio::runtime::Runtime) {
     let main = idle[0].1.max(0) as f64;
     let depth = idle[1].1.max(idle[2].1).max(0) as f64;
     eprintln!(
-        "\nprojection (plain ws, no TLS): 5 main-feed sockets idle {:.1} KiB; \
+        "\nprojection (warmed plain ws; shared startup extra, TLS unmeasured): \
+         5 main-feed sockets idle {:.1} KiB; \
          26 sockets (5 main + 10 depth-20 + 10 depth-200 + 1 order-update as main) \
          idle {:.1} KiB",
         5.0 * main / 1024.0,
@@ -773,11 +821,11 @@ fn ratchet_plans() -> Vec<Plan> {
 /// (x86 dev container, debug build). That historical description is not a
 /// fresh measurement of this port. Each is a ceiling, never a target.
 struct Bounds {
-    /// Heap one idle socket keeps after `connect`.
+    /// Incremental idle heap after all endpoint connector profiles are warm.
     idle_kept_bytes: i64,
     /// Blocks allocated per MiB received while frames are dropped at once.
     steady_blocks_per_mib: f64,
-    /// Heap kept by 1,024 held frames over the payload they hold.
+    /// Net process-heap growth over held payload, not total backing storage.
     held_amplification: f64,
 }
 
@@ -808,7 +856,7 @@ fn violations(run: &Run, plans: &[Plan], bounds: &Bounds) -> Vec<String> {
     let amp = held.kept_bytes as f64 / held_payload(plans[1]) as f64;
     if amp > bounds.held_amplification {
         out.push(format!(
-            "held frames pin {amp:.2}x their payload > {:.2}x",
+            "held frames add {amp:.2}x net heap / payload > {:.2}x",
             bounds.held_amplification
         ));
     }
@@ -831,6 +879,16 @@ fn assert_not_vacuous(run: &Run, plans: &[Plan]) {
             (plan.count() * plan.frame_len()) as u64,
             "bytes lost in {plan:?}"
         );
+        let expected_held = match *plan {
+            Plan::Drop { .. } => 0,
+            Plan::Hold { count, hold, .. } => hold.min(count),
+        };
+        assert_eq!(w.held_frames, expected_held, "held count wrong in {plan:?}");
+        assert_eq!(
+            w.held_payload_bytes,
+            held_payload(*plan),
+            "held bytes wrong in {plan:?}"
+        );
     }
     assert!(
         run.idle_kept_bytes > 0,
@@ -840,15 +898,16 @@ fn assert_not_vacuous(run: &Run, plans: &[Plan]) {
         run.windows[0].alloc_blocks > 0,
         "the steady read allocated nothing: DHAT saw no read buffer chunk"
     );
-    assert!(
-        run.windows[1].kept_bytes > 0,
-        "1,024 held frames pinned no heap: the hold did not happen"
-    );
 }
 
 #[test]
 fn dhat_reader_memory_ratchet() {
     let _lock = PROFILER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Workspace feature unification enables both providers. Select the same
+    // provider as production before profiling this plain-loopback fixture.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("install test crypto provider"); // APPROVED: test initialization
     let _profiler = dhat::Profiler::builder().testing().build();
     let rt = runtime();
     warm_up(&rt);
@@ -860,6 +919,12 @@ fn dhat_reader_memory_ratchet() {
         DhanEndpointType::Depth200,
     ] {
         let run = run_socket(&rt, endpoint, &plans, None);
+        eprintln!(
+            "warmed production {}: idle {} B, windows {:?}",
+            endpoint.as_str(),
+            run.idle_kept_bytes,
+            run.windows
+        );
         assert_not_vacuous(&run, &plans);
         let broken = violations(&run, &plans, &BOUNDS);
         assert!(
@@ -876,6 +941,10 @@ fn dhat_reader_memory_ratchet() {
         DhanEndpointType::MainFeed,
         &plans,
         Some(WebSocketConfig::default()),
+    );
+    eprintln!(
+        "raw default control: idle {} B, windows {:?}",
+        raw.idle_kept_bytes, raw.windows
     );
     assert_not_vacuous(&raw, &plans);
     assert!(
@@ -1009,6 +1078,8 @@ fn test_reader_memory_violations_each_ceiling_and_missing_window() {
             Window {
                 frames: plans[0].count() as u64,
                 payload_bytes: (plans[0].count() * plans[0].frame_len()) as u64,
+                held_frames: 0,
+                held_payload_bytes: 0,
                 alloc_blocks: 1,
                 alloc_bytes: 1,
                 kept_bytes: 1,
@@ -1016,6 +1087,8 @@ fn test_reader_memory_violations_each_ceiling_and_missing_window() {
             Window {
                 frames: plans[1].count() as u64,
                 payload_bytes: (plans[1].count() * plans[1].frame_len()) as u64,
+                held_frames: 1_024,
+                held_payload_bytes: held_payload(plans[1]),
                 alloc_blocks: 1,
                 alloc_bytes: 1,
                 kept_bytes: (held_payload(plans[1]) * 4) as i64,
@@ -1025,6 +1098,17 @@ fn test_reader_memory_violations_each_ceiling_and_missing_window() {
     };
     assert_not_vacuous(&run, &plans);
     assert!(violations(&run, &plans, &BOUNDS).is_empty());
+    let held_growth_at_limit = run.windows[1].kept_bytes;
+    run.windows[1].kept_bytes = 0;
+    assert_not_vacuous(&run, &plans);
+    assert!(violations(&run, &plans, &BOUNDS).is_empty());
+    run.windows[1].held_frames = 0;
+    assert!(std::panic::catch_unwind(|| assert_not_vacuous(&run, &plans)).is_err());
+    run.windows[1].held_frames = 1_024;
+    run.windows[1].held_payload_bytes -= 1;
+    assert!(std::panic::catch_unwind(|| assert_not_vacuous(&run, &plans)).is_err());
+    run.windows[1].held_payload_bytes = held_payload(plans[1]);
+    run.windows[1].kept_bytes = held_growth_at_limit;
     run.idle_kept_bytes += 1;
     assert!(violations(&run, &plans, &BOUNDS)[0].starts_with("idle socket"));
     run.idle_kept_bytes = BOUNDS.idle_kept_bytes;

@@ -2023,3 +2023,40 @@ The first combined all-target Clippy run atab08101cb rejected the new
 reader test's nested production-socket type. Name that existing type through
 a private alias; do not suppress the lint or change its runtime behavior.
 Retain the failed run and repeat the unchanged full lint gate before pushing.
+
+### 2026-11-02: repair the two observed final-suite failures
+
+The ordinary ff1cf12cf push failed its workspace test gate; all other native
+gates passed. A complete no-fail-fast diagnostic run then recorded16,428
+passed,2 failed,32 ignored with unchanged source. The failed targets were the
+spawn-tool guard and the newly recovered reader-memory fixture. No push,
+merge or deployment is claimed from that run.
+
+- [x] Recognize GNU coreutils timeout only in the reviewed deployment backup
+  module: at most7 literal sites, the same2 production deadlines and5 owned
+  fixture children. Use the canonical production-region scanner and reject
+  outside paths, lookalikes, extra sites, removed deadlines and trailing
+  production. Runtime bans, backup code and its20/30s plus5s kill bounds are
+  unchanged. Three new guard tests ratchet the static test floor to16524.
+- [x] Initialize the reader fixture's explicit AWS-LC provider before DHAT.
+  Warm each endpoint's distinct shared connector profile before the warmed
+  per-socket comparison. Separately record first endpoint dials in process
+  order and retained process state; Depth20 shares MainFeed's ALPN cache.
+  The original127,312-byte Depth200 observation remains retained, not erased.
+- [x] Replace positive net heap growth as a false proxy for FIFO ownership.
+  Observe retained count, bytes and final marker/header/payload after the
+  DHAT end sample, before releasing frames. A zero-growth positive control
+  and missing-count/wrong-byte negatives pin this distinction. Preserve48KiB
+  warmed idle,400blocks/MiB and4x incremental net-heap/payload ceilings and
+  raw128KiB negative control. This is not total backing storage or RSS proof.
+  A context-only diagnostic passed with the old assertion; the earlier
+  failing client remains unattributed, so no raw-only cause is claimed.
+- [x] The corrected two-target native run passed22 tests with0 failures and
+  unchanged source. Two independent reviews bind the reader correction to
+  SHA25624cb14efd8cbf7518deed0cfd4ef813805066d16c4cfbfa2d086a2ef9a202b2c.
+- [ ] Re-run final committed-source native publication, exact-source CI and
+  the real infrastructure plan before automatic merge and live deployment.
+
+All changes in this correction are tests or records. Keep both depth feeds
+and live orders off. Earlier failures and every unpublished checkpoint remain
+preserved; finite checks do not establish universal reliability or latency.
