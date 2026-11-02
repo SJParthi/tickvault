@@ -1858,3 +1858,98 @@ runs; they are not the two failures in this checkpoint.
   publication checks at the new source checkpoint, followed by fresh coverage
   within measured resources. Preserve all earlier failed logs and compare
   source hashes rather than relabelling old evidence as a new full pass.
+
+### 2026-11-02: preserve deployment artifacts and close publication blockers
+
+The normal native push at77a3e1ac9 passed the full workspace, formatting,
+all-target Clippy, advisory/dependency, Loom and integrity gates, then failed
+the unchanged public-function test-recognition ratchet (322 versus307).
+That push did not publish source. Its failed log remains retained.
+
+- [x] Repair test discovery with meaningful function-name references and three
+  new behavioral tests; leave the scanner and307 baseline unchanged.
+  - Files: crates/api/src/handlers/stock_movers.rs,
+    crates/app/src/operator_movers.rs, crates/app/src/subscribe_reconcile.rs,
+    crates/app/tests/bin_subprocess_reports.rs,
+    crates/app/tests/evening_state_recovery_boundaries.rs,
+    crates/aws-lambdas/src/operator_control.rs,
+    crates/common/src/operator_movers_wire.rs,
+    crates/common/src/operator_stock_movers_wire.rs,
+    crates/core/src/network/ip_verifier.rs,
+    crates/core/src/test_support.rs, crates/core/src/test_support/ssm.rs.
+  - Tests: test_matches_price_combines_case_insensitive_search_with_direction_and_missing_change,
+    test_assert_requests_rejects_incomplete_misdirected_or_unencrypted_records,
+    test_run_filtered_cli_rejects_bad_arguments_with_a_complete_v2_envelope.
+    Each new test passed natively with unchanged source during its command.
+- [x] Make the stopped-instance deployment fences fail closed on unknown,
+  denied, timed-out or malformed reads; pin binary and checkout to one verified
+  revision. Preserve prior fixed artifacts privately before overwrite and
+  refuse dirty/untracked source or hidden index flags.
+  - Files: .github/workflows/deploy-aws.yml,
+    crates/app/src/bin/smoke_test.rs,
+    crates/app/src/bin/smoke_test/deploy_backup.rs,
+    crates/common/tests/aws_deploy_safety_guard.rs,
+    crates/common/tests/aws_infra_wiring.rs,
+    crates/app/tests/host_tuning_boot_wiring_guard.rs.
+  - Edge cases: absent/past/current stop markers; denied, invalid calendar,
+    oversized and timeout responses; bad revision and failed fetch/reset;
+    source symlinks, replaced files, dirty indexes, hidden flags, collisions,
+    bounded files/bytes/tool output, inherited Git repository selectors.
+  - Test Plan:20 standalone behavioral tests and three planted regressions
+    passed review; native smoke, deployment, infrastructure, host-tuning,
+    shell-budget, Rust-only and budget-latch targets remain required.
+  - Rollback: selected private prior artifacts and old Git ref are preserved;
+    full automatic/atomic rollback is not claimed. Independently verify the
+    temporary instance returns to its observed stopped baseline.
+  - Observability: fixed failure categories and private checksum manifest;
+    never emit marker secrets or file contents. Verify deployed provenance,
+    effective activation settings and fresh read-only health after release.
+- [x] Include both directly imported common mover-wire modules in the Lambda
+  source digest, with executable-digest and omission controls. Trigger paths
+  stay unchanged; actual deployed ZIP identity remains a separate check.
+  - Files: .github/workflows/terraform-apply.yml,
+    crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
+- [x] Archive #2169's historical handoff with byte-identical original payload
+  and explicit historical provenance in docs/recovery/handoff-2026-10-31.md.
+  Ratchet the static test-attribute count from15598 to16456. This is neither
+  an executed-test total nor a coverage percentage.
+- [ ] Run the final combined native gates, publish one reviewed integration
+  PR, inspect exact-source CI and a real plan-only infrastructure run, use
+  repository automatic merge, deploy both app and portal, and verify actual
+  live behavior. Retain all earlier failures and separate old/new identities.
+
+Live disk investigation also identified a unit error in the network alarm's
+description. Correct only its wording and comments in
+deploy/aws/terraform/alarms.tf: the configured Average NetworkOut is a byte
+count per60-second period, with a50MiB threshold for five periods, not50MB/s.
+Threshold, statistic, periods, actions and missing-data behavior are unchanged.
+Current disk-use observations and earlier growth-rate alerts are distinct;
+neither justifies deleting stored market data or suppressing the alarm.
+
+The actual combined overlay checks passed117 common deployment/source guards,
+30 smoke/host-tuning tests and8 Lambda budget-latch tests, each with unchanged
+source during its command. The full public-function recognition guard now
+passes at the unchanged307 baseline. Final committed-source native push and
+CI remain required; these focused totals are not whole-workspace coverage.
+
+- [x] Correct two demonstrated Stocks interaction faults in
+  crates/aws-lambdas/src/operator_control_console.html: let the inactive native
+  direction button own the entire visible switch hit area, and retain invalid
+  UTF-8 search feedback using the existing typed error state during the1s
+  repaint. Normal validation and lock clear that state; no invalid request or
+  stale quote becomes usable.
+  - Final HTML SHA2566226059a333a70a726bf4a34da7d4dc5c57818efd95951244bea42efab4d88da.
+    JavaScript34,480bytes/308lines remains under the existing34,530/350 ceiling.
+  - Exact-source Chromium:28 page scenarios,54 pointer/touch/keyboard switch
+    scenarios and8 Data/CSV scenarios passed with intercepted synthetic data.
+    The old source's timer defect and the first narrow hit-area edge failure
+    remain recorded. Existing layout crops remain byte-identical.
+- [ ] Reconcile newly discovered paused branch work beyond the24-PR inventory.
+  Preserve all refs; current-source review has found additional AWS-control,
+  token-cache, special-session and observability/storage proposals. Historical
+  WIP is not accepted blindly: parked-ack trimming has a concrete false-clean
+  counterexample that requires a separate correctness proof before integration.
+
+Depth20, Depth200 and live-order activation remain off throughout. Final
+validation must not bypass gates, broaden runtime exceptions or relabel
+after-close observations as open-market throughput/latency/loss proof.

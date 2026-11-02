@@ -333,7 +333,7 @@ impl Reply {
 mod tests {
     use super::*;
     #[test]
-    fn filters_round_trip_without_shell_metacharacters() {
+    fn test_to_hex_from_hex_round_trip_without_shell_metacharacters() {
         // Test-only adversarial input; split the literal so the source-only
         // HTML-handler guard does not classify this data as executable markup.
         for search in [
@@ -386,7 +386,7 @@ mod tests {
         assert!(serde_json::from_str::<Filter>(r#"{"command":"evil"}"#).is_err());
     }
     #[test]
-    fn reply_requires_new_protocol_and_original_capture_clock() {
+    fn test_valid_at_requires_new_protocol_and_original_capture_clock() {
         let now = 1_800_000_000;
         let mut reply = Reply::error(BridgeError::Timeout, now);
         assert!(reply.valid_at(now + 59, &Filter::default()));
@@ -656,5 +656,48 @@ mod tests {
             page.rows[0].price.security_id = id;
             assert!(!page.valid(), "unsafe browser identity {id}");
         }
+    }
+
+    #[test]
+    fn test_matches_price_combines_case_insensitive_search_with_direction_and_missing_change() {
+        let mut price = snapshot().rows.remove(0).price;
+        price.name = "Acme Bank".into();
+        for (direction, expected) in [
+            (Direction::All, [true, true, true, true]),
+            (Direction::Gainers, [true, false, false, false]),
+            (Direction::Losers, [false, true, false, false]),
+        ] {
+            for (change, directional_match) in [Some(3.0), Some(-3.0), Some(0.0), None]
+                .into_iter()
+                .zip(expected)
+            {
+                price.change_pct = change;
+                for (search, name_match) in [
+                    ("", true),
+                    ("aCmE", true),
+                    ("BANK", true),
+                    ("absent", false),
+                ] {
+                    let filter = Filter {
+                        search: search.into(),
+                        direction,
+                        ..Filter::default()
+                    };
+                    assert_eq!(
+                        filter.matches_price(&price),
+                        name_match && directional_match,
+                        "direction={direction:?}, change={change:?}, search={search:?}"
+                    );
+                }
+            }
+        }
+        price.name = "ßeta".into();
+        assert!(
+            Filter {
+                search: "SSE".into(),
+                ..Filter::default()
+            }
+            .matches_price(&price)
+        );
     }
 }

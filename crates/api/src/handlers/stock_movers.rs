@@ -1288,7 +1288,8 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn movers_routes_refuse_disabled_or_empty_auth_even_during_paper_boot() {
+    async fn test_require_configured_bearer_auth_refuses_disabled_or_empty_auth_even_during_paper_boot()
+     {
         use axum::{
             body::Body,
             http::{Request, StatusCode},
@@ -1325,7 +1326,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn enabled_movers_auth_distinguishes_missing_wrong_and_correct_tokens() {
+    async fn test_require_configured_bearer_auth_distinguishes_missing_wrong_and_correct_tokens() {
         use axum::{
             body::Body,
             http::{Request, StatusCode},

@@ -496,16 +496,21 @@ fn boot_units_never_run_the_rollback_restored_binary() {
 
     let deploy = read(DEPLOY);
     // All three binaries are downloaded into bin/.next. The smoke binary
-    // reads config and spill paths relative to /opt/tickvault, then the
-    // promotion returns the shell there before installing the host copy.
+    // reads config and spill paths relative to /opt/tickvault. The outer
+    // shell returns there before config/smoke; promotion runs in a subshell
+    // so host installation keeps that same working directory.
     let staging = deploy
-        .find("cd bin/.next; TVS3=")
+        .find("cd /opt/tickvault/bin/.next; TVS3=")
         .expect("the deploy no longer enters the staged binary directory");
+    let app_directory = deploy[staging..]
+        .find("\"cd /opt/tickvault\",")
+        .map(|offset| staging + offset)
+        .expect("the deploy no longer returns to the app directory before smoke");
     let smoke = deploy
-        .find("(cd ../..; timeout 40 bin/.next/smoke_test --duration 30)")
+        .find("\"timeout 40 bin/.next/smoke_test --duration 30\"")
         .expect("the deploy no longer runs the staged smoke test from the app directory");
     let promote = deploy
-        .find("mv tickvault smoke_test tv-movers ..; cd ../..")
+        .find("(cd bin/.next; chown ec2-user:ec2-user tickvault smoke_test tv-movers; mv tickvault smoke_test tv-movers ..)")
         .expect("the deploy no longer promotes all three staged binaries");
     let install = deploy
         .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
@@ -514,7 +519,7 @@ fn boot_units_never_run_the_rollback_restored_binary() {
              have nothing to run",
         );
     assert!(
-        staging < smoke && smoke < promote && promote < install,
+        staging < app_directory && app_directory < smoke && smoke < promote && promote < install,
         "bin/tickvault-host must be installed AFTER staged smoke and promotion, \
          with the shell returned to the app directory before installation"
     );

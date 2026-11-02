@@ -1948,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_closed_primary_rebinds_without_refunding_daily_rounds() {
+    fn test_forget_on_preserves_rebound_owner_and_daily_rounds() {
         let (book, _rounds) = SubscribeReconcile::new(false);
         let (first, receiver) = socket();
         let (replacement, _replacement_receiver) = socket();
@@ -1980,7 +1980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_refusal_keeps_the_primary_timestamp_and_expected_entry() {
+    fn test_forget_on_backup_refusal_preserves_primary_timestamp_and_expected_entry() {
         let (book, _rounds) = SubscribeReconcile::new(false);
         let (primary, _primary_receiver) = socket();
         let (backup, _backup_receiver) = socket();

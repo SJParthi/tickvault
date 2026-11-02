@@ -189,7 +189,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reply_valid_at_requires_known_protocol_and_bounded_capture_clock() {
+    fn test_valid_at_requires_known_protocol_and_bounded_capture_clock() {
         let now = 1_800_000_000;
         for (age, expected) in [(-6, false), (-5, true), (0, true), (60, true), (61, false)] {
             let reply = Reply::error(BridgeError::AppUnavailable, now - age);

@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_http_client_refuses_redirects() {
+    async fn test_local_client_refuses_redirects() {
         let fixture = HttpFixture::start(true).await;
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(3),

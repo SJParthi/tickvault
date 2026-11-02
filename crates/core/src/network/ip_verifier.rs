@@ -775,7 +775,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_public_ip_transport_uses_a_counted_synthetic_tripwire() {
+    async fn test_public_ip_attempts_counts_synthetic_transport_refusal() {
         let fixture = crate::test_support::ssm::FailureFixture::new();
         let result = fixture
             .scope(fetch_ip_from_url(
@@ -789,7 +789,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_public_ip_detection_retries_then_falls_back_with_synthetic_transport() {
+    async fn test_public_ip_urls_record_primary_retries_then_fallback() {
         let fixture = crate::test_support::ssm::FailureFixture::new();
         let result = fixture.scope(detect_public_ip()).await;
         assert!(

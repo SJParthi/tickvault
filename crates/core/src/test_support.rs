@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_disabled_when_opt_in_absent_even_with_credentials() {
+    fn test_real_ssm_tests_enabled_requires_opt_in_even_with_credentials() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_disabled_when_opt_in_set_but_no_credentials() {
+    fn test_real_ssm_tests_enabled_requires_credentials_after_opt_in() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_enabled_when_opt_in_and_credentials_both_present() {
+    fn test_real_ssm_tests_enabled_accepts_opt_in_and_credentials_together() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_accepts_true_and_rejects_other_values() {
+    fn test_real_ssm_tests_enabled_accepts_true_and_rejects_other_values() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_disabled_when_neither_present() {
+    fn test_real_ssm_tests_enabled_refuses_when_neither_present() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {

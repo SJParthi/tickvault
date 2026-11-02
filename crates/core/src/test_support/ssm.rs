@@ -184,4 +184,64 @@ mod tests {
             "scope must be removed after completion"
         );
     }
+
+    #[test]
+    fn test_assert_requests_rejects_incomplete_misdirected_or_unencrypted_records() {
+        let request = |path: &str, with_decryption| Request {
+            path: path.into(),
+            with_decryption,
+        };
+        let left = request("/tickvault/unit-test/left", true);
+        let right = request("/tickvault/unit-test/right", true);
+        let suffixes: &[&str] = &["/left", "/right"];
+        for (case, records, minimum, maximum, accepted) in [
+            (
+                "exact complete",
+                vec![left.clone(), right.clone()],
+                2,
+                2,
+                true,
+            ),
+            ("ranged subset", vec![left.clone()], 1, 2, true),
+            ("too few", vec![left.clone()], 2, 2, false),
+            ("too many", vec![left.clone(), right.clone()], 1, 1, false),
+            (
+                "wrong prefix",
+                vec![request("/tickvault/prod/left", true)],
+                1,
+                2,
+                false,
+            ),
+            (
+                "wrong suffix",
+                vec![request("/tickvault/unit-test/other", true)],
+                1,
+                2,
+                false,
+            ),
+            (
+                "not decrypted",
+                vec![request("/tickvault/unit-test/left", false)],
+                1,
+                2,
+                false,
+            ),
+            (
+                "duplicate left missing right",
+                vec![left.clone(), left],
+                2,
+                2,
+                false,
+            ),
+        ] {
+            // Build only the existing synthetic client. No request is sent;
+            // malformed recorded inputs must not pass the assertion helper.
+            let fixture = FailureFixture::new();
+            *fixture.requests.lock().expect("fixture records") = records;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fixture.assert_requests(minimum, maximum, suffixes);
+            }));
+            assert_eq!(result.is_ok(), accepted, "{case}");
+        }
+    }
 }

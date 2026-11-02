@@ -626,16 +626,19 @@ fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
     // — a stale unit would load a stale config. Under the single-prod-env model
     // (operator 2026-06-30) the unit sets TV_ENVIRONMENT=prod and production.toml
     // locks dry_run=true (NO real orders), so refreshing the unit keeps the box
-    // on the correct env. The deploy must git-pull the clone AND re-copy the
-    // systemd unit before daemon-reload + restart.
+    // on the correct env. The deploy must refresh to the exact shipped SHA
+    // AND re-copy the systemd unit before daemon-reload + restart. Following
+    // moving origin/main can combine one revision's binary with another's config.
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
             .expect("deploy-aws.yml must be readable"); // APPROVED: test
     assert!(
-        content.contains("git -C repo reset --hard origin/main"),
-        "deploy-aws.yml SSM command must git-refresh the box's repo clone to \
-         origin/main before copying config/systemd — otherwise the box runs \
-         its stale first-boot files forever."
+        content.contains("git -C repo fetch --depth 1 origin $DEPLOY_SHA")
+            && content.contains("git -C repo reset --hard $DEPLOY_SHA")
+            && content.contains("TV_REV=$(sudo -u ec2-user git -C repo rev-parse HEAD)")
+            && !content.contains("git -C repo reset --hard origin/main"),
+        "deploy-aws.yml must pin and verify the exact binary revision before \
+         copying config/systemd; a moving main or stale first-boot clone is unsafe."
     );
     assert!(
         content.contains(

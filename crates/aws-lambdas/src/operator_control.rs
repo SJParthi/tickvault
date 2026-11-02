@@ -3365,7 +3365,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn both_movers_modes_require_ssm_success_and_never_return_stderr() {
+    async fn test_strict_read_payload_requires_ssm_success_and_never_returns_stderr() {
         for action in ["fno-stocks", "stock-movers"] {
             let now = MockShell::default().now;
             let payload = if action == "fno-stocks" {
@@ -3407,7 +3407,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn both_movers_modes_refuse_pending_stdout_at_the_deadline() {
+    async fn test_strict_read_payload_refuses_pending_stdout_at_the_deadline() {
         for action in ["fno-stocks", "stock-movers"] {
             let now = MockShell::default().now;
             let payload = if action == "fno-stocks" {

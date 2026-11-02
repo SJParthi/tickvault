@@ -44,7 +44,7 @@ const NOW: i64 = BOUNDARY + 600;
 const BROKEN: &[u8] = b"v2 torn-and-untrusted";
 
 #[test]
-fn independent_one_nanosecond_before_boundary_is_the_only_recoverable_case() {
+fn test_load_state_for_evening_recovers_only_before_boundary_and_preserves_evidence() {
     let base = Temp::new();
     let boundary = SystemTime::UNIX_EPOCH + Duration::from_secs(BOUNDARY as u64);
     for (tag, when, recover) in [

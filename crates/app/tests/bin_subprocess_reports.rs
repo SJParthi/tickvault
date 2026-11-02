@@ -1,5 +1,5 @@
-//! Subprocess tests for the three helper binaries in `src/bin/`:
-//! `tv-guarantees`, `tv_doctor` and `smoke_test`.
+//! Subprocess tests for the helper binaries in `src/bin/`:
+//! `tv-guarantees`, `tv_doctor`, `smoke_test` and `tv-movers`.
 //!
 //! Each one is a `main()` with its logic inline, so no unit test in the
 //! library can reach it. These tests run the compiled binary
@@ -11,12 +11,18 @@
 //! temp dir and removes it at the end; nothing is written inside the repo.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const GUARANTEES: &str = env!("CARGO_BIN_EXE_tv-guarantees");
 const DOCTOR: &str = env!("CARGO_BIN_EXE_tv_doctor");
 const SMOKE: &str = env!("CARGO_BIN_EXE_smoke_test");
+const MOVERS: &str = env!("CARGO_BIN_EXE_tv-movers");
+const MOVERS_TEST_TIMEOUT_SECS: u64 = 15;
+const MOVERS_TEST_TIMEOUT: Duration = Duration::from_secs(MOVERS_TEST_TIMEOUT_SECS);
+const MOVERS_CAPTURE_LIMIT: usize = 64 * 1024;
 
 /// The four verdict labels exactly as the text report prints them.
 const LABELS: [&str; 4] = ["GUARANTEED", "BOUNDED", "IMPOSSIBLE", "** BROKEN **"];
@@ -110,9 +116,82 @@ fn with_git_safe_directory(cmd: &mut Command) -> &mut Command {
 }
 
 fn run(bin: &str, args: &[&str], cwd: &Path) -> Output {
-    with_git_safe_directory(Command::new(bin).args(args).current_dir(cwd))
+    let mut command = Command::new(bin);
+    with_git_safe_directory(command.args(args).current_dir(cwd));
+    if bin == MOVERS {
+        // Only this new child loses the four provider/application secrets.
+        // Preserve runtime proxy, CA, auth guards, HOME and LLVM_PROFILE_FILE.
+        // Malformed arguments must return before constructing a provider.
+        for name in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "TICKVAULT_OPERATOR_KEY",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("TICKVAULT_TEST_REAL_SSM", "0");
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("owned subprocess runtime");
+        return runtime.block_on(capture_movers(command));
+    }
+    command
         .output()
         .unwrap_or_else(|e| panic!("spawn {bin}: {e}"))
+}
+
+async fn read_movers_pipe(pipe: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    let limit = u64::try_from(MOVERS_CAPTURE_LIMIT + 1).expect("small capture limit");
+    let mut bytes = Vec::new();
+    pipe.take(limit).read_to_end(&mut bytes).await?;
+    if bytes.len() > MOVERS_CAPTURE_LIMIT {
+        return Err(std::io::Error::other(
+            "movers child output exceeded test cap",
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn capture_movers(mut command: tokio::process::Command) -> Output {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn movers helper");
+    let stdout = child.stdout.take().expect("captured stdout");
+    let stderr = child.stderr.take().expect("captured stderr");
+    let captured = {
+        let capture = async {
+            let (stdout, stderr, status) = tokio::try_join!(
+                read_movers_pipe(stdout),
+                read_movers_pipe(stderr),
+                child.wait()
+            )?;
+            Ok::<_, std::io::Error>(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        tokio::time::timeout(MOVERS_TEST_TIMEOUT, capture).await
+    };
+    let failure = match captured {
+        Ok(Ok(output)) => return output,
+        Ok(Err(error)) => format!("movers capture failed: {error}"),
+        Err(_) => "movers child exceeded its test deadline".to_owned(),
+    };
+    // The capture futures have been dropped. Reap the direct owned child
+    // before reporting failure; termination still depends on OS scheduling.
+    let killed = child.start_kill();
+    let reaped = child.wait().await;
+    panic!("{failure}; kill={killed:?}; reap={reaped:?}");
 }
 
 /// A `git` command in `dir` with `safe.directory=*` set.
@@ -688,4 +767,50 @@ fn smoke_fails_when_the_spill_path_is_not_a_directory() {
     assert!(err.contains("[3/5]"), "{err}");
     assert!(err.contains("SMOKE FAIL: spill dir not writable"), "{err}");
     assert!(!err.contains("[4/5]"));
+}
+
+#[test]
+fn test_run_filtered_cli_rejects_bad_arguments_with_a_complete_v2_envelope() {
+    use tickvault_common::operator_movers_wire::{BridgeError, MAX_WIRE_BYTES};
+    use tickvault_common::operator_stock_movers_wire::{
+        FILTERED_PROTOCOL_VERSION, Filter, Outcome, Reply,
+    };
+
+    let dir = TempDir::new("movers-invalid-arguments");
+    let encoded = Filter::default().to_hex().expect("valid filter");
+    // Every case must be rejected before the credential resolver or HTTP
+    // client is reached. An empty argv selects the separate v1 mode, so it
+    // deliberately does not belong in this filtered-mode test.
+    for args in [
+        vec!["--filter"],
+        vec!["--filter", "not-hex"],
+        vec!["--start", "7b7d"],
+        vec!["--filter", encoded.as_str(), "extra"],
+    ] {
+        let before = chrono::Utc::now().timestamp();
+        let output = run(MOVERS, &args, dir.path());
+        let after = chrono::Utc::now().timestamp();
+        assert!(
+            output.status.success(),
+            "typed refusal must exit cleanly: {}",
+            output.status
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "the helper must not leak diagnostics"
+        );
+        assert!(output.stdout.len() <= MAX_WIRE_BYTES);
+        let reply: Reply =
+            serde_json::from_slice(&output.stdout).expect("one complete v2 JSON envelope");
+        assert_eq!(reply.version, FILTERED_PROTOCOL_VERSION);
+        assert_eq!(
+            reply.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+        assert!((before..=after).contains(&reply.captured_at_epoch_secs));
+        assert!(reply.valid_at(after, &Filter::default()));
+        assert_eq!(std::fs::read_dir(dir.path()).expect("owned cwd").count(), 0);
+    }
 }
