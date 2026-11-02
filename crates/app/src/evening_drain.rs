@@ -35,16 +35,36 @@
 //! backlog then, whether the next boot is the evening drain boot, and whether
 //! the evening has given up. A missing file reads as "no restart yet"; a
 //! damaged or unreadable one stops the restarts (it could not be counted).
+//! New records carry a CRC. Unchecksummed v1 records are never trusted for
+//! decisions: they block their current evening, then the supervisor can
+//! quarantine them using only a strictly older filesystem modification time.
+//! A current/future-dated damaged file stays closed. Quarantine preserves the
+//! original bytes; it does not infer a day from an untrusted record.
 //! Cold: read once a minute after the close and once at boot. The restarted
 //! app sends its usual boot message; the shutdown message is not sent.
 
-use std::path::Path;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info};
 
 /// The state file, relative to the app's working directory.
 pub const EVENING_DRAIN_STATE_PATH: &str = "data/state/evening-drain.state";
+// All fixed-width integer fields plus framing fit comfortably inside this
+// bound. Applied BEFORE reading or parsing, including corrupt input.
+const STATE_MAX_BYTES: usize = 256;
+const STATE_CRC_HEX_DIGITS: usize = 8;
+const CRC32_IEEE_POLYNOMIAL: u32 = 0xedb8_8320;
+const BITS_PER_BYTE: usize = 8;
+const SECONDS_PER_DAY: i64 = 86_400;
+const IST_OFFSET_SECS: i64 = 19_800;
+// Boot's pending clear and the supervisor share this lock. The state directory
+// has one owning process; independent external writers are not coordinated.
+static STATE_IO: Mutex<()> = Mutex::new(());
 /// Planned restarts allowed in one evening.
 pub const EVENING_DRAIN_RESTARTS_MAX: u32 = 3;
 /// Least time between two restarts, and from a restart to its progress
@@ -123,25 +143,42 @@ pub struct EveningState {
 }
 
 impl EveningState {
-    /// `v1 day restarts last backlog pending gave_up`. Pure.
+    /// `v2 day restarts last backlog pending gave_up crc32`. Pure, bounded.
+    /// CRC detects accidental damage; it does not authenticate deliberate edits.
     #[must_use]
     pub fn to_line(&self) -> String {
-        format!(
-            "v1 {} {} {} {} {} {}\n",
+        let payload = format!(
+            "v2 {} {} {} {} {} {}",
             self.day,
             self.restarts,
             self.last_unix,
             self.backlog_before,
             self.pending_unix,
             u8::from(self.gave_up)
-        )
+        );
+        format!("{payload} {:08x}\n", state_crc32(payload.as_bytes()))
     }
 
     /// The inverse of [`Self::to_line`]; anything else is `None`. Pure.
     #[must_use]
     pub fn from_line(line: &str) -> Option<Self> {
-        let mut it = line.split_ascii_whitespace();
-        if it.next()? != "v1" {
+        if line.len() > STATE_MAX_BYTES {
+            return None;
+        }
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let (payload, checksum) = line.rsplit_once(' ')?;
+        if checksum.len() != STATE_CRC_HEX_DIGITS
+            || !checksum
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || u32::from_str_radix(checksum, 16).ok()? != state_crc32(payload.as_bytes())
+        {
+            return None;
+        }
+        let mut it = payload.split_ascii_whitespace();
+        // v1 cannot detect valid-digit corruption and must not drive a cap,
+        // give-up latch or pending flag during migration.
+        if it.next()? != "v2" {
             return None;
         }
         let state = Self {
@@ -160,29 +197,208 @@ impl EveningState {
     }
 }
 
+// IEEE CRC-32 over at most STATE_MAX_BYTES, once per cold state read/write.
+// Kept local rather than widening a storage-internal WAL checksum API.
+fn state_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..BITS_PER_BYTE {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (CRC32_IEEE_POLYNOMIAL & mask);
+        }
+    }
+    !crc
+}
+
+enum StateRead {
+    Missing,
+    Valid(EveningState),
+    Invalid(Metadata),
+}
+
+fn regular_metadata(path: &Path) -> std::io::Result<Metadata> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::other("evening state is not a regular file"));
+    }
+    Ok(metadata)
+}
+
+fn unchanged_file(before: &Metadata, after: &Metadata) -> bool {
+    if !after.file_type().is_file()
+        || before.len() != after.len()
+        || before
+            .modified()
+            .ok()
+            .zip(after.modified().ok())
+            .is_none_or(|(a, b)| a != b)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // Automatic archival requires file identity, implemented for both
+        // supported runtimes (macOS and Linux). Other platforms fail closed.
+        false
+    }
+}
+
+fn read_state(path: &Path) -> std::io::Result<StateRead> {
+    let before = match regular_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(StateRead::Missing),
+        Err(err) => return Err(err),
+    };
+    let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    if !unchanged_file(&before, &opened) {
+        return Err(std::io::Error::other("evening state changed while opening"));
+    }
+    let mut bytes = Vec::with_capacity(STATE_MAX_BYTES + 1);
+    (&mut file)
+        .take((STATE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !unchanged_file(&opened, &after) {
+        return Err(std::io::Error::other("evening state changed while reading"));
+    }
+    let state = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(EveningState::from_line);
+    Ok(match state {
+        Some(state) => StateRead::Valid(state),
+        None => StateRead::Invalid(after),
+    })
+}
+
 /// Reads the state: the default when the file does not exist, `None` when it
 /// cannot be read or parsed (the caller then makes no restart: a count it
 /// cannot read is a cap it cannot keep).
 #[must_use]
 pub fn load_state(path: &Path) -> Option<EveningState> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => EveningState::from_line(&s),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(EveningState::default()),
-        Err(_) => None,
+    let _guard = STATE_IO.lock().ok()?;
+    match read_state(path).ok()? {
+        StateRead::Missing => Some(EveningState::default()),
+        StateRead::Valid(state) => Some(state),
+        StateRead::Invalid(_) => None,
     }
 }
 
-/// Writes the state (temp file and rename).
+fn evening_start_unix(now_unix: i64) -> Option<i64> {
+    if now_unix < 0 {
+        return None;
+    }
+    let local = now_unix.checked_add(IST_OFFSET_SECS)?;
+    let day = local
+        .div_euclid(SECONDS_PER_DAY)
+        .checked_mul(SECONDS_PER_DAY)?;
+    let start = day
+        .checked_add(i64::try_from(crate::drain_hold::DRAIN_HOLD_START_SECS_IST).ok()?)?
+        .checked_sub(IST_OFFSET_SECS)?;
+    let start = if start > now_unix {
+        start.checked_sub(SECONDS_PER_DAY)?
+    } else {
+        start
+    };
+    (start >= 0).then_some(start)
+}
+
+fn quarantine_directory(path: &Path, start_unix: i64) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".bad-{start_unix}"));
+    PathBuf::from(name)
+}
+
+fn archive_untrusted_state(
+    path: &Path,
+    expected: &Metadata,
+    start_unix: i64,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    if !unchanged_file(expected, &regular_metadata(path)?) {
+        return Err(std::io::Error::other(
+            "evening state changed before quarantine",
+        ));
+    }
+    let quarantine = quarantine_directory(path, start_unix);
+    // create_dir reserves the destination without overwriting evidence.
+    std::fs::create_dir(&quarantine)?;
+    rename(path, &quarantine.join("state"))?;
+    Ok(quarantine)
+}
+
+/// Reads the supervisor's evening state and archives only old, untrusted
+/// regular files. A damaged/legacy file modified at or after this evening's
+/// 15:40 IST start stays closed. Embedded dates are never trusted.
+///
+/// Original bytes go to a newly reserved `.bad-<start>/state` directory;
+/// a collision or any I/O failure refuses recovery. Mac/Linux file identity
+/// checks and the process-local lock protect cooperating app accesses. They
+/// do not make an atomic compare-and-rename against independent external writers.
+#[must_use]
+pub fn load_state_for_evening(path: &Path, now_unix: i64) -> Option<EveningState> {
+    let _guard = STATE_IO.lock().ok()?;
+    let start = evening_start_unix(now_unix)?;
+    match read_state(path).ok()? {
+        StateRead::Missing => Some(EveningState::default()),
+        StateRead::Valid(state) => Some(state),
+        StateRead::Invalid(metadata) => {
+            let cutoff = SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(u64::try_from(start).ok()?))?;
+            if metadata.modified().ok()? >= cutoff {
+                return None;
+            }
+            let quarantine = archive_untrusted_state(path, &metadata, start, |from, to| {
+                std::fs::rename(from, to)
+            })
+            .ok()?;
+            info!(path = %path.display(), quarantine = %quarantine.display(),
+                "evening drain: preserved an old untrusted state; this evening starts fresh");
+            Some(EveningState::default())
+        }
+    }
+}
+
+/// Writes and syncs a v2 temp file, renames it, then syncs its parent.
+/// This propagates durability errors; it is not a power-loss guarantee for
+/// every filesystem, storage device or external writer.
 ///
 /// # Errors
 /// The write or the rename failed.
 pub fn store_state(path: &Path, state: &EveningState) -> std::io::Result<()> {
+    let _guard = STATE_IO
+        .lock()
+        .map_err(|_| std::io::Error::other("evening state lock poisoned"))?;
+    store_state_locked(path, state)
+}
+
+fn store_state_locked(path: &Path, state: &EveningState) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, state.to_line())?;
-    std::fs::rename(&tmp, path)
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::other("evening temp is not a regular file"));
+        }
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    let mut file = File::create(&tmp)?;
+    file.write_all(state.to_line().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 /// Whether a restart may be requested at `secs_ist` (15:50 to 05:00, wrapping
@@ -346,7 +562,12 @@ pub fn catchup_budget_for(
 // TEST-EXEMPT: file I/O around catchup_budget_for, which is unit-tested (test_catchup_budget_for_*) and on store_state/load_state.
 pub fn budget_or(standard: u64) -> u64 {
     let path = Path::new(EVENING_DRAIN_STATE_PATH);
-    let Some(state) = load_state(path) else {
+    // Keep the read/clear transaction inside one lock: an old boot snapshot
+    // must not overwrite a newer supervisor restart count when clearing pending.
+    let Ok(_guard) = STATE_IO.lock() else {
+        return standard;
+    };
+    let Ok(StateRead::Valid(state)) = read_state(path) else {
         return standard;
     };
     if state.pending_unix == 0 {
@@ -362,7 +583,7 @@ pub fn budget_or(standard: u64) -> u64 {
         pending_unix: 0,
         ..state
     };
-    if let Err(err) = store_state(path, &cleared) {
+    if let Err(err) = store_state_locked(path, &cleared) {
         error!(
             code = ErrorCode::DrainHold01NotWritten.code_str(),
             source = "evening_drain_state",
@@ -404,6 +625,61 @@ mod tests {
     /// `evening_step` with the day's own work done and the cross-check clear.
     fn step(s: &EveningState, backlog: Option<u64>, now: i64, secs: u64) -> EveningStep {
         evening_step(s, DAY, true, true, backlog, now, secs)
+    }
+
+    #[test]
+    fn test_regression_state_crc32_matches_the_ieee_reference_vector() {
+        assert_eq!(state_crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(state_crc32(b""), 0);
+        assert_eq!(
+            EveningState::default().to_line(),
+            "v2 0 0 0 0 0 0 3598aea2\n"
+        );
+    }
+
+    #[test]
+    fn test_regression_quarantine_rename_failure_preserves_original_and_refuses_reset() {
+        let dir =
+            std::env::temp_dir().join(format!("tv-evening-rename-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let path = dir.join("state");
+        std::fs::write(&path, b"old torn bytes").expect("fixture");
+        let metadata = regular_metadata(&path).expect("metadata");
+        let result = archive_untrusted_state(&path, &metadata, NOW, |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rename failure",
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).expect("original"), b"old torn bytes");
+        assert!(!quarantine_directory(&path, NOW).join("state").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_regression_replacement_after_read_is_not_archived() {
+        let dir =
+            std::env::temp_dir().join(format!("tv-evening-replacement-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let path = dir.join("state");
+        std::fs::write(&path, b"old").expect("old");
+        let metadata = regular_metadata(&path).expect("metadata");
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, b"new").expect("replacement");
+        File::open(&replacement)
+            .expect("open")
+            .set_modified(metadata.modified().expect("mtime"))
+            .expect("same mtime");
+        std::fs::rename(&replacement, &path).expect("replace");
+        assert!(
+            archive_untrusted_state(&path, &metadata, NOW, |from, to| std::fs::rename(from, to))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).expect("new remains"), b"new");
+        assert!(!quarantine_directory(&path, NOW).exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

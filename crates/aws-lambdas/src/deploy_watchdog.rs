@@ -12,29 +12,21 @@
 //! INSTANT instance-start event pattern (the PRIMARY morning deploy
 //! trigger) plus the 08:50 / 15:51 IST cron backups.
 //!
-//! On each fire it answers ONE question, using GitHub as the source of
-//! truth (the same idempotency signal `deploy-aws-after-close.yml` itself
-//! uses): is `main` HEAD already deployed?
+//! Every fire records the deployed binary and an observed target SHA. GitHub
+//! main is preferred; the SSM fallback is the newest DEPLOY-RELEVANT commit,
+//! so a newer binary may legitimately differ from that mirror.
 //!
-//! * desired == deployed  -> healthy, stay SILENT (no spam).
-//! * desired != deployed  -> the cron missed (or is late) -> trigger
-//!   `deploy-aws-after-close.yml` via workflow_dispatch (itself
-//!   idempotent and market-hours-guarded, so a double-fire with the
-//!   cron is a safe no-op) AND publish a Severity::High Telegram.
-//! * either sha unknown (GitHub API blip / no deploy history) -> stay
-//!   SILENT and log WARNING. The watchdog NEVER dispatches on uncertainty
-//!   — a spurious deploy is worse than waiting for the next
-//!   5-minutes-later run. No false-OK: we only ever claim "deployed" by
-//!   positive sha match, never by absence.
+//! Only a bounded GitHub comparison of two exact commit IDs can establish
+//! that the recorded binary is an ancestor of the target and authorize a
+//! deployment request. Equality needs no network comparison. A newer binary,
+//! divergent history, missing credentials, or unavailable comparison never
+//! dispatches and never produces an "old build" notification. Unknown and
+//! divergent outcomes remain explicit in structured logs and result JSON.
 //!
-//! B9 deploy provenance rides every fire: the on-box binary sha (SSM
-//! `/tickvault/<env>/deploy/binary-git-sha`, written by deploy-aws.yml
-//! post-swap) is compared against main HEAD and published as the
-//! `tv_binary_main_sha_mismatch` CloudWatch metric (the
-//! `tv-<env>-binary-sha-stale` alarm's input), and `binary_is_stale` is
-//! the GROUND-TRUTH box-start staleness signal (a green off-hours NO-OP
-//! skip run can fool the GitHub signal but never the SSM param — the
-//! 2026-07-09 outage class).
+//! The existing `tv_binary_main_sha_mismatch` metric still records mismatch,
+//! independently of ancestry: mismatch is evidence, not proof of old code.
+//! A successful workflow run remains diagnostic only, since an off-hours
+//! no-op run can be green without replacing the binary.
 //!
 //! **Holiday-stop day (2026-10-20).** A stale verdict does NOT dispatch while
 //! `/tickvault/<env>/holiday-stop-date` (the marker the app's holiday gate
@@ -61,17 +53,20 @@
 //!   instead of urllib — same status/body tuple semantics: transport
 //!   failure -> (0, {"error": "github request failed"}), unparsable body
 //!   on an HTTP response -> {"error": "github http error"}.
-//! * the SSM token cache is a process-`static` Mutex map (the legacy
-//!   module-global `_param_cache`) — warm containers skip the re-read;
-//!   the BINARY sha param is deliberately NOT cached (legacy parity: it
-//!   changes on every deploy).
+//! * positive SSM token reads are cached for at most five minutes; empty
+//!   reads and errors are not cached. Binary and target SHAs are never cached.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
+
+mod ancestry;
+use ancestry::{
+    BuildComparison, BuildRelation, classify_comparison, comparison_path, validated_full_sha,
+};
 
 /// Env defaults — legacy parity (`os.environ.get(...)` fallbacks).
 const DEFAULT_GH_REPO: &str = "SJParthi/tickvault";
@@ -79,15 +74,11 @@ const DEFAULT_GH_DESIRED_REF: &str = "main";
 const DEFAULT_GH_DEPLOY_WORKFLOW: &str = "deploy-aws.yml";
 const DEFAULT_GH_DISPATCH_WORKFLOW: &str = "deploy-aws-after-close.yml";
 const DEFAULT_BINARY_SHA_PARAM: &str = "/tickvault/prod/deploy/binary-git-sha";
-/// The SSM MIRROR of main HEAD, written every 30 minutes by
+/// Newest deploy-relevant commit, written every 30 minutes by
 /// postmerge-catchup.yml -- NOT by deploy-aws.yml.
-///
-/// That distinction is the whole point and is easy to get wrong: deploy-aws
-/// writes GITHUB_SHA, which IS main HEAD at deploy time, so a mirror written
-/// there would always equal `binary-git-sha` and `binary_is_stale` would be
-/// permanently false -- a green signal that can never go red. The mirror has
-/// to advance when MAIN advances, whether or not a deploy followed, which is
-/// exactly what a 30-minute cron that reads `repos/:repo/commits/main` does.
+/// Its path filter intentionally excludes unrelated workflow-only commits.
+/// The mirror may therefore be an ancestor of a correctly deployed binary;
+/// it must never authorize a deploy from inequality alone.
 const DEFAULT_DESIRED_SHA_PARAM: &str = "/tickvault/prod/deploy/desired-git-sha";
 
 /// B9 deploy provenance metric identity — legacy parity
@@ -100,21 +91,17 @@ const MISMATCH_METRIC_HOST: &str = "tickvault-prod";
 
 const GITHUB_API_BASE: &str = "https://api.github.com"; // APPROVED: infrastructure constant — the GitHub REST API base (Lambda-side, legacy watchdog parity)
 const GITHUB_TIMEOUT_SECONDS: u64 = 10;
+const GITHUB_RESPONSE_BYTES_MAX: usize = 256 * 1024;
+const TOKEN_CACHE_TTL_SECONDS: u64 = 300;
+const TOKEN_CACHE_TTL: Duration = Duration::from_secs(TOKEN_CACHE_TTL_SECONDS);
+const TOKEN_CACHE_ENTRIES_MAX: usize = 4;
 
 // ------------------------------------------------------------------------
 // Pure decision logic (no IO — unit-tested below, legacy tests ported 1:1)
 // ------------------------------------------------------------------------
 
-/// Return true iff a redeploy is needed.
-///
-/// Stale ONLY when BOTH shas are known AND they differ. If either is
-/// unknown (empty/None — GitHub API blip, or no successful deploy run
-/// yet) we return false: the watchdog must never dispatch on uncertainty
-/// (a spurious deploy is worse than waiting for the next 5-minutes-later
-/// run). This is the no-false-OK contract inverted — we never claim
-/// "deployed" by absence, and we never "fix" what we cannot positively
-/// confirm is broken. Legacy parity: `if not desired_sha or not
-/// deployed_sha: return False`.
+/// Legacy workflow-history mismatch diagnostic. This does not establish
+/// ancestry and must not authorize a deployment request.
 pub fn is_stale(desired_sha: Option<&str>, deployed_sha: Option<&str>) -> bool {
     let (Some(desired), Some(deployed)) = (desired_sha, deployed_sha) else {
         return false;
@@ -185,22 +172,9 @@ pub fn resolve_desired_sha<'a>(
     (None, "none")
 }
 
-/// Return true iff the ON-BOX running binary is provably older than main
-/// HEAD.
-///
-/// This is the GROUND-TRUTH staleness signal for the box-start
-/// (instance-start) firing: `binary_sha` is the SSM
-/// /tickvault/<env>/deploy/binary-git-sha param, which deploy-aws.yml
-/// writes ONLY after a verified-healthy binary swap. Unlike the GitHub
-/// "last successful deploy-aws run" head_sha (see `is_stale`), a green
-/// off-hours NO-OP skip run or a market-hours-blocked run can NEVER
-/// advance this param — so a box that auto-started on the previous binary
-/// is caught here even when a misleading skip run makes the GitHub signal
-/// look "deployed" (the exact 2026-07-09 boot-critical-fix outage class).
-///
-/// No-false-OK: reuses `binary_mismatch_value`, which returns None when
-/// EITHER sha is unknown/empty/"unknown" — so an SSM/GitHub blip is
-/// treated as "not stale" and never triggers a spurious redeploy.
+/// Legacy binary mismatch diagnostic retained for callers. Despite its
+/// historical name, inequality does not prove that the binary is older.
+/// Deployment authorization uses exact-SHA ancestry instead.
 pub fn binary_is_stale(binary_sha: Option<&str>, desired_sha: Option<&str>) -> bool {
     binary_mismatch_value(binary_sha, desired_sha) == Some(1.0)
 }
@@ -209,22 +183,35 @@ pub fn binary_is_stale(binary_sha: Option<&str>, desired_sha: Option<&str>) -> b
 // IO helpers (thin wrappers — exercised in the live deploy, legacy parity)
 // ------------------------------------------------------------------------
 
-/// Warm-container SSM param cache — legacy parity (`_param_cache`
-/// module-global). Only the GitHub TOKEN goes through this; the binary
-/// sha param is read fresh every fire.
-static PARAM_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+/// Only positive token values are cached, with bounded lifetime and entries.
+/// Do not derive Debug: cached values are secrets.
+struct CachedParam {
+    value: String,
+    cached_at: Instant,
+}
 
-/// SSM SecureString read with warm-container caching. Any failure returns
-/// "" (the watchdog must never crash on the token read — legacy parity:
-/// the blanket `except` in `_cached_param`).
+impl CachedParam {
+    fn usable_at(&self, now: Instant) -> Option<&str> {
+        let age = now.checked_duration_since(self.cached_at)?;
+        (age < TOKEN_CACHE_TTL && !self.value.is_empty()).then_some(self.value.as_str())
+    }
+}
+
+static PARAM_CACHE: Mutex<Option<HashMap<String, CachedParam>>> = Mutex::new(None);
+
+/// Failure or an empty result is retried on the next invocation. Successful
+/// values expire so token rotation does not require replacing warm containers.
 async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
     if name.is_empty() {
         return String::new();
     }
     {
-        let guard = PARAM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.as_ref().and_then(|c| c.get(name)) {
-            return cached.clone();
+        let mut guard = PARAM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cache) = guard.as_mut() {
+            if let Some(value) = cache.get(name).and_then(|v| v.usable_at(Instant::now())) {
+                return value.to_string();
+            }
+            cache.remove(name);
         }
     }
     match ssm
@@ -235,16 +222,26 @@ async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
         .await
     {
         Ok(resp) => {
-            let val = resp
+            let value = resp
                 .parameter()
                 .and_then(|p| p.value())
                 .unwrap_or("")
                 .to_string();
-            let mut guard = PARAM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            guard
-                .get_or_insert_with(HashMap::new)
-                .insert(name.to_string(), val.clone());
-            val
+            if !value.is_empty() {
+                let mut guard = PARAM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                let cache = guard.get_or_insert_with(HashMap::new);
+                if cache.len() >= TOKEN_CACHE_ENTRIES_MAX && !cache.contains_key(name) {
+                    cache.clear();
+                }
+                cache.insert(
+                    name.to_string(),
+                    CachedParam {
+                        value: value.clone(),
+                        cached_at: Instant::now(),
+                    },
+                );
+            }
+            value
         }
         Err(e) => {
             // The param NAME is safe to log; the value never is.
@@ -252,6 +249,41 @@ async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
             String::new()
         }
     }
+}
+
+fn append_github_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if chunk.len() > GITHUB_RESPONSE_BYTES_MAX.saturating_sub(body.len()) {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
+/// Bound accumulated response bytes as well as the existing request timeout.
+/// Page 2 of comparisons avoids GitHub's first-page file/patch payload.
+async fn read_github_response(mut response: reqwest::Response) -> (u16, Value) {
+    let status = response.status().as_u16();
+    if response
+        .content_length()
+        .is_some_and(|n| n > GITHUB_RESPONSE_BYTES_MAX as u64)
+    {
+        return (0, json!({"error": "github response exceeds byte limit"}));
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if append_github_chunk(&mut body, &chunk) => {}
+            Ok(Some(_)) => return (0, json!({"error": "github response exceeds byte limit"})),
+            Ok(None) => break,
+            Err(_) => return (0, json!({"error": "github response read failed"})),
+        }
+    }
+    let parsed = if body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).unwrap_or_else(|_| json!({"error": "github http error"}))
+    };
+    (status, parsed)
 }
 
 /// Minimal GitHub REST call. Returns (status, json) — legacy `_gh` parity:
@@ -283,16 +315,7 @@ async fn gh(
         req = req.header("content-type", "application/json").json(b);
     }
     match req.send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let txt = resp.text().await.unwrap_or_default();
-            let parsed = if txt.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&txt).unwrap_or_else(|_| json!({"error": "github http error"}))
-            };
-            (status, parsed)
-        }
+        Ok(resp) => read_github_response(resp).await,
         // Token-redaction hardening: never log the raw reqwest error here
         // (its Display can embed the URL); the fixed literal is enough.
         Err(_) => (0, json!({"error": "github request failed"})),
@@ -315,7 +338,7 @@ async fn desired_sha(
     )
     .await;
     if status == 200 {
-        return body.get("sha").and_then(Value::as_str).map(str::to_string);
+        return validated_full_sha(body.get("sha").and_then(Value::as_str)).map(str::to_string);
     }
     warn!(status, "could not fetch desired sha");
     None
@@ -401,7 +424,7 @@ async fn read_sha_param(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            if val.is_empty() { None } else { Some(val) }
+            validated_full_sha(Some(&val)).map(str::to_string)
         }
         Err(e) => {
             warn!(param, error = %e, "could not read sha param");
@@ -410,9 +433,32 @@ async fn read_sha_param(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String
     }
 }
 
+/// Compare immutable commits; a missing token or comparison failure is
+/// uncertainty, including when the target came from an SSM mirror.
+async fn verify_build_comparison(
+    client: &reqwest::Client,
+    token: &str,
+    repo: &str,
+    binary: Option<&str>,
+    desired: Option<&str>,
+) -> BuildComparison {
+    let (Some(binary), Some(desired)) = (validated_full_sha(binary), validated_full_sha(desired))
+    else {
+        return BuildComparison::unknown("invalid_or_missing_sha", None);
+    };
+    if binary == desired {
+        return BuildComparison::current();
+    }
+    let Some(path) = comparison_path(repo, binary, desired) else {
+        return BuildComparison::unknown("invalid_repository", None);
+    };
+    let (status, body) = gh(client, token, "GET", &path, None).await;
+    classify_comparison(binary, desired, status, &body)
+}
+
 /// B9 deploy provenance: publish tv_binary_main_sha_mismatch so the
 /// tv-<env>-binary-sha-stale alarm (Minimum >= 1 over 24h) can detect a
-/// running binary that lags main HEAD for a full day. Wrapped so the
+/// persistent mismatch. Mismatch alone does not establish ancestry. Wrapped so the
 /// watchdog's core stale-deploy dispatch job NEVER breaks on metric IO
 /// (legacy parity: the blanket `except` + error log).
 async fn publish_binary_mismatch_metric(
@@ -501,8 +547,42 @@ fn short8(sha: Option<&str>) -> String {
     sha.unwrap_or("").chars().take(8).collect()
 }
 
+/// This notification is only sent for a verified ancestor relationship.
+/// A dispatch receipt proves acceptance, not deployment completion.
+fn verified_behind_alert(
+    binary: Option<&str>,
+    desired: Option<&str>,
+    desired_source: &str,
+    workflow: &str,
+    dispatched: bool,
+) -> (String, String) {
+    let outcome = if dispatched {
+        "accepted"
+    } else {
+        "not confirmed"
+    };
+    let subject = format!("Deploy watchdog: verified build lag — redeploy request {outcome}");
+    let receipt = if dispatched {
+        "was accepted"
+    } else {
+        "was not confirmed"
+    };
+    let message = format!(
+        "The recorded binary {} is an ancestor of observed target {} (source: {}). \
+         The redeploy request to {} {}. Deployment completion is not verified; \
+         the existing market-hours and holiday safeguards still apply.",
+        short8(binary),
+        short8(desired),
+        desired_source,
+        workflow,
+        receipt,
+    );
+    (subject, message)
+}
+
 /// Entry point. Idempotent — safe to run on every 5-minutes-after
-/// schedule. Legacy `lambda_handler` parity, same result JSON shape.
+/// schedule. Result JSON preserves legacy fields and adds explicit ancestry;
+/// `stale`/`binary_stale` are null when the comparison is unresolved.
 pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let window = event
         .get("window")
@@ -531,6 +611,7 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let sns = crate::clients::sns(&config);
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(GITHUB_TIMEOUT_SECONDS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     let token = cached_param(&ssm, &token_param).await;
@@ -552,7 +633,7 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     info!(
         desired_source,
         desired = %short8(desired.as_deref()),
-        "resolved main HEAD for the provenance comparison"
+        "resolved observed target for the provenance comparison"
     );
     // Read the on-box binary provenance sha ONCE per fire — used BOTH for
     // the 24h mismatch metric and the ground-truth box-binary staleness
@@ -570,38 +651,55 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     )
     .await;
 
-    // Two INDEPENDENT staleness signals, OR-ed so we never REDUCE
-    // detection:
-    // * github_stale — main HEAD != head_sha of the last SUCCESSFUL
-    //   deploy-aws run. Best-effort: a green off-hours no-op SKIP run (box
-    //   down) concludes `success` with head_sha = the merged commit, so
-    //   this signal can be FOOLED into "deployed" while the box actually
-    //   booted stale (postmerge-catchup.yml can create such skip runs).
-    // * binary_stale — the ON-BOX running binary's provenance sha != main
-    //   HEAD. GROUND TRUTH: the SSM param only advances on a verified
-    //   swap, so a skip run can never fool it (2026-07-09 outage class).
+    // Workflow history and the mismatch metric remain diagnostics. Neither
+    // proves direction: only exact-SHA ancestry can authorize a dispatch.
     let github_stale = is_stale(desired.as_deref(), deployed.as_deref());
-    let binary_stale = binary_is_stale(binary.as_deref(), desired.as_deref());
-    let stale = github_stale || binary_stale;
+    let comparison = verify_build_comparison(
+        &http,
+        &token,
+        &gh_repo,
+        binary.as_deref(),
+        desired.as_deref(),
+    )
+    .await;
+    let binary_stale = comparison.relation.permits_dispatch();
+    let stale = binary_stale;
     info!(
         window,
         desired = %short8(desired.as_deref()),
         deployed = %short8(deployed.as_deref()),
         binary = %short8(binary.as_deref()),
+        desired_source,
+        relation = comparison.relation.as_str(),
+        verification_reason = comparison.reason,
+        comparison_http_status = ?comparison.http_status,
         github_stale,
-        binary_stale,
-        stale,
+        dispatch_permitted = binary_stale,
         "deploy-watchdog verdict"
     );
 
     if !stale {
-        // Healthy OR uncertain — stay silent (no spam, no spurious deploy).
+        if matches!(
+            comparison.relation,
+            BuildRelation::Unknown | BuildRelation::Diverged
+        ) {
+            warn!(
+                relation = comparison.relation.as_str(),
+                reason = comparison.reason,
+                "deploy comparison unresolved: automatic dispatch held"
+            );
+        }
         return Ok(json!({
             "window": window,
-            "stale": false,
+            "stale": comparison.relation.stale_value(),
             "github_stale": github_stale,
-            "binary_stale": binary_stale,
+            "binary_stale": comparison.relation.stale_value(),
+            "relation": comparison.relation.as_str(),
+            "verification_reason": comparison.reason,
+            "comparison_http_status": comparison.http_status,
+            "desired_source": desired_source,
             "dispatched": false,
+            "skipped": comparison.relation.as_str(),
         }));
     }
 
@@ -630,6 +728,10 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
             "stale": true,
             "github_stale": github_stale,
             "binary_stale": binary_stale,
+            "relation": comparison.relation.as_str(),
+            "verification_reason": comparison.reason,
+            "comparison_http_status": comparison.http_status,
+            "desired_source": desired_source,
             "dispatched": false,
             "skipped": "holiday_stop",
         }));
@@ -643,40 +745,12 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
         &gh_desired_ref,
     )
     .await;
-    // Name the box-binary case explicitly so the operator knows the box is
-    // RUNNING old code right now (vs. just a late deploy pipeline).
-    let (subject, detail) = if binary_stale {
-        (
-            "Deploy watchdog: box booted on STALE code — redeploy triggered".to_string(),
-            format!(
-                "⚠️ The box is RUNNING an old build: its binary is {} but main is at {}",
-                short8(binary.as_deref()),
-                short8(desired.as_deref())
-            ),
-        )
-    } else {
-        (
-            "Deploy watchdog: GitHub cron missed — redeploy triggered".to_string(),
-            format!(
-                "⚠️ The {window} auto-deploy did not land: main is at {} but the last successful deploy was {}",
-                short8(desired.as_deref()),
-                short8(deployed.as_deref())
-            ),
-        )
-    };
-    let message = format!(
-        "{detail}. The AWS watchdog {} the redeploy ({gh_dispatch_workflow}). \
-         It is idempotent + market-hours-guarded, so it is safe. {}",
-        if dispatched {
-            "TRIGGERED"
-        } else {
-            "FAILED to trigger"
-        },
-        if dispatched {
-            "No action needed — confirm the deploy run goes green."
-        } else {
-            "ACTION: dispatch the deploy manually."
-        }
+    let (subject, message) = verified_behind_alert(
+        binary.as_deref(),
+        desired.as_deref(),
+        desired_source,
+        &gh_dispatch_workflow,
+        dispatched,
     );
     publish(&sns, &alerts_topic_arn, &subject, &message).await;
     warn!(
@@ -688,15 +762,18 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
         "stale": true,
         "github_stale": github_stale,
         "binary_stale": binary_stale,
+        "relation": comparison.relation.as_str(),
+        "verification_reason": comparison.reason,
+        "comparison_http_status": comparison.http_status,
+        "desired_source": desired_source,
         "dispatched": dispatched,
     }))
 }
 
 // ------------------------------------------------------------------------
 // Tests — the legacy test_handler.py suite ported 1:1 (same names). The
-// decision contract that must never regress: dispatch ONLY when both shas
-// are known AND differ; NEVER dispatch on uncertainty; whitespace-
-// insensitive equality.
+// Legacy diagnostics stay covered. Dispatch authorization additionally needs
+// verified ancestry; mismatch or successful workflow history is insufficient.
 // ------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -925,7 +1002,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // binary_is_stale (pure) — the ground-truth box-start dispatch signal
+    // binary_is_stale (pure) — retained legacy mismatch diagnostic
     // -------------------------------------------------------------------
 
     #[test]
@@ -954,5 +1031,234 @@ mod tests {
         assert!(!binary_is_stale(Some("deadbee"), None));
         assert!(!binary_is_stale(Some("deadbee"), Some("")));
         assert!(!binary_is_stale(Some("deadbee"), Some("unknown")));
+    }
+
+    #[test]
+    fn token_cache_expires_at_ttl_and_never_reuses_empty_or_future_values() {
+        let now = Instant::now();
+        let cached = CachedParam {
+            value: "synthetic-test-token".into(),
+            cached_at: now,
+        };
+        assert_eq!(cached.usable_at(now), Some("synthetic-test-token"));
+        assert!(
+            cached
+                .usable_at(now + TOKEN_CACHE_TTL - Duration::from_nanos(1))
+                .is_some()
+        );
+        assert!(cached.usable_at(now + TOKEN_CACHE_TTL).is_none());
+        assert!(
+            cached
+                .usable_at(now + TOKEN_CACHE_TTL + Duration::from_secs(1))
+                .is_none()
+        );
+        let empty = CachedParam {
+            value: String::new(),
+            cached_at: now,
+        };
+        assert!(empty.usable_at(now).is_none());
+        let future = CachedParam {
+            value: "synthetic-test-token".into(),
+            cached_at: now + Duration::from_secs(1),
+        };
+        assert!(future.usable_at(now).is_none());
+    }
+
+    #[test]
+    fn github_body_limit_accepts_exact_cap_and_refuses_next_byte_without_growth() {
+        let mut body = vec![b' '; GITHUB_RESPONSE_BYTES_MAX - 1];
+        assert!(append_github_chunk(&mut body, b" "));
+        assert_eq!(body.len(), GITHUB_RESPONSE_BYTES_MAX);
+        assert!(!append_github_chunk(&mut body, b"x"));
+        assert_eq!(body.len(), GITHUB_RESPONSE_BYTES_MAX);
+        let mut empty = Vec::new();
+        assert!(!append_github_chunk(
+            &mut empty,
+            &vec![b'x'; GITHUB_RESPONSE_BYTES_MAX + 1]
+        ));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_dispatch_alert_never_claims_redeploy_was_triggered_or_complete() {
+        let (subject, body) = verified_behind_alert(
+            Some(&full_sha("aaaaaaa")),
+            Some(&full_sha("bbbbbbb")),
+            "ssm-mirror",
+            "deploy-aws-after-close.yml",
+            false,
+        );
+        assert!(subject.ends_with("request not confirmed"));
+        assert!(body.contains("source: ssm-mirror"));
+        assert!(body.contains(".yml was not confirmed."));
+        assert!(body.contains("completion is not verified"));
+        for misleading in ["old build", "main is at", "TRIGGERED", "No action needed"] {
+            assert!(!body.contains(misleading), "{misleading}");
+        }
+    }
+
+    #[test]
+    fn accepted_dispatch_alert_reports_receipt_not_deployment_completion() {
+        let (subject, body) = verified_behind_alert(
+            Some(&full_sha("aaaaaaa")),
+            Some(&full_sha("bbbbbbb")),
+            "github",
+            "deploy-aws-after-close.yml",
+            true,
+        );
+        assert!(subject.ends_with("request accepted"));
+        assert!(body.contains("was accepted"));
+        assert!(body.contains("completion is not verified"));
+    }
+
+    #[tokio::test]
+    async fn missing_token_cannot_dispatch_from_a_mirror_mismatch() {
+        // If this short-circuit regresses, an explicit loopback-only proxy
+        // prevents the fixture from reaching GitHub or ambient proxy services.
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let binary = full_sha("aaaaaaa");
+        let desired = full_sha("bbbbbbb");
+        let compared = verify_build_comparison(
+            &http,
+            "",
+            "SJParthi/tickvault",
+            Some(&binary),
+            Some(&desired),
+        )
+        .await;
+        assert_eq!(compared.relation, BuildRelation::Unknown);
+        assert_eq!(compared.reason, "github_unavailable");
+        assert_eq!(compared.http_status, Some(0));
+        assert!(!compared.relation.permits_dispatch());
+        let equal = verify_build_comparison(
+            &http,
+            "",
+            "SJParthi/tickvault",
+            Some(&binary),
+            Some(&binary),
+        )
+        .await;
+        assert_eq!(equal, BuildComparison::current());
+    }
+
+    #[test]
+    fn dispatch_uses_ancestry_after_metric_and_before_existing_holiday_guard() {
+        let source = include_str!("deploy_watchdog.rs");
+        let handle = &source[source.find("pub async fn handle(").unwrap()..];
+        let handle = &handle[..handle.find("\n}\n").unwrap()];
+        let metric = handle.find("publish_binary_mismatch_metric(").unwrap();
+        let compare = handle
+            .find("let comparison = verify_build_comparison(")
+            .unwrap();
+        let authorization = handle
+            .find("let binary_stale = comparison.relation.permits_dispatch()")
+            .unwrap();
+        let held = handle.find("if !stale {").unwrap();
+        let holiday = handle
+            .find("crate::start_watchdog::holiday_stop_is_today(")
+            .unwrap();
+        let dispatch = handle.find("let dispatched = dispatch_deploy(").unwrap();
+        let notification = handle.find("verified_behind_alert(").unwrap();
+        assert!(metric < compare && compare < authorization && authorization < held);
+        assert!(held < holiday && holiday < dispatch && dispatch < notification);
+        assert!(!handle.contains("github_stale ||"));
+        assert!(!handle.contains("binary_is_stale("));
+    }
+
+    /// Local socket only, explicit no_proxy: fixtures never consume provider
+    /// credentials or contact GitHub. The response is bounded by each caller.
+    async fn local_github_response(
+        raw: Vec<u8>,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            // Oversize responses may be rejected before this write completes.
+            let _ = socket.write_all(&raw).await;
+            let _ = socket.shutdown().await;
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/owned-test-fixture"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn bounded_http_reader_accepts_json_and_empty_dispatch_receipt() {
+        let payload = br#"{"status":"ahead","ahead_by":1}"#;
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(payload);
+        let (response, server) = local_github_response(raw).await;
+        let (status, body) = read_github_response(response).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"status":"ahead","ahead_by":1}));
+        server.await.unwrap();
+        let (response, server) =
+            local_github_response(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_vec())
+                .await;
+        assert_eq!(read_github_response(response).await, (204, json!({})));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_http_reader_rejects_declared_and_chunked_oversize_responses() {
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            GITHUB_RESPONSE_BYTES_MAX + 1
+        )
+        .into_bytes();
+        let (response, server) = local_github_response(raw).await;
+        let (status, body) = read_github_response(response).await;
+        assert_eq!(status, 0);
+        assert_eq!(body["error"], "github response exceeds byte limit");
+        server.await.unwrap();
+        let mut raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        raw.extend_from_slice(format!("{:x}\r\n", GITHUB_RESPONSE_BYTES_MAX).as_bytes());
+        raw.resize(raw.len() + GITHUB_RESPONSE_BYTES_MAX, b' ');
+        raw.extend_from_slice(b"\r\n1\r\nx\r\n0\r\n\r\n");
+        let (response, server) = local_github_response(raw).await;
+        let (status, body) = read_github_response(response).await;
+        assert_eq!(status, 0);
+        assert_eq!(body["error"], "github response exceeds byte limit");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_or_truncated_http_body_cannot_authorize_dispatch() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{".to_vec();
+        let (response, server) = local_github_response(raw).await;
+        let (status, body) = read_github_response(response).await;
+        let binary = full_sha("aaaaaaa");
+        let desired = full_sha("bbbbbbb");
+        let comparison = classify_comparison(&binary, &desired, status, &body);
+        assert_eq!(comparison.relation, BuildRelation::Unknown);
+        assert!(!comparison.relation.permits_dispatch());
+        server.await.unwrap();
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{".to_vec();
+        let (response, server) = local_github_response(raw).await;
+        let (status, body) = read_github_response(response).await;
+        assert_eq!(status, 0);
+        assert_eq!(body["error"], "github response read failed");
+        server.await.unwrap();
     }
 }
