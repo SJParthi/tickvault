@@ -10,6 +10,47 @@ fn trading() -> TradingConfig {
     config["trading"].clone().try_into().expect("trading")
 }
 
+#[test]
+fn test_day_verdict_strict_failure_survives_1024_bound_and_incomplete_session() {
+    let mut verdict = DayVerdict::with_calendar(calendar());
+    let (mut rows, host) = good(at(0, 9, 15));
+    let row = &mut rows[Stage::DrainMainFrame as usize];
+    row.strict_version = Some(1);
+    row.strict_samples = Some(100);
+    row.strict_samples_at_or_above_1000ns = Some(100);
+    assert_eq!(row.p99_ns, Some(1_024));
+    assert!(verdict.observe(&rows, &host).is_none());
+    let (rows, host) = good(at(0, 15, 40));
+    let daily = verdict
+        .observe(&rows, &host)
+        .expect("incomplete daily evidence");
+    assert_eq!(daily.tick_step.0, SignalResult::Fail);
+    assert_eq!(daily.verdict, Verdict::Unknown);
+    let reasons = verdict_reasons(&daily);
+    assert!(reasons.contains("FAIL strict_1000ns_observed"));
+    assert!(reasons.contains("drain_main_frame"));
+    assert!(!reasons.contains("UNKNOWN strict_1000ns_unresolved"));
+}
+
+#[test]
+fn test_day_verdict_strict_passing_counts_do_not_certify_session_intervals() {
+    let mut verdict = DayVerdict::with_calendar(calendar());
+    let row = run_day(&mut verdict, 0, |minute| {
+        let (mut rows, host) = good(minute);
+        for row in &mut rows {
+            row.strict_version = Some(1);
+            row.strict_samples = Some(100);
+            row.strict_samples_at_or_above_1000ns = Some(0);
+        }
+        (rows, host)
+    })
+    .expect("daily row");
+    assert_eq!(row.coverage.strict_sampled_minutes, [375; 4]);
+    assert_eq!(row.tick_step.0, SignalResult::Unknown);
+    assert_eq!(row.verdict, Verdict::Unknown);
+    assert!(verdict_reasons(&row).contains("strict_session_intervals_unproven"));
+}
+
 pub(super) fn calendar() -> Arc<TradingCalendar> {
     Arc::new(TradingCalendar::from_config(&trading()).expect("calendar"))
 }

@@ -97,8 +97,10 @@
 //! * A post-close-only restart cannot overwrite the day's row. An overlapping
 //!   process with zero session rows emits UNKNOWN. No current-day row must be
 //!   displayed as insufficient, never replaced with yesterday's verdict.
-//! * Existing histogram recording is unchanged: the ≤1,024 ns first bucket
-//!   cannot prove the strict <1,000 ns goal. Exact classification is follow-up.
+//! * The historical histogram projection is unchanged: its ≤1,024 ns first
+//!   bucket cannot prove the strict <1,000 ns goal. Versioned raw-bin counts
+//!   now classify recorded samples exactly; session intervals and freshness
+//!   remain unproven, so passing counts do not certify a complete session.
 //! * CPU wait is the kernel's `run_delay` growth between sampling attempts,
 //!   nominally one second apart; delayed attempts span longer intervals and
 //!   cannot establish hidden one-second maxima. A first reading is a baseline.
@@ -128,8 +130,6 @@ use crate::hot_path_telemetry::Stage;
 use crate::hot_thread_sched::{HotThread, SchedPublisher};
 
 mod coverage;
-#[cfg(test)]
-mod coverage_tests;
 pub use coverage::DayCoverage;
 use coverage::SessionPlan;
 
@@ -850,10 +850,10 @@ pub struct DayEvidence {
 /// Pure: the five signals and the verdict from one day's evidence.
 #[must_use]
 pub fn decide_verdict(e: &DayEvidence) -> (Verdict, [SignalResult; 5]) {
-    let step = if e
-        .worst_step_p99
-        .iter()
-        .any(|p| p.is_some_and(|n| n > LEGACY_FIRST_BUCKET_NS))
+    let step = if e.coverage.strict_failed_minutes.iter().any(|n| *n > 0)
+        || e.worst_step_p99
+            .iter()
+            .any(|p| p.is_some_and(|n| n > LEGACY_FIRST_BUCKET_NS))
     {
         // Every historical bucket above the first has a lower endpoint >1024.
         SignalResult::Fail
@@ -1034,15 +1034,39 @@ pub fn verdict_reasons(row: &CapacityVerdictRow) -> String {
     if row.backlog.1.is_none() || row.backlog.2.is_none() {
         push(&mut s, "UNKNOWN backlog_close_sample_missing");
     }
-    if row
-        .tick_step
-        .2
-        .is_some_and(|n| (TICK_STEP_P99_TARGET_NS..=LEGACY_FIRST_BUCKET_NS).contains(&n))
+    if row.tick_step.0 == SignalResult::Unknown
+        && row
+            .tick_step
+            .2
+            .is_some_and(|n| (TICK_STEP_P99_TARGET_NS..=LEGACY_FIRST_BUCKET_NS).contains(&n))
     {
+        let exact_counts_complete = row.session_minutes > 0
+            && row
+                .coverage
+                .strict_sampled_minutes
+                .iter()
+                .all(|n| *n == row.session_minutes);
         push(
             &mut s,
-            "UNKNOWN strict_1000ns_unresolved: historical first bucket straddles the strict target",
+            if exact_counts_complete {
+                "UNKNOWN strict_session_intervals_unproven: exact sample counts do not establish freshness or continuous observation"
+            } else {
+                "UNKNOWN strict_1000ns_unresolved: historical first bucket straddles the strict target"
+            },
         );
+    }
+    for (index, stage) in TICK_STEP_STAGES.iter().enumerate() {
+        let failed = row.coverage.strict_failed_minutes[index];
+        if failed > 0 {
+            push(
+                &mut s,
+                &format!(
+                    "FAIL strict_1000ns_observed: {} recorded minute populations failed strict p99 for {}",
+                    failed,
+                    stage.as_str()
+                ),
+            );
+        }
     }
     let stage = row.tick_step.1.map_or("none", Stage::as_str);
     let p99 = row
@@ -1264,6 +1288,14 @@ impl DayVerdict {
         e.session_minutes = e.session_minutes.saturating_add(1);
         for (index, stage) in TICK_STEP_STAGES.iter().enumerate() {
             let row = &latency[*stage as usize];
+            if let Some(passes) = row.strict_counts().and_then(|n| n.p99_below_1000ns()) {
+                e.coverage.strict_sampled_minutes[index] =
+                    e.coverage.strict_sampled_minutes[index].saturating_add(1);
+                if !passes {
+                    e.coverage.strict_failed_minutes[index] =
+                        e.coverage.strict_failed_minutes[index].saturating_add(1);
+                }
+            }
             if row.samples == 0 {
                 continue;
             }
@@ -1552,6 +1584,9 @@ pub fn append_verdict_row(buffer: &mut Buffer, r: &CapacityVerdictRow) -> Result
 }
 
 #[cfg(test)]
+mod coverage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::coverage_tests::calendar;
     use super::*;
@@ -1579,6 +1614,9 @@ mod tests {
             max_ns: max,
             samples_over_1024ns: 0,
             publishes: 60,
+            strict_version: None,
+            strict_samples: None,
+            strict_samples_at_or_above_1000ns: None,
         })
     }
 

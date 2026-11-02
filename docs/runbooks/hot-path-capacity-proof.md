@@ -1,5 +1,43 @@
 # Hot-path latency and capacity proof — how to read it
 
+## Strict 1,000 ns sample evidence (2026-10-31)
+
+New latency rows can carry three nullable LONG columns: `strict_version`,
+`strict_samples`, and `strict_samples_at_or_above_1000ns`. Version 1 uses
+disjoint raw bins [0,999] and [1000,1024], with later bins unchanged. The
+numerator and denominator come from the same raw snapshot difference and
+minute accumulation. The existing p99 bounds, `histogram` labels and
+`samples_over_1024ns` keep their historical meaning.
+
+| Input | Recorded-sample result |
+| --- | --- |
+| Version absent/unsupported, either count absent/negative, violations greater than samples | UNKNOWN |
+| Zero strict samples | UNKNOWN |
+| Valid version 1 and violations ≤ integer `samples / 100` | Sample population's nearest-rank p99 is strictly below 1,000 ns |
+| More violations | Observed strict FAIL |
+
+Equality at 1,000 ns is a violating sample. The percentile permits its
+specified tail; it does not claim every call is below the target. Use exact
+integer arithmetic, not a rounded floating ratio. A 1,024 ns legacy p99
+alone remains UNKNOWN. Receipt-to-fold's fine `samples` count is an
+independent atomic population; never combine it with the strict numerator.
+
+These fields establish the threshold classification of recorded samples
+only. Missing freshness, elapsed observation intervals, excluded work or
+persisted minutes still prevent a session PASS. The daily evaluator can
+retain an observed strict FAIL but introduces no positive session path:
+`strict_session_intervals_unproven` identifies positive exact counts that
+still lack interval/freshness proof. `NOT_NEEDED` remains a capacity result.
+
+Read the exact requested eligible date/window and stage, including the three
+fields and `publishes`. Historical rows have NULL strict evidence. A schema
+without these columns needs the additive ensure before a query can use them;
+a failed query is missing evidence, not a fast result. Readiness now checks
+all three columns are LONG before allowing proof writes. No table key,
+CloudWatch metric/label, stall threshold or alarm changes.
+
+## Existing operational and capacity evidence
+
 Added 2026-10-30; coverage correction 2026-10-31. Three QuestDB tables provide evidence for two questions:
 
 1. What latency was observed for the instrumented frame stages? The existing 1,024 ns first bucket cannot prove the strict p99 <1,000 ns target.

@@ -180,11 +180,23 @@ mod tests {
         let value = if query.contains("FROM tables()") {
             json!({"dataset": [[true, true]]})
         } else if query.contains("FROM table_columns(") {
-            let (_, keys) = proof_table_readiness::TABLE_KEYS
+            let (table, keys) = proof_table_readiness::TABLE_KEYS
                 .iter()
                 .find(|(table, _)| query.contains(&format!("'{table}'")))
                 .expect("known table");
-            columns(keys)
+            let mut result = columns(keys);
+            if *table == HOT_PATH_LATENCY_MINUTE_TABLE {
+                for (name, ty) in HOT_PATH_LATENCY_MINUTE_COLUMNS
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("strict_"))
+                {
+                    result["dataset"]
+                        .as_array_mut()
+                        .expect("columns")
+                        .push(json!([name, ty, false, false]));
+                }
+            }
+            result
         } else {
             assert!(query.starts_with("CREATE TABLE") || query.starts_with("ALTER TABLE"));
             json!({"ddl": "OK"})
@@ -211,6 +223,8 @@ mod tests {
             day_ist_nanos: TEST_MINUTE,
             verdict: Verdict::Unknown,
             session_minutes: 1,
+            coverage: Default::default(),
+            disk_minutes: 0,
             tick_step: (SignalResult::Unknown, None, None),
             ticks_over_1ms: (SignalResult::Pass, 0),
             cpu_wait: (SignalResult::Unknown, None, None),
@@ -218,8 +232,6 @@ mod tests {
             backlog: (SignalResult::Unknown, None, None),
             worst_host_cpu_busy_pct: Some(12.5),
             process_start_ist_nanos: TEST_MINUTE,
-            coverage: Default::default(),
-            disk_minutes: 0,
         })
     }
 
@@ -281,6 +293,59 @@ mod tests {
             assert!(
                 proof_table_readiness::validate(&flags, &json!({"dataset": []}), keys).is_err()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_strict_columns_must_all_be_long_before_any_write() {
+        for name in [
+            "strict_version",
+            "strict_samples",
+            "strict_samples_at_or_above_1000ns",
+        ] {
+            for wrong_type in [None, Some("DOUBLE"), Some("INT"), Some("SYMBOL")] {
+                let repaired = Arc::new(AtomicBool::new(false));
+                let repaired_on_server = Arc::clone(&repaired);
+                let server = Server::new(move |request| {
+                    let answer = healthy_answer(request);
+                    if !repaired_on_server.load(Ordering::Acquire)
+                        && request
+                            .query()
+                            .contains("table_columns('hot_path_latency_minute')")
+                    {
+                        let (status, body) = answer.expect("metadata");
+                        let mut value: Value = serde_json::from_str(&body).expect("metadata JSON");
+                        let rows = value["dataset"].as_array_mut().expect("rows");
+                        if let Some(ty) = wrong_type {
+                            let row = rows
+                                .iter_mut()
+                                .find(|row| row[0] == name)
+                                .expect("strict column");
+                            row[1] = json!(ty);
+                        } else {
+                            rows.retain(|row| row[0] != name);
+                        }
+                        return Some((status, value.to_string()));
+                    }
+                    answer
+                });
+                let gate = Arc::new(ProofTableReadiness::default());
+                let mut writer = HotPathLatencyMinuteWriter::new(&server.config, Arc::clone(&gate));
+                writer
+                    .append_message(&minute_message())
+                    .expect("pending rows");
+                assert!(
+                    !ensure_hot_path_latency_minute_table(&server.config, false, &gate).await,
+                    "{name}: {wrong_type:?}"
+                );
+                assert!(!gate.keyed.load(Ordering::Acquire));
+                assert!(writer.flush().is_err());
+                assert!(server.writes().is_empty());
+                repaired.store(true, Ordering::Release);
+                assert!(ensure_hot_path_latency_minute_table(&server.config, false, &gate).await);
+                writer.flush().expect("all types verified");
+                assert_eq!(server.writes().len(), 1);
+            }
         }
     }
 

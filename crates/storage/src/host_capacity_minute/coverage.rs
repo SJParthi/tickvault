@@ -21,6 +21,11 @@ pub struct DayCoverage {
     pub verdict_at_secs: Option<u32>,
     /// Nonempty valid minute rows for each tick-step stage.
     pub stage_minutes: [u64; 4],
+    /// Observed minute populations whose exact strict p99 failed. Positive
+    /// strict counts do not certify whole-session intervals or freshness.
+    pub strict_failed_minutes: [u64; 4],
+    /// Nonempty valid strict count pairs, without an interval/freshness claim.
+    pub strict_sampled_minutes: [u64; 4],
     /// Minutes with every supplied aggregate reader observation present.
     /// This does not certify every registered member behind that aggregate.
     pub reader_minutes: u64,

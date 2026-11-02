@@ -7303,3 +7303,32 @@ The following matrices apply to each of the three DT-PROOF items. Demand labels 
 | Real-time proof | Local changes improve evidence honesty; persisted/fresh dated observations still required | Monday runbook and explicit UNKNOWN for missing/ambiguous data; no live pass here |
 
 Known limits remain: a registered scheduler member can be unreadable behind another readable aggregate member; calendar minute counts do not certify exact sampling intervals; cached backlog values have no successful-poll timestamp; a daily decision accumulates before downstream persistence and cannot certify that every proof row landed; HTTP acknowledgement is not a power-loss durability guarantee. The current legacy 1,024 ns histogram cannot certify strict p99 below 1,000 ns. Strict instrumentation is separate coordinated work, not silently folded into this validation claim.
+## DT-STRICT — exact classification below 1,000 ns (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed strict-target request relayed by the coordinator, with explicit approval of the three nullable LONG fields, exact type readiness, same-snapshot counts and no new daily PASS path. Source preparation first; builds and quiet-host benchmarks require coordinator resource slots. No deployment or live setting change.
+
+The old first bin is like one box holding both 999 ns and 1,000 ns: its label cannot tell which side of the requested limit a sample occupied. Two disjoint boxes make that distinction while the old exporter can still add them together.
+
+| Evidence | Meaning |
+| --- | --- |
+| Historical p99 upper bound 1,024 ns | Strict target UNKNOWN |
+| Version 1, nonzero N, violations at most `N / 100` | Recorded population's nearest-rank p99 below 1,000 ns |
+| More violations | Observed strict FAIL; equality at 1,000 counts as a violation |
+| Missing/invalid version or counts, zero samples | UNKNOWN |
+| Positive counts without interval/freshness proof | No whole-session PASS |
+
+- [ ] Split the first raw atomic bin, retaining one event-bin increment and the legacy exporter projection; derive exact counts from the same raw snapshot difference.
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/storage/src/hot_path_telemetry/strict_threshold.rs, crates/storage/src/hot_path_telemetry/strict_tests.rs
+  - Tests: test_record_stage_nanos_strict_boundaries_keep_legacy_projection, test_strict_sample_counts_p99_below_1000ns_uses_exact_nearest_rank, test_strict_window_regression_is_unknown_and_next_window_recovers, test_strict_window_concurrent_real_recording_conserves_the_same_population
+- [ ] Persist nullable versioned counts through additive DDL and protocol V1; require exact LONG readiness and omit all strict fields together on invalidity or signed overflow.
+  - Files: crates/storage/src/hot_path_latency_minute.rs, crates/storage/src/hot_path_latency_minute/strict_tests.rs, crates/storage/src/hot_path_latency_minute/proof_table_readiness.rs, crates/storage/src/hot_path_latency_minute/readiness_tests.rs
+  - Tests: test_from_columns_and_strict_counts_reject_legacy_partial_and_bad_counts, test_minute_strict_counts_never_mix_receipt_fine_and_raw_populations, test_append_row_strict_version_and_counts_are_v1_integers_and_jointly_present, test_ensure_strict_columns_must_all_be_long_before_any_write
+- [ ] Preserve observed strict failures in the daily evaluator, with explicit interval/freshness UNKNOWN for positive counts; document scope and keep operational stall behavior separate.
+  - Files: crates/storage/src/host_capacity_minute.rs, crates/storage/src/host_capacity_minute/coverage.rs, crates/storage/src/host_capacity_minute/coverage_tests.rs, docs/runbooks/hot-path-capacity-proof.md
+  - Tests: test_day_verdict_strict_failure_survives_1024_bound_and_incomplete_session, test_day_verdict_strict_passing_counts_do_not_certify_session_intervals
+- [ ] Validate boundaries, rank, resets/overflow, concurrency, schema/ILP compatibility and allocation; run meaningful negative controls and coordinated before/after recorder timing. Record measured scope and remaining gaps.
+  - Files: crates/storage/tests/dhat_hot_path_telemetry.rs, crates/storage/tests/dhat_hot_path_latency_minute.rs
+  - Tests: dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation, dhat_publish_window_with_minute_accumulator_is_zero_allocation
+
+Each item cross-references the 15-row and 7-row matrices in `.claude/rules/project/per-wave-guarantee-matrix.md`. Concrete scope: fixed arrays and one histogram increment per event; cold minute/schema work; unchanged table keys, exporter names/labels, stall budgets, alerts, dependencies and live toggles; three nullable LONG columns on the existing minute table; unit/property/concurrency/protocol/schema/DHAT checks and independent review. Coverage, full workspace checks, real engine migration and actual latency measurements need execution evidence. No absolute performance or loss guarantee is made. Exact observation intervals, source freshness, hidden scheduler members and uninstrumented inner operations remain separate work.
