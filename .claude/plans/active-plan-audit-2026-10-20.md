@@ -1812,3 +1812,49 @@ fields before production code, fake cfg mentions, UTF-8 source boundaries and
 paused Tokio timers with unchanged wall time. Native regression assertions stay
 active. Rollback uses preserved refs/patches; no production deployment is part
 of this local implementation checkpoint.
+
+
+### 2026-11-02: close native publication-check and Rust-header gaps
+
+The combined Stocks checkpoint 545d27149 completed 16,330 passing tests,
+2 failing Rust-header classification guards and 32 ignored tests. Preserve that
+failed result. The earlier 13 failures passed in both the focused and combined
+runs; they are not the two failures in this checkpoint.
+
+- [x] Distinguish compiler-defined Rust inner attributes from interpreter
+  shebangs while retaining renamed-script detection, BOM handling and every
+  existing runtime/scan allowance and non-vacuity assertion.
+  - Files: crates/common/tests/rust_only_guard.rs
+  - Tests: test_regression_rust_inner_attributes_are_not_interpreter_headers,
+    test_regression_real_shebangs_remain_visible_when_scripts_are_renamed_rust,
+    test_regression_only_rust_trivia_can_precede_an_attribute_bracket
+- [x] Remove unproven shared fast receipts from the native pre-push decision.
+  Every normal and FULL_QA invocation executes format, all-target Clippy,
+  workspace tests, banned-pattern and test-count checks. Retain remaining
+  checks and blocking failure/timeout outcomes; add --locked to build/tests.
+  - Files: scripts/git-hooks/pre-push,
+    crates/common/tests/native_pre_push_policy_guard.rs,
+    crates/common/tests/shell_budget_guard.rs
+  - Tests: default_and_full_qa_never_trust_shared_receipts_to_hide_failure_or_timeout,
+    format_clippy_banned_and_count_failures_still_block_native_push,
+    successful_native_push_runs_all_checks_and_only_then_writes_its_receipt,
+    inherited_shell_startup_and_exported_functions_cannot_escape_the_owned_stubs
+  - The workspace-test timeout is a fixed 1,800 seconds, based on the recorded
+    1,288.604-second compile/test run; the old 300 seconds is below its
+    529.85 seconds of harness runtime alone. This changes waiting capacity,
+    not assertions, cases or passing criteria. Other timeouts are unchanged.
+    Removal of receipt parsing removes its obsolete two-awk allowance.
+  - Controlled fixture checks are not real native QA. Existing advisory-network
+    and missing-tool skip policies remain explicit; actual audit and deny were
+    separately executed successfully at 545d27149 with the pinned tools.
+- [x] Address all-target lint findings in the new v2 Stocks response: box the
+  large successful snapshot, retaining the identical serde wire schema and
+  validation, and use an array in the three-row sort fixture.
+  - Files: crates/common/src/operator_stock_movers_wire.rs,
+    crates/api/src/handlers/stock_movers.rs
+  - A successful snapshot adds one boxed allocation on the bounded control
+    read path; no zero-allocation or submicrosecond claim is made.
+- [ ] Execute the corrected native fixtures, all-target lint and full native
+  publication checks at the new source checkpoint, followed by fresh coverage
+  within measured resources. Preserve all earlier failed logs and compare
+  source hashes rather than relabelling old evidence as a new full pass.

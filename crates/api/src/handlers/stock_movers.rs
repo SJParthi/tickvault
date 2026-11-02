@@ -288,7 +288,9 @@ fn finish(
         valid_until_epoch_secs,
         version: FILTERED_PROTOCOL_VERSION,
         captured_at_epoch_secs: prices.observed_at_epoch_secs,
-        outcome: Outcome::Snapshot { snapshot },
+        outcome: Outcome::Snapshot {
+            snapshot: Box::new(snapshot),
+        },
     };
     let Outcome::Snapshot { snapshot } = &reply.outcome else {
         return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
@@ -540,7 +542,7 @@ mod tests {
     }
     fn snapshot(reply: Reply) -> Snapshot {
         match reply.outcome {
-            Outcome::Snapshot { snapshot } => snapshot,
+            Outcome::Snapshot { snapshot } => *snapshot,
             other => panic!("expected snapshot, got {other:?}"),
         }
     }

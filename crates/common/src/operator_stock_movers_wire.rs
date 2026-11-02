@@ -294,7 +294,7 @@ impl Snapshot {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Outcome {
-    Snapshot { snapshot: Snapshot },
+    Snapshot { snapshot: Box<Snapshot> },
     Error { code: BridgeError },
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -465,7 +465,9 @@ mod tests {
             version: FILTERED_PROTOCOL_VERSION,
             captured_at_epoch_secs: now,
             valid_until_epoch_secs: now + 60,
-            outcome: Outcome::Snapshot { snapshot: good },
+            outcome: Outcome::Snapshot {
+                snapshot: Box::new(good),
+            },
         };
         assert!(reply.valid_at(now, &Filter::default()));
         assert!(!reply.valid_at(
@@ -578,7 +580,7 @@ mod tests {
                     sort_order: Some(order),
                     ..Filter::default()
                 };
-                let mut rows = vec![missing.clone(), high.clone(), low.clone()];
+                let mut rows = [missing.clone(), high.clone(), low.clone()];
                 rows.sort_unstable_by(|a, b| filter.compare_rows(a, b));
                 let expected = match (column, order) {
                     (_, SortOrder::Asc) => [90, 10, 1],

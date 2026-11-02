@@ -6,15 +6,16 @@
 # Calls .claude/hooks/ scanners for banned patterns, test count, data integrity,
 # pub fn test coverage, and financial test guards.
 #
-# DEDUP: If pre-commit gate passed for same HEAD within 5 min,
-# gates 1-5 are SKIPPED. Only push-only gates run.
+# Gates 1-5 always run. The shared .last-quality-pass can be written by
+# fast commit/push scanners that never run clippy or the workspace tests,
+# so it is not evidence for skipping any native publication check.
 #
 # Gate order:
-#   1. cargo fmt --check          [skippable if commit-verified]
-#   2. cargo clippy -D warnings   [skippable if commit-verified]
-#   3. cargo test (full workspace) [skippable if commit-verified]
-#   4. Banned pattern scan (full)  [skippable if commit-verified]
-#   5. Test count guard            [skippable if commit-verified]
+#   1. cargo fmt --check
+#   2. cargo clippy -D warnings
+#   3. cargo test (full workspace)
+#   4. Banned pattern scan (full)
+#   5. Test count guard
 #   6. cargo audit (CVEs + yanked)
 #   7. cargo deny check (license + advisory)
 #   8. Loom concurrency tests
@@ -59,133 +60,112 @@ else
   echo "  SKIP: plan-gate.sh not found" >&2
 fi
 
-# ─────────────────────────────────────────────
-# DEDUP CHECK: Did pre-commit gate already pass for this HEAD?
-# ─────────────────────────────────────────────
-STATE_FILE="$CLAUDE_HOOKS/.last-quality-pass"
 HEAD_CURRENT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-HEAD_PARENT=$(git rev-parse HEAD~1 2>/dev/null || echo "unknown")
-COMMIT_VERIFIED=false
-AGE=0
 
-if [ -f "$STATE_FILE" ]; then
-  SAVED_HASH=$(awk '{print $1}' "$STATE_FILE")
-  SAVED_TIME=$(awk '{print $2}' "$STATE_FILE")
-  NOW=$(date +%s)
-  AGE=$(( NOW - SAVED_TIME ))
+echo "╔══════════════════════════════════════════════╗" >&2
+echo "║       PRE-PUSH SAFETY NET (11 Gates)         ║" >&2
+echo "╚══════════════════════════════════════════════╝" >&2
 
-  if { [ "$SAVED_HASH" = "$HEAD_CURRENT" ] || [ "$SAVED_HASH" = "$HEAD_PARENT" ]; } && [ "$AGE" -lt 300 ]; then
-    COMMIT_VERIFIED=true
+# Gate 1: cargo fmt
+echo "  [1/11] cargo fmt --check..." >&2
+FMT_OUT=$(timeout 120 cargo fmt --all -- --check 2>&1)
+FMT_EXIT=$?
+if [ "$FMT_EXIT" -eq 124 ]; then
+  echo "  FAIL: cargo fmt timed out (120s)" >&2
+  FAILED=1
+elif [ "$FMT_EXIT" -ne 0 ]; then
+  echo "  FAIL: Code not formatted:" >&2
+  echo "$FMT_OUT" | tail -10 >&2
+  FAILED=1
+else
+  echo "  PASS: cargo fmt" >&2
+fi
+
+# Gate 2: cargo clippy
+echo "  [2/11] cargo clippy..." >&2
+CLIPPY_OUT=$(timeout 240 cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1)
+CLIPPY_EXIT=$?
+if [ "$CLIPPY_EXIT" -eq 124 ]; then
+  echo "  FAIL: cargo clippy timed out (240s)" >&2
+  FAILED=1
+elif [ "$CLIPPY_EXIT" -ne 0 ]; then
+  echo "  FAIL: clippy warnings found:" >&2
+  echo "$CLIPPY_OUT" | tail -20 >&2
+  FAILED=1
+else
+  echo "  PASS: cargo clippy (zero warnings)" >&2
+fi
+
+# Gate 3: cargo test
+echo "  [3/11] cargo test..." >&2
+# 2026-11-02 recovery run: 698s compile + 529.85s harness time,
+# 1288.604s overall. The old 300s can expire even with a warm cache.
+# Fixed 30-minute allowance; a slow or failing run still blocks the push.
+WORKSPACE_TEST_TIMEOUT_SECS=1800
+TEST_OUT=$(timeout "$WORKSPACE_TEST_TIMEOUT_SECS" cargo test --workspace --locked 2>&1)
+TEST_EXIT=$?
+if [ "$TEST_EXIT" -eq 124 ]; then
+  echo "  FAIL: cargo test timed out (${WORKSPACE_TEST_TIMEOUT_SECS}s); full verification incomplete" >&2
+  FAILED=1
+elif [ "$TEST_EXIT" -ne 0 ]; then
+  echo "  FAIL: cargo test failed:" >&2
+  echo "$TEST_OUT" | tail -20 >&2
+  FAILED=1
+else
+  echo "  PASS: cargo test" >&2
+fi
+
+# Gate 4: Banned pattern scan (push-scoped)
+# 2026-07-16 gate-integrity fix (operator-approved): the scanner takes a
+# NEWLINE-separated file list ($2) — the old `tr '\n' ' '` form made it
+# scan ZERO files. Push-scoped here; full tree runs in ci.yml Repo Guards.
+echo "  [4/11] Banned pattern scan (push-scoped)..." >&2
+PUSH_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
+if [ -z "$PUSH_BASE" ]; then
+  # fail-closed (review r2 F1): a degraded clone (missing origin/main) must
+  # never fall back to a full-tree scan — that re-creates the killed-hook
+  # fail-open on exactly the clones where the push range cannot be proven.
+  echo "  FAIL: cannot resolve push range (origin/main missing) — run: git fetch origin main" >&2
+  FAILED=1
+else
+  # fail-closed (final review B-MED): a git-diff failure (partial clone
+  # offline, corrupt object) must never masquerade as "no changes" → PASS
+  CHANGED_PUSH_ALL=$(git diff --name-only "$PUSH_BASE"..HEAD 2>/dev/null)
+  DIFF_EXIT=$?
+  CHANGED_RS=$(printf '%s\n' "$CHANGED_PUSH_ALL" | grep -E '^crates/.*\.rs$' || true)
+  RS_COUNT=$(printf '%s\n' "$CHANGED_RS" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "$DIFF_EXIT" -ne 0 ]; then
+    echo "  FAIL: git diff failed (exit $DIFF_EXIT) — cannot enumerate push range; refusing to skip scans" >&2
+    FAILED=1
+  elif [ "$RS_COUNT" -eq 0 ]; then
+    echo "  PASS: Banned pattern scan (no .rs changes in push range; full tree scanned in CI)" >&2
+  elif [ -x "$CLAUDE_HOOKS/banned-pattern-scanner.sh" ]; then
+    BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
+    BANNED_OUT=$(timeout "$BANNED_TIMEOUT" "$CLAUDE_HOOKS/banned-pattern-scanner.sh" "$PROJECT_DIR" "$CHANGED_RS" 2>&1)
+    BANNED_EXIT=$?
+    if [ "$BANNED_EXIT" -eq 124 ]; then
+      echo "  FAIL: Banned pattern scan timed out (${BANNED_TIMEOUT}s) — blocking push" >&2
+      FAILED=1
+    elif [ "$BANNED_EXIT" -ne 0 ]; then
+      echo "$BANNED_OUT" | tail -20 >&2
+      echo "  FAIL: Banned patterns in push range ($RS_COUNT .rs file(s) scanned)" >&2
+      FAILED=1
+    else
+      echo "  PASS: Banned pattern scan ($RS_COUNT .rs file(s) in push range)" >&2
+    fi
+  else
+    echo "  SKIP: Scanner not available" >&2
   fi
 fi
 
-if [ "$COMMIT_VERIFIED" = "true" ]; then
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  PRE-PUSH (FAST — commit-verified ${AGE}s ago) ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-  echo "  [1-5/11] SKIP: Already verified by pre-commit gate" >&2
+# Gate 5: Test count guard
+echo "  [5/11] Test count guard..." >&2
+if [ -x "$CLAUDE_HOOKS/test-count-guard.sh" ]; then
+  if ! timeout 30 "$CLAUDE_HOOKS/test-count-guard.sh" "$PROJECT_DIR" 2>&1; then
+    FAILED=1
+  fi
 else
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║       PRE-PUSH SAFETY NET (11 Gates)         ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-
-  # Gate 1: cargo fmt
-  echo "  [1/11] cargo fmt --check..." >&2
-  FMT_OUT=$(timeout 120 cargo fmt --all -- --check 2>&1)
-  FMT_EXIT=$?
-  if [ "$FMT_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo fmt timed out (120s)" >&2
-    FAILED=1
-  elif [ "$FMT_EXIT" -ne 0 ]; then
-    echo "  FAIL: Code not formatted:" >&2
-    echo "$FMT_OUT" | tail -10 >&2
-    FAILED=1
-  else
-    echo "  PASS: cargo fmt" >&2
-  fi
-
-  # Gate 2: cargo clippy
-  echo "  [2/11] cargo clippy..." >&2
-  CLIPPY_OUT=$(timeout 240 cargo clippy --workspace --all-targets -- -D warnings 2>&1)
-  CLIPPY_EXIT=$?
-  if [ "$CLIPPY_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo clippy timed out (240s)" >&2
-    FAILED=1
-  elif [ "$CLIPPY_EXIT" -ne 0 ]; then
-    echo "  FAIL: clippy warnings found:" >&2
-    echo "$CLIPPY_OUT" | tail -20 >&2
-    FAILED=1
-  else
-    echo "  PASS: cargo clippy (zero warnings)" >&2
-  fi
-
-  # Gate 3: cargo test
-  echo "  [3/11] cargo test..." >&2
-  TEST_OUT=$(timeout 300 cargo test --workspace 2>&1)
-  TEST_EXIT=$?
-  if [ "$TEST_EXIT" -eq 124 ]; then
-    echo "  FAIL: cargo test timed out (300s)" >&2
-    FAILED=1
-  elif [ "$TEST_EXIT" -ne 0 ]; then
-    echo "  FAIL: cargo test failed:" >&2
-    echo "$TEST_OUT" | tail -20 >&2
-    FAILED=1
-  else
-    echo "  PASS: cargo test" >&2
-  fi
-
-  # Gate 4: Banned pattern scan (push-scoped)
-  # 2026-07-16 gate-integrity fix (operator-approved): the scanner takes a
-  # NEWLINE-separated file list ($2) — the old `tr '\n' ' '` form made it
-  # scan ZERO files. Push-scoped here; full tree runs in ci.yml Repo Guards.
-  echo "  [4/11] Banned pattern scan (push-scoped)..." >&2
-  PUSH_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
-  if [ -z "$PUSH_BASE" ]; then
-    # fail-closed (review r2 F1): a degraded clone (missing origin/main) must
-    # never fall back to a full-tree scan — that re-creates the killed-hook
-    # fail-open on exactly the clones where the push range cannot be proven.
-    echo "  FAIL: cannot resolve push range (origin/main missing) — run: git fetch origin main" >&2
-    FAILED=1
-  else
-    # fail-closed (final review B-MED): a git-diff failure (partial clone
-    # offline, corrupt object) must never masquerade as "no changes" → PASS
-    CHANGED_PUSH_ALL=$(git diff --name-only "$PUSH_BASE"..HEAD 2>/dev/null)
-    DIFF_EXIT=$?
-    CHANGED_RS=$(printf '%s\n' "$CHANGED_PUSH_ALL" | grep -E '^crates/.*\.rs$' || true)
-    RS_COUNT=$(printf '%s\n' "$CHANGED_RS" | sed '/^$/d' | wc -l | tr -d ' ')
-    if [ "$DIFF_EXIT" -ne 0 ]; then
-      echo "  FAIL: git diff failed (exit $DIFF_EXIT) — cannot enumerate push range; refusing to skip scans" >&2
-      FAILED=1
-    elif [ "$RS_COUNT" -eq 0 ]; then
-      echo "  PASS: Banned pattern scan (no .rs changes in push range; full tree scanned in CI)" >&2
-    elif [ -x "$CLAUDE_HOOKS/banned-pattern-scanner.sh" ]; then
-      BANNED_TIMEOUT=$(( 60 + RS_COUNT / 2 ))
-      BANNED_OUT=$(timeout "$BANNED_TIMEOUT" "$CLAUDE_HOOKS/banned-pattern-scanner.sh" "$PROJECT_DIR" "$CHANGED_RS" 2>&1)
-      BANNED_EXIT=$?
-      if [ "$BANNED_EXIT" -eq 124 ]; then
-        echo "  FAIL: Banned pattern scan timed out (${BANNED_TIMEOUT}s) — blocking push" >&2
-        FAILED=1
-      elif [ "$BANNED_EXIT" -ne 0 ]; then
-        echo "$BANNED_OUT" | tail -20 >&2
-        echo "  FAIL: Banned patterns in push range ($RS_COUNT .rs file(s) scanned)" >&2
-        FAILED=1
-      else
-        echo "  PASS: Banned pattern scan ($RS_COUNT .rs file(s) in push range)" >&2
-      fi
-    else
-      echo "  SKIP: Scanner not available" >&2
-    fi
-  fi
-
-  # Gate 5: Test count guard
-  echo "  [5/11] Test count guard..." >&2
-  if [ -x "$CLAUDE_HOOKS/test-count-guard.sh" ]; then
-    if ! timeout 30 "$CLAUDE_HOOKS/test-count-guard.sh" "$PROJECT_DIR" 2>&1; then
-      FAILED=1
-    fi
-  else
-    echo "  SKIP: test-count-guard.sh not found" >&2
-  fi
+  echo "  SKIP: test-count-guard.sh not found" >&2
 fi
 
 # ─────────────────────────────────────────────
@@ -254,7 +234,7 @@ for crate in $HOT_CRATES; do
     LOOM_FOUND=true
     echo "  Running loom tests for crates/$crate ($LOOM_TARGET_FLAGS)..." >&2
     # shellcheck disable=SC2086
-    LOOM_OUT=$(timeout 300 cargo test -p "tickvault-$crate" --features loom $LOOM_TARGET_FLAGS 2>&1)
+    LOOM_OUT=$(timeout 300 cargo test --locked -p "tickvault-$crate" --features loom $LOOM_TARGET_FLAGS 2>&1)
     LOOM_EXIT=$?
     if [ "$LOOM_EXIT" -eq 124 ]; then
       echo "  FAIL: Loom tests timed out (300s) for $crate" >&2
@@ -345,13 +325,7 @@ fi
 TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
 echo "$HEAD_CURRENT $(date +%s) $TEST_COUNT" > "$CLAUDE_HOOKS/.last-quality-pass"
 
-if [ "$COMMIT_VERIFIED" = "true" ]; then
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  PUSH ALLOWED (fast path — 6 gates only)     ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-else
-  echo "╔══════════════════════════════════════════════╗" >&2
-  echo "║  ALL 11 GATES PASSED — Push allowed           ║" >&2
-  echo "╚══════════════════════════════════════════════╝" >&2
-fi
+echo "╔══════════════════════════════════════════════╗" >&2
+echo "║  ALL 11 GATES PASSED — Push allowed           ║" >&2
+echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

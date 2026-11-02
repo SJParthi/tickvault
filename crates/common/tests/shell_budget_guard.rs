@@ -684,7 +684,6 @@ const AWK_JQ_BUDGET: &[(&str, usize)] = &[
     ("scripts/count-current-expiry-universe.sh", 1),
     ("scripts/coverage-gate.sh", 2),
     ("scripts/diagnose-write-amplification.sh", 1),
-    ("scripts/git-hooks/pre-push", 2),
     ("scripts/notify-telegram.sh", 2),
     ("scripts/questdb-console-gate-matrix.sh", 2),
     ("scripts/register-dhan-ip.sh", 9),
