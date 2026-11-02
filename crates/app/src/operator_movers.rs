@@ -126,7 +126,7 @@ async fn read_local() -> Result<Reply, BridgeError> {
     read_response(response).await
 }
 
-fn local_client() -> Result<reqwest::Client, BridgeError> {
+pub(crate) fn local_client() -> Result<reqwest::Client, BridgeError> {
     reqwest::Client::builder()
         .no_proxy() // APPROVED: only the fixed loopback destination below; no cloud proxy receives the token.
         .redirect(reqwest::redirect::Policy::none())
@@ -179,6 +179,10 @@ async fn capture() -> Reply {
 /// Standalone CLI output. No tracing subscriber: SSM receives only the JSON envelope.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _provider = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let arguments: Vec<_> = std::env::args().skip(1).take(3).collect();
+    if !arguments.is_empty() {
+        return crate::operator_stock_movers::run_filtered(&arguments).await;
+    }
     let reply = capture().await;
     let out = std::io::stdout();
     let mut lock = out.lock();

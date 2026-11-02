@@ -54,3 +54,8 @@ pub mod telegram_webhook;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod time;
+
+#[path = "../../common/src/operator_stock_movers_wire.rs"]
+pub mod operator_stock_movers_wire;
+
+pub mod operator_stock_movers;

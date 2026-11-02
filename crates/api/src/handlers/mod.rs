@@ -25,3 +25,5 @@ pub mod health;
 pub mod quote;
 pub mod speed_health;
 pub mod stats;
+
+pub mod stock_movers;

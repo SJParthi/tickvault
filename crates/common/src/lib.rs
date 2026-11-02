@@ -64,3 +64,5 @@ pub mod trading_calendar;
 pub mod types;
 pub mod url_join;
 pub mod ws_event_types;
+
+pub mod operator_stock_movers_wire;

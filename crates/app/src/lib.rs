@@ -357,3 +357,5 @@ pub mod trading_pipeline;
 pub mod table_storage_rollup;
 pub mod ws_audit_consumer;
 pub mod ws_connection_rollup;
+
+pub mod operator_stock_movers;

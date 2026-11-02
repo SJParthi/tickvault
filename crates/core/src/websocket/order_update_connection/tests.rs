@@ -133,6 +133,7 @@ mod tests {
                 notifier: None,
                 failures_before_attempt: 0,
                 stability_reached: &mut stable,
+                test_watchdog_notify: None,
             },
         )
         .await

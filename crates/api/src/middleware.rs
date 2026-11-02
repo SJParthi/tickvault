@@ -534,6 +534,20 @@ fn sanitize_forwarded_peer(forwarded: &str) -> String {
     }
 }
 
+/// Movers remain authenticated even when paper boot disables auth for other
+/// development endpoints. Empty configured tokens cannot authenticate an empty
+/// Bearer value, even if the public enabled flag was set independently.
+pub(crate) async fn require_configured_bearer_auth(
+    axum::extract::State(config): axum::extract::State<ApiAuthConfig>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !config.enabled || config.load_bearer_token().expose_secret().is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    require_bearer_auth(axum::extract::State(config), request, next).await
+}
+
 /// Bearer token validation middleware for mutating endpoints.
 ///
 /// GAP-SEC-01: Protects mutating API endpoints with bearer token auth.

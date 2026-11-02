@@ -98,11 +98,14 @@ fn order_update_websocket_config() -> WebSocketConfig {
         .accept_unmasked_frames(false)
 }
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
-    spawn_with_panic_notify,
+    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
 };
 use crate::websocket::tls::build_websocket_tls_connector;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "order_update_connection/idle_probe.rs"]
+mod idle_probe;
+use idle_probe::{IdleProbe, SessionWatchdog};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -767,6 +770,8 @@ async fn connect_and_listen(
             notifier,
             failures_before_attempt,
             stability_reached,
+            #[cfg(test)]
+            test_watchdog_notify: None,
         },
     )
     .await
@@ -800,6 +805,9 @@ struct OrderUpdateSession<'a> {
     notifier: Option<&'a Arc<crate::notification::NotificationService>>,
     failures_before_attempt: u32,
     stability_reached: &'a mut bool,
+    /// Inject only the idle signal in unit tests; production uses its watchdog.
+    #[cfg(test)]
+    test_watchdog_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Runs the same login/read lifecycle for any connected WebSocket transport.
@@ -822,6 +830,8 @@ where
         notifier,
         failures_before_attempt,
         stability_reached,
+        #[cfg(test)]
+        test_watchdog_notify,
     } = session;
     let m_messages = metrics::counter!("tv_order_update_messages_total");
     let _active = OrderUpdateActiveGuard::new(m_active);
@@ -844,34 +854,19 @@ where
     // that may never come (causes false AuthTimeout reconnect loops).
     info!("order update WebSocket login sent — entering read loop");
 
-    // STAGE-B (P1.1): no client-side read deadline on the order update WS.
-    //
-    // Order update is a JSON stream, not binary. Silence is NORMAL — no
-    // orders means no messages, sometimes for hours. A read deadline here
-    // was the root cause of the 2-minute reconnect storm we saw earlier.
-    // Dhan's server-side ping/pong keeps the connection alive; our reader
-    // only wakes on real data, real errors, or real stream closure.
-    //
-    // Stage C's watchdog provides a liveness backstop at 660s (11 min).
-    let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
-
-    // STAGE-C.3: per-connection activity watchdog. 660s threshold (600s
-    // allowable silence between orders + 60s safety margin). The counter
-    // is bumped on every Some(Ok(_)) message — Text, Ping, Pong, Close,
-    // Binary. Dhan's server pings every 10s, so even in a no-order window
-    // the counter advances constantly and the watchdog never fires a
-    // false positive. It only fires when the socket is truly dead.
+    // Order updates can be legitimately silent for hours. Keep the existing
+    // four-hour, market-hours-gated idle backstop, then probe the socket before
+    // deciding to reconnect. Dhan's order-stream docs do not promise pings on
+    // a cadence; RFC 6455 requires peers to answer Ping with matching Pong.
+    let _ = select_read_timeout_secs; // retained for existing compatibility tests
     let activity_counter = Arc::new(crate::sync::AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
-    let watchdog = ActivityWatchdog::new(
-        // O(1) EXEMPT: watchdog label built once per spawn, not per frame (cold path)
-        "order-update".to_string(),
-        Arc::clone(&activity_counter),
-        Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS),
-        Arc::clone(&watchdog_notify),
-    );
-    // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
-    let watchdog_handle = spawn_with_panic_notify(watchdog);
+    #[cfg(test)]
+    let watchdog_notify = test_watchdog_notify.unwrap_or(watchdog_notify);
+    let mut watchdog =
+        SessionWatchdog::new(Arc::clone(&activity_counter), Arc::clone(&watchdog_notify));
+    let mut idle_probe: Option<IdleProbe> = None;
+    let mut probe_sequence = 0_u64;
 
     // ZL-P0-1: heartbeat gauge handle for the order update WS.
     // O(1) EXEMPT: one gauge lookup per reconnect cycle
@@ -886,16 +881,60 @@ where
     let stability_sleep = time::sleep(stability_window());
     tokio::pin!(stability_sleep);
 
-    // The read loop is wrapped in a helper closure so every exit path can
-    // abort the watchdog handle exactly once. This avoids sprinkling
-    // `watchdog_handle.abort()` at every `return` site.
-    let loop_result: Result<(), OrderUpdateConnectionError> = loop {
+    // The watchdog guard aborts its task on return, cancellation and unwind.
+    loop {
+        let probe_deadline = idle_probe.as_ref().map(IdleProbe::deadline);
+        let probe_sending = idle_probe.as_ref().is_some_and(IdleProbe::sending);
         let frame_result = tokio::select! {
+            // An expired deadline wins a simultaneous ready read. This keeps
+            // the probe bounded; it is not an exactly-once delivery guarantee.
             biased;
-            () = watchdog_notify.notified() => {
-                break Err(OrderUpdateConnectionError::WatchdogFired(
-                    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
-                ));
+            () = idle_probe::wait_deadline(probe_deadline), if idle_probe.is_some() => {
+                if let Some(probe) = idle_probe.as_ref() {
+                    let (phase, timeout_secs) = probe.timeout_phase();
+                    let result = if probe.sending() { "send_timeout" } else { "response_timeout" };
+                    metrics::counter!(
+                        "tv_ws_activity_watchdog_fired_total", "label" => "order-update"
+                    ).increment(1);
+                    metrics::counter!(
+                        "tv_order_update_idle_probe_total", "result" => result
+                    ).increment(1);
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        source = "order_update_liveness_probe",
+                        idle_threshold_secs = WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
+                        phase, timeout_secs,
+                        "order stream idle probe timed out; reconnecting after bounded liveness check"
+                    );
+                    break Err(OrderUpdateConnectionError::LivenessProbeTimeout { phase, timeout_secs });
+                }
+                continue;
+            }
+            sent = std::future::poll_fn(|cx| match idle_probe.as_mut() {
+                Some(probe) => probe.poll_send(&mut write, cx),
+                None => std::task::Poll::Pending,
+            }), if probe_sending => {
+                match sent {
+                    Ok(()) => {
+                        if idle_probe.as_mut().is_some_and(IdleProbe::sent) {
+                            metrics::counter!("tv_order_update_idle_probe_total", "result" => "live").increment(1);
+                            idle_probe = None;
+                            watchdog.restart();
+                        }
+                    }
+                    Err(err) => {
+                        metrics::counter!("tv_order_update_idle_probe_total", "result" => "send_error").increment(1);
+                        // O(1) EXEMPT: cold failed-probe transport error, never per tick.
+                        break Err(OrderUpdateConnectionError::LivenessProbeSend(err.to_string()));
+                    }
+                }
+                continue;
+            }
+            () = watchdog_notify.notified(), if idle_probe.is_none() => {
+                probe_sequence = probe_sequence.wrapping_add(1);
+                idle_probe = Some(IdleProbe::new(probe_sequence));
+                metrics::counter!("tv_order_update_idle_probe_total", "result" => "started").increment(1);
+                continue;
             }
             () = &mut stability_sleep, if !*stability_reached => {
                 // Guard is load-bearing: a completed tokio Sleep must never
@@ -940,6 +979,12 @@ where
                 break Ok(());
             }
         };
+
+        if idle_probe.as_mut().is_some_and(|probe| probe.observe(&msg)) {
+            metrics::counter!("tv_order_update_idle_probe_total", "result" => "live").increment(1);
+            idle_probe = None;
+            watchdog.restart();
+        }
 
         match msg {
             Message::Text(text) => {
@@ -1189,11 +1234,7 @@ where
                 // Binary, Pong, Frame — ignore.
             }
         }
-    };
-
-    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
-    watchdog_handle.abort();
-    loop_result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1688,14 +1729,14 @@ enum OrderUpdateConnectionError {
     #[error("read timeout — no messages for {ORDER_UPDATE_READ_TIMEOUT_SECS}s")]
     ReadTimeout,
 
-    /// STAGE-C.3: per-connection activity watchdog fired. No frames or
-    /// pings received within the 660s (11 min) threshold — the socket is
-    /// dead and the outer loop must reconnect. Distinct from
-    /// `ReadTimeout` because the watchdog enforces a TRUE silence check
-    /// (frames + pings), whereas `ReadTimeout` was a client-side read
-    /// deadline that fired on any silence, including legitimate idle.
-    #[error("order update WebSocket activity watchdog fired after {0}s of silence")]
-    WatchdogFired(u64),
+    #[error("order update liveness probe timed out {phase} after {timeout_secs}s")]
+    LivenessProbeTimeout {
+        phase: &'static str,
+        timeout_secs: u64,
+    },
+
+    #[error("order update liveness probe send failed: {0}")]
+    LivenessProbeSend(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1705,6 +1746,10 @@ enum OrderUpdateConnectionError {
 #[cfg(test)]
 #[path = "order_update_connection/tests.rs"]
 mod active_gauge_tests;
+
+#[cfg(test)]
+#[path = "order_update_connection/idle_probe_tests.rs"]
+mod idle_probe_tests;
 
 #[cfg(test)]
 mod tests {

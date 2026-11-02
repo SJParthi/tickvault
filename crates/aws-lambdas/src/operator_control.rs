@@ -1438,17 +1438,45 @@ pub fn html_resp(footer_html: &str) -> Value {
 // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 #[allow(async_fn_in_trait)]
 pub trait OpsShell {
+    fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+        None
+    }
+    async fn stock_movers_payload(
+        &self,
+        filter: &crate::operator_stock_movers_wire::Filter,
+    ) -> Result<String, crate::operator_movers_wire::BridgeError> {
+        let encoded = filter
+            .to_hex()
+            .ok_or(crate::operator_movers_wire::BridgeError::InvalidResponse)?;
+        crate::operator_stock_movers::strict_read_payload(
+            self,
+            format!(
+                "{} --filter {}",
+                crate::operator_control_action_commands::MOVERS_COMMAND,
+                encoded
+            ),
+        )
+        .await
+    }
     /// Per-container bounded read cache; test shells may opt out.
     fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
         None
     }
     /// Fixed read-only Rust helper, dispatched through the existing shell sender.
     async fn movers_payload(&self) -> String {
-        self.ssm_shell_sync(
-            &[crate::operator_control_action_commands::MOVERS_COMMAND.to_owned()],
-            18.0,
+        match crate::operator_stock_movers::strict_read_payload(
+            self,
+            crate::operator_control_action_commands::MOVERS_COMMAND.to_owned(),
         )
         .await
+        {
+            Ok(output) => output,
+            Err(code) => serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                code,
+                self.now_epoch(),
+            ))
+            .unwrap_or_default(),
+        }
     }
     /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
@@ -2132,6 +2160,25 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         // (cross_verify removed 2026-07-16 — the 15:31 IST Dhan live-vs-
         // historical comparer was deleted in PR-C3 2026-07-14; unknown-action
         // 400 now.)
+        "stock-movers" => {
+            let filter = match payload.get("filter") {
+                Some(value) => serde_json::from_value::<crate::operator_stock_movers_wire::Filter>(
+                    value.clone(),
+                ),
+                None => Ok(crate::operator_stock_movers_wire::Filter::default()),
+            };
+            let Ok(filter) = filter else {
+                return resp(400, &json!({"error":"Invalid movers filter"}));
+            };
+            if !filter.valid() {
+                return resp(400, &json!({"error":"Invalid movers filter"}));
+            }
+            let reply = crate::operator_stock_movers::read(shell, &filter).await;
+            resp(
+                200,
+                &json!({"ok":true,"action":action,"movers":reply,"observed_at_epoch_secs":shell.now_epoch()}),
+            )
+        }
         "fno-stocks" => {
             let reply = crate::operator_movers::read(shell).await;
             resp(
@@ -2225,6 +2272,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
 /// it feeds are what the unit tests cover, exactly like the legacy oracle's
 /// boto3 glue).
 pub struct AwsShell {
+    stock_movers_cache: crate::operator_stock_movers::MoversCache,
     movers_cache: crate::operator_movers::MoversCache,
     ec2: aws_sdk_ec2::Client,
     ssm: aws_sdk_ssm::Client,
@@ -2271,6 +2319,7 @@ impl AwsShell {
             .ok();
         Self {
             ec2: crate::clients::ec2(&config),
+            stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
             movers_cache: crate::operator_movers::MoversCache::default(),
             ssm: crate::clients::ssm(&config),
             cloudwatch: crate::clients::cloudwatch(&config),
@@ -2354,6 +2403,9 @@ impl AwsShell {
 }
 
 impl OpsShell for AwsShell {
+    fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+        Some(&self.stock_movers_cache)
+    }
     fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
         Some(&self.movers_cache)
     }
@@ -2919,8 +2971,10 @@ mod tests {
     // seam. Defaults mirror the legacy fixtures: secret "s3cret-token",
     // market CLOSED (WipeGate pins the clock off-hours), instance running.
     struct MockShell {
+        stock_movers_cache: crate::operator_stock_movers::MoversCache,
         movers_cache: crate::operator_movers::MoversCache,
         movers_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        last_movers_command: std::sync::atomic::AtomicBool,
         secret: String,
         market_hours: bool,
         /// `None` = the data-destructive lock follows `market_hours` (every
@@ -2952,8 +3006,10 @@ mod tests {
     impl Default for MockShell {
         fn default() -> Self {
             Self {
+                stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
                 movers_cache: crate::operator_movers::MoversCache::default(),
                 movers_gate: None,
+                last_movers_command: std::sync::atomic::AtomicBool::new(false),
                 secret: AUTH_SECRET.to_string(),
                 market_hours: false,
                 destructive_locked: None,
@@ -2988,6 +3044,9 @@ mod tests {
     }
 
     impl OpsShell for MockShell {
+        fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+            Some(&self.stock_movers_cache)
+        }
         fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
             Some(&self.movers_cache)
         }
@@ -3040,7 +3099,19 @@ mod tests {
             if let Some(msg) = self.forbid_ssm {
                 panic!("{msg}");
             }
-            self.captured.lock().unwrap().push(commands.to_vec());
+            let movers = commands.len() == 1
+                && (commands[0] == crate::operator_control_action_commands::MOVERS_COMMAND
+                    || commands[0].starts_with("/opt/tickvault/bin/tv-movers --filter "));
+            self.last_movers_command
+                .store(movers, std::sync::atomic::Ordering::Relaxed);
+            if movers {
+                self.captured_sync.lock().unwrap().push(commands.to_vec());
+                if let Some(gate) = &self.movers_gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+            } else {
+                self.captured.lock().unwrap().push(commands.to_vec());
+            }
             self.ssm_result.clone()
         }
         async fn ssm_shell_sync(&self, commands: &[String], _timeout_secs: f64) -> String {
@@ -3054,7 +3125,15 @@ mod tests {
             &self,
             _command_id: &str,
         ) -> Result<(String, String, String), String> {
-            self.invocation.clone()
+            if self
+                .last_movers_command
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self.invocation == Err("not registered".into())
+            {
+                Ok(("Success".into(), self.sync_output.clone(), String::new()))
+            } else {
+                self.invocation.clone()
+            }
         }
         async fn firing_alarms(&self) -> Option<Vec<String>> {
             self.alarms.clone()
@@ -3174,7 +3253,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let reply = post(&shell, json!({"action":"fno-stocks"})).await;
         assert_eq!(body_of(&reply)["movers"]["code"], "timeout");
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(22));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(18));
         assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
         gate.add_permits(1);
         tokio::time::advance(std::time::Duration::from_secs(20)).await;
@@ -3205,6 +3284,154 @@ mod tests {
         assert_eq!(body["observed_at_epoch_secs"], now);
         assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
         assert!(shell.captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_movers_auth_and_invalid_filter_never_reach_ssm() {
+        let shell = MockShell::default();
+        assert_eq!(
+            status_of(&route(&post_event(&json!({"action":"stock-movers"}), None), &shell).await),
+            401
+        );
+        for filter in [
+            json!({"offset":1}),
+            json!({"search":"x".repeat(33)}),
+            json!({"command":"evil"}),
+            json!(null),
+        ] {
+            assert_eq!(
+                status_of(&post(&shell, json!({"action":"stock-movers","filter":filter})).await),
+                400
+            );
+        }
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+        let stopped = MockShell {
+            instance_state: Ok("stopped".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            body_of(&post(&stopped, json!({"action":"stock-movers"})).await)["movers"]["code"],
+            "instance_stopped"
+        );
+        assert!(stopped.captured_sync.lock().unwrap().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn filtered_movers_cache_is_keyed_and_shell_receives_hex_only() {
+        use crate::operator_stock_movers_wire::{Filter, Reply};
+        let shell = MockShell {
+            sync_output: serde_json::to_string(&Reply::error(
+                crate::operator_movers_wire::BridgeError::AppUnavailable,
+                MockShell::default().now,
+            ))
+            .unwrap(),
+            ..Default::default()
+        };
+        let a = Filter {
+            search: "a'$(id);".into(),
+            ..Filter::default()
+        };
+        let b = Filter {
+            fno_only: false,
+            ..a.clone()
+        };
+        for f in [&a, &a, &b] {
+            let response = post(&shell, json!({"action":"stock-movers","filter":f})).await;
+            assert_eq!(body_of(&response)["movers"]["code"], "app_unavailable");
+        }
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+        for (commands, f) in shell.captured_sync.lock().unwrap().iter().zip([&a, &b]) {
+            assert_eq!(commands.len(), 1);
+            let encoded = commands[0]
+                .strip_prefix("/opt/tickvault/bin/tv-movers --filter ")
+                .unwrap();
+            assert_eq!(Filter::from_hex(encoded), Some(f.clone()));
+            assert!(!commands[0].contains("$("));
+        }
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let _response = post(&shell, json!({"action":"stock-movers","filter":b})).await;
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn filtered_movers_concurrent_filters_share_one_inflight_gate() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(biased;post(&shell,json!({"action":"stock-movers"})),async{let r=post(&shell,json!({"action":"stock-movers","filter":{"fno_only":false}})).await;gate.add_permits(1);r});
+        assert_eq!(body_of(&first)["movers"]["code"], "bridge_unavailable");
+        assert_eq!(body_of(&second)["movers"]["code"], "busy");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_movers_modes_require_ssm_success_and_never_return_stderr() {
+        for action in ["fno-stocks", "stock-movers"] {
+            let now = MockShell::default().now;
+            let payload = if action == "fno-stocks" {
+                serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            };
+            for (status, stderr, accepted) in [
+                ("Success", "", true),
+                ("Failed", "", false),
+                ("Unknown", "", false),
+                ("Cancelled", "", false),
+                ("TimedOut", "", false),
+                ("DeliveryTimedOut", "", false),
+                ("Success", "private server diagnostic", false),
+            ] {
+                let shell = MockShell {
+                    invocation: Ok((status.into(), payload.clone(), stderr.into())),
+                    ..Default::default()
+                };
+                let response = post(&shell, json!({"action":action})).await;
+                let body = body_of(&response);
+                assert_eq!(
+                    body["movers"]["code"] == "app_unauthorized",
+                    accepted,
+                    "{action} {status}"
+                );
+                assert!(!response.to_string().contains("private server diagnostic"));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_movers_modes_refuse_pending_stdout_at_the_deadline() {
+        for action in ["fno-stocks", "stock-movers"] {
+            let now = MockShell::default().now;
+            let payload = if action == "fno-stocks" {
+                serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            };
+            let shell = MockShell {
+                invocation: Ok(("InProgress".into(), payload, String::new())),
+                ..Default::default()
+            };
+            let start = tokio::time::Instant::now();
+            let response = post(&shell, json!({"action":action})).await;
+            assert_eq!(body_of(&response)["movers"]["code"], "timeout");
+            assert_eq!(start.elapsed(), std::time::Duration::from_secs(18));
+        }
     }
 
     fn status_of(resp: &Value) -> i64 {
@@ -3389,13 +3616,15 @@ mod tests {
         // 53,229 bytes: the reviewed fourth tab adds bounded gainers/losers
         // tables with conservative source age and explicit unavailable states.
         // Its 23 Chromium fixtures are separate from this exact-content pin.
+        // 2026-11-02: reconstructed index/F&O filters and paging; frontend and
+        // SSM ceilings retained. Browser functions have separate local fixtures.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "f5bfb57b34aed7100c7760c6e2556cce62751fa8fd420a802723d11eccc6705c"
+            "6c394f93299e53e40e9598942df67fc4703fff31f7e0914f731ac4433d2fab14"
         );
-        assert_eq!(CONSOLE_HTML.len(), 53_221);
+        assert_eq!(CONSOLE_HTML.len(), 57_232);
     }
 
     // ------------------------------------------------ audit L4 source scans

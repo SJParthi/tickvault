@@ -12,7 +12,7 @@
 //!   2. triggers on push to main with `deploy/aws/terraform/**` path filter
 //!   3. has both terraform-plan and terraform-apply jobs
 //!   4. uses pinned `hashicorp/setup-terraform` v4 action
-//!   5. uses pinned `aws-actions/configure-aws-credentials` v4 action
+//!   5. uses pinned `aws-actions/configure-aws-credentials` v6.3.0 action
 //!      (2026-10-09: both are pinned to a 40-character commit SHA with the
 //!      tag as a trailing comment, not to the movable tag itself)
 //!   6. has the market-hours guard job
@@ -131,7 +131,7 @@ fn r4_uses_pinned_setup_terraform_action() {
 fn r5_uses_pinned_configure_aws_credentials_action() {
     let body = read(WORKFLOW);
     // 2026-10-09: SHA form, same reason as r4.
-    assert_pinned_to_sha_with_tag(&body, "aws-actions/configure-aws-credentials", "v4");
+    assert_pinned_to_sha_with_tag(&body, "aws-actions/configure-aws-credentials", "v6.3.0");
 }
 
 /// Every `uses: <action>@…` line in `body` names a 40-character commit SHA
