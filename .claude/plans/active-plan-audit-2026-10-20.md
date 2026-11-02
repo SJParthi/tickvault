@@ -1,5 +1,18 @@
 # Implementation Plan: 2026-10-20 seven-agent code audit fixes
 
+## Preserved #2152 continuation — 2026-10-31
+
+The user authorized resuming the preserved speed/health dashboard on green
+#2158, with honest strict-target UNKNOWN/failure states. Its scoped design,
+edge cases, failure modes, tests, rollback and observability are maintained in
+[`speed-2152-resume.md`](speed-2152-resume.md). This child plan belongs to this
+active audit plan; no unrelated active plan is archived to make room for it.
+The continuation preserves original #2152 history and proceeds only to a
+reviewed, native-gated draft PR; it does not merge, deploy, publish environment
+configuration, or repeat withheld probe/fuzz work. Runtime/coverage/session
+limitations remain explicit. The child plan cross-references the mandatory
+15-row and 7-row matrices and records scope-specific validation, not guarantees.
+
 **Status:** IN_PROGRESS
 **Date:** 2026-10-20
 **Approved by:** Parthiban, 2026-10-20: "Dee fic everything dude I need zero defects zero errors dude"

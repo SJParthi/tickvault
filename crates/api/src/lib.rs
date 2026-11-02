@@ -167,8 +167,8 @@ pub fn build_router_with_auth(
             require_bearer_auth,
         ));
 
-    // Security trim 2026-07-04 (operator directive, Session A): the 4 read-only
-    // `/api/debug/*` routes move OFF the public router and behind the SAME
+    // Security trim 2026-07-04 (operator directive, Session A): the read-only (4 then,
+    // 5 with speed-health) `/api/debug/*` routes move OFF the public router and behind the SAME
     // bearer-auth middleware — applied UNCONDITIONALLY (deliberately NOT gated
     // on `feed_toggle_public`).
     //
@@ -207,6 +207,14 @@ pub fn build_router_with_auth(
         .route(
             "/api/debug/cross-verify/latest",
             axum::routing::get(handlers::debug::cross_verify_latest),
+        )
+        // Owner 2026-10-30: speed and health numbers for the /dashboard page
+        // (step latencies, ticks per minute, the daily tick check, backlog,
+        // reconnects, candle overflow). Read-only, 5 s cached, bearer-gated
+        // like the other debug reads.
+        .route(
+            "/api/debug/speed-health",
+            axum::routing::get(handlers::speed_health::speed_health),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config,
