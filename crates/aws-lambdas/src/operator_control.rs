@@ -195,6 +195,11 @@ pub const SQL_BANNED: [&str; 25] = [
 /// SQL console (both the Data-tab query box and the DB tab share `sql`).
 pub const SQL_MAX_ROWS: i64 = 1000;
 
+// Below SSM's inline stdout ceiling; over-limit replies are errors, not CSV.
+const SQL_MAX_BYTES: usize = 20_000;
+const SQL_COMPLETE: &str = "\nTV_SQL_OK\n";
+const SQL_HTTP_OK: &str = "\nTV_SQL_HTTP_200\n";
+
 /// legacy: `_QDB_LINK_TTL_SECS = 90` — TTL of the one-click console link
 /// token minted by the `qdb_console_url` action. The console front Lambda
 /// verifies it (same control secret, HMAC over `"qdblink|<exp>"`) and swaps
@@ -1481,6 +1486,153 @@ pub trait OpsShell {
     fn auth_failures(&self) -> &AuthFailureGuard;
 }
 
+// Deliberate parity correction: a failed query must never look like zero rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlQueryError {
+    Unavailable,
+    Failed,
+    TimedOut,
+    Incomplete,
+    TooLarge,
+    InvalidCsv,
+}
+
+fn sql_query_command(query: &str) -> String {
+    let enc = url_quote(query);
+    // Keep the existing read-only SQL/row gates. pipefail preserves curl's
+    // nonzero status; the byte probe and trailer reject truncation, including
+    // SSM truncation. Include the fixed HTTP-status frame plus one extra byte
+    // in the probe: even a truncated body ending in a forged status frame is
+    // one byte over the body cap. Physical-line caps cut multiline CSV cells.
+    format!(
+        "bash -o pipefail -c \"curl -fsS --max-time 5 -w '\\nTV_SQL_HTTP_%{{http_code}}\\n' 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}'|head -c {}&&printf '\\nTV_SQL_OK\\n'\"",
+        SQL_MAX_BYTES + SQL_HTTP_OK.len() + 1
+    )
+}
+
+fn completed_sql_csv(stdout: String, stderr: &str) -> Result<String, SqlQueryError> {
+    if !stderr.is_empty() {
+        return Err(SqlQueryError::Failed);
+    }
+    let framed = stdout
+        .strip_suffix(SQL_COMPLETE)
+        .ok_or(SqlQueryError::Incomplete)?;
+    // curl -f alone accepts redirects. Only an exact HTTP 200 is data.
+    let csv = framed
+        .strip_suffix(SQL_HTTP_OK)
+        .ok_or(SqlQueryError::Failed)?;
+    if csv.is_empty() {
+        return Err(SqlQueryError::Incomplete);
+    }
+    if csv.len() > SQL_MAX_BYTES {
+        return Err(SqlQueryError::TooLarge);
+    }
+    Ok(csv.to_string())
+}
+
+// The existing, workspace-pinned csv crate owns field interpretation. Its
+// parser intentionally accepts some malformed quoting, so reject those forms
+// before parsing rather than silently repairing forensic data.
+fn sql_csv_syntax_valid(text: &str) -> bool {
+    let mut state = 0; // 0 field start, 1 plain, 2 quoted, 3 after quote
+    let mut record_started = false;
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if state != 2 && matches!(byte, b'\r' | b'\n') {
+            // csv::Reader skips blank records. Their meaning could be one
+            // null/empty field, so reject rather than invent a zero-row result.
+            if !record_started {
+                return false;
+            }
+            if byte == b'\r' && bytes.peek() == Some(&b'\n') {
+                bytes.next();
+            }
+            state = 0;
+            record_started = false;
+            continue;
+        }
+        record_started = true;
+        state = match (state, byte) {
+            (2, b'"') => 3,
+            (2, _) => 2,
+            (3, b'"') => 2,
+            (3, b',') => 0,
+            (3, _) => return false,
+            (0, b'"') => 2,
+            (_, b'"') => return false,
+            (_, b',') => 0,
+            _ => 1,
+        };
+    }
+    state != 2
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SqlQueryData {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_sql_csv(text: &str) -> Result<SqlQueryData, SqlQueryError> {
+    if text.len() > SQL_MAX_BYTES {
+        return Err(SqlQueryError::TooLarge);
+    }
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if !sql_csv_syntax_valid(text) {
+        return Err(SqlQueryError::InvalidCsv);
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .from_reader(text.as_bytes());
+    let header = reader.headers().map_err(|_| SqlQueryError::InvalidCsv)?;
+    if header.is_empty() {
+        return Err(SqlQueryError::InvalidCsv);
+    }
+    let columns = header.iter().map(str::to_owned).collect();
+    let row_limit = usize::try_from(SQL_MAX_ROWS).map_err(|_| SqlQueryError::TooLarge)?;
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        if rows.len() == row_limit {
+            return Err(SqlQueryError::TooLarge);
+        }
+        let record = record.map_err(|_| SqlQueryError::InvalidCsv)?;
+        rows.push(record.iter().map(str::to_owned).collect());
+    }
+    Ok(SqlQueryData { columns, rows })
+}
+
+async fn read_sql_csv<S: OpsShell>(
+    shell: &S,
+    commands: &[String],
+    budget: std::time::Duration,
+) -> Result<String, SqlQueryError> {
+    // Bound the complete operation, including sending and polling AWS calls.
+    tokio::time::timeout(budget, async {
+        let cid = shell
+            .ssm_shell(commands)
+            .await
+            .map_err(|_| SqlQueryError::Unavailable)?;
+        loop {
+            match shell.command_invocation(&cid).await {
+                Ok((status, stdout, stderr)) if status == "Success" => {
+                    return completed_sql_csv(stdout, &stderr);
+                }
+                Ok((status, _, _))
+                    if !matches!(status.as_str(), "Pending" | "InProgress" | "Delayed") =>
+                {
+                    return Err(SqlQueryError::Failed);
+                }
+                // SSM may not have registered the invocation immediately.
+                Ok(_) | Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs_f64(VIEW_POLL_SECS)).await;
+        }
+    })
+    .await
+    .unwrap_or(Err(SqlQueryError::TimedOut))
+}
+
 /// legacy 500 arm: `except Exception: _resp(500, {"error": "action failed",
 /// "action": action})`.
 fn action_failed(action: &str) -> Value {
@@ -1889,16 +2041,37 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                 );
             }
             let q = cap_sql_rows(&q);
-            let enc = url_quote(&q);
-            let cmds = [
-                "set +e".to_string(),
-                format!(
-                    "curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}' 2>/dev/null | head -{} || echo 'query failed'",
-                    SQL_MAX_ROWS + 1
+            let cmds = [sql_query_command(&q)];
+            match read_sql_csv(
+                shell,
+                &cmds,
+                std::time::Duration::from_secs_f64(VIEW_TIMEOUT_SECS),
+            )
+            .await
+            .and_then(|csv| parse_sql_csv(&csv).map(|data| (csv, data)))
+            {
+                Ok((csv, data)) => resp(
+                    200,
+                    &json!({"ok": true, "action": "sql", "csv": csv, "columns": data.columns, "rows": data.rows}),
                 ),
-            ];
-            let out = shell.ssm_shell_sync(&cmds, VIEW_TIMEOUT_SECS).await;
-            resp(200, &json!({"ok": true, "action": "sql", "csv": out}))
+                Err(error) => {
+                    tracing::warn!(?error, "operator-portal SQL result unavailable");
+                    let (status, reason) = match error {
+                        SqlQueryError::TimedOut => {
+                            (504, "query timed out; no result was confirmed")
+                        }
+                        SqlQueryError::TooLarge => (
+                            502,
+                            "query result is too large; select fewer rows or columns",
+                        ),
+                        _ => (502, "query failed or returned an incomplete result"),
+                    };
+                    resp(
+                        status,
+                        &json!({"ok": false, "action": "sql", "error": reason}),
+                    )
+                }
+            }
         }
         "qdb_console_url" => {
             // READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
@@ -3070,13 +3243,15 @@ mod tests {
         // RE-BLESSED 2026-10-22 (plan item 64, operator Quote 37) — 47,076
         // bytes, unchanged size: the stopped-box banner reads "auto-stops
         // 16:30 IST" (was 17:30), the daily stop's new time.
+        // 2026-11-02 corrective proposal: SQL cells are parsed in Rust and
+        // rendered from structured columns/rows; failed reads remain errors.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "5c9d8633bebce1a8b0ca07ce3a9e8664acb3fd6a353dda2e8a9f23970e1f6203"
+            "bfe714385aa855f677339e88a533f3f4f58d0caca4369200b1d3994c5a9e1e2f"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_076);
+        assert_eq!(CONSOLE_HTML.len(), 47_068);
     }
 
     // ------------------------------------------------ audit L4 source scans
@@ -6388,5 +6563,365 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(body.contains("· portal"));
         assert!(body.contains("· main"));
         assert!(body.contains("<footer"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_send_failure_is_not_an_empty_success() {
+        let shell = MockShell {
+            ssm_result: Err("SSM unavailable".to_string()),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert!(body.get("csv").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sql_terminal_failure_never_uses_partial_stdout() {
+        for status in [
+            "Failed",
+            "Cancelled",
+            "TimedOut",
+            "DeliveryTimedOut",
+            "Unexpected",
+        ] {
+            let shell = MockShell {
+                invocation: Ok((
+                    status.to_string(),
+                    format!("value\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                    String::new(),
+                )),
+                ..MockShell::default()
+            };
+            let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+            assert_eq!(status_of(&response), 502, "{status}");
+            assert_eq!(body_of(&response)["ok"], false, "{status}");
+            assert!(body_of(&response).get("csv").is_none(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_poll_timeout_is_explicit() {
+        for invocation in [
+            Err("not registered".to_string()),
+            Ok(("InProgress".to_string(), String::new(), String::new())),
+        ] {
+            let shell = MockShell {
+                invocation,
+                ..MockShell::default()
+            };
+            let result = read_sql_csv(
+                &shell,
+                &["read-only fixture".to_string()],
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(result, Err(SqlQueryError::TimedOut));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_header_only_is_a_real_empty_result() {
+        let csv = "value\r\n";
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(
+            &shell,
+            json!({"action": "sql", "query": "SELECT 1 LIMIT 0"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        assert_eq!(body_of(&response)["ok"], true);
+        assert_eq!(body_of(&response)["csv"], csv);
+    }
+
+    #[tokio::test]
+    async fn test_sql_keeps_authorization_and_read_only_gates() {
+        let shell = MockShell {
+            forbid_ssm: Some("gates must run before SSM"),
+            ..MockShell::default()
+        };
+        let unauthorized = route(
+            &post_event(&json!({"action": "sql", "query": "SELECT 1"}), None),
+            &shell,
+        )
+        .await;
+        assert_eq!(status_of(&unauthorized), 401);
+        let write = post(
+            &shell,
+            json!({"action": "sql", "query": "DROP TABLE ticks"}),
+        )
+        .await;
+        assert_eq!(status_of(&write), 400);
+    }
+
+    #[test]
+    fn test_completed_sql_csv_rejects_missing_trailer_empty_and_oversized_results() {
+        assert_eq!(
+            completed_sql_csv("value\n1\n".to_string(), ""),
+            Err(SqlQueryError::Incomplete)
+        );
+        assert_eq!(
+            completed_sql_csv(format!("{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Err(SqlQueryError::Incomplete)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!("value\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                "curl failed"
+            ),
+            Err(SqlQueryError::Failed)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!(
+                    "{}{SQL_HTTP_OK}{SQL_COMPLETE}",
+                    "x".repeat(SQL_MAX_BYTES + 1)
+                ),
+                ""
+            ),
+            Err(SqlQueryError::TooLarge)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!("{}{SQL_HTTP_OK}{SQL_COMPLETE}", "x".repeat(SQL_MAX_BYTES)),
+                ""
+            )
+            .unwrap()
+            .len(),
+            SQL_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_status_gates_valid_multiline_csv() {
+        // Both statuses carry the same complete, valid result. Failure must
+        // come from transport status rather than malformed fixture content.
+        let csv = "event,detail\r\nfilled,\"comma, quote \"\"ok\"\" and\nnewline\"\r\n";
+        for status in ["Failed", "Success"] {
+            let shell = MockShell {
+                invocation: Ok((
+                    status.to_string(),
+                    format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                    String::new(),
+                )),
+                ..MockShell::default()
+            };
+            let response = post(
+                &shell,
+                json!({"action": "sql", "query": "SELECT * FROM order_audit LIMIT 1"}),
+            )
+            .await;
+            let body = body_of(&response);
+            if status == "Failed" {
+                assert_eq!(status_of(&response), 502);
+                assert_eq!(body["ok"], false);
+                assert!(body.get("csv").is_none());
+                assert!(body.get("rows").is_none());
+                assert!(body.get("columns").is_none());
+                continue;
+            }
+            assert_eq!(status_of(&response), 200);
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["columns"], json!(["event", "detail"]));
+            assert_eq!(
+                body["rows"],
+                json!([["filled", "comma, quote \"ok\" and\nnewline"]])
+            );
+            assert_eq!(body["csv"], csv);
+        }
+    }
+
+    #[test]
+    fn test_parse_sql_csv_keeps_quoted_commas_quotes_and_newlines() {
+        for (text, expected) in [
+            ("event,detail\nfilled,\"ACME, LTD\"\n", "ACME, LTD"),
+            ("event,detail\nfilled,\"said \"\"ok\"\"\"\n", "said \"ok\""),
+            (
+                "event,detail\r\nfilled,\"line 1\nline 2\"\r\n",
+                "line 1\nline 2",
+            ),
+            (
+                "event,detail\r\nfilled,\"line 1\r\nline 2\"\r\n",
+                "line 1\r\nline 2",
+            ),
+            ("\u{feff}event,detail\nfilled,\"₹ café\"\n", "₹ café"),
+            ("event,detail\nfilled,", ""),
+            ("event,detail\nfilled,\"\"", ""),
+        ] {
+            let data = parse_sql_csv(text).unwrap();
+            assert_eq!(data.columns, ["event", "detail"]);
+            assert_eq!(data.rows.len(), 1);
+            assert_eq!(data.rows[0], ["filled", expected]);
+        }
+    }
+
+    #[test]
+    fn test_sql_csv_syntax_valid_refuses_ambiguous_quotes() {
+        for text in [
+            "event,detail\nfilled,\"cut",
+            "event,detail\nfilled,bad\"quote",
+            "event,detail\nfilled,\"ok\"extra",
+        ] {
+            assert!(!sql_csv_syntax_valid(text));
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+        assert!(sql_csv_syntax_valid(
+            "event,detail\nfilled,\"said \"\"ok\"\"\"\n"
+        ));
+    }
+
+    #[test]
+    fn test_parse_sql_csv_distinguishes_header_only_missing_and_wrong_width() {
+        assert_eq!(
+            parse_sql_csv("event,detail\r\n").unwrap(),
+            SqlQueryData {
+                columns: vec!["event".to_string(), "detail".to_string()],
+                rows: Vec::new(),
+            }
+        );
+        for text in [
+            "",
+            "\r\n",
+            "event,detail\nfilled\n",
+            "event,detail\nfilled,ok,extra\n",
+        ] {
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+    }
+
+    #[test]
+    fn test_parse_sql_csv_keeps_row_and_byte_bounds() {
+        let at_limit = format!("value\n{}", "x\n".repeat(1000));
+        assert_eq!(parse_sql_csv(&at_limit).unwrap().rows.len(), 1000);
+        assert_eq!(
+            parse_sql_csv(&format!("{at_limit}x\n")),
+            Err(SqlQueryError::TooLarge)
+        );
+        assert_eq!(
+            parse_sql_csv(&"x".repeat(SQL_MAX_BYTES + 1)),
+            Err(SqlQueryError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_returns_structured_cells_and_original_download() {
+        let csv = "event,detail\r\nfilled,\"comma, quote \"\"ok\"\" and\nnewline\"\r\n";
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(
+            &shell,
+            json!({"action": "sql", "query": "SELECT * FROM order_audit LIMIT 1"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_of(&response);
+        assert_eq!(body["columns"], json!(["event", "detail"]));
+        assert_eq!(
+            body["rows"],
+            json!([["filled", "comma, quote \"ok\" and\nnewline"]])
+        );
+        assert_eq!(body["csv"], csv);
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_refuses_malformed_completed_csv() {
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("a,b\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        assert_eq!(body_of(&response)["ok"], false);
+        assert!(body_of(&response).get("rows").is_none());
+    }
+
+    #[test]
+    fn test_parse_sql_csv_never_drops_ambiguous_blank_records() {
+        for text in ["value\n\n", "value\r\n\r\n", "value\r\r", "\nvalue\n"] {
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+        let empty = parse_sql_csv("value\r\n\"\"\r\n").unwrap();
+        assert_eq!(empty.rows, vec![vec![String::new()]]);
+        assert!(parse_sql_csv("value\r\n").unwrap().rows.is_empty());
+        assert_eq!(
+            parse_sql_csv("value\r\n\"line 1\r\n\r\nline 2\"\r\n")
+                .unwrap()
+                .rows[0][0],
+            "line 1\r\n\r\nline 2"
+        );
+    }
+
+    #[test]
+    fn test_completed_sql_csv_requires_exact_http_200_without_leaking_body() {
+        for status in [
+            "201", "204", "206", "301", "302", "307", "308", "400", "500",
+        ] {
+            let response = format!("private upstream body\nTV_SQL_HTTP_{status}\n{SQL_COMPLETE}");
+            assert_eq!(
+                completed_sql_csv(response, ""),
+                Err(SqlQueryError::Failed),
+                "{status}"
+            );
+        }
+        let csv = "value\n1\n";
+        assert_eq!(
+            completed_sql_csv(format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Ok(csv.to_string())
+        );
+    }
+
+    #[test]
+    fn test_completed_sql_csv_preserves_embedded_markers_and_refuses_forged_boundary() {
+        let csv = format!("value\n\"{SQL_HTTP_OK}{SQL_COMPLETE}\"\n");
+        assert_eq!(
+            completed_sql_csv(format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Ok(csv)
+        );
+        // The capped stream can coincidentally end with an in-body HTTP200
+        // marker, but its body portion is then MAX+1 and cannot be accepted.
+        let captured = format!("{}{SQL_HTTP_OK}", "x".repeat(SQL_MAX_BYTES + 1));
+        assert_eq!(captured.len(), SQL_MAX_BYTES + SQL_HTTP_OK.len() + 1);
+        assert_eq!(
+            completed_sql_csv(format!("{captured}{SQL_COMPLETE}"), ""),
+            Err(SqlQueryError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_refuses_redirect_with_csv_shaped_body() {
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("private_header\nprivate_row\nTV_SQL_HTTP_302\n{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert!(body.get("csv").is_none());
+        assert!(body.get("rows").is_none());
+        assert!(!body.to_string().contains("private_"));
     }
 }

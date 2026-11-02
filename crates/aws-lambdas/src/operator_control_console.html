@@ -397,18 +397,16 @@ async function feedToggle(feed,enabled){
     $('feedsmsg').textContent='⚠ '+m; toast('⚠ '+String(m).slice(0,120)); }
   setTimeout(loadFeeds,1200); }
 
-// Shared CSV → grid renderer (Data tab query box + DB tab reuse it).
-function parseCsv(csv){ const lines=(csv||'').split(/\r?\n/).filter(x=>x.length);
-  return lines.map(l=>l.split(',').map(c=>c.replace(/^"|"$/g,''))); }
+// SQL columns and rows are parsed and bounded in Rust.
+function sqlResult(j){return j&&j.ok===true&&typeof j.csv==='string'&&j.csv&&Array.isArray(j.columns)&&j.columns.length&&j.columns.every(c=>typeof c==='string')&&Array.isArray(j.rows)&&j.rows.every(r=>Array.isArray(r)&&r.length===j.columns.length&&r.every(c=>typeof c==='string'))?j:null;}
 // QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
 // value is already IST (project storage convention); strip the noisy
 // microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
 function tcell(c){ const m=/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$/.exec(c); return m? m[1]+' '+m[2]+' IST' : c; }
-// Renders rows (header + data, all esc()-wrapped) into el; returns data-row count.
-function renderGrid(el,rows){ if(!rows.length){ el.innerHTML='<span class="muted">no rows</span>'; return 0; }
-  let h='<table><tr>'+rows[0].map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
-  for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
-  el.innerHTML=h+'</table>'; return rows.length-1; }
+// Escapes every cell and returns the data-row count.
+function renderGrid(el,j){let h='<table><tr>'+j.columns.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
+  for(const row of j.rows)h+='<tr>'+row.map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
+  el.innerHTML=h+'</table>';return j.rows.length;}
 
 // ---- DB console (read-only, lives in the Data tab) ----
 // Writes are blocked SERVER-SIDE by the hardened _is_safe_sql gate (single
@@ -416,9 +414,9 @@ function renderGrid(el,rows){ if(!rows.length){ el.innerHTML='<span class="muted
 // convenience, never the security boundary.
 let dbTables=[], dbCsv='';
 async function loadDbTables(){ $('dbtables').dataset.loaded='1'; $('dbtables').innerHTML='<span class="muted">loading…</span>';
-  const j=await call('sql',{query:'SELECT table_name FROM tables() ORDER BY table_name'});
+  const j=sqlResult(await call('sql',{query:'SELECT table_name FROM tables() ORDER BY table_name'}));
   if(!j){ $('dbtables').innerHTML='<span class="warn">load failed</span>'; return; }
-  dbTables=parseCsv(j.csv).slice(1).map(r=>r[0]).filter(Boolean);
+  dbTables=j.rows.map(r=>r[0]).filter(Boolean);
   if(!dbTables.length){ $('dbtables').innerHTML='<span class="warn">no tables returned — is the box running?</span>'; return; }
   // Click handlers pass an INDEX into the just-fetched list — the table name
   // used in follow-up queries always comes from QuestDB's own tables() output,
@@ -426,14 +424,14 @@ async function loadDbTables(){ $('dbtables').dataset.loaded='1'; $('dbtables').i
   $('dbtables').innerHTML=dbTables.map((t,i)=>'<div style="padding:6px 0;border-bottom:1px solid var(--line)"><a href="#" style="color:var(--cyan);text-decoration:none;font-size:13px" onclick="dbPick('+i+');return false">'+esc(t)+'</a></div>').join(''); }
 async function dbPick(i){ const t=dbTables[i]; if(t==null) return;
   $('dbcolname').textContent='— '+t; $('dbcols').innerHTML='<span class="muted">loading…</span>';
-  const j=await call('sql',{query:"SELECT * FROM table_columns('"+t.replace(/'/g,"''")+"')"});
-  if(j) renderGrid($('dbcols'),parseCsv(j.csv)); else $('dbcols').innerHTML='<span class="warn">columns load failed</span>';
+  const j=sqlResult(await call('sql',{query:"SELECT * FROM table_columns('"+t.replace(/'/g,"''")+"')"}));
+  if(j) renderGrid($('dbcols'),j); else $('dbcols').innerHTML='<span class="warn">columns load failed</span>';
   $('dbsql').value='SELECT * FROM "'+t.replace(/"/g,'')+'" LIMIT 100';
   runDbSql(); }
 async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type a query'); return; }
   $('dbout').innerHTML='<span class="muted">running…</span>'; $('dbcount').textContent=''; dbCsv='';
-  const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
-  dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
+  const j=sqlResult(await call('sql',{query:q}));if(!j){$('dbout').textContent='Query unavailable.';return;}
+  dbCsv=j.csv;const n=renderGrid($('dbout'),j);
   $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
 async function openQdbConsole(){ const w=window.open('','_blank'); // open SYNC in the click (popup-safe) BEFORE the await
   const j=await call('qdb_console_url');

@@ -111,6 +111,81 @@ fn quote_packet(security_id: u32, ltp: f32, ltt: u32, volume: u32) -> Vec<u8> {
     buf
 }
 
+/// Match the historical Quote fixture day before any timed drain. Otherwise
+/// SpotPriceStore::new() uses today and every spot update takes the stale-day
+/// refusal path. This deliberately changes the measured Quote workload.
+fn quote_ingest() -> LiveIngest {
+    let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    ingest
+        .spot_prices()
+        .reset_for_trading_day(tickvault_app::spot_price_store::ist_day_of(
+            SESSION_EPOCH_SECS,
+        ));
+    ingest
+}
+
+/// Untimed non-vacuity: folds and rows alone do not prove spot updates ran.
+fn assert_quote_frames_store(frames: &[CapturedFrame], drain_counters: &'static DrainCounters) {
+    assert!(!frames.is_empty(), "the Quote workload must not be empty");
+    let mut ingest = quote_ingest();
+    let mut folded = 0u64;
+    for (i, frame) in (0u64..).zip(frames) {
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            frame,
+            SESSION_RECEIPT_NANOS,
+            1_000 + i,
+            drain_counters,
+        );
+        assert_eq!(out.unparseable, 0, "every Quote packet must parse");
+        assert_eq!(out.abandoned_bytes, 0, "every Quote byte must be consumed");
+        assert_eq!(
+            out.folded, TICKS_PER_MAIN_FRAME,
+            "every Quote packet must fold"
+        );
+        folded += out.folded;
+        let expected_ltt =
+            SESSION_EPOCH_SECS - 300 + u32::try_from(i / 4).expect("fixture time fits");
+        let expected_paise = 10_000 + i64::try_from(i % 97).expect("price step fits") * 5;
+        for security_id in 13..17u64 {
+            let spots = ingest.spot_prices();
+            assert_eq!(
+                spots.latest_exchange_secs(
+                    security_id,
+                    tickvault_common::types::ExchangeSegment::IdxI
+                ),
+                Some(expected_ltt),
+                "every Quote must update the stored spot time",
+            );
+            assert_eq!(
+                spots.latest_paise(security_id, tickvault_common::types::ExchangeSegment::IdxI),
+                Some(expected_paise),
+                "every Quote, including equal-time updates, must store its price",
+            );
+        }
+    }
+    let packets = TICKS_PER_MAIN_FRAME * u64::try_from(frames.len()).expect("frame count fits");
+    assert_eq!(folded, packets, "every Quote packet must fold");
+    assert_eq!(
+        ingest.pending_rows(),
+        packets,
+        "every Quote packet must append a row"
+    );
+    let spots = ingest.spot_prices();
+    assert_eq!(
+        spots.tracked(),
+        4,
+        "all four Quote instruments must have a spot"
+    );
+    assert_eq!(
+        spots.refusals(),
+        (0, 0, 0, 0),
+        "no spot update may be refused"
+    );
+    assert_eq!(spots.future_day_refusals(), 0);
+    assert_eq!(spots.future_time_capped(), 0);
+}
+
 fn main_feed_frame(n: u64) -> CapturedFrame {
     let mut bytes = Vec::with_capacity(200);
     for i in 0..4u32 {
@@ -343,7 +418,7 @@ fn main_feed_drain_samples(
     let mut samples: Vec<u64> = Vec::with_capacity(PERCENTILE_SAMPLES);
     let mut i = 0u64;
     while samples.len() < PERCENTILE_SAMPLES {
-        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let mut ingest = quote_ingest();
         for frame in frames {
             let start = Instant::now();
             black_box(drain_main_feed_frame(
@@ -401,6 +476,7 @@ fn main_feed_drain_tail_gate() -> Result<(), String> {
     drain_tail_gate::self_test(budget, TICKS_PER_MAIN_FRAME)?;
 
     let frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(main_feed_frame).collect();
+    assert_quote_frames_store(&frames, counters());
     let samples = main_feed_drain_samples(&frames, counters());
     let verdict = drain_tail_gate::tail_verdict(&samples, TICKS_PER_MAIN_FRAME, budget, multiplier)
         .ok_or_else(|| "no samples".to_string())?;
@@ -426,22 +502,18 @@ fn bench_feed_drain(c: &mut Criterion) {
     let drain_counters = counters();
 
     let main_frames: Vec<CapturedFrame> = (0..FRAME_POOL).map(main_feed_frame).collect();
+    assert_quote_frames_store(&main_frames, drain_counters);
     c.bench_function("feed_drain/main_feed_frame_4_quotes", |b| {
         b.iter_custom(|iters| {
-            run_timed(
-                iters,
-                &main_frames,
-                || LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8),
-                |ingest, frame, i| {
-                    black_box(drain_main_feed_frame(
-                        ingest,
-                        black_box(frame),
-                        SESSION_RECEIPT_NANOS,
-                        1_000 + i,
-                        drain_counters,
-                    ));
-                },
-            )
+            run_timed(iters, &main_frames, quote_ingest, |ingest, frame, i| {
+                black_box(drain_main_feed_frame(
+                    ingest,
+                    black_box(frame),
+                    SESSION_RECEIPT_NANOS,
+                    1_000 + i,
+                    drain_counters,
+                ));
+            })
         });
     });
 

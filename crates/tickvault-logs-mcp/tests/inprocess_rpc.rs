@@ -1108,6 +1108,9 @@ fn cloudwatch_logs_sigv4_and_portal_validation_never_touch_the_network() {
         let _env = EnvGuard::set(&[
             ("AWS_ACCESS_KEY_ID", "AKIDINPROCESSTESTONLY0"),
             ("AWS_SECRET_ACCESS_KEY", "inprocess-test-secret-never-real"),
+            // AWS_REGION takes precedence; clear inherited values so this
+            // invalid default is selected before any HTTP request is built.
+            ("AWS_REGION", ""),
             ("AWS_DEFAULT_REGION", "Bad_Region!"),
             ("AWS_SESSION_TOKEN", ""),
             ("TICKVAULT_PORTAL_URL", ""),

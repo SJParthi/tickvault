@@ -389,7 +389,7 @@ fn out_of_window_refusal_does_not_allocate_per_tick() {
 /// Blocks, not bytes, for the same reason the fold gate gives: the row buffer
 /// is supposed to grow with tick count. A frame carrying 4 packets folded
 /// 2,500 times is 10,000 ticks through the same path as the gate above, so the
-/// same 512-block ceiling applies and means the same thing.
+/// same 256-block ceiling applies and means the same thing.
 #[test]
 fn frame_drain_seam_does_not_allocate_per_tick() {
     let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -428,7 +428,7 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
                 // than the fold it claims to gate: 1,536 blocks that would
                 // have looked like a near-pass rather than a broken test.
                 // The non-vacuity companion is what caught it.
-                SESSION_EPOCH_SECS + (n % 600) as u32,
+                SESSION_EPOCH_SECS + u32::try_from(n / 4).expect("fixture time fits"),
             ));
         }
         CapturedFrame {
@@ -444,14 +444,50 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
         }
     }
 
-    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-    let c = counters();
-
-    // Warm-up OUTSIDE the window, same reasoning as the fold gate: first touch
-    // of an instrument allocates its slot and registers its metric keys.
-    for n in 0..4u64 {
-        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
+    fn receipt_nanos(n: u64) -> i64 {
+        SESSION_RECEIPT_NANOS + i64::try_from(n / 4).expect("fixture time fits") * 1_000_000_000
     }
+
+    // Readback stays OUTSIDE DHAT. Prices change even for equal-time frames,
+    // so this detects omitted updates that a final timestamp alone misses.
+    fn assert_spots(ingest: &LiveIngest, n: u64) {
+        use tickvault_common::types::ExchangeSegment;
+        let spots = ingest.spot_prices();
+        let expected_secs = SESSION_EPOCH_SECS + u32::try_from(n / 4).expect("fixture time fits");
+        let expected_paise = 10_000 + i64::try_from(n % 97).expect("price step fits") * 5;
+        for id in 13..17u64 {
+            assert_eq!(
+                spots.latest_exchange_secs(id, ExchangeSegment::IdxI),
+                Some(expected_secs)
+            );
+            assert_eq!(
+                spots.latest_paise(id, ExchangeSegment::IdxI),
+                Some(expected_paise)
+            );
+        }
+        assert_eq!(spots.tracked(), 4);
+        assert_eq!(spots.refusals(), (0, 0, 0, 0));
+        assert_eq!(spots.future_day_refusals(), 0);
+        assert_eq!(spots.future_time_capped(), 0);
+    }
+
+    const WARMUP_FRAMES: u64 = 4;
+    let c = counters();
+    let warmed_ingest = || {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(tickvault_app::spot_price_store::ist_day_of(
+                SESSION_EPOCH_SECS,
+            ));
+        // Warm first-key inserts and metrics registration outside DHAT.
+        for n in 0..WARMUP_FRAMES {
+            let out = drain_main_feed_frame(&mut ingest, &frame(n, n), receipt_nanos(n), 1_000, c);
+            assert_eq!(out.folded, 4);
+            assert_spots(&ingest, n);
+        }
+        ingest
+    };
 
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, as above
 
@@ -469,20 +505,36 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
     // permanently unguarded while looking guarded. The fold gate above never
     // had this problem because its fixture is a plain struct that never
     // touches the heap; a frame is bytes, so it must be built up front.
-    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(100 + n, n)).collect();
+    // Do not rewind after warmup or cycle older exchange timestamps into the
+    // same store. Receipt advances with the wire time to avoid future caps.
+    let frames: Vec<CapturedFrame> = (WARMUP_FRAMES..WARMUP_FRAMES + FRAMES)
+        .map(|n| frame(100 + n, n))
+        .collect();
 
+    let mut ingest = warmed_ingest();
+    let mut measured_folded = 0u64;
     let profiler = dhat::Profiler::builder().testing().build();
-    for (n, f) in frames.iter().enumerate() {
-        let _ = drain_main_feed_frame(
-            &mut ingest,
-            f,
-            SESSION_RECEIPT_NANOS + n as i64,
-            1_000 + n as u64,
-            c,
-        );
+    for (n, f) in (WARMUP_FRAMES..).zip(&frames) {
+        let out = drain_main_feed_frame(&mut ingest, f, receipt_nanos(n), 1_000 + n, c);
+        measured_folded += out.folded;
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
+    assert_eq!(measured_folded, FRAMES * 4);
+    assert_eq!(ingest.pending_rows(), (FRAMES + WARMUP_FRAMES) * 4);
+    assert_spots(&ingest, WARMUP_FRAMES + FRAMES - 1);
+
+    // Re-exercise the exact sequence AFTER measurement on an independent
+    // ingest. This proves each accepted spot update without profiling the
+    // readback helpers or pre-warming the whole workload before DHAT.
+    let mut proof_ingest = warmed_ingest();
+    for (n, f) in (WARMUP_FRAMES..).zip(&frames) {
+        let out = drain_main_feed_frame(&mut proof_ingest, f, receipt_nanos(n), 1_000 + n, c);
+        assert_eq!(out.folded, 4);
+        assert_spots(&proof_ingest, n);
+    }
+    assert_eq!(proof_ingest.pending_rows(), (FRAMES + WARMUP_FRAMES) * 4);
+    drop(proof_ingest);
 
     assert!(
         stats.total_blocks <= MAX_BLOCKS,

@@ -2,34 +2,14 @@
 //!
 //! Gated behind `#[cfg(test)]` — never compiled into production binaries.
 
-/// Detects whether tests that assert against a REAL, REACHABLE SSM should run.
-///
-/// Requires BOTH:
-/// 1. an explicit `TICKVAULT_TEST_REAL_SSM=1` opt-in, and
-/// 2. credentials on the machine ([`has_aws_credentials`]).
-///
-/// # Why this exists (2026-08-07)
-///
-/// Six tests previously branched on [`has_aws_credentials`] alone and, when it
-/// returned `true`, asserted `"with real AWS credentials, fetch should
-/// succeed"`. That conflates two different questions:
-///
-/// * *"are credentials present?"* — what `has_aws_credentials` answers, and
-/// * *"is SSM actually reachable, with our parameters in it?"* — what those
-///   assertions actually require.
-///
-/// Any environment holding the first without the second fails them: a CI
-/// sandbox where the tooling exports a stray `AWS_ACCESS_KEY_ID` with no route
-/// to SSM, a developer laptop carrying `~/.aws/credentials` for an unrelated
-/// account, an offline machine, a locked-down VPC. Observed live: all six
-/// panicked in a sandbox purely because the proxy had exported a key.
-///
-/// Requiring an explicit opt-in makes running against live infrastructure a
-/// deliberate act rather than an accident of the ambient environment. Without
-/// the opt-in the tests assert the genuine unit contract — returns `Err`,
-/// never panics — which holds everywhere.
-///
-/// [`has_aws_credentials`]: fn.has_aws_credentials.html
+/// Task-scoped synthetic SSM failure fixtures; no provider configuration or sockets.
+pub(crate) mod ssm;
+
+/// Explicit opt-in helper retained for a separately authorized live integration lane.
+/// Default unit tests use [`ssm`] fixtures regardless of this flag and never
+/// construct the ambient provider chain. Checking this helper after an API call
+/// does not gate that call; any future live test must check before construction.
+/// Requires TICKVAULT_TEST_REAL_SSM=1/true and credential metadata presence.
 pub fn real_ssm_tests_enabled() -> bool {
     matches!(
         std::env::var("TICKVAULT_TEST_REAL_SSM").as_deref(),
