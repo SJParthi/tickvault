@@ -112,10 +112,23 @@
   <div id="app" hidden>
     <div class="tabs">
       <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
+      <button type="button" class="tab" data-t="movers" id="movers-tab">Top Movers</button>
       <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
       <div class="tab" data-t="admin" onclick="tab('admin')">🛠️ Admin</div>
     </div>
 
+    <section data-tab="movers" hidden>
+      <div class="card">
+        <h2>F&amp;O stock movers</h2>
+        <p class="muted">Prices captured by Tickvault. Strongest 20 gainers and 20 losers from today's F&amp;O stock list.</p>
+        <div class="row"><button class="b-blu" id="movers-refresh" type="button">Refresh movers</button></div>
+        <p id="movers-status" role="status" aria-live="polite">Open this tab to load a snapshot.</p>
+        <p id="movers-meta" class="muted"></p>
+        <div style="overflow-x:auto"><table aria-label="Top F&O stock movers"><thead><tr><th>Direction</th><th>Stock</th><th>Price ₹</th><th>Change %</th><th>Last trade IST</th></tr></thead><tbody id="movers-rows"></tbody></table></div>
+        <p id="movers-selection" class="muted"></p>
+        <p class="muted">Refreshes at most every 30 seconds while this tab is visible and auto-refresh is enabled. No historical prices are substituted when the market is closed.</p>
+      </div>
+    </section>
     <!-- OVERVIEW -->
     <section data-tab="overview">
       <div class="card">
@@ -251,16 +264,16 @@ function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textC
 
 function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
   TOKEN=v; sessionStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
-function lock(){ TOKEN=''; sessionStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten in this tab'); }
+function lock(){ TOKEN=''; moversGeneration++; moversReply=null; renderMovers(); sessionStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten in this tab'); }
 
 function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
-  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); }
+  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers') loadMovers(); }
 
-async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
+async function call(action, extra, signal){ if(!TOKEN){ toast('Locked'); return null; }
   try{ const r=await fetch(location.href,{method:'POST',
       headers:{'authorization':'Bearer '+TOKEN,'content-type':'application/json'},
-      body:JSON.stringify(Object.assign({action},extra||{}))});
+      body:JSON.stringify(Object.assign({action},extra||{})),signal});
     const j=await r.json().catch(()=>({}));
     if(r.status===401){ toast('Wrong key (401)'); setLive(false); return null; }
     if(r.status===409){ toast(j.error||'Blocked during market hours'); return null; }
@@ -545,9 +558,40 @@ async function pollNuke(cid,n){
     setTimeout(loadOverview,6000); return; }
   setTimeout(()=>pollNuke(cid,n+1),5000); }
 
-function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
+function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); if(curTab==='movers'&&!document.hidden&&performance.now()-moversLastAttempt>=30000) loadMovers(); },8000); }
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
+
+let moversReply=null,moversBusy=false,moversGeneration=0,moversReceived=0,moversObserved=0,moversRequestSeconds=0,moversLastAttempt=-Infinity;
+const moversMessages={instance_stopped:'The AWS instance is stopped. No prices can be read.',instance_unavailable:'AWS instance status could not be checked.',bridge_unavailable:'The private connection or installed movers helper is unavailable.',credentials_unavailable:'The app credential could not be loaded on the server.',app_unauthorized:'The app rejected its server-side credential.',app_unavailable:'The app could not serve movers.',timeout:'The movers request timed out.',invalid_response:'The server returned incomplete or invalid movers data.',response_too_large:'The response exceeded the safe transport size.',busy:'Another movers refresh is running. Try again shortly.'};
+const sourceMessages={closed:'Market closed — no live movers.',no_fno_list:"Today's F&O stock list is not available.",no_data:'No captured prices are available in the query window.',unreachable:'The price database is unreachable.',query_failed:'The price query failed.'};
+function moversCell(row,value){const td=document.createElement('td');td.textContent=String(value);row.appendChild(td);}
+function renderMovers(){
+  const rows=$('movers-rows');rows.replaceChildren();$('movers-meta').textContent='';$('movers-selection').textContent='';
+  if(!moversReply){$('movers-status').textContent=TOKEN?'No verified snapshot. Refresh to try again.':'Unlock this tab to view movers.';return;}
+  const reply=moversReply;
+  if(reply.result==='error'){$('movers-status').textContent=moversMessages[reply.code]||'Movers unavailable.';return;}
+  const s=reply.snapshot,elapsed=Math.max(0,(performance.now()-moversReceived)/1000),transport=Math.max(0,moversObserved-reply.captured_at_epoch_secs)+moversRequestSeconds+2;
+  const age=s.data_age_secs===null?null:Math.ceil(s.data_age_secs+transport+elapsed);
+  const expired=transport+elapsed>60;
+  if(expired){$('movers-status').textContent='Refresh required — snapshot freshness can no longer be confirmed.';return;}
+  $('movers-status').textContent=sourceMessages[s.status]||(s.status==='stale'?'Source reports stale prices.':s.status==='live'&&age!==null&&age<=60?'Newest trade: at most 60s old. Individual stocks may be older.':'Freshness unconfirmed — refresh before using these prices.');
+  $('movers-meta').textContent=`${s.stocks_priced} of ${s.fno_stocks_total} F&O stocks priced · newest trade ${s.as_of_ist||'—'} IST · conservative age estimate ${age===null?'unknown':age+'s'} · captured ${new Date(reply.captured_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST`;
+  for(const [direction,stocks] of [['Gainer',s.gainers],['Loser',s.losers]])for(const stock of stocks){const row=document.createElement('tr');moversCell(row,direction);moversCell(row,stock.name);moversCell(row,stock.ltp.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}));moversCell(row,(stock.change_pct>0?'+':'')+stock.change_pct.toFixed(2)+'%');moversCell(row,stock.last_trade_ist);rows.appendChild(row);}
+  $('movers-selection').textContent=`Showing ${s.gainers.length} of ${s.gainers_total} gainers and ${s.losers.length} of ${s.losers_total} losers among captured stocks. Stocks without captured prices, unchanged stocks and stocks without a previous close are excluded.`;
+}
+async function loadMovers(){
+  if(moversBusy||!TOKEN||document.hidden)return;
+  moversBusy=true;moversReply=null;renderMovers();moversLastAttempt=performance.now();const generation=moversGeneration;$('movers-refresh').disabled=true;$('movers-status').textContent='Reading a verified snapshot…';
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),25000);
+  try{const j=await call('fno-stocks',undefined,controller.signal);if(generation!==moversGeneration||!TOKEN)return;
+    const r=j&&j.movers;moversReply=j&&j.ok===true&&r&&r.version===1&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&['snapshot','error'].includes(r.result)?r:null;moversObserved=j&&j.observed_at_epoch_secs||0;moversReceived=performance.now();moversRequestSeconds=Math.max(0,(moversReceived-moversLastAttempt)/1000);renderMovers();
+  }catch(e){moversReply=null;renderMovers();}finally{clearTimeout(timeout);moversBusy=false;$('movers-refresh').disabled=false;}
+}
+$('movers-tab').addEventListener('click',()=>tab('movers'));
+$('movers-refresh').addEventListener('click',loadMovers);
+setInterval(()=>{if(curTab==='movers'&&!document.hidden&&!moversBusy)renderMovers();},1000);
+document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
 
 // A URL ending in #key=<secret> (or ?key=) keeps the key for this tab only, strips it from the
 // address bar and unlocks. No alert sends such a link since 2026-09-27 (audit PR36a:

@@ -823,16 +823,14 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
-          expected=$(LC_ALL=C sort <<'EOF'
-          crates/app/tests/dhat_depth_drain.rs
-          crates/app/tests/dhat_idle_seed_step.rs
-          crates/app/tests/dhat_live_ingest_seam.rs
-          crates/app/tests/dhat_main_feed_backup_dedup.rs
-          crates/app/tests/dhat_mark_forward.rs
-          crates/app/tests/dhat_order_path_recorder.rs
-          crates/app/tests/dhat_wal_ring_sink_accept.rs
-          crates/app/tests/dhat_ws_lag.rs
-          crates/app/tests/dhat_ws_lag_recorder.rs
+          app_expected=$(cat .github/dhat-app-targets.txt)
+          if [ "$(printf '%s\n' "$app_expected" | wc -l)" -ne 11 ] || \
+            printf '%s\n' "$app_expected" | grep -qvE '^crates/app/tests/dhat_[a-z0-9_]+\.rs$'; then
+            echo "::error::app DHAT inventory must contain exactly 11 explicit app test paths."
+            exit 1
+          fi
+          expected=$(LC_ALL=C sort <<EOF
+          $app_expected
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
           crates/core/tests/dhat_frame_silence_activity.rs
@@ -863,7 +861,7 @@ jobs:
           # not silently break the comparison.
           expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
           if ! diff <(echo "$expected") <(echo "$actual"); then
-            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
+            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane targets in ci.yml and .github/dhat-app-targets.txt (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
           fi
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
@@ -878,9 +876,9 @@ jobs:
           shared-key: ci-dhat-zero-alloc
           cache-on-failure: true
 
-      # NOTE: plain `cargo test` (not nextest) is deliberate — every dhat
-      # target holds exactly ONE #[test] (dhat allows one Profiler per
-      # process), so there is no intra-binary parallelism to manage, and the
+      # NOTE: plain `cargo test` (not nextest) is deliberate. DHAT has one
+      # process-global profiler. The seed/level/book cases have separate
+      # single-test binaries; other targets retain their existing layout, and the
       # guards below need the classic harness output. Two false-OK guards
       # per step (audit Rule 11): (1) the tee'd "running 0 tests" scan — if
       # the `--features dhat` flag is ever dropped, the three cfg-gated core
@@ -1064,6 +1062,7 @@ jobs:
           set -euo pipefail
           cargo test -p tickvault-app \
             --test dhat_depth_drain --test dhat_idle_seed_step \
+            --test dhat_depth_book_row_presize --test dhat_depth_level_row_presize \
             --test dhat_live_ingest_seam \
             --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
             --test dhat_order_path_recorder --test dhat_wal_ring_sink_accept \
@@ -1099,9 +1098,11 @@ jobs:
           # idle seed step and the depth row pre-size.
           # 9 since 2026-10-30 (order path under 1 us): dhat_order_path_recorder
           # gates the order path with the production recorder installed.
+          # 11 since 2026-10-31: isolate level/book heap cases in their own
+          # binaries, retaining all three cases and their exact 0/0 budgets.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------

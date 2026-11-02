@@ -1438,6 +1438,18 @@ pub fn html_resp(footer_html: &str) -> Value {
 // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 #[allow(async_fn_in_trait)]
 pub trait OpsShell {
+    /// Per-container bounded read cache; test shells may opt out.
+    fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+        None
+    }
+    /// Fixed read-only Rust helper, dispatched through the existing shell sender.
+    async fn movers_payload(&self) -> String {
+        self.ssm_shell_sync(
+            &[crate::operator_control_action_commands::MOVERS_COMMAND.to_owned()],
+            18.0,
+        )
+        .await
+    }
     /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
     /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
@@ -2120,6 +2132,14 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         // (cross_verify removed 2026-07-16 — the 15:31 IST Dhan live-vs-
         // historical comparer was deleted in PR-C3 2026-07-14; unknown-action
         // 400 now.)
+        "fno-stocks" => {
+            let reply = crate::operator_movers::read(shell).await;
+            resp(
+                200,
+                &json!({"ok": true, "action": action, "movers": reply,
+                "observed_at_epoch_secs": shell.now_epoch()}),
+            )
+        }
         "feeds-view" => {
             // READ-ONLY: current per-feed enabled/lane state + per-feed
             // health, via SSM-curl of the app's local API (SG keeps :3001
@@ -2205,6 +2225,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
 /// it feeds are what the unit tests cover, exactly like the legacy oracle's
 /// boto3 glue).
 pub struct AwsShell {
+    movers_cache: crate::operator_movers::MoversCache,
     ec2: aws_sdk_ec2::Client,
     ssm: aws_sdk_ssm::Client,
     cloudwatch: aws_sdk_cloudwatch::Client,
@@ -2250,6 +2271,7 @@ impl AwsShell {
             .ok();
         Self {
             ec2: crate::clients::ec2(&config),
+            movers_cache: crate::operator_movers::MoversCache::default(),
             ssm: crate::clients::ssm(&config),
             cloudwatch: crate::clients::cloudwatch(&config),
             budgets: crate::clients::budgets_us_east_1().await,
@@ -2332,6 +2354,9 @@ impl AwsShell {
 }
 
 impl OpsShell for AwsShell {
+    fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+        Some(&self.movers_cache)
+    }
     fn auth_failures(&self) -> &AuthFailureGuard {
         &self.auth_failures
     }
@@ -2894,6 +2919,8 @@ mod tests {
     // seam. Defaults mirror the legacy fixtures: secret "s3cret-token",
     // market CLOSED (WipeGate pins the clock off-hours), instance running.
     struct MockShell {
+        movers_cache: crate::operator_movers::MoversCache,
+        movers_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
         secret: String,
         market_hours: bool,
         /// `None` = the data-destructive lock follows `market_hours` (every
@@ -2925,6 +2952,8 @@ mod tests {
     impl Default for MockShell {
         fn default() -> Self {
             Self {
+                movers_cache: crate::operator_movers::MoversCache::default(),
+                movers_gate: None,
                 secret: AUTH_SECRET.to_string(),
                 market_hours: false,
                 destructive_locked: None,
@@ -2959,6 +2988,9 @@ mod tests {
     }
 
     impl OpsShell for MockShell {
+        fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+            Some(&self.movers_cache)
+        }
         fn auth_failures(&self) -> &AuthFailureGuard {
             &self.auth_failures
         }
@@ -3013,6 +3045,9 @@ mod tests {
         }
         async fn ssm_shell_sync(&self, commands: &[String], _timeout_secs: f64) -> String {
             self.captured_sync.lock().unwrap().push(commands.to_vec());
+            if let Some(gate) = &self.movers_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             self.sync_output.clone()
         }
         async fn command_invocation(
@@ -3066,6 +3101,110 @@ mod tests {
 
     async fn post(shell: &MockShell, body: Value) -> Value {
         route(&post_event(&body, Some(AUTH_SECRET)), shell).await
+    }
+
+    #[tokio::test]
+    async fn movers_authentication_and_stopped_state_precede_any_private_request() {
+        let shell = MockShell::default();
+        let reply = route(&post_event(&json!({"action":"fno-stocks"}), None), &shell).await;
+        assert_eq!(status_of(&reply), 401);
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+        let stopped = MockShell {
+            instance_state: Ok("stopped".into()),
+            ..Default::default()
+        };
+        let reply = post(&stopped, json!({"action":"fno-stocks"})).await;
+        let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["movers"]["code"], "instance_stopped");
+        assert!(stopped.captured_sync.lock().unwrap().is_empty());
+        assert!(stopped.captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn movers_fixed_command_cache_expires_and_never_forwards_user_input() {
+        use crate::operator_movers_wire::{BridgeError, Reply};
+        let now = MockShell::default().now;
+        let shell = MockShell {
+            sync_output: serde_json::to_string(&Reply::error(BridgeError::AppUnauthorized, now))
+                .unwrap(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let reply = post(&shell, json!({"action":"fno-stocks", "url":"https://invalid.example", "command":"ignored"})).await;
+            let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+            assert_eq!(body["movers"]["code"], "app_unauthorized");
+        }
+        assert_eq!(
+            shell.captured_sync.lock().unwrap().as_slice(),
+            &[vec![
+                crate::operator_control_action_commands::MOVERS_COMMAND.to_string()
+            ]]
+        );
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let _reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn movers_concurrent_refresh_is_bounded_and_does_not_dispatch_twice() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(biased; post(&shell, json!({"action":"fno-stocks"})), async {
+            let response = post(&shell, json!({"action":"fno-stocks"})).await;
+            gate.add_permits(1);
+            response
+        });
+        let a: Value = serde_json::from_str(first["body"].as_str().unwrap()).unwrap();
+        let b: Value = serde_json::from_str(second["body"].as_str().unwrap()).unwrap();
+        assert_eq!(a["movers"]["code"], "bridge_unavailable");
+        assert_eq!(b["movers"]["code"], "busy");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn movers_stalled_bridge_times_out_and_releases_in_flight_exclusion() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(body_of(&reply)["movers"]["code"], "timeout");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(22));
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        gate.add_permits(1);
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let retry = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(body_of(&retry)["movers"]["code"], "bridge_unavailable");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn movers_valid_snapshot_preserves_prices_clock_and_declared_coverage() {
+        let now = MockShell::default().now;
+        let payload = json!({"version":1,"captured_at_epoch_secs":now,"result":"snapshot",
+            "snapshot":{"status":"live","market_open":true,"as_of_ist":"10:15:00",
+                "data_age_secs":2,"fno_stocks_total":236,"stocks_priced":1,"window_secs":900,
+                "value_basis":"day volume x average traded price / 1 crore","selection_limit":20,
+                "gainers_total":1,"losers_total":0,"losers":[],"gainers":[{
+                    "security_id":123,"segment":"NSE_EQ","name":"EXAMPLE","ltp":123.45,
+                    "prev_close":120.0,"change":3.45,"change_pct":2.875,"volume":1000,
+                    "value_cr":0.0123,"last_trade_ist":"10:15:00"}]}});
+        let shell = MockShell {
+            sync_output: payload.to_string(),
+            ..Default::default()
+        };
+        let reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(status_of(&reply), 200);
+        let body = body_of(&reply);
+        assert_eq!(body["movers"], payload);
+        assert_eq!(body["observed_at_epoch_secs"], now);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        assert!(shell.captured.lock().unwrap().is_empty());
     }
 
     fn status_of(resp: &Value) -> i64 {
@@ -3245,13 +3384,18 @@ mod tests {
         // 16:30 IST" (was 17:30), the daily stop's new time.
         // 2026-11-02 corrective proposal: SQL cells are parsed in Rust and
         // rendered from structured columns/rows; failed reads remain errors.
+        //
+        // RE-BLESSED 2026-10-31 (owner-requested Top Movers) — 47,076 ->
+        // 53,229 bytes: the reviewed fourth tab adds bounded gainers/losers
+        // tables with conservative source age and explicit unavailable states.
+        // Its 23 Chromium fixtures are separate from this exact-content pin.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "bfe714385aa855f677339e88a533f3f4f58d0caca4369200b1d3994c5a9e1e2f"
+            "f5bfb57b34aed7100c7760c6e2556cce62751fa8fd420a802723d11eccc6705c"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_068);
+        assert_eq!(CONSOLE_HTML.len(), 53_221);
     }
 
     // ------------------------------------------------ audit L4 source scans
@@ -3583,15 +3727,15 @@ mod tests {
     }
 
     #[test]
-    fn test_html_has_exactly_three_tabs() {
-        // 2026-07-02 redesign (operator: "webpage looks completely messy, too
-        // many buttons"): exactly Overview / Data / Admin — nothing else.
+    fn test_html_has_exactly_four_ordered_tabs() {
+        // 2026-10-31 continuation: the owner explicitly requested Top Movers
+        // on this portal. Keep the complete ordered tab list pinned.
         let re = regex::Regex::new(r#"data-t="(\w+)""#).unwrap();
         let tabs: Vec<&str> = re
             .captures_iter(CONSOLE_HTML)
             .map(|c| c.get(1).unwrap().as_str())
             .collect();
-        assert_eq!(tabs, ["overview", "data", "admin"]);
+        assert_eq!(tabs, ["overview", "movers", "data", "admin"]);
     }
 
     #[test]

@@ -1546,3 +1546,214 @@ OE1: no new counter or alarm; new `kind` labels on `tv_order_update_decode_quirk
 Carries the 15-row + 7-row matrix by reference to
 `.claude/rules/project/per-wave-guarantee-matrix.md`; per-PR specifics are in each
 PR body.
+
+
+### Public operator portal Top Movers — 2026-10-31 continuation
+
+Requested by the owner in the Codex continuation: add Top Movers to the supplied
+API Gateway dashboard and verify the actual page. The prepared implementation
+is undergoing validation; full validation and live deployment are separate steps.
+
+Design: the existing operator authentication gate dispatches one fixed standalone
+Rust reader through the existing SSM sender. The reader fetches the same server-side
+API credential as app startup and calls only the fixed loopback F&O endpoint. It
+preserves canonical prices and selects at most 20 gainers and 20 losers. The input,
+transport, request time and per-container cache are bounded; this cold control path
+does not claim constant time or submicrosecond latency.
+
+Edge Cases / Failure Modes: missing helper, stopped instance, invalid credentials,
+database failures, malformed or truncated responses, incomplete stock coverage,
+stale data, redirect attempts, oversized streaming bodies, overlapping requests,
+late replies after locking and background-tab expiry produce explicit states.
+Conservative browser age includes request duration and two seconds for integer
+timestamp precision. An upper estimate beyond the freshness limit is unconfirmed,
+not proof that the source is stale; the newest trade may be outside displayed movers.
+The canonical API now carries the UTC epoch of the same original observation used
+to compute its row age. Both serialized API caching and the helper/Lambda bridge
+must preserve that anchor: stamping helper completion could hide original query
+time on a later cache hit. Missing or invalid legacy anchors fail closed. The
+naive IST source clock must have its IST offset removed before becoming Unix time.
+
+Rollback: revert the app helper packaging and operator Lambda together through the
+existing deployment process. Missing or incompatible helper output fails closed.
+The three-file swap is not atomic and existing automatic rollback restores only
+the main app; no stronger rollback guarantee is introduced.
+
+Observability: show captured time, conservative age, source state, priced/universe
+counts and selected/total counts. Errors are typed codes; helper output never
+contains credentials or raw SDK diagnostics. Actual live browser verification is
+read-only and distinct from intercepted browser fixtures.
+
+- [x] Connect the authenticated operator action to one standalone Rust read-only
+  helper, with canonical app prices, bounded top20 selections, explicit errors,
+  timeout, age and per-container cache.
+  - Files: crates/app/src/operator_movers.rs, crates/app/src/bin/tickvault_operator_read.rs,
+    crates/common/src/operator_movers_wire.rs, crates/aws-lambdas/src/operator_movers.rs,
+    crates/aws-lambdas/src/operator_control.rs
+  - Tests: canonical_large_universe_selects_complete_top_twenty_each_way,
+    closed_is_preserved_with_no_invented_prices,
+    malformed_or_inconsistent_source_is_refused_as_a_whole,
+    movers_authentication_and_stopped_state_precede_any_private_request,
+    movers_fixed_command_cache_expires_and_never_forwards_user_input,
+    movers_concurrent_refresh_is_bounded_and_does_not_dispatch_twice
+- [x] Add the accessible portal table with explicit closed/stale/expired/error
+  states and package the helper through the existing deployment workflow.
+  - Files: crates/aws-lambdas/src/operator_control_console.html,
+    crates/aws-lambdas/src/operator_control_action_commands.rs,
+    .github/workflows/deploy-aws.yml, crates/app/Cargo.toml,
+    crates/common/tests/browser_surface_and_toolchain_guard.rs
+  - Tests: console_embedded_shell_never_grows, ssm_workflow_shell_never_grows,
+    workflow_run_lines_never_grow, javascript_bytes_inside_script_tags_stay_under_the_ceiling
+  - Browser: real Chromium fixtures for rows, closed, errors, malicious symbol text,
+    expiry, refresh in flight, lock, visibility and mobile layout; actual live
+    portal re-check only after an explicitly reviewed deployment.
+- [x] Validate the corrected source timestamp through API and Lambda caches.
+  - Files: crates/api/src/handlers/fno_stocks.rs,
+    crates/app/src/operator_movers.rs
+  - Tests: test_one_row_is_live_with_change_and_value,
+    test_get_fno_stocks_cache_hit_skips_the_query,
+    cached_source_keeps_original_clock_instead_of_helper_completion_time,
+    source_clock_missing_malformed_future_or_expired_is_not_replaced_with_now
+  - Controls: re-anchoring at helper completion and omitting the IST conversion
+    must fail their intended assertions; restore exact source afterward.
+  - The former c5 workspace compile was deliberately interrupted before any
+    tests after an independent cache-age counterexample; it is not a passed suite.
+  - Corrected source: ten helper and twenty API tests passed before and after
+    both effective fault controls. All fixed source hashes were restored;
+    23 browser fixtures and 46 pure verifier checks passed. Full workspace,
+    all-target lint, native publication and live deployment remain separate.
+- [x] Reconcile existing deployment, crate-root and HTML guards with the new helper
+  and requested tab; retain the exact content hash, ordered tabs and smoke-before-
+  promotion-before-host-install assertions. Preserve the helper's production and
+  test lint denials. No deployment or helper runtime behavior changes here.
+  - Files: crates/app/tests/host_tuning_boot_wiring_guard.rs,
+    crates/app/src/bin/tickvault_operator_read.rs,
+    crates/aws-lambdas/src/operator_control.rs
+  - Tests: boot_units_never_run_the_rollback_restored_binary,
+    production_crate_roots_keep_the_deny_blanket,
+    every_crate_root_decides_about_silent_panics,
+    every_crate_root_denies_unsafe_code, console_html_content_pin,
+    test_html_has_exactly_four_ordered_tabs
+  - The unchanged bcf8dc7 diagnostic completed 15,445 passed / 6 failed / 33
+    ignored across 460 harnesses. These six failures are preserved as failed
+    evidence; the corrected candidate still requires its own validation.
+
+
+### 2026-10-31: isolate the idle-seed and depth pre-size allocation gates
+
+- [ ] Complete exact-source validation of the allocation-test isolation below.
+  Source is prepared; this checkbox does not claim a passed suite or publication.
+  - The 12f9632 full run completed 15,450 passed / 1 failed / 33 ignored across
+    460 harnesses. The book pre-size case reached 16,000 levels, 1,600 ticks and
+    966,368 book bytes, but process-global DHAT measured 6 blocks / 389 bytes
+    against the unchanged 0-block / 0-byte ceiling. Preserve this failed result.
+  - The test file is byte-identical on main, bcf8 and 12f. Pinned DHAT 0.3.3
+    documents that a lock between test bodies does not exclude allocations by
+    parallel libtest bookkeeping. The original failure has no saved stacks, so
+    its specific allocation source remains unproven. Passing later nocapture
+    diagnostics do not erase the captured full-suite failure.
+  - Keep each of the three original heap cases in its own integration-test
+    binary: dhat_idle_seed_step, dhat_depth_level_row_presize and
+    dhat_depth_book_row_presize. Retain all original function names, bodies,
+    warm-up, nonvacuity and zero-allocation assertions; no feature gating/skips.
+  - Keep explicit CI commands, exact app target count 11, the zero-test refusal
+    and sorted expected/actual target equality. Extract only the fixed app
+    expected inventory into .github/dhat-app-targets.txt, with missing/invalid
+    inventory refusal. Do not derive expected names from discovered files or
+    raise the existing shell ceiling. Other crate lists/counts are unchanged.
+  - Before final validation, run the predeclared five captured parallel
+    stack-attribution diagnostics with temporary DHAT-aware assertions and
+    retained profiles; restore exact source. If they all pass, attribution
+    remains unknown. They are diagnostics, not replacement acceptance evidence.
+  - Then run all three isolated positive targets, the book-reserve removal
+    control (which must fail the allocation assertion after meaningful appends),
+    exact restoration and final positives. Static/canonical guards, all-target
+    lint, exact-commit full/native/CI gates remain required and pending.
+
+
+### 2026-10-31: retain scanner verdicts within the existing native deadline
+
+- [ ] Complete committed-head workspace/lint and native/CI validation after
+  importing the independently reviewed shared scanner correction.
+  - The portal ab5 workspace completed 15,451 passed / 0 failed / 33 ignored
+    across 462 harnesses. Keep its source and result attribution intact.
+  - Cache the existing test-file inventory per crate and use equivalent Bash
+    name/prefix extraction. Preserve all matching expressions, exclusions,
+    exemptions, baseline values, verdicts and existing 300/120-second deadlines.
+  - Import the reviewed 14 real-hook Rust fixtures, including contained Git
+    configuration/selector handling and the truthful assert-prefixed helper.
+    Prior author/peer fixture and control evidence is not a new portal run.
+  - Existing product Rust is byte-identical to ab5; the added common-crate
+    fixture still requires the new committed-head workspace validation.
+  - The 83.342-second full scan belongs to the earlier bd source observation.
+    Do not relabel it as a portal timing or bypass any normal publication gate.
+
+### 2026-11-01: diagnose and repair Portal #2178's actual coverage failures
+
+The operator-authorized recovery coordinator requested this isolated successor on
+`c2032ce28eb3c6c9be2fb2bbc742c37f246373da`; recovered-portal remains unchanged.
+This item carries the existing 15-row + 7-row guarantee matrix by reference to
+`.claude/rules/project/per-wave-guarantee-matrix.md`. The composed source retains
+both independently reviewed corrections and their separately attributed evidence;
+changed-head full/lint/native/CI validation remains pending at source freeze.
+
+| Observed failure | Cause and preserved safety check |
+|---|---|
+| External Git sentinel changed in both coverage attempts | Detached fixture maintenance removed its own lock; keep every snapshot entry and the full equality assertion |
+| WAL lifetime property overflowed on attempt two | Retained bucket ids collided after clock steps; require replay protection and retain strict no-overflow inside the collision-free envelope |
+
+- [ ] Complete the Git fixture correction and changed-head validation without
+  weakening external-repository isolation or the existing child deadline.
+  - Files: crates/common/tests/pub_fn_test_guard_behavior.rs
+  - Tests: fixture_git_children_cannot_mutate_a_poison_selected_external_repository,
+    hook_child_cannot_false_pass_through_a_poison_selected_clean_index
+  - Actual Git 2.56.0 with two libtest workers reproduced the original equality
+    failure: the sentinel's empty `.git/objects/maintenance.lock` disappeared
+    between snapshots. The fixed 20-run diagnostic matrix passed 19 runs and
+    failed one; a separate matrix also caught disappearance during a read.
+  - Keep complete snapshot equality, fatal read diagnostics, all Git-selector
+    isolation and the existing ten-second child limit. Set only the synthetic
+    fixture command's `maintenance.autoDetach=false` so automatic maintenance
+    completes before snapshots. Do not exclude the changing lock file.
+  - The exact corrected common source passed all 23 predeclared runs of the
+    same 19 fixtures: Git 2.56.0/two workers for 20 runs, plus Git 2.52.0 with
+    two/four workers and Git 2.56.0 with four workers. These are 23 repeated
+    passing runs, not 437 distinct tests or a combined workspace/CI result.
+- [ ] Complete the WAL property's retained-bucket envelope correction and
+  changed-head validation with unchanged safety assertions and property bounds.
+  - Files: crates/storage/tests/wal_unapplied_ranges_properties.rs
+  - Tests: test_regression_portal_2178_in_session_overflow_seed,
+    test_regression_portal_2178_exact_ring_wrap_replays_before_and_after_persist,
+    proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame
+  - Exact input: seed 11217553172582376467, start 1, stuck false, mirror true,
+    extra false, straddle false. Retain the original 256 property cases and
+    all no-skip/no-prune assertions; no seed ignore or arbitrary bound change.
+  - The isolated diagnostic reproduced the original assertion at lifetime 12,
+    frame 0: retained id 6479807 and new id 6479935 share slot 63, exactly
+    128 buckets apart. Production intentionally fails towards replay here;
+    the production watermark implementation remains byte-identical to c203.
+  - The R envelope uses actual retained ids and newly shed frame ids, including
+    mirror and inverted records. Collision-free steps retain strict no-overflow;
+    real collisions require finite known bounds and independent database-model
+    no-skip/no-prune decisions in RAM and after persist/reload. Probes may
+    legitimately persist an existing overflow into a protected range.
+  - Preserve all six inputs, RNG draws, persist timing, 256 cases and existing
+    Z/G/B/S/O/M3 assertions. The focused wrap fixture advances both sink HWMs
+    beyond both pending marks so low watermarks cannot conceal lost protection.
+  - The exact copied WAL source passed its complete ten-test property harness.
+    Separately omitting the collision flag and bounded-range insertion each
+    failed the intended replay assertion. Both exact restorations passed the
+    focused regression again. These scoped results belong to the preserved WAL
+    candidate; identical source justifies retaining them without new mutations.
+
+Preserve run 41266407564 / job 124730630660 raw evidence. The first built-in
+attempt failed the Git sentinel test; the second failed it again and the WAL
+seed. Coverage threshold enforcement did not run. No resource-cause attribution
+or blind rerun replaces these actual assertion failures. Original failure logs,
+input packets, independent reviews and positive/control results remain retained.
+
+Think of two alarms: keep both alarms working, record what set them off, then
+check that each correction addresses its cause. The composed repair now requires
+ordinary plan/common/property guards, a normal gated commit, exact new-head
+workspace and all-target lint, then coordinated fast/native/pre-PR and CI checks.
+No merge, deployment, coverage percentage or production latency result is claimed.

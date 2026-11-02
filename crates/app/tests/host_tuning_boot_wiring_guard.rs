@@ -495,12 +495,18 @@ fn boot_units_never_run_the_rollback_restored_binary() {
     );
 
     let deploy = read(DEPLOY);
+    // All three binaries are downloaded into bin/.next. The smoke binary
+    // reads config and spill paths relative to /opt/tickvault, then the
+    // promotion returns the shell there before installing the host copy.
+    let staging = deploy
+        .find("cd bin/.next; TVS3=")
+        .expect("the deploy no longer enters the staged binary directory");
     let smoke = deploy
-        .find("bin/smoke_test.new --duration")
-        .expect("the deploy no longer smoke-tests the new binary");
+        .find("(cd ../..; timeout 40 bin/.next/smoke_test --duration 30)")
+        .expect("the deploy no longer runs the staged smoke test from the app directory");
     let promote = deploy
-        .find("mv bin/tickvault.new")
-        .expect("the deploy no longer promotes the new binary");
+        .find("mv tickvault smoke_test tv-movers ..; cd ../..")
+        .expect("the deploy no longer promotes all three staged binaries");
     let install = deploy
         .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
         .expect(
@@ -508,9 +514,9 @@ fn boot_units_never_run_the_rollback_restored_binary() {
              have nothing to run",
         );
     assert!(
-        smoke < promote && promote < install,
-        "bin/tickvault-host must be installed AFTER the smoke test and the \
-         promotion, so it only ever holds a binary that passed the smoke test"
+        staging < smoke && smoke < promote && promote < install,
+        "bin/tickvault-host must be installed AFTER staged smoke and promotion, \
+         with the shell returned to the app directory before installation"
     );
     let rollback = deploy
         .find("cp -f bin/tickvault.backup bin/tickvault")

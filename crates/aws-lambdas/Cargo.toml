@@ -56,6 +56,9 @@ aws-sdk-lambda = { workspace = true }
 totp-rs = { workspace = true }
 secrecy = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [[bin]]
 name = "start-watchdog"
 path = "src/bin/start_watchdog.rs"
