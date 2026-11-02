@@ -349,10 +349,12 @@ fn handshake(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) -> io
 // Clients
 // ---------------------------------------------------------------------------
 
+type ProductionReader = DhanFeedSocketImpl<fn() -> Option<FeedTokenBuffer<String>>>;
+
 /// The production socket and, for the bite check only, a raw
 /// `tokio-tungstenite` stream with a caller-chosen config.
 enum Client {
-    Production(Box<DhanFeedSocketImpl<fn() -> Option<FeedTokenBuffer<String>>>>),
+    Production(Box<ProductionReader>),
     Raw(
         Box<
             tokio_tungstenite::WebSocketStream<

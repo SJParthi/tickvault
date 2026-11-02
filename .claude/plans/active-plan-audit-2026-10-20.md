@@ -2018,3 +2018,8 @@ claimed merged merely because their behavior has a later equivalent.
 Current reviewed patches and standalone controls are saved under the
 20261102T071741Z recovery evidence root. Native validation of this combined
 port is still pending. Depth20, Depth200 and live orders stay off.
+
+The first combined all-target Clippy run atab08101cb rejected the new
+reader test's nested production-socket type. Name that existing type through
+a private alias; do not suppress the lint or change its runtime behavior.
+Retain the failed run and repeat the unchanged full lint gate before pushing.
