@@ -102,6 +102,29 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "but the day marker could not be saved",
         "retried marker-only and paged on xverify_failed after the last attempt (no-rest rule section 12.15.7)",
     ),
+    // Recovery review, 2026-10-31: retain the original 51e/51f/51g retry
+    // warnings under no-rest sections 12.15.13-15 and the existing daily
+    // xverify_failed page policy. Each entry identifies one live call site.
+    (
+        "crates/app/src/dhan_live_crossverify_boot.rs",
+        "could not save a held main-feed spot set for the 1-minute cross-check",
+        "the recorder retries held sets; this process latches unknown coverage until success and the daily coverage failure uses the existing xverify_failed page; no new per-retry page",
+    ),
+    (
+        "crates/app/src/dhan_live_crossverify_boot.rs",
+        "a held spot set never reached today's subscribe record",
+        "this branch sets coverage.known=false before comparison; coverage_unknown refuses the archive marker and reports through the existing daily xverify_failed path",
+    ),
+    (
+        "crates/app/src/dhan_live_crossverify_boot.rs",
+        "refused the day, but could not save that",
+        "the refused marker only suppresses later catch-up attempts and never releases an archive; a failed write permits another bounded refusal, with paging still governed by the separate paged marker",
+    ),
+    (
+        "crates/app/src/dhan_live_universe.rs",
+        "could not save today's widened spot list for the 1-minute cross-check",
+        "the widen first latches this process's record-write failure; the recorder retries and current-day verification remains coverage_unknown until success, using the existing daily page",
+    ),
     (
         "crates/app/src/dhan_live_crossverify_boot.rs",
         "could not tell whether our last candles were sealed",

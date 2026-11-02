@@ -1,4 +1,4 @@
-//! Sixteen ceilings, three crates, one number (nine until 2026-10-12) — and nothing making them agree.
+//! Seventeen ceilings, three crates, one number (nine until 2026-10-12) — and nothing making them agree.
 //!
 //! Found 2026-08-22. Every per-entity cap in this workspace is `25_000`, and
 //! every one of them says in its own doc comment that it is deliberately the
@@ -100,6 +100,11 @@ const CEILINGS: &[(&str, &str)] = &[
         "crates/trading/src/oms/engine.rs",
         "MAX_TRACKED_ORDER_ALIASES",
     ),
+    // 2026-10-31 recovery: the day's recorded keys use the main-feed capacity.
+    (
+        "crates/app/src/xverify_day_record.rs",
+        "DAY_RECORD_MAX_INSTRUMENTS",
+    ),
 ];
 
 /// Read `const NAME: usize = <literal>;` out of a file, underscores stripped.
@@ -197,7 +202,7 @@ fn guard_self_test() {
     );
     assert_eq!(
         CEILINGS.len(),
-        16,
+        17,
         "the ceiling list changed size — that is fine, but it should be a \
          deliberate edit with the reason recorded, not a silent drift"
     );
