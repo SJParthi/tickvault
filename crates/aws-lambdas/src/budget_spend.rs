@@ -356,3 +356,34 @@ mod tests {
         assert_eq!(trusted_spend_for_line(Some(3.0), 75.0, day2), Some(3.0));
     }
 }
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    use crate::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn test_budget_coordinates_from_env_reads_both_variables() {
+        let _lock = env_lock();
+        let _acct = EnvVarGuard::set(BUDGET_ACCOUNT_ID_ENV, Some(" 123456789012 "));
+        let _name = EnvVarGuard::set(BUDGET_NAME_ENV, Some("tv-prod-monthly"));
+        assert_eq!(
+            budget_coordinates_from_env(),
+            Ok(BudgetCoordinates {
+                account_id: "123456789012".to_string(),
+                budget_name: "tv-prod-monthly".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_budget_coordinates_from_env_refuses_a_missing_variable() {
+        let _lock = env_lock();
+        let _acct = EnvVarGuard::set(BUDGET_ACCOUNT_ID_ENV, Some("123456789012"));
+        let _name = EnvVarGuard::set(BUDGET_NAME_ENV, None);
+        assert_eq!(
+            budget_coordinates_from_env(),
+            Err(format!("{BUDGET_NAME_ENV} env var is missing or empty"))
+        );
+    }
+}
