@@ -1947,9 +1947,74 @@ CI remain required; these focused totals are not whole-workspace coverage.
 - [ ] Reconcile newly discovered paused branch work beyond the24-PR inventory.
   Preserve all refs; current-source review has found additional AWS-control,
   token-cache, special-session and observability/storage proposals. Historical
-  WIP is not accepted blindly: parked-ack trimming has a concrete false-clean
-  counterexample that requires a separate correctness proof before integration.
+  WIP is not accepted blindly: lagging rows refute an applied/queryable-row
+  claim, but do not alone refute the documented acknowledged-WAL contract.
 
 Depth20, Depth200 and live-order activation remain off throughout. Final
 validation must not bypass gates, broaden runtime exceptions or relabel
 after-close observations as open-market throughput/latency/loss proof.
+
+### 2026-11-02: reconcile remaining branch work against the current runtime
+
+Preserved all original branch refs and fetched the newer handoff2a4a916 under
+a separate recovery ref. The full955-ref inventory and later remote-head
+reconciliation distinguish represented changes, explicit retirements, unbuilt
+proposals and ports requiring validation. Literal old branch tips are not
+claimed merged merely because their behavior has a later equivalent.
+
+- [x] Port private token-cache creation and safe stale-link replacement;
+  protect QuestDB restart during capture and parse UTC08/09 as decimal.
+  Files: token_cache.rs, aws-control.yml, aws_control_capture_guard.rs.
+- [x] Use one IST session date and TradingCalendar::is_session_day for
+  live-universe wait/widen eligibility, with executable regression controls.
+  Files: main.rs, live_universe_session_day_guard.rs. This changes day
+  eligibility, not the existing time windows or late-attach cutoff.
+- [x] Report retained refused-spill bytes and actual overflow episodes;
+  port the newer W4 parked-ack lineage including forgotten-table taint,
+  persisted pending-state recovery and failed sidecar-write controls.
+  Files: seal_spill.rs, wal_applied_watermark.rs, wal_suspension_watcher.rs,
+  wal_unapplied_ranges.rs and the retained proptest regression seed.
+  Contract: accepted QuestDB WAL acknowledgements plus the existing60-second
+  writeback/settle and two clean probes. This is not proof of applied rows,
+  an empty WAL backlog, fsync, power-loss durability or zero data loss.
+- [x] Start existing telemetry after tracing and before watched supervisors;
+  classify a failed thread spawn as HOT-PATH-04, Medium/log-only.
+  Files: main.rs, error_code.rs, error-rules.yaml, runbook and wiring guards.
+  Registered gauges alone do not prove the telemetry thread is running.
+  Correct the stale options-store boot log: boot rehydrate was removed.
+- [x] Port bounded local TCP/rmem pressure sampling, with a guard against
+  broad CloudWatch export patterns. Files: kernel_rx_queue_sampler.rs,
+  kernel_tcp_ext_local_only_guard.rs. Namespace counters do not prove
+  per-connection delivery, loss or network latency.
+- [x] Restore the observed enabled/disabled/enabled-runtime service state
+  after filesystem recovery without starting it; reject unknown states and
+  make restoration failure terminal across the outer SSH retry loop.
+  Narrow scheduler PassRole to the actual scheduler role and retain the
+  SSM service condition. Strengthen direct control-secret alias checks.
+  Files: emergency-fs-recover.yml, main.tf, emergency_recovery_state_guard.rs,
+  aws_infra_wiring.rs, github_workflow_guard.rs.
+  Limits: SIGKILL/host loss and ambiguous SSH outcomes are not atomic rollback.
+- [x] Port the production reader-memory allocation ratchet with cancellable,
+  bounded fixture I/O, full payload/order checks and writer-task completion.
+  Files: dhat_ws_reader_memory.rs and ci.yml. CI now explicitly executes10
+  core DHAT targets. Preserve the48KiB idle,400blocks/MiB and4x held-payload
+  ceilings, the existing293-line workflow budget and the existing coverage
+  exclusion for dhat_ allocation tests. No new ignored tests or exemptions.
+  Plain synthetic loopback excludes TLS/vendor behavior and latency claims.
+- [x] Correct the full-console digest/length pin to the reviewed6226059a
+  HTML84,855bytes. The prior6cf push was interrupted during tests after this
+  mismatch was identified; no successful push is claimed for that attempt.
+- [x] Ratchet the measured static test-attribute baseline16456 to16521.
+  This is not an executed-test count, scenario completeness or coverage.
+- [ ] Test Plan: full native publication gates and exact-source CI; explicit
+  ten-target core DHAT run; storage failure/restart, auth inode, special-day,
+  telemetry, workflow, source-budget and console-pin controls. Preserve all
+  failed/interrupted attempts and report the actual final source identity.
+- [ ] Review a real plan-only Terraform run, then automatic merge and deploy
+  both EC2 binaries and operator Lambda. Verify full deployed SHA/ZIP/HTML
+  identities, actual hosted Stocks selections and effective safety settings.
+  Restore the observed stopped server baseline after temporary checks.
+
+Current reviewed patches and standalone controls are saved under the
+20261102T071741Z recovery evidence root. Native validation of this combined
+port is still pending. Depth20, Depth200 and live orders stay off.

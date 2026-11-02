@@ -650,9 +650,10 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
         ]
       },
       {
+        # The daily start target passes only this role as AutomationAssumeRole.
         Effect   = "Allow"
         Action   = "iam:PassRole"
-        Resource = "*"
+        Resource = aws_iam_role.eventbridge_ec2_scheduler.arn
         Condition = {
           StringEquals = {
             "iam:PassedToService" = "ssm.amazonaws.com"

@@ -1379,3 +1379,79 @@ fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
          variables.tf in the same change"
     );
 }
+
+/// The scheduler's sole automation target passes its own role. Source checks
+/// cannot establish live IAM drift or replace a reviewed Terraform plan.
+fn scheduler_pass_role_is_scoped(content: &str) -> bool {
+    let policy =
+        terraform_resource_block(content, "aws_iam_role_policy", "eventbridge_ec2_scheduler");
+    if policy.matches("\"iam:PassRole\"").count() != 1 {
+        return false;
+    }
+    let rest = &policy[policy.find("\"iam:PassRole\"").unwrap()..];
+    let statement = &rest[..rest.find("Condition").unwrap_or(rest.len())];
+    let resource_lines: Vec<_> = statement
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("Resource"))
+        .collect();
+    let target = terraform_resource_block(content, "aws_cloudwatch_event_target", "daily_start");
+    resource_lines == ["Resource = aws_iam_role.eventbridge_ec2_scheduler.arn"]
+        && rest.contains("\"iam:PassedToService\" = \"ssm.amazonaws.com\"")
+        && target
+            .lines()
+            .any(|line| line.trim() == "role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn")
+        && target.lines().any(|line| {
+            line.trim() == "AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]"
+        })
+}
+
+#[test]
+fn eventbridge_scheduler_pass_role_is_scoped_to_its_actual_target() {
+    let source =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf")).unwrap();
+    assert!(scheduler_pass_role_is_scoped(&source));
+}
+
+#[test]
+fn eventbridge_scheduler_pass_role_guard_rejects_permission_and_target_regressions() {
+    let source =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf")).unwrap();
+    assert!(scheduler_pass_role_is_scoped(&source));
+    for (before, after) in [
+        (
+            "Resource = aws_iam_role.eventbridge_ec2_scheduler.arn",
+            "Resource = \"*\"",
+        ),
+        (
+            "Resource = aws_iam_role.eventbridge_ec2_scheduler.arn",
+            "Resource = aws_iam_role.unrelated.arn",
+        ),
+        (
+            "\"iam:PassedToService\" = \"ssm.amazonaws.com\"",
+            "\"iam:PassedToService\" = \"ec2.amazonaws.com\"",
+        ),
+        (
+            "\"iam:PassedToService\" = \"ssm.amazonaws.com\"",
+            "# \"iam:PassedToService\" = \"ssm.amazonaws.com\"",
+        ),
+        (
+            "role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn",
+            "role_arn  = aws_iam_role.unrelated.arn",
+        ),
+        (
+            "AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]",
+            "AutomationAssumeRole = [aws_iam_role.unrelated.arn]",
+        ),
+    ] {
+        assert_eq!(
+            source.matches(before).count(),
+            1,
+            "fixture must change exactly one target"
+        );
+        assert!(
+            !scheduler_pass_role_is_scoped(&source.replace(before, after)),
+            "regression={after}"
+        );
+    }
+}

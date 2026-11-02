@@ -493,17 +493,17 @@ fn r20_no_workflow_publishes_the_operator_key() {
             !body.contains("#key="),
             "{name}: builds a #key= link; the operator key must never be sent (audit PR36a)"
         );
-        for (i, line) in body.lines().enumerate() {
-            if line.contains("--message") || line.contains("MESSAGE=") {
-                assert!(
-                    !line.contains("KEY}") && !line.contains("$KEY") && !line.contains("LINK}"),
-                    "{name}:{}: a published message references the key: {line}",
-                    i + 1
-                );
-            }
-        }
+        let hits = published_message_key_leaks(&body);
+        assert!(
+            hits.is_empty(),
+            "{name}: published-message secret references: {hits:?}"
+        );
     }
     assert!(scanned > 0, "no workflow files scanned");
+    assert!(
+        secret_holding_vars(&read(WORKFLOW)).contains(&"TOK".to_string()),
+        "the alias scan must find the real control-secret reader, not pass vacuously"
+    );
 
     let body = read(WORKFLOW);
     let start = body
@@ -1297,5 +1297,182 @@ fn emergency_fs_recover_normalises_force_disk_input() {
             format!("before\nflag=\"{expected}\"\nafter\n"),
             "only exact yes may enable the disk-check override: {input:?}"
         );
+    }
+}
+
+/// Join the conventional backslash continuations used by these workflows.
+/// This is a source-pattern guard, not a shell parser or complete dataflow analysis.
+fn joined_shell_lines(body: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(head) = trimmed.strip_suffix('\\') {
+            current.push_str(head);
+            current.push(' ');
+        } else {
+            current.push_str(trimmed);
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Names directly assigned from the literal control-secret SSM read. This
+/// intentionally does not claim to trace aliases through arbitrary commands.
+fn secret_holding_vars(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in joined_shell_lines(body) {
+        if !(line.contains("aws ssm get-parameter") && line.contains("control-secret")) {
+            continue;
+        }
+        let Some(at) = ["=$(", "=\"$("]
+            .iter()
+            .filter_map(|pattern| line.find(pattern))
+            .min()
+        else {
+            continue;
+        };
+        let head = &line[..at];
+        let start = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let name = &head[start..];
+        if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && !names.iter().any(|existing| existing == name)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Conservative lexical reference detection: quoting/escaping can produce a
+/// false positive, but a longer variable name does not count as this name.
+fn references_shell_variable(line: &str, name: &str) -> bool {
+    [format!("${name}"), format!("${{{name}")]
+        .iter()
+        .any(|needle| {
+            line.match_indices(needle).any(|(i, _)| {
+                line[i + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+            })
+        })
+}
+
+/// Preserve the existing KEY/LINK rule and additionally reject direct
+/// control-secret reader names in conventional, possibly continued messages.
+fn published_message_key_leaks(body: &str) -> Vec<String> {
+    let is_message = |line: &str| line.contains("--message") || line.contains("MESSAGE=");
+    let mut hits = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        if is_message(line)
+            && (line.contains("KEY}") || line.contains("$KEY") || line.contains("LINK}"))
+        {
+            hits.push(format!("{}: {line}", i + 1));
+        }
+    }
+    let names = secret_holding_vars(body);
+    for line in joined_shell_lines(body) {
+        if is_message(&line)
+            && names
+                .iter()
+                .any(|name| references_shell_variable(&line, name))
+        {
+            hits.push(format!("direct control-secret reader in a message: {line}"));
+        }
+    }
+    hits
+}
+
+#[test]
+fn published_secret_alias_guard_catches_renamed_and_continued_readers() {
+    for name in ["TOK", "SESSION_CONSOLE", "_console9"] {
+        let read = format!(
+            "if ! {name}=$(aws ssm get-parameter \\\n  --name /tickvault/prod/operator/control-secret --with-decryption); then exit 1; fi\n"
+        );
+        assert_eq!(secret_holding_vars(&read), [name]);
+        for reference in [
+            format!("${name}"),
+            format!("${{{name}}}"),
+            format!("${{{name}:-fallback}}"),
+            format!("${{{name}:0:8}}"),
+            format!("${{{name}//x/y}}"),
+        ] {
+            let source = format!("{read}aws sns publish \\\n --message \"{reference}\"\n");
+            assert_eq!(
+                published_message_key_leaks(&source).len(),
+                1,
+                "alias={name}"
+            );
+            let assignment = format!("{read}MESSAGE=\"{reference}\"\n");
+            assert_eq!(
+                published_message_key_leaks(&assignment).len(),
+                1,
+                "alias={name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn published_secret_alias_guard_accepts_safe_references_and_ignores_longer_names() {
+    let assignment_source = "TOK=$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret --with-decryption)\n";
+    for safe in [
+        "aws sns publish --message \"$TOKEN_COUNT\"",
+        "MESSAGE=\"${TOK_COUNT}\"",
+        "MESSAGE=\"$TOK_COUNT\"",
+        "printf 'Authorization: Bearer %s' \"$TOK\" > header",
+        "# MESSAGE=\"$TOK\"",
+        "aws sns publish --message \"paste your device key from Parameter Store\"",
+    ] {
+        assert!(published_message_key_leaks(&format!("{assignment_source}{safe}\n")).is_empty());
+    }
+    assert!(
+        secret_holding_vars("# TOK=$(aws ssm get-parameter --name control-secret)\n").is_empty()
+    );
+    let quoted = "TOK=\"$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret --with-decryption)\"\n";
+    assert_eq!(secret_holding_vars(quoted), ["TOK"]);
+    assert!(published_message_key_leaks(&format!("{quoted}MESSAGE=\"$TOKEN_COUNT\"\n")).is_empty());
+    let real = read(WORKFLOW);
+    assert!(secret_holding_vars(&real).contains(&"TOK".to_string()));
+    assert!(published_message_key_leaks(&real).is_empty());
+}
+
+#[test]
+fn published_secret_alias_guard_catches_double_quoted_command_substitutions() {
+    for name in ["TOK", "SESSION_CONSOLE", "_console9"] {
+        let source = format!(
+            "{name}=\"$(aws ssm get-parameter \\\n+              --name /tickvault/prod/operator/control-secret --with-decryption)\"\n"
+        );
+        assert_eq!(secret_holding_vars(&source), [name]);
+        for reference in [format!("${name}"), format!("${{{name}}}")] {
+            assert_eq!(
+                published_message_key_leaks(&format!(
+                    "{source}aws sns publish --message \"{reference}\"\n"
+                ))
+                .len(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn published_secret_alias_guard_retains_legacy_key_and_link_rejections() {
+    for body in [
+        "aws sns publish --message \"$KEY\"",
+        "MESSAGE=\"${KEY}\"",
+        "aws sns publish --message \"${LINK}\"",
+    ] {
+        assert_eq!(published_message_key_leaks(body).len(), 1);
     }
 }

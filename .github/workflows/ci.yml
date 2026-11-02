@@ -839,6 +839,7 @@ jobs:
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_truedata_decode_zero_alloc.rs
+          crates/core/tests/dhat_ws_reader_memory.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
           crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
@@ -907,7 +908,7 @@ jobs:
             --test dhat_telegram_dispatcher \
             --test dhat_token_handle \
             --test dhat_truedata_decode_zero_alloc \
-            --test dhat_ws_reader_zero_alloc \
+            --test dhat_ws_reader_memory --test dhat_ws_reader_zero_alloc \
             2>&1 | tee /tmp/dhat-core.log
           if grep -q 'running 0 tests' /tmp/dhat-core.log; then
             echo "::error::a core dhat target ran ZERO tests — vacuous green (--features dhat missing, or the cfg gate excluded the test). Rule 11: no false-OK."
@@ -944,8 +945,10 @@ jobs:
           # and left both the drift list and the --test flag behind.
           # 2026-10-10 (plan 52g/52h): dhat_frame_silence_activity added for
           # the per-kind frame-silence register: 8 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-11-02 (recovered plan52c): production reader memory
+          # allocation ratchet added with its explicit target: 9 -> 10.
+          if [ "$ran" -ne 10 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 

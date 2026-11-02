@@ -3618,13 +3618,16 @@ mod tests {
         // Its 23 Chromium fixtures are separate from this exact-content pin.
         // 2026-11-02: reconstructed index/F&O filters and paging; frontend and
         // SSM ceilings retained. Browser functions have separate local fixtures.
+        // 2026-11-02: full switch hit area and timer-stable invalid-search
+        // feedback; reviewed HTML6226059a passed28+1 page,54 switch and8 CSV
+        // browser controls. The existing JavaScript ceiling stays unchanged.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "4a86b97f90df048caf75f85470a9bdc8a630d9cf5c1efe4faf9aa642d78f270a"
+            "6226059a333a70a726bf4a34da7d4dc5c57818efd95951244bea42efab4d88da"
         );
-        assert_eq!(CONSOLE_HTML.len(), 84_476);
+        assert_eq!(CONSOLE_HTML.len(), 84_855);
     }
 
     // ------------------------------------------------ audit L4 source scans
