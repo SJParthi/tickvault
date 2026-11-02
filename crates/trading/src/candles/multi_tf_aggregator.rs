@@ -4697,16 +4697,15 @@ mod tests {
             (STOCK, 400, 101.5, 1_040, 400),
             (INDEX, 400, 501.0, 0, 400),
         ];
-        for tf in [TfIndex::S1] {
-            let start = tf.bucket_start(OPEN + 40) - OPEN;
-            check(
-                "own listening time",
-                &p3,
-                (10, 20, &[(STOCK, 70)]),
-                tf,
-                start,
-            );
-        }
+        let tf = TfIndex::S1;
+        let start = tf.bucket_start(OPEN + 40) - OPEN;
+        check(
+            "own listening time",
+            &p3,
+            (10, 20, &[(STOCK, 70)]),
+            tf,
+            start,
+        );
     }
 
     /// The bar `restart_bars` wrote for `key`, as the fields a stored row
@@ -5053,13 +5052,12 @@ mod tests {
         ];
         p2.extend(index_every_5s(5, 1_000));
         p2.sort_by_key(|p| p.4);
-        for tf in [TfIndex::S1] {
-            written_exactly(
-                "a gap packet that traded after the first receipt",
-                &p2,
-                (STOCK, tf, tf.bucket_start(OPEN + 605)),
-            );
-        }
+        let tf = TfIndex::S1;
+        written_exactly(
+            "a gap packet that traded after the first receipt",
+            &p2,
+            (STOCK, tf, tf.bucket_start(OPEN + 605)),
+        );
 
         // 4. Review round 23 (HIGH, reproduced by the reviewer): two downtime
         //    trades arrive late and out of order after the socket listens
@@ -5078,14 +5076,12 @@ mod tests {
         ];
         p4.extend(index_every_5s(5, 1_000));
         p4.sort_by_key(|p| p.4);
-        for tf in [TfIndex::S1] {
-            absent_or_consistent(
-                "a second late downtime trade",
-                &p4,
-                (52, 56, &[]),
-                (STOCK, tf, tf.bucket_start(OPEN + 75)),
-            );
-        }
+        absent_or_consistent(
+            "a second late downtime trade",
+            &p4,
+            (52, 56, &[]),
+            (STOCK, tf, tf.bucket_start(OPEN + 75)),
+        );
         // The trade after the first one that traded past the listen time is
         // exact, and written.
         let key = (STOCK, TfIndex::S1, OPEN + 200);
@@ -5769,7 +5765,7 @@ mod tests {
             .count();
         let (withheld, carries) = agg.withhold_open_buckets();
         assert!(written.contains(&(TfIndex::M1, OPEN + 60)));
-        assert!(!written.iter().any(|w| *w == (TfIndex::M1, OPEN + 120)));
+        assert!(!written.contains(&(TfIndex::M1, OPEN + 120)));
         assert_eq!(withheld, open_before);
         assert!(withheld > 0);
         assert_eq!(carries, 0);
@@ -6525,8 +6521,7 @@ mod tests {
                 let all: Vec<Step> = head
                     .iter()
                     .chain(&tail)
-                    .cloned()
-                    .map(|s| Step { dropped: false, ..s })
+                    .map(|s| Step { dropped: false, ..*s })
                     .collect();
                 let live = fold(&all, false);
                 let (restarted, reach) = fold_restart(&head, &tail);
@@ -10374,14 +10369,11 @@ mod tests {
         // the first slot past the boot count before DT-A6).
         let slot_bytes = std::mem::size_of::<InstrumentSlot>();
         let reserved = slot_bytes * AGGREGATOR_MAX_SLOTS;
-        eprintln!(
-            "DT-A6: InstrumentSlot = {slot_bytes} B; slots reserved at the ceiling = \
-             {reserved} B ({:.1} MiB)",
-            reserved as f64 / (1024.0 * 1024.0)
-        );
         assert!(
             reserved <= 128 * 1024 * 1024,
-            "the ceiling pre-size must stay under 128 MiB of the 13 GiB budget"
+            "the ceiling pre-size must stay under 128 MiB of the 13 GiB budget; \
+             InstrumentSlot = {slot_bytes} B, reserved = {reserved} B ({:.1} MiB)",
+            reserved as f64 / (1024.0 * 1024.0)
         );
     }
 
@@ -10758,14 +10750,14 @@ mod tests {
         }
     }
 
-    /// ADVERSARIAL REGRESSION (2026-08-09, security review, HIGH).
-    ///
-    /// A hostile or malformed packet carrying an all-ones LTT must not be able
-    /// to shove the event-time watermark into the far future. Before the fix
-    /// the advance ran ahead of every gate, so one such packet — refused for
-    /// folding — still set the watermark to ~4.29 billion, and the next
-    /// catch-up cycle force-sealed every open bucket in the entire book with
-    /// incomplete OHLCV. Silent, whole-book, and unrecoverable (the watermark
+    // ADVERSARIAL REGRESSION (2026-08-09, security review, HIGH).
+    //
+    // A hostile or malformed packet carrying an all-ones LTT must not be able
+    // to shove the event-time watermark into the far future. Before the fix
+    // the advance ran ahead of every gate, so one such packet — refused for
+    // folding — still set the watermark to ~4.29 billion, and the next
+    // catch-up cycle force-sealed every open bucket in the entire book with
+    // incomplete OHLCV. Silent, whole-book, and unrecoverable (the watermark
 
     /// BITE TEST (2026-08-25) — the sentinel bypass of the timestamp band.
     ///
@@ -11125,6 +11117,7 @@ mod tests {
     ///       catch_up_seal_all_sweep_cost -- --ignored --nocapture
     #[test]
     #[ignore = "measurement harness, not a gate — see doc comment"]
+    #[allow(clippy::print_stdout)] // APPROVED: plan item 12b preserves calibration output; this ignored harness's printed timing is its result.
     fn catch_up_seal_all_sweep_cost_at_the_authorized_ceiling() {
         let cap = crate::candles::AGGREGATOR_MAX_SLOTS;
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, cap);
@@ -11178,6 +11171,7 @@ mod tests {
     ///       fold_cost_at_the_authorized_ceiling -- --ignored --nocapture
     #[test]
     #[ignore = "measurement harness, not a gate — see doc comment"]
+    #[allow(clippy::print_stdout)] // APPROVED: plan item 12b preserves calibration output; this ignored harness's printed timing is its result.
     fn fold_cost_at_the_authorized_ceiling() {
         let cap = crate::candles::AGGREGATOR_MAX_SLOTS;
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, cap);
@@ -11489,12 +11483,6 @@ mod tests {
             .get(&(OPEN + 3))
             .copied()
             .expect("the post-restart bucket must have been published");
-        println!(
-            "HOSTILE C: post-restart S1 bar volume={} net_volume_signed={} net_volume()={:?}",
-            t3.volume,
-            t3.net_volume_signed,
-            t3.net_volume()
-        );
         assert!(
             u64::try_from(t3.net_volume_signed.abs()).unwrap_or(u64::MAX) <= t3.volume,
             "net_volume_signed ({}) exceeds the bar's own volume ({}) — the \
@@ -11544,17 +11532,13 @@ mod tests {
             by_bucket.insert(start, st);
         }
         let t3 = by_bucket.get(&(OPEN + 3)).copied().expect("published");
-        println!(
-            "HOSTILE C2: volume={} net_signed={} net_volume()={:?}",
-            t3.volume,
-            t3.net_volume_signed,
-            t3.net_volume()
-        );
         assert_eq!(
             t3.net_volume(),
             Some(200),
             "the bar's only classified flow was +200 (a buy); the published \
-             net must not be negative"
+             net must not be negative; volume={}, net_signed={}",
+            t3.volume,
+            t3.net_volume_signed
         );
     }
 
@@ -11627,10 +11611,6 @@ mod tests {
             .get(&(OPEN + 5))
             .copied()
             .expect("the first post-restart bucket must have been published");
-        println!(
-            "HOSTILE C3: post-restart-no-open-bucket S1 bar volume={} tick_count={}",
-            t5.volume, t5.tick_count
-        );
         assert!(
             t5.tick_count > 0,
             "sanity: the bar must have seen ticks at all"
@@ -11658,7 +11638,8 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut violations: Vec<(Vec<(u32, u32, f32)>, TfIndex, u32, i64, u64)> = Vec::new();
+        type NetViolation = (Vec<(u32, u32, f32)>, TfIndex, u32, i64, u64);
+        let mut violations: Vec<NetViolation> = Vec::new();
         for _case in 0..3_000 {
             let n = 6 + (next() % 8) as usize;
             let mut seq: Vec<(u32, u32, f32)> = vec![(0, 1_000, 100.0)];
@@ -11769,12 +11750,6 @@ mod tests {
             by_bucket.insert(start, st);
         }
         let t2 = by_bucket.get(&(OPEN + 2)).copied().expect("published");
-        println!(
-            "HOSTILE D: bucket t2 volume={} net_signed={} net_volume()={:?}",
-            t2.volume,
-            t2.net_volume_signed,
-            t2.net_volume()
-        );
         assert!(
             u64::try_from(t2.net_volume_signed.abs()).unwrap_or(u64::MAX) <= t2.volume,
             "|net_volume_signed| ({}) exceeds the bar's own volume ({}) with no \
@@ -12030,11 +12005,11 @@ mod tests {
             let expected = u64::from(max_cum - first_cum);
             tally.record(s1, expected, &log);
         }
-        println!("HOSTILE CATCHUP FUZZ: {}", tally.summary());
         assert_eq!(
             (tally.over, tally.under),
             (0, 0),
-            "conservation broken under interleaved catch-up seals"
+            "conservation broken under interleaved catch-up seals: {}",
+            tally.summary()
         );
     }
 
@@ -12132,12 +12107,6 @@ mod tests {
             .iter()
             .filter(|(seq, _, _, _)| seq.windows(2).any(|w| w[1].1 < w[0].1))
             .count();
-        println!(
-            "HOSTILE FUZZ: {} failures / 4000. S1 over-reports (DOUBLE COUNT): {over}; \
-             S1 under-reports (LOSS): {under}. M1 over: {m1_over}; M1 under: {m1_under}. \
-             failures whose sequence contains a STALE (backwards) cumulative: {stale}",
-            failures.len()
-        );
         // Hoisted out of the `assert!` argument list. Inside it the chain is
         // evaluated only on failure, so it is dead text on every passing run —
         // and a six-line expression buried in a macro argument is the harder
@@ -12150,7 +12119,10 @@ mod tests {
             .join("\n");
         assert!(
             failures.is_empty(),
-            "{} of 4000 sequences failed conservation. First 3:\n{first_three}",
+            "{} of 4000 sequences failed conservation. S1 over-reports (DOUBLE COUNT): {over}; \
+             S1 under-reports (LOSS): {under}. M1 over: {m1_over}; M1 under: {m1_under}. \
+             Failures containing a STALE (backwards) cumulative: {stale}. \
+             First 3:\n{first_three}",
             failures.len()
         );
     }

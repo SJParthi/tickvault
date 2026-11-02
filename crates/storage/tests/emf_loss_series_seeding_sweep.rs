@@ -270,10 +270,10 @@ fn callees_receiving(body: &str, token: &str) -> Vec<String> {
             .into_iter()
             .rev()
             .collect();
-        if let Some(last) = seg.rsplit("::").next() {
-            if !last.is_empty() {
-                out.push(last.to_owned());
-            }
+        if let Some(last) = seg.rsplit("::").next()
+            && !last.is_empty()
+        {
+            out.push(last.to_owned());
         }
     }
     out.sort();
@@ -307,11 +307,7 @@ fn sources_define_a_seeding_ctor(body: &str, callee: &str) -> bool {
             continue;
         };
         let after = &f[site + "counter!(".len()..];
-        let first_arg = after
-            .split(|c| c == ',' || c == ')')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let first_arg = after.split([',', ')']).next().unwrap_or("").trim();
         let is_bare_ident = !first_arg.is_empty()
             && !first_arg.starts_with('"')
             && first_arg

@@ -236,6 +236,7 @@ fn coverage_lockdown_required_crates_are_listed() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn coverage_lockdown_pinned_floors_are_sane() {
     // The pins themselves must stay in (0, 100] and cover all 8 crates —
     // guards against a typo'd pin (e.g. 9.5 instead of 99.5) silently

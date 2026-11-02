@@ -5684,8 +5684,10 @@ mod tests {
     }
 
     fn archive_now(replay: &mut MidSessionReplay, probe: ReplayProbe, now: i64) -> ReplayOutcome {
-        let mut outcome = ReplayOutcome::default();
-        outcome.files_rewound = replay.observe_probe(probe, now);
+        let mut outcome = ReplayOutcome {
+            files_rewound: replay.observe_probe(probe, now),
+            ..ReplayOutcome::default()
+        };
         replay.archive_confirmed(&mut outcome);
         outcome
     }

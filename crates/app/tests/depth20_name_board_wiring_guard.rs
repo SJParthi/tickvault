@@ -525,6 +525,7 @@ fn the_per_socket_plan_drains_inside_one_steering_interval() {
 /// swaps one instrument per socket per minute, whose only use for the depth is
 /// the wedge signal, which a six-times-deeper queue delays six times longer.
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn depth200_keeps_its_shallow_queue_and_the_stack_picks_by_endpoint() {
     assert!(
         DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH < DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,

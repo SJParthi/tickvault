@@ -97,7 +97,7 @@ fn open_interest() -> impl Strategy<Value = u32> {
         // The absent sentinel: EVERY Ticker-mode packet carries it, and every
         // equity carries it always. Common in the feed, so common here.
         3 => Just(0u32),
-        7 => (1u32..5_000),
+        7 => 1u32..5_000,
     ]
 }
 

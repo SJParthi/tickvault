@@ -899,6 +899,7 @@ fn unpinned_action_lines(files: &[(String, String)], allow: &[&str]) -> Vec<Stri
 // the GitHub token) were pinned to movable tags, so whoever could move the
 // tag could run code with those credentials.
 #[test]
+#[allow(clippy::absurd_extreme_comparisons)] // APPROVED: the ceiling is 0 today, so `len() <= CEILING` reads as `is_empty()`; it is written against the constant so the check follows the ceiling it names.
 fn test_regression_every_remote_action_is_pinned_to_a_commit_sha() {
     assert!(
         UNPINNED_ACTION_ALLOWLIST.len() <= UNPINNED_ACTION_CEILING,

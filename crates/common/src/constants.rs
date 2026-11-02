@@ -3478,6 +3478,7 @@ mod market_hours_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
     fn test_muhurat_window_constants_pinned() {
         // CCL-06: 18:00 IST open, 19:30 IST close (exclusive), superset of the
         // announced NSE Muhurat windows.

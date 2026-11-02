@@ -5991,7 +5991,7 @@ mod tests {
             t0: tokio::time::Instant::now(),
             start_unix: day0().live_final_unix_secs + after_lf,
             progress: Box::new(|_| None),
-            drained: Box::new(|now| Some(now)),
+            drained: Box::new(Some),
             staged: Box::new(|_| 0),
             wal: Box::new(|_| Some(vec![wal_row(7, 7)])),
             wal_reads: std::cell::Cell::new(0),

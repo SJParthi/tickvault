@@ -19,6 +19,43 @@ fi
 VIOLATIONS=0
 REPORT=""
 
+# Preserve the same eligible files, but classify each path only once.
+ELIGIBLE_FILES=""
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  full_path="$PROJECT_DIR/$file"
+  [ ! -f "$full_path" ] && continue
+
+  # Skip binary files and lock files
+  if echo "$file" | grep -qE '\.(lock|png|jpg|gif|ico|woff|woff2|ttf|eot)$'; then
+    continue
+  fi
+
+  # Skip CI workflows that contain detection patterns (not real secrets)
+  if echo "$file" | grep -qE '(secret-scan|security-audit)\.yml$'; then
+    continue
+  fi
+
+  # Skip this scanner itself (contains secret patterns as detection rules)
+  if echo "$file" | grep -qE 'secret-scanner\.sh$'; then
+    continue
+  fi
+
+  # Only scan relevant file types for secrets (including .sh and extensionless like Dockerfile)
+  basename_file=$(basename "$file")
+  if ! echo "$file" | grep -qE '\.(rs|toml|json|yml|yaml|cfg|conf|ini|properties|sh|env|txt)$' && \
+     ! echo "$basename_file" | grep -qiE '^(Dockerfile|Makefile|Justfile|Procfile)$'; then
+    continue
+  fi
+
+  # Skip test files entirely (test fixtures may have fake secrets)
+  if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/fixtures/)'; then
+    continue
+  fi
+
+  ELIGIBLE_FILES="${ELIGIBLE_FILES}${file}"$'\n'
+done <<< "$STAGED_FILES"
+
 scan_secret() {
   local pattern="$1"
   local description="$2"
@@ -27,38 +64,33 @@ scan_secret() {
     [ -z "$file" ] && continue
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
-
-    # Skip binary files and lock files
-    if echo "$file" | grep -qE '\.(lock|png|jpg|gif|ico|woff|woff2|ttf|eot)$'; then
-      continue
-    fi
-
-    # Skip CI workflows that contain detection patterns (not real secrets)
-    if echo "$file" | grep -qE '(secret-scan|security-audit)\.yml$'; then
-      continue
-    fi
-
-    # Skip this scanner itself (contains secret patterns as detection rules)
-    if echo "$file" | grep -qE 'secret-scanner\.sh$'; then
-      continue
-    fi
-
-    # Only scan relevant file types for secrets (including .sh and extensionless like Dockerfile)
-    local basename_file
-    basename_file=$(basename "$file")
-    if ! echo "$file" | grep -qE '\.(rs|toml|json|yml|yaml|cfg|conf|ini|properties|sh|env|txt)$' && \
-       ! echo "$basename_file" | grep -qiE '^(Dockerfile|Makefile|Justfile|Procfile)$'; then
-      continue
-    fi
-
-    # Skip test files entirely (test fixtures may have fake secrets)
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/fixtures/)'; then
-      continue
-    fi
+    # Most file/pattern pairs have no hit; do not start the filter pipeline.
+    grep -qiE -- "$pattern" "$full_path" 2>/dev/null || continue
 
     # -E (ERE) is required: several patterns use {N}/{N,} quantifiers which
     # are literal text under plain grep (BRE) and would never match — e.g.
     # the AWS Access Key ID pattern AKIA[0-9A-Z]{16}.
+    # 2026-08-10 SECURITY FIX (audit item 8). The exclusions before sed below
+    # match the RAW line, because those exclusions are deliberately
+    # comment-scoped ('// test', '/// ', '#[doc', '#[cfg(test)]') or are code
+    # identifiers. The exclusions after sed are bare English words; those were
+    # being matched against the whole line too — so a REAL secret was excused
+    # by a word in a trailing comment.
+    #
+    # PROVEN before the fix: access_token = "AAAA1111BBBB2222CCCC3333" was
+    # CAUGHT bare, and reported CLEAN with '// stub for tests' appended. Same
+    # secret, same file — one comment defeated the scanner, locally AND in the
+    # CI lane that reuses this script.
+    #
+    # Genuine fixtures do NOT depend on these words: test paths are already
+    # excluded wholesale above (/tests/, _test.rs, /test_, _tests.rs,
+    # /benches/, /fixtures/), so this layer only ever governed PRODUCTION
+    # files, where a real secret must never be excused by a comment.
+    #
+    # The strip is deliberately conservative: '//' is ignored when preceded by
+    # ':' so URLs (https://...) are never truncated, and '#' only counts as a
+    # comment when preceded by whitespace so URL fragments survive. Both
+    # choices fail toward MORE detection, never less.
     local matches
     matches=$(grep -n -i -E "$pattern" "$full_path" 2>/dev/null \
       | grep -v 'secret-scan-ignore' \
@@ -76,27 +108,6 @@ scan_secret() {
       | grep -v 'fetch_ssm_secret' \
       | grep -v 'rotate_secret' \
       | grep -v '_SECRET: &str' \
-      `# 2026-08-10 SECURITY FIX (audit item 8). Everything ABOVE this line is` \
-      `# matched against the RAW line, because those exclusions are deliberately` \
-      `# comment-scoped ('// test', '/// ', '#[doc', '#[cfg(test)]') or are code` \
-      `# identifiers. Everything BELOW is a bare English word, and those were` \
-      `# being matched against the whole line too — so a REAL secret was excused` \
-      `# by a word in a trailing comment.` \
-      `#` \
-      `# PROVEN before the fix: access_token = "AAAA1111BBBB2222CCCC3333" was` \
-      `# CAUGHT bare, and reported CLEAN with '// stub for tests' appended. Same` \
-      `# secret, same file — one comment defeated the scanner, locally AND in the` \
-      `# CI lane that reuses this script.` \
-      `#` \
-      `# Genuine fixtures do NOT depend on these words: test paths are already` \
-      `# excluded wholesale above (/tests/, _test.rs, /test_, _tests.rs,` \
-      `# /benches/, /fixtures/), so this layer only ever governed PRODUCTION` \
-      `# files, where a real secret must never be excused by a comment.` \
-      `#` \
-      `# The strip is deliberately conservative: '//' is ignored when preceded by` \
-      `# ':' so URLs (https://...) are never truncated, and '#' only counts as a` \
-      `# comment when preceded by whitespace so URL fragments survive. Both` \
-      `# choices fail toward MORE detection, never less.` \
       | sed -E 's@([^:])//.*$@\1@; s@[[:space:]]+#.*$@@' \
       | grep -v 'REDACTED' \
       | grep -v 'placeholder' \
@@ -120,7 +131,7 @@ scan_secret() {
         VIOLATIONS=$((VIOLATIONS + 1))
       done <<< "$matches"
     fi
-  done <<< "$STAGED_FILES"
+  done <<< "$ELIGIBLE_FILES"
 }
 
 echo "=== Secret Scanner ===" >&2

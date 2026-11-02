@@ -2935,7 +2935,7 @@ mod tests {
                     InstrumentClass::IndexOption,
                     "NSE",
                     "NIFTY",
-                    2026_09_24,
+                    20260924,
                     strike,
                     leg,
                 ));
@@ -2943,7 +2943,7 @@ mod tests {
             }
         }
         // Room for three strikes' worth of legs.
-        let sel = select_contract_universe(&rows, &HashMap::new(), 2026_08_26, 6);
+        let sel = select_contract_universe(&rows, &HashMap::new(), 20260826, 6);
         assert_eq!(sel.instruments.len(), 6);
         let kept: Vec<i64> = sel
             .instruments
@@ -2989,7 +2989,7 @@ mod tests {
         }
     }
 
-    const TODAY: u32 = 2026_08_19;
+    const TODAY: u32 = 20260819;
 
     fn no_spot() -> HashMap<String, i64> {
         HashMap::new()
@@ -3032,7 +3032,7 @@ mod tests {
                 InstrumentClass::IndexFuture,
                 "NSE",
                 "NIFTY",
-                2026_09_24,
+                20260924,
                 0,
                 OptionLeg::None,
             ),
@@ -3041,7 +3041,7 @@ mod tests {
                 InstrumentClass::StockFuture,
                 "NSE",
                 "RELIANCE",
-                2026_10_29,
+                20261029,
                 0,
                 OptionLeg::None,
             ),
@@ -3075,7 +3075,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -3084,7 +3084,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -3095,7 +3095,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "NIFTY",
-            2026_09_24,
+            20260924,
             24_000,
             OptionLeg::Call,
         ));
@@ -3114,7 +3114,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "FINNIFTY",
-            2026_08_28,
+            20260828,
             24_000,
             OptionLeg::Call,
         )];
@@ -3143,7 +3143,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 underlying,
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -3152,7 +3152,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 underlying,
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -3370,7 +3370,7 @@ mod tests {
     fn atm_window_reason_is_applied_only_when_a_window_really_was() {
         let rows = stock_ladder("RELIANCE");
         let mut prices = HashMap::new();
-        prices.insert("RELIANCE".to_string(), 1_000_00i64);
+        prices.insert("RELIANCE".to_string(), 100_000i64);
         let sel = select_contract_universe(&rows, &prices, TODAY, 25_000);
         assert!(sel.stock_options > 0, "the fixture must actually select");
         assert_eq!(sel.atm_window_reason, "applied");
@@ -3399,7 +3399,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "TINY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -3408,7 +3408,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "TINY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -3473,7 +3473,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -3482,7 +3482,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -3514,7 +3514,7 @@ mod tests {
                     InstrumentClass::IndexOption,
                     "NSE",
                     "NIFTY",
-                    2026_08_28,
+                    20260828,
                     strike,
                     leg,
                 ));
@@ -3758,8 +3758,8 @@ mod tests {
         }
     }
 
-    /// The emit wrappers must be callable with no recorder installed — which
-    /// is the state in every unit test and in the seconds before boot Step 3.
+    // The emit wrappers must be callable with no recorder installed — which
+    // is the state in every unit test and in the seconds before boot Step 3.
 
     /// `gave_up` must be pre-registered like every other reason, or the ONE
     /// increment it will ever make in a session is eaten as the CloudWatch
@@ -3856,7 +3856,7 @@ mod tests {
             InstrumentClass::IndexFuture,
             "NSE",
             "NIFTY",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         )];
@@ -3909,7 +3909,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "MCX",
             "GOLD",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         )];
@@ -3934,7 +3934,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 24_000,
                 OptionLeg::Call,
             ),
@@ -3943,7 +3943,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 24_000,
                 OptionLeg::Put,
             ),
@@ -3952,7 +3952,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 24_100,
                 OptionLeg::Call,
             ),
@@ -3961,7 +3961,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 24_100,
                 OptionLeg::Put,
             ),
@@ -4003,7 +4003,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -4012,7 +4012,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -4023,7 +4023,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "BSE",
             "SENSEX",
-            2026_08_28,
+            20260828,
             80_000,
             OptionLeg::Call,
         ));
@@ -4060,7 +4060,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_28,
+                20260828,
                 0,
                 OptionLeg::Call,
             ),
@@ -4069,7 +4069,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_28,
+                20260828,
                 1000,
                 OptionLeg::None,
             ),
@@ -4127,7 +4127,7 @@ mod tests {
             InstrumentClass::IndexFuture,
             "NSE",
             "NIFTY",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         ));
@@ -4164,7 +4164,7 @@ mod tests {
             InstrumentClass::StockOption,
             "NSE",
             "RELIANCE",
-            2026_08_28,
+            20260828,
             1_234,
             OptionLeg::Put,
         )]);
@@ -4212,7 +4212,7 @@ mod tests {
                     InstrumentClass::IndexOption,
                     "NSE",
                     "NIFTY",
-                    2026_08_28,
+                    20260828,
                     24_500,
                     OptionLeg::Call,
                 )
@@ -4224,7 +4224,7 @@ mod tests {
                     InstrumentClass::StockOption,
                     "NSE",
                     "RELIANCE",
-                    2026_08_28,
+                    20260828,
                     3_000,
                     OptionLeg::Call,
                 )
@@ -4305,7 +4305,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "NIFTY",
-            2026_08_20,
+            20260820,
             24_000,
             OptionLeg::Call,
         )];
@@ -4316,7 +4316,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Call,
             ));
@@ -4325,7 +4325,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Put,
             ));
@@ -4348,7 +4348,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Call,
             ));
@@ -4357,7 +4357,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Put,
             ));
@@ -4378,7 +4378,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_18,
+                20260818,
                 0,
                 OptionLeg::None,
             ),
@@ -4387,7 +4387,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_01,
+                20260801,
                 0,
                 OptionLeg::None,
             ),
@@ -4405,7 +4405,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         )];
@@ -4499,8 +4499,8 @@ mod tests {
             Some("RELIANCE-BSE")
         );
         // Same numeric id on a derivative segment: absent, never borrowed.
-        assert!(labels.get(&(13, "NSE_FNO")).is_none());
-        assert!(labels.get(&(77, "MCX_COMM")).is_none());
+        assert!(!labels.contains_key(&(13, "NSE_FNO")));
+        assert!(!labels.contains_key(&(77, "MCX_COMM")));
     }
 
     #[test]
@@ -4721,7 +4721,7 @@ mod tests {
                 InstrumentClass::IndexFuture,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 0,
                 OptionLeg::None,
             ),
@@ -4730,7 +4730,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_28,
+                20260828,
                 1_000,
                 OptionLeg::Put,
             ),
@@ -4781,7 +4781,7 @@ mod tests {
                         InstrumentClass::StockOption,
                         "NSE",
                         &underlying,
-                        2026_08_28,
+                        20260828,
                         strike,
                         leg,
                     ));
@@ -4795,7 +4795,7 @@ mod tests {
                 InstrumentClass::StockFuture,
                 "NSE",
                 &underlying,
-                2026_08_28,
+                20260828,
                 0,
                 OptionLeg::None,
             ));
@@ -4921,7 +4921,7 @@ mod spot_backstop_tests {
             "at the floor is fresh"
         );
         assert!(
-            rows.prices.get(&(2, 1)).is_none(),
+            !rows.prices.contains_key(&(2, 1)),
             "one microsecond before is stale"
         );
         assert_eq!(rows.prices.get(&(3, 1)), Some(&30_000));

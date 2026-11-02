@@ -3898,7 +3898,7 @@ mod tests {
             "the budget must exceed the minimum time the rate limit imposes"
         );
 
-        let mut bad = c.clone();
+        let mut bad = c;
         bad.live_read_timeout_secs = bad.run_budget_secs;
         assert!(
             bad.validate().is_err(),
@@ -5624,7 +5624,7 @@ mod tests {
             let cmp = unscoped(&live, &rest, inputs);
             assert_eq!(cmp.missing_live_late, 2, "{inputs:?}");
             // The zero-volume equity minute is never real and never excused.
-            assert_eq!(cmp.missing_live_zero_volume >= 1, true);
+            assert!(cmp.missing_live_zero_volume >= 1);
         }
         let cmp = unscoped(&live, &rest, excuse_inputs(None));
         assert_eq!(cmp.late_excused, 2);

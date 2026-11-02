@@ -178,7 +178,7 @@ fn strip_line_comments_keeping(body: &str, keep: &str) -> String {
     body.lines()
         .filter(|l| {
             let t = l.trim_start();
-            !(t.starts_with("//") && !l.contains(keep))
+            !t.starts_with("//") || l.contains(keep)
         })
         .collect::<Vec<_>>()
         .join("\n")

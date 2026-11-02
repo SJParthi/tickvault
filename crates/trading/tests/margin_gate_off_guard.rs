@@ -64,6 +64,7 @@ fn toml_section<'a>(content: &'a str, header: &str) -> &'a str {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn test_margin_gate_rest_master_lock_const_is_false() {
     // The compiled truth: the master lock holds.
     assert!(

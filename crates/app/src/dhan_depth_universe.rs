@@ -1669,6 +1669,7 @@ mod tests {
     /// release mode; both would be faster.
     #[test]
     #[ignore = "wall-clock measurement, run on demand"]
+    #[allow(clippy::print_stdout)] // APPROVED: #[ignore]d measurement harness run with --nocapture; the printed figure is its only output.
     fn select_depth_universe_cost_at_the_authorized_ceiling() {
         // 220 F&O underlyings, 100 strikes each, both legs = 44,000 rows.
         let mut rows: Vec<DepthCandidate> = Vec::with_capacity(44_000);
