@@ -889,6 +889,30 @@ pub fn finish_live_universe_widen(truncated: bool, subscribed: usize) {
 static LAST_TODAYS_LIST: std::sync::Mutex<Option<(String, Vec<SubscribeInstrument>)>> =
     std::sync::Mutex::new(None);
 
+/// Whether a widen read today's list for `date_ist` and has not finished, so
+/// the day record may lack instruments already placed on the wire (plan item
+/// 51f, review round 1): the 1-minute cross-check then reports its coverage
+/// unknown instead of judging a record it cannot trust. One lock, O(1), once
+/// per check.
+#[must_use]
+pub fn widen_unfinished_for(date_ist: chrono::NaiveDate) -> bool {
+    held_list_is_for(
+        LAST_TODAYS_LIST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+        date_ist,
+    )
+}
+
+/// Whether a kept list was read for `date_ist`. Pure, O(1).
+fn held_list_is_for(
+    held: Option<&(String, Vec<SubscribeInstrument>)>,
+    date_ist: chrono::NaiveDate,
+) -> bool {
+    held.is_some_and(|(d, _)| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") == Ok(date_ist))
+}
+
 /// Records the list the widen just finished as subscribed now, in the day's
 /// cross-check record (plan item 51e). A widen that finished short records
 /// the whole list (see the record module's honest limits). A failed write is
@@ -906,6 +930,16 @@ fn record_widened_list_for_crossverify(truncated: bool) {
         return;
     };
     let secs = crate::xverify_day_record::ist_secs_of_day_now();
+    // The daily recorder also writes it into each later day's record while
+    // this process lives, and retries a failed write at this second, never
+    // earlier (§12.15.13, review round 3).
+    crate::xverify_day_record::note_process_held(
+        crate::xverify_day_record::HeldOrigin::Widen,
+        &list,
+        crate::xverify_day_record::UniverseBasis::MasterList,
+        date,
+        secs,
+    );
     match crate::xverify_day_record::record_spot_subscribed(
         date,
         &list,
@@ -919,15 +953,21 @@ fn record_widened_list_for_crossverify(truncated: bool) {
             truncated,
             "today's widened spot list recorded for the 1-minute cross-check"
         ),
-        Err(err) => tracing::warn!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            source = "xverify_day_record_write_failed",
-            %date,
-            %err,
-            instruments = list.len(),
-            "could not save today's widened spot list for the 1-minute cross-check; the \
-             check covers only what its day record holds, and reports the shortfall"
-        ),
+        Err(err) => {
+            // Review round 2: the daily recorder retries the held sets, and
+            // until one write of all of them lands the check reads this day's
+            // coverage as unknown.
+            crate::xverify_day_record::note_record_write_failed(date);
+            tracing::warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_day_record_write_failed",
+                %date,
+                %err,
+                instruments = list.len(),
+                "could not save today's widened spot list for the 1-minute cross-check; it is \
+                 retried, and until it lands the day's coverage reads unknown"
+            );
+        }
     }
 }
 
@@ -3772,6 +3812,25 @@ mod tests {
         record_widen_list_overdue(865);
         assert_eq!(live_universe_degraded_reason(), Some("no_usable_widening"));
         LIVE_UNIVERSE_DEGRADED.store(0, Ordering::Relaxed);
+    }
+
+    /// Review round 1 (51f): a list read for the day and not yet taken by a
+    /// finished widen marks the day's coverage unknown; another day's list,
+    /// or none, does not.
+    #[test]
+    fn widen_unfinished_for_reads_only_the_kept_list_of_that_day() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).expect("date");
+        let other = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+        let kept = ("2026-11-02".to_owned(), Vec::new());
+        assert!(held_list_is_for(Some(&kept), day));
+        assert!(!held_list_is_for(Some(&kept), other));
+        assert!(!held_list_is_for(None, day));
+        let garbled = ("not-a-date".to_owned(), Vec::new());
+        assert!(!held_list_is_for(Some(&garbled), day));
+        // The live slot: no widen in this test process read a list for 1999.
+        assert!(!widen_unfinished_for(
+            chrono::NaiveDate::from_ymd_opt(1999, 1, 1).expect("date")
+        ));
     }
 
     /// The overdue page uses the reason a fresh boot uses for a missing list,

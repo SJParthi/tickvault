@@ -43,6 +43,10 @@ pub mod muhurat_window;
 pub mod operator_control;
 pub mod operator_control_action_commands;
 pub mod operator_control_commands;
+// Share the std+serde-only wire schema without linking the application's common crate.
+pub mod operator_movers;
+#[path = "../../common/src/operator_movers_wire.rs"]
+pub mod operator_movers_wire;
 pub mod qdb_console_front;
 pub mod qdb_console_proxy;
 pub mod start_watchdog;
@@ -50,3 +54,8 @@ pub mod telegram_webhook;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod time;
+
+#[path = "../../common/src/operator_stock_movers_wire.rs"]
+pub mod operator_stock_movers_wire;
+
+pub mod operator_stock_movers;

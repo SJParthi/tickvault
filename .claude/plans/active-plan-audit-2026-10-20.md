@@ -1,5 +1,18 @@
 # Implementation Plan: 2026-10-20 seven-agent code audit fixes
 
+## Preserved #2152 continuation — 2026-10-31
+
+The user authorized resuming the preserved speed/health dashboard on green
+#2158, with honest strict-target UNKNOWN/failure states. Its scoped design,
+edge cases, failure modes, tests, rollback and observability are maintained in
+[`speed-2152-resume.md`](speed-2152-resume.md). This child plan belongs to this
+active audit plan; no unrelated active plan is archived to make room for it.
+The continuation preserves original #2152 history and proceeds only to a
+reviewed, native-gated draft PR; it does not merge, deploy, publish environment
+configuration, or repeat withheld probe/fuzz work. Runtime/coverage/session
+limitations remain explicit. The child plan cross-references the mandatory
+15-row and 7-row matrices and records scope-specific validation, not guarantees.
+
 **Status:** IN_PROGRESS
 **Date:** 2026-10-20
 **Approved by:** Parthiban, 2026-10-20: "Dee fic everything dude I need zero defects zero errors dude"
@@ -12,6 +25,127 @@ reconnect paths, build run, branch check). One PR per lettered group, serially
 Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-core` (crates/core), `tickvault-storage`
 (crates/storage), `tickvault-common` (crates/common/tests guards), `tickvault-trading`
 (crates/trading, risk only; indicator/ and strategy/ need their own §28 approval).
+
+## 2026-10-31: resumed security and order telemetry integration
+
+**Scope status:** IN_PROGRESS — local workspace checks passed; publication and merge pending.
+**Authorization:** the user's renewed instruction to resume paused work, relayed
+by the coordinator on 2026-10-31, explicitly names these three previously tested
+patches. This records existing session authorization; it does not invent a new
+exception, authorize a live recovery, or approve a deployment.
+
+Base: `0fd844582cbdac209f54e4394459b799f2ba797a`. Isolated independent checkout:
+`/tmp/tickvault-integrate-security`, branch `security/recovery-scanner-order-gauge`.
+The original checkout, original branches and saved component patches stay intact.
+This scope uses the existing active plan because the repository already has five
+active plans; no unrelated plan is archived and no plan ceiling is increased.
+
+### Design
+
+MOV1: `compute_for_list` no longer returns early when closed. Closed → window `closed_session_window(now)` and an upper bound `ts <=` in the SQL; open → unchanged 15-minute live read. The wire validators accept `closed` with priced rows.
+
+Integrate exactly the reviewed FORCE_DISK normalization, secret-scanner output
+redaction and order-update active-gauge lifetime fixes. Normalize the workflow's
+remote-template value to literal yes/no while preserving every existing market
+and Muhurat gate. Report scanner category/path/line while omitting matched source;
+retain every detection/filter/exit policy. Make a private Rust scope guard own the
+connected order socket's existing gauge through login/read and every future drop.
+Use the small borrowed session struct and generic in-memory transport boundary
+already validated in the component proposal; add no new lint exemption.
+
+Guarantee matrix: cross-reference the full 15-row and 7-row matrix in
+`.claude/rules/project/per-wave-guarantee-matrix.md`. For this scope, security is
+the three behavioral boundaries above; performance is constant work at connection
+entry/drop, not a per-frame addition; schemas, financial arithmetic, persistence,
+dependency pins, runtime ownership and alarm policy are unchanged. No universal
+coverage, losslessness, strict latency or future production guarantee is claimed.
+
+### Edge Cases
+
+MOV1: before 09:15, weekend or holiday → empty `closed`; a stock with no trade that day is simply absent (counted as unpriced); a query failure after the close reads `unreachable` / `query_failed`, never `closed`.
+
+
+Only exact lowercase yes opts into FORCE_DISK; empty, malformed and shell/sed
+metacharacter inputs become no. A scanner detection still blocks even if its
+matching line begins with a credential, contains colons or is short. Clean input
+still succeeds. The order gauge must clear after login-write error, dropping a
+pending login at the test deadline, task abort, unwind and sequential sessions. It stays one during
+a live connected session. Release panic=abort cannot execute destructors; process
+termination and overlapping independent sockets are outside the tested contract.
+
+### Failure Modes
+
+MOV1: the whole-session read is slower than the 15-minute live read; it gets its own 8 s timeout (measured ~4 s round trip incl. portal on 2026-11-03, 743 NSE_EQ stocks), under the helper's 12 s capture bound.
+
+
+Patch drift must be resolved without copying an older workflow over the newer
+Muhurat logic. The scanner must not weaken a regex, exclusion or blocking exit to
+hide output. The gauge fix must not alter login, authentication, reconnect,
+watchdog or message handling. Missing external build resources leave validation
+pending; earlier component tests are evidence for those snapshots, not a pass on
+this integration. Source preparation runs no recovery, service, broker or AWS call.
+
+### Test Plan
+
+MOV1: api unit tests for the window, the SQL upper bound, closed-with-rows, closed-empty and closed-failure; portal content pin re-pinned for the message text.
+
+
+- [ ] S1. Normalize the actual workflow substitution and retain a Rust behavioral guard.
+  - Files: .github/workflows/emergency-fs-recover.yml, crates/common/tests/github_workflow_guard.rs
+  - Tests: emergency_fs_recover_normalises_force_disk_input
+- [ ] S2. Omit source snippets from scanner reports while preserving detection.
+  - Files: .claude/hooks/secret-scanner.sh, crates/common/tests/secret_scanner_redaction.rs
+  - Tests: secret_scanner_blocks_credentials_without_printing_source, secret_scanner_still_accepts_clean_input
+- [ ] S3. Own the active gauge for the complete connected order session.
+  - Files: crates/core/src/websocket/order_update_connection.rs, crates/core/src/websocket/order_update_connection/tests.rs
+  - Tests: test_regression_order_update_active_gauge_login_send_error, test_regression_order_update_active_gauge_login_timeout, test_regression_order_update_active_gauge_task_abort, test_regression_order_update_active_gauge_unwind, test_regression_order_update_active_gauge_sequential_sessions
+
+Local validation on this exact base: eight focused positives; seven intended
+original-behavior regression failures, followed by restored positives; 100 common
+guards, 27 lifecycle guards and 118 order-connection tests; all-target workspace
+Clippy with warnings denied; full workspace 15,441 passed, zero failed, 33 existing
+ignores; 11 dedicated Loom tests. That full-workspace run precedes the final
+test-module packaging below; production source is byte-identical. Commands used
+Rust 1.95.0, offline/locked, one build job and one test thread.
+The first workspace attempt could not bind sandbox loopback sockets. The permitted
+rerun exposed the production-panic guard's classification of the external fixture
+filename. The fixture moved to canonical `tests.rs`. The native banned-pattern
+scanner then required the real test boundary to be visible inside that file, so
+the fixture now also sits in an explicit `#[cfg(test)] mod tests`. Its body is
+byte-identical after removing indentation and adjusting the parent-import depth;
+all assertions and production logic are unchanged. No guard or allowlist changed.
+After the final wrapper, all five lifecycle tests pass, original behavior fails
+all five, and restored behavior passes all five again; 63 panic/Rust-only/shell/
+source-size guard tests and workspace all-targets Clippy pass. The actual banned
+scanner now passes too. Earlier failures remain recorded in external artifacts.
+
+Independent source review found no blocker, including the canonical test-layout
+follow-up. Normal commit/push gates precede publication;
+record their actual results and any optional-tool skips in the PR. Keep logs
+bounded and never print matched secret source. S1–S3 remain open as merge-completion
+items; their local implementation and tests are complete. The draft targets `main`
+for required CI, explicitly depends on unmerged #2158, and gives reviewers the
+focused `0fd844582..HEAD` range. Do not bypass hooks, merge, auto-merge or deploy.
+
+### Rollback
+
+MOV1: revert the PR; the page goes back to a blank table after the close. No data, schema or AWS change.
+
+
+Each component can be reverted through ordinary reviewed Git changes if needed;
+reverting any one reintroduces its documented bug, so assess that consequence.
+There is no infrastructure, deployment, credential rotation or live rollback in
+this task. The original saved component patches remain available outside Git.
+
+### Observability
+
+MOV1: no new metric; the page meta line shows the newest stored tick time and its age.
+
+
+No new metric or alarm is added. `tv_order_update_ws_active` now returns to zero
+when its connected future exits or is dropped. Scanner findings retain their
+category, path, line and blocking status without source content. Workflow recovery
+behavior is only reviewed/tested on inert templates; no real recovery is run.
 
 ## Plan Items
 
@@ -545,7 +679,7 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 - [x] C1. A spilled hour is set aside by the age of its END and gets a second
   evening; an unparseable spill name no longer holds every partition's archive.
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/partition_archive.rs
-  - Tests: test_spill_file_older_than_measures_a_top_volume_spill_from_the_hour_end,
+  - Tests: test_spill_file_older_than_counts_from_the_hour_end_and_saturates,
     test_unparseable_spill_name_does_not_hold_every_partition,
     test_undated_top_volume_spill_file_is_set_aside
 
@@ -764,7 +898,7 @@ attack (adversarially verified). Implemented in parallel on sub-branches
   every CREATE TABLE literal (dated allowlist for the two scratch tables).
   - Files: crates/app/src/order_observability.rs, crates/app/src/dhan_rest_stack.rs, crates/storage/tests/
   - Note (2026-10-28): the J3 lifecycle half lived in the app lifecycle writer module, DELETED by owner Quote 44 with the daily lifecycle write (PR N below); the J3 ensure-and-hold pin was replaced by the no-writer guard.
-  - Tests: ensure-wiring source guard; create_table_has_dedup guard
+  - Tests: ensure-wiring source guard; every_create_table_carries_a_dedup_key guard
 - [x] J4 (core, api) Order-update WebSocket connects with explicit bounded
   limits; the connect-config guard scans every `connect_async*` site; the error
   summary writer streams and bounds its read; the ping/pong counter uses
@@ -862,7 +996,7 @@ rule (808 park, $75 stop, token self-heal and frame-silence `act` stay as they a
   `tv_hot_path_stage_p99_ns{stage}` (and p50, p999) on local `/metrics` only,
   and log one coded `warn!` per episode when a stage's p99 passes its budget;
   plus a Criterion bench reading p99 from samples for the drain stage.
-  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches (existing bench file for the drain)
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/benches/ (existing bench file for the drain)
   - Tests: quantile maths against a known distribution (empty, one bucket, top bucket), DHAT on record_stage_nanos unchanged, episode latch once
 
 - [x] K6 (app, storage, quality) Drain p99 tail (owner, 2026-10-26: "Always
@@ -980,7 +1114,7 @@ fields, 10,186 live minutes missing, 45 traded) and the timeframe check found
   every attempt until 09:30 (find whether any subscribed or ranked contract
   loses its underlying, fix if so); two QuestDB console Lambda log groups
   keep logs forever (set retention).
-  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/ws_frame_spill.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/contract_underlying_map.rs, deploy/aws/terraform/
   - Tests: DHAT on the socket path unchanged; regression test per change
   - Done 2026-10-26: the WAL writer polls for 50 ms after its last record (1 ms sleep) before its blocking wait, so the reader no longer pays a futex wake per frame (harness: WAL hand-off max 4.0 ms -> 22 us, 0 over budget; frames reach the WAL file up to about 1 ms later); the reserved-connections gauge follows the widen; contract-map refusals are counted only for subscribed contracts (none lose their underlying); the two QuestDB console log groups get 14-day retention in terraform (not applied, not validated locally). Live confirmation waits for the next session.
 
@@ -1042,7 +1176,7 @@ Approved by: owner Quote 44 (2026-10-28), recorded in the daily-universe rule fi
   path, one bounded pass at a time with a queued rerun; the 7-day sweep deletes
   a file (and a `.json.tmp` leftover) only after a verified copy exists.
   - Files: crates/app/src/instrument_snapshot_upload.rs, crates/app/src/dhan_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
-  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_build_once_counts_the_sweep_held_files_on_the_held_counter, the_snapshot_copy_uses_the_configured_cold_bucket
+  - Tests: test_run_snapshot_pass_copies_verifies_and_marks_then_skips_without_network, test_run_snapshot_pass_sends_different_bytes_to_a_sidecar_never_over_the_first, test_run_bounded_snapshot_pass_ends_a_hung_pass_as_a_counted_failure, test_run_snapshot_pass_stops_after_three_s3_timeouts_in_a_row, test_drive_snapshot_passes_runs_once_more_for_a_request_during_a_pass, test_claim_or_queue_pass_queues_a_rerun_and_counts_the_skip, test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy, test_sweep_artifacts_after_verified_copies_counts_the_held_files, the_snapshot_copy_uses_the_configured_cold_bucket
 - [x] N3 (app) The 31 Oct wipe keeps every object under `instrument-snapshots/`.
   - Files: (crates/app/src/wipe_2026_10_31.rs, deleted 2026-10-29 after the 28 Oct run, commit 72f55c66b)
   - Tests: (test_classify_s3_key_keeps_every_instrument_snapshot, deleted 2026-10-29 with the tool)
@@ -1232,9 +1366,11 @@ Requested: owner brief relayed to this session on 2026-10-30 ("yes add the fno s
 
 Requested: owner, 2026-10-30, relayed by the coordinator session ("O(1) at p99 everywhere", "use only max"). Scope: find every per-event path (tick, frame, seal, order, request, alert) that is not O(1) or allocates and is not in CLAUDE.md's non-O(1) table; fix it in files no other session owns with byte-identical output, else add an honest row. No new page, alarm, EMF name, config switch or cost change. Design, failure modes, rollback and observability for these edits follow the plan sections below: each fix is local, keeps every outcome and written byte unchanged, and reverts with one commit.
 
-- [x] O1S1. Seal escalation fault path: constant record length for the floor, per-episode spill/DLQ failure lines (`FailureEpisode`), literal blind-probe label; seal writer keeps its rescue buffer across cycles (`drain_once_into`)
+Reconciliation 2026-10-31: the current base already keeps the rescue scratch buffer through `drain_once_reusing` / `drain_scratch` and prefaults the production ring. Preserve those canonical paths and their existing tests, add this branch's episode accounting and comparison assertions, and retain the original branch history. Validation on 2026-10-31: 319 distinct focused storage/core/API/common cases passed, including the seal and Telegram DHAT ratchets; each of five isolated negative controls failed its intended assertion and passed after exact restoration. The restored absorption/coalescer modules then passed 70 repeated cases, and workspace all-targets Clippy passed with warnings denied. These repeated cases are not added to the distinct total. The live-flush rearm requires a nonzero pending-row count before a successful synchronous HTTP send: refused-only empty flushes and failed nonempty flushes leave the episode open. HTTP acceptance does not prove WAL application, power-loss durability or recovery of the failed disk tier. No new timing measurement was performed; committed-head full tests, normal publication gates and CI remain pending.
+
+- [x] O1S1. Seal escalation fault path: constant record length for the floor, per-episode spill/DLQ failure lines (`FailureEpisode`), literal blind-probe label; seal writer keeps its rescue buffer across cycles (`drain_once_reusing`)
   - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs
-  - Tests: test_failure_episode_opens_once_and_closes_with_its_count, test_repeated_spill_failures_keep_every_outcome_and_latch_one_episode, test_floor_payload_constant_equals_the_serialised_record_length, test_blind_probe_tier_label_literal_matches_the_const, test_drain_once_into_matches_drain_once_and_reuses_its_buffer, test_note_clean_flush_ends_an_episode_so_the_next_failure_logs_again, test_spill_recovery_ends_the_dlq_episode_so_a_later_double_failure_logs
+  - Tests: test_failure_episode_opens_once_and_closes_with_its_count, test_repeated_spill_failures_keep_every_outcome_and_latch_one_episode, test_floor_payload_constant_equals_the_serialised_record_length, test_blind_probe_tier_label_literal_matches_the_const, test_drain_once_reusing_matches_drain_once_and_reuses_its_buffer, test_note_clean_flush_ends_an_episode_so_the_next_failure_logs_again, test_live_clean_flush_rearms_failure_episodes_through_the_production_drain, test_refused_only_live_flush_keeps_failure_episodes_open, test_failed_nonempty_live_flush_keeps_failure_episodes_open, test_spill_recovery_ends_the_dlq_episode_so_a_later_double_failure_logs
 - [x] O1S2. Telegram coalescer renders a body only when the bucket keeps it, one entry match instead of clone-per-fold (crates/core)
   - Files: crates/core/src/notification/coalescer.rs
   - Tests: test_payload_rendered_only_while_the_bucket_keeps_samples, test_sample_cap_at_10
@@ -1244,6 +1380,14 @@ Requested: owner, 2026-10-30, relayed by the coordinator session ("O(1) at p99 e
 - [x] O1S4. CLAUDE.md O(1) table: nine new rows plus the `active_order_count` correction; owned-file findings recorded as proposals
   - Files: CLAUDE.md
   - Tests: every_rs_file_named_in_claude_md_table_exists
+
+### ITEM MOV1 — Stocks movers show the ended session's stored prices after the close (2026-11-03)
+
+Requested: owner, 2026-11-03 ("in top movers we should always see the data ... which ever data is completely available in live AWS server should be at least allowed to be displayed"), design approved on the decision card "Approve, build it". This PR is step 1 (server on). Step 2 (a daily S3 file so the page works while the server is off, plus a date/time picker) is a later PR under the same approval.
+
+- [x] MOV1a. After the close, `/api/fno-stocks` and `/api/stock-movers` read the session that just ended (`[09:15, min(now, 15:40)]` IST) instead of returning an empty `closed`; status stays `closed`, `market_open` false; before 09:15 or on a day with no rows it stays empty `closed`; query failures keep their own status
+  - Files: crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/stock_movers.rs, crates/common/src/operator_stock_movers_wire.rs, crates/common/src/operator_movers_wire.rs, crates/aws-lambdas/src/operator_control_console.html, crates/aws-lambdas/src/operator_control.rs
+  - Tests: test_closed_market_shows_the_ended_sessions_stored_prices, test_closed_market_with_no_rows_reads_closed_not_no_data, test_closed_market_failure_stays_a_failure_and_never_reads_open, test_closed_session_window_bounds, test_closed_sql_carries_the_upper_bound_and_live_sql_does_not, closed_stale_partial_empty_and_query_failure_remain_distinct, console_html_content_pin
 
 ## Design
 
@@ -1427,3 +1571,594 @@ OE1: no new counter or alarm; new `kind` labels on `tv_order_update_decode_quirk
 Carries the 15-row + 7-row matrix by reference to
 `.claude/rules/project/per-wave-guarantee-matrix.md`; per-PR specifics are in each
 PR body.
+
+
+### Public operator portal Top Movers — 2026-10-31 continuation
+
+Requested by the owner in the Codex continuation: add Top Movers to the supplied
+API Gateway dashboard and verify the actual page. The prepared implementation
+is undergoing validation; full validation and live deployment are separate steps.
+
+Design: the existing operator authentication gate dispatches one fixed standalone
+Rust reader through the existing SSM sender. The reader fetches the same server-side
+API credential as app startup and calls only the fixed loopback F&O endpoint. It
+preserves canonical prices and selects at most 20 gainers and 20 losers. The input,
+transport, request time and per-container cache are bounded; this cold control path
+does not claim constant time or submicrosecond latency.
+
+Edge Cases / Failure Modes: missing helper, stopped instance, invalid credentials,
+database failures, malformed or truncated responses, incomplete stock coverage,
+stale data, redirect attempts, oversized streaming bodies, overlapping requests,
+late replies after locking and background-tab expiry produce explicit states.
+Conservative browser age includes request duration and two seconds for integer
+timestamp precision. An upper estimate beyond the freshness limit is unconfirmed,
+not proof that the source is stale; the newest trade may be outside displayed movers.
+The canonical API now carries the UTC epoch of the same original observation used
+to compute its row age. Both serialized API caching and the helper/Lambda bridge
+must preserve that anchor: stamping helper completion could hide original query
+time on a later cache hit. Missing or invalid legacy anchors fail closed. The
+naive IST source clock must have its IST offset removed before becoming Unix time.
+
+Rollback: revert the app helper packaging and operator Lambda together through the
+existing deployment process. Missing or incompatible helper output fails closed.
+The three-file swap is not atomic and existing automatic rollback restores only
+the main app; no stronger rollback guarantee is introduced.
+
+Observability: show captured time, conservative age, source state, priced/universe
+counts and selected/total counts. Errors are typed codes; helper output never
+contains credentials or raw SDK diagnostics. Actual live browser verification is
+read-only and distinct from intercepted browser fixtures.
+
+- [x] Connect the authenticated operator action to one standalone Rust read-only
+  helper, with canonical app prices, bounded top20 selections, explicit errors,
+  timeout, age and per-container cache.
+  - Files: crates/app/src/operator_movers.rs, crates/app/src/bin/tickvault_operator_read.rs,
+    crates/common/src/operator_movers_wire.rs, crates/aws-lambdas/src/operator_movers.rs,
+    crates/aws-lambdas/src/operator_control.rs
+  - Tests: canonical_large_universe_selects_complete_top_twenty_each_way,
+    closed_is_preserved_with_no_invented_prices,
+    malformed_or_inconsistent_source_is_refused_as_a_whole,
+    movers_authentication_and_stopped_state_precede_any_private_request,
+    movers_fixed_command_cache_expires_and_never_forwards_user_input,
+    movers_concurrent_refresh_is_bounded_and_does_not_dispatch_twice
+- [x] Add the accessible portal table with explicit closed/stale/expired/error
+  states and package the helper through the existing deployment workflow.
+  - Files: crates/aws-lambdas/src/operator_control_console.html,
+    crates/aws-lambdas/src/operator_control_action_commands.rs,
+    .github/workflows/deploy-aws.yml, crates/app/Cargo.toml,
+    crates/common/tests/browser_surface_and_toolchain_guard.rs
+  - Tests: console_embedded_shell_never_grows, ssm_workflow_shell_never_grows,
+    workflow_run_lines_never_grow, javascript_bytes_inside_script_tags_stay_under_the_ceiling
+  - Browser: real Chromium fixtures for rows, closed, errors, malicious symbol text,
+    expiry, refresh in flight, lock, visibility and mobile layout; actual live
+    portal re-check only after an explicitly reviewed deployment.
+- [x] Validate the corrected source timestamp through API and Lambda caches.
+  - Files: crates/api/src/handlers/fno_stocks.rs,
+    crates/app/src/operator_movers.rs
+  - Tests: test_one_row_is_live_with_change_and_value,
+    test_get_fno_stocks_cache_hit_skips_the_query,
+    cached_source_keeps_original_clock_instead_of_helper_completion_time,
+    source_clock_missing_malformed_future_or_expired_is_not_replaced_with_now
+  - Controls: re-anchoring at helper completion and omitting the IST conversion
+    must fail their intended assertions; restore exact source afterward.
+  - The former c5 workspace compile was deliberately interrupted before any
+    tests after an independent cache-age counterexample; it is not a passed suite.
+  - Corrected source: ten helper and twenty API tests passed before and after
+    both effective fault controls. All fixed source hashes were restored;
+    23 browser fixtures and 46 pure verifier checks passed. Full workspace,
+    all-target lint, native publication and live deployment remain separate.
+- [x] Reconcile existing deployment, crate-root and HTML guards with the new helper
+  and requested tab; retain the exact content hash, ordered tabs and smoke-before-
+  promotion-before-host-install assertions. Preserve the helper's production and
+  test lint denials. No deployment or helper runtime behavior changes here.
+  - Files: crates/app/tests/host_tuning_boot_wiring_guard.rs,
+    crates/app/src/bin/tickvault_operator_read.rs,
+    crates/aws-lambdas/src/operator_control.rs
+  - Tests: boot_units_never_run_the_rollback_restored_binary,
+    production_crate_roots_keep_the_deny_blanket,
+    every_crate_root_decides_about_silent_panics,
+    every_crate_root_denies_unsafe_code, console_html_content_pin,
+    test_html_has_exactly_four_ordered_tabs
+  - The unchanged bcf8dc7 diagnostic completed 15,445 passed / 6 failed / 33
+    ignored across 460 harnesses. These six failures are preserved as failed
+    evidence; the corrected candidate still requires its own validation.
+
+
+### 2026-10-31: isolate the idle-seed and depth pre-size allocation gates
+
+- [ ] Complete exact-source validation of the allocation-test isolation below.
+  Source is prepared; this checkbox does not claim a passed suite or publication.
+  - The 12f9632 full run completed 15,450 passed / 1 failed / 33 ignored across
+    460 harnesses. The book pre-size case reached 16,000 levels, 1,600 ticks and
+    966,368 book bytes, but process-global DHAT measured 6 blocks / 389 bytes
+    against the unchanged 0-block / 0-byte ceiling. Preserve this failed result.
+  - The test file is byte-identical on main, bcf8 and 12f. Pinned DHAT 0.3.3
+    documents that a lock between test bodies does not exclude allocations by
+    parallel libtest bookkeeping. The original failure has no saved stacks, so
+    its specific allocation source remains unproven. Passing later nocapture
+    diagnostics do not erase the captured full-suite failure.
+  - Keep each of the three original heap cases in its own integration-test
+    binary: dhat_idle_seed_step, dhat_depth_level_row_presize and
+    dhat_depth_book_row_presize. Retain all original function names, bodies,
+    warm-up, nonvacuity and zero-allocation assertions; no feature gating/skips.
+  - Keep explicit CI commands, exact app target count 11, the zero-test refusal
+    and sorted expected/actual target equality. Extract only the fixed app
+    expected inventory into .github/dhat-app-targets.txt, with missing/invalid
+    inventory refusal. Do not derive expected names from discovered files or
+    raise the existing shell ceiling. Other crate lists/counts are unchanged.
+  - Before final validation, run the predeclared five captured parallel
+    stack-attribution diagnostics with temporary DHAT-aware assertions and
+    retained profiles; restore exact source. If they all pass, attribution
+    remains unknown. They are diagnostics, not replacement acceptance evidence.
+  - Then run all three isolated positive targets, the book-reserve removal
+    control (which must fail the allocation assertion after meaningful appends),
+    exact restoration and final positives. Static/canonical guards, all-target
+    lint, exact-commit full/native/CI gates remain required and pending.
+
+
+### 2026-10-31: retain scanner verdicts within the existing native deadline
+
+- [ ] Complete committed-head workspace/lint and native/CI validation after
+  importing the independently reviewed shared scanner correction.
+  - The portal ab5 workspace completed 15,451 passed / 0 failed / 33 ignored
+    across 462 harnesses. Keep its source and result attribution intact.
+  - Cache the existing test-file inventory per crate and use equivalent Bash
+    name/prefix extraction. Preserve all matching expressions, exclusions,
+    exemptions, baseline values, verdicts and existing 300/120-second deadlines.
+  - Import the reviewed 14 real-hook Rust fixtures, including contained Git
+    configuration/selector handling and the truthful assert-prefixed helper.
+    Prior author/peer fixture and control evidence is not a new portal run.
+  - Existing product Rust is byte-identical to ab5; the added common-crate
+    fixture still requires the new committed-head workspace validation.
+  - The 83.342-second full scan belongs to the earlier bd source observation.
+    Do not relabel it as a portal timing or bypass any normal publication gate.
+
+### 2026-11-01: diagnose and repair Portal #2178's actual coverage failures
+
+The operator-authorized recovery coordinator requested this isolated successor on
+`c2032ce28eb3c6c9be2fb2bbc742c37f246373da`; recovered-portal remains unchanged.
+This item carries the existing 15-row + 7-row guarantee matrix by reference to
+`.claude/rules/project/per-wave-guarantee-matrix.md`. The composed source retains
+both independently reviewed corrections and their separately attributed evidence;
+changed-head full/lint/native/CI validation remains pending at source freeze.
+
+| Observed failure | Cause and preserved safety check |
+|---|---|
+| External Git sentinel changed in both coverage attempts | Detached fixture maintenance removed its own lock; keep every snapshot entry and the full equality assertion |
+| WAL lifetime property overflowed on attempt two | Retained bucket ids collided after clock steps; require replay protection and retain strict no-overflow inside the collision-free envelope |
+
+- [ ] Complete the Git fixture correction and changed-head validation without
+  weakening external-repository isolation or the existing child deadline.
+  - Files: crates/common/tests/pub_fn_test_guard_behavior.rs
+  - Tests: fixture_git_children_cannot_mutate_a_poison_selected_external_repository,
+    hook_child_cannot_false_pass_through_a_poison_selected_clean_index
+  - Actual Git 2.56.0 with two libtest workers reproduced the original equality
+    failure: the sentinel's empty `.git/objects/maintenance.lock` disappeared
+    between snapshots. The fixed 20-run diagnostic matrix passed 19 runs and
+    failed one; a separate matrix also caught disappearance during a read.
+  - Keep complete snapshot equality, fatal read diagnostics, all Git-selector
+    isolation and the existing ten-second child limit. Set only the synthetic
+    fixture command's `maintenance.autoDetach=false` so automatic maintenance
+    completes before snapshots. Do not exclude the changing lock file.
+  - The exact corrected common source passed all 23 predeclared runs of the
+    same 19 fixtures: Git 2.56.0/two workers for 20 runs, plus Git 2.52.0 with
+    two/four workers and Git 2.56.0 with four workers. These are 23 repeated
+    passing runs, not 437 distinct tests or a combined workspace/CI result.
+- [ ] Complete the WAL property's retained-bucket envelope correction and
+  changed-head validation with unchanged safety assertions and property bounds.
+  - Files: crates/storage/tests/wal_unapplied_ranges_properties.rs
+  - Tests: test_regression_portal_2178_in_session_overflow_seed,
+    test_regression_portal_2178_exact_ring_wrap_replays_before_and_after_persist,
+    proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame
+  - Exact input: seed 11217553172582376467, start 1, stuck false, mirror true,
+    extra false, straddle false. Retain the original 256 property cases and
+    all no-skip/no-prune assertions; no seed ignore or arbitrary bound change.
+  - The isolated diagnostic reproduced the original assertion at lifetime 12,
+    frame 0: retained id 6479807 and new id 6479935 share slot 63, exactly
+    128 buckets apart. Production intentionally fails towards replay here;
+    the production watermark implementation remains byte-identical to c203.
+  - The R envelope uses actual retained ids and newly shed frame ids, including
+    mirror and inverted records. Collision-free steps retain strict no-overflow;
+    real collisions require finite known bounds and independent database-model
+    no-skip/no-prune decisions in RAM and after persist/reload. Probes may
+    legitimately persist an existing overflow into a protected range.
+  - Preserve all six inputs, RNG draws, persist timing, 256 cases and existing
+    Z/G/B/S/O/M3 assertions. The focused wrap fixture advances both sink HWMs
+    beyond both pending marks so low watermarks cannot conceal lost protection.
+  - The exact copied WAL source passed its complete ten-test property harness.
+    Separately omitting the collision flag and bounded-range insertion each
+    failed the intended replay assertion. Both exact restorations passed the
+    focused regression again. These scoped results belong to the preserved WAL
+    candidate; identical source justifies retaining them without new mutations.
+
+Preserve run 41266407564 / job 124730630660 raw evidence. The first built-in
+attempt failed the Git sentinel test; the second failed it again and the WAL
+seed. Coverage threshold enforcement did not run. No resource-cause attribution
+or blind rerun replaces these actual assertion failures. Original failure logs,
+input packets, independent reviews and positive/control results remain retained.
+
+Think of two alarms: keep both alarms working, record what set them off, then
+check that each correction addresses its cause. The composed repair now requires
+ordinary plan/common/property guards, a normal gated commit, exact new-head
+workspace and all-target lint, then coordinated fast/native/pre-PR and CI checks.
+No merge, deployment, coverage percentage or production latency result is claimed.
+
+
+### 2026-11-02: preserve recovery and finish the requested Stocks surface
+
+The user authorized continuation and parallel repairs, supplied the Stocks
+reference screenshots, and asked that other fixes continue. Original unpublished
+refs, missing-a9b0e89c evidence and prior validation records remain preserved.
+Depth20, Depth200 and live order activation stay off.
+
+- [x] Implement the existing portal Stocks view with F&O/index selection,
+  watchlist, Gainers/Losers, full-universe backend sorting before paging,
+  bounded search and truthful unavailable/stale/error displays.
+  - Files: crates/aws-lambdas/src/operator_control_console.html,
+    crates/aws-lambdas/src/operator_control.rs,
+    crates/api/src/handlers/stock_movers.rs,
+    crates/common/src/operator_stock_movers_wire.rs
+  - Browser evidence: 28 passing Chromium controls on HTML SHA256
+    4a86b97f90df048caf75f85470a9bdc8a630d9cf5c1efe4faf9aa642d78f270a;
+    synthetic intercepted data only. Existing CSV functions remain preserved.
+  - Exact portal byte measurement and bounded frontend scope are recorded in
+    rust-only-forever-lock-2026-07-19.md §0.17; other allowances remain unchanged.
+- [x] Correct the failures found by the combined native run without discarding
+  their evidence or weakening the existing safety assertions.
+  - Files: crates/common/src/source_scan.rs,
+    crates/common/tests/production_panic_macro_guard.rs,
+    crates/core/tests/order_update_choke_point_guard.rs,
+    crates/core/tests/ws_telegram_visibility_guard.rs,
+    crates/app/tests/cov_xvs_crossverify_spawn.rs,
+    crates/app/src/dhan_live_crossverify_boot.rs,
+    crates/app/src/daily_task_marker.rs,
+    crates/app/src/holiday_gate.rs, crates/app/src/main.rs,
+    crates/api/src/handlers/fno_stocks.rs,
+    crates/common/tests/scanner_behavior_guard.rs,
+    crates/common/tests/doctor_read_only_guard.rs,
+    .claude/hooks/secret-scanner.sh
+  - Tests: test_regression_production_region_cannot_borrow_another_items_test_gate,
+    test_regression_panic_guard_requires_compiler_enforced_test_file_boundary,
+    test_regression_choke_point_guard_sees_bypass_after_test_only_field,
+    test_dhan_live_crossverify_boot_spawn_closed_calendar_never_pages_and_can_be_cancelled,
+    test_missing_token_weekday_pages_once_with_test_write_marker_in_and_test_marker_exists_in,
+    secret_scanner_preserves_all_families_and_comment_boundaries
+  - The prior full run is 16,312 passed / 13 failed / 32 ignored; these are
+    implementation corrections pending fresh combined native validation.
+- [ ] Complete fresh combined workspace, all-target lint and required native
+  guard/coverage validation; record exact scope and unresolved results.
+  - Real owned QuestDB execution at f521fb09: five round-trip tests passed,
+    then one restart readback passed using the same saved test binary.
+    This establishes neither production durability nor power-loss safety.
+
+Scenarios include long Unicode names at 320/390px, late/error/expired responses,
+full-universe sorting, unknown fields, duplicate scanner inputs, test-only
+fields before production code, fake cfg mentions, UTF-8 source boundaries and
+paused Tokio timers with unchanged wall time. Native regression assertions stay
+active. Rollback uses preserved refs/patches; no production deployment is part
+of this local implementation checkpoint.
+
+
+### 2026-11-02: close native publication-check and Rust-header gaps
+
+The combined Stocks checkpoint 545d27149 completed 16,330 passing tests,
+2 failing Rust-header classification guards and 32 ignored tests. Preserve that
+failed result. The earlier 13 failures passed in both the focused and combined
+runs; they are not the two failures in this checkpoint.
+
+- [x] Distinguish compiler-defined Rust inner attributes from interpreter
+  shebangs while retaining renamed-script detection, BOM handling and every
+  existing runtime/scan allowance and non-vacuity assertion.
+  - Files: crates/common/tests/rust_only_guard.rs
+  - Tests: test_regression_rust_inner_attributes_are_not_interpreter_headers,
+    test_regression_real_shebangs_remain_visible_when_scripts_are_renamed_rust,
+    test_regression_only_rust_trivia_can_precede_an_attribute_bracket
+- [x] Remove unproven shared fast receipts from the native pre-push decision.
+  Every normal and FULL_QA invocation executes format, all-target Clippy,
+  workspace tests, banned-pattern and test-count checks. Retain remaining
+  checks and blocking failure/timeout outcomes; add --locked to build/tests.
+  - Files: scripts/git-hooks/pre-push,
+    crates/common/tests/native_pre_push_policy_guard.rs,
+    crates/common/tests/shell_budget_guard.rs
+  - Tests: default_and_full_qa_never_trust_shared_receipts_to_hide_failure_or_timeout,
+    format_clippy_banned_and_count_failures_still_block_native_push,
+    successful_native_push_runs_all_checks_and_only_then_writes_its_receipt,
+    inherited_shell_startup_and_exported_functions_cannot_escape_the_owned_stubs
+  - The workspace-test timeout is a fixed 1,800 seconds, based on the recorded
+    1,288.604-second compile/test run; the old 300 seconds is below its
+    529.85 seconds of harness runtime alone. This changes waiting capacity,
+    not assertions, cases or passing criteria. Other timeouts are unchanged.
+    Removal of receipt parsing removes its obsolete two-awk allowance.
+  - Controlled fixture checks are not real native QA. Existing advisory-network
+    and missing-tool skip policies remain explicit; actual audit and deny were
+    separately executed successfully at 545d27149 with the pinned tools.
+- [x] Address all-target lint findings in the new v2 Stocks response: box the
+  large successful snapshot, retaining the identical serde wire schema and
+  validation, and use an array in the three-row sort fixture.
+  - Files: crates/common/src/operator_stock_movers_wire.rs,
+    crates/api/src/handlers/stock_movers.rs
+  - A successful snapshot adds one boxed allocation on the bounded control
+    read path; no zero-allocation or submicrosecond claim is made.
+- [ ] Execute the corrected native fixtures, all-target lint and full native
+  publication checks at the new source checkpoint, followed by fresh coverage
+  within measured resources. Preserve all earlier failed logs and compare
+  source hashes rather than relabelling old evidence as a new full pass.
+
+### 2026-11-02: preserve deployment artifacts and close publication blockers
+
+The normal native push at77a3e1ac9 passed the full workspace, formatting,
+all-target Clippy, advisory/dependency, Loom and integrity gates, then failed
+the unchanged public-function test-recognition ratchet (322 versus307).
+That push did not publish source. Its failed log remains retained.
+
+- [x] Repair test discovery with meaningful function-name references and three
+  new behavioral tests; leave the scanner and307 baseline unchanged.
+  - Files: crates/api/src/handlers/stock_movers.rs,
+    crates/app/src/operator_movers.rs, crates/app/src/subscribe_reconcile.rs,
+    crates/app/tests/bin_subprocess_reports.rs,
+    crates/app/tests/evening_state_recovery_boundaries.rs,
+    crates/aws-lambdas/src/operator_control.rs,
+    crates/common/src/operator_movers_wire.rs,
+    crates/common/src/operator_stock_movers_wire.rs,
+    crates/core/src/network/ip_verifier.rs,
+    crates/core/src/test_support.rs, crates/core/src/test_support/ssm.rs.
+  - Tests: test_matches_price_combines_case_insensitive_search_with_direction_and_missing_change,
+    test_assert_requests_rejects_incomplete_misdirected_or_unencrypted_records,
+    test_run_filtered_cli_rejects_bad_arguments_with_a_complete_v2_envelope.
+    Each new test passed natively with unchanged source during its command.
+- [x] Make the stopped-instance deployment fences fail closed on unknown,
+  denied, timed-out or malformed reads; pin binary and checkout to one verified
+  revision. Preserve prior fixed artifacts privately before overwrite and
+  refuse dirty/untracked source or hidden index flags.
+  - Files: .github/workflows/deploy-aws.yml,
+    crates/app/src/bin/smoke_test.rs,
+    crates/app/src/bin/smoke_test/deploy_backup.rs,
+    crates/common/tests/aws_deploy_safety_guard.rs,
+    crates/common/tests/aws_infra_wiring.rs,
+    crates/app/tests/host_tuning_boot_wiring_guard.rs.
+  - Edge cases: absent/past/current stop markers; denied, invalid calendar,
+    oversized and timeout responses; bad revision and failed fetch/reset;
+    source symlinks, replaced files, dirty indexes, hidden flags, collisions,
+    bounded files/bytes/tool output, inherited Git repository selectors.
+  - Test Plan:20 standalone behavioral tests and three planted regressions
+    passed review; native smoke, deployment, infrastructure, host-tuning,
+    shell-budget, Rust-only and budget-latch targets remain required.
+  - Rollback: selected private prior artifacts and old Git ref are preserved;
+    full automatic/atomic rollback is not claimed. Independently verify the
+    temporary instance returns to its observed stopped baseline.
+  - Observability: fixed failure categories and private checksum manifest;
+    never emit marker secrets or file contents. Verify deployed provenance,
+    effective activation settings and fresh read-only health after release.
+- [x] Include both directly imported common mover-wire modules in the Lambda
+  source digest, with executable-digest and omission controls. Trigger paths
+  stay unchanged; actual deployed ZIP identity remains a separate check.
+  - Files: .github/workflows/terraform-apply.yml,
+    crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
+- [x] Archive #2169's historical handoff with byte-identical original payload
+  and explicit historical provenance in docs/recovery/handoff-2026-10-31.md.
+  Ratchet the static test-attribute count from15598 to16456. This is neither
+  an executed-test total nor a coverage percentage.
+- [ ] Run the final combined native gates, publish one reviewed integration
+  PR, inspect exact-source CI and a real plan-only infrastructure run, use
+  repository automatic merge, deploy both app and portal, and verify actual
+  live behavior. Retain all earlier failures and separate old/new identities.
+
+Live disk investigation also identified a unit error in the network alarm's
+description. Correct only its wording and comments in
+deploy/aws/terraform/alarms.tf: the configured Average NetworkOut is a byte
+count per60-second period, with a50MiB threshold for five periods, not50MB/s.
+Threshold, statistic, periods, actions and missing-data behavior are unchanged.
+Current disk-use observations and earlier growth-rate alerts are distinct;
+neither justifies deleting stored market data or suppressing the alarm.
+
+The actual combined overlay checks passed117 common deployment/source guards,
+30 smoke/host-tuning tests and8 Lambda budget-latch tests, each with unchanged
+source during its command. The full public-function recognition guard now
+passes at the unchanged307 baseline. Final committed-source native push and
+CI remain required; these focused totals are not whole-workspace coverage.
+
+- [x] Correct two demonstrated Stocks interaction faults in
+  crates/aws-lambdas/src/operator_control_console.html: let the inactive native
+  direction button own the entire visible switch hit area, and retain invalid
+  UTF-8 search feedback using the existing typed error state during the1s
+  repaint. Normal validation and lock clear that state; no invalid request or
+  stale quote becomes usable.
+  - Final HTML SHA2566226059a333a70a726bf4a34da7d4dc5c57818efd95951244bea42efab4d88da.
+    JavaScript34,480bytes/308lines remains under the existing34,530/350 ceiling.
+  - Exact-source Chromium:28 page scenarios,54 pointer/touch/keyboard switch
+    scenarios and8 Data/CSV scenarios passed with intercepted synthetic data.
+    The old source's timer defect and the first narrow hit-area edge failure
+    remain recorded. Existing layout crops remain byte-identical.
+- [ ] Reconcile newly discovered paused branch work beyond the24-PR inventory.
+  Preserve all refs; current-source review has found additional AWS-control,
+  token-cache, special-session and observability/storage proposals. Historical
+  WIP is not accepted blindly: lagging rows refute an applied/queryable-row
+  claim, but do not alone refute the documented acknowledged-WAL contract.
+
+Depth20, Depth200 and live-order activation remain off throughout. Final
+validation must not bypass gates, broaden runtime exceptions or relabel
+after-close observations as open-market throughput/latency/loss proof.
+
+### 2026-11-02: reconcile remaining branch work against the current runtime
+
+Preserved all original branch refs and fetched the newer handoff2a4a916 under
+a separate recovery ref. The full955-ref inventory and later remote-head
+reconciliation distinguish represented changes, explicit retirements, unbuilt
+proposals and ports requiring validation. Literal old branch tips are not
+claimed merged merely because their behavior has a later equivalent.
+
+- [x] Port private token-cache creation and safe stale-link replacement;
+  protect QuestDB restart during capture and parse UTC08/09 as decimal.
+  Files: token_cache.rs, aws-control.yml, aws_control_capture_guard.rs.
+- [x] Use one IST session date and TradingCalendar::is_session_day for
+  live-universe wait/widen eligibility, with executable regression controls.
+  Files: main.rs, live_universe_session_day_guard.rs. This changes day
+  eligibility, not the existing time windows or late-attach cutoff.
+- [x] Report retained refused-spill bytes and actual overflow episodes;
+  port the newer W4 parked-ack lineage including forgotten-table taint,
+  persisted pending-state recovery and failed sidecar-write controls.
+  Files: seal_spill.rs, wal_applied_watermark.rs, wal_suspension_watcher.rs,
+  wal_unapplied_ranges.rs and the retained proptest regression seed.
+  Contract: accepted QuestDB WAL acknowledgements plus the existing60-second
+  writeback/settle and two clean probes. This is not proof of applied rows,
+  an empty WAL backlog, fsync, power-loss durability or zero data loss.
+- [x] Start existing telemetry after tracing and before watched supervisors;
+  classify a failed thread spawn as HOT-PATH-04, Medium/log-only.
+  Files: main.rs, error_code.rs, error-rules.yaml, runbook and wiring guards.
+  Registered gauges alone do not prove the telemetry thread is running.
+  Correct the stale options-store boot log: boot rehydrate was removed.
+- [x] Port bounded local TCP/rmem pressure sampling, with a guard against
+  broad CloudWatch export patterns. Files: kernel_rx_queue_sampler.rs,
+  kernel_tcp_ext_local_only_guard.rs. Namespace counters do not prove
+  per-connection delivery, loss or network latency.
+- [x] Restore the observed enabled/disabled/enabled-runtime service state
+  after filesystem recovery without starting it; reject unknown states and
+  make restoration failure terminal across the outer SSH retry loop.
+  Narrow scheduler PassRole to the actual scheduler role and retain the
+  SSM service condition. Strengthen direct control-secret alias checks.
+  Files: emergency-fs-recover.yml, main.tf, emergency_recovery_state_guard.rs,
+  aws_infra_wiring.rs, github_workflow_guard.rs.
+  Limits: SIGKILL/host loss and ambiguous SSH outcomes are not atomic rollback.
+- [x] Port the production reader-memory allocation ratchet with cancellable,
+  bounded fixture I/O, full payload/order checks and writer-task completion.
+  Files: dhat_ws_reader_memory.rs and ci.yml. CI now explicitly executes10
+  core DHAT targets. Preserve the48KiB idle,400blocks/MiB and4x held-payload
+  ceilings, the existing293-line workflow budget and the existing coverage
+  exclusion for dhat_ allocation tests. No new ignored tests or exemptions.
+  Plain synthetic loopback excludes TLS/vendor behavior and latency claims.
+- [x] Correct the full-console digest/length pin to the reviewed6226059a
+  HTML84,855bytes. The prior6cf push was interrupted during tests after this
+  mismatch was identified; no successful push is claimed for that attempt.
+- [x] Ratchet the measured static test-attribute baseline16456 to16521.
+  This is not an executed-test count, scenario completeness or coverage.
+- [ ] Test Plan: full native publication gates and exact-source CI; explicit
+  ten-target core DHAT run; storage failure/restart, auth inode, special-day,
+  telemetry, workflow, source-budget and console-pin controls. Preserve all
+  failed/interrupted attempts and report the actual final source identity.
+- [ ] Review a real plan-only Terraform run, then automatic merge and deploy
+  both EC2 binaries and operator Lambda. Verify full deployed SHA/ZIP/HTML
+  identities, actual hosted Stocks selections and effective safety settings.
+  Restore the observed stopped server baseline after temporary checks.
+
+Current reviewed patches and standalone controls are saved under the
+20261102T071741Z recovery evidence root. Native validation of this combined
+port is still pending. Depth20, Depth200 and live orders stay off.
+
+The first combined all-target Clippy run atab08101cb rejected the new
+reader test's nested production-socket type. Name that existing type through
+a private alias; do not suppress the lint or change its runtime behavior.
+Retain the failed run and repeat the unchanged full lint gate before pushing.
+
+### 2026-11-02: repair the two observed final-suite failures
+
+The ordinary ff1cf12cf push failed its workspace test gate; all other native
+gates passed. A complete no-fail-fast diagnostic run then recorded16,428
+passed,2 failed,32 ignored with unchanged source. The failed targets were the
+spawn-tool guard and the newly recovered reader-memory fixture. No push,
+merge or deployment is claimed from that run.
+
+- [x] Recognize GNU coreutils timeout only in the reviewed deployment backup
+  module: at most7 literal sites, the same2 production deadlines and5 owned
+  fixture children. Use the canonical production-region scanner and reject
+  outside paths, lookalikes, extra sites, removed deadlines and trailing
+  production. Runtime bans, backup code and its20/30s plus5s kill bounds are
+  unchanged. Three new guard tests ratchet the static test floor to16524.
+- [x] Initialize the reader fixture's explicit AWS-LC provider before DHAT.
+  Warm each endpoint's distinct shared connector profile before the warmed
+  per-socket comparison. Separately record first endpoint dials in process
+  order and retained process state; Depth20 shares MainFeed's ALPN cache.
+  The original127,312-byte Depth200 observation remains retained, not erased.
+- [x] Replace positive net heap growth as a false proxy for FIFO ownership.
+  Observe retained count, bytes and final marker/header/payload after the
+  DHAT end sample, before releasing frames. A zero-growth positive control
+  and missing-count/wrong-byte negatives pin this distinction. Preserve48KiB
+  warmed idle,400blocks/MiB and4x incremental net-heap/payload ceilings and
+  raw128KiB negative control. This is not total backing storage or RSS proof.
+  A context-only diagnostic passed with the old assertion; the earlier
+  failing client remains unattributed, so no raw-only cause is claimed.
+- [x] The corrected two-target native run passed22 tests with0 failures and
+  unchanged source. Two independent reviews bind the reader correction to
+  SHA25624cb14efd8cbf7518deed0cfd4ef813805066d16c4cfbfa2d086a2ef9a202b2c.
+- [ ] Re-run final committed-source native publication, exact-source CI and
+  the real infrastructure plan before automatic merge and live deployment.
+
+All changes in this correction are tests or records. Keep both depth feeds
+and live orders off. Earlier failures and every unpublished checkpoint remain
+preserved; finite checks do not establish universal reliability or latency.
+
+
+### 2026-11-03: complete publication and close the dated budget/fence defects
+
+The user continues to authorize fixing, building, merging and deploying the
+recovered work. Keep every original ref and unpublished patch. Both depth
+feeds and live-order activation remain off. The November 2 native push at192
+passed the full workspace, lint, audit/deny, both Loom suites, integrity and
+financial checks, but the public-function scanner exceeded its120-second
+native limit. An isolated original scan took168.532 seconds and counted306
+against baseline307. The first proposed optimization also timed out; retain
+that failed record and do not claim publication or change the deadline.
+
+- [x] Apply the documented November standing native budget of75USD. Quotes37
+  and45 already limit185USD to October. Actual AWS still read185USD onNov2.
+  Preserve historical185 defaults and the existing UTC-month runtime clamp;
+  compare native budget with effective November-onward values in six guards.
+- [x] Make both Terraform stop-marker reads refuse unknown/malformed values.
+  Accept absence only from classified ParameterNotFound, preserve provider
+  status and bytes, bound response/time and keep raw output private. Preserve
+  the held-current-month false override and known absent/nonmatching default.
+- [x] Apply the same byte-preserving capture to the deployment start fence.
+  Extra/oversized trailing newlines and multibyte errors cannot normalize to
+  a valid marker. Keep20+5second/4097byte bounds, parameters and shell budgets.
+  Earlier V1 counterexamples are saved; independent reviewers passed corrected
+  controls. These are infrastructure controls, with no new runtime language.
+- [x] Combined native budget, deployment, infrastructure, workflow and shell
+  guards passed137 tests,0failed,0ignored on the applied three-patch source.
+- [x] Finish a semantic-preserving public-function scanner optimization.
+  Retain the legacy declaration/test regex, line boundaries, duplicate counts,
+  crate scope, exemption adjacency, unusual-file fallback and missing-state
+  refusal. Retain Bash3-compatible syntax and native120 seconds. Final hook
+  SHAe12b5307 passed34 equivalence cases and independent binary/error controls.
+  Saved-source scan completed21.378s; actual combined-tree scan completed33.255s
+  with unchanged source/count306. Ratchet the measured untested floor307 to306
+  and the static test-attribute count16524 to16543; these are not coverage.
+  - Files: .claude/hooks/pub-fn-test-guard.sh, crates/common/tests/pub_fn_test_guard_behavior.rs
+  - Tests: indexed_exemptions_preserve_adjacent_markers_and_unterminated_last_line,
+    indexed_test_lines_keep_utf8_and_separate_file_boundaries,
+    indexed_test_corpus_falls_back_for_early_late_and_mixed_binary_text,
+    large_binary_inventory_preserves_matches_when_zero_check_stops_early
+- [x] Add the missed15Jan2026 holiday from official NSE/CMTR/72260 and
+  NSE/FAOP/72262. Exercise the shipped calendar: Jan15 closes while Jan14/16
+  stay open. All other configuration is unchanged. The60-day expiry reminder
+  remains active; no authoritative2027 circular was verified or invented.
+  - Files: config/base.toml, crates/common/tests/nse_holiday_calendar_guard.rs
+  - Tests: test_2026_election_addendum_closes_shipped_calendar
+- [x] Combined native scanner/calendar, Rust-only, browser/toolchain, shell
+  and ignored-test guards passed111 tests,0failed,0ignored at03:41UTC.
+  Preserve the earlier18pass/1fail forbidden grep-spawn and110pass/1fail
+  filesystem-order runs. The fixture now uses Rust filesystem enumeration and
+  places its binary match in the observed first entry, with order checked
+  again after overwrite. No spawn allowance or deadline was increased.
+- [ ] Run final native guards, measured static-count ratchets, committed-source
+  all-target lint and ordinary publication. Preserve every failed attempt.
+  Create and attach the draft PR only after the actual fresh pre-PR gate.
+- [ ] Accept exact-source CI, dedicated allocation checks, raw coverage report
+  and a real plan-only Terraform run before the repository merge flow. Review
+  daily-start state, native75 budget, IAM and all Lambda changes. Keep plan/apply
+  stop-marker refusal active; do not infer absence from permission errors.
+- [ ] Verify deployed app/helper and portal identities, real Stocks behavior
+  and effective activation settings. Use today's observed instance baseline
+  and market/capture window, never yesterday's stopped assumption. Preserve
+  private deployment backups and live data; app rollback must not restore the
+  expired October native budget or undo a valid budget/holiday stop marker.
+
+Package all recovered Codex work and compatible pending PR changes in one
+combined PR, as explicitly requested onNov3. Map all24 original PRs, preserve
+their original refs, and resolve covered PRs only after verified combined
+landing. The incompatible parking_lot0.13 upgrade remains explicit. The exact
+GitHub-token SSM parameter is absent in current metadata; the ancestry repair
+does not provision credentials. No speculative IAM permission change is made.
+
+Observability: keep source hashes, command outcomes, actual workflow heads,
+plan actions, selected live safety fields and actual screenshots. Error paths
+report typed failure without provider bodies. No finite test set establishes
+zero bugs/loss, exhaustive coverage or universal O(1)/submicrosecond latency.

@@ -75,12 +75,13 @@
 //!   to that crate). This file stops at the unknown code, which is the core
 //!   crate's walk (`stacked_disconnect_reason`); the app-side skip is not
 //!   exercised here.
-//! * `MAX_PACKETS_PER_FRAME` (70,000) itself is not reached; the cap semantics
-//!   are pinned at small n by passing an explicit `max_packets`.
+//! * Generated stacks use small packet counts; a deterministic regression
+//!   additionally reaches `MAX_PACKETS_PER_FRAME` and one packet above it.
 
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use tickvault_common::constants::MAX_PACKETS_PER_FRAME as MAX_PACKETS;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::parser::depth::stacked_depth_disconnect_reason;
 use tickvault_core::parser::dispatcher::{
@@ -94,12 +95,14 @@ use tickvault_core::websocket::connection::{FrameClass, classify_frame};
 use tickvault_core::websocket::pool_budget::DhanEndpointType;
 use tickvault_core::websocket::types::DisconnectCode;
 
+#[path = "../../../fuzz/fuzz_targets/main_feed_stacked_frame_oracle.rs"]
+mod fuzz_main_feed_oracle;
+
 // ===========================================================================
 // Reference: main feed (literal offsets from 03-live-market-feed-websocket.md)
 // ===========================================================================
 
 const HEADER_LEN: usize = 8;
-const MAX_PACKETS: u32 = 70_000;
 const KNOWN_CODES: [u8; 8] = [1, 2, 4, 5, 6, 7, 8, 50];
 const NAMED_DISCONNECT_REASONS: [u16; 15] = [
     800, 801, 803, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814, 0,
@@ -412,11 +415,15 @@ fn field_at(code: u8, byte: usize) -> Option<&'static str> {
 }
 
 /// Reference: the first disconnect reason in a frame that walks end to end by
-/// the protocol size table, else `None`.
+/// the protocol size table within the production packet cap, else `None`.
 fn ref_main_stacked(frame: &[u8]) -> Option<u16> {
     let mut offset = 0usize;
+    let mut packets = 0_u32;
     let mut found = None;
     while offset < frame.len() {
+        if packets == MAX_PACKETS {
+            return None;
+        }
         let size = ref_size(frame[offset])?;
         if offset + size > frame.len() {
             return None;
@@ -425,6 +432,7 @@ fn ref_main_stacked(frame: &[u8]) -> Option<u16> {
             found = Some(read_le(frame, offset + 8, 2) as u16);
         }
         offset += size;
+        packets += 1;
     }
     found
 }
@@ -1484,6 +1492,42 @@ proptest! {
 // ===========================================================================
 // Pinned extremes (deterministic, so a regression names itself)
 // ===========================================================================
+
+#[test]
+fn test_regression_initial_disconnect_obeys_actual_packet_cap() {
+    // Regression: 2026-10-31 — the fuzz oracle treated over-cap frames as
+    // accepted. Exercise the very same oracle as the fuzz entry point.
+    let mut disconnect = [0_u8; 10];
+    disconnect[0] = 50;
+    disconnect[1..3].copy_from_slice(&10_u16.to_le_bytes());
+    disconnect[8..10].copy_from_slice(&805_u16.to_le_bytes());
+    let mut ticker = [0_u8; 16];
+    ticker[0] = 2;
+    ticker[1..3].copy_from_slice(&16_u16.to_le_bytes());
+    assert!(matches!(
+        dispatch_frame(&ticker, 0),
+        Ok(ParsedFrame::Tick(_))
+    ));
+    let mut frame = disconnect.to_vec();
+    for _ in 1..MAX_PACKETS {
+        frame.extend_from_slice(&ticker);
+    }
+    fuzz_main_feed_oracle::check_frame(&frame);
+    assert_eq!(ref_main_stacked(&frame), Some(805));
+    assert_eq!(stacked_disconnect_reason(&frame, MAX_PACKETS), Some(805));
+    assert_eq!(
+        classify_frame(DhanEndpointType::MainFeed, &frame),
+        FrameClass::Disconnect(DisconnectCode::from_u16(805))
+    );
+    frame.extend_from_slice(&ticker);
+    fuzz_main_feed_oracle::check_frame(&frame);
+    assert_eq!(ref_main_stacked(&frame), None);
+    assert_eq!(stacked_disconnect_reason(&frame, MAX_PACKETS), None);
+    assert_eq!(
+        classify_frame(DhanEndpointType::MainFeed, &frame),
+        FrameClass::Data
+    );
+}
 
 #[test]
 fn every_byte_value_as_a_main_feed_code_is_classified_exactly() {

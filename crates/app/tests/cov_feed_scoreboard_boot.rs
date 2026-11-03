@@ -1366,7 +1366,7 @@ fn test_feed_scoreboard_scan_errors_jsonl_skips_foreign_bare_blank_and_unopenabl
         "tv-cov-scoreboard-jsonl-{}-{nanos}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("claim a fresh temp dir");
     // 10:00 IST on DAY = 04:30 UTC.
     let line = serde_json::json!({
         "code": "PROC-01",

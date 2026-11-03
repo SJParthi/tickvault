@@ -207,7 +207,7 @@ async fn test_disk_pressure_boot_loop_idle_volume_publishes_used_gauge_and_keeps
     let handle_metrics = recorder();
     no_archive_bucket();
     let dir = unique_dir("idle");
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("claim a fresh temp dir");
     let (logs, _guard) = capture_logs();
     // A sentinel no real reading can produce: a gauge still holding it after
     // the polls was never set by this loop (the loop's own registration at
@@ -268,7 +268,7 @@ async fn test_disk_pressure_boot_loop_over_high_water_starts_episode_then_escala
     let _ = recorder();
     no_archive_bucket();
     let dir = unique_dir("episode");
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("claim a fresh temp dir");
     let (logs, _guard) = capture_logs();
     drain_reclaim_signal().await;
     let before = episode_counters();
@@ -357,7 +357,7 @@ async fn test_disk_pressure_boot_loop_blind_probe_reports_sustained_failure_then
         "a blind probe must never start an episode: {blind}"
     );
 
-    std::fs::create_dir_all(&dir).expect("create the data folder");
+    std::fs::create_dir(&dir).expect("claim the data folder");
     run_polls(2).await;
     handle.abort();
     let text = logs.text();

@@ -1473,7 +1473,7 @@ impl ErrorCode {
             // disk and is done the next evening.
             Self::DrainHold01NotWritten => Severity::Medium,
             // HOT-PATH-04: the stall page and the stage gauges are dark for
-            // this process; nothing is lost, but nothing would warn either.
+            // this process; this failure alone does not establish capture loss.
             Self::HotPath04TelemetryNotStarted => Severity::Medium,
             Self::HotPathStall01 => Severity::High,
             // BOOT-04 halts boot, PROC-02 is a crash, API-SERVER-01 leaves the

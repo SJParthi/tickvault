@@ -26,12 +26,19 @@
 //! # Cost
 //!
 //! Cold path only: one read, one merge and at most one write per recording
-//! (the boot, and the end of a widen), **O(instruments)** with one hash probe
-//! each, plus an O(files) sweep of old day files after a write. Never per tick.
+//! (the daily recorder, and the end of a widen): **O(file bytes)** to parse,
+//! O(instruments) to merge (one hash probe each), **O(n log n)** to write (the
+//! entries are sorted so the file is stable), plus an O(files) sweep of old day
+//! files after a write. Never per tick.
 //! The write is a temp file, `sync_all`, `rename` and a folder `sync_all`, run
 //! through `off_worker` so a slow disk never holds a shared runtime worker.
 //! SPACE: at most [`DAY_RECORD_MAX_INSTRUMENTS`] keys (the main-feed capacity);
 //! a recording past it is refused for the new keys and counted in the result.
+//! A successfully saved incomplete record retains that state on later reloads.
+//! Legacy files without completeness metadata also stay unknown; unreadable
+//! files are kept and refused, never replaced with a smaller process history.
+//! A failed write may leave an older complete file after restart: process-local
+//! failure state and best-effort folder sync are not durable intent tracking.
 //!
 //! # Honest limits
 //!
@@ -51,8 +58,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
@@ -88,6 +96,136 @@ const DAY_RECORD_READ_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// Serialises read-merge-write so two recordings in one process (the boot and
 /// a widen) never lose each other's keys.
 static RECORD_LOCK: Mutex<()> = Mutex::new(());
+
+/// The main-feed spot sets this process holds on its sockets, one per origin
+/// (the boot set, and the widened day list once a widen finishes), for the
+/// daily recorder (§12.15.13, review round 1), with a generation bumped on
+/// every note so a clear never erases a failure noted after the recorder's
+/// snapshot (review round 3). At most two entries, cold.
+static PROCESS_HELD: Mutex<(u64, Vec<HeldSet>)> = Mutex::new((0, Vec::new()));
+
+/// One noted set (review round 3: each keeps the instant it went on the
+/// wire, so a retried write never stamps it earlier than that).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSet {
+    /// Which step of this process put it on the sockets.
+    pub origin: HeldOrigin,
+    /// The set.
+    pub instruments: Vec<SubscribeInstrument>,
+    /// Where it came from.
+    pub basis: UniverseBasis,
+    /// The IST date it was noted on.
+    pub noted_on: NaiveDate,
+    /// The IST second of that day it was noted at.
+    pub noted_secs: u32,
+}
+
+impl HeldSet {
+    /// The second to record this set at on `day`, given the recorder's
+    /// first stamp for that day: never earlier than the set was put on the
+    /// wire (its own second on its noting day), never earlier than the
+    /// recorder's stamp, and the recorder's stamp for a set held since an
+    /// earlier day. Pure, O(1).
+    #[must_use]
+    pub fn stamp_on(&self, day: NaiveDate, recorder_secs: u32) -> u32 {
+        if self.noted_on == day {
+            self.noted_secs.max(recorder_secs)
+        } else {
+            recorder_secs
+        }
+    }
+}
+
+/// Which step of this process put a set on the main-feed sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldOrigin {
+    /// The boot subscribe.
+    Boot,
+    /// A finished widen to today's list (added beside the boot set).
+    Widen,
+}
+
+/// Notes a set this process put on its main-feed sockets at `noted_secs` of
+/// IST day `noted_on`, replacing an earlier set of the same origin, and
+/// bumps the generation. The daily recorder writes every noted set into each
+/// IST day's record from 08:00 until the close, so a process alive across
+/// midnight records the new day too. O(entries ≤ 2) plus one copy.
+pub fn note_process_held(
+    origin: HeldOrigin,
+    instruments: &[SubscribeInstrument],
+    basis: UniverseBasis,
+    noted_on: NaiveDate,
+    noted_secs: u32,
+) {
+    let mut held = PROCESS_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // O(1) EXEMPT: at most one entry per origin, two origins.
+    held.1.retain(|set| set.origin != origin);
+    held.1.push(HeldSet {
+        origin,
+        instruments: instruments.to_vec(),
+        basis,
+        noted_on,
+        noted_secs,
+    });
+    held.0 = held.0.wrapping_add(1);
+}
+
+/// The generation and every set noted by [`note_process_held`], cloned.
+/// O(total instruments), cold.
+#[must_use]
+pub fn process_held() -> (u64, Vec<HeldSet>) {
+    PROCESS_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The IST day (days from CE, 0 = none) on which a day-record write failed
+/// in this process and no later write of every held set succeeded (review
+/// round 2). The check reads it as coverage unknown: the record may lack a
+/// set that is on the wire.
+static WRITE_FAILED_DAY: AtomicI64 = AtomicI64::new(0);
+
+fn day_number(date_ist: NaiveDate) -> i64 {
+    i64::from(date_ist.num_days_from_ce())
+}
+
+/// Notes that a write into `date_ist`'s record failed. One store, O(1).
+pub fn note_record_write_failed(date_ist: NaiveDate) {
+    WRITE_FAILED_DAY.store(day_number(date_ist), Ordering::Release);
+}
+
+/// Clears a failure noted for `date_ist` once every held set of `generation`
+/// (from [`process_held`]) was written again, and returns whether it did.
+/// Nothing is cleared when a set was noted since that snapshot (review round
+/// 3): the check runs under the same lock [`note_process_held`] takes, so a
+/// widen noted after the snapshot keeps its failure for the next retry. A
+/// failure noted for another day stays. One lock and one compare-and-swap,
+/// O(1).
+pub fn clear_record_write_failed(date_ist: NaiveDate, generation: u64) -> bool {
+    let held = PROCESS_HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.0 != generation {
+        return false;
+    }
+    let _was = WRITE_FAILED_DAY.compare_exchange(
+        day_number(date_ist),
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    true
+}
+
+/// Whether a write into `date_ist`'s record failed and was not yet redone.
+/// One load, O(1).
+#[must_use]
+pub fn record_write_failed_for(date_ist: NaiveDate) -> bool {
+    WRITE_FAILED_DAY.load(Ordering::Acquire) == day_number(date_ist)
+}
 
 /// Where one recording's set came from (plan item 51f).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +283,8 @@ pub struct SpotDayRecord {
     /// Composite key `(security_id, segment byte)` (I-P1-11) to the earliest
     /// second of the IST day it was subscribed.
     first_secs: HashMap<(SecurityId, u8), u32>,
+    /// False stays false for the day after any refused key or legacy read.
+    coverage_complete: bool,
 }
 
 /// What one merge changed.
@@ -156,7 +296,7 @@ pub struct MergeOutcome {
     pub moved_earlier: usize,
     /// New keys refused because the record was full.
     pub refused_full: usize,
-    /// A day flag changed.
+    /// A basis flag or the persistent completeness flag changed.
     pub flags_changed: bool,
 }
 
@@ -177,6 +317,7 @@ impl SpotDayRecord {
             master_listed: false,
             index_fallback: false,
             first_secs: HashMap::new(),
+            coverage_complete: true,
         }
     }
 
@@ -216,6 +357,10 @@ impl SpotDayRecord {
                 }
                 None if full => {
                     out.refused_full = out.refused_full.saturating_add(1);
+                    if self.coverage_complete {
+                        self.coverage_complete = false;
+                        out.flags_changed = true;
+                    }
                 }
                 None => {
                     self.first_secs.insert(key, secs_of_day);
@@ -231,6 +376,14 @@ impl SpotDayRecord {
     #[must_use]
     pub const fn is_index_fallback_day(&self) -> bool {
         self.index_fallback && !self.master_listed
+    }
+
+    /// Whether this record has explicit completeness metadata and none of its
+    /// recorded merges refused a key. Failed writes from another process can be
+    /// absent from it; this is not continuous-subscription or delivery proof. O(1).
+    #[must_use]
+    pub const fn coverage_known(&self) -> bool {
+        self.coverage_complete
     }
 
     /// Number of instruments recorded.
@@ -285,6 +438,9 @@ struct DayRecordFile {
     master_listed: bool,
     index_fallback: bool,
     instruments: Vec<DayRecordEntry>,
+    /// Older files cannot prove that no key was refused or history replaced.
+    #[serde(default)]
+    coverage_complete: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -307,7 +463,8 @@ pub fn day_record_path(date_ist: NaiveDate) -> PathBuf {
 
 /// Reads one day's record. `Ok(None)` when the file does not exist; `Err`
 /// when it cannot be read, is over [`DAY_RECORD_READ_CAP_BYTES`], does not
-/// parse, names another day, or holds a key twice. O(file bytes), cold.
+/// parse, names another day, exceeds the instrument cap, holds an invalid
+/// segment/second/id, or holds a key twice. O(file bytes), cold.
 fn read_record_in(base: &Path, date_ist: NaiveDate) -> std::io::Result<Option<SpotDayRecord>> {
     let path = record_path_in(base, date_ist);
     let file = match std::fs::File::open(&path) {
@@ -315,7 +472,8 @@ fn read_record_in(base: &Path, date_ist: NaiveDate) -> std::io::Result<Option<Sp
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    let mut bytes = Vec::new();
+    // Start with one small read buffer; the reader's hard cap bounds growth.
+    let mut bytes = Vec::with_capacity(8 * 1024);
     file.take(DAY_RECORD_READ_CAP_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > DAY_RECORD_READ_CAP_BYTES {
@@ -332,12 +490,25 @@ fn read_record_in(base: &Path, date_ist: NaiveDate) -> std::io::Result<Option<Sp
             "day record names another day",
         ));
     }
+    if parsed.instruments.len() > DAY_RECORD_MAX_INSTRUMENTS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "day record exceeds the instrument cap",
+        ));
+    }
     let mut record = SpotDayRecord::new(date_ist);
     record.master_listed = parsed.master_listed;
     record.index_fallback = parsed.index_fallback;
+    record.coverage_complete = parsed.coverage_complete;
     for entry in parsed.instruments {
-        if record.first_secs.len() >= DAY_RECORD_MAX_INSTRUMENTS {
-            break;
+        if ExchangeSegment::from_byte(entry.segment).is_none()
+            || entry.first_secs_of_day >= 86_400
+            || i64::try_from(entry.security_id).is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "day record has an invalid instrument or second",
+            ));
         }
         if record
             .first_secs
@@ -356,7 +527,7 @@ fn read_record_in(base: &Path, date_ist: NaiveDate) -> std::io::Result<Option<Sp
 /// Writes `record` atomically: temp file, `sync_all`, `rename`, folder
 /// `sync_all`; then removes record files older than
 /// [`DAY_RECORD_KEEP_DAYS`]. A folder sync failure after the rename is not an
-/// error (the file is in place). O(instruments + files), cold.
+/// error (the file is in place). O(n log n) (sorted entries) + O(files), cold.
 fn write_record_in(base: &Path, record: &SpotDayRecord) -> std::io::Result<()> {
     let mut instruments: Vec<DayRecordEntry> = record
         .first_secs
@@ -373,6 +544,7 @@ fn write_record_in(base: &Path, record: &SpotDayRecord) -> std::io::Result<()> {
         master_listed: record.master_listed,
         index_fallback: record.index_fallback,
         instruments,
+        coverage_complete: record.coverage_complete,
     };
     let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
     std::fs::create_dir_all(base)?;
@@ -442,17 +614,17 @@ fn sweep_old_records_in(base: &Path, date_ist: NaiveDate) {
 pub struct RecordOutcome {
     /// What the merge changed.
     pub merge: MergeOutcome,
-    /// The file on disk was unreadable and was replaced by this recording
-    /// alone (earlier recordings of the day are lost; the next ones re-add).
+    /// Retained outcome field; always false. Unreadable prior records are now
+    /// retained and refused, so a successful write never replaces their history.
     pub replaced_unreadable: bool,
     /// Instruments in the record after this recording.
     pub recorded: usize,
 }
 
 /// Records `instruments` as subscribed at `secs_of_day` on `date_ist`, under
-/// `base`. Read, merge, and write only when something changed. A file that
-/// cannot be read is replaced (reported in the outcome). O(instruments),
-/// cold.
+/// `base`. Read, merge, and write only when something changed. An unreadable
+/// prior record is retained and refused: a current set cannot reconstruct its
+/// history. O(file bytes + instruments + n log n), cold.
 fn record_in(
     base: &Path,
     date_ist: NaiveDate,
@@ -463,18 +635,25 @@ fn record_in(
     let _guard = RECORD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (mut record, replaced_unreadable) = match read_record_in(base, date_ist) {
-        Ok(Some(record)) => (record, false),
-        Ok(None) => (SpotDayRecord::new(date_ist), false),
-        Err(_) => (SpotDayRecord::new(date_ist), true),
-    };
+    if secs_of_day >= 86_400
+        || instruments
+            .iter()
+            .any(|instrument| i64::try_from(instrument.security_id).is_err())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recording instrument or second is outside the reader's domain",
+        ));
+    }
+    let mut record =
+        read_record_in(base, date_ist)?.unwrap_or_else(|| SpotDayRecord::new(date_ist));
     let merge = record.merge(instruments, secs_of_day, basis);
-    if merge.changed() || replaced_unreadable {
+    if merge.changed() {
         write_record_in(base, &record)?;
     }
     Ok(RecordOutcome {
         merge,
-        replaced_unreadable,
+        replaced_unreadable: false,
         recorded: record.len(),
     })
 }
@@ -491,14 +670,24 @@ pub fn record_spot_subscribed(
     secs_of_day: u32,
     basis: UniverseBasis,
 ) -> std::io::Result<RecordOutcome> {
+    record_spot_subscribed_in(
+        Path::new(DAY_RECORD_DIR),
+        date_ist,
+        instruments,
+        secs_of_day,
+        basis,
+    )
+}
+
+fn record_spot_subscribed_in(
+    base: &Path,
+    date_ist: NaiveDate,
+    instruments: &[SubscribeInstrument],
+    secs_of_day: u32,
+    basis: UniverseBasis,
+) -> std::io::Result<RecordOutcome> {
     tickvault_storage::off_worker::off_worker(|| {
-        record_in(
-            Path::new(DAY_RECORD_DIR),
-            date_ist,
-            instruments,
-            secs_of_day,
-            basis,
-        )
+        record_in(base, date_ist, instruments, secs_of_day, basis)
     })
 }
 
@@ -509,9 +698,14 @@ pub fn record_spot_subscribed(
 /// The file exists but cannot be trusted (unreadable, over the cap, not
 /// parseable, another day's, or a key twice).
 pub fn read_spot_day_record(date_ist: NaiveDate) -> std::io::Result<Option<SpotDayRecord>> {
-    tickvault_storage::off_worker::off_worker(|| {
-        read_record_in(Path::new(DAY_RECORD_DIR), date_ist)
-    })
+    read_spot_day_record_in(Path::new(DAY_RECORD_DIR), date_ist)
+}
+
+fn read_spot_day_record_in(
+    base: &Path,
+    date_ist: NaiveDate,
+) -> std::io::Result<Option<SpotDayRecord>> {
+    tickvault_storage::off_worker::off_worker(|| read_record_in(base, date_ist))
 }
 
 /// The current IST second of the day, from the wall clock. O(1).
@@ -547,15 +741,26 @@ mod tests {
 
     static TMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+    fn claim_dir(path: PathBuf) -> std::io::Result<TmpDir> {
+        std::fs::create_dir(&path)?;
+        Ok(TmpDir(path))
+    }
+
     fn unique_dir() -> TmpDir {
-        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "tv_xverify_day_record_{}_{}",
-            std::process::id(),
-            n
-        ));
-        let _created = std::fs::create_dir_all(&dir);
-        TmpDir(dir)
+        for _ in 0..32 {
+            let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "tv_xverify_day_record_{}_{}",
+                std::process::id(),
+                n
+            ));
+            match claim_dir(dir) {
+                Ok(owned) => return owned,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => panic!("create day-record fixture: {err}"),
+            }
+        }
+        panic!("no exclusive day-record fixture path after 32 attempts")
     }
 
     fn inst(id: SecurityId, segment: ExchangeSegment) -> SubscribeInstrument {
@@ -739,18 +944,17 @@ mod tests {
     }
 
     #[test]
-    fn test_an_unreadable_record_is_replaced_and_reported() {
+    fn test_an_unreadable_record_is_retained_and_refused() {
         let dir = unique_dir();
-        std::fs::write(record_path_in(dir.path(), day()), b"garbage")
-            .unwrap_or_else(|e| panic!("write: {e}"));
+        let path = record_path_in(dir.path(), day());
+        std::fs::write(&path, b"garbage").expect("corrupt fixture");
         let a = inst(2885, ExchangeSegment::NseEquity);
-        let out = record_in(dir.path(), day(), &[a], 30_000, UniverseBasis::MasterList)
-            .unwrap_or_else(|e| panic!("record: {e}"));
-        assert!(out.replaced_unreadable);
-        let read = read_record_in(dir.path(), day())
-            .unwrap_or_else(|e| panic!("read: {e}"))
-            .unwrap_or_else(|| panic!("record missing"));
-        assert_eq!(read.len(), 1);
+        assert!(record_in(dir.path(), day(), &[a], 30_000, UniverseBasis::MasterList).is_err());
+        assert_eq!(
+            std::fs::read(path).expect("prior bytes retained"),
+            b"garbage"
+        );
+        assert!(read_record_in(dir.path(), day()).is_err());
     }
 
     #[test]
@@ -813,18 +1017,354 @@ mod tests {
     }
 
     #[test]
-    fn test_record_spot_subscribed_then_read_spot_day_record_in_the_fixed_dir() {
-        // A date far in the past so the fixed folder holds nothing of the
-        // live day; the sweep only removes files older than this date.
-        let d = NaiveDate::from_ymd_opt(1999, 1, 4).unwrap_or_default();
+    fn test_record_spot_subscribed_then_read_spot_day_record_in_an_isolated_dir() {
+        let dir = unique_dir();
+        let d = day();
         let a = inst(424_242, ExchangeSegment::NseEquity);
-        let out = record_spot_subscribed(d, &[a], 33_300, UniverseBasis::MasterList)
-            .unwrap_or_else(|e| panic!("record: {e}"));
-        assert!(out.recorded >= 1);
-        let read = read_spot_day_record(d)
-            .unwrap_or_else(|e| panic!("read: {e}"))
-            .unwrap_or_else(|| panic!("record missing"));
+        let out = record_spot_subscribed_in(dir.path(), d, &[a], 33_300, UniverseBasis::MasterList)
+            .expect("record through the same off-worker adapter");
+        assert_eq!(out.recorded, 1);
+        let read = read_spot_day_record_in(dir.path(), d)
+            .expect("read through the same off-worker adapter")
+            .expect("record exists");
         assert_eq!(read.first_secs_of_day(&a), Some(33_300));
-        let _removed = std::fs::remove_file(day_record_path(d));
+        assert!(read.coverage_known());
+    }
+
+    // The two tests below share PROCESS_HELD and WRITE_FAILED_DAY, so they
+    // are one test: run in parallel they would race on the statics.
+
+    /// Review rounds 1 to 3: a noted set replaces only the earlier set of the
+    /// same origin and bumps the generation; a failed write is noted per IST
+    /// day; a clear lands only for that day and only when nothing was noted
+    /// since the snapshot.
+    #[test]
+    fn test_note_process_held_process_held_and_note_record_write_failed_record_write_failed_for_clear_record_write_failed()
+     {
+        let a = SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::IdxI,
+        };
+        let b = SubscribeInstrument {
+            security_id: 2_885,
+            segment: ExchangeSegment::NseEquity,
+        };
+        // Far-future days, so no other test's day collides.
+        let day = NaiveDate::from_ymd_opt(2998, 1, 5).expect("date");
+        let other = NaiveDate::from_ymd_opt(2998, 1, 6).expect("date");
+        note_process_held(
+            HeldOrigin::Boot,
+            &[a],
+            UniverseBasis::IndexFallback,
+            day,
+            30_600,
+        );
+        note_process_held(
+            HeldOrigin::Widen,
+            &[b],
+            UniverseBasis::MasterList,
+            day,
+            39_600,
+        );
+        let (first_generation, _) = process_held();
+        note_process_held(
+            HeldOrigin::Widen,
+            &[a, b],
+            UniverseBasis::MasterList,
+            day,
+            40_000,
+        );
+        let (generation, held) = process_held();
+        assert_eq!(generation, first_generation.wrapping_add(1));
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().any(|s| s.origin == HeldOrigin::Boot
+            && s.instruments == vec![a]
+            && s.noted_secs == 30_600));
+        assert!(held.iter().any(|s| s.origin == HeldOrigin::Widen
+            && s.instruments == vec![a, b]
+            && s.noted_secs == 40_000));
+
+        note_record_write_failed(day);
+        assert!(record_write_failed_for(day));
+        assert!(!record_write_failed_for(other));
+        assert!(
+            !clear_record_write_failed(day, first_generation),
+            "a set noted after the snapshot keeps the failure"
+        );
+        assert!(record_write_failed_for(day));
+        assert!(clear_record_write_failed(other, generation));
+        assert!(record_write_failed_for(day), "another day's clear keeps it");
+        assert!(clear_record_write_failed(day, generation));
+        assert!(!record_write_failed_for(day));
+    }
+
+    /// Review round 3: a set is recorded at the later of its own second and
+    /// the recorder's first stamp on the day it was noted, and at the
+    /// recorder's stamp on a later day. A widen at 15:29 never reads earlier.
+    #[test]
+    fn test_held_set_stamp_on_never_moves_a_set_earlier_than_it_was_noted() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 2).expect("date");
+        let next = NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+        let widen = HeldSet {
+            origin: HeldOrigin::Widen,
+            instruments: Vec::new(),
+            basis: UniverseBasis::MasterList,
+            noted_on: day,
+            noted_secs: 55_740,
+        };
+        assert_eq!(widen.stamp_on(day, 28_800), 55_740);
+        assert_eq!(widen.stamp_on(next, 28_800), 28_800);
+        let night_boot = HeldSet {
+            origin: HeldOrigin::Boot,
+            noted_secs: 3 * 3_600,
+            ..widen.clone()
+        };
+        assert_eq!(night_boot.stamp_on(day, 28_800), 28_800);
+        // A retry on the noting day keeps the widen at 15:29: the record
+        // then holds it from 15:29, so coverage reads short.
+        let mut record = SpotDayRecord::new(day);
+        let inst = SubscribeInstrument {
+            security_id: 2_885,
+            segment: ExchangeSegment::NseEquity,
+        };
+        let _ = record.merge(&[inst], widen.stamp_on(day, 28_800), widen.basis);
+        assert_eq!(record.first_secs_of_day(&inst), Some(55_740));
+    }
+
+    #[test]
+    fn test_fixture_collision_never_takes_ownership_of_existing_directory() {
+        let dir = unique_dir();
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).expect("existing fixture");
+        let sentinel = occupied.join("sentinel");
+        std::fs::write(&sentinel, b"keep").expect("sentinel");
+        assert!(claim_dir(occupied).is_err());
+        assert_eq!(std::fs::read(sentinel).expect("not removed"), b"keep");
+    }
+
+    #[test]
+    fn test_read_record_rejects_invalid_entries_and_cap_plus_one() {
+        let dir = unique_dir();
+        let path = record_path_in(dir.path(), day());
+        for (id, segment, second) in [
+            (1, 255, 0),
+            (1, ExchangeSegment::NseEquity.binary_code(), 86_400),
+            (u64::MAX, ExchangeSegment::NseEquity.binary_code(), 0),
+        ] {
+            let file = DayRecordFile {
+                date_ist: day().to_string(),
+                master_listed: true,
+                index_fallback: false,
+                coverage_complete: true,
+                instruments: vec![DayRecordEntry {
+                    security_id: id,
+                    segment,
+                    first_secs_of_day: second,
+                }],
+            };
+            std::fs::write(&path, serde_json::to_vec(&file).expect("fixture JSON"))
+                .expect("fixture write");
+            assert!(read_record_in(dir.path(), day()).is_err());
+        }
+        let mut file = DayRecordFile {
+            date_ist: day().to_string(),
+            master_listed: true,
+            index_fallback: false,
+            coverage_complete: true,
+            instruments: (1..=DAY_RECORD_MAX_INSTRUMENTS as u64)
+                .map(|id| DayRecordEntry {
+                    security_id: id,
+                    segment: ExchangeSegment::NseEquity.binary_code(),
+                    first_secs_of_day: 1,
+                })
+                .collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&file).expect("at cap")).expect("write at cap");
+        assert_eq!(
+            read_record_in(dir.path(), day())
+                .expect("read at cap")
+                .expect("record")
+                .len(),
+            DAY_RECORD_MAX_INSTRUMENTS
+        );
+        file.instruments.push(DayRecordEntry {
+            security_id: 1,
+            segment: ExchangeSegment::NseEquity.binary_code(),
+            first_secs_of_day: 2,
+        });
+        std::fs::write(&path, serde_json::to_vec(&file).expect("over cap"))
+            .expect("write over cap");
+        assert!(
+            read_record_in(dir.path(), day()).is_err(),
+            "trailing duplicate must not be silently truncated"
+        );
+    }
+
+    /// Size and duplicate validation must each reject independently: a
+    /// duplicate at cap+1 alone would let either missing check hide the other.
+    #[test]
+    fn test_read_record_independently_refuses_distinct_over_cap_and_in_cap_duplicate() {
+        let dir = unique_dir();
+        let path = record_path_in(dir.path(), day());
+        let mut file = DayRecordFile {
+            date_ist: day().to_string(),
+            master_listed: true,
+            index_fallback: false,
+            coverage_complete: true,
+            instruments: (1..=DAY_RECORD_MAX_INSTRUMENTS as u64 + 1)
+                .map(|id| DayRecordEntry {
+                    security_id: id,
+                    segment: ExchangeSegment::NseEquity.binary_code(),
+                    first_secs_of_day: 1,
+                })
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&file).expect("distinct over-cap fixture");
+        assert!(bytes.len() as u64 <= DAY_RECORD_READ_CAP_BYTES);
+        std::fs::write(&path, bytes).expect("write distinct over-cap record");
+        let Err(error) = read_record_in(dir.path(), day()) else {
+            panic!("distinct cap+1 must refuse");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "day record exceeds the instrument cap");
+
+        file.instruments.truncate(1);
+        file.instruments.push(DayRecordEntry {
+            security_id: 1,
+            segment: ExchangeSegment::NseEquity.binary_code(),
+            first_secs_of_day: 2,
+        });
+        assert!(file.instruments.len() < DAY_RECORD_MAX_INSTRUMENTS);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&file).expect("in-cap duplicate fixture"),
+        )
+        .expect("write in-cap duplicate record");
+        let Err(error) = read_record_in(dir.path(), day()) else {
+            panic!("in-cap duplicate must refuse");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "day record holds a key twice");
+    }
+
+    #[test]
+    fn test_coverage_known_stays_false_after_overflow_and_restart() {
+        let dir = unique_dir();
+        let many: Vec<_> = (1..=DAY_RECORD_MAX_INSTRUMENTS as u64)
+            .map(|id| inst(id, ExchangeSegment::NseEquity))
+            .collect();
+        record_in(dir.path(), day(), &many, 30_000, UniverseBasis::MasterList)
+            .expect("initial full record");
+        let before = read_record_in(dir.path(), day())
+            .expect("read")
+            .expect("record");
+        assert!(before.coverage_known());
+        let extra = inst(9_999_999, ExchangeSegment::NseEquity);
+        let out = record_in(
+            dir.path(),
+            day(),
+            &[extra],
+            30_000,
+            UniverseBasis::MasterList,
+        )
+        .expect("persist bounded incomplete record");
+        assert_eq!(out.merge.refused_full, 1);
+        let after = read_record_in(dir.path(), day())
+            .expect("restart read")
+            .expect("record");
+        assert!(!after.coverage_known());
+        let (_, _, coverage) =
+            crate::dhan_live_crossverify_boot::targets_from_day_record(Some(&after), &[]);
+        assert!(!coverage.known);
+        assert_eq!(
+            crate::dhan_live_crossverify_boot::coverage_refusal(coverage),
+            Err(crate::dhan_live_crossverify_boot::AttemptFailure::CoverageUnknown)
+        );
+        record_in(
+            dir.path(),
+            day(),
+            &many[..1],
+            30_000,
+            UniverseBasis::MasterList,
+        )
+        .expect("later subset retry");
+        assert!(
+            !read_record_in(dir.path(), day())
+                .expect("read retry")
+                .expect("record")
+                .coverage_known()
+        );
+    }
+
+    #[test]
+    fn test_legacy_record_without_completeness_stays_unknown_after_retry() {
+        let dir = unique_dir();
+        let path = record_path_in(dir.path(), day());
+        let legacy = serde_json::json!({
+            "date_ist": day().to_string(), "master_listed": true, "index_fallback": false,
+            "instruments": [{"security_id":1,"segment":1,"first_secs_of_day":30000}]
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).expect("legacy JSON"))
+            .expect("legacy file");
+        let read = read_record_in(dir.path(), day())
+            .expect("read legacy")
+            .expect("record");
+        assert!(!read.coverage_known());
+        record_in(
+            dir.path(),
+            day(),
+            &[inst(2, ExchangeSegment::NseEquity)],
+            30_000,
+            UniverseBasis::MasterList,
+        )
+        .expect("retry adds another key");
+        let read = read_record_in(dir.path(), day())
+            .expect("read retry")
+            .expect("record");
+        assert_eq!(read.len(), 2);
+        assert!(!read.coverage_known());
+        let (_, _, coverage) =
+            crate::dhan_live_crossverify_boot::targets_from_day_record(Some(&read), &[]);
+        assert_eq!(
+            crate::dhan_live_crossverify_boot::coverage_refusal(coverage),
+            Err(crate::dhan_live_crossverify_boot::AttemptFailure::CoverageUnknown)
+        );
+    }
+
+    #[test]
+    fn test_invalid_recording_input_preserves_the_valid_prior_file() {
+        let dir = unique_dir();
+        let valid = inst(1, ExchangeSegment::NseEquity);
+        record_in(
+            dir.path(),
+            day(),
+            &[valid],
+            30_000,
+            UniverseBasis::MasterList,
+        )
+        .expect("initial valid record");
+        let path = record_path_in(dir.path(), day());
+        let before = std::fs::read(&path).expect("prior bytes");
+        for (instrument, second) in [
+            (inst(u64::MAX, ExchangeSegment::NseEquity), 30_000),
+            (valid, 86_400),
+        ] {
+            let error = record_in(
+                dir.path(),
+                day(),
+                &[instrument],
+                second,
+                UniverseBasis::MasterList,
+            )
+            .expect_err("refuse before replacing a readable record");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(std::fs::read(&path).expect("retained file"), before);
+            let read = read_record_in(dir.path(), day())
+                .expect("still valid")
+                .expect("record");
+            assert!(read.coverage_known());
+            assert_eq!(read.len(), 1);
+            assert_eq!(read.first_secs_of_day(&valid), Some(30_000));
+        }
     }
 }

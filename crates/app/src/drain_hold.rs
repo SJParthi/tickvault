@@ -437,7 +437,10 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             let measured = tokio::task::spawn_blocking(move || {
                 (
                     measure_day_work(day),
-                    crate::evening_drain::load_state(evening_path),
+                    crate::evening_drain::load_state_for_evening(
+                        evening_path,
+                        chrono::Utc::now().timestamp(),
+                    ),
                     crate::daily_task_marker::daily_marker_exists(
                         crate::dhan_live_crossverify_boot::CROSSVERIFY_MARKER_TASK,
                         day,
@@ -469,6 +472,9 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 tickvault_core::notification::source_badge::RuntimeSource::Aws
             );
             let evening_day = chrono::Datelike::num_days_from_ce(&day);
+            if evening.is_some() {
+                evening_state_bad = false;
+            }
             if evening.is_none() && !evening_state_bad {
                 evening_state_bad = true;
                 error!(

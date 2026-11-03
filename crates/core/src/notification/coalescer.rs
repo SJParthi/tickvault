@@ -243,7 +243,8 @@ impl BucketState {
     /// Folds one more event into the bucket. `payload` is called only when
     /// the sample is kept (2026-10-30 O(1) sweep): past
     /// `MAX_SAMPLES_PER_BUCKET` the body is never rendered or copied, only
-    /// counted. O(1).
+    /// counted. Constant bookkeeping; keeping a sample also pays the caller's
+    /// payload construction cost.
     fn fold(&mut self, now_ms: u64, payload: impl FnOnce() -> String) -> bool {
         self.count = self.count.saturating_add(1);
         self.last_ts_ms = now_ms;
@@ -397,8 +398,9 @@ impl TelegramCoalescer {
     /// `payload` is called at most once, and only when the event is coalesced
     /// AND its bucket still keeps samples (fewer than
     /// `MAX_SAMPLES_PER_BUCKET`); a bypassed event or one past the cap never
-    /// renders it (2026-10-30 O(1) sweep). O(1): one map probe under the
-    /// bucket lock.
+    /// renders it (2026-10-30 O(1) sweep). One expected-O(1) map entry
+    /// operation under the bucket lock, plus the payload cost for a kept
+    /// sample. Hash-table growth and payload construction may allocate.
     pub fn observe(
         &self,
         topic: &'static str,

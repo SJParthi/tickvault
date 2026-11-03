@@ -32,8 +32,6 @@ use tokio::net::{TcpListener, TcpStream};
 struct Resp {
     status: u16,
     body: Vec<u8>,
-    /// Declare this Content-Length instead of the real one (body unsent).
-    declared_len: Option<usize>,
     /// Send no Content-Length at all; the body ends at connection close.
     omit_len: bool,
 }
@@ -43,7 +41,6 @@ impl Resp {
         Self {
             status: 200,
             body: v.to_string().into_bytes(),
-            declared_len: None,
             omit_len: false,
         }
     }
@@ -51,7 +48,6 @@ impl Resp {
         Self {
             status,
             body: body.as_bytes().to_vec(),
-            declared_len: None,
             omit_len: false,
         }
     }
@@ -126,16 +122,12 @@ async fn serve_one(mut s: TcpStream, handler: Handler, log: Arc<Mutex<Vec<String
         .push(format!("{path} {query}"));
     let resp = handler(&path, &query);
     let mut out = format!("HTTP/1.1 {} X\r\nConnection: close\r\n", resp.status);
-    if let Some(declared) = resp.declared_len {
-        out.push_str(&format!("Content-Length: {declared}\r\n"));
-    } else if !resp.omit_len {
+    if !resp.omit_len {
         out.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
     }
     out.push_str("\r\n");
     let _ = s.write_all(out.as_bytes()).await;
-    if resp.declared_len.is_none() {
-        let _ = s.write_all(&resp.body).await;
-    }
+    let _ = s.write_all(&resp.body).await;
     let _ = s.flush().await;
     let _ = s.shutdown().await;
 }
@@ -385,6 +377,52 @@ async fn run(sc: Scenario) -> (TfConsistencySummaryData, Mock) {
     (summary, mock)
 }
 
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("captured log lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn run_with_captured_log(sc: Scenario) -> (TfConsistencySummaryData, Mock, String) {
+    use tracing::instrument::WithSubscriber as _;
+    let captured = CapturedLog::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let (summary, mock) = run(sc).with_subscriber(subscriber).await;
+    let log = String::from_utf8(captured.0.lock().expect("captured log lock").clone())
+        .expect("fixture tracing is UTF-8");
+    (summary, mock, log)
+}
+
+fn padded_empty_discovery(len: usize, omit_len: bool) -> Resp {
+    let mut response = discovery(&[]);
+    assert!(len >= response.body.len());
+    response.body.resize(len, b' ');
+    response.omit_len = omit_len;
+    // Padding changes only the size, so disabling a cap would accept this
+    // discovery result rather than fail on malformed JSON or a short body.
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).expect("valid fixture"),
+        json!({"dataset": []})
+    );
+    response
+}
+
 /// A port that never answers: the listener stays bound for the life of the
 /// test process (so a parallel test can never be handed the same port) and
 /// closes every accepted connection before reading a byte. The pass sees a
@@ -539,33 +577,66 @@ async fn test_tf_consistency_boot_run_empty_discovery_count_malformed_degrades()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tf_consistency_boot_run_discovery_declared_oversize_is_refused() {
-    let mut big = Resp::raw(200, "");
-    big.declared_len = Some(TF_VERIFY_MAX_RESPONSE_BYTES + 1);
-    let sc = Scenario {
-        discovery: Some(big),
-        count: Some(Resp::json(&json!({"dataset": [[0]]}))),
-        ..Scenario::default()
-    };
-    let (s, _mock) = run(sc).await;
-    assert_eq!(s.status_label, "blind");
-    assert!(s.degraded);
+    for len in [
+        TF_VERIFY_MAX_RESPONSE_BYTES,
+        TF_VERIFY_MAX_RESPONSE_BYTES + 1,
+    ] {
+        let sc = Scenario {
+            discovery: Some(padded_empty_discovery(len, false)),
+            count: Some(Resp::json(&json!({"dataset": [[0]]}))),
+            ..Scenario::default()
+        };
+        let (s, _mock, log) = run_with_captured_log(sc).await;
+        if len == TF_VERIFY_MAX_RESPONSE_BYTES {
+            assert_eq!(
+                s.status_label, "no_data",
+                "the exact cap is accepted: {log}"
+            );
+            assert!(!s.degraded);
+        } else {
+            assert_eq!(s.status_label, "blind");
+            assert!(s.degraded);
+            // A verdict alone would also pass if the header gate were removed
+            // and the post-read cap rejected the body. Pin the earlier reason.
+            assert!(
+                log.contains(&format!("declared content-length {len} bytes exceeds")),
+                "the declared-length gate must reject before the body cap: {log}"
+            );
+            assert!(!log.contains("response body"));
+        }
+        assert_eq!(s.instruments, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tf_consistency_boot_run_discovery_streamed_oversize_body_is_refused() {
-    // No Content-Length: the post-read cap is the only defense.
-    let mut big = Resp::raw(200, "");
-    big.body = vec![b' '; TF_VERIFY_MAX_RESPONSE_BYTES + 1];
-    big.omit_len = true;
-    let sc = Scenario {
-        discovery: Some(big),
-        count: Some(Resp::json(&json!({"dataset": [[0]]}))),
-        ..Scenario::default()
-    };
-    let (s, _mock) = run(sc).await;
-    assert_eq!(s.status_label, "blind");
-    assert!(s.degraded);
-    assert_eq!(s.instruments, 0);
+    for len in [
+        TF_VERIFY_MAX_RESPONSE_BYTES,
+        TF_VERIFY_MAX_RESPONSE_BYTES + 1,
+    ] {
+        let sc = Scenario {
+            discovery: Some(padded_empty_discovery(len, true)),
+            count: Some(Resp::json(&json!({"dataset": [[0]]}))),
+            ..Scenario::default()
+        };
+        let (s, _mock, log) = run_with_captured_log(sc).await;
+        if len == TF_VERIFY_MAX_RESPONSE_BYTES {
+            assert_eq!(
+                s.status_label, "no_data",
+                "the exact cap is accepted: {log}"
+            );
+            assert!(!s.degraded);
+        } else {
+            assert_eq!(s.status_label, "blind");
+            assert!(s.degraded);
+            assert!(
+                log.contains(&format!("response body {len} bytes exceeds")),
+                "the streamed body must hit the actual size gate: {log}"
+            );
+            assert!(!log.contains("declared content-length"));
+        }
+        assert_eq!(s.instruments, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

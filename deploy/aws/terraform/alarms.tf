@@ -169,8 +169,8 @@ resource "aws_cloudwatch_metric_alarm" "ebs_write_latency" {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Network out > 50 MB/sec for 5 min — possibly a runaway egress
-# (tick replay loop, debug dump, or compromise)
+# 5. Average NetworkOut > 50 MiB per 60-second period for 5 periods
+# NetworkOut is a byte count; with one sample per period, this is 50 MiB/min.
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "network_out_high" {
@@ -181,8 +181,8 @@ resource "aws_cloudwatch_metric_alarm" "network_out_high" {
   namespace           = "AWS/EC2"
   period              = 60
   statistic           = "Average"
-  threshold           = 52428800 # 50 MB/sec in bytes
-  alarm_description   = "Network egress > 50 MB/sec for 5 minutes. Unusual — data transfer cost risk + possible runaway. See DR runbook §9."
+  threshold           = 52428800 # 50 MiB byte-count sample, not bytes/second
+  alarm_description   = "Average NetworkOut exceeds 50 MiB in each of five 60-second periods. This metric is a byte count, not bytes/second. Investigate transfer cost and the responsible job. See DR runbook §9."
   treat_missing_data  = "notBreaching"
 
   dimensions = {

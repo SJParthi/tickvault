@@ -436,6 +436,13 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
     ("bash", "test harnesses invoking the repo's own .sh hooks"),
     ("sh", "same, POSIX form"),
     (
+        "timeout",
+        "GNU coreutils deadline supervisor, restricted below to the deployment \
+         backup module. Preserves the reviewed 20s Git/sudo and 30s sha256sum \
+         deadlines with kill-after=5, plus five owned test children. It is \
+         neither a language runtime nor a shell; no general spawn allowance.",
+    ),
+    (
         "docker",
         "compose health checks (infra.rs) + container tests",
     ),
@@ -509,6 +516,108 @@ fn spawned_literals(body: &str) -> Vec<String> {
     out
 }
 
+const DEPLOY_BACKUP_TIMEOUT_SOURCE: &str = "crates/app/src/bin/smoke_test/deploy_backup.rs";
+// Two production supervisors and five owned fixture supervisors. Shrink-only.
+const DEPLOY_BACKUP_TIMEOUT_SITE_CEILING: usize = 7;
+
+fn timeout_spawn_scope_problem(path: &str, binaries: &[String]) -> Option<String> {
+    let sites = binaries
+        .iter()
+        .filter(|bin| bin.as_str() == "timeout")
+        .count();
+    if sites == 0 {
+        None
+    } else if path != DEPLOY_BACKUP_TIMEOUT_SOURCE || sites > DEPLOY_BACKUP_TIMEOUT_SITE_CEILING {
+        Some(format!(
+            "  {path}: {sites} timeout spawn(s) outside the reviewed backup scope/ceiling"
+        ))
+    } else {
+        None
+    }
+}
+
+#[test]
+fn timeout_scope_rejects_other_paths_lookalikes_and_extra_sites() {
+    let one = spawned_literals(r#"Command::new("timeout")"#);
+    assert!(timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &one).is_none());
+    for path in [
+        "crates/app/src/main.rs",
+        "crates/app/tests/deploy_backup.rs",
+        "crates/app/src/bin/other/deploy_backup.rs",
+        "./crates/app/src/bin/smoke_test/deploy_backup.rs",
+        "crates/app/src/bin/smoke_test/deploy_backup.rs.bak",
+    ] {
+        assert!(
+            timeout_spawn_scope_problem(path, &one).is_some(),
+            "path={path}"
+        );
+    }
+    let ceiling = vec!["timeout".to_string(); DEPLOY_BACKUP_TIMEOUT_SITE_CEILING];
+    assert!(timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &ceiling).is_none());
+    let over = vec!["timeout".to_string(); DEPLOY_BACKUP_TIMEOUT_SITE_CEILING + 1];
+    assert!(timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &over).is_some());
+    assert!(timeout_spawn_scope_problem("crates/app/src/main.rs", &["git".to_string()]).is_none());
+}
+
+fn deploy_backup_deadline_roles_match(body: &str) -> bool {
+    let Some(production) = tickvault_common::source_scan::production_region(body) else {
+        return false;
+    };
+    let production = tickvault_common::source_scan::strip_rust_comments(&production);
+    spawned_literals(&production)
+        .iter()
+        .filter(|name| name.as_str() == "timeout")
+        .count()
+        == 2
+        && production.contains(r#"command.args(["--kill-after=5", "20"])"#)
+        && production.contains(r#".args(["--kill-after=5", "30", "sha256sum", "--"])"#)
+}
+
+#[test]
+fn deploy_backup_keeps_its_reviewed_production_deadline_roles() {
+    let body = read_scan_text(&repo_root(), DEPLOY_BACKUP_TIMEOUT_SOURCE);
+    assert!(
+        deploy_backup_deadline_roles_match(&body),
+        "the complete production region must retain both reviewed deadlines"
+    );
+}
+
+#[test]
+fn deploy_backup_deadline_guard_keeps_trailing_production_and_refuses_missing_test_module() {
+    let body = read_scan_text(&repo_root(), DEPLOY_BACKUP_TIMEOUT_SOURCE);
+    assert!(deploy_backup_deadline_roles_match(&body));
+    let test_gate = "#[cfg(test)]\nmod tests {";
+    assert_eq!(body.matches(test_gate).count(), 1);
+    assert!(!deploy_backup_deadline_roles_match(&body.replacen(
+        test_gate,
+        "mod tests {",
+        1
+    )));
+    let fixture_site = r#"let mut verify = Command::new("timeout");"#;
+    assert_eq!(body.matches(fixture_site).count(), 1);
+    let moved = body.replacen(fixture_site, r#"let mut verify = Command::new("git");"#, 1)
+        + r#"
+fn trailing_production_probe() { let _child = Command::new("timeout"); }
+"#;
+    assert!(
+        timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &spawned_literals(&moved))
+            .is_none(),
+        "fixture stays within the total seven-site ceiling"
+    );
+    assert!(
+        !deploy_backup_deadline_roles_match(&moved),
+        "a third production supervisor after mod tests must still be seen"
+    );
+    let commented = body.replace(
+        r#"command.args(["--kill-after=5", "20"]);"#,
+        r#"// command.args(["--kill-after=5", "20"]);"#,
+    );
+    assert!(
+        !deploy_backup_deadline_roles_match(&commented),
+        "a comment must not stand in for the deadline"
+    );
+}
+
 #[test]
 fn every_spawned_binary_is_on_the_allowlist() {
     let root = repo_root();
@@ -522,7 +631,11 @@ fn every_spawned_binary_is_on_the_allowlist() {
             continue;
         }
         let body = read_scan_text(&root, &path);
-        for bin in spawned_literals(&body) {
+        let binaries = spawned_literals(&body);
+        if let Some(problem) = timeout_spawn_scope_problem(&path, &binaries) {
+            violations.push(problem);
+        }
+        for bin in binaries {
             seen_any = true;
             if !allowed.contains(&bin.as_str()) {
                 violations.push(format!("  {path}: Command::new(\"{bin}\")"));
@@ -601,6 +714,8 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
         "systemctl",
         "modprobe",
         "/usr/bin/true",
+        // 2026-11-02: only the reviewed backup supervisor sites, not a runtime.
+        "timeout",
     ];
 
     let mut actual: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(b, _)| *b).collect();
@@ -682,7 +797,8 @@ const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     // 301 → 275 the same day: the speed-and-health panel compacted the script.
     ("crates/api/src/handlers/dashboard_page.rs", 275),
     ("crates/api/src/handlers/feeds_page.rs", 226),
-    ("crates/aws-lambdas/src/operator_control_console.html", 319),
+    // Public portal Top Movers, user-requested 2026-10-31; scope/measurement in §0.16.
+    ("crates/aws-lambdas/src/operator_control_console.html", 350),
 ];
 
 /// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
@@ -1125,9 +1241,10 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // 11,014 → 10,953 on review: both token-gated reads share one guard.
     ("crates/api/src/handlers/dashboard_page.rs", 10_953),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
+    // Requested Stocks reference view, 2026-11-02; measured scope in §0.17.
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        26_601,
+        34_530,
     ),
 ];
 

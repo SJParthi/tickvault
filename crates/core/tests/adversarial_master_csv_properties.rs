@@ -28,16 +28,18 @@
 //!    arithmetic for paise and lots) on generated numeric strings, and on
 //!    arbitrary strings never panic and never return a value outside their
 //!    contract (a real calendar date in 1970..=2999 or 0; paise >= 0 and
-//!    below 2^53; a lot that the text actually spells, or 0).
+//!    below 2^53; for lots, exactly what `ref_exact_lot` reads: an exact
+//!    digit-shift over the decimal text, with no `f64`, so a fraction below
+//!    `f64` resolution or behind an exponent is refused, or 0).
 //!
 //! Honest limits: a field containing a raw newline is out of the parser's
 //! contract (documented) and is not generated in the round trip. Each
 //! round-trip case pads to the 1,000-row floor with fixed filler rows, so a
 //! case is ~1,000 rows; case counts are set to keep the file fast in debug.
-//! `parse_lot_size` accepts a decimal spelling whose fraction is below
-//! `f64` resolution (`75.000000000000001` reads as 75); generated spellings
-//! stay within 6 fractional digits, and that edge is pinned by the ignored
-//! `bug_parse_lot_size_refuses_every_non_zero_fraction`.
+//! `parse_lot_size` once accepted a decimal spelling whose fraction is below
+//! `f64` resolution (`75.000000000000001` read as 75); fixed 2026-10-30 and
+//! pinned by `test_regression_parse_lot_size_refuses_every_non_zero_fraction`.
+//! Generated spellings stay within 6 fractional digits.
 
 use chrono::{Datelike, NaiveDate};
 use proptest::prelude::*;
@@ -373,6 +375,59 @@ fn with_filler(records: Vec<Record>) -> Vec<Record> {
 // References for the scalar parsers
 // ---------------------------------------------------------------------------
 
+/// Exact reference for `parse_lot_size`, independent of the parser: the
+/// decimal text (optional `+`, digits with at most one `.`, optional
+/// exponent) is shifted by its exponent over its digit string; a lot is the
+/// integer before the point when every digit after it is `0` and it lies in
+/// `1..=u32::MAX`. No `f64` anywhere, so a fraction below `f64` resolution
+/// or hidden behind an exponent is seen.
+fn ref_exact_lot(text: &str) -> u64 {
+    let unsigned = text.trim().strip_prefix('+').unwrap_or(text.trim());
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], &unsigned[at + 1..]),
+        None => (unsigned, "0"),
+    };
+    let Ok(exponent) = exponent.parse::<i64>() else {
+        return 0;
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits: String = format!("{integer}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return 0;
+    }
+    // Position of the point in `digits` after the shift.
+    let point = i64::try_from(integer.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    let len = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+    if point < len
+        && digits[usize::try_from(point.max(0)).unwrap_or(0)..]
+            .bytes()
+            .any(|b| b != b'0')
+    {
+        return 0;
+    }
+    // A whole number: its digits, then zeros up to the point. Anything
+    // longer than 11 significant places is beyond u32.
+    let whole_len = point.saturating_sub(len - i64::try_from(significant.len()).unwrap_or(0));
+    if whole_len > 11 {
+        return 0;
+    }
+    let kept = usize::try_from(point.min(len)).unwrap_or(0);
+    let mut whole = digits[..kept].to_owned();
+    for _ in 0..point.saturating_sub(len) {
+        whole.push('0');
+    }
+    match whole.parse::<u64>() {
+        Ok(lot) if (1..=u64::from(u32::MAX)).contains(&lot) => lot,
+        _ => 0,
+    }
+}
+
 /// `YYYYMMDD` when (y, m, d) is a real date in 1970..=2999, else 0 (chrono's
 /// calendar, independent of the module's own `days_in_month`).
 fn ref_ymd(y: i64, m: i64, d: i64) -> u32 {
@@ -572,7 +627,7 @@ proptest! {
     /// Property 1: arbitrary text never panics; an `Ok` is never smaller
     /// than the floor.
     #[test]
-    fn prop_arbitrary_text_never_panics(text in "\\PC{0,400}") {
+    fn prop_arbitrary_text_never_panics(text in "(?s).{0,400}") {
         if let Ok(rows) = parse_master_csv(&text) {
             prop_assert!(rows.len() >= MIN_PLAUSIBLE_MASTER_ROWS);
         }
@@ -740,15 +795,21 @@ proptest! {
         prop_assert_eq!(u64::from(parse_lot_size(&text)), want, "{:?}", text);
     }
 
-    /// Arbitrary strings: never a panic; a non-zero lot is a number the text
-    /// spells.
+    /// Arbitrary strings, long fraction tails and exponent spellings: never a
+    /// panic, and the lot is exactly what the exact decimal reference reads
+    /// (0 = refused). Catches a fraction below `f64` resolution and any
+    /// off-by-one in the exponent shift.
     #[test]
-    fn prop_parse_lot_size_never_fabricates(text in "\\PC{0,30}|[0-9.eE+ -]{0,24}") {
-        let lot = parse_lot_size(&text);
-        if lot > 0 {
-            let spelled: f64 = text.trim().parse().expect("a lot spells a number");
-            prop_assert_eq!(spelled, f64::from(lot), "{:?}", text);
-        }
+    fn prop_parse_lot_size_matches_exact_decimal_reference(text in prop_oneof![
+        "\\PC{0,30}",
+        any::<String>(),
+        "[0-9.eE+ -]{0,24}",
+        "[0-9]{1,4}\\.0{10,24}[0-9]",
+        "[0-9]{1,6}(\\.[0-9]{0,8})?[eE][+-]?[0-9]{1,2}",
+        "0{0,15}[1-9][0-9]{0,10}(\\.0{0,5})?",
+        "[0-9]{1,3}\\.[0-9]{0,30}[eE]-?[0-9]{1,3}",
+    ]) {
+        prop_assert_eq!(u64::from(parse_lot_size(&text)), ref_exact_lot(&text), "{:?}", text);
     }
 }
 
@@ -810,28 +871,37 @@ fn test_scalar_parsers_hostile_table() {
     }
 }
 
-/// BUG (low; found 2026-10-30): `parse_lot_size` documents "Only a value
-/// whose fraction is exactly zero is a lot size" and "a fractional lot is
-/// refused rather than truncated", but it decides the fraction on the `f64`
-/// the text rounds to, so a fraction below `f64` resolution is truncated
-/// away and the lot is accepted.
-///
-/// Minimal input: `"75.000000000000001"` returns 75 (the nearest `f64` is
-/// exactly 75.0). Real vendor files carry `75.0`, so this is not reachable
-/// from today's master; it is a contract gap, not a live loss.
-///
-/// Proposed fix: before the `f64` path, when the trimmed text has a `.`,
-/// require every digit after it (up to an optional exponent) to be `0`, or
-/// parse the decimal exactly (integer part, fraction digits, exponent) the
-/// way `order_update::exact_decimal_i64` does.
+// Regression: 2026-10-30 — parse_lot_size truncated a fraction below f64 resolution.
+/// `parse_lot_size` documents "Only a value whose fraction is exactly zero is
+/// a lot size", but decided the fraction on the `f64` the text rounds to, so
+/// a fraction below `f64` resolution was truncated away: `"75.000000000000001"`
+/// returned 75 (its nearest `f64` is exactly 75.0). Fixed 2026-10-30 by
+/// reading the decimal text digit by digit (`decimal_text_is_whole`). Real
+/// vendor files carry `75.0`, so this was a contract gap, not a live loss.
+/// Whole values written with trailing zeros or an exponent stay accepted.
 #[test]
-#[ignore = "BUG: parse_lot_size truncates a fraction below f64 resolution (75.000000000000001 -> 75)"]
-fn bug_parse_lot_size_refuses_every_non_zero_fraction() {
+fn test_regression_parse_lot_size_refuses_every_non_zero_fraction() {
     for text in [
         "75.000000000000001",
         "1.0000000000000001",
         "250.00000000000001",
+        "7.50000000000000000001e1",
+        "-75.0",
     ] {
-        assert_eq!(parse_lot_size(text), 0, "{text:?} has a non-zero fraction");
+        assert_eq!(
+            parse_lot_size(text),
+            0,
+            "{text:?} is not a whole positive lot"
+        );
+    }
+    for (text, want) in [
+        ("75.000000000000000", 75),
+        ("7.5e1", 75),
+        ("750e-1", 75),
+        ("+75", 75),
+        (" 75.0 ", 75),
+        ("1.000e3", 1000),
+    ] {
+        assert_eq!(parse_lot_size(text), want, "{text:?}");
     }
 }

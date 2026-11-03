@@ -70,9 +70,9 @@ pub const REQUIRED_SOMAXCONN: u64 = 4_096;
 /// Memory-map areas per process (plan item 2, 2026-10-30). QuestDB maps every
 /// column file of every open partition, and the stock 65,530 is a real
 /// ceiling on a box holding weeks of hour-partitioned tables: past it the
-/// database fails its next `mmap` and the WAL apply stalls. QuestDB shares the
-/// host kernel with this process, so this process reading it checks the
-/// database's limit too.
+/// database fails its next `mmap` and the WAL apply stalls. This check reads
+/// the local host's kernel setting. A QuestDB process on a separate host needs
+/// its own verification; this process cannot establish that remote limit.
 ///
 /// Must stay in lockstep with `vm.max_map_count` in
 /// `deploy/aws/sysctl/99-tickvault-net.conf`. Pinned by

@@ -3353,9 +3353,9 @@ mod failure_arm_tests {
         assert_eq!(out["truncated"], json!(true));
         let lines = out["lines"].as_array().cloned().unwrap_or_default();
         assert_eq!(
-            lines.last(),
-            Some(&json!("tail-two")),
-            "the last whole line survives the cut: {out}"
+            lines,
+            vec![json!("tail-one"), json!("tail-two")],
+            "only both complete tail lines survive, without the partial NUL prefix: {out}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -522,10 +522,13 @@ const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 /// real trading day.
 #[test]
 fn holiday_gate_is_wired_and_fail_open() {
-    // 1. The app exposes the exit-code gate (also asked in-process by the gate).
+    // 1. The app exposes the legacy exit-code CLI through its owning module.
     let main = read("crates/app/src/main.rs");
+    let gate = read(HOLIDAY_GATE_RS);
     assert!(
-        main.contains("fn trading_day_gate_exit_code")
+        gate.contains("pub fn trading_day_gate_exit_code(")
+            && main.contains("use tickvault_app::holiday_gate::trading_day_gate_exit_code;")
+            && main.contains("trading_day_gate_exit_code(calendar.is_trading_day(today_ist))")
             && main.contains("--check-trading-day")
             && main.contains("run_trading_day_gate"),
         "main.rs must expose the --check-trading-day gate (exit 0=trading / 75=holiday)"
@@ -534,7 +537,6 @@ fn holiday_gate_is_wired_and_fail_open() {
     // 2. The gate itself (a shell script until 2026-10-01, audit D6c; now the
     //    app's `holiday-gate` subcommand): override marker, stops the box ONLY
     //    on the definitive 75 verdict, IMDSv2 token-required, fail-open.
-    let gate = read(HOLIDAY_GATE_RS);
     assert!(
         gate.contains("ALLOW_HOLIDAY_RUN"),
         "gate must honour the /opt/tickvault/ALLOW_HOLIDAY_RUN override marker"

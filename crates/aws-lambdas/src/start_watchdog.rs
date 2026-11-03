@@ -3599,29 +3599,36 @@ mod sdk_loopback_tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_handle_ping_describes_the_instance_and_publishes_the_dashboard_link() {
-        let (endpoint, requests) = start_fleet(Fleet::default()).await;
+    #[test]
+    fn test_handle_ping_describes_the_instance_and_publishes_the_dashboard_link() {
         let _lock = env_lock();
-        let _aws = aws_env_guards(&endpoint);
-        let _id = EnvVarGuard::set("EC2_INSTANCE_ID", Some("i-0loopback"));
-        let _topic = EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
-        let _port = EnvVarGuard::set("DASHBOARD_PORT", Some("3001"));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread fixture runtime")
+            .block_on(async {
+                let (endpoint, requests) = start_fleet(Fleet::default()).await;
+                let _aws = aws_env_guards(&endpoint);
+                let _id = EnvVarGuard::set("EC2_INSTANCE_ID", Some("i-0loopback"));
+                let _topic =
+                    EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
+                let _port = EnvVarGuard::set("DASHBOARD_PORT", Some("3001"));
 
-        let out = handle(json!({"mode": "ping"}))
-            .await
-            .expect("ping succeeds");
-        assert!(out.is_object(), "{out}");
-        let ops = operations(&requests);
-        assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
-        let publish = recorded(&requests)
-            .into_iter()
-            .find(|r| r.query_action().as_deref() == Some("Publish"))
-            .expect("the ping publishes");
-        let message = publish.form_value("Message").unwrap_or_default();
-        assert!(
-            message.contains("http://203.0.113.7:3001/feeds"),
-            "the start message carries the dashboard link: {message}"
-        );
+                let out = handle(json!({"mode": "ping"}))
+                    .await
+                    .expect("ping succeeds");
+                assert!(out.is_object(), "{out}");
+                let ops = operations(&requests);
+                assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+                let publish = recorded(&requests)
+                    .into_iter()
+                    .find(|r| r.query_action().as_deref() == Some("Publish"))
+                    .expect("the ping publishes");
+                let message = publish.form_value("Message").unwrap_or_default();
+                assert!(
+                    message.contains("http://203.0.113.7:3001/feeds"),
+                    "the start message carries the dashboard link: {message}"
+                );
+            });
     }
 }

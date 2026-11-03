@@ -33,7 +33,7 @@
 //!   [`KERNEL_RX_BACKLOG_CONSECUTIVE_SAMPLES`] consecutive samples, re-armed
 //!   only once it drops below half the threshold.
 //!
-//! * Also reads the kernel's own TCP drop counters (2026-10-30, plan item
+//! * Also reads kernel TCP receive-pressure events (2026-10-30, plan item
 //!   52j phase A). Each sample reads `/proc/net/netstat` and finds nine
 //!   `TcpExt` counters by NAME, never by column number (the column order
 //!   changes between kernels): [`TCP_EXT_COUNTERS`]. Each one's growth since
@@ -55,9 +55,10 @@
 //! # Honest limits
 //!
 //! * The `TcpExt` counters cover the whole network namespace, not only our
-//!   sockets. In the app's container that is our own traffic plus anything
-//!   else in the same namespace. They say THAT the kernel dropped or pruned
-//!   receive data, not on which socket. Per-socket detail needs a
+//!   sockets. They include all traffic in the app's network namespace.
+//!   Some are drops, others are pruning attempts, compaction or advertised
+//!   zero-window events. None is an exchange tick-loss count or socket-level
+//!   attribution. Per-socket detail needs a
 //!   `getsockopt` probe, which is not built (it needs `unsafe`).
 //! * `tcp_rmem` is per network namespace; `rmem_max` is host-wide. The
 //!   gauges show what the app's namespace reads at task start; a later
@@ -79,8 +80,12 @@
 //! on the blocking pool (`spawn_blocking`), never on a runtime worker. The inode set and
 //! the read buffers are reused across samples. The `/proc/net/netstat` read
 //! reuses the same buffer and adds O(fields × 9) name compares (about 120
-//! fields today), no allocation. The counter handles are resolved once per
-//! name, the first time that name is seen.
+//! fields today). Parsing does not allocate; the retained read buffer may
+//! grow when the proc tables exceed its capacity. Counter handles resolve
+//! once per observed name. Published totals cover observed in-session
+//! increments only, not kernel lifetime counts. A gap forgets the seed but
+//! leaves an already-published cumulative total; it does not prove zero
+//! pressure while the sampler was unavailable.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -111,7 +116,7 @@ pub const KERNEL_RX_QUEUE_SUM_GAUGE: &str = "tv_dhan_ws_kernel_rx_queue_bytes_su
 /// WS-GAP-03 emit from the code's other sites.
 pub const KERNEL_RX_BACKLOG_SOURCE: &str = "kernel_rx_queue_backlog";
 
-/// Counter of the kernel's `TcpExt` receive-side drop and prune events, one
+/// Counter of sampled kernel `TcpExt` receive-pressure events, one
 /// series per kernel counter name (label `counter`). Local `/metrics` only.
 pub const KERNEL_TCP_EXT_COUNTER: &str = "tv_kernel_tcp_ext_total";
 
@@ -127,8 +132,8 @@ pub const KERNEL_TCP_RMEM_MAX_GAUGE: &str = "tv_kernel_tcp_rmem_max_bytes";
 
 /// The `TcpExt` counters read from `/proc/net/netstat`, by kernel name.
 ///
-/// * `PruneCalled`, `RcvPruned`, `OfoPruned`: the receive queue ran out of
-///   buffer memory and the kernel pruned (dropped) queued data.
+/// * `PruneCalled`: receive pruning attempts; it does not itself prove a drop.
+/// * `RcvPruned`, `OfoPruned`: receive and out-of-order queue pruning events.
 /// * `TCPRcvCollapsed`: queued data was compacted to save memory.
 /// * `TCPRcvQDrop`: a packet was dropped because the receive buffer was full.
 /// * `TCPBacklogDrop`: a packet was dropped from the socket backlog.
@@ -439,9 +444,13 @@ impl ProcReader {
     /// buffer. An unreadable file or a file with no `TcpExt` lines leaves
     /// every counter `None`.
     fn sample_tcp_ext(&mut self) {
+        self.sample_tcp_ext_from(std::path::Path::new(PROC_NET_NETSTAT_PATH));
+    }
+
+    fn sample_tcp_ext_from(&mut self, path: &std::path::Path) {
         self.table.clear();
-        let read = std::fs::File::open(PROC_NET_NETSTAT_PATH)
-            .and_then(|mut file| file.read_to_string(&mut self.table));
+        let read =
+            std::fs::File::open(path).and_then(|mut file| file.read_to_string(&mut self.table));
         if read.is_err() || !parse_tcp_ext_counters(&self.table, &mut self.tcp_ext) {
             self.tcp_ext = [None; TCP_EXT_COUNTER_COUNT];
         }
@@ -486,10 +495,20 @@ impl ProcReader {
 /// Either is `None` when its file cannot be read or parsed. Blocking file
 /// I/O: call it on the blocking pool.
 fn read_rmem_ceilings() -> (Option<u64>, Option<u64>) {
-    let rmem_max = std::fs::read_to_string(PROC_RMEM_MAX_PATH)
+    read_rmem_ceilings_from(
+        std::path::Path::new(PROC_RMEM_MAX_PATH),
+        std::path::Path::new(PROC_TCP_RMEM_PATH),
+    )
+}
+
+fn read_rmem_ceilings_from(
+    rmem_path: &std::path::Path,
+    tcp_rmem_path: &std::path::Path,
+) -> (Option<u64>, Option<u64>) {
+    let rmem_max = std::fs::read_to_string(rmem_path)
         .ok()
         .and_then(|text| parse_rmem_max(&text));
-    let tcp_rmem_max = std::fs::read_to_string(PROC_TCP_RMEM_PATH)
+    let tcp_rmem_max = std::fs::read_to_string(tcp_rmem_path)
         .ok()
         .and_then(|text| parse_tcp_rmem_max(&text));
     (rmem_max, tcp_rmem_max)
@@ -884,7 +903,7 @@ IpExt: 99 99\n";
     }
 
     #[test]
-    fn tcp_ext_deltas_first_sample_seeds_then_adds_growth() {
+    fn tcp_ext_deltas_new_and_advance_seed_then_add_growth() {
         let mut deltas = TcpExtDeltas::new();
         let mut reading = [None; TCP_EXT_COUNTER_COUNT];
         reading[0] = Some(100);
@@ -903,7 +922,7 @@ IpExt: 99 99\n";
     }
 
     #[test]
-    fn tcp_ext_deltas_saturate_on_a_reset_and_reseed() {
+    fn tcp_ext_deltas_advance_saturates_on_a_reset_and_reseeds() {
         let mut deltas = TcpExtDeltas::default();
         let mut reading = [None; TCP_EXT_COUNTER_COUNT];
         reading[4] = Some(1_000);
@@ -923,7 +942,7 @@ IpExt: 99 99\n";
     }
 
     #[test]
-    fn tcp_ext_deltas_forget_a_counter_that_disappears() {
+    fn tcp_ext_deltas_advance_forgets_a_counter_that_disappears() {
         let mut deltas = TcpExtDeltas::new();
         let mut reading = [None; TCP_EXT_COUNTER_COUNT];
         reading[2] = Some(50);
@@ -972,33 +991,87 @@ IpExt: 99 99\n";
         );
     }
 
-    #[test]
-    fn read_rmem_ceilings_matches_the_parsers_on_this_host() {
-        // On Linux both files exist; elsewhere both are None. Either way the
-        // reader must agree with parsing the files directly.
-        let (rmem_max, tcp_rmem_max) = read_rmem_ceilings();
-        let direct = std::fs::read_to_string(PROC_RMEM_MAX_PATH)
-            .ok()
-            .and_then(|text| parse_rmem_max(&text));
-        assert_eq!(rmem_max, direct);
-        if let Some(max) = tcp_rmem_max {
-            assert!(max > 0);
+    struct ProcFixture(std::path::PathBuf);
+
+    impl ProcFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tickvault-kernel-sampler-{}-{serial}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("fresh owned fixture directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for ProcFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
     #[test]
-    fn proc_reader_sample_tcp_ext_is_absent_or_parsed() {
+    fn read_rmem_ceilings_handles_each_file_independently() {
+        let fixture = ProcFixture::new();
+        let rmem = fixture.0.join("rmem_max");
+        let tcp = fixture.0.join("tcp_rmem");
+        assert_eq!(read_rmem_ceilings_from(&rmem, &tcp), (None, None));
+        std::fs::write(&rmem, "67108864\n").expect("write rmem fixture");
+        assert_eq!(
+            read_rmem_ceilings_from(&rmem, &tcp),
+            (Some(67_108_864), None)
+        );
+        std::fs::write(&tcp, "4096 131072 33554432\n").expect("write tcp fixture");
+        assert_eq!(
+            read_rmem_ceilings_from(&rmem, &tcp),
+            (Some(67_108_864), Some(33_554_432))
+        );
+        std::fs::write(&rmem, "invalid").expect("corrupt rmem fixture");
+        assert_eq!(
+            read_rmem_ceilings_from(&rmem, &tcp),
+            (None, Some(33_554_432))
+        );
+        std::fs::write(&tcp, "4096 131072 33554432 extra").expect("corrupt tcp fixture");
+        assert_eq!(read_rmem_ceilings_from(&rmem, &tcp), (None, None));
+    }
+
+    #[test]
+    fn proc_reader_sample_tcp_ext_clears_stale_values_on_read_or_parse_failure() {
+        let fixture = ProcFixture::new();
+        let path = fixture.0.join("netstat");
         let mut reader = ProcReader::new();
-        reader.sample_tcp_ext();
-        let readable = std::fs::read_to_string(PROC_NET_NETSTAT_PATH)
-            .map(|text| text.contains(TCP_EXT_LINE_PREFIX))
-            .unwrap_or(false);
-        if readable {
-            // PruneCalled has been in TcpExt since Linux 2.6.
-            assert!(reader.tcp_ext[0].is_some());
-        } else {
-            assert!(reader.tcp_ext.iter().all(Option::is_none));
-        }
+        std::fs::write(&path, NETSTAT).expect("write netstat fixture");
+        reader.sample_tcp_ext_from(&path);
+        assert_eq!(reader.tcp_ext[0], Some(3));
+        std::fs::write(&path, "IpExt: a\nIpExt: 1\n").expect("replace netstat fixture");
+        reader.sample_tcp_ext_from(&path);
+        assert_eq!(reader.tcp_ext, [None; TCP_EXT_COUNTER_COUNT]);
+        std::fs::write(&path, NETSTAT).expect("restore netstat fixture");
+        reader.sample_tcp_ext_from(&path);
+        assert_eq!(reader.tcp_ext[1], Some(2));
+        std::fs::remove_file(&path).expect("remove netstat fixture");
+        reader.sample_tcp_ext_from(&path);
+        assert_eq!(reader.tcp_ext, [None; TCP_EXT_COUNTER_COUNT]);
+    }
+
+    #[test]
+    fn tcp_ext_deltas_advance_keeps_counter_boundaries_independent() {
+        let mut deltas = TcpExtDeltas::new();
+        let mut reading = [None; TCP_EXT_COUNTER_COUNT];
+        reading[0] = Some(u64::MAX - 1);
+        reading[1] = Some(0);
+        deltas.advance(&reading);
+        reading[0] = Some(u64::MAX);
+        reading[1] = Some(u64::MAX);
+        let growth = deltas.advance(&reading);
+        assert_eq!(growth[0], Some(1));
+        assert_eq!(growth[1], Some(u64::MAX));
+        reading[0] = Some(0);
+        let reset = deltas.advance(&reading);
+        assert_eq!(reset[0], Some(0), "reset never wraps into a huge increment");
+        assert_eq!(reset[1], Some(0), "the other counter is unchanged");
     }
 
     #[test]

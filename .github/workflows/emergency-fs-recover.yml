@@ -17,7 +17,7 @@
 # candles_<tf>, none of it checked against an S3 copy. Those steps are
 # REMOVED. What is left is non-destructive: stop the app, vacuum the system
 # journal and the package cache, grow the partition and filesystem to the
-# volume's size, bring docker and QuestDB back, re-enable the app. If the
+# volume's size, bring docker and QuestDB back, restore app enablement. If the
 # root is full of DATA, grow the volume first (grow-ebs-volume.yml) and then
 # run this to extend the filesystem; deleting captured data needs a fresh
 # dated operator quote naming the data, recorded in the rule file first.
@@ -57,12 +57,13 @@
 #     answers now FAILS the run instead of reporting nothing to drop.
 #
 # WHAT IT DOES ON THE BOX (in order; every step fails loudly)
-#   1. stop + disable tickvault (so the app cannot refill the disk mid-recovery)
+#   1. record enabled/disabled state, then stop + disable tickvault for recovery
 #   2. vacuum the system journal and the package cache (no market data)
 #   3. growpart + xfs_growfs so the grown volume is actually usable
 #   4. restart containerd + docker and bring QuestDB up (nothing is dropped)
-#   5. re-enable tickvault (NOT started — the operator-side verification starts
-#      it over SSM once the agent registers), restart the SSM agent, print df.
+#   5. restart the SSM agent and print df; on success or error restore the
+#      original enablement without starting tickvault. An intentional disable
+#      stays disabled. Unknown states refuse before stopping the app.
 #
 # It never stops the instance and never touches the volume, the budget, or
 # any table. (Before 2026-10-09 step 2 deleted the WAL/spill/DLQ backlog and
@@ -143,7 +144,7 @@ jobs:
           fi
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4 (commit; was the v4 tag object ff717079, 2026-10-09)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0 (commit)
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -220,11 +221,20 @@ jobs:
             echo "REFUSED: root is ${USED_PCT:-?}% used, not full — this recovery stops and disables the app. Re-run with force_disk_check=yes if you really mean it."
             exit 3
           fi
-          echo "=== 1. stop + disable the app ==="
+          # Preserve stop-app's intentional disable and runtime-only enablement.
+          APP_ENABLED_RC=0; APP_ENABLED=$(sudo systemctl is-enabled tickvault 2>/dev/null) || APP_ENABLED_RC=$?
+          case "$APP_ENABLED:$APP_ENABLED_RC" in enabled:0|disabled:1) APP_ENABLE_ARGS=();; enabled-runtime:0) APP_ENABLE_ARGS=(--runtime);; *) echo "REFUSED: tickvault enablement could not be classified safely"; exit 3;; esac
+          # Exit 4 is terminal: a retry must not adopt a failed disable as its baseline.
+          restore_app_enabled() {
+            rc=$?
+            if [ "$APP_ENABLED" != disabled ] && ! sudo systemctl enable "${APP_ENABLE_ARGS[@]}" tickvault; then echo "FAILED: could not restore tickvault enablement"; rc=4; fi
+            RESTORED_RC=0; RESTORED=$(sudo systemctl is-enabled tickvault 2>/dev/null) || RESTORED_RC=$?
+            [ "$RESTORED:$RESTORED_RC" = "$APP_ENABLED:$APP_ENABLED_RC" ] || { echo "FAILED: tickvault enablement restoration was not confirmed"; rc=4; }
+            exit "$rc"
+          }
+          trap restore_app_enabled EXIT
           sudo systemctl stop tickvault || true
-          sudo systemctl disable tickvault || true
-          echo "UNIT=$(systemctl is-active tickvault) ENABLED=$(systemctl is-enabled tickvault)"
-          echo "=== 2. free space WITHOUT touching market data (Quote 28) ==="
+          sudo systemctl disable "${APP_ENABLE_ARGS[@]}" tickvault || true
           # Sizes are printed so the operator can see what fills the disk; the
           # WAL, spill and DLQ are KEPT (no verified S3 copy is checked here).
           sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/spill-hold 2>/dev/null || true
@@ -232,38 +242,31 @@ jobs:
           sudo dnf clean all >/dev/null 2>&1 || true
           sync
           echo "AFTER-VACUUM"; df -B1G / | tail -1
-          echo "=== 3. grow the filesystem ==="
           ROOT=$(findmnt -no SOURCE /); DISK=$(lsblk -no PKNAME "$ROOT")
           # Only the TRAILING digits are the partition number: /dev/nvme0n1p1 -> "1".
           # The first live run used 's/[^0-9]*//' and got "0n1p1", which growpart
           # rejected — the filesystem stayed at its old size while the run said OK.
           PART=$(lsblk -no KNAME "$ROOT" | sed 's/.*[^0-9]//')
-          echo "root=$ROOT disk=$DISK part=$PART"
           case "$PART" in ''|*[!0-9]*) echo "FAILED: could not derive a numeric partition number from $ROOT"; exit 1;; esac
           sudo growpart "/dev/$DISK" "$PART" || echo "growpart-nochange"
           FSTYPE=$(findmnt -no FSTYPE /)
           if [ "$FSTYPE" = xfs ]; then sudo xfs_growfs -d / ; else sudo resize2fs "$ROOT"; fi
           echo "AFTER-GROW"; df -B1G / | tail -1
-          echo "=== 4. containerd + docker + QuestDB up (no table is dropped) ==="
           # After a disk-full boot dockerd could not dial containerd (first live run);
           # restarting containerd and clearing docker's failed state fixed it.
           sudo systemctl restart containerd || true
           sudo systemctl reset-failed docker docker.socket 2>/dev/null || true
           sudo systemctl start docker || true
           sleep 5
-          echo "docker=$(systemctl is-active docker) containerd=$(systemctl is-active containerd)"
           sudo docker start tv-questdb >/dev/null 2>&1 || true
           up=0
           for i in $(seq 1 90); do curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%201' >/dev/null 2>&1 && { up=1; break; }; sleep 2; done
           if [ "$up" != 1 ]; then echo "FAILED: QuestDB never answered on :9000"; sudo docker ps -a; exit 1; fi
-          echo "=== 5. re-enable the app (not started) + wake the SSM agent ==="
-          sudo systemctl enable tickvault || true
           sudo systemctl restart amazon-ssm-agent || true
           sleep 5; systemctl is-active amazon-ssm-agent || true
           echo "FINAL"; df -h / | tail -1
           EOS
-          sed -i "s/__FORCE_DISK__/${FORCE_DISK}/" recover.sh
-          echo "script written ($(wc -l < recover.sh) lines)"
+          sed -i "s/__FORCE_DISK__/$([ "$FORCE_DISK" = yes ] && echo yes || echo no)/" recover.sh
 
       - name: Push a 60-second key via EC2 Instance Connect and run the recovery
         env:
@@ -285,8 +288,8 @@ jobs:
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
                    -i eic_key ec2-user@"$IP" 'bash -s' < recover.sh; rc=$?
             if [ "$rc" -eq 0 ]; then ok=1; break; fi
-            if [ "$rc" -eq 3 ]; then
-              echo "::error::the on-box precondition REFUSED (root filesystem is not full) — nothing was deleted or dropped. Re-run with force_disk_check=yes only if you mean it."
+            if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
+              echo "::error::the on-box safety precondition refused or enablement restoration was unconfirmed; review the reason above. No further SSH attempts will run."
               exit 1
             fi
             echo "ssh attempt $attempt did not complete — sshd may still be starting; retrying in 15s"

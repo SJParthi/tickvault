@@ -132,10 +132,9 @@ pub const WATCHDOG_THRESHOLD_VIX_SECS: u64 = 30;
 /// - `1800s` (2026-04-21) still fired every 30 min on idle accounts →
 ///   Telegram shows 4+ reconnects every trading morning with zero orders
 ///   (observed 2026-04-23 09:10 / 09:40 / 10:10 / 10:40).
-/// - `14400s` (2026-04-22) = 4 hours. Longer than any realistic in-market
-///   idle window (market hours are 6.5h total 09:15-15:30, but order
-///   update only goes silent when NO orders flow — still capped by
-///   truly-dead-socket detection via the read loop's `Err(..)` branch).
+/// - `14400s` (2026-04-22) = 4 hours. A quiet account can exceed this
+///   interval while its socket remains healthy. The order reader now probes
+///   with a bounded Ping/Pong exchange before reconnecting for idle expiry.
 pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
 
 /// Watchdog threshold for depth WebSocket connections in DEFERRED mode
@@ -236,6 +235,8 @@ pub struct ActivityWatchdog {
     /// When the watchdog fires, it calls `notify_one`; the read loop then
     /// returns `Err(WatchdogFired)`.
     notify: Arc<Notify>,
+    /// The owner will probe liveness before classifying an idle socket as failed.
+    probe_before_reconnect: bool,
 }
 
 impl ActivityWatchdog {
@@ -253,7 +254,15 @@ impl ActivityWatchdog {
             counter,
             threshold,
             notify,
+            probe_before_reconnect: false,
         }
+    }
+
+    /// Notify the owner to perform a bounded liveness probe before emitting
+    /// a reconnect failure. Other watchdog users retain immediate diagnosis.
+    pub(crate) const fn with_liveness_probe(mut self) -> Self {
+        self.probe_before_reconnect = true;
+        self
     }
 
     /// Runs the watchdog loop until either the counter goes stale for
@@ -299,6 +308,10 @@ impl ActivityWatchdog {
                 // (weekday + market-hours) so Saturday/Sunday boots no
                 // longer false-page on Dhan-server idle TCP resets.
                 if is_within_trading_session_ist() {
+                    if self.probe_before_reconnect {
+                        self.notify.notify_one();
+                        return;
+                    }
                     error!(
                         code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                         source = "activity_watchdog_fired",

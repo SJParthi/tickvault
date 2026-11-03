@@ -506,8 +506,88 @@ fn is_invocation_scan_target(path: &str) -> bool {
 ///
 /// Verified at fix time: all 99 tracked shebangs are `bash`, so this closes
 /// LATENT blind spots and both allowlists stay at their hard-zero floor.
-fn has_interpreter_shebang(content: &str) -> bool {
-    content.lines().next().is_some_and(|l| l.starts_with("#!"))
+fn has_interpreter_shebang(path: &str, content: &str) -> bool {
+    interpreter_shebang_line(path, content).is_some()
+}
+
+/// The header after `#!`, unless this Rust source starts an inner attribute.
+/// Rust permits whitespace and ordinary comments before the opening bracket;
+/// doc comments remain tokens. This is lexical disambiguation, not validation
+/// of the attribute body. The compiler owns that validation.
+///
+/// Only `.rs` source gets this distinction. A real interpreter header remains
+/// visible even when the script is renamed `.rs`; other filenames receive no
+/// attribute exemption. A leading BOM is decoded conservatively for both kinds
+/// of header, but leading whitespace before `#!` never becomes a shebang.
+fn interpreter_shebang_line<'a>(path: &str, content: &'a str) -> Option<&'a str> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let rest = content.strip_prefix("#!")?;
+    if path.ends_with(".rs") && rust_inner_attribute_follows(rest) {
+        return None;
+    }
+    Some(rest.lines().next().unwrap_or_default())
+}
+
+/// Rust's shebang/attribute boundary uses Pattern_White_Space and non-doc
+/// comments. The scan is O(header bytes), with no allocation or recursion.
+fn rust_inner_attribute_follows(mut rest: &str) -> bool {
+    loop {
+        rest = rest.trim_start_matches(|ch| {
+            matches!(
+                ch,
+                '\u{0009}'
+                    ..='\u{000d}'
+                        | ' '
+                        | '\u{0085}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+            )
+        });
+        if rest.starts_with('[') {
+            return true;
+        }
+        if rest.starts_with("//") {
+            if rest.starts_with("//!") || (rest.starts_with("///") && !rest.starts_with("////")) {
+                return false;
+            }
+            let Some(newline) = rest.find('\n') else {
+                return false;
+            };
+            rest = &rest[newline + 1..];
+            continue;
+        }
+        if !rest.starts_with("/*")
+            || rest.starts_with("/*!")
+            || (rest.starts_with("/**") && !rest.starts_with("/***") && !rest.starts_with("/**/"))
+        {
+            return false;
+        }
+        let bytes = rest.as_bytes();
+        let mut cursor = 2;
+        let mut depth = 1usize;
+        while cursor + 1 < bytes.len() {
+            match &bytes[cursor..cursor + 2] {
+                b"/*" => {
+                    depth += 1;
+                    cursor += 2;
+                }
+                b"*/" => {
+                    depth -= 1;
+                    cursor += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        if depth != 0 {
+            return false;
+        }
+        rest = &rest[cursor..];
+    }
 }
 
 /// The runtime a shebang line names, if any — `#!/usr/bin/env node` -> `node`,
@@ -529,9 +609,8 @@ fn has_interpreter_shebang(content: &str) -> bool {
 /// it needs no enumeration of file names or extensions — the same move §0.3
 /// of the lock file made for deciding WHICH files to scan, applied one step
 /// further to WHAT they declare.
-fn shebang_runtime(content: &str) -> Option<String> {
-    let first = content.lines().next()?;
-    let rest = first.strip_prefix("#!")?;
+fn shebang_runtime(path: &str, content: &str) -> Option<String> {
+    let rest = interpreter_shebang_line(path, content)?;
     // `env` and its `-S` split-string form introduce the real runtime; a bare
     // path is the runtime itself. Flags between them are skipped so
     // `#!/usr/bin/env -S deno run --allow-net` resolves to `deno`.
@@ -565,8 +644,9 @@ fn shebang_runtime(content: &str) -> Option<String> {
 /// self-test pins them — a guard that started counting `-euo pipefail` would
 /// fail on most of this repo's own scripts.
 fn shebang_inline_payload(content: &str) -> Option<String> {
-    let first = content.lines().next()?;
-    let rest = first.strip_prefix("#!")?;
+    // No Rust-path exemption is needed here: an attribute never names a
+    // shell. Share BOM handling so an allowed shell cannot hide its payload.
+    let rest = interpreter_shebang_line("", content)?;
     let mut parts = rest.split_whitespace();
     // Resolve the runtime exactly as `shebang_runtime` does, then keep the
     // iterator positioned after it.
@@ -1949,7 +2029,7 @@ fn every_tracked_executable_is_inside_the_invocation_scan() {
     // still has one.
     for path in git_ls_files_including_untracked(&["."]) {
         let content = read_scan_text(&root, &path);
-        if !has_interpreter_shebang(&content) {
+        if !has_interpreter_shebang(&path, &content) {
             continue;
         }
         executables += 1;
@@ -1994,7 +2074,7 @@ fn every_tracked_shebang_names_an_allowed_runtime() {
     // SCOPE FIX #17 (2026-09-02): tracked AND untracked, decoded lossily.
     for path in git_ls_files_including_untracked(&["."]) {
         let content = read_scan_text(&root, &path);
-        let Some(runtime) = shebang_runtime(&content) else {
+        let Some(runtime) = shebang_runtime(&path, &content) else {
             continue;
         };
         checked += 1;
@@ -2039,7 +2119,7 @@ fn shebang_runtime_parser_self_test() {
         ("fn main() {}\n", None),
     ] {
         assert_eq!(
-            shebang_runtime(line).as_deref(),
+            shebang_runtime("tools/probe", line).as_deref(),
             expected,
             "shebang parse of {line:?}"
         );
@@ -2048,15 +2128,131 @@ fn shebang_runtime_parser_self_test() {
     // tracked, executable, and invisible to every other check here.
     let hostile = "#!/usr/bin/env node\nconst fs=require('fs');\n";
     assert_eq!(
-        shebang_runtime(hostile).as_deref(),
+        shebang_runtime("tools/probe", hostile).as_deref(),
         Some("node"),
         "the hostile fixture MUST resolve to node — if this fails, SCOPE FIX \
          #15 has been reverted and the hole is open again"
     );
     assert!(
-        !["bash", "sh"].contains(&shebang_runtime(hostile).unwrap_or_default().as_str()),
+        !["bash", "sh"].contains(
+            &shebang_runtime("tools/probe", hostile)
+                .unwrap_or_default()
+                .as_str()
+        ),
         "and it must NOT be in the allowed set"
     );
+}
+
+#[test]
+fn test_regression_rust_inner_attributes_are_not_interpreter_headers() {
+    // Regression: 2026-11-02 — the first-line fixture gate was incorrectly
+    // reported as an executable whose interpreter was `[cfg(test)]`.
+    let path = "crates/core/src/websocket/order_update_connection/idle_probe_tests.rs";
+    assert!(is_excluded_from_invocation_scan(path));
+    for source in [
+        "#![cfg(test)]\nfn fixture() {}",
+        "#![cfg(unix)]\nfn fixture() {}",
+        "#![allow(dead_code)]\nfn fixture() {}",
+        "#! [cfg(test)]",
+        "#!\r\n[cfg(test)]",
+        "#! /* a /* nested */ z */ [cfg(test)]",
+        "#!/**/[cfg(test)]",
+        "#!/***/[cfg(test)]",
+        "#!// ordinary\n[cfg(test)]",
+        "#!//// ordinary\n[cfg(test)]",
+        "\u{feff}#![cfg(test)]",
+    ] {
+        assert!(!has_interpreter_shebang(path, source), "{source:?}");
+        assert_eq!(shebang_runtime(path, source), None, "{source:?}");
+    }
+    for whitespace in [
+        '\t', '\n', '\u{000b}', '\u{000c}', '\r', ' ', '\u{0085}', '\u{200e}', '\u{200f}',
+        '\u{2028}', '\u{2029}',
+    ] {
+        let source = format!("#!{whitespace}[cfg(test)]");
+        assert!(!has_interpreter_shebang(path, &source), "{source:?}");
+        assert_eq!(shebang_runtime(path, &source), None, "{source:?}");
+    }
+}
+
+#[test]
+fn test_regression_real_shebangs_remain_visible_when_scripts_are_renamed_rust() {
+    // The filename is never enough to exempt a declared interpreter.
+    let banned = banned_token();
+    for runtime in ["node", "deno", banned.as_str()] {
+        for prefix in ["#!/usr/bin/", "#!/usr/bin/env ", "#!/usr/bin/env -S "] {
+            let source = format!("{prefix}{runtime}\n#![cfg(test)]\n");
+            for path in [
+                "crates/app/src/renamed.rs",
+                "tools/renamed",
+                "scripts/renamed.sh",
+            ] {
+                assert!(has_interpreter_shebang(path, &source), "{path}: {source:?}");
+                assert_eq!(shebang_runtime(path, &source).as_deref(), Some(runtime));
+                assert!(!["bash", "sh"].contains(&runtime));
+            }
+            assert!(is_excluded_from_invocation_scan(
+                "crates/app/src/renamed.rs"
+            ));
+        }
+    }
+    let bom_script = "\u{feff}#!/usr/bin/env node\n";
+    assert!(has_interpreter_shebang("renamed.rs", bom_script));
+    assert_eq!(
+        shebang_runtime("renamed.rs", bom_script).as_deref(),
+        Some("node")
+    );
+    assert_eq!(
+        shebang_runtime("allowed.rs", "#!/bin/bash\n").as_deref(),
+        Some("bash")
+    );
+    for prefix in ["", "\u{feff}"] {
+        let inline = format!("{prefix}#!/usr/bin/env -S bash -c \"node app.js\"\n");
+        assert_eq!(
+            shebang_runtime("tools/wrapper", &inline).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            shebang_inline_payload(&inline).as_deref(),
+            Some("node app.js")
+        );
+        assert!(count_node_invocations(&inline) > 0);
+    }
+}
+
+#[test]
+fn test_regression_only_rust_trivia_can_precede_an_attribute_bracket() {
+    for source in [
+        "#!/// doc\n[cfg(test)]",
+        "#!//! doc\n[cfg(test)]",
+        "#!/** doc */[cfg(test)]",
+        "#!/*! doc */[cfg(test)]",
+        "#!/* unterminated [cfg(test)]",
+        "#!\u{00a0}[cfg(test)]",
+        "#!\u{2003}[cfg(test)]",
+        "#!\u{feff}[cfg(test)]",
+    ] {
+        assert!(has_interpreter_shebang("fixture.rs", source), "{source:?}");
+        assert!(
+            shebang_runtime("fixture.rs", source).is_some(),
+            "{source:?}"
+        );
+    }
+    assert!(has_interpreter_shebang("tools/not-rust", "#![cfg(test)]"));
+    assert!(shebang_runtime("tools/not-rust", "#![cfg(test)]").is_some());
+    for source in [
+        " #[cfg(test)]",
+        "#!",
+        "\n#!/usr/bin/env node",
+        " #!/usr/bin/env node",
+    ] {
+        if source == "#!" {
+            assert!(has_interpreter_shebang("fixture.rs", source));
+        } else {
+            assert!(!has_interpreter_shebang("fixture.rs", source));
+        }
+        assert_eq!(shebang_runtime("fixture.rs", source), None);
+    }
 }
 
 /// (e) NO Rust-side process spawn of a banned interpreter (SCOPE FIX #4).
@@ -2430,12 +2626,10 @@ fn node_family_invocations_only_shrink() {
 /// HONEST SCOPE: this pins the FLAG, not the lint result — CI itself is what
 /// actually runs clippy.
 ///
-/// 2026-10-30 (plan item 12b): a second clippy step lints EVERY target
-/// (`--all-targets`: tests, benches, examples) of the crates in
-/// [`CLIPPY_ALL_TARGETS_CRATES`]. This test now also fails if that step loses
-/// `--all-targets` or `-D warnings`, or stops naming one of those crates. The
-/// list may only grow: app, core and trading join once their test code
-/// measures clean.
+/// Plan item 12b: the 2026-10-30 five-crate checkpoint was expanded on
+/// 2026-10-31 to EVERY target of EVERY workspace crate. This test fails if
+/// the step loses `--all-targets`, `--workspace` or `-D warnings`; the
+/// separately checked crate floor includes app, core and trading.
 #[test]
 fn ci_clippy_gate_stays_armed() {
     let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -2476,12 +2670,12 @@ fn ci_clippy_gate_stays_armed() {
     );
     for step in &all_targets {
         assert!(
-            step.contains("-D warnings"),
-            "CI TEST-TARGET LINT GATE DISARMED: `{}` dropped `-D warnings`.",
+            step.contains("--workspace") && step.contains("-D warnings"),
+            "CI TEST-TARGET LINT GATE DISARMED: `{}` dropped `--workspace` or `-D warnings`.",
             step.trim()
         );
     }
-    // The floor armed on 2026-10-30, written out here so that dropping a crate
+    // The floor expanded on 2026-10-31, written out here so that dropping a crate
     // takes a second, visible edit in this test and not only in the list.
     for armed in [
         "tickvault-common",
@@ -2489,22 +2683,16 @@ fn ci_clippy_gate_stays_armed() {
         "tickvault-api",
         "tickvault-aws-lambdas",
         "tickvault-logs-mcp",
+        "tickvault-app",
+        "tickvault-core",
+        "tickvault-trading",
     ] {
         assert!(
             CLIPPY_ALL_TARGETS_CRATES.contains(&armed),
-            "CI TEST-TARGET LINT GATE NARROWED: `{armed}` was armed on 2026-10-30 \
+            "CI TEST-TARGET LINT GATE NARROWED: `{armed}` is in the 2026-10-31 floor \
              and left CLIPPY_ALL_TARGETS_CRATES. The list may only grow."
         );
     }
-    for krate in CLIPPY_ALL_TARGETS_CRATES {
-        let flag = format!("-p {krate} ");
-        assert!(
-            all_targets.iter().any(|s| s.contains(&flag)),
-            "CI TEST-TARGET LINT GATE NARROWED: `{krate}` is no longer linted with \
-             `--all-targets` in ci.yml. The crate list may only grow."
-        );
-    }
-
     // 2026-10-30 (12b review): a clippy step can also be switched off without
     // touching the flags: `|| true`, a later `-A warnings`, or
     // `continue-on-error` on the step. Refuse all three on every clippy step.
@@ -2541,6 +2729,61 @@ fn ci_clippy_gate_stays_armed() {
             line.trim()
         );
     }
+}
+
+/// Every workspace crate is linted with `--all-targets -D warnings` in CI.
+/// Expanded from five to eight on 2026-10-31; the floor may only grow.
+const CLIPPY_ALL_TARGETS_CRATES: &[&str] = &[
+    "tickvault-common",
+    "tickvault-storage",
+    "tickvault-api",
+    "tickvault-aws-lambdas",
+    "tickvault-logs-mcp",
+    "tickvault-app",
+    "tickvault-core",
+    "tickvault-trading",
+];
+
+#[test]
+fn clippy_all_targets_covers_every_workspace_member() {
+    // Ask Cargo to resolve member globs/exclusions instead of maintaining a
+    // second manifest parser. No dependencies are fetched or compiled here.
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("inspect Cargo workspace members");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse Cargo workspace metadata");
+    let members = workspace["workspace_members"]
+        .as_array()
+        .expect("workspace member ids");
+    let mut packages: Vec<&str> = workspace["packages"]
+        .as_array()
+        .expect("workspace package metadata")
+        .iter()
+        .filter(|package| members.contains(&package["id"]))
+        .map(|package| package["name"].as_str().expect("package name"))
+        .collect();
+    let mut linted: Vec<&str> = CLIPPY_ALL_TARGETS_CRATES.to_vec();
+    packages.sort_unstable();
+    linted.sort_unstable();
+    assert_eq!(
+        packages, linted,
+        "every workspace member must enter the all-targets lint gate"
+    );
 }
 
 /// Crates whose every target (tests and benches included) measured clippy-clean

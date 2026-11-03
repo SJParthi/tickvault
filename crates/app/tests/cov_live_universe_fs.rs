@@ -117,6 +117,7 @@ impl Sandbox {
             "tv-cov-live-universe-{tag}-{}-{nanos}",
             std::process::id()
         ));
+        std::fs::create_dir(&root).expect("claim a fresh sandbox root");
         std::fs::create_dir_all(root.join("data/instrument-cache")).expect("sandbox");
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("enter sandbox");

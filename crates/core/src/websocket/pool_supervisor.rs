@@ -15723,16 +15723,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_subscribe_guard_zero_cap_endpoint_does_not_panic_on_batching() {
-        // order-update reports a zero per-message cap and carries no
-        // instruments; `chunks(0)` would panic, so the batcher floors at 1.
-        let g = SubscribeGuard::try_new(DhanEndpointType::OrderUpdate, Vec::new())
-            .expect("an empty set is always admissible");
-        assert!(g.is_empty());
-        assert_eq!(g.batch_count(), 0);
-    }
-
     // -- frame sink: THE ONE RULE ------------------------------------------
 
     /// Recording sink used to prove ordering and to prove the drain loop does

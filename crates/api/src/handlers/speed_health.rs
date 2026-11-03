@@ -4,9 +4,10 @@
 //! visualising"*).
 //!
 //! The `/dashboard` page polls this endpoint and paints whatever it returns.
-//! Every label, every number and every green / amber / red verdict is decided
-//! HERE, in Rust, where it is tested; the page only paints tiles (its script is
-//! size-capped by the browser-surface guard). Nothing on the response names a
+//! Every source label, number and operational budget verdict originates HERE
+//! in Rust. The page additionally withdraws colours for legacy/expired response
+//! envelopes; it does not infer strict proof from an operational colour.
+//! Its script is size-capped by the browser-surface guard. No tile names a
 //! library, a file path or a metric name: the labels are plain English.
 //!
 //! # Sources, all already stored or already measured
@@ -30,8 +31,12 @@
 //!   of it. The verdict uses that: RED only when even half the bound is over
 //!   the step's budget (certainly over), AMBER when the bound is over but half
 //!   is not (possibly over).
+//! * Those colours are operational STALL budgets, not the strict below-one-
+//!   microsecond target. Lifetime samples have neither last-sample stamps nor
+//!   dated observation intervals here, so strict/session proof stays UNKNOWN.
+//!   The first bucket includes 1,024 nanoseconds and cannot prove below 1,000.
 //! * The in-memory step figures cover the time since the app started; the
-//!   "worst in the last 75 s" figure is the only recent window.
+//!   "worst in the last 75 s" figure is a separate window, not the lifetime max.
 //! * Ticks are judged only between 09:15 and 15:30, and "no trade in the last
 //!   minute" is red only while the database is caught up: rows QuestDB has not
 //!   applied yet are not readable, so a backlog reads amber, not "lost".
@@ -54,7 +59,7 @@
 //! columns probe and rows read run one after the other, 3 s each; everything
 //! else runs beside them at 3 s or less), so a request waiting on the lock
 //! waits at most about that long before it reads the fresh cache. Reading the metrics page is
-//! **O(lines)** in one pass; reading the step counters is O(5 steps × 28
+//! **O(lines)** in one pass; reading the step counters is O(7 steps × 28
 //! buckets). Neither runs on the feed path. The route is bearer-gated with the
 //! other `/api/debug/*` reads.
 
@@ -84,6 +89,12 @@ const METRICS_SCRAPE_TIMEOUT_SECS: u64 = 2;
 /// Largest metrics page this endpoint reads. A bigger page is not parsed and
 /// every figure from it shows "not available" (never a partial read).
 const METRICS_SCRAPE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Response contract with separate operational/strict scopes and capture time.
+const SPEED_HEALTH_EVIDENCE_VERSION: u8 = 1;
+
+/// The owner's strict eligible in-memory stage target, distinct from stalls.
+const STRICT_TICK_TARGET_NANOS: u64 = 1_000;
 
 /// Full minutes of tick counts shown.
 const TICK_WINDOW_MINUTES: i64 = 15;
@@ -219,6 +230,10 @@ pub struct Section {
 /// The full `GET /api/debug/speed-health` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpeedHealthResponse {
+    pub evidence_version: u8,
+    /// Response capture time only: NOT the newest sample or a proof interval.
+    /// Cached responses retain this timestamp so a client can expire them.
+    pub captured_at_unix_ms: i64,
     /// Trading session open right now (weekend and NSE-holiday aware).
     pub market_open: bool,
     pub sections: Vec<Section>,
@@ -304,6 +319,7 @@ pub(crate) async fn compute_speed_health(state: &SharedAppState) -> SpeedHealthR
     });
 
     build_sections(&Inputs {
+        captured_at_unix_ms: chrono::Utc::now().timestamp_millis(),
         market_open,
         ist_now,
         apply_lag,
@@ -338,6 +354,7 @@ pub(crate) struct StageFigures {
 
 /// Everything the sections are built from.
 pub(crate) struct Inputs {
+    pub captured_at_unix_ms: i64,
     pub market_open: bool,
     pub ist_now: i64,
     /// The database apply backlog the WAL watcher last read, in process;
@@ -352,7 +369,7 @@ pub(crate) struct Inputs {
     /// Feed connection tasks running (a task stays counted through its own
     /// reconnects, so this is not "connected"); `None` until the feed reports.
     pub connection_tasks: Option<u64>,
-    pub stages: [StageFigures; 5],
+    pub stages: [StageFigures; ALL_STAGES.len()],
     pub exporter: Option<ExporterReadings>,
     pub ticks: QueryOutcome,
     pub quotes: QueryOutcome,
@@ -371,8 +388,11 @@ pub(crate) fn build_sections(inputs: &Inputs) -> SpeedHealthResponse {
         connections_section(inputs),
         overflow_section(inputs.exporter.as_ref()),
         minute_table_section(&inputs.minute_table),
+        strict_target_section(&inputs.stages),
     ];
     SpeedHealthResponse {
+        evidence_version: SPEED_HEALTH_EVIDENCE_VERSION,
+        captured_at_unix_ms: inputs.captured_at_unix_ms,
         market_open: inputs.market_open,
         sections,
     }
@@ -381,15 +401,17 @@ pub(crate) fn build_sections(inputs: &Inputs) -> SpeedHealthResponse {
 /// Plain-English name of each step.
 pub(crate) const fn stage_label(stage: Stage) -> &'static str {
     match stage {
-        Stage::SocketToWal => "Saving each message as it arrives",
-        Stage::RingDwell => "Waiting in line before processing",
-        Stage::MainRuntimeLag => "Main engine response delay",
-        Stage::ReaderRuntimeLag => "Socket reader response delay",
-        Stage::DrainMainFrame => "Processing one market message",
+        Stage::SocketToWal => "Receiving a frame and handing it off",
+        Stage::RingDwell => "Receipt to taking a frame for processing",
+        Stage::MainRuntimeLag => "Main engine timer wake-up (diagnostic)",
+        Stage::ReaderRuntimeLag => "Socket reader timer wake-up (diagnostic)",
+        Stage::DrainMainFrame => "Processing one main-feed frame",
+        Stage::ReceiptToFold => "Receipt to finishing one live main-feed frame",
+        Stage::MetricsUpkeep => "Metrics housekeeping run (diagnostic)",
     }
 }
 
-/// The verdict for one step from its 99th percentile bound and its budget.
+/// Operational stall verdict only, never a strict one-microsecond verdict.
 pub(crate) fn stage_light(p99: Option<QuantileBound>, budget_nanos: u64) -> Light {
     match p99 {
         None => Light::Grey,
@@ -410,22 +432,39 @@ fn bound_text(bound: QuantileBound) -> String {
     }
 }
 
-fn speed_section(stages: &[StageFigures; 5], exporter: Option<&ExporterReadings>) -> Section {
+fn speed_section(
+    stages: &[StageFigures; ALL_STAGES.len()],
+    exporter: Option<&ExporterReadings>,
+) -> Section {
     let tiles = stages
         .iter()
         .map(|fig| {
             let label = stage_label(fig.stage);
             let budget = fig.stage.stall_budget_nanos();
+            if !stage_samples_valid(fig) {
+                return Tile::new(label, "UNKNOWN — no consistent samples", Light::Grey)
+                    .with_detail(format!(
+                        "operational stall budget {} nanoseconds",
+                        group_digits(budget)
+                    ));
+            }
             let Some(q) = stage_quantiles(&fig.buckets) else {
-                return Tile::new(label, "no samples yet", Light::Grey)
-                    .with_detail(format!("limit {}", human_nanos(budget)));
+                return Tile::new(label, "no samples yet", Light::Grey).with_detail(format!(
+                    "operational stall budget {} nanoseconds",
+                    group_digits(budget)
+                ));
             };
             let mean = fig.sum_nanos.checked_div(fig.count).unwrap_or(0);
             let worst_75s = exporter
                 .and_then(|e| e.stage_max_75s[fig.stage as usize])
                 .map_or_else(
-                    || "worst in the last 75 s not available".to_string(),
-                    |n| format!("worst in the last 75 s {}", human_nanos(n)),
+                    || "published 75-second maximum unavailable".to_string(),
+                    |n| {
+                        format!(
+                            "published 75-second maximum {}; freshness unknown",
+                            human_nanos(n)
+                        )
+                    },
                 );
             Tile::new(
                 label,
@@ -433,7 +472,7 @@ fn speed_section(stages: &[StageFigures; 5], exporter: Option<&ExporterReadings>
                 stage_light(Some(q.p99), budget),
             )
             .with_detail(format!(
-                "half {} · average {} · limit {} · {} of {} over the limit · {}",
+                "half {} · average {} · stall budget {} · {} of {} over the stall budget · {}",
                 bound_text(q.p50),
                 human_nanos(mean),
                 human_nanos(budget),
@@ -444,10 +483,72 @@ fn speed_section(stages: &[StageFigures; 5], exporter: Option<&ExporterReadings>
         })
         .collect();
     Section {
-        title: "How fast each step runs",
-        note: "Since the app started. Green: 99 of every 100 runs are inside the step's \
-               limit. Amber: they may not be. Red: they are not."
+        title: "Operational stall budgets — since process start",
+        note: "These colours compare p99 bucket bounds with broad stall budgets, not \
+               the strict one-microsecond target. Runtime delays and metrics upkeep are diagnostics. \
+               Receipt-to-fold overlaps earlier frame stages; durations must not be added. \
+               The published 75-second maximum has no publication timestamp here. \
+               Neither window is a session verdict."
             .to_string(),
+        tiles,
+    }
+}
+
+/// A relaxed snapshot must at least have a nonempty, consistent denominator.
+fn stage_samples_valid(fig: &StageFigures) -> bool {
+    fig.count > 0
+        && fig
+            .buckets
+            .iter()
+            .try_fold(0u64, |sum, n| sum.checked_add(*n))
+            == Some(fig.count)
+}
+
+/// The current producers cannot establish a fresh, dated strict-target result.
+/// Expose the observed populations without inventing sample timestamps, interval
+/// boundaries, a request date, or whole-session coverage. No strict PASS path is
+/// enabled by a small lifetime bucket, a 75-second max, or a capacity verdict.
+fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
+    let tiles = stages.iter().filter_map(|fig| {
+        let unit = match fig.stage {
+            Stage::SocketToWal => "received frame, all endpoints; includes refused handoffs",
+            Stage::RingDwell => "received frame, all endpoints; overlaps receive time",
+            Stage::DrainMainFrame => "main-feed frame; decode/fold/append combined",
+            Stage::ReceiptToFold => "live main-feed frame; overlaps earlier stages; ring-refused frames excluded",
+            Stage::MainRuntimeLag | Stage::ReaderRuntimeLag | Stage::MetricsUpkeep => return None,
+        };
+        let (bound, recorded_failure) = if stage_samples_valid(fig) {
+            match stage_quantiles(&fig.buckets).map(|q| q.p99) {
+                Some(QuantileBound::AtMost(n)) if n / 2 >= STRICT_TICK_TARGET_NANOS => (
+                    format!("recorded lifetime p99 FAIL: above {} and at most {} nanoseconds", group_digits(n / 2), group_digits(n)), true,
+                ),
+                Some(QuantileBound::AtMost(n)) => (
+                    format!("recorded lifetime p99 UNKNOWN: upper bound {} nanoseconds straddles the strict target", group_digits(n)), false,
+                ),
+                Some(QuantileBound::Overflow) => ("recorded lifetime p99 FAIL: exceeds the histogram range".to_string(), true),
+                None => ("p99 unavailable".to_string(), false),
+            }
+        } else {
+            ("p99 unavailable: zero or inconsistent samples".to_string(), false)
+        };
+        let (value, status) = if recorded_failure {
+            ("LIFETIME FAIL · session UNKNOWN", Light::Red)
+        } else {
+            ("UNKNOWN", Light::Grey)
+        };
+        Some(Tile::new(stage_label(fig.stage), value, status).with_detail(format!(
+            "{} samples · unit: {unit} · window: since process start (exact interval unavailable) · last sample: unknown · session result UNKNOWN · {bound}",
+            group_digits(fig.count),
+        )))
+    }).collect();
+    Section {
+        title: "Strict target evidence — session UNKNOWN",
+        note: format!(
+            "Target: p99 below {} nanoseconds. The first bucket includes 1,024 nanoseconds. \
+             Sample freshness and dated interval/session coverage are unavailable. \
+             These lifetime frame observations are not Monday proof or every-stage proof.",
+            group_digits(STRICT_TICK_TARGET_NANOS),
+        ),
         tiles,
     }
 }
@@ -850,8 +951,8 @@ pub(crate) fn database_caught_up(inputs: &Inputs) -> bool {
 
 /// The watcher's apply lag and suspended-table count, only while its reading
 /// is fresh: both `None` when there is no stamp or the stamp is older than
-/// [`APPLY_LAG_FRESH_MAX_SECS`]. A stamp ahead of `now_unix` (a clock step)
-/// counts as fresh. O(1).
+/// [`APPLY_LAG_FRESH_MAX_SECS`]. A missing/nonpositive stamp or a clock step
+/// that places it ahead of `now_unix` is unknown, never fresh. O(1).
 pub(crate) fn fresh_wal_reading(
     apply_lag: Option<u64>,
     suspended_tables: Option<u64>,
@@ -859,8 +960,11 @@ pub(crate) fn fresh_wal_reading(
     now_unix: i64,
 ) -> (Option<u64>, Option<u64>) {
     let fresh = published_at_unix.is_some_and(|at| {
-        u64::try_from(now_unix.saturating_sub(at))
-            .map_or(true, |age| age <= APPLY_LAG_FRESH_MAX_SECS)
+        at > 0
+            && now_unix
+                .checked_sub(at)
+                .and_then(|age| u64::try_from(age).ok())
+                .is_some_and(|age| age <= APPLY_LAG_FRESH_MAX_SECS)
     });
     if fresh {
         (apply_lag, suspended_tables)
@@ -1116,7 +1220,9 @@ fn minute_table_section(outcome: &QueryOutcome) -> Section {
     };
     Section {
         title: "Per-minute speed record",
-        note: "Saved once a minute, newest first, shown as stored (no verdict).".to_string(),
+        note: "Newest 20 rows within 24 hours, shown as stored (no verdict). This is \
+               not a requested-date session grid, completeness check, or Monday proof."
+            .to_string(),
         tiles,
     }
 }
@@ -1306,7 +1412,7 @@ async fn fetch_metrics_text(client: &reqwest::Client, url: Option<&str>) -> Opti
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ExporterReadings {
     /// Worst sample per step in the last 75 s, nanoseconds, by step index.
-    pub stage_max_75s: [Option<u64>; 5],
+    pub stage_max_75s: [Option<u64>; ALL_STAGES.len()],
     pub pinned_bytes: Option<f64>,
     pub pinned_segments: Option<f64>,
     /// Sum over every label set.
@@ -1538,6 +1644,7 @@ mod tests {
 
     fn all_down_inputs(market_open: bool) -> Inputs {
         Inputs {
+            captured_at_unix_ms: 1_793_329_225_000,
             market_open,
             ist_now: IST_0930_25,
             apply_lag: None,
@@ -1860,25 +1967,184 @@ mod tests {
         exporter.stage_max_75s[0] = Some(250_000);
         let section = speed_section(&stages, Some(&exporter));
         let tile = &section.tiles[0];
-        assert_eq!(tile.label, "Saving each message as it arrives");
+        assert_eq!(tile.label, "Receiving a frame and handing it off");
         assert_eq!(tile.value, "99% at most 8.2 µs");
         assert_eq!(tile.status, Light::Green);
         assert!(tile.detail.contains("average 5.0 µs"), "{}", tile.detail);
-        assert!(tile.detail.contains("limit 100.0 µs"), "{}", tile.detail);
         assert!(
-            tile.detail.contains("1 of 101 over the limit"),
+            tile.detail.contains("stall budget 100.0 µs"),
             "{}",
             tile.detail
         );
         assert!(
-            tile.detail.contains("worst in the last 75 s 250.0 µs"),
+            tile.detail.contains("1 of 101 over the stall budget"),
+            "{}",
+            tile.detail
+        );
+        assert!(
+            tile.detail
+                .contains("published 75-second maximum 250.0 µs; freshness unknown"),
             "{}",
             tile.detail
         );
         // A step with no samples is grey and says so.
         assert_eq!(section.tiles[1].status, Light::Grey);
-        assert_eq!(section.tiles[1].value, "no samples yet");
+        assert_eq!(section.tiles[1].value, "UNKNOWN — no consistent samples");
         assert_eq!(section.tiles.len(), ALL_STAGES.len());
+    }
+
+    #[test]
+    fn test_strict_target_never_promotes_lifetime_buckets_to_session_proof() {
+        let mut inputs = all_down_inputs(true);
+        inputs.stages[0].count = 100;
+        inputs.stages[0].buckets[0] = 100;
+        // Every sample may violate 1,000 ns while fitting the 1,024 ns bucket.
+        inputs.stages[0].sum_nanos = 100 * 1_001;
+        let operational = speed_section(&inputs.stages, None);
+        assert_eq!(operational.tiles[0].status, Light::Green);
+        assert!(operational.title.contains("stall"));
+        assert!(operational.note.contains("not the strict"));
+        let strict = strict_target_section(&inputs.stages);
+        assert!(strict.note.contains("1,024"));
+        assert!(strict.note.contains("not Monday proof"));
+        assert_eq!(
+            strict.tiles.len(),
+            4,
+            "runtime timers and metrics upkeep are not frame stages"
+        );
+        let first = &strict.tiles[0];
+        assert_eq!(first.status, Light::Grey);
+        assert_eq!(first.value, "UNKNOWN");
+        for detail in [
+            "100 samples",
+            "all endpoints",
+            "since process start",
+            "last sample: unknown",
+            "1,024 nanoseconds",
+        ] {
+            assert!(
+                first.detail.contains(detail),
+                "missing {detail}: {}",
+                first.detail
+            );
+        }
+        assert!(strict.tiles[2].detail.contains("main-feed frame"));
+        // A higher bucket proves a lifetime breach, not a fresh session result.
+        inputs.stages[0].buckets[0] = 0;
+        inputs.stages[0].buckets[1] = 100;
+        let historical = strict_target_section(&inputs.stages);
+        assert_eq!(historical.tiles[0].status, Light::Red);
+        assert_eq!(historical.tiles[0].value, "LIFETIME FAIL · session UNKNOWN");
+        assert!(historical.tiles[0].detail.contains("above 1,024"));
+        assert!(
+            historical.tiles[0]
+                .detail
+                .contains("session result UNKNOWN")
+        );
+        // Overflow remains visible adverse evidence with the same scope caveat.
+        inputs.stages[0].buckets[1] = 0;
+        inputs.stages[0].buckets[STAGE_BUCKETS - 1] = 100;
+        let overflow = strict_target_section(&inputs.stages);
+        assert!(
+            overflow.tiles[0]
+                .detail
+                .contains("exceeds the histogram range")
+        );
+        assert_eq!(overflow.tiles[0].status, Light::Red);
+        assert_eq!(overflow.tiles[0].value, "LIFETIME FAIL · session UNKNOWN");
+    }
+
+    #[test]
+    fn test_zero_and_inconsistent_samples_are_unknown_even_with_a_small_bucket() {
+        for count in [0, 99] {
+            let mut inputs = all_down_inputs(true);
+            inputs.stages[0].count = count;
+            inputs.stages[0].buckets[0] = 100;
+            assert_eq!(
+                speed_section(&inputs.stages, None).tiles[0].status,
+                Light::Grey
+            );
+            let strict = strict_target_section(&inputs.stages);
+            assert_eq!(strict.tiles[0].value, "UNKNOWN");
+            assert!(strict.tiles[0].detail.contains("zero or inconsistent"));
+        }
+    }
+
+    #[test]
+    fn test_current_stage_catalog_is_complete_and_diagnostics_are_separate() {
+        let mut inputs = all_down_inputs(true);
+        let mut exporter = String::new();
+        for (index, fig) in inputs.stages.iter_mut().enumerate() {
+            fig.count = 100;
+            fig.buckets[0] = 100;
+            fig.sum_nanos = 100 * 1_001;
+            exporter.push_str(&format!(
+                "tv_hot_path_stage_max_ns_75s{{stage=\"{}\"}} {}\n",
+                fig.stage.as_str(),
+                2_000 + index,
+            ));
+        }
+        // Both added producer indexes must parse without dropping a value or
+        // indexing the old five-slot response out of bounds.
+        let readings = parse_metrics_text(&exporter);
+        for (index, maximum) in readings.stage_max_75s.iter().enumerate() {
+            assert_eq!(*maximum, Some(2_000 + u64::try_from(index).expect("index")));
+        }
+        let operational = speed_section(&inputs.stages, Some(&readings));
+        assert_eq!(operational.tiles.len(), 7);
+        for (tile, stage) in operational.tiles.iter().zip(ALL_STAGES) {
+            assert_eq!(tile.label, stage_label(stage));
+            assert!(tile.detail.contains("0 of 100 over the stall budget"));
+        }
+        assert!(operational.note.contains("durations must not be added"));
+        let strict = strict_target_section(&inputs.stages);
+        let labels: Vec<&str> = strict
+            .tiles
+            .iter()
+            .map(|tile| tile.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                stage_label(Stage::SocketToWal),
+                stage_label(Stage::RingDwell),
+                stage_label(Stage::DrainMainFrame),
+                stage_label(Stage::ReceiptToFold),
+            ],
+        );
+        assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
+        assert!(strict.tiles[0].detail.contains("includes refused handoffs"));
+        assert!(strict.tiles[3].detail.contains("live main-feed frame"));
+        assert!(
+            strict.tiles[3]
+                .detail
+                .contains("ring-refused frames excluded")
+        );
+        // The overlapping end-to-end population can show its own recorded
+        // failure; it still cannot certify a requested session or all ticks.
+        let receipt = &mut inputs.stages[Stage::ReceiptToFold as usize];
+        receipt.buckets[0] = 0;
+        receipt.buckets[1] = 100;
+        let strict = strict_target_section(&inputs.stages);
+        assert_eq!(strict.tiles[3].value, "LIFETIME FAIL · session UNKNOWN");
+        assert_eq!(strict.tiles[3].status, Light::Red);
+    }
+
+    #[test]
+    fn test_response_capture_contract_is_not_a_sample_timestamp() {
+        let inputs = all_down_inputs(false);
+        let response = build_sections(&inputs);
+        let encoded = serde_json::to_value(&response).expect("plain serializable response");
+        assert_eq!(encoded["evidence_version"], 1);
+        assert_eq!(encoded["captured_at_unix_ms"], inputs.captured_at_unix_ms);
+        let strict = response.sections.last().expect("strict section");
+        assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
+        assert!(strict.note.contains("freshness"));
+        assert!(
+            minute_table_section(&QueryOutcome::Missing)
+                .note
+                .contains("not a requested-date session grid")
+        );
     }
 
     const METRICS_SAMPLE: &str = "\
@@ -2118,10 +2384,17 @@ garbage line without a number x
         );
         // No stamp (withdrawn or never published) is unknown.
         assert_eq!(fresh_wal_reading(Some(3), Some(0), None, now), (None, None));
-        // A stamp ahead of the clock (a step back) still counts.
+        // A clock step cannot turn unproven age into a fresh green reading.
+        for stamp in [now + 1, now + 30, 0, -1, i64::MIN, i64::MAX] {
+            assert_eq!(
+                fresh_wal_reading(Some(3), Some(0), Some(stamp), now),
+                (None, None),
+                "unusable timestamp {stamp}",
+            );
+        }
         assert_eq!(
-            fresh_wal_reading(Some(3), Some(1), Some(now + 30), now),
-            (Some(3), Some(1))
+            fresh_wal_reading(Some(3), Some(0), Some(now), now),
+            (Some(3), Some(0)),
         );
     }
 
@@ -2211,7 +2484,7 @@ garbage line without a number x
         // The false-OK guard: with every source down nothing may read green.
         for market_open in [true, false] {
             let resp = build_sections(&all_down_inputs(market_open));
-            assert_eq!(resp.sections.len(), 7);
+            assert_eq!(resp.sections.len(), 8);
             for tile in all_tiles(&resp) {
                 assert_eq!(
                     tile.status,
@@ -2576,7 +2849,7 @@ garbage line without a number x
         let state = test_state_with_port(1);
         assert_eq!(state.metrics_scrape_url(), None);
         let resp = compute_speed_health(&state).await;
-        assert_eq!(resp.sections.len(), 7);
+        assert_eq!(resp.sections.len(), 8);
         for tile in all_tiles(&resp) {
             // The in-memory step counters may hold samples recorded by other
             // tests in this process; every database and metrics tile is grey.
@@ -2584,5 +2857,298 @@ garbage line without a number x
                 assert_eq!(tile.status, Light::Grey, "{}", tile.label);
             }
         }
+    }
+
+    struct HttpFixtureReply {
+        status: u16,
+        body: Vec<u8>,
+        chunked: bool,
+    }
+
+    /// Records each complete request before answering it. Unexpected requests
+    /// are recorded too, so a forbidden rows query cannot hide behind a closed
+    /// listener. Dropping the fixture stops its task, including on assertion failure.
+    struct HttpFixture {
+        base_url: String,
+        requests: Arc<std::sync::Mutex<Vec<reqwest::Url>>>,
+        writes: tokio::sync::mpsc::UnboundedReceiver<std::io::Result<()>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for HttpFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl HttpFixture {
+        async fn start(replies: Vec<HttpFixtureReply>) -> Self {
+            use tokio::io::AsyncReadExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind HTTP fixture");
+            let base_url = format!("http://{}", listener.local_addr().expect("fixture address"));
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let origin = base_url.clone();
+            let (written, writes) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let mut replies = replies.into_iter();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = stream
+                            .read(&mut buffer)
+                            .await
+                            .expect("read fixture request");
+                        assert_ne!(count, 0, "request ended before its headers");
+                        request.extend_from_slice(&buffer[..count]);
+                        assert!(request.len() <= 16 * 1024, "unexpectedly large request");
+                    }
+                    let request = std::str::from_utf8(&request).expect("ASCII HTTP request");
+                    let mut line = request
+                        .lines()
+                        .next()
+                        .expect("request line")
+                        .split_whitespace();
+                    assert_eq!(line.next(), Some("GET"));
+                    let target = line.next().expect("request target");
+                    let url = reqwest::Url::parse(&format!("{origin}{target}"))
+                        .expect("fixture request URL");
+                    recorded.lock().expect("request log").push(url);
+                    let reply = replies.next().unwrap_or(HttpFixtureReply {
+                        status: 500,
+                        body: b"unexpected request".to_vec(),
+                        chunked: false,
+                    });
+                    written
+                        .send(write_fixture_reply(&mut stream, reply).await)
+                        .expect("fixture result receiver");
+                }
+            });
+            Self {
+                base_url,
+                requests,
+                writes,
+                task,
+            }
+        }
+
+        fn requests(&self) -> Vec<reqwest::Url> {
+            self.requests.lock().expect("request log").clone()
+        }
+
+        async fn assert_replies_written(&mut self, count: usize) {
+            for _ in 0..count {
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.writes.recv())
+                    .await
+                    .expect("fixture must finish writing its reply")
+                    .expect("fixture task exited before reporting its reply")
+                    .expect("fixture must write the entire reply without an I/O error");
+            }
+        }
+    }
+
+    async fn write_fixture_reply(
+        stream: &mut tokio::net::TcpStream,
+        reply: HttpFixtureReply,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let framing = if reply.chunked {
+            "Transfer-Encoding: chunked".to_string()
+        } else {
+            format!("Content-Length: {}", reply.body.len())
+        };
+        let header = format!(
+            "HTTP/1.1 {} Fixture\r\nContent-Type: text/plain\r\n{framing}\r\nConnection: close\r\n\r\n",
+            reply.status
+        );
+        if reply.chunked {
+            stream.write_all(header.as_bytes()).await?;
+            // Independent of the production limit and far smaller than it:
+            // the reader has to accumulate many HTTP chunks before refusing.
+            let chunks = reply.body.chunks(64 * 1024);
+            let count = chunks.len();
+            let mut frame = Vec::with_capacity(64 * 1024 + 32);
+            for (index, chunk) in chunks.enumerate() {
+                frame.clear();
+                frame.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                frame.extend_from_slice(chunk);
+                frame.extend_from_slice(b"\r\n");
+                if index + 1 == count {
+                    // Send the final data byte and chunk terminator together,
+                    // before the over-limit reader deliberately closes.
+                    frame.extend_from_slice(b"0\r\n\r\n");
+                }
+                stream.write_all(&frame).await?;
+            }
+            if count == 0 {
+                stream.write_all(b"0\r\n\r\n").await?;
+            }
+        } else {
+            // A 503 reader can close after the status line, so send these
+            // small fixtures' headers and body in the same write.
+            let mut response = header.into_bytes();
+            response.extend_from_slice(&reply.body);
+            stream.write_all(&response).await?;
+        }
+        Ok(())
+    }
+
+    fn fixture_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("loopback HTTP client")
+    }
+
+    fn metrics_body_of_length(length: usize) -> Vec<u8> {
+        let prefix = b"tv_seal_spill_bytes 42\n# ";
+        let mut body = vec![b'x'; length];
+        body[..prefix.len()].copy_from_slice(prefix);
+        body[length - 1] = b'\n';
+        body
+    }
+
+    async fn fetch_fixture_metrics(fixture: &HttpFixture) -> Option<String> {
+        let client = fixture_client();
+        let url = format!("{}/metrics", fixture.base_url);
+        let started = tokio::time::Instant::now();
+        let result = fetch_metrics_text(&client, Some(&url)).await;
+        // None also means timeout: that must fail these refusal tests rather
+        // than masquerade as the status or size guard being exercised.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(METRICS_SCRAPE_TIMEOUT_SECS),
+            "metrics fixture exceeded the production request timeout"
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metrics_text_accepts_exactly_16_mib_without_truncation() {
+        // The protocol contract, independent of METRICS_SCRAPE_MAX_BYTES.
+        let expected = metrics_body_of_length(16 * 1024 * 1024);
+        let mut fixture = HttpFixture::start(vec![HttpFixtureReply {
+            status: 200,
+            body: expected.clone(),
+            chunked: true,
+        }])
+        .await;
+        let body = fetch_fixture_metrics(&fixture)
+            .await
+            .expect("exactly 16 MiB is allowed");
+        fixture.assert_replies_written(1).await;
+        assert_eq!(body.len(), expected.len());
+        assert!(
+            body.as_bytes() == expected.as_slice(),
+            "metrics body changed or was truncated"
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path(), "/metrics");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metrics_text_refuses_chunked_16_mib_plus_one_whole() {
+        let mut fixture = HttpFixture::start(vec![HttpFixtureReply {
+            status: 200,
+            body: metrics_body_of_length(16 * 1024 * 1024 + 1),
+            chunked: true,
+        }])
+        .await;
+        assert!(
+            fetch_fixture_metrics(&fixture).await.is_none(),
+            "an over-limit page must not yield its otherwise valid metrics prefix"
+        );
+        fixture.assert_replies_written(1).await;
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path(), "/metrics");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metrics_text_refuses_503_with_a_valid_metrics_body() {
+        let mut fixture = HttpFixture::start(vec![HttpFixtureReply {
+            status: 503,
+            body: b"tv_seal_spill_bytes 42\n".to_vec(),
+            chunked: false,
+        }])
+        .await;
+        assert!(fetch_fixture_metrics(&fixture).await.is_none());
+        fixture.assert_replies_written(1).await;
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path(), "/metrics");
+    }
+
+    fn fixture_queries(fixture: &HttpFixture) -> Vec<String> {
+        fixture
+            .requests()
+            .iter()
+            .map(|request| {
+                assert_eq!(request.path(), "/exec");
+                let pairs = request.query_pairs().collect::<Vec<_>>();
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].0, "query");
+                pairs[0].1.to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_read_minute_table_without_designated_column_only_queries_columns() {
+        let mut fixture = HttpFixture::start(vec![HttpFixtureReply {
+            status: 200,
+            body: br#"{"columns":[{"name":"column"},{"name":"designated"}],"dataset":[["observed_at",false],["stage",false]]}"#.to_vec(),
+            chunked: false,
+        }])
+        .await;
+        let outcome = read_minute_table(&fixture_client(), &fixture.base_url, IST_0930_25).await;
+        fixture.assert_replies_written(1).await;
+        assert_eq!(outcome, QueryOutcome::Refused);
+        assert_eq!(
+            fixture_queries(&fixture),
+            ["SELECT \"column\", designated FROM table_columns('hot_path_latency_minute')"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_minute_table_queries_discovered_timestamp_and_returns_rows() {
+        let mut fixture = HttpFixture::start(vec![
+            HttpFixtureReply {
+                status: 200,
+                body: br#"{"columns":[{"name":"column"},{"name":"designated"}],"dataset":[["stage",false],["observed_at",true]]}"#.to_vec(),
+                chunked: false,
+            },
+            HttpFixtureReply {
+                status: 200,
+                body: br#"{"columns":[{"name":"observed_at"},{"name":"stage"},{"name":"max_ns"}],"dataset":[["2026-10-30T09:29:00.000000Z","parse",900]]}"#.to_vec(),
+                chunked: false,
+            },
+        ])
+        .await;
+        let outcome = read_minute_table(&fixture_client(), &fixture.base_url, IST_0930_25).await;
+        fixture.assert_replies_written(2).await;
+        assert_eq!(
+            outcome,
+            rows(
+                &["observed_at", "stage", "max_ns"],
+                vec![vec![
+                    json_str("2026-10-30T09:29:00.000000Z"),
+                    json_str("parse"),
+                    Value::from(900)
+                ]]
+            )
+        );
+        assert_eq!(
+            fixture_queries(&fixture),
+            [
+                "SELECT \"column\", designated FROM table_columns('hot_path_latency_minute')",
+                "SELECT * FROM hot_path_latency_minute WHERE observed_at >= '2026-10-29T09:30:25.000000Z' ORDER BY observed_at DESC LIMIT 20",
+            ]
+        );
     }
 }

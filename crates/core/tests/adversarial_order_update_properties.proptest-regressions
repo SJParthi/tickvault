@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc d514c4934e9bd0af20f5de0c1b2b9dfd36392b28bdd87646d1c257a344103249 # shrinks to frame = "{\"Data\":{\"StrikePrice\":-9.345468904800974e+257}}"
+cc d5d635ef47f0724effa7082bba7c8832400f5edb63b60af33df76eb4e0afbb7a # shrinks to frame = "{\"Data\":{\"refLtp\":4.072370321849077e-171}}"

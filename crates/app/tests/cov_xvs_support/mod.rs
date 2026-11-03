@@ -512,7 +512,7 @@ impl TempRoot {
             .unwrap_or(0);
         let path =
             std::env::temp_dir().join(format!("tv-cov-xvs-{tag}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create temp root");
+        std::fs::create_dir(&path).expect("claim a fresh temp root");
         Self { path }
     }
 }

@@ -18,7 +18,8 @@
 //!    arrays of tables) replaced by 0, -1, `i64::MAX`, `i64::MIN`, a
 //!    fraction, NaN, +/-inf, -0.0, a string or a bool never panics in
 //!    `from_str` or `validate`.
-//! 4. A leaf replaced by ITSELF is the identity (property 2 per leaf).
+//! 4. (No separate property: "a leaf set to itself" is property 2, which
+//!    checks the whole of base.toml once.)
 //! 5. The guarded fields `validate` documents (rate limit, timeouts, batch
 //!    size, daily-loss percent, capital, connection count, token windows,
 //!    the depth-200 resubscribe bounds) set to their forbidden values are
@@ -29,8 +30,8 @@
 //! guarded set only; for an arbitrary numeric leaf, whether a mutation is
 //! refused depends on whether that key is read and on its Rust type, which
 //! this file cannot see (unknown keys are ignored by serde here). The count
-//! of leaves whose wrong-typed replacement still deserializes is measured
-//! and printed, not asserted.
+//! of leaves whose wrong-typed replacement still deserializes is not pinned.
+//! Aggregate mutation counts are included in assertion failures.
 
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
@@ -43,7 +44,9 @@ fn base_toml_text() -> String {
 }
 
 fn base_value() -> Value {
-    toml::from_str::<Value>(&base_toml_text()).expect("base.toml is TOML")
+    static BASE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| toml::from_str::<Value>(&base_toml_text()).expect("base.toml is TOML"))
+        .clone()
 }
 
 #[derive(Clone, Debug)]
@@ -84,16 +87,6 @@ fn leaf_mut<'a>(value: &'a mut Value, path: &[Step]) -> &'a mut Value {
             .and_then(|a| a.get_mut(*i))
             .expect("path index"),
     })
-}
-
-fn path_text(path: &[Step]) -> String {
-    path.iter()
-        .map(|s| match s {
-            Step::Key(k) => k.clone(),
-            Step::Index(i) => format!("[{i}]"),
-        })
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 /// Deserialize and validate; `None` when `from_str` refuses, otherwise the
@@ -140,9 +133,10 @@ fn test_base_toml_parses_validates_and_round_trips() {
 }
 
 /// Property 3 (exhaustive): every leaf of base.toml times every hostile
-/// replacement: never a panic. Counts are printed so the coverage is
-/// visible; at least one replacement per numeric leaf must be refused
-/// somewhere in the set, or the run proves nothing.
+/// replacement: never a panic. All mutations are accounted for, and the
+/// global refusal counts prove both rejection stages are exercised;
+/// they do not require a refusal for every numeric leaf. Documented guards
+/// have field-specific refusal assertions in Property 5 below.
 #[test]
 fn test_every_leaf_of_base_toml_times_every_hostile_value_never_panics() {
     let base = base_value();
@@ -174,9 +168,6 @@ fn test_every_leaf_of_base_toml_times_every_hostile_value_never_panics() {
     );
     assert!(
         refused_by_validate > 0,
-        "validate refused {refused_by_validate}"
-    );
-    println!(
         "base.toml mutations: {} leaves x {} values = {total}; serde refused {refused_by_serde}, \
          validate refused {refused_by_validate}, accepted {accepted}",
         paths.len(),
@@ -419,7 +410,7 @@ proptest! {
 
     /// Property 1a: arbitrary text never panics.
     #[test]
-    fn prop_arbitrary_text_never_panics(text in "\\PC{0,300}") {
+    fn prop_arbitrary_text_never_panics(text in "(?s).{0,300}") {
         let _ = load(&text);
     }
 
@@ -445,11 +436,16 @@ proptest! {
         let _ = load(&lines.join("\n"));
     }
 
+}
+
+proptest! {
+    // Fewer cases: the exhaustive leaf x hostile-value test covers the grid.
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
     /// Property 3 (random): a random leaf of base.toml set to a random
-    /// integer, float (including non-finite) or string never panics, and a
-    /// leaf set to ITSELF is the identity (property 4).
+    /// integer, float (including non-finite), string or bool never panics.
     #[test]
-    fn prop_random_leaf_mutation_never_panics_and_identity_is_identity(
+    fn prop_random_leaf_mutation_never_panics(
         leaf in any::<prop::sample::Index>(),
         replacement in prop_oneof![
             any::<i64>().prop_map(Value::Integer),
@@ -467,15 +463,5 @@ proptest! {
         *leaf_mut(&mut mutated, path) = replacement;
         let text = toml::to_string(&mutated).expect("serialize mutation");
         let _ = load(&text);
-
-        let mut same = base.clone();
-        let original = leaf_mut(&mut same, path).clone();
-        *leaf_mut(&mut same, path) = original;
-        let text = toml::to_string(&same).expect("serialize identity");
-        let reloaded = load(&text);
-        prop_assert!(
-            matches!(reloaded, Some(Ok(_))),
-            "identity at {} broke base.toml: {:?}", path_text(path), reloaded.map(|r| r.err())
-        );
     }
 }

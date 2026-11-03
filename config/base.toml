@@ -43,6 +43,13 @@ max_orders_per_second = 10
 # Format: { date = "YYYY-MM-DD", name = "..." }
 # Weekends are excluded automatically — only list weekday holidays.
 
+# Late addition for both NSE CM and F&O, issued 12 Jan 2026:
+# https://nsearchives.nseindia.com/content/circulars/CMTR72260.pdf
+# https://nsearchives.nseindia.com/content/circulars/FAOP72262.pdf
+[[trading.nse_holidays]]
+date = "2026-01-15"
+name = "Municipal Corporation Election - Maharashtra"
+
 [[trading.nse_holidays]]
 date = "2026-01-26"
 name = "Republic Day"

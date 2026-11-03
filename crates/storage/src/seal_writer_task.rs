@@ -139,9 +139,9 @@ impl DrainOutcome {
 /// item 1.2f.4 sleeps `SEAL_DRAIN_INTERVAL` between cycles).
 ///
 /// Allocates one rescue buffer of up to `max_drain` seals per call. The
-/// live runner calls [`drain_once_reusing`] with a buffer it keeps, so the
-/// live cycle allocates nothing here; this form is for tests and one-off
-/// callers.
+/// live runner calls [`drain_once_reusing`] with a buffer it keeps. Once
+/// that buffer covers the batch, scratch reuse allocates nothing; larger
+/// batches can grow it. This form is for tests and one-off callers.
 ///
 /// **No FIFO inversion on rescue.** Popped seals are NOT pushed back
 /// into the ring (which would put them at the BACK and invert
@@ -263,12 +263,18 @@ pub fn drain_once_reusing(
     // Attempt the flush. On success: drop the rescue buffer (all
     // committed). On failure: cascade EVERY popped seal through the
     // rescue path.
+    // Refused rows return Ok from append without entering the ILP buffer;
+    // their empty flush also returns Ok without making an HTTP request.
+    // Only a nonempty successful send can rearm the failure episodes.
+    let had_pending_rows = writer.pending_count() > 0;
     match writer.flush() {
         Ok(()) => {
             outcome.flushed_ok = true;
-            // A committed flush ends any open spill/DLQ failure episode, so the
-            // next unrelated failure logs its cause (2026-10-30 review).
-            pipeline.note_clean_flush();
+            // This is HTTP acceptance, not proof of WAL application or of
+            // recovery of the failed spill/DLQ disk tier.
+            if had_pending_rows {
+                pipeline.note_clean_flush();
+            }
             // Audit PR41a: an amended bar committed live while its original
             // waits in the spill. Append the fuller copy behind it, so no
             // replay ends on the original.
@@ -3085,7 +3091,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_once_into_matches_drain_once_and_reuses_its_buffer() {
+    fn test_drain_once_reusing_matches_drain_once_and_reuses_its_buffer() {
         // 2026-10-30 O(1) sweep: the runner's kept buffer must give the same
         // outcome as a fresh one, leave nothing behind, and not grow again on
         // a cycle no bigger than the largest before it.
@@ -3119,7 +3125,7 @@ mod tests {
                 kept.submit(seal, now);
             }
             let a = drain_once(&mut fresh, &mut writer_a, 8, now);
-            let b = drain_once_into(&mut kept, &mut writer_b, 8, now, &mut buffer);
+            let b = drain_once_reusing(&mut kept, &mut writer_b, 8, now, &mut buffer);
             assert_eq!(a, b, "round {round}: same outcome with a kept buffer");
             assert!(buffer.is_empty(), "round {round}: the buffer is cleared");
             if round == 0 {

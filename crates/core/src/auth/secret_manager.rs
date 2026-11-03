@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(test))]
 use aws_config::Region;
 use aws_sdk_ssm::Client as SsmClient;
 use secrecy::SecretString;
@@ -80,6 +81,10 @@ fn validate_environment(env: &str) -> Result<String, ApplicationError> {
 /// Validates that the environment string contains only alphanumeric
 /// characters and hyphens to prevent path traversal.
 pub fn resolve_environment() -> Result<String, ApplicationError> {
+    #[cfg(test)]
+    if let Some(environment) = crate::test_support::ssm::environment_override() {
+        return Ok(environment);
+    }
     let env = std::env::var("TV_ENVIRONMENT")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -114,6 +119,7 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
 ///
 /// Uses default AWS SDK configuration — reads credentials from
 /// `~/.aws/credentials` (dev Mac) or IAM role (prod AWS).
+#[cfg(not(test))]
 pub(crate) async fn create_ssm_client() -> SsmClient {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new("ap-south-1"))
@@ -121,6 +127,13 @@ pub(crate) async fn create_ssm_client() -> SsmClient {
         .await;
 
     SsmClient::new(&config)
+}
+
+// Unit tests cannot construct the ambient AWS provider chain. A missing fixture
+// is a test failure, not an implicit permission to read a real account.
+#[cfg(test)]
+pub(crate) async fn create_ssm_client() -> SsmClient {
+    crate::test_support::ssm::scoped_client()
 }
 
 /// Public wrapper around [`create_ssm_client`] for callers outside this
@@ -619,7 +632,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ssm_client_returns_without_panic() {
-        let _client = create_ssm_client().await;
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        fixture
+            .scope(async {
+                let client = create_ssm_client().await;
+                assert_eq!(client.config().region().unwrap().as_ref(), "ap-south-1");
+            })
+            .await;
+        assert!(
+            fixture.requests().is_empty(),
+            "construction must not send a request"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -714,21 +737,15 @@ mod tests {
     /// matching in main.rs.
     #[tokio::test]
     async fn test_fetch_api_bearer_token_errors_without_real_ssm() {
-        let result = fetch_api_bearer_token().await;
-        assert!(
-            result.is_err(),
-            "fetch_api_bearer_token must fail without real SSM connectivity"
-        );
-        match result.err().unwrap() {
-            ApplicationError::SecretRetrieval { path, .. } => {
-                assert!(
-                    path.contains("/api/bearer-token"),
-                    "error path must include /api/bearer-token, got {}",
-                    path
-                );
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_api_bearer_token()).await;
+        match result {
+            Err(ApplicationError::SecretRetrieval { path, .. }) => {
+                assert_eq!(path, "/tickvault/unit-test/api/bearer-token");
             }
-            other => panic!("expected SecretRetrieval error, got {:?}", other),
+            other => panic!("expected synthetic SecretRetrieval error, got {other:?}"),
         }
+        fixture.assert_requests(1, 1, &["/api/bearer-token"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1022,12 +1039,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_secret_returns_error_without_real_ssm() {
-        let ssm_client = create_ssm_client().await;
-        let result = fetch_secret(&ssm_client, "/tickvault/test/nonexistent/secret").await;
-        assert!(
-            result.is_err(),
-            "fetch_secret must fail without real SSM connectivity"
-        );
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture
+            .scope(async {
+                let client = create_ssm_client().await;
+                fetch_secret(&client, "/tickvault/unit-test/nonexistent/secret").await
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        fixture.assert_requests(1, 1, &["/nonexistent/secret"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1036,21 +1059,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_dhan_credentials_returns_error_without_real_ssm() {
-        let result = fetch_dhan_credentials().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            // Dev machine with real AWS credentials — SSM is reachable,
-            // so fetch_dhan_credentials succeeds. Validate the happy path.
-            assert!(
-                result.is_ok(),
-                "with real AWS credentials, fetch should succeed"
-            );
-        } else {
-            // CI or machine without AWS credentials — SSM is unreachable.
-            assert!(
-                result.is_err(),
-                "fetch_dhan_credentials must fail without real SSM"
-            );
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_dhan_credentials()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        // try_join! may cancel sibling requests after the first failure.
+        fixture.assert_requests(
+            1,
+            3,
+            &[
+                "/dhan/client-id",
+                "/dhan/client-secret",
+                "/dhan/totp-secret",
+            ],
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1206,22 +1230,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_questdb_credentials_returns_error_without_real_ssm() {
-        let result = fetch_questdb_credentials().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
-        } else {
-            assert!(result.is_err(), "must fail without real SSM");
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_questdb_credentials()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        // try_join! may cancel sibling requests after the first failure.
+        fixture.assert_requests(1, 2, &["/questdb/pg-user", "/questdb/pg-password"]);
     }
 
     #[tokio::test]
     async fn test_fetch_telegram_credentials_returns_error_without_real_ssm() {
-        let result = fetch_telegram_credentials().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
-        } else {
-            assert!(result.is_err(), "must fail without real SSM");
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_telegram_credentials()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        // try_join! may cancel sibling requests after the first failure.
+        fixture.assert_requests(1, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     /// Source-scan ratchet (audit-findings Rule 13):

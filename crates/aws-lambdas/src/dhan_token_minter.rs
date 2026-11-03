@@ -2678,91 +2678,116 @@ mod tests {
             );
         }
 
-        #[tokio::test]
-        async fn test_handle_mints_and_reports_the_parameter_it_wrote() {
-            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
-            let token: &'static str = Box::leak(sample_jwt().into_boxed_str());
-            let body: &'static str =
-                Box::leak(format!(r#"{{"accessToken":"{token}"}}"#).into_boxed_str());
-            let (dhan_url, _) = start_mint_server("200 OK", body).await;
-
+        #[test]
+        fn test_handle_mints_and_reports_the_parameter_it_wrote() {
             let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _aws = aws_env_guards(&ssm_endpoint);
-            let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
-            let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("dhan-depth"));
-            let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+                    let token: &'static str = Box::leak(sample_jwt().into_boxed_str());
+                    let body: &'static str =
+                        Box::leak(format!(r#"{{"accessToken":"{token}"}}"#).into_boxed_str());
+                    let (dhan_url, _) = start_mint_server("200 OK", body).await;
 
-            let reply = handle(serde_json::json!({}))
-                .await
-                .expect("handle must succeed");
-            assert_eq!(reply["status"], "ok");
-            assert_eq!(reply["service"], "dhan-depth");
-            assert_eq!(
-                reply["parameter"],
-                "/tickvault/prod/dhan-depth/access-token"
-            );
-            let reply_text = reply.to_string();
-            assert!(
-                !reply_text.contains(token),
-                "the reply never carries the token"
-            );
-            assert!(
-                recorded(&ssm_requests)
-                    .iter()
-                    .any(|r| r.target == "AmazonSSM.PutParameter" && r.body.contains(token))
-            );
+                    let _aws = aws_env_guards(&ssm_endpoint);
+                    let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("dhan-depth"));
+                    let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+
+                    let reply = handle(serde_json::json!({}))
+                        .await
+                        .expect("handle must succeed");
+                    assert_eq!(reply["status"], "ok");
+                    assert_eq!(reply["service"], "dhan-depth");
+                    assert_eq!(
+                        reply["parameter"],
+                        "/tickvault/prod/dhan-depth/access-token"
+                    );
+                    let reply_text = reply.to_string();
+                    assert!(
+                        !reply_text.contains(token),
+                        "the reply never carries the token"
+                    );
+                    assert!(
+                    recorded(&ssm_requests)
+                        .iter()
+                        .any(|r| r.target == "AmazonSSM.PutParameter" && r.body.contains(token))
+                );
+                });
         }
 
-        #[tokio::test]
-        async fn test_handle_fails_loudly_and_publishes_nothing_on_a_rejected_mint() {
-            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
-            let (dhan_url, _) =
-                start_mint_server("401 Unauthorized", r#"{"errorMessage":"bad client"}"#).await;
-
+        #[test]
+        fn test_handle_fails_loudly_and_publishes_nothing_on_a_rejected_mint() {
             let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _aws = aws_env_guards(&ssm_endpoint);
-            let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
-            let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
-            let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+                    let (dhan_url, _) =
+                        start_mint_server("401 Unauthorized", r#"{"errorMessage":"bad client"}"#)
+                            .await;
 
-            let err = handle(serde_json::json!({}))
-                .await
-                .expect_err("a rejected mint must fail the invocation");
-            let text = err.to_string();
-            assert!(text.contains("HTTP 401"), "{text}");
-            assert!(
-                !text.contains(PIN),
-                "the PIN never reaches the Lambda error"
-            );
-            assert!(
-                recorded(&ssm_requests)
-                    .iter()
-                    .all(|r| r.target != "AmazonSSM.PutParameter")
-            );
+                    let _aws = aws_env_guards(&ssm_endpoint);
+                    let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
+                    let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+
+                    let err = handle(serde_json::json!({}))
+                        .await
+                        .expect_err("a rejected mint must fail the invocation");
+                    let text = err.to_string();
+                    assert!(text.contains("HTTP 401"), "{text}");
+                    assert!(
+                        !text.contains(PIN),
+                        "the PIN never reaches the Lambda error"
+                    );
+                    assert!(
+                        recorded(&ssm_requests)
+                            .iter()
+                            .all(|r| r.target != "AmazonSSM.PutParameter")
+                    );
+                });
         }
 
-        #[tokio::test]
-        async fn test_handle_refuses_an_unknown_service_before_any_call() {
+        #[test]
+        fn test_handle_refuses_an_unknown_service_before_any_call() {
             let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("groww"));
-            let err = handle(serde_json::json!({}))
-                .await
-                .expect_err("an unknown namespace must be refused");
-            assert!(
-                err.to_string()
-                    .contains("refusing to mint into an unknown namespace")
-            );
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("groww"));
+                    let err = handle(serde_json::json!({}))
+                        .await
+                        .expect_err("an unknown namespace must be refused");
+                    assert!(
+                        err.to_string()
+                            .contains("refusing to mint into an unknown namespace")
+                    );
+                });
         }
 
-        #[tokio::test]
-        async fn test_handle_refuses_to_guess_the_auth_host() {
+        #[test]
+        fn test_handle_refuses_to_guess_the_auth_host() {
             let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
-            let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, None);
-            let err = handle(serde_json::json!({}))
-                .await
-                .expect_err("an unset auth host must be refused");
-            assert!(err.to_string().contains(DHAN_AUTH_BASE_URL_ENV));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
+                    let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, None);
+                    let err = handle(serde_json::json!({}))
+                        .await
+                        .expect_err("an unset auth host must be refused");
+                    assert!(err.to_string().contains(DHAN_AUTH_BASE_URL_ENV));
+                });
         }
 
         // ---- describe_transport_error, on real reqwest errors -------------

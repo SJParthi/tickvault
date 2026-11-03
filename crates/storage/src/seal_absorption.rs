@@ -358,11 +358,14 @@ impl SealDiskFloor {
 /// outage, the shape the floor-refusal branch already closed in DA-14. Now the
 /// first failure of an episode logs, the rest are counted, and the episode
 /// closes with the count on the first of: the next seal that tier accepts, the
-/// next committed live candle flush (`note_clean_flush`), or, for the DLQ
-/// episode only, the next seal the spill accepts (the DLQ is then no longer
+/// next nonempty live candle flush returning `Ok` (`note_clean_flush`), or,
+/// for the DLQ episode only, the next seal the spill accepts (the DLQ is then no longer
 /// reached). "Accepts" includes a seal the spill skips because it already
 /// holds a fuller copy of that bar, so an episode can end on a seal that
 /// wrote nothing; the next real failure then opens a new episode and logs.
+/// An empty flush after refused rows does not end the episode. A nonempty
+/// successful flush proves HTTP acceptance, not WAL application or recovery
+/// of the failed disk tier.
 /// O(1): one relaxed add and one relaxed swap per failure, one relaxed load
 /// per success in the common case.
 /// No allocation outside the one line per episode edge.
@@ -435,6 +438,8 @@ impl SealAbsorptionPipeline {
             floor: SealDiskFloor::new(spill.spill_dir().to_path_buf()),
             spill,
             dlq: Arc::new(SealDlqWriter::new()),
+            spill_failure: FailureEpisode::default(),
+            dlq_failure: FailureEpisode::default(),
         };
         pipeline.prefault_ring();
         pipeline
@@ -573,12 +578,14 @@ impl SealAbsorptionPipeline {
     /// again through this pipeline (QuestDB recovered first, so no later seal
     /// was escalated) stayed latched, and the next, unrelated failure logged
     /// nothing and its error was never written. Called by the live drain on
-    /// every candle flush that committed (`drain_once_into`; the boot drain
-    /// and the mid-session replay flushes do not call it); two relaxed loads
-    /// when nothing is open.
+    /// a nonempty candle flush returning `Ok` (`drain_once_reusing`); an empty
+    /// flush of refused rows does not qualify. This acknowledges HTTP
+    /// acceptance, not WAL application or recovery of the failed disk tier.
+    /// The boot drain and the mid-session replay flushes do not call it;
+    /// two relaxed loads when nothing is open.
     pub(crate) fn note_clean_flush(&self) {
-        self.close_spill_episode("a live candle flush committed");
-        self.close_dlq_episode("a live candle flush committed");
+        self.close_spill_episode("a nonempty live candle flush was accepted over HTTP");
+        self.close_dlq_episode("a nonempty live candle flush was accepted over HTTP");
     }
 
     /// Closes the spill failure episode, if one is open, with its count.
@@ -666,7 +673,7 @@ impl SealAbsorptionPipeline {
                         exchange_segment_code = evicted.exchange_segment_code,
                         "tier-2 spill failed — escalating to tier-3 DLQ; later spill failures \
                          of this episode are counted, not logged, until the spill accepts a seal \
-                         or a live candle flush commits"
+                         or a nonempty live candle flush is accepted over HTTP"
                     );
                 }
                 let dlq_record = SealDlqRecord::from(&serialised);
@@ -995,21 +1002,56 @@ mod tests {
             spill_as_file.clone(),
             dlq.clone(),
         );
-        let now = jan1_noon_utc();
-        for i in 0..5_u64 {
-            let s = mk_buffered_seal(100 + i, 0, TfIndex::M1, 1_716_023_700, 100.0);
-            assert_eq!(p.rescue_in_flight(s, now), SubmitOutcome::DlqWritten);
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        assert!(p.spill_failure.failing.load(Ordering::Relaxed));
-        assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 5);
-        let dlq_writer = SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
-        assert_eq!(dlq_writer.read_all(now).expect("read dlq").len(), 5);
-        // Clear the blocker: the next spill succeeds and closes the episode.
-        std::fs::remove_file(&spill_as_file).expect("remove blocker");
-        let s = mk_buffered_seal(200, 0, TfIndex::M1, 1_716_023_700, 100.0);
-        assert_eq!(p.rescue_in_flight(s, now), SubmitOutcome::Spilled);
-        assert!(!p.spill_failure.failing.load(Ordering::Relaxed));
-        assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 0);
+        let captured = Capture::default();
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let now = jan1_noon_utc();
+            for i in 0..5_u64 {
+                let s = mk_buffered_seal(100 + i, 0, TfIndex::M1, 1_716_023_700, 100.0);
+                assert_eq!(p.rescue_in_flight(s, now), SubmitOutcome::DlqWritten);
+            }
+            assert!(p.spill_failure.failing.load(Ordering::Relaxed));
+            assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 5);
+            let dlq_writer = SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
+            assert_eq!(dlq_writer.read_all(now).expect("read dlq").len(), 5);
+            // Clear the blocker: the next spill succeeds and closes the episode.
+            std::fs::remove_file(&spill_as_file).expect("remove blocker");
+            let s = mk_buffered_seal(200, 0, TfIndex::M1, 1_716_023_700, 100.0);
+            assert_eq!(p.rescue_in_flight(s, now), SubmitOutcome::Spilled);
+            assert!(!p.spill_failure.failing.load(Ordering::Relaxed));
+            assert_eq!(p.spill_failure.failed_in_episode.load(Ordering::Relaxed), 0);
+        });
+        let logged = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("trace text");
+        assert_eq!(logged.matches("tier-2 spill failed").count(), 1);
+        assert_eq!(
+            logged
+                .matches("sealed-candle spill failure episode ended")
+                .count(),
+            1
+        );
+        assert!(
+            logged.contains("failed=5"),
+            "the recovery reports every failure"
+        );
         cleanup(&spill_as_file, &dlq);
     }
 
@@ -1036,6 +1078,271 @@ mod tests {
         quiet.note_clean_flush();
         assert!(!quiet.spill_failure.failing.load(Ordering::Relaxed));
         cleanup(&spill, &dlq);
+    }
+
+    struct OwnedFlushFixtureDir(PathBuf);
+
+    impl OwnedFlushFixtureDir {
+        fn new(tag: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "tickvault-seal-live-flush-{tag}-{}-{nonce}",
+                std::process::id()
+            ));
+            // A preexisting path is an error, never a cleanup target.
+            std::fs::create_dir(&path).expect("exclusive fixture directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for OwnedFlushFixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn accept_one_candle_flush(listener: std::net::TcpListener) -> Vec<u8> {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        const REQUEST_CAP: usize = 64 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no production candle request");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("accept candle request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("request read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("response write timeout");
+        let mut request = Vec::with_capacity(4096);
+        let mut block = [0_u8; 1024];
+        let header_end = loop {
+            assert!(Instant::now() < deadline, "incomplete candle request");
+            let count = stream.read(&mut block).expect("read candle request");
+            assert!(count > 0, "candle request ended early");
+            assert!(request.len() + count <= REQUEST_CAP, "fixture request cap");
+            request.extend_from_slice(&block[..count]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_end = end + 4;
+                let headers = std::str::from_utf8(&request[..header_end]).expect("HTTP headers");
+                assert!(headers.starts_with("POST /write?precision=n HTTP/1.1\r\n"));
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .expect("content length")
+                    .1
+                    .trim()
+                    .parse::<usize>()
+                    .expect("numeric content length");
+                assert!(length <= REQUEST_CAP - header_end, "fixture body cap");
+                if request.len() == header_end + length {
+                    break header_end;
+                }
+                assert!(
+                    request.len() < header_end + length,
+                    "unexpected extra bytes"
+                );
+            }
+        };
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("acknowledge candle write");
+        request.split_off(header_end)
+    }
+
+    #[test]
+    fn test_live_clean_flush_rearms_failure_episodes_through_the_production_drain() {
+        // The direct note_clean_flush test cannot catch a missing call from
+        // the live drain. A real protocol-V1 HTTP ACK exercises that branch.
+        let owned = OwnedFlushFixtureDir::new("ack");
+        let mut pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            4,
+            owned.0.join("spill"),
+            owned.0.join("dlq"),
+        );
+        assert!(pipeline.spill_failure.open());
+        assert!(pipeline.dlq_failure.open());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("owned loopback fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let fixture = std::thread::spawn(move || accept_one_candle_flush(listener));
+        let config = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        static KEYED: AtomicBool = AtomicBool::new(true);
+        let mut writer = crate::shadow_candle_writer::ShadowCandleWriter::new(&config)
+            .expect("production writer")
+            .with_keyed_for_test(&KEYED);
+        let now = jan1_noon_utc();
+        let seal = mk_buffered_seal(77, 0, TfIndex::M1, 1_716_023_700, 101.0);
+        assert_eq!(pipeline.submit(seal, now), SubmitOutcome::Buffered);
+        let mut scratch = Vec::with_capacity(4);
+        let outcome = crate::seal_writer_task::drain_once_reusing(
+            &mut pipeline,
+            &mut writer,
+            4,
+            now,
+            &mut scratch,
+        );
+        let body =
+            String::from_utf8(fixture.join().expect("fixture completed")).expect("ILP text body");
+        assert!(body.starts_with("candles_1m,"), "a real candle was written");
+        assert!(body.contains("security_id=77i"));
+        assert_eq!(outcome.ring_seals_popped, 1);
+        assert!(outcome.flushed_ok);
+        assert!(!outcome.has_rescues());
+        assert!(scratch.is_empty());
+        assert!(!pipeline.spill_failure.failing.load(Ordering::Relaxed));
+        assert!(!pipeline.dlq_failure.failing.load(Ordering::Relaxed));
+        assert_eq!(
+            pipeline
+                .spill_failure
+                .failed_in_episode
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            pipeline
+                .dlq_failure
+                .failed_in_episode
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            pipeline.spill_failure.open(),
+            "later spill failure is a new episode"
+        );
+        assert!(
+            pipeline.dlq_failure.open(),
+            "later DLQ failure is a new episode"
+        );
+    }
+
+    #[test]
+    fn test_refused_only_live_flush_keeps_failure_episodes_open() {
+        let owned = OwnedFlushFixtureDir::new("refused");
+        let mut pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            4,
+            owned.0.join("spill"),
+            owned.0.join("dlq"),
+        );
+        assert!(pipeline.spill_failure.open());
+        assert!(pipeline.dlq_failure.open());
+        let mut writer = crate::shadow_candle_writer::ShadowCandleWriter::for_test();
+        let refused = mk_buffered_seal(77, 0, TfIndex::M1, 0, 101.0);
+        // Establish the intended empty-success path independently of the
+        // drain's outcome: this row is deliberately refused before encoding.
+        writer.append_seal(&refused).expect("deliberate refusal");
+        assert_eq!(writer.pending_count(), 0);
+        assert_eq!(writer.buffer_byte_count(), 0);
+        let now = jan1_noon_utc();
+        assert_eq!(pipeline.submit(refused, now), SubmitOutcome::Buffered);
+        let mut scratch = Vec::with_capacity(4);
+        let outcome = crate::seal_writer_task::drain_once_reusing(
+            &mut pipeline,
+            &mut writer,
+            4,
+            now,
+            &mut scratch,
+        );
+        assert_eq!(outcome.ring_seals_popped, 1);
+        assert!(outcome.flushed_ok, "an empty flush still returns Ok");
+        assert!(!outcome.has_rescues());
+        assert!(scratch.is_empty());
+        assert_eq!(writer.pending_count(), 0);
+        assert_eq!(writer.buffer_byte_count(), 0);
+        assert!(pipeline.spill_failure.failing.load(Ordering::Relaxed));
+        assert!(pipeline.dlq_failure.failing.load(Ordering::Relaxed));
+        assert_eq!(
+            pipeline
+                .spill_failure
+                .failed_in_episode
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            pipeline
+                .dlq_failure
+                .failed_in_episode
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_failed_nonempty_live_flush_keeps_failure_episodes_open() {
+        let owned = OwnedFlushFixtureDir::new("failed");
+        let spill = owned.0.join("spill");
+        let dlq = owned.0.join("dlq");
+        std::fs::write(&spill, b"spill blocker").expect("owned spill blocker");
+        std::fs::write(&dlq, b"DLQ blocker").expect("owned DLQ blocker");
+        let mut pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(4, spill, dlq);
+        // Drive both failed tiers rather than the unrelated low-space refusal.
+        pipeline.set_free_probe_for_test(|_| Some(u64::MAX));
+        assert!(pipeline.spill_failure.open());
+        assert!(pipeline.dlq_failure.open());
+        static KEYED: AtomicBool = AtomicBool::new(true);
+        // The empty test conf cannot dial any endpoint. Its bounded reconnect
+        // attempts fail after a real row is appended by the production drain.
+        let mut writer =
+            crate::shadow_candle_writer::ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED);
+        let now = jan1_noon_utc();
+        let seal = mk_buffered_seal(77, 0, TfIndex::M1, 1_716_023_700, 101.0);
+        assert_eq!(pipeline.submit(seal, now), SubmitOutcome::Buffered);
+        let mut scratch = Vec::with_capacity(4);
+        let outcome = crate::seal_writer_task::drain_once_reusing(
+            &mut pipeline,
+            &mut writer,
+            4,
+            now,
+            &mut scratch,
+        );
+        assert_eq!(outcome.ring_seals_popped, 1);
+        assert!(!outcome.flushed_ok);
+        assert_eq!(outcome.rescued_dropped, 1);
+        assert_eq!(outcome.rescued_dropped_below_floor, 0);
+        assert_eq!(outcome.rescued_to_spill, 0);
+        assert_eq!(outcome.rescued_to_dlq, 0);
+        assert!(scratch.is_empty());
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "failed bytes are discarded after rescue"
+        );
+        assert_eq!(writer.buffer_byte_count(), 0);
+        assert!(pipeline.spill_failure.failing.load(Ordering::Relaxed));
+        assert!(pipeline.dlq_failure.failing.load(Ordering::Relaxed));
+        // The original failure plus this failed rescue remain one episode.
+        assert_eq!(
+            pipeline
+                .spill_failure
+                .failed_in_episode
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            pipeline
+                .dlq_failure
+                .failed_in_episode
+                .load(Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]

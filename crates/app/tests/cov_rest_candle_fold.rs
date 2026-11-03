@@ -82,7 +82,6 @@ fn counter(name: &str, label: &str) -> f64 {
 struct Resp {
     status: u16,
     body: Vec<u8>,
-    declared_len: Option<usize>,
     omit_len: bool,
 }
 
@@ -91,7 +90,6 @@ impl Resp {
         Self {
             status: 200,
             body: v.to_string().into_bytes(),
-            declared_len: None,
             omit_len: false,
         }
     }
@@ -99,7 +97,6 @@ impl Resp {
         Self {
             status,
             body: body.to_vec(),
-            declared_len: None,
             omit_len: false,
         }
     }
@@ -159,16 +156,12 @@ async fn serve_one(mut s: TcpStream, handler: Handler, log: Arc<Mutex<Vec<String
     log.lock().expect("log lock").push(query.clone());
     let resp = handler(&query);
     let mut out = format!("HTTP/1.1 {} X\r\nConnection: close\r\n", resp.status);
-    if let Some(declared) = resp.declared_len {
-        out.push_str(&format!("Content-Length: {declared}\r\n"));
-    } else if !resp.omit_len {
+    if !resp.omit_len {
         out.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
     }
     out.push_str("\r\n");
     let _ = s.write_all(out.as_bytes()).await;
-    if resp.declared_len.is_none() {
-        let _ = s.write_all(&resp.body).await;
-    }
+    let _ = s.write_all(&resp.body).await;
     let _ = s.flush().await;
     let _ = s.shutdown().await;
 }
@@ -287,6 +280,19 @@ fn bars_json(date: NaiveDate, minutes: &[i64], close: f64) -> Resp {
 fn discovery(pairs: &[(i64, &str)]) -> Resp {
     let ds: Vec<Value> = pairs.iter().map(|(s, g)| json!([s, g])).collect();
     Resp::json(&json!({ "dataset": ds }))
+}
+
+fn padded_response(mut response: Resp, len: usize, omit_len: bool) -> Resp {
+    let value = serde_json::from_slice::<Value>(&response.body).expect("valid unpadded fixture");
+    assert!(len >= response.body.len());
+    response.body.resize(len, b' ');
+    response.omit_len = omit_len;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).expect("valid padded fixture"),
+        value,
+        "only the response size changes"
+    );
+    response
 }
 
 fn days_ago(n: u64) -> NaiveDate {
@@ -564,15 +570,24 @@ async fn test_rest_candle_fold_run_discovery_and_body_failures_fold_nothing() {
         "truedata",
         discovery(&[(-5, "IDX_I"), (301, "EVIL'"), (302, "IDX_I")]),
     );
-    let mut declared = Resp::raw(200, b"");
-    declared.declared_len = Some(FOLD_MAX_RESPONSE_BYTES + 1);
-    fx.bars
-        .insert(("truedata", 302, day_start_nanos(today)), declared);
-    let mut streamed = Resp::raw(200, b"");
-    streamed.body = vec![b' '; FOLD_MAX_RESPONSE_BYTES + 1];
-    streamed.omit_len = true;
-    fx.bars
-        .insert(("truedata", 302, day_start_nanos(days_ago(1))), streamed);
+    // Both responses contain otherwise valid bars: the refusal cannot be
+    // explained by a missing body or malformed JSON instead of the byte cap.
+    fx.bars.insert(
+        ("truedata", 302, day_start_nanos(today)),
+        padded_response(
+            bars_json(today, &[0], 30.0),
+            FOLD_MAX_RESPONSE_BYTES + 1,
+            false,
+        ),
+    );
+    fx.bars.insert(
+        ("truedata", 302, day_start_nanos(days_ago(1))),
+        padded_response(
+            bars_json(days_ago(1), &[0], 30.0),
+            FOLD_MAX_RESPONSE_BYTES + 1,
+            true,
+        ),
+    );
     fx.bars.insert(
         ("truedata", 302, day_start_nanos(days_ago(2))),
         Resp::raw(200, &[0xff, 0xfe, 0xfd]),
@@ -659,9 +674,14 @@ async fn test_rest_candle_fold_run_discovery_unparseable_and_oversize_skip_feeds
     let mut fx = Fixture::default();
     fx.discovery
         .insert("dhan", Resp::raw(200, b"definitely not json"));
-    let mut declared = Resp::raw(200, b"");
-    declared.declared_len = Some(FOLD_MAX_RESPONSE_BYTES + 1);
-    fx.discovery.insert("truedata", declared);
+    fx.discovery.insert(
+        "truedata",
+        padded_response(
+            discovery(&[(305, "IDX_I")]),
+            FOLD_MAX_RESPONSE_BYTES + 1,
+            false,
+        ),
+    );
     let mock = spawn_mock(handler_for(fx)).await;
     let (tx, rx) = mpsc::channel(4);
     let slot = slot_with(rx);
@@ -674,6 +694,100 @@ async fn test_rest_candle_fold_run_discovery_unparseable_and_oversize_skip_feeds
         "two discovery reads and nothing else: {reqs:?}"
     );
     assert!(reqs.iter().all(|r| r.starts_with("SELECT DISTINCT")));
+}
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("captured log lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rest_candle_fold_run_response_byte_cap_accepts_exact_and_refuses_one_over() {
+    use tracing::instrument::WithSubscriber as _;
+    harness();
+    let today = today_ist();
+    let cases = [
+        (701, false, false),
+        (702, false, true),
+        (703, true, false),
+        (704, true, true),
+    ];
+    let mut fx = Fixture::default();
+    let identities: Vec<_> = cases.iter().map(|(sid, _, _)| (*sid, "IDX_I")).collect();
+    fx.discovery.insert("dhan", discovery(&identities));
+    for (sid, omit_len, oversized) in cases {
+        fx.bars.insert(
+            ("dhan", sid, day_start_nanos(today)),
+            padded_response(
+                bars_json(today, &[0], 77.0),
+                FOLD_MAX_RESPONSE_BYTES + usize::from(oversized),
+                omit_len,
+            ),
+        );
+    }
+    let mock = spawn_mock(handler_for(fx)).await;
+    let (tx, rx) = mpsc::channel(4);
+    let slot = slot_with(rx);
+    drop(tx);
+    let captured = CapturedLog::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        run_rest_candle_fold(params(mock.port, 1, &slot)).with_subscriber(subscriber),
+    )
+    .await
+    .expect("bounded catch-up finishes");
+    let log = String::from_utf8(captured.0.lock().expect("captured log lock").clone())
+        .expect("fixture tracing is UTF-8");
+    let store = spot_bar_store().expect("store");
+    assert_eq!(mock.requests().len(), 6, "two discovery and four bar reads");
+    for (sid, omit_len, oversized) in cases {
+        assert_eq!(mock.count(&format!("security_id = {sid} ")), 1);
+        let row = store.bar_at(
+            key(Feed::Dhan, u64::try_from(sid).expect("positive fixture id")),
+            TfIndex::M1,
+            bucket_secs(today, 0),
+        );
+        let query_failed = log.lines().any(|line| {
+            line.contains(&format!("security_id={sid}")) && line.contains("stage=\"catchup_query\"")
+        });
+        if oversized {
+            assert!(
+                row.is_none(),
+                "one byte over must not fold (omit_len={omit_len})"
+            );
+            assert!(
+                query_failed,
+                "refusal occurs in the capped query stage: {log}"
+            );
+        } else {
+            assert_eq!(row.expect("exact cap folds").close, 77.0);
+            assert!(
+                !query_failed,
+                "exact cap must not report query failure: {log}"
+            );
+        }
+    }
+    // REST reports one stage for header and streamed refusals. These cases
+    // prove the externally visible cap and the no-length streaming path;
+    // they do not independently distinguish the earlier header optimization.
 }
 
 #[tokio::test(start_paused = true)]

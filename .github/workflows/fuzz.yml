@@ -90,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [tick_parser, config_parser, ws_frame_wal_replay, dhan_depth_packet, truedata_frame_decoder]
+        target: [tick_parser, config_parser, ws_frame_wal_replay, dhan_depth_packet, truedata_frame_decoder, main_feed_stacked_frame, order_update_json, instrument_master_csv, seal_spill_record, strategy_recipe_files, segment_query, dhan_intraday_json]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -107,7 +107,7 @@ jobs:
           prefix-key: fuzz-${{ env.NIGHTLY_VERSION }}
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # cargo-fuzz
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # cargo-fuzz
         with:
           tool: cargo-fuzz
 
@@ -148,9 +148,10 @@ jobs:
         if: steps.check.outputs.exists == 'true' && steps.build.outcome == 'success'
         env:
           # PR #288 (#8 + Phase 12.3): scheduled runs use 3600s (1h), 12x the
-          # prior 300s. 2 targets x 1h = 2h/week = 8h/month — ~0.4% of the
-          # 2000-min/mo GH Actions free-tier budget. Still well within cost
-          # per aws-budget.md. Manual dispatch can go higher for deep runs.
+          # prior 300s. The 12-target matrix configures 12 runner-hours/week
+          # before builds, about 52 runner-hours in an average month. This is
+          # configured work, not a verified free-tier or billing allowance.
+          # Manual dispatch can go higher for deep runs.
           FUZZ_SECS: ${{ github.event.inputs.fuzz_duration_secs || '3600' }}
         run: |
           set -o pipefail

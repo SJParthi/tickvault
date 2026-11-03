@@ -53,7 +53,15 @@ fn read(rel: &str) -> String {
 
 /// CI's clippy invocation, verbatim. If this string leaves `ci.yml`, the local
 /// script is no longer a stand-in for the gate and the parity claim is void.
-const CI_CLIPPY_INVOCATION: &str = "cargo clippy --workspace --no-deps -- -D warnings";
+const CI_CLIPPY_INVOCATION: &str =
+    "cargo clippy --workspace --all-targets --no-deps -- -D warnings";
+
+/// Lines of `text` that are not `#` comments.
+fn code_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect()
+}
 
 /// The tail of CI's second clippy step (2026-10-30, plan item 12b), which lints
 /// every target of the crates named before it with `-p`.
@@ -91,7 +99,9 @@ fn ci_all_targets_crates() -> Vec<String> {
 fn ci_still_runs_the_invocation_the_local_script_mirrors() {
     let ci = read(".github/workflows/ci.yml");
     assert!(
-        ci.contains(CI_CLIPPY_INVOCATION),
+        code_lines(&ci)
+            .iter()
+            .any(|line| { line.trim_start().strip_prefix("run: ") == Some(CI_CLIPPY_INVOCATION) }),
         "clippy_local_parity_guard: ci.yml no longer contains the pinned clippy \
          invocation `{CI_CLIPPY_INVOCATION}`.\n\
          scripts/clippy-local.sh exists to mirror THAT command. If CI's scope \
@@ -158,6 +168,28 @@ fn the_local_script_lints_all_targets_of_exactly_the_crates_ci_does() {
     );
 }
 
+/// Plan item 12b: both local entry points must lint every target of the
+/// workspace, with the real shim passing exactly CI's warning-denial flags.
+#[test]
+fn the_local_script_lints_all_workspace_targets_in_both_entry_points() {
+    let script = read("scripts/clippy-local.sh");
+    let code = code_lines(&script);
+    // The shim branch runs CI's command with CI's exact flags: it has no
+    // grep gate, so `-- -D warnings` is the only thing that makes a warning
+    // fail there (12b review).
+    assert!(
+        code.iter()
+            .any(|line| { line.trim_start().strip_prefix("exec ") == Some(CI_CLIPPY_INVOCATION) }),
+        "the real cargo-clippy entry point must exec `{CI_CLIPPY_INVOCATION}` exactly"
+    );
+    assert!(
+        code.iter()
+            .any(|line| line.trim_start()
+                == "cargo check --workspace --all-targets >\"${OUT}\" 2>&1"),
+        "the clippy-driver fallback must check every target of the workspace"
+    );
+}
+
 #[test]
 fn the_local_script_exists_and_is_a_bash_program() {
     let script = read("scripts/clippy-local.sh");
@@ -186,23 +218,12 @@ fn the_local_script_mirrors_ci_scope_and_never_widens_or_narrows_it() {
          with CI. RUSTC_WORKSPACE_WRAPPER already restricts linting to workspace \
          members, but the flag must stay visible so the parity is readable."
     );
-    // NOT wider than CI. CI runs `--all-targets` only for the clean crates
-    // (2026-10-30); `--all-targets` on the whole workspace would surface lints
-    // CI never runs, training the reader to ignore local output. Comments are
-    // stripped first: the script DOCUMENTS its scope.
-    // Judged per COMMAND, not per line: the fallback runs both checks on one
-    // line joined by `&&`.
-    let widened: Vec<&str> = code_lines(&script)
-        .into_iter()
-        .flat_map(|l| l.split("&&").flat_map(|c| c.split(';')))
-        .filter(|c| c.contains("--all-targets") && c.contains("--workspace"))
-        .collect();
+    // Both paths include test, bench and example targets; comments cannot
+    // satisfy the assertion. The exact commands are pinned above.
     assert!(
-        widened.is_empty(),
-        "clippy_local_parity_guard: the local script must NOT run --all-targets on the \
-         whole workspace: {widened:?}. CI lints test targets of the clean crates only; \
-         a wider local gate produces findings CI will never enforce, and a gate people \
-         learn to ignore is worse than no gate."
+        code_lines(&script).iter().any(|line| line.trim_start()
+            == "export CLIPPY_ARGS=\"--no-deps\" RUSTC_WORKSPACE_WRAPPER=\"${DRIVER}\""),
+        "the fallback must pass --no-deps to clippy-driver in workspace-wrapper mode"
     );
     // The fallback must be the wrapper, not a silent skip.
     assert!(

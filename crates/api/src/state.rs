@@ -405,6 +405,7 @@ struct AppStateInner {
     /// TTL cache for the `/api/fno-stocks` response body (2026-10-30).
     /// Single slot, 2s TTL — see [`FNO_STOCKS_CACHE_TTL_SECS`].
     fno_stocks_cache: crate::response_cache::SingleSlotTtlCache,
+    stock_movers_cache: crate::handlers::stock_movers::MoversCache,
 }
 
 impl SharedAppState {
@@ -492,6 +493,7 @@ impl SharedAppState {
                 ),
                 metrics_scrape_url: std::sync::OnceLock::new(),
                 speed_health_refresh: tokio::sync::Mutex::new(()),
+                stock_movers_cache: crate::handlers::stock_movers::MoversCache::default(),
                 fno_stocks_cache: crate::response_cache::SingleSlotTtlCache::new(
                     std::time::Duration::from_secs(FNO_STOCKS_CACHE_TTL_SECS),
                 ),
@@ -589,6 +591,10 @@ impl SharedAppState {
 
     /// Returns the `/api/fno-stocks` TTL response cache (2026-10-30).
     // TEST-EXEMPT: trivial accessor; exercised by the fno-stocks cache test.
+    pub(crate) fn stock_movers_cache(&self) -> &crate::handlers::stock_movers::MoversCache {
+        &self.inner.stock_movers_cache
+    }
+
     pub fn fno_stocks_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
         &self.inner.fno_stocks_cache
     }

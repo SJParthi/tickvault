@@ -9,14 +9,18 @@
 //! fields, so the tests below assert WHAT was logged (error code, peer label,
 //! feed name, duration), not merely that a call happened.
 //!
-//! Every test runs on the default current-thread tokio runtime (or a plain
-//! `#[test]` thread), so `tracing::subscriber::set_default` scopes the
-//! capture to that test alone. No environment variable is set, no sleep is
-//! used, and every file this suite creates lives under `std::env::temp_dir()`
-//! and is removed before the test ends.
+//! Each async test uses a current-thread runtime, so the tracing subscriber
+//! remains local to that test. Handler persistence and environment-based auth
+//! run in bounded Rust child tests with an owned working directory and explicit
+//! token inputs. The parent never changes its environment or working directory.
+//! Files belong to exclusively created temporary directories; HTTP fixtures use
+//! loopback and report completed requests and I/O errors through joined tasks.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -141,17 +145,99 @@ fn events_of(events: &Arc<Mutex<Vec<CapturedEvent>>>) -> Vec<CapturedEvent> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn unique_temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "tv-api-covgap-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {dir:?}: {e}"));
-    dir
+#[derive(Debug)]
+struct OwnedDir(PathBuf);
+
+impl OwnedDir {
+    fn try_create(path: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &FsPath {
+        &self.0
+    }
+}
+
+impl Drop for OwnedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn unique_temp_dir(tag: &str) -> OwnedDir {
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "tv-api-covgap-{tag}-{}-{sequence}",
+            std::process::id()
+        ));
+        match OwnedDir::try_create(path) {
+            Ok(owner) => return owner,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create owned API test directory: {error}"),
+        }
+    }
+    panic!("API test directory names collided on every bounded attempt");
+}
+
+const CHILD_TEST_ENV: &str = "TV_COVERAGE_API_CHILD_TEST";
+const CHILD_CASE_ENV: &str = "TV_COVERAGE_API_CHILD_CASE";
+const FEED_CHILD_TEST: &str = "enabling_truedata_flips_the_flag_and_logs_the_feed_label";
+const AUTH_CHILD_TEST: &str =
+    "from_env_in_live_mode_without_a_token_generates_one_and_logs_the_code";
+
+fn child_case(test_name: &str) -> Option<String> {
+    if std::env::var(CHILD_TEST_ENV).ok().as_deref() == Some(test_name) {
+        Some(std::env::var(CHILD_CASE_ENV).expect("child case is explicit"))
+    } else {
+        None
+    }
+}
+
+async fn run_isolated_test(test_name: &str, case: &str, root: &FsPath, token: Option<&str>) {
+    let mut command =
+        tokio::process::Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .current_dir(root)
+        .env(CHILD_TEST_ENV, test_name)
+        .env(CHILD_CASE_ENV, case)
+        .env_remove("TV_API_TOKEN")
+        .kill_on_drop(true);
+    if let Some(token) = token {
+        command.env("TV_API_TOKEN", token);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("isolated API test timed out")
+        .expect("isolated API test must start");
+    assert!(
+        output.status.success(),
+        "isolated test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("running 1 test"),
+        "child selected no test: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "child did not pass: {stdout}"
+    );
+}
+
+fn assert_token_not_logged(events: &[CapturedEvent], token: &str) {
+    assert!(
+        !events
+            .iter()
+            .flat_map(|event| &event.fields)
+            .any(|(_, value)| value.contains(token)),
+        "captured event leaked token material"
+    );
 }
 
 fn state_with_questdb(
@@ -199,7 +285,27 @@ async fn body_string(resp: axum::response::Response) -> (StatusCode, String) {
 
 /// A mock QuestDB that answers ONE connection per canned body (status 200),
 /// then drops the listener so every later connection is refused.
-async fn start_mock_questdb(responses: Vec<&'static str>) -> u16 {
+struct MockQuestDb {
+    port: u16,
+    task: tokio::task::JoinHandle<io::Result<Vec<String>>>,
+}
+
+impl MockQuestDb {
+    async fn finish(&mut self) -> io::Result<Vec<String>> {
+        tokio::time::timeout(Duration::from_secs(6), &mut self.task)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mock completion timed out"))?
+            .map_err(io::Error::other)?
+    }
+}
+
+impl Drop for MockQuestDb {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_mock_questdb(responses: Vec<&'static str>) -> MockQuestDb {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -207,23 +313,63 @@ async fn start_mock_questdb(responses: Vec<&'static str>) -> u16 {
         .await
         .expect("bind should succeed");
     let port = listener.local_addr().expect("local_addr").port();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::with_capacity(responses.len());
         for body in responses {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = vec![0u8; 8192];
-            let _read = stream.read(&mut buf).await;
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mock accept timed out"))??;
+            let mut request = Vec::with_capacity(1024);
+            let mut buf = [0_u8; 1024];
+            loop {
+                let count = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "mock read timed out")
+                    })??;
+                if count == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "incomplete HTTP request",
+                    ));
+                }
+                request.extend_from_slice(&buf[..count]);
+                if request.len() > 8192 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HTTP headers exceed fixture bound",
+                    ));
+                }
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = std::str::from_utf8(&request)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let request_line = request.lines().next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing request line")
+            })?;
+            requests.push(request_line.to_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
-            let _written = stream.write_all(response.as_bytes()).await;
-            let _shut = stream.shutdown().await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                stream.write_all(response.as_bytes()),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mock write timed out"))??;
+            tokio::time::timeout(Duration::from_secs(5), stream.shutdown())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "mock shutdown timed out")
+                })??;
         }
+        Ok(requests)
     });
-    port
+    MockQuestDb { port, task }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +389,7 @@ fn persist_failure_whose_tmp_cleanup_also_fails_logs_the_cleanup_error() {
     const ENAMETOOLONG: i32 = 36;
 
     let root = unique_temp_dir("longpath");
-    let mut parent = root.clone();
+    let mut parent = root.path().to_path_buf();
     // Fill with components of at most 200 bytes (NAME_MAX is 255), leaving
     // room for the final `data` component.
     loop {
@@ -294,7 +440,9 @@ fn persist_failure_whose_tmp_cleanup_also_fails_logs_the_cleanup_error() {
         "the logged cleanup error must be the ENAMETOOLONG from remove_file: {cleanup:?}"
     );
 
-    std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    let root_path = root.path().to_path_buf();
+    drop(root);
+    assert!(!root_path.exists(), "owned temp root must be removed");
 }
 
 /// feed_state_persist.rs:224 — a read error other than NotFound (the
@@ -303,7 +451,7 @@ fn persist_failure_whose_tmp_cleanup_also_fails_logs_the_cleanup_error() {
 #[test]
 fn load_feed_state_returns_none_when_the_path_is_unreadable() {
     let root = unique_temp_dir("unreadable");
-    let path = root.join("data").join("feed-state.json");
+    let path = root.path().join("data").join("feed-state.json");
     std::fs::create_dir_all(&path).expect("make the overlay path a directory");
 
     // Guard against a vacuous pass: the read really does fail with a
@@ -313,7 +461,9 @@ fn load_feed_state_returns_none_when_the_path_is_unreadable() {
 
     assert_eq!(load_feed_state(&path), None);
 
-    std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    let root_path = root.path().to_path_buf();
+    drop(root);
+    assert!(!root_path.exists(), "owned temp root must be removed");
 }
 
 // ---------------------------------------------------------------------------
@@ -324,11 +474,27 @@ fn load_feed_state_returns_none_when_the_path_is_unreadable() {
 /// actually flipped carries the feed's label. TrueData is runtime-toggleable,
 /// so its enable runs `set_enabled` and the log.
 ///
-/// Side effect (the handler's own, shared with the existing set_feed unit
-/// tests): the handler persists to its fixed relative path
-/// `data/feed-state.json` under the crate directory, which is git-ignored.
+/// The handler's fixed relative persistence path is exercised inside a child
+/// process whose working directory belongs to this test, never the checkout.
 #[tokio::test]
 async fn enabling_truedata_flips_the_flag_and_logs_the_feed_label() {
+    if child_case(FEED_CHILD_TEST).is_none() {
+        let root = unique_temp_dir("feed-child");
+        let cwd_before = std::env::current_dir().expect("parent cwd");
+        let sentinel = root.path().join("untouched");
+        std::fs::write(&sentinel, b"keep").expect("owned sentinel");
+        let overlay = root.path().join("data/feed-state.json");
+        assert!(!overlay.exists());
+        run_isolated_test(FEED_CHILD_TEST, "feed", root.path(), None).await;
+        assert_eq!(std::env::current_dir().expect("parent cwd"), cwd_before);
+        assert_eq!(std::fs::read(sentinel).expect("sentinel survives"), b"keep");
+        assert!(
+            load_feed_state(&overlay).is_some(),
+            "child must persist into its owned cwd"
+        );
+        return;
+    }
+    assert_eq!(child_case(FEED_CHILD_TEST).as_deref(), Some("feed"));
     let state = state_with_questdb("127.0.0.1", 9, Arc::new(SystemHealthStatus::new()));
     assert!(!state.feed_runtime().is_enabled(Feed::Truedata));
 
@@ -349,6 +515,23 @@ async fn enabling_truedata_flips_the_flag_and_logs_the_feed_label() {
     assert_eq!(toggled.level, Level::INFO);
     assert_eq!(toggled.field("feed"), Some("truedata"));
     assert_eq!(toggled.field("enabled"), Some("true"));
+    let persisted = load_feed_state(
+        &std::env::current_dir()
+            .expect("child cwd")
+            .join("data/feed-state.json"),
+    )
+    .expect("the real handler must persist in the isolated cwd");
+    // The current on-disk schema stores only Dhan's enabled flag plus its
+    // write timestamp, not the runtime-only lane fields or TrueData flag.
+    assert_eq!(
+        persisted.dhan_enabled,
+        state.feed_runtime().snapshot().dhan_enabled
+    );
+    assert!(
+        chrono::NaiveDateTime::parse_from_str(&persisted.updated_at_ist, "%Y-%m-%d %H:%M:%S")
+            .is_ok(),
+        "the persisted snapshot carries its documented IST timestamp"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -380,12 +563,12 @@ async fn health_reports_inactive_for_a_reported_but_stopped_pipeline() {
 /// reports 503.
 #[tokio::test]
 async fn failed_query_against_a_reachable_questdb_is_an_uncached_404() {
-    let port = start_mock_questdb(vec![
+    let mut mock = start_mock_questdb(vec![
         "{\"query\":\"x\",\"error\":\"table does not exist [table=ticks]\",\"position\":0}",
         "{\"query\":\"SHOW TABLES\",\"dataset\":[]}",
     ])
     .await;
-    let state = state_with_questdb("127.0.0.1", port, Arc::new(SystemHealthStatus::new()));
+    let state = state_with_questdb("127.0.0.1", mock.port, Arc::new(SystemHealthStatus::new()));
 
     let first = get_quote(
         State(state.clone()),
@@ -398,6 +581,16 @@ async fn failed_query_against_a_reachable_questdb_is_an_uncached_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let json: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
     assert_eq!(json["error"], "no tick data found for this security_id");
+
+    let requests = mock
+        .finish()
+        .await
+        .expect("both mock requests must complete without I/O failure");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /exec?query="));
+    assert!(requests[0].contains("security_id"));
+    assert!(requests[0].contains("42"));
+    assert_eq!(requests[1], "GET /exec?query=SHOW+TABLES HTTP/1.1");
 
     // Not cached: the repeat goes back to QuestDB, which is now gone.
     let second = get_quote(State(state), Path(42_u64), Query(QuoteParams::default()))
@@ -554,19 +747,39 @@ async fn auth_rejections_log_path_peer_and_the_reload_hint() {
 /// middleware.rs:445-448 — `from_env(false)` with no `TV_API_TOKEN` fails
 /// CLOSED: auth stays on with a generated UUID token, and the CRITICAL
 /// `error!` carries the GAP-SEC-01 code and severity. The test never sets the
-/// variable; if the environment already provides one, the other arm is
-/// asserted instead.
-#[test]
-fn from_env_in_live_mode_without_a_token_generates_one_and_logs_the_code() {
+/// variable in the parent. Separate child cases remove it or supply a known
+/// synthetic value, so neither branch depends on the operator's environment.
+#[tokio::test]
+async fn from_env_in_live_mode_without_a_token_generates_one_and_logs_the_code() {
+    let Some(case) = child_case(AUTH_CHILD_TEST) else {
+        let root = unique_temp_dir("auth-child");
+        let cwd_before = std::env::current_dir().expect("parent cwd");
+        run_isolated_test(AUTH_CHILD_TEST, "missing-token", root.path(), None).await;
+        run_isolated_test(
+            AUTH_CHILD_TEST,
+            "fixed-token",
+            root.path(),
+            Some(GOOD_TOKEN),
+        )
+        .await;
+        assert_eq!(std::env::current_dir().expect("parent cwd"), cwd_before);
+        return;
+    };
+    match case.as_str() {
+        "missing-token" => assert!(std::env::var_os("TV_API_TOKEN").is_none()),
+        "fixed-token" => assert_eq!(std::env::var("TV_API_TOKEN").as_deref(), Ok(GOOD_TOKEN)),
+        _ => panic!("unexpected isolated auth case"),
+    }
     let (_guard, events) = capture();
     let config = ApiAuthConfig::from_env(false);
 
     assert!(config.enabled, "live mode must never disable auth");
-    match std::env::var("TV_API_TOKEN") {
-        Ok(token) if !token.is_empty() => {
-            assert_eq!(config.token_value_for_test(), token);
+    match case.as_str() {
+        "fixed-token" => {
+            assert_eq!(config.token_value_for_test(), GOOD_TOKEN);
+            assert_token_not_logged(&events_of(&events), GOOD_TOKEN);
         }
-        _ => {
+        "missing-token" => {
             let generated = config.token_value_for_test();
             assert!(
                 uuid::Uuid::parse_str(&generated).is_ok(),
@@ -589,6 +802,63 @@ fn from_env_in_live_mode_without_a_token_generates_one_and_logs_the_code() {
                 !critical.message().contains(&generated),
                 "the generated token must never be logged"
             );
+            assert_token_not_logged(&events_of(&events), &generated);
         }
+        _ => panic!("unexpected isolated auth case"),
     }
+}
+
+#[test]
+fn test_owned_directory_collision_preserves_existing_contents() {
+    let root = unique_temp_dir("collision-parent");
+    let existing = root.path().join("existing");
+    std::fs::create_dir(&existing).expect("existing owner directory");
+    let sentinel = existing.join("sentinel");
+    std::fs::write(&sentinel, b"keep").expect("sentinel");
+    let error = OwnedDir::try_create(existing.clone()).expect_err("existing directory is not ours");
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel survives refusal"),
+        b"keep"
+    );
+    let root_path = root.path().to_path_buf();
+    drop(root);
+    assert!(
+        !root_path.exists(),
+        "only the successful owner cleans its tree"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_completion_refuses_an_incomplete_request() {
+    use tokio::io::AsyncWriteExt;
+    let mut mock = start_mock_questdb(vec!["{}"]).await;
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", mock.port))
+        .await
+        .expect("connect fixture");
+    stream
+        .write_all(b"GET /incomplete")
+        .await
+        .expect("partial request");
+    stream.shutdown().await.expect("finish partial request");
+    let error = mock
+        .finish()
+        .await
+        .expect_err("incomplete requests cannot count as completed cases");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+#[should_panic(expected = "captured event leaked token material")]
+fn test_redaction_assertion_checks_later_structured_fields() {
+    let (_guard, events) = capture();
+    tracing::info!("first ordinary event");
+    tracing::warn!(
+        token = GOOD_TOKEN,
+        "second event without token in its message"
+    );
+    let captured = events_of(&events);
+    assert_eq!(captured.len(), 2);
+    assert!(!captured[1].message().contains(GOOD_TOKEN));
+    assert_token_not_logged(&captured, GOOD_TOKEN);
 }

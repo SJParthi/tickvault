@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn a_trade_time_from_before_today_is_refused_not_stored() {
         let s = store();
-        let yesterday = T0 - u32::try_from(SECONDS_PER_DAY).unwrap_or(86_400);
+        let yesterday = T0 - SECONDS_PER_DAY;
         assert_eq!(
             s.record(2885, NSE_EQ, 1234.55, yesterday, 0),
             RecordOutcome::StaleTradingDay
@@ -787,7 +787,7 @@ mod tests {
             s.record(2885, NSE_EQ, 1234.55, T0, 0),
             RecordOutcome::Stored
         );
-        let tomorrow = T0 + u32::try_from(SECONDS_PER_DAY).unwrap_or(86_400);
+        let tomorrow = T0 + SECONDS_PER_DAY;
         assert_eq!(
             s.record(2885, NSE_EQ, 9999.99, tomorrow, 0),
             RecordOutcome::FutureTradingDay,
@@ -1016,7 +1016,7 @@ mod tests {
     fn snapshot_prices_is_the_shape_the_contract_join_already_consumes() {
         let s = store();
         s.record(2885, NSE_EQ, 1234.55, T0, 0);
-        s.record(13, IDX, 24_500.10, T0, 0);
+        s.record(13, IDX, 24_500.1, T0, 0);
         let snap = s.snapshot_prices();
         assert_eq!(snap.get(&(2885, NSE_EQ.binary_code())), Some(&123_455));
         assert_eq!(snap.get(&(13, IDX.binary_code())), Some(&2_450_010));

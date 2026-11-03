@@ -2348,6 +2348,8 @@ pub struct SpillPruneOutcome {
     /// hold seals a recovery path gave up on and are those seals' only copy.
     /// Their bytes are in `bytes_after`.
     pub refused_kept: usize,
+    /// Bytes held by `refused_kept` (PR31c). Also counted in `bytes_after`.
+    pub refused_kept_bytes: u64,
     /// Non-empty files at the top level or in `replaying/` deleted WITH a
     /// verified cold copy (DA-13a). Their seals were never written to
     /// `candles_*`: the only copy is now the cold bucket's `seal-spill/`, and
@@ -2530,6 +2532,27 @@ fn prune_spill_files_inner(
     outcome
 }
 
+/// Logs one coded `warn!` when the sweep found files still kept in `refused/`
+/// (PR31c), so a pile that nobody re-ingests is seen on every sweep. Returns
+/// whether it logged. STORAGE-GAP-04 at WARN matches no metric filter, so
+/// this line pages nobody; each file was already reported when it moved
+/// there. O(1), once per retention sweep.
+fn report_refused_files_remain(outcome: &SpillPruneOutcome) -> bool {
+    if outcome.refused_kept == 0 {
+        return false;
+    }
+    warn!(
+        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+        source = "seal_refused_files_remain",
+        files = outcome.refused_kept,
+        bytes = outcome.refused_kept_bytes,
+        "sealed-candle spill files are still kept in refused/: some candles may remain \
+         missing from candles_*. These files are never deleted and are NOT re-ingested \
+         automatically; verify their contents before replaying them."
+    );
+    true
+}
+
 /// Counts the files in `refused/` and their bytes, deleting nothing
 /// (PR40b-f). O(files), on the cold retention sweep.
 fn count_kept_refused(dir: &Path, outcome: &mut SpillPruneOutcome) {
@@ -2546,6 +2569,7 @@ fn count_kept_refused(dir: &Path, outcome: &mut SpillPruneOutcome) {
             && meta.is_file()
         {
             outcome.refused_kept += 1;
+            outcome.refused_kept_bytes = outcome.refused_kept_bytes.saturating_add(meta.len());
             outcome.bytes_after = outcome.bytes_after.saturating_add(meta.len());
         }
     }
@@ -2865,6 +2889,7 @@ pub fn prune_spill_files(
     // APPROVED: cast — a file count, far below f64 precision loss.
     #[allow(clippy::cast_precision_loss)] // APPROVED: a file count, far below 2^52
     metrics::gauge!(SEAL_SPILL_REFUSED_FILES_GAUGE).set(outcome.refused_kept as f64);
+    let _ = report_refused_files_remain(&outcome);
     // APPROVED: cast — a per-pass file count, always <= u64.
     metrics::counter!(SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER)
         .increment(outcome.refused_not_uploaded as u64);
@@ -4993,12 +5018,74 @@ mod tests {
             assert!(spill.exists() && dlq_copy.exists() && other.exists());
             assert_eq!(out.refused_kept, 2, "both seal files are counted");
             assert_eq!(out.bytes_after, 320, "their bytes are in the total");
+            assert_eq!(out.refused_kept_bytes, 320, "refused bytes counted apart");
+            assert!(report_refused_files_remain(&out), "kept files are reported");
             assert_eq!(
                 (out.deleted, out.archive_deleted, out.records_lost),
                 (0, 0, 0)
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_report_refused_files_remain_logs_only_when_files_are_kept() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("owned log buffer")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Capture(std::sync::Arc::clone(&captured));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let kept = SpillPruneOutcome {
+            refused_kept: 3,
+            refused_kept_bytes: 384,
+            ..SpillPruneOutcome::default()
+        };
+        // A scoped subscriber observes the actual warning. Returning `true`
+        // without emitting it must fail; parallel tests keep their own logs.
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!report_refused_files_remain(&SpillPruneOutcome::default()));
+            assert!(captured.lock().expect("owned log buffer").is_empty());
+            assert!(report_refused_files_remain(&kept));
+            assert!(report_refused_files_remain(&kept));
+        });
+        let bytes = captured.lock().expect("owned log buffer");
+        let text = std::str::from_utf8(&bytes).expect("JSON log is UTF-8");
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("complete JSON event"))
+            .collect();
+        assert_eq!(events.len(), 2, "one warning on each nonempty sweep");
+        for event in events {
+            assert_eq!(event["level"], "WARN");
+            assert_eq!(event["fields"]["code"], "STORAGE-GAP-04");
+            assert_eq!(event["fields"]["source"], "seal_refused_files_remain");
+            assert_eq!(event["fields"]["files"], 3);
+            assert_eq!(event["fields"]["bytes"], 384);
+            let message = event["fields"]["message"]
+                .as_str()
+                .expect("warning has a message");
+            assert!(message.contains("some candles may remain"));
+            assert!(message.contains("NOT re-ingested automatically"));
+        }
     }
 
     #[test]

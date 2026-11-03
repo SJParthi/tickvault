@@ -13,19 +13,22 @@
 //! chunk. A frame held in the ring or the WAL queue therefore keeps its whole
 //! chunk alive, and `RingByteBudget` counts only `frame.len()`.
 //!
-//! This file measures that under DHAT, through the production code only:
+//! The gated runs measure that under DHAT through the production socket:
 //! `DhanFeedSocketImpl::connect` and `recv`, which build their config with
 //! `websocket_config(endpoint)`.
 //!
 //! ## What it measures, per endpoint (MainFeed, Depth20, Depth200)
 //!
-//! 1. **Idle.** Heap the socket keeps after `connect` (read buffer, stream
-//!    state, the writer task and its queue).
+//! 1. **Warmed idle.** Incremental heap the socket keeps after `connect`
+//!    (read buffer, stream state, writer task and queue), after initializing
+//!    every endpoint's shared connector/runtime state. First endpoint dials
+//!    separately report idle, connect allocations and process-retained bytes.
 //! 2. **Steady.** Blocks and bytes allocated per frame and per MiB received
 //!    while each frame is dropped at once.
-//! 3. **Held.** Heap kept while the newest K frames are held FIFO, the way the
-//!    ring and the WAL queue hold them, against the payload bytes held. The
-//!    ratio is the pinning amplification.
+//! 3. **Held.** Net process-heap growth while the newest K frames are held
+//!    FIFO, compared with their payload bytes. Actual retained counts, bytes
+//!    and marker order prove ownership independently of allocation growth.
+//!    The ratio is incremental, not total backing allocation or an RSS bound.
 //! 4. **Cap frame.** Heap while one frame at `max_frame_bytes(endpoint)` is
 //!    held, after it is dropped, and after later small frames.
 //!
@@ -34,34 +37,38 @@
 //! DHAT counts every thread. The fake server is a plain std thread: it does
 //! the WebSocket handshake by hand into a stack buffer, encodes every frame
 //! it will send BEFORE the first measurement, and inside a window only calls
-//! `write_all` on pre-built bytes and reads one atomic. It keeps no heap
-//! after the handshake. The client runs on a current-thread runtime built
+//! nonblocking writes on pre-built bytes and reads cancellation atomics. Its
+//! prebuilt batches remain allocated outside each measured delta; they are
+//! not absent from the process heap. The client runs on a current-thread runtime built
 //! before any measurement, and the held frames go into a `VecDeque` sized
 //! before the window opens.
 //!
 //! ## Honest limits
 //!
-//! * Plain `ws://` on loopback. Production is `wss://`: rustls copies each
-//!   decrypted record into a fresh `Vec` (up to 16 KiB of received
-//!   plaintext) on the same read task, and keeps its own deframer buffer.
-//!   None of that is measured here. Measuring it needs a loopback TLS server,
-//!   which needs a new dev dependency or a committed test key (owner).
+//! * Plain `ws://` on loopback. TLS record buffering/decryption, the live
+//!   network, and the vendor packet mix are not measured. Synthetic payloads
+//!   exercise transport buffering; they do not prove accepted market ticks.
+//! * All frame lengths, order markers, and remaining bytes are checked. This
+//!   extra fixture work affects scheduling; these are allocation observations,
+//!   not latency measurements or a production allocation guarantee.
 //! * Loopback segmentation is not the vendor's, so allocation counts move a
-//!   little from run to run. The exact figures belong to the ignored report;
+//!   little from run to run. The exact figures belong to the optional report;
 //!   the ratchet bounds are wide on purpose.
 //! * One socket per endpoint, measured one at a time. Figures for 16 or 26
 //!   sockets are this per-socket figure multiplied, not a live measurement.
 //!
-//! DHAT allows one profiler at a time, so the two tests share a lock.
+//! DHAT counts all threads. Every test in this binary shares one lock.
 //!
-//! Run the report: `cargo test -p tickvault-core --test dhat_ws_reader_memory
-//! -- --ignored --nocapture`.
+//! Run the normal allocation gate with `cargo test --locked -p tickvault-core
+//! --test dhat_ws_reader_memory`. For the additional large shape report, set
+//! `TV_READER_MEMORY_REPORT=1` and select `dhat_reader_memory_ratchet -- --nocapture`.
+//! The normal gate still runs first; no test is ignored or conditionally skipped.
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,13 +86,14 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-/// DHAT allows one running profiler per process; the report and the ratchet
-/// take this lock so `--include-ignored` cannot start two.
+/// Serialize every test so auxiliary fixture allocations cannot enter DHAT windows.
 static PROFILER_LOCK: Mutex<()> = Mutex::new(());
 
-/// Bytes the fake server writes per `write_all`: one TCP segment on a
-/// 1,500-byte MTU, so the client sees reads the size real traffic gives.
-const SEGMENT_BYTES: usize = 1_448;
+/// Write chunk size only. TCP may combine or split these writes; this is not
+/// a claim about packet boundaries or the vendor's segmentation.
+const WRITE_CHUNK_BYTES: usize = 1_448;
+const SERVER_POLL_INTERVAL: Duration = Duration::from_micros(200);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long any one scenario may take before the test gives up.
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(120);
@@ -117,6 +125,8 @@ fn payload(endpoint: DhanEndpointType, len: usize, marker: u32) -> Vec<u8> {
             chunk.copy_from_slice(&ticker_packet(marker.wrapping_add(i as u32)));
         }
     }
+    assert!(out.len() >= 8, "the fixture needs an order marker");
+    out[4..8].copy_from_slice(&marker.to_le_bytes());
     out
 }
 
@@ -138,9 +148,10 @@ fn encode_frame(out: &mut Vec<u8>, body: &[u8]) {
 
 /// `count` frames of `frame_len` bytes, encoded back to back.
 fn encode_batch(endpoint: DhanEndpointType, frame_len: usize, count: usize) -> Vec<u8> {
-    let body = payload(endpoint, frame_len, 1);
+    let mut body = payload(endpoint, frame_len, 1);
     let mut out = Vec::with_capacity(count * (frame_len + 10));
-    for _ in 0..count {
+    for index in 0..count {
+        body[4..8].copy_from_slice(&((index + 1) as u32).to_le_bytes());
         encode_frame(&mut out, &body);
     }
     out
@@ -158,10 +169,11 @@ struct FakeServer {
     /// Set by the server once the handshake reply is written and its
     /// temporary strings are freed.
     handshake_done: Arc<AtomicBool>,
+    accepted: Arc<AtomicBool>,
     /// Set by the client when it has read everything; the server then drops
     /// the connection.
     finished: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl FakeServer {
@@ -170,39 +182,54 @@ impl FakeServer {
         let port = listener.local_addr().expect("local addr").port(); // APPROVED: test
         let released = Arc::new(AtomicUsize::new(0));
         let handshake_done = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_writer = Arc::clone(&accepted);
         let finished = Arc::new(AtomicBool::new(false));
         let (r, h, f) = (
             Arc::clone(&released),
             Arc::clone(&handshake_done),
             Arc::clone(&finished),
         );
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener"); // APPROVED: test
         let thread = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept"); // APPROVED: test
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            let mut stream = loop {
+                check_io_deadline(&f, deadline)?;
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(SERVER_POLL_INTERVAL);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             drop(listener);
-            handshake(&mut stream);
+            stream.set_nonblocking(true)?;
+            accepted_writer.store(true, Ordering::Release);
+            handshake(&mut stream, &f, deadline)?;
             h.store(true, Ordering::Release);
             for (i, batch) in batches.iter().enumerate() {
+                let deadline = Instant::now() + SCENARIO_TIMEOUT;
                 while r.load(Ordering::Acquire) <= i {
-                    if f.load(Ordering::Acquire) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_micros(200));
+                    check_io_deadline(&f, deadline)?;
+                    std::thread::sleep(SERVER_POLL_INTERVAL);
                 }
-                for segment in batch.chunks(SEGMENT_BYTES) {
-                    if stream.write_all(segment).is_err() {
-                        return;
-                    }
+                for chunk in batch.chunks(WRITE_CHUNK_BYTES) {
+                    write_until(&mut stream, chunk, &f, deadline)?;
                 }
             }
             while !f.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(SERVER_POLL_INTERVAL);
             }
-            drop(batches);
+            Ok(())
         });
         Self {
             port,
             released,
             handshake_done,
+            accepted,
             finished,
             thread: Some(thread),
         }
@@ -216,6 +243,10 @@ impl FakeServer {
         let deadline = Instant::now() + SCENARIO_TIMEOUT;
         while !self.handshake_done.load(Ordering::Acquire) {
             assert!(Instant::now() < deadline, "server handshake never finished");
+            assert!(
+                !self.thread.as_ref().expect("server thread").is_finished(),
+                "server ended before its handshake"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -228,28 +259,78 @@ impl FakeServer {
 impl Drop for FakeServer {
     fn drop(&mut self) {
         self.finished.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if !std::thread::panicking() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+                    other => panic!("fake server failed: {other:?}"),
+                }
+            }
         }
     }
 }
 
-/// Reads the client's upgrade request into a stack buffer and answers 101.
-/// The only heap it touches is the accept key and the reply line, both freed
-/// before `handshake_done` is set.
-fn handshake(stream: &mut TcpStream) {
+/// Every network syscall is nonblocking. Cancellation and an absolute deadline
+/// are checked even while a peer makes partial progress, so Drop cannot become
+/// trapped in accept/read/write on a stalled loopback peer.
+fn check_io_deadline(stop: &AtomicBool, deadline: Instant) -> io::Result<()> {
+    if stop.load(Ordering::Acquire) {
+        return Err(ErrorKind::Interrupted.into());
+    }
+    if Instant::now() >= deadline {
+        return Err(ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
+fn write_until<W: Write>(
+    stream: &mut W,
+    mut bytes: &[u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        check_io_deadline(stop, deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(SERVER_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Reads the upgrade request into a fixed stack buffer. The accept key/reply
+/// allocations are freed before handshake_done is published.
+fn handshake(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) -> io::Result<()> {
     let mut buf = [0u8; 8_192];
     let mut len = 0;
     loop {
-        let n = stream.read(&mut buf[len..]).expect("read upgrade request"); // APPROVED: test
-        assert!(n > 0, "client closed during the upgrade");
-        len += n;
-        if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+        check_io_deadline(stop, deadline)?;
+        match stream.read(&mut buf[len..]) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(read) => len += read,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(SERVER_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        if buf[..len].windows(4).any(|window| window == b"\r\n\r\n") {
             break;
         }
-        assert!(len < buf.len(), "upgrade request larger than 8 KiB");
+        if len == buf.len() {
+            return Err(ErrorKind::InvalidData.into());
+        }
     }
-    let request = std::str::from_utf8(&buf[..len]).expect("ascii request"); // APPROVED: test
+    let request = std::str::from_utf8(&buf[..len]).map_err(|_| ErrorKind::InvalidData)?;
     let key = request
         .lines()
         .find_map(|line| {
@@ -258,23 +339,25 @@ fn handshake(stream: &mut TcpStream) {
                 .eq_ignore_ascii_case("sec-websocket-key")
                 .then(|| value.trim())
         })
-        .expect("Sec-WebSocket-Key header"); // APPROVED: test
+        .ok_or(ErrorKind::InvalidData)?;
     let accept = derive_accept_key(key.as_bytes());
     let reply = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    stream.write_all(reply.as_bytes()).expect("write 101"); // APPROVED: test
+    write_until(stream, reply.as_bytes(), stop, deadline)
 }
 
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
 
+type ProductionReader = DhanFeedSocketImpl<fn() -> Option<FeedTokenBuffer<String>>>;
+
 /// The production socket and, for the bite check only, a raw
 /// `tokio-tungstenite` stream with a caller-chosen config.
 enum Client {
-    Production(Box<DhanFeedSocketImpl<fn() -> Option<FeedTokenBuffer<String>>>>),
+    Production(Box<ProductionReader>),
     Raw(
         Box<
             tokio_tungstenite::WebSocketStream<
@@ -335,6 +418,9 @@ impl Client {
 struct Window {
     frames: u64,
     payload_bytes: u64,
+    /// Observed FIFO ownership after the measurement, before releasing frames.
+    held_frames: usize,
+    held_payload_bytes: u64,
     alloc_blocks: u64,
     alloc_bytes: u64,
     /// `curr_bytes` at the end of the window minus at its start.
@@ -429,32 +515,45 @@ fn run_socket(
 
     let before = stats();
     let mut client = rt.block_on(async {
-        match raw {
-            None => Client::production(endpoint, url).await,
-            Some(config) => Client::raw(url, config).await,
-        }
+        tokio::time::timeout(SCENARIO_TIMEOUT, async {
+            match raw {
+                None => Client::production(endpoint, url).await,
+                Some(config) => Client::raw(url, config).await,
+            }
+        })
+        .await
+        .expect("loopback connection timed out") // APPROVED: test
     });
     server.wait_handshake();
-    // Let the writer task reach its first await so its state is settled.
+    // Give the writer task an initial scheduling opportunity. This is an
+    // after-connect observation, not proof that every lazy path is warmed.
     rt.block_on(tokio::task::yield_now());
     let after = stats();
     let idle_kept_bytes = curr_delta(&after, &before);
     let connect_alloc_bytes = after.total_bytes - before.total_bytes;
 
     for plan in plans {
+        let expected = payload(endpoint, plan.frame_len(), 1);
         let start = stats();
         server.release_next();
         let mut frames = 0u64;
         let mut payload_bytes = 0u64;
         rt.block_on(async {
             tokio::time::timeout(SCENARIO_TIMEOUT, async {
-                for _ in 0..plan.count() {
+                for index in 0..plan.count() {
                     let frame = client.next_frame().await;
                     assert_eq!(
                         frame.len(),
                         plan.frame_len(),
                         "frame length changed in transit"
                     );
+                    assert_eq!(&frame[..4], &expected[..4], "frame header changed");
+                    assert_eq!(
+                        &frame[4..8],
+                        &((index + 1) as u32).to_le_bytes(),
+                        "frame order changed"
+                    );
+                    assert_eq!(&frame[8..], &expected[8..], "frame payload changed");
                     frames += 1;
                     payload_bytes += frame.len() as u64;
                     if let Plan::Hold { hold, .. } = plan {
@@ -469,9 +568,28 @@ fn run_socket(
             .expect("scenario timed out"); // APPROVED: test
         });
         let end = stats();
+        // Observe actual ownership after the allocation window. A retained
+        // frame can reuse pre-existing capacity without positive net growth.
+        let held_frames = held.len();
+        let held_payload_bytes = held.iter().map(|frame| frame.len() as u64).sum();
+        let first_retained = plan
+            .count()
+            .checked_sub(held_frames)
+            .expect("held more frames than received"); // APPROVED: test
+        for (offset, frame) in held.iter().enumerate() {
+            assert_eq!(&frame[..4], &expected[..4], "retained header changed");
+            assert_eq!(
+                &frame[4..8],
+                &((first_retained + offset + 1) as u32).to_le_bytes(),
+                "retained FIFO order changed"
+            );
+            assert_eq!(&frame[8..], &expected[8..], "retained payload changed");
+        }
         windows.push(Window {
             frames,
             payload_bytes,
+            held_frames,
+            held_payload_bytes,
             alloc_blocks: end.total_blocks - start.total_blocks,
             alloc_bytes: end.total_bytes - start.total_bytes,
             kept_bytes: curr_delta(&end, &start),
@@ -481,7 +599,17 @@ fn run_socket(
     }
     drop(client);
     drop(server);
-    rt.block_on(tokio::task::yield_now());
+    // Dropping the production socket closes its writer channels. Await actual
+    // task completion before another scenario can measure its deferred frees.
+    rt.block_on(async {
+        tokio::time::timeout(SCENARIO_TIMEOUT, async {
+            while rt.metrics().num_alive_tasks() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("socket writer did not terminate"); // APPROVED: test
+    });
     Run {
         idle_kept_bytes,
         connect_alloc_bytes,
@@ -509,22 +637,44 @@ fn held_payload(plan: Plan) -> u64 {
     }
 }
 
-/// One warm-up dial so lazy one-time state (TLS roots, runtime pieces) is
-/// built before anything is measured.
+/// Initialize each endpoint before the warmed per-socket gate. Depth200 has
+/// a separate process-wide no-ALPN config; warming MainFeed alone leaves its
+/// first roots/config allocation inside the otherwise-warmed comparison.
+/// These are first endpoint dials in process order, not three independent
+/// cold profiles: Depth20 shares MainFeed's already-initialized ALPN cache.
 fn warm_up(rt: &tokio::runtime::Runtime) {
-    let _ = run_socket(
-        rt,
+    for endpoint in [
         DhanEndpointType::MainFeed,
-        &[Plan::Drop {
-            frame_len: 162,
-            count: 256,
-        }],
-        None,
-    );
+        DhanEndpointType::Depth20,
+        DhanEndpointType::Depth200,
+    ] {
+        let before = stats();
+        let run = run_socket(
+            rt,
+            endpoint,
+            &[Plan::Drop {
+                frame_len: 162,
+                count: 256,
+            }],
+            None,
+        );
+        let idle = run.idle_kept_bytes;
+        let allocated = run.connect_alloc_bytes;
+        // run_socket joined the server and awaited writer-task completion.
+        // Drop its result buffers before observing process-retained state.
+        drop(run);
+        let retained = curr_delta(&stats(), &before);
+        eprintln!(
+            "first endpoint dial in process order, {}: idle {idle} B, connect allocated \
+             {allocated} B, process retained after close {retained} B; includes any \
+             shared initialization, not TLS-only bytes or the warmed socket budget",
+            endpoint.as_str()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Report (ignored)
+// Optional extended report (the normal ratchet always runs first)
 // ---------------------------------------------------------------------------
 
 fn report_plans(endpoint: DhanEndpointType) -> Vec<Plan> {
@@ -581,14 +731,7 @@ fn describe(plan: Plan) -> String {
     }
 }
 
-#[test]
-#[ignore = "report: run with --ignored --nocapture"]
-fn reader_memory_report() {
-    let _lock = PROFILER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _profiler = dhat::Profiler::builder().testing().build();
-    let rt = runtime();
-    warm_up(&rt);
-
+fn reader_memory_report(rt: &tokio::runtime::Runtime) {
     let mut idle = Vec::new();
     for endpoint in [
         DhanEndpointType::MainFeed,
@@ -596,7 +739,7 @@ fn reader_memory_report() {
         DhanEndpointType::Depth200,
     ] {
         let plans = report_plans(endpoint);
-        let run = run_socket(&rt, endpoint, &plans, None);
+        let run = run_socket(rt, endpoint, &plans, None);
         eprintln!(
             "\n== {} (cap {} B) ==\nidle kept {} B, allocated during connect {} B",
             endpoint.as_str(),
@@ -632,7 +775,7 @@ fn reader_memory_report() {
 
     // Bite reference: the library default read buffer (128 KiB).
     let raw = run_socket(
-        &rt,
+        rt,
         DhanEndpointType::MainFeed,
         &ratchet_plans(),
         Some(WebSocketConfig::default()),
@@ -645,7 +788,8 @@ fn reader_memory_report() {
     let main = idle[0].1.max(0) as f64;
     let depth = idle[1].1.max(idle[2].1).max(0) as f64;
     eprintln!(
-        "\nprojection (plain ws, no TLS): 5 main-feed sockets idle {:.1} KiB; \
+        "\nprojection (warmed plain ws; shared startup extra, TLS unmeasured): \
+         5 main-feed sockets idle {:.1} KiB; \
          26 sockets (5 main + 10 depth-20 + 10 depth-200 + 1 order-update as main) \
          idle {:.1} KiB",
         5.0 * main / 1024.0,
@@ -673,14 +817,15 @@ fn ratchet_plans() -> Vec<Plan> {
     ]
 }
 
-/// Bounds set from the 2026-10-30 report run (x86 dev container, debug
-/// build), with wide margins. Each is a ceiling, never a target.
+/// Ceilings inherited unchanged from the paused 2026-10-30 WIP report
+/// (x86 dev container, debug build). That historical description is not a
+/// fresh measurement of this port. Each is a ceiling, never a target.
 struct Bounds {
-    /// Heap one idle socket keeps after `connect`.
+    /// Incremental idle heap after all endpoint connector profiles are warm.
     idle_kept_bytes: i64,
     /// Blocks allocated per MiB received while frames are dropped at once.
     steady_blocks_per_mib: f64,
-    /// Heap kept by 1,024 held frames over the payload they hold.
+    /// Net process-heap growth over held payload, not total backing storage.
     held_amplification: f64,
 }
 
@@ -711,7 +856,7 @@ fn violations(run: &Run, plans: &[Plan], bounds: &Bounds) -> Vec<String> {
     let amp = held.kept_bytes as f64 / held_payload(plans[1]) as f64;
     if amp > bounds.held_amplification {
         out.push(format!(
-            "held frames pin {amp:.2}x their payload > {:.2}x",
+            "held frames add {amp:.2}x net heap / payload > {:.2}x",
             bounds.held_amplification
         ));
     }
@@ -721,12 +866,28 @@ fn violations(run: &Run, plans: &[Plan], bounds: &Bounds) -> Vec<String> {
 /// Every frame the server sent arrived, whole, and the read path really
 /// allocated: a run that measured nothing cannot pass.
 fn assert_not_vacuous(run: &Run, plans: &[Plan]) {
+    assert_eq!(run.windows.len(), plans.len(), "missing measurement window");
+    assert_eq!(
+        run.after_release.len(),
+        plans.len(),
+        "missing release observation"
+    );
     for (plan, w) in plans.iter().zip(&run.windows) {
         assert_eq!(w.frames, plan.count() as u64, "frames lost in {plan:?}");
         assert_eq!(
             w.payload_bytes,
             (plan.count() * plan.frame_len()) as u64,
             "bytes lost in {plan:?}"
+        );
+        let expected_held = match *plan {
+            Plan::Drop { .. } => 0,
+            Plan::Hold { count, hold, .. } => hold.min(count),
+        };
+        assert_eq!(w.held_frames, expected_held, "held count wrong in {plan:?}");
+        assert_eq!(
+            w.held_payload_bytes,
+            held_payload(*plan),
+            "held bytes wrong in {plan:?}"
         );
     }
     assert!(
@@ -737,15 +898,16 @@ fn assert_not_vacuous(run: &Run, plans: &[Plan]) {
         run.windows[0].alloc_blocks > 0,
         "the steady read allocated nothing: DHAT saw no read buffer chunk"
     );
-    assert!(
-        run.windows[1].kept_bytes > 0,
-        "1,024 held frames pinned no heap: the hold did not happen"
-    );
 }
 
 #[test]
-fn reader_memory_ratchet() {
+fn dhat_reader_memory_ratchet() {
     let _lock = PROFILER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Workspace feature unification enables both providers. Select the same
+    // provider as production before profiling this plain-loopback fixture.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("install test crypto provider"); // APPROVED: test initialization
     let _profiler = dhat::Profiler::builder().testing().build();
     let rt = runtime();
     warm_up(&rt);
@@ -757,6 +919,12 @@ fn reader_memory_ratchet() {
         DhanEndpointType::Depth200,
     ] {
         let run = run_socket(&rt, endpoint, &plans, None);
+        eprintln!(
+            "warmed production {}: idle {} B, windows {:?}",
+            endpoint.as_str(),
+            run.idle_kept_bytes,
+            run.windows
+        );
         assert_not_vacuous(&run, &plans);
         let broken = violations(&run, &plans, &BOUNDS);
         assert!(
@@ -774,9 +942,181 @@ fn reader_memory_ratchet() {
         &plans,
         Some(WebSocketConfig::default()),
     );
+    eprintln!(
+        "raw default control: idle {} B, windows {:?}",
+        raw.idle_kept_bytes, raw.windows
+    );
     assert_not_vacuous(&raw, &plans);
     assert!(
         !violations(&raw, &plans, &BOUNDS).is_empty(),
         "a 128 KiB read buffer passed every bound: the ratchet does not bite"
     );
+    if std::env::var("TV_READER_MEMORY_REPORT").is_ok_and(|value| value == "1") {
+        reader_memory_report(&rt);
+    }
+}
+
+#[test]
+fn test_fixture_cancellation_and_expired_io_deadline() {
+    let _lock = PROFILER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let stop = AtomicBool::new(false);
+    assert_eq!(
+        check_io_deadline(&stop, Instant::now()).unwrap_err().kind(),
+        ErrorKind::TimedOut
+    );
+    stop.store(true, Ordering::Release);
+    assert_eq!(
+        check_io_deadline(&stop, Instant::now() + HANDSHAKE_TIMEOUT)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Interrupted
+    );
+
+    // No client: the listener's accept loop must observe cancellation.
+    let mut server = FakeServer::spawn(Vec::new());
+    server.finished.store(true, Ordering::Release);
+    assert_eq!(
+        server
+            .thread
+            .take()
+            .expect("thread")
+            .join()
+            .expect("join")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Interrupted
+    );
+
+    // A client connects but never supplies an HTTP upgrade. Once a connection
+    // is accepted, cancelling still exits the read loop instead of hanging Drop.
+    let mut server = FakeServer::spawn(Vec::new());
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], server.port));
+    let mut client = TcpStream::connect_timeout(&address, HANDSHAKE_TIMEOUT).expect("connect");
+    client
+        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+        .expect("client write deadline");
+    client
+        .write_all(b"GET / HTTP/1.1\r\n")
+        .expect("partial upgrade");
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    while !server.accepted.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "server never accepted the partial upgrade"
+        );
+        std::thread::sleep(SERVER_POLL_INTERVAL);
+    }
+    server.finished.store(true, Ordering::Release);
+    assert_eq!(
+        server
+            .thread
+            .take()
+            .expect("thread")
+            .join()
+            .expect("join")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Interrupted
+    );
+    assert!(!server.handshake_done.load(Ordering::Acquire));
+
+    struct StalledWriter<'a> {
+        calls: usize,
+        cancel: &'a AtomicBool,
+    }
+    impl Write for StalledWriter<'_> {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.cancel.store(true, Ordering::Release);
+            Err(ErrorKind::WouldBlock.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    stop.store(false, Ordering::Release);
+    let mut writer = StalledWriter {
+        calls: 0,
+        cancel: &stop,
+    };
+    assert_eq!(
+        write_until(&mut writer, b"unwritten", &stop, Instant::now())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::TimedOut
+    );
+    assert_eq!(writer.calls, 0, "expired I/O must not write");
+    assert_eq!(
+        write_until(
+            &mut writer,
+            b"unwritten",
+            &stop,
+            Instant::now() + HANDSHAKE_TIMEOUT
+        )
+        .unwrap_err()
+        .kind(),
+        ErrorKind::Interrupted
+    );
+    assert_eq!(
+        writer.calls, 1,
+        "backpressure must return to the cancellation check"
+    );
+}
+
+#[test]
+fn test_reader_memory_violations_each_ceiling_and_missing_window() {
+    let _lock = PROFILER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let plans = ratchet_plans();
+    let mut run = Run {
+        idle_kept_bytes: BOUNDS.idle_kept_bytes,
+        connect_alloc_bytes: 1,
+        windows: vec![
+            Window {
+                frames: plans[0].count() as u64,
+                payload_bytes: (plans[0].count() * plans[0].frame_len()) as u64,
+                held_frames: 0,
+                held_payload_bytes: 0,
+                alloc_blocks: 1,
+                alloc_bytes: 1,
+                kept_bytes: 1,
+            },
+            Window {
+                frames: plans[1].count() as u64,
+                payload_bytes: (plans[1].count() * plans[1].frame_len()) as u64,
+                held_frames: 1_024,
+                held_payload_bytes: held_payload(plans[1]),
+                alloc_blocks: 1,
+                alloc_bytes: 1,
+                kept_bytes: (held_payload(plans[1]) * 4) as i64,
+            },
+        ],
+        after_release: vec![0, 0],
+    };
+    assert_not_vacuous(&run, &plans);
+    assert!(violations(&run, &plans, &BOUNDS).is_empty());
+    let held_growth_at_limit = run.windows[1].kept_bytes;
+    run.windows[1].kept_bytes = 0;
+    assert_not_vacuous(&run, &plans);
+    assert!(violations(&run, &plans, &BOUNDS).is_empty());
+    run.windows[1].held_frames = 0;
+    assert!(std::panic::catch_unwind(|| assert_not_vacuous(&run, &plans)).is_err());
+    run.windows[1].held_frames = 1_024;
+    run.windows[1].held_payload_bytes -= 1;
+    assert!(std::panic::catch_unwind(|| assert_not_vacuous(&run, &plans)).is_err());
+    run.windows[1].held_payload_bytes = held_payload(plans[1]);
+    run.windows[1].kept_bytes = held_growth_at_limit;
+    run.idle_kept_bytes += 1;
+    assert!(violations(&run, &plans, &BOUNDS)[0].starts_with("idle socket"));
+    run.idle_kept_bytes = BOUNDS.idle_kept_bytes;
+    run.windows[0].alloc_blocks = (run.windows[0].mib() * BOUNDS.steady_blocks_per_mib) as u64 + 1;
+    assert!(violations(&run, &plans, &BOUNDS)[0].starts_with("steady read"));
+    run.windows[0].alloc_blocks = 1;
+    run.windows[1].kept_bytes += 1;
+    assert!(violations(&run, &plans, &BOUNDS)[0].starts_with("held frames"));
+    run.windows.clear();
+    assert!(std::panic::catch_unwind(|| assert_not_vacuous(&run, &plans)).is_err());
 }

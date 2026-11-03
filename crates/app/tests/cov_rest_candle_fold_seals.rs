@@ -153,7 +153,7 @@ impl TempDir {
             .unwrap_or(0);
         let dir =
             std::env::temp_dir().join(format!("tv-cov-{tag}-{}-{nanos}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir(&dir).expect("claim a fresh temp dir");
         Self(dir)
     }
 

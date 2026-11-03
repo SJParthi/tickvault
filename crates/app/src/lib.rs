@@ -28,6 +28,7 @@
 // coverage-horizon staleness watchdog - pages the operator BEFORE the
 // calendar runs off its year-end cliff into un-listed holidays.
 pub mod calendar_staleness;
+pub mod operator_movers;
 // PR-C3 (2026-07-14): `cross_verify_1m_boot` module DELETED — the 15:31 IST
 // Dhan live-vs-historical 1m cross-verify retired with the Dhan live WS
 // (operator 2026-07-13; cross-verify-1m-error-codes.md retirement banner).
@@ -356,3 +357,5 @@ pub mod trading_pipeline;
 pub mod table_storage_rollup;
 pub mod ws_audit_consumer;
 pub mod ws_connection_rollup;
+
+pub mod operator_stock_movers;

@@ -15,6 +15,11 @@
 //! `tickvault_storage::partition_archive::VerifiedDayGate`). A vacuous or
 //! failed run writes NO marker, so the archive keeps waiting — up to its own
 //! bounded hold ceiling.
+//! The recovered past-day pass can also check dates inside that hold before
+//! today's run when its bounded budget fits. No historical finality oracle
+//! is wired: those dates cannot release the archive from date alone. Current
+//! comparison/persistence/coverage gates and the existing hold exceptions
+//! still apply; first-noted target coverage is not full capture proof.
 //!
 //! Complexity: cold path, once a day. Target building is O(subscribed); the
 //! comparison itself is documented in `dhan_live_crossverify`.
@@ -45,9 +50,9 @@ use crate::daily_task_marker::{
 use crate::dhan_live_crossverify::{
     AttemptStamp, DayComparison, DhanLiveCrossverifyConfig, LIVE_FINAL_SECS_OF_DAY_IST,
     LateWindowPolicy, MissingJudgeable, RUN_SECS_OF_DAY_IST, ReadPolicy, RunReport,
-    SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_MINUTES, XverifyCoverage, XverifyTarget, daily_row,
-    deterministic_run_ts_nanos, downgrade_for_coverage, fetched_at_ist_nanos_now,
-    run_cross_verification, session_minutes_subscribed,
+    SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_MINUTES, SESSION_OPEN_SECS_OF_DAY_IST, XverifyCoverage,
+    XverifyTarget, daily_row, deterministic_run_ts_nanos, downgrade_for_coverage,
+    fetched_at_ist_nanos_now, run_cross_verification, session_minutes_subscribed,
 };
 use crate::option_rank::OptionFamily;
 use crate::shutdown_class::{
@@ -231,10 +236,12 @@ pub fn crossverify_targets_with_skipped(
 /// With a record: every instrument it holds that the check can target, in the
 /// record's `(segment, security_id)` order; `planned` is targets times
 /// [`SESSION_MINUTES`], `covered` sums [`session_minutes_subscribed`] of each
-/// target's first second; `known` is `true`. Without one (absent or
+/// target's first second; `known` additionally requires the record's persisted
+/// completeness metadata. Without one (absent or
 /// unreadable): the boot set, `covered` 0, `known` `false`. Returns the
 /// targets, the instruments that cannot be targeted (F&O), and the coverage.
-/// O(instruments).
+/// O(n log n) for the record's sorted order plus two `Vec`s, then O(n); cold,
+/// once per day checked.
 #[must_use]
 pub fn targets_from_day_record(
     record: Option<&SpotDayRecord>,
@@ -282,7 +289,7 @@ pub fn targets_from_day_record(
         XverifyCoverage {
             planned_instrument_minutes: planned,
             covered_instrument_minutes: covered,
-            known: true,
+            known: record.coverage_known(),
             index_fallback_day: record.is_index_fallback_day(),
         },
     )
@@ -548,11 +555,14 @@ pub enum AttemptFailure {
     SkippedNoTime,
     /// The live side was not known final before the read: the catch-up floor
     /// was still moving below the close, or a strict read of an unknown
-    /// completeness found late minutes missing (§12.15.10). Only the vendor
-    /// tape was kept.
+    /// completeness found late minutes missing (§12.15.10). That retry kept
+    /// only vendor tape. Also used when a historical comparison has no finality
+    /// evidence; its last attempt may retain a partial audit but no marker.
     LiveNotFinal,
     /// QuestDB had not applied `candles_1m` through the snapshot taken after
-    /// the drain (§12.15.10). Nothing was read.
+    /// the drain (§12.15.10), or no historical applied-state oracle exists.
+    /// Earlier attempts read nothing; a last historical attempt may keep an
+    /// unjudged partial audit but cannot release the archive.
     LiveNotApplied,
     /// The seal writer had not drained after the last catch-up sweep, or a
     /// seal spill file for today was staged (§12.15.10). Nothing was read.
@@ -894,11 +904,13 @@ pub struct LiveReadiness {
 }
 
 impl LiveReadiness {
-    /// For a day that is no longer today: nothing more can be folded into
-    /// it, and the readiness wait reads only today's progress.
+    /// No historical finality oracle is wired. An older date alone does not
+    /// prove that replay, staged seals or QuestDB WAL have finished.
+    /// The current-day tracker cannot certify this date, so preserve unknown
+    /// readiness and withhold its archive marker (§12.15.16).
     pub const PAST_DAY: Self = Self {
-        durability: Durability::Applied,
-        completeness: Completeness::Final,
+        durability: Durability::NotReady(DhanLiveXverifyNotReady::NotApplied),
+        completeness: Completeness::Unknown,
     };
 }
 
@@ -1493,14 +1505,25 @@ pub const fn past_day_worst_case_secs(run_budget_secs: u64) -> u64 {
         .saturating_add(XVERIFY_RETRY_INTERVAL_SECS.saturating_mul(attempts.saturating_sub(1)))
 }
 
+/// The most past days one IST day can run: the hold window.
+const MAX_PAST_DAYS_TRIED: usize =
+    tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS as usize;
+
+/// Slack between a past day's worst-case end and 15:41 (review round 1).
+pub const PAST_DAY_FIT_MARGIN_SECS: u64 = 60;
+
 /// Whether a past day started at `now_secs_of_day` ends, at its worst case,
 /// before today's own run at 15:41 (plan item 51g). Before the run a past day
 /// starts only when it does; otherwise it waits for the pass after today's
 /// run, so the one attempt today gets before the 16:30 stop (§12.15.12) is
-/// never pushed late. Pure, O(1).
+/// never pushed late. A margin of [`PAST_DAY_FIT_MARGIN_SECS`] keeps a pass
+/// that ends on the minute (whole seconds, a slow file write) off 15:41.
+/// Pure, O(1).
 #[must_use]
 pub const fn past_day_fits_before_run(now_secs_of_day: u64, run_budget_secs: u64) -> bool {
-    now_secs_of_day.saturating_add(past_day_worst_case_secs(run_budget_secs))
+    now_secs_of_day
+        .saturating_add(past_day_worst_case_secs(run_budget_secs))
+        .saturating_add(PAST_DAY_FIT_MARGIN_SECS)
         <= XVERIFY_RUN_AT_SECS_OF_DAY_IST
 }
 
@@ -1517,15 +1540,31 @@ const SUPERVISOR_STEP_PAST_SECS: u64 = 60;
 /// started in time to have reported (before the 16:23 end bound, or on an
 /// earlier day), and only when nothing reported today: no report from this
 /// process, no day marker, no paged marker. Pure, O(1).
+/// The wall clock must also still be at or past the supervisor deadline;
+/// exhausting the bounded re-sleeps never authorizes an early page.
 #[must_use]
 pub const fn supervisor_should_page(
+    now_secs_of_day: u64,
     trading_day: bool,
     started_in_time: bool,
     worker_reported: bool,
     recorded: bool,
     paged: bool,
 ) -> bool {
-    trading_day && started_in_time && !worker_reported && !recorded && !paged
+    now_secs_of_day >= XVERIFY_SUPERVISOR_SECS_OF_DAY_IST
+        && trading_day
+        && started_in_time
+        && !worker_reported
+        && !recorded
+        && !paged
+}
+
+/// Seconds the supervisor still has to wait for 16:24 IST after a sleep that
+/// woke short of it (a wall clock stepped back during the sleep); 0 at or
+/// after it. Pure, O(1).
+#[must_use]
+pub const fn supervisor_shortfall_secs(now_secs_of_day: u64) -> u64 {
+    XVERIFY_SUPERVISOR_SECS_OF_DAY_IST.saturating_sub(now_secs_of_day)
 }
 
 /// Sleeps until 16:24 IST each day and pages `xverify_failed` (reason
@@ -1542,9 +1581,21 @@ async fn run_supervisor(calendar: Arc<TradingCalendar>, started: (chrono::NaiveD
             SECS_PER_DAY - now + XVERIFY_SUPERVISOR_SECS_OF_DAY_IST
         };
         tokio::time::sleep(Duration::from_secs(wait)).await;
+        // The sleep runs on the monotonic clock, the check on the wall clock:
+        // a wall clock stepped back during the wait wakes short of 16:24,
+        // before the worker's last attempt can have reported. Sleep the
+        // shortfall, a bounded number of times (as `drive_day` does).
+        for _ in 0..XVERIFY_EVENING_RESLEEP_MAX {
+            let shortfall = supervisor_shortfall_secs(now_ist_secs_of_day());
+            if shortfall == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(shortfall)).await;
+        }
         let (today, _) = today_ist();
         let started_in_time = started.0 < today || started.1 < XVERIFY_LAST_END_SECS_OF_DAY_IST;
         if supervisor_should_page(
+            now_ist_secs_of_day(),
             calendar.is_trading_day(today),
             started_in_time,
             worker_reported(today),
@@ -1561,13 +1612,16 @@ async fn run_supervisor(calendar: Arc<TradingCalendar>, started: (chrono::NaiveD
 /// Runs the past-day catch-up (plan item 51g): each day from
 /// [`past_days_to_check`], oldest first, through [`run_day`]. With `before_run`
 /// it starts a day only when [`past_day_fits_before_run`]; it returns `false`
-/// when it left a day for later. Cold, at most `MAX_CROSSVERIFY_HOLD_DAYS`
-/// days.
+/// when it left a day for later. A day in `tried` already ran in this
+/// process on `pass_day` and is skipped, so a past day gets at most one
+/// run per IST day per process (§12.15.15, review round 2). Cold, at most
+/// `MAX_CROSSVERIFY_HOLD_DAYS` days.
 async fn run_past_days(
     deps: &CrossverifyBootDeps,
     boot_set: &[SubscribeInstrument],
     pass_day: chrono::NaiveDate,
     before_run: bool,
+    tried: &mut Vec<chrono::NaiveDate>,
 ) -> bool {
     let calendar = Arc::clone(&deps.calendar);
     let days = past_days_to_check(
@@ -1577,6 +1631,10 @@ async fn run_past_days(
         |d| daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, d),
     );
     for day in days {
+        // O(1) EXEMPT: at most MAX_CROSSVERIFY_HOLD_DAYS (3) entries.
+        if tried.contains(&day) {
+            continue;
+        }
         if before_run
             && !past_day_fits_before_run(now_ist_secs_of_day(), deps.config.run_budget_secs)
         {
@@ -1595,6 +1653,7 @@ async fn run_past_days(
             "Dhan 1-minute cross-verification: checking a past trading day that was never \
              recorded, before the S3 archive releases it unverified"
         );
+        tried.push(day);
         run_day(deps, boot_set, day, day_start_ist_nanos_of(day), pass_day).await;
     }
     true
@@ -1627,7 +1686,18 @@ pub fn spawn_dhan_live_crossverify(
     let boot_set = main_feed.to_vec();
     let (boot_day, _) = today_ist();
     let boot_secs = now_ist_secs_of_day();
-    record_boot_set(boot_day, &boot_set, boot_secs, deps.universe_basis);
+    // §12.15.13 (review round 1): the boot set is recorded by the daily
+    // recorder, at 08:00 at the earliest and never after the close, so a
+    // night-time process (an evening-drain restart) never records a set into
+    // the next trading day's record.
+    crate::xverify_day_record::note_process_held(
+        crate::xverify_day_record::HeldOrigin::Boot,
+        &boot_set,
+        deps.universe_basis,
+        boot_day,
+        u32::try_from(boot_secs).unwrap_or(u32::MAX),
+    );
+    tokio::spawn(run_day_recorder());
     tokio::spawn(run_supervisor(
         Arc::clone(&deps.calendar),
         (boot_day, boot_secs),
@@ -1639,75 +1709,291 @@ pub fn spawn_dhan_live_crossverify(
             "Dhan 1-minute cross-verification armed — it compares our 1-minute candles \
              against Dhan's own record after the close, and today's S3 archive waits for it"
         );
-        let mut first = true;
-        let mut past_done_for: Option<chrono::NaiveDate> = None;
+        let mut state = WorkerDay::default();
+        // Past days already run in this process on `tried_on` (review round 2).
+        let mut tried_on: Option<chrono::NaiveDate> = None;
+        let mut tried: Vec<chrono::NaiveDate> = Vec::with_capacity(MAX_PAST_DAYS_TRIED);
         loop {
-            let (today, _) = today_ist();
-            let catch_up = first
-                && should_catch_up(
-                    now_ist_secs_of_day(),
-                    daily_marker_exists(CROSSVERIFY_MARKER_TASK, today),
-                );
-            first = false;
-            if !catch_up {
-                // §12.15.15: past days first when they fit before 15:41.
-                if past_done_for != Some(today)
-                    && run_past_days(&deps, &boot_set, today, true).await
-                {
-                    past_done_for = Some(today);
-                }
-                let sleep_secs = secs_until_next_run_ist(now_ist_secs_of_day());
-                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-            }
             let (today, day_start_ist_nanos) = today_ist();
-            if !deps.calendar.is_trading_day(today) {
-                info!(%today, "Dhan 1-minute cross-verification skipped — not a trading day");
-                note_worker_reported(today);
-            } else if daily_marker_exists(CROSSVERIFY_MARKER_TASK, today) {
-                info!(%today, "Dhan 1-minute cross-verification already recorded for today");
-                note_worker_reported(today);
-            } else {
-                run_day(&deps, &boot_set, today, day_start_ist_nanos, today).await;
+            let now = now_ist_secs_of_day();
+            if tried_on != Some(today) {
+                tried_on = Some(today);
+                tried.clear();
             }
-            // §12.15.15: whatever today's marker says.
-            if past_done_for != Some(today) {
-                run_past_days(&deps, &boot_set, today, false).await;
-                past_done_for = Some(today);
+            match worker_step(now, state.for_day(today)) {
+                WorkerStep::WaitUntil(target_secs) => {
+                    tokio::time::sleep(Duration::from_secs(target_secs.saturating_sub(now))).await;
+                }
+                WorkerStep::PastBeforeRun => {
+                    state.before_run_tried = Some(today);
+                    // §12.15.15: past days first when they fit before 15:41.
+                    if run_past_days(&deps, &boot_set, today, true, &mut tried).await {
+                        state.past_done = Some(today);
+                    }
+                }
+                WorkerStep::Today => {
+                    state.today_done = Some(today);
+                    if !deps.calendar.is_trading_day(today) {
+                        info!(%today, "Dhan 1-minute cross-verification skipped — not a trading day");
+                        note_worker_reported(today);
+                    } else if daily_marker_exists(CROSSVERIFY_MARKER_TASK, today) {
+                        info!(%today, "Dhan 1-minute cross-verification already recorded for today");
+                        note_worker_reported(today);
+                    } else if daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, today) {
+                        // §12.15.14 (review round 2): a terminal refusal is never
+                        // retried, by this process or a restarted one.
+                        info!(
+                            %today,
+                            "Dhan 1-minute cross-verification refused today for coverage; \
+                             not run again"
+                        );
+                        note_worker_reported(today);
+                    } else {
+                        run_day(&deps, &boot_set, today, day_start_ist_nanos, today).await;
+                    }
+                }
+                WorkerStep::PastAfterRun => {
+                    // §12.15.15: whatever today's marker says.
+                    state.past_done = Some(today);
+                    run_past_days(&deps, &boot_set, today, false, &mut tried).await;
+                }
+                WorkerStep::WaitTomorrow => {
+                    let secs = SECS_PER_DAY
+                        .saturating_sub(now)
+                        .saturating_add(XVERIFY_MORNING_SECS_OF_DAY_IST);
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                }
             }
         }
     })
 }
 
-/// Records the boot set in the day's subscribe record (plan item 51e). A
-/// failed write is one coded `warn!` on a source no alarm filter matches; the
-/// day's check then reads what the record holds, or reports its coverage
-/// unknown (§12.15.14). Cold, once per process.
-fn record_boot_set(
+/// The earliest second of the IST day the worker starts work and the day
+/// recorder records (§12.15.13, §12.15.15; review round 1): 08:00 IST, after
+/// the drain hold's latest end (07:30) and before the 09:00 open. A process
+/// alive before it (an evening-drain restart after midnight) does nothing for
+/// the day until then, and one stopped before it records nothing.
+pub const XVERIFY_MORNING_SECS_OF_DAY_IST: u64 = 8 * 3_600;
+
+const _: () = assert!(
+    XVERIFY_MORNING_SECS_OF_DAY_IST < SESSION_OPEN_SECS_OF_DAY_IST as u64
+        && XVERIFY_MORNING_SECS_OF_DAY_IST < XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+    "the morning start must come before the session opens"
+);
+
+/// What the worker has done on one IST day, in this process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkerDay {
+    before_run_tried: Option<chrono::NaiveDate>,
+    today_done: Option<chrono::NaiveDate>,
+    past_done: Option<chrono::NaiveDate>,
+}
+
+impl WorkerDay {
+    /// The day's flags, for `day`.
+    fn for_day(self, day: chrono::NaiveDate) -> WorkerFlags {
+        WorkerFlags {
+            before_run_tried: self.before_run_tried == Some(day),
+            today_done: self.today_done == Some(day),
+            past_done: self.past_done == Some(day),
+        }
+    }
+}
+
+/// The worker's flags for the current IST day (§12.15.15).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerFlags {
+    /// The before-15:41 past-day pass ran today (it may have left days for
+    /// after today's check).
+    pub before_run_tried: bool,
+    /// Today's own check ran (or today needed none).
+    pub today_done: bool,
+    /// Every past day was taken today.
+    pub past_done: bool,
+}
+
+/// The worker's next step (§12.15.15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStep {
+    /// Sleep until this second of the IST day, then decide again.
+    WaitUntil(u64),
+    /// The past-day pass, only days that fit before 15:41.
+    PastBeforeRun,
+    /// Today's own check (or its skip on a non-trading or recorded day).
+    Today,
+    /// The past-day pass after today's check, every remaining day.
+    PastAfterRun,
+    /// Nothing left today: sleep until tomorrow's morning start.
+    WaitTomorrow,
+}
+
+/// The worker's next step from the IST second of day and today's flags
+/// (§12.15.15, review round 1). Pure, total, O(1).
+///
+/// | Now | Flags | Step |
+/// |---|---|---|
+/// | before 08:00 | any | wait until 08:00 |
+/// | 08:00 to 15:41 | before-run pass not tried | past days that fit before 15:41 |
+/// | 08:00 to 15:41 | tried | wait until 15:41 |
+/// | 15:41 or later | today not done | today's check (at once: a late boot or an overrunning pass) |
+/// | 15:41 or later | today done, past days not done | every remaining past day |
+/// | 15:41 or later | both done | wait until tomorrow's 08:00 |
+///
+/// Every step decides again afterwards, so a pass that overruns 15:41 runs
+/// today's check at once, and a restart after 15:41 on a recorded day still
+/// runs the past days.
+#[must_use]
+pub const fn worker_step(now_secs_of_day: u64, flags: WorkerFlags) -> WorkerStep {
+    if now_secs_of_day < XVERIFY_MORNING_SECS_OF_DAY_IST {
+        return WorkerStep::WaitUntil(XVERIFY_MORNING_SECS_OF_DAY_IST);
+    }
+    if !should_catch_up(now_secs_of_day, false) {
+        // Before 15:41.
+        return if flags.before_run_tried {
+            WorkerStep::WaitUntil(
+                now_secs_of_day.saturating_add(secs_until_next_run_ist(now_secs_of_day)),
+            )
+        } else {
+            WorkerStep::PastBeforeRun
+        };
+    }
+    if !flags.today_done {
+        WorkerStep::Today
+    } else if !flags.past_done {
+        WorkerStep::PastAfterRun
+    } else {
+        WorkerStep::WaitTomorrow
+    }
+}
+
+/// Records the process's held main-feed sets in the day's subscribe record
+/// once per IST day, at 08:00 at the earliest and only before the close
+/// (§12.15.13, review round 1): a process alive before 08:00 waits, one that
+/// is stopped first records nothing, a process alive across midnight records
+/// the new day too, and a boot after the close records nothing (it could only
+/// add instruments it never captured in the session). A failed write (here
+/// or at the end of a widen) is retried every [`DAY_RECORD_POLL_SECS`] until
+/// every held set lands (review round 2). Each set is written at the later
+/// of the day's first recorder stamp and the second it went on the wire that
+/// day (review round 3), so a retry never moves a set earlier than it was
+/// subscribed, nor later than its first recorded second. One
+/// small file write a day, plus a one-load poll a minute while the session
+/// runs; cold.
+async fn run_day_recorder() {
+    let mut recorded_for: Option<(chrono::NaiveDate, u64)> = None;
+    loop {
+        let (today, _) = today_ist();
+        let now = now_ist_secs_of_day();
+        let stamp_today = recorded_for.and_then(|(d, s)| (d == today).then_some(s));
+        let failed = crate::xverify_day_record::record_write_failed_for(today);
+        match day_record_step(now, stamp_today.is_some(), failed) {
+            DayRecordStep::WaitUntil(target_secs) => {
+                tokio::time::sleep(Duration::from_secs(target_secs.saturating_sub(now))).await;
+            }
+            DayRecordStep::Record => {
+                let stamp = stamp_today.unwrap_or(now);
+                recorded_for = Some((today, stamp));
+                let day_secs = u32::try_from(stamp).unwrap_or(u32::MAX);
+                let (generation, held_sets) = crate::xverify_day_record::process_held();
+                let mut all_written = true;
+                for held in &held_sets {
+                    // Review round 3: each set at its own second when it went on
+                    // the wire today, never earlier.
+                    let set_secs = held.stamp_on(today, day_secs);
+                    all_written &=
+                        record_held_set(today, &held.instruments, u64::from(set_secs), held.basis);
+                }
+                if !all_written {
+                    crate::xverify_day_record::note_record_write_failed(today);
+                    tokio::time::sleep(Duration::from_secs(DAY_RECORD_POLL_SECS)).await;
+                } else if !crate::xverify_day_record::clear_record_write_failed(today, generation) {
+                    // A set was noted after the snapshot; any failure noted for
+                    // it stays, and the next step writes it again.
+                    info!(%today, "a held spot set was noted during the record write");
+                }
+            }
+            DayRecordStep::WaitTomorrow => {
+                let secs = SECS_PER_DAY
+                    .saturating_sub(now)
+                    .saturating_add(XVERIFY_MORNING_SECS_OF_DAY_IST);
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+        }
+    }
+}
+
+/// How often the day recorder looks for a failed write to redo while the
+/// session runs (review round 2).
+pub const DAY_RECORD_POLL_SECS: u64 = 60;
+
+/// The day recorder's next step (§12.15.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayRecordStep {
+    /// Sleep until this second of the IST day, then decide again.
+    WaitUntil(u64),
+    /// Record the held sets now.
+    Record,
+    /// Nothing to record today: sleep until tomorrow's 08:00.
+    WaitTomorrow,
+}
+
+/// The day recorder's next step. Pure, total, O(1): before 08:00 wait; from
+/// 08:00 to the close record once, then again whenever a write failed, and
+/// otherwise look again every [`DAY_RECORD_POLL_SECS`]; after the close wait
+/// for tomorrow.
+#[must_use]
+pub const fn day_record_step(
+    now_secs_of_day: u64,
+    recorded_today: bool,
+    write_failed_today: bool,
+) -> DayRecordStep {
+    if now_secs_of_day < XVERIFY_MORNING_SECS_OF_DAY_IST {
+        DayRecordStep::WaitUntil(XVERIFY_MORNING_SECS_OF_DAY_IST)
+    } else if now_secs_of_day >= SESSION_CLOSE_SECS_OF_DAY_IST as u64 {
+        DayRecordStep::WaitTomorrow
+    } else if !recorded_today || write_failed_today {
+        DayRecordStep::Record
+    } else {
+        DayRecordStep::WaitUntil(now_secs_of_day.saturating_add(DAY_RECORD_POLL_SECS))
+    }
+}
+
+/// Records one held set in the day's subscribe record (plan item 51e) and
+/// returns whether it landed. A failed write is one coded `warn!` on a
+/// source no alarm filter matches; the caller notes it, so the day's check
+/// reads its coverage as unknown until a retry lands (§12.15.14). Cold.
+fn record_held_set(
     day: chrono::NaiveDate,
     boot_set: &[SubscribeInstrument],
     secs_of_day: u64,
     basis: UniverseBasis,
-) {
+) -> bool {
     let secs = u32::try_from(secs_of_day).unwrap_or(u32::MAX);
     match crate::xverify_day_record::record_spot_subscribed(day, boot_set, secs, basis) {
-        Ok(outcome) => info!(
-            %day,
-            added = outcome.merge.added,
-            recorded = outcome.recorded,
-            basis = basis.as_str(),
-            replaced_unreadable = outcome.replaced_unreadable,
-            "the boot's main-feed spot set is recorded for the 1-minute cross-check"
-        ),
-        Err(err) => warn!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            source = "xverify_day_record_write_failed",
-            %day,
-            %err,
-            instruments = boot_set.len(),
-            path = %crate::xverify_day_record::day_record_path(day).display(),
-            "could not save the boot's main-feed spot set for the 1-minute cross-check; \
-             the check covers only what its day record holds, and reports the shortfall"
-        ),
+        Ok(outcome) => {
+            info!(
+                %day,
+                added = outcome.merge.added,
+                recorded = outcome.recorded,
+                basis = basis.as_str(),
+                replaced_unreadable = outcome.replaced_unreadable,
+                "a held main-feed spot set is recorded for the 1-minute cross-check"
+            );
+            true
+        }
+        Err(err) => {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_day_record_write_failed",
+                %day,
+                %err,
+                instruments = boot_set.len(),
+                path = %crate::xverify_day_record::day_record_path(day).display(),
+                "could not save a held main-feed spot set for the 1-minute cross-check; \
+                 it is retried, and until it lands the day's coverage reads unknown"
+            );
+            false
+        }
     }
 }
 
@@ -1998,7 +2284,33 @@ async fn run_day(
             None
         }
     };
-    let (owned_targets, _skipped, coverage) = targets_from_day_record(record.as_ref(), boot_set);
+    let (owned_targets, _skipped, mut coverage) =
+        targets_from_day_record(record.as_ref(), boot_set);
+    // §12.15.14 (review round 1): a widen that read today's list and never
+    // finished may have placed instruments the record does not hold, so the
+    // day's coverage is unknown (fail closed), never judged on a short record.
+    if today == pass_day && crate::dhan_live_universe::widen_unfinished_for(today) {
+        coverage.known = false;
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_widen_unfinished",
+            %today,
+            "today's spot-list widen never finished, so the 1-minute cross-check \
+             cannot tell which instruments were on the wire; coverage is unknown"
+        );
+    }
+    // Review round 2: a held set this process could not save to the record
+    // (and no retry landed) is on the wire but not in the record.
+    if today == pass_day && crate::xverify_day_record::record_write_failed_for(today) {
+        coverage.known = false;
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_day_record_write_failed",
+            %today,
+            "a held spot set never reached today's subscribe record, so the 1-minute \
+             cross-check cannot tell which instruments were on the wire; coverage is unknown"
+        );
+    }
     let targets = owned_targets.as_slice();
     info!(
         %today,
@@ -2106,23 +2418,30 @@ async fn run_day(
     }
 }
 
-/// Reports the day's final failure once per IST day, across processes
+/// Reports a final failure unless the day's persisted paged marker exists
 /// (§12.15.8, 51b review): reads today's paged marker, reports through
 /// [`report_final_failure`], and writes the marker when that paged. A marker
 /// that cannot be written leaves the page standing and is a coded `warn!`; a
 /// later failure the same day then pages again (loud, never silent). One file
-/// stat, plus one small file write after a page; cold, at most twice a day.
+/// stat, plus one small file write after a page; cold, per final report.
+/// The worker and supervisor share one in-process claim around the actual
+/// read, emit and marker write. Separate processes still rely on the marker
+/// and the existing single-instance boundary, not a distributed claim.
 fn page_final_failure_once(
     failure: AttemptFailure,
     today: chrono::NaiveDate,
     attempts: u32,
     targets: usize,
 ) {
-    let paged_today = daily_marker_exists(CROSSVERIFY_PAGED_MARKER_TASK, today);
-    if !report_final_failure(failure, today, attempts, targets, paged_today) {
-        return;
-    }
-    if let Err(err) = try_write_daily_marker(CROSSVERIFY_PAGED_MARKER_TASK, today) {
+    let result = tickvault_storage::off_worker::off_worker(|| {
+        final_failure_page_with_claim(
+            &FINAL_FAILURE_PAGE_CLAIM,
+            || daily_marker_exists(CROSSVERIFY_PAGED_MARKER_TASK, today),
+            |paged_today| report_final_failure(failure, today, attempts, targets, paged_today),
+            || try_write_daily_marker(CROSSVERIFY_PAGED_MARKER_TASK, today).map(|_| ()),
+        )
+    });
+    if let Err(err) = result {
         warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_paged_marker_write_failed",
@@ -2134,6 +2453,30 @@ fn page_final_failure_once(
              and permissions on the state folder"
         );
     }
+}
+
+/// Cold-path serialization for the worker and its supervisor. The claim is
+/// held through persistence: a failed write leaves the marker absent and a
+/// later call can report again, as before. Production acquires it inside
+/// `off_worker` in the production multi-thread runtime; the caller can still
+/// wait on a slow disk, and this is not a bounded-latency or cross-process lock.
+static FINAL_FAILURE_PAGE_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn final_failure_page_with_claim(
+    claim: &std::sync::Mutex<()>,
+    read_paged: impl FnOnce() -> bool,
+    report: impl FnOnce(bool) -> bool,
+    write_marker: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let _claim = claim
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let paged_today = read_paged();
+    if !report(paged_today) {
+        return Ok(false);
+    }
+    write_marker()?;
+    Ok(true)
 }
 
 /// Reports the day's final failure. Returns `true` when it paged.
@@ -2285,9 +2628,10 @@ fn report_final_failure(
         | AttemptFailure::NotPersisted
         | AttemptFailure::Incomplete
         | AttemptFailure::AuditRowsLost
-        // §12.15.10: never the outcome of the day's LAST attempt
-        // (`decide_read` reads there), but an earlier attempt's readiness
-        // reason ends the day when the next attempt is skipped for time.
+        // §12.15.10: current-day `decide_read` reads on the last attempt;
+        // an earlier readiness failure can end that day when no retry fits.
+        // The historical archive veto (§12.15.16) can also return these
+        // reasons after a last-attempt partial read; it still writes no marker.
         | AttemptFailure::LiveNotFinal
         | AttemptFailure::LiveNotApplied
         | AttemptFailure::SealsPending
@@ -2515,14 +2859,17 @@ async fn run_once(
                     // the subscribed universe for the whole session releases the
                     // S3 hold.
                     .and_then(|()| coverage_refusal(coverage));
-            // The marker condition must stay exactly `should_write_marker`
-            // plus a complete run plus full coverage; the pure functions
-            // agree by test.
+            let observed_today = today_ist().0;
+            let verdict = archive_release_verdict(verdict, today, observed_today, readiness);
+            // The marker still needs `should_write_marker`, a complete run,
+            // full coverage and now the historical readiness veto. The pure
+            // functions agree by test; no date-only finality is inferred.
             debug_assert_eq!(
                 verdict.is_ok(),
                 should_write_marker(c, persisted_ok)
                     && complete
                     && coverage_refusal(coverage).is_ok()
+                    && archive_release_verdict(Ok(()), today, observed_today, readiness).is_ok()
             );
             match marker_step(verdict, tokio::time::Instant::now(), deadline) {
                 // §12.15.8: a persist that finished never started a flush it
@@ -2598,6 +2945,33 @@ fn page_divergence_once(c: &DayComparison, paged: &AtomicBool) {
              as untrustworthy until this is explained."
         );
     }
+}
+
+/// Final archive eligibility, after comparison, persistence and coverage.
+/// Current-day behavior stays unchanged. A non-current day needs actual
+/// applied/final evidence; an older date is not such evidence. No historical
+/// oracle is currently wired, so its production readiness remains unknown.
+/// Prior failures retain their reason and a future date is refused outright.
+fn archive_release_verdict(
+    verdict: Result<(), AttemptFailure>,
+    target_day: chrono::NaiveDate,
+    observed_today: chrono::NaiveDate,
+    readiness: LiveReadiness,
+) -> Result<(), AttemptFailure> {
+    verdict?;
+    if target_day == observed_today {
+        return Ok(());
+    }
+    if target_day > observed_today {
+        return Err(AttemptFailure::LiveNotFinal);
+    }
+    if let Durability::NotReady(reason) = readiness.durability {
+        return Err(retry_reason(reason));
+    }
+    if readiness.completeness != Completeness::Final {
+        return Err(AttemptFailure::LiveNotFinal);
+    }
+    Ok(())
 }
 
 /// What `run_once` does with an attempt's verdict (§12.15.8).
@@ -5335,6 +5709,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_final_failure_page_claim_serializes_worker_and_supervisor() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Mutex, mpsc};
+
+        let claim = Mutex::new(());
+        let marker = AtomicBool::new(false);
+        let reports = AtomicUsize::new(0);
+        let writes = AtomicUsize::new(0);
+        let budget = Duration::from_secs(5);
+        let (writing_tx, writing_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        std::thread::scope(|scope| {
+            let claim = &claim;
+            let marker = &marker;
+            let reports = &reports;
+            let writes = &writes;
+            let first = scope.spawn(move || {
+                final_failure_page_with_claim(
+                    claim,
+                    || marker.load(Ordering::Acquire),
+                    |already_paged| {
+                        if already_paged {
+                            return false;
+                        }
+                        reports.fetch_add(1, Ordering::Relaxed);
+                        true
+                    },
+                    || {
+                        writing_tx.send(()).expect("first call reached persistence");
+                        release_rx
+                            .recv_timeout(budget)
+                            .expect("release first write");
+                        writes.fetch_add(1, Ordering::Relaxed);
+                        marker.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                )
+            });
+            writing_rx
+                .recv_timeout(budget)
+                .expect("first write is held");
+            let (started_tx, started_rx) = mpsc::sync_channel(1);
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            let second = scope.spawn(move || {
+                started_tx.send(()).expect("second call started");
+                let result = final_failure_page_with_claim(
+                    claim,
+                    || marker.load(Ordering::Acquire),
+                    |already_paged| {
+                        if already_paged {
+                            return false;
+                        }
+                        reports.fetch_add(1, Ordering::Relaxed);
+                        true
+                    },
+                    || {
+                        writes.fetch_add(1, Ordering::Relaxed);
+                        marker.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                );
+                done_tx.send(result).expect("second result");
+            });
+            started_rx
+                .recv_timeout(budget)
+                .expect("second caller is active");
+            let early = done_rx.recv_timeout(Duration::from_secs(1));
+            let waited_for_first = matches!(&early, Err(mpsc::RecvTimeoutError::Timeout));
+            // Release and join before asserting so a negative control cannot
+            // strand a fixture thread while the assertion unwinds.
+            release_tx.send(()).expect("release writer");
+            let first_result = first.join().expect("first caller joined");
+            second.join().expect("second caller joined");
+            let second_result = match early {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => done_rx
+                    .recv_timeout(budget)
+                    .expect("second completed after release"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("second result disconnected"),
+            };
+            assert!(
+                waited_for_first,
+                "a concurrent caller passed an unfinished page claim"
+            );
+            assert!(first_result.expect("first marker persisted"));
+            assert!(!second_result.expect("second observed the marker"));
+        });
+        assert_eq!(reports.load(Ordering::Relaxed), 1);
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+        assert!(marker.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_final_failure_page_claim_retries_after_marker_write_failure() {
+        use std::sync::atomic::AtomicUsize;
+        let claim = std::sync::Mutex::new(());
+        let marker = AtomicBool::new(false);
+        let reports = AtomicUsize::new(0);
+        let writes = AtomicUsize::new(0);
+        let report = |fail_write| {
+            final_failure_page_with_claim(
+                &claim,
+                || marker.load(Ordering::Acquire),
+                |already_paged| {
+                    if already_paged {
+                        return false;
+                    }
+                    reports.fetch_add(1, Ordering::Relaxed);
+                    true
+                },
+                || {
+                    writes.fetch_add(1, Ordering::Relaxed);
+                    if fail_write {
+                        return Err(std::io::Error::other("synthetic marker write failure"));
+                    }
+                    marker.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+        };
+        assert!(report(true).is_err());
+        assert!(!marker.load(Ordering::Acquire));
+        assert!(report(false).expect("a later successful write is reported"));
+        assert!(!report(false).expect("the persisted marker suppresses another page"));
+        assert_eq!(reports.load(Ordering::Relaxed), 2);
+        assert_eq!(writes.load(Ordering::Relaxed), 2);
+    }
+
     /// The emit side of the rule above: the unpaged `SkippedNoTime` arm is an
     /// `error!` on the alarmed `xverify_failed` source; the already-paged
     /// branch is coded `warn!`s only; the wrapper reads and writes the paged
@@ -5363,6 +5867,11 @@ mod tests {
         assert!(arm.contains("source = \"xverify_failed\""));
         assert!(arm.contains("code = ErrorCode::WsGapConnectionState.code_str()"));
         let wrapper = fn_body(prod, "fn page_final_failure_once(");
+        assert!(wrapper.contains("tickvault_storage::off_worker::off_worker(||"));
+        assert!(
+            wrapper
+                .contains("final_failure_page_with_claim(\n            &FINAL_FAILURE_PAGE_CLAIM,")
+        );
         let read_at = wrapper
             .find("daily_marker_exists(CROSSVERIFY_PAGED_MARKER_TASK, today)")
             .expect("reads today's paged marker");
@@ -6499,8 +7008,12 @@ mod tests {
             worst,
             4 * attempt_max_secs(600) + 3 * XVERIFY_RETRY_INTERVAL_SECS
         );
-        let last_start = XVERIFY_RUN_AT_SECS_OF_DAY_IST - worst;
+        let last_start = XVERIFY_RUN_AT_SECS_OF_DAY_IST - worst - PAST_DAY_FIT_MARGIN_SECS;
         assert!(past_day_fits_before_run(last_start, 600));
+        assert!(
+            !past_day_fits_before_run(XVERIFY_RUN_AT_SECS_OF_DAY_IST - worst, 600),
+            "a pass whose worst case ends exactly at 15:41 does not start (review round 1)"
+        );
         assert!(!past_day_fits_before_run(last_start + 1, 600));
         assert!(
             past_day_fits_before_run(8 * 3_600 + 30 * 60, 600),
@@ -6508,6 +7021,209 @@ mod tests {
         );
         assert!(!past_day_fits_before_run(u64::MAX, 600));
         assert!(!past_day_fits_before_run(0, u64::MAX));
+    }
+
+    /// Review round 1: the worker's step table, every flag combination at
+    /// the boundary seconds.
+    #[test]
+    fn test_worker_step_table() {
+        let run = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        let morning = XVERIFY_MORNING_SECS_OF_DAY_IST;
+        let none = WorkerFlags::default();
+        let tried = WorkerFlags {
+            before_run_tried: true,
+            ..none
+        };
+        let today = WorkerFlags {
+            today_done: true,
+            ..tried
+        };
+        let all = WorkerFlags {
+            past_done: true,
+            ..today
+        };
+        // Before 08:00: wait, whatever the flags (an evening-drain restart).
+        for flags in [none, tried, today, all] {
+            assert_eq!(worker_step(0, flags), WorkerStep::WaitUntil(morning));
+            assert_eq!(
+                worker_step(morning - 1, flags),
+                WorkerStep::WaitUntil(morning)
+            );
+        }
+        assert_eq!(worker_step(morning, none), WorkerStep::PastBeforeRun);
+        assert_eq!(worker_step(run - 1, none), WorkerStep::PastBeforeRun);
+        assert_eq!(worker_step(run - 1, tried), WorkerStep::WaitUntil(run));
+        assert_eq!(worker_step(morning, tried), WorkerStep::WaitUntil(run));
+        // From 15:41: today first (a late boot, or a pass that overran).
+        assert_eq!(worker_step(run, none), WorkerStep::Today);
+        assert_eq!(worker_step(run, tried), WorkerStep::Today);
+        assert_eq!(worker_step(SECS_PER_DAY - 1, none), WorkerStep::Today);
+        // A restart after 15:41 on a recorded day still runs the past days.
+        assert_eq!(worker_step(run + 3_600, today), WorkerStep::PastAfterRun);
+        assert_eq!(
+            worker_step(
+                run,
+                WorkerFlags {
+                    today_done: true,
+                    ..none
+                }
+            ),
+            WorkerStep::PastAfterRun
+        );
+        assert_eq!(worker_step(run, all), WorkerStep::WaitTomorrow);
+        // Past days done before 15:41 never skip today's own check.
+        let past_only = WorkerFlags {
+            before_run_tried: true,
+            past_done: true,
+            ..none
+        };
+        assert_eq!(worker_step(run, past_only), WorkerStep::Today);
+    }
+
+    /// Review round 1: every second of the day leads to today's check by
+    /// 15:41 at the latest and never runs it twice; a fresh process each day
+    /// (a process across days resets its flags with the date).
+    #[test]
+    fn test_worker_step_reaches_today_once_from_any_boot_second() {
+        for boot in (0..SECS_PER_DAY).step_by(97) {
+            let mut now = boot;
+            let mut flags = WorkerFlags::default();
+            let mut today_runs = 0;
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                assert!(steps < 10, "boot {boot}: the loop must settle");
+                match worker_step(now, flags) {
+                    WorkerStep::WaitUntil(target) => {
+                        assert!(target > now, "boot {boot}: a wait moves time forward");
+                        now = target;
+                    }
+                    WorkerStep::PastBeforeRun => flags.before_run_tried = true,
+                    WorkerStep::Today => {
+                        assert!(now >= XVERIFY_RUN_AT_SECS_OF_DAY_IST);
+                        today_runs += 1;
+                        flags.today_done = true;
+                    }
+                    WorkerStep::PastAfterRun => flags.past_done = true,
+                    WorkerStep::WaitTomorrow => break,
+                }
+            }
+            assert_eq!(today_runs, 1, "boot {boot}");
+        }
+    }
+
+    /// Review round 1: the per-day flags belong to one date only, so a
+    /// process alive across midnight starts the new day clean.
+    #[test]
+    fn test_worker_day_flags_reset_with_the_date() {
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).expect("date");
+        let tuesday = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).expect("date");
+        let state = WorkerDay {
+            before_run_tried: Some(monday),
+            today_done: Some(monday),
+            past_done: Some(monday),
+        };
+        assert_eq!(
+            state.for_day(monday),
+            WorkerFlags {
+                before_run_tried: true,
+                today_done: true,
+                past_done: true,
+            }
+        );
+        assert_eq!(state.for_day(tuesday), WorkerFlags::default());
+    }
+
+    /// Review rounds 1 and 2: the day recorder writes from 08:00 and before
+    /// the close only (a night-time process never records the next trading
+    /// day early; a post-close boot records nothing), once, again after a
+    /// failed write, and otherwise looks again a minute later.
+    #[test]
+    fn test_day_record_step_table() {
+        let morning = XVERIFY_MORNING_SECS_OF_DAY_IST;
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST as u64;
+        for recorded in [false, true] {
+            for failed in [false, true] {
+                assert_eq!(
+                    day_record_step(3 * 3_600, recorded, failed),
+                    DayRecordStep::WaitUntil(morning)
+                );
+                assert_eq!(
+                    day_record_step(close, recorded, failed),
+                    DayRecordStep::WaitTomorrow
+                );
+                assert_eq!(
+                    day_record_step(SECS_PER_DAY - 1, recorded, failed),
+                    DayRecordStep::WaitTomorrow
+                );
+            }
+        }
+        assert_eq!(
+            day_record_step(morning, false, false),
+            DayRecordStep::Record
+        );
+        assert_eq!(
+            day_record_step(close - 1, false, false),
+            DayRecordStep::Record
+        );
+        assert_eq!(day_record_step(morning, true, true), DayRecordStep::Record);
+        assert_eq!(
+            day_record_step(morning, true, false),
+            DayRecordStep::WaitUntil(morning + DAY_RECORD_POLL_SECS)
+        );
+        assert!(morning < SESSION_OPEN_SECS_OF_DAY_IST as u64);
+    }
+
+    /// Review round 2: a terminal refusal is never run again today, by this
+    /// process or a restarted one; a past day runs at most once per IST day
+    /// per process; a failed record write makes today's coverage unknown and
+    /// is retried at the day's first stamp.
+    #[test]
+    fn test_round2_refusal_retry_and_write_failure_wiring() {
+        let prod = prod_src();
+        let spawn = fn_body(prod, "fn spawn_dhan_live_crossverify(");
+        let recorded_at = spawn
+            .find("daily_marker_exists(CROSSVERIFY_MARKER_TASK, today)")
+            .expect("the recorded-day skip");
+        let refused_at = spawn
+            .find("daily_marker_exists(CROSSVERIFY_REFUSED_MARKER_TASK, today)")
+            .expect("the refused-day skip");
+        let run_at = spawn
+            .find("run_day(&deps, &boot_set, today, day_start_ist_nanos, today)")
+            .expect("today's run");
+        assert!(recorded_at < refused_at && refused_at < run_at);
+        assert!(spawn.contains("tried.clear();"));
+        let past = fn_body(prod, "async fn run_past_days(");
+        let skip_at = past
+            .find("if tried.contains(&day) {")
+            .expect("the tried skip");
+        let push_at = past.find("tried.push(day);").expect("the tried push");
+        let day_at = past.find("run_day(deps, boot_set, day,").expect("the run");
+        assert!(skip_at < push_at && push_at < day_at);
+        let run_day = fn_body(prod, "async fn run_day(");
+        assert!(run_day.contains(
+            "if today == pass_day && crate::xverify_day_record::record_write_failed_for(today) {"
+        ));
+        let recorder = fn_body(prod, "async fn run_day_recorder(");
+        assert!(recorder.contains("let stamp = stamp_today.unwrap_or(now);"));
+        assert!(
+            recorder.contains(
+                "crate::xverify_day_record::clear_record_write_failed(today, generation)"
+            )
+        );
+        assert!(recorder.contains("let set_secs = held.stamp_on(today, day_secs);"));
+        assert!(recorder.contains("crate::xverify_day_record::note_record_write_failed(today);"));
+    }
+
+    /// Review round 1: the supervisor re-sleeps while the wall clock still
+    /// reads before 16:24 after its monotonic sleep.
+    #[test]
+    fn test_supervisor_shortfall_secs() {
+        let at = XVERIFY_SUPERVISOR_SECS_OF_DAY_IST;
+        assert_eq!(supervisor_shortfall_secs(at), 0);
+        assert_eq!(supervisor_shortfall_secs(at + 1), 0);
+        assert_eq!(supervisor_shortfall_secs(at - 30), 30);
+        assert_eq!(supervisor_shortfall_secs(0), at);
     }
 
     /// 51g: the supervisor pages only on a trading day, when the worker
@@ -6521,7 +7237,14 @@ mod tests {
                         for paged in [false, true] {
                             let want = trading && in_time && !reported && !recorded && !paged;
                             assert_eq!(
-                                supervisor_should_page(trading, in_time, reported, recorded, paged),
+                                supervisor_should_page(
+                                    XVERIFY_SUPERVISOR_SECS_OF_DAY_IST,
+                                    trading,
+                                    in_time,
+                                    reported,
+                                    recorded,
+                                    paged,
+                                ),
                                 want
                             );
                         }
@@ -6534,6 +7257,187 @@ mod tests {
             XVERIFY_DEADLINE_SECS_OF_DAY_IST
         );
         assert!(XVERIFY_SUPERVISOR_SECS_OF_DAY_IST > XVERIFY_LAST_END_SECS_OF_DAY_IST);
+    }
+
+    /// Exhausting the bounded re-sleeps must not turn an early wall-clock
+    /// reading into permission to page while the worker can still report.
+    #[test]
+    fn test_supervisor_never_pages_before_deadline_after_clock_steps() {
+        let deadline = XVERIFY_SUPERVISOR_SECS_OF_DAY_IST;
+        for now in [
+            0,
+            XVERIFY_MORNING_SECS_OF_DAY_IST,
+            deadline - 30,
+            deadline - 1,
+        ] {
+            assert!(
+                !supervisor_should_page(now, true, true, false, false, false),
+                "an early wall clock must retain the worker's reporting window"
+            );
+        }
+        assert!(supervisor_should_page(
+            deadline, true, true, false, false, false
+        ));
+        assert!(supervisor_should_page(
+            deadline + 1,
+            true,
+            true,
+            false,
+            false,
+            false
+        ));
+        let supervisor = fn_body(prod_src(), "async fn run_supervisor(");
+        assert!(supervisor.contains("supervisor_should_page(\n            now_ist_secs_of_day(),"));
+    }
+
+    /// A measured, persisted and fully covered comparison still cannot
+    /// release an older day's archive on date-only readiness assumptions.
+    #[test]
+    fn test_historical_unknown_readiness_cannot_release_a_fully_covered_archive() {
+        let target = chrono::NaiveDate::from_ymd_opt(2026, 10, 30).expect("date");
+        let observed = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).expect("date");
+        let coverage = XverifyCoverage {
+            planned_instrument_minutes: SESSION_MINUTES as i64,
+            covered_instrument_minutes: SESSION_MINUTES as i64,
+            known: true,
+            index_fallback_day: false,
+        };
+        let ordinary =
+            classify_attempt(false, true, Ok(()), true).and_then(|()| coverage_refusal(coverage));
+        assert_eq!(ordinary, Ok(()), "all non-readiness release gates pass");
+        let now = tokio::time::Instant::now();
+        let result = archive_release_verdict(ordinary, target, observed, LiveReadiness::PAST_DAY);
+        assert_eq!(
+            marker_step(result, now, now + Duration::from_secs(1)),
+            MarkerStep::Unrecorded(AttemptFailure::LiveNotApplied),
+            "the real marker decision must retain an archive without historical evidence"
+        );
+    }
+
+    #[test]
+    fn test_historical_archive_requires_both_applied_and_final_evidence() {
+        let target = chrono::NaiveDate::from_ymd_opt(2026, 10, 30).expect("date");
+        let observed = target.succ_opt().expect("next date");
+        let now = tokio::time::Instant::now();
+        let pending = [
+            (
+                LiveReadiness {
+                    durability: Durability::NotReady(DhanLiveXverifyNotReady::SealsPending),
+                    completeness: Completeness::Final,
+                },
+                AttemptFailure::SealsPending,
+            ),
+            (
+                LiveReadiness {
+                    durability: Durability::NotReady(DhanLiveXverifyNotReady::SealSpillParked),
+                    completeness: Completeness::Final,
+                },
+                AttemptFailure::SealSpillParked,
+            ),
+            (
+                LiveReadiness {
+                    durability: Durability::NotReady(DhanLiveXverifyNotReady::NotApplied),
+                    completeness: Completeness::Final,
+                },
+                AttemptFailure::LiveNotApplied,
+            ),
+            (
+                LiveReadiness {
+                    durability: Durability::Applied,
+                    completeness: Completeness::Unknown,
+                },
+                AttemptFailure::LiveNotFinal,
+            ),
+            (
+                LiveReadiness {
+                    durability: Durability::Applied,
+                    completeness: Completeness::Frozen {
+                        sealed_through_secs_of_day: SESSION_CLOSE_SECS_OF_DAY_IST - 60,
+                    },
+                },
+                AttemptFailure::LiveNotFinal,
+            ),
+            (
+                LiveReadiness {
+                    durability: Durability::Applied,
+                    completeness: Completeness::Moving {
+                        sealed_through_secs_of_day: SESSION_CLOSE_SECS_OF_DAY_IST - 60,
+                    },
+                },
+                AttemptFailure::LiveNotFinal,
+            ),
+        ];
+        for (readiness, reason) in pending {
+            let result = archive_release_verdict(Ok(()), target, observed, readiness);
+            assert_eq!(
+                marker_step(result, now, now + Duration::from_secs(1)),
+                MarkerStep::Unrecorded(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn test_archive_readiness_preserves_prior_failures_and_current_day_semantics() {
+        let target = chrono::NaiveDate::from_ymd_opt(2026, 10, 30).expect("date");
+        let observed = target.succ_opt().expect("next date");
+        let final_and_applied = LiveReadiness {
+            durability: Durability::Applied,
+            completeness: Completeness::Final,
+        };
+        assert_eq!(
+            archive_release_verdict(Ok(()), target, target, LiveReadiness::PAST_DAY),
+            Ok(()),
+            "current-day partial-read rules are unchanged"
+        );
+        for prior in [
+            AttemptFailure::Vacuous,
+            AttemptFailure::NotPersisted,
+            AttemptFailure::Incomplete,
+            AttemptFailure::AuditRowsLost,
+            AttemptFailure::CoverageShort,
+            AttemptFailure::CoverageUnknown,
+        ] {
+            assert_eq!(
+                archive_release_verdict(Err(prior), target, observed, final_and_applied),
+                Err(prior)
+            );
+        }
+        assert_eq!(
+            archive_release_verdict(Ok(()), target, observed, final_and_applied),
+            Ok(()),
+            "supplied evidence is accepted; no production historical oracle supplies it yet"
+        );
+        assert_eq!(
+            archive_release_verdict(Ok(()), observed, target, final_and_applied),
+            Err(AttemptFailure::LiveNotFinal),
+            "a future date cannot be certified"
+        );
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            marker_step(Ok(()), now + Duration::from_secs(1), now),
+            MarkerStep::PastDeadline,
+            "the existing deadline gate remains in force"
+        );
+    }
+
+    #[test]
+    fn test_historical_readiness_veto_is_wired_before_the_real_marker_decision() {
+        let body = fn_body(prod_src(), "async fn run_once(");
+        let eligibility = body
+            .find("archive_release_verdict(verdict, today, observed_today, readiness)")
+            .expect("the real attempt enforces historical readiness");
+        let marker = body
+            .find("match marker_step(verdict,")
+            .expect("the real attempt still uses the marker deadline gate");
+        assert!(eligibility < marker);
+        assert!(body.contains("let observed_today = today_ist().0;"));
+        let readiness = fn_body(prod_src(), "async fn attempt_readiness(");
+        assert!(readiness.contains("return LiveReadiness::PAST_DAY;"));
+        assert_eq!(LiveReadiness::PAST_DAY.completeness, Completeness::Unknown);
+        assert_eq!(
+            LiveReadiness::PAST_DAY.durability,
+            Durability::NotReady(DhanLiveXverifyNotReady::NotApplied)
+        );
     }
 
     /// 51g: the worker's report is per IST day.
@@ -6586,11 +7490,17 @@ mod tests {
         );
         assert!(run_once.contains(".and_then(|()| coverage_refusal(coverage));"));
         let spawn = fn_body(prod, "fn spawn_dhan_live_crossverify(");
-        assert!(
-            spawn.contains("record_boot_set(boot_day, &boot_set, boot_secs, deps.universe_basis);")
-        );
+        assert!(spawn.contains("crate::xverify_day_record::HeldOrigin::Boot,"));
+        assert!(spawn.contains("tokio::spawn(run_day_recorder());"));
         assert!(spawn.contains("tokio::spawn(run_supervisor("));
+        assert!(spawn.contains("match worker_step(now, state.for_day(today)) {"));
         assert_eq!(spawn.matches("run_past_days(").count(), 2);
+        assert!(run_day.contains("widen_unfinished_for(today)"));
+        let recorder = fn_body(prod, "async fn run_day_recorder(");
+        assert!(recorder.contains("match day_record_step(now, stamp_today.is_some(), failed) {"));
+        assert!(recorder.contains(
+            "record_held_set(today, &held.instruments, u64::from(set_secs), held.basis);"
+        ));
         let supervisor = fn_body(prod, "async fn run_supervisor(");
         assert!(
             supervisor
@@ -7124,6 +8034,306 @@ mod tests {
             Completeness::Frozen {
                 sealed_through_secs_of_day: CLOSE - 60
             }
+        );
+    }
+    /// Real missing-token attempt and retry driver, with a fixed weekday and
+    /// fixed attempt-planning time. No production clock override, CWD change,
+    /// global token installation or global tracing override. A loopback
+    /// listener detects an erroneous vendor connection without a provider.
+    #[tokio::test(start_paused = true)]
+    async fn test_missing_token_weekday_pages_once_with_test_write_marker_in_and_test_marker_exists_in()
+     {
+        use crate::daily_task_marker::{test_marker_exists_in, test_write_marker_in};
+        use std::cell::Cell;
+        use tickvault_common::config::TradingConfig;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Default)]
+        struct PageFields {
+            source: String,
+            day: String,
+            reason: String,
+        }
+        impl tracing::field::Visit for PageFields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "source" => self.source = value.to_owned(),
+                    "today" => self.day = value.to_owned(),
+                    "reason" => self.reason = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, &format!("{value:?}"));
+            }
+        }
+        type PageEvent = (tracing::Level, String, String, String);
+        struct PageEvents(Arc<std::sync::Mutex<Vec<PageEvent>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageEvents {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = PageFields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("page event capture").push((
+                    *event.metadata().level(),
+                    fields.source,
+                    fields.day,
+                    fields.reason,
+                ));
+            }
+        }
+        let page_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let page_dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(PageEvents(Arc::clone(&page_events))),
+        );
+        let vendor_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("owned loopback vendor endpoint");
+        vendor_listener
+            .set_nonblocking(true)
+            .expect("nonblocking vendor witness");
+
+        assert!(
+            global_token_manager().is_none(),
+            "this library test has no token manager"
+        );
+        let calendar = Arc::new(
+            TradingCalendar::from_config(&TradingConfig {
+                market_open_time: "09:15:00".to_owned(),
+                market_close_time: "15:30:00".to_owned(),
+                order_cutoff_time: "15:29:00".to_owned(),
+                data_collection_start: "09:00:00".to_owned(),
+                data_collection_end: "16:00:00".to_owned(),
+                timezone: "Asia/Kolkata".to_owned(),
+                max_orders_per_second: 10,
+                nse_holidays: Vec::new(),
+                muhurat_trading_dates: Vec::new(),
+                nse_mock_trading_dates: Vec::new(),
+            })
+            .expect("weekday calendar"),
+        );
+        let deps = CrossverifyBootDeps {
+            // An invalid readiness URL and held loopback vendor endpoint;
+            // no real provider endpoint or credentials are used.
+            questdb_exec_url: String::new(),
+            intraday_url: format!(
+                "http://{}/v2/charts/intraday",
+                vendor_listener.local_addr().expect("vendor address")
+            ),
+            config: DhanLiveCrossverifyConfig {
+                tolerance_paise: 0,
+                fetch_timeout_secs: 1,
+                live_read_timeout_secs: 1,
+                run_budget_secs: 600,
+            },
+            questdb: QuestDbConfig {
+                host: String::new(),
+                http_port: 0,
+                pg_port: 0,
+                ilp_port: 0,
+            },
+            calendar,
+            universe_basis: UniverseBasis::ConfiguredIndices,
+        };
+        let today = day();
+        assert!(deps.calendar.is_trading_day(today));
+        // Observe the actual success-marker location used by run_once.
+        // Read only: never alter the process CWD or any existing marker.
+        let success_marker = std::env::current_dir()
+            .expect("absolute starting directory")
+            .join(daily_marker_path(CROSSVERIFY_MARKER_TASK, today));
+        let read_success_marker = || match std::fs::read(&success_marker) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => panic!("cannot observe success marker: {err}"),
+        };
+        let success_before = read_success_marker();
+        let targets = [XverifyTarget {
+            security_id: 13,
+            segment: "IDX_I".to_owned(),
+            instrument: "INDEX".to_owned(),
+        }];
+        let coverage = XverifyCoverage {
+            planned_instrument_minutes: 1,
+            covered_instrument_minutes: 1,
+            known: true,
+            index_fallback_day: false,
+        };
+        let divergence_paged = AtomicBool::new(false);
+        let readiness = std::sync::Mutex::new(None);
+        let attempt_calls = Cell::new(0_u32);
+        let result = drive_day(
+            today,
+            deps.config.run_budget_secs,
+            || XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            || true,
+            || panic!("15:41 fixture must execute a real attempt, not skip it"),
+            |plan: AttemptPlan| {
+                attempt_calls.set(attempt_calls.get() + 1);
+                let deps = &deps;
+                let targets = &targets;
+                let divergence_paged = &divergence_paged;
+                let readiness = &readiness;
+                async move {
+                    let cfg = DhanLiveCrossverifyConfig {
+                        run_budget_secs: plan.run_budget_secs,
+                        ..deps.config
+                    };
+                    run_once(
+                        deps,
+                        &cfg,
+                        (targets, coverage),
+                        (today, day_start_ist_nanos_of(today)),
+                        divergence_paged,
+                        (plan.deadline.expect("full attempt deadline"), plan.is_last),
+                        readiness,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        assert!(attempt_calls.get() > 0, "no-token path actually ran");
+        assert_eq!(result.attempts, attempt_calls.get());
+        assert!(result.attempts <= XVERIFY_MAX_ATTEMPTS_PER_DAY);
+        assert_eq!(result.failure, Some(AttemptFailure::NoToken));
+        assert!(!result.day_changed);
+        assert!(readiness.lock().expect("readiness lock").is_some());
+        assert!(!divergence_paged.load(Ordering::Relaxed));
+        assert_eq!(
+            read_success_marker(),
+            success_before,
+            "a NoToken attempt must not create or overwrite the success marker"
+        );
+        match vendor_listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("NoToken must never connect to the intraday endpoint: {other:?}"),
+        }
+
+        struct MarkerRoot(std::path::PathBuf);
+        impl Drop for MarkerRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tickvault-crossverify-page-{}-{stamp}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("exclusive owned marker directory");
+        let owned = MarkerRoot(path);
+        let emitted = Cell::new(0_u32);
+        let writes = Cell::new(0_u32);
+        let page = |claim: &std::sync::Mutex<()>, date| {
+            final_failure_page_with_claim(
+                claim,
+                || test_marker_exists_in(&owned.0, CROSSVERIFY_PAGED_MARKER_TASK, date),
+                |already_paged| {
+                    // Synchronous thread-local capture: no subscriber is
+                    // held across an await or installed process-wide.
+                    let did_page = tracing::dispatcher::with_default(&page_dispatch, || {
+                        report_final_failure(
+                            AttemptFailure::NoToken,
+                            date,
+                            result.attempts,
+                            targets.len(),
+                            already_paged,
+                        )
+                    });
+                    if did_page {
+                        emitted.set(emitted.get() + 1);
+                    }
+                    did_page
+                },
+                || {
+                    writes.set(writes.get() + 1);
+                    test_write_marker_in(&owned.0, CROSSVERIFY_PAGED_MARKER_TASK, date).map(|_| ())
+                },
+            )
+            .expect("real atomic page marker write")
+        };
+        let first_claim = std::sync::Mutex::new(());
+        assert!(page(&first_claim, today));
+        assert!(test_marker_exists_in(
+            &owned.0,
+            CROSSVERIFY_PAGED_MARKER_TASK,
+            today
+        ));
+        assert!(
+            !test_marker_exists_in(&owned.0, CROSSVERIFY_MARKER_TASK, today),
+            "a page marker must not also write the successful-verify task"
+        );
+        let marker = owned
+            .0
+            .join(format!("{CROSSVERIFY_PAGED_MARKER_TASK}-{today}.marker"));
+        let persisted = std::fs::read(&marker).expect("persisted page marker");
+        assert!(
+            String::from_utf8_lossy(&persisted).contains(&format!("delivered_date_ist={today}"))
+        );
+        let restarted_claim = std::sync::Mutex::new(());
+        assert!(
+            !page(&restarted_claim, today),
+            "new claim must reread the durable marker and suppress the same day"
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("marker still present"),
+            persisted
+        );
+        assert_eq!(emitted.get(), 1);
+        assert_eq!(
+            writes.get(),
+            1,
+            "suppressed page must not rewrite the marker"
+        );
+        let tomorrow = today.succ_opt().expect("next date");
+        assert!(deps.calendar.is_trading_day(tomorrow));
+        assert!(
+            page(&restarted_claim, tomorrow),
+            "a different day must rearm"
+        );
+        assert!(test_marker_exists_in(
+            &owned.0,
+            CROSSVERIFY_PAGED_MARKER_TASK,
+            tomorrow
+        ));
+        assert!(!test_marker_exists_in(
+            &owned.0,
+            CROSSVERIFY_MARKER_TASK,
+            tomorrow
+        ));
+        assert_eq!(emitted.get(), 2);
+        assert_eq!(writes.get(), 2);
+        assert_eq!(
+            *page_events.lock().expect("actual page events"),
+            vec![
+                (
+                    tracing::Level::ERROR,
+                    "xverify_failed".to_owned(),
+                    today.to_string(),
+                    "no_token".to_owned(),
+                ),
+                (
+                    tracing::Level::WARN,
+                    "xverify_already_paged_today".to_owned(),
+                    today.to_string(),
+                    "no_token".to_owned(),
+                ),
+                (
+                    tracing::Level::ERROR,
+                    "xverify_failed".to_owned(),
+                    tomorrow.to_string(),
+                    "no_token".to_owned(),
+                ),
+            ],
+            "actual alarm events occur once per date, with only a warning on same-day replay"
         );
     }
 }

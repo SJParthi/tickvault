@@ -114,18 +114,33 @@ struct TempFile(PathBuf);
 
 impl TempFile {
     fn with_contents(tag: &str, contents: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "tv_cov_gaps_common_{}_{}_{}",
-            std::process::id(),
-            nanos,
-            tag
-        ));
-        std::fs::write(&path, contents).expect("temp file must be writable"); // APPROVED: test
-        Self(path)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        const MAX_ATTEMPTS: usize = 64;
+        for _ in 0..MAX_ATTEMPTS {
+            let next = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tv_cov_gaps_common_{}_{next}_{tag}",
+                std::process::id()
+            ));
+            match Self::create_at(path, contents) {
+                Ok(file) => return file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create temp file: {error}"),
+            }
+        }
+        panic!("could not claim a temp file after {MAX_ATTEMPTS} attempts")
+    }
+
+    fn create_at(path: PathBuf, contents: &str) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let owned = Self(path);
+        file.write_all(contents.as_bytes())?;
+        Ok(owned)
     }
 
     fn path_str(&self) -> &str {
@@ -137,6 +152,20 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+#[test]
+fn test_temp_file_collision_neither_truncates_nor_removes_an_existing_file() {
+    let original = TempFile::with_contents("collision-owner", "original fixture contents");
+    let collision = TempFile::create_at(original.0.clone(), "replacement");
+    assert!(
+        matches!(collision, Err(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    drop(collision);
+    assert_eq!(
+        std::fs::read_to_string(&original.0).expect("original file retained"),
+        "original fixture contents"
+    );
 }
 
 fn run_floors(args: &[&str]) -> (i32, String) {

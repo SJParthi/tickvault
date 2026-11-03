@@ -1335,7 +1335,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
 
 resource "aws_cloudwatch_metric_alarm" "dhan_feed_delay_high" {
   alarm_name        = "tv-${var.environment}-dhan-feed-delay-high"
-  alarm_description = "New Dhan trades are arriving at least 60 seconds after the exchange stamped them, for 10 minutes in a row. The gauge is each minute's WORST delay of a NEW trade (repeated quotes and replayed frames are excluded). Minimum over 5 minutes, for 2 periods, means EVERY minute for 10 minutes had a trade at least a minute late, so one stale first packet after a reconnect cannot page. Triage: (1) tv_dhan_feed_ring_dwell_max_ms - if high, the delay is on OUR side (the fold is behind). (2) tv_dhan_ws_worst_conn_tick_age_secs - one deaf socket. (3) If both are normal, the delay is Dhan's delivery, and the only action is to note it for the support ticket. NOT a detector of ticks Dhan never sent."
+  alarm_description = "Dhan price updates carried trade timestamps at least 60 seconds older than local receipt time. Minimum of the peak-held gauge over two 300-second periods means every observed gauge sample in those periods breached, not every trade or every instant. Exact repeated quotes, refused ticks and WAL replay are excluded; first snapshots and changed price, volume or session extremes with an old trade time can still count. Check clock-probe freshness, lag by class/connection, ring dwell and socket freshness. This does not isolate vendor transport delay or detect ticks never sent. No recovery page is sent, so a later ALARM can follow an unannounced OK."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 60000
@@ -1344,9 +1344,9 @@ resource "aws_cloudwatch_metric_alarm" "dhan_feed_delay_high" {
   metric_name         = "tv_dhan_ws_lag_max_ms"
   namespace           = local.app_namespace
   period              = 300
-  # Minimum, NOT Maximum (§2.6 REJECT row): the gauge is already a per-minute
-  # peak, so Maximum would page on ONE late print. Minimum pages only when the
-  # delay is sustained across every minute of the window.
+  # Minimum (§2.6): all observed samples of the minute-peak gauge must
+  # breach in both periods. This is recurring observed trade age, not a
+  # continuous-delay or all-trades guarantee; missing samples are not proof.
   statistic  = "Minimum"
   dimensions = local.app_dimensions
 

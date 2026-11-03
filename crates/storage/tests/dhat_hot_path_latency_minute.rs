@@ -32,7 +32,7 @@ use tickvault_storage::hot_path_telemetry::{
     record_stage_nanos,
 };
 use tickvault_storage::hot_thread_sched::{
-    SchedPublisher, register_main_worker_thread, release_main_worker_thread,
+    SchedPublisher, register_drain_thread, register_main_worker_thread, release_main_worker_thread,
 };
 
 mod dhat_support;
@@ -83,12 +83,21 @@ fn dhat_publish_window_with_minute_accumulator_is_zero_allocation() {
     // This thread stands in for a main-runtime worker, so the scheduling
     // read has a thread to read (on Linux) inside the window.
     let _slot = register_main_worker_thread();
+    // Also exercise the own-drain selector and its two /proc reads. Its
+    // lifecycle allocation is cold; warm-up retains the sampled identity.
+    let _own_drain = register_drain_thread();
+    let config: toml::Value =
+        toml::from_str(include_str!("../../../config/base.toml")).expect("config");
+    let trading: tickvault_common::config::TradingConfig =
+        config["trading"].clone().try_into().expect("trading");
+    let calendar = tickvault_common::trading_calendar::TradingCalendar::from_config(&trading)
+        .expect("calendar");
     let mut w = Window {
         handles: TelemetryHandles::resolve(),
         minute: MinuteAccumulator::new(),
         sched: SchedPublisher::new(),
         host: HostSampler::new(),
-        day: DayVerdict::new(),
+        day: DayVerdict::with_calendar(std::sync::Arc::new(calendar)),
         verdicts: 0,
     };
     // Warm up: touch every static, resolve each scheduling series' handle
@@ -157,6 +166,10 @@ fn dhat_publish_window_with_minute_accumulator_is_zero_allocation() {
             for (row, stage) in rows.iter().zip(ALL_STAGES.iter()) {
                 assert_eq!(row.stage, *stage);
                 assert_eq!(row.minute_ist_nanos, host.minute_ist_nanos);
+                let counts = row
+                    .strict_counts()
+                    .expect("publisher supplied exact raw counts");
+                assert!(counts.samples_at_or_above_1000ns <= counts.samples);
             }
         }
         ProofMessage::Verdict(_) => panic!("the first item is the warm-up minute"),

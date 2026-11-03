@@ -21,8 +21,8 @@
 //!    integers past i64/u64, `NaN`, `inf`, padded spellings) never panic,
 //!    only ever fail with `JsonError`, and when they decode they decode to a
 //!    value checked against a reference written here: an Int field holds
-//!    exactly the integer spelled (never a neighbouring one), a Float field
-//!    holds the finite number spelled.
+//!    exactly the integer spelled, a Float field holds the finite number
+//!    spelled (for the generated spellings; float limits are described below).
 //! 5. A fill-critical field (`Quantity`, `TradedQty`, `RemainingQuantity`,
 //!    `Price`, `TradedPrice`, `AvgTradedPrice`) that is null, empty or
 //!    whitespace, in either casing, is refused with `JsonError`; `OrderNo`
@@ -31,15 +31,20 @@
 //!    fields are only Unicode `White_Space`), and `unreadable_order_frame_type`
 //!    agrees with a reference written from its doc comment.
 //! 7. Arbitrary JSON-shaped frames that decode re-serialize to a frame that
-//!    decodes to the same order (floats within one ULP: serde_json here is
-//!    built without `float_roundtrip`, which the module documents).
+//!    decodes to the same order (floats within one ULP inside
+//!    [1e-22, 1e22] and within a relative 1e-14 outside it: serde_json here
+//!    is built without `float_roundtrip`, which the module documents).
 //!
 //! Honest limits: the field table (accepted key, other casing, type) is
 //! private to the module, so it is restated below; a drift would show up as
 //! a property failure, not silently. Generated floats are `paise / 100`
 //! values, which serde_json reads back exactly; floats with 17 significant
-//! digits are compared within one ULP (property 7). The decode-quirk
-//! counters are not observed here (no metrics recorder is installed).
+//! digits are compared as in property 7. The decode-quirk counters are not
+//! observed here (no metrics recorder is installed).
+//!
+//! Raw numeric Int winners are now checked digit by digit before the update
+//! is accepted. The regression grid rejects rounded fractions and underflow
+//! on every Int field/casing while retaining discarded-alias precedence.
 
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
@@ -440,11 +445,12 @@ fn field_value(update: &OrderUpdate, accepted: &str) -> Value {
     serde_json::to_value(update).expect("serialize")[accepted].clone()
 }
 
-/// Above this magnitude serde_json (no `float_roundtrip`) can re-read a
-/// shortest-rendered float more than one ULP off (measured 2 ULPs at
-/// 9.3e257); no order price is anywhere near it.
+/// Outside [1 / EXTREME_MAGNITUDE, EXTREME_MAGNITUDE] serde_json (no
+/// `float_roundtrip`) can re-read a shortest-rendered float more than one ULP
+/// off (measured 2 ULPs at 9.3e257 and at 4.07e-171); no order price is
+/// anywhere near either end.
 const EXTREME_MAGNITUDE: f64 = 1e22;
-/// Relative tolerance applied above [`EXTREME_MAGNITUDE`] (about 45 ULPs).
+/// Relative tolerance applied outside that band (about 45 ULPs).
 const EXTREME_RELATIVE_TOLERANCE: f64 = 1e-14;
 
 /// Two decoded updates are the same order, with float fields allowed one
@@ -463,11 +469,12 @@ fn same_order_within_one_ulp(a: &OrderUpdate, b: &OrderUpdate) -> Result<(), Str
             );
             let ulps = ((fx.to_bits() as i64) - (fy.to_bits() as i64)).abs();
             // Measured: one ULP holds for prices; at extreme magnitudes the
-            // re-read drifts further (2 ULPs at -9.345468904800974e257).
+            // re-read drifts further (2 ULPs at -9.345468904800974e257 and 4.07e-171).
             let ulp_apart = fx == fy
                 || (fx.signum() == fy.signum()
                     && (ulps <= 1
-                        || (fx.abs() >= EXTREME_MAGNITUDE
+                        || ((fx.abs() >= EXTREME_MAGNITUDE
+                            || fx.abs() <= 1.0 / EXTREME_MAGNITUDE)
                             && ((fx - fy) / fx).abs() <= EXTREME_RELATIVE_TOLERANCE)));
             if !ulp_apart {
                 return Err(format!(
@@ -663,8 +670,8 @@ proptest! {
 
 /// Property 4c: every extreme spelling, as a bare literal and as a string,
 /// in both casings, on every numeric field: never a panic, only `Ok` or the
-/// typed `JsonError`, never `FrameTooLarge`; an Int that decodes is within 1
-/// of the value spelled (never a fabricated integer), a Float that decodes
+/// typed `JsonError`, never `FrameTooLarge`; an Int that decodes equals the
+/// exact integer spelled, a Float that decodes
 /// is finite and within one ULP of the value spelled.
 #[test]
 fn test_extreme_numbers_on_every_numeric_field_never_panic_or_fabricate() {
@@ -690,24 +697,21 @@ fn test_extreme_numbers_on_every_numeric_field_never_panic_or_fabricate() {
                                 assert_eq!(got.as_f64(), Some(0.0), "{key} = {raw}");
                                 continue;
                             }
-                            let spelled: f64 = trimmed.parse().unwrap_or_else(|e| {
-                                panic!("{key} = {raw} decoded but does not spell a number: {e}")
-                            });
                             match kind {
                                 Kind::Int => {
                                     let v = got.as_i64().expect("int field");
-                                    assert!(
-                                        (v as f64 - spelled).abs() <= 1.0,
-                                        "{key} = {raw}: decoded {v}, spelled {spelled}"
+                                    assert_eq!(
+                                        Some(v),
+                                        ref_exact_int(trimmed),
+                                        "{key} = {raw}: decoded integer must match the exact digits"
                                     );
-                                    if let Some(exact) = ref_exact_int(trimmed) {
-                                        assert!(
-                                            v == exact || !is_integer_literal(trimmed),
-                                            "{key} = {raw}: decoded {v}, exactly {exact}"
-                                        );
-                                    }
                                 }
                                 Kind::Float => {
+                                    let spelled: f64 = trimmed.parse().unwrap_or_else(|e| {
+                                        panic!(
+                                            "{key} = {raw} decoded but does not spell a number: {e}"
+                                        )
+                                    });
                                     let v = got.as_f64().expect("float field");
                                     assert!(v.is_finite(), "{key} = {raw}: {v}");
                                     let close = v == spelled
@@ -1020,7 +1024,7 @@ proptest! {
     /// Arbitrary text (not JSON-shaped) never panics, only yields `Ok` or
     /// the typed `JsonError` (all inputs here are under the size cap).
     #[test]
-    fn prop_arbitrary_text_is_ok_or_json_error(text in "\\PC{0,200}") {
+    fn prop_arbitrary_text_is_ok_or_json_error(text in "(?s).{0,200}") {
         let result = parse_order_update(&text);
         prop_assert!(result.is_ok() || is_json_error(&result), "{:?}", result);
         if let Ok(update) = &result {
@@ -1079,41 +1083,294 @@ fn test_restated_field_table_covers_every_order_update_field() {
     }
 }
 
-/// BUG (found 2026-10-30 by `test_extreme_integers_on_int_field_exact_verdicts`):
-/// a FRACTIONAL JSON number on an Int field is decoded as an integer when
-/// serde_json (built without `float_roundtrip`) misreads it by one ULP onto
-/// an integral `f64`, although the correctly rounded `f64` is fractional.
-/// The module documents only the narrower limit "a fractional wire number
-/// whose NEAREST `f64` is integral reads as that integer"; in every case
-/// below the nearest `f64` is NOT integral, so each should fail the typed
-/// parse loudly, and today each decodes to a made-up integer quantity.
-///
-/// Minimal input: `{"Data":{"OrderNo":"7","Status":"TRADED","Quantity":100.00000000000001}}`
-/// decodes with `quantity == 100` (correctly rounded value
-/// 100.0000000000000142..., not integral).
-///
-/// Proposed fix: enable serde_json's `float_roundtrip` feature (needs owner
-/// approval, it is a dependency feature change) so the `f64` is correctly
-/// rounded; then only the documented nearest-is-integral limit remains.
-/// Alternative with no dependency change: before the `Value` parse, refuse
-/// an Int-typed field whose raw JSON number text has a non-zero fractional
-/// digit (would need a raw-text scan or `RawValue`).
 #[test]
-#[ignore = "BUG: fractional JSON number on an Int field misread by serde_json onto an integer (100.00000000000001 -> 100)"]
-fn bug_fractional_json_number_on_int_field_is_never_an_integer() {
-    for (literal, correctly_rounded) in [
-        ("100.00000000000001", 100.000_000_000_000_01_f64),
-        ("4503599627370495.5", 4_503_599_627_370_495.5_f64),
-        ("2251799813685245.25", 2_251_799_813_685_245.25_f64),
-    ] {
-        // The literal's correctly rounded f64 really is fractional.
-        assert_eq!(literal.parse::<f64>().ok(), Some(correctly_rounded));
-        assert_ne!(correctly_rounded.fract(), 0.0, "{literal}");
-        let result = parse_order_update(&frame_with_one_numeric("Quantity", literal));
-        assert!(
-            is_json_error(&result),
-            "{literal}: a fractional quantity must fail loudly, got {:?}",
-            result.map(|u| u.quantity)
-        );
+fn test_regression_fractional_json_numbers_on_every_int_field_are_refused() {
+    // Regression: 2026-10-31 — fractional JSON quantities rounded to integers
+    // and underflow rounded to zero before the typed order parse saw them.
+    let literals = [
+        "100.00000000000001",
+        "4503599627370495.5",
+        "2251799813685245.25",
+        "1.00000000000000001",
+        "-1.00000000000000001",
+        "-100.00000000000001",
+        "1e-999",
+        "-1e-999",
+        "1e-99999999999999999999999999999999",
+        "-1e-99999999999999999999999999999999",
+        "100000000000000001e-17",
+        "-100000000000000001e-17",
+        "15e-1",
+        "9223372036854775807.00000000000000001",
+        "-9223372036854775808.00000000000000001",
+        "9223372036854775808",
+        "-9223372036854775809",
+        "18446744073709551615",
+        "1e999",
+    ];
+    let fields = FIELDS
+        .iter()
+        .filter(|f| f.2 == Kind::Int)
+        .collect::<Vec<_>>();
+    assert_eq!(fields.len(), 8);
+    for &&(accepted, alt, _) in &fields {
+        for key in [accepted, alt] {
+            for literal in literals {
+                assert_eq!(ref_exact_int(literal), None, "refusal oracle: {literal}");
+                for raw in [
+                    literal.to_string(),
+                    serde_json::to_string(literal).expect("string"),
+                ] {
+                    assert!(
+                        is_json_error(&parse_order_update(&frame_with_one_numeric(key, &raw))),
+                        "{key} = {raw} must be refused"
+                    );
+                }
+            }
+        }
     }
+}
+
+#[test]
+fn test_exact_integer_controls_on_every_int_field_and_casing() {
+    let cases = [
+        ("0", 0),
+        ("-0", 0),
+        ("-0.0", 0),
+        ("0e-999", 0),
+        ("-0e-999", 0),
+        ("7", 7),
+        ("-7", -7),
+        ("50.0", 50),
+        ("-50.0", -50),
+        ("1.25e2", 125),
+        ("-1.25E+2", -125),
+        ("100e-2", 1),
+        ("4503599627370495.0", 4_503_599_627_370_495),
+        ("9223372036854775807", i64::MAX),
+        ("-9223372036854775808", i64::MIN),
+    ];
+    for &(accepted, alt, _) in FIELDS.iter().filter(|f| f.2 == Kind::Int) {
+        for key in [accepted, alt] {
+            for (literal, expected) in cases {
+                for raw in [
+                    literal.to_string(),
+                    serde_json::to_string(literal).expect("string"),
+                ] {
+                    let update = parse_order_update(&frame_with_one_numeric(key, &raw))
+                        .unwrap_or_else(|e| panic!("{key} = {raw}: {e}"));
+                    assert_eq!(
+                        field_value(&update, accepted),
+                        json!(expected),
+                        "{key} = {raw}"
+                    );
+                }
+            }
+            // Preserve the existing conservative refusal for float-shaped
+            // literals at/above 2^52; their exact string forms still work.
+            for (literal, expected) in [
+                ("4503599627370496.0", 4_503_599_627_370_496),
+                ("9007199254740993.0", 9_007_199_254_740_993),
+                ("9223372036854775807.0", i64::MAX),
+                ("-9223372036854775808.0", i64::MIN),
+                ("1e18", 1_000_000_000_000_000_000),
+            ] {
+                assert!(is_json_error(&parse_order_update(&frame_with_one_numeric(
+                    key, literal
+                ))));
+                let quoted = serde_json::to_string(literal).expect("string");
+                let update = parse_order_update(&frame_with_one_numeric(key, &quoted))
+                    .expect("exact string");
+                assert_eq!(
+                    field_value(&update, accepted),
+                    json!(expected),
+                    "{key} = {quoted}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_raw_integer_validation_checks_only_the_surviving_field_and_wrapper() {
+    let bad = "1.00000000000000001";
+    for &(accepted, alt, _) in FIELDS.iter().filter(|f| f.2 == Kind::Int) {
+        let cases = [
+            (format!(r#""{accepted}":7,"{alt}":{bad}"#), Some(7)),
+            (format!(r#""{accepted}":"7.0","{alt}":{bad}"#), Some(7)),
+            (format!(r#""{alt}":{bad},"{accepted}":7"#), Some(7)),
+            (format!(r#""{accepted}":{bad},"{alt}":7"#), None),
+            (format!(r#""{alt}":7,"{accepted}":{bad}"#), None),
+            (format!(r#""{accepted}":null,"{alt}":7"#), Some(7)),
+            (format!(r#""{accepted}":null,"{alt}":"7e0""#), Some(7)),
+            (format!(r#""{accepted}":null,"{alt}":{bad}"#), None),
+            (format!(r#""{accepted}":7,"{alt}":null"#), Some(7)),
+            (format!(r#""{accepted}":{bad},"{alt}":null"#), None),
+            (format!(r#""{accepted}":{bad},"{accepted}":7"#), Some(7)),
+            (format!(r#""{accepted}":7,"{accepted}":{bad}"#), None),
+            (format!(r#""{alt}":{bad},"{alt}":7"#), Some(7)),
+            (format!(r#""{alt}":7,"{alt}":{bad}"#), None),
+            (
+                format!(r#""{accepted}":null,"{alt}":{bad},"{alt}":7"#),
+                Some(7),
+            ),
+            (
+                format!(r#""{accepted}":7,"{accepted}":null,"{alt}":{bad}"#),
+                None,
+            ),
+        ];
+        for wrapper in ["Data", "data"] {
+            for (fields, expected) in &cases {
+                let frame =
+                    format!(r#"{{"{wrapper}":{{"OrderNo":"7","Status":"TRADED",{fields}}}}}"#);
+                let result = parse_order_update(&frame);
+                match (expected, &result) {
+                    (Some(n), Ok(update)) => {
+                        assert_eq!(field_value(update, accepted), json!(n), "{frame}")
+                    }
+                    (None, Err(OrderUpdateParseError::JsonError(_))) => {}
+                    _ => panic!("{frame}: expected {expected:?}, got {result:?}"),
+                }
+            }
+        }
+        let good_data = format!(r#"{{"{accepted}":7}}"#);
+        let bad_data = format!(r#"{{"{accepted}":{bad}}}"#);
+        for (wrappers, expected) in [
+            (format!(r#""Data":{good_data},"data":{bad_data}"#), Some(7)),
+            (format!(r#""data":{bad_data},"Data":{good_data}"#), Some(7)),
+            (format!(r#""Data":{bad_data},"data":{good_data}"#), None),
+            (format!(r#""Data":{bad_data},"Data":{good_data}"#), Some(7)),
+            (format!(r#""Data":{good_data},"Data":{bad_data}"#), None),
+            (format!(r#""data":{bad_data},"data":{good_data}"#), Some(7)),
+            (format!(r#""data":{good_data},"data":{bad_data}"#), None),
+            (format!(r#""Data":null,"data":{good_data}"#), None),
+        ] {
+            let frame = format!("{{{wrappers}}}");
+            let result = parse_order_update(&frame);
+            match (expected, &result) {
+                (Some(n), Ok(update)) => {
+                    assert_eq!(field_value(update, accepted), json!(n), "{frame}")
+                }
+                (None, Err(OrderUpdateParseError::JsonError(_))) => {}
+                _ => panic!("{frame}: expected {expected:?}, got {result:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_raw_integer_winners_use_decoded_keys_and_ignore_nested_lookalikes() {
+    let cases = [
+        (
+            r#"{"\u0044ata":{"\u0051uantity":1.00000000000000001}}"#,
+            None,
+        ),
+        (
+            r#"{"Data":{"Quantity":1.00000000000000001,"\u0051uantity":7}}"#,
+            Some(7),
+        ),
+        (
+            r#"{"Data":{"\u0051uantity":7,"Quantity":1.00000000000000001}}"#,
+            None,
+        ),
+        (
+            r#"{"\u0044ata":{"\u0051uantity":7,"quantity":1.00000000000000001}}"#,
+            Some(7),
+        ),
+        (
+            r#"{"Data":{"x":{"Quantity":1.00000000000000001},"Quantity":7}}"#,
+            Some(7),
+        ),
+        (
+            r#"{"Data":{"Quantity":7,"Remarks":"\"Quantity\":1.00000000000000001"}}"#,
+            Some(7),
+        ),
+        (
+            r#"{"Data":{"Quantity":7,"Price":1.00000000000000001}}"#,
+            Some(7),
+        ),
+    ];
+    for (frame, expected) in cases {
+        match (expected, parse_order_update(frame)) {
+            (Some(n), Ok(update)) => assert_eq!(update.quantity, n, "{frame}"),
+            (None, Err(OrderUpdateParseError::JsonError(_))) => {}
+            (_, got) => panic!("{frame}: expected {expected:?}, got {got:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_regression_private_json_tags_cannot_fabricate_order_values() {
+    // Regression: 2026-10-31 — axum enables serde_json/raw_value in the app.
+    // Value's private-key visitor turned these wire objects into numbers or
+    // whole orders. The order parser must keep object keys literal in either
+    // feature graph, including decoded escaped keys and every nested level.
+    let empty = parse_order_update(r#"{"Data":{}}"#).expect("empty Data contract");
+    for tag in [
+        "$serde_json::private::RawValue",
+        r"\u0024serde_json::private::RawValue",
+    ] {
+        let object = format!(r#"{{"{tag}":"100.00000000000001"}}"#);
+        for &(accepted, alt, _) in FIELDS.iter().filter(|f| f.2 == Kind::Int) {
+            for key in [accepted, alt] {
+                let frame = frame_with_one_numeric(key, &object);
+                assert!(
+                    is_json_error(&parse_order_update(&frame)),
+                    "object is not an integer: {frame}"
+                );
+            }
+        }
+        let order_text =
+            serde_json::to_string(r#"{"Data":{"Quantity":100.00000000000001}}"#).expect("string");
+        let frame = format!(r#"{{"{tag}":{order_text}}}"#);
+        assert!(
+            is_json_error(&parse_order_update(&frame)),
+            "there is no literal Data member: {frame}"
+        );
+
+        let data_text = serde_json::to_string(
+            r#"{"OrderNo":"forged","Status":"TRADED","Quantity":100.00000000000001}"#,
+        )
+        .expect("string");
+        let frame = format!(r#"{{"Data":{{"{tag}":{data_text}}}}}"#);
+        assert_eq!(
+            parse_order_update(&frame).expect("unknown Data member"),
+            empty,
+            "{frame}"
+        );
+
+        // A real accepted quantity wins even when the discarded alias is a
+        // magic-key object; the null accepted key must yield and then refuse.
+        let frame = format!(r#"{{"Data":{{"Quantity":7,"quantity":{object}}}}}"#);
+        assert_eq!(
+            parse_order_update(&frame)
+                .expect("accepted key wins")
+                .quantity,
+            7
+        );
+        let frame = format!(r#"{{"Data":{{"Quantity":null,"quantity":{object}}}}}"#);
+        assert!(is_json_error(&parse_order_update(&frame)), "{frame}");
+    }
+}
+
+#[test]
+fn test_private_json_tags_remain_unknown_keys_and_literal_text() {
+    let tag = "$serde_json::private::RawValue";
+    let text = r#"{"$serde_json::private::RawValue":"true"}"#;
+    let quoted = serde_json::to_string(text).expect("string");
+    let frame = format!(
+        r#"{{"{tag}":"not JSON","Data":{{"{tag}":"not JSON","Quantity":7,"Remarks":{quoted}}}}}"#
+    );
+    let update = parse_order_update(&frame).expect("unknown keys stay unknown");
+    assert_eq!(update.quantity, 7);
+    assert_eq!(update.remarks, text);
+
+    // The message-type helper must use the same literal-object boundary:
+    // an object Type is not a string, so lowercase type supplies the tag.
+    let frame = r#"{"Data":{},"Type":{"$serde_json::private::RawValue":"\"order_alert\""},"type":"heartbeat"}"#;
+    let update = parse_order_update(frame).expect("metadata does not cost the event");
+    assert_eq!(
+        unreadable_order_frame_type(&update, frame).as_deref(),
+        Some("heartbeat")
+    );
 }

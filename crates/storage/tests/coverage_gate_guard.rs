@@ -319,3 +319,240 @@ fn coverage_gate_warns_on_report_crate_without_explicit_floor() {
         "an unlisted crate must be NAMED in a WARN so it gets a floor:\n{out}"
     );
 }
+
+/// Regression: 2026-11-02. Corrupt counters must fail before aggregation,
+/// even with all threshold crates present. llvm-cov emits integer tokens;
+/// missing fields must not masquerade as an explicit zero-line file.
+#[test]
+fn coverage_gate_rejects_missing_null_and_invalid_line_counts() {
+    let cases = [
+        ("{}", "present, non-null number"),
+        (r#"{"count":100}"#, "present, non-null number"),
+        (r#"{"covered":100}"#, "present, non-null number"),
+        ("null", "present, non-null number"),
+        (r#"{"count":null,"covered":0}"#, "present, non-null number"),
+        (
+            r#"{"count":100,"covered":null}"#,
+            "present, non-null number",
+        ),
+        (
+            r#"{"count":"100","covered":100}"#,
+            "present, non-null number",
+        ),
+        (
+            r#"{"count":100,"covered":true}"#,
+            "present, non-null number",
+        ),
+        (
+            r#"{"count":-1,"covered":0}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":100,"covered":-1}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":100.5,"covered":100}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":100,"covered":99.5}"#,
+            "canonical non-negative safe integer",
+        ),
+        // Catch decimal precision lost by a floor-only integer check. This
+        // also detects a jq build that discards the original numeric token.
+        (
+            r#"{"count":100.00000000000000000001,"covered":100}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":100,"covered":99.99999999999999999999}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":100.0,"covered":100}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":1e2,"covered":100}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":-1e-999,"covered":0}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":9007199254740992,"covered":0}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":18446744073709551615,"covered":0}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":1e999,"covered":0}"#,
+            "canonical non-negative safe integer",
+        ),
+        (
+            r#"{"count":100,"covered":101}"#,
+            "covered must not exceed count",
+        ),
+        (
+            r#"{"count":0,"covered":1}"#,
+            "covered must not exceed count",
+        ),
+    ];
+    for (index, (lines, diagnostic)) in cases.into_iter().enumerate() {
+        let mut entries = full_presence_entries(&["app"]);
+        entries.push(format!(
+            r#"{{"filename":"/w/crates/app/src/lib.rs","summary":{{"lines":{lines}}}}}"#
+        ));
+        let (code, out) = run_gate(
+            &format!(
+                "tv_gate_invalid_counter_{}_{index}.json",
+                std::process::id()
+            ),
+            &coverage_json(&entries),
+        );
+        assert_ne!(code, 0, "corrupt case {index} must fail: {lines}\n{out}");
+        assert!(
+            out.contains(diagnostic),
+            "case {index} must reject the corrupt input itself, not merely fail a floor: {out}"
+        );
+    }
+}
+
+#[test]
+fn coverage_gate_refuses_unknown_whole_crate_coverage() {
+    let entries: Vec<_> = THRESHOLD_CRATES
+        .iter()
+        .map(|c| file_entry(&format!("/w/crates/{c}/src/lib.rs"), 0, 0))
+        .collect();
+    let (code, out) = run_gate("tv_gate_explicit_zero_lines.json", &coverage_json(&entries));
+    assert_ne!(
+        code, 0,
+        "no measured lines cannot establish crate coverage: {out}"
+    );
+    assert_eq!(out.matches("UNKNOWN:").count(), THRESHOLD_CRATES.len());
+    assert!(
+        !out.contains("100.00%"),
+        "unknown coverage must not be reported as 100%: {out}"
+    );
+}
+
+#[test]
+fn coverage_gate_accepts_zero_line_files_alongside_measured_files() {
+    let mut entries = full_presence_entries(&[]);
+    entries.push(file_entry("/w/crates/app/src/empty.rs", 0, 0));
+    let (code, out) = run_gate("tv_gate_mixed_zero_file.json", &coverage_json(&entries));
+    assert_eq!(
+        code, 0,
+        "a valid empty file does not invalidate measured files: {out}"
+    );
+    assert_eq!(out.matches("100.00%").count(), THRESHOLD_CRATES.len());
+}
+
+#[test]
+fn coverage_gate_rejects_malformed_containers_and_filenames() {
+    use serde_json::{Map, Value, json};
+
+    let rows: Vec<Value> = full_presence_entries(&[])
+        .iter()
+        .map(|entry| serde_json::from_str(entry).unwrap())
+        .collect();
+    let valid_unit = json!({"files": rows});
+    let keyed_files: Map<String, Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (index.to_string(), row.clone()))
+        .collect();
+    let mut cases = vec![
+        (
+            json!({"data": {"only": valid_unit}}),
+            "coverage data must be an array",
+        ),
+        (
+            json!({"data": [{"files": keyed_files}]}),
+            "coverage files must be an array",
+        ),
+        (
+            json!({"data": [valid_unit, {"files": null}]}),
+            "coverage files must be an array",
+        ),
+        (
+            json!({"data": [valid_unit, {}]}),
+            "coverage files must be an array",
+        ),
+    ];
+    for filename in [None, Some(Value::Null), Some(json!(42)), Some(json!(""))] {
+        let mut invalid = json!({"summary": {"lines": {"count": 100, "covered": 100}}});
+        if let Some(filename) = filename {
+            invalid["filename"] = filename;
+        }
+        let mut extra_rows = rows.clone();
+        extra_rows.push(invalid);
+        cases.push((
+            json!({"data": [{"files": extra_rows}]}),
+            "coverage filename must be a nonempty string",
+        ));
+    }
+    for (index, (report, diagnostic)) in cases.into_iter().enumerate() {
+        let (code, out) = run_gate(
+            &format!("tv_gate_bad_schema_{}_{index}.json", std::process::id()),
+            &report.to_string(),
+        );
+        assert_ne!(code, 0, "malformed report case {index} must fail: {out}");
+        assert!(
+            out.contains(diagnostic),
+            "case {index} must name the malformed report: {out}"
+        );
+    }
+}
+
+#[test]
+fn coverage_gate_nonempty_file_with_no_covered_lines_still_fails() {
+    let mut entries = full_presence_entries(&["app"]);
+    entries.push(file_entry("/w/crates/app/src/lib.rs", 1, 0));
+    let (code, out) = run_gate("tv_gate_zero_covered.json", &coverage_json(&entries));
+    assert_ne!(code, 0, "0/1 must fail the app floor: {out}");
+    assert!(out.contains("FAIL: app") && out.contains("0.00%"), "{out}");
+}
+
+#[test]
+fn coverage_gate_rejects_unsafe_line_count_aggregation_before_rounding() {
+    let mut entries = full_presence_entries(&["app"]);
+    entries.push(file_entry(
+        "/w/crates/app/src/first.rs",
+        9_007_199_254_740_991,
+        0,
+    ));
+    entries.push(file_entry("/w/crates/app/src/second.rs", 1, 0));
+    let (code, out) = run_gate("tv_gate_unsafe_sum.json", &coverage_json(&entries));
+    assert_ne!(
+        code, 0,
+        "individually valid counters can overflow their sum: {out}"
+    );
+    assert!(
+        out.contains("line-count total exceeds exact integer range"),
+        "{out}"
+    );
+}
+
+#[test]
+fn coverage_gate_preserves_the_scaled_product_exact_integer_limit() {
+    let mut entries = full_presence_entries(&["app"]);
+    entries.push(file_entry(
+        "/w/crates/app/src/lib.rs",
+        9_007_199_254_740_991,
+        9_007_199_254_740_991,
+    ));
+    let (code, out) = run_gate(
+        "tv_gate_unsafe_scaled_product.json",
+        &coverage_json(&entries),
+    );
+    assert_ne!(
+        code, 0,
+        "large valid integers must not bypass the product guard: {out}"
+    );
+    assert!(out.contains("EXACT-INTEGER ENVELOPE EXCEEDED"), "{out}");
+}

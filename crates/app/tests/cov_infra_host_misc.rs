@@ -83,7 +83,7 @@ fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
         .unwrap_or(0);
     let dir =
         std::env::temp_dir().join(format!("tv-cov-misc-{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("claim a fresh temp dir");
     dir
 }
 
@@ -187,6 +187,31 @@ impl Drop for EmptyPath {
     }
 }
 
+/// Restores the original socket setting even when an assertion unwinds.
+/// Every caller holds the same binary-wide ENV_LOCK as EmptyPath.
+struct NotifySocketGuard(Option<std::ffi::OsString>);
+
+impl NotifySocketGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let saved = std::env::var_os("NOTIFY_SOCKET");
+        // SAFETY: the caller holds ENV_LOCK through this guard's drop.
+        unsafe { std::env::set_var("NOTIFY_SOCKET", path) };
+        Self(saved)
+    }
+}
+
+impl Drop for NotifySocketGuard {
+    fn drop(&mut self) {
+        // SAFETY: the caller still holds ENV_LOCK.
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("NOTIFY_SOCKET", value),
+                None => std::env::remove_var("NOTIFY_SOCKET"),
+            }
+        }
+    }
+}
+
 /// The exact `Unavailable` shape when `chronyc` cannot be spawned.
 fn assert_chronyc_unavailable(err: &ClockSkewError) {
     match err {
@@ -285,16 +310,11 @@ async fn test_infra_spawn_clock_skew_poller_keeps_running_and_logs_failed_resamp
 #[tokio::test]
 async fn test_infra_notify_and_browser_failure_arms_log_and_return() {
     let _env = ENV_LOCK.lock().await;
-    let dir = unique_temp_dir("notify");
-    let missing_socket = dir.join("no-such-notify.sock");
-    let saved_path = std::env::var_os("PATH");
+    let empty_path = EmptyPath::new("notify");
+    let missing_socket = empty_path.dir.join("no-such-notify.sock");
+    let _notify_socket = NotifySocketGuard::set(&missing_socket);
 
     let (cap, guard) = capture_logs();
-    // SAFETY: Rust 2024 marks env mutation unsafe; ENV_LOCK serialises every
-    // env change in this binary and the values are restored below.
-    unsafe {
-        std::env::set_var("NOTIFY_SOCKET", &missing_socket);
-    }
     notify_systemd_watchdog();
     notify_systemd_ready();
     let logs = cap.text();
@@ -317,10 +337,6 @@ async fn test_infra_notify_and_browser_failure_arms_log_and_return() {
 
     // Browser launcher with no launcher on PATH: the spawn error is logged
     // and the call returns (best-effort, never blocks boot).
-    // SAFETY: see above.
-    unsafe {
-        std::env::set_var("PATH", &dir);
-    }
     open_in_browser("http://127.0.0.1:9/never-opened").await;
     let logs = cap.text();
     assert!(
@@ -328,16 +344,6 @@ async fn test_infra_notify_and_browser_failure_arms_log_and_return() {
         "a missing launcher is reported: {logs}"
     );
     drop(guard);
-
-    // SAFETY: see above.
-    unsafe {
-        std::env::remove_var("NOTIFY_SOCKET");
-        match saved_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -630,30 +636,39 @@ async fn test_dhan_universe_rider_enabled_waits_for_its_target_hour() {
         "already built: sleep to tomorrow's target"
     );
 
-    // Target the last second of the IST day so the live rider SLEEPS rather
-    // than building (a build would download from the vendor). In the final
-    // ten seconds of the IST day the target could fall due during the test,
-    // so the live half is skipped there; the schedule above still ran.
-    let now_sod = ist_secs_of_day(chrono::Utc::now().timestamp());
-    let wait = next_wait(now_sod, LAST_SECOND, false);
-    if now_sod >= LAST_SECOND - 10 {
+    // Exercise only the enabled supervisor/wait arm. The fixture target is
+    // deliberately outside the real seconds-of-day range, not a valid
+    // production hour: even a delayed test or midnight rollover cannot make
+    // it enter the hardcoded vendor-download arm. The valid-hour schedule
+    // assertions above remain separate from this isolation mechanism.
+    const NEVER_DUE_FIXTURE_TARGET: u32 = 86_400;
+    assert!(ist_secs_of_day(chrono::Utc::now().timestamp()) < NEVER_DUE_FIXTURE_TARGET);
+    for second in 0..NEVER_DUE_FIXTURE_TARGET {
         assert!(
-            wait.is_none_or(|w| w <= Duration::from_secs(10)),
-            "inside the last ten seconds the target is at most ten seconds away: {wait:?}"
+            next_wait(second, NEVER_DUE_FIXTURE_TARGET, false).is_some_and(|wait| !wait.is_zero()),
+            "the fixture target must never become due at second {second}"
         );
-        return;
     }
-    assert!(
-        wait.is_some_and(|w| w > Duration::from_secs(10)),
-        "the rider will sleep longer than this test runs: {wait:?}"
-    );
+    let (cap, _guard) = capture_logs();
     let cfg = DhanUniverseConfig {
         enabled: true,
-        target_secs_of_day_ist: LAST_SECOND,
+        target_secs_of_day_ist: NEVER_DUE_FIXTURE_TARGET,
         ..DhanUniverseConfig::default()
     };
     let handle = spawn_dhan_universe_rider(cfg, loopback_questdb(), String::new());
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if cap
+                .text()
+                .contains("daily instrument master + NSE indices rider armed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the enabled rider must reach its wait arm");
     assert!(
         !handle.is_finished(),
         "an enabled rider is a forever loop, waiting for its build hour"

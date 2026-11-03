@@ -34,7 +34,8 @@
 //! # Complexity
 //!
 //! [`spawn_frame_drain`] runs once per lane start: one thread, one runtime,
-//! two syscalls. Nothing here runs per frame.
+//! optional placement syscalls and cold scheduler registration. Nothing here
+//! runs per frame.
 
 use std::sync::OnceLock;
 
@@ -225,7 +226,9 @@ where
                 return;
             };
             place_this_thread(core, rt_priority);
+            let registration = tickvault_storage::hot_thread_sched::register_drain_thread();
             let output = runtime.block_on(future);
+            drop(registration);
             let _receiver_gone_is_fine = result_tx.send(output);
             // The runtime is leaked like the main one (see main.rs,
             // RUNTIME-NOT-DROPPED-AT-EXIT): dropping it can wait on a timer

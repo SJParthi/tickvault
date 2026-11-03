@@ -16,7 +16,9 @@
 //! and (owner 2026-10-30) the bearer-gated `GET /api/debug/speed-health` —
 //! and renders them with ~5s auto-refresh. The page shows REAL values, never
 //! hardcoded numbers. The speed-and-health panel is painted generically: the
-//! server decides every label, number and green / amber / red / grey verdict
+//! server decides each source's label, number and operational verdict; the page
+//! rejects legacy/expired snapshots, and strict session proof stays UNKNOWN.
+//! The server decides metric semantics
 //! (`handlers::speed_health`, where it is tested), so the page's script stays
 //! inside the browser-surface guard's size ceilings.
 //!
@@ -38,6 +40,14 @@
 //! `Html(...)` with `X-Frame-Options: SAMEORIGIN` + a `frame-ancestors 'self'`
 //! CSP, and every fetched value rendered via `textContent` (never `innerHTML`)
 //! so the page is XSS-proof by construction.
+//!
+//! Browser controls: DOM writes use createElement/textContent; one failed read
+//! clears only its panel. Gated reads stop after a current-generation 401 until
+//! Save. Refreshes never overlap. F&O rows are live only when their source says
+//! live; feed enable switches are distinct from feed-health verdicts. Automatic
+//! polls pause while hidden, and returning to the tab clears old speed colours.
+//! The 15-second response lease is three UI poll periods, not a latency/sample-
+//! freshness policy. Its timer expires even while another endpoint's read hangs.
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect};
@@ -145,10 +155,14 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </table></div>
   </div>
 
-  <h2>Speed and health</h2>
-  <p class="sub">How fast each step runs, ticks saved per minute, the daily tick check,
-     backlog, connections and candle overflow. Green is good, amber needs a look,
-     red needs action, grey means no verdict.</p>
+  <h2>Strict p99 below 1 microsecond</h2>
+  <p class="card" id="strict-proof">UNKNOWN — this endpoint has no dated, complete,
+     fresh strict-target proof. A first histogram bucket through 1,024 nanoseconds
+     cannot prove below 1,000. Since-startup readings are not Monday/session proof.</p>
+  <h2>Operational health and historical observations</h2>
+  <p class="sub">Speed colours use broad stall budgets, not the strict target above.
+     Each section states its own window. Grey means UNKNOWN. Response freshness
+     does not establish sample freshness or complete session coverage.</p>
   <div id="speed"></div>
 
   <div id="status"></div>
@@ -159,8 +173,6 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
 <script>
-// Every fetched value is rendered with createElement + textContent, never
-// innerHTML, so nothing from the server can become markup.
 const tokenEl   = document.getElementById("token");
 const overallEl = document.getElementById("overall");
 const feedsEl   = document.getElementById("feeds");
@@ -188,8 +200,9 @@ function setStatus(msg, cls) {
 const VERDICT_EMOJI = { ok: "✅", degraded: "⚠️", down: "🆘", disabled: "⭕" };
 function emojiFor(verdict) { return VERDICT_EMOJI[verdict] || "❔"; }
 const LIGHT_EMOJI = { green: "🟢", amber: "🟠", red: "🔴" };
+const SPEED_RESPONSE_MAX_AGE_MS = 15000;
+let speedTimer;
 
-// Returns parsed JSON or null, so one dead endpoint blanks one panel only.
 async function getJson(url) {
   try {
     const res = await fetch(url, { headers: authHeaders() });
@@ -201,7 +214,6 @@ async function getJson(url) {
   }
 }
 
-// Gated reads: a 401 for a request sent after Save stops them until Save.
 let denied = false, gen = 0;
 async function getGated(url) {
   if (denied) return null;
@@ -215,7 +227,6 @@ async function getGated(url) {
   }
 }
 
-// In-flight guard: the 5s auto-refresh and a manual Save never overlap.
 let refreshing = false;
 async function refresh() {
   if (refreshing) return;
@@ -290,7 +301,6 @@ function renderFeeds(feeds, feedsHealth) {
   for (const hv of rows) {
     const key = hv.feed;
     const card = el("div", "card");
-    // ON/OFF from /api/feeds, the verdict from /api/feeds/health.
     const enabled = !!feeds[key + "_enabled"];
     cardHead(card, key + " — " + (enabled ? "ON" : "OFF"),
       emojiFor(hv.verdict) + " " + (hv.verdict || "unknown").toUpperCase());
@@ -336,8 +346,6 @@ function renderStats(stats) {
   statsEl.appendChild(grid);
 }
 
-// F&O stocks price movers (owner 2026-10-30). Rows come from /api/fno-stocks;
-// only status "live" is shown as live, every other status says why.
 let fnoData = null, fnoMode = "gain", fnoDesc = true;
 const fnoNote = document.getElementById("fno-note");
 const fnoBody = document.getElementById("fno-body");
@@ -399,15 +407,19 @@ document.getElementById("fno-sort").addEventListener("click", (e) => {
   renderFno();
 });
 
-// Speed and health: the server decides every label, number and colour.
 function renderSpeed(speed) {
+  clearTimeout(speedTimer);
   speedEl.replaceChildren();
-  if (!speed || !speed.sections) {
+  const age = speed ? Date.now() - speed.captured_at_unix_ms : NaN;
+  if (!speed || speed.evidence_version !== 1 || !Number.isSafeInteger(speed.captured_at_unix_ms)
+      || age < 0 || age >= SPEED_RESPONSE_MAX_AGE_MS || !Array.isArray(speed.sections)
+      || !speed.sections.every(s => s && Array.isArray(s.tiles) && s.tiles.every(t => t && typeof t.value === "string"))) {
     speedEl.appendChild(el("div", "card", denied || !tokenEl.value.trim()
-      ? "— enter the API token above and press Save."
-      : "— could not read speed and health."));
+      ? "UNKNOWN — enter the API token above and press Save."
+      : "UNKNOWN — snapshot missing, legacy, or expired; no current colours."));
     return;
   }
+  speedTimer = setTimeout(() => renderSpeed(null), SPEED_RESPONSE_MAX_AGE_MS - age);
   for (const s of speed.sections) {
     const card = el("div", "card");
     card.appendChild(el("div", "name", s.title));
@@ -430,7 +442,7 @@ document.getElementById("save").addEventListener("click", () => {
 });
 
 refresh();
-// Every 5s; skipped while the tab is hidden. Save still refreshes at once.
+document.addEventListener("visibilitychange", () => { renderSpeed(null); if (!document.hidden) refresh(); });
 setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 </script>
 </body>
@@ -587,10 +599,11 @@ mod tests {
     #[test]
     fn test_dashboard_page_paints_the_speed_panel_from_server_verdicts() {
         // Owner 2026-10-30: the speed and health numbers appear on this page.
-        // The page must not compute verdicts itself: it reads each tile's
-        // `status` (green / amber / red, anything else grey) as sent.
+        // Rust supplies operational verdicts. The page withdraws expired or
+        // legacy responses; it never infers strict proof from their colours.
         for marker in [
-            "Speed and health",
+            "Operational health and historical observations",
+            "Strict p99 below 1 microsecond",
             "id=\"speed\"",
             "renderSpeed(speed)",
             "speed.sections",

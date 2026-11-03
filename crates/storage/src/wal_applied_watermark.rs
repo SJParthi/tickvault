@@ -85,23 +85,16 @@
 //!   the bucket table from one slack below the segment's first record, and
 //!   the boot fold gives each folded bucket one slack on its top. The range
 //!   lookup is unchanged.
-//! * **Honest limit, measured by counters, not fixed:** while a QuestDB
-//!   probe is unclean (a suspended table, a latched apply lag, or a blind
-//!   probe) every ack parks, and the whole stretch stays pinned until a
-//!   replay reaches it; on a box whose backlog does not drain that is about
-//!   one session of WAL per lag-latched day. [`WAL_SUSPECT_EPISODES_COUNTER`]
-//!   and [`WAL_SUSPECT_SECONDS_COUNTER`] (local `/metrics` only, registered
-//!   at 0 at boot) show how often and how long. The follow-up, not built:
-//!   confirm parked live acks once a full [`WATERMARK_DURABILITY_LAG_SECS`]
-//!   (60 s) and two clean probes follow them, as `settling/` does for
-//!   replays.
-//!   **⚠ BUILT 2026-10-27 (plan item PR W4), for lag-only episodes:** see
-//!   `wal_parked_confirm`. An episode whose every unclean probe was a
-//!   complete view with no suspended table (only apply lag latched) has its
-//!   own ranges cut back out, and the watermark raised to its parked acks,
-//!   once the durability lag and two clean probes follow its end with no
-//!   episode in between and no other range over its spans. A suspended,
-//!   partial or blind episode keeps its ranges as before.
+//! * Unclean probes park acknowledgements. W4 now releases only the parked
+//!   range above a lag-only episode's entry window after the existing
+//!   [`WATERMARK_DURABILITY_LAG_SECS`] (60 s) and two later clean probes,
+//!   with no new episode or overlapping range mark. Unsafe or forgotten
+//!   untrusted tables keep their range. This uses the existing conditional
+//!   acknowledgement/writeback contract, as `settling/` does; it does not
+//!   prove that every row is queryable or that `nosync` writes were fsynced.
+//!   A restart loses only the pending confirmation and retains the range.
+//!   [`WAL_PARKED_CONFIRM_COUNTER`] reports outcomes locally; absent series
+//!   means that outcome has not been observed, not a completed proof.
 //!
 //! **⚠ ADDED 2026-10-20 (PR W review round 5), the upper side:** the same
 //! reorder bound lets a segment's last record sit up to one slack ABOVE the
@@ -254,6 +247,17 @@ pub const WAL_SUSPECT_EPISODES_COUNTER: &str = "tv_wal_suspect_episodes_total";
 /// this, read beside `tv_wal_unapplied_pinned_bytes`, is what shows whether
 /// pinned bytes grow with lag-latched days. Local `/metrics` only, as above.
 pub const WAL_SUSPECT_SECONDS_COUNTER: &str = "tv_wal_suspect_seconds_total";
+/// Counter: bucket-table overflow EPISODES (audit PR32). One per false-to-true
+/// transition of the table's overflow flag, set by the two arms that lose a
+/// frame from the table: a bucket-id collision in `note_unapplied` and a range
+/// wider than the table in `note_unapplied_range`. A flag inherited from the
+/// file at boot is not counted (it is an earlier process's episode), and the
+/// persist's own re-raise after a racing bound (`bound_known_overflow_locked`)
+/// is not a new episode. Once the persist or a drained reset clears the flag,
+/// the next overflow counts again. Local `/metrics` only: no CloudWatch
+/// filter, no EMF name, no alarm. Registered at 0 at boot.
+pub const UNAPPLIED_OVERFLOW_EPISODES_COUNTER: &str = "tv_wal_unapplied_overflow_episodes_total";
+
 /// Counter: what happened to a lag-only suspicion episode's parked acks
 /// (plan item W4, 2026-10-30), labelled `outcome`:
 /// `confirmed` (their range above the episode's entry window was trimmed
@@ -277,11 +281,12 @@ pub const PARKED_CONFIRM_CLEAN_PROBES: u64 =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeVerdict {
     /// Every row parsed, no table suspended, none latched untrusted.
+    /// This does not mean zero apply lag or queryable completion.
     Clean,
     /// Every row parsed and no table suspended, but at least one table is
     /// latched untrusted for apply lag: the rows are in QuestDB's WAL and
     /// not yet applied. An episode that only ever sees this verdict may
-    /// have its parked acks confirmed once the lag clears.
+    /// become eligible for conditional retention release after the latch clears.
     LagOnly,
     /// A table is suspended, a row did not parse, or the probe could not
     /// see. An episode that sees this even once is never confirmed.
@@ -2118,12 +2123,12 @@ impl AppliedWatermark {
     /// an episode stays in `settling/`. A trim that would need a 33rd range
     /// is retried at the next clean probe.
     ///
-    /// Why a lag-only episode can be trusted after this: a latched table was
-    /// still acking into its WAL with nothing suspended; the latch releases
-    /// only when its apply lag has stopped growing (the staircase rule,
-    /// `WalLagTracker::untrusted_count`), and the two later clean probes and
-    /// the lag are the same evidence the settle step archives a replayed
-    /// batch on.
+    /// This preserves the replay-settle acknowledgement/writeback envelope:
+    /// no observed suspension, the existing untrusted latch released, the
+    /// writeback delay elapsed, and two later clean probes. Latch release
+    /// can leave a nonzero backlog; this is not proof of queryable rows or
+    /// fsync durability. Longer-than-budget writeback, saturated storage or
+    /// a later `RESUME WAL FROM` remain outside that conditional envelope.
     ///
     /// Returns whether it confirmed. Called after every clean probe, on the
     /// watcher task (the only caller of the probe report, so nothing else
@@ -2132,9 +2137,7 @@ impl AppliedWatermark {
     fn confirm_parked_if_due(&self, now: u64) -> bool {
         let confirmed = crate::off_worker::off_worker(|| {
             let mut state = self.lock_ranges();
-            let Some(pending) = state.parked_confirm else {
-                return None;
-            };
+            let pending = state.parked_confirm?;
             let outcome = if self.suspect_episodes.load(Ordering::Acquire) != pending.episodes_at {
                 Some("held_episode")
             } else if pending.contaminated {
@@ -2186,9 +2189,8 @@ impl AppliedWatermark {
             span_hi = pending.hi,
             parked_ticks = pending.parked_ticks,
             parked_depth = pending.parked_depth,
-            "WAL parked acks confirmed: the apply-lag episode ended, the durability lag and two \
-             more clean QuestDB probes followed with no new episode, so the session's WAL above \
-             the episode's entry window is no longer pinned"
+            "WAL parked acknowledgement range released under the writeback-delay and probe rule; \
+             other guards may still retain WAL. This does not prove all rows are queryable or fsynced"
         );
         crate::off_worker::off_worker(|| self.persist_now());
         true
@@ -2321,7 +2323,7 @@ impl AppliedWatermark {
                 .fetch_min(id << UNAPPLIED_BUCKET_SHIFT, Ordering::AcqRel);
             self.overflow_high_seq
                 .fetch_max(bucket_top, Ordering::AcqRel);
-            self.overflowed.store(true, Ordering::Release);
+            self.raise_overflow();
         }
     }
 
@@ -2337,6 +2339,21 @@ impl AppliedWatermark {
         if self.bucket_counts[slot].load(Ordering::Relaxed) == 0 {
             self.bucket_counts[slot].store(1, Ordering::Relaxed);
         }
+    }
+
+    /// Sets the overflow flag after an arm recorded its bounds, and counts an
+    /// episode on [`UNAPPLIED_OVERFLOW_EPISODES_COUNTER`] only when the flag
+    /// was clear (audit PR32). The swap writes `true` with Release, as the
+    /// store it replaces did, so a reader that sees the flag still sees the
+    /// bounds written before it. Overflow arms only: the per-frame shed path
+    /// that records its bucket never reaches here. Returns `true` on a new
+    /// episode.
+    fn raise_overflow(&self) -> bool {
+        let new_episode = !self.overflowed.swap(true, Ordering::AcqRel);
+        if new_episode {
+            metrics::counter!(UNAPPLIED_OVERFLOW_EPISODES_COUNTER).increment(1);
+        }
+        new_episode
     }
 
     /// Every bucket touched by `[lo, hi]` is marked unapplied — a whole batch
@@ -2362,7 +2379,7 @@ impl AppliedWatermark {
             // Low before high, as in `note_unapplied`.
             self.overflow_low_seq.fetch_min(lo, Ordering::AcqRel);
             self.overflow_high_seq.fetch_max(hi, Ordering::AcqRel);
-            self.overflowed.store(true, Ordering::Release);
+            self.raise_overflow();
             return;
         }
         // O(1) EXEMPT: bounded by UNAPPLIED_BUCKETS, cold failure arm
@@ -3894,6 +3911,97 @@ mod tests {
         assert!(!snap.overflowed);
         wm.reset_unapplied_below(u64::MAX);
         assert!(!wm.snapshot().range_has_unapplied(new, new));
+    }
+
+    /// Audit PR32: overflow episodes are counted once per false-to-true
+    /// transition, not once per lost frame, and count again after a reset.
+    #[test]
+    fn test_overflow_episodes_count_each_false_to_true_transition_once() {
+        struct Recorder(std::sync::Arc<AtomicU64>);
+        struct Counter(std::sync::Arc<AtomicU64>);
+
+        impl metrics::CounterFn for Counter {
+            fn increment(&self, value: u64) {
+                self.0.fetch_add(value, Ordering::Relaxed);
+            }
+            fn absolute(&self, _: u64) {}
+        }
+
+        impl metrics::Recorder for Recorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                if key.name() == UNAPPLIED_OVERFLOW_EPISODES_COUNTER {
+                    metrics::Counter::from_arc(std::sync::Arc::new(Counter(std::sync::Arc::clone(
+                        &self.0,
+                    ))))
+                } else {
+                    metrics::Counter::noop()
+                }
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let observed = std::sync::Arc::new(AtomicU64::new(0));
+        let recorder = Recorder(std::sync::Arc::clone(&observed));
+        metrics::with_local_recorder(&recorder, || {
+            let wm = AppliedWatermark::new_for_tests();
+            let first = seq(10);
+            let stride = (UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT;
+            wm.note_unapplied(first);
+            assert_eq!(observed.load(Ordering::Relaxed), 0);
+            // Collisions and a wide range during one episode count only once.
+            wm.note_unapplied(first + stride);
+            wm.note_unapplied(first + 2 * stride);
+            wm.note_unapplied(first + stride);
+            assert!(wm.snapshot().overflowed);
+            assert_eq!(observed.load(Ordering::Relaxed), 1);
+            wm.note_unapplied_range(seq(1), seq(1) + stride);
+            assert_eq!(observed.load(Ordering::Relaxed), 1);
+            // Clearing the real flag re-arms the actual published counter.
+            wm.reset_unapplied();
+            assert!(!wm.snapshot().overflowed);
+            wm.note_unapplied_range(seq(1), seq(1) + stride);
+            assert_eq!(observed.load(Ordering::Relaxed), 2);
+            assert!(!wm.raise_overflow());
+            assert_eq!(observed.load(Ordering::Relaxed), 2);
+        });
     }
 
     /// The 2026-09-05 loss, pinned. An adversarial sweep found this on the day
@@ -5498,6 +5606,129 @@ mod w4_parked_confirm_tests {
         assert!(wm.lock_ranges().parked_confirm.is_none());
     }
 
+    struct OwnedWatermarkDir(PathBuf);
+
+    impl OwnedWatermarkDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("tv-w4-watermark-{}-{serial}", std::process::id()));
+            std::fs::create_dir(&path).expect("fresh owned watermark directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for OwnedWatermarkDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_parked_confirmation_reload_keeps_ranges_and_forgets_pending_release() {
+        let dir = OwnedWatermarkDir::new();
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir.0);
+        let exit = lag_only_episode(&wm, 1_000 * SEC_NS);
+        assert!(wm.lock_ranges().parked_confirm.is_some());
+        let disk = AppliedSnapshot::load(&dir.0).expect("persisted episode snapshot");
+        assert_ne!(disk.ranges_gen, 0, "valid sidecar generation is durable");
+        assert!(
+            disk.ranges.intersects(seq(20), seq(20)),
+            "entry range persisted"
+        );
+        assert!(
+            disk.ranges.intersects(seq(150), seq(150)),
+            "parked range persisted"
+        );
+
+        let restarted = AppliedWatermark::new_for_tests();
+        restarted.bind(&dir.0);
+        assert!(
+            restarted.lock_ranges().parked_confirm.is_none(),
+            "pending release is RAM only"
+        );
+        ack_both(&restarted, seq(500));
+        for offset in [61, 122, 183] {
+            probe(&restarted, ProbeVerdict::Clean, exit + offset * SEC_NS);
+        }
+        assert!(covered(&restarted, seq(20)));
+        assert!(
+            covered(&restarted, seq(150)),
+            "clean probes after restart do not invent a pending release"
+        );
+        assert!(
+            !restarted
+                .snapshot()
+                .frame_is_applied(AppliedSink::Ticks, seq(150))
+        );
+    }
+
+    #[test]
+    fn test_parked_confirmation_sidecar_write_failure_keeps_entry_and_foreign_disk_guards() {
+        let dir = OwnedWatermarkDir::new();
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir.0);
+        let exit = lag_only_episode(&wm, 1_000 * SEC_NS);
+        let foreign = seq(400);
+        assert!(wm.add_unapplied_range(foreign, foreign));
+        ack_both(&wm, seq(500));
+        wm.persist_at(2_000 * SEC_NS);
+        wm.persist_at(2_000 * SEC_NS + WATERMARK_DURABILITY_LAG_NANOS);
+        let before = AppliedSnapshot::load(&dir.0).expect("valid pre-confirmation snapshot");
+        assert!(
+            before.hwm_ticks > foreign,
+            "watermark alone would permit the foreign frame"
+        );
+        assert!(before.ranges.intersects(foreign, foreign));
+
+        // A directory at the owned tmp-file path forces the actual sidecar
+        // write to fail, without permission assumptions or production seams.
+        std::fs::create_dir(
+            dir.0
+                .join(crate::wal_unapplied_ranges::UNAPPLIED_RANGES_TMP),
+        )
+        .expect("block only this fixture's sidecar tmp path");
+        probe(&wm, ProbeVerdict::Clean, exit + 30 * SEC_NS);
+        probe(&wm, ProbeVerdict::Clean, exit + 61 * SEC_NS);
+        assert!(
+            wm.lock_ranges().parked_confirm.is_none(),
+            "eligible own span was processed"
+        );
+        assert!(
+            !covered(&wm, seq(150)),
+            "test reaches the confirmation mutation"
+        );
+        assert!(
+            wm.ranges_failing.load(Ordering::Acquire),
+            "actual sidecar write failed"
+        );
+        assert_eq!(
+            wm.lock_ranges().durable_gen,
+            0,
+            "no successful sidecar generation is invented"
+        );
+        assert!(covered(&wm, seq(20)));
+        assert!(covered(&wm, foreign));
+
+        let disk = AppliedSnapshot::load(&dir.0).expect("fallback watermark stays readable");
+        assert!(
+            disk.range_has_unapplied(seq(20), seq(20)),
+            "entry guard survives failure/reload"
+        );
+        assert!(
+            disk.range_has_unapplied(foreign, foreign),
+            "foreign guard survives failure/reload"
+        );
+        assert!(!disk.frame_is_applied(AppliedSink::Ticks, seq(20)));
+        assert!(!disk.frame_is_applied(AppliedSink::Ticks, foreign));
+        let restarted = AppliedWatermark::new_for_tests();
+        restarted.bind(&dir.0);
+        assert!(restarted.lock_ranges().parked_confirm.is_none());
+        assert!(restarted.snapshot().range_has_unapplied(foreign, foreign));
+    }
+
     #[test]
     fn test_probe_verdict_from_clean() {
         assert_eq!(ProbeVerdict::from_clean(true), ProbeVerdict::Clean);
@@ -5606,7 +5837,9 @@ mod w4_parked_confirm_tests {
                         } else if !suspect {
                             suspect = true;
                             episode += 1;
-                            for e in 1..episode as usize { interrupted[e] = true; }
+                            for flag in interrupted.iter_mut().skip(1) {
+                                *flag = true;
+                            }
                             lag_only.push(v == ProbeVerdict::LagOnly);
                             exit_at.push(None);
                             cleans_since_exit.push(0);

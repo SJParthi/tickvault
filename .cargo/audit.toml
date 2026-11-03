@@ -41,3 +41,8 @@
 # list. No other package version changed; no ignore added.
 ignore = []
 
+[output]
+quiet = false
+# Block informational unsoundness at any dependency depth. Native/CI
+# --deny yanked remains additive; do not silently allow an unsound warning.
+deny = ["unsound"]

@@ -172,17 +172,13 @@ pub fn build_router_with_auth(
     // bearer-auth middleware — applied UNCONDITIONALLY (deliberately NOT gated
     // on `feed_toggle_public`).
     //
-    // HONEST CONTRACT (adversarial-review fix 2026-07-04): on EVERY real boot
-    // (prod AND local Mac) main.rs constructs `ApiAuthConfig::from_token` with
-    // the SSM-fetched token and HARD-FAILS if the fetch fails — so auth is
-    // ALWAYS enabled at runtime and these routes ALWAYS demand
-    // `Authorization: Bearer <token>` (401 otherwise, fail-closed). The
-    // `require_bearer_auth` disabled-passthrough is reachable ONLY for
-    // empty-token constructions (unit/router tests, `ApiAuthConfig::disabled`)
-    // — it is NOT a "local dev is tokenless" carve-out. Tokenless callers
-    // (curl, MCP `tool_tickvault_api` without TICKVAULT_API_BEARER_TOKEN) get
-    // 401 here even on localhost; the tickvault-logs MCP LOG tools are
-    // unaffected because they read the local filesystem, never these routes.
+    // 2026-11-02: corrected the former always-enabled runtime claim.
+    // Normal nonempty SSM credentials enable these legacy gates. Paper boot
+    // can intentionally choose PaperEmptyAuthDisabled, so disabled passthrough
+    // is reachable in production and these legacy debug routes then permit
+    // tokenless requests. That boot policy is unchanged here. The movers
+    // routes below use require_configured_bearer_auth and instead return 503
+    // when authentication is disabled or its configured token is empty.
     // Kept for the F&O stocks route below; `auth_config` itself moves into
     // `debug_routes`.
     let fno_auth_config = auth_config.clone();
@@ -317,6 +313,10 @@ pub fn build_router_with_auth(
     // without a valid token is refused before it spends rate budget.
     let fno_stocks_routes: Router<SharedAppState> = Router::new()
         .route(
+            "/api/stock-movers",
+            axum::routing::get(handlers::stock_movers::get_stock_movers),
+        )
+        .route(
             "/api/fno-stocks",
             axum::routing::get(handlers::fno_stocks::get_fno_stocks),
         )
@@ -326,7 +326,7 @@ pub fn build_router_with_auth(
         ))
         .route_layer(axum::middleware::from_fn_with_state(
             fno_auth_config,
-            require_bearer_auth,
+            middleware::require_configured_bearer_auth,
         ));
     // The 4 `/api/debug/*` routes live on `debug_routes` above (bearer-auth
     // gated, security trim 2026-07-04) — no longer on the public router.

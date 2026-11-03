@@ -143,7 +143,7 @@ fi
 # Extract per-crate coverage from llvm-cov JSON using jq, then enforce the
 # thresholds in awk with EXACT scaled-integer arithmetic (rust-only purge
 # Phase 2a-2, 2026-07-18: replaces the inline interpreter/Fraction block — same
-# semantics, same output, same exit codes).
+# measured-input semantics; malformed or unmeasured crates fail closed).
 # llvm-cov JSON format: { "data": [ { "files": [ { "filename": "...", "summary": { "lines": { "count": N, "covered": M } } } ] } ] }
 #
 # EXACTNESS CONTRACT (unchanged from the Fraction implementation this
@@ -166,28 +166,24 @@ fi
 TSV_FILE="$(mktemp)"
 trap 'rm -f "$TSV_FILE"' EXIT
 
-# FAIL CLOSED on a PRESENT null/non-numeric lines.count / lines.covered
-# (review round 2 fix, 2026-07-18): the previous `// 0` turned an explicit
-# JSON null into 0 and let a string ride into awk (where `+0` coerces to 0),
-# so a corrupt report read 100.00% PASS. The old evaluator crashed with a
-# TypeError there (exit 1); restore that fail-closed contract with a named
-# jq error (set -e aborts the gate on jq's non-zero exit). A MISSING key
-# stays 0 — the old evaluator `.get(..., 0)` was equally open there, and the
-# parity contract deliberately keeps missing-key behavior unchanged.
+# Validate BEFORE aggregation: missing/null counts are corrupt, not zero lines.
+# This intentionally tightens the old missing-key parity behavior. Explicit
+# count=covered=0 is a valid file; a whole crate with no measured lines is unknown.
 jq -r '
-  def req_num($k):
-    (.summary.lines // {}) as $l
-    | if ($l | has($k))
-      then ($l[$k]
-            | if type == "number" then .
-              else error("summary.lines.\($k) is present but \(type) — corrupt coverage JSON; refusing to treat it as 0 (fail closed)") end)
-      else 0 end;
-  (.data // [])[]
-  | (.files // [])[]
-  | [ (.filename // ""),
-      req_num("count"),
-      req_num("covered") ]
-  | @tsv
+  def line_count($k):
+    .summary.lines[$k]
+    | if type != "number" then error("summary.lines.\($k) must be a present, non-null number")
+      elif (tostring | test("^(0|[1-9][0-9]*)$") | not) or . > 9007199254740991
+      then error("summary.lines.\($k) must be a canonical non-negative safe integer")
+      else . end;
+  if ("100.00000000000000000001" | fromjson | tostring) != "100.00000000000000000001"
+  then error("JSON processor must preserve numeric token precision for coverage validation") else . end
+  | (.data | if type == "array" then .[] else error("coverage data must be an array") end)
+  | (.files | if type == "array" then .[] else error("coverage files must be an array") end)
+  | (.filename | if type == "string" and length > 0 then . else error("coverage filename must be a nonempty string") end) as $filename
+  | line_count("count") as $count | line_count("covered") as $covered
+  | if $covered > $count then error("summary.lines.covered must not exceed count")
+    else [$filename, $count, $covered] | @tsv end
 ' "$COVERAGE_JSON" > "$TSV_FILE"
 
 LC_ALL=C awk -F'\t' \
@@ -257,6 +253,10 @@ FILENAME == tf {
   fn = $1; count = $2 + 0; covered = $3 + 0
   if (match(fn, /crates\/[^\/]+\//)) {
     name = substr(fn, RSTART + 7, RLENGTH - 8)
+    if (count > 9007199254740991 - cnt[name]) {
+      print "  ERROR: coverage line-count total exceeds exact integer range for crate " name
+      died = 1; exit 1
+    }
     cnt[name] += count
     cov[name] += covered
   }
@@ -341,17 +341,13 @@ END {
       exit 1
     }
     if (cnt[name] == 0) {
-      # zero countable lines == 100% by definition (same as before)
-      ok = (100 * G_pow >= G_scaled)
-      pct = 100
-    } else {
-      # EXACT comparison: pct == threshold PASSES (ratchet = at least).
-      ok = (cov[name] * 100 * G_pow >= G_scaled * cnt[name])
-      # display value only — one IEEE division of exact integers, which is
-      # the correctly-rounded double of the true ratio (same double the old
-      # float(Fraction(covered*100, count)) produced)
-      pct = (cov[name] * 100) / cnt[name]
+      printf "  UNKNOWN: %s has zero countable lines; refusing a coverage verdict.\n", name
+      failed = 1; continue
     }
+    # EXACT comparison: pct == threshold PASSES (ratchet = at least).
+    ok = (cov[name] * 100 * G_pow >= G_scaled * cnt[name])
+    # Division is display-only; the exact integer products decide the verdict.
+    pct = (cov[name] * 100) / cnt[name]
     st = ok ? "PASS" : "FAIL"
     if (!ok) failed = 1
     # 2-decimal display so a value just below the threshold can no longer

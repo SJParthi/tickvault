@@ -100,6 +100,19 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
+/// Exit code returned by the `--check-trading-day` gate.
+///
+/// This is the legacy calendar-check CLI contract. The boot-time
+/// `holiday-gate` subcommand uses its narrower [`decide`] policy instead.
+/// Operators running `tickvault --check-trading-day` receive:
+/// - `0`  = today (IST) is a trading day → let the app start.
+/// - `75` = today is a weekend / NSE holiday (non-trading).
+///
+/// Pure so the contract is unit-testable without touching the clock/config.
+pub fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
+    if is_trading_day { 0 } else { 75 }
+}
+
 /// The first argument that selects this subcommand.
 pub const HOLIDAY_GATE_SUBCOMMAND: &str = "holiday-gate";
 
@@ -623,6 +636,20 @@ async fn stop_this_instance(imds_base: &str) -> i32 {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn test_trading_day_gate_exit_code_trading() {
+        // Trading day → 0 so the gate lets the app start.
+        assert_eq!(trading_day_gate_exit_code(true), 0);
+    }
+
+    #[test]
+    fn test_trading_day_gate_exit_code_non_trading() {
+        // Weekend/holiday → 75 so the gate self-stops the instance.
+        assert_eq!(trading_day_gate_exit_code(false), 75);
+        // 75 must be distinct from the fail-open load-error code 70.
+        assert_ne!(trading_day_gate_exit_code(false), 70);
+    }
 
     #[test]
     fn test_is_invocation_matches_only_the_first_argument() {

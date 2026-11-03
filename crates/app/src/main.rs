@@ -70,6 +70,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
+use tickvault_app::holiday_gate::trading_day_gate_exit_code;
 use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
@@ -119,19 +120,6 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-
-/// Exit code returned by the `--check-trading-day` gate.
-///
-/// The holiday gate (`tickvault holiday-gate`, `holiday_gate.rs`; a shell
-/// script until 2026-10-01) reads this code, as does any operator running
-/// `tickvault --check-trading-day` by hand. Contract:
-/// - `0`  = today (IST) is a trading day → let the app start.
-/// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
-///
-/// Pure so the contract is unit-testable without touching the clock/config.
-fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
-    if is_trading_day { 0 } else { 75 }
-}
 
 /// `--check-trading-day` short-circuit: load config → build the calendar →
 /// evaluate IST today → exit with [`trading_day_gate_exit_code`].
@@ -1253,36 +1241,6 @@ async fn async_main() -> Result<()> {
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
 
-    // Live proof that nothing on the live path is waiting (2026-10-02):
-    // the publisher thread, plus one lateness probe per tokio runtime. AFTER
-    // the recorder install, like every pre-resolved handle above.
-    // 2026-10-30: the per-minute latency proof tables, writer before publisher.
-    let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
-    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
-        error!(
-            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
-            error = %err,
-            "the hot-path telemetry thread FAILED TO SPAWN — stage latency and task \
-             heartbeat gauges will not publish (host thread or memory limit)"
-        );
-    }
-    // Plan item 4: task heartbeats + memory ladder, before the watched supervisors.
-    tickvault_app::task_watch_boot::start_task_watch(&config);
-    tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
-        tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
-        tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
-        u64::MAX,
-    ));
-    if tickvault_core::websocket::reader_runtime::reader_runtime_handle().is_some() {
-        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(
-            tickvault_storage::hot_path_telemetry::run_runtime_probe(
-                tickvault_storage::hot_path_telemetry::HotTask::ReaderRuntime,
-                tickvault_storage::hot_path_telemetry::Stage::ReaderRuntimeLag,
-                u64::MAX,
-            ),
-        );
-    }
-
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
     //
@@ -1903,7 +1861,11 @@ async fn async_main() -> Result<()> {
         .increment(0);
     metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_SECONDS_COUNTER)
         .increment(0);
-    tickvault_storage::wal_parked_confirm::register_counters(); // PR W4, local only
+    // Bucket-table overflow episodes: local metrics only, once per false-to-true transition.
+    metrics::counter!(
+        tickvault_storage::wal_applied_watermark::UNAPPLIED_OVERFLOW_EPISODES_COUNTER
+    )
+    .increment(0);
     // PR W review round 5: every trim refusal reason exists from boot, so a
     // trim refused all session is visible. The pinned gauges are NOT set to 0
     // here on purpose: 0 would read "nothing pinned" while the trim never ran.
@@ -2336,24 +2298,21 @@ async fn async_main() -> Result<()> {
     // existed; write what it recorded (and any failed fold persist) now.
     let _boot_fold_logged = tickvault_storage::wal_unapplied_ranges::log_boot_fold_summary();
 
-    // Live proof that nothing on the live path is waiting (2026-10-02):
-    // the publisher thread, plus one lateness probe per tokio runtime.
-    // Plan ITEM 52f (2026-10-30): this runs AFTER the subscriber `init()`
-    // above, so a spawn failure and any stall page reach the log. It is
-    // still after the metrics recorder install (Step 2), so every handle it
-    // resolves is live. No WebSocket, Dhan lane or frame drain starts
-    // before this point. Ratchet:
-    // crates/app/tests/hot_path_telemetry_boot_wiring_guard.rs.
-    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
+    // Start telemetry after metrics and tracing, before the watched live tasks.
+    // 2026-10-30: the per-minute latency proof tables, writer before publisher.
+    let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
+    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher(std::sync::Arc::clone(
+        &trading_calendar,
+    )) {
         error!(
-            code = tickvault_common::error_code::ErrorCode::HotPath04TelemetryNotStarted
-                .code_str(),
+            code = tickvault_common::error_code::ErrorCode::HotPath04TelemetryNotStarted.code_str(),
             error = %err,
-            "the hot-path telemetry thread did not start: stage latency and task \
-             heartbeat gauges will not publish and the stall page cannot fire \
-             (host thread or memory limit)"
+            "the hot-path telemetry thread did not start; stage and heartbeat publication \
+             and its stall detection are unavailable (host thread or memory limit)"
         );
     }
+    // Plan item 4: task heartbeats + memory ladder, before the watched supervisors.
+    tickvault_app::task_watch_boot::start_task_watch(&config);
     tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
         tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
         tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
@@ -3814,7 +3773,13 @@ async fn async_main() -> Result<()> {
     // lost that race and the whole session ran on 4 instruments instead of
     // 4,565, silently. This wait is bounded and fail-soft: on timeout the
     // resolve below takes its existing, loudly-logged fallback.
-    let universe_date_ist = tickvault_app::dhan_universe::today_ist_date();
+    // One IST date for the artifact and calendar verdict: a weekend Muhurat
+    // session needs the same list/widening path as a regular session day.
+    let universe_day_ist = chrono::Utc::now()
+        .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+        .date_naive();
+    let universe_date_ist = universe_day_ist.to_string();
+    let universe_session_day = trading_calendar.is_session_day(universe_day_ist);
     // Off-session boots (non-trading day, or before the rider's build hour)
     // fall back to the index universe BY DESIGN — the artifact cannot exist
     // yet. Judged ONCE here so the wait and the resolve agree, and so the
@@ -3829,7 +3794,7 @@ async fn async_main() -> Result<()> {
         &config.dhan_universe,
         &universe_date_ist,
         universe_collapse_expected,
-        trading_calendar.is_trading_day_today(),
+        universe_session_day,
     )
     .await;
     // Judged AGAIN after the wait (audit re-check 7). A boot between 07:10
@@ -3934,6 +3899,9 @@ async fn async_main() -> Result<()> {
             // A second copy of the top contracts on another main-feed socket
             // (scope lock 2026-10-02). 0 turns it off.
             main_feed_backup_top_n: config.dhan_universe.backup_top_n,
+            subscribe_reconcile_auto_resubscribe: config
+                .dhan_universe
+                .subscribe_reconcile_auto_resubscribe,
             // Frame-silence fast paths (scope lock 2026-10-10): shadow by
             // default, so they count would-redials before anything acts.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
@@ -3978,17 +3946,17 @@ async fn async_main() -> Result<()> {
             // than let one writer silently overwrite the other.
             rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
             // Audit D3b: a boot that did not get today's spot list adds it
-            // once the rider writes it, without a restart. Trading days only:
-            // a holiday has no session to widen, and waiting would keep the late
-            // attach polling until 15:30 for nothing.
+            // once the rider writes it, without a restart. Include calendar-listed
+            // Muhurat sessions; ordinary weekends/holidays still have no session
+            // to widen. The existing bounded polling window is unchanged.
             widen_universe: (tickvault_app::dhan_live_universe::live_universe_widen_pending()
-                && trading_calendar.is_trading_day_today())
-            .then(|| tickvault_app::dhan_live_universe::TodaysUniverseSource {
-                cfg: config.dhan_universe.clone(),
-                index_universe: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-                capacity: tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
-                    .subscription_capacity(),
-            }),
+                && universe_session_day)
+                .then(|| tickvault_app::dhan_live_universe::TodaysUniverseSource {
+                    cfg: config.dhan_universe.clone(),
+                    index_universe: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                    capacity: tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
+                        .subscription_capacity(),
+                }),
         },
     );
 
@@ -5149,8 +5117,8 @@ async fn build_shared_infra(
             spot_days = config.market_ram_store.spot_days,
             chain_row_cap = config.market_ram_store.chain_row_cap,
             "market_ram_store: RAM residency ARMED — spots month-deep (filled by \
-             the fold catch-up + live seals), options current-day (chain publishes \
-             + boot rehydrate); depth gauges show the honest fill level"
+             the fold catch-up + live seals), options current-day store installed; \
+             no boot rehydrate; depth gauges show the observed fill level"
         );
     } else {
         info!(
@@ -6592,20 +6560,6 @@ mod tests {
     #[test]
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
-    }
-
-    #[test]
-    fn test_trading_day_gate_exit_code_trading() {
-        // Trading day → 0 so the gate lets the app start.
-        assert_eq!(trading_day_gate_exit_code(true), 0);
-    }
-
-    #[test]
-    fn test_trading_day_gate_exit_code_non_trading() {
-        // Weekend/holiday → 75 so the gate self-stops the instance.
-        assert_eq!(trading_day_gate_exit_code(false), 75);
-        // 75 must be distinct from the fail-open load-error code 70.
-        assert_ne!(trading_day_gate_exit_code(false), 70);
     }
 
     #[test]

@@ -272,13 +272,13 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// value on drop. Only use while holding [`ENV_LOCK`].
 pub(crate) struct EnvVarGuard {
     key: String,
-    previous: Option<String>,
+    previous: Option<std::ffi::OsString>,
 }
 
 impl EnvVarGuard {
     // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
     pub(crate) fn set(key: &str, value: Option<&str>) -> Self {
-        let previous = std::env::var(key).ok();
+        let previous = std::env::var_os(key);
         match value {
             // SAFETY: every caller holds ENV_LOCK; restored on drop.
             Some(v) => unsafe { std::env::set_var(key, v) },
@@ -307,8 +307,9 @@ impl Drop for EnvVarGuard {
 /// keys, a fixed region, one attempt, no IMDS, no profile files.
 // TEST-EXEMPT: test-only helper (this module is cfg(test)); every sdk_loopback test runs it.
 pub(crate) fn aws_env_guards(endpoint: &str) -> Vec<EnvVarGuard> {
-    vec![
+    let mut guards = vec![
         EnvVarGuard::set("AWS_ENDPOINT_URL", Some(endpoint)),
+        EnvVarGuard::set("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", Some("false")),
         EnvVarGuard::set("AWS_ACCESS_KEY_ID", Some("AKIDLOOPBACK")),
         EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", Some("loopback-secret")),
         EnvVarGuard::set("AWS_SESSION_TOKEN", None),
@@ -321,8 +322,27 @@ pub(crate) fn aws_env_guards(endpoint: &str) -> Vec<EnvVarGuard> {
             "AWS_SHARED_CREDENTIALS_FILE",
             Some("/nonexistent/tv-loopback-credentials"),
         ),
-    ]
+    ];
+    // A service-specific endpoint overrides AWS_ENDPOINT_URL. Claim every
+    // client this crate constructs so host settings cannot send a fixture
+    // request outside its owned listener. Restore all values on drop.
+    guards.extend(
+        AWS_SERVICE_ENDPOINT_KEYS
+            .iter()
+            .map(|key| EnvVarGuard::set(key, Some(endpoint))),
+    );
+    guards
 }
+
+const AWS_SERVICE_ENDPOINT_KEYS: [&str; 7] = [
+    "AWS_ENDPOINT_URL_SSM",
+    "AWS_ENDPOINT_URL_EC2",
+    "AWS_ENDPOINT_URL_SNS",
+    "AWS_ENDPOINT_URL_BUDGETS",
+    "AWS_ENDPOINT_URL_EVENTBRIDGE",
+    "AWS_ENDPOINT_URL_CLOUDWATCH",
+    "AWS_ENDPOINT_URL_LAMBDA",
+];
 
 /// A scripted AWS account for the multi-service `handle` tests: one EC2
 /// instance, a set of SSM parameters, one budget, SNS and EventBridge that
@@ -492,10 +512,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_aws_env_guards_override_and_restore_host_endpoint_settings() {
+        let _lock = env_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime")
+            .block_on(async {
+                let (alternate, alternate_requests) = start_fleet(Fleet::default()).await;
+                let mut fleet = Fleet::default();
+                fleet
+                    .ssm
+                    .insert("/loopback/owned".to_owned(), "owned".to_owned());
+                let (endpoint, requests) = start_loopback_aws(move |request| {
+                    if request.path == "/2015-03-31/functions" {
+                        LoopbackResponse::json(200, r#"{"Functions":[]}"#)
+                    } else {
+                        fleet.respond(request)
+                    }
+                })
+                .await;
+                let _ambient_endpoint = EnvVarGuard::set("AWS_ENDPOINT_URL", Some(&alternate));
+                let _ambient_ignore =
+                    EnvVarGuard::set("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", Some("true"));
+                let _ambient_services: Vec<_> = AWS_SERVICE_ENDPOINT_KEYS
+                    .iter()
+                    .map(|key| EnvVarGuard::set(key, Some(&alternate)))
+                    .collect();
+                {
+                    let _aws = aws_env_guards(&endpoint);
+                    let config = crate::clients::sdk_config().await;
+                    assert_eq!(config.endpoint_url(), Some(endpoint.as_str()));
+                    // Service-specific endpoint settings are resolved while constructing
+                    // each client. Exercise the real request path rather than infer
+                    // their endpoint from the shared config alone.
+                    let reply = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::clients::ssm(&config)
+                            .get_parameter()
+                            .name("/loopback/owned")
+                            .send(),
+                    )
+                    .await
+                    .expect("owned loopback request deadline")
+                    .expect("owned loopback response");
+                    assert_eq!(reply.parameter().and_then(|p| p.value()), Some("owned"));
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        crate::clients::ec2(&config)
+                            .describe_instances()
+                            .send()
+                            .await
+                            .expect("owned EC2 response");
+                        crate::clients::sns(&config)
+                            .publish()
+                            .topic_arn("arn:aws:sns:ap-south-1:123456789012:loopback")
+                            .message("fixture")
+                            .send()
+                            .await
+                            .expect("owned SNS response");
+                        crate::clients::eventbridge(&config)
+                            .list_event_buses()
+                            .send()
+                            .await
+                            .expect("owned EventBridge response");
+                        crate::clients::cloudwatch(&config)
+                            .set_alarm_state()
+                            .alarm_name("loopback")
+                            .state_value(aws_sdk_cloudwatch::types::StateValue::Ok)
+                            .state_reason("fixture")
+                            .send()
+                            .await
+                            .expect("owned CloudWatch response");
+                        crate::clients::lambda(&config)
+                            .list_functions()
+                            .send()
+                            .await
+                            .expect("owned Lambda response");
+                        crate::clients::budgets_us_east_1()
+                            .await
+                            .describe_budget()
+                            .account_id("123456789012")
+                            .budget_name("tv")
+                            .send()
+                            .await
+                            .expect("owned Budgets response");
+                    })
+                    .await
+                    .expect("all service endpoints stay within owned loopback deadline");
+                    assert_eq!(
+                        operations(&requests),
+                        vec![
+                            "AmazonSSM.GetParameter",
+                            "DescribeInstances",
+                            "Publish",
+                            "AWSEvents.ListEventBuses",
+                            "SetAlarmState",
+                            "",
+                            "AWSBudgetServiceGateway.DescribeBudget",
+                        ]
+                    );
+                    assert_eq!(recorded(&requests)[5].path, "/2015-03-31/functions");
+                    assert!(recorded(&alternate_requests).is_empty());
+                }
+                assert_eq!(
+                    std::env::var("AWS_ENDPOINT_URL").ok().as_deref(),
+                    Some(alternate.as_str())
+                );
+                assert_eq!(
+                    std::env::var("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
+                        .ok()
+                        .as_deref(),
+                    Some("true")
+                );
+                for key in AWS_SERVICE_ENDPOINT_KEYS {
+                    assert_eq!(std::env::var(key).ok().as_deref(), Some(alternate.as_str()));
+                }
+            });
+    }
+
+    #[test]
     fn test_query_action_and_form_value_read_the_form_body() {
         let request = LoopbackRequest {
             target: String::new(),
             body: "Action=DescribeInstances&Version=2016-11-15&InstanceId.1=i-0abc".to_string(),
+            path: "/".to_owned(),
         };
         assert_eq!(request.query_action().as_deref(), Some("DescribeInstances"));
         assert_eq!(

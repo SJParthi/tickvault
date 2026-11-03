@@ -3308,28 +3308,35 @@ mod sdk_loopback_tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_handle_runs_the_guard_against_a_stopped_box_without_stopping_it() {
-        let (endpoint, requests) = start_fleet(Fleet {
-            instance_state: Some("stopped"),
-            ..Fleet::default()
-        })
-        .await;
+    #[test]
+    fn test_handle_runs_the_guard_against_a_stopped_box_without_stopping_it() {
         let _lock = env_lock();
-        let _aws = aws_env_guards(&endpoint);
-        let _id = EnvVarGuard::set("INSTANCE_ID", Some("i-0loopback"));
-        let _topic = EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
-        let _rule = EnvVarGuard::set("START_RULE_NAME", Some("tv-prod-start"));
-        let _acct = EnvVarGuard::set(BUDGET_ACCOUNT_ID_ENV, Some("123456789012"));
-        let _name = EnvVarGuard::set(BUDGET_NAME_ENV, Some("tv-prod-monthly"));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread fixture runtime")
+            .block_on(async {
+                let (endpoint, requests) = start_fleet(Fleet {
+                    instance_state: Some("stopped"),
+                    ..Fleet::default()
+                })
+                .await;
+                let _aws = aws_env_guards(&endpoint);
+                let _id = EnvVarGuard::set("INSTANCE_ID", Some("i-0loopback"));
+                let _topic =
+                    EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
+                let _rule = EnvVarGuard::set("START_RULE_NAME", Some("tv-prod-start"));
+                let _acct = EnvVarGuard::set(BUDGET_ACCOUNT_ID_ENV, Some("123456789012"));
+                let _name = EnvVarGuard::set(BUDGET_NAME_ENV, Some("tv-prod-monthly"));
 
-        let out = handle(json!({})).await.expect("the guard runs");
-        assert!(out.is_object(), "{out}");
-        let ops = operations(&requests);
-        assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
-        assert!(
-            !ops.iter().any(|o| o == "StopInstances"),
-            "a stopped box is never stopped again: {ops:?}"
-        );
+                let out = handle(json!({})).await.expect("the guard runs");
+                assert!(out.is_object(), "{out}");
+                let ops = operations(&requests);
+                assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+                assert!(
+                    !ops.iter().any(|o| o == "StopInstances"),
+                    "a stopped box is never stopped again: {ops:?}"
+                );
+            });
     }
 }

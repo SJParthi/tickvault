@@ -29,12 +29,24 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("tv-cov-brutex-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        Self(dir)
+        const MAX_ATTEMPTS: usize = 64;
+        for _ in 0..MAX_ATTEMPTS {
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("tv-cov-brutex-{tag}-{}-{n}", std::process::id()));
+            match Self::create_at(dir) {
+                Ok(scratch) => return scratch,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create scratch dir: {error}"),
+            }
+        }
+        panic!("could not claim a scratch directory after {MAX_ATTEMPTS} attempts")
+    }
+
+    fn create_at(dir: PathBuf) -> std::io::Result<Self> {
+        // A guard may remove only a directory this call created exclusively.
+        std::fs::create_dir(&dir)?;
+        Ok(Self(dir))
     }
     fn path(&self) -> &Path {
         &self.0
@@ -45,6 +57,22 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn scratch_collision_preserves_the_existing_directory_and_contents() {
+    let original = Scratch::new("collision-owner");
+    let sentinel = original.path().join("sentinel");
+    std::fs::write(&sentinel, b"owned by the original fixture").expect("sentinel");
+    let collision = Scratch::create_at(original.path().to_owned());
+    assert!(
+        matches!(collision, Err(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    drop(collision);
+    assert_eq!(
+        std::fs::read(&sentinel).expect("original sentinel retained"),
+        b"owned by the original fixture"
+    );
 }
 
 fn known_all(_: InstrumentKey) -> bool {

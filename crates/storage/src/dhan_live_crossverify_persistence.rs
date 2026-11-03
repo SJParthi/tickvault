@@ -111,6 +111,8 @@
 //! the DEDUP key: how much of the session the run's targets were subscribed for,
 //! from the day's own subscribe record. Plan item 51f reads them to hold the S3
 //! archive and to keep a `clean` day at `partial`; they never touch `diverged`.
+//! The two minute counts mean something only when `coverage_known` is true: a
+//! row with it false may still carry the record's counts (review round 2).
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -514,11 +516,12 @@ pub struct DhanLiveXverifyDailyRow {
     pub planned_instrument_minutes: i64,
     /// Plan item 51e: of `planned_instrument_minutes`, the minutes that start
     /// at or after each target's first subscribed second of the day (from the
-    /// day's own record). 0 when `coverage_known` is false. Outside the DEDUP
-    /// key.
+    /// day's own record). May retain counts when `coverage_known` is false;
+    /// those counts cannot establish coverage. Outside the DEDUP key.
     pub covered_instrument_minutes: i64,
-    /// Plan item 51e: the targets came from the day's own record. `false`
-    /// when it was absent or unreadable and the boot set was checked instead.
+    /// Plan item 51e: the target record has known completeness metadata.
+    /// `false` for an absent/unreadable/legacy/incomplete record, or a current
+    /// unfinished widen/unsaved set. This is not continuous delivery evidence.
     /// Outside the DEDUP key.
     pub coverage_known: bool,
 }
