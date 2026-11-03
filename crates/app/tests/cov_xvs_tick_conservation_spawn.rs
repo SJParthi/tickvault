@@ -166,7 +166,19 @@ async fn test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_ca
             assert!(line.contains("verdict=partial"), "{line}");
             assert!(line.contains("reason=process_started_mid_day"), "{line}");
             assert!(line.contains("db_tick_rows=10i"), "{line}");
-            assert!(line.contains("count_reads=1i"), "{line}");
+            // The count settles the verdict on the first read that answers.
+            // Under the paused clock that read can time out: `drive_paused`
+            // steps virtual time once the fake server has been quiet for a
+            // moment of real time, and if the task has woken but not yet
+            // connected, the step passes the 30 s query timeout. The task then
+            // reads again 120 s later, as it should. Reproduced locally about
+            // once in 30 runs (count_reads=2i, db_tick_rows=10i). So one or two
+            // reads are both correct here; `db_tick_rows=10i` above proves a
+            // read answered, and a third read would mean neither did.
+            assert!(
+                line.contains("count_reads=1i") || line.contains("count_reads=2i"),
+                "{line}"
+            );
         } else {
             assert!(
                 daily.is_empty(),
