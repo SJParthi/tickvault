@@ -524,6 +524,11 @@ pub(super) struct FnoStocksInputs<'a> {
     pub(super) artifact_dir: &'a Path,
     pub(super) market_open: bool,
     pub(super) now_ist: chrono::NaiveDateTime,
+    /// A chosen past IST minute to read instead of now (owner 2026-11-03:
+    /// pick any stored date and time). `None` reads now. When set, the
+    /// answer is a stored-session read: `closed`, `market_open` false, the
+    /// window `[that day 09:15, min(at, that day 15:40)]`.
+    pub(super) read_at_ist: Option<chrono::NaiveDateTime>,
     pub(super) timeout: Duration,
 }
 
@@ -543,13 +548,16 @@ pub(super) async fn compute_for_list(
     let observed_at_epoch_secs = inputs.now_ist.and_utc().timestamp()
         - chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS).num_seconds();
     let total = list.as_ref().map_or(0, |l| l.len());
-    let open = inputs.market_open;
+    // A chosen minute is always a stored-session read, never live.
+    let read_at = inputs.read_at_ist.map(|at| at.min(inputs.now_ist));
+    let open = inputs.market_open && read_at.is_none();
+    let at = read_at.unwrap_or(inputs.now_ist);
     // Closed: read the session that just ended (owner 2026-11-03). Before the
     // day's 09:15 there is nothing to show, so the answer stays empty `closed`.
     let closed_window = if open {
         None
     } else {
-        match closed_session_window(inputs.now_ist) {
+        match closed_session_window(at) {
             Some(window) => Some(window),
             None => {
                 return FnoStocksResponse::empty("closed", false, total, observed_at_epoch_secs);
@@ -598,7 +606,7 @@ pub(super) async fn compute_for_list(
         return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
     };
     // A newest row inside the forward skew reads as age 0, never negative.
-    let age = (inputs.now_ist - newest).num_seconds().max(0);
+    let age = (at - newest).num_seconds().max(0);
     let window_secs = closed_window.map_or(FNO_STOCKS_WINDOW_SECS, |(s, e)| {
         (e - s).num_seconds().clamp(1, FNO_STOCKS_MAX_WINDOW_SECS)
     });
@@ -641,6 +649,7 @@ pub async fn get_fno_stocks(State(state): State<SharedAppState>) -> Response {
         artifact_dir: Path::new(FNO_UNDERLYING_ARTIFACT_DIR),
         market_open: tickvault_common::market_hours::is_trading_session_now(),
         now_ist: now_ist_naive(),
+        read_at_ist: None,
         timeout: Duration::from_secs(FNO_STOCKS_QUERY_TIMEOUT_SECS),
     })
     .await;
@@ -723,6 +732,7 @@ pub(super) mod tests {
             artifact_dir: dir,
             market_open,
             now_ist: at(NOW),
+            read_at_ist: None,
             timeout: Duration::from_millis(300),
         })
         .await

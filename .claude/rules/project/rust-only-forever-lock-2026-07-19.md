@@ -29,6 +29,8 @@
 
 **§0.15 (2026-10-30, APPROVED by the owner on the card "Yes, raise it (Recommended)"; earlier ask "yes add the fno stocks page to dashboard dude"):** the dashboard's script budget rows in `browser_surface_and_toolchain_guard.rs` may grow from 235 to at most 301 lines and from 8,781 to at most 12,194 bytes, for the F&O stocks movers section only (PR #2141). `SCRIPT_BUDGET` and `HTML_ALLOWED_FRONTEND` unchanged. REJECT: going above those numbers or raising them again without a fresh dated note; a new script tag, page or HTML file; growing any other row; using it for anything else.
 
+**§0.18 (2026-11-03, owner: "why the fucvkign exisitng data is not available dude with available dates and times for slection dude okay? in top movers dude okay?", after approving the "Approve, build it" design card):** the operator portal's Stocks view gets a date and an IST time input; the chosen minute travels as the movers filter's optional `as_of`, and the read stays in Rust. The portal's JS_BYTE_BUDGET row may grow from 34,530 to at most 34,714 bytes; lines (308 of 350), script tags and inline handlers unchanged. REJECT: going above that, a new script tag, page or handler, or using it for anything else.
+
 The dated §0.x SCOPE FIX sections each add further REJECT rows for specific guard holes (interpreter invocations, build systems in the dependency graph, etc.) — read them before touching the guard.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update THIS file FIRST with a fresh dated quote, only then can the PR land."

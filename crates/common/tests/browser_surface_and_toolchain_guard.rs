@@ -1242,9 +1242,11 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/dashboard_page.rs", 10_953),
     ("crates/api/src/handlers/feeds_page.rs", 9_720),
     // Requested Stocks reference view, 2026-11-02; measured scope in §0.17.
+    // 34,530 → 34,714 on 2026-11-03: the movers date and time selection,
+    // owner-requested in rust-only-forever-lock-2026-07-19.md §0.18.
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        34_530,
+        34_714,
     ),
 ];
 
