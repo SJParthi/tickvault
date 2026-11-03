@@ -307,7 +307,12 @@ fn finish(
 async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
     let now = inputs.now_ist.and_utc().timestamp()
         - chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS).num_seconds();
-    let date = inputs.now_ist.format("%Y-%m-%d").to_string();
+    // A chosen minute reads that day's lists; otherwise today's.
+    let at = inputs
+        .read_at_ist
+        .map_or(inputs.now_ist, |at| at.min(inputs.now_ist));
+    let open = inputs.market_open && inputs.read_at_ist.is_none();
+    let date = at.format("%Y-%m-%d").to_string();
     let fno = fno_stocks::load_fno_underlyings(&fno_stocks::fno_underlying_artifact_path(
         inputs.artifact_dir,
         &date,
@@ -315,25 +320,17 @@ async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
     let membership = load_memberships(inputs.artifact_dir, &date);
     let finish_empty = |status| {
         finish(
-            FnoStocksResponse::empty(status, inputs.market_open, 0, now),
+            FnoStocksResponse::empty(status, open, 0, now),
             filter.clone(),
             membership.as_deref(),
             fno.as_deref(),
         )
     };
     if filter.fno_only && fno.is_none() {
-        return finish_empty(if inputs.market_open {
-            "no_fno_list"
-        } else {
-            "closed"
-        });
+        return finish_empty(if open { "no_fno_list" } else { "closed" });
     }
     if (!filter.fno_only || filter.index.is_some()) && membership.is_none() {
-        return finish_empty(if inputs.market_open {
-            "no_index_list"
-        } else {
-            "closed"
-        });
+        return finish_empty(if open { "no_index_list" } else { "closed" });
     }
     let names = if filter.fno_only {
         fno.as_ref().map(|f| &f.names)
@@ -341,22 +338,14 @@ async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
         membership.as_ref().map(|m| &m.names)
     };
     let Some(names) = names else {
-        return finish_empty(if inputs.market_open {
-            "no_index_list"
-        } else {
-            "closed"
-        });
+        return finish_empty(if open { "no_index_list" } else { "closed" });
     };
     let selected_index = filter
         .index
         .as_ref()
         .and_then(|name| membership.as_ref()?.indices.binary_search(name).ok());
     if filter.index.is_some() && selected_index.is_none() {
-        return finish_empty(if inputs.market_open {
-            "no_index_list"
-        } else {
-            "closed"
-        });
+        return finish_empty(if open { "no_index_list" } else { "closed" });
     }
     let names: HashMap<_, _> = names
         .iter()
@@ -374,11 +363,7 @@ async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
         return Reply::error(BridgeError::ResponseTooLarge, now);
     }
     if names.is_empty() {
-        return finish_empty(if inputs.market_open {
-            "no_data"
-        } else {
-            "closed"
-        });
+        return finish_empty(if open { "no_data" } else { "closed" });
     }
     // Closed or open, the price engine decides: after the close it reads the
     // session that just ended so stored prices always show (owner 2026-11-03).
@@ -397,6 +382,18 @@ pub async fn get_stock_movers(
     if !filter.valid() {
         return (axum::http::StatusCode::BAD_REQUEST, "Invalid movers filter").into_response();
     }
+    // A chosen minute must be a real calendar minute (the wire checks only
+    // its shape).
+    let read_at_ist = match filter.as_of.as_deref() {
+        None => None,
+        Some(text) => match chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M") {
+            Ok(at) => Some(at),
+            Err(_) => {
+                return (axum::http::StatusCode::BAD_REQUEST, "Invalid movers filter")
+                    .into_response();
+            }
+        },
+    };
     let market_open = tickvault_common::market_hours::is_trading_session_now();
     let now = chrono::Utc::now().timestamp();
     let Ok(mut slot) = state.stock_movers_cache().slot.try_lock() else {
@@ -422,6 +419,7 @@ pub async fn get_stock_movers(
             artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
             market_open,
             now_ist: fno_stocks::now_ist_naive(),
+            read_at_ist,
             timeout: QUERY_TIMEOUT,
         },
         filter.clone(),
@@ -532,6 +530,10 @@ mod tests {
                 artifact_dir: dir,
                 market_open: open,
                 now_ist: at("2026-10-30 11:15:30"),
+                read_at_ist: filter
+                    .as_of
+                    .as_deref()
+                    .map(|t| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M").unwrap()),
                 timeout: Duration::from_millis(300),
             },
             filter,
@@ -978,6 +980,31 @@ mod tests {
             snapshot(run(&f.0, "http://127.0.0.1:1", true, Filter::default()).await).status,
             SourceStatus::Unreachable
         );
+    }
+    #[tokio::test]
+    async fn chosen_minute_reads_the_stored_session_even_while_the_market_is_open() {
+        // Owner 2026-11-03: pick any stored date and time on the movers page.
+        let f = Fixture::new(8);
+        let url = http("200 OK", prices(8, "2026-10-30T09:59:10.000000Z")).await;
+        let filter = Filter {
+            as_of: Some("2026-10-30T10:00".into()),
+            ..Filter::default()
+        };
+        let s = snapshot(run(&f.0, &url, true, filter.clone()).await);
+        assert_eq!(s.status, SourceStatus::Closed);
+        assert!(!s.market_open);
+        assert!(!s.rows.is_empty());
+        assert_eq!(s.filter, filter);
+        assert_eq!(s.as_of_ist.as_deref(), Some("09:59:10"));
+        assert_eq!(s.data_age_secs, Some(50));
+        // Before that day's 09:15 nothing traded: an empty `closed`, no query.
+        let early = Filter {
+            as_of: Some("2026-10-30T09:00".into()),
+            ..Filter::default()
+        };
+        let s = snapshot(run(&f.0, "http://127.0.0.1:1", true, early).await);
+        assert_eq!(s.status, SourceStatus::Closed);
+        assert!(s.rows.is_empty());
     }
     #[tokio::test]
     async fn direction_and_missing_close_are_filtered_before_pagination() {

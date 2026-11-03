@@ -1354,3 +1354,26 @@ Scope is this requested Stocks feature only. This note does not authorize a
 new script/runtime/surface, another budget increase, order or depth activation,
 or deployment. Backend sorting and data transport remain Rust; this frontend
 measurement is not a latency, coverage, zero-loss or security guarantee.
+
+## §0.18. 2026-11-03 — date and time selection on the Stocks movers view
+
+The owner, 2026-11-03 (verbatim, typos preserved): "why the fucvkign exisitng
+data is not available dude with available dates and times for slection dude
+okay? in top movers dude okay?", after approving the design card "Approve,
+build it" the same evening, which named a date picker (from 2 Nov) and a time
+picker (9:15 AM to 3:30 PM) on Stocks → Price Movers.
+
+This adds two inputs (a date and an IST time) to the existing Stocks view and
+sends the chosen minute as the optional `as_of` field of the existing movers
+filter. The read, the window and the sort stay in Rust (the API's price
+engine); the page only passes the value through. No new page, script tag,
+external script, inline handler or interpreted backend.
+
+Measured by the guard after implementation: this portal's JS_BYTE_BUDGET row
+moves **34,530 → 34,714 UTF-8 bytes** (+184). JavaScript lines stay 308 within
+the unchanged 350-line ceiling; one script tag; inline handler occurrences
+unchanged at 21. Every other allowance is unchanged.
+
+Scope is this date and time selection only. It authorizes no other budget
+increase, order or depth activation, or deployment. It is not a latency,
+coverage, zero-loss or security guarantee.

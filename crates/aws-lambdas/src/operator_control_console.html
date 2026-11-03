@@ -287,7 +287,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
               <th><button class="sort-button" type="button" data-sort="volume"><span class="sort-indicator"></span>Volume</button></th>
             </tr></thead><tbody id="movers-rows"></tbody></table>
           </div>
-          <div class="mover-searchbar"><div class="stock-query"><input id="movers-search" type="search" maxlength="32" placeholder="Search stocks in this universe" aria-label="Search stocks in this universe"><button id="movers-apply" type="button">Search</button></div><button id="movers-refresh" class="movers-refresh" type="button">Refresh</button></div>
+          <div class="mover-searchbar"><div class="stock-query"><input id="movers-search" type="search" maxlength="32" placeholder="Search stocks in this universe" aria-label="Search stocks in this universe"><button id="movers-apply" type="button">Search</button></div><div class="stock-query"><input id="movers-date" type="date" min="2026-11-02" aria-label="Date to view (empty: today)" title="Pick a stored trading day to view its movers"><input id="movers-time" type="time" step="60" min="09:15" max="15:40" aria-label="Time to view, IST" title="Movers as they stood at this IST minute (empty: 15:30)"></div><button id="movers-refresh" class="movers-refresh" type="button">Refresh</button></div>
           <p id="movers-status" class="mover-status" role="status" aria-live="polite">Open Stocks to load a snapshot.</p>
           <p id="movers-meta" class="mover-meta"></p>
           <div class="mover-page"><p id="movers-selection"></p><button id="movers-prev" type="button" disabled>Previous 20</button><button id="movers-next" type="button" disabled>Next 20</button></div>
@@ -755,8 +755,8 @@ function renderWatch(){
   if(!root.children.length)root.appendChild(stockNode('p',stockWatch.size?'No matching selected stocks.':'Select a stock checkbox to add it to this tab’s watchlist.','watch-empty'));
 }
 function moversMessage(key){return $('movers-messages').getAttribute('data-'+key)||'Movers unavailable.';}
-function moversFilter(){return {fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset,sort_by:moversSort,sort_order:moversOrder};}
-function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset','sort_by','sort_order'].every(k=>a[k]===b[k]);}
+function moversFilter(){return {fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset,sort_by:moversSort,sort_order:moversOrder,as_of:$('movers-date').value?$('movers-date').value+'T'+($('movers-time').value||'15:30'):undefined};}
+function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset','sort_by','sort_order','as_of'].every(k=>a[k]===b[k]);}
 function indexLabel(name){const aliases={'Nifty 50':'Nifty 50','Nifty Bank':'Nifty Bank','Nifty Financial Services':'Fin Nifty','Nifty Next 50':'Nifty Next 50','Nifty Smallcap 50':'Nifty Small Cap 50','Nifty Midcap 50':'Nifty Mid Cap 50','Nifty 100':'NIFTY 100','Nifty 200':'NIFTY 200'};return Object.hasOwn(aliases,name)?aliases[name]:name;}
 function moversIndices(s){
   moversNames=s.index_names;const menu=$('universe-picker'),chosen=$('movers-index').value;menu.replaceChildren(new Option('All','all'),new Option('F&O Stocks','fno'));
@@ -798,7 +798,7 @@ async function loadMovers(){
 }
 function changeMovers(offset=0){moversOffset=offset;moversGeneration++;moversReply=null;renderMovers();loadMovers();}
 $('movers-tab').addEventListener('click',()=>tab('movers'));$('movers-refresh').addEventListener('click',loadMovers);
-$('movers-apply').addEventListener('click',()=>changeMovers());$('movers-search').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();changeMovers();}});
+$('movers-apply').addEventListener('click',()=>changeMovers());$('movers-search').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();changeMovers();}});$('movers-date').addEventListener('change',()=>changeMovers());$('movers-time').addEventListener('change',()=>changeMovers());
 $('movers-prev').addEventListener('click',()=>changeMovers(Math.max(0,moversOffset-20)));$('movers-next').addEventListener('click',()=>changeMovers(moversOffset+20));
 document.querySelectorAll('[data-direction]').forEach(b=>b.addEventListener('click',()=>{$('movers-direction').value=b.dataset.direction;moversSort='change_pct';moversOrder=b.dataset.direction==='gainers'?'desc':'asc';changeMovers();}));
 document.querySelectorAll('[data-sort]').forEach(b=>b.addEventListener('click',()=>{moversOrder=moversSort===b.dataset.sort&&moversOrder==='desc'?'asc':'desc';moversSort=b.dataset.sort;changeMovers();}));
