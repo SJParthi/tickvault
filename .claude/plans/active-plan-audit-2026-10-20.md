@@ -42,6 +42,8 @@ active plans; no unrelated plan is archived and no plan ceiling is increased.
 
 ### Design
 
+MOV1: `compute_for_list` no longer returns early when closed. Closed → window `closed_session_window(now)` and an upper bound `ts <=` in the SQL; open → unchanged 15-minute live read. The wire validators accept `closed` with priced rows.
+
 Integrate exactly the reviewed FORCE_DISK normalization, secret-scanner output
 redaction and order-update active-gauge lifetime fixes. Normalize the workflow's
 remote-template value to literal yes/no while preserving every existing market
@@ -60,6 +62,9 @@ coverage, losslessness, strict latency or future production guarantee is claimed
 
 ### Edge Cases
 
+MOV1: before 09:15, weekend or holiday → empty `closed`; a stock with no trade that day is simply absent (counted as unpriced); a query failure after the close reads `unreachable` / `query_failed`, never `closed`.
+
+
 Only exact lowercase yes opts into FORCE_DISK; empty, malformed and shell/sed
 metacharacter inputs become no. A scanner detection still blocks even if its
 matching line begins with a credential, contains colons or is short. Clean input
@@ -70,6 +75,9 @@ termination and overlapping independent sockets are outside the tested contract.
 
 ### Failure Modes
 
+MOV1: the whole-session read is slower than the 15-minute live read; it gets its own 8 s timeout (measured ~4 s round trip incl. portal on 2026-11-03, 743 NSE_EQ stocks), under the helper's 12 s capture bound.
+
+
 Patch drift must be resolved without copying an older workflow over the newer
 Muhurat logic. The scanner must not weaken a regex, exclusion or blocking exit to
 hide output. The gauge fix must not alter login, authentication, reconnect,
@@ -78,6 +86,9 @@ pending; earlier component tests are evidence for those snapshots, not a pass on
 this integration. Source preparation runs no recovery, service, broker or AWS call.
 
 ### Test Plan
+
+MOV1: api unit tests for the window, the SQL upper bound, closed-with-rows, closed-empty and closed-failure; portal content pin re-pinned for the message text.
+
 
 - [ ] S1. Normalize the actual workflow substitution and retain a Rust behavioral guard.
   - Files: .github/workflows/emergency-fs-recover.yml, crates/common/tests/github_workflow_guard.rs
@@ -118,12 +129,18 @@ focused `0fd844582..HEAD` range. Do not bypass hooks, merge, auto-merge or deplo
 
 ### Rollback
 
+MOV1: revert the PR; the page goes back to a blank table after the close. No data, schema or AWS change.
+
+
 Each component can be reverted through ordinary reviewed Git changes if needed;
 reverting any one reintroduces its documented bug, so assess that consequence.
 There is no infrastructure, deployment, credential rotation or live rollback in
 this task. The original saved component patches remain available outside Git.
 
 ### Observability
+
+MOV1: no new metric; the page meta line shows the newest stored tick time and its age.
+
 
 No new metric or alarm is added. `tv_order_update_ws_active` now returns to zero
 when its connected future exits or is dropped. Scanner findings retain their
@@ -1363,6 +1380,14 @@ Reconciliation 2026-10-31: the current base already keeps the rescue scratch buf
 - [x] O1S4. CLAUDE.md O(1) table: nine new rows plus the `active_order_count` correction; owned-file findings recorded as proposals
   - Files: CLAUDE.md
   - Tests: every_rs_file_named_in_claude_md_table_exists
+
+### ITEM MOV1 — Stocks movers show the ended session's stored prices after the close (2026-11-03)
+
+Requested: owner, 2026-11-03 ("in top movers we should always see the data ... which ever data is completely available in live AWS server should be at least allowed to be displayed"), design approved on the decision card "Approve, build it". This PR is step 1 (server on). Step 2 (a daily S3 file so the page works while the server is off, plus a date/time picker) is a later PR under the same approval.
+
+- [x] MOV1a. After the close, `/api/fno-stocks` and `/api/stock-movers` read the session that just ended (`[09:15, min(now, 15:40)]` IST) instead of returning an empty `closed`; status stays `closed`, `market_open` false; before 09:15 or on a day with no rows it stays empty `closed`; query failures keep their own status
+  - Files: crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/stock_movers.rs, crates/common/src/operator_stock_movers_wire.rs, crates/common/src/operator_movers_wire.rs, crates/aws-lambdas/src/operator_control_console.html, crates/aws-lambdas/src/operator_control.rs
+  - Tests: test_closed_market_shows_the_ended_sessions_stored_prices, test_closed_market_with_no_rows_reads_closed_not_no_data, test_closed_market_failure_stays_a_failure_and_never_reads_open, test_closed_session_window_bounds, test_closed_sql_carries_the_upper_bound_and_live_sql_does_not, closed_stale_partial_empty_and_query_failure_remain_distinct, console_html_content_pin
 
 ## Design
 

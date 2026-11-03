@@ -373,17 +373,15 @@ async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
     if names.len() > MAX_SOURCE_ROWS {
         return Reply::error(BridgeError::ResponseTooLarge, now);
     }
-    if !inputs.market_open {
-        return finish(
-            FnoStocksResponse::empty("closed", false, names.len(), now),
-            filter,
-            membership.as_deref(),
-            fno.as_deref(),
-        );
-    }
     if names.is_empty() {
-        return finish_empty("no_data");
+        return finish_empty(if inputs.market_open {
+            "no_data"
+        } else {
+            "closed"
+        });
     }
+    // Closed or open, the price engine decides: after the close it reads the
+    // session that just ended so stored prices always show (owner 2026-11-03).
     let prices =
         fno_stocks::compute_for_list(inputs, Some(Arc::new(FnoUnderlyings { names }))).await;
     finish(prices, filter, membership.as_deref(), fno.as_deref())
@@ -942,11 +940,18 @@ mod tests {
     #[tokio::test]
     async fn closed_stale_partial_empty_and_query_failure_remain_distinct() {
         let f = Fixture::new(8);
-        let closed = snapshot(run(&f.0, "http://127.0.0.1:1", false, Filter::default()).await);
+        // After the close the stored session prices show (owner 2026-11-03).
+        let url = http("200 OK", prices(8, "2026-10-30T11:15:10.000000Z")).await;
+        let closed = snapshot(run(&f.0, &url, false, Filter::default()).await);
         assert_eq!(closed.status, SourceStatus::Closed);
-        assert!(closed.rows.is_empty());
+        assert!(!closed.market_open);
+        assert!(!closed.rows.is_empty());
         assert!(closed.universe_available);
         assert_eq!(closed.universe_total, 4);
+        let failed_closed =
+            snapshot(run(&f.0, "http://127.0.0.1:1", false, Filter::default()).await);
+        assert_eq!(failed_closed.status, SourceStatus::Unreachable);
+        assert!(failed_closed.rows.is_empty());
         let url = http("200 OK", prices(2, "2026-10-30T11:10:00.000000Z")).await;
         let stale = snapshot(run(&f.0, &url, true, Filter::default()).await);
         assert_eq!(stale.status, SourceStatus::Stale);
