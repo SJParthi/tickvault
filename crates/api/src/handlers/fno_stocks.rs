@@ -88,6 +88,14 @@ pub const FNO_STOCKS_WINDOW_SECS: i64 = 900;
 /// The newest row may be at most this old for the answer to read `live`.
 pub const FNO_STOCKS_LIVE_MAX_AGE_SECS: i64 = 60;
 
+/// How far an exchange trade time may run ahead of this box's clock and still
+/// count. The query keeps only each stock's newest row, so a tighter bound
+/// would drop a stock whose newest trade is stamped a second ahead instead of
+/// falling back to an older row. Same value as the spot price store's
+/// `FUTURE_TRADE_TIME_SKEW_SECS`; a row further ahead is a wrong clock and is
+/// still refused.
+const FNO_STOCKS_FUTURE_SKEW_SECS: i64 = 5;
+
 /// Upper bound on rows the query may return. The F&O list is about 220
 /// stocks; the bound only stops a malformed list from asking for more.
 const FNO_STOCKS_MAX_ROWS: usize = 1_000;
@@ -526,7 +534,7 @@ pub(super) async fn compute_for_list(
             r.ltp.is_finite()
                 && r.ltp > 0.0
                 && r.ts >= window_start(inputs.now_ist)
-                && r.ts <= inputs.now_ist
+                && r.ts <= inputs.now_ist + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS)
         })
         .collect();
     let newest = rows
@@ -538,7 +546,8 @@ pub(super) async fn compute_for_list(
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
         return FnoStocksResponse::empty("no_data", true, total, observed_at_epoch_secs);
     };
-    let age = (inputs.now_ist - newest).num_seconds();
+    // A newest row inside the forward skew reads as age 0, never negative.
+    let age = (inputs.now_ist - newest).num_seconds().max(0);
     FnoStocksResponse {
         status: if age <= FNO_STOCKS_LIVE_MAX_AGE_SECS {
             "live"
@@ -885,6 +894,28 @@ pub(super) mod tests {
             Some("11:15:10"),
             "the index row sets no time"
         );
+    }
+
+    #[tokio::test]
+    async fn test_regression_newest_row_slightly_ahead_of_the_clock_is_kept() {
+        // NOW is 11:15:30. The newest trade is stamped 3 s ahead: the stock
+        // stays on the page with age 0. One 10 s ahead is a wrong clock and is
+        // refused, so only the other stock remains.
+        let dir = list_dir("ahead");
+        let ahead = r#"[2885,"NSE_EQ",1450.5,1400.0,1,1450.0,"2026-10-30T11:15:33.000000Z"]"#;
+        let url = mock("200 OK", dataset(&[ahead])).await;
+        let r = run(&url, &dir, true).await;
+        assert_eq!(r.status, "live");
+        assert_eq!(r.stocks_priced, 1);
+        assert_eq!(r.data_age_secs, Some(0));
+        assert_eq!(r.as_of_ist.as_deref(), Some("11:15:33"));
+
+        let far = r#"[2885,"NSE_EQ",1450.5,1400.0,1,1450.0,"2026-10-30T11:15:40.000000Z"]"#;
+        let url = mock("200 OK", dataset(&[far, INFY])).await;
+        let r = run(&url, &dir, true).await;
+        let names: Vec<&str> = r.stocks.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["INFY"]);
+        assert_eq!(r.data_age_secs, Some(5));
     }
 
     #[tokio::test]
