@@ -383,7 +383,7 @@ mod tests {
         }
     }
     #[test]
-    fn as_of_shape_accepts_only_a_full_ist_minute() {
+    fn test_valid_as_of_shape_accepts_only_a_full_ist_minute() {
         assert!(valid_as_of_shape("2026-11-03T15:29"));
         for bad in [
             "",
