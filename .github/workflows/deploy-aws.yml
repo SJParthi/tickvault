@@ -757,9 +757,11 @@ jobs:
           # CLI's exact ParameterNotFound classification proves absence.
           # GNU date round-trips the expected month/date form; raw values and
           # provider error bodies never reach logs. Each provider read is bounded.
+          # A suffix preserves trailing bytes through shell capture; only one
+          # normal CLI newline is removed. Local C locale makes lengths bytes.
           read_stop_fence() { local kind="$1" suffix="$2" format="$3" raw rc LC_ALL=C expected=10; [ "$kind" != budget ] || expected=7; shift 3
-            if raw=$(timeout -k 5 20 "$@" 2>&1 | tr '\000' '?' | head -c 4097); then [ "${#raw}" = "$expected" ] && [ "$(date -u -d "${raw}${suffix}" +"$format" 2>/dev/null)" = "$raw" ] || { echo "::error::DEPLOY_FENCE $kind invalid; refusing start" >&2; return 1; }; echo "DEPLOY_FENCE $kind=valid" >&2; printf '%s' "$raw"
-            else rc=$?; if { [ "$rc" = 254 ] || [ "$rc" = 255 ]; } && [ "${#raw}" -le 4096 ] && [[ "$raw" =~ ^[[:space:]]*An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then echo "DEPLOY_FENCE $kind=absent" >&2; else echo "::error::DEPLOY_FENCE $kind unavailable; refusing start" >&2; return 1; fi; fi
+            if raw=$(timeout -k 5 20 "$@" 2>&1 | tr '\000' '?' | head -c 4097; rc=$?; printf '.'; exit "$rc"); then raw=${raw%.}; raw=${raw%$'\n'}; [ "${#raw}" = "$expected" ] && [ "$(date -u -d "${raw}${suffix}" +"$format" 2>/dev/null)" = "$raw" ] || { echo "::error::DEPLOY_FENCE $kind invalid; refusing start" >&2; return 1; }; echo "DEPLOY_FENCE $kind=valid" >&2; printf '%s' "$raw"
+            else rc=$?; raw=${raw%.}; if { [ "$rc" = 254 ] || [ "$rc" = 255 ]; } && [ "${#raw}" -le 4096 ] && [[ "$raw" =~ ^[[:space:]]*An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then echo "DEPLOY_FENCE $kind=absent" >&2; else echo "::error::DEPLOY_FENCE $kind unavailable; refusing start" >&2; return 1; fi; fi
           }
           LATCH=$(read_stop_fence budget -01 %Y-%m aws ssm get-parameter --region "$REGION" --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text) || exit 1
           if [ -n "$LATCH" ] && [ "$LATCH" = "$(date -u +%Y-%m)" ]; then

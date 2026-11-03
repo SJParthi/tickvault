@@ -410,22 +410,24 @@ jobs:
 
       # Audit PR30 (2026-09-27): while the budget-stop latch names the current
       # UTC billing month, plan the daily-start rule as DISABLED so this
-      # apply never undoes a budget stop. FAIL-OPEN: an unreadable or missing
-      # latch plans the rule ENABLED as before (the hourly hard-stop guard
-      # still stops a breached box within the hour and disables it again).
+      # apply never undoes a budget stop. Unreadable/malformed values fail
+      # closed; only a classified ParameterNotFound proves absence. Keep the
+      # provider body bounded/private and preserve the known absent/old default.
+      # Append a sentinel before shell capture strips trailing newlines; remove
+      # only that sentinel and one CLI newline, retaining malformed/oversize tails.
       - name: Read the budget-stop latch
         if: github.event_name != 'pull_request'
         run: |
-          set -uo pipefail
-          LATCH=$(aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" \
-            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-          MONTH=$(date -u +%Y-%m)
-          if [ -n "${LATCH}" ] && [ "${LATCH}" = "${MONTH}" ]; then
+          set -euo pipefail; export LC_ALL=C
+          if LATCH=$(timeout -k 5 20 aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text 2>&1 | tr '\000' '?' | head -c 4097; RC=$?; printf '.'; exit "$RC"); then
+            LATCH=${LATCH%.}; LATCH=${LATCH%$'\n'}; [ "${#LATCH}" = 7 ] && [ "$(LC_ALL=C date -u -d "${LATCH}-01" +%Y-%m 2>/dev/null)" = "$LATCH" ] || { echo "::error::TF_BUDGET_FENCE invalid; refusing planning"; exit 1; }
+          else
+            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing planning"; exit 1; fi
+          fi
+          MONTH=$(date -u +%Y-%m); if [ "$LATCH" = "$MONTH" ]; then
             echo "::warning::budget-stop latch holds for ${MONTH} — planning the daily-start rule DISABLED"
             echo "TF_VAR_daily_start_enabled=false" >> "$GITHUB_ENV"
-          else
-            echo "budget-stop latch not set for ${MONTH} — daily-start rule planned ENABLED"
-          fi
+          else echo "TF_BUDGET_FENCE confirmed absent or nonmatching — daily-start default unchanged"; fi
 
       - name: terraform plan
         if: github.event_name != 'pull_request'
@@ -636,19 +638,19 @@ jobs:
       # step), and $GITHUB_ENV from the plan job does not cross jobs, so the
       # latch is read again here. Without this step the real apply planned
       # the daily-start rule ENABLED on every run and undid a budget stop.
-      # Same fail-open read as the plan job; the raw value is never echoed.
+      # The same fail-closed read runs here; raw values/errors are never echoed.
       - name: Read the budget-stop latch
         run: |
-          set -uo pipefail
-          LATCH=$(aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" \
-            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-          MONTH=$(date -u +%Y-%m)
-          if [ -n "${LATCH}" ] && [ "${LATCH}" = "${MONTH}" ]; then
+          set -euo pipefail; export LC_ALL=C
+          if LATCH=$(timeout -k 5 20 aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text 2>&1 | tr '\000' '?' | head -c 4097; RC=$?; printf '.'; exit "$RC"); then
+            LATCH=${LATCH%.}; LATCH=${LATCH%$'\n'}; [ "${#LATCH}" = 7 ] && [ "$(LC_ALL=C date -u -d "${LATCH}-01" +%Y-%m 2>/dev/null)" = "$LATCH" ] || { echo "::error::TF_BUDGET_FENCE invalid; refusing applying"; exit 1; }
+          else
+            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing applying"; exit 1; fi
+          fi
+          MONTH=$(date -u +%Y-%m); if [ "$LATCH" = "$MONTH" ]; then
             echo "::warning::budget-stop latch holds for ${MONTH} — applying the daily-start rule DISABLED"
             echo "TF_VAR_daily_start_enabled=false" >> "$GITHUB_ENV"
-          else
-            echo "budget-stop latch not set for ${MONTH} — daily-start rule applied ENABLED"
-          fi
+          else echo "TF_BUDGET_FENCE confirmed absent or nonmatching — daily-start default unchanged"; fi
 
       - name: terraform apply
         # Re-plan + apply on THIS runner instead of applying the saved tfplan.

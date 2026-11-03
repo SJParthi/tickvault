@@ -1,4 +1,4 @@
-//! Execute the actual deployment preflight with owned fake AWS commands.
+//! Execute the actual deployment and Terraform stop-fence steps with fake AWS.
 //! No cloud calls, activation, inherited-environment clearing, or real host edits.
 #![cfg(test)]
 #![cfg(target_os = "linux")]
@@ -144,9 +144,16 @@ case "$1 $2" in
       absent) echo "$missing" >&2; exit 254;;
       absent_v1) echo "$missing" >&2; exit 255;;
       old) echo "$past";;
+      future) echo 2026-12;;
       current) echo "$current";;
       empty) :;;
       none) echo None;;
+      whitespace) echo " $past";;
+      trailing_newline) printf '%s\n\n' "$past";;
+      oversized_newlines) printf '%s' "$past"; printf '%5000s' '' | tr ' ' '\n';;
+      oversized_multibyte_error) printf '%s' "$missing" >&2; printf '\303\251%.0s' {1..2100} >&2; exit 254;;
+      oversized_missing_newlines) printf '%s' "$missing" >&2; printf '%5000s' '' | tr ' ' '\n' >&2; exit 254;;
+      multiple) printf '%s\n%s\n' "$past" "$current";;
       invalid) echo "$invalid";;
       five_digit_year) echo "$five";;
       nul) printf '%s\000' "$past";;
@@ -212,6 +219,10 @@ fn test_regression_deploy_unknown_or_malformed_marker_never_starts_or_logs_body(
     for mode in [
         "empty",
         "none",
+        "trailing_newline",
+        "oversized_newlines",
+        "oversized_missing_newlines",
+        "oversized_multibyte_error",
         "invalid",
         "five_digit_year",
         "nul",
@@ -224,6 +235,10 @@ fn test_regression_deploy_unknown_or_malformed_marker_never_starts_or_logs_body(
         "oversized",
         "oversized_error",
     ] {
+        assert!(
+            AWS.contains(&format!("{mode})")),
+            "fixture must generate {mode}"
+        );
         for holiday in [false, true] {
             let fixture = Fixture::new();
             let output = if holiday {
@@ -406,4 +421,138 @@ fn test_regression_backup_branch_precedes_all_normal_smoke_actions() {
     );
     assert!(ensure.contains("timeout -k 5 20 \"$@\""));
     assert!(ensure.contains("head -c 4097"));
+    assert!(ensure.contains("rc=$?; printf '.'; exit \"$rc\""));
+    assert!(ensure.contains("LC_ALL=C expected=10"));
+}
+
+fn terraform_budget_steps() -> Vec<String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        fs::read_to_string(root.join("../../.github/workflows/terraform-apply.yml")).unwrap();
+    let marker = "- name: Read the budget-stop latch";
+    let steps: Vec<_> = source
+        .split(marker)
+        .skip(1)
+        .map(|tail| step_run(&format!("{marker}{tail}"), marker))
+        .collect();
+    assert_eq!(
+        steps.len(),
+        2,
+        "both planning and applying must retain the fence"
+    );
+    steps
+}
+
+#[test]
+fn test_regression_terraform_budget_confirmed_absence_and_valid_nonmatching_keep_default() {
+    for step in terraform_budget_steps() {
+        for mode in ["absent", "absent_v1", "old", "future"] {
+            let fixture = Fixture::new();
+            let output = fixture
+                .command(&step)
+                .env("BUDGET_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{mode}: {:?}", output.status);
+            assert!(
+                fixture.text("environment").is_empty(),
+                "no unrequested enable/disable override"
+            );
+            assert_eq!(fixture.text("calls"), "ssm get-parameter\n");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains("TF_BUDGET_FENCE confirmed absent or nonmatching"));
+            assert!(!text.contains("PRIVATE_MARKER"));
+        }
+    }
+}
+
+#[test]
+fn test_regression_terraform_budget_current_month_disables_daily_start_in_both_jobs() {
+    for step in terraform_budget_steps() {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command(&step)
+            .env("BUDGET_MODE", "current")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+        assert_eq!(
+            fixture.text("environment"),
+            "TF_VAR_daily_start_enabled=false\n"
+        );
+        assert_eq!(fixture.text("calls"), "ssm get-parameter\n");
+    }
+}
+
+#[test]
+fn test_regression_terraform_budget_unknown_or_malformed_never_reaches_plan_or_apply() {
+    for step in terraform_budget_steps() {
+        for mode in [
+            "empty",
+            "none",
+            "whitespace",
+            "trailing_newline",
+            "oversized_newlines",
+            "oversized_missing_newlines",
+            "oversized_multibyte_error",
+            "multiple",
+            "invalid",
+            "five_digit_year",
+            "nul",
+            "denied",
+            "throttled",
+            "timeout",
+            "terminated",
+            "misleading",
+            "prefix",
+            "oversized",
+            "oversized_error",
+        ] {
+            let fixture = Fixture::new();
+            let script = format!("{step}\nprintf reached > next-step\n");
+            let output = fixture
+                .command(&script)
+                .env("BUDGET_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{mode}: {:?}", output.status);
+            assert!(fixture.text("environment").is_empty());
+            assert!(
+                !fixture.0.join("next-step").exists(),
+                "{mode} crossed the fence"
+            );
+            assert_eq!(fixture.text("calls"), "ssm get-parameter\n");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains("::error::TF_BUDGET_FENCE"), "{mode}");
+            assert!(
+                !text.contains("PRIVATE_MARKER"),
+                "{mode} leaked provider body"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_regression_terraform_budget_read_retains_bounded_single_parameter_surface() {
+    for step in terraform_budget_steps() {
+        assert!(step.contains("set -euo pipefail; export LC_ALL=C"));
+        assert!(step.contains("timeout -k 5 20 aws ssm get-parameter"));
+        assert!(step.contains("head -c 4097"));
+        assert!(step.contains("RC=$?; printf '.'; exit \"$RC\""));
+        assert_eq!(
+            step.matches("/tickvault-guard/prod/budget-stop-month")
+                .count(),
+            1
+        );
+        assert!(!step.contains("--with-decryption"));
+        assert!(!step.contains("TF_VAR_daily_start_enabled=true"));
+    }
 }

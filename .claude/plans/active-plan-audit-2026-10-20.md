@@ -2060,3 +2060,80 @@ merge or deployment is claimed from that run.
 All changes in this correction are tests or records. Keep both depth feeds
 and live orders off. Earlier failures and every unpublished checkpoint remain
 preserved; finite checks do not establish universal reliability or latency.
+
+
+### 2026-11-03: complete publication and close the dated budget/fence defects
+
+The user continues to authorize fixing, building, merging and deploying the
+recovered work. Keep every original ref and unpublished patch. Both depth
+feeds and live-order activation remain off. The November 2 native push at192
+passed the full workspace, lint, audit/deny, both Loom suites, integrity and
+financial checks, but the public-function scanner exceeded its120-second
+native limit. An isolated original scan took168.532 seconds and counted306
+against baseline307. The first proposed optimization also timed out; retain
+that failed record and do not claim publication or change the deadline.
+
+- [x] Apply the documented November standing native budget of75USD. Quotes37
+  and45 already limit185USD to October. Actual AWS still read185USD onNov2.
+  Preserve historical185 defaults and the existing UTC-month runtime clamp;
+  compare native budget with effective November-onward values in six guards.
+- [x] Make both Terraform stop-marker reads refuse unknown/malformed values.
+  Accept absence only from classified ParameterNotFound, preserve provider
+  status and bytes, bound response/time and keep raw output private. Preserve
+  the held-current-month false override and known absent/nonmatching default.
+- [x] Apply the same byte-preserving capture to the deployment start fence.
+  Extra/oversized trailing newlines and multibyte errors cannot normalize to
+  a valid marker. Keep20+5second/4097byte bounds, parameters and shell budgets.
+  Earlier V1 counterexamples are saved; independent reviewers passed corrected
+  controls. These are infrastructure controls, with no new runtime language.
+- [x] Combined native budget, deployment, infrastructure, workflow and shell
+  guards passed137 tests,0failed,0ignored on the applied three-patch source.
+- [x] Finish a semantic-preserving public-function scanner optimization.
+  Retain the legacy declaration/test regex, line boundaries, duplicate counts,
+  crate scope, exemption adjacency, unusual-file fallback and missing-state
+  refusal. Retain Bash3-compatible syntax and native120 seconds. Final hook
+  SHAe12b5307 passed34 equivalence cases and independent binary/error controls.
+  Saved-source scan completed21.378s; actual combined-tree scan completed33.255s
+  with unchanged source/count306. Ratchet the measured untested floor307 to306
+  and the static test-attribute count16524 to16543; these are not coverage.
+  - Files: .claude/hooks/pub-fn-test-guard.sh, crates/common/tests/pub_fn_test_guard_behavior.rs
+  - Tests: indexed_exemptions_preserve_adjacent_markers_and_unterminated_last_line,
+    indexed_test_lines_keep_utf8_and_separate_file_boundaries,
+    indexed_test_corpus_falls_back_for_early_late_and_mixed_binary_text,
+    large_binary_inventory_preserves_matches_when_zero_check_stops_early
+- [x] Add the missed15Jan2026 holiday from official NSE/CMTR/72260 and
+  NSE/FAOP/72262. Exercise the shipped calendar: Jan15 closes while Jan14/16
+  stay open. All other configuration is unchanged. The60-day expiry reminder
+  remains active; no authoritative2027 circular was verified or invented.
+  - Files: config/base.toml, crates/common/tests/nse_holiday_calendar_guard.rs
+  - Tests: test_2026_election_addendum_closes_shipped_calendar
+- [x] Combined native scanner/calendar, Rust-only, browser/toolchain, shell
+  and ignored-test guards passed111 tests,0failed,0ignored at03:41UTC.
+  Preserve the earlier18pass/1fail forbidden grep-spawn and110pass/1fail
+  filesystem-order runs. The fixture now uses Rust filesystem enumeration and
+  places its binary match in the observed first entry, with order checked
+  again after overwrite. No spawn allowance or deadline was increased.
+- [ ] Run final native guards, measured static-count ratchets, committed-source
+  all-target lint and ordinary publication. Preserve every failed attempt.
+  Create and attach the draft PR only after the actual fresh pre-PR gate.
+- [ ] Accept exact-source CI, dedicated allocation checks, raw coverage report
+  and a real plan-only Terraform run before the repository merge flow. Review
+  daily-start state, native75 budget, IAM and all Lambda changes. Keep plan/apply
+  stop-marker refusal active; do not infer absence from permission errors.
+- [ ] Verify deployed app/helper and portal identities, real Stocks behavior
+  and effective activation settings. Use today's observed instance baseline
+  and market/capture window, never yesterday's stopped assumption. Preserve
+  private deployment backups and live data; app rollback must not restore the
+  expired October native budget or undo a valid budget/holiday stop marker.
+
+Package all recovered Codex work and compatible pending PR changes in one
+combined PR, as explicitly requested onNov3. Map all24 original PRs, preserve
+their original refs, and resolve covered PRs only after verified combined
+landing. The incompatible parking_lot0.13 upgrade remains explicit. The exact
+GitHub-token SSM parameter is absent in current metadata; the ancestry repair
+does not provision credentials. No speculative IAM permission change is made.
+
+Observability: keep source hashes, command outcomes, actual workflow heads,
+plan actions, selected live safety fields and actual screenshots. Error paths
+report typed failure without provider bodies. No finite test set establishes
+zero bugs/loss, exhaustive coverage or universal O(1)/submicrosecond latency.

@@ -1,5 +1,5 @@
 //! Runs the real public-function hook in isolated synthetic repositories.
-//! Pins legacy verdicts and the once-per-crate inventory optimization.
+//! Pins legacy verdicts, crate-local indexing and binary/error fallback behavior.
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
@@ -734,4 +734,128 @@ fn capture_preserves_nonzero_exit_and_both_output_streams() {
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(output.stdout, b"standard");
     assert_eq!(output.stderr, b"diagnostic");
+}
+
+#[test]
+fn indexed_exemptions_preserve_adjacent_markers_and_unterminated_last_line() {
+    let case = CaseDir::new();
+    case.write("crates/a/src/lib.rs", "pub fn first_line() {}\npub fn first_line() {}\n// TEST-EXEMPT: first marker\n// TEST-EXEMPT: adjacent second marker\npub fn exempted() {}\n// TEST-EXEMPT: separated\n\npub fn final_line() {}");
+    case.assert_outcome("all", Some(3), true, 0, "stable (3)");
+}
+
+#[test]
+fn indexed_test_lines_keep_utf8_and_separate_file_boundaries() {
+    let case = CaseDir::new();
+    case.write(
+        "crates/a/src/lib.rs",
+        "pub fn alpha() {}\npub fn hidden() {}\n",
+    );
+    // Joining these files without a newline invents `test.*hidden` coverage.
+    case.write("crates/a/tests/a.rs", "#[test]\n// test");
+    case.write("crates/a/tests/b.rs", "// fn marker hidden\n#[test]\n");
+    case.write("crates/a/tests/c.rs", "#[test]\n// test α — alpha\n");
+    case.assert_outcome("all", Some(1), true, 0, "stable (1)");
+}
+
+#[test]
+fn indexed_test_corpus_falls_back_for_early_late_and_mixed_binary_text() {
+    for invalid in [false, true] {
+        for padding in [0, 200_000] {
+            let case = CaseDir::new();
+            case.write("crates/a/src/lib.rs", "pub fn hidden() {}\n");
+            case.write("crates/a/tests/a.rs", "#[test]\nfn unrelated() {}\n");
+            case.write("crates/a/tests/b.rs", "placeholder");
+            let mut body = b"#[test]\n".to_vec();
+            body.resize(body.len() + padding, b'x');
+            body.push(if invalid { 0xff } else { 0 });
+            body.extend_from_slice(b"\nfn test_hidden() {}\n");
+            fs::write(case.0.join("crates/a/tests/b.rs"), body).expect("owned binary fixture");
+            case.assert_outcome("all", Some(0), true, 0, "stable (0)");
+        }
+    }
+}
+
+#[test]
+fn large_binary_inventory_preserves_matches_when_zero_check_stops_early() {
+    let case = CaseDir::new();
+    case.write("crates/a/src/lib.rs", "pub fn hidden() {}\n");
+    // Build all entries before choosing the binary file: directory enumeration
+    // order need not follow names or creation order on the fixture filesystem.
+    case.write(
+        "crates/a/tests/000_binary.rs",
+        "#[test]\nfn unrelated() {}\n",
+    );
+    let bulk = format!(
+        "crates/a/tests/{}/{}/{}/{}/{}",
+        "a".repeat(100),
+        "b".repeat(100),
+        "c".repeat(100),
+        "d".repeat(100),
+        "e".repeat(100)
+    );
+    for index in 0..400 {
+        case.write(
+            &format!("{bulk}/case_{index:04}.rs"),
+            "#[test]\nfn unrelated() {}\n",
+        );
+    }
+    // Witness this owned fixture's filesystem order and bytes without an extra
+    // process. The whole-hook verdict below still exercises real grep/xargs.
+    fn collect_inventory(
+        directory: &std::path::Path,
+        base: &std::path::Path,
+        inventory: &mut Vec<PathBuf>,
+    ) {
+        for entry in fs::read_dir(directory).expect("owned inventory directory") {
+            let entry = entry.expect("owned inventory entry");
+            let kind = entry.file_type().expect("owned inventory entry type");
+            let path = entry.path();
+            if kind.is_dir() {
+                collect_inventory(&path, base, inventory);
+            } else {
+                assert!(kind.is_file(), "fixture contains only regular files");
+                if path.extension().is_some_and(|extension| extension == "rs") {
+                    let bytes = fs::read(&path).expect("owned fixture source");
+                    if bytes
+                        .windows(b"#[test]".len())
+                        .any(|part| part == b"#[test]")
+                    {
+                        inventory.push(
+                            path.strip_prefix(base)
+                                .expect("fixture-relative path")
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let mut inventory = Vec::new();
+    collect_inventory(&case.0.join("crates/a"), &case.0, &mut inventory);
+    let inventory_bytes: usize = inventory
+        .iter()
+        .map(|path| path.to_str().expect("ASCII fixture path").len() + 1)
+        .sum();
+    assert_eq!(
+        inventory.len(),
+        401,
+        "all qualifying fixture files must be present"
+    );
+    assert!(
+        inventory_bytes > 200_000,
+        "inventory must exceed the former pipe bound"
+    );
+    let first = inventory.first().expect("nonempty qualifying inventory");
+    fs::write(case.0.join(first), b"#[test]\n\0\nfn test_hidden() {}\n")
+        .expect("place binary match before the large text inventory");
+    let mut after_overwrite = Vec::new();
+    collect_inventory(&case.0.join("crates/a"), &case.0, &mut after_overwrite);
+    assert_eq!(
+        inventory, after_overwrite,
+        "overwriting the selected binary must preserve inventory order"
+    );
+    // Over 200KB of per-file count output exceeds the pipe capacity that made
+    // `! printf ... | grep -q ...` invert a producer SIGPIPE into acceptance.
+    // This runs the whole hook with real files/grep/xargs and its 10s deadline.
+    case.assert_outcome("all", Some(0), true, 0, "stable (0)");
 }

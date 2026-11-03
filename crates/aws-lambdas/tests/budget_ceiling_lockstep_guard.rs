@@ -1,9 +1,11 @@
-//! Build-failing ratchet pinning the **budget kill-ceiling 4-way lockstep**.
+//! Build-failing ratchet pinning the **effective budget kill-ceiling lockstep**.
 //!
-//! The ceiling is not a display value — it is a KILL line. At 90% and 100% of
-//! `budget.tf limit_amount`, AWS Budget Actions run `STOP_EC2_INSTANCES` on the
-//! prod box, and the hard-stop-guard Lambda additionally DISABLES the morning
-//! start cron. Four places encode it:
+//! The ceiling is not a display value — it is a KILL line. At 100% of
+//! `budget.tf limit_amount`, the one native action stops the prod box; the
+//! hard-stop-guard Lambda additionally disables the morning start cron.
+//! Since 1 November 2026, native $75 matches the EFFECTIVE guard/digest line.
+//! Their configured $185 values preserve the October-only allowance and are
+//! clamped by UTC billing month. Four places encode these two roles:
 //!
 //! | # | Site | Role |
 //! |---|---|---|
@@ -27,7 +29,7 @@
 //! cannot catch that. This test can.
 //!
 //! Authority: `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
-//! §0 Quote 13 + §7; `.claude/rules/project/aws-budget.md`.
+//! §0 Quotes 13, 37 and 45 + §7; `.claude/rules/project/aws-budget.md`.
 
 #![cfg(test)]
 
@@ -87,7 +89,8 @@ fn hcl_quoted_number(body: &str, key: &str) -> f64 {
     found.unwrap_or_else(|| panic!("no uncommented `{key} = \"<number>\"` assignment found"))
 }
 
-/// All four sites MUST agree. Any single-site edit fails the build here.
+/// Native $75 must match all effective November-onward lines, while the
+/// three configured values retain the explicitly historical October allowance.
 #[test]
 fn budget_ceiling_agrees_across_all_four_sites() {
     let root = repo_root();
@@ -99,30 +102,37 @@ fn budget_ceiling_agrees_across_all_four_sites() {
         &read(&root.join("deploy/aws/terraform/budget-guards.tf")),
         "BUDGET_KILL_USD",
     );
-
-    assert!(
-        (tf_limit - tf_kill).abs() < f64::EPSILON,
-        "budget.tf limit_amount ({tf_limit}) != budget-guards.tf BUDGET_KILL_USD ({tf_kill})"
+    assert_eq!(
+        tf_limit, STANDING_BUDGET_KILL_USD,
+        "the native limit must be the authorized standing line, not October's allowance"
     );
-    assert!(
-        (tf_limit - BUDGET_USD).abs() < f64::EPSILON,
-        "budget.tf limit_amount ({tf_limit}) != budget_digest::BUDGET_USD ({BUDGET_USD}) — \
-         the operator's digest would report a percentage of the WRONG ceiling"
-    );
-    assert!(
-        (tf_limit - DEFAULT_BUDGET_KILL_USD).abs() < f64::EPSILON,
-        "budget.tf limit_amount ({tf_limit}) != hard_stop_guard::DEFAULT_BUDGET_KILL_USD \
-         ({DEFAULT_BUDGET_KILL_USD}) — see this file's header: a fallback BELOW the real \
-         ceiling stops the prod box mid-session whenever the env var is missing"
-    );
+    for (site, configured) in [
+        ("BUDGET_KILL_USD", tf_kill),
+        ("budget_digest::BUDGET_USD", BUDGET_USD),
+        ("DEFAULT_BUDGET_KILL_USD", DEFAULT_BUDGET_KILL_USD),
+    ] {
+        assert_eq!(
+            configured, OCTOBER_2026_KILL_USD,
+            "{site} must preserve the historical October configuration"
+        );
+        for year in 2026..=2028 {
+            for month in 1..=12 {
+                if (year, month) < (2026, 11) {
+                    continue;
+                }
+                assert_eq!(
+                    effective_budget_kill_usd(configured, year, month),
+                    tf_limit,
+                    "{site} disagrees with native standing limit in {year}-{month:02}"
+                );
+            }
+        }
+    }
 }
 
-/// The fallback may never sit BELOW the real ceiling.
-///
-/// Kept as its own test with its own message because it is the property that
-/// actually protects the box, and because it states the safe direction
-/// explicitly: equal is correct, higher is merely harmless, lower is a
-/// mid-session outage.
+/// The effective November fallback may never sit below the native line.
+/// Compare after the month clamp: the historical raw $185 default is not
+/// the amount that the running November guard actually uses.
 #[test]
 fn fallback_kill_line_is_never_below_the_real_ceiling() {
     let root = repo_root();
@@ -130,45 +140,31 @@ fn fallback_kill_line_is_never_below_the_real_ceiling() {
         &read(&root.join("deploy/aws/terraform/budget.tf")),
         "limit_amount",
     );
+    let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11);
     assert!(
-        DEFAULT_BUDGET_KILL_USD >= tf_limit,
-        "DEFAULT_BUDGET_KILL_USD ({DEFAULT_BUDGET_KILL_USD}) is BELOW the real ceiling \
-         ({tf_limit}). Fail direction MUST be kills-later-never-earlier: a missing \
-         BUDGET_KILL_USD env var would otherwise stop the prod box at \
-         ${DEFAULT_BUDGET_KILL_USD} while the operator-approved ceiling is ${tf_limit}."
+        effective >= tf_limit,
+        "effective November fallback ({effective}) is below the native ceiling ({tf_limit})"
     );
 }
 
-/// The ceiling must stay a real guard, not a rubber stamp.
-///
-/// Since operator Quote 30 (2026-10-13) the ONE native `STOP_EC2_INSTANCES`
-/// action fires at 100% of the limit (the 90% early stop was removed; see
-/// `native_stop_is_one_action_at_100_percent` below), so the limit itself has
-/// to clear the measured month with margin, or the box is stopped mid-month.
-/// It also must not drift so high that it stops being a guard at all.
+/// The recorded October bill estimate belongs to October's allowance,
+/// never to the November standing native line authorized by Quotes 37/45.
 #[test]
-fn ceiling_brackets_the_recorded_bill_high_estimate() {
-    let root = repo_root();
-    let tf_limit = hcl_quoted_number(
-        &read(&root.join("deploy/aws/terraform/budget.tf")),
-        "limit_amount",
-    );
-    // 2026-10-13 (Quote 30): Cost Explorer read October 1-12 = $71.80 and
-    // projected ~$173-175 at the old config. With disk IOPS 6000 -> 3000
-    // (-$15/mo, ~$8.50 over the rest of October) the projection is ~$165
-    // (Assumed). The previous $112.72 here was the 2026-08-19 estimate and
-    // had gone stale: it let the 90% line "clear" a bill it sat far below.
+fn october_allowance_brackets_the_recorded_bill_high_estimate() {
+    let october_line = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 10);
+    // 2026-10-13 (Quote 30): the IOPS reduction made the October projection
+    // about $165 (Assumed). Retain that historical check without imposing
+    // October's bill on the separately authorized November $75 limit.
     const BILL_HIGH_USD: f64 = 165.0;
     assert!(
-        tf_limit > BILL_HIGH_USD,
-        "the native stop line (${tf_limit:.2}, 100% of limit_amount) does NOT clear \
-         the recorded month (${BILL_HIGH_USD:.2}) — STOP_EC2_INSTANCES would fire \
-         mid-month. Cut cost or raise the limit with a dated quote first."
+        october_line > BILL_HIGH_USD,
+        "October's stop line (${october_line:.2}) must clear its recorded estimate \
+         (${BILL_HIGH_USD:.2}); this is not the November native limit"
     );
     assert!(
-        tf_limit <= 3.0 * BILL_HIGH_USD,
-        "limit_amount (${tf_limit}) is more than 3x the recorded month \
-         (${BILL_HIGH_USD:.2}) — that is a rubber stamp, not a kill line."
+        october_line <= 3.0 * BILL_HIGH_USD,
+        "October's line (${october_line}) is more than 3x its recorded estimate \
+         (${BILL_HIGH_USD:.2})"
     );
 }
 
