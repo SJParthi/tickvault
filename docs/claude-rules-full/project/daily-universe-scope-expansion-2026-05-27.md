@@ -3403,3 +3403,26 @@ Owner, verbatim (relayed by the coordinator session): "go ahead and fix the muhu
 - Treating an ordinary weekend or a weekday holiday (no Muhurat entry) as a session day, or changing what any guard does on one.
 - Typing Muhurat times anywhere without the same change in `config/base.toml`.
 - Removing the Muhurat arm from a workflow guard, or a guard job that no longer has `config/base.toml` to read.
+
+#### Quote 50 (2026-11-03, ~11:30–11:50 IST) — KEEP EVERY TICK AND CANDLE FROM 2026-11-02; DELETE EVERYTHING DATED BEFORE IT, ONCE (preserve EXACTLY)
+
+Owner messages (2026-11-03), verbatim: "see clelary ntoe entire ticks candles data shdou lbe always in s3 right startign nov 2 2026 dude okay? wohtotu fialign dude okay?" and then "remove all the data before nov 2 2026 dude okay only startig n nov 2 2026 dta needs to be avialabel for btoh lvie tickvault and backettsign britex dude okay?". Told on a card that the delete is permanent (every S3 version, no undo), the owner tapped "Everything before 2 Nov" (card text: "Also delete logs, instrument snapshots and audit records dated before 2 Nov. Deploy files needed for rollback are still kept.") and "Tonight after deploy (Recommended)" (card text: "After PR #2187 is merged and deployed and the after-close copy to S3 is verified, outside 09:00-15:45 IST. Listings of what exists are taken before and after.").
+
+| Item | What Quote 50 authorizes |
+|---|---|
+| Keep, always | Every tick, repeat quote, candle (every timeframe) and raw feed frame dated 2026-11-02 IST or later, in `s3://tv-prod-cold/` (and on the box inside its hot windows), for live tickvault and for brutex backtesting. No future wipe, nuke, rebuild or clean-up quote deletes any of it unless it names this data explicitly. This adds to Quote 27; it does not replace it |
+| One delete: box | Every partition of `ticks`, `tick_quotes`, `market_depth`, `market_depth_book`, `feed_aux_packets`, `candles_*` and of every SEBI/audit table whose newest row is before 2026-11-02 00:00 IST; spill, DLQ and WAL files (`data/ws_wal`, `archive/`, `replaying/`, `settling/`) holding only rows before that instant |
+| One delete: cloud | In `tv-prod-cold`, every object version under `raw-frames/<date before 2026-11-02>/`, `questdb-partitions/<table>/<partition before 2026-11-02>`, `instrument-snapshots/<date before 2026-11-02>/`, `logs/` objects dated before 2026-11-02, and `tick-quarantine/` objects dated before 2026-11-02, by version id after a full dry listing |
+| When | One run on 2026-11-03 IST after PR #2187 is merged and deployed and the after-close S3 copy of 2026-11-02 is verified; never 09:00–15:45 IST on a trading day, never during a deploy; box steps with the app stopped. A step that cannot run that evening (box state or a missing permission) waits for the next evening under the same rules; the quote is spent when the run completes |
+| Proof | A listing before and after every step (partitions with per-day row counts, file names and sizes, object versions) |
+| Safety step | Right after the S3 delete is verified, upload markers on the box that refer to deleted S3 copies are removed (the Quote 46c reason: a stale marker would let a prune delete a local file as if it were still copied) |
+| Not authorized | Anything dated 2026-11-02 IST or later; `deploys/` (rollback); `applied.tvaw`, the unapplied-ranges sidecar, `deferred_depth.tvdd`, `.wal-owner.lock`, `schema_reset_log`; Terraform state; any other bucket, volume or snapshot; versioning, lifecycle, object lock or bucket policy |
+
+After the run Quote 50 is SPENT for deletion; its "Keep, always" row stays binding.
+
+##### What violates Quote 50 (REJECT)
+- Deleting anything dated 2026-11-02 IST or later, or any `deploys/` object, under this or any later quote that does not name it.
+- Any step 09:00–15:45 IST on a trading day, during a deploy, or a box step with the app running.
+- Deleting without the listing before and the listing after, or a cloud delete without the dry listing.
+- Changing versioning, lifecycle, object lock or bucket policy under Quote 50.
+- A second deletion run under Quote 50.
