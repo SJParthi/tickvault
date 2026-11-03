@@ -14,7 +14,8 @@
 //! - the daily `tick_conservation_audit` row is written when today is a
 //!   weekday and now is before the 15:45:00 IST check, and it reads
 //!   `verdict=partial`, `reason=process_started_mid_day`, with the database
-//!   count 5 + 5 = 10 (two tables) read once.
+//!   count 5 + 5 = 10 (two tables), read once, or twice when the first read
+//!   times out under the paused clock (see the assertion below).
 //!
 //! A clock reading within a few seconds of one of those edges is not asserted
 //! (the task reads the wall clock a moment after the test does).
@@ -162,7 +163,8 @@ async fn test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_ca
             let line = &daily[0];
             assert!(line.contains("feed=dhan"), "{line}");
             // Started at 12:00 IST: never full coverage, so `partial` whatever
-            // the count, and the count (5 + 5) settles it on the first read.
+            // the count, and the count (5 + 5) settles it on the first read
+            // that answers.
             assert!(line.contains("verdict=partial"), "{line}");
             assert!(line.contains("reason=process_started_mid_day"), "{line}");
             assert!(line.contains("db_tick_rows=10i"), "{line}");

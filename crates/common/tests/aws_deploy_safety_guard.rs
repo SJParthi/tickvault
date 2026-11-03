@@ -147,6 +147,8 @@ case "$1 $2" in
       old) echo "$past";;
       released) case "$*" in *holiday-stop-date*) exit 99;; *) echo released-2026-10;; esac;;
       released_invalid) case "$*" in *holiday-stop-date*) exit 99;; *) echo released-2026-13;; esac;;
+      released_holiday) case "$*" in *holiday-stop-date*) echo released-2026-11;; *) exit 99;; esac;;
+      released_holiday_date) case "$*" in *holiday-stop-date*) echo released-2026-11-03;; *) exit 99;; esac;;
       future) echo 2026-12;;
       current) echo "$current";;
       empty) :;;
@@ -211,6 +213,26 @@ fn test_regression_deploy_released_budget_marker_is_not_a_latch() {
     );
     assert!(!fixture.text("environment").contains("DEPLOY_SKIP_REASON"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("DEPLOY_FENCE budget=released"));
+}
+
+/// Only the BUDGET marker has a released form. A released-shaped value in the
+/// holiday marker is malformed and must refuse the start. Pins the
+/// `[ "$kind" = budget ]` gate: without it this case starts the box (shown
+/// by mutation in the same review).
+#[test]
+fn test_regression_deploy_released_shape_in_holiday_marker_refuses() {
+    for holiday in ["released_holiday", "released_holiday_date"] {
+        let fixture = Fixture::new();
+        let output = fixture.ensure("absent", holiday);
+        assert!(!output.status.success(), "{holiday}: {output:?}");
+        assert!(!fixture.0.join("started").exists(), "{holiday}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("DEPLOY_FENCE holiday invalid"),
+            "{holiday}: {stderr}"
+        );
+        assert!(!stderr.contains("holiday=released"), "{holiday}: {stderr}");
+    }
 }
 
 #[test]
