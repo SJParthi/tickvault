@@ -1113,6 +1113,9 @@ jobs:
         # DEPLOY_SHA is validated as exactly 40 lowercase hex characters before
         # its single literal splice into the SSM script; subsequent references
         # expand only on the instance. No unvalidated value enters that payload.
+        # The splice sits on the `'commands=[` opener line: the SSM quoting lint
+        # (scripts/validate-deploy-ssm-quoting.sh) rejects an apostrophe on any
+        # interior line of the block, and the opener is the one line it allows.
         env:
           AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
           DEPLOY_SHA: ${{ github.sha }}
@@ -1122,8 +1125,7 @@ jobs:
             --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault deploy sha=$DEPLOY_SHA" \
-            --parameters 'commands=[
-              "set -euo pipefail; DEPLOY_SHA='$DEPLOY_SHA'",
+            --parameters 'commands=["set -euo pipefail; DEPLOY_SHA='"$DEPLOY_SHA"'",
               "command -v git >/dev/null 2>&1 || sudo timeout 180 dnf install -y git || sudo timeout 180 yum install -y git",
               "command -v docker >/dev/null 2>&1 || sudo timeout 180 dnf install -y docker || sudo timeout 180 yum install -y docker",
               "sudo systemctl enable --now docker",
