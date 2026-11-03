@@ -145,6 +145,8 @@ case "$1 $2" in
       absent_v1) echo "$missing" >&2; exit 255;;
       absent_cli_v2) printf '\naws: [ERROR]: %s\n' "$missing" >&2; exit 254;;
       old) echo "$past";;
+      released) case "$*" in *holiday-stop-date*) exit 99;; *) echo released-2026-10;; esac;;
+      released_invalid) case "$*" in *holiday-stop-date*) exit 99;; *) echo released-2026-13;; esac;;
       future) echo 2026-12;;
       current) echo "$current";;
       empty) :;;
@@ -193,6 +195,24 @@ fn test_regression_deploy_confirmed_absence_and_valid_past_markers_allow_one_sta
     }
 }
 
+/// The hard-stop guard releases a budget stop at the new month by writing
+/// `released-<old month>` (hard_stop_guard.rs). That value is a release, not
+/// a latch, so it must start the box like an absent marker. Found by the
+/// 2026-11-03 adversarial review: the strict reader refused it, which would
+/// have blocked every stopped-box deploy after any released budget stop.
+#[test]
+fn test_regression_deploy_released_budget_marker_is_not_a_latch() {
+    let fixture = Fixture::new();
+    let output = fixture.ensure("released", "absent");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fixture.text("calls").matches("ec2 start-instances").count(),
+        1
+    );
+    assert!(!fixture.text("environment").contains("DEPLOY_SKIP_REASON"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("DEPLOY_FENCE budget=released"));
+}
+
 #[test]
 fn test_regression_deploy_matching_stop_markers_preserve_stopped_state() {
     for (budget, holiday, reason) in [
@@ -230,6 +250,7 @@ fn test_regression_deploy_unknown_or_malformed_marker_never_starts_or_logs_body(
         "nul",
         "denied",
         "denied_cli_v2",
+        "released_invalid",
         "throttled",
         "timeout",
         "terminated",
@@ -449,7 +470,14 @@ fn terraform_budget_steps() -> Vec<String> {
 #[test]
 fn test_regression_terraform_budget_confirmed_absence_and_valid_nonmatching_keep_default() {
     for step in terraform_budget_steps() {
-        for mode in ["absent", "absent_v1", "absent_cli_v2", "old", "future"] {
+        for mode in [
+            "absent",
+            "absent_v1",
+            "absent_cli_v2",
+            "released",
+            "old",
+            "future",
+        ] {
             let fixture = Fixture::new();
             let output = fixture
                 .command(&step)
@@ -508,6 +536,7 @@ fn test_regression_terraform_budget_unknown_or_malformed_never_reaches_plan_or_a
             "nul",
             "denied",
             "denied_cli_v2",
+            "released_invalid",
             "throttled",
             "timeout",
             "terminated",
