@@ -422,7 +422,7 @@ jobs:
           if LATCH=$(timeout -k 5 20 aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text 2>&1 | tr '\000' '?' | head -c 4097; RC=$?; printf '.'; exit "$RC"); then
             LATCH=${LATCH%.}; LATCH=${LATCH%$'\n'}; [ "${#LATCH}" = 7 ] && [ "$(LC_ALL=C date -u -d "${LATCH}-01" +%Y-%m 2>/dev/null)" = "$LATCH" ] || { echo "::error::TF_BUDGET_FENCE invalid; refusing planning"; exit 1; }
           else
-            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing planning"; exit 1; fi
+            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*(aws:\ \[ERROR\]:\ )?An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing planning"; exit 1; fi
           fi
           MONTH=$(date -u +%Y-%m); if [ "$LATCH" = "$MONTH" ]; then
             echo "::warning::budget-stop latch holds for ${MONTH} — planning the daily-start rule DISABLED"
@@ -645,7 +645,7 @@ jobs:
           if LATCH=$(timeout -k 5 20 aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text 2>&1 | tr '\000' '?' | head -c 4097; RC=$?; printf '.'; exit "$RC"); then
             LATCH=${LATCH%.}; LATCH=${LATCH%$'\n'}; [ "${#LATCH}" = 7 ] && [ "$(LC_ALL=C date -u -d "${LATCH}-01" +%Y-%m 2>/dev/null)" = "$LATCH" ] || { echo "::error::TF_BUDGET_FENCE invalid; refusing applying"; exit 1; }
           else
-            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing applying"; exit 1; fi
+            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*(aws:\ \[ERROR\]:\ )?An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing applying"; exit 1; fi
           fi
           MONTH=$(date -u +%Y-%m); if [ "$LATCH" = "$MONTH" ]; then
             echo "::warning::budget-stop latch holds for ${MONTH} — applying the daily-start rule DISABLED"

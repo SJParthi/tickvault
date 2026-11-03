@@ -143,6 +143,7 @@ case "$1 $2" in
     case "$mode" in
       absent) echo "$missing" >&2; exit 254;;
       absent_v1) echo "$missing" >&2; exit 255;;
+      absent_cli_v2) printf '\naws: [ERROR]: %s\n' "$missing" >&2; exit 254;;
       old) echo "$past";;
       future) echo 2026-12;;
       current) echo "$current";;
@@ -158,6 +159,7 @@ case "$1 $2" in
       five_digit_year) echo "$five";;
       nul) printf '%s\000' "$past";;
       denied) echo 'An error occurred (AccessDeniedException) when calling the GetParameter operation: PRIVATE_MARKER ParameterNotFound' >&2; exit 254;;
+      denied_cli_v2) echo 'aws: [ERROR]: An error occurred (AccessDeniedException) when calling the GetParameter operation: PRIVATE_MARKER ParameterNotFound' >&2; exit 254;;
       throttled) echo 'An error occurred (ThrottlingException) when calling the GetParameter operation: PRIVATE_MARKER' >&2; exit 254;;
       timeout) echo "$missing" >&2; exit 124;;
       terminated) echo "$missing" >&2; exit 143;;
@@ -173,7 +175,7 @@ esac
 
 #[test]
 fn test_regression_deploy_confirmed_absence_and_valid_past_markers_allow_one_start() {
-    for mode in ["absent", "absent_v1", "old"] {
+    for mode in ["absent", "absent_v1", "absent_cli_v2", "old"] {
         let fixture = Fixture::new();
         let output = fixture.ensure(mode, mode);
         assert!(output.status.success(), "{mode}: {output:?}");
@@ -227,6 +229,7 @@ fn test_regression_deploy_unknown_or_malformed_marker_never_starts_or_logs_body(
         "five_digit_year",
         "nul",
         "denied",
+        "denied_cli_v2",
         "throttled",
         "timeout",
         "terminated",
@@ -446,7 +449,7 @@ fn terraform_budget_steps() -> Vec<String> {
 #[test]
 fn test_regression_terraform_budget_confirmed_absence_and_valid_nonmatching_keep_default() {
     for step in terraform_budget_steps() {
-        for mode in ["absent", "absent_v1", "old", "future"] {
+        for mode in ["absent", "absent_v1", "absent_cli_v2", "old", "future"] {
             let fixture = Fixture::new();
             let output = fixture
                 .command(&step)
@@ -504,6 +507,7 @@ fn test_regression_terraform_budget_unknown_or_malformed_never_reaches_plan_or_a
             "five_digit_year",
             "nul",
             "denied",
+            "denied_cli_v2",
             "throttled",
             "timeout",
             "terminated",
