@@ -1299,3 +1299,58 @@ are unchanged, no new `<script>` tag, no new page, no new HTML file.
 - growing any other row of either budget under this section;
 - using this section for anything but the F&O stocks movers section of the
   dashboard.
+
+
+## §0.16. 2026-10-31 — public operator portal Top Movers
+
+Current user request: "so whva you added the dashbaord webpage to see to pmovers dude"
+and "so ypu will evrufy automaticlaly from the real lvie webpage right dude".
+The standing request explicitly permits the frontend exception while requiring Rust
+for backend logic. This addition implements that requested view in the existing
+operator portal; it does not authorize deployment, a new browser surface or an
+interpreted backend.
+
+The existing portal script grows from 319 to 350 lines and 26,601 to 31,671 UTF-8 bytes
+(measured by the guard, including script-tag lines and their newlines). Its exact frontend rows are updated for this
+feature only; script-tag and inline-handler counts are unchanged. New cells use
+textContent. The app secret stays on the server.
+
+The read-only standalone Rust helper is `tv-movers`; its fixed launcher is counted
+in the existing action-command literal budget. The actual sender remains in
+operator_control.rs. No shell ceiling, sender allowlist, unsafe exemption or new
+interpreted program is added. Existing deploy glue stages all three binaries in
+bin/.next, reads each exact S3 object with fail-fast behavior, runs the smoke gate
+before swapping, and moves the three files together. The fixed prefix and working
+directory reduce repetition while preserving the existing ceilings. The swap is
+not a filesystem transaction: its partial-failure behavior is still subject to
+the existing app rollback workflow.
+
+
+## §0.17. 2026-11-02 — requested Stocks reference view in the existing portal
+
+The current user requests "i need this rpecise design webpage view and its
+slections dude okay?" and "just focus on this stocks webpage eviw alone dude
+okay? only focus on stocks dude okay?", with Dhan Stocks screenshots showing
+Price Movers, Gainers/Losers, NSE and the F&O/index selector. The standing
+request permits frontend code while requiring Rust for backend logic. The user
+subsequently asked to keep the other fixes progressing too.
+
+This implements that requested Stocks surface inside the existing operator
+portal: a left watchlist, one universe/index selector, sorting, bounded search,
+page selection and explicit stale/error/unknown-data states. The existing
+Overview, Data and Admin functions are retained. It adds no browser page,
+script tag, external script or interpreted backend.
+
+The coordinator's implementation decision is to set only this portal's
+JS_BYTE_BUDGET row to its measured **34,530 UTF-8 bytes**, from 31,671. This
+number was measured after implementation; it is not a separate numerical
+approval quoted from the user. The guard includes script-tag lines and their
+newlines. The final script has 308 lines within the unchanged 350-line ceiling,
+one script tag and the unchanged 21 source-scanner handler occurrences
+(19 parsed inline handler attributes). Every other byte/line, handler, shell,
+spawn, runtime and surface allowance remains unchanged.
+
+Scope is this requested Stocks feature only. This note does not authorize a
+new script/runtime/surface, another budget increase, order or depth activation,
+or deployment. Backend sorting and data transport remain Rust; this frontend
+measurement is not a latency, coverage, zero-loss or security guarantee.

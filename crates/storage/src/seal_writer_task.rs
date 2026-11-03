@@ -139,9 +139,9 @@ impl DrainOutcome {
 /// item 1.2f.4 sleeps `SEAL_DRAIN_INTERVAL` between cycles).
 ///
 /// Allocates one rescue buffer of up to `max_drain` seals per call. The
-/// live runner calls [`drain_once_reusing`] with a buffer it keeps, so the
-/// live cycle allocates nothing here; this form is for tests and one-off
-/// callers.
+/// live runner calls [`drain_once_reusing`] with a buffer it keeps. Once
+/// that buffer covers the batch, scratch reuse allocates nothing; larger
+/// batches can grow it. This form is for tests and one-off callers.
 ///
 /// **No FIFO inversion on rescue.** Popped seals are NOT pushed back
 /// into the ring (which would put them at the BACK and invert
@@ -263,9 +263,18 @@ pub fn drain_once_reusing(
     // Attempt the flush. On success: drop the rescue buffer (all
     // committed). On failure: cascade EVERY popped seal through the
     // rescue path.
+    // Refused rows return Ok from append without entering the ILP buffer;
+    // their empty flush also returns Ok without making an HTTP request.
+    // Only a nonempty successful send can rearm the failure episodes.
+    let had_pending_rows = writer.pending_count() > 0;
     match writer.flush() {
         Ok(()) => {
             outcome.flushed_ok = true;
+            // This is HTTP acceptance, not proof of WAL application or of
+            // recovery of the failed spill/DLQ disk tier.
+            if had_pending_rows {
+                pipeline.note_clean_flush();
+            }
             // Audit PR41a: an amended bar committed live while its original
             // waits in the spill. Append the fuller copy behind it, so no
             // replay ends on the original.
@@ -3080,6 +3089,59 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_once_reusing_matches_drain_once_and_reuses_its_buffer() {
+        // 2026-10-30 O(1) sweep: the runner's kept buffer must give the same
+        // outcome as a fresh one, leave nothing behind, and not grow again on
+        // a cycle no bigger than the largest before it.
+        let now = jan1_noon_utc();
+        let (spill_a, dlq_a) = temp_pair("into-a");
+        let (spill_b, dlq_b) = temp_pair("into-b");
+        let mut fresh = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            16,
+            spill_a.clone(),
+            dlq_a.clone(),
+        );
+        let mut kept = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+            16,
+            spill_b.clone(),
+            dlq_b.clone(),
+        );
+        let mut writer_a = ShadowCandleWriter::for_test();
+        let mut writer_b = ShadowCandleWriter::for_test();
+        let mut buffer: Vec<BufferedSeal> = Vec::new();
+        let mut capacity_after_first = 0;
+        for (round, count) in [5_u64, 3, 5].into_iter().enumerate() {
+            for i in 0..count {
+                let seal = mk_seal(
+                    100 + i,
+                    0,
+                    TfIndex::M1,
+                    1_716_023_700 + (round as u32) * 60,
+                    100.0 + i as f64,
+                );
+                fresh.submit(seal, now);
+                kept.submit(seal, now);
+            }
+            let a = drain_once(&mut fresh, &mut writer_a, 8, now);
+            let b = drain_once_reusing(&mut kept, &mut writer_b, 8, now, &mut buffer);
+            assert_eq!(a, b, "round {round}: same outcome with a kept buffer");
+            assert!(buffer.is_empty(), "round {round}: the buffer is cleared");
+            if round == 0 {
+                capacity_after_first = buffer.capacity();
+                assert!(capacity_after_first >= 5);
+            } else {
+                assert_eq!(
+                    buffer.capacity(),
+                    capacity_after_first,
+                    "round {round}: no regrowth on a cycle no bigger than the first"
+                );
+            }
+        }
+        cleanup(&spill_a, &dlq_a);
+        cleanup(&spill_b, &dlq_b);
+    }
+
+    #[test]
     fn test_drain_once_with_max_drain_zero_is_idle() {
         let (spill, dlq) = temp_pair("max-zero");
         let mut pipeline =
@@ -5684,8 +5746,10 @@ mod tests {
     }
 
     fn archive_now(replay: &mut MidSessionReplay, probe: ReplayProbe, now: i64) -> ReplayOutcome {
-        let mut outcome = ReplayOutcome::default();
-        outcome.files_rewound = replay.observe_probe(probe, now);
+        let mut outcome = ReplayOutcome {
+            files_rewound: replay.observe_probe(probe, now),
+            ..ReplayOutcome::default()
+        };
         replay.archive_confirmed(&mut outcome);
         outcome
     }

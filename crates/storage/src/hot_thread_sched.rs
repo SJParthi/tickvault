@@ -29,7 +29,7 @@
 //! * `ws_reader_<n>`: each socket reader worker registers its thread id
 //!   once, at thread start ([`register_ws_reader_thread`], up to
 //!   [`MAX_WS_READER_SLOTS`]), one series per worker.
-//! * `main_workers`: the frame drain is a TASK on the shared main runtime,
+//! * `main_workers`: when the frame drain is a TASK on the shared main runtime,
 //!   so it moves between that runtime's worker threads (work stealing, the
 //!   LIFO slot, a `block_in_place` that hands the worker to a new thread).
 //!   Following the drain's last host with one baseline threw away every
@@ -42,6 +42,11 @@
 //!   `on_thread_stop` hook ([`release_main_worker_thread`]). The series is
 //!   the SUM of every registered worker's growth, so the drain moving
 //!   between workers loses nothing.
+//! * With the drain on its own OS thread, [`register_drain_thread`] registers
+//!   that thread for its lifetime. Its wait feeds the EXISTING host-minute
+//!   drain columns through [`SchedPublisher::last_second_drain_run_delay_ns`].
+//!   No metric name or label series is added; `main_workers` continues to
+//!   describe the shared runtime, without being mislabeled as the own drain.
 //!
 //! # Honest limits
 //!
@@ -78,12 +83,16 @@
 //! | [`register_ws_reader_thread`] | one `/proc/thread-self` read link per reader thread, once at thread start (cold) |
 //! | [`register_main_worker_thread`] | one thread-local read on every worker park after the first (plus one thread-local add while refused, and a slot scan once every [`REFUSED_RETRY_EVERY_PARKS`] parks); the first call on a thread reads `/proc/thread-self` once (one syscall, one small `PathBuf`) and scans at most [`MAX_MAIN_WORKER_SLOTS`] atomics. Never on the frame path |
 //! | [`release_main_worker_thread`] | one thread-local read and at most one compare-and-swap, once per runtime thread exit |
-//! | [`SchedPublisher::publish`] | O(reader slots + main slots) = O(12) pairs of file reads plus one `/proc/stat` read, once a second, on the `tv-telemetry` thread |
+//! | [`register_drain_thread`] | one cached thread-id read, at most one `/proc/thread-self` read link, and one `Arc` allocation at own-thread startup; one compare-and-swap at exit. Never per frame |
+//! | [`SchedPublisher::publish`] | O(reader slots + main slots + WAL + own drain) pairs of file reads plus one `/proc/stat` read, once a second, on the `tv-telemetry` thread |
 
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use arc_swap::ArcSwapOption;
 
 /// Pre-sized read buffer for `/proc` files, so a long `/proc/stat` (its
 /// `intr` line grows with the IRQ count) never regrows it on the telemetry
@@ -111,8 +120,8 @@ pub enum HotThread {
     WsReader2 = 2,
     /// Socket reader worker 3.
     WsReader3 = 3,
-    /// Every thread acting as a main-runtime worker (the drain's runtime),
-    /// summed.
+    /// Every thread acting as a main-runtime worker, summed. A proxy for
+    /// drain wait only when the drain runs on that shared runtime.
     MainWorkers = 4,
     /// The WAL writer thread (`ws-frame-spill-writer`), one thread
     /// (2026-10-30, for the per-minute capacity row).
@@ -159,6 +168,20 @@ static NEXT_READER_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 /// The WAL writer thread id; 0 = not registered.
 static WAL_WRITER_TID: AtomicI64 = AtomicI64::new(0);
+
+/// None = shared runtime. Identity is separate from the OS id, so an old
+/// guard cannot clear a replacement even with an unreadable or reused id.
+static DRAIN_THREAD: OnceLock<ArcSwapOption<RegisteredDrainThread>> = OnceLock::new();
+const DRAIN_THREAD_UNREADABLE: i64 = -1;
+
+struct RegisteredDrainThread {
+    /// Positive Linux thread id, or -1 when it could not be read.
+    tid: i64,
+}
+
+fn drain_thread_registry() -> &'static ArcSwapOption<RegisteredDrainThread> {
+    DRAIN_THREAD.get_or_init(|| ArcSwapOption::from(None))
+}
 
 /// Main-runtime worker thread id per slot; 0 = free.
 static MAIN_TIDS: [AtomicI64; MAX_MAIN_WORKER_SLOTS] =
@@ -247,6 +270,50 @@ pub fn register_wal_writer_thread() -> bool {
     }
     WAL_WRITER_TID.store(tid, Ordering::Relaxed);
     true
+}
+
+/// Registration for one own drain's lifetime. Drop it before reporting the
+/// drain's completion; unwinding also releases it. An old drain's exit cannot
+/// clear a replacement thread's registration.
+#[must_use = "keep the registration alive until the own drain exits"]
+pub struct DrainThreadRegistration {
+    thread: Arc<RegisteredDrainThread>,
+}
+
+impl Drop for DrainThreadRegistration {
+    fn drop(&mut self) {
+        let _previous = drain_thread_registry().compare_and_swap(&self.thread, None);
+    }
+}
+
+/// Registers the calling thread as the dedicated frame drain (cold, once
+/// per lane start). Retain the returned guard until that drain exits. A
+/// missing thread id still records own-thread mode, with unknown CPU wait.
+pub fn register_drain_thread() -> DrainThreadRegistration {
+    register_drain_thread_id(current_thread_id())
+}
+
+fn register_drain_thread_id(tid: i64) -> DrainThreadRegistration {
+    let tid = if tid > 0 {
+        tid
+    } else {
+        DRAIN_THREAD_UNREADABLE
+    };
+    let thread = Arc::new(RegisteredDrainThread { tid });
+    // Cold registration only: this Arc bump gives the registry
+    // and lifetime guard ownership of the same identity, with no data copy.
+    drain_thread_registry().store(Some(Arc::clone(&thread)));
+    DrainThreadRegistration { thread }
+}
+
+/// The registered dedicated drain id: 0 in shared mode, -1 when an own
+/// drain's id is unreadable, or its positive Linux thread id.
+#[must_use]
+pub fn registered_drain_thread_id() -> i64 {
+    drain_thread_registry()
+        .load()
+        .as_ref()
+        .map_or(0, |thread| thread.tid)
 }
 
 /// Registers the calling thread as a main-runtime worker. Call from the main
@@ -401,6 +468,11 @@ pub struct SchedPublisher {
     readers: [SlotState; MAX_WS_READER_SLOTS],
     mains: [SlotState; MAX_MAIN_WORKER_SLOTS],
     wal: SlotState,
+    drain: SlotState,
+    drain_registration: Option<Arc<RegisteredDrainThread>>,
+    /// Own-drain wait, or the shared-worker proxy when no own drain is
+    /// registered. Selected at publish time, not later at minute assembly.
+    drain_second: Option<u64>,
     /// Accumulated `(run_delay_ns, involuntary_switches)` per series.
     totals: [(u64, u64); SERIES_COUNT],
     delay: [Option<metrics::Counter>; SERIES_COUNT],
@@ -428,6 +500,9 @@ impl SchedPublisher {
             readers: [SlotState::default(); MAX_WS_READER_SLOTS],
             mains: [SlotState::default(); MAX_MAIN_WORKER_SLOTS],
             wal: SlotState::default(),
+            drain: SlotState::default(),
+            drain_registration: None,
+            drain_second: None,
             totals: [(0, 0); SERIES_COUNT],
             delay: [const { None }; SERIES_COUNT],
             switches: [const { None }; SERIES_COUNT],
@@ -477,6 +552,32 @@ impl SchedPublisher {
     fn fold_main(&mut self, slot: usize, tid: i64, delay: u64, switches: u64) {
         let growth = self.mains[slot].observe(tid, delay, switches);
         self.add(HotThread::MainWorkers, growth);
+    }
+
+    /// Selects the drain evidence for this publish. Unknown own-drain
+    /// readings stay unknown even when the background workers were read.
+    fn fold_drain(
+        &mut self,
+        registration: Option<&Arc<RegisteredDrainThread>>,
+        reading: Option<(u64, u64)>,
+    ) {
+        let same_registration = match (&self.drain_registration, registration) {
+            (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_registration {
+            self.drain = SlotState::default();
+            // Telemetry-only Arc bump on registration changes;
+            // retains identity so a reused OS id starts a fresh baseline.
+            self.drain_registration = registration.map(Arc::clone);
+        }
+        self.drain_second = match registration {
+            None => self.second[HotThread::MainWorkers as usize],
+            Some(thread) => {
+                reading.map(|(delay, switches)| self.drain.observe(thread.tid, delay, switches).0)
+            }
+        };
     }
 
     /// Publishes `series` from its accumulated totals.
@@ -539,6 +640,15 @@ impl SchedPublisher {
                 .set(main_workers_registered() as f64);
         }
         read += mains_read;
+        let drain_registration = drain_thread_registry().load();
+        let drain_tid = drain_registration.as_ref().map_or(0, |thread| thread.tid);
+        let drain_reading = if drain_tid > 0 {
+            self.read_thread(drain_tid)
+        } else {
+            None
+        };
+        self.fold_drain(drain_registration.as_ref(), drain_reading);
+        read += usize::from(drain_reading.is_some());
         let wal_tid = WAL_WRITER_TID.load(Ordering::Relaxed);
         if wal_tid != 0
             && let Some((delay, switches)) = self.read_thread(wal_tid)
@@ -568,6 +678,15 @@ impl SchedPublisher {
         self.second[series as usize]
     }
 
+    /// The last publish's drain wait. Own mode reads only the dedicated
+    /// thread; shared mode uses the main-worker sum, which also includes
+    /// their other tasks. `None` means no applicable reading, never zero.
+    /// The first readable sample establishes the baseline (0). O(1).
+    #[must_use]
+    pub fn last_second_drain_run_delay_ns(&self) -> Option<u64> {
+        self.drain_second
+    }
+
     /// The accumulated `(run_delay_ns, involuntary_switches)` of `series`.
     #[cfg(test)]
     fn totals(&self, series: HotThread) -> (u64, u64) {
@@ -593,6 +712,118 @@ mod tests {
 
     fn proc_readable() -> bool {
         current_thread_id() != 0
+    }
+
+    #[test]
+    fn test_register_drain_thread_and_registered_drain_thread_id_follow_guard_lifetime() {
+        let _guard = lock();
+        assert_eq!(registered_drain_thread_id(), 0);
+        let registration = register_drain_thread();
+        let expected = match current_thread_id() {
+            0 => DRAIN_THREAD_UNREADABLE,
+            tid => tid,
+        };
+        assert_eq!(registered_drain_thread_id(), expected);
+        drop(registration);
+        assert_eq!(registered_drain_thread_id(), 0);
+    }
+
+    #[test]
+    fn test_register_drain_thread_replacement_is_not_cleared_by_previous_guard() {
+        let _guard = lock();
+        for (previous_id, next_id) in [(101, 202), (202, 202), (0, 0)] {
+            let previous = register_drain_thread_id(previous_id);
+            let replacement = register_drain_thread_id(next_id);
+            drop(previous);
+            let expected = if next_id == 0 {
+                DRAIN_THREAD_UNREADABLE
+            } else {
+                next_id
+            };
+            assert_eq!(registered_drain_thread_id(), expected);
+            drop(replacement);
+            assert_eq!(registered_drain_thread_id(), 0);
+        }
+    }
+
+    #[test]
+    fn test_register_drain_thread_unwind_releases_registration() {
+        let _guard = lock();
+        let outcome = std::panic::catch_unwind(|| {
+            let _registration = register_drain_thread_id(101);
+            panic!("simulate the dedicated drain panicking");
+        });
+        assert!(outcome.is_err());
+        assert_eq!(registered_drain_thread_id(), 0);
+    }
+
+    #[test]
+    fn test_last_second_drain_run_delay_ns_uses_own_wait_in_host_row() {
+        let mut p = SchedPublisher::new();
+        p.fold_main(0, 101, 1_000, 0);
+        p.fold_main(0, 101, 9_001_000, 1);
+        let own = Arc::new(RegisteredDrainThread { tid: 202 });
+        p.fold_drain(Some(&own), Some((2_000, 0)));
+        p.fold_drain(Some(&own), Some((2_500, 1)));
+        assert_eq!(
+            p.last_second_run_delay_ns(HotThread::MainWorkers),
+            Some(9_000_000)
+        );
+        assert_eq!(p.last_second_drain_run_delay_ns(), Some(500));
+
+        // Exercise the actual capacity-row consumer: this failed before
+        // HostSampler stopped reading MainWorkers unconditionally.
+        let mut host = crate::host_capacity_minute::HostSampler::new();
+        host.absorb_second(&p);
+        assert_eq!(
+            host.close_minute(0, 60_000_000_000).drain_wait,
+            Some((500, 500))
+        );
+    }
+
+    #[test]
+    fn test_last_second_drain_run_delay_ns_unreadable_own_never_uses_background_wait() {
+        let mut p = SchedPublisher::new();
+        p.fold_main(0, 101, 1_000, 0);
+        p.fold_main(0, 101, 9_001_000, 1);
+        for tid in [202, DRAIN_THREAD_UNREADABLE] {
+            let own = Arc::new(RegisteredDrainThread { tid });
+            p.fold_drain(Some(&own), None);
+            assert_eq!(p.last_second_drain_run_delay_ns(), None);
+            let mut host = crate::host_capacity_minute::HostSampler::new();
+            host.absorb_second(&p);
+            assert_eq!(host.close_minute(0, 60_000_000_000).drain_wait, None);
+        }
+    }
+
+    #[test]
+    fn test_last_second_drain_run_delay_ns_shared_and_replacement_baselines() {
+        let mut p = SchedPublisher::new();
+        p.fold_drain(None, None);
+        assert_eq!(p.last_second_drain_run_delay_ns(), None);
+        p.fold_main(0, 101, 1_000, 0);
+        p.fold_main(0, 101, 1_700, 1);
+        p.fold_drain(None, None);
+        assert_eq!(p.last_second_drain_run_delay_ns(), Some(700));
+        let own = Arc::new(RegisteredDrainThread { tid: 202 });
+        p.fold_drain(Some(&own), Some((10_000, 0)));
+        assert_eq!(p.last_second_drain_run_delay_ns(), Some(0), "new baseline");
+        p.fold_drain(Some(&own), Some((10_500, 0)));
+        assert_eq!(p.last_second_drain_run_delay_ns(), Some(500));
+        // No shared-mode sample need occur between replacements, and the
+        // kernel may reuse the same id with higher counters.
+        let replacement = Arc::new(RegisteredDrainThread { tid: 202 });
+        p.fold_drain(Some(&replacement), Some((50_000, 0)));
+        assert_eq!(
+            p.last_second_drain_run_delay_ns(),
+            Some(0),
+            "replacement baseline"
+        );
+        p.fold_drain(None, None);
+        assert_eq!(p.last_second_drain_run_delay_ns(), Some(700));
+        // Even a reused OS id starts fresh after a shared-mode interval.
+        p.fold_drain(Some(&replacement), Some((99_000, 0)));
+        assert_eq!(p.last_second_drain_run_delay_ns(), Some(0));
     }
 
     #[test]

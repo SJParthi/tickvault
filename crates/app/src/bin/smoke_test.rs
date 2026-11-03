@@ -56,10 +56,26 @@
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+#[path = "smoke_test/deploy_backup.rs"]
+mod deploy_backup;
+
 const DEFAULT_DURATION_SECS: u64 = 30;
 const CONFIG_BASE_PATH: &str = "config/base.toml";
 
 fn main() -> Result<(), String> {
+    // Deployment preservation exits before config loading, directory probes or
+    // any normal smoke behavior. It never starts the application or a provider.
+    if std::env::args().nth(1).as_deref() == Some("--preserve-deploy") {
+        if std::env::args().count() != 2 {
+            return Err("DEPLOY_BACKUP: unexpected arguments".to_string());
+        }
+        #[cfg(target_os = "linux")]
+        return deploy_backup::preserve_deployment(Path::new("/"), 0, Some("ec2-user"))
+            .map(|path| eprintln!("DEPLOY_BACKUP_CREATED {}", path.display()));
+        #[cfg(not(target_os = "linux"))]
+        return Err("DEPLOY_BACKUP: Linux host required".to_string());
+    }
     let start = Instant::now();
     let duration = parse_duration_flag().unwrap_or(DEFAULT_DURATION_SECS);
     eprintln!("S7-Step4: tv-smoke-test starting (budget {}s)", duration);

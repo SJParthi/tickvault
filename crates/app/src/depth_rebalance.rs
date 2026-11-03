@@ -2637,7 +2637,6 @@ mod apply_tests {
         let mut sockets = vec![s0];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         if tickvault_core::websocket::pool_supervisor::rotation_halted() {
             // The latch is process-global; another test may have tripped it.

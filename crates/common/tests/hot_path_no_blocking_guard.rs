@@ -65,6 +65,15 @@ const TARGETS: &[Target] = &[
         file: "crates/storage/src/hot_path_telemetry.rs",
         function: Some("pub fn record_stage_nanos("),
     },
+    // The public recorder delegates to these atomic/classification bodies.
+    Target {
+        file: "crates/storage/src/hot_path_telemetry.rs",
+        function: Some("fn record(&self, stage: Stage, nanos: u64)"),
+    },
+    Target {
+        file: "crates/storage/src/hot_path_telemetry/strict_threshold.rs",
+        function: Some("pub(super) const fn raw_bucket_index("),
+    },
     Target {
         file: "crates/storage/src/hot_path_telemetry.rs",
         function: Some("pub fn beat_at("),

@@ -34,6 +34,7 @@ const BUDGET_BYTES: u64 = 0;
 const BUDGET_BLOCKS: u64 = 0;
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn dhat_rescue_floor_and_durability_lag_are_zero_allocation() {
     let wm = applied_watermark();
     let lag: &'static mut DurabilityLag = Box::leak(Box::new(DurabilityLag::new()));

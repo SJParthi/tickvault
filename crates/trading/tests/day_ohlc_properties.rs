@@ -39,12 +39,12 @@ type Packet = (f64, f64);
 /// Prices that are real, plus every corrupt shape seen in a live payload.
 fn price() -> impl Strategy<Value = f64> {
     prop_oneof![
-        60 => (0.05f64..90_000.0),
+        60 => 0.05f64..90_000.0,
         4 => Just(0.0),
         4 => Just(f64::NAN),
         3 => Just(f64::INFINITY),
         3 => Just(f64::NEG_INFINITY),
-        3 => (-90_000.0f64..0.0),
+        3 => -90_000.0f64..0.0,
         3 => Just(f64::from(f32::MAX)),
         3 => Just(f64::MIN_POSITIVE),
         3 => Just(DAY_OPEN_MAX_PLAUSIBLE_PRICE * 2.0),

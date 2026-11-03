@@ -94,7 +94,7 @@ jobs:
     if: needs.preflight.outputs.ready == 'true'
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -171,14 +171,14 @@ jobs:
           set -euo pipefail
           action="$ACTION_INPUT"
           force="$FORCE_INPUT"
-          # Only stop/reboot/restart-app interrupt a live session.
+          # These actions interrupt capture or its persistence during a live session.
           case "$action" in
-            stop|reboot|restart-app|stop-app|rotate-ip) sensitive=1 ;;
+            stop|reboot|restart-app|stop-app|rotate-ip|restart-questdb) sensitive=1 ;;
             *) sensitive=0 ;;
           esac
           if [ "$sensitive" = "1" ] && [ "$force" != "yes" ]; then
             # IST = UTC+5:30. Capture window UTC 03:30-10:10 (09:00-15:40 IST), Mon-Fri.
-            mins=$(( ( $(date -u +%H) * 60 + $(date -u +%M) ) ))
+            mins=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
             dow=$(date -u +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes  # 1=Mon..7=Sun
             if [ "$MUHURAT" = "yes" ] || { [ "$dow" -le 5 ] && [ "$mins" -ge 210 ] && [ "$mins" -le 610 ]; }; then
               echo "::error::'$action' blocked during the capture window (09:00-15:40 IST Mon-Fri, or all of a Muhurat date). Re-run with force=yes if truly needed."

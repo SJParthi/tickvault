@@ -47,11 +47,27 @@ if [ -z "$FILES" ]; then
   exit 0
 fi
 
+# A private, size-limited text index is optional: unsupported encodings, binary
+# input, unusual filenames or any index failure retain the legacy search path.
+TEST_INDEX=""
+TEST_CHARSET=$(locale charmap 2>/dev/null || true)
+case "$TEST_CHARSET" in
+  UTF-8|UTF8|ANSI_X3.4-1968|US-ASCII)
+    if command -v iconv >/dev/null 2>&1 && [ -z "${GREP_OPTIONS:-}" ]; then
+      TEST_INDEX=$(mktemp "${TMPDIR:-/tmp}/tickvault-pubfn.XXXXXXXX" 2>/dev/null || true)
+    fi
+    ;;
+esac
+trap '[ -z "$TEST_INDEX" ] || rm -f -- "$TEST_INDEX"' EXIT
+trap 'exit 2' HUP INT TERM
+
 # Count untested pub fns
 count_untested() {
   local scan_files="$1"
   local scan_mode="$2"
   local count=0
+  local test_files="" test_crate="" exemption_lines=""
+  local matched_names=" " unmatched_names=" " fast_test_paths=0 indexed_tests=0
 
   while IFS= read -r file; do
     [ -z "$file" ] && continue
@@ -78,12 +94,18 @@ count_untested() {
 
     [ -z "$pub_fns" ] && continue
 
+    # Read marker positions once, rather than rereading the file for every fn.
+    # Literal marker matching and immediately preceding-line semantics stay intact.
+    exemption_lines=""
+    if [ "$scan_mode" = "all" ]; then
+      exemption_lines=$'\n'$(sed -n '/TEST-EXEMPT:/=' "$full_path" 2>/dev/null || true)$'\n'
+    fi
+
     while IFS= read -r line; do
       [ -z "$line" ] && continue
 
-      local fn_name
-      fn_name=$(echo "$line" | sed -n 's/.*fn \([a-z_][a-z0-9_]*\).*/\1/p')
-      [ -z "$fn_name" ] && continue
+      [[ "$line" =~ .*fn\ ([a-z_][a-z0-9_]*).* ]] || continue
+      local fn_name="${BASH_REMATCH[1]}"
 
       # Skip structural functions
       case "$fn_name" in
@@ -95,10 +117,10 @@ count_untested() {
       # Check for TEST-EXEMPT
       if [ "$scan_mode" = "all" ]; then
         local line_num
-        line_num=$(echo "$line" | cut -d: -f1)
+        line_num="${line%%:*}"
         if [ -n "$line_num" ] && [ "$line_num" -gt 1 ]; then
           local prev_line=$((line_num - 1))
-          if sed -n "${prev_line}p" "$full_path" 2>/dev/null | grep -q 'TEST-EXEMPT:'; then
+          if [[ "$exemption_lines" == *$'\n'"$prev_line"$'\n'* ]]; then
             continue
           fi
         fi
@@ -106,8 +128,67 @@ count_untested() {
 
       # Search for matching test
       local test_found
-      test_found=$(grep -r "#\[test\]" "$crate_dir" --include='*.rs' -l 2>/dev/null | \
-        xargs grep -l "fn test_.*${fn_name}\|fn ${fn_name}_\|test.*${fn_name}" 2>/dev/null || true)
+      # Cache verdicts, not declarations: duplicate untested fns still count.
+      # Space-delimited ASCII names work on Bash 3; no associative arrays needed.
+      if [ "$test_crate" != "$crate_dir" ]; then
+        test_files=$(grep -r "#\[test\]" "$crate_dir" --include='*.rs' -l 2>/dev/null || true)
+        test_crate="$crate_dir"
+        matched_names=" " unmatched_names=" "
+        # Preserve legacy xargs quirks for unusual names, including tokens that
+        # could be interpreted as grep options. Ordinary names can stop early.
+        local flat_paths="${test_files//$'\n'/}"
+        fast_test_paths=1
+        if [[ "$flat_paths" =~ [[:space:]] ]] ||
+           [[ "$test_files" == -* || "$test_files" == *$'\n-'* ||
+              "$test_files" == *\'* || "$test_files" == *\"* || "$test_files" == *\\* ]]; then
+          fast_test_paths=0
+        fi
+        indexed_tests=0
+        if [ "$fast_test_paths" -eq 1 ] && [ -n "$TEST_INDEX" ] && [ -n "$test_files" ]; then
+          # Capture all per-file counts: /dev/null enables grep early-exit,
+          # and a text sibling can mask a binary file in aggregate exit status.
+          # Any zero count or invalid encoding retains legacy binary semantics.
+          local text_counts="" zero_status=0
+          if text_counts=$(printf '%s\n' "$test_files" | xargs grep -I -c '^' 2>/dev/null); then
+            # No producer pipe: grep -q may stop early. Only status 1 proves
+            # there was no zero; a validation error also retains legacy search.
+            grep -qE '(^|:)0$' <<< "$text_counts" 2>/dev/null || zero_status=$?
+            if [ "$zero_status" -eq 1 ] &&
+               printf '%s\n' "$test_files" | xargs iconv -f "$TEST_CHARSET" -t "$TEST_CHARSET" >/dev/null 2>&1 &&
+               (ulimit -f 65536 && printf '%s\n' "$test_files" | xargs grep -h -e test -e 'fn ' > "$TEST_INDEX") 2>/dev/null; then
+              indexed_tests=1
+            fi
+          fi
+        fi
+      fi
+      if [[ "$matched_names" == *" $fn_name "* ]]; then
+        test_found=match
+      elif [[ "$unmatched_names" == *" $fn_name "* ]]; then
+        test_found=""
+      else
+        if [ "$indexed_tests" -eq 1 ]; then
+          # Every legacy match lies on a line containing test or "fn ". The
+          # index preserves those entire lines and file-boundary newlines; the
+          # exact legacy expression still decides each function's coverage.
+          test_found=""
+          local lookup_status=0
+          grep -q "fn test_.*${fn_name}\|fn ${fn_name}_\|test.*${fn_name}" "$TEST_INDEX" 2>/dev/null || lookup_status=$?
+          if [ "$lookup_status" -eq 0 ]; then
+            test_found=match
+          elif [ "$lookup_status" -ne 1 ]; then
+            indexed_tests=0
+          fi
+        fi
+        if [ "$indexed_tests" -eq 0 ]; then
+          test_found=$(printf '%s\n' "$test_files" | \
+            xargs grep -l "fn test_.*${fn_name}\|fn ${fn_name}_\|test.*${fn_name}" 2>/dev/null || true)
+        fi
+        if [ -n "$test_found" ]; then
+          matched_names+="$fn_name "
+        else
+          unmatched_names+="$fn_name "
+        fi
+      fi
 
       if [ -z "$test_found" ]; then
         count=$((count + 1))

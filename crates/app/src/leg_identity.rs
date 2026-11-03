@@ -68,7 +68,7 @@ mod tests {
         assert_eq!(found.underlying, "NIFTY");
         assert_eq!(found.strike_paise, 2_500_000);
         assert!(
-            map.get(&(12_345_u64, 8_u8)).is_none(),
+            !map.contains_key(&(12_345_u64, 8_u8)),
             "segment is part of the key"
         );
     }

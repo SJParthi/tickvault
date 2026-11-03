@@ -231,6 +231,7 @@ fn test_watchdog_pinger_is_shared_prefix_feed_unconditional_and_real() {
 /// WatchdogSec). Parses the REAL unit file so the two sides cannot drift
 /// apart silently.
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn test_pinger_interval_within_unit_watchdog_budget() {
     let unit = strip_line_comments(&read("deploy/systemd/tickvault.service"));
     assert!(

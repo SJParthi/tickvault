@@ -4218,6 +4218,33 @@ the code ships.
   `xverify_unsettled_final` (the last attempt read with missing-minute judging
   off). The option pass logs its skip at `info!`.
 
+**2026-10-30 note (51e/51f/51g) — four coverage `reason` values on the existing
+`xverify_failed` page, no new page.** The owner answered, in the coordinator
+session on 2026-10-30 about 12:10 IST, the decision card "The 1-minute
+cross-check session (it compares our candles with Dhan's after close) wants 4
+new reasons to trigger the EXISTING 'cross-check failed' Telegram alert. They
+fire when: the check covered fewer stocks than we subscribed, coverage can't be
+told, the stock list fell back to the 4 indices only, or the check worker never
+reported. This means more pages on bad days, and no new alarm type. Allow it?"
+with **"Yes, add the 4 reasons (Recommended)"** ("I record your OK in the alert
+rule file. On a day the check didn't really cover the market, you get the
+existing 'cross-check failed' message, at most once per day, instead of a
+silent pass."). Recorded BEFORE the code ships (plan items 51e, 51f, 51g;
+`no-rest-except-live-feed-2026-06-27.md` §12.15).
+
+- **NO** new alarm, metric filter, EMF name, dimension or `ok_actions`. No
+  terraform change.
+- `xverify_failed` keeps its meaning and gains four `reason` values:
+  `coverage_short` (the check compared fewer instruments than the day's
+  subscribed spot/index set), `coverage_unknown` (the subscribed set could not
+  be read, so coverage cannot be told), `fallback_universe` (the live universe
+  fell back to the four index ids) and `worker_never_reported` (the check
+  worker ended without a verdict). It still pages at most once per day, after
+  the last attempt, through the same paged-marker rule as every other `reason`.
+- REJECT under this note: a separate page, alarm, filter or EMF name for any of
+  the four; paging more than once per day; downgrading a real `diverged` day
+  to `xverify_failed`; using this note for any other `reason`.
+
 ---
 
 ## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts

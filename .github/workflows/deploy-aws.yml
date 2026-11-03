@@ -315,7 +315,7 @@ jobs:
           # review HIGH fix — a rerun-if-env-changed on GITHUB_SHA killed the
           # Build & Verify cache on every commit).
           TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
-        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault -p tickvault-app
+        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault --bin tv-movers -p tickvault-app
 
       - name: Build smoke_test binary (ARM64 musl static)
         # Separate binary at crates/app/src/bin/smoke_test.rs — exits 0/1
@@ -333,6 +333,8 @@ jobs:
           BIN_DIR=target/aarch64-unknown-linux-musl/release
           file "$BIN_DIR/tickvault"
           file "$BIN_DIR/smoke_test"
+          file "$BIN_DIR/tv-movers" | grep -q 'aarch64\|ARM'
+          file "$BIN_DIR/tv-movers" | grep -q 'statically linked'
           # Confirm the file command reports ARM aarch64 (not x86)
           file "$BIN_DIR/tickvault" | grep -q 'aarch64\|ARM' \
             || (echo "FAIL: tickvault is not ARM64 — arch mismatch with Graviton box"; exit 1)
@@ -359,14 +361,13 @@ jobs:
             exit 1
           fi
 
-      - name: Stage both binaries for upload
+      - name: Stage app, smoke test and read-only operator helper
         run: |
           mkdir -p dist
           BIN_DIR=target/aarch64-unknown-linux-musl/release
-          cp "$BIN_DIR/tickvault"   dist/tickvault
-          cp "$BIN_DIR/smoke_test"  dist/smoke_test
+          cp "$BIN_DIR/tickvault" "$BIN_DIR/smoke_test" "$BIN_DIR/tv-movers" dist/
 
-      - name: Upload artifact (both binaries)
+      - name: Upload artifact (all three binaries)
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -380,7 +381,7 @@ jobs:
         # deploy job's credential step (same action + inputs) so it works both
         # pre- and post-OIDC-migration.
         if: failure()
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -530,7 +531,7 @@ jobs:
         # operator has only AWS_ACCESS_KEY_ID/SECRET set — so this step MUST
         # accept either. Mirrors seed-staging-ssm.yml so deploy works the
         # moment the box exists, not only after the OIDC migration.
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -751,16 +752,21 @@ jobs:
 
           # Audit PR30 (2026-09-27): a budget stop stays stopped for the UTC
           # billing month. The latch is read before the start, for every
-          # event type (the post-merge catch-up dispatches by
-          # workflow_dispatch too). FAIL-OPEN: an unreadable latch starts the
-          # box as before; the hourly hard-stop guard still stops a breached
-          # box within the hour. The raw value is never echoed.
-          LATCH=$(aws ssm get-parameter --region "$REGION" \
-            --name "/tickvault-guard/prod/budget-stop-month" \
-            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          # event type (the post-merge catch-up dispatches by workflow_dispatch
+          # too). Fail closed on unreadable or malformed markers. Only the
+          # CLI's exact ParameterNotFound classification proves absence.
+          # GNU date round-trips the expected month/date form; raw values and
+          # provider error bodies never reach logs. Each provider read is bounded.
+          # A suffix preserves trailing bytes through shell capture; only one
+          # normal CLI newline is removed. Local C locale makes lengths bytes.
+          read_stop_fence() { local kind="$1" suffix="$2" format="$3" raw rc LC_ALL=C expected=10; [ "$kind" != budget ] || expected=7; shift 3
+            if raw=$(timeout -k 5 20 "$@" 2>&1 | tr '\000' '?' | head -c 4097; rc=$?; printf '.'; exit "$rc"); then raw=${raw%.}; raw=${raw%$'\n'}; if [ "$kind" = budget ] && [[ "$raw" =~ ^released-([0-9]{4}-[0-9]{2})$ ]] && [ "$(date -u -d "${BASH_REMATCH[1]}-01" +%Y-%m 2>/dev/null)" = "${BASH_REMATCH[1]}" ]; then echo "DEPLOY_FENCE $kind=released" >&2; return 0; fi; [ "${#raw}" = "$expected" ] && [ "$(date -u -d "${raw}${suffix}" +"$format" 2>/dev/null)" = "$raw" ] || { echo "::error::DEPLOY_FENCE $kind invalid; refusing start" >&2; return 1; }; echo "DEPLOY_FENCE $kind=valid" >&2; printf '%s' "$raw"
+            else rc=$?; raw=${raw%.}; if { [ "$rc" = 254 ] || [ "$rc" = 255 ]; } && [ "${#raw}" -le 4096 ] && [[ "$raw" =~ ^[[:space:]]*(aws:\ \[ERROR\]:\ )?An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then echo "DEPLOY_FENCE $kind=absent" >&2; else echo "::error::DEPLOY_FENCE $kind unavailable; refusing start" >&2; return 1; fi; fi
+          }
+          LATCH=$(read_stop_fence budget -01 %Y-%m aws ssm get-parameter --region "$REGION" --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text) || exit 1
           if [ -n "$LATCH" ] && [ "$LATCH" = "$(date -u +%Y-%m)" ]; then
             echo "DEPLOY_SKIP_REASON=budget_stop" >> "$GITHUB_ENV"
-            echo "::notice::Box is stopped by the monthly budget stop for $(date -u +%Y-%m) — not starting it, skipping deploy. To deploy anyway, delete /tickvault-guard/prod/budget-stop-month and re-enable the daily-start rule, then re-run."
+            echo "::notice::DEPLOY_FENCE budget=matching — leaving the budget-stopped box stopped; no override attempted."
             exit 0
           fi
 
@@ -769,12 +775,13 @@ jobs:
           # holiday. Every dispatcher (deploy-watchdog, deploy-aws-after-close,
           # postmerge-catchup) runs this workflow by workflow_dispatch, which
           # sets SHOULD_BE_UP=yes, so without this check a holiday redeploy
-          # would start the box the gate just stopped. Same read and fail-open
-          # as the budget latch above (unreadable = start as before); the
-          # GitHub role already reads this parameter (oidc.tf). Green no-op.
-          HSTOP=$(aws ssm get-parameter --region "$REGION" --name "/tickvault/prod/holiday-stop-date" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          # would start the box the gate just stopped. The same strict reader
+          # validates this date and refuses an unknown result before starting.
+          # GitHub role already reads this parameter (oidc.tf). A valid matching
+          # marker is a green no-op; unreadable/invalid is a loud refusal.
+          HSTOP=$(read_stop_fence holiday '' %F aws ssm get-parameter --region "$REGION" --name "/tickvault/prod/holiday-stop-date" --query 'Parameter.Value' --output text) || exit 1
           if [ -n "$HSTOP" ] && [ "$HSTOP" = "$(TZ='Asia/Kolkata' date +%F)" ]; then
-            echo "DEPLOY_SKIP_REASON=holiday_stop" >> "$GITHUB_ENV"; echo "::notice::Box was stopped today by the NSE holiday gate — not starting it, skipping deploy. To deploy anyway, start the box from the console (the gate lets a second start the same day through, and never stops a boot outside 08:25-09:15 IST), then re-run with confirm_market_hours=yes (09:00-15:45 IST) or after 15:45 IST: a running box deploys."; exit 0
+            echo "DEPLOY_SKIP_REASON=holiday_stop" >> "$GITHUB_ENV"; echo "::notice::DEPLOY_FENCE holiday=matching — leaving the holiday-stopped box stopped; no override attempted."; exit 0
           fi
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
@@ -851,16 +858,13 @@ jobs:
             echo "::warning::$MISSING /tickvault/prod/* keys are missing — app boot may HALT. Populate them MANUALLY via aws ssm put-parameter (operator-owned; the deploy never auto-seeds prod)."
           fi
 
-      - name: Upload both binaries to S3 deploy bucket
+      - name: Upload app, smoke test and read-only helper to S3
         # Skipped on an intentional off-hours skip — no deploy is happening.
         if: env.DEPLOY_SKIP_REASON == ''
         run: |
-          chmod +x ./dist/tickvault ./dist/smoke_test
-          aws s3 cp ./dist/tickvault \
-            s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }}
-          aws s3 cp ./dist/smoke_test \
-            s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
+          chmod +x ./dist/tickvault ./dist/smoke_test ./dist/tv-movers
+          aws s3 cp ./dist/ \
+            s3://tv-prod-cold/deploys/${{ github.sha }}/ --recursive --exclude '*' --include tickvault --include smoke_test --include tv-movers \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
       - name: Re-gate market hours at SWAP time (no mid-session restart)
@@ -1103,23 +1107,25 @@ jobs:
         # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
         # `${{ }}` interpolation. GitHub compiles any run script containing an
         # expression into a SINGLE template expression capped at 21,000 chars;
-        # this block is ~23,100, so one interpolation makes the whole workflow
-        # file unparseable — `422 Exceeded max expression length 21000` — which
-        # kills the push trigger AND workflow_dispatch, silently blocking every
-        # deploy. Pass values through `env:` below and reference them as shell
-        # variables instead. Inside the single-quoted `--parameters 'commands=[…]'`
-        # payload use quote-splicing ('"$VAR"') — a bare $VAR will not expand.
+        # a historically oversized block failed with `422 Exceeded max expression
+        # length 21000`. The current block is smaller, but keeping expressions out
+        # avoids coupling deploy validity to that limit. Pass values through env.
+        # DEPLOY_SHA is validated as exactly 40 lowercase hex characters before
+        # its single literal splice into the SSM script; subsequent references
+        # expand only on the instance. No unvalidated value enters that payload.
+        # The splice sits on the `'commands=[` opener line: the SSM quoting lint
+        # (scripts/validate-deploy-ssm-quoting.sh) rejects an apostrophe on any
+        # interior line of the block, and the opener is the one line it allows.
         env:
           AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
           DEPLOY_SHA: ${{ github.sha }}
         run: |
-          CMD_ID=$(aws ssm send-command \
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid deployment SHA"; exit 1; }; CMD_ID=$(aws ssm send-command \
             --region "$AWS_REGION_EFF" \
             --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault deploy sha=$DEPLOY_SHA" \
-            --parameters 'commands=[
-              "set -euo pipefail",
+            --parameters 'commands=["set -euo pipefail; DEPLOY_SHA='$DEPLOY_SHA'",
               "command -v git >/dev/null 2>&1 || sudo timeout 180 dnf install -y git || sudo timeout 180 yum install -y git",
               "command -v docker >/dev/null 2>&1 || sudo timeout 180 dnf install -y docker || sudo timeout 180 yum install -y docker",
               "sudo systemctl enable --now docker",
@@ -1130,34 +1136,34 @@ jobs:
               "if docker compose version >/dev/null 2>&1; then echo COMPOSE-PLUGIN-OK: already present - skipping install; else sudo timeout 180 dnf install -y docker-compose-plugin || sudo timeout 180 yum install -y docker-compose-plugin || echo compose plugin not in distro repos - falling back to pinned static binary; fi",
               "if ! docker compose version >/dev/null 2>&1; then COMPOSE_ARCH=$(uname -m); case \"$COMPOSE_ARCH\" in aarch64) COMPOSE_SHA256=\"$COMPOSE_SHA256_AARCH64\";; x86_64) COMPOSE_SHA256=\"$COMPOSE_SHA256_X86_64\";; *) COMPOSE_SHA256=\"\";; esac; if [ -z \"$COMPOSE_SHA256\" ]; then echo WARN: no pinned compose sha256 for arch $COMPOSE_ARCH - skipping static install; else timeout 150 curl -fsSL --max-time 120 https://github.com/docker/compose/releases/download/$COMPOSE_PIN/docker-compose-linux-$COMPOSE_ARCH -o /tmp/docker-compose.dl && echo \"$COMPOSE_SHA256  /tmp/docker-compose.dl\" | sha256sum -c - && sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo install -m 0755 -o root -g root /tmp/docker-compose.dl /usr/local/lib/docker/cli-plugins/docker-compose || echo WARN: pinned compose plugin download or sha256 verification FAILED - nothing installed - final verify below decides; rm -f /tmp/docker-compose.dl; fi; fi",
               "docker compose version || (echo FATAL: docker compose plugin still unavailable after distro package + pinned sha256-verified static binary attempts - boot path would BOOT-02 on the next nuke; exit 1)",
-              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
+              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin/.next",
+              "cd /opt/tickvault/bin/.next; TVS3=s3://tv-prod-cold/deploys/$DEPLOY_SHA; timeout 300 aws s3 cp \"$TVS3/tickvault\" tickvault",
+              "timeout 300 aws s3 cp \"$TVS3/smoke_test\" smoke_test",
+              "timeout 300 aws s3 cp \"$TVS3/tv-movers\" tv-movers",
+              "chmod +x tickvault smoke_test tv-movers",
+              "(cd ../..; timeout -k 5 120 bin/.next/smoke_test --preserve-deploy)",
               "chown -R ec2-user:ec2-user /opt/tickvault",
               "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user git clone --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
               "cd /opt/tickvault",
-              "if [ -d repo/.git ]; then sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin main && sudo -u ec2-user git -C repo reset --hard origin/main; fi",
+              "sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin $DEPLOY_SHA && sudo -u ec2-user git -C repo reset --hard $DEPLOY_SHA && TV_REV=$(sudo -u ec2-user git -C repo rev-parse HEAD) && test \"$TV_REV\" = $DEPLOY_SHA || exit 1",
               "if [ ! -d repo/config ]; then echo FATAL: repo/config missing after git clone; exit 1; fi",
               "cp -f repo/config/*.toml config/",
               "chown -R ec2-user:ec2-user config/",
               "echo ===== deployed config/production.toml line count + head =====",
               "wc -l config/production.toml repo/config/production.toml",
-              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
+              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config differs from repo after copy; diff config/production.toml repo/config/production.toml; exit 1)",
               "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -f repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service; fi",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
               "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
+              "timeout 40 bin/.next/smoke_test --duration 30",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
-              "chmod +x bin/tickvault.new bin/smoke_test.new",
-              "timeout 40 bin/smoke_test.new --duration 30",
-              "mv bin/tickvault.new   bin/tickvault",
-              "mv bin/smoke_test.new  bin/smoke_test",
-              "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
+              "(cd bin/.next; chown ec2-user:ec2-user tickvault smoke_test tv-movers; mv tickvault smoke_test tv-movers ..)",
               "install -m 0755 -o root -g root bin/tickvault bin/tickvault-host",
               "cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service",
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
-              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose up attempt 1 failed - a recreate leaves the old container renamed to <id>_<service> and the daemon can then refuse to start it; removing the containers of this compose project and retrying once (named volumes and data are untouched)\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
+              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose retry after stale-container cleanup; named volumes and data retained\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
               "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:9000/index.html || { echo \"FATAL: console shell page (/index.html) not served as a complete HTTP 200 within 5s on the box\"; exit 1; }",
               "systemctl daemon-reload",

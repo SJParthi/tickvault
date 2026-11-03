@@ -1730,9 +1730,10 @@ mod tests {
     /// True when a level carries no resting order and is therefore padding
     /// rather than a price point. See the section header: the parser has no
     /// sentinel, so absence is "no size and no orders", plus a defensive
-    /// guard on a non-positive / non-finite price (never a real NSE price).
+    /// guard on a non-positive / NaN price (never a real NSE price).
     fn depth_level_is_absent(level: &DeepDepthLevel) -> bool {
-        (level.quantity == 0 && level.orders == 0) || !(level.price > 0.0)
+        (level.quantity == 0 && level.orders == 0)
+            || level.price.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
     }
 
     /// Bid prices must be NON-INCREASING by level: level 0 is the best (i.e.

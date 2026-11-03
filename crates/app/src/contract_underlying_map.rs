@@ -1274,24 +1274,24 @@ mod tests {
     #[test]
     fn contract_label_renders_the_mandated_precise_format() {
         assert_eq!(
-            contract_label("NIFTY", 2026_09_25, 2_450_000, "CE"),
+            contract_label("NIFTY", 20260925, 2_450_000, "CE"),
             "NIFTY-25Sep2026-24500-CE"
         );
         assert_eq!(
-            contract_label("RELIANCE", 2026_06_25, 2_800_000, "PE"),
+            contract_label("RELIANCE", 20260625, 2_800_000, "PE"),
             "RELIANCE-25Jun2026-28000-PE"
         );
         // A single-digit day is zero-padded, so 5 Sep sorts and reads beside
         // 25 Sep instead of collating between 19 and 20.
         assert_eq!(
-            contract_label("TCS", 2026_09_05, 400_000, "CE"),
+            contract_label("TCS", 20260905, 400_000, "CE"),
             "TCS-05Sep2026-4000-CE"
         );
         // Whitespace and case come from the master verbatim; the map is built
         // on a trimmed symbol, so the label must trim the same way or the two
         // describe the same contract differently.
         assert_eq!(
-            contract_label("  INFY  ", 2026_12_31, 150_000, " CE "),
+            contract_label("  INFY  ", 20261231, 150_000, " CE "),
             "INFY-31Dec2026-1500-CE"
         );
     }
@@ -1304,11 +1304,11 @@ mod tests {
     #[test]
     fn contract_label_keeps_a_fractional_strike() {
         assert_eq!(
-            contract_label("IDEA", 2026_09_25, 1_250, "PE"),
+            contract_label("IDEA", 20260925, 1_250, "PE"),
             "IDEA-25Sep2026-12.50-PE"
         );
         assert_eq!(
-            contract_label("YESBANK", 2026_09_25, 2_075, "CE"),
+            contract_label("YESBANK", 20260925, 2_075, "CE"),
             "YESBANK-25Sep2026-20.75-CE"
         );
     }
@@ -1323,13 +1323,13 @@ mod tests {
             "NIFTY-0-24500-CE"
         );
         assert_eq!(
-            contract_label("NIFTY", 2026_13_45, 2_450_000, "CE"),
+            contract_label("NIFTY", 20261345, 2_450_000, "CE"),
             "NIFTY-20261345-24500-CE"
         );
         // A future with no leg has no trailing separator — a dangling `-`
         // would read as a truncated label.
         assert_eq!(
-            contract_label("NIFTY", 2026_09_25, 0, ""),
+            contract_label("NIFTY", 20260925, 0, ""),
             "NIFTY-25Sep2026-0"
         );
     }

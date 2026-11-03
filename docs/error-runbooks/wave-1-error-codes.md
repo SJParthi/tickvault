@@ -101,6 +101,43 @@ not applied logs this code once, with a `source` field, and boot continues:
 Source for these: `crates/core/src/websocket/hot_thread_placement.rs`,
 `crates/app/src/drain_thread.rs`, `crates/app/src/main.rs::report_hot_thread_placement`.
 
+## HOT-PATH-04 — the hot-path telemetry thread did not start
+
+**Added 2026-10-30** (plan ITEM 52f). **Severity:** Medium. **Pages:** nothing
+(log-sink-only; boot never fails over it). Logged ONCE at boot as a coded
+`error!` (`ErrorCode::HotPath04TelemetryNotStarted`).
+
+**Before this code:** the same failure was tagged BOOT-02, which pages and
+means "the QuestDB boot probe ran out of time". That was wrong in two ways.
+It named the wrong thing, and the line was written before the log was set up,
+so nobody ever saw it. The spawn now runs right after the log is set up.
+
+**Trigger:** `hot_path_telemetry::spawn_publisher` could not start the
+`tv-telemetry` OS thread. The host refused a new thread: a thread or memory
+limit (`TasksMax` in the systemd unit, `ulimit -u`, or low memory).
+
+**What is unavailable:** periodic stage-latency and task-heartbeat
+publication, closed-minute proof production, and this publisher's
+HOT-PATH-STALL-01 detection. This startup failure does not itself establish
+a capture loss. Runtime lateness probes still run, but their observations
+are not published by the missing thread.
+
+**Check:** inspect the boot error and publication freshness/sample counts.
+Some metric handles are registered before the thread spawn, so an existing
+zero or stale series is not proof that the publisher started. Per-minute
+proof rows can also stop advancing.
+
+**Triage:**
+1. Read the line's `error` field (the OS reason).
+2. Check the unit's `TasksMax` and the box's memory. Raise the limit or free
+   memory, then restart in the next safe window (after 15:45 IST).
+3. Until then, treat a quiet HOT-PATH-STALL-01 as "not watched", not as
+   "healthy".
+
+**Source:** `crates/storage/src/hot_path_telemetry.rs::spawn_publisher`,
+called from `crates/app/src/main.rs` right after the tracing subscriber
+`init()`. Ratchet: `crates/app/tests/hot_path_telemetry_boot_wiring_guard.rs`.
+
 ## PHASE2-01 — Phase 2 dispatch failed (LTPs absent or empty plan)
 
 **Trigger:** `run_phase2_scheduler` emitted `Phase2Failed` after one

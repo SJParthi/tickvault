@@ -33,8 +33,8 @@ use tickvault_app::evening_drain::{
     EVENING_DRAIN_LAST_RESTART_SECS_IST, EVENING_DRAIN_PENDING_MAX_AGE_SECS,
     EVENING_DRAIN_RESTARTS_MAX, EVENING_DRAIN_SPACING_SECS, EVENING_DRAIN_STATE_PATH,
     EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST, EveningState, EveningStep, budget_or, catchup_budget_for,
-    crossverify_settled, evening_step, load_state, state_for_give_up, state_for_restart,
-    store_state,
+    crossverify_settled, evening_step, load_state, load_state_for_evening, state_for_give_up,
+    state_for_restart, store_state,
 };
 
 const DAY: i32 = 739_910;
@@ -183,7 +183,7 @@ struct Outcome {
 /// The drain-hold supervisor's per-minute composition (drain_hold.rs, the
 /// evening block; pinned by `the_supervisor_model_matches_drain_hold_rs`).
 fn supervise(path: &Path, day: i32, m: &Minute, kill: Kill) -> Outcome {
-    let loaded = load_state(path);
+    let loaded = load_state_for_evening(path, m.now);
     let step = match loaded {
         Some(e) => evening_step(
             &e,
@@ -424,7 +424,7 @@ fn drive_evening(
 fn the_supervisor_model_matches_drain_hold_rs() {
     let src = include_str!("../src/drain_hold.rs");
     for needle in [
-        "crate::evening_drain::load_state(evening_path)",
+        "crate::evening_drain::load_state_for_evening(",
         "Some(evening) if on_aws => crate::evening_drain::evening_step(",
         "crate::evening_drain::crossverify_settled(xverify_marker, secs_ist)",
         "_ => crate::evening_drain::EveningStep::Idle,",
@@ -440,6 +440,10 @@ fn the_supervisor_model_matches_drain_hold_rs() {
             "drain_hold.rs no longer contains: {needle}"
         );
     }
+    let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains(
+        "crate::evening_drain::load_state_for_evening(evening_path,chrono::Utc::now().timestamp(),)"
+    ), "the recovery model must use the real state path and current clock");
     // The restart is asked only after the record landed.
     let fn_at = src
         .find("async fn request_evening_restart(")
@@ -974,16 +978,9 @@ fn nothing_restarts_before_the_cross_verification_settles_or_after_five() {
     }
 }
 
-/// DEFECT (see the ignore reason). The module header says "a damaged ... one
-/// stops the restarts (it could not be counted)". A single flipped bit in
-/// an ASCII digit still parses, so a damaged file can lower the count or
-/// clear the give-up latch instead of stopping the restarts.
+/// Regression: 2026-11-02 — v1 valid-digit corruption could lower the cap
+/// or clear the give-up latch. Every newly written v2 field is CRC protected.
 #[test]
-#[ignore = "DEFECT: the state line has no checksum. '1' (0x31) and '0' (0x30) differ by one bit, \
-            as do '3'/'2', so one flipped bit in gave_up or restarts still parses and lifts the \
-            latch or the cap instead of failing closed. Fix: a v2 line with a CRC-32 of the \
-            fields (read v1 during rollout), refused whole on mismatch; or keep the decision \
-            fields in a fixed binary record with a CRC, like the WAL control files."]
 fn a_single_flipped_bit_never_lets_more_restarts_through() {
     let s = EveningState {
         day: DAY,
@@ -1016,19 +1013,10 @@ fn a_single_flipped_bit_never_lets_more_restarts_through() {
     );
 }
 
-/// DEFECT (see the ignore reason). A torn file stops tonight's restarts,
-/// which is the contract. Nothing ever rewrites it (the decision path only
-/// writes from a state it could read, and `budget_or` returns before its
-/// write), so it also stops every LATER evening until someone deletes it.
-/// `drain_hold.rs` maps an unreadable state to Idle and writes nothing; the
-/// error is logged once per process, log-sink only. Proposed fix: when the
-/// content does not parse and the file was last written before this
-/// evening's 15:40 IST start, rename it aside (`evening-drain.state.bad-<unix>`)
-/// and read the default; a file damaged tonight stays fail-closed.
+/// Regression: 2026-11-02 — old torn bytes previously blocked every later
+/// evening. Only old filesystem mtime allows quarantine; damaged data is
+/// never used to decide which evening a record belongs to.
 #[test]
-#[ignore = "DEFECT: an unparseable evening-drain.state is never rewritten, so one torn write \
-            disables the evening drain on every later evening too. Root cause and fix in the \
-            doc comment above."]
 fn a_torn_file_from_last_evening_does_not_block_tonight() {
     let d = TempDir::new("torn-yesterday");
     let p = d.state_path();
@@ -1040,6 +1028,19 @@ fn a_torn_file_from_last_evening_does_not_block_tonight() {
     );
     std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
     std::fs::write(&p, &y.to_line().into_bytes()[..12]).expect("torn yesterday");
+    // A newly created file is NOT old merely because its contents mention
+    // yesterday. Set the actual filesystem time that recovery must verify.
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .expect("open")
+        .set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(
+                    u64::try_from(evening_start_unix(-1)).expect("positive epoch"),
+                ),
+        )
+        .expect("set old mtime");
     let mut restarted = false;
     let start = evening_start_unix(0);
     for k in 0..evening_minutes() {

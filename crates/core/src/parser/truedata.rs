@@ -729,10 +729,7 @@ pub fn check_seq(previous: Option<i32>, current: i32) -> SeqCheck {
 mod tests {
     use super::*;
 
-    /// Builds a synthetic 90-byte Trade Binary frame from the documented
-    /// offsets, so the tests exercise the REAL offset map rather than a
-    /// hand-copied duplicate of it.
-    fn build_trade_frame(
+    struct TradeFrameFields {
         symbol_id: i32,
         timestamp: i32,
         ltp: f32,
@@ -749,7 +746,29 @@ mod tests {
         ohl: u8,
         seq_no: i32,
         bid_ask: Option<(f32, i32, f32, i32)>,
-    ) -> Vec<u8> {
+    }
+
+    /// Builds a synthetic Trade Binary frame from the documented offsets,
+    /// so the tests exercise the REAL offset map rather than a hand-copied duplicate.
+    fn build_trade_frame(fields: TradeFrameFields) -> Vec<u8> {
+        let TradeFrameFields {
+            symbol_id,
+            timestamp,
+            ltp,
+            ltq,
+            atp,
+            tot_volume,
+            open,
+            high,
+            low,
+            prev_close,
+            oi,
+            prev_oi,
+            turnover,
+            ohl,
+            seq_no,
+            bid_ask,
+        } = fields;
         // The SDK's `msg_map` uses two DISTINCT codes, not one code with two
         // lengths: 'T' carries bid/ask (90 B), 'W' does not (74 B).
         let (len, code) = if bid_ask.is_some() {
@@ -785,24 +804,24 @@ mod tests {
 
     /// The v2.6 p.16 documented sample, as a frame.
     fn sample_frame() -> Vec<u8> {
-        build_trade_frame(
-            100_000_995,
-            1_608_115_952,
-            1472.8,
-            635,
-            1475.83,
-            680_949,
-            1475.05,
-            1484.0,
-            1463.0,
-            1468.35,
-            0,
-            0,
-            1_004_964_962.67,
-            b'O',
-            4775,
-            Some((1472.8, 429, 1473.3, 34)),
-        )
+        build_trade_frame(TradeFrameFields {
+            symbol_id: 100_000_995,
+            timestamp: 1_608_115_952,
+            ltp: 1472.8,
+            ltq: 635,
+            atp: 1475.83,
+            tot_volume: 680_949,
+            open: 1475.05,
+            high: 1484.0,
+            low: 1463.0,
+            prev_close: 1468.35,
+            oi: 0,
+            prev_oi: 0,
+            turnover: 1_004_964_962.67,
+            ohl: b'O',
+            seq_no: 4775,
+            bid_ask: Some((1472.8, 429, 1473.3, 34)),
+        })
     }
 
     // --- frame classification ---
@@ -904,24 +923,24 @@ mod tests {
         // Ties the two fixture styles together: if the builder and the
         // golden vector ever disagree, one of them is wrong and the build
         // says so instead of quietly trusting the builder.
-        let built = build_trade_frame(
-            100_000_995,
-            1_608_115_952,
-            1472.8,
-            635,
-            1475.83,
-            680_949,
-            1475.05,
-            1484.0,
-            1463.0,
-            1468.35,
-            111,
-            222,
-            1_004_964_962.67,
-            b'O',
-            4775,
-            Some((1472.8, 429, 1473.3, 34)),
-        );
+        let built = build_trade_frame(TradeFrameFields {
+            symbol_id: 100_000_995,
+            timestamp: 1_608_115_952,
+            ltp: 1472.8,
+            ltq: 635,
+            atp: 1475.83,
+            tot_volume: 680_949,
+            open: 1475.05,
+            high: 1484.0,
+            low: 1463.0,
+            prev_close: 1468.35,
+            oi: 111,
+            prev_oi: 222,
+            turnover: 1_004_964_962.67,
+            ohl: b'O',
+            seq_no: 4775,
+            bid_ask: Some((1472.8, 429, 1473.3, 34)),
+        });
         assert_eq!(
             built.as_slice(),
             GOLDEN_TRADE_90.as_slice(),
@@ -955,24 +974,24 @@ mod tests {
 
     #[test]
     fn test_decode_trade_binary_74_byte_no_bid_ask() {
-        let frame = build_trade_frame(
-            42,
-            1_700_000_000,
-            100.0,
-            1,
-            100.0,
-            10,
-            100.0,
-            101.0,
-            99.0,
-            100.0,
-            0,
-            0,
-            0.0,
-            0,
-            7,
-            None,
-        );
+        let frame = build_trade_frame(TradeFrameFields {
+            symbol_id: 42,
+            timestamp: 1_700_000_000,
+            ltp: 100.0,
+            ltq: 1,
+            atp: 100.0,
+            tot_volume: 10,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            prev_close: 100.0,
+            oi: 0,
+            prev_oi: 0,
+            turnover: 0.0,
+            ohl: 0,
+            seq_no: 7,
+            bid_ask: None,
+        });
         assert_eq!(frame.len(), TD_TRADE_BINARY_LEN_QUOTE_ONLY);
         let t = decode_trade_binary(&frame).expect("74-byte frame must decode");
         assert_eq!(t.seq_no, 7);
@@ -1552,7 +1571,7 @@ mod control_frame_tests {
         let put = |f: &mut Vec<u8>, off: usize, cap: usize, s: &str| {
             let bytes = s.as_bytes();
             let n = bytes.len().min(cap);
-            f[off..off + n].copy_from_slice(&bytes[..n]);
+            f[off..][..n].copy_from_slice(&bytes[..n]);
         };
         put(&mut f, OFF_AUTH_MESSAGE, LEN_AUTH_MESSAGE, message);
         put(&mut f, OFF_AUTH_SEGMENT, LEN_AUTH_SEGMENT, segments);

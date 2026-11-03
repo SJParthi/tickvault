@@ -90,7 +90,14 @@ fn repo_root() -> PathBuf {
 /// the first one silently stops counting the rest of the file. Over-counting
 /// a risk is the safe direction; a `#[cfg(test)]` helper above `mod tests`
 /// earns an explicit allowlist entry instead of a blind spot.
+/// A leading INNER `#![cfg(test)]` gates the entire file in the compiler,
+/// so its macros cannot reach a production binary. Only that exact leading
+/// form is recognised; comments, strings and item-level attributes do not
+/// establish a file boundary.
 fn production_panic_sites(text: &str) -> usize {
+    if text.trim_start().starts_with("#![cfg(test)]") {
+        return 0;
+    }
     text.lines()
         .take_while(|l| !l.trim_start().starts_with("mod tests"))
         .filter(|l| !l.trim_start().starts_with("//"))
@@ -242,4 +249,33 @@ fn guard_self_test_distinguishes_code_from_prose_and_tests() {
         1,
         "the guard must see the arm it exists for"
     );
+}
+
+#[test]
+fn test_regression_panic_guard_requires_compiler_enforced_test_file_boundary() {
+    // Regression: 2026-11-02 — an out-of-line fixture file is excluded only
+    // by a compiler-enforced whole-file gate, never by its filename.
+    assert_eq!(
+        production_panic_sites("#![cfg(test)]\nfn fixture() { panic!(\"expected Ping\"); }"),
+        0
+    );
+    assert_eq!(
+        production_panic_sites(" \n#![cfg(test)]\nfn fixture() { unreachable!(); }"),
+        0
+    );
+    for prefix in [
+        "#[cfg(test)]\nfn helper() {}\n",
+        "//! #![cfg(test)]\n",
+        "/* #![cfg(test)] */\n",
+        "const MENTION: &str = \"#![cfg(test)]\";\n",
+        "mod fixture { #![cfg(test)] }\n",
+        "#![cfg_attr(test, allow(dead_code))]\n",
+        "",
+    ] {
+        assert_eq!(
+            production_panic_sites(&format!("{prefix}fn live() {{ panic!(\"live\"); }}")),
+            1,
+            "this prefix does not gate the entire file: {prefix:?}"
+        );
+    }
 }

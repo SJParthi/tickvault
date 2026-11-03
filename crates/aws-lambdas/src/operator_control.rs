@@ -195,6 +195,11 @@ pub const SQL_BANNED: [&str; 25] = [
 /// SQL console (both the Data-tab query box and the DB tab share `sql`).
 pub const SQL_MAX_ROWS: i64 = 1000;
 
+// Below SSM's inline stdout ceiling; over-limit replies are errors, not CSV.
+const SQL_MAX_BYTES: usize = 20_000;
+const SQL_COMPLETE: &str = "\nTV_SQL_OK\n";
+const SQL_HTTP_OK: &str = "\nTV_SQL_HTTP_200\n";
+
 /// legacy: `_QDB_LINK_TTL_SECS = 90` — TTL of the one-click console link
 /// token minted by the `qdb_console_url` action. The console front Lambda
 /// verifies it (same control secret, HMAC over `"qdblink|<exp>"`) and swaps
@@ -1433,6 +1438,46 @@ pub fn html_resp(footer_html: &str) -> Value {
 // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 #[allow(async_fn_in_trait)]
 pub trait OpsShell {
+    fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+        None
+    }
+    async fn stock_movers_payload(
+        &self,
+        filter: &crate::operator_stock_movers_wire::Filter,
+    ) -> Result<String, crate::operator_movers_wire::BridgeError> {
+        let encoded = filter
+            .to_hex()
+            .ok_or(crate::operator_movers_wire::BridgeError::InvalidResponse)?;
+        crate::operator_stock_movers::strict_read_payload(
+            self,
+            format!(
+                "{} --filter {}",
+                crate::operator_control_action_commands::MOVERS_COMMAND,
+                encoded
+            ),
+        )
+        .await
+    }
+    /// Per-container bounded read cache; test shells may opt out.
+    fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+        None
+    }
+    /// Fixed read-only Rust helper, dispatched through the existing shell sender.
+    async fn movers_payload(&self) -> String {
+        match crate::operator_stock_movers::strict_read_payload(
+            self,
+            crate::operator_control_action_commands::MOVERS_COMMAND.to_owned(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(code) => serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                code,
+                self.now_epoch(),
+            ))
+            .unwrap_or_default(),
+        }
+    }
     /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
     /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
@@ -1479,6 +1524,153 @@ pub trait OpsShell {
     async fn main_sha(&self) -> String;
     /// Audit M4: this container's failed-key table.
     fn auth_failures(&self) -> &AuthFailureGuard;
+}
+
+// Deliberate parity correction: a failed query must never look like zero rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlQueryError {
+    Unavailable,
+    Failed,
+    TimedOut,
+    Incomplete,
+    TooLarge,
+    InvalidCsv,
+}
+
+fn sql_query_command(query: &str) -> String {
+    let enc = url_quote(query);
+    // Keep the existing read-only SQL/row gates. pipefail preserves curl's
+    // nonzero status; the byte probe and trailer reject truncation, including
+    // SSM truncation. Include the fixed HTTP-status frame plus one extra byte
+    // in the probe: even a truncated body ending in a forged status frame is
+    // one byte over the body cap. Physical-line caps cut multiline CSV cells.
+    format!(
+        "bash -o pipefail -c \"curl -fsS --max-time 5 -w '\\nTV_SQL_HTTP_%{{http_code}}\\n' 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}'|head -c {}&&printf '\\nTV_SQL_OK\\n'\"",
+        SQL_MAX_BYTES + SQL_HTTP_OK.len() + 1
+    )
+}
+
+fn completed_sql_csv(stdout: String, stderr: &str) -> Result<String, SqlQueryError> {
+    if !stderr.is_empty() {
+        return Err(SqlQueryError::Failed);
+    }
+    let framed = stdout
+        .strip_suffix(SQL_COMPLETE)
+        .ok_or(SqlQueryError::Incomplete)?;
+    // curl -f alone accepts redirects. Only an exact HTTP 200 is data.
+    let csv = framed
+        .strip_suffix(SQL_HTTP_OK)
+        .ok_or(SqlQueryError::Failed)?;
+    if csv.is_empty() {
+        return Err(SqlQueryError::Incomplete);
+    }
+    if csv.len() > SQL_MAX_BYTES {
+        return Err(SqlQueryError::TooLarge);
+    }
+    Ok(csv.to_string())
+}
+
+// The existing, workspace-pinned csv crate owns field interpretation. Its
+// parser intentionally accepts some malformed quoting, so reject those forms
+// before parsing rather than silently repairing forensic data.
+fn sql_csv_syntax_valid(text: &str) -> bool {
+    let mut state = 0; // 0 field start, 1 plain, 2 quoted, 3 after quote
+    let mut record_started = false;
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if state != 2 && matches!(byte, b'\r' | b'\n') {
+            // csv::Reader skips blank records. Their meaning could be one
+            // null/empty field, so reject rather than invent a zero-row result.
+            if !record_started {
+                return false;
+            }
+            if byte == b'\r' && bytes.peek() == Some(&b'\n') {
+                bytes.next();
+            }
+            state = 0;
+            record_started = false;
+            continue;
+        }
+        record_started = true;
+        state = match (state, byte) {
+            (2, b'"') => 3,
+            (2, _) => 2,
+            (3, b'"') => 2,
+            (3, b',') => 0,
+            (3, _) => return false,
+            (0, b'"') => 2,
+            (_, b'"') => return false,
+            (_, b',') => 0,
+            _ => 1,
+        };
+    }
+    state != 2
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SqlQueryData {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_sql_csv(text: &str) -> Result<SqlQueryData, SqlQueryError> {
+    if text.len() > SQL_MAX_BYTES {
+        return Err(SqlQueryError::TooLarge);
+    }
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if !sql_csv_syntax_valid(text) {
+        return Err(SqlQueryError::InvalidCsv);
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .from_reader(text.as_bytes());
+    let header = reader.headers().map_err(|_| SqlQueryError::InvalidCsv)?;
+    if header.is_empty() {
+        return Err(SqlQueryError::InvalidCsv);
+    }
+    let columns = header.iter().map(str::to_owned).collect();
+    let row_limit = usize::try_from(SQL_MAX_ROWS).map_err(|_| SqlQueryError::TooLarge)?;
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        if rows.len() == row_limit {
+            return Err(SqlQueryError::TooLarge);
+        }
+        let record = record.map_err(|_| SqlQueryError::InvalidCsv)?;
+        rows.push(record.iter().map(str::to_owned).collect());
+    }
+    Ok(SqlQueryData { columns, rows })
+}
+
+async fn read_sql_csv<S: OpsShell>(
+    shell: &S,
+    commands: &[String],
+    budget: std::time::Duration,
+) -> Result<String, SqlQueryError> {
+    // Bound the complete operation, including sending and polling AWS calls.
+    tokio::time::timeout(budget, async {
+        let cid = shell
+            .ssm_shell(commands)
+            .await
+            .map_err(|_| SqlQueryError::Unavailable)?;
+        loop {
+            match shell.command_invocation(&cid).await {
+                Ok((status, stdout, stderr)) if status == "Success" => {
+                    return completed_sql_csv(stdout, &stderr);
+                }
+                Ok((status, _, _))
+                    if !matches!(status.as_str(), "Pending" | "InProgress" | "Delayed") =>
+                {
+                    return Err(SqlQueryError::Failed);
+                }
+                // SSM may not have registered the invocation immediately.
+                Ok(_) | Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs_f64(VIEW_POLL_SECS)).await;
+        }
+    })
+    .await
+    .unwrap_or(Err(SqlQueryError::TimedOut))
 }
 
 /// legacy 500 arm: `except Exception: _resp(500, {"error": "action failed",
@@ -1889,16 +2081,37 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                 );
             }
             let q = cap_sql_rows(&q);
-            let enc = url_quote(&q);
-            let cmds = [
-                "set +e".to_string(),
-                format!(
-                    "curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}' 2>/dev/null | head -{} || echo 'query failed'",
-                    SQL_MAX_ROWS + 1
+            let cmds = [sql_query_command(&q)];
+            match read_sql_csv(
+                shell,
+                &cmds,
+                std::time::Duration::from_secs_f64(VIEW_TIMEOUT_SECS),
+            )
+            .await
+            .and_then(|csv| parse_sql_csv(&csv).map(|data| (csv, data)))
+            {
+                Ok((csv, data)) => resp(
+                    200,
+                    &json!({"ok": true, "action": "sql", "csv": csv, "columns": data.columns, "rows": data.rows}),
                 ),
-            ];
-            let out = shell.ssm_shell_sync(&cmds, VIEW_TIMEOUT_SECS).await;
-            resp(200, &json!({"ok": true, "action": "sql", "csv": out}))
+                Err(error) => {
+                    tracing::warn!(?error, "operator-portal SQL result unavailable");
+                    let (status, reason) = match error {
+                        SqlQueryError::TimedOut => {
+                            (504, "query timed out; no result was confirmed")
+                        }
+                        SqlQueryError::TooLarge => (
+                            502,
+                            "query result is too large; select fewer rows or columns",
+                        ),
+                        _ => (502, "query failed or returned an incomplete result"),
+                    };
+                    resp(
+                        status,
+                        &json!({"ok": false, "action": "sql", "error": reason}),
+                    )
+                }
+            }
         }
         "qdb_console_url" => {
             // READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
@@ -1947,6 +2160,33 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         // (cross_verify removed 2026-07-16 — the 15:31 IST Dhan live-vs-
         // historical comparer was deleted in PR-C3 2026-07-14; unknown-action
         // 400 now.)
+        "stock-movers" => {
+            let filter = match payload.get("filter") {
+                Some(value) => serde_json::from_value::<crate::operator_stock_movers_wire::Filter>(
+                    value.clone(),
+                ),
+                None => Ok(crate::operator_stock_movers_wire::Filter::default()),
+            };
+            let Ok(filter) = filter else {
+                return resp(400, &json!({"error":"Invalid movers filter"}));
+            };
+            if !filter.valid() {
+                return resp(400, &json!({"error":"Invalid movers filter"}));
+            }
+            let reply = crate::operator_stock_movers::read(shell, &filter).await;
+            resp(
+                200,
+                &json!({"ok":true,"action":action,"movers":reply,"observed_at_epoch_secs":shell.now_epoch()}),
+            )
+        }
+        "fno-stocks" => {
+            let reply = crate::operator_movers::read(shell).await;
+            resp(
+                200,
+                &json!({"ok": true, "action": action, "movers": reply,
+                "observed_at_epoch_secs": shell.now_epoch()}),
+            )
+        }
         "feeds-view" => {
             // READ-ONLY: current per-feed enabled/lane state + per-feed
             // health, via SSM-curl of the app's local API (SG keeps :3001
@@ -2032,6 +2272,8 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
 /// it feeds are what the unit tests cover, exactly like the legacy oracle's
 /// boto3 glue).
 pub struct AwsShell {
+    stock_movers_cache: crate::operator_stock_movers::MoversCache,
+    movers_cache: crate::operator_movers::MoversCache,
     ec2: aws_sdk_ec2::Client,
     ssm: aws_sdk_ssm::Client,
     cloudwatch: aws_sdk_cloudwatch::Client,
@@ -2077,6 +2319,8 @@ impl AwsShell {
             .ok();
         Self {
             ec2: crate::clients::ec2(&config),
+            stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
+            movers_cache: crate::operator_movers::MoversCache::default(),
             ssm: crate::clients::ssm(&config),
             cloudwatch: crate::clients::cloudwatch(&config),
             budgets: crate::clients::budgets_us_east_1().await,
@@ -2159,6 +2403,12 @@ impl AwsShell {
 }
 
 impl OpsShell for AwsShell {
+    fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+        Some(&self.stock_movers_cache)
+    }
+    fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+        Some(&self.movers_cache)
+    }
     fn auth_failures(&self) -> &AuthFailureGuard {
         &self.auth_failures
     }
@@ -2721,6 +2971,10 @@ mod tests {
     // seam. Defaults mirror the legacy fixtures: secret "s3cret-token",
     // market CLOSED (WipeGate pins the clock off-hours), instance running.
     struct MockShell {
+        stock_movers_cache: crate::operator_stock_movers::MoversCache,
+        movers_cache: crate::operator_movers::MoversCache,
+        movers_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        last_movers_command: std::sync::atomic::AtomicBool,
         secret: String,
         market_hours: bool,
         /// `None` = the data-destructive lock follows `market_hours` (every
@@ -2752,6 +3006,10 @@ mod tests {
     impl Default for MockShell {
         fn default() -> Self {
             Self {
+                stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
+                movers_cache: crate::operator_movers::MoversCache::default(),
+                movers_gate: None,
+                last_movers_command: std::sync::atomic::AtomicBool::new(false),
                 secret: AUTH_SECRET.to_string(),
                 market_hours: false,
                 destructive_locked: None,
@@ -2786,6 +3044,12 @@ mod tests {
     }
 
     impl OpsShell for MockShell {
+        fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+            Some(&self.stock_movers_cache)
+        }
+        fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+            Some(&self.movers_cache)
+        }
         fn auth_failures(&self) -> &AuthFailureGuard {
             &self.auth_failures
         }
@@ -2835,18 +3099,41 @@ mod tests {
             if let Some(msg) = self.forbid_ssm {
                 panic!("{msg}");
             }
-            self.captured.lock().unwrap().push(commands.to_vec());
+            let movers = commands.len() == 1
+                && (commands[0] == crate::operator_control_action_commands::MOVERS_COMMAND
+                    || commands[0].starts_with("/opt/tickvault/bin/tv-movers --filter "));
+            self.last_movers_command
+                .store(movers, std::sync::atomic::Ordering::Relaxed);
+            if movers {
+                self.captured_sync.lock().unwrap().push(commands.to_vec());
+                if let Some(gate) = &self.movers_gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+            } else {
+                self.captured.lock().unwrap().push(commands.to_vec());
+            }
             self.ssm_result.clone()
         }
         async fn ssm_shell_sync(&self, commands: &[String], _timeout_secs: f64) -> String {
             self.captured_sync.lock().unwrap().push(commands.to_vec());
+            if let Some(gate) = &self.movers_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             self.sync_output.clone()
         }
         async fn command_invocation(
             &self,
             _command_id: &str,
         ) -> Result<(String, String, String), String> {
-            self.invocation.clone()
+            if self
+                .last_movers_command
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self.invocation == Err("not registered".into())
+            {
+                Ok(("Success".into(), self.sync_output.clone(), String::new()))
+            } else {
+                self.invocation.clone()
+            }
         }
         async fn firing_alarms(&self) -> Option<Vec<String>> {
             self.alarms.clone()
@@ -2893,6 +3180,258 @@ mod tests {
 
     async fn post(shell: &MockShell, body: Value) -> Value {
         route(&post_event(&body, Some(AUTH_SECRET)), shell).await
+    }
+
+    #[tokio::test]
+    async fn movers_authentication_and_stopped_state_precede_any_private_request() {
+        let shell = MockShell::default();
+        let reply = route(&post_event(&json!({"action":"fno-stocks"}), None), &shell).await;
+        assert_eq!(status_of(&reply), 401);
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+        let stopped = MockShell {
+            instance_state: Ok("stopped".into()),
+            ..Default::default()
+        };
+        let reply = post(&stopped, json!({"action":"fno-stocks"})).await;
+        let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["movers"]["code"], "instance_stopped");
+        assert!(stopped.captured_sync.lock().unwrap().is_empty());
+        assert!(stopped.captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn movers_fixed_command_cache_expires_and_never_forwards_user_input() {
+        use crate::operator_movers_wire::{BridgeError, Reply};
+        let now = MockShell::default().now;
+        let shell = MockShell {
+            sync_output: serde_json::to_string(&Reply::error(BridgeError::AppUnauthorized, now))
+                .unwrap(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let reply = post(&shell, json!({"action":"fno-stocks", "url":"https://invalid.example", "command":"ignored"})).await;
+            let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+            assert_eq!(body["movers"]["code"], "app_unauthorized");
+        }
+        assert_eq!(
+            shell.captured_sync.lock().unwrap().as_slice(),
+            &[vec![
+                crate::operator_control_action_commands::MOVERS_COMMAND.to_string()
+            ]]
+        );
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let _reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn movers_concurrent_refresh_is_bounded_and_does_not_dispatch_twice() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(biased; post(&shell, json!({"action":"fno-stocks"})), async {
+            let response = post(&shell, json!({"action":"fno-stocks"})).await;
+            gate.add_permits(1);
+            response
+        });
+        let a: Value = serde_json::from_str(first["body"].as_str().unwrap()).unwrap();
+        let b: Value = serde_json::from_str(second["body"].as_str().unwrap()).unwrap();
+        assert_eq!(a["movers"]["code"], "bridge_unavailable");
+        assert_eq!(b["movers"]["code"], "busy");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn movers_stalled_bridge_times_out_and_releases_in_flight_exclusion() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(body_of(&reply)["movers"]["code"], "timeout");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(18));
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        gate.add_permits(1);
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let retry = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(body_of(&retry)["movers"]["code"], "bridge_unavailable");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn movers_valid_snapshot_preserves_prices_clock_and_declared_coverage() {
+        let now = MockShell::default().now;
+        let payload = json!({"version":1,"captured_at_epoch_secs":now,"result":"snapshot",
+            "snapshot":{"status":"live","market_open":true,"as_of_ist":"10:15:00",
+                "data_age_secs":2,"fno_stocks_total":236,"stocks_priced":1,"window_secs":900,
+                "value_basis":"day volume x average traded price / 1 crore","selection_limit":20,
+                "gainers_total":1,"losers_total":0,"losers":[],"gainers":[{
+                    "security_id":123,"segment":"NSE_EQ","name":"EXAMPLE","ltp":123.45,
+                    "prev_close":120.0,"change":3.45,"change_pct":2.875,"volume":1000,
+                    "value_cr":0.0123,"last_trade_ist":"10:15:00"}]}});
+        let shell = MockShell {
+            sync_output: payload.to_string(),
+            ..Default::default()
+        };
+        let reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(status_of(&reply), 200);
+        let body = body_of(&reply);
+        assert_eq!(body["movers"], payload);
+        assert_eq!(body["observed_at_epoch_secs"], now);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        assert!(shell.captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_movers_auth_and_invalid_filter_never_reach_ssm() {
+        let shell = MockShell::default();
+        assert_eq!(
+            status_of(&route(&post_event(&json!({"action":"stock-movers"}), None), &shell).await),
+            401
+        );
+        for filter in [
+            json!({"offset":1}),
+            json!({"search":"x".repeat(33)}),
+            json!({"command":"evil"}),
+            json!(null),
+        ] {
+            assert_eq!(
+                status_of(&post(&shell, json!({"action":"stock-movers","filter":filter})).await),
+                400
+            );
+        }
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+        let stopped = MockShell {
+            instance_state: Ok("stopped".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            body_of(&post(&stopped, json!({"action":"stock-movers"})).await)["movers"]["code"],
+            "instance_stopped"
+        );
+        assert!(stopped.captured_sync.lock().unwrap().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn filtered_movers_cache_is_keyed_and_shell_receives_hex_only() {
+        use crate::operator_stock_movers_wire::{Filter, Reply};
+        let shell = MockShell {
+            sync_output: serde_json::to_string(&Reply::error(
+                crate::operator_movers_wire::BridgeError::AppUnavailable,
+                MockShell::default().now,
+            ))
+            .unwrap(),
+            ..Default::default()
+        };
+        let a = Filter {
+            search: "a'$(id);".into(),
+            ..Filter::default()
+        };
+        let b = Filter {
+            fno_only: false,
+            ..a.clone()
+        };
+        for f in [&a, &a, &b] {
+            let response = post(&shell, json!({"action":"stock-movers","filter":f})).await;
+            assert_eq!(body_of(&response)["movers"]["code"], "app_unavailable");
+        }
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+        for (commands, f) in shell.captured_sync.lock().unwrap().iter().zip([&a, &b]) {
+            assert_eq!(commands.len(), 1);
+            let encoded = commands[0]
+                .strip_prefix("/opt/tickvault/bin/tv-movers --filter ")
+                .unwrap();
+            assert_eq!(Filter::from_hex(encoded), Some(f.clone()));
+            assert!(!commands[0].contains("$("));
+        }
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let _response = post(&shell, json!({"action":"stock-movers","filter":b})).await;
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn filtered_movers_concurrent_filters_share_one_inflight_gate() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(biased;post(&shell,json!({"action":"stock-movers"})),async{let r=post(&shell,json!({"action":"stock-movers","filter":{"fno_only":false}})).await;gate.add_permits(1);r});
+        assert_eq!(body_of(&first)["movers"]["code"], "bridge_unavailable");
+        assert_eq!(body_of(&second)["movers"]["code"], "busy");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_strict_read_payload_requires_ssm_success_and_never_returns_stderr() {
+        for action in ["fno-stocks", "stock-movers"] {
+            let now = MockShell::default().now;
+            let payload = if action == "fno-stocks" {
+                serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            };
+            for (status, stderr, accepted) in [
+                ("Success", "", true),
+                ("Failed", "", false),
+                ("Unknown", "", false),
+                ("Cancelled", "", false),
+                ("TimedOut", "", false),
+                ("DeliveryTimedOut", "", false),
+                ("Success", "private server diagnostic", false),
+            ] {
+                let shell = MockShell {
+                    invocation: Ok((status.into(), payload.clone(), stderr.into())),
+                    ..Default::default()
+                };
+                let response = post(&shell, json!({"action":action})).await;
+                let body = body_of(&response);
+                assert_eq!(
+                    body["movers"]["code"] == "app_unauthorized",
+                    accepted,
+                    "{action} {status}"
+                );
+                assert!(!response.to_string().contains("private server diagnostic"));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_strict_read_payload_refuses_pending_stdout_at_the_deadline() {
+        for action in ["fno-stocks", "stock-movers"] {
+            let now = MockShell::default().now;
+            let payload = if action == "fno-stocks" {
+                serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            };
+            let shell = MockShell {
+                invocation: Ok(("InProgress".into(), payload, String::new())),
+                ..Default::default()
+            };
+            let start = tokio::time::Instant::now();
+            let response = post(&shell, json!({"action":action})).await;
+            assert_eq!(body_of(&response)["movers"]["code"], "timeout");
+            assert_eq!(start.elapsed(), std::time::Duration::from_secs(18));
+        }
     }
 
     fn status_of(resp: &Value) -> i64 {
@@ -3070,13 +3609,25 @@ mod tests {
         // RE-BLESSED 2026-10-22 (plan item 64, operator Quote 37) — 47,076
         // bytes, unchanged size: the stopped-box banner reads "auto-stops
         // 16:30 IST" (was 17:30), the daily stop's new time.
+        // 2026-11-02 corrective proposal: SQL cells are parsed in Rust and
+        // rendered from structured columns/rows; failed reads remain errors.
+        //
+        // RE-BLESSED 2026-10-31 (owner-requested Top Movers) — 47,076 ->
+        // 53,229 bytes: the reviewed fourth tab adds bounded gainers/losers
+        // tables with conservative source age and explicit unavailable states.
+        // Its 23 Chromium fixtures are separate from this exact-content pin.
+        // 2026-11-02: reconstructed index/F&O filters and paging; frontend and
+        // SSM ceilings retained. Browser functions have separate local fixtures.
+        // 2026-11-02: full switch hit area and timer-stable invalid-search
+        // feedback; reviewed HTML6226059a passed28+1 page,54 switch and8 CSV
+        // browser controls. The existing JavaScript ceiling stays unchanged.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "5c9d8633bebce1a8b0ca07ce3a9e8664acb3fd6a353dda2e8a9f23970e1f6203"
+            "6226059a333a70a726bf4a34da7d4dc5c57818efd95951244bea42efab4d88da"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_076);
+        assert_eq!(CONSOLE_HTML.len(), 84_855);
     }
 
     // ------------------------------------------------ audit L4 source scans
@@ -3408,15 +3959,15 @@ mod tests {
     }
 
     #[test]
-    fn test_html_has_exactly_three_tabs() {
-        // 2026-07-02 redesign (operator: "webpage looks completely messy, too
-        // many buttons"): exactly Overview / Data / Admin — nothing else.
+    fn test_html_has_exactly_four_ordered_tabs() {
+        // 2026-10-31 continuation: the owner explicitly requested Top Movers
+        // on this portal. Keep the complete ordered tab list pinned.
         let re = regex::Regex::new(r#"data-t="(\w+)""#).unwrap();
         let tabs: Vec<&str> = re
             .captures_iter(CONSOLE_HTML)
             .map(|c| c.get(1).unwrap().as_str())
             .collect();
-        assert_eq!(tabs, ["overview", "data", "admin"]);
+        assert_eq!(tabs, ["overview", "movers", "data", "admin"]);
     }
 
     #[test]
@@ -6388,5 +6939,365 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(body.contains("· portal"));
         assert!(body.contains("· main"));
         assert!(body.contains("<footer"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_send_failure_is_not_an_empty_success() {
+        let shell = MockShell {
+            ssm_result: Err("SSM unavailable".to_string()),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert!(body.get("csv").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sql_terminal_failure_never_uses_partial_stdout() {
+        for status in [
+            "Failed",
+            "Cancelled",
+            "TimedOut",
+            "DeliveryTimedOut",
+            "Unexpected",
+        ] {
+            let shell = MockShell {
+                invocation: Ok((
+                    status.to_string(),
+                    format!("value\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                    String::new(),
+                )),
+                ..MockShell::default()
+            };
+            let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+            assert_eq!(status_of(&response), 502, "{status}");
+            assert_eq!(body_of(&response)["ok"], false, "{status}");
+            assert!(body_of(&response).get("csv").is_none(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_poll_timeout_is_explicit() {
+        for invocation in [
+            Err("not registered".to_string()),
+            Ok(("InProgress".to_string(), String::new(), String::new())),
+        ] {
+            let shell = MockShell {
+                invocation,
+                ..MockShell::default()
+            };
+            let result = read_sql_csv(
+                &shell,
+                &["read-only fixture".to_string()],
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(result, Err(SqlQueryError::TimedOut));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_header_only_is_a_real_empty_result() {
+        let csv = "value\r\n";
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(
+            &shell,
+            json!({"action": "sql", "query": "SELECT 1 LIMIT 0"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        assert_eq!(body_of(&response)["ok"], true);
+        assert_eq!(body_of(&response)["csv"], csv);
+    }
+
+    #[tokio::test]
+    async fn test_sql_keeps_authorization_and_read_only_gates() {
+        let shell = MockShell {
+            forbid_ssm: Some("gates must run before SSM"),
+            ..MockShell::default()
+        };
+        let unauthorized = route(
+            &post_event(&json!({"action": "sql", "query": "SELECT 1"}), None),
+            &shell,
+        )
+        .await;
+        assert_eq!(status_of(&unauthorized), 401);
+        let write = post(
+            &shell,
+            json!({"action": "sql", "query": "DROP TABLE ticks"}),
+        )
+        .await;
+        assert_eq!(status_of(&write), 400);
+    }
+
+    #[test]
+    fn test_completed_sql_csv_rejects_missing_trailer_empty_and_oversized_results() {
+        assert_eq!(
+            completed_sql_csv("value\n1\n".to_string(), ""),
+            Err(SqlQueryError::Incomplete)
+        );
+        assert_eq!(
+            completed_sql_csv(format!("{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Err(SqlQueryError::Incomplete)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!("value\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                "curl failed"
+            ),
+            Err(SqlQueryError::Failed)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!(
+                    "{}{SQL_HTTP_OK}{SQL_COMPLETE}",
+                    "x".repeat(SQL_MAX_BYTES + 1)
+                ),
+                ""
+            ),
+            Err(SqlQueryError::TooLarge)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!("{}{SQL_HTTP_OK}{SQL_COMPLETE}", "x".repeat(SQL_MAX_BYTES)),
+                ""
+            )
+            .unwrap()
+            .len(),
+            SQL_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_status_gates_valid_multiline_csv() {
+        // Both statuses carry the same complete, valid result. Failure must
+        // come from transport status rather than malformed fixture content.
+        let csv = "event,detail\r\nfilled,\"comma, quote \"\"ok\"\" and\nnewline\"\r\n";
+        for status in ["Failed", "Success"] {
+            let shell = MockShell {
+                invocation: Ok((
+                    status.to_string(),
+                    format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                    String::new(),
+                )),
+                ..MockShell::default()
+            };
+            let response = post(
+                &shell,
+                json!({"action": "sql", "query": "SELECT * FROM order_audit LIMIT 1"}),
+            )
+            .await;
+            let body = body_of(&response);
+            if status == "Failed" {
+                assert_eq!(status_of(&response), 502);
+                assert_eq!(body["ok"], false);
+                assert!(body.get("csv").is_none());
+                assert!(body.get("rows").is_none());
+                assert!(body.get("columns").is_none());
+                continue;
+            }
+            assert_eq!(status_of(&response), 200);
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["columns"], json!(["event", "detail"]));
+            assert_eq!(
+                body["rows"],
+                json!([["filled", "comma, quote \"ok\" and\nnewline"]])
+            );
+            assert_eq!(body["csv"], csv);
+        }
+    }
+
+    #[test]
+    fn test_parse_sql_csv_keeps_quoted_commas_quotes_and_newlines() {
+        for (text, expected) in [
+            ("event,detail\nfilled,\"ACME, LTD\"\n", "ACME, LTD"),
+            ("event,detail\nfilled,\"said \"\"ok\"\"\"\n", "said \"ok\""),
+            (
+                "event,detail\r\nfilled,\"line 1\nline 2\"\r\n",
+                "line 1\nline 2",
+            ),
+            (
+                "event,detail\r\nfilled,\"line 1\r\nline 2\"\r\n",
+                "line 1\r\nline 2",
+            ),
+            ("\u{feff}event,detail\nfilled,\"₹ café\"\n", "₹ café"),
+            ("event,detail\nfilled,", ""),
+            ("event,detail\nfilled,\"\"", ""),
+        ] {
+            let data = parse_sql_csv(text).unwrap();
+            assert_eq!(data.columns, ["event", "detail"]);
+            assert_eq!(data.rows.len(), 1);
+            assert_eq!(data.rows[0], ["filled", expected]);
+        }
+    }
+
+    #[test]
+    fn test_sql_csv_syntax_valid_refuses_ambiguous_quotes() {
+        for text in [
+            "event,detail\nfilled,\"cut",
+            "event,detail\nfilled,bad\"quote",
+            "event,detail\nfilled,\"ok\"extra",
+        ] {
+            assert!(!sql_csv_syntax_valid(text));
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+        assert!(sql_csv_syntax_valid(
+            "event,detail\nfilled,\"said \"\"ok\"\"\"\n"
+        ));
+    }
+
+    #[test]
+    fn test_parse_sql_csv_distinguishes_header_only_missing_and_wrong_width() {
+        assert_eq!(
+            parse_sql_csv("event,detail\r\n").unwrap(),
+            SqlQueryData {
+                columns: vec!["event".to_string(), "detail".to_string()],
+                rows: Vec::new(),
+            }
+        );
+        for text in [
+            "",
+            "\r\n",
+            "event,detail\nfilled\n",
+            "event,detail\nfilled,ok,extra\n",
+        ] {
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+    }
+
+    #[test]
+    fn test_parse_sql_csv_keeps_row_and_byte_bounds() {
+        let at_limit = format!("value\n{}", "x\n".repeat(1000));
+        assert_eq!(parse_sql_csv(&at_limit).unwrap().rows.len(), 1000);
+        assert_eq!(
+            parse_sql_csv(&format!("{at_limit}x\n")),
+            Err(SqlQueryError::TooLarge)
+        );
+        assert_eq!(
+            parse_sql_csv(&"x".repeat(SQL_MAX_BYTES + 1)),
+            Err(SqlQueryError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_returns_structured_cells_and_original_download() {
+        let csv = "event,detail\r\nfilled,\"comma, quote \"\"ok\"\" and\nnewline\"\r\n";
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(
+            &shell,
+            json!({"action": "sql", "query": "SELECT * FROM order_audit LIMIT 1"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_of(&response);
+        assert_eq!(body["columns"], json!(["event", "detail"]));
+        assert_eq!(
+            body["rows"],
+            json!([["filled", "comma, quote \"ok\" and\nnewline"]])
+        );
+        assert_eq!(body["csv"], csv);
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_refuses_malformed_completed_csv() {
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("a,b\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        assert_eq!(body_of(&response)["ok"], false);
+        assert!(body_of(&response).get("rows").is_none());
+    }
+
+    #[test]
+    fn test_parse_sql_csv_never_drops_ambiguous_blank_records() {
+        for text in ["value\n\n", "value\r\n\r\n", "value\r\r", "\nvalue\n"] {
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+        let empty = parse_sql_csv("value\r\n\"\"\r\n").unwrap();
+        assert_eq!(empty.rows, vec![vec![String::new()]]);
+        assert!(parse_sql_csv("value\r\n").unwrap().rows.is_empty());
+        assert_eq!(
+            parse_sql_csv("value\r\n\"line 1\r\n\r\nline 2\"\r\n")
+                .unwrap()
+                .rows[0][0],
+            "line 1\r\n\r\nline 2"
+        );
+    }
+
+    #[test]
+    fn test_completed_sql_csv_requires_exact_http_200_without_leaking_body() {
+        for status in [
+            "201", "204", "206", "301", "302", "307", "308", "400", "500",
+        ] {
+            let response = format!("private upstream body\nTV_SQL_HTTP_{status}\n{SQL_COMPLETE}");
+            assert_eq!(
+                completed_sql_csv(response, ""),
+                Err(SqlQueryError::Failed),
+                "{status}"
+            );
+        }
+        let csv = "value\n1\n";
+        assert_eq!(
+            completed_sql_csv(format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Ok(csv.to_string())
+        );
+    }
+
+    #[test]
+    fn test_completed_sql_csv_preserves_embedded_markers_and_refuses_forged_boundary() {
+        let csv = format!("value\n\"{SQL_HTTP_OK}{SQL_COMPLETE}\"\n");
+        assert_eq!(
+            completed_sql_csv(format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Ok(csv)
+        );
+        // The capped stream can coincidentally end with an in-body HTTP200
+        // marker, but its body portion is then MAX+1 and cannot be accepted.
+        let captured = format!("{}{SQL_HTTP_OK}", "x".repeat(SQL_MAX_BYTES + 1));
+        assert_eq!(captured.len(), SQL_MAX_BYTES + SQL_HTTP_OK.len() + 1);
+        assert_eq!(
+            completed_sql_csv(format!("{captured}{SQL_COMPLETE}"), ""),
+            Err(SqlQueryError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_refuses_redirect_with_csv_shaped_body() {
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("private_header\nprivate_row\nTV_SQL_HTTP_302\n{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert!(body.get("csv").is_none());
+        assert!(body.get("rows").is_none());
+        assert!(!body.to_string().contains("private_"));
     }
 }

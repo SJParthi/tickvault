@@ -1413,7 +1413,7 @@ mod tests {
             assert_eq!(r.close, 100.0 + i as f64);
             assert_eq!(
                 r.tf_ordinal,
-                (i as usize % tickvault_trading::candles::tf_index::TF_COUNT) as u8
+                (i % tickvault_trading::candles::tf_index::TF_COUNT) as u8
             );
         }
         let _ = std::fs::remove_dir_all(dir);

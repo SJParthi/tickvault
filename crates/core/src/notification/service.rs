@@ -3373,25 +3373,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_returns_noop_without_ssm() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
         let config = NotificationConfig {
             send_timeout_ms: 100,
-            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_api_base_url: "http://127.0.0.1:9".to_string(),
             sns_enabled: false,
             ..NotificationConfig::default()
         };
-        let service = NotificationService::initialize(&config).await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            // Dev machine with real AWS credentials — Telegram creds fetched from SSM.
-            assert!(
-                service.is_active(),
-                "with real AWS credentials, notification service should be active"
-            );
-        } else {
-            assert!(
-                !service.is_active(),
-                "without real SSM, service should be in no-op mode"
-            );
-        }
+        let service = fixture
+            .scope(NotificationService::initialize(&config))
+            .await;
+        assert!(
+            !service.is_active(),
+            "synthetic SSM failure must return no-op"
+        );
+        // initialize uses join!, so both Telegram parameter reads complete;
+        // an SNS phone lookup must never begin after either required read fails.
+        fixture.assert_requests(2, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     // -----------------------------------------------------------------------
@@ -3785,17 +3783,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_with_sns_disabled() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
         let config = NotificationConfig {
             send_timeout_ms: 100,
-            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_api_base_url: "http://127.0.0.1:9".to_string(),
             sns_enabled: false,
             ..NotificationConfig::default()
         };
-        let service = NotificationService::initialize(&config).await;
-        // Without real SSM, should fall back to no-op
-        // With real SSM, should be active but without SNS
-        // Either way, should not panic
-        let _ = service.is_active();
+        let service = fixture
+            .scope(NotificationService::initialize(&config))
+            .await;
+        assert!(
+            !service.is_active(),
+            "synthetic SSM failure must return no-op"
+        );
+        // initialize uses join!, so both Telegram parameter reads complete;
+        // an SNS phone lookup must never begin after either required read fails.
+        fixture.assert_requests(2, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     // -----------------------------------------------------------------------
@@ -3804,16 +3808,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_with_sns_enabled_falls_back_gracefully() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
         let config = NotificationConfig {
             send_timeout_ms: 100,
-            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_api_base_url: "http://127.0.0.1:9".to_string(),
             sns_enabled: true,
             ..NotificationConfig::default()
         };
-        let service = NotificationService::initialize(&config).await;
-        // Whether SSM is available or not, initialize should not panic
-        // SNS phone number fetch may fail, but service still initializes
-        let _ = service.is_active();
+        let service = fixture
+            .scope(NotificationService::initialize(&config))
+            .await;
+        assert!(
+            !service.is_active(),
+            "synthetic SSM failure must return no-op"
+        );
+        // initialize uses join!, so both Telegram parameter reads complete;
+        // an SNS phone lookup must never begin after either required read fails.
+        fixture.assert_requests(2, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     // -----------------------------------------------------------------------

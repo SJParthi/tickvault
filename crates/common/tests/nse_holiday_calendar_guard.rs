@@ -19,7 +19,9 @@
 //! calendar with 2 of 14 holidays pasted still fails) + per-entry hygiene.
 //! Both are intentional; neither subsumes the other.
 
-use chrono::Datelike;
+use chrono::{Datelike, NaiveDate};
+use tickvault_common::config::TradingConfig;
+use tickvault_common::trading_calendar::TradingCalendar;
 
 /// NSE publishes ~14-15 trading holidays/year; 10 is the loose lower bound
 /// that catches "the calendar was never rolled over" without flapping on
@@ -102,4 +104,38 @@ fn test_current_year_holidays_present_and_valid() {
          (need >= {MIN_CURRENT_YEAR_HOLIDAYS}). Add the official NSE trading-holiday \
          calendar for {current_year} to [[trading.nse_holidays]]."
     );
+}
+
+/// NSE/CMTR/72260 and NSE/FAOP/72262 (12 Jan 2026) added this closure to
+/// both segments after their annual circulars. Exercise the shipped calendar's
+/// real gates so an omitted addendum cannot silently reopen the date.
+#[test]
+fn test_2026_election_addendum_closes_shipped_calendar() {
+    let cfg = base_toml();
+    let trading: TradingConfig = cfg
+        .get("trading")
+        .expect("shipped config must contain [trading]")
+        .clone()
+        .try_into()
+        .expect("shipped [trading] must deserialize");
+    let calendar =
+        TradingCalendar::from_config(&trading).expect("shipped holiday calendar must be valid");
+    let holiday = NaiveDate::from_ymd_opt(2026, 1, 15).expect("valid official holiday date");
+
+    assert!(calendar.is_holiday(holiday));
+    assert!(!calendar.is_trading_day(holiday));
+    assert!(!calendar.is_session_day(holiday));
+
+    // The one-day closure must not close its ordinary neighboring sessions.
+    for day in [14, 16] {
+        let adjacent = NaiveDate::from_ymd_opt(2026, 1, day).expect("valid adjacent date");
+        assert!(
+            calendar.is_trading_day(adjacent),
+            "{adjacent} must stay open"
+        );
+        assert!(
+            calendar.is_session_day(adjacent),
+            "{adjacent} must stay open"
+        );
+    }
 }

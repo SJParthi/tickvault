@@ -52,7 +52,9 @@ fn dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation() {
                 let nanos = if i % 1_000 == 0 {
                     500_000
                 } else {
-                    900 + i % 64
+                    // Exercise both sides of the exact threshold, including
+                    // equality, inside the allocation measurement.
+                    [0, 999, 1_000, 1_001, 1_024, 1_025][(i as usize) % 6]
                 };
                 record_stage_nanos(stage, nanos);
                 beat_at(HotTask::FrameDrain, Instant::now());

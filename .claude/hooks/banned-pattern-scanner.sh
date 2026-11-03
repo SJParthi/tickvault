@@ -131,9 +131,14 @@ scan_prod_code() {
     # (proof examples + operator CLIs like tv_doctor whose OUTPUT is stdout).
     # This mirrors the compile-time policy: the print/unwrap deny lints are
     # scoped to each crate's prod lib.rs, not to examples/bins.
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/)'; then
+    if [[ "$file" =~ (_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/) ]]; then
       continue
     fi
+
+    # These token patterns cannot arise from the added line-number prefix.
+    # A raw no-match cannot produce a hit after test/comment exclusion.
+    # Keep the same BRE pattern; avoid extraction and filter forks on no-match.
+    grep -q -- "$pattern" "$full_path" || continue
 
     # Extract prod code (strips #[cfg(test)] blocks), then scan
     local matches
@@ -250,10 +255,11 @@ scan_hot_path() {
     [ -z "$file" ] && continue
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/)'; then
+    if [[ "$file" =~ (_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/) ]]; then
       continue
     fi
 
+    grep -q -- "$pattern" "$full_path" || continue
     local prod_code
     prod_code=$(extract_prod_code "$full_path")
     [ -z "$prod_code" ] && continue
@@ -634,9 +640,10 @@ scan_hot_path_sync_fs() {
     [ -z "$file" ] && continue
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+    if [[ "$file" =~ (_test\.rs|/tests/|/test_|_tests\.rs|/benches/) ]]; then
       continue
     fi
+    grep -qE -- "$pattern" "$full_path" || continue
     # Production-only: strip #[cfg(test)] blocks via the same awk used
     # in the universal scanner.
     local prod_code

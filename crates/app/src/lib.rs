@@ -28,6 +28,7 @@
 // coverage-horizon staleness watchdog - pages the operator BEFORE the
 // calendar runs off its year-end cliff into un-listed holidays.
 pub mod calendar_staleness;
+pub mod operator_movers;
 // PR-C3 (2026-07-14): `cross_verify_1m_boot` module DELETED — the 15:31 IST
 // Dhan live-vs-historical 1m cross-verify retired with the Dhan live WS
 // (operator 2026-07-13; cross-verify-1m-error-codes.md retirement banner).
@@ -191,6 +192,10 @@ pub mod rest_candle_fold;
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
 pub mod spot_price_store;
+/// The day's subscribed main-feed spot set with each instrument's first
+/// subscribe second, read by the 1-minute cross-check when it fires (plan item
+/// 51e, no-rest-except-live-feed §12.15.13).
+pub mod xverify_day_record;
 // `top_volume_snapshot`, `top_volume_sweep` and `volume_leaderboard` DELETED
 // 2026-10-22 (plan item 62, operator Quote 34): nothing writes `top_volume_*`
 // and the ranking that only fed it is gone. The pieces the depth planners read
@@ -254,6 +259,10 @@ pub mod leg_identity;
 pub mod log_coalescer;
 /// `tickvault strategy-dry-run`: load, verify and replay published brutex strategy folders (no order, no live change).
 pub mod strategy_dry_run;
+/// Expected-vs-first-seen main-feed subscription reconcile with an in-place
+/// resend through `LiveSubscriptionCommand::Resubscribe` (plan item 3b). Off by
+/// default (`[dhan_universe] subscribe_reconcile_auto_resubscribe`).
+pub mod subscribe_reconcile;
 // The one-off 2026-10-22 rebuild (plan item 66, Quotes 32/33/34): its pure
 // module, box subcommand and SSM shell were DELETED 2026-10-29 after the
 // 2026-10-28 run, per rust-only lock §0.13 (`shell_budget_guard.rs`
@@ -348,3 +357,5 @@ pub mod trading_pipeline;
 pub mod table_storage_rollup;
 pub mod ws_audit_consumer;
 pub mod ws_connection_rollup;
+
+pub mod operator_stock_movers;

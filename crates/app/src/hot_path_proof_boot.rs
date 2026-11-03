@@ -11,13 +11,17 @@
 //!
 //! Both are cold (boot only). Nothing here runs per tick.
 
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_storage::hot_path_latency_minute::{
-    ENSURE_ATTEMPTS, ENSURE_RETRY_INTERVAL, ensure_hot_path_latency_minute_table,
-    spawn_hot_path_latency_minute_writer,
+    ENSURE_ATTEMPTS, ENSURE_RETRY_INTERVAL, ProofTableReadiness,
+    ensure_hot_path_latency_minute_table, spawn_hot_path_latency_minute_writer,
 };
-use tracing::error;
+use tracing::{error, info};
 
 /// The main tokio runtime (the one the frame drain runs on).
 ///
@@ -45,25 +49,47 @@ pub fn build_main_runtime(worker_threads: usize) -> std::io::Result<tokio::runti
         .build()
 }
 
-/// Starts the per-minute proof tables: a task that creates them (retried
-/// quietly while QuestDB starts; only the last attempt logs) and the writer
-/// thread with its queue. Call once, inside the runtime, before the telemetry
-/// publisher. Returns whether the writer started; a writer that cannot start
-/// logs one coded `error!` and every minute is then counted as dropped.
+/// Starts the gated writer before its ensure task and before the telemetry
+/// publisher. The initial quiet retries become bounded-backoff background
+/// retries until real metadata confirms every key. Returns thread-start
+/// success, not database readiness. Shutdown ownership remains separate.
 pub fn start_hot_path_proof(questdb: &QuestDbConfig) -> bool {
-    let ddl_config = questdb.clone();
-    tokio::spawn(async move {
-        for attempt in 1..=ENSURE_ATTEMPTS {
-            if ensure_hot_path_latency_minute_table(&ddl_config, attempt == ENSURE_ATTEMPTS).await {
-                break;
-            }
-            if attempt < ENSURE_ATTEMPTS {
-                tokio::time::sleep(ENSURE_RETRY_INTERVAL).await;
-            }
+    start_with(
+        questdb,
+        spawn_hot_path_latency_minute_writer,
+        |ddl_config, readiness| {
+            // Detached like the existing boot tasks; runtime shutdown cancels
+            // ensure, while the writer stays fail-closed if it was never keyed.
+            drop(tokio::spawn(async move {
+                retry_until_keyed(move |report| {
+                    let config = ddl_config.clone();
+                    let readiness = Arc::clone(&readiness);
+                    async move {
+                        ensure_hot_path_latency_minute_table(&config, report, &readiness).await
+                    }
+                })
+                .await;
+            }));
+        },
+    )
+}
+
+fn start_with(
+    questdb: &QuestDbConfig,
+    spawn_writer: impl FnOnce(
+        &QuestDbConfig,
+        Arc<ProofTableReadiness>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    spawn_ensure: impl FnOnce(QuestDbConfig, Arc<ProofTableReadiness>),
+) -> bool {
+    let readiness = Arc::new(ProofTableReadiness::default());
+    match spawn_writer(questdb, Arc::clone(&readiness)) {
+        Ok(_writer) => {
+            // A rejected second start or OS spawn failure starts no orphan
+            // ensure task, and cannot open another writer's per-start gate.
+            spawn_ensure(questdb.clone(), readiness);
+            true
         }
-    });
-    match spawn_hot_path_latency_minute_writer(questdb) {
-        Ok(_writer) => true,
         Err(err) => {
             error!(
                 code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
@@ -72,6 +98,30 @@ pub fn start_hot_path_proof(questdb: &QuestDbConfig) -> bool {
                  latency table will not be written (minutes counted as dropped)"
             );
             false
+        }
+    }
+}
+
+async fn retry_until_keyed<F, Fut>(mut ensure: F) -> u32
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut attempt = 0_u32;
+    let mut delay = ENSURE_RETRY_INTERVAL;
+    let max_delay = Duration::from_secs(crate::candle_ddl_boot::DDL_BACKGROUND_RETRY_MAX_SECS);
+    loop {
+        attempt = attempt.saturating_add(1);
+        if ensure(attempt == ENSURE_ATTEMPTS).await {
+            info!(
+                attempt,
+                "hot-path proof tables verified keyed — buffered writes may resume"
+            );
+            return attempt;
+        }
+        tokio::time::sleep(delay).await;
+        if attempt >= ENSURE_ATTEMPTS {
+            delay = delay.saturating_mul(2).min(max_delay);
         }
     }
 }
@@ -126,5 +176,83 @@ mod tests {
             rt.block_on(async { (start_hot_path_proof(&cfg), start_hot_path_proof(&cfg)) });
         assert!(first, "the first start installs the writer");
         assert!(!second, "a second start is refused");
+    }
+
+    #[test]
+    fn test_rejected_writer_start_never_spawns_an_ensure_task() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        for reason in ["already installed", "injected OS spawn failure"] {
+            assert!(!start_with(
+                &cfg,
+                |_, _| Err(std::io::Error::other(reason)),
+                |_, _| panic!("a failed writer must not start an ensure task"),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_successful_start_passes_the_same_gate_to_the_ensure_task() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let shared = std::cell::RefCell::new(None);
+        assert!(start_with(
+            &cfg,
+            |_, readiness| {
+                *shared.borrow_mut() = Some(readiness);
+                std::thread::Builder::new().spawn(|| {})
+            },
+            |_, readiness| assert!(Arc::ptr_eq(
+                shared.borrow().as_ref().expect("writer gate"),
+                &readiness
+            )),
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_retries_past_ten_with_a_bounded_backoff() {
+        let mut times = Vec::new();
+        let mut reports = Vec::new();
+        let attempts = retry_until_keyed(|report| {
+            times.push(tokio::time::Instant::now());
+            reports.push(report);
+            std::future::ready(times.len() == 18)
+        })
+        .await;
+        assert_eq!(attempts, 18);
+        assert_eq!(reports.iter().filter(|&&r| r).count(), 1);
+        assert!(reports[usize::try_from(ENSURE_ATTEMPTS - 1).expect("index")]);
+        let delays: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(delays[..10].iter().all(|&d| d == ENSURE_RETRY_INTERVAL));
+        assert_eq!(delays[10], ENSURE_RETRY_INTERVAL * 2);
+        assert_eq!(delays[11], ENSURE_RETRY_INTERVAL * 4);
+        assert!(
+            delays[14..].iter().all(|&d| d
+                == Duration::from_secs(crate::candle_ddl_boot::DDL_BACKGROUND_RETRY_MAX_SECS))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelling_a_retry_does_not_schedule_another_attempt() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let task = tokio::spawn(retry_until_keyed(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(false)
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        task.abort();
+        assert!(task.await.expect_err("cancelled").is_cancelled());
+        tokio::time::advance(ENSURE_RETRY_INTERVAL * 100).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

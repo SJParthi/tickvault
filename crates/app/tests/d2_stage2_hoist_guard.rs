@@ -29,6 +29,7 @@
 //!   tick publisher; the Groww bridge runs its OWN aggregator instance with
 //!   its own wiring guards. The builder-spawns-the-shared-pipeline half
 //!   SURVIVES below.
+//!
 //! The single-construction contract (ONE `build_shared_infra` call, the API
 //! bound once, the seal-writer spawned once) survives re-anchored on the
 //! whole file instead of the deleted slow-path slice.

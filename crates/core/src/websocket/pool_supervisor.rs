@@ -14351,7 +14351,6 @@ mod tests {
                     >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
                 let must_park = past_bound && (model_refreshed_this_cycle || model_grace_used);
                 let action = close_808(&mut s, at);
-                model_refreshed_this_cycle = false;
                 if must_park {
                     let is_park = matches!(action, SupervisorAction::Park { .. });
                     prop_assert!(is_park, "300 s after the last fresh token, refresh spent: {:?}", action);
@@ -15722,16 +15721,6 @@ mod tests {
             SubscribeGuard::try_new(DhanEndpointType::Depth200, instruments(2)).is_err(),
             "two instruments on a depth-200 connection must be refused locally"
         );
-    }
-
-    #[test]
-    fn test_subscribe_guard_zero_cap_endpoint_does_not_panic_on_batching() {
-        // order-update reports a zero per-message cap and carries no
-        // instruments; `chunks(0)` would panic, so the batcher floors at 1.
-        let g = SubscribeGuard::try_new(DhanEndpointType::OrderUpdate, Vec::new())
-            .expect("an empty set is always admissible");
-        assert!(g.is_empty());
-        assert_eq!(g.batch_count(), 0);
     }
 
     // -- frame sink: THE ONE RULE ------------------------------------------
@@ -22275,8 +22264,9 @@ mod tests {
         let start = t0();
         let mut ep = episode_after_805(&[0], start);
         let mut wait_from = start;
-        for attempt in 0..usize::from(OVERFLOW_PROBE_MAX_ATTEMPTS) {
-            let delay = secs(OVERFLOW_PROBE_DELAYS_SECS[attempt]);
+        // DELAYS has exactly MAX_ATTEMPTS entries (compile-time assert above).
+        for (attempt, &delay_secs) in OVERFLOW_PROBE_DELAYS_SECS.iter().enumerate() {
+            let delay = secs(delay_secs);
             assert_eq!(
                 ep.poll(wait_from + delay - secs(1), true),
                 OverflowEpisodeEffect::default(),
@@ -23076,7 +23066,7 @@ mod tests {
                     let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
                     eps.on_watched_self_redial(slot, now)
                 }
-                _ => eps.poll(now, roll % 7 != 0),
+                _ => eps.poll(now, !roll.is_multiple_of(7)),
             };
             let in_flight = usize::from(eps.main.watched().is_some())
                 + usize::from(eps.depth.watched().is_some());
@@ -26182,3 +26172,7 @@ mod subscription_audit_tests {
 #[cfg(test)]
 #[path = "pool_supervisor/frame_silence_evidence_tests.rs"]
 mod frame_silence_evidence_tests;
+
+#[cfg(test)]
+#[path = "pool_supervisor/cov_part1_tests.rs"]
+mod cov_part1_tests;

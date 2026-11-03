@@ -237,7 +237,11 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   OCTOBER 2026 only (Budgets API: $157.18 spent, $175.88 forecast). The
   #   Lambda clamps November onward to $75 in code; this native stop moves
   #   to $75 on or after 1 November.
-  limit_amount      = "185"
+  # 2026-11-02 (operator Quotes 37 and 45, daily-universe §0): the
+  # October-only allowance has expired. Apply the already-authorized $75
+  # standing native line; the historical Lambda/digest settings remain $185
+  # and their unchanged UTC-month clamp already enforces $75 from November.
+  limit_amount      = "75"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

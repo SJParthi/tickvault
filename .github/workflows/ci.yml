@@ -208,7 +208,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
-      - name: cargo clippy (workspace, libs + bins only)
+      - name: cargo clippy (all workspace targets)
+        # Plan item 12b (2026-10-31): every workspace crate's libs, bins,
+        # tests, benches and examples are linted with warnings fatal. One
+        # command replaces the redundant five-crate checkpoint's two passes,
+        # keeping workflow shell within its existing ceiling. The original
+        # dated measurements below explain why all-targets was deferred.
         # THE GATE IS ARMED (2026-08-11). `-D warnings` is ON: any clippy
         # warning in lib+bin code now FAILS this job, and Build & Verify is
         # a needed job of All Green, so it blocks the merge.
@@ -221,10 +226,8 @@ jobs:
         # stale. Measured before arming: `cargo clippy --workspace --no-deps
         # -- -D warnings` exits 0 on this tree.
         #
-        # `--all-targets` is STILL deliberately omitted, and that is a real
-        # remaining gap, not an oversight: test code legitimately uses
-        # `eprintln!` (calibration output) and the workspace does not
-        # currently build clean in that mode.
+        # `--all-targets` is now on this step for every workspace crate
+        # (plan item 12b, expanded 2026-10-31). The history below is kept as written.
         #
         # MEASURED 2026-08-26 (this comment said "its true warning count is
         # UNMEASURED" until now, and an unmeasured gap is indistinguishable
@@ -252,7 +255,7 @@ jobs:
         # Ratcheted by `crates/common/tests/rust_only_guard.rs::
         # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
         # dropped again.
-        run: cargo clippy --workspace --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a
@@ -434,6 +437,11 @@ jobs:
     name: "Coverage & Perf"
     needs: build-and-verify
     runs-on: ubuntu-latest
+    # LLVM coverage maps do not require DWARF debug data. Keep instrumentation,
+    # debug assertions and overflow checks; reduce instrumented link/disk load.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     # 45 → 60 min (2026-07-09): headroom for the targeted llvm-cov retry
     # below — a cold-cache run + one retry must not die to the job timeout.
     timeout-minutes: 60
@@ -460,7 +468,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== df -h BEFORE cleanup ==="
           df -h /
           # Well-known GH-hosted-runner cleanup recipe: drop preinstalled
           # toolchains this job never uses (~25-30 GB reclaimed).
@@ -471,10 +478,7 @@ jobs:
                       /opt/ghc \
                       /usr/local/share/boost \
                       /opt/hostedtoolcache/CodeQL || true
-          if command -v docker >/dev/null 2>&1; then
-            sudo docker system prune -af >/dev/null 2>&1 || true
-          fi
-          echo "=== df -h AFTER cleanup ==="
+          sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
 
       - name: Checkout
@@ -524,19 +528,29 @@ jobs:
               --output-path target/llvm-cov/coverage.json \
               -- --skip dhat_
           }
-          # Targeted retry (flake signature b — see the dated comment at the
-          # top of this job): exactly ONE retry, only after wiping profraw
-          # residue from the failed attempt (compiled artifacts are kept, so
-          # the retry is mostly a re-run of the test phase). A genuinely
-          # failing test fails BOTH attempts → the job is red; the coverage
-          # THRESHOLD step below is untouched and never retried.
+          # Exactly ONE retry after removing raw profiles. Pinned llvm-cov
+          # 0.9.1 cleans workspace package artifacts on each normal invocation;
+          # dependency artifacts remain. A second failed attempt stays fatal.
+          # The coverage THRESHOLD step below is untouched and never retried.
           if ! run_cov; then
             echo "::warning::cargo llvm-cov failed (attempt 1/2) — retrying once after profraw clean (exit-101 flake class, see #1454). A second failure is a real red."
-            cargo llvm-cov clean --workspace --profraw-only \
+            cargo llvm-cov clean --profraw-only \
               || cargo llvm-cov clean --workspace
             mkdir -p target/llvm-cov
             run_cov
           fi
+
+      # Keep the final failure state visible before any later job cleanup.
+      # Ordinary and instrumented targets are distinct; no size is inferred
+      # from the compressed cache. Missing paths/du timeout are diagnostic only.
+      - name: Report coverage runner resources
+        if: always()
+        shell: bash
+        run: |
+          df -h .
+          df -i .
+          free -m
+          timeout 15s du -sh target/debug target/llvm-cov-target target/llvm-cov 2>/dev/null || true
 
       - name: Enforce per-crate coverage thresholds
         run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
@@ -809,16 +823,14 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
-          expected=$(LC_ALL=C sort <<'EOF'
-          crates/app/tests/dhat_depth_drain.rs
-          crates/app/tests/dhat_idle_seed_step.rs
-          crates/app/tests/dhat_live_ingest_seam.rs
-          crates/app/tests/dhat_main_feed_backup_dedup.rs
-          crates/app/tests/dhat_mark_forward.rs
-          crates/app/tests/dhat_order_path_recorder.rs
-          crates/app/tests/dhat_wal_ring_sink_accept.rs
-          crates/app/tests/dhat_ws_lag.rs
-          crates/app/tests/dhat_ws_lag_recorder.rs
+          app_expected=$(cat .github/dhat-app-targets.txt)
+          if [ "$(printf '%s\n' "$app_expected" | wc -l)" -ne 11 ] || \
+            printf '%s\n' "$app_expected" | grep -qvE '^crates/app/tests/dhat_[a-z0-9_]+\.rs$'; then
+            echo "::error::app DHAT inventory must contain exactly 11 explicit app test paths."
+            exit 1
+          fi
+          expected=$(LC_ALL=C sort <<EOF
+          $app_expected
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
           crates/core/tests/dhat_frame_silence_activity.rs
@@ -827,6 +839,7 @@ jobs:
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_truedata_decode_zero_alloc.rs
+          crates/core/tests/dhat_ws_reader_memory.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
           crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
@@ -849,7 +862,7 @@ jobs:
           # not silently break the comparison.
           expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
           if ! diff <(echo "$expected") <(echo "$actual"); then
-            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
+            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane targets in ci.yml and .github/dhat-app-targets.txt (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
           fi
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
@@ -864,9 +877,9 @@ jobs:
           shared-key: ci-dhat-zero-alloc
           cache-on-failure: true
 
-      # NOTE: plain `cargo test` (not nextest) is deliberate — every dhat
-      # target holds exactly ONE #[test] (dhat allows one Profiler per
-      # process), so there is no intra-binary parallelism to manage, and the
+      # NOTE: plain `cargo test` (not nextest) is deliberate. DHAT has one
+      # process-global profiler. The seed/level/book cases have separate
+      # single-test binaries; other targets retain their existing layout, and the
       # guards below need the classic harness output. Two false-OK guards
       # per step (audit Rule 11): (1) the tee'd "running 0 tests" scan — if
       # the `--features dhat` flag is ever dropped, the three cfg-gated core
@@ -895,7 +908,7 @@ jobs:
             --test dhat_telegram_dispatcher \
             --test dhat_token_handle \
             --test dhat_truedata_decode_zero_alloc \
-            --test dhat_ws_reader_zero_alloc \
+            --test dhat_ws_reader_memory --test dhat_ws_reader_zero_alloc \
             2>&1 | tee /tmp/dhat-core.log
           if grep -q 'running 0 tests' /tmp/dhat-core.log; then
             echo "::error::a core dhat target ran ZERO tests — vacuous green (--features dhat missing, or the cfg gate excluded the test). Rule 11: no false-OK."
@@ -932,8 +945,10 @@ jobs:
           # and left both the drift list and the --test flag behind.
           # 2026-10-10 (plan 52g/52h): dhat_frame_silence_activity added for
           # the per-kind frame-silence register: 8 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-11-02 (recovered plan52c): production reader memory
+          # allocation ratchet added with its explicit target: 9 -> 10.
+          if [ "$ran" -ne 10 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
@@ -1050,6 +1065,7 @@ jobs:
           set -euo pipefail
           cargo test -p tickvault-app \
             --test dhat_depth_drain --test dhat_idle_seed_step \
+            --test dhat_depth_book_row_presize --test dhat_depth_level_row_presize \
             --test dhat_live_ingest_seam \
             --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
             --test dhat_order_path_recorder --test dhat_wal_ring_sink_accept \
@@ -1085,9 +1101,11 @@ jobs:
           # idle seed step and the depth row pre-size.
           # 9 since 2026-10-30 (order path under 1 us): dhat_order_path_recorder
           # gates the order path with the production recorder installed.
+          # 11 since 2026-10-31: isolate level/book heap cases in their own
+          # binaries, retaining all three cases and their exact 0/0 budgets.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step."; exit 1
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------

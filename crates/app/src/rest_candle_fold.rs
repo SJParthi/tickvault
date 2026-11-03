@@ -3749,6 +3749,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// [`bar_at`] with an explicit composite identity (feed, sid, segment).
+    #[allow(clippy::too_many_arguments)] // APPROVED: test helper mirroring the bar's own fields (identity + OHLCV); a wrapper struct would only rename them.
     fn bar_ident_at(
         feed: Feed,
         security_id: SecurityId,

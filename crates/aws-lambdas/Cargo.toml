@@ -17,6 +17,8 @@ license.workspace = true
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Reuse workspace-pinned csv 1.4.0 for the bounded operator query response.
+csv = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -53,6 +55,9 @@ aws-sdk-lambda = { workspace = true }
 # keeps the PIN/TOTP-secret/token in redacting wrappers.
 totp-rs = { workspace = true }
 secrecy = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "start-watchdog"

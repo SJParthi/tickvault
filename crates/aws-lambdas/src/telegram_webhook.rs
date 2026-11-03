@@ -384,7 +384,7 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
     ),
     (
         "dhan-feed-delay-high",
-        "🔷 DHAN: live prices are reaching us more than a minute after the trade happened, for 10 minutes straight",
+        "🔷 DHAN: repeated checks found received price updates with trade times at least a minute old — investigate feed timing",
     ),
     (
         "dhan-main-reconnect-slow",
@@ -1871,6 +1871,37 @@ mod tests {
             alarm_phrase("tv-prod-questdb-disconnected"),
             "The database has been unreachable for too long"
         );
+    }
+
+    #[test]
+    fn feed_delay_pages_describe_timestamp_age_without_claiming_continuous_delay() {
+        // The seven observed 2026-11-02 OK->ALARM transitions. OK actions
+        // are disabled for this alarm, so the Lambda sees no intervening OK.
+        // Every re-armed incident must still reach the rendered output.
+        let mut cache = AlertCache::new();
+        let name = "tv-prod-dhan-feed-delay-high";
+        for (now, when) in [
+            (0.0, "2026-11-02T03:57:15.297+0000"),
+            (6_060.0, "2026-11-02T05:38:15.297+0000"),
+            (7_800.0, "2026-11-02T06:07:15.298+0000"),
+            (8_640.0, "2026-11-02T06:21:15.297+0000"),
+            (10_800.0, "2026-11-02T06:57:15.297+0000"),
+            (12_720.0, "2026-11-02T07:29:15.297+0000"),
+            (13_980.0, "2026-11-02T07:50:15.297+0000"),
+            // A repeated delivery also stays visible through the short
+            // renderer; wording correction must not suppress an incident.
+            (14_040.0, "2026-11-02T07:50:15.297+0000"),
+        ] {
+            let texts = fold_records(&[alarm_record(name, "ALARM", when)], now, &mut cache);
+            assert_eq!(texts.len(), 1, "an ALARM must still be delivered at {when}");
+            let text = &texts[0];
+            assert!(text.contains("DHAN") && text.contains("trade times"));
+            assert!(text.contains("at least a minute"), "equality breaches too");
+            assert!(
+                !text.contains("10 minutes straight") && !text.contains("after the trade happened"),
+                "sampled trade-age peaks cannot prove continuous transport delay: {text}"
+            );
+        }
     }
 
     #[test]

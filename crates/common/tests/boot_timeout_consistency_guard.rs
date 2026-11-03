@@ -21,6 +21,7 @@
 use tickvault_common::constants::{BOOT_DEADLINE_SECS, BOOT_TIMEOUT_SECS, TOKEN_INIT_TIMEOUT_SECS};
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn token_init_timeout_does_not_exceed_umbrella_boot_timeout() {
     // Step 6 (Dhan auth) — per-step timeout must respect the umbrella.
     assert!(
@@ -34,6 +35,7 @@ fn token_init_timeout_does_not_exceed_umbrella_boot_timeout() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn boot_questdb_deadline_does_not_exceed_umbrella_boot_timeout() {
     // Step 7 (QuestDB DDL) — per-step deadline must respect the umbrella.
     assert!(
@@ -46,6 +48,7 @@ fn boot_questdb_deadline_does_not_exceed_umbrella_boot_timeout() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn umbrella_boot_timeout_is_at_least_90s() {
     // Sanity: the umbrella must be generous enough to cover a realistic
     // cold boot (Docker pull + Dhan CSV download + universe build +
@@ -58,6 +61,7 @@ fn umbrella_boot_timeout_is_at_least_90s() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn token_init_timeout_is_at_least_30s() {
     // Sanity: per-step timeouts must be generous enough to cover
     // single-digit-second normal cases plus reasonable network blips.

@@ -447,7 +447,9 @@ pub fn parse_lot_size(value: &str) -> u32 {
     if !units.is_finite() || units <= 0.0 {
         return 0;
     }
-    if units.fract() != 0.0 {
+    // `fract()` alone misses a fraction below `f64` resolution:
+    // `75.000000000000001` rounds to exactly 75.0. The decimal text decides.
+    if units.fract() != 0.0 || !decimal_text_is_whole(trimmed) {
         return 0;
     }
     if units > f64::from(u32::MAX) {
@@ -459,6 +461,43 @@ pub fn parse_lot_size(value: &str) -> u32 {
     let units = units as u32;
     units
 }
+
+/// Whether a decimal number's TEXT is a whole number, read digit by digit so
+/// no `f64` rounding can hide a fraction (`75.000000000000001` is not whole).
+///
+/// Takes an optional sign, digits with at most one `.`, and an optional
+/// `e`/`E` exponent. Text it cannot read as that shape returns `false`.
+/// O(text length), no allocation; runs only on the cold CSV build.
+// O(1) EXEMPT: begin — one pass over one CSV cell, cold path
+fn decimal_text_is_whole(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], &unsigned[at + 1..]),
+        None => (unsigned, "0"),
+    };
+    let Ok(exponent) = exponent.parse::<i64>() else {
+        return false;
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    // The decimal point sits after `integer.len() + exponent` digits of
+    // `integer ++ fraction`; whole means every digit after it is zero.
+    let point = i64::try_from(integer.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    integer
+        .bytes()
+        .chain(fraction.bytes())
+        .enumerate()
+        .all(|(index, digit)| i64::try_from(index).unwrap_or(i64::MAX) < point || digit == b'0')
+}
+// O(1) EXEMPT: end
 
 /// `numerator / denominator` as an exact `f64`, with no lossy cast.
 ///
@@ -1177,7 +1216,7 @@ mod tests {
         );
         let r = rows_by_id(&body, 44311);
         assert_eq!(r.class, InstrumentClass::IndexOption);
-        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.expiry_ymd, 20260828);
         assert_eq!(r.strike_paise, 2_450_000, "24500 rupees is 2,450,000 paise");
         assert_eq!(r.option_leg, OptionLeg::Call);
         assert_eq!(r.underlying_symbol, "NIFTY");
@@ -1332,10 +1371,10 @@ mod tests {
 
     #[test]
     fn test_parse_expiry_ymd_accepts_both_vendor_forms_and_refuses_the_rest() {
-        assert_eq!(parse_expiry_ymd("2026-08-28"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 2026_08_28);
+        assert_eq!(parse_expiry_ymd("2026-08-28"), 20260828);
+        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 20260828);
+        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 20260828);
+        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 20260828);
         // Refusals — every one of these must read as "no expiry", never as a
         // date that could win the nearest-expiry slot.
         assert_eq!(parse_expiry_ymd(""), 0);
@@ -1358,12 +1397,12 @@ mod tests {
         assert_eq!(parse_expiry_ymd("2026-09-31"), 0);
         assert_eq!(parse_expiry_ymd("2026-11-31"), 0);
         // Real dates still pass, leap years included.
-        assert_eq!(parse_expiry_ymd("2026-02-28"), 2026_02_28);
-        assert_eq!(parse_expiry_ymd("2028-02-29"), 2028_02_29, "leap year");
+        assert_eq!(parse_expiry_ymd("2026-02-28"), 20260228);
+        assert_eq!(parse_expiry_ymd("2028-02-29"), 20280229, "leap year");
         assert_eq!(parse_expiry_ymd("2026-02-29"), 0, "not a leap year");
-        assert_eq!(parse_expiry_ymd("2000-02-29"), 2000_02_29, "400-year rule");
+        assert_eq!(parse_expiry_ymd("2000-02-29"), 20000229, "400-year rule");
         assert_eq!(parse_expiry_ymd("1900-02-29"), 0, "100-year rule");
-        assert_eq!(parse_expiry_ymd("2026-12-31"), 2026_12_31);
+        assert_eq!(parse_expiry_ymd("2026-12-31"), 20261231);
     }
 
     #[test]
@@ -1381,7 +1420,7 @@ mod tests {
         );
         let r = rows_by_id(&body, 44311);
         assert_eq!(r.class, InstrumentClass::IndexOption);
-        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.expiry_ymd, 20260828);
         assert_eq!(r.strike_paise, 2_450_000);
         assert_eq!(r.option_leg, OptionLeg::Call);
     }
@@ -1398,7 +1437,7 @@ mod tests {
             parse_expiry_ymd("2026-12-31"),
         ];
         days.sort_unstable();
-        assert_eq!(days, [2026_08_28, 2026_09_01, 2026_12_31, 2027_01_01]);
+        assert_eq!(days, [20260828, 20260901, 20261231, 20270101]);
     }
 
     #[test]

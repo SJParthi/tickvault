@@ -52,6 +52,7 @@ pub mod muhurat;
 // `open_price_source` DELETED as a pair — the retired `/marketfeed/quote`
 // open-price fallback (already a REMOVE class in
 // no-rest-except-live-feed-2026-06-27.md §3; zero refs outside the pair).
+pub mod operator_movers_wire;
 pub mod order_types;
 pub mod price_precision;
 pub mod sanitize;
@@ -63,3 +64,5 @@ pub mod trading_calendar;
 pub mod types;
 pub mod url_join;
 pub mod ws_event_types;
+
+pub mod operator_stock_movers_wire;

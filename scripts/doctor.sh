@@ -211,7 +211,7 @@ for v in TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD; do
         printf "[PASS] %-14s %s is set\n" "env" "$v"
         PASS=$((PASS + 1))
     else
-        printf "[WARN] %-14s %s not set (blocks LIVE mode boot — set before `make run`)\n" "env" "$v"
+        printf '[WARN] %-14s %s not set (blocks LIVE mode boot — set before `make run`)\n' "env" "$v"
     fi
 done
 

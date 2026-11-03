@@ -50,9 +50,10 @@
 //! bound how often the query runs.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -87,9 +88,19 @@ pub const FNO_STOCKS_WINDOW_SECS: i64 = 900;
 /// The newest row may be at most this old for the answer to read `live`.
 pub const FNO_STOCKS_LIVE_MAX_AGE_SECS: i64 = 60;
 
+/// How far an exchange trade time may run ahead of this box's clock and still
+/// count. The query keeps only each stock's newest row, so a tighter bound
+/// would drop a stock whose newest trade is stamped a second ahead instead of
+/// falling back to an older row. Same value as the spot price store's
+/// `FUTURE_TRADE_TIME_SKEW_SECS`; a row further ahead is a wrong clock and is
+/// still refused.
+const FNO_STOCKS_FUTURE_SKEW_SECS: i64 = 5;
+
 /// Upper bound on rows the query may return. The F&O list is about 220
 /// stocks; the bound only stops a malformed list from asking for more.
 const FNO_STOCKS_MAX_ROWS: usize = 1_000;
+const FNO_STOCKS_QUERY_ROWS: usize = FNO_STOCKS_MAX_ROWS + 1;
+const FNO_ARTIFACT_MAX_BYTES: usize = 256 * 1024;
 
 /// One crore, for the value column.
 const RUPEES_PER_CRORE: f64 = 10_000_000.0;
@@ -131,9 +142,12 @@ pub struct FnoStocksResponse {
     pub status: &'static str,
     /// Trading session open right now (weekend and holiday aware).
     pub market_open: bool,
+    /// UTC epoch seconds of the original observation, before the query.
+    /// Retained in cached bodies so callers can age `data_age_secs` correctly.
+    pub observed_at_epoch_secs: i64,
     /// Time of the newest row, `HH:MM:SS` IST; `None` without rows.
     pub as_of_ist: Option<String>,
-    /// Seconds between the newest row and now; `None` without rows.
+    /// Seconds between the newest row and the original observation; `None` without rows.
     pub data_age_secs: Option<i64>,
     /// F&O stocks on today's list (0 when the list is missing).
     pub fno_stocks_total: usize,
@@ -148,10 +162,16 @@ pub struct FnoStocksResponse {
 }
 
 impl FnoStocksResponse {
-    fn empty(status: &'static str, market_open: bool, fno_stocks_total: usize) -> Self {
+    pub(super) fn empty(
+        status: &'static str,
+        market_open: bool,
+        fno_stocks_total: usize,
+        observed_at_epoch_secs: i64,
+    ) -> Self {
         Self {
             status,
             market_open,
+            observed_at_epoch_secs,
             as_of_ist: None,
             data_age_secs: None,
             fno_stocks_total,
@@ -166,7 +186,7 @@ impl FnoStocksResponse {
 /// Today's F&O stocks, keyed on the composite `(security_id, segment code)`.
 #[derive(Debug, Default)]
 pub struct FnoUnderlyings {
-    names: HashMap<(u64, u8), String>,
+    pub(super) names: HashMap<(u64, u8), String>,
 }
 
 impl FnoUnderlyings {
@@ -201,6 +221,7 @@ impl FnoUnderlyings {
 
 #[derive(Deserialize)]
 struct ArtifactEnvelope {
+    count: usize,
     mappings: Vec<ArtifactEntry>,
 }
 
@@ -222,49 +243,81 @@ pub fn fno_underlying_artifact_path(dir: &Path, date_ist: &str) -> PathBuf {
 /// `NSE_EQ` only. `None` when the bytes are not the writer's envelope.
 #[must_use]
 pub fn parse_fno_underlyings(bytes: &[u8]) -> Option<FnoUnderlyings> {
+    if bytes.len() > FNO_ARTIFACT_MAX_BYTES {
+        return None;
+    }
     let envelope: ArtifactEnvelope = serde_json::from_slice(bytes).ok()?;
+    if envelope.count != envelope.mappings.len() {
+        return None;
+    }
     let mut names = HashMap::with_capacity(envelope.mappings.len());
     for entry in envelope.mappings {
         if entry.index_name == FNO_UNDERLYING_TAG
             && entry.exchange_segment == EXCHANGE_SEGMENT_NSE_EQ
             && entry.security_id != 0
         {
-            names
-                .entry((entry.security_id, entry.exchange_segment))
-                .or_insert(entry.symbol);
+            match names.entry((entry.security_id, entry.exchange_segment)) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(entry.symbol);
+                }
+                std::collections::hash_map::Entry::Occupied(slot)
+                    if slot.get() != &entry.symbol =>
+                {
+                    return None;
+                }
+                std::collections::hash_map::Entry::Occupied(_) => (),
+            }
         }
     }
     Some(FnoUnderlyings { names })
 }
 
 /// The last list read, keyed by its path (the path carries the IST date).
-static FNO_LIST_CACHE: Mutex<Option<(PathBuf, Arc<FnoUnderlyings>)>> = Mutex::new(None);
+type FnoListCache = Option<(PathBuf, u64, SystemTime, Arc<FnoUnderlyings>)>;
+static FNO_LIST_CACHE: Mutex<FnoListCache> = Mutex::new(None);
 
-/// Loads the day's list, reading the file only when the path changed (a new
-/// IST date) or the last read failed. `None` when the file is missing,
+/// Loads the day's list, re-reading after path, length or modification time
+/// changes. Missing or invalid replacement files never reuse a cached list. `None` when the file is missing,
 /// unreadable, malformed or empty.
-fn load_fno_underlyings(path: &Path) -> Option<Arc<FnoUnderlyings>> {
+pub(super) fn load_fno_underlyings(path: &Path) -> Option<Arc<FnoUnderlyings>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > FNO_ARTIFACT_MAX_BYTES as u64 {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
     let mut slot = FNO_LIST_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_path, list)) = slot.as_ref()
+    if let Some((cached_path, len, mtime, list)) = slot.as_ref()
         && cached_path == path
+        && *len == metadata.len()
+        && *mtime == modified
     {
         return Some(Arc::clone(list));
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take((FNO_ARTIFACT_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
     let list = parse_fno_underlyings(&bytes)?;
     if list.is_empty() {
         return None;
     }
     let list = Arc::new(list);
-    *slot = Some((path.to_path_buf(), Arc::clone(&list)));
+    *slot = Some((
+        path.to_path_buf(),
+        metadata.len(),
+        modified,
+        Arc::clone(&list),
+    ));
     Some(list)
 }
 
 /// IST wall-clock now, as a naive date-time (the same convention `ticks.ts`
 /// is stored in).
-fn now_ist_naive() -> chrono::NaiveDateTime {
+pub(super) fn now_ist_naive() -> chrono::NaiveDateTime {
     (chrono::Utc::now() + chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS)).naive_utc()
 }
 
@@ -285,7 +338,7 @@ fn build_fno_stocks_sql(ids: &[u64], window_start_ist: chrono::NaiveDateTime) ->
         "SELECT security_id, segment, ltp, close, volume, avg_price, ts FROM ticks \
          WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}' \
          AND security_id IN ({id_list}) \
-         LATEST ON ts PARTITION BY security_id, segment LIMIT {FNO_STOCKS_MAX_ROWS}",
+         LATEST ON ts PARTITION BY security_id, segment LIMIT {FNO_STOCKS_QUERY_ROWS}",
         segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ),
         window_start_ist.format("%Y-%m-%dT%H:%M:%S%.6fZ"),
     )
@@ -336,7 +389,7 @@ async fn query_fno_rows(
     sql: &str,
     timeout: Duration,
 ) -> Result<Vec<TickRow>, QueryFailure> {
-    let resp = client
+    let mut resp = client
         .get(format!("{base_url}/exec"))
         .timeout(timeout)
         .query(&[("query", sql)])
@@ -346,11 +399,26 @@ async fn query_fno_rows(
     if !resp.status().is_success() {
         return Err(QueryFailure::Refused);
     }
-    let body: serde_json::Value = resp.json().await.map_err(|_| QueryFailure::Refused)?;
+    const BODY_LIMIT: usize = tickvault_common::operator_movers_wire::MAX_SOURCE_BYTES;
+    if resp.content_length().is_some_and(|n| n > BODY_LIMIT as u64) {
+        return Err(QueryFailure::Refused);
+    }
+    let mut bytes = Vec::with_capacity(BODY_LIMIT);
+    while let Some(chunk) = resp.chunk().await.map_err(|_| QueryFailure::Refused)? {
+        if chunk.len() > BODY_LIMIT.saturating_sub(bytes.len()) {
+            return Err(QueryFailure::Refused);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| QueryFailure::Refused)?;
     let dataset = body
         .get("dataset")
         .and_then(serde_json::Value::as_array)
         .ok_or(QueryFailure::Refused)?;
+    if dataset.len() > FNO_STOCKS_MAX_ROWS {
+        return Err(QueryFailure::Refused);
+    }
     Ok(dataset
         .iter()
         .filter_map(|row| parse_tick_row(row.as_array()?))
@@ -417,34 +485,58 @@ fn build_rows(list: &FnoUnderlyings, rows: Vec<TickRow>) -> Vec<FnoStockRow> {
 }
 
 /// Everything the computation needs from outside, so tests can drive it.
-struct FnoStocksInputs<'a> {
-    client: &'a reqwest::Client,
-    base_url: &'a str,
-    artifact_dir: &'a Path,
-    market_open: bool,
-    now_ist: chrono::NaiveDateTime,
-    timeout: Duration,
+pub(super) struct FnoStocksInputs<'a> {
+    pub(super) client: &'a reqwest::Client,
+    pub(super) base_url: &'a str,
+    pub(super) artifact_dir: &'a Path,
+    pub(super) market_open: bool,
+    pub(super) now_ist: chrono::NaiveDateTime,
+    pub(super) timeout: Duration,
 }
 
 /// Computes the answer. Never panics; every failure is a status.
 async fn compute_fno_stocks(inputs: FnoStocksInputs<'_>) -> FnoStocksResponse {
     let date = inputs.now_ist.format("%Y-%m-%d").to_string();
     let list = load_fno_underlyings(&fno_underlying_artifact_path(inputs.artifact_dir, &date));
+    compute_for_list(inputs, list).await
+}
+
+/// Shared price engine: callers supply a canonical eligible-name set.
+/// Market hours, query, prices, turnover and sorting retain one implementation.
+pub(super) async fn compute_for_list(
+    inputs: FnoStocksInputs<'_>,
+    list: Option<Arc<FnoUnderlyings>>,
+) -> FnoStocksResponse {
+    let observed_at_epoch_secs = inputs.now_ist.and_utc().timestamp()
+        - chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS).num_seconds();
     let total = list.as_ref().map_or(0, |l| l.len());
     if !inputs.market_open {
-        return FnoStocksResponse::empty("closed", false, total);
+        return FnoStocksResponse::empty("closed", false, total, observed_at_epoch_secs);
     }
     let Some(list) = list else {
-        return FnoStocksResponse::empty("no_fno_list", true, 0);
+        return FnoStocksResponse::empty("no_fno_list", true, 0, observed_at_epoch_secs);
     };
     let sql = build_fno_stocks_sql(&list.sorted_ids(), window_start(inputs.now_ist));
     let rows = match query_fno_rows(inputs.client, inputs.base_url, &sql, inputs.timeout).await {
         Ok(rows) => rows,
         Err(QueryFailure::Unreachable) => {
-            return FnoStocksResponse::empty("unreachable", true, total);
+            return FnoStocksResponse::empty("unreachable", true, total, observed_at_epoch_secs);
         }
-        Err(QueryFailure::Refused) => return FnoStocksResponse::empty("query_failed", true, total),
+        Err(QueryFailure::Refused) => {
+            return FnoStocksResponse::empty("query_failed", true, total, observed_at_epoch_secs);
+        }
     };
+    // A malformed price or out-of-window timestamp cannot make older accepted
+    // prices look live. Use the same accepted rows for both age and rendering.
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| {
+            r.ltp.is_finite()
+                && r.ltp > 0.0
+                && r.ts >= window_start(inputs.now_ist)
+                && r.ts <= inputs.now_ist + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS)
+        })
+        .collect();
     let newest = rows
         .iter()
         .filter(|r| list.name_of(r.security_id, r.segment_code).is_some())
@@ -452,9 +544,10 @@ async fn compute_fno_stocks(inputs: FnoStocksInputs<'_>) -> FnoStocksResponse {
         .max();
     let stocks = build_rows(&list, rows);
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
-        return FnoStocksResponse::empty("no_data", true, total);
+        return FnoStocksResponse::empty("no_data", true, total, observed_at_epoch_secs);
     };
-    let age = (inputs.now_ist - newest).num_seconds();
+    // A newest row inside the forward skew reads as age 0, never negative.
+    let age = (inputs.now_ist - newest).num_seconds().max(0);
     FnoStocksResponse {
         status: if age <= FNO_STOCKS_LIVE_MAX_AGE_SECS {
             "live"
@@ -462,6 +555,7 @@ async fn compute_fno_stocks(inputs: FnoStocksInputs<'_>) -> FnoStocksResponse {
             "stale"
         },
         market_open: true,
+        observed_at_epoch_secs,
         as_of_ist: Some(newest.format("%H:%M:%S").to_string()),
         data_age_secs: Some(age),
         fno_stocks_total: total,
@@ -504,7 +598,7 @@ pub async fn get_fno_stocks(State(state): State<SharedAppState>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn at(text: &str) -> chrono::NaiveDateTime {
@@ -606,7 +700,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.ends_with(&format!("LIMIT {FNO_STOCKS_MAX_ROWS}")),
+            sql.ends_with(&format!("LIMIT {FNO_STOCKS_QUERY_ROWS}")),
             "{sql}"
         );
     }
@@ -686,7 +780,7 @@ mod tests {
     #[test]
     fn test_name_of_needs_the_full_composite_key() {
         let list = parse_fno_underlyings(
-            br#"{"mappings":[{"index_name":"FNO_UNDERLYING","symbol":"ABC","isin":"","security_id":5,"exchange_segment":1}]}"#,
+            br#"{"count":1,"mappings":[{"index_name":"FNO_UNDERLYING","symbol":"ABC","isin":"","security_id":5,"exchange_segment":1}]}"#,
         )
         .expect("parses");
         assert_eq!(list.name_of(5, EXCHANGE_SEGMENT_NSE_EQ), Some("ABC"));
@@ -735,6 +829,13 @@ mod tests {
         assert_eq!(r.stocks_priced, 1);
         assert_eq!(r.as_of_ist.as_deref(), Some("11:15:20"));
         assert_eq!(r.data_age_secs, Some(10));
+        assert_eq!(
+            r.observed_at_epoch_secs,
+            chrono::DateTime::parse_from_rfc3339("2026-10-30T05:45:30Z")
+                .unwrap()
+                .timestamp(),
+            "age must retain its original pre-query UTC clock, with the IST offset removed"
+        );
         let s = &r.stocks[0];
         assert_eq!((s.name.as_str(), s.segment), ("RELIANCE", "NSE_EQ"));
         assert!((s.change.expect("change") - 50.5).abs() < 1e-9);
@@ -796,6 +897,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_regression_newest_row_slightly_ahead_of_the_clock_is_kept() {
+        // NOW is 11:15:30. The newest trade is stamped 3 s ahead: the stock
+        // stays on the page with age 0. One 10 s ahead is a wrong clock and is
+        // refused, so only the other stock remains.
+        let dir = list_dir("ahead");
+        let ahead = r#"[2885,"NSE_EQ",1450.5,1400.0,1,1450.0,"2026-10-30T11:15:33.000000Z"]"#;
+        let url = mock("200 OK", dataset(&[ahead])).await;
+        let r = run(&url, &dir, true).await;
+        assert_eq!(r.status, "live");
+        assert_eq!(r.stocks_priced, 1);
+        assert_eq!(r.data_age_secs, Some(0));
+        assert_eq!(r.as_of_ist.as_deref(), Some("11:15:33"));
+
+        let far = r#"[2885,"NSE_EQ",1450.5,1400.0,1,1450.0,"2026-10-30T11:15:40.000000Z"]"#;
+        let url = mock("200 OK", dataset(&[far, INFY])).await;
+        let r = run(&url, &dir, true).await;
+        let names: Vec<&str> = r.stocks.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["INFY"]);
+        assert_eq!(r.data_age_secs, Some(5));
+    }
+
+    #[tokio::test]
     async fn test_old_newest_row_is_stale_not_live() {
         let dir = list_dir("stale");
         let old = r#"[2885,"NSE_EQ",1450.5,1400.0,1,1450.0,"2026-10-30T11:10:00.000000Z"]"#;
@@ -829,7 +952,7 @@ mod tests {
 
     // ---- route ----
 
-    fn mock_state(http_port: u16) -> SharedAppState {
+    pub(in crate::handlers) fn mock_state(http_port: u16) -> SharedAppState {
         use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
         SharedAppState::new(
             QuestDbConfig {
@@ -864,15 +987,20 @@ mod tests {
     #[tokio::test]
     async fn test_get_fno_stocks_cache_hit_skips_the_query() {
         let state = mock_state(1);
-        state
-            .fno_stocks_cache()
-            .put(r#"{"status":"live","sentinel":true}"#.to_string());
+        state.fno_stocks_cache().put(
+            r#"{"status":"live","observed_at_epoch_secs":1800000000,"sentinel":true}"#.to_string(),
+        );
         let resp = get_fno_stocks(State(state)).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("body");
         assert!(String::from_utf8_lossy(&body).contains("sentinel"));
+        let cached: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            cached["observed_at_epoch_secs"], 1_800_000_000_i64,
+            "a cache hit must not refresh the original observation clock"
+        );
     }
 
     #[tokio::test]
@@ -918,12 +1046,35 @@ mod tests {
     #[test]
     fn test_handler_uses_the_shared_client_and_a_timeout() {
         let source = include_str!("fno_stocks.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .map_or(source, |(before, _)| before);
+        let (production, _) = source
+            .split_once("\n#[cfg(test)]\npub(super) mod tests {")
+            .expect("the shared F&O test-module boundary must remain explicit");
         assert!(production.contains("state.questdb_http_client()"));
         assert!(production.contains(".timeout(timeout)"));
         assert!(!production.contains(concat!("Client::", "builder")));
         assert!(!production.contains(concat!("Client::", "new")));
+    }
+    #[test]
+    fn fno_artifact_rejects_missing_or_mismatched_declared_count() {
+        for bytes in [
+            br#"{"mappings":[]}"#.as_slice(),
+            br#"{"count":1,"mappings":[]}"#.as_slice(),
+        ] {
+            assert!(parse_fno_underlyings(bytes).is_none());
+        }
+        assert!(parse_fno_underlyings(&vec![b' '; FNO_ARTIFACT_MAX_BYTES + 1]).is_none());
+    }
+    #[test]
+    fn fno_duplicate_identity_cannot_choose_a_conflicting_symbol() {
+        let body = |name: &str| {
+            serde_json::json!({"count":2,"mappings":[{"index_name":"FNO_UNDERLYING","symbol":"ABC","security_id":5,"exchange_segment":1},{"index_name":"FNO_UNDERLYING","symbol":name,"security_id":5,"exchange_segment":1}]}).to_string()
+        };
+        assert_eq!(
+            parse_fno_underlyings(body("ABC").as_bytes())
+                .unwrap()
+                .name_of(5, 1),
+            Some("ABC")
+        );
+        assert!(parse_fno_underlyings(body("WRONG").as_bytes()).is_none());
     }
 }

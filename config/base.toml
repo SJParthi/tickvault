@@ -43,6 +43,13 @@ max_orders_per_second = 10
 # Format: { date = "YYYY-MM-DD", name = "..." }
 # Weekends are excluded automatically — only list weekday holidays.
 
+# Late addition for both NSE CM and F&O, issued 12 Jan 2026:
+# https://nsearchives.nseindia.com/content/circulars/CMTR72260.pdf
+# https://nsearchives.nseindia.com/content/circulars/FAOP72262.pdf
+[[trading.nse_holidays]]
+date = "2026-01-15"
+name = "Municipal Corporation Election - Maharashtra"
+
 [[trading.nse_holidays]]
 date = "2026-01-26"
 name = "Republic Day"
@@ -889,6 +896,13 @@ frame_silence_fast_path = "shadow"
 # (tv_depth_first_packet_latency_ms, basis "depth200_socket") supports it.
 # Bounds 10..=600, checked at boot.
 depth200_silent_swap_resubscribe_secs = 90
+
+# Plan item 3b (2026-10-30): a main-feed instrument subscribed over 120 s ago
+# that has sent nothing, on a socket that delivers others, is offered again IN
+# PLACE (unsubscribe, then subscribe, same socket, never a redial), at most 3
+# rounds a day. false = the delta is found and counted as "would_resubscribe"
+# (local /metrics only) and nothing is sent. Turning it on is the owner's call.
+subscribe_reconcile_auto_resubscribe = false
 
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —

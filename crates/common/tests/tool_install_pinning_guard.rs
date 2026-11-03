@@ -171,10 +171,9 @@ fn unversioned_cargo_installs(line: &str) -> usize {
             if let Some(v) = w
                 .strip_prefix("--version=")
                 .or_else(|| w.strip_prefix("--vers="))
+                && is_exact_version(v)
             {
-                if is_exact_version(v) {
-                    versioned = true;
-                }
+                versioned = true;
             }
             if is_exact_at_version(w) {
                 versioned = true;

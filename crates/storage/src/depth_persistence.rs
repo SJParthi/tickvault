@@ -182,7 +182,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use questdb::ingress::{Buffer, ColumnName, ProtocolVersion, Sender, TableName, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -335,6 +335,53 @@ pub struct DepthRow {
     pub capture_seq: i64,
     /// Designated timestamp — ARRIVAL time, not exchange time. See module docs.
     pub ts_nanos: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Pre-checked ILP names (the per-level row cost, 2026-10-30)
+// ---------------------------------------------------------------------------
+
+// Passing a plain `&str` to a `questdb::ingress::Buffer` method makes it
+// re-check the name character by character on EVERY call: eleven names per
+// `market_depth` row, so on the drain that is one validation pass per name
+// per level. These names are fixed literals, so the answer never changes;
+// `the_depth_ilp_names_pass_questdbs_own_name_checks` (test module) runs
+// QuestDB's own validators over every one of them, and the writers pass the
+// names as `ColumnName` / `TableName` built unchecked, which skips only that
+// re-check. The bytes written are the same (the check can only return an
+// error, never change the output), pinned by
+// `the_prechecked_writer_writes_the_same_bytes_as_the_checked_one`.
+//
+// The name list lives in the test module, not here: a test-only item above
+// the production code would cut the production half that source-scan guards
+// read (they split the file at the first test-config attribute, so that
+// attribute must not appear above the test module, not even in a comment).
+
+/// A depth column name, already proven valid by the test module's name list.
+///
+/// Every build with debug assertions enabled runs QuestDB's own check on each call,
+/// so a name added at a call site without being valid fails every test that
+/// writes a row; a release build skips it.
+///
+/// # Performance
+/// O(1) in release: wraps the `&'static str`, no scan.
+#[inline(always)]
+fn depth_col(name: &'static str) -> ColumnName<'static> {
+    debug_assert!(
+        ColumnName::new(name).is_ok(),
+        "depth ILP column name {name:?} fails QuestDB's own name check"
+    );
+    ColumnName::new_unchecked(name)
+}
+
+/// A depth table name, already proven valid by the test module's name check.
+#[inline(always)]
+fn depth_table(name: &'static str) -> TableName<'static> {
+    debug_assert!(
+        TableName::new(name).is_ok(),
+        "depth ILP table name {name:?} fails QuestDB's own name check"
+    );
+    TableName::new_unchecked(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -2205,15 +2252,15 @@ impl DepthWriter {
         debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.side));
         debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
         self.buffer
-            .table(MARKET_DEPTH_BOOK_TABLE)
+            .table(depth_table(MARKET_DEPTH_BOOK_TABLE))
             .context("table")?
-            .symbol("segment", row.segment)
+            .symbol(depth_col("segment"), row.segment)
             .context("segment")?
-            .symbol("depth_kind", row.depth_kind)
+            .symbol(depth_col("depth_kind"), row.depth_kind)
             .context("depth_kind")?
-            .symbol("side", row.side)
+            .symbol(depth_col("side"), row.side)
             .context("side")?
-            .symbol("feed", feed)
+            .symbol(depth_col("feed"), feed)
             .context("feed")?;
         // `contract`, resolved once per instrument run exactly as the level
         // writer does; omitted (NULL) when the day's table does not know it.
@@ -2233,21 +2280,24 @@ impl DepthWriter {
             // name is written as it is; no per-row scan.
             debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
             self.buffer
-                .symbol("contract", &**name)
+                .symbol(depth_col("contract"), &**name)
                 .context("contract")?;
         }
         self.buffer
-            .column_i64("security_id", row.security_id)
+            .column_i64(depth_col("security_id"), row.security_id)
             .context("security_id")?
-            .column_i64("levels", i64::try_from(levels).unwrap_or(i64::MAX))
+            .column_i64(
+                depth_col("levels"),
+                i64::try_from(levels).unwrap_or(i64::MAX),
+            )
             .context("levels")?
-            .column_arr("price", &row.prices)
+            .column_arr(depth_col("price"), &row.prices)
             .context("price")?
-            .column_arr("quantity", &row.quantities)
+            .column_arr(depth_col("quantity"), &row.quantities)
             .context("quantity")?
-            .column_arr("orders", &row.orders)
+            .column_arr(depth_col("orders"), &row.orders)
             .context("orders")?
-            .column_i64("capture_seq", row.capture_seq)
+            .column_i64(depth_col("capture_seq"), row.capture_seq)
             .context("capture_seq")?
             .at(TimestampNanos::new(row.ts_nanos))
             .context("designated timestamp")?;
@@ -2319,15 +2369,15 @@ impl DepthWriter {
         // measures at ~1.53e9 rows per session. The check did not disappear; it
         // moved to the compiler, which is principle 2 in its literal form.
         self.buffer
-            .table(MARKET_DEPTH_TABLE)
+            .table(depth_table(MARKET_DEPTH_TABLE))
             .context("table")?
-            .symbol("segment", row.segment)
+            .symbol(depth_col("segment"), row.segment)
             .context("segment")?
-            .symbol("depth_kind", row.depth_kind)
+            .symbol(depth_col("depth_kind"), row.depth_kind)
             .context("depth_kind")?
-            .symbol("side", row.side)
+            .symbol(depth_col("side"), row.side)
             .context("side")?
-            .symbol("feed", feed)
+            .symbol(depth_col("feed"), feed)
             .context("feed")?;
         // `contract` — the instrument's NAME, from the same published table the
         // tick and candle writers read (operator 2026-09-22, item 44i). Resolved
@@ -2355,21 +2405,21 @@ impl DepthWriter {
             // name is written as it is; no per-row scan.
             debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
             self.buffer
-                .symbol("contract", &**name)
+                .symbol(depth_col("contract"), &**name)
                 .context("contract")?;
         }
         self.buffer
-            .column_i64("security_id", row.security_id)
+            .column_i64(depth_col("security_id"), row.security_id)
             .context("security_id")?
-            .column_i64("level", row.level)
+            .column_i64(depth_col("level"), row.level)
             .context("level")?
-            .column_f64("price", row.price)
+            .column_f64(depth_col("price"), row.price)
             .context("price")?
-            .column_i64("quantity", row.quantity)
+            .column_i64(depth_col("quantity"), row.quantity)
             .context("quantity")?
-            .column_i64("orders", row.orders)
+            .column_i64(depth_col("orders"), row.orders)
             .context("orders")?
-            .column_i64("capture_seq", row.capture_seq)
+            .column_i64(depth_col("capture_seq"), row.capture_seq)
             .context("capture_seq")?
             .at(TimestampNanos::new(row.ts_nanos))
             .context("designated timestamp")?;
@@ -4167,6 +4217,275 @@ mod tests {
         );
     }
     use super::*;
+    // -----------------------------------------------------------------------
+    // Pre-checked ILP names (2026-10-30): same bytes as the checked API
+    // -----------------------------------------------------------------------
+
+    /// Every table column name the two depth writers put on a line.
+    const DEPTH_ILP_COLUMN_NAMES: [&str; 12] = [
+        "segment",
+        "depth_kind",
+        "side",
+        "feed",
+        "contract",
+        "security_id",
+        "level",
+        // `market_depth_book` writes `price`, `quantity` and `orders` as array
+        // columns under the same names.
+        "price",
+        "quantity",
+        "orders",
+        "capture_seq",
+        "levels",
+    ];
+
+    /// A session-window arrival stamp (10:00 IST on 2026-10-29), so the
+    /// writer's window gate never refuses the rows these tests compare.
+    const PRECHECKED_TS_NANOS: i64 = 1_793_268_000_000_000_000;
+
+    /// The `market_depth` line exactly as the writer built it before
+    /// 2026-10-30: every name passed as a `&str`, so QuestDB checks it.
+    fn checked_level_line(buf: &mut Buffer, row: &DepthRow, feed: &str, contract: Option<&str>) {
+        buf.table(MARKET_DEPTH_TABLE)
+            .and_then(|b| b.symbol("segment", row.segment))
+            .and_then(|b| b.symbol("depth_kind", row.depth_kind))
+            .and_then(|b| b.symbol("side", row.side))
+            .and_then(|b| b.symbol("feed", feed))
+            .expect("symbols");
+        if let Some(name) = contract {
+            buf.symbol("contract", name).expect("contract");
+        }
+        buf.column_i64("security_id", row.security_id)
+            .and_then(|b| b.column_i64("level", row.level))
+            .and_then(|b| b.column_f64("price", row.price))
+            .and_then(|b| b.column_i64("quantity", row.quantity))
+            .and_then(|b| b.column_i64("orders", row.orders))
+            .and_then(|b| b.column_i64("capture_seq", row.capture_seq))
+            .and_then(|b| b.at(TimestampNanos::new(row.ts_nanos)))
+            .expect("fields");
+    }
+
+    /// The `market_depth_book` line exactly as the writer built it before
+    /// 2026-10-30.
+    fn checked_book_line(
+        buf: &mut Buffer,
+        row: &DepthBookRow<'_>,
+        feed: &str,
+        contract: Option<&str>,
+    ) {
+        buf.table(MARKET_DEPTH_BOOK_TABLE)
+            .and_then(|b| b.symbol("segment", row.segment))
+            .and_then(|b| b.symbol("depth_kind", row.depth_kind))
+            .and_then(|b| b.symbol("side", row.side))
+            .and_then(|b| b.symbol("feed", feed))
+            .expect("symbols");
+        if let Some(name) = contract {
+            buf.symbol("contract", name).expect("contract");
+        }
+        let levels = i64::try_from(row.prices.len()).unwrap_or(i64::MAX);
+        buf.column_i64("security_id", row.security_id)
+            .and_then(|b| b.column_i64("levels", levels))
+            .and_then(|b| b.column_arr("price", &row.prices))
+            .and_then(|b| b.column_arr("quantity", &row.quantities))
+            .and_then(|b| b.column_arr("orders", &row.orders))
+            .and_then(|b| b.column_i64("capture_seq", row.capture_seq))
+            .and_then(|b| b.at(TimestampNanos::new(row.ts_nanos)))
+            .expect("fields");
+    }
+
+    /// A fresh buffer shaped exactly like the writer's own.
+    fn buffer_like(w: &DepthWriter) -> Buffer {
+        Buffer::new(w.buffer.protocol_version())
+    }
+
+    /// The contract name the writer resolved for its last row, if any.
+    fn resolved_contract(w: &DepthWriter) -> Option<String> {
+        w.contract_label
+            .as_ref()
+            .and_then(|(_, _, name)| name.as_deref().map(str::to_owned))
+    }
+
+    /// Every level of one packet, appended by the writer and by the checked
+    /// reference, must produce the same bytes.
+    fn assert_level_packet_bytes_match(
+        rows: &[DepthRow],
+        contract: Option<&str>,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        if let (Some(name), Some(first)) = (contract, rows.first()) {
+            w.contract_label = Some((
+                first.security_id,
+                first.segment,
+                Some(std::sync::Arc::from(name)),
+            ));
+        }
+        let mut reference = buffer_like(&w);
+        for row in rows {
+            w.append_row(row).map_err(|e| {
+                proptest::test_runner::TestCaseError::fail(format!("append_row: {e:#}"))
+            })?;
+            let label = resolved_contract(&w);
+            checked_level_line(&mut reference, row, Feed::Dhan.as_str(), label.as_deref());
+        }
+        proptest::prop_assert_eq!(w.buffer_bytes(), reference.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn the_depth_ilp_names_pass_questdbs_own_name_checks() {
+        for name in DEPTH_ILP_COLUMN_NAMES {
+            assert!(ColumnName::new(name).is_ok(), "column name {name:?}");
+        }
+        for table in [MARKET_DEPTH_TABLE, MARKET_DEPTH_BOOK_TABLE] {
+            assert!(TableName::new(table).is_ok(), "table name {table:?}");
+        }
+    }
+
+    /// The release build's unchecked names would let an invalid literal
+    /// through; the debug check in `depth_col` is what stops it in tests.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "fails QuestDB's own name check")
+    )]
+    fn a_bad_depth_column_name_fails_every_debug_build() {
+        // Release intentionally skips validation; the valid-name and byte
+        // identity tests above still pin every production literal there.
+        assert_eq!(depth_col("bad,name").as_ref(), "bad,name");
+    }
+
+    #[test]
+    fn the_prechecked_writer_writes_the_same_bytes_as_the_checked_one() {
+        // One hand-picked row per edge: NaN, both infinities, negative zero,
+        // a negative price, the largest finite value, zero and level 200.
+        let prices = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            -1.5,
+            f64::MAX,
+            0.0,
+            24_513.05,
+        ];
+        let rows: Vec<DepthRow> = prices
+            .iter()
+            .enumerate()
+            .map(|(i, &price)| DepthRow {
+                security_id: 52_175,
+                segment: "NSE_FNO",
+                depth_kind: DEPTH_KIND_200,
+                side: if i % 2 == 0 {
+                    DEPTH_SIDE_BID
+                } else {
+                    DEPTH_SIDE_ASK
+                },
+                level: if i == 7 {
+                    200
+                } else {
+                    i64::try_from(i).unwrap_or(0) + 1
+                },
+                price,
+                quantity: i64::from(u32::MAX),
+                orders: 0,
+                capture_seq: i64::MAX,
+                ts_nanos: PRECHECKED_TS_NANOS,
+            })
+            .collect();
+        assert_level_packet_bytes_match(&rows, None).expect("no contract");
+        assert_level_packet_bytes_match(&rows, Some("NIFTY-Nov2026-24500-CE")).expect("contract");
+
+        let price = [f64::NAN, 0.0, -1.0, f64::MAX];
+        let quantity = [0.0, f64::from(u32::MAX), 1.0, f64::NAN];
+        let orders = [0.0, 1.0, f64::NAN, f64::from(u32::MAX)];
+        let book = DepthBookRow {
+            security_id: 52_175,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_20,
+            side: DEPTH_SIDE_ASK,
+            prices: &price,
+            quantities: &quantity,
+            orders: &orders,
+            capture_seq: 1,
+            ts_nanos: PRECHECKED_TS_NANOS,
+        };
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        w.append_book_row(&book).expect("book row");
+        let mut reference = buffer_like(&w);
+        let label = resolved_contract(&w);
+        checked_book_line(&mut reference, &book, Feed::Dhan.as_str(), label.as_deref());
+        assert_eq!(w.buffer_bytes(), reference.as_bytes());
+    }
+
+    /// Any f64 bit pattern, including every NaN payload and both infinities.
+    fn any_f64_bits() -> impl proptest::strategy::Strategy<Value = f64> {
+        use proptest::strategy::Strategy as _;
+        proptest::prelude::any::<u64>().prop_map(f64::from_bits)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        /// Random packets of 20 or 200 levels (any price bits, quantities and
+        /// orders across the full u32 range, either side, any capture seq):
+        /// the pre-checked writer and the checked reference write the same
+        /// bytes, for `market_depth` and for `market_depth_book`.
+        #[test]
+        fn proptest_prechecked_depth_lines_match_the_checked_lines(
+            levels in proptest::sample::select(vec![20_usize, 200]),
+            prices in proptest::collection::vec(any_f64_bits(), 200),
+            quantities in proptest::collection::vec(proptest::prelude::any::<u32>(), 200),
+            orders in proptest::collection::vec(proptest::prelude::any::<u32>(), 200),
+            security_id in 0_i64..=i64::from(u32::MAX),
+            capture_seq in 0_i64..=i64::MAX,
+            bid in proptest::prelude::any::<bool>(),
+            with_contract in proptest::prelude::any::<bool>(),
+        ) {
+            let side = if bid { DEPTH_SIDE_BID } else { DEPTH_SIDE_ASK };
+            let kind = if levels == 20 { DEPTH_KIND_20 } else { DEPTH_KIND_200 };
+            let rows: Vec<DepthRow> = (0..levels)
+                .map(|i| DepthRow {
+                    security_id,
+                    segment: "NSE_FNO",
+                    depth_kind: kind,
+                    side,
+                    level: i64::try_from(i).unwrap_or(0) + 1,
+                    price: prices[i],
+                    quantity: i64::from(quantities[i]),
+                    orders: i64::from(orders[i]),
+                    capture_seq,
+                    ts_nanos: PRECHECKED_TS_NANOS,
+                })
+                .collect();
+            let contract = with_contract.then_some("RELIANCE-Nov2026-1400-PE");
+            assert_level_packet_bytes_match(&rows, contract)?;
+
+            let q: Vec<f64> = quantities[..levels].iter().map(|&v| f64::from(v)).collect();
+            let o: Vec<f64> = orders[..levels].iter().map(|&v| f64::from(v)).collect();
+            let book = DepthBookRow {
+                security_id,
+                segment: "NSE_FNO",
+                depth_kind: kind,
+                side,
+                prices: &prices[..levels],
+                quantities: &q,
+                orders: &o,
+                capture_seq,
+                ts_nanos: PRECHECKED_TS_NANOS,
+            };
+            let mut w = DepthWriter::for_test_book(Feed::Dhan);
+            if let Some(name) = contract {
+                w.contract_label = Some((security_id, "NSE_FNO", Some(std::sync::Arc::from(name))));
+            }
+            w.append_book_row(&book).map_err(|e| {
+                proptest::test_runner::TestCaseError::fail(format!("append_book_row: {e:#}"))
+            })?;
+            let mut reference = buffer_like(&w);
+            let label = resolved_contract(&w);
+            checked_book_line(&mut reference, &book, Feed::Dhan.as_str(), label.as_deref());
+            proptest::prop_assert_eq!(w.buffer_bytes(), reference.as_bytes());
+        }
+    }
 
     // ---- flush-failure classification (2026-08-25) ----------------------
     //

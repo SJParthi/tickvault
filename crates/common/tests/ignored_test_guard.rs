@@ -49,22 +49,7 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
-    // Added 2026-10-30 with the combined-fault chaos tests (PR #2157): two
-    // tests that expose real defects in the evening-drain state file and
-    // fail until those are fixed (the owner decides the fix; root cause and
-    // proposed fix are in each test's ignore reason and doc comment). They
-    // are kept, not deleted, so the defects stay visible and the fix PR only
-    // has to remove these two rows. Run them with:
-    //
-    //   cargo test -p tickvault-app --test chaos_combined_evening_drain -- --ignored
-    (
-        "crates/app/tests/chaos_combined_evening_drain.rs",
-        "a_single_flipped_bit_never_lets_more_restarts_through",
-    ),
-    (
-        "crates/app/tests/chaos_combined_evening_drain.rs",
-        "a_torn_file_from_last_evening_does_not_block_tonight",
-    ),
+    // 2026-11-02: the two evening-state defect tests now run unignored.
     // Added 2026-10-30 with plan item DT0: a wall-clock yardstick for the
     // ring-dwell + decode part of the `receipt_to_fold` stage, quiet and with
     // two busy threads competing for the CPUs (the r8g.large has two). It
@@ -247,6 +232,16 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     (
         "crates/app/src/dhan_depth_universe.rs",
         "select_depth_universe_cost_at_the_authorized_ceiling",
+    ),
+    // Added 2026-10-30 with plan item 3b: times the subscribe reconcile's
+    // share of the drain's 30 s silence scan at 25,000 expected instruments
+    // and prints the number. Same shape as the harnesses above: a wall-clock
+    // figure on a shared CI runner is a flake, so it is run in release by
+    // hand and never gates a merge. The behaviour is gated by the ordinary
+    // tests in the same file.
+    (
+        "crates/app/src/subscribe_reconcile.rs",
+        "sweep_cost_at_the_authorized_ceiling",
     ),
     (
         "crates/storage/tests/critical_errcode_alarm_coverage_guard.rs",

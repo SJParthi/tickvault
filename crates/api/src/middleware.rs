@@ -534,6 +534,20 @@ fn sanitize_forwarded_peer(forwarded: &str) -> String {
     }
 }
 
+/// Movers remain authenticated even when paper boot disables auth for other
+/// development endpoints. Empty configured tokens cannot authenticate an empty
+/// Bearer value, even if the public enabled flag was set independently.
+pub(crate) async fn require_configured_bearer_auth(
+    axum::extract::State(config): axum::extract::State<ApiAuthConfig>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !config.enabled || config.load_bearer_token().expose_secret().is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    require_bearer_auth(axum::extract::State(config), request, next).await
+}
+
 /// Bearer token validation middleware for mutating endpoints.
 ///
 /// GAP-SEC-01: Protects mutating API endpoints with bearer token auth.
@@ -556,7 +570,12 @@ pub async fn require_bearer_auth(
     // (URI path only — NEVER the query string, which could carry tokens)
     // and a sanitized peer label, so the operator can distinguish their own
     // browser from a credential probe. Header VALUES are never logged.
-    let request_path = request.uri().path().to_string();
+    //
+    // Borrowed, not copied (2026-10-30 O(1) sweep): the path is read only
+    // by the three 401 arms, and `.to_string()` allocated it on every
+    // request, accepted ones included. The borrow ends before the accept
+    // arm moves `request` into `next.run`, so the logged text is unchanged.
+    let request_path = request.uri().path();
 
     // Extract Authorization header
     let auth_header = request

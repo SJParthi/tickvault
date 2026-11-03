@@ -98,11 +98,14 @@ fn order_update_websocket_config() -> WebSocketConfig {
         .accept_unmasked_frames(false)
 }
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
-    spawn_with_panic_notify,
+    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
 };
 use crate::websocket::tls::build_websocket_tls_connector;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "order_update_connection/idle_probe.rs"]
+mod idle_probe;
+use idle_probe::{IdleProbe, SessionWatchdog};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -753,14 +756,90 @@ async fn connect_and_listen(
         );
     }
 
-    let m_active = metrics::gauge!("tv_order_update_ws_active");
+    let _ = calendar; // market-hours flag no longer needed in the read loop
+    listen_on_connected_order_stream(
+        ws_stream,
+        metrics::gauge!("tv_order_update_ws_active"),
+        OrderUpdateSession {
+            client_id,
+            access_token: &access_token,
+            order_sender,
+            wal_spill,
+            authenticated_signal,
+            authenticated_latch,
+            notifier,
+            failures_before_attempt,
+            stability_reached,
+            #[cfg(test)]
+            test_watchdog_notify: None,
+        },
+    )
+    .await
+}
+
+/// Owns the connected-socket gauge until login/read finishes or is dropped.
+/// A scope guard also clears it on early errors, task cancellation and unwind.
+struct OrderUpdateActiveGuard(metrics::Gauge);
+
+impl OrderUpdateActiveGuard {
+    fn new(gauge: metrics::Gauge) -> Self {
+        gauge.set(1.0);
+        Self(gauge)
+    }
+}
+
+impl Drop for OrderUpdateActiveGuard {
+    fn drop(&mut self) {
+        self.0.set(0.0);
+    }
+}
+
+/// Borrowed inputs for one connected login/read session.
+struct OrderUpdateSession<'a> {
+    client_id: &'a str,
+    access_token: &'a str,
+    order_sender: &'a broadcast::Sender<OrderUpdate>,
+    wal_spill: Option<&'a Arc<WsFrameSpill>>,
+    authenticated_signal: Option<&'a Arc<tokio::sync::Notify>>,
+    authenticated_latch: Option<&'a Arc<std::sync::atomic::AtomicBool>>,
+    notifier: Option<&'a Arc<crate::notification::NotificationService>>,
+    failures_before_attempt: u32,
+    stability_reached: &'a mut bool,
+    /// Inject only the idle signal in unit tests; production uses its watchdog.
+    #[cfg(test)]
+    test_watchdog_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Runs the same login/read lifecycle for any connected WebSocket transport.
+/// Keeping the transport boundary here allows in-memory failure tests.
+async fn listen_on_connected_order_stream<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    m_active: metrics::Gauge,
+    session: OrderUpdateSession<'_>,
+) -> Result<(), OrderUpdateConnectionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let OrderUpdateSession {
+        client_id,
+        access_token,
+        order_sender,
+        wal_spill,
+        authenticated_signal,
+        authenticated_latch,
+        notifier,
+        failures_before_attempt,
+        stability_reached,
+        #[cfg(test)]
+        test_watchdog_notify,
+    } = session;
     let m_messages = metrics::counter!("tv_order_update_messages_total");
-    m_active.set(1.0);
+    let _active = OrderUpdateActiveGuard::new(m_active);
 
     let (mut write, mut read) = ws_stream.split();
 
     // Send login message.
-    let login_msg = build_order_update_login(client_id, &access_token);
+    let login_msg = build_order_update_login(client_id, access_token);
     write
         .send(Message::Text(login_msg.into()))
         .await
@@ -775,35 +854,19 @@ async fn connect_and_listen(
     // that may never come (causes false AuthTimeout reconnect loops).
     info!("order update WebSocket login sent — entering read loop");
 
-    // STAGE-B (P1.1): no client-side read deadline on the order update WS.
-    //
-    // Order update is a JSON stream, not binary. Silence is NORMAL — no
-    // orders means no messages, sometimes for hours. A read deadline here
-    // was the root cause of the 2-minute reconnect storm we saw earlier.
-    // Dhan's server-side ping/pong keeps the connection alive; our reader
-    // only wakes on real data, real errors, or real stream closure.
-    //
-    // Stage C's watchdog provides a liveness backstop at 660s (11 min).
-    let _ = calendar; // market-hours flag no longer needed
-    let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
-
-    // STAGE-C.3: per-connection activity watchdog. 660s threshold (600s
-    // allowable silence between orders + 60s safety margin). The counter
-    // is bumped on every Some(Ok(_)) message — Text, Ping, Pong, Close,
-    // Binary. Dhan's server pings every 10s, so even in a no-order window
-    // the counter advances constantly and the watchdog never fires a
-    // false positive. It only fires when the socket is truly dead.
+    // Order updates can be legitimately silent for hours. Keep the existing
+    // four-hour, market-hours-gated idle backstop, then probe the socket before
+    // deciding to reconnect. Dhan's order-stream docs do not promise pings on
+    // a cadence; RFC 6455 requires peers to answer Ping with matching Pong.
+    let _ = select_read_timeout_secs; // retained for existing compatibility tests
     let activity_counter = Arc::new(crate::sync::AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
-    let watchdog = ActivityWatchdog::new(
-        // O(1) EXEMPT: watchdog label built once per spawn, not per frame (cold path)
-        "order-update".to_string(),
-        Arc::clone(&activity_counter),
-        Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS),
-        Arc::clone(&watchdog_notify),
-    );
-    // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
-    let watchdog_handle = spawn_with_panic_notify(watchdog);
+    #[cfg(test)]
+    let watchdog_notify = test_watchdog_notify.unwrap_or(watchdog_notify);
+    let mut watchdog =
+        SessionWatchdog::new(Arc::clone(&activity_counter), Arc::clone(&watchdog_notify));
+    let mut idle_probe: Option<IdleProbe> = None;
+    let mut probe_sequence = 0_u64;
 
     // ZL-P0-1: heartbeat gauge handle for the order update WS.
     // O(1) EXEMPT: one gauge lookup per reconnect cycle
@@ -818,17 +881,60 @@ async fn connect_and_listen(
     let stability_sleep = time::sleep(stability_window());
     tokio::pin!(stability_sleep);
 
-    // The read loop is wrapped in a helper closure so every exit path can
-    // abort the watchdog handle exactly once. This avoids sprinkling
-    // `watchdog_handle.abort()` at every `return` site.
-    let loop_result: Result<(), OrderUpdateConnectionError> = loop {
+    // The watchdog guard aborts its task on return, cancellation and unwind.
+    loop {
+        let probe_deadline = idle_probe.as_ref().map(IdleProbe::deadline);
+        let probe_sending = idle_probe.as_ref().is_some_and(IdleProbe::sending);
         let frame_result = tokio::select! {
+            // An expired deadline wins a simultaneous ready read. This keeps
+            // the probe bounded; it is not an exactly-once delivery guarantee.
             biased;
-            () = watchdog_notify.notified() => {
-                m_active.set(0.0);
-                break Err(OrderUpdateConnectionError::WatchdogFired(
-                    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
-                ));
+            () = idle_probe::wait_deadline(probe_deadline), if idle_probe.is_some() => {
+                if let Some(probe) = idle_probe.as_ref() {
+                    let (phase, timeout_secs) = probe.timeout_phase();
+                    let result = if probe.sending() { "send_timeout" } else { "response_timeout" };
+                    metrics::counter!(
+                        "tv_ws_activity_watchdog_fired_total", "label" => "order-update"
+                    ).increment(1);
+                    metrics::counter!(
+                        "tv_order_update_idle_probe_total", "result" => result
+                    ).increment(1);
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        source = "order_update_liveness_probe",
+                        idle_threshold_secs = WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
+                        phase, timeout_secs,
+                        "order stream idle probe timed out; reconnecting after bounded liveness check"
+                    );
+                    break Err(OrderUpdateConnectionError::LivenessProbeTimeout { phase, timeout_secs });
+                }
+                continue;
+            }
+            sent = std::future::poll_fn(|cx| match idle_probe.as_mut() {
+                Some(probe) => probe.poll_send(&mut write, cx),
+                None => std::task::Poll::Pending,
+            }), if probe_sending => {
+                match sent {
+                    Ok(()) => {
+                        if idle_probe.as_mut().is_some_and(IdleProbe::sent) {
+                            metrics::counter!("tv_order_update_idle_probe_total", "result" => "live").increment(1);
+                            idle_probe = None;
+                            watchdog.restart();
+                        }
+                    }
+                    Err(err) => {
+                        metrics::counter!("tv_order_update_idle_probe_total", "result" => "send_error").increment(1);
+                        // O(1) EXEMPT: cold failed-probe transport error, never per tick.
+                        break Err(OrderUpdateConnectionError::LivenessProbeSend(err.to_string()));
+                    }
+                }
+                continue;
+            }
+            () = watchdog_notify.notified(), if idle_probe.is_none() => {
+                probe_sequence = probe_sequence.wrapping_add(1);
+                idle_probe = Some(IdleProbe::new(probe_sequence));
+                metrics::counter!("tv_order_update_idle_probe_total", "result" => "started").increment(1);
+                continue;
             }
             () = &mut stability_sleep, if !*stability_reached => {
                 // Guard is load-bearing: a completed tokio Sleep must never
@@ -865,16 +971,20 @@ async fn connect_and_listen(
         let msg = match frame_result {
             Some(Ok(msg)) => msg,
             Some(Err(err)) => {
-                m_active.set(0.0);
                 // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
                 break Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
             None => {
                 // Stream ended (server closed connection).
-                m_active.set(0.0);
                 break Ok(());
             }
         };
+
+        if idle_probe.as_mut().is_some_and(|probe| probe.observe(&msg)) {
+            metrics::counter!("tv_order_update_idle_probe_total", "result" => "live").increment(1);
+            idle_probe = None;
+            watchdog.restart();
+        }
 
         match msg {
             Message::Text(text) => {
@@ -1042,7 +1152,6 @@ async fn connect_and_listen(
                                     reason = %reason,
                                     "order update WebSocket auth/API error from server"
                                 );
-                                m_active.set(0.0);
                                 break Err(OrderUpdateConnectionError::AuthFailed(reason));
                             }
                             // R4 (2026-10-01, reality check): a frame carrying the
@@ -1119,18 +1228,13 @@ async fn connect_and_listen(
             }
             Message::Close(frame) => {
                 info!(?frame, "order update WebSocket close frame received");
-                m_active.set(0.0);
                 break Ok(());
             }
             _ => {
                 // Binary, Pong, Frame — ignore.
             }
         }
-    };
-
-    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
-    watchdog_handle.abort();
-    loop_result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,14 +1508,22 @@ fn fire_authenticated_signal_once(
 /// typically contains `"error"` or `"errorCode"` fields. If none are found,
 /// the response is treated as a success (could be an ack or the first order update).
 ///
-/// Pure function — no I/O, no allocation on success path when response is valid.
+/// Pure function, no I/O. **Not allocation-free and not once per connect**
+/// (corrected 2026-10-30, O(1) sweep): the read loop calls it for EVERY text
+/// frame that fails the typed order-update parse (the login ack and any
+/// other non-order JSON, for the life of the connection), and each call
+/// parses the frame into a `serde_json::Value` tree, O(frame bytes) with an
+/// allocation per node; a non-JSON frame also gets a lowercase copy. The
+/// cadence is the order-update socket's non-order traffic, which is sparse
+/// (orders are 1 to 100 a day), and the frame size cap bounds the bytes, so
+/// it is recorded in CLAUDE.md's O(1) table rather than reworked.
 fn classify_auth_response(response_text: &str) -> AuthResponseKind {
     // Try to parse as JSON to inspect for error fields.
     match serde_json::from_str::<serde_json::Value>(response_text) {
         Ok(value) => classify_auth_json(&value),
         Err(_) => {
             // Non-JSON text response — check for error keywords.
-            let lower = response_text.to_lowercase(); // O(1) EXEMPT: cold auth path, runs once per connect
+            let lower = response_text.to_lowercase(); // O(1) EXEMPT: per non-order text frame, sparse; see the doc above
             if lower.contains("error") || lower.contains("unauthorized") || lower.contains("denied")
             {
                 AuthResponseKind::Failed(
@@ -1617,14 +1729,14 @@ enum OrderUpdateConnectionError {
     #[error("read timeout — no messages for {ORDER_UPDATE_READ_TIMEOUT_SECS}s")]
     ReadTimeout,
 
-    /// STAGE-C.3: per-connection activity watchdog fired. No frames or
-    /// pings received within the 660s (11 min) threshold — the socket is
-    /// dead and the outer loop must reconnect. Distinct from
-    /// `ReadTimeout` because the watchdog enforces a TRUE silence check
-    /// (frames + pings), whereas `ReadTimeout` was a client-side read
-    /// deadline that fired on any silence, including legitimate idle.
-    #[error("order update WebSocket activity watchdog fired after {0}s of silence")]
-    WatchdogFired(u64),
+    #[error("order update liveness probe timed out {phase} after {timeout_secs}s")]
+    LivenessProbeTimeout {
+        phase: &'static str,
+        timeout_secs: u64,
+    },
+
+    #[error("order update liveness probe send failed: {0}")]
+    LivenessProbeSend(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,8 +1744,39 @@ enum OrderUpdateConnectionError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "order_update_connection/tests.rs"]
+mod active_gauge_tests;
+
+#[cfg(test)]
+#[path = "order_update_connection/idle_probe_tests.rs"]
+mod idle_probe_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn production_source(src: &str) -> String {
+        tickvault_common::source_scan::production_region(src)
+            .expect("order-update source must retain its cfg(test) mod tests boundary")
+    }
+
+    #[test]
+    fn test_regression_order_source_guard_keeps_code_after_test_only_fields() {
+        // Regression: 2026-11-02 — the injected idle signal's cfg(test)
+        // field hid the entire read loop from first-attribute splitters.
+        let src = "struct Session {\n    #[cfg(test)]\n    signal: (),\n}\n\
+                   fn read_loop() { production_read(); }\n\
+                   #[cfg(test)]\nmod tests { fn fixture() { test_only_read(); } }\n\
+                   fn trailing() { production_tail(); }\n";
+        let prod = production_source(src);
+        assert!(prod.contains("production_read();"));
+        assert!(prod.contains("production_tail();"));
+        assert!(!prod.contains("test_only_read();"));
+        assert!(
+            std::panic::catch_unwind(|| production_source("fn no_test_module() {}")).is_err(),
+            "a missing test-module boundary must fail loudly"
+        );
+    }
 
     #[test]
     fn test_order_update_websocket_config_sets_every_bound_explicitly() {
@@ -1673,8 +1816,7 @@ mod tests {
     #[test]
     fn test_order_update_dial_passes_the_explicit_config() {
         let src = include_str!("order_update_connection.rs");
-        let marker = concat!("#[cfg(", "test)]");
-        let production = src.split(marker).next().unwrap_or(src);
+        let production = production_source(src);
         assert!(production.contains("Some(order_update_websocket_config())"));
         assert!(!production.contains(concat!("request, ", "None, true")));
     }
@@ -1733,9 +1875,7 @@ mod tests {
     #[test]
     fn test_unparseable_order_arm_precedes_the_non_order_arm_and_counts_the_drop() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src
-            .find(concat!("#[cfg(", "test)]"))
-            .expect("test marker present")];
+        let prod = production_source(src);
         let arm = prod
             .find("AuthResponseKind::Success if looks_like_order_update(&text)")
             .expect("the envelope arm exists");
@@ -2866,7 +3006,7 @@ mod tests {
     #[test]
     fn test_frame_too_large_arm_precedes_auth_classification() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("test marker present")];
+        let prod = production_source(src);
         let arm_region = &prod[prod
             .find("match parse_order_update(&text)")
             .expect("frame parse match must exist in the read loop")..];
@@ -3034,9 +3174,7 @@ mod tests {
     #[test]
     fn test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src
-            .find(concat!("#[cfg(", "test)]"))
-            .expect("test marker present")];
+        let prod = production_source(src);
         let gate = prod
             .find("if let Some(msg_type) = unreadable_order_frame_type(&update, &text)")
             .expect("the ORDER-EVT-02 gate uses the parser's verdict");
@@ -3114,3 +3252,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "order_update_connection_run_loop_cov_tests.rs"]
+mod order_update_connection_run_loop_cov_tests;

@@ -22,6 +22,8 @@ all-features = true
 # are outside our control and should not block CI.
 [advisories]
 unmaintained = "workspace"
+# Include transitive unsound advisories, not only workspace direct deps.
+unsound = "all"
 # Temporary advisory ignores — waiting on stable upstream fixes.
 # Review at every dependency-bump pass; remove once the fix ships in a
 # non-alpha release and we bump the relevant workspace dep.
