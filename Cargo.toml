@@ -52,7 +52,7 @@ crossbeam-channel = "=0.5.17"
 # spin-lock internally anyway. parking_lot::Mutex is ~30ns uncontended,
 # never poisons, and is already present transitively via tokio /
 # tokio-tungstenite.
-parking_lot = "=0.12.5"
+parking_lot = "=0.13.0"
 
 # ---- Section 4: Database ----
 # Valkey/redis was removed in #O4 (2026-05-24). Dual-instance lock
