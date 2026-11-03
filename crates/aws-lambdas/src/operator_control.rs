@@ -3621,13 +3621,16 @@ mod tests {
         // 2026-11-02: full switch hit area and timer-stable invalid-search
         // feedback; reviewed HTML6226059a passed28+1 page,54 switch and8 CSV
         // browser controls. The existing JavaScript ceiling stays unchanged.
+        // 2026-11-03: the closed-market message now says the table shows the
+        // last stored prices of the latest session (owner: never a blank table
+        // after the close). Text only, no JavaScript change.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "6226059a333a70a726bf4a34da7d4dc5c57818efd95951244bea42efab4d88da"
+            "acc3057bbcb6b2cdd108b62f71163531ab870259893b2999a1d8d2c77a6474db"
         );
-        assert_eq!(CONSOLE_HTML.len(), 84_855);
+        assert_eq!(CONSOLE_HTML.len(), 84_932);
     }
 
     // ------------------------------------------------ audit L4 source scans

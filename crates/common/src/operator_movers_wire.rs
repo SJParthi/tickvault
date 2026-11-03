@@ -102,7 +102,9 @@ impl Snapshot {
                     && self.data_age_secs.is_some_and(|n| (0..=60).contains(&n))
             }
             SourceStatus::Stale => self.market_open && self.stocks_priced > 0,
-            SourceStatus::Closed => !self.market_open && self.stocks_priced == 0,
+            // After the close the snapshot may carry the ended session's
+            // final stored prices (owner 2026-11-03), so priced is allowed.
+            SourceStatus::Closed => !self.market_open,
             _ => self.stocks_priced == 0,
         };
         counts_valid

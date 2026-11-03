@@ -58,7 +58,9 @@ use std::time::{Duration, SystemTime};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use tickvault_common::constants::{EXCHANGE_SEGMENT_NSE_EQ, IST_UTC_OFFSET_NANOS};
+use tickvault_common::constants::{
+    EXCHANGE_SEGMENT_NSE_EQ, IST_UTC_OFFSET_NANOS, MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS,
+};
 use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 
 use crate::response_cache::cached_json_response;
@@ -84,6 +86,9 @@ const FNO_STOCKS_QUERY_TIMEOUT_SECS: u64 = 3;
 /// How far back the query reads `ticks`. F&O stocks trade every few seconds
 /// in session, so 15 minutes keeps the scan small and still finds each one.
 pub const FNO_STOCKS_WINDOW_SECS: i64 = 900;
+
+/// Upper bound on a reported window (one day), the wire's own limit.
+const FNO_STOCKS_MAX_WINDOW_SECS: i64 = 86_400;
 
 /// The newest row may be at most this old for the answer to read `live`.
 pub const FNO_STOCKS_LIVE_MAX_AGE_SECS: i64 = 60;
@@ -321,6 +326,27 @@ pub(super) fn now_ist_naive() -> chrono::NaiveDateTime {
     (chrono::Utc::now() + chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS)).naive_utc()
 }
 
+/// Timeout for the after-close read, which covers the whole session that just
+/// ended instead of the last 15 minutes. Measured 2026-11-03 on the live box:
+/// 743 NSE_EQ stocks over 09:15–15:40 answered inside the portal's 4 s round
+/// trip. Stays under the helper's 12 s capture bound.
+const FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS: u64 = 8;
+
+/// The session whose final stored prices the movers show while the market is
+/// closed: `[date 09:15, min(now, date 15:40)]` IST. Owner, 2026-11-03: the
+/// page must always show the data the server holds, never a blank table after
+/// the close. `None` before the date's 09:15 (nothing traded yet that day).
+/// A weekend or holiday yields a window with no rows, which reads `closed`.
+#[must_use]
+fn closed_session_window(
+    now_ist: chrono::NaiveDateTime,
+) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    let midnight = now_ist.date().and_time(chrono::NaiveTime::MIN);
+    let open = midnight + chrono::Duration::nanoseconds(MARKET_OPEN_IST_NANOS);
+    let close = midnight + chrono::Duration::nanoseconds(MARKET_CLOSE_IST_NANOS);
+    (now_ist > open).then_some((open, now_ist.min(close)))
+}
+
 /// Start of the query window: `now − window`, never before IST midnight.
 #[must_use]
 fn window_start(now_ist: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
@@ -332,11 +358,18 @@ fn window_start(now_ist: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
 /// The movers SQL. Every interpolated value is a number or a constant; no
 /// caller text reaches it.
 #[must_use]
-fn build_fno_stocks_sql(ids: &[u64], window_start_ist: chrono::NaiveDateTime) -> String {
+fn build_fno_stocks_sql(
+    ids: &[u64],
+    window_start_ist: chrono::NaiveDateTime,
+    window_end_ist: Option<chrono::NaiveDateTime>,
+) -> String {
     let id_list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let end = window_end_ist.map_or_else(String::new, |end| {
+        format!(" AND ts <= '{}'", end.format("%Y-%m-%dT%H:%M:%S%.6fZ"))
+    });
     format!(
         "SELECT security_id, segment, ltp, close, volume, avg_price, ts FROM ticks \
-         WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}' \
+         WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}'{end} \
          AND security_id IN ({id_list}) \
          LATEST ON ts PARTITION BY security_id, segment LIMIT {FNO_STOCKS_QUERY_ROWS}",
         segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ),
@@ -510,32 +543,49 @@ pub(super) async fn compute_for_list(
     let observed_at_epoch_secs = inputs.now_ist.and_utc().timestamp()
         - chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS).num_seconds();
     let total = list.as_ref().map_or(0, |l| l.len());
-    if !inputs.market_open {
-        return FnoStocksResponse::empty("closed", false, total, observed_at_epoch_secs);
-    }
-    let Some(list) = list else {
-        return FnoStocksResponse::empty("no_fno_list", true, 0, observed_at_epoch_secs);
+    let open = inputs.market_open;
+    // Closed: read the session that just ended (owner 2026-11-03). Before the
+    // day's 09:15 there is nothing to show, so the answer stays empty `closed`.
+    let closed_window = if open {
+        None
+    } else {
+        match closed_session_window(inputs.now_ist) {
+            Some(window) => Some(window),
+            None => {
+                return FnoStocksResponse::empty("closed", false, total, observed_at_epoch_secs);
+            }
+        }
     };
-    let sql = build_fno_stocks_sql(&list.sorted_ids(), window_start(inputs.now_ist));
-    let rows = match query_fno_rows(inputs.client, inputs.base_url, &sql, inputs.timeout).await {
+    let Some(list) = list else {
+        let status = if open { "no_fno_list" } else { "closed" };
+        return FnoStocksResponse::empty(status, open, 0, observed_at_epoch_secs);
+    };
+    let (start, end) = closed_window.unwrap_or((
+        window_start(inputs.now_ist),
+        inputs.now_ist + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS),
+    ));
+    let sql = build_fno_stocks_sql(&list.sorted_ids(), start, closed_window.map(|w| w.1));
+    let timeout = if open {
+        inputs.timeout
+    } else {
+        inputs
+            .timeout
+            .max(Duration::from_secs(FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS))
+    };
+    let rows = match query_fno_rows(inputs.client, inputs.base_url, &sql, timeout).await {
         Ok(rows) => rows,
         Err(QueryFailure::Unreachable) => {
-            return FnoStocksResponse::empty("unreachable", true, total, observed_at_epoch_secs);
+            return FnoStocksResponse::empty("unreachable", open, total, observed_at_epoch_secs);
         }
         Err(QueryFailure::Refused) => {
-            return FnoStocksResponse::empty("query_failed", true, total, observed_at_epoch_secs);
+            return FnoStocksResponse::empty("query_failed", open, total, observed_at_epoch_secs);
         }
     };
     // A malformed price or out-of-window timestamp cannot make older accepted
     // prices look live. Use the same accepted rows for both age and rendering.
     let rows: Vec<_> = rows
         .into_iter()
-        .filter(|r| {
-            r.ltp.is_finite()
-                && r.ltp > 0.0
-                && r.ts >= window_start(inputs.now_ist)
-                && r.ts <= inputs.now_ist + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS)
-        })
+        .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
         .collect();
     let newest = rows
         .iter()
@@ -544,23 +594,29 @@ pub(super) async fn compute_for_list(
         .max();
     let stocks = build_rows(&list, rows);
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
-        return FnoStocksResponse::empty("no_data", true, total, observed_at_epoch_secs);
+        let status = if open { "no_data" } else { "closed" };
+        return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
     };
     // A newest row inside the forward skew reads as age 0, never negative.
     let age = (inputs.now_ist - newest).num_seconds().max(0);
+    let window_secs = closed_window.map_or(FNO_STOCKS_WINDOW_SECS, |(s, e)| {
+        (e - s).num_seconds().clamp(1, FNO_STOCKS_MAX_WINDOW_SECS)
+    });
     FnoStocksResponse {
-        status: if age <= FNO_STOCKS_LIVE_MAX_AGE_SECS {
+        status: if !open {
+            "closed"
+        } else if age <= FNO_STOCKS_LIVE_MAX_AGE_SECS {
             "live"
         } else {
             "stale"
         },
-        market_open: true,
+        market_open: open,
         observed_at_epoch_secs,
         as_of_ist: Some(newest.format("%H:%M:%S").to_string()),
         data_age_secs: Some(age),
         fno_stocks_total: total,
         stocks_priced: stocks.len(),
-        window_secs: FNO_STOCKS_WINDOW_SECS,
+        window_secs,
         value_basis: VALUE_BASIS,
         stocks,
     }
@@ -685,7 +741,7 @@ pub(super) mod tests {
 
     #[test]
     fn test_build_fno_stocks_sql_is_bounded_keyed_and_constant() {
-        let sql = build_fno_stocks_sql(&[1594, 2885], window_start(at(NOW)));
+        let sql = build_fno_stocks_sql(&[1594, 2885], window_start(at(NOW)), None);
         assert!(
             sql.contains("FROM ticks WHERE segment = 'NSE_EQ' AND feed = 'dhan'"),
             "{sql}"
@@ -792,14 +848,66 @@ pub(super) mod tests {
     // ---- the handler computation ----
 
     #[tokio::test]
-    async fn test_closed_market_runs_no_query_and_shows_no_rows() {
+    async fn test_closed_market_shows_the_ended_sessions_stored_prices() {
+        // Owner 2026-11-03: after the close the page shows the stored prices.
         let dir = list_dir("closed");
-        // Port 1 refuses: a query would turn the status into `unreachable`.
-        let r = run("http://127.0.0.1:1", &dir, false).await;
+        let url = mock("200 OK", dataset(&[RELIANCE, INFY])).await;
+        let r = run(&url, &dir, false).await;
+        assert_eq!(r.status, "closed");
+        assert!(!r.market_open);
+        assert_eq!(r.stocks.len(), 2);
+        assert_eq!(r.stocks_priced, 2);
+        assert_eq!(r.fno_stocks_total, 3);
+        assert_eq!(r.as_of_ist.as_deref(), Some("11:15:25"));
+        // 09:15 to NOW (11:15:30): the whole session so far, not 15 minutes.
+        assert_eq!(r.window_secs, 2 * 3600 + 30);
+    }
+
+    #[tokio::test]
+    async fn test_closed_market_with_no_rows_reads_closed_not_no_data() {
+        let dir = list_dir("closed-empty");
+        let url = mock("200 OK", dataset(&[])).await;
+        let r = run(&url, &dir, false).await;
         assert_eq!(r.status, "closed");
         assert!(r.stocks.is_empty());
         assert!(!r.market_open);
-        assert_eq!(r.fno_stocks_total, 3);
+    }
+
+    #[tokio::test]
+    async fn test_closed_market_failure_stays_a_failure_and_never_reads_open() {
+        let dir = list_dir("closed-fail");
+        let r = run("http://127.0.0.1:1", &dir, false).await;
+        assert_eq!(r.status, "unreachable");
+        assert!(!r.market_open);
+        assert!(r.stocks.is_empty());
+    }
+
+    #[test]
+    fn test_closed_session_window_bounds() {
+        assert_eq!(closed_session_window(at("2026-10-30 09:15:00")), None);
+        assert_eq!(closed_session_window(at("2026-10-30 08:00:00")), None);
+        assert_eq!(
+            closed_session_window(at("2026-10-30 11:15:30")),
+            Some((at("2026-10-30 09:15:00"), at("2026-10-30 11:15:30")))
+        );
+        assert_eq!(
+            closed_session_window(at("2026-10-30 18:40:00")),
+            Some((at("2026-10-30 09:15:00"), at("2026-10-30 15:40:00")))
+        );
+    }
+
+    #[test]
+    fn test_closed_sql_carries_the_upper_bound_and_live_sql_does_not() {
+        let end = at("2026-10-30 15:40:00");
+        let closed = build_fno_stocks_sql(&[1594], at("2026-10-30 09:15:00"), Some(end));
+        assert!(
+            closed.contains(
+                "ts >= '2026-10-30T09:15:00.000000Z' AND ts <= '2026-10-30T15:40:00.000000Z'"
+            ),
+            "{closed}"
+        );
+        let live = build_fno_stocks_sql(&[1594], at("2026-10-30 09:15:00"), None);
+        assert!(!live.contains("ts <="), "{live}");
     }
 
     #[tokio::test]
