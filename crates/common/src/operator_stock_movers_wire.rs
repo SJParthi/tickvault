@@ -57,6 +57,29 @@ pub struct Filter {
     pub sort_by: Option<SortColumn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<SortOrder>,
+    /// The IST minute to read, `YYYY-MM-DDTHH:MM`. Absent: the live view, or
+    /// after the close the latest session. Owner 2026-11-03: the movers must
+    /// let him pick any stored date and time. Absent keeps the earlier wire
+    /// bytes for existing clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+}
+
+/// Length of an `as_of` value, `YYYY-MM-DDTHH:MM`.
+pub const AS_OF_TEXT_BYTES: usize = 16;
+
+/// Shape check only (digits and separators); the API parses the calendar
+/// date and refuses one that does not exist.
+#[must_use]
+pub fn valid_as_of_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == AS_OF_TEXT_BYTES
+        && bytes.iter().enumerate().all(|(i, byte)| match i {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        })
 }
 impl Default for Filter {
     fn default() -> Self {
@@ -68,6 +91,7 @@ impl Default for Filter {
             offset: 0,
             sort_by: None,
             sort_order: None,
+            as_of: None,
         }
     }
 }
@@ -81,6 +105,7 @@ impl Filter {
             && self.offset < MAX_SOURCE_ROWS
             && self.offset.is_multiple_of(SELECTION_LIMIT)
             && self.sort_by.is_some() == self.sort_order.is_some()
+            && self.as_of.as_deref().is_none_or(valid_as_of_shape)
     }
     /// Only lowercase hex reaches the shell, never a raw index or search term.
     pub fn to_hex(&self) -> Option<String> {
@@ -356,6 +381,37 @@ mod tests {
             );
             assert_eq!(Filter::from_hex(&hex), Some(f));
         }
+    }
+    #[test]
+    fn test_valid_as_of_shape_accepts_only_a_full_ist_minute() {
+        assert!(valid_as_of_shape("2026-11-03T15:29"));
+        for bad in [
+            "",
+            "2026-11-03",
+            "2026-11-03 15:29",
+            "2026-11-03T15:29:00",
+            "2026-1x-03T15:29",
+            "2026-11-03T15-29",
+        ] {
+            assert!(!valid_as_of_shape(bad), "{bad}");
+        }
+        let with = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..Filter::default()
+        };
+        assert!(with.valid());
+        assert_eq!(Filter::from_hex(&with.to_hex().unwrap()), Some(with));
+        let bad = Filter {
+            as_of: Some("yesterday".into()),
+            ..Filter::default()
+        };
+        assert!(!bad.valid());
+        // Absent as_of keeps the earlier wire bytes.
+        assert!(
+            !serde_json::to_string(&Filter::default())
+                .unwrap()
+                .contains("as_of")
+        );
     }
     #[test]
     fn invalid_filters_are_rejected_before_transport() {

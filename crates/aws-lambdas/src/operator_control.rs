@@ -3624,13 +3624,15 @@ mod tests {
         // 2026-11-03: the closed-market message now says the table shows the
         // last stored prices of the latest session (owner: never a blank table
         // after the close). Text only, no JavaScript change.
+        // 2026-11-03: date and IST time inputs on Stocks → Price Movers; the
+        // chosen minute goes out as the filter's `as_of` (rust-only lock §0.18).
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "acc3057bbcb6b2cdd108b62f71163531ab870259893b2999a1d8d2c77a6474db"
+            "23e776dd428983649c095226bbbef2d38f7dc8c29934cf8060171e483984bea4"
         );
-        assert_eq!(CONSOLE_HTML.len(), 84_932);
+        assert_eq!(CONSOLE_HTML.len(), 85_508);
     }
 
     // ------------------------------------------------ audit L4 source scans
