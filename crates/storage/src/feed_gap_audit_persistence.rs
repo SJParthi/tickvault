@@ -242,7 +242,10 @@ pub async fn ensure_feed_gap_audit_table(questdb_config: &QuestDbConfig) {
 /// ILP-over-HTTP conf. HTTP (not TCP) so every flush gets a server ACK and a
 /// server-side reject surfaces as `Err` instead of a silently empty table.
 fn feed_gap_audit_ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;",
+        config.host, config.http_port
+    )
 }
 
 /// Lazy ILP-over-HTTP writer for `feed_gap_audit`. An unreachable QuestDB at

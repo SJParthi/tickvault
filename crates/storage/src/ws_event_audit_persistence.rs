@@ -300,7 +300,10 @@ pub struct WsEventAuditWriter {
 /// HTTP gives a per-flush server ACK (see the 2026-07-05 note on
 /// [`WsEventAuditWriter`]). Pure + unit-tested (the transport ratchet).
 fn ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;",
+        config.host, config.http_port
+    )
 }
 
 /// A `SecurityId` (u64) as the LONG the table stores. Dhan ids are far below
@@ -567,7 +570,7 @@ mod tests {
             ilp_port: 9009,
         };
         let conf = ilp_http_conf(&cfg);
-        assert_eq!(conf, "http::addr=tv-questdb:9000;");
+        assert_eq!(conf, "http::addr=tv-questdb:9000;protocol_version=1;");
         assert!(
             conf.starts_with("http::addr="),
             "must be ILP-over-HTTP, never tcp:: — got {conf}"
