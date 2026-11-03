@@ -1392,6 +1392,14 @@ Requested: owner, 2026-11-03 ("in top movers we should always see the data ... w
   - Files: crates/common/src/operator_stock_movers_wire.rs, crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/stock_movers.rs, crates/aws-lambdas/src/operator_control_console.html, crates/aws-lambdas/src/operator_control.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
   - Tests: test_valid_as_of_shape_accepts_only_a_full_ist_minute, chosen_minute_reads_the_stored_session_even_while_the_market_is_open, console_html_content_pin, javascript_bytes_inside_script_tags_stay_under_the_ceiling
 
+### ITEM ILP1 — cold-path ILP writers pin the protocol so a slow QuestDB at boot cannot leave them dead all day (2026-11-03)
+
+Found live 2026-11-03: `ws_event_audit` (19:19 IST) and `feed_gap_audit` (17:21 IST) logged "QuestDB unreachable — buffering locally" at construction. Their conf had no `protocol_version`, so `Sender::from_conf` read QuestDB's `/settings` while building; it timed out, the writer kept `sender: None`, and `flush` bails for the rest of the process. Design: pin `protocol_version=1;` in the seven storage confs that lack it (the tick, depth, order and latency writers already pin it), so building makes no network call and a slow QuestDB is a retried flush error with rows retained (bounded by `ilp_overflow`). Edge cases: the disconnected buffer was already V1, so a pinned V1 sender never mismatches it; these tables hold no array columns, so V1 text doubles carry the same values. Failure modes: QuestDB down keeps flush failing and retrying, never a silent drop beyond the existing overflow bound. Rollback: revert; behaviour returns to probe-at-build. Observability: unchanged (existing flush-error logs and `ilp_overflow` counters).
+
+- [x] ILP1. Pin `protocol_version=1;` in the seven storage ILP confs without it, plus a source-scan guard and a no-network build test
+  - Files: crates/storage/src/ws_event_audit_persistence.rs, crates/storage/src/feed_gap_audit_persistence.rs, crates/storage/src/feed_episode_audit_persistence.rs, crates/storage/src/feed_scoreboard_persistence.rs, crates/storage/src/ws_connection_daily_persistence.rs, crates/storage/src/tick_conservation_audit_persistence.rs, crates/storage/src/table_storage_probe.rs, crates/storage/tests/ilp_conf_pins_protocol_guard.rs
+  - Tests: every_ilp_http_conf_in_storage_pins_the_protocol_version, a_pinned_conf_builds_a_sender_without_reaching_questdb
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the

@@ -217,7 +217,10 @@ impl TickConservationAuditWriter {
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); append/flush covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
         crate::ilp_overflow::register_overflow_baseline(TICK_CONSERVATION_AUDIT_TABLE);
-        let conf = format!("http::addr={}:{};", config.host, config.http_port);
+        let conf = format!(
+            "http::addr={}:{};protocol_version=1;",
+            config.host, config.http_port
+        );
         match Sender::from_conf(conf) {
             Ok(s) => {
                 let buffer = s.new_buffer();

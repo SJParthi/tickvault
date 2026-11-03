@@ -393,7 +393,10 @@ pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
 /// Builds the ILP-over-HTTP conf string (per-flush server ACK — the
 /// 2026-07-05 fire-and-forget lesson; cold path, once/day).
 fn scoreboard_ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;",
+        config.host, config.http_port
+    )
 }
 
 /// Lazy ILP-over-HTTP writer for both scoreboard tables. Mirrors
@@ -845,7 +848,7 @@ mod tests {
             ilp_port: 9009,
         };
         let conf = scoreboard_ilp_http_conf(&cfg);
-        assert_eq!(conf, "http::addr=tv-questdb:9000;");
+        assert_eq!(conf, "http::addr=tv-questdb:9000;protocol_version=1;");
         assert!(!conf.contains("9009"), "must not target ILP TCP: {conf}");
     }
 

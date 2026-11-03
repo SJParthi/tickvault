@@ -366,7 +366,10 @@ pub async fn ensure_ws_connection_daily_table(questdb_config: &QuestDbConfig) {
 /// violation) surfaces as `Err` instead of a silently empty table (the
 /// 2026-07-05 `ws_event_audit` lesson).
 fn ws_connection_daily_ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;",
+        config.host, config.http_port
+    )
 }
 
 /// Lazy ILP-over-HTTP writer for `ws_connection_daily`. Mirrors

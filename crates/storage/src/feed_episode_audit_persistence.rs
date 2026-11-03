@@ -213,7 +213,10 @@ pub async fn ensure_feed_episode_audit_table(questdb_config: &QuestDbConfig) {
 /// violation) surfaces as `Err` instead of a silently empty table (the
 /// 2026-07-05 ws_event_audit lesson).
 fn episode_ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;",
+        config.host, config.http_port
+    )
 }
 
 /// Lazy ILP-over-HTTP writer for `feed_episode_audit`. Mirrors
@@ -541,7 +544,7 @@ mod tests {
             ilp_port: 9009,
         };
         let conf = episode_ilp_http_conf(&cfg);
-        assert_eq!(conf, "http::addr=tv-questdb:9000;");
+        assert_eq!(conf, "http::addr=tv-questdb:9000;protocol_version=1;");
         assert!(
             !conf.contains("9009"),
             "must target the HTTP port, not ILP TCP: {conf}"
