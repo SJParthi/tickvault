@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use tickvault_storage::hot_path_telemetry::{
     ALL_STAGES, HotTask, RollingMax, STAGE_BUCKETS, Stage, beat_at, record_stage_nanos,
-    stage_quantiles,
+    record_stage_nanos_weighted, stage_quantiles,
 };
 
 mod dhat_support;
@@ -57,6 +57,8 @@ fn dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation() {
                     [0, 999, 1_000, 1_001, 1_024, 1_025][(i as usize) % 6]
                 };
                 record_stage_nanos(stage, nanos);
+                // PR DP-6: the per-tick weighted record, same budget (0).
+                record_stage_nanos_weighted(Stage::DrainMainTick, nanos, i % 70);
                 beat_at(HotTask::FrameDrain, Instant::now());
             }
         },

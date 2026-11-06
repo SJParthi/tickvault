@@ -109,6 +109,16 @@ How to read it:
 - `ring_dwell` starts at the pre-WAL receipt instant and overlaps socket work; `receipt_to_fold` overlaps both. Do not sum these values or divide a frame percentile into a per-row percentile.
 - `i64::MAX` means the value was above every histogram bound; read `max_ns` for the real value.
 - `main_runtime_lag`, `reader_runtime_lag` and `metrics_upkeep` are not tick steps. They measure the lateness of a 100 ms sleep and the exporter upkeep.
+- **`ts` is IST written as Z (2026-11-06, PR DP-6).** The minute stamp is the IST wall clock stored in the designated timestamp, so QuestDB shows it with a `Z` suffix although it is IST, not UTC. Compare it with `dateadd('m', 330, now())`, never with `now()` (which is UTC): `WHERE ts > dateadd('m', 330 - 10, now())` is the last ten minutes.
+- **`samples_over_1024ns` is NULL on `main_runtime_lag`, `reader_runtime_lag`, `ring_dwell` and `receipt_to_fold` (from 2026-11-06, PR DP-6).** Every sample of those stages is above 1,024 ns by construction (a 100 ms sleep, a queue wait, three steps end to end), so the count read 100% and looked like a failure. Rows written before the change still carry the old count.
+- **Per-tick cost: the `drain_main_tick` stage (from 2026-11-06, PR DP-6).** `drain_main_frame` times whole frames, and a frame stacks many tick packets, so one frame sample is many ticks' work. Each main-feed frame now also records its decode/fold/append time divided by its tick packets, as that many samples (`record_stage_nanos_weighted`). So `samples` on the `drain_main_tick` row is the minute's tick count, and its percentiles are over ticks. A multi-packet frame gives each of its ticks the frame's per-tick AVERAGE, not each tick's own time, so a slow tick inside a fast frame is averaged down. 1,024 ns is a bucket edge (the first log2 bucket holds every sample up to 1,024 ns), so `p99_ns <= 1024` means the minute's p99 per-tick cost was under about 1 µs; `samples_over_1024ns` counts the ticks above that edge. A frame with no tick packet (only OI, status or disconnect packets) records nothing here.
+
+```sql
+SELECT ts, samples AS ticks, p50_ns, p99_ns, p999_ns, max_ns, samples_over_1024ns
+FROM hot_path_latency_minute
+WHERE ts IN today() AND stage = 'drain_main_tick'
+ORDER BY ts;
+```
 
 ## 3. Host evidence per minute (CPU wait, CPU, disk, QuestDB, ticks)
 
