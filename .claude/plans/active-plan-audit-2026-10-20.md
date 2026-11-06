@@ -2256,6 +2256,10 @@ Revert the PR; the compose line is one deletion.
 - [ ] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
 - [ ] DP-5 market_depth_book zero-row self-heal
 - [ ] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (packets per frame recorded at the record site) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
+- [ ] DP-7 after-close depth pass floor: 8% (12.9 GB on the 150 GB box, where the disk sat all night: 795 early stops 15:45 Nov 5 → 05:35 Nov 6) replaced by one point above the 5% pinned-delete floor plus a 2 GiB byte floor, after asking for a reclaim and waiting up to 3 minutes; stale 644 GB comment fixed
+- [ ] DP-8 spill replay retires the LAST spill file too once its hour has closed and it has been quiet (`spill_file_may_still_be_appended`); before, `depth-dhan-498258.dspl` (2.6 GB, 3 Nov) was replayed every evening
+- [ ] DP-9 the pressure-episode log text and the `pressure_hot_days` config comment say that market_depth HOURS (yesterday's included) are eligible; only DAY partitions keep the today+yesterday floor
+- [ ] DP-10 the re-arm budget also refills when a session depth hour passes its hot window (`rearm_window_key`), not only at the date change and the close; config comment carries the measured ~45 GB/day DB + ~20 GB WAL on 150 GB
 
 ### PR AL — 2026-11-06 live incident: alarm truth and retries (app, storage)
 
