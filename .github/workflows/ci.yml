@@ -857,6 +857,7 @@ jobs:
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
           crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
+          crates/storage/tests/dhat_depth_book_hand_off.rs
           crates/storage/tests/dhat_flush_buffer_recycle.rs
           crates/storage/tests/dhat_hot_path_latency_minute.rs
           crates/storage/tests/dhat_hot_path_telemetry.rs
@@ -1023,20 +1024,22 @@ jobs:
       # 2026-11-06 (PF-4): dhat_tick_rescue_spare (a rescue hand-off reuses a recycled
       # batch, 0 blocks), third flag line, 11 -> 12; its drift-list line is paid for by
       # folding the count check below onto one line.
+      # 2026-11-06 (PF-4b review round 1): dhat_depth_book_hand_off (the drain's book
+      # append and flush or rescue hand-off allocate nothing with recycled batches),
+      # first flag line, 12 -> 13; its drift-list line is paid for by folding the
+      # zero-tests check below onto one line.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
-            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc \
+            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc --test dhat_depth_book_hand_off \
             --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle --test dhat_seal_per_seal_path \
             --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog --test dhat_task_watch --test dhat_tick_rescue_spare \
             2>&1 | tee /tmp/dhat-storage.log
-          if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
-            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."; exit 1
-          fi
+          if grep -q 'running 0 tests' /tmp/dhat-storage.log; then echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."; exit 1; fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 12 ]; then echo "::error::storage DHAT step executed $ran targets, expected 12 — a --test flag was dropped from this step."; exit 1; fi
+          if [ "$ran" -ne 13 ]; then echo "::error::storage DHAT step executed $ran targets, expected 13 — a --test flag was dropped from this step."; exit 1; fi
 
       - name: DHAT (trading)
         shell: bash

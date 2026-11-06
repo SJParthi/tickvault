@@ -307,6 +307,10 @@ pub mod depth_persistence;
 // their own length and CRC, so a binary ILP v2 batch is never cut at a
 // newline on replay. Step 1 of the depth array-row switch.
 pub mod depth_spill_frame;
+// Plan item PF-4b (2026-11-06): the depth book writer's staged rows; the frame
+// drain stages typed `market_depth_book` rows and the writer and rescue
+// threads write the ILP text.
+pub mod depth_stage;
 // Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
 // does not use (open interest, previous close, market status, disconnect, the
 // connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's

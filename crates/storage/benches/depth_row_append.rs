@@ -17,7 +17,12 @@
 //!     levels per instrument run (a depth-20 side).
 //!   - `depth_row_append/book_row_5`: `market_depth_book`, one array row per
 //!     side of five levels (the inline depth a Full packet carries, the
-//!     production shape since depth sockets were switched off).
+//!     production shape since depth sockets were switched off). ⚠ CHANGED
+//!     2026-11-06 (plan item PF-4b): the drain STAGES a book row (identity
+//!     columns plus 15 values copied into a pre-sized batch) and the writer
+//!     thread writes its ILP text, so this target now times the staging the
+//!     drain pays, not the text. Measured the same day (x86 dev container,
+//!     median per row): 402 ns before, 63 ns after.
 //!
 //! After Criterion, both shapes are timed one row at a time and a p99 over
 //! the budget exits 1 (`../../core/benches/support/tail_gate.rs`). Only under
