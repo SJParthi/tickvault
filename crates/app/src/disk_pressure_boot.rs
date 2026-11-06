@@ -1006,7 +1006,7 @@ mod tests {
     // Muhurat session ran unlimited passes, and a pass after 15:40 or on a
     // holiday eve had no stop time.
     #[test]
-    fn test_regression_l1_pressure_session_day_reads_muhurat_and_holidays() {
+    fn test_regression_l1_pressure_session_day_and_pressure_gate_on_read_muhurat_and_holidays() {
         let calendar = TradingCalendar::from_config(&tickvault_common::config::TradingConfig {
             market_open_time: "09:15:00".to_owned(),
             market_close_time: "15:30:00".to_owned(),
@@ -1098,7 +1098,7 @@ mod tests {
     // Regression: PR DP review M3/M7 — off-session progress is refunded; the
     // in-session raw upload waits for 90%.
     #[test]
-    fn test_regression_m3_m7_refund_and_raw_upload_gate() {
+    fn test_regression_m3_m7_refund_off_session_progress_and_raw_upload_wanted() {
         assert_eq!(
             refund_off_session_progress(PressurePass::Dropped(3), true),
             PressurePass::GatedProgress(3)

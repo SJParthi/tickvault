@@ -1576,7 +1576,7 @@ mod tests {
     // Regression: PR DP review M5 — the 6% / 9 GB floor sat below one
     // partition rewrite above the 5% pinned-delete line.
     #[test]
-    fn test_regression_m5_floor_holds_a_rewrite_above_the_pinned_line() {
+    fn test_regression_m5_after_close_floor_bytes_and_space_request_safe() {
         let gib: u64 = 1024 * 1024 * 1024;
         let total: u64 = 150 * 1_000_000_000;
         let floor = after_close_floor_bytes(total);

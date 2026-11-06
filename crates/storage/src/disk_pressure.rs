@@ -1444,7 +1444,7 @@ mod dp_gate_and_rearm_tests {
     // Regression: PR DP review M1 — refunded in-session passes at 90%+ could
     // never escalate.
     #[test]
-    fn test_regression_m1_gated_stall_escalates_after_five_passes_without_a_fall() {
+    fn test_regression_m1_observe_gated_pass_escalates_after_five_passes_without_a_fall() {
         let mut tracker = GatedStallTracker::default();
         assert!(
             !tracker.observe_gated_pass(92),

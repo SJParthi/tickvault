@@ -7506,7 +7506,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dp5_book_self_heal_decision_and_book_wal_applied() {
+    fn test_dp5_book_self_heal_decision_book_wal_applied_book_sequencer_txn_book_self_heal_rename_target()
+     {
         let ok = BookSelfHealReadings {
             replay_held: true,
             row_count: Some(0),
