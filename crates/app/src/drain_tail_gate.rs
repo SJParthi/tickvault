@@ -20,6 +20,15 @@
 /// (`feed_drain/main_feed_frame_4_quotes`), in nanoseconds per tick.
 pub const MAIN_FEED_DRAIN_BUDGET_KEY: &str = "feed_drain_main_feed";
 
+/// The budget key the Full-packet frames are measured against
+/// (`feed_drain/main_feed_full_frame_4` and `_own`), in nanoseconds per tick.
+/// Added 2026-11-06 (owner card "Honest 2.5 µs for now (Recommended)"):
+/// Full frames get their own measured key; Quote frames keep
+/// [`MAIN_FEED_DRAIN_BUDGET_KEY`]. It must sit above that key in the TOML,
+/// because `bench-gate.sh` takes the first key whose name the bench id
+/// contains, and both keys are contained in the Full ids.
+pub const MAIN_FEED_FULL_DRAIN_BUDGET_KEY: &str = "feed_drain_main_feed_full";
+
 /// The environment variable the bench workflow already uses to scale the
 /// absolute budgets on slower CI runners (`.github/workflows/bench.yml`).
 pub const BUDGET_MULTIPLIER_ENV: &str = "BENCH_BUDGET_MULTIPLIER";
@@ -203,6 +212,66 @@ mod tests {
         );
         let text = std::fs::read_to_string(path).expect("budgets TOML is in the repo");
         assert!(budget_from_toml(&text, MAIN_FEED_DRAIN_BUDGET_KEY).is_some());
+        assert!(budget_from_toml(&text, MAIN_FEED_FULL_DRAIN_BUDGET_KEY).is_some());
+    }
+
+    /// `budget_from_toml` matches the exact key, so the Full key never reads
+    /// the Quote figure or the reverse.
+    #[test]
+    fn test_budget_from_toml_tells_the_full_key_from_the_quote_key() {
+        let text = "[budgets]\nfeed_drain_main_feed_full = 2500\nfeed_drain_main_feed = 1000\n";
+        assert_eq!(
+            budget_from_toml(text, MAIN_FEED_FULL_DRAIN_BUDGET_KEY),
+            Some(2500)
+        );
+        assert_eq!(
+            budget_from_toml(text, MAIN_FEED_DRAIN_BUDGET_KEY),
+            Some(1000)
+        );
+    }
+
+    /// `bench-gate.sh` takes the first `[budgets]` key in file order that the
+    /// normalised bench id contains (or that contains it). The Full ids
+    /// contain BOTH keys, so the Full key must come first, or the median arm
+    /// would hold Full frames to the Quote key again.
+    #[test]
+    fn test_real_budget_file_routes_full_and_quote_ids_to_their_own_keys() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../quality/benchmark-budgets.toml"
+        );
+        let text = std::fs::read_to_string(path).expect("budgets TOML is in the repo");
+        let mut in_budgets = false;
+        let mut keys: Vec<&str> = Vec::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.starts_with('[') {
+                in_budgets = line == "[budgets]";
+                continue;
+            }
+            if let (true, Some((name, _))) = (in_budgets, line.split_once('=')) {
+                keys.push(name.trim());
+            }
+        }
+        let first_match = |bench: &str| -> Option<&str> {
+            keys.iter()
+                .copied()
+                .find(|k| bench.contains(k) || k.contains(bench))
+        };
+        for full in [
+            "feed_drain_main_feed_full_frame_4",
+            "feed_drain_main_feed_full_frame_4_own",
+        ] {
+            assert_eq!(
+                first_match(full),
+                Some(MAIN_FEED_FULL_DRAIN_BUDGET_KEY),
+                "{full}"
+            );
+        }
+        assert_eq!(
+            first_match("feed_drain_main_feed_frame_4_quotes"),
+            Some(MAIN_FEED_DRAIN_BUDGET_KEY)
+        );
     }
 
     #[test]
