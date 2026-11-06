@@ -2216,11 +2216,21 @@ Property test: for random universes and random filters, `select` over the publis
 #### Observability
 `tv_movers_universe_publish_total{outcome}` and `tv_movers_universe_publish_duration_ms` (local /metrics only, no page); the Lambda logs `source=s3|ssm` and the elapsed ms per movers call.
 
-- [ ] MV-1 shared `select` in common + API refactor (identity proptest)
-- [ ] MV-2 app publisher task + config switch + counters
-- [ ] MV-3 terraform live-view bucket + two scoped IAM grants
-- [ ] MV-4 Lambda S3 read + fallback + timing log
-- [ ] MV-5 portal keeps rows while refreshing
+- [x] MV-1 shared `select` in common + API refactor (identity proptest)
+  - Files: crates/common/src/operator_movers_universe.rs, crates/api/src/handlers/stock_movers.rs, crates/api/src/handlers/fno_stocks.rs
+  - Tests: proptest_select_equals_the_per_filter_path, test_select_equals_the_per_filter_path_on_named_edge_cases, test_select_filters_sorts_and_pages_one_universe_for_every_filter, test_universe_constants_match_the_common_constants
+- [x] MV-2 app publisher task + config switch + counters
+  - Files: crates/app/src/movers_universe_publisher.rs, crates/app/src/main.rs, crates/common/src/config.rs, config/base.toml
+  - Tests: test_publish_universe_counts_put_failures_and_never_puts_a_failed_build, test_failure_episode_warns_once_and_reports_the_recovery, test_spawn_target_honours_the_switch_and_fails_closed_without_a_bucket, test_operator_movers_publish_defaults_on_and_parses_overrides
+- [x] MV-3 terraform live-view bucket + two scoped IAM grants
+  - Files: deploy/aws/terraform/live-view-bucket.tf, deploy/aws/terraform/main.tf, deploy/aws/terraform/operator-control-lambda.tf
+  - Tests: test_live_view_bucket_is_unversioned_expiring_private_encrypted_and_tls_only, test_live_view_grants_name_the_one_object_only
+- [x] MV-4 Lambda S3 read + fallback + timing log
+  - Files: crates/aws-lambdas/src/operator_stock_movers.rs, crates/aws-lambdas/src/operator_control.rs, .github/workflows/terraform-apply.yml
+  - Tests: test_stock_movers_answer_from_a_fresh_published_universe_without_ssm, test_from_published_refuses_every_unusable_universe_and_the_box_answers, test_from_published_times_out_and_the_box_answers
+- [x] MV-5 portal keeps rows while refreshing
+  - Files: crates/aws-lambdas/src/operator_control_console.html
+  - Tests: console_html_content_pin
 
 ### PR DP — 2026-11-06 live incident: the disk-pressure archiver starved QuestDB 08:31–09:13 IST (app, storage, deploy)
 
