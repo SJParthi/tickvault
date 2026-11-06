@@ -13,6 +13,8 @@
 //!    least 2, so HTTP has a pool of its own and an export cannot hold the
 //!    thread a `/write` needs.
 //! 3. `QDB_SHARED_NETWORK_WORKER_COUNT` is present and defaults to at least 2.
+//! 4. The HTTP worker count exceeds the export connection limit (PR DP
+//!    review M6), so exports can never hold every HTTP worker.
 
 use std::path::PathBuf;
 
@@ -106,6 +108,20 @@ fn http_has_its_own_worker_pool_of_at_least_two() {
         "QDB_HTTP_WORKER_COUNT defaults to {n}: with 0 HTTP rides the shared network \
          pool and with 1 an /exp export holds the thread every ILP /write needs \
          (2026-11-06, 4-5 minutes per market_depth hour)"
+    );
+}
+
+// Regression: PR DP review M6 — 2 HTTP workers under an export limit of 4
+// let two /exp streams hold every worker and starve /write and /exec again.
+#[test]
+fn http_workers_exceed_the_export_connection_limit() {
+    let env = questdb_env(&compose());
+    let workers = default_number(value_of(&env, "QDB_HTTP_WORKER_COUNT"));
+    let exports = default_number(value_of(&env, "QDB_HTTP_EXPORT_CONNECTION_LIMIT"));
+    assert!(
+        workers > exports,
+        "QDB_HTTP_WORKER_COUNT ({workers}) must exceed QDB_HTTP_EXPORT_CONNECTION_LIMIT \
+         ({exports}) so exports can never hold every HTTP worker"
     );
 }
 

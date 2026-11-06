@@ -176,13 +176,13 @@ const QUESTDB_ENV: [(&str, ComposeValue); 13] = [
     ("QDB_METRICS_ENABLED", ComposeValue::Literal("TRUE")),
     (
         "QDB_HTTP_EXPORT_CONNECTION_LIMIT",
-        ComposeValue::Literal("4"),
+        ComposeValue::Literal("2"),
     ),
     (
         "QDB_HTTP_WORKER_COUNT",
         ComposeValue::Interpolated {
             var: "TV_QDB_HTTP_WORKERS",
-            default: "2",
+            default: "3",
         },
     ),
     (
@@ -219,11 +219,25 @@ const QUESTDB_ENV: [(&str, ComposeValue); 13] = [
     ("QDB_PG_PASSWORD", ComposeValue::ByName),
 ];
 
+/// The operator's cpuset variable (PR DP review L2: the fallback passes a
+/// cpuset only when this is set).
+const CPUSET_VAR: &str = "TV_QDB_CPUSET";
+
 /// The compose service's resource limits, mirrored for `docker run`.
 const CPUSET: ComposeValue = ComposeValue::Interpolated {
-    var: "TV_QDB_CPUSET",
+    var: CPUSET_VAR,
     default: "2,3",
 };
+
+/// The `-p` spec for the console port on `http_bind`; an IPv6 address is
+/// bracketed, as docker requires (PR DP review L2). O(1).
+fn console_port_spec(http_bind: &str) -> String {
+    if http_bind.contains(':') && !http_bind.starts_with('[') {
+        format!("[{http_bind}]:9000:9000")
+    } else {
+        format!("{http_bind}:9000:9000")
+    }
+}
 const CPUS: ComposeValue = ComposeValue::Interpolated {
     var: "TV_QDB_CPUS",
     default: "2.0",
@@ -406,7 +420,7 @@ fn compose_ladder() -> impl Iterator<Item = ComposeCli> {
 /// QuestDB through the published ports) and no `platform` pin (docker picks
 /// the host's architecture from the multi-arch digest).
 fn docker_run_args(http_bind: &str, overrides: &[(&'static str, String)]) -> Vec<String> {
-    let console_port = format!("{http_bind}:9000:9000");
+    let console_port = console_port_spec(http_bind);
     let mut args: Vec<String> = [
         "run",
         "-d",
@@ -433,11 +447,14 @@ fn docker_run_args(http_bind: &str, overrides: &[(&'static str, String)]) -> Vec
     .map(|s| (*s).to_string())
     .collect();
     // `--flag=value` so an operator value can never be read as another flag.
-    for (flag, value) in [
-        ("--cpuset-cpus", CPUSET),
-        ("--cpus", CPUS),
-        ("--memory", MEM_LIMIT),
-    ] {
+    // PR DP review L2: the cpuset is passed only when the operator set one.
+    // Compose's default (`2,3`) names CPUs a 2-vCPU box does not have, and
+    // docker refuses to create the container with it; before PR DP-1 the
+    // fallback passed no cpuset at all, which is kept.
+    if let Some((_, cpuset)) = overrides.iter().find(|(name, _)| *name == CPUSET_VAR) {
+        args.push(format!("--cpuset-cpus={cpuset}"));
+    }
+    for (flag, value) in [("--cpus", CPUS), ("--memory", MEM_LIMIT)] {
         if let Some(v) = compose_value(value, overrides) {
             args.push(format!("{flag}={v}"));
         }
@@ -916,7 +933,7 @@ mod tests {
                 .contains("-p 0.0.0.0:9000:9000 -p 8812:8812 -p 9009:9009 -p 127.0.0.1:9003:9003")
         );
         assert!(joined.contains(
-            "-v tv-questdb-data:/var/lib/questdb --shm-size 512m --cpuset-cpus=2,3 --cpus=2.0 \
+            "-v tv-questdb-data:/var/lib/questdb --shm-size 512m --cpus=2.0 \
              --memory=6g --memory-reservation=2g --oom-score-adj=-500"
         ));
         assert!(joined.contains("-e QDB_PG_USER -e QDB_PG_PASSWORD"));
@@ -1087,6 +1104,26 @@ mod tests {
         assert_eq!(value_of("mem_reservation:"), MEM_RESERVATION);
         assert_eq!(value_of("oom_score_adj:"), OOM_SCORE_ADJ);
         assert_eq!(value_of("shm_size:"), SHM_SIZE);
+    }
+
+    // Regression: PR DP review L2 — the fallback passed compose's default
+    // cpuset `2,3`, which docker refuses on the 2-vCPU box; and an IPv6 bind
+    // made an unbracketed port spec docker cannot parse.
+    #[test]
+    fn test_regression_l2_no_default_cpuset_and_bracketed_ipv6_port() {
+        let bare = docker_run_args("127.0.0.1", &[]);
+        assert!(
+            !bare.iter().any(|a| a.starts_with("--cpuset-cpus")),
+            "no cpuset unless the operator set one: {bare:?}"
+        );
+        assert!(bare.contains(&"127.0.0.1:9000:9000".to_string()));
+        let set = docker_run_args("127.0.0.1", &[(CPUSET_VAR, "0-1".to_string())]);
+        assert!(set.contains(&"--cpuset-cpus=0-1".to_string()), "{set:?}");
+        assert_eq!(console_port_spec("::1"), "[::1]:9000:9000");
+        assert_eq!(console_port_spec("[::1]"), "[::1]:9000:9000");
+        assert_eq!(console_port_spec("0.0.0.0"), "0.0.0.0:9000:9000");
+        let v6 = docker_run_args("::", &[]);
+        assert!(v6.contains(&"[::]:9000:9000".to_string()), "{v6:?}");
     }
 
     #[test]
