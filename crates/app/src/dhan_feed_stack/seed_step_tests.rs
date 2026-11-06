@@ -10,7 +10,9 @@ use super::*;
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use tickvault_common::feed::Feed;
-use tickvault_core::pipeline::tick_gap_detector::{DEFAULT_SILENCE_FLOOR_MILLIS, SilenceReport};
+use tickvault_core::pipeline::tick_gap_detector::{
+    DEFAULT_SILENCE_FLOOR_MILLIS, LIVE_ATTACH_WARMUP_MILLIS, SilenceReport,
+};
 
 /// An exchange time inside a session (epoch seconds), as `catch_up_book`
 /// in the main test module uses.
@@ -649,7 +651,9 @@ proptest! {
 fn test_scan_silence_on_a_part_seeded_batch_counts_only_seeded_instruments() {
     const N: usize = 1_500;
     const T: u64 = 1_000_000;
-    let at = T + DEFAULT_SILENCE_FLOOR_MILLIS + 1;
+    // Past the live lane's stock-option attach warmup (plan PR AL-5), so a
+    // seeded, never-ticked NSE_FNO contract is judged rather than `Warming`.
+    let at = T + LIVE_ATTACH_WARMUP_MILLIS + DEFAULT_SILENCE_FLOOR_MILLIS + 1;
     for (steps_before, want) in [(0usize, 0u64), (1, 512), (2, 1_024), (3, 1_500)] {
         let mut ingest = ingest_with_detector(N + 1);
         assert_eq!(

@@ -1961,7 +1961,8 @@ impl LiveIngest {
     /// REPLACES the detector, discarding whatever it had learned.
     #[must_use]
     pub fn with_detector_capacity(mut self, capacity: usize) -> Self {
-        self.detector = TickGapDetector::with_capacity(capacity.max(1), DetectorConfig::default());
+        self.detector =
+            TickGapDetector::with_capacity(capacity.max(1), DetectorConfig::live_lane());
         self
     }
 
@@ -2005,7 +2006,11 @@ impl LiveIngest {
         Self {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
-            detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            // Plan PR AL-5 (2026-11-06): the live lane's detector gives each
+            // seeded NSE_FNO contract a 10-minute warmup and floors its judged
+            // cadence at 60 s (`DetectorConfig::live_lane`); indices and cash
+            // stocks are judged as before.
+            detector: TickGapDetector::with_capacity(capacity, DetectorConfig::live_lane()),
             subscribe_reconcile: None,
             depth200_cross_feed_latched: [0; MAX_TOTAL_DHAN_CONNECTIONS as usize],
             dead_class_latch: AtomicU8::new(0),
