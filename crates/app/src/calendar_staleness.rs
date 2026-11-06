@@ -56,8 +56,10 @@
 //! sync; one small read at start and one write per page, O(1), on the
 //! blocking pool, cold). The gauge is still set on every check.
 //!
-//! **Honest limits.** A missing or damaged file reads as "not paged this
-//! week", so it pages (errs toward paging). A failed write logs one `warn!`
+//! **Honest limits.** A missing or damaged file, a path that is not a
+//! regular file, or a read slower than 2 s reads as "not paged this week",
+//! so it pages (errs toward paging). The temp file is created exclusively,
+//! owner read/write only on unix. A failed write logs one `warn!`
 //! and the next boot pages again. A wall clock stepped back into an earlier
 //! week pages once for that week. The per-day latch inside a process is
 //! still in memory, so in the every-boot band a restart storm pages once per
@@ -107,6 +109,10 @@ const WEEK_PREFIX: &str = "iso_week=";
 /// The most bytes the reader looks at; a real file is about 18.
 const WEEK_READ_CAP_BYTES: u64 = 64;
 
+/// The start-up read of the week file gives up after this long (a stalled
+/// volume); a timeout reads as "not paged this week" (errs toward paging).
+const WEEK_READ_TIMEOUT_SECS: u64 = 2;
+
 /// An ISO week, `(iso year, week number)`.
 pub type IsoWeekKey = (i32, u32);
 
@@ -143,6 +149,12 @@ pub fn should_page_now(
 /// or not exactly one valid line. Cold, one small read.
 #[must_use]
 pub fn read_last_paged_week(path: &Path) -> Option<IsoWeekKey> {
+    // Only a regular file is read: a FIFO or device at this path could
+    // block the read forever (review 2026-11-06; the caller also bounds it
+    // with WEEK_READ_TIMEOUT_SECS).
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     let mut text = String::with_capacity(32);
     file.take(WEEK_READ_CAP_BYTES)
@@ -163,8 +175,23 @@ pub fn write_last_paged_week(path: &Path, week: IsoWeekKey) -> std::io::Result<(
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
+    // A stale temp file from a crashed write is removed first, then the new
+    // one is created exclusively (`create_new`, owner read/write only on
+    // unix), so a link planted at the temp path is never followed.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(format!("{WEEK_PREFIX}{}-W{:02}\n", week.0, week.1).as_bytes())?;
         f.sync_all()?;
     }
@@ -209,11 +236,15 @@ pub fn spawn_calendar_staleness_watchdog(
         let mut last_warned_no_notifier: Option<NaiveDate> = None;
         // Cold, once per process: the ISO week last paged (AL-6). A failed
         // read or a join error reads as "not paged" (errs toward paging).
-        let mut last_paged_week: Option<IsoWeekKey> = tokio::task::spawn_blocking(|| {
-            read_last_paged_week(Path::new(CALENDAR_STALENESS_WEEK_PATH))
-        })
+        let mut last_paged_week: Option<IsoWeekKey> = tokio::time::timeout(
+            std::time::Duration::from_secs(WEEK_READ_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(|| {
+                read_last_paged_week(Path::new(CALENDAR_STALENESS_WEEK_PATH))
+            }),
+        )
         .await
         .ok()
+        .and_then(Result::ok)
         .flatten();
         info!(
             coverage_end = %coverage_end_display(calendar.coverage_end_date()),
@@ -412,6 +443,30 @@ mod tests {
             !path.with_extension("tmp").exists(),
             "temp file renamed away"
         );
+    }
+
+    #[test]
+    fn test_a_path_that_is_not_a_regular_file_reads_as_not_paged() {
+        // A directory (standing in for a FIFO or device) is never opened.
+        let path = temp_path("not-regular");
+        std::fs::create_dir_all(&path).unwrap(); // APPROVED: test
+        assert_eq!(read_last_paged_week(&path), None);
+    }
+
+    #[test]
+    fn test_a_stale_temp_file_is_replaced_and_the_file_is_owner_only() {
+        let path = temp_path("stale-tmp");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap(); // APPROVED: test
+        std::fs::write(path.with_extension("tmp"), b"left by a crash").unwrap(); // APPROVED: test
+        write_last_paged_week(&path, (2026, 46)).unwrap(); // APPROVED: test
+        assert_eq!(read_last_paged_week(&path), Some((2026, 46)));
+        assert!(!path.with_extension("tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode(); // APPROVED: test
+            assert_eq!(mode & 0o777, 0o600, "owner read/write only");
+        }
     }
 
     #[test]
