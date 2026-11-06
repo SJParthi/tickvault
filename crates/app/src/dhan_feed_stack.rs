@@ -7255,6 +7255,21 @@ async fn run_frame_drain(
                             tickvault_storage::hot_path_telemetry::Stage::DrainMainFrame,
                             frame_work_end.saturating_duration_since(frame_work_start),
                         );
+                        // PR DP-6: one tick's share of the frame (its time
+                        // over its ticks), weighted by the tick count; four
+                        // relaxed atomics, nothing for a frame with no tick.
+                        tickvault_storage::hot_path_telemetry::record_stage_nanos_weighted(
+                            tickvault_storage::hot_path_telemetry::Stage::DrainMainTick,
+                            u64::try_from(
+                                frame_work_end
+                                    .saturating_duration_since(frame_work_start)
+                                    .as_nanos(),
+                            )
+                            .unwrap_or(u64::MAX)
+                            .checked_div(outcome.tick_packets)
+                            .unwrap_or(0),
+                            outcome.tick_packets,
+                        );
                         // DT0 (2026-10-29): socket receipt -> folded, on the
                         // same clock read; five relaxed atomics.
                         tickvault_storage::hot_path_telemetry::record_receipt_to_fold_nanos(
@@ -8755,6 +8770,9 @@ pub fn drain_main_feed_frame(
                     // Unreachable: the match arm above admits only these two.
                     _ => unreachable!("arm admits only Tick and TickWithDepth"),
                 };
+                // PR DP-6: the frame's tick count, the weight of its per-tick
+                // `drain_main_tick` sample.
+                out.tick_packets = out.tick_packets.saturating_add(1);
                 // Delivery lag is recorded AFTER the fold below (2026-09-23,
                 // FIFTH scope-lock row), because only the fold knows whether
                 // this packet is a REPEATED quote — same trade time, same
@@ -9083,6 +9101,10 @@ pub fn drain_main_feed_frame(
 pub struct FrameOutcome {
     /// Packets in this frame that became a buffered row.
     pub folded: u64,
+    /// Tick packets (Tick or TickWithDepth) this frame took into the fold
+    /// arm (PR DP-6): the weight of the frame's `drain_main_tick` sample.
+    /// Backup-set drops are not counted.
+    pub tick_packets: u64,
     /// DISCONNECT packets this frame carried and the drain decoded. Split
     /// out of the untyped non-tick count on 2026-08-26 so a reason the
     /// classifier could not act on is still visible — see the drain arm.

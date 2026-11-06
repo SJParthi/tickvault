@@ -90,6 +90,27 @@ fn unique_dir(tag: &str) -> PathBuf {
     ))
 }
 
+/// An all-weekdays calendar (no holidays) for the PR DP-2 session gate.
+fn calendar() -> Arc<tickvault_common::trading_calendar::TradingCalendar> {
+    Arc::new(
+        tickvault_common::trading_calendar::TradingCalendar::from_config(
+            &tickvault_common::config::TradingConfig {
+                market_open_time: "09:15:00".to_owned(),
+                market_close_time: "15:30:00".to_owned(),
+                order_cutoff_time: "15:29:00".to_owned(),
+                data_collection_start: "09:00:00".to_owned(),
+                data_collection_end: "16:00:00".to_owned(),
+                timezone: "Asia/Kolkata".to_owned(),
+                max_orders_per_second: 10,
+                nse_holidays: Vec::new(),
+                muhurat_trading_dates: Vec::new(),
+                nse_mock_trading_dates: Vec::new(),
+            },
+        )
+        .expect("calendar"),
+    )
+}
+
 fn questdb() -> QuestDbConfig {
     // Never contacted: no archive bucket resolves, so no pass is built.
     QuestDbConfig {
@@ -175,7 +196,10 @@ fn test_disk_pressure_boot_spawn_disabled_returns_none() {
     rt.block_on(async {
         let mut c = cfg(90, 70);
         c.pressure_archive_enabled = false;
-        assert!(spawn_supervised_disk_pressure_loop(unique_dir("off"), questdb(), c).is_none());
+        assert!(
+            spawn_supervised_disk_pressure_loop(unique_dir("off"), questdb(), c, calendar())
+                .is_none()
+        );
     });
 }
 
@@ -189,8 +213,13 @@ fn test_disk_pressure_boot_spawn_insane_thresholds_returns_none() {
         // low not strictly below high, high of 0, high above 100: all refused.
         for (high, low) in [(70_u8, 70_u8), (0, 0), (101, 50), (50, 60)] {
             assert!(
-                spawn_supervised_disk_pressure_loop(unique_dir("bad"), questdb(), cfg(high, low))
-                    .is_none(),
+                spawn_supervised_disk_pressure_loop(
+                    unique_dir("bad"),
+                    questdb(),
+                    cfg(high, low),
+                    calendar()
+                )
+                .is_none(),
                 "thresholds high={high} low={low} must be refused"
             );
         }
@@ -215,8 +244,9 @@ async fn test_disk_pressure_boot_loop_idle_volume_publishes_used_gauge_and_keeps
     metrics::gauge!("tv_data_disk_used_pct").set(255.0);
     let before = episode_counters();
 
-    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(100, 1))
-        .expect("a sane, enabled config spawns the loop");
+    let handle =
+        spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(100, 1), calendar())
+            .expect("a sane, enabled config spawns the loop");
     run_polls(3).await;
     assert!(
         !handle.is_finished(),
@@ -275,7 +305,7 @@ async fn test_disk_pressure_boot_loop_over_high_water_starts_episode_then_escala
     let config = cfg(1, 0);
     let max_passes = u64::from(config.pressure_max_passes);
 
-    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), config)
+    let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), config, calendar())
         .expect("a sane, enabled config spawns the loop");
     // 71 polls, t = 0..=4,200 s: polls 0..max_passes-1 pass, the next
     // escalates (t = 240 at the default 4), then Hold until t = 3,840 where
@@ -341,7 +371,8 @@ async fn test_disk_pressure_boot_loop_blind_probe_reports_sustained_failure_then
     let (logs, _guard) = capture_logs();
 
     let handle =
-        spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(100, 99)).expect("spawned");
+        spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), cfg(100, 99), calendar())
+            .expect("spawned");
     run_polls(u64::from(PRESSURE_PROBE_FAILING_POLLS) + 1).await;
     let blind = logs.text();
     assert!(

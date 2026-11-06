@@ -373,12 +373,20 @@ pressure_high_water_pct = 75
 # oscillating.
 pressure_low_water_pct = 60
 
-# Hot window used only while under pressure. Clamped UP to the same hard
-# MIN_HOT_DAYS = 2 floor as every other class, so today's and yesterday's
-# partitions are untouchable AT ANY PRESSURE: the archiver's verify
-# re-counts rows after the export (closing the export->count race) but not
-# the count->drop race, and on a partition still being written that window
-# can swallow an arriving tick. Setting this lower changes nothing.
+# Hot window used only while under pressure, for the DAY-partitioned
+# tables. Clamped UP to the same hard MIN_HOT_DAYS = 2 floor as every other
+# class, so today's and yesterday's DAY partitions are untouchable AT ANY
+# PRESSURE: the archiver's verify re-counts rows after the export (closing
+# the export->count race) but not the count->drop race, and on a partition
+# still being written that window can swallow an arriving tick. Setting this
+# lower changes nothing.
+#
+# CORRECTED 2026-11-06 (PR DP-9): that floor does NOT cover market_depth.
+# Depth is archived by the HOUR (depth_hot_hours, floored at 4 hours), so
+# under pressure yesterday's depth hours and today's hours older than the
+# window are eligible, and leave the box once each S3 copy is verified.
+# Since PR DP-2, a pressure pass on a trading day between 08:45 and 15:40 IST
+# archives one partition at most, and no depth partition below 90% used.
 pressure_hot_days = 2
 
 # Cooldown between episodes. Bounds mid-session export load when usage sits
@@ -388,6 +396,16 @@ pressure_min_interval_secs = 900
 # Archive passes per episode before escalating. Each pass archives up to
 # max_partitions_per_run partitions; if four have not moved the needle the
 # volume is not recoverable by retention and the operator needs to hear so.
+#
+# 2026-11-06 (PR DP-3/DP-10): the thresholds above were sized for less data
+# than the box now writes. Measured on the 150 GB root: about 45 GB a day into
+# QuestDB plus about 20 GB of frame log, so 75% is reached inside one
+# session. An escalated episode used to get three hourly re-arms and then
+# hold until the next boot (5 Nov: re-arms spent by 11:37 IST, held at 92%
+# all night). The re-arm budget now refills on a new IST date, at the 15:40
+# close, and each time a session depth hour passes depth_hot_hours, so
+# reclaim continues through the evening and the night. Not changed here: the
+# four numbers in this block.
 pressure_max_passes = 4
 
 # One trading session's disk burn, in BYTES. 0 = the runway trigger is OFF,
