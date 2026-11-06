@@ -58,6 +58,7 @@
 pub mod aggregator_cell;
 mod fold_counters;
 pub use fold_counters::seed_fold_counter_baselines;
+mod fold_warm_up;
 pub mod live_candle_state;
 pub mod multi_tf_aggregator;
 pub mod seal_ring;
