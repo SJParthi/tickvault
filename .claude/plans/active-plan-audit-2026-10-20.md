@@ -2207,6 +2207,37 @@ Property test: for random universes and random filters, `select` over the publis
 - [ ] MV-4 Lambda S3 read + fallback + timing log
 - [ ] MV-5 portal keeps rows while refreshing
 
-### PR BR — 2026-11-06 live incident: boot WAL catch-up must not starve the box (app, storage)
+### PR DP — 2026-11-06 live incident: the disk-pressure archiver starved QuestDB 08:31–09:13 IST (app, storage, deploy)
 
-**Measured:** 08:31–08:56 IST main-runtime freezes up to 1.03 s and 100–180 ms every minute, process CPU 75–81% of 2 cores, WAL writer waiting 5.8–5.9 s per minute for CPU, QuestDB (pinned to 1 core) reported disconnected 15 times, ticks spilled until ~09:14. Design and items are added after the boot-outage investigation returns verified root cause.
+**Approved by:** Parthiban, 2026-11-06 ("go ahead fix everything dude approved").
+
+**Verified root cause (live logs, QuestDB SHOW PARAMETERS, errors.jsonl):** the box booted at 95% disk used; the disk-pressure leg exported 41 partitions back to back 08:31:05–09:13:11 (nine market_depth hours of 95–115M rows, 4–5 min each) through QuestDB HTTP /exp. QuestDB runs one shared network worker (`shared.network.worker.count=1`, `http.worker.count=0`) on one core, so each export held the thread every ILP /write and /exec needs: 14 BOOT-01, 30 reconnects, 2,935,971 tick rows and 2,331,360 depth levels rescued to spill, WAL probe blind x4. Underneath: `market_depth_book` exists with designated timestamp `timestamp` and 0 rows, so array rows are refused and inline depth writes 10 level rows per Full packet (~7 GiB/h); the Nov 5 pressure episode spent its 3 re-arms by 11:37 and held all night at 92%; the after-close depth pass stopped ~700 times at its 8% free floor while the drain hold kept the box up to 07:30. Same pattern Nov 4 and Nov 5. Ruled out: boot WAL replay (refused), evening restart (none), #2191, CPU quota throttling.
+
+#### Design
+- QuestDB gets its own HTTP worker pool (`QDB_HTTP_WORKER_COUNT=2`) so an /exp stream cannot hold the thread ILP /write and /exec use; host tuning stops forcing the network pool to 1.
+- The pressure pass is gated: inside 08:45–15:40 IST it exports no market_depth partition unless used ≥ 90%, and exports at most one partition per in-session pass; a pass started before the open stops at its next partition boundary after 09:00.
+- The pressure episode re-arm budget resets when the IST trading date changes or the session closes, so reclaim runs overnight instead of at the next boot.
+- The after-close depth pass that stops at its disk floor requests a reclaim, and the drain hold no longer counts floor-blocked depth buckets (a floor-blocked hold is capped at one hour and counted).
+- Boot self-heal: when `market_depth_book` exists with the wrong designated timestamp AND `count()` is 0, drop and re-create it with `ts` (never when it holds a row; a non-empty wrong table keeps todays refusal).
+
+#### Edge Cases
+Pressure at ≥ 90% inside the session; a partition export already running at 09:00; trading-date change while an episode is open; holiday and weekend; non-empty wrong-ts book table; QuestDB unreachable during the self-heal; HTTP worker count on a 1-core cpuset.
+
+#### Failure Modes
+Disk fills inside the session below 90% (ingest shed path unchanged, alarms unchanged); export refused (counted, retried next pass); self-heal drop fails (falls back to level rows exactly as today, coded warn).
+
+#### Test Plan
+Unit tests for the gate (time × used% × table), the re-arm reset on date change, the drain-hold exclusion, the self-heal guard (0 rows only), a compose/host-tuning guard that the HTTP pool is separate. Scoped `cargo test -p` for app and storage.
+
+#### Rollback
+Revert the PR; the compose line is one deletion.
+
+#### Observability
+`tv_disk_pressure_pass_gated_total{reason}`, `tv_disk_pressure_rearm_reset_total`, `tv_depth_book_self_heal_total{outcome}`, `tv_drain_hold_floor_blocked_buckets` (local /metrics only, no new page).
+
+- [ ] DP-1 QuestDB HTTP worker pool + host tuning
+- [ ] DP-2 in-session gate + one partition per pass + pre-open deadline
+- [ ] DP-3 re-arm reset on date change / session close
+- [ ] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
+- [ ] DP-5 market_depth_book zero-row self-heal
+- [ ] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (packets per frame recorded at the record site) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
