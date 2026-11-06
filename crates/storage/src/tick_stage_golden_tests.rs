@@ -372,7 +372,7 @@ fn summary(batches: &[Golden]) -> (Vec<u8>, usize, u64, u64) {
     (text, rows, min, max)
 }
 
-fn check(name: &str, seed: u64, heavy: bool) {
+fn assert_matches_golden(name: &str, seed: u64, heavy: bool) {
     let _g = TEST_PUBLISH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -408,20 +408,20 @@ fn check(name: &str, seed: u64, heavy: bool) {
 
 #[test]
 fn pf4_golden_light_seed_1() {
-    check("light_seed_1", 0x9E37_79B9_7F4A_7C15, false);
+    assert_matches_golden("light_seed_1", 0x9E37_79B9_7F4A_7C15, false);
 }
 
 #[test]
 fn pf4_golden_light_seed_2() {
-    check("light_seed_2", 0xD1B5_4A32_D192_ED03, false);
+    assert_matches_golden("light_seed_2", 0xD1B5_4A32_D192_ED03, false);
 }
 
 #[test]
 fn pf4_golden_light_seed_3() {
-    check("light_seed_3", 0x8CB9_2BA7_2F3D_8DD7, false);
+    assert_matches_golden("light_seed_3", 0x8CB9_2BA7_2F3D_8DD7, false);
 }
 
 #[test]
 fn pf4_golden_heavy_publishes() {
-    check("heavy_publishes", 0x2545_F491_4F6C_DD1D, true);
+    assert_matches_golden("heavy_publishes", 0x2545_F491_4F6C_DD1D, true);
 }
