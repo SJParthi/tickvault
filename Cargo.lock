@@ -4254,6 +4254,7 @@ dependencies = [
  "aws-sdk-sns",
  "aws-sdk-ssm",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "csv",
  "form_urlencoded",

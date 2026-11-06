@@ -241,11 +241,13 @@ pub struct ApplicationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OperatorMoversConfig {
     /// Publish the universe to `s3://<live_view_bucket>/movers/universe.json`
-    /// every 5 s in session and every 60 s otherwise. Default `true`.
+    /// every 5 s while a portal viewer is active (heartbeat), never otherwise.
+    /// Default `true`.
     #[serde(default = "default_operator_movers_publish_enabled")]
     pub publish_enabled: bool,
     /// Bucket name; empty derives `tv-<env>-live-view` from `TV_ENVIRONMENT`
-    /// (no environment ⇒ not published, fail closed).
+    /// (no environment ⇒ not published, fail closed). A name that breaks the
+    /// S3 naming rules is refused (not published).
     #[serde(default)]
     pub live_view_bucket: String,
 }

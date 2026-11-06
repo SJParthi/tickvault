@@ -69,16 +69,30 @@ pub const UNIVERSE_SESSION_END_SECS_OF_DAY_IST: i64 = 56_400;
 pub const UNIVERSE_LIVE_MAX_AGE_SECS: i64 = 60;
 /// Window reported by an answer with no rows (the API's `FNO_STOCKS_WINDOW_SECS`).
 pub const UNIVERSE_DEFAULT_WINDOW_SECS: i64 = 900;
-/// A published universe older than this, while the session was open when it
-/// was built, is not used (the reader falls back to asking the box).
-pub const UNIVERSE_MAX_AGE_OPEN_SECS: i64 = 20;
-/// The same bound when the session was closed when it was built. The reply's
-/// own 60 s capture bound still applies after [`select`].
-pub const UNIVERSE_MAX_AGE_CLOSED_SECS: i64 = 300;
+/// A published universe older than this is not used (the reader falls back
+/// to asking the box). One bound, session open or closed: the publisher
+/// re-publishes every 5 s whenever a viewer is active, closed session
+/// included, so a closed-session universe needs no longer bound (the 300 s
+/// bound it had was dead: a reply's own capture bound is 60 s).
+pub const UNIVERSE_MAX_AGE_SECS: i64 = 20;
 /// A universe stamped this far ahead of the reader's clock is refused.
 pub const UNIVERSE_MAX_FUTURE_SKEW_SECS: i64 = 5;
 /// Object key of the published universe inside the live-view bucket.
 pub const MOVERS_UNIVERSE_OBJECT_KEY: &str = "movers/universe.json";
+/// Object key of the viewer heartbeat inside the live-view bucket. The
+/// operator Lambda writes it on a movers call; the app publishes the universe
+/// only while it is unexpired (no viewer, no publishing, no database query).
+pub const MOVERS_VIEWER_OBJECT_KEY: &str = "movers/viewer.json";
+/// A heartbeat keeps the publisher running this long after it was written.
+pub const VIEWER_HEARTBEAT_TTL_SECS: i64 = 120;
+/// The Lambda writes the heartbeat at most once per this many seconds per
+/// container (the portal refreshes every 30 s while the view is open).
+pub const VIEWER_HEARTBEAT_INTERVAL_SECS: i64 = 30;
+/// Largest heartbeat object a reader accepts, in bytes.
+pub const MAX_VIEWER_BYTES: usize = 256;
+// A viewer refreshing every interval keeps the heartbeat alive across two
+// missed writes.
+const _: () = assert!(VIEWER_HEARTBEAT_INTERVAL_SECS * 3 < VIEWER_HEARTBEAT_TTL_SECS);
 /// The Stocks view never shows the turnover estimate as actual value.
 pub const ACTUAL_VALUE_UNAVAILABLE: &str =
     "Actual traded value is not captured; Value (Cr.) is unavailable.";
@@ -87,6 +101,83 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// Bound on one stored list name; a name the view cannot show (over 128
 /// bytes) is still carried so `select` refuses it exactly as the API did.
 const MAX_LIST_NAME_BYTES: usize = 1_024;
+
+/// The viewer heartbeat (`movers/viewer.json`): "a viewer is looking until
+/// this UTC second".
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerHeartbeat {
+    pub until_epoch_secs: i64,
+}
+
+impl ViewerHeartbeat {
+    /// The heartbeat a call at `now_epoch` writes.
+    #[must_use]
+    pub fn written_at(now_epoch: i64) -> Self {
+        Self {
+            until_epoch_secs: now_epoch.saturating_add(VIEWER_HEARTBEAT_TTL_SECS),
+        }
+    }
+
+    /// Parses a stored heartbeat; `None` when oversize or malformed. O(bytes).
+    #[must_use]
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_VIEWER_BYTES {
+            return None;
+        }
+        serde_json::from_slice(bytes).ok()
+    }
+
+    /// Whether a viewer is active at `now_epoch`: unexpired, and not stamped
+    /// further ahead than one heartbeat plus the clock skew bound (a far
+    /// future value would otherwise keep the publisher running for good).
+    #[must_use]
+    pub fn active_at(&self, now_epoch: i64) -> bool {
+        now_epoch < self.until_epoch_secs
+            && self.until_epoch_secs.saturating_sub(now_epoch)
+                <= VIEWER_HEARTBEAT_TTL_SECS + UNIVERSE_MAX_FUTURE_SKEW_SECS
+    }
+}
+
+/// S3 bucket name rules this view's bucket must meet: 3 to 63 characters of
+/// `[a-z0-9-]`, starting and ending with a letter or digit, and none of the
+/// reserved prefixes or suffixes (`xn--`, `sthree-`, `-s3alias`, `--ol-s3`,
+/// `--x-s3`). Dots are refused too (they break TLS virtual hosting). O(len).
+#[must_use]
+pub fn valid_live_view_bucket_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && !name.starts_with("xn--")
+        && !name.starts_with("sthree-")
+        && !name.ends_with("-s3alias")
+        && !name.ends_with("--ol-s3")
+        && !name.ends_with("--x-s3")
+}
+
+/// An AWS account id: exactly 12 ASCII digits.
+#[must_use]
+pub fn valid_account_id(value: &str) -> bool {
+    value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Weekday 09:00–15:40 IST at a UTC second. The reader's own session state
+/// (the Lambda has no holiday calendar, so a weekday holiday reads open and
+/// an open universe on it is refused: the box answers). O(1).
+#[must_use]
+pub fn weekday_session_open_at(epoch_secs: i64) -> bool {
+    let local = epoch_secs.saturating_add(UNIVERSE_IST_OFFSET_SECS);
+    // 1970-01-01 was a Thursday: day 0 → Thu, 2 → Sat, 3 → Sun.
+    let weekday_from_thursday = local.div_euclid(SECONDS_PER_DAY).rem_euclid(7);
+    let of_day = local.rem_euclid(SECONDS_PER_DAY);
+    !matches!(weekday_from_thursday, 2 | 3)
+        && (UNIVERSE_SESSION_START_SECS_OF_DAY_IST..UNIVERSE_SESSION_END_SECS_OF_DAY_IST)
+            .contains(&of_day)
+}
 
 /// The live-view bucket of one environment, `tv-<env>-live-view`.
 #[must_use]
@@ -182,10 +273,13 @@ pub enum UniverseRefusal {
     Invalid,
     /// Built for a different IST date than the reader's.
     OtherDay,
-    /// Older than [`UNIVERSE_MAX_AGE_OPEN_SECS`] / [`UNIVERSE_MAX_AGE_CLOSED_SECS`].
+    /// Older than [`UNIVERSE_MAX_AGE_SECS`].
     Stale,
     /// Stamped more than [`UNIVERSE_MAX_FUTURE_SKEW_SECS`] ahead of the reader.
     Future,
+    /// Its `market_open` differs from the reader's own session state at the
+    /// read (a universe built just before 09:00 or 15:40 read just after).
+    SessionChanged,
 }
 
 impl UniverseRefusal {
@@ -197,6 +291,7 @@ impl UniverseRefusal {
             Self::OtherDay => "other_day",
             Self::Stale => "stale",
             Self::Future => "future",
+            Self::SessionChanged => "session_changed",
         }
     }
 }
@@ -288,13 +383,11 @@ impl MoversUniverse {
         if age < -UNIVERSE_MAX_FUTURE_SKEW_SECS {
             return Err(UniverseRefusal::Future);
         }
-        let limit = if self.market_open {
-            UNIVERSE_MAX_AGE_OPEN_SECS
-        } else {
-            UNIVERSE_MAX_AGE_CLOSED_SECS
-        };
-        if age > limit {
+        if age > UNIVERSE_MAX_AGE_SECS {
             return Err(UniverseRefusal::Stale);
+        }
+        if weekday_session_open_at(now_epoch) != self.market_open {
+            return Err(UniverseRefusal::SessionChanged);
         }
         Ok(())
     }
@@ -452,13 +545,16 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
             last_trade_ist: hh_mm_ss(row.ts_ist_secs),
         });
     }
-    // O(k log k): change % descending, no change last, name breaks ties;
-    // stable, so equal keys keep the database order.
-    stocks.sort_by(|a, b| match (a.change_pct, b.change_pct) {
-        (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.name.cmp(&b.name),
+    // O(k log k): change % descending, no change last, then name, then
+    // security id: a total order, so the database order never shows.
+    stocks.sort_by(|a, b| {
+        match (a.change_pct, b.change_pct) {
+            (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        }
+        .then_with(|| a.security_id.cmp(&b.security_id))
     });
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
         let status = if open {
@@ -893,35 +989,126 @@ mod tests {
     }
 
     #[test]
-    fn test_usable_at_refuses_other_day_stale_and_future_universes() {
+    fn test_usable_at_refuses_other_day_stale_future_and_session_changed_universes() {
         let mut u = universe(vec![]);
         assert_eq!(u.usable_at(OBSERVED), Ok(()));
-        assert_eq!(u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_OPEN_SECS), Ok(()));
+        assert_eq!(u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_SECS), Ok(()));
         assert_eq!(
-            u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_OPEN_SECS + 1),
+            u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_SECS + 1),
             Err(UniverseRefusal::Stale)
         );
         assert_eq!(
             u.usable_at(OBSERVED - UNIVERSE_MAX_FUTURE_SKEW_SECS - 1),
             Err(UniverseRefusal::Future)
         );
-        u.market_open = false;
-        assert_eq!(u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_CLOSED_SECS), Ok(()));
-        assert_eq!(
-            u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_CLOSED_SECS + 1),
-            Err(UniverseRefusal::Stale)
-        );
         assert_eq!(
             u.usable_at(OBSERVED + SECONDS_PER_DAY),
             Err(UniverseRefusal::OtherDay)
         );
+        // Mid-session, a universe that says closed is refused.
+        u.market_open = false;
+        assert_eq!(u.usable_at(OBSERVED), Err(UniverseRefusal::SessionChanged));
+        // 15:40:00 IST the same Thursday: a closed universe is usable for the
+        // same 20 s (the publisher refreshes it every 5 s while viewed).
+        let close = OBSERVED + 15_870;
+        u.observed_at_epoch_secs = close;
+        assert_eq!(u.usable_at(close + UNIVERSE_MAX_AGE_SECS), Ok(()));
+        assert_eq!(
+            u.usable_at(close + UNIVERSE_MAX_AGE_SECS + 1),
+            Err(UniverseRefusal::Stale)
+        );
+        // Built open at 15:39:55, read at 15:40:02: the session changed.
+        u.market_open = true;
+        u.observed_at_epoch_secs = close - 5;
+        assert_eq!(u.usable_at(close + 2), Err(UniverseRefusal::SessionChanged));
         for refusal in [
             UniverseRefusal::Invalid,
             UniverseRefusal::OtherDay,
             UniverseRefusal::Stale,
             UniverseRefusal::Future,
+            UniverseRefusal::SessionChanged,
         ] {
             assert!(!refusal.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_weekday_session_open_at_follows_the_ist_clock_and_weekday() {
+        let close = OBSERVED + 15_870; // Thu 15:40:00 IST
+        let nine = OBSERVED - 8_130; // Thu 09:00:00 IST
+        assert!(weekday_session_open_at(OBSERVED));
+        assert!(weekday_session_open_at(nine));
+        assert!(!weekday_session_open_at(nine - 1));
+        assert!(weekday_session_open_at(close - 1));
+        assert!(!weekday_session_open_at(close));
+        assert!(weekday_session_open_at(OBSERVED + SECONDS_PER_DAY)); // Fri
+        assert!(!weekday_session_open_at(OBSERVED + 2 * SECONDS_PER_DAY)); // Sat
+        assert!(!weekday_session_open_at(OBSERVED + 3 * SECONDS_PER_DAY)); // Sun
+        assert!(weekday_session_open_at(OBSERVED + 4 * SECONDS_PER_DAY)); // Mon
+        assert!(!weekday_session_open_at(i64::MIN));
+        let _ = weekday_session_open_at(i64::MAX);
+    }
+
+    #[test]
+    fn test_viewer_heartbeat_written_at_parse_and_active_at() {
+        let beat = ViewerHeartbeat::written_at(OBSERVED);
+        assert_eq!(beat.until_epoch_secs, OBSERVED + VIEWER_HEARTBEAT_TTL_SECS);
+        let bytes = serde_json::to_vec(&beat).unwrap();
+        assert_eq!(bytes, br#"{"until_epoch_secs":1793252850}"#);
+        assert_eq!(ViewerHeartbeat::parse(&bytes), Some(beat));
+        assert!(beat.active_at(OBSERVED));
+        assert!(beat.active_at(OBSERVED + VIEWER_HEARTBEAT_TTL_SECS - 1));
+        assert!(!beat.active_at(OBSERVED + VIEWER_HEARTBEAT_TTL_SECS));
+        // A heartbeat stamped far ahead never keeps the publisher running.
+        let far = ViewerHeartbeat {
+            until_epoch_secs: OBSERVED
+                + VIEWER_HEARTBEAT_TTL_SECS
+                + UNIVERSE_MAX_FUTURE_SKEW_SECS
+                + 1,
+        };
+        assert!(!far.active_at(OBSERVED));
+        assert!(far.active_at(OBSERVED + 1));
+        assert!(ViewerHeartbeat::parse(b"{}").is_none());
+        assert!(ViewerHeartbeat::parse(br#"{"until_epoch_secs":1,"x":2}"#).is_none());
+        let mut big = bytes.clone();
+        big.resize(MAX_VIEWER_BYTES + 1, b' ');
+        assert!(ViewerHeartbeat::parse(&big).is_none());
+    }
+
+    #[test]
+    fn test_valid_live_view_bucket_name_and_valid_account_id() {
+        for good in ["tv-prod-live-view", "abc", "a1-b2", &"a".repeat(63)] {
+            assert!(valid_live_view_bucket_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "ab",
+            &"a".repeat(64),
+            "Tv-prod-live-view",
+            "tv.prod.live",
+            "-tv",
+            "tv-",
+            "tv_prod",
+            "tv prod",
+            "xn--tv",
+            "sthree-tv",
+            "tv-s3alias",
+            "tv--ol-s3",
+            "tv--x-s3",
+            "tv/prod",
+        ] {
+            assert!(!valid_live_view_bucket_name(bad), "{bad}");
+        }
+        assert!(valid_live_view_bucket_name(&live_view_bucket_for("prod")));
+        assert!(valid_account_id("123456789012"));
+        for bad in [
+            "",
+            "12345678901",
+            "1234567890123",
+            "12345678901a",
+            " 23456789012",
+        ] {
+            assert!(!valid_account_id(bad), "{bad}");
         }
     }
 

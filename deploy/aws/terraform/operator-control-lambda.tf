@@ -142,6 +142,15 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["${aws_s3_bucket.tv_live_view.arn}/movers/universe.json"]
   }
 
+  # Plan PR MV review: the viewer heartbeat that makes the box publish (one
+  # key only; the box publishes nothing and queries nothing without it).
+  statement {
+    sid       = "WriteMoversViewer"
+    effect    = "Allow"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.tv_live_view.arn}/movers/viewer.json"]
+  }
+
   # Review finding 7: pin logs to THIS account + this Lambda's log group only.
   statement {
     sid    = "LambdaLogs"

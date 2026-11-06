@@ -277,9 +277,55 @@ pub fn parse_fno_underlyings(bytes: &[u8]) -> Option<FnoUnderlyings> {
     Some(FnoUnderlyings { names })
 }
 
-/// The last list read, keyed by its path (the path carries the IST date).
-type FnoListCache = Option<(PathBuf, u64, SystemTime, Arc<FnoUnderlyings>)>;
-static FNO_LIST_CACHE: Mutex<FnoListCache> = Mutex::new(None);
+/// One cached file: its path, length, modification time and parsed value.
+type CachedFile<T> = (PathBuf, u64, SystemTime, Arc<T>);
+
+/// The two most recently read versions of a daily file, keyed by path (the
+/// path carries the IST date). Two slots so a chosen-minute read of another
+/// day does not evict today's list (plan PR MV review: one slot re-read and
+/// re-parsed today's file after every `as_of` request). O(1): two compares.
+pub(super) struct FileCache<T> {
+    slots: Mutex<[Option<CachedFile<T>>; 2]>,
+}
+
+impl<T> FileCache<T> {
+    pub(super) const fn new() -> Self {
+        Self {
+            slots: Mutex::new([None, None]),
+        }
+    }
+
+    /// The cached value for exactly this file version, moved to the front.
+    pub(super) fn get(&self, path: &Path, len: u64, modified: SystemTime) -> Option<Arc<T>> {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|(p, l, m, _)| p == path && *l == len && *m == modified)
+        })?;
+        slots.swap(0, at);
+        slots[0].as_ref().map(|(_, _, _, value)| Arc::clone(value))
+    }
+
+    /// Stores a freshly read version at the front: it replaces an older
+    /// version of the same path, else the least recently used slot.
+    pub(super) fn put(&self, path: &Path, len: u64, modified: SystemTime, value: Arc<T>) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = slots
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|(p, _, _, _)| p == path))
+            .unwrap_or(1);
+        slots[at] = Some((path.to_path_buf(), len, modified, value));
+        slots.swap(0, at);
+    }
+}
+
+static FNO_LIST_CACHE: FileCache<FnoUnderlyings> = FileCache::new();
 
 /// Loads the day's list, re-reading after path, length or modification time
 /// changes. Missing or invalid replacement files never reuse a cached list. `None` when the file is missing,
@@ -291,15 +337,8 @@ pub(super) fn load_fno_underlyings(path: &Path) -> Option<Arc<FnoUnderlyings>> {
         return None;
     }
     let modified = metadata.modified().ok()?;
-    let mut slot = FNO_LIST_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_path, len, mtime, list)) = slot.as_ref()
-        && cached_path == path
-        && *len == metadata.len()
-        && *mtime == modified
-    {
-        return Some(Arc::clone(list));
+    if let Some(list) = FNO_LIST_CACHE.get(path, metadata.len(), modified) {
+        return Some(list);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
@@ -311,12 +350,7 @@ pub(super) fn load_fno_underlyings(path: &Path) -> Option<Arc<FnoUnderlyings>> {
         return None;
     }
     let list = Arc::new(list);
-    *slot = Some((
-        path.to_path_buf(),
-        metadata.len(),
-        modified,
-        Arc::clone(&list),
-    ));
+    FNO_LIST_CACHE.put(path, metadata.len(), modified, Arc::clone(&list));
     Some(list)
 }
 
@@ -445,8 +479,18 @@ pub(super) async fn query_fno_rows(
         }
         bytes.extend_from_slice(&chunk);
     }
+    // Parsing up to two lists' worth of JSON is CPU work: it runs on the
+    // blocking pool, never on a runtime worker (plan PR MV review).
+    tokio::task::spawn_blocking(move || parse_query_body(&bytes, max_rows))
+        .await
+        .map_err(|_| QueryFailure::Refused)?
+}
+
+/// Parses a QuestDB `/exec` body into rows. Malformed rows are skipped, a
+/// malformed body or more than `max_rows` rows is a failure. O(bytes).
+fn parse_query_body(bytes: &[u8], max_rows: usize) -> Result<Vec<TickRow>, QueryFailure> {
     let body: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| QueryFailure::Refused)?;
+        serde_json::from_slice(bytes).map_err(|_| QueryFailure::Refused)?;
     let dataset = body
         .get("dataset")
         .and_then(serde_json::Value::as_array)
@@ -510,11 +554,17 @@ pub(super) fn build_rows(list: &FnoUnderlyings, rows: Vec<TickRow>) -> Vec<FnoSt
         })
         .collect();
     // O(k log k), k ≤ the list size.
-    out.sort_by(|a, b| match (a.change_pct, b.change_pct) {
-        (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.name.cmp(&b.name),
+    // Security id breaks a name tie, so the order never depends on the
+    // database's row order (plan PR MV: the universe's union query and the
+    // per-list query return rows in different orders).
+    out.sort_by(|a, b| {
+        match (a.change_pct, b.change_pct) {
+            (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        }
+        .then_with(|| a.security_id.cmp(&b.security_id))
     });
     out
 }

@@ -1,14 +1,16 @@
-//! Plan PR MV (2026-11-06): pins the shape of the live-view bucket and the two
-//! IAM grants on it, and that the app and the Lambda agree on its name and key.
+//! Plan PR MV (2026-11-06): pins the shape of the live-view bucket and the four
+//! one-key IAM grants on it, and that the app and the Lambda agree on its name and key.
 //!
 //! The bucket holds a disposable view (the published movers universe), so it
 //! must stay unversioned and expiring, private, encrypted and TLS-only, and
-//! the grants must name the ONE object, never the bucket or a wildcard.
+//! the grants must name ONE object per action (the box writes the universe
+//! and reads the viewer heartbeat; the Lambda reads the universe and writes
+//! the heartbeat), never the bucket or a wildcard.
 
 use std::path::{Path, PathBuf};
 
 use tickvault_common::operator_movers_universe::{
-    MOVERS_UNIVERSE_OBJECT_KEY, live_view_bucket_for,
+    MOVERS_UNIVERSE_OBJECT_KEY, MOVERS_VIEWER_OBJECT_KEY, live_view_bucket_for,
 };
 
 fn workspace_root() -> PathBuf {
@@ -66,6 +68,16 @@ fn test_live_view_bucket_is_unversioned_expiring_private_encrypted_and_tls_only(
         "resource \"aws_s3_bucket_lifecycle_configuration\" \"tv_live_view\"",
     );
     assert!(lifecycle.contains("expiration {") && lifecycle.contains("days = 2"));
+    assert!(
+        lifecycle.contains("abort_incomplete_multipart_upload {")
+            && lifecycle.contains("days_after_initiation = 1"),
+        "an abandoned multipart upload must not linger"
+    );
+    let ownership = block(
+        &tf,
+        "resource \"aws_s3_bucket_ownership_controls\" \"tv_live_view\"",
+    );
+    assert!(ownership.contains("object_ownership = \"BucketOwnerEnforced\""));
     let pab = block(
         &tf,
         "resource \"aws_s3_bucket_public_access_block\" \"tv_live_view\"",
@@ -94,48 +106,80 @@ fn test_live_view_bucket_is_unversioned_expiring_private_encrypted_and_tls_only(
     assert!(policy.contains("data.aws_iam_policy_document.tv_live_view_tls_only.json"));
 }
 
+/// The `{ ... }` statement in `main.tf` that ends at `resource_line`.
+fn main_stanza<'a>(main: &'a str, resource_line: &str) -> &'a str {
+    let at = main
+        .find(resource_line)
+        .unwrap_or_else(|| panic!("instance grant {resource_line}")); // APPROVED: test
+    &main[main[..at].rfind("      {\n").unwrap_or(0)..at] // APPROVED: test
+}
+
+/// The `statement { ... }` block of the Lambda policy with this sid.
+fn lambda_statement(lambda: &str, sid: &str) -> String {
+    let policy = block(
+        lambda,
+        "data \"aws_iam_policy_document\" \"operator_control_permissions\"",
+    );
+    let start = policy
+        .find(&format!("sid       = \"{sid}\""))
+        .unwrap_or_else(|| panic!("Lambda statement {sid}")); // APPROVED: test
+    policy[start
+        ..policy[start..]
+            .find("\n  }")
+            .map_or(policy.len(), |e| start + e)]
+        .to_string()
+}
+
 #[test]
-fn test_live_view_grants_name_the_one_object_only() {
+fn test_live_view_grants_name_one_object_per_action_only() {
     let main = read("deploy/aws/terraform/main.tf");
+    let universe_line =
+        "        Resource = \"arn:aws:s3:::tv-${var.environment}-live-view/movers/universe.json\"";
+    let viewer_line =
+        "        Resource = \"arn:aws:s3:::tv-${var.environment}-live-view/movers/viewer.json\"";
     let lines: Vec<&str> = main
         .lines()
         .filter(|l| l.contains("live-view") && !l.trim_start().starts_with('#'))
         .collect();
     assert_eq!(
         lines,
-        [
-            "        Resource = \"arn:aws:s3:::tv-${var.environment}-live-view/movers/universe.json\""
-        ],
-        "the instance role may write the movers object only"
+        [universe_line, viewer_line],
+        "the instance role may write the universe and read the heartbeat only"
     );
-    let put = main
-        .find("-live-view/movers/universe.json")
-        .expect("instance grant"); // APPROVED: test
-    let stanza = &main[main[..put].rfind("      {\n").unwrap_or(0)..put]; // APPROVED: test
-    assert!(stanza.contains("Action   = [\"s3:PutObject\"]"), "{stanza}");
+    let put = main_stanza(&main, universe_line);
+    assert!(put.contains("Action   = [\"s3:PutObject\"]"), "{put}");
+    let get = main_stanza(&main, viewer_line);
+    assert!(get.contains("Action   = [\"s3:GetObject\"]"), "{get}");
 
     let lambda = read("deploy/aws/terraform/operator-control-lambda.tf");
-    let read_grant = block(
-        &lambda,
-        "data \"aws_iam_policy_document\" \"operator_control_permissions\"",
-    );
-    let start = read_grant
-        .find("sid       = \"ReadMoversUniverse\"")
-        .expect("Lambda read grant"); // APPROVED: test
-    let stanza = &read_grant[start
-        ..read_grant[start..]
-            .find("\n  }")
-            .map_or(read_grant.len(), |e| start + e)];
+    let read_grant = lambda_statement(&lambda, "ReadMoversUniverse");
     assert!(
-        stanza.contains("actions   = [\"s3:GetObject\"]"),
-        "{stanza}"
+        read_grant.contains("actions   = [\"s3:GetObject\"]"),
+        "{read_grant}"
     );
     assert!(
-        stanza.contains("resources = [\"${aws_s3_bucket.tv_live_view.arn}/movers/universe.json\"]")
+        read_grant
+            .contains("resources = [\"${aws_s3_bucket.tv_live_view.arn}/movers/universe.json\"]")
+    );
+    let write_grant = lambda_statement(&lambda, "WriteMoversViewer");
+    assert!(
+        write_grant.contains("actions   = [\"s3:PutObject\"]"),
+        "{write_grant}"
+    );
+    assert!(
+        write_grant
+            .contains("resources = [\"${aws_s3_bucket.tv_live_view.arn}/movers/viewer.json\"]")
+    );
+    assert_eq!(
+        lambda.matches("aws_s3_bucket.tv_live_view.arn}/").count(),
+        2,
+        "exactly the two one-key grants"
     );
     assert!(lambda.contains("LIVE_VIEW_BUCKET = aws_s3_bucket.tv_live_view.bucket"));
+    assert!(lambda.contains("BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id"));
     assert!(
         !lambda.contains("tv_live_view.arn}/*") && !main.contains("live-view/*"),
         "no wildcard grant on the live-view bucket"
     );
+    assert_eq!(MOVERS_VIEWER_OBJECT_KEY, "movers/viewer.json");
 }
