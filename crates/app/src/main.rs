@@ -71,7 +71,9 @@ use tickvault_app::boot_helpers::{
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
 use tickvault_app::holiday_gate::trading_day_gate_exit_code;
-use tickvault_app::{host_limits, infra, observability, subsystem_memory};
+use tickvault_app::{
+    host_limits, infra, movers_universe_publisher, observability, subsystem_memory,
+};
 
 use std::net::SocketAddr;
 
@@ -5221,6 +5223,8 @@ async fn build_shared_infra(
             ),
         );
     }
+    // Plan PR MV (2026-11-06): publish the movers universe to S3 for the portal.
+    let _movers = movers_universe_publisher::spawn(api_state.clone(), &config.operator_movers);
     // Infra sweep row 12 (2026-09-08): this was ONE SSM call on the boot path
     // with no retry — a transient SSM throttle or a cold-start DNS blip at
     // 08:30 failed the whole boot, and the start-watchdog then paged for a
