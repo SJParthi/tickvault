@@ -2300,3 +2300,9 @@ Revert the PR.
 - [ ] PF-1 turn on `[tick_storage] own_ilp_encoder` in production config (byte-identical proof exists, bench p99 ~0.8 µs vs library 1.8–2.4 µs), with a one-session live read of `hot_path_latency_minute` per-tick figures before/after
 - [ ] PF-2 measure core placement (QuestDB cpuset 0 vs main runtime workers) with `tv_hot_thread_run_delay_ns_total` and decide; no change without numbers
 - [ ] PF-3 profile the drain's per-packet cost on the live shape (cold 25k-instrument maps) and cut the largest step
+- PF measurement 2026-11-06 (x86, loaded host, 25,000 instruments, 1 packet/frame, DRAM-cold mode): production shape (Full, library encoder, 10 level rows) p50 7.5 µs / p99 22–30 µs per tick; with book rows 4.1 / 10.7 µs; plus own encoder 3.2 / 8.3 µs. Under 1 µs is not reachable while the drain encodes ILP text (~1.5 µs per Full tick alone). Ranked cuts, each with an old-vs-new proof:
+- [ ] PF-4 move ILP encoding off the drain: drain pushes a fixed ~200 B binary record per tick into a pre-allocated per-flush buffer; the writer thread encodes with the same write functions (byte-identical proptest over random tick streams; rescue/spill/watermark tests)
+- [ ] PF-5 batch the seal hand-off per frame (same `BufferedSeal` sequence, escalation path tested)
+- [ ] PF-6 one shared instrument index (gap detector, backup dedup, spot store keyed by the aggregator slot; identical verdicts under proptest)
+- [ ] PF-7 candle slot layout split (per-tick vs seal-only fields) + prefetch after the index lookup (restart_differential + consume_tick equality proptest)
+- [ ] PF-8 per-frame batching of per-tick atomic counters (ingest_ticks, conservation ledger, tick_ts_placement, tick_quotes count, repeat_quote)
