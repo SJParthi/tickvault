@@ -336,7 +336,7 @@ jobs:
           for b in ${BINS}; do
             cp "target/lambda/${b}/bootstrap.zip" "${ZIP_DIR}/${b}.zip"
           done
-          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock crates/common/src/operator_movers_wire.rs crates/common/src/operator_stock_movers_wire.rs | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
+          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock crates/common/src/operator_movers_wire.rs crates/common/src/operator_stock_movers_wire.rs crates/common/src/operator_movers_universe.rs | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
           printf '%s' "${SRC_DIGEST}" > "${ZIP_DIR}/source.digest"
           ls -la "${ZIP_DIR}"
 
@@ -621,7 +621,7 @@ jobs:
           for b in ${BINS}; do
             cp "target/lambda/${b}/bootstrap.zip" "${ZIP_DIR}/${b}.zip"
           done
-          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock crates/common/src/operator_movers_wire.rs crates/common/src/operator_stock_movers_wire.rs | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
+          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock crates/common/src/operator_movers_wire.rs crates/common/src/operator_stock_movers_wire.rs crates/common/src/operator_movers_universe.rs | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
           printf '%s' "${SRC_DIGEST}" > "${ZIP_DIR}/source.digest"
           ls -la "${ZIP_DIR}"
 

@@ -484,6 +484,15 @@ mode = "off"
 [task_heartbeat]
 respawn_on_missed_beats = false
 
+# Plan PR MV (2026-11-06): publish the Stocks movers universe to
+# s3://tv-<env>-live-view/movers/universe.json (every 5 s, and only while the
+# portal has a viewer; no viewer = no query, no publish) so the operator
+# portal answers a movers click in well under a second. Off = the portal keeps
+# the slower box path. Empty bucket = derived from TV_ENVIRONMENT.
+[operator_movers]
+publish_enabled = true
+live_view_bucket = ""
+
 [websocket]
 ping_interval_secs = 10
 pong_timeout_secs = 10

@@ -47,3 +47,27 @@ pub fn lambda(config: &SdkConfig) -> aws_sdk_lambda::Client {
 pub fn eventbridge(config: &SdkConfig) -> aws_sdk_eventbridge::Client {
     aws_sdk_eventbridge::Client::new(config)
 }
+
+/// S3 client — the operator-control Lambda's read of the published movers
+/// universe (plan PR MV, one GetObject on one key).
+pub fn s3(config: &SdkConfig) -> aws_sdk_s3::Client {
+    aws_sdk_s3::Client::new(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_s3_client_builds_from_a_static_config_without_network() {
+        let config = SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("ap-south-1"))
+            .build();
+        let client = s3(&config);
+        assert_eq!(
+            client.config().region().map(|r| r.as_ref()),
+            Some("ap-south-1")
+        );
+    }
+}

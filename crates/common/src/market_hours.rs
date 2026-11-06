@@ -93,6 +93,26 @@ pub fn is_trading_session_now() -> bool {
     combine_trading_session(is_within_trading_session_ist(), calendar_trading_day_today)
 }
 
+/// [`is_trading_session_now`] for a given Unix second (UTC), so a caller that
+/// also needs the time can take both from ONE clock reading (plan PR MV,
+/// 2026-11-06: the movers view read `market_open` and the time separately,
+/// and the two could straddle 09:00 or 15:40). The installed calendar is
+/// asked about the IST date of `utc_secs`, not today. O(1).
+#[must_use]
+pub fn is_trading_session_at(utc_secs: i64) -> bool {
+    if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let calendar_trading_day = SESSION_CALENDAR.get().map(|c| {
+        chrono::DateTime::from_timestamp(
+            utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)),
+            0,
+        )
+        .is_none_or(|ist| c.is_trading_day(ist.date_naive()))
+    });
+    combine_trading_session(in_trading_session_at(utc_secs), calendar_trading_day)
+}
+
 /// Pure combiner for [`is_trading_session_now`] — unit-testable without a clock.
 ///
 /// `in_weekday_session` is the time-of-day + weekday gate
@@ -457,6 +477,26 @@ mod tests {
 
     /// Test override propagates through the trading-session gate too,
     /// otherwise tests that pin "in market hours" would break the gate.
+    /// Plan PR MV: the session state for a given second, from that second only.
+    #[test]
+    fn test_is_trading_session_at_reads_the_given_second_and_its_ist_date() {
+        let _force_guard = ForceHours::set(false);
+        // Thu 2026-10-29 11:15:30 IST.
+        let thursday_mid_session = 1_793_252_730_i64;
+        let calendar_says = SESSION_CALENDAR.get().is_none_or(|c| {
+            c.is_trading_day(chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap_or_default())
+        });
+        assert_eq!(is_trading_session_at(thursday_mid_session), calendar_says);
+        // The same day at 08:00 and at 15:40 IST: outside the session.
+        assert!(!is_trading_session_at(thursday_mid_session - 11_730));
+        assert!(!is_trading_session_at(thursday_mid_session + 15_870));
+        // Sat 2026-10-31 11:15:30 IST: a weekend never reads open.
+        assert!(!is_trading_session_at(thursday_mid_session + 2 * 86_400));
+        drop(_force_guard);
+        let _forced = ForceHours::set(true);
+        assert!(is_trading_session_at(thursday_mid_session + 2 * 86_400));
+    }
+
     #[test]
     fn trading_session_force_override_returns_true_when_set() {
         let _force_guard = ForceHours::set(true);

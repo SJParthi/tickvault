@@ -313,6 +313,9 @@ pub mod index_constituency_boot;
 /// kept forever (owner Quote 44, 2026-10-28); the sweep deletes a local
 /// dated file only after its verified copy exists.
 pub mod instrument_snapshot_upload;
+/// Plan PR MV (2026-11-06): publishes the Stocks movers universe to S3 for
+/// the operator Lambda.
+pub mod movers_universe_publisher;
 pub mod observability;
 /// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
 /// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
