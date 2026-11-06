@@ -3954,13 +3954,17 @@ mod tests {
         // Next and Refresh are disabled, so a double Next cannot skip a page
         // and a new sort mark never shows over old-order rows unmarked.
         // `$$` is document.querySelectorAll, to stay inside the script budget.
+        // Combined review, same day: each accepted reply carries the filter
+        // generation it answered, and a snapshot from an older generation is
+        // reloaded instead of rendered, so an older filter's rows never show
+        // under newer controls (tab hidden mid-load was the path).
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "ae161f94996b82a9103c5d6a8589138a019f822e5bdec650925b315dcbccd9d7"
+            "801ba17e37712bf3930d06274f9b45a7ee1217c0c536200ede769675f23bfc1a"
         );
-        assert_eq!(CONSOLE_HTML.len(), 85_473);
+        assert_eq!(CONSOLE_HTML.len(), 85_542);
     }
 
     // ------------------------------------------------ audit L4 source scans

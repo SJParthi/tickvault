@@ -72,8 +72,11 @@ use tracing::{info, warn};
 pub const PUBLISH_INTERVAL_SECS: u64 = 5;
 /// Ceiling of the failure backoff.
 pub const MAX_BACKOFF_SECS: u64 = 120;
-/// A closed read's price rows are reused at most this long.
-pub const CLOSED_REUSE_MAX_SECS: u64 = 600;
+/// A closed read's price rows are reused at most this long. 60 s (was 600
+/// until the 2026-11-06 combined review): each copy is re-stamped with a new
+/// observation time, so this bounds how much older than its "snapshot" time
+/// a shown row can be. Runs only while a viewer is active.
+pub const CLOSED_REUSE_MAX_SECS: u64 = 60;
 /// Bound on one universe build (lists + one query).
 const BUILD_TIMEOUT_SECS: u64 = 10;
 /// Bound on one PutObject.

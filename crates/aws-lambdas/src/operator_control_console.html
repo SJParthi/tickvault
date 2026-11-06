@@ -772,7 +772,7 @@ function updateStockControls(){
 function renderMovers(){
   const rows=$('movers-rows');rows.replaceChildren();moversVisible=[];watchPrices=[];renderWatch();$('movers-meta').textContent='';$('movers-selection').textContent='';$('movers-prev').disabled=$('movers-next').disabled=true;$('stocks-select-all').disabled=true;$('stocks-select-all').checked=false;updateStockControls();
   if(!moversReply){moversNote(TOKEN?'empty':'locked');return;}
-  const reply=moversReply;if(reply.result==='error'){moversNote(reply.code);return;}
+  const reply=moversReply;if(reply.result==='error'){moversNote(reply.code);return;}if(reply.gen!==moversGeneration)return loadMovers();
   const s=reply.snapshot,elapsed=Math.max(0,(performance.now()-moversReceived)/1000),transport=Math.max(0,moversObserved-reply.captured_at_epoch_secs)+moversRequestSeconds+2,age=s.data_age_secs===null?null:Math.ceil(s.data_age_secs+transport+elapsed);
   if(moversObserved+moversRequestSeconds+2+elapsed>=reply.valid_until_epoch_secs){moversNote('expired');return;}
   const freshness=moversMessage(s.status==='live'?(age!==null&&age<=60?'fresh':'unknown'):s.status),partial=s.stocks_priced<s.universe_total||s.membership_status!=='available'||!s.fno_list_available;
@@ -794,7 +794,7 @@ async function loadMovers(){
   if(new TextEncoder().encode(filter.search).length>32||/[\x00-\x1f\x7f]/.test(filter.search)){moversReply={result:'error',code:'invalid_search'};renderMovers();return;}
   moversBusy=true;moversLastAttempt=performance.now();const generation=moversGeneration;$('movers-table').inert=$('movers-prev').disabled=$('movers-next').disabled=$('movers-refresh').disabled=true;moversNote('loading');const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),25000);
   try{const j=await call('stock-movers',{filter},controller.signal);if(generation!==moversGeneration||!TOKEN)return;const r=j&&j.movers;
-    if(j&&j.ok===true&&r&&r.version===2&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&Number.isSafeInteger(r.valid_until_epoch_secs)&&r.valid_until_epoch_secs>j.observed_at_epoch_secs&&r.valid_until_epoch_secs<=r.captured_at_epoch_secs+60&&(r.result==='error'||r.result==='snapshot'&&sameMoversFilter(r.snapshot&&r.snapshot.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names))){moversReply=r;if(r.result==='snapshot')moversIndices(r.snapshot);}else moversReply=null;
+    if(j&&j.ok===true&&r&&r.version===2&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&Number.isSafeInteger(r.valid_until_epoch_secs)&&r.valid_until_epoch_secs>j.observed_at_epoch_secs&&r.valid_until_epoch_secs<=r.captured_at_epoch_secs+60&&(r.result==='error'||r.result==='snapshot'&&sameMoversFilter(r.snapshot&&r.snapshot.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names))){moversReply=r;r.gen=generation;if(r.result==='snapshot')moversIndices(r.snapshot);}else moversReply=null;
     moversObserved=j&&j.observed_at_epoch_secs||0;moversReceived=performance.now();moversRequestSeconds=Math.max(0,(moversReceived-moversLastAttempt)/1000);renderMovers();
   }catch(e){moversReply=null;renderMovers();}finally{clearTimeout(timeout);moversBusy=false;$('movers-table').inert=$('movers-refresh').disabled=false;if(generation!==moversGeneration&&TOKEN&&curTab==='movers')loadMovers();}
 }
