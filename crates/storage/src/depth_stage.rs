@@ -110,6 +110,14 @@ const _: () = assert!(
     "a staged book row must stay a small Copy value"
 );
 
+/// A floor under the text length of ANY `market_depth_book` line: a side
+/// with no levels, no contract name, one-digit integers and the shortest
+/// segment, kind, side and feed labels is about 150 bytes. Bounds how many
+/// rows a batch of at most `DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES` of text can
+/// hold (the recycle bound `MAX_DEPTH_STAGED_SPARE_RAM_BYTES`). Pinned by
+/// `test_min_book_line_bytes_is_a_floor_for_every_label`.
+pub const MIN_BOOK_LINE_BYTES: usize = 128;
+
 /// The shortest inline book line in production text: a five-level side with
 /// no contract name is about 370 bytes. Rows are reserved at a quarter of a
 /// kilobyte of text, so a full batch of inline rows never grows them.
@@ -126,7 +134,14 @@ pub const DEPTH_STAGED_ROWS_PRESIZE: usize =
 /// values (120 bytes) for about 370 to 400 bytes of text (under 0.33), so a
 /// full batch of inline rows never grows the arena; a depth-200 row stores
 /// 600 values for about 5,000 bytes of text (0.96) and a burst of those grows
-/// it, counted on `tv_depth_stage_grow_total`, as the text buffer grew before.
+/// it on the drain below the flush trigger, counted on
+/// `tv_depth_stage_grow_total`. ⚠ That growth is NEW with PF-4b (review round
+/// 1, 2026-11-06): the text buffer it replaces was pre-sized to the trigger
+/// plus a crossing frame and did not grow below it. A grown batch is still
+/// recycled (`MAX_DEPTH_STAGED_SPARE_RAM_BYTES` covers a batch grown to the
+/// trigger), so each batch grows once on a depth-socket day and is then
+/// reused. Production writes only inline five-level rows today (depth sockets
+/// off), which never grow it.
 pub const DEPTH_STAGED_VALUES_PRESIZE: usize = DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES * 3 / 8 / 8;
 
 /// A batch of staged book rows, their level values, and the name tables they
@@ -359,6 +374,28 @@ impl DepthStagedBatch {
     #[cfg(test)]
     pub(crate) fn as_ptr_for_test(&self) -> *const StagedBookRow {
         self.rows.as_ptr()
+    }
+
+    /// An empty batch with room for exactly `rows` rows and `values` values
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn with_capacity_for_test(rows: usize, values: usize) -> Self {
+        let mut batch = Self::new();
+        batch.rows.reserve_exact(rows);
+        batch.values.reserve_exact(values);
+        batch
+    }
+
+    /// The value arena's allocation (tests).
+    #[cfg(test)]
+    pub(crate) fn values_ptr_for_test(&self) -> *const f64 {
+        self.values.as_ptr()
+    }
+
+    /// `(rows capacity, values capacity)` (tests).
+    #[cfg(test)]
+    pub(crate) fn capacities_for_test(&self) -> (usize, usize) {
+        (self.rows.capacity(), self.values.capacity())
     }
 
     /// The name table pinned at `pin`.

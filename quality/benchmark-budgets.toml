@@ -124,7 +124,7 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # feed_drain_main_feed because bench-gate.sh takes the FIRST matching key in
 # file order, and feed_drain_main_feed also matches those names. The Full p99
 # tail gate in the bench reads the same key.
-feed_drain_main_feed_full = 2500        # <2.5us per tick — matches feed_drain/main_feed_full_frame_4 and feed_drain/main_feed_full_frame_4_own (Full packets, both encoders)
+feed_drain_main_feed_full = 2500        # <2.5us per tick — matches feed_drain/main_feed_full_frame_4 and feed_drain/main_feed_full_frame_4_own (Full packets, both encoders) and feed_drain/main_feed_full_frame_4_own_nodepth (PF-4b 2026-11-06: same frames, no inline depth)
 feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes
 feed_drain_depth         = 1000         # <1us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet. Was 1500 until 2026-10-30 (plan ITEM DT, depth row stage): pre-checked ILP names on every depth row took the x86 dev container from 531 to 366 ns per level (depth-20 frame, 42.5 to 29.3 us per 80 levels) and from 638 to 437 ns per level (depth-200 packet, 127.6 to 87.5 us per 200 levels), byte-identical rows.
 candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.

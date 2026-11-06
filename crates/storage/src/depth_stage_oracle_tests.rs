@@ -12,13 +12,16 @@
 //! * `proptest_pf4b_ordered_bytes_equal_the_legacy_append`: every queue is
 //!   read after every operation, so the batches leave in row order and their
 //!   concatenation must equal the oracle's text byte for byte.
-//! * `proptest_pf4b_stress_lines_equal_the_legacy_append`: queues are left
-//!   unread for random stretches (retained spans, width cuts, rescues, a full
-//!   rescue queue, parks, inline spills) and the stream ends with the lane's
-//!   shutdown sequence. Batches can then leave out of row order, so the
-//!   comparison is the MULTISET of lines (each line split by a small ILP v2
-//!   reader), plus the exact level total. Line ORDER inside a batch is the
-//!   ordered test's and the golden fixtures' job.
+//! * `proptest_pf4b_stress_lines_equal_the_legacy_append`: the writer queue
+//!   is left unread for random stretches (retained spans, width cuts and
+//!   rescues) and the stream ends with the lane's shutdown sequence. Batches
+//!   can then leave out of row order, so the comparison is the MULTISET of
+//!   lines (each line split by a small ILP v2 reader). Whether a random case
+//!   also reaches a full rescue queue, a park or an inline spill is NOT
+//!   asserted; those arms are pinned by the deterministic tests below
+//!   (`test_parked_staged_batch_spills_the_legacy_bytes_at_shutdown`,
+//!   `test_inline_spill_of_staged_rows_writes_the_legacy_bytes`). Line ORDER
+//!   inside a batch is the ordered test's and the golden fixtures' job.
 
 use super::depth_stage_golden_tests::Rng;
 use super::*;
@@ -485,6 +488,65 @@ fn test_parked_staged_batch_spills_the_legacy_bytes_at_shutdown() {
     let mut got = queued;
     got.extend_from_slice(&read_v2_spill_dir(&spill));
     let _ = std::fs::remove_dir_all(&spill);
+    assert_eq!(got, legacy.buffer.as_bytes());
+}
+
+/// The drain's INLINE spill (the rescue queue full, rows the WAL holds but
+/// the deferral check refuses, nothing parkable) writes the staged rows as
+/// text first and spills exactly the legacy bytes; the pins stay with the
+/// batch (never dropped on the drain).
+#[test]
+fn test_inline_spill_of_staged_rows_writes_the_legacy_bytes() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish(99);
+    let spill = temp_dir("inline");
+    let mut w = DepthWriter::for_test_book(Feed::Dhan)
+        .with_spill_dir_for_test(spill.clone())
+        .with_wal_defer_check_for_test(|_, _, _| false);
+    let (_rescue_sink, rescue_rx) = w.split_rescue_offload();
+    let mut legacy = LegacyBook::new();
+    let prices = [24_500.25, 24_500.2, 24_500.15, 24_500.1, 24_500.05];
+    let mut seq = 500_i64;
+    let mut queued = Vec::new();
+    // Every row carries a capture sequence and nothing is marked unbacked,
+    // so a full rescue queue cannot park the third batch: it spills inline.
+    for round in 0..3_i64 {
+        for k in 0..6_i64 {
+            for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
+                seq += 1;
+                let row = DepthBookRow {
+                    security_id: ID_BASE + (round + k) % IDS,
+                    segment: SEGMENTS[((ID_BASE + (round + k) % IDS) % 3) as usize],
+                    depth_kind: DEPTH_KIND_5,
+                    side,
+                    prices: &prices,
+                    quantities: &prices,
+                    orders: &prices,
+                    capture_seq: seq,
+                    ts_nanos: SESSION_TS_NANOS + seq,
+                };
+                w.append_book_row(&row).expect("append");
+                legacy.append(&row);
+            }
+        }
+        assert!(!w.pending_unbacked());
+        assert!(w.discard_pending() > 0);
+    }
+    assert!(w.parked_rescue.is_empty(), "nothing was parkable");
+    assert!(w.staged.is_empty(), "the inline arm cleared the rows");
+    assert!(w.staged.pin_count() > 0, "the drain kept the pins");
+    while let Ok(b) = rescue_rx.try_recv() {
+        queued.extend_from_slice(&rescue_batch_bytes(&b));
+        release_floor(b);
+    }
+    let inline = read_v2_spill_dir(&spill);
+    let _ = std::fs::remove_dir_all(&spill);
+    publish_candle_contract_labels(CandleContractLabels::default());
+    assert!(!inline.is_empty(), "the third batch was spilled inline");
+    let mut got = queued;
+    got.extend_from_slice(&inline);
     assert_eq!(got, legacy.buffer.as_bytes());
 }
 

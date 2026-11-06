@@ -369,3 +369,97 @@ fn test_ram_bytes_counts_capacity_not_length() {
     batch.clear();
     assert_eq!(batch.ram_bytes(), ram, "a clear keeps the capacity");
 }
+
+/// `MIN_BOOK_LINE_BYTES` is a floor under every line the writer can write:
+/// no levels, no contract name, one-digit integers, every feed, every segment
+/// label the depth path can carry, every kind and side.
+#[test]
+fn test_min_book_line_bytes_is_a_floor_for_every_label() {
+    let mut shortest = usize::MAX;
+    for feed in Feed::ALL {
+        for code in 0..=u8::MAX {
+            let Some(segment) = crate::depth_persistence::depth_segment_label(code) else {
+                continue;
+            };
+            for kind in [DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200] {
+                for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
+                    let r = DepthBookRow {
+                        security_id: 0,
+                        segment,
+                        depth_kind: kind,
+                        side,
+                        prices: &[],
+                        quantities: &[],
+                        orders: &[],
+                        capture_seq: 0,
+                        ts_nanos: 0,
+                    };
+                    shortest = shortest.min(book_line_len(*feed, &r, 0, None));
+                }
+            }
+        }
+    }
+    assert!(shortest < usize::MAX, "some label was checked");
+    assert!(
+        shortest >= MIN_BOOK_LINE_BYTES,
+        "the shortest line is {shortest} bytes, under the floor {MIN_BOOK_LINE_BYTES}"
+    );
+}
+
+/// Fills a pre-sized batch with `levels`-level rows (and `name`) until one
+/// more row would pass `DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES` of text (the
+/// flush trigger plus a crossing frame); returns the batch.
+fn fill_to_the_text_bound(levels: usize, name: Option<&str>) -> DepthStagedBatch {
+    let mut batch = DepthStagedBatch::presized();
+    let values = vec![123.45_f64; levels];
+    let mut seq = 0_i64;
+    loop {
+        let r = DepthBookRow {
+            security_id: 1,
+            segment: "IDX_I",
+            depth_kind: DEPTH_KIND_5,
+            side: DEPTH_SIDE_BID,
+            prices: &values,
+            quantities: &values,
+            orders: &values,
+            capture_seq: seq % 10,
+            ts_nanos: seq % 10,
+        };
+        let len = book_line_len(Feed::Dhan, &r, levels, name.map(escaped_symbol_len));
+        if batch.text_bytes() + len > DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES {
+            return batch;
+        }
+        let _ = batch.push(&r, 0, len);
+        seq += 1;
+    }
+}
+
+/// PF-4b review round 1: a batch that grew only up to the flush trigger (a
+/// depth-20 or depth-200 burst, or the shortest possible rows) must still be
+/// recycled, or every later hand-off reserves a fresh batch on the drain.
+#[test]
+fn test_a_batch_grown_to_the_flush_trigger_is_still_recycled() {
+    let bound = crate::depth_persistence::MAX_DEPTH_STAGED_SPARE_RAM_BYTES;
+    for (levels, name) in [
+        (0, None),
+        (5, None),
+        (5, Some("NIFTY-25Nov2026-24500-CE")),
+        (20, None),
+        (200, None),
+    ] {
+        let batch = fill_to_the_text_bound(levels, name);
+        assert!(!batch.is_empty());
+        assert!(
+            batch.ram_bytes() <= bound,
+            "{levels} levels: {} bytes over the recycle bound {bound}",
+            batch.ram_bytes()
+        );
+    }
+    // (The realistic inline shape never grows at all: pinned by
+    // `test_presize_holds_a_full_batch_of_inline_rows_without_growing` and by
+    // the depth writer's regrow test. These rows are deliberately shorter.)
+    // The depth-200 shape does grow (counted on the drain), within the bound.
+    assert!(
+        fill_to_the_text_bound(200, None).ram_bytes() > DepthStagedBatch::presized().ram_bytes()
+    );
+}

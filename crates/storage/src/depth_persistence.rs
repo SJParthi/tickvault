@@ -4066,13 +4066,40 @@ impl DepthRescueSink {
     }
 }
 
-/// A spent staged batch bigger than this (it grew under a depth-200 burst)
-/// is dropped by the thread that spent it rather than returned to the drain,
-/// so a burst-sized reservation is not pinned for the session. Twice the
-/// pre-size.
+/// A spent staged batch bigger than this is dropped by the thread that spent
+/// it rather than returned to the drain.
+///
+/// ⚠ CHANGED 2026-11-06 (PF-4b review round 1): this was twice the
+/// pre-size, which a batch of depth-20 or depth-200 rows passes BELOW the
+/// 8 MiB flush trigger (the value arena is sized for inline five-level
+/// rows), so every such batch was dropped and every later hand-off reserved
+/// and pre-touched a fresh one on the drain. It is now the most a batch can
+/// grow to while holding at most `DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES` of
+/// text (the flush trigger plus one crossing frame, the bound the text
+/// buffer was sized to): every row costs at least
+/// [`crate::depth_stage::MIN_BOOK_LINE_BYTES`] of text and every value 8, and
+/// a `Vec` grown by doubling holds under twice what it needs. So a batch
+/// grown only up to the flush trigger is always recycled, and on a depth-on
+/// day each batch grows once and is then reused. About 29 MiB of address
+/// space per batch at the worst (rows at the shortest line), committed only
+/// as written; pinned by
+/// `test_a_batch_grown_to_the_flush_trigger_is_still_recycled`.
 pub const MAX_DEPTH_STAGED_SPARE_RAM_BYTES: usize = 2
-    * (crate::depth_stage::DEPTH_STAGED_ROWS_PRESIZE * crate::depth_stage::STAGED_BOOK_ROW_BYTES
-        + crate::depth_stage::DEPTH_STAGED_VALUES_PRESIZE * 8);
+    * (DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES / crate::depth_stage::MIN_BOOK_LINE_BYTES
+        * crate::depth_stage::STAGED_BOOK_ROW_BYTES
+        + DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES);
+
+const _: () = assert!(
+    MAX_DEPTH_STAGED_SPARE_RAM_BYTES
+        >= 2 * (crate::depth_stage::DEPTH_STAGED_ROWS_PRESIZE
+            * crate::depth_stage::STAGED_BOOK_ROW_BYTES
+            + crate::depth_stage::DEPTH_STAGED_VALUES_PRESIZE * 8),
+    "a pre-sized staged batch must always be recycled"
+);
+const _: () = assert!(
+    DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES > DEPTH_BOOK_FLUSH_BYTES,
+    "the recycle bound covers the flush trigger plus a crossing frame"
+);
 
 /// Clears a spent staged batch ON THE CALLING THREAD (the writer or rescue
 /// thread: its pins are dropped here) and offers it to the drain's spare
@@ -4501,8 +4528,14 @@ impl DepthWriterSink {
         let Some(spare_return) = self.spare_return.as_ref() else {
             return;
         };
-        if batch.buffer.capacity() == 0 {
-            // A book batch's empty buffer: nothing worth returning.
+        if batch.buffer.protocol_version() != DepthLayout::Levels.protocol()
+            || batch.buffer.capacity() == 0
+        {
+            // PF-4b review round 1: a BOOK writer never reads this lane (its
+            // batches are staged), so a text buffer a cold path grew
+            // (`materialize_staged`, the unsplit synchronous flush) and that
+            // rode a later batch here is dropped on THIS thread instead of
+            // sitting in the lane for the life of the process.
             return;
         }
         let protocol = batch.buffer.protocol_version();
@@ -6545,27 +6578,59 @@ mod tests {
         assert_eq!(w.buffer.capacity(), cap, "no regrowth below the pre-size");
         assert_eq!(w.buffer.as_bytes().as_ptr(), ptr, "no reallocation");
 
-        // Book: rows up to the byte cut (`book_flush_due`) never reallocate.
+        // Book (PF-4b, 2026-11-06): the drain STAGES rows, so the pre-size
+        // that matters is the staged batch's. Inline five-level rows up to
+        // the byte cut (`book_flush_due`) never reallocate it.
         let mut book = DepthWriter::for_test_book(Feed::Dhan);
-        let book_ptr = book.buffer.as_bytes().as_ptr();
-        let book_cap = book.buffer.capacity();
-        let (p, q, o) = book_levels(200);
+        let rows_ptr = book.staged.as_ptr_for_test();
+        let values_ptr = book.staged.values_ptr_for_test();
+        let caps = book.staged.capacities_for_test();
+        let (p, q, o) = book_levels(5);
         let mut seq = 1_i64;
         while !book.book_flush_due() {
-            book.append_book_row(&book_row(&p, &q, &o, seq))
+            book.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], seq))
                 .expect("append");
             seq += 1;
-            assert!(seq < 10_000, "8 MiB must arrive within a few thousand rows");
+            assert!(
+                seq < 100_000,
+                "8 MiB must arrive within tens of thousands of rows"
+            );
         }
         assert_eq!(
-            book.buffer.capacity(),
-            book_cap,
-            "book: no regrowth to the cut"
+            book.staged.capacities_for_test(),
+            caps,
+            "book: five-level rows never regrow the staged batch to the cut"
         );
+        assert_eq!(book.staged.as_ptr_for_test(), rows_ptr, "book: rows kept");
         assert_eq!(
-            book.buffer.as_bytes().as_ptr(),
-            book_ptr,
-            "book: no reallocation"
+            book.staged.values_ptr_for_test(),
+            values_ptr,
+            "book: values kept"
+        );
+        assert!(
+            book.buffer.as_bytes().is_empty(),
+            "book: the drain wrote no text"
+        );
+        // 200-level rows (depth-200 sockets, switched off today) DO grow the
+        // value arena before the cut (counted on `tv_depth_stage_grow_total`),
+        // and the grown batch is still small enough to be recycled.
+        let mut wide = DepthWriter::for_test_book(Feed::Dhan);
+        let caps = wide.staged.capacities_for_test();
+        let (p, q, o) = book_levels(200);
+        while !wide.book_flush_due() {
+            wide.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+            seq += 1;
+        }
+        assert!(
+            wide.staged.capacities_for_test().1 > caps.1,
+            "200-level rows grow the value arena"
+        );
+        assert!(
+            wide.staged.ram_bytes() <= MAX_DEPTH_STAGED_SPARE_RAM_BYTES,
+            "a batch grown only up to the flush trigger is still recycled: {} > {}",
+            wide.staged.ram_bytes(),
+            MAX_DEPTH_STAGED_SPARE_RAM_BYTES
         );
 
         // A hand-off that finds no spare waiting reserves the pre-size for the
@@ -8214,7 +8279,18 @@ mod tests {
             w.append_book_row(&book_row(&p, &q, &o, seq))
                 .expect("append");
         }
-        let payload = w.buffer.as_bytes().to_vec();
+        // PF-4b (2026-11-06): the drain stages book rows, so the payload is
+        // the staged rows written as text, exactly as a spill writes them.
+        let payload = w.pending_ilp_bytes();
+        assert!(
+            payload.len() > 3 * 200 * 8 * 3,
+            "the payload must hold the three 200-level rows ({} bytes)",
+            payload.len()
+        );
+        assert!(
+            payload.contains(&b'\n'),
+            "a v2 payload carries newline bytes"
+        );
         let version = spill_version_of(w.buffer.protocol_version());
         assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_2);
         assert_eq!(
@@ -8413,8 +8489,11 @@ mod tests {
 
         for packets in [1usize, 4, BOOK_CROSSING_PACKETS_MAX] {
             let mut wr = DepthWriter::for_test_book(Feed::Truedata);
-            let ptr = wr.buffer.as_bytes().as_ptr();
-            let cap = wr.buffer.capacity();
+            // PF-4b (2026-11-06): the drain stages book rows, so the pre-size
+            // that must hold the crossing frame is the STAGED batch's.
+            let rows_ptr = wr.staged.as_ptr_for_test();
+            let values_ptr = wr.staged.values_ptr_for_test();
+            let caps = wr.staged.capacities_for_test();
             // Fill to within one row of the cut, not yet due.
             while wr.pending_bytes() + w < DEPTH_BOOK_FLUSH_BYTES {
                 wr.append_book_row(&wide).expect("fill");
@@ -8427,12 +8506,22 @@ mod tests {
                 wr.book_flush_due(),
                 "packets={packets}: the frame crossed the cut"
             );
-            assert_eq!(wr.buffer.capacity(), cap, "packets={packets}: no regrowth");
             assert_eq!(
-                wr.buffer.as_bytes().as_ptr(),
-                ptr,
-                "packets={packets}: no reallocation"
+                wr.staged.capacities_for_test(),
+                caps,
+                "packets={packets}: no regrowth"
             );
+            assert_eq!(
+                wr.staged.as_ptr_for_test(),
+                rows_ptr,
+                "packets={packets}: rows not reallocated"
+            );
+            assert_eq!(
+                wr.staged.values_ptr_for_test(),
+                values_ptr,
+                "packets={packets}: values not reallocated"
+            );
+            assert!(wr.buffer.as_bytes().is_empty(), "the drain wrote no text");
         }
     }
 
@@ -8530,6 +8619,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PF-4b review round 1: the BOOK twin of the two tests above. A book
+    /// writer's hand-off installs a STAGED spare from `spare_staged`: one at
+    /// or above the staged pre-size is installed as is (same allocation,
+    /// never shrunk), one below it is grown to the pre-size, and an empty
+    /// lane reserves a fresh pre-sized batch. Its text buffer is never
+    /// reserved.
+    #[test]
+    fn test_book_hand_off_installs_a_staged_spare_at_the_presize_boundary() {
+        use crate::depth_stage::{
+            DEPTH_STAGED_ROWS_PRESIZE as ROWS, DEPTH_STAGED_VALUES_PRESIZE as VALUES,
+            DepthStagedBatch,
+        };
+        let (p, q, o) = book_levels(5);
+        // (spare rows, spare values, expect the same allocation back)
+        let cases: [(Option<(usize, usize)>, bool); 4] = [
+            (None, false),
+            (Some((ROWS / 2, VALUES / 2)), false),
+            (Some((ROWS, VALUES)), true),
+            (Some((ROWS * 2, VALUES * 2)), true),
+        ];
+        for (spare, kept) in cases {
+            let (mut w, _sink, _rx) = DepthWriter::for_test_book(Feed::Dhan).split_for_offload();
+            let mut spare_ptrs = None;
+            if let Some((rows, values)) = spare {
+                let batch = DepthStagedBatch::with_capacity_for_test(rows, values);
+                spare_ptrs = Some((batch.as_ptr_for_test(), batch.capacities_for_test()));
+                w.spare_staged_tx
+                    .as_ref()
+                    .expect("split opens the staged lane")
+                    .try_send(batch)
+                    .expect("lane has room");
+            }
+            let handed = w.staged.as_ptr_for_test();
+            w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+                .expect("append");
+            w.flush().expect("hand off");
+            let case = format!("spare {spare:?}");
+            assert!(w.staged.is_empty(), "{case}");
+            assert_ne!(w.staged.as_ptr_for_test(), handed, "{case}: a new batch");
+            let (rows, values) = w.staged.capacities_for_test();
+            assert!(
+                rows >= ROWS && values >= VALUES,
+                "{case}: at least the pre-size"
+            );
+            if let (Some((ptr, caps)), true) = (spare_ptrs, kept) {
+                assert_eq!(w.staged.as_ptr_for_test(), ptr, "{case}: kept");
+                assert_eq!(w.staged.capacities_for_test(), caps, "{case}: never shrunk");
+            }
+            assert_eq!(w.buffer.capacity(), 0, "{case}: no text buffer reserved");
+        }
+    }
+
+    /// PF-4b review round 1: a book writer's text buffer that a cold path
+    /// grew and that then rode an offloaded batch is dropped on the writer
+    /// thread, never parked in the buffer lane a book writer does not read;
+    /// the staged batch still comes back on its own lane.
+    #[test]
+    fn test_book_writer_thread_drops_a_grown_text_buffer_instead_of_parking_it() {
+        let dir = spill_tmp("pf4b-book-buffer-lane");
+        let (mut w, mut sink, rx) = DepthWriter::for_test_book(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        // What `materialize_staged` or the unsplit flush leaves behind: an
+        // empty text buffer with a large capacity.
+        w.buffer.reserve(1 << 20);
+        assert!(w.buffer.capacity() >= 1 << 20);
+        let (p, q, o) = book_levels(5);
+        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+            .expect("append");
+        w.flush().expect("hand off");
+        let mut batch = rx.try_recv().expect("handed off");
+        assert!(
+            batch.buffer.capacity() >= 1 << 20,
+            "the grown buffer rode the batch"
+        );
+        let _ = sink.write(&mut batch);
+        assert!(
+            w.spare_buffers
+                .as_ref()
+                .expect("split opens the lane")
+                .try_recv()
+                .is_err(),
+            "a book writer's text buffer must never wait in a lane nobody reads"
+        );
+        assert!(
+            w.spare_staged
+                .as_ref()
+                .expect("split opens the staged lane")
+                .try_recv()
+                .is_ok(),
+            "the staged batch is still recycled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
