@@ -333,6 +333,9 @@ pub mod off_worker;
 /// Our own ILP encoder and sender for the tick writer (plan ITEM DT).
 pub mod tick_ilp;
 pub mod tick_persistence;
+// Plan item PF-4 (2026-11-06): the tick writer's staged rows; the frame drain
+// stages typed rows and the writer and rescue threads write the ILP text.
+pub mod tick_stage;
 // Plan item M5 (2026-10-27, owner Quote 41): repeat quotes (no new trade) go
 // to `tick_quotes`, stamped at arrival; same tick writer and buffer.
 pub mod tick_quotes_persistence;

@@ -52,9 +52,11 @@ fn offload_write_body(source: &str, rescue_sig: &str) -> String {
     rest[..end].to_string()
 }
 
-fn assert_carries_bounded_retry(body: &str, who: &str, counter: &str) {
-    // Two flushes, not one — the retry itself.
-    let flushes = body.matches("sender.flush(&mut batch.buffer)").count();
+fn assert_carries_bounded_retry(body: &str, who: &str, counter: &str, flush: &str) {
+    // Two flushes, not one — the retry itself. `flush` is the sink's send
+    // call: the depth sink sends the batch's buffer; the tick sink, since
+    // PF-4 (2026-11-06), the text it wrote from the staged rows.
+    let flushes = body.matches(flush).count();
     assert_eq!(
         flushes, 2,
         "{who}: the offload sink must flush TWICE — one first attempt and one \
@@ -99,14 +101,24 @@ fn assert_carries_bounded_retry(body: &str, who: &str, counter: &str) {
 fn the_tick_offload_sink_carries_the_bounded_retry() {
     let source = include_str!("../src/tick_persistence.rs");
     let body = offload_write_body(source, "fn rescue(&mut self, batch: &mut FlushBatch");
-    assert_carries_bounded_retry(&body, "TickWriterSink", "tv_tick_flush_retries_total");
+    assert_carries_bounded_retry(
+        &body,
+        "TickWriterSink",
+        "tv_tick_flush_retries_total",
+        "sender.flush(&mut self.encode_buf)",
+    );
 }
 
 #[test]
 fn the_depth_offload_sink_carries_the_bounded_retry() {
     let source = include_str!("../src/depth_persistence.rs");
     let body = offload_write_body(source, "fn rescue(&mut self, batch: &mut DepthFlushBatch");
-    assert_carries_bounded_retry(&body, "DepthWriterSink", "tv_depth_flush_retries_total");
+    assert_carries_bounded_retry(
+        &body,
+        "DepthWriterSink",
+        "tv_depth_flush_retries_total",
+        "sender.flush(&mut batch.buffer)",
+    );
 }
 
 /// The offload path must remain the one production actually uses — otherwise

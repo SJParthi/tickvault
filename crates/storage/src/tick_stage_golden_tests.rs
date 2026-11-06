@@ -100,7 +100,7 @@ struct Golden {
 
 /// The batch's ILP text, exactly as the writer thread would send it.
 fn batch_bytes(batch: &FlushBatch) -> Vec<u8> {
-    batch.ilp_bytes().to_vec()
+    batch.encode_ilp_for_test(Feed::Dhan)
 }
 
 fn price(rng: &mut Rng) -> f32 {

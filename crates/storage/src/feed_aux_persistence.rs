@@ -313,14 +313,23 @@ impl AuxPacketRow {
 /// Appends one row to an ILP buffer (no flush). Symbols first, as ILP
 /// requires; `None` columns omitted (NULL).
 ///
-/// # Errors
-/// Propagates ILP buffer errors.
 /// Generic over [`IlpLine`] (plan ITEM DT, 2026-10-30), so the tick writer's
 /// library buffer and our own encoder write this row through one layout.
-pub(crate) fn append_aux_row<B: IlpLine>(
+///
+/// The contract-name table is passed in (plan item PF-4, 2026-11-06): the
+/// tick writer stages the row and another thread writes it later, with the
+/// table pinned when the drain accepted it, so its bytes are the ones the
+/// drain would have written then. Before PF-4 this read the global table
+/// itself (that form is kept for the tests in `tick_test_writers.rs`); the
+/// body is unchanged.
+///
+/// # Errors
+/// Propagates ILP buffer errors.
+pub(crate) fn append_aux_row_with_labels<B: IlpLine>(
     buffer: &mut B,
     feed: &str,
     row: &AuxPacketRow,
+    labels: &crate::candle_contract_labels::CandleContractLabels,
 ) -> Result<()> {
     buffer.table(FEED_AUX_PACKETS_TABLE).context("table")?;
     buffer
@@ -332,7 +341,6 @@ pub(crate) fn append_aux_row<B: IlpLine>(
     buffer
         .symbol("kind", sanitize_ilp_symbol(row.kind.as_str()).as_ref())
         .context("kind")?;
-    let labels = crate::candle_contract_labels::candle_contract_labels();
     if let Some(name) = labels.get(&(row.security_id, row.segment)) {
         buffer
             .symbol("contract", sanitize_ilp_symbol(name).as_ref())
@@ -563,7 +571,8 @@ mod tests {
 
     fn line(row: &AuxPacketRow) -> String {
         let mut buf = questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1);
-        append_aux_row(&mut buf, "dhan", row).expect("append");
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        append_aux_row_with_labels(&mut buf, "dhan", row, &labels).expect("append");
         String::from_utf8(buf.as_bytes().to_vec()).expect("utf8")
     }
 
