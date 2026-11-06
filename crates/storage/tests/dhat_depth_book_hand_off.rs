@@ -20,6 +20,14 @@
 //!
 //! Only the drain's calls are inside the window. Stall rows carry capture
 //! sequence 0 (no WAL record), so no hand-off takes a rescue floor.
+//!
+//! Both threads recycle into ONE spare lane, so an allocation count alone
+//! cannot tell a broken recycle on one path from a refill by the other
+//! (review round 2). Each cycle therefore also checks identity, outside the
+//! window: the hand-off installs the oldest waiting spare (same allocation),
+//! and after the writer's `write` or the rescue thread's `recycle` the batch
+//! that left the drain is back in the lane. A flush cycle and a rescue cycle
+//! are retried together, as one pair.
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -101,8 +109,46 @@ struct Lane {
 }
 
 impl Lane {
+    /// Before a hand-off: the batch about to leave and the spares waiting.
+    fn before_hand_off(&self) -> (usize, Vec<usize>) {
+        (
+            self.w.staged_allocation_for_test(),
+            self.w.spare_staged_allocations_for_test(),
+        )
+    }
+
+    /// After a hand-off: the drain took the OLDEST waiting spare (when one
+    /// waited), the same allocation, and the lane lost exactly that one.
+    fn check_hand_off(&self, spares: &[usize], what: &str) {
+        if let Some(&oldest) = spares.first() {
+            assert_eq!(
+                self.w.staged_allocation_for_test(),
+                oldest,
+                "{what}: the drain's next batch must be the recycled allocation"
+            );
+        }
+        assert_eq!(
+            self.w.spare_staged_allocations_for_test(),
+            spares.get(1..).unwrap_or(&[]),
+            "{what}: the hand-off took one spare"
+        );
+    }
+
+    /// After the writer or rescue thread finished: the batch that left the
+    /// drain is back in the lane, the same allocation, behind the others.
+    fn check_recycled(&self, spares: &[usize], out: usize, what: &str) {
+        let mut want = spares.get(1..).unwrap_or(&[]).to_vec();
+        want.push(out);
+        assert_eq!(
+            self.w.spare_staged_allocations_for_test(),
+            want,
+            "{what}: the spent batch must come back to the drain's spare lane"
+        );
+    }
+
     /// One flush cycle; returns the drain's allocation.
     fn flush_cycle(&mut self) -> (u64, u64) {
+        let (out, spares) = self.before_hand_off();
         let (w, i, seq) = (&mut self.w, &mut self.i, &mut self.seq);
         let got = measure(|| {
             for _ in 0..SIDES_PER_CYCLE {
@@ -113,17 +159,20 @@ impl Lane {
             w.flush().expect("hand off");
         });
         assert_eq!(self.w.pending(), 0, "the batch left the drain");
+        self.check_hand_off(&spares, "flush");
         let mut batch = self.rx.try_recv().expect("handed to the writer queue");
         assert_eq!(batch.rows(), SIDES_PER_CYCLE * 5, "every level was staged");
         // The writer thread: writes the text (rescued to the spill, no
         // QuestDB here) and recycles the batch.
         let _landed = self.sink.write(&mut batch);
+        self.check_recycled(&spares, out, "writer sink");
         got
     }
 
     /// One stall cycle through the rescue queue; returns the drain's
     /// allocation.
     fn rescue_cycle(&mut self) -> (u64, u64) {
+        let (out, spares) = self.before_hand_off();
         let (w, i) = (&mut self.w, &mut self.i);
         let got = measure(|| {
             for _ in 0..SIDES_PER_CYCLE {
@@ -132,19 +181,25 @@ impl Lane {
             }
             assert!(w.discard_pending() > 0, "handed to the rescue queue");
         });
+        self.check_hand_off(&spares, "rescue");
         let batch = self.rescue_rx.try_recv().expect("queued for rescue");
         assert_eq!(batch.rows(), SIDES_PER_CYCLE * 5);
         self.rescue_sink.rescue(&batch);
         self.rescue_sink.recycle(batch);
+        self.check_recycled(&spares, out, "rescue sink");
         got
     }
 }
 
-fn retried(lane: &mut Lane, cycle: fn(&mut Lane) -> (u64, u64)) -> (u64, u64) {
-    let mut got = (u64::MAX, u64::MAX);
+/// One flush cycle then one rescue cycle, retried as a PAIR: an attempt
+/// passes only when BOTH halves allocated nothing. (Retrying each half on
+/// its own let a broken recycle on one path pass: the other path's recycle
+/// refilled the shared lane during the retry.)
+fn retried_pair(lane: &mut Lane) -> ((u64, u64), (u64, u64)) {
+    let mut got = ((u64::MAX, u64::MAX), (u64::MAX, u64::MAX));
     for _ in 0..ATTEMPTS {
-        got = cycle(lane);
-        if got == (0, 0) {
+        got = (lane.flush_cycle(), lane.rescue_cycle());
+        if got == ((0, 0), (0, 0)) {
             break;
         }
     }
@@ -178,16 +233,15 @@ fn dhat_depth_book_hand_off_allocates_nothing_with_batches_recycled() {
             // measured cycle pins it on its first row.
             publish("BANKNIFTY-27Nov2026-51200-PE");
         }
-        let got = retried(&mut lane, Lane::flush_cycle);
+        let (flush, rescue) = retried_pair(&mut lane);
         assert_eq!(
-            got,
+            flush,
             (0, 0),
             "flush cycle {n}: the drain's book append and hand-off must allocate nothing \
              with a recycled batch waiting (bytes, blocks)"
         );
-        let got = retried(&mut lane, Lane::rescue_cycle);
         assert_eq!(
-            got,
+            rescue,
             (0, 0),
             "rescue cycle {n}: the drain's book append and rescue hand-off must allocate \
              nothing with a recycled batch waiting (bytes, blocks)"

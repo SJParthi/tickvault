@@ -2443,6 +2443,46 @@ impl DepthWriter {
         self.pending
     }
 
+    /// PF-4b review round 2: the allocation of the batch the drain is
+    /// staging into now, so the hand-off DHAT gate (an integration test) can
+    /// prove a recycled batch came back. O(1).
+    #[doc(hidden)]
+    #[must_use]
+    // TEST-EXEMPT: test seam read by `dhat_depth_book_hand_off`, which asserts on it every cycle.
+    pub fn staged_allocation_for_test(&self) -> usize {
+        self.staged.allocation_addr()
+    }
+
+    /// PF-4b review round 2: the allocations waiting in the staged spare
+    /// lane, oldest first. Takes each batch and sends it back in the same
+    /// order, so the lane is unchanged. Allocates; tests only, never on the
+    /// drain. O(spares).
+    #[doc(hidden)]
+    #[must_use]
+    // TEST-EXEMPT: test seam read by `dhat_depth_book_hand_off`, which asserts on it every cycle.
+    pub fn spare_staged_allocations_for_test(&self) -> Vec<usize> {
+        // O(1) EXEMPT: begin — a test seam; the DHAT gate calls it OUTSIDE its measured window, never the drain.
+        let (Some(spares), Some(back)) =
+            (self.spare_staged.as_ref(), self.spare_staged_tx.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut held = Vec::new();
+        while let Ok(batch) = spares.try_recv() {
+            held.push(batch);
+        }
+        let addrs = held
+            .iter()
+            .map(crate::depth_stage::DepthStagedBatch::allocation_addr)
+            .collect();
+        for batch in held {
+            // The lane was just emptied and holds as many as were taken.
+            let _returned = back.try_send(batch);
+        }
+        // O(1) EXEMPT: end
+        addrs
+    }
+
     /// Rows discarded on failed flushes over this writer's lifetime.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the discard tests below.
@@ -4493,6 +4533,13 @@ impl DepthWriterSink {
             // the empty buffer it arrived with.
             std::mem::swap(&mut batch.buffer, &mut self.scratch);
             self.scratch.clear();
+            // PF-4b review round 2: a batch past the pre-size (a burst of
+            // depth-200 rows) grew the scratch; keep it at most the pre-size
+            // so the burst's memory is freed here, on the writer thread, and
+            // the next book batch reserves the pre-size again.
+            if self.scratch.capacity() > DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES {
+                self.scratch = Buffer::new(DepthLayout::Book.protocol());
+            }
         }
         // The batch is DONE — landed or rescued — whatever the outcome. This
         // is what the replay confirm waits on, and the watermark file is

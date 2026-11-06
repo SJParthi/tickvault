@@ -810,3 +810,72 @@ fn test_park_bytes_is_the_text_length_plus_the_staged_capacity() {
         "text by length, staged rows by capacity"
     );
 }
+
+/// PF-4b review round 2: the writer thread's book scratch never stays above
+/// the pre-size. A batch whose text passes it grows the scratch for that one
+/// write; the scratch is then dropped, and the next book batch reserves the
+/// pre-size again.
+#[test]
+fn test_writer_sink_scratch_shrinks_back_after_a_batch_above_the_presize() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish_candle_contract_labels(CandleContractLabels::default());
+    let spill = temp_dir("scratch");
+    let (mut w, mut sink, rx) = DepthWriter::for_test_book(Feed::Dhan)
+        .with_spill_dir_for_test(spill.clone())
+        .with_wal_defer_check_for_test(|_, _, _| false)
+        .split_for_offload();
+    let values: Vec<f64> = (0..MAX_DEPTH_BOOK_LEVELS)
+        .map(|i| 100.0 + i as f64)
+        .collect();
+    let mut seq = 1_i64;
+    let mut append = |w: &mut DepthWriter, levels: usize| {
+        seq += 1;
+        w.append_book_row(&DepthBookRow {
+            security_id: 52_000,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_BID,
+            prices: &values[..levels],
+            quantities: &values[..levels],
+            orders: &values[..levels],
+            capture_seq: seq,
+            ts_nanos: SESSION_TS_NANOS,
+        })
+        .expect("append");
+    };
+    // A small batch: the scratch is reserved to the pre-size and kept.
+    append(&mut w, 5);
+    w.flush().expect("hand off");
+    let mut small = rx.try_recv().expect("small batch queued");
+    let _ = sink.write(&mut small);
+    assert!(
+        sink.scratch.capacity() >= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES,
+        "a normal batch keeps the reserved scratch"
+    );
+    // A burst: the batch's text passes the pre-size.
+    while w.staged.text_bytes() <= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES {
+        append(&mut w, MAX_DEPTH_BOOK_LEVELS);
+    }
+    w.flush().expect("hand off");
+    let mut burst = rx.try_recv().expect("burst batch queued");
+    let _ = sink.write(&mut burst);
+    assert!(
+        sink.scratch.capacity() <= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES,
+        "the burst-sized scratch must not be kept: capacity {}",
+        sink.scratch.capacity()
+    );
+    assert!(
+        burst.buffer.as_bytes().is_empty(),
+        "the batch keeps the empty buffer it arrived with"
+    );
+    // The next normal batch reserves the pre-size again.
+    append(&mut w, 5);
+    w.flush().expect("hand off");
+    let mut after = rx.try_recv().expect("next batch queued");
+    let _ = sink.write(&mut after);
+    assert!(sink.scratch.capacity() >= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES);
+    assert!(sink.scratch.capacity() <= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES * 2);
+    let _ = std::fs::remove_dir_all(&spill);
+}

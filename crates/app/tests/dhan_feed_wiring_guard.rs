@@ -488,3 +488,80 @@ fn no_drain_flush_site_bypasses_the_feed_health_report() {
          toward liveness while the feed is genuinely delivering."
     );
 }
+
+// ---------------------------------------------------------------------------
+// PF-4b review round 2 — the depth rescue thread recycles its staged batch
+// ---------------------------------------------------------------------------
+
+/// The `tv-depth-rescue` thread must hand every spent staged batch back to
+/// the drain's spare lane (`rescue_sink.recycle(batch)`), inside its receive
+/// loop and after the rescue itself.
+///
+/// Why a source scan: the writer and rescue threads share ONE spare lane, so
+/// with this call deleted the drain still finds spares (the writer's) on most
+/// hand-offs and no counter moves; a stall then reserves a fresh 6 MiB batch
+/// per rescue. The storage DHAT gate `dhat_depth_book_hand_off` drives the
+/// sink's `recycle` itself, so it cannot see whether THIS loop calls it.
+/// Paired behaviour test: `dhat_depth_book_hand_off_allocates_nothing_with_batches_recycled`
+/// (the recycled allocation is the one the drain takes next).
+///
+/// Order: the tick twin (`tv-tick-rescue`) reports `finished()` BEFORE it
+/// recycles, so a shutdown deadline never counts a rescued batch as
+/// abandoned (PF-4 review round 2). The depth loop has no `finished()`
+/// today; if one is added, the recycle must stay after it.
+#[test]
+fn depth_rescue_thread_recycles_each_batch_after_rescuing_it() {
+    const SPAWN: &str = ".name(\"tv-depth-rescue\".to_owned())";
+    const EXIT: &str = "info!(\"depth rescue thread exiting";
+    let start = STACK_SRC
+        .find(SPAWN)
+        .expect("the tv-depth-rescue thread must exist");
+    let rest = &STACK_SRC[start..];
+    let end = rest
+        .find(EXIT)
+        .expect("the tv-depth-rescue thread must log its exit after its loop");
+    // Comments stripped, so a commented-out call cannot satisfy the scan.
+    let body: String = rest[..end]
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let looped = body
+        .find("while let Ok(batch) = rescue_rx.recv() {")
+        .expect("the rescue thread must drain its queue in a receive loop");
+    let rescue = body
+        .find("rescue_sink.rescue(&batch);")
+        .expect("the rescue thread must rescue each batch");
+    let recycle = body.find("rescue_sink.recycle(batch);").expect(
+        "the tv-depth-rescue loop must call `rescue_sink.recycle(batch)`: without it a \
+         stall reserves a fresh staged batch on the drain for every rescue",
+    );
+    assert!(
+        looped < rescue && rescue < recycle,
+        "inside the receive loop, `rescue_sink.recycle(batch)` must follow \
+         `rescue_sink.rescue(&batch)` (the batch is spent only once rescued)"
+    );
+    if let Some(finished) = body.find(".finished()") {
+        assert!(
+            finished < recycle,
+            "the recycle must come after `finished()`, the order PF-4 settled on for the \
+             tick rescue thread"
+        );
+    }
+    assert_eq!(
+        body.matches("rescue_sink.recycle(").count(),
+        1,
+        "exactly one recycle per received batch"
+    );
+    // Only the receive loop's closing brace lies between the recycle and the
+    // exit log: the recycle is the loop's last statement, not after the loop.
+    let after = &body[recycle + "rescue_sink.recycle(batch);".len()..];
+    assert_eq!(
+        after.trim(),
+        "}",
+        "`rescue_sink.recycle(batch)` must be the last statement INSIDE the receive loop"
+    );
+}

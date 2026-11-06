@@ -467,6 +467,21 @@ fn test_a_batch_grown_to_the_flush_trigger_is_still_recycled() {
 // ---- Behaviour of the small batch accessors (pub-fn test guard, 2026-11-06) ----
 
 #[test]
+fn test_allocation_addr_is_the_rows_allocation_and_survives_a_move() {
+    let batch = DepthStagedBatch::presized();
+    let addr = batch.allocation_addr();
+    assert_eq!(addr, batch.as_ptr_for_test().addr());
+    let moved = batch;
+    assert_eq!(moved.allocation_addr(), addr, "a move keeps the allocation");
+    let other = DepthStagedBatch::presized();
+    assert_ne!(
+        other.allocation_addr(),
+        addr,
+        "two live batches are two allocations"
+    );
+}
+
+#[test]
 fn test_for_layout_presizes_a_book_batch_and_leaves_a_level_batch_empty() {
     let (rows, values) = DepthStagedBatch::for_layout(DepthLayout::Book).capacities_for_test();
     assert!(rows >= DEPTH_STAGED_ROWS_PRESIZE, "book rows {rows}");
