@@ -808,6 +808,56 @@ fn nightly_frees_disk_before_checkout_and_creates_its_issue_labels() {
     }
 }
 
+/// 2026-11-06 (PR CI, CI-1/CI-2): eight nights failed on "No space left on
+/// device" while linking test binaries with full debug info, the aarch64
+/// runner was shut down mid-compile, and each failure opened a NEW issue
+/// that never named the failing test.
+#[test]
+fn nightly_builds_without_debug_info_and_keeps_one_issue() {
+    let wf = read(".github/workflows/full-test-nightly.yml");
+    for var in [
+        "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+    ] {
+        assert_eq!(
+            wf.matches(var).count(),
+            2,
+            "both nightly jobs (x86 and aarch64) set {var}"
+        );
+    }
+    assert_eq!(
+        wf.matches("trap 'echo \"=== df -h after the build ===\"; df -h /' EXIT")
+            .count(),
+        2,
+        "both test steps print free disk after the build, even when it fails"
+    );
+    assert!(
+        !wf.contains("run: cargo check"),
+        "the duplicate check step is gone (cargo test builds the same targets)"
+    );
+    assert!(
+        wf.contains("grep -m 60 -E 'FAILED|panicked|error\\[|No space left'"),
+        "the issue body leads with the lines that name the failure"
+    );
+    let search = wf
+        .find("in:title \"nightly regression: full-workspace\"")
+        .expect("the x86 job looks for its open issue first");
+    let comment = wf
+        .find("gh issue comment \"$num\"")
+        .expect("an open issue is commented on");
+    let create = wf
+        .find("--title \"nightly regression: full-workspace tests failing\"")
+        .expect("one fixed title, no commit in it");
+    assert!(
+        search < comment && comment < create,
+        "search, then comment, then create only when none is open"
+    );
+    assert!(
+        !wf.contains("full-workspace test failed @"),
+        "no per-commit title: each night would open a new issue"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Stress audit 2026-10-09: RO-5/SEC-2 (action pins), OPS-2 (reset-failed),
 // RO-1 (no market-data deletion in a workflow).
