@@ -2354,7 +2354,7 @@ Revert the PR.
 - [x] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
   - Files: crates/storage/src/partition_archive.rs (one `mod` line), crates/storage/src/partition_archive/stub_integration_tests/tg_export_regressions_tests.rs (reuses the stub QuestDB + S3 harness)
   - Tests: `test_regression_tg3_export_429_keeps_every_partition_and_uploads_nothing` (429 body is a valid 3-row CSV; bite-checked: removing the `/exp` status check fails it), `test_regression_tg3_a_partition_kept_by_429_is_archived_once_exp_answers`, `test_regression_tg3_stalled_export_keeps_partition_and_pass_ends_within_bound`, `test_regression_tg3_trickling_export_keeps_partition_and_pass_ends_within_bound`
-  - Bound tested on main: per-run cap + one `/exp` per partition per pass + the export client timeout. The in-session time cap (`ArchivePassLimits`, PR DP #2196) is not on main and is not covered here.
+  - Bound tested here: per-run cap + one `/exp` per partition per pass + the export client timeout. The in-session time cap (`ArchivePassLimits`, PR DP #2196, merged after these tests were written) is covered by DP's own tests (`test_stub_with_pass_limits_skip_depth_cap_and_deadline`, `test_regression_deadline_only_pass_is_not_gated_on_wal_lag`, `test_pass_deadline_reached_boundaries`), not here.
 - [ ] TG-4 nightly contention test: production compose limits, one hour of depth, archiver export concurrent with ILP writes and /exec probes
 
 ### PR PF — 2026-11-06: per-tick in-memory path toward under 1 µs with live proof (storage, app, config)
