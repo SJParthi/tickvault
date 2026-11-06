@@ -2294,3 +2294,9 @@ Revert the PR.
 - [ ] TG-2 WAL catch-up against a stalling QuestDB (ack timeout, lag pause, clock run-out) (`chaos_catchup_slow_questdb.rs`)
 - [ ] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
 - [ ] TG-4 nightly contention test: production compose limits, one hour of depth, archiver export concurrent with ILP writes and /exec probes
+
+### PR PF — 2026-11-06: per-tick in-memory path toward under 1 µs with live proof (storage, app, config)
+**Approved by:** Parthiban, 2026-11-06 ("i need always less than one microsecodn across the entore codebase workspace woth a real tiem proof"; "go ahead fix everything dude approved"). Honest scope: in-memory per-tick steps only; network, disk and database steps cannot be under 1 µs.
+- [ ] PF-1 turn on `[tick_storage] own_ilp_encoder` in production config (byte-identical proof exists, bench p99 ~0.8 µs vs library 1.8–2.4 µs), with a one-session live read of `hot_path_latency_minute` per-tick figures before/after
+- [ ] PF-2 measure core placement (QuestDB cpuset 0 vs main runtime workers) with `tv_hot_thread_run_delay_ns_total` and decide; no change without numbers
+- [ ] PF-3 profile the drain's per-packet cost on the live shape (cold 25k-instrument maps) and cut the largest step
