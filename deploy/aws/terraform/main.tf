@@ -314,6 +314,13 @@ resource "aws_iam_role_policy" "tv_instance" {
         ]
       },
       {
+        # Plan PR MV (2026-11-06): the movers universe publisher writes ONE
+        # object (live-view-bucket.tf). PutObject on that key only.
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::tv-${var.environment}-live-view/movers/universe.json"
+      },
+      {
         # NSE-holiday self-stop: the boot-time holiday gate
         # (`tickvault holiday-gate`) stops THIS instance on a non-trading
         # day so the Mon-Fri start cron never bills a full no-op day.
