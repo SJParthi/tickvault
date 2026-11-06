@@ -1,6 +1,7 @@
 //! Authenticated filtered reader. At most one bounded cached filter result and
 //! one command in flight per Lambda container. Never filters a truncated page.
 use crate::operator_control::OpsShell;
+use crate::operator_movers_universe::{MAX_UNIVERSE_BYTES, MoversUniverse, select};
 use crate::operator_movers_wire::{BridgeError, MAX_WIRE_BYTES};
 use crate::operator_stock_movers_wire::{Filter, Reply};
 const CACHE_SECONDS: u64 = 20;
@@ -75,11 +76,73 @@ async fn bounded_capture<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
         Err(_) => Reply::error(BridgeError::Timeout, shell.now_epoch()),
     }
 }
+/// Bound on reading the published universe before falling back to the box.
+const PUBLISHED_READ_TIMEOUT_MILLIS: u64 = 2_000;
+
+/// Plan PR MV (2026-11-06): the reply from the published movers universe, or
+/// why it cannot be used. A chosen minute (`as_of`) always goes to the box.
+/// Cold path: one bounded GetObject, O(bytes) parse, O(n log n) select.
+pub(crate) async fn from_published<S: OpsShell>(
+    shell: &S,
+    filter: &Filter,
+) -> Result<Reply, &'static str> {
+    if filter.as_of.is_some() {
+        return Err("as_of");
+    }
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_millis(PUBLISHED_READ_TIMEOUT_MILLIS),
+        shell.movers_universe_object(),
+    )
+    .await
+    .map_err(|_| "timeout")?
+    .map_err(|_| "unavailable")?;
+    if bytes.len() > MAX_UNIVERSE_BYTES {
+        return Err("too_large");
+    }
+    let universe: MoversUniverse = serde_json::from_slice(&bytes).map_err(|_| "corrupt")?;
+    let now = shell.now_epoch();
+    universe
+        .usable_at(now)
+        .map_err(|refusal| refusal.as_str())?;
+    let reply = select(&universe, filter);
+    if !reply.valid_at(now, filter) {
+        return Err("reply_invalid");
+    }
+    Ok(reply)
+}
+
 /// Called only after existing operator authentication and filter validation.
+/// Answers from the published universe when it is usable (about 0.1-0.3 s),
+/// else through the box exactly as before. One log line per call names the
+/// source and the elapsed time.
 pub async fn read<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
     if !filter.valid() {
         return Reply::error(BridgeError::InvalidResponse, shell.now_epoch());
     }
+    let started = std::time::Instant::now();
+    let fallback = match from_published(shell, filter).await {
+        Ok(reply) => {
+            tracing::info!(
+                source = "s3",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "stock movers answered"
+            );
+            return reply;
+        }
+        Err(reason) => reason,
+    };
+    let reply = read_from_box(shell, filter).await;
+    tracing::info!(
+        source = "ssm",
+        fallback,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "stock movers answered"
+    );
+    reply
+}
+
+/// The SSM path, unchanged from before plan PR MV.
+async fn read_from_box<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
     let Some(cache) = shell.stock_movers_cache() else {
         return bounded_capture(shell, filter).await;
     };

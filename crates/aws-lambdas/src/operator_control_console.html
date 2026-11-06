@@ -788,15 +788,15 @@ function renderMovers(){
   $('movers-prev').disabled=s.filter.offset===0;$('movers-next').disabled=s.filter.offset+s.rows.length>=s.matching_total;
 }
 async function loadMovers(){
-  if(moversBusy||!TOKEN||document.hidden)return;const filter=moversFilter();moversReply=null;renderMovers();
+  if(moversBusy||!TOKEN||document.hidden)return;const filter=moversFilter();
   if(new TextEncoder().encode(filter.search).length>32||/[\x00-\x1f\x7f]/.test(filter.search)){moversReply={result:'error',code:'invalid_search'};renderMovers();return;}
   moversBusy=true;moversLastAttempt=performance.now();const generation=moversGeneration;$('movers-refresh').disabled=true;$('movers-status').textContent=moversMessage('loading');const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),25000);
   try{const j=await call('stock-movers',{filter},controller.signal);if(generation!==moversGeneration||!TOKEN)return;const r=j&&j.movers;
-    if(j&&j.ok===true&&r&&r.version===2&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&Number.isSafeInteger(r.valid_until_epoch_secs)&&r.valid_until_epoch_secs>j.observed_at_epoch_secs&&r.valid_until_epoch_secs<=r.captured_at_epoch_secs+60&&(r.result==='error'||r.result==='snapshot'&&sameMoversFilter(r.snapshot&&r.snapshot.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names))){moversReply=r;if(r.result==='snapshot')moversIndices(r.snapshot);}
+    if(j&&j.ok===true&&r&&r.version===2&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&Number.isSafeInteger(r.valid_until_epoch_secs)&&r.valid_until_epoch_secs>j.observed_at_epoch_secs&&r.valid_until_epoch_secs<=r.captured_at_epoch_secs+60&&(r.result==='error'||r.result==='snapshot'&&sameMoversFilter(r.snapshot&&r.snapshot.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names))){moversReply=r;if(r.result==='snapshot')moversIndices(r.snapshot);}else moversReply=null;
     moversObserved=j&&j.observed_at_epoch_secs||0;moversReceived=performance.now();moversRequestSeconds=Math.max(0,(moversReceived-moversLastAttempt)/1000);renderMovers();
   }catch(e){moversReply=null;renderMovers();}finally{clearTimeout(timeout);moversBusy=false;$('movers-refresh').disabled=false;if(generation!==moversGeneration&&TOKEN&&curTab==='movers')loadMovers();}
 }
-function changeMovers(offset=0){moversOffset=offset;moversGeneration++;moversReply=null;renderMovers();loadMovers();}
+function changeMovers(offset=0){moversOffset=offset;moversGeneration++;updateStockControls();loadMovers();}
 $('movers-tab').addEventListener('click',()=>tab('movers'));$('movers-refresh').addEventListener('click',loadMovers);
 $('movers-apply').addEventListener('click',()=>changeMovers());$('movers-search').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();changeMovers();}});$('movers-date').addEventListener('change',()=>changeMovers());$('movers-time').addEventListener('change',()=>changeMovers());
 $('movers-prev').addEventListener('click',()=>changeMovers(Math.max(0,moversOffset-20)));$('movers-next').addEventListener('click',()=>changeMovers(moversOffset+20));

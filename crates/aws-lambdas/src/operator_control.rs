@@ -1458,6 +1458,13 @@ pub trait OpsShell {
         )
         .await
     }
+    /// Plan PR MV (2026-11-06): the published movers universe object
+    /// (`s3://<LIVE_VIEW_BUCKET>/movers/universe.json`), at most
+    /// `MAX_UNIVERSE_BYTES`. `Err` on any failure; the caller then falls back
+    /// to the box. Test shells default to "absent".
+    async fn movers_universe_object(&self) -> Result<Vec<u8>, String> {
+        Err("absent".to_string())
+    }
     /// Per-container bounded read cache; test shells may opt out.
     fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
         None
@@ -2275,6 +2282,10 @@ pub struct AwsShell {
     stock_movers_cache: crate::operator_stock_movers::MoversCache,
     movers_cache: crate::operator_movers::MoversCache,
     ec2: aws_sdk_ec2::Client,
+    /// Plan PR MV: reads the published movers universe.
+    s3: aws_sdk_s3::Client,
+    /// `LIVE_VIEW_BUCKET` (terraform); empty = no published universe.
+    live_view_bucket: String,
     ssm: aws_sdk_ssm::Client,
     cloudwatch: aws_sdk_cloudwatch::Client,
     /// AWS Budgets (free) for the month-to-date cost, since 2026-10-22
@@ -2319,6 +2330,8 @@ impl AwsShell {
             .ok();
         Self {
             ec2: crate::clients::ec2(&config),
+            s3: crate::clients::s3(&config),
+            live_view_bucket: std::env::var("LIVE_VIEW_BUCKET").unwrap_or_default(),
             stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
             movers_cache: crate::operator_movers::MoversCache::default(),
             ssm: crate::clients::ssm(&config),
@@ -2405,6 +2418,31 @@ impl AwsShell {
 impl OpsShell for AwsShell {
     fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
         Some(&self.stock_movers_cache)
+    }
+    async fn movers_universe_object(&self) -> Result<Vec<u8>, String> {
+        if self.live_view_bucket.is_empty() {
+            return Err("no live-view bucket".to_string());
+        }
+        let out = self
+            .s3
+            .get_object()
+            .bucket(&self.live_view_bucket)
+            .key(crate::operator_movers_universe::MOVERS_UNIVERSE_OBJECT_KEY)
+            .send()
+            .await
+            .map_err(|err| aws_sdk_s3::error::DisplayErrorContext(&err).to_string())?;
+        if out.content_length().is_some_and(|n| {
+            n < 0 || n as u64 > crate::operator_movers_universe::MAX_UNIVERSE_BYTES as u64
+        }) {
+            return Err("too large".to_string());
+        }
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .map_err(|err| err.to_string())?
+            .into_bytes();
+        Ok(bytes.to_vec())
     }
     fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
         Some(&self.movers_cache)
@@ -3001,6 +3039,10 @@ mod tests {
         captured: std::sync::Mutex<Vec<Vec<String>>>,
         captured_sync: std::sync::Mutex<Vec<Vec<String>>>,
         auth_failures: AuthFailureGuard,
+        /// Plan PR MV: the published movers universe object.
+        published_universe: Result<Vec<u8>, String>,
+        /// Plan PR MV: how long reading it takes (paused-clock tests).
+        published_delay_ms: u64,
     }
 
     impl Default for MockShell {
@@ -3027,6 +3069,8 @@ mod tests {
                 captured: std::sync::Mutex::new(Vec::new()),
                 captured_sync: std::sync::Mutex::new(Vec::new()),
                 auth_failures: AuthFailureGuard::new(),
+                published_universe: Err("absent".to_string()),
+                published_delay_ms: 0,
             }
         }
     }
@@ -3046,6 +3090,12 @@ mod tests {
     impl OpsShell for MockShell {
         fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
             Some(&self.stock_movers_cache)
+        }
+        async fn movers_universe_object(&self) -> Result<Vec<u8>, String> {
+            if self.published_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.published_delay_ms)).await;
+            }
+            self.published_universe.clone()
         }
         fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
             Some(&self.movers_cache)
@@ -3315,6 +3365,149 @@ mod tests {
         );
         assert!(stopped.captured_sync.lock().unwrap().is_empty());
     }
+    // ------------------------------------------------ plan PR MV: S3 fast path
+    fn published_universe(observed: i64, market_open: bool) -> Vec<u8> {
+        use crate::operator_movers_universe::*;
+        let listed = ListedStock {
+            security_id: 2,
+            segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+            name: "STOCK002".into(),
+        };
+        serde_json::to_vec(&MoversUniverse {
+            format_version: UNIVERSE_FORMAT_VERSION,
+            trading_date_ist: ist_date_of_epoch(observed).unwrap(),
+            observed_at_epoch_secs: observed,
+            read_at_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS,
+            market_open,
+            window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
+            prices: UniversePrices::Rows {
+                rows: vec![PriceRow {
+                    security_id: 2,
+                    segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                    ltp: 110.0,
+                    prev_close: Some(100.0),
+                    volume: Some(10),
+                    ts_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS - 3,
+                }],
+            },
+            fno: Some(vec![listed.clone()]),
+            membership: Some(UniverseMembership {
+                names: vec![listed],
+                indices: vec!["Nifty 50".into()],
+                by_stock: vec![StockIndices {
+                    security_id: 2,
+                    segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                    indices: vec![0],
+                }],
+                partial: false,
+            }),
+        })
+        .unwrap()
+    }
+    fn box_shell(published: Result<Vec<u8>, String>) -> MockShell {
+        MockShell {
+            sync_output: serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                crate::operator_movers_wire::BridgeError::AppUnavailable,
+                MockShell::default().now,
+            ))
+            .unwrap(),
+            published_universe: published,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stock_movers_answer_from_a_fresh_published_universe_without_ssm() {
+        let now = MockShell::default().now;
+        for filter in [
+            json!({}),
+            json!({"fno_only":false,"sort_by":"name","sort_order":"asc"}),
+            json!({"fno_only":false,"index":"Nifty 50","direction":"gainers"}),
+        ] {
+            let shell = box_shell(Ok(published_universe(now - 3, true)));
+            let response = post(&shell, json!({"action":"stock-movers","filter":filter})).await;
+            let movers = &body_of(&response)["movers"];
+            assert_eq!(movers["result"], "snapshot", "{movers}");
+            assert_eq!(movers["captured_at_epoch_secs"], now - 3);
+            assert_eq!(movers["snapshot"]["rows"][0]["security_id"], 2);
+            assert!(
+                shell.captured_sync.lock().unwrap().is_empty(),
+                "no SSM round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_published_refuses_every_unusable_universe_and_the_box_answers() {
+        let now = MockShell::default().now;
+        let mut oversize = published_universe(now, true);
+        oversize.resize(
+            crate::operator_movers_universe::MAX_UNIVERSE_BYTES + 1,
+            b' ',
+        );
+        let cases: Vec<(&str, Result<Vec<u8>, String>, Value)> = vec![
+            ("unavailable", Err("NoSuchKey".into()), json!({})),
+            ("corrupt", Ok(b"{not json".to_vec()), json!({})),
+            ("too_large", Ok(oversize), json!({})),
+            ("stale", Ok(published_universe(now - 21, true)), json!({})),
+            (
+                "other_day",
+                Ok(published_universe(now - 86_400, false)),
+                json!({}),
+            ),
+            ("future", Ok(published_universe(now + 6, true)), json!({})),
+            (
+                "as_of",
+                Ok(published_universe(now, true)),
+                json!({"as_of":"2026-11-03T15:29"}),
+            ),
+        ];
+        for (reason, published, filter) in cases {
+            let shell = box_shell(published);
+            let parsed: crate::operator_stock_movers_wire::Filter =
+                serde_json::from_value(filter.clone()).unwrap();
+            assert_eq!(
+                crate::operator_stock_movers::from_published(&shell, &parsed).await,
+                Err(reason)
+            );
+            let response = post(&shell, json!({"action":"stock-movers","filter":filter})).await;
+            assert_eq!(
+                body_of(&response)["movers"]["code"],
+                "app_unavailable",
+                "{reason}: the box answered"
+            );
+            assert_eq!(shell.captured_sync.lock().unwrap().len(), 1, "{reason}");
+        }
+        // A closed-session universe stays usable for 300 s by its own bound,
+        // but the reply's 60 s capture bound still sends an older one to the box.
+        let shell = box_shell(Ok(published_universe(now - 120, false)));
+        assert_eq!(
+            crate::operator_stock_movers::from_published(
+                &shell,
+                &crate::operator_stock_movers_wire::Filter::default()
+            )
+            .await,
+            Err("reply_invalid")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_from_published_times_out_and_the_box_answers() {
+        let now = MockShell::default().now;
+        let shell = MockShell {
+            published_delay_ms: 2_500,
+            ..box_shell(Ok(published_universe(now, true)))
+        };
+        assert_eq!(
+            crate::operator_stock_movers::from_published(
+                &shell,
+                &crate::operator_stock_movers_wire::Filter::default()
+            )
+            .await,
+            Err("timeout")
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn filtered_movers_cache_is_keyed_and_shell_receives_hex_only() {
         use crate::operator_stock_movers_wire::{Filter, Reply};
@@ -3626,13 +3819,16 @@ mod tests {
         // after the close). Text only, no JavaScript change.
         // 2026-11-03: date and IST time inputs on Stocks → Price Movers; the
         // chosen minute goes out as the filter's `as_of` (rust-only lock §0.18).
+        // 2026-11-06 (plan PR MV): a movers refresh keeps the previous rows on
+        // screen under the loading status instead of blanking the table; a
+        // reply that fails the checks still clears it. Fewer script bytes.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "23e776dd428983649c095226bbbef2d38f7dc8c29934cf8060171e483984bea4"
+            "e0a24aba58d956263053397d6ebda91463925a1a76be9e6fd892a942de374e8c"
         );
-        assert_eq!(CONSOLE_HTML.len(), 85_508);
+        assert_eq!(CONSOLE_HTML.len(), 85_488);
     }
 
     // ------------------------------------------------ audit L4 source scans
