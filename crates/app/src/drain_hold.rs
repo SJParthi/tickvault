@@ -68,6 +68,17 @@ pub const DRAIN_HOLD_DONE_POLLS: u32 = 2;
 /// committing, so the backlog flickers between 0 and a handful rather than
 /// sitting at exactly 0 (Assumed; MEASURED live 12–350 during a session).
 pub const DRAIN_HOLD_IDLE_LAG: u64 = 10;
+/// How long skipped-depth buckets keep the hold while every after-close pass
+/// stops at its disk floor (PR DP-4, 2026-11-06). Measured on 5 Nov: the
+/// pass stopped ~700 times at the floor while the hold kept the box up to the
+/// 07:30 IST ceiling, paying for a night in which nothing could be written
+/// back. Past this cap the buckets stop holding the box (they stay marked,
+/// and their segments stay on disk, for the next evening).
+pub const DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS: u64 = 3_600;
+/// Gauge: skipped-depth buckets that are marked while the after-close pass
+/// is blocked by its disk floor (0 otherwise). Local `/metrics` only,
+/// registered at 0 when the supervisor starts.
+pub const FLOOR_BLOCKED_BUCKETS_GAUGE: &str = "tv_drain_hold_floor_blocked_buckets";
 /// Timeout for one SSM write.
 const DRAIN_HOLD_PUT_TIMEOUT: Duration = Duration::from_secs(10); // APPROVED: this IS the named constant
 
@@ -148,6 +159,9 @@ pub struct DayWork {
     /// The last after-close pass's buckets a rerun could still finish;
     /// `None` until a pass has finished in this process.
     pub deferred_retryable_left: Option<u64>,
+    /// Seconds every after-close pass has been stopping at its disk floor;
+    /// `None` when the last pass did not (PR DP-4).
+    pub deferred_floor_blocked_secs: Option<u64>,
     /// Non-empty files waiting in the tick, depth, top-volume and audit
     /// spill folders.
     pub spill_files: usize,
@@ -174,7 +188,8 @@ impl DayWork {
     #[must_use]
     pub fn is_done(&self) -> bool {
         let deferred_done = (self.deferred_marks == 0 && !self.deferred_overflowed)
-            || self.deferred_retryable_left == Some(0);
+            || self.deferred_retryable_left == Some(0)
+            || self.deferred_floor_blocked();
         deferred_done
             && self.spill_files == 0
             && self.seal_staged == Some(0)
@@ -184,16 +199,41 @@ impl DayWork {
             && !self.wal_holding
     }
 
+    /// Whether the skipped-depth buckets stop holding the box: every pass
+    /// has stopped at its disk floor for at least
+    /// [`DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS`] (PR DP-4). O(1).
+    #[must_use]
+    pub fn deferred_floor_blocked(&self) -> bool {
+        self.deferred_floor_blocked_secs
+            .is_some_and(|secs| secs >= DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS)
+    }
+
+    /// Marked buckets the disk floor is blocking right now (0 when no pass
+    /// is floor-blocked), for [`FLOOR_BLOCKED_BUCKETS_GAUGE`]. O(1).
+    #[must_use]
+    pub fn floor_blocked_buckets(&self) -> usize {
+        if self.deferred_floor_blocked_secs.is_some() {
+            self.deferred_marks
+        } else {
+            0
+        }
+    }
+
     /// A short, plain summary for the parameter and the log line.
     #[must_use]
     pub fn left_text(&self) -> String {
         let show = |v: Option<u64>| v.map_or_else(|| "unknown".to_string(), |v| v.to_string());
         format!(
-            "depth_buckets={}{} spill_files={} seal_files={} db_backlog={} suspended={}{} \
+            "depth_buckets={}{}{} spill_files={} seal_files={} db_backlog={} suspended={}{} \
              wal_segments={}{}",
             self.deferred_marks,
             if self.deferred_overflowed {
                 "+overflow"
+            } else {
+                ""
+            },
+            if self.deferred_floor_blocked_secs.is_some() {
+                "+floor_blocked"
             } else {
                 ""
             },
@@ -251,6 +291,15 @@ fn waiting_spill_files(dir: &Path) -> usize {
         .count()
 }
 
+/// Seconds the after-close pass has been floor-blocked at `now_unix`, from
+/// the start instant it published; `None` when it is not blocked. A clock
+/// behind the start reads as 0 seconds (still blocked, not yet capped).
+/// Pure, O(1).
+#[must_use]
+pub fn floor_blocked_secs(since_unix: Option<i64>, now_unix: i64) -> Option<u64> {
+    since_unix.map(|since| u64::try_from(now_unix.saturating_sub(since)).unwrap_or(0))
+}
+
 /// Measures the day's work. Blocking file I/O: run it off the async workers.
 #[must_use]
 // TEST-EXEMPT: reads the production spill folders and process globals; each part is unit-tested (waiting_spill_files, is_done, last_pass_retryable_left, wal_apply_lag_max).
@@ -279,6 +328,10 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
         deferred_overflowed: marks.overflowed,
         deferred_retryable_left:
             crate::dhan_feed_stack::deferred_depth_pass::last_pass_retryable_left(),
+        deferred_floor_blocked_secs: floor_blocked_secs(
+            crate::dhan_feed_stack::deferred_depth_pass::floor_blocked_since_unix(),
+            chrono::Utc::now().timestamp(),
+        ),
         spill_files,
         seal_staged,
         apply_lag: tickvault_common::ingest_shed::wal_apply_lag_max(),
@@ -406,6 +459,7 @@ impl HoldState {
 pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let param = drain_hold_param(&environment);
+        metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(0.0);
         let mut ssm: Option<aws_sdk_ssm::Client> = None;
         let mut state = HoldState::default();
         let mut progress = ProgressTracker::default();
@@ -517,6 +571,9 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 }
             }
             work.wal_holding = evening_step.holds();
+            #[allow(clippy::cast_precision_loss)] // APPROVED: a bucket count, far below 2^53
+            let floor_blocked = work.floor_blocked_buckets() as f64;
+            metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(floor_blocked);
             let pass_rows = crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total();
             let stalled = progress.observe(&work, pass_rows, now_unix);
             let done = work.is_done();
@@ -697,6 +754,51 @@ mod tests {
             suspended: Some(0),
             ..DayWork::default()
         }
+    }
+
+    // Regression: 2026-11-05 (PR DP-4) — the after-close pass stopped ~700
+    // times at its disk floor while the marked depth buckets held the box up
+    // to the 07:30 IST ceiling. Floor-blocked buckets hold for one hour, then
+    // stop holding.
+    #[test]
+    fn test_regression_dp4_floor_blocked_depth_buckets_hold_at_most_an_hour() {
+        let blocked = |secs: Option<u64>| DayWork {
+            deferred_marks: 40,
+            deferred_retryable_left: Some(40),
+            deferred_floor_blocked_secs: secs,
+            ..done_work()
+        };
+        assert!(!blocked(None).is_done(), "not floor-blocked: holds");
+        assert!(!blocked(Some(0)).is_done(), "just blocked: holds");
+        assert!(
+            !blocked(Some(DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS - 1)).is_done(),
+            "inside the hour: holds"
+        );
+        assert!(
+            blocked(Some(DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS)).is_done(),
+            "an hour blocked: released"
+        );
+        // Other work still holds the box on its own.
+        let with_spill = DayWork {
+            spill_files: 2,
+            ..blocked(Some(DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS))
+        };
+        assert!(!with_spill.is_done());
+        assert_eq!(blocked(Some(5)).floor_blocked_buckets(), 40);
+        assert_eq!(blocked(None).floor_blocked_buckets(), 0);
+        assert!(blocked(Some(5)).left_text().contains("+floor_blocked"));
+        assert!(!blocked(None).left_text().contains("+floor_blocked"));
+    }
+
+    #[test]
+    fn test_floor_blocked_secs_from_the_published_start() {
+        assert_eq!(floor_blocked_secs(None, 1_000), None);
+        assert_eq!(floor_blocked_secs(Some(400), 1_000), Some(600));
+        assert_eq!(
+            floor_blocked_secs(Some(2_000), 1_000),
+            Some(0),
+            "a clock behind the start reads 0"
+        );
     }
 
     #[test]
