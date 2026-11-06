@@ -1782,7 +1782,7 @@ mod tests {
 mod select_equivalence {
     use super::*;
     use proptest::prelude::*;
-    use tickvault_common::operator_stock_movers_wire::{Direction, SortColumn, SortOrder};
+    use tickvault_common::operator_stock_movers_wire::{Direction, Outcome, SortColumn, SortOrder};
 
     const INDEX_LABELS: [&str; 3] = ["Nifty 50", "Nifty Bank", "Nifty IT"];
 
@@ -1858,7 +1858,7 @@ mod select_equivalence {
             2 => f64::NAN,
             3 => f64::INFINITY,
             // Few distinct prices, so equal change % (tie-breaks) is common.
-            n => 90.0 + f64::from(n) * 2.5,
+            n => 97.5 + f64::from(n % 4) * 2.5,
         };
         let close = match close {
             0 => None,
@@ -1961,26 +1961,27 @@ mod select_equivalence {
         #![proptest_config(ProptestConfig::with_cases(512))]
         #[test]
         fn proptest_select_equals_the_per_filter_path(
-            clock_kind in 0u8..6,
+            clock_kind in 0u8..10,
             open in any::<bool>(),
-            read_kind in 0u8..5,
-            fno_mask in proptest::option::of(any::<u32>()),
-            mem_mask in proptest::option::of(any::<u32>()),
+            read_kind in 0u8..8,
+            fno_mask in proptest::option::weighted(0.9, any::<u32>()),
+            mem_mask in proptest::option::weighted(0.9, any::<u32>()),
             labels in 0u8..8,
             per_stock in proptest::collection::vec(any::<u8>(), 1..6),
             partial in any::<bool>(),
             name_kind in 0u8..3,
             rows in proptest::collection::vec(
-                (1u64..=26, 0u8..4, 0u8..12, 0u8..5, 0u8..4, -1_300i64..=10),
-                0..40,
+                (1u64..=26, 0u8..4, 0u8..16, 0u8..8, 0u8..4, -950i64..=10),
+                0..60,
             ),
-            failure_kind in 0u8..6,
+            failure_kind in 0u8..12,
+            allow_duplicates in 0u8..8,
             fno_only in any::<bool>(),
-            index in 0u8..5,
-            search in 0u8..5,
-            direction in 0u8..3,
-            offset in 0u8..2,
-            sort in proptest::option::of((0u8..6, any::<bool>())),
+            index in 0u8..10,
+            search in 0u8..10,
+            direction in 0u8..6,
+            offset in 0u8..4,
+            sort in proptest::option::weighted(0.4, (0u8..6, any::<bool>())),
         ) {
             let now = [
                 clock(8, 0, 0, 0),
@@ -1989,27 +1990,41 @@ mod select_equivalence {
                 clock(11, 15, 30, 700),
                 clock(15, 35, 0, 0),
                 clock(16, 0, 0, 0),
-            ][usize::from(clock_kind)];
+            ][usize::from(match clock_kind {
+                0..=2 => clock_kind,
+                3..=6 => 3,
+                7 | 8 => 4,
+                _ => 5,
+            })];
             let read_at = [
                 None,
                 Some(clock(9, 10, 0, 0)),
                 Some(clock(11, 0, 0, 0)),
                 Some(clock(15, 29, 0, 0)),
                 Some(clock(23, 59, 0, 0)),
-            ][usize::from(read_kind)];
+            ][usize::from(read_kind.saturating_sub(3))];
             let fno = fno_mask.map(|m| fno_list(m, name_kind));
             let membership = mem_mask.map(|m| memberships(m, labels, &per_stock, partial, name_kind));
             let base = read_at.map_or(now, |r| r.min(now));
+            // One row per (id, segment), as `LATEST ON` returns, except in one
+            // case in eight, which keeps duplicates (the refusal path).
+            let mut seen = std::collections::HashSet::new();
             let db: Vec<TickRow> = rows
                 .iter()
+                .filter(|(id, seg, ..)| allow_duplicates == 0 || seen.insert((*id, *seg == 0)))
                 .map(|(id, seg, ltp, close, vol, off)| tick_row(*id, *seg, *ltp, *close, *vol, *off, base))
                 .collect();
             let failure = match failure_kind {
-                4 => Some(QueryFailure::Unreachable),
-                5 => Some(QueryFailure::Refused),
+                10 => Some(QueryFailure::Unreachable),
+                11 => Some(QueryFailure::Refused),
                 _ => None,
             };
-            let filter = filter_from(fno_only, index, search, direction, offset, sort);
+            // Weighted toward the informative cases: no index and no search
+            // six times in ten, so most cases select priced rows.
+            let code = |kind: u8| kind.saturating_sub(5);
+            let direction = direction.saturating_sub(3);
+            let offset = u8::from(offset == 3);
+            let filter = filter_from(fno_only, code(index), code(search), direction, offset, sort);
             prop_assume!(filter.valid());
             let (new, old, universe) = both(now, open, read_at, fno.as_ref(), membership.as_ref(), &db, failure, &filter);
             prop_assert_eq!(&new, &old);
@@ -2067,6 +2082,31 @@ mod select_equivalence {
             let (new, old, _) = both(now, open, None, fno, membership, &db, None, &filter);
             assert_eq!(new, old, "{filter:?}");
         }
+        // Equal change % everywhere: the name breaks the tie, in both paths.
+        let tied: Vec<TickRow> = (1..=8)
+            .map(|id| tick_row(id, 1, 6, 4, 3, -5, now))
+            .collect();
+        let all = filter_from(false, 0, 0, 0, 0, None);
+        let (new, old, _) = both(
+            now,
+            true,
+            None,
+            Some(&fno),
+            Some(&membership),
+            &tied,
+            None,
+            &all,
+        );
+        assert_eq!(new, old);
+        let Outcome::Snapshot { snapshot } = &new.outcome else {
+            panic!("expected a snapshot, got {new:?}");
+        };
+        let names: Vec<&str> = snapshot
+            .rows
+            .iter()
+            .map(|r| r.price.name.as_str())
+            .collect();
+        assert_eq!(names.first(), Some(&"STOCK01"), "{names:?}");
         // Before 09:15 on a closed read: no query, closed for every filter.
         let early = clock(9, 10, 0, 0);
         let (new, old, universe) = both(
