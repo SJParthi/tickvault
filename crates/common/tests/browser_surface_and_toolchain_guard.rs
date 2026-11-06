@@ -1244,9 +1244,11 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // Requested Stocks reference view, 2026-11-02; measured scope in §0.17.
     // 34,530 → 34,714 on 2026-11-03: the movers date and time selection,
     // owner-requested in rust-only-forever-lock-2026-07-19.md §0.18.
+    // 34,714 → 34,627 on 2026-11-06 (plan PR MV review): the in-flight lock on
+    // the movers table cost bytes, a shared `$$` helper saved more.
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        34_714,
+        34_627,
     ),
 ];
 

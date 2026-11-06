@@ -321,6 +321,13 @@ resource "aws_iam_role_policy" "tv_instance" {
         Resource = "arn:aws:s3:::tv-${var.environment}-live-view/movers/universe.json"
       },
       {
+        # Plan PR MV review: the publisher builds only while a portal viewer
+        # is active; it reads the Lambda's heartbeat. GetObject on that key only.
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::tv-${var.environment}-live-view/movers/viewer.json"
+      },
+      {
         # NSE-holiday self-stop: the boot-time holiday gate
         # (`tickvault holiday-gate`) stops THIS instance on a non-trading
         # day so the Mon-Fri start cron never bills a full no-op day.

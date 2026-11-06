@@ -21,9 +21,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_EQ, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
 };
@@ -144,9 +144,9 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
     })
 }
 
-/// One current file cached by path and observed metadata, never yesterday's list.
-type MembershipCache = Option<(PathBuf, u64, SystemTime, Arc<Memberships>)>;
-static MEMBERSHIP_CACHE: Mutex<MembershipCache> = Mutex::new(None);
+/// The two most recent membership files by path and observed metadata
+/// (today's and one chosen other date), never a stale version of either.
+static MEMBERSHIP_CACHE: fno_stocks::FileCache<Memberships> = fno_stocks::FileCache::new();
 fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
     let path = dir.join(format!("{INDEX_MAPPING_PREFIX}{date}.json"));
     let mut file = std::fs::File::open(&path).ok()?;
@@ -155,15 +155,8 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
         return None;
     }
     let modified = metadata.modified().ok()?;
-    let mut cache = MEMBERSHIP_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((held, len, mtime, data)) = cache.as_ref()
-        && held == &path
-        && *len == metadata.len()
-        && *mtime == modified
-    {
-        return Some(Arc::clone(data));
+    if let Some(data) = MEMBERSHIP_CACHE.get(&path, metadata.len(), modified) {
+        return Some(data);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
@@ -171,7 +164,7 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
         .read_to_end(&mut bytes)
         .ok()?;
     let data = Arc::new(parse_memberships(&bytes, date)?);
-    *cache = Some((path, metadata.len(), modified, Arc::clone(&data)));
+    MEMBERSHIP_CACHE.put(&path, metadata.len(), modified, Arc::clone(&data));
     Some(data)
 }
 fn cache_current(deadline: i64, captured_open: bool, now: i64, current_open: bool) -> bool {
@@ -330,11 +323,20 @@ fn assemble_universe(
 async fn build_universe(inputs: FnoStocksInputs<'_>) -> MoversUniverse {
     let plan = plan_read(inputs.now_ist, inputs.market_open, inputs.read_at_ist);
     let date = plan.at.format("%Y-%m-%d").to_string();
-    let fno = fno_stocks::load_fno_underlyings(&fno_stocks::fno_underlying_artifact_path(
-        inputs.artifact_dir,
-        &date,
-    ));
-    let membership = load_memberships(inputs.artifact_dir, &date);
+    // File reads and JSON parsing are blocking work: on the blocking pool,
+    // never a runtime worker (plan PR MV review). A failed hand-off reads as
+    // both lists unavailable, which the reply reports as such.
+    let dir = inputs.artifact_dir.to_path_buf();
+    let (fno, membership) = tokio::task::spawn_blocking(move || {
+        (
+            fno_stocks::load_fno_underlyings(&fno_stocks::fno_underlying_artifact_path(
+                &dir, &date,
+            )),
+            load_memberships(&dir, &date),
+        )
+    })
+    .await
+    .unwrap_or((None, None));
     let ids = union_ids(fno.as_deref(), membership.as_deref());
     let fetched = match plan.window {
         None => Fetched::BeforeSession,
@@ -369,19 +371,96 @@ async fn build_universe(inputs: FnoStocksInputs<'_>) -> MoversUniverse {
     assemble_universe(&plan, fno.as_deref(), membership.as_deref(), fetched)
 }
 
-/// The live universe (now, today's lists) for the app's publisher, read with
-/// this API state's QuestDB client. Cold path: two small file reads (cached
-/// by metadata) and one bounded query.
+/// One clock reading: the session state and the IST time of the SAME instant
+/// (plan PR MV review: reading them separately could straddle 09:00 or
+/// 15:40 and build an "open" universe for a closed minute). O(1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveClock {
+    pub market_open: bool,
+    pub now_ist: chrono::NaiveDateTime,
+    /// UTC epoch seconds of the same instant.
+    pub now_epoch: i64,
+}
+
+impl LiveClock {
+    /// The clock at one UTC instant.
+    #[must_use]
+    pub fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
+        let now_epoch = now.timestamp();
+        Self {
+            market_open: tickvault_common::market_hours::is_trading_session_at(now_epoch),
+            now_ist: (now + chrono::Duration::seconds(IST_UTC_OFFSET_SECONDS_I64)).naive_utc(),
+            now_epoch,
+        }
+    }
+
+    /// The clock now (one `Utc::now()` read).
+    #[must_use]
+    pub fn now() -> Self {
+        Self::at(chrono::Utc::now())
+    }
+}
+
+/// What makes a stored-session (closed) live read the same read as an
+/// earlier one: its IST date and its window end. Two reads with the same key
+/// query the same rows, so the publisher may reuse the first one's price rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedReadKey {
+    pub date_ist: String,
+    pub window_end_ist_secs: i64,
+}
+
+/// The reuse key of a live read at this clock: `Some` only for a closed read
+/// that queries (after the day's 09:15), `None` for an open read (its window
+/// moves every second) or a read that queries nothing. O(1).
+#[must_use]
+pub fn closed_read_key(clock: LiveClock) -> Option<ClosedReadKey> {
+    let plan = plan_read(clock.now_ist, clock.market_open, None);
+    match plan.window {
+        Some((_, end, true)) if !plan.open => Some(ClosedReadKey {
+            date_ist: plan.at.format("%Y-%m-%d").to_string(),
+            window_end_ist_secs: end.and_utc().timestamp(),
+        }),
+        _ => None,
+    }
+}
+
+/// An earlier closed universe re-stamped as observed at this clock: the same
+/// price rows and lists, the observation and read instants of `clock`
+/// (exactly what a fresh build at `clock` with the same rows would carry).
+/// `None` unless `clock` is a closed read with the universe's key. O(n) copy.
+#[must_use]
+pub fn restamped(
+    universe: &MoversUniverse,
+    key: &ClosedReadKey,
+    clock: LiveClock,
+) -> Option<MoversUniverse> {
+    if closed_read_key(clock).as_ref() != Some(key)
+        || universe.market_open
+        || universe.trading_date_ist != key.date_ist
+    {
+        return None;
+    }
+    let plan = plan_read(clock.now_ist, clock.market_open, None);
+    let mut out = universe.clone();
+    out.observed_at_epoch_secs = plan.observed;
+    out.read_at_ist_secs = plan.at.and_utc().timestamp();
+    Some(out)
+}
+
+/// The live universe (today's lists, at `clock`) for the app's publisher,
+/// read with this API state's QuestDB client. Cold path: two small file reads
+/// (cached by metadata, on the blocking pool) and one bounded query.
 // TEST-EXEMPT: thin wrapper over build_universe (driven by every route test below); needs a live QuestDB
-pub async fn build_live_universe(state: &SharedAppState) -> MoversUniverse {
+pub async fn build_live_universe(state: &SharedAppState, clock: LiveClock) -> MoversUniverse {
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
     build_universe(FnoStocksInputs {
         client: state.questdb_http_client(),
         base_url: &base_url,
         artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
-        market_open: tickvault_common::market_hours::is_trading_session_now(),
-        now_ist: fno_stocks::now_ist_naive(),
+        market_open: clock.market_open,
+        now_ist: clock.now_ist,
         read_at_ist: None,
         timeout: QUERY_TIMEOUT,
     })
@@ -412,8 +491,9 @@ pub async fn get_stock_movers(
             }
         },
     };
-    let market_open = tickvault_common::market_hours::is_trading_session_now();
-    let now = chrono::Utc::now().timestamp();
+    let clock = LiveClock::now();
+    let market_open = clock.market_open;
+    let now = clock.now_epoch;
     let Ok(mut slot) = state.stock_movers_cache().slot.try_lock() else {
         return axum::Json(Reply::error(
             BridgeError::Busy,
@@ -440,7 +520,7 @@ pub async fn get_stock_movers(
                 base_url: &base_url,
                 artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
                 market_open,
-                now_ist: fno_stocks::now_ist_naive(),
+                now_ist: clock.now_ist,
                 read_at_ist,
                 timeout: QUERY_TIMEOUT,
             })
@@ -770,6 +850,8 @@ mod tests {
     use super::*;
     use fno_stocks::FnoStocksResponse;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
     use tickvault_common::operator_movers_universe::ACTUAL_VALUE_UNAVAILABLE;
     use tickvault_common::operator_movers_wire::{MAX_WIRE_BYTES, SourceStatus};
     use tickvault_common::operator_stock_movers_wire::{
@@ -1436,8 +1518,11 @@ mod tests {
         // No lists in the test working directory and no QuestDB: the build
         // still returns a well-formed universe (no query, no lists).
         let state = fno_stocks::tests::mock_state(1);
-        let universe = build_live_universe(&state).await;
+        let clock = LiveClock::now();
+        let universe = build_live_universe(&state, clock).await;
         assert!(universe.valid(), "{universe:?}");
+        assert_eq!(universe.market_open, clock.market_open);
+        assert_eq!(universe.observed_at_epoch_secs, clock.now_epoch);
         assert_eq!(
             universe.read_at_ist_secs - universe.observed_at_epoch_secs,
             19_800
@@ -1771,6 +1856,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------- plan PR MV review fixes
+    /// UTC instant of an IST wall time.
+    fn utc_of(ist_text: &str) -> chrono::DateTime<chrono::Utc> {
+        (at(ist_text) - chrono::Duration::seconds(IST_UTC_OFFSET_SECONDS_I64)).and_utc()
+    }
+
+    #[test]
+    fn test_universe_constants_equal_the_fno_stocks_constants() {
+        use tickvault_common::operator_movers_universe::UNIVERSE_LIVE_MAX_AGE_SECS;
+        assert_eq!(
+            UNIVERSE_LIVE_MAX_AGE_SECS,
+            fno_stocks::FNO_STOCKS_LIVE_MAX_AGE_SECS
+        );
+        assert_eq!(
+            UNIVERSE_DEFAULT_WINDOW_SECS,
+            fno_stocks::FNO_STOCKS_WINDOW_SECS
+        );
+    }
+
+    #[test]
+    fn test_live_clock_takes_session_state_and_time_from_one_instant() {
+        // Fri 2026-10-30 15:39:59 and 15:40:00 IST.
+        let before = LiveClock::at(utc_of("2026-10-30 15:39:59"));
+        let after = LiveClock::at(utc_of("2026-10-30 15:40:00"));
+        assert_eq!(before.now_ist, at("2026-10-30 15:39:59"));
+        assert_eq!(after.now_ist, at("2026-10-30 15:40:00"));
+        assert_eq!(after.now_epoch, utc_of("2026-10-30 15:40:00").timestamp());
+        assert!(!after.market_open, "15:40 is closed");
+        assert_eq!(
+            before.market_open,
+            tickvault_common::market_hours::is_trading_session_at(before.now_epoch)
+        );
+        // Saturday: never open.
+        assert!(!LiveClock::at(utc_of("2026-10-31 11:00:00")).market_open);
+        let now = LiveClock::now();
+        assert!((now.now_epoch - chrono::Utc::now().timestamp()).abs() <= 1);
+    }
+
+    fn clock(ist_text: &str, market_open: bool) -> LiveClock {
+        let at_utc = utc_of(ist_text);
+        LiveClock {
+            market_open,
+            now_ist: at(ist_text),
+            now_epoch: at_utc.timestamp(),
+        }
+    }
+
+    #[test]
+    fn test_closed_read_key_names_the_date_and_window_end_of_a_closed_read_only() {
+        assert_eq!(closed_read_key(clock("2026-10-30 11:00:00", true)), None);
+        assert_eq!(
+            closed_read_key(clock("2026-10-30 09:10:00", false)),
+            None,
+            "before 09:15 nothing is queried"
+        );
+        let evening = closed_read_key(clock("2026-10-30 16:05:00", false)).unwrap();
+        assert_eq!(evening.date_ist, DATE);
+        assert_eq!(
+            evening.window_end_ist_secs,
+            at("2026-10-30 15:40:00").and_utc().timestamp()
+        );
+        assert_eq!(
+            closed_read_key(clock("2026-10-30 22:30:00", false)),
+            Some(evening.clone()),
+            "the same read all evening"
+        );
+        assert_ne!(
+            closed_read_key(clock("2026-10-31 16:05:00", false)),
+            Some(evening),
+            "a new date is a new read"
+        );
+        // A closed day inside the session hours: the window end moves.
+        assert_ne!(
+            closed_read_key(clock("2026-10-31 11:00:00", false)),
+            closed_read_key(clock("2026-10-31 11:00:05", false))
+        );
+    }
+
+    #[test]
+    fn test_restamped_moves_only_the_observation_and_only_for_the_same_closed_read() {
+        let first = clock("2026-10-30 16:05:00", false);
+        let key = closed_read_key(first).unwrap();
+        let plan = plan_read(first.now_ist, false, None);
+        let fetched = Fetched::Rows(vec![TickRow {
+            security_id: 2,
+            segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+            ltp: 110.0,
+            close: Some(100.0),
+            volume: Some(5),
+            avg_price: None,
+            ts: at("2026-10-30 15:29:00"),
+        }]);
+        let built = assemble_universe(&plan, None, None, fetched);
+        let later = clock("2026-10-30 18:00:00", false);
+        let again = restamped(&built, &key, later).unwrap();
+        let fresh_plan = plan_read(later.now_ist, false, None);
+        assert_eq!(again.observed_at_epoch_secs, fresh_plan.observed);
+        assert_eq!(again.observed_at_epoch_secs, later.now_epoch);
+        assert_eq!(
+            again.read_at_ist_secs,
+            at("2026-10-30 18:00:00").and_utc().timestamp()
+        );
+        let mut expected = built.clone();
+        expected.observed_at_epoch_secs = again.observed_at_epoch_secs;
+        expected.read_at_ist_secs = again.read_at_ist_secs;
+        assert_eq!(again, expected, "rows, lists and window unchanged");
+        assert!(again.valid());
+        assert!(restamped(&built, &key, clock("2026-10-31 16:05:00", false)).is_none());
+        assert!(restamped(&built, &key, clock("2026-10-30 16:05:00", true)).is_none());
+        let mut open = built.clone();
+        open.market_open = true;
+        assert!(restamped(&open, &key, later).is_none());
+    }
+
+    #[test]
+    fn test_file_cache_keeps_today_and_one_other_date() {
+        let cache: fno_stocks::FileCache<u32> = fno_stocks::FileCache::new();
+        let t = SystemTime::UNIX_EPOCH;
+        let today = Path::new("/x/today.json");
+        let other = Path::new("/x/other.json");
+        let third = Path::new("/x/third.json");
+        assert!(cache.get(today, 1, t).is_none());
+        cache.put(today, 1, t, Arc::new(1));
+        cache.put(other, 1, t, Arc::new(2));
+        assert_eq!(
+            cache.get(today, 1, t).as_deref(),
+            Some(&1),
+            "today survives"
+        );
+        assert_eq!(cache.get(other, 1, t).as_deref(), Some(&2));
+        assert!(cache.get(today, 2, t).is_none(), "a changed file is a miss");
+        cache.put(today, 2, t, Arc::new(3));
+        assert_eq!(cache.get(today, 2, t).as_deref(), Some(&3));
+        assert_eq!(cache.get(other, 1, t).as_deref(), Some(&2));
+        // A third path evicts the least recently used one (today, here).
+        cache.put(third, 1, t, Arc::new(4));
+        assert!(cache.get(today, 2, t).is_none());
+        assert_eq!(cache.get(other, 1, t).as_deref(), Some(&2));
+        assert_eq!(cache.get(third, 1, t).as_deref(), Some(&4));
     }
 }
 
