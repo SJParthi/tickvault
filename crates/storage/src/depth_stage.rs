@@ -249,6 +249,14 @@ impl DepthStagedBatch {
             .saturating_add(self.values.capacity().saturating_mul(8))
     }
 
+    /// Address of the rows allocation: the batch's identity for the recycle
+    /// checks (a moved batch keeps it). Public because the DHAT gate is an
+    /// integration test and cannot see `#[cfg(test)]` items. O(1).
+    #[must_use]
+    pub fn allocation_addr(&self) -> usize {
+        self.rows.as_ptr().addr()
+    }
+
     /// Levels of rows an encode refused and already counted.
     #[must_use]
     pub(crate) fn refused_levels(&self) -> usize {
