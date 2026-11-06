@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_judged_cadence_floors_only_nse_fno() {
+    fn test_judged_cadence_millis_floors_only_nse_fno() {
         let live = DetectorConfig::live_lane();
         assert_eq!(
             live.judged_cadence_millis(ExchangeSegment::NseFno, 25_000),

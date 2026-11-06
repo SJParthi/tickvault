@@ -1234,6 +1234,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ensure_feed_scoreboard_tables_with_counts_zero_on_2xx_and_every_statement_on_5xx()
+    {
+        // Plan PR AL-2: the caller decides "ensured" from this count, so a
+        // 2xx run must read 0 and a refused run every one of the 6 statements
+        // (in both reporting modes).
+        let ok_port = spawn_mock_http(MOCK_HTTP_200).await;
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&mock_cfg(ok_port), 1, false).await,
+            0
+        );
+        let bad_port = spawn_mock_http(MOCK_HTTP_500).await;
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&mock_cfg(bad_port), 1, false).await,
+            6
+        );
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&mock_cfg(bad_port), 1, true).await,
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_ensure_statements_returns_the_failed_count() {
+        let statements = ["A;".to_string(), "B;".to_string()];
+        // Unreachable: every statement fails (one attempt each once QuestDB
+        // reads as down).
+        assert_eq!(
+            run_ensure_statements(&unreachable_cfg(), &statements, 2, "test", false).await,
+            2
+        );
+        // 2xx: nothing failed.
+        let port = spawn_mock_http(MOCK_HTTP_200).await;
+        assert_eq!(
+            run_ensure_statements(&mock_cfg(port), &statements, 2, "test", true).await,
+            0
+        );
+        // No statements: nothing to fail.
+        assert_eq!(
+            run_ensure_statements(&unreachable_cfg(), &[], 2, "test", true).await,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn test_ensure_feed_scoreboard_tables_unreachable_degrades_without_panic() {
         // Transport-error path: every DDL send Err arm logs and continues.
         assert_eq!(

@@ -591,6 +591,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ensure_feed_episode_audit_table_with_counts_zero_on_2xx_and_every_statement_on_5xx()
+     {
+        // Plan PR AL-2: the caller decides "ensured" from this count.
+        let ok_port = spawn_mock_http(MOCK_HTTP_200).await;
+        assert_eq!(
+            ensure_feed_episode_audit_table_with(&mock_cfg(ok_port), 1, true).await,
+            0
+        );
+        let bad_port = spawn_mock_http(MOCK_HTTP_500).await;
+        assert_eq!(
+            ensure_feed_episode_audit_table_with(&mock_cfg(bad_port), 1, false).await,
+            3
+        );
+    }
+
+    #[tokio::test]
     async fn test_ensure_feed_episode_audit_table_unreachable_degrades_without_panic() {
         // Transport-error path: every DDL send Err arm logs and continues.
         assert_eq!(

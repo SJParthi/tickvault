@@ -949,6 +949,30 @@ mod tests {
     }
 
     #[test]
+    fn test_register_rollup_attempt_counters_seeds_every_outcome_at_zero() {
+        // Under a local Prometheus recorder: all three `outcome` series exist
+        // at 0 right after registration (so the first real attempt is a change
+        // from a known zero), and a noted attempt moves only its own series.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, register_rollup_attempt_counters);
+        let seeded = handle.render();
+        for outcome in ALL_ROLLUP_OUTCOMES {
+            let line = format!(
+                "{ROLLUP_ATTEMPTS_COUNTER}{{outcome=\"{}\"}} 0",
+                outcome.label()
+            );
+            assert!(seeded.contains(&line), "missing `{line}` in:\n{seeded}");
+        }
+        metrics::with_local_recorder(&recorder, || {
+            note_rollup_attempt(RollupAttemptOutcome::Retry);
+        });
+        let after = handle.render();
+        assert!(after.contains(&format!("{ROLLUP_ATTEMPTS_COUNTER}{{outcome=\"retry\"}} 1")));
+        assert!(after.contains(&format!("{ROLLUP_ATTEMPTS_COUNTER}{{outcome=\"ok\"}} 0")));
+    }
+
+    #[test]
     fn test_now_secs_of_day_ist_is_inside_one_day() {
         assert!(now_secs_of_day_ist() < 86_400);
     }

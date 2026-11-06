@@ -118,7 +118,7 @@ pub type IsoWeekKey = (i32, u32);
 
 /// The ISO week `day` falls in (weeks start on Monday). O(1), pure.
 #[must_use]
-pub fn iso_week_of(day: NaiveDate) -> IsoWeekKey {
+fn iso_week_of(day: NaiveDate) -> IsoWeekKey {
     let week = day.iso_week();
     (week.year(), week.week())
 }
@@ -148,7 +148,7 @@ pub fn should_page_now(
 /// The ISO week last paged, or `None` when the file is missing, unreadable
 /// or not exactly one valid line. Cold, one small read.
 #[must_use]
-pub fn read_last_paged_week(path: &Path) -> Option<IsoWeekKey> {
+fn read_last_paged_week(path: &Path) -> Option<IsoWeekKey> {
     // Only a regular file is read: a FIFO or device at this path could
     // block the read forever (review 2026-11-06; the caller also bounds it
     // with WEEK_READ_TIMEOUT_SECS).
@@ -171,7 +171,7 @@ pub fn read_last_paged_week(path: &Path) -> Option<IsoWeekKey> {
 ///
 /// # Errors
 /// Any I/O error creating the folder or writing, syncing or renaming the file.
-pub fn write_last_paged_week(path: &Path, week: IsoWeekKey) -> std::io::Result<()> {
+fn write_last_paged_week(path: &Path, week: IsoWeekKey) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");

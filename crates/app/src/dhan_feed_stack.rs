@@ -11410,7 +11410,7 @@ pub fn record_ws_lag_not_a_trade_excluded() {
 /// Counts a folded packet that carried no NEW trade (plan PR AL-1,
 /// 2026-11-06) as excluded from the delivery-lag measurement, under reason
 /// `not_new_trade`. One relaxed atomic add; no allocation.
-pub fn record_ws_lag_not_new_trade_excluded() {
+fn record_ws_lag_not_new_trade_excluded() {
     ws_lag_handles().excluded_not_new_trade.increment(1);
 }
 
