@@ -112,9 +112,20 @@ order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 # multiplied by BENCH_BUDGET_MULTIPLIER (2.5), so the CI ceiling is 2.5 us
 # per tick for the median AND for the feed_drain p99 tail gate (was 6.25 us);
 # the 5% regression arm is what holds the CI median near 769 ns. The same key
-# also gates feed_drain/main_feed_frame_4_full (Full packets, every price
-# field set, inline depth book rows), added the same day.
-feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes and feed_drain/main_feed_frame_4_full
+# also gated feed_drain/main_feed_frame_4_full (Full packets, every price
+# field set, inline depth book rows), added the same day, until 2026-11-06.
+# 2026-11-06 (owner card "Honest 2.5 µs for now (Recommended)": Full-packet
+# frames get their own measured 2.5 us key; Quote frames keep 1 us; lower it
+# as the code improves): the Full frames failed the 1 us key every night at
+# 1.5-4.6 us per tick depending on the runner CPU (the 1 us figure was set
+# from Quote frames). The Full benches are renamed
+# feed_drain/main_feed_full_frame_4 and feed_drain/main_feed_full_frame_4_own
+# so feed_drain_main_feed_full matches them by substring; it sits ABOVE
+# feed_drain_main_feed because bench-gate.sh takes the FIRST matching key in
+# file order, and feed_drain_main_feed also matches those names. The Full p99
+# tail gate in the bench reads the same key.
+feed_drain_main_feed_full = 2500        # <2.5us per tick — matches feed_drain/main_feed_full_frame_4 and feed_drain/main_feed_full_frame_4_own (Full packets, both encoders)
+feed_drain_main_feed     = 1000         # <1us per tick — matches feed_drain/main_feed_frame_4_quotes
 feed_drain_depth         = 1000         # <1us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet. Was 1500 until 2026-10-30 (plan ITEM DT, depth row stage): pre-checked ILP names on every depth row took the x86 dev container from 531 to 366 ns per level (depth-20 frame, 42.5 to 29.3 us per 80 levels) and from 638 to 437 ns per level (depth-200 packet, 127.6 to 87.5 us per 200 levels), byte-identical rows.
 candles_consume_tick     = 1000         # <1us per tick — the per-tick candle fold over every timeframe (plan ITEM DT, 2026-10-30). Matches candles/consume_tick_hit_20k, candles/consume_tick_hit_500 (500-tick batches, divided below) and candles/consume_tick_live_mix_2k (one tick per element); the bench also holds the live-mix p99 to this key. Measured on the x86 dev container: see the PR that added it (plan ITEM DT-FOLD) for the hit and live-mix figures.
 tick_row_append          = 1000         # <1us per row — matches tick_row_append/full_row, tick_row_append/quote_row and tick_row_append/tick_quotes_row (plan ITEM DT row stage, 2026-10-30). Measured on the x86 dev container 0.84-1.06 us per row; about 90% of it is the questdb-rs buffer encoding (float text, name escaping), which its public API cannot bypass. 2026-10-30 (DT-OWN-ILP): also matches tick_row_append/own_{full,quote,tick_quotes}_row (our own encoder, `[tick_storage] own_ilp_encoder`), and the bench holds those three to this key at p99 per row. Measured 2026-10-30 on the x86 dev container (busier than the row-stage run: main's own rows read 1.17-1.36 us there): ours 0.65-0.77 us per row median, per-call p50 0.57-0.66 us, p99 0.86-1.19 us across three runs.
@@ -178,8 +189,8 @@ depth_row_append         = 1000         # <1us per row — matches depth_row_app
 pipeline_batch_100_mixed  = 100   # 100 mixed packets per iter
 pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
 feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PROOF-9)
-feed_drain_main_feed_frame_4_full   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29)
-feed_drain_main_feed_frame_4_full_own = 4  # identical four-Full frame, existing Own tick encoder comparison
+feed_drain_main_feed_full_frame_4   = 4    # 4 Full packets per frame (ITEM DT step 0, 2026-10-29; renamed from main_feed_frame_4_full 2026-11-06)
+feed_drain_main_feed_full_frame_4_own = 4  # identical four-Full frame, existing Own tick encoder comparison
 feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
 feed_drain_depth200_packet          = 200  # 200 levels per packet
 backup_dedup_admit_tick_pair        = 2    # two packets per iter: the first copy and its byte-identical second copy (plan ITEM DT, 2026-10-30)

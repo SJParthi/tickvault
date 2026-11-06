@@ -177,11 +177,35 @@ fn test_full_frame_amortized_budget_pass_does_not_mean_strict_frame_pass() {
     assert!(amortized.within);
 }
 
+/// 2026-11-06 (owner card "Honest 2.5 µs for now (Recommended)"): the Full
+/// tail gate reads the Full key and the Quote tail gate keeps the Quote key.
+#[test]
+fn test_full_and_quote_tail_gates_read_their_own_budget_keys() {
+    let bench = include_str!("../benches/feed_drain.rs");
+    let full = bench
+        .split_once("fn full_feed_drain_tail_gates()")
+        .expect("Full-frame tails")
+        .1
+        .split_once("let frames")
+        .expect("budget read precedes the frame pool")
+        .0;
+    assert!(full.contains("drain_tail_gate::MAIN_FEED_FULL_DRAIN_BUDGET_KEY"));
+    let quote = bench
+        .split_once("fn main_feed_drain_tail_gate()")
+        .expect("Quote tail")
+        .1
+        .split_once("let frames")
+        .expect("budget read precedes the frame pool")
+        .0;
+    assert!(quote.contains("drain_tail_gate::MAIN_FEED_DRAIN_BUDGET_KEY"));
+    assert!(!quote.contains("MAIN_FEED_FULL_DRAIN_BUDGET_KEY"));
+}
+
 #[test]
 fn test_full_frame_comparison_keeps_both_encoder_call_sites_and_default() {
     let bench = include_str!("../benches/feed_drain.rs");
     let library = bench
-        .split_once("c.bench_function(\"feed_drain/main_feed_frame_4_full\"")
+        .split_once("c.bench_function(\"feed_drain/main_feed_full_frame_4\"")
         .expect("original Library benchmark")
         .1
         .split_once("c.bench_function(")
@@ -189,7 +213,7 @@ fn test_full_frame_comparison_keeps_both_encoder_call_sites_and_default() {
         .0;
     assert!(library.contains("full_ingest(TickIlpEncoder::Library)"));
     let own = bench
-        .split_once("c.bench_function(\"feed_drain/main_feed_frame_4_full_own\"")
+        .split_once("c.bench_function(\"feed_drain/main_feed_full_frame_4_own\"")
         .expect("Own comparison")
         .1
         .split_once("let depth20_frames")
