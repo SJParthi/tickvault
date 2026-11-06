@@ -80,7 +80,8 @@
 //!
 //! ## Cost
 //!
-//! 7 rows a minute, ~3,400 rows a day at the box's ~8 hours. QuestDB only;
+//! 8 rows a minute (one per stage, `ALL_STAGES`), ~3,900 rows a day at the
+//! box's ~8 hours. QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,6 +160,19 @@ pub const HOT_PATH_LATENCY_MINUTE_COLUMNS: &[(&str, &str)] = &[
     ("strict_samples_at_or_above_1000ns", "LONG"),
 ];
 
+/// Whether `samples_over_1024ns` means anything for `stage` (PR DP-6). The
+/// two runtime-lag stages time a 100 ms sleep, ring dwell is a frame waiting
+/// in a queue, and receipt-to-fold spans three steps: each is above 1,024 ns
+/// by construction, so the count was every sample (100%) and read as a
+/// failure. Those write NULL. Pure, O(1).
+#[must_use]
+pub const fn over_1024ns_is_meaningful(stage: Stage) -> bool {
+    !matches!(
+        stage,
+        Stage::MainRuntimeLag | Stage::ReaderRuntimeLag | Stage::RingDwell | Stage::ReceiptToFold
+    )
+}
+
 /// One stage's minute. `Copy`; building one allocates nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LatencyMinuteRow {
@@ -178,8 +192,9 @@ pub struct LatencyMinuteRow {
     pub p999_ns: Option<u64>,
     /// The minute's largest sample, ns.
     pub max_ns: u64,
-    /// Samples above [`OVER_BOUND_NANOS`].
-    pub samples_over_1024ns: u64,
+    /// Samples above [`OVER_BOUND_NANOS`]; `None` (NULL) on the stages where
+    /// every sample is above it by construction ([`over_1024ns_is_meaningful`]).
+    pub samples_over_1024ns: Option<u64>,
     /// One-second windows folded into this minute.
     pub publishes: u64,
     /// Version of the exact threshold evidence; historical NULL is unknown.
@@ -377,7 +392,8 @@ impl MinuteAccumulator {
             p99_ns: p99,
             p999_ns: p999,
             max_ns: self.max[i],
-            samples_over_1024ns: samples.saturating_sub(first),
+            samples_over_1024ns: over_1024ns_is_meaningful(stage)
+                .then(|| samples.saturating_sub(first)),
             publishes: self.publishes,
             strict_version: strict.map(|_| STRICT_MEASUREMENT_VERSION),
             strict_samples: strict.map(|(n, _)| n),
@@ -680,7 +696,8 @@ impl HotPathLatencyMinuteWriter {
         self.pending
     }
 
-    /// Appends one row. Cold path: seven a minute, on the writer thread.
+    /// Appends one row. Cold path: one per stage a minute (`ALL_STAGES`, eight
+    /// since PR DP-6), on the writer thread.
     ///
     /// # Errors
     /// Propagates ILP buffer errors.
@@ -722,10 +739,15 @@ impl HotPathLatencyMinuteWriter {
             // the two counts independently into a different percentile.
             None => row,
         };
+        // PR DP-6: NULL (left out) where the count is 100% by construction.
+        let row = match r.samples_over_1024ns {
+            Some(n) => row
+                .column_i64("samples_over_1024ns", to_i64(n))
+                .context("samples_over_1024ns")?,
+            None => row,
+        };
         row.column_i64("max_ns", to_i64(r.max_ns))
             .context("max_ns")?
-            .column_i64("samples_over_1024ns", to_i64(r.samples_over_1024ns))
-            .context("samples_over_1024ns")?
             .column_i64("publishes", to_i64(r.publishes))
             .context("publishes")?
             .at(TimestampNanos::new(r.minute_ist_nanos))
@@ -734,7 +756,7 @@ impl HotPathLatencyMinuteWriter {
         Ok(())
     }
 
-    /// Appends one queued item whole: a minute's seven latency rows and its
+    /// Appends one queued item whole: a minute's latency rows (one per stage) and its
     /// host row, or a day's verdict row. A failure part-way rewinds the
     /// buffer to before the item, so a half-built row can never poison later
     /// flushes (hostile review, 2026-10-30). Writer thread only.
@@ -1059,7 +1081,10 @@ mod tests {
             assert_eq!(row.samples, 0);
             assert_eq!((row.p50_ns, row.p99_ns, row.p999_ns), (None, None, None));
             assert_eq!(row.max_ns, 0);
-            assert_eq!(row.samples_over_1024ns, 0);
+            assert_eq!(
+                row.samples_over_1024ns,
+                over_1024ns_is_meaningful(row.stage).then_some(0)
+            );
             assert_eq!(row.publishes, 60);
         }
     }
@@ -1078,7 +1103,7 @@ mod tests {
             (Some(1_024), Some(1_024), Some(1_024))
         );
         assert_eq!(r.max_ns, 700);
-        assert_eq!(r.samples_over_1024ns, 0);
+        assert_eq!(r.samples_over_1024ns, Some(0));
     }
 
     /// Edge case: every sample in one bucket.
@@ -1097,7 +1122,7 @@ mod tests {
             (r.p50_ns, r.p99_ns, r.p999_ns),
             (Some(4_096), Some(4_096), Some(4_096))
         );
-        assert_eq!(r.samples_over_1024ns, 10_000);
+        assert_eq!(r.samples_over_1024ns, Some(10_000));
         assert_eq!(r.publishes, 10);
     }
 
@@ -1116,7 +1141,7 @@ mod tests {
         assert_eq!(r.p99_ns, Some(1_024), "100 of 59,100 is under 1%");
         assert_eq!(r.p999_ns, Some(16_384), "but over 0.1%");
         assert_eq!(r.max_ns, 9_000);
-        assert_eq!(r.samples_over_1024ns, 100);
+        assert_eq!(r.samples_over_1024ns, None, "PR DP-6: NULL on ring_dwell");
     }
 
     /// Edge case: samples in the unbounded top bucket give a NULL
@@ -1136,7 +1161,7 @@ mod tests {
             (sentinel, sentinel, sentinel)
         );
         assert_eq!(r.max_ns, huge);
-        assert_eq!(r.samples_over_1024ns, 5);
+        assert_eq!(r.samples_over_1024ns, None, "PR DP-6: NULL on runtime lag");
         // Above the fine histogram's top bound (2^24 ns) on receipt_to_fold:
         // the log2 bound of the same stage (2^26 ns for 50 ms), not NULL.
         let mut acc = MinuteAccumulator::new();
@@ -1169,7 +1194,10 @@ mod tests {
         let r = row_of(&acc.rows().expect("rows"), Stage::ReceiptToFold);
         assert_eq!(r.p99_ns, Some(1_280));
         assert_eq!(r.samples, 10);
-        assert_eq!(r.samples_over_1024ns, 10);
+        assert_eq!(
+            r.samples_over_1024ns, None,
+            "PR DP-6: NULL on receipt_to_fold"
+        );
     }
 
     /// Bucket counts saturate rather than wrap.
@@ -1248,6 +1276,32 @@ mod tests {
         let r = row_of(&rows, Stage::RingDwell);
         assert_eq!(r.minute_ist_nanos, minute(5));
         assert_eq!((r.samples, r.publishes), (3, 3));
+    }
+
+    // Regression: 2026-11-06 (PR DP-6) — `drain_main_frame` was per FRAME
+    // only, so a frame of 70 ticks read as one sample of 70 ticks' cost; the
+    // minute now writes a `drain_main_tick` row of per-tick samples.
+    #[test]
+    fn test_regression_dp6_every_minute_has_a_drain_main_tick_row() {
+        let mut acc = MinuteAccumulator::new();
+        // 70 ticks at 600 ns (a 42 µs frame), recorded as 70 weighted samples.
+        let _ = acc.absorb(minute(0), &window_with(Stage::DrainMainTick, 600, 70));
+        let rows = acc.rows().expect("rows");
+        let tick = row_of(&rows, Stage::DrainMainTick);
+        assert_eq!(tick.samples, 70);
+        assert_eq!(tick.histogram, HISTOGRAM_LOG2);
+        assert_eq!(tick.p99_ns, Some(1_024), "p99_ns <= 1024 means under 1 µs");
+        assert_eq!(tick.samples_over_1024ns, Some(0));
+        assert_eq!(rows.len(), ALL_STAGES.len());
+        assert!(rows.iter().any(|r| r.stage == Stage::DrainMainTick));
+        assert!(over_1024ns_is_meaningful(Stage::SocketToWal));
+        assert!(over_1024ns_is_meaningful(Stage::DrainMainFrame));
+        assert!(over_1024ns_is_meaningful(Stage::MetricsUpkeep));
+        assert!(over_1024ns_is_meaningful(Stage::DrainMainTick));
+        assert!(!over_1024ns_is_meaningful(Stage::RingDwell));
+        assert!(!over_1024ns_is_meaningful(Stage::MainRuntimeLag));
+        assert!(!over_1024ns_is_meaningful(Stage::ReaderRuntimeLag));
+        assert!(!over_1024ns_is_meaningful(Stage::ReceiptToFold));
     }
 
     /// The max is the largest per-second max, per stage.
@@ -1371,6 +1425,14 @@ mod tests {
         ] {
             assert!(drain.contains(col), "{col} in {drain}");
         }
+        // PR DP-6: NULL (left out) where the count is 100% by construction,
+        // and a `drain_main_tick` row every minute.
+        let dwell = text
+            .lines()
+            .find(|l| l.contains("stage=ring_dwell"))
+            .expect("dwell row");
+        assert!(!dwell.contains("samples_over_1024ns"), "{dwell}");
+        assert!(text.lines().any(|l| l.contains("stage=drain_main_tick")));
         let empty = text
             .lines()
             .find(|l| l.contains("stage=socket_to_wal"))

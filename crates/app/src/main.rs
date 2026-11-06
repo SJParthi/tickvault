@@ -690,7 +690,8 @@ fn main() -> Result<()> {
     );
     // Plan ITEM DT: the drain's placement, and (when asked) this thread
     // pinned to the background core so the main runtime built below, and
-    // every thread it spawns, inherits it. Off by default; see hot_thread_boot.
+    // every thread it spawns, inherits it (off by default). DP-6: cores read before the pin.
+    let _process_cores = tickvault_storage::host_capacity_minute::record_process_core_count();
     tickvault_app::hot_thread_boot::place_drain_and_background(rt_decision);
 
     let runtime = tickvault_app::hot_path_proof_boot::build_main_runtime(worker_threads)
@@ -3108,6 +3109,7 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from("data"),
             config.questdb.clone(),
             config.partition_retention.clone(),
+            std::sync::Arc::clone(&trading_calendar),
         );
 
     // The DAILY archive sweep, on its own polling scheduler (2026-09-01).

@@ -1092,13 +1092,17 @@ mod tests {
     #[tokio::test]
     async fn test_replay_posts_each_record_whole_and_truncates_a_closed_file() {
         let dir = temp_dir("replay");
+        let view = crate::tick_spill_replay::tests::test_spill_view();
         let closed = dir.join("depth-dhan-1.dspl");
-        let live = dir.join("depth-dhan-2.dspl");
+        // PR DP-8: the live file carries the view's current hour.
+        let live = dir.join(format!(
+            "depth-dhan-{}.dspl",
+            crate::tick_spill_replay::tests::live_spill_hour(&view)
+        ));
         let v2: &[u8] = b"bin \n with \n newlines \x00\x01";
         write_records(&closed, &[(b"market_depth,a=1 b=1i 1\n", 1), (v2, 2)]);
         write_records(&live, &[(b"market_depth,a=2 b=2i 2\n", 1)]);
         let (url, bodies, server) = spawn_recording_server().await;
-        let view = crate::tick_spill_replay::tests::test_spill_view();
         let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
@@ -1149,7 +1153,13 @@ mod tests {
     #[tokio::test]
     async fn test_a_torn_tail_on_the_live_file_waits_for_the_writer() {
         let dir = temp_dir("live-torn");
-        let live = dir.join("depth-dhan-1.dspl");
+        // PR DP-8: the live file carries the view's current hour.
+        let live = dir.join(format!(
+            "depth-dhan-{}.dspl",
+            crate::tick_spill_replay::tests::live_spill_hour(
+                &crate::tick_spill_replay::tests::test_spill_view()
+            )
+        ));
         write_records(&live, &[(b"market_depth,a=1 b=1i 1\n", 1)]);
         // Half a record: a write in flight.
         let header = encode_header(1, b"market_depth,a=2 b=2i 2\n").expect("h");
@@ -1352,10 +1362,14 @@ mod tests {
                 1,
             )],
         );
-        write_records(
-            &dir.join("depth-dhan-2.dspl"),
-            &[(b"market_depth,a=3 b=3i 3\n", 1)],
-        );
+        // PR DP-8: the live file carries the view's current hour.
+        let live = dir.join(format!(
+            "depth-dhan-{}.dspl",
+            crate::tick_spill_replay::tests::live_spill_hour(
+                &crate::tick_spill_replay::tests::test_spill_view()
+            )
+        ));
+        write_records(&live, &[(b"market_depth,a=3 b=3i 3\n", 1)]);
         let (url, _bodies, server) = spawn_recording_server().await;
         let out = replay_framed_spill_dir(
             &dir,
@@ -1382,7 +1396,7 @@ mod tests {
             "acks won by line isolation are confirmed before the file is emptied"
         );
         forget_resume_offset(&closed);
-        forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
+        forget_resume_offset(&live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

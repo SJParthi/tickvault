@@ -1355,11 +1355,19 @@ pub(crate) fn spill_file_hour(path: &Path) -> Option<u64> {
 
 /// Whether the spill writer may still append to `path` (audit DA-13b).
 ///
-/// The last file by name always may. Any other file is treated as closed only
-/// when the hour in its name is before the current wall-clock hour AND its
-/// mtime is at least [`SPILL_LIVE_FILE_QUIET_SECS`] in the past. A name that
-/// does not parse or an mtime that cannot be read reads as live: doubt keeps
-/// the data. A non-last file kept live is counted, so a clock step shows.
+/// A file is treated as closed only when the hour in its name is before the
+/// current wall-clock hour AND its mtime is at least
+/// [`SPILL_LIVE_FILE_QUIET_SECS`] in the past. A name that does not parse or
+/// an mtime that cannot be read reads as live: doubt keeps the data. A
+/// non-last file kept live is counted, so a clock step shows.
+///
+/// PR DP-8 (2026-11-06): the LAST file by name follows the same rule. Before,
+/// it always read as live, so the newest file in a folder was never retired
+/// even long after its hour closed: `data/spill/depth/depth-dhan-498258.dspl`
+/// (2.6 GB, from 3 Nov) was replayed again every evening from a rewind. The
+/// writer names files from the CURRENT hour, so a last file whose hour ended
+/// and that has been quiet receives no more appends, exactly like any other.
+/// A last file kept live is not counted (it is the normal case).
 /// Cold replay path: one compare and one `SystemTime` subtraction.
 pub(crate) fn spill_file_may_still_be_appended(
     path: &Path,
@@ -1369,7 +1377,7 @@ pub(crate) fn spill_file_may_still_be_appended(
     dir_label: &'static str,
 ) -> bool {
     if is_last {
-        return true;
+        return !spill_file_closed_and_quiet(path, meta, view);
     }
     let live = !spill_file_closed_and_quiet(path, meta, view);
     if live {
@@ -1985,12 +1993,12 @@ pub async fn replay_spill_dir(
     // size independent of how large any spill file has grown.
     let mut buf = vec![0_u8; REPLAY_STREAM_BUFFER_BYTES];
     // The writer appends to the file for the CURRENT hour, and `list_spill_files`
-    // sorts by name (hour). The LAST entry is always treated as live; since
-    // audit DA-13b an earlier entry is closed only when its hour has passed AND
-    // it has been quiet for `SPILL_LIVE_FILE_QUIET_SECS`, because the writer
-    // names files from the wall clock and a clock step makes it append to a
-    // file that is not last. A closed file has no appender, so emptying it
-    // cannot destroy anything.
+    // sorts by name (hour). Every entry, the LAST one included (PR DP-8,
+    // 2026-11-06; before, the last was always live), is closed only when its
+    // hour has passed AND it has been quiet for `SPILL_LIVE_FILE_QUIET_SECS`
+    // (audit DA-13b), because the writer names files from the wall clock and
+    // a clock step makes it append to a file that is not last. A closed file
+    // has no appender, so emptying it cannot destroy anything.
     let label = dir_label(dir);
     let files = list_spill_files(dir);
     let last_index = files.len().saturating_sub(1);
@@ -3269,6 +3277,16 @@ pub(crate) mod tests {
         view
     }
 
+    /// An hour a spill file can carry in its name to read as the file the
+    /// writer is still appending, under `view` and under every later test
+    /// view that advances the clock by less than an hour (PR DP-8: an
+    /// older-hour file is closed once quiet, even when it is the last one in
+    /// its folder). The hour after the view's, so a test running near an hour
+    /// boundary cannot see it close.
+    pub(crate) fn live_spill_hour(view: &SpillSinkView) -> u64 {
+        view.now_unix_secs / SPILL_FILE_HOUR_SECS + 1
+    }
+
     /// Test view: `view` after two clean probes and the durability lag, so the
     /// acks it stamped are confirmed.
     pub(crate) fn confirmed_spill_view(view: &SpillSinkView) -> SpillSinkView {
@@ -4292,8 +4310,11 @@ pub(crate) mod tests {
         // append-destroying bug found on 2026-09-03. Bounded cost: at most one
         // hour of spill stays on disk until the rollover makes it closed.
         let dir = temp_dir("ok");
+        let view = test_spill_view();
         let closed = dir.join("ticks-dhan-1.ilp");
-        let live = dir.join("ticks-dhan-2.ilp");
+        // PR DP-8: the live file carries the view's current hour (an older
+        // hour, quiet, is closed even when it is the last file).
+        let live = dir.join(format!("ticks-dhan-{}.ilp", live_spill_hour(&view)));
         let payload = b"ticks value=1i 1\nticks value=2i 2\n";
         std::fs::write(&closed, payload).expect("write closed");
         std::fs::write(&live, payload).expect("write live");
@@ -4303,7 +4324,6 @@ pub(crate) mod tests {
             2,
         );
         let client = crate::http_client::build_probe_client(5).expect("client");
-        let view = test_spill_view();
         let outcome = replay_spill_dir(&dir, &url, &client, &view).await;
         let _ = server.join();
 
@@ -5176,8 +5196,10 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     #[tokio::test]
     async fn test_regression_da13b_a_drained_closed_file_waits_for_confirmed_acks() {
         let dir = temp_dir("da13b-confirm");
+        let view = test_spill_view();
         let closed = dir.join("ticks-dhan-1.ilp");
-        let live = dir.join("ticks-dhan-2.ilp");
+        // PR DP-8: the live file carries an hour the view reads as open.
+        let live = dir.join(format!("ticks-dhan-{}.ilp", live_spill_hour(&view)));
         std::fs::write(&closed, GOOD_LINE).expect("write"); // APPROVED: test
         std::fs::write(&live, GOOD_LINE).expect("write"); // APPROVED: test
         let (url, server) = spawn_selective_server().await;
@@ -5185,7 +5207,6 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let len = GOOD_LINE.len() as u64;
         let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
 
-        let view = test_spill_view();
         let first = replay_spill_dir(&dir, &url, &client, &view).await;
         assert_eq!(first.bytes_replayed, 2 * len);
         assert_eq!(first.files_awaiting_confirm, 1);
@@ -5430,11 +5451,19 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             check("ticks-dhan-x.ilp".into(), &now),
             "a name that does not parse: live"
         );
-        let last = dir.join("ticks-dhan-3.ilp");
+        // PR DP-8: the last file follows the same rule: live while its hour
+        // is open, closed once its hour ended and it has been quiet.
+        let last = dir.join(format!("ticks-dhan-{}.ilp", live_spill_hour(&now)));
         std::fs::write(&last, GOOD_LINE).expect("write"); // APPROVED: test
         let meta = std::fs::metadata(&last).expect("meta"); // APPROVED: test
         assert!(spill_file_may_still_be_appended(
             &last, &meta, true, &now, "ticks"
+        ));
+        let old_last = dir.join("ticks-dhan-3.ilp");
+        std::fs::write(&old_last, GOOD_LINE).expect("write"); // APPROVED: test
+        let meta = std::fs::metadata(&old_last).expect("meta"); // APPROVED: test
+        assert!(!spill_file_may_still_be_appended(
+            &old_last, &meta, true, &now, "ticks"
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6457,7 +6486,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     }
 
     #[test]
-    fn test_spill_file_may_still_be_appended_last_always_live_and_counts_nonlast_live() {
+    fn test_spill_file_may_still_be_appended_closed_last_is_not_live_and_counts_nonlast_live() {
         let dir = temp_dir("da13b-direct-appended");
         let closed = dir.join("ticks-dhan-1.ilp");
         let unnamed = dir.join("ticks-dhan-x.ilp");
@@ -6467,14 +6496,28 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let meta_unnamed = std::fs::metadata(&unnamed).expect("meta"); // APPROVED: test
         let view = test_spill_view();
         let rec = OneCounterRecorder::new(SPILL_REPLAY_NONLAST_LIVE_COUNTER);
-        let (last, closed_nonlast, unnamed_nonlast) = metrics::with_local_recorder(&rec, || {
-            (
-                spill_file_may_still_be_appended(&closed, &meta, true, &view, "ticks"),
-                spill_file_may_still_be_appended(&closed, &meta, false, &view, "ticks"),
-                spill_file_may_still_be_appended(&unnamed, &meta_unnamed, false, &view, "ticks"),
-            )
-        });
-        assert!(last, "the last file may always be appended");
+        let (last_closed, last_unnamed, closed_nonlast, unnamed_nonlast) =
+            metrics::with_local_recorder(&rec, || {
+                (
+                    spill_file_may_still_be_appended(&closed, &meta, true, &view, "ticks"),
+                    spill_file_may_still_be_appended(&unnamed, &meta_unnamed, true, &view, "ticks"),
+                    spill_file_may_still_be_appended(&closed, &meta, false, &view, "ticks"),
+                    spill_file_may_still_be_appended(
+                        &unnamed,
+                        &meta_unnamed,
+                        false,
+                        &view,
+                        "ticks",
+                    ),
+                )
+            });
+        // Regression: 2026-11-06 (PR DP-8) — the last file always read as
+        // live, so a 2.6 GB depth spill file from 3 Nov was never retired.
+        assert!(
+            !last_closed,
+            "a closed, quiet LAST file is not live either (PR DP-8)"
+        );
+        assert!(last_unnamed, "doubt keeps the last file live");
         assert!(!closed_nonlast, "a closed, quiet non-last file is not live");
         assert!(unnamed_nonlast, "doubt keeps the file live");
         assert_eq!(

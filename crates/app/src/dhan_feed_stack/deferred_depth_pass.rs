@@ -33,7 +33,11 @@
 //!   QuestDB's apply backlog is above [`AFTER_CLOSE_APPLY_LAG_CEILING`]. It
 //!   stops starting new work at 07:15 IST the next morning,
 //!   and it stops early when free disk on the WAL volume falls below
-//!   [`AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION`].
+//!   [`after_close_floor_bytes`] (the 5% pinned-delete line plus one partition
+//!   rewrite plus 2 GiB, at least [`AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES`]),
+//!   after first asking for a reclaim (only above the pinned line) and
+//!   waiting, BEFORE it takes the depth-partition hold, up to
+//!   [`AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS`] pauses for it (PR DP-4/DP-7).
 //!
 //! # Why the ingest shed does not pause it (fixed 2026-10-13)
 //!
@@ -100,7 +104,7 @@
 //!   bucket in full. Bounded to one bucket by flushing at every bucket edge.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tickvault_common::error_code::ErrorCode;
@@ -177,20 +181,78 @@ const _: () = assert!(
         <= tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64
 );
 
-/// Free-space fraction of the WAL volume below which the pass stops writing.
+/// Bytes one late commit's `market_depth` HOUR-partition rewrite can need on
+/// top of the data already there (PR DP review M5): measured ~7 GiB an hour
+/// with level rows on 2026-11-06. QuestDB writes the new partition version
+/// before it frees the old one.
+pub const AFTER_CLOSE_PARTITION_REWRITE_ESTIMATE_BYTES: u64 = 7 * 1024 * 1024 * 1024;
+
+/// Headroom above the pinned-delete line plus one rewrite (PR DP review M5):
+/// two WAL segments (128 MiB each) and a 16 MiB late batch, many times over.
+pub const AFTER_CLOSE_FLOOR_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The smallest floor in free bytes, whatever the volume size (PR DP review
+/// M5): at least one rewrite plus headroom on any disk.
+pub const AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+const _: () = assert!(
+    AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES
+        >= AFTER_CLOSE_PARTITION_REWRITE_ESTIMATE_BYTES + AFTER_CLOSE_FLOOR_HEADROOM_BYTES
+);
+
+/// Free bytes on the WAL volume below which the pass stops writing, for a
+/// volume of `total_bytes`. Pure, O(1).
 ///
-/// Equal to the ingest shed's all-depth threshold
-/// (`ingest_shed::SHED_ALL_DEPTH_BELOW_FREE`, 8%): the pass stops where even
-/// live dedicated depth would be shed. It sits three points (about 19 GB on
-/// the 644 GB volume) above `ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION`
-/// (5%), where the byte prune starts deleting pinned segments as a counted
-/// loss, so the pass's own writes (checked before every bucket and before
-/// every late flush, so at most one 16 MiB batch plus the partition rewrite
-/// its commit causes between checks) cannot carry the volume there. It is
-/// below the inline shed threshold (15%), so a disk-only inline shed does not
-/// stop the pass. Both orderings are pinned by a test.
-pub const AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION: f64 =
-    tickvault_common::ingest_shed::SHED_ALL_DEPTH_BELOW_FREE;
+/// ⚠ CHANGED 2026-11-06 (PR DP-7, then the PR DP review M5). This was the
+/// ingest shed's all-depth threshold (8%, 12.9 GB on the 150 GB root, where
+/// the disk sat all night on 5 Nov: 795 early stops 15:45 to 05:35). DP-7
+/// moved it to one point above `ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION`
+/// (5%, where the byte prune deletes pinned segments as a counted loss),
+/// 6% or 9 GB; the review showed one partition rewrite (~7 GiB) from there
+/// crosses the 5% line, so the rewrite itself could push the box into
+/// deleting the very segments this pass reads. The floor is now
+/// `max(5% line + one hour-partition rewrite + 2 GiB, 10 GiB)`: about
+/// 16 GiB (11%) on the 150 GB root, below the inline shed threshold (15%).
+/// Honest consequence: 12.9 GB free on that box is BELOW this floor; the
+/// pass asks for a reclaim and waits before it takes the depth partitions,
+/// and the pressure loop reclaims back to back after 15:40 (review M3).
+#[must_use]
+pub fn after_close_floor_bytes(total_bytes: u64) -> u64 {
+    // A few bytes either way cannot matter against a GiB-sized floor.
+    // APPROVED: ratio of a byte count, rounded down
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let pinned_line = (total_bytes as f64
+        * tickvault_storage::ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION)
+        as u64;
+    pinned_line
+        .saturating_add(AFTER_CLOSE_PARTITION_REWRITE_ESTIMATE_BYTES)
+        .saturating_add(AFTER_CLOSE_FLOOR_HEADROOM_BYTES)
+        .max(AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES)
+}
+
+/// Whether the pass may wake the reclaim sweep at this free fraction (PR DP
+/// review M5): only above the pinned-delete line, where the byte prune takes
+/// ordinary (uploaded, unpinned) segments. At or below it the prune deletes
+/// PINNED segments, the very deferred-depth frames this pass reads, so the
+/// pass never asks for that; the pressure loop and the WAL's own floor still
+/// act there. Unmeasured reads as not safe. O(1).
+#[must_use]
+pub fn space_request_safe(free_fraction: Option<f64>) -> bool {
+    free_fraction.is_some_and(|f| {
+        f.is_finite() && f > tickvault_storage::ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION
+    })
+}
+
+/// How many [`AFTER_CLOSE_PAUSE`] polls the pass waits, after asking for a
+/// reclaim, for the disk to come back above its floor before it stops (PR
+/// DP-4/DP-7): 18 × 10 s = 3 minutes. The reclaim sweep runs at most once a
+/// minute (`reclaim_signal::RECLAIM_MIN_INTERVAL_SECS`), so this covers at
+/// least two sweeps.
+pub const AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS: u32 = 18;
 
 /// The widest bucket range one segment may cover before the overflow sweep
 /// stops trusting it (a segment normally spans one or two buckets).
@@ -230,7 +292,7 @@ pub enum PassStop {
     /// The lane is shutting down.
     Cancelled,
     /// Free disk on the WAL volume fell below
-    /// [`AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION`], or could not be measured.
+    /// [`after_close_floor_bytes`], or could not be measured.
     DiskFloor,
 }
 
@@ -291,14 +353,89 @@ pub const fn after_close_step(
     PassStep::Run
 }
 
-/// Whether a measured free fraction is below the pass's disk floor. An
-/// unmeasured disk (`None`, a failed `statvfs`) reads as below it: adding
-/// rows to a volume nobody can measure is the direction that loses data,
-/// and stopping costs only a carry to the next evening. O(1).
-fn disk_below_pass_floor(free_fraction: Option<f64>) -> bool {
-    free_fraction.is_none_or(|f| !f.is_finite() || f < AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION)
+/// Whether the measured free space is below the pass's disk floor
+/// ([`after_close_floor_bytes`] of the volume, whose total is read from the
+/// free bytes over the free fraction). An unmeasured disk (`None`, a failed
+/// `statvfs`, a zero or nonsense fraction) reads as below it: adding rows to
+/// a volume nobody can measure is the direction that loses data, and
+/// stopping costs only a carry to the next evening. O(1).
+fn disk_below_pass_floor(free_fraction: Option<f64>, free_bytes: Option<u64>) -> bool {
+    match (free_fraction, free_bytes) {
+        // At or below the pinned-delete line the free bytes are already under
+        // it, so under the floor (decided on the fraction, which a saturated
+        // total could not distort).
+        (Some(f), Some(_))
+            if f.is_finite()
+                && f <= tickvault_storage::ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION =>
+        {
+            true
+        }
+        (Some(f), Some(b)) if f.is_finite() && f > 0.0 && f <= 1.0 => {
+            // Rounding is far below the GiB-sized floor.
+            // APPROVED: total bytes from the measured ratio
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let total = (b as f64 / f) as u64;
+            b < after_close_floor_bytes(total)
+        }
+        _ => true,
+    }
 }
 
+/// The pass's floor read from the live signals. O(1), two `statvfs` reads.
+fn disk_low(signals: &PassSignals<'_>, wal_dir: &Path) -> bool {
+    disk_below_pass_floor(
+        (signals.disk_free_fraction)(wal_dir),
+        (signals.disk_free_bytes)(wal_dir),
+    )
+}
+
+/// Asks for space (the reclaim sweep and the raw uploader) only where that
+/// cannot delete the pass's own pinned segments ([`space_request_safe`], PR
+/// DP review M5). Returns whether it asked. O(1).
+fn request_space_if_safe(signals: &PassSignals<'_>, wal_dir: &Path) -> bool {
+    let safe = space_request_safe((signals.disk_free_fraction)(wal_dir));
+    if safe {
+        (signals.request_space)();
+    }
+    safe
+}
+
+/// Whether the disk is still below the floor after asking for a reclaim and
+/// waiting up to [`AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS`] pauses for it (PR
+/// DP-4/DP-7). Before, the pass stopped at the first low reading and nothing
+/// asked the reclaim sweep or the raw uploader to free anything, so on
+/// 2026-11-05 it stopped ~700 times overnight at the same 12.9 GB. Returns
+/// early on cancellation. Cold path, the pass's own thread.
+///
+/// PR DP review M4: called only BEFORE the pass takes the depth-partition
+/// hold, and only inside the window; under the hold the pass checks the
+/// floor without waiting ([`disk_low`]), so a 3-minute wait never blocks the
+/// archiver.
+fn disk_stays_low(signals: &PassSignals<'_>, wal_dir: &Path, cancel: &AtomicBool) -> bool {
+    if !disk_low(signals, wal_dir) {
+        return false;
+    }
+    if !request_space_if_safe(signals, wal_dir) {
+        // At or below the pinned-delete line: nothing safe to ask for.
+        return true;
+    }
+    for _ in 0..AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS {
+        if cancel.load(Ordering::Acquire) {
+            return true;
+        }
+        (signals.sleep)(AFTER_CLOSE_PAUSE);
+        if !disk_low(signals, wal_dir) {
+            metrics::counter!(DEFERRED_DEPTH_PASS_COUNTER, "outcome" => "floor_reclaimed")
+                .increment(1);
+            return false;
+        }
+    }
+    true
+}
 /// Seconds until the next window opens, from `secs_ist`. `0` inside the
 /// window. O(1).
 #[must_use]
@@ -320,7 +457,31 @@ pub struct PassSignals<'a> {
     /// Free-space fraction (0.0..=1.0) of the volume holding the WAL
     /// directory passed in; `None` when it cannot be measured.
     pub disk_free_fraction: &'a dyn Fn(&Path) -> Option<f64>,
+    /// Free bytes of the same volume; `None` when it cannot be measured
+    /// (PR DP-7).
+    pub disk_free_bytes: &'a dyn Fn(&Path) -> Option<u64>,
+    /// Asks the reclaim sweep and the raw uploader to free space (PR
+    /// DP-4/DP-7). Live: one stored permit each, never a second sweep.
+    pub request_space: &'a dyn Fn(),
     pub sleep: &'a dyn Fn(Duration),
+}
+
+/// The live [`PassSignals::request_space`]: wakes the reclaim sweep and the
+/// raw uploader (one stored permit each). Cold path.
+fn request_reclaim_and_raw_upload() {
+    crate::reclaim_signal::request_reclaim();
+    crate::reclaim_signal::request_raw_upload();
+}
+
+/// Free bytes of the volume holding `path`: one `statvfs` call, `None` when
+/// the probe fails. Cold path.
+fn probe_free_bytes(path: &Path) -> Option<u64> {
+    match tickvault_storage::disk_health_watcher::probe_disk_free_bytes(path) {
+        tickvault_storage::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
+            Some(free_bytes)
+        }
+        tickvault_storage::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => None,
+    }
 }
 
 /// Free-space fraction of the volume holding `path`: one `statvfs` call,
@@ -350,6 +511,8 @@ pub fn live_signals() -> PassSignals<'static> {
             tickvault_storage::wal_applied_watermark::applied_watermark().is_sink_suspect()
         },
         disk_free_fraction: &probe_free_fraction,
+        disk_free_bytes: &probe_free_bytes,
+        request_space: &request_reclaim_and_raw_upload,
         sleep: &|d| std::thread::sleep(d),
     }
 }
@@ -405,9 +568,59 @@ pub fn pass_rows_written_total() -> u64 {
     PASS_ROWS_WRITTEN.load(Ordering::Relaxed)
 }
 
+/// Unix second at which passes started stopping at the disk floor, run after
+/// run with no pass in between that finished another way; `0` = not blocked.
+/// Read by the drain hold (PR DP-4).
+static FLOOR_BLOCKED_SINCE_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// The next [`FLOOR_BLOCKED_SINCE_UNIX`] after a pass that ended with
+/// `stop`, at `now_unix`: a floor stop keeps the earliest start (or starts
+/// one), anything else clears it. A floor stop by a pass that `progressed`
+/// (wrote rows or cleared a bucket) restarts the clock at `now_unix` (PR DP
+/// review M2): the drain hold's one-hour cap measures time blocked with no
+/// progress, not time since the first floor stop of a night that is still
+/// writing back. Pure, O(1).
+#[must_use]
+pub const fn next_floor_blocked_since(
+    prev: i64,
+    stop: Option<PassStop>,
+    progressed: bool,
+    now_unix: i64,
+) -> i64 {
+    match stop {
+        Some(PassStop::DiskFloor) => {
+            if prev > 0 && !progressed {
+                prev
+            } else {
+                now_unix
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// Records a finished pass for the drain hold. O(1).
 pub fn publish_pass_outcome(summary: &PassSummary) {
     LAST_PASS_RETRYABLE_LEFT.store(summary.retryable_left(), Ordering::Release);
+    let prev = FLOOR_BLOCKED_SINCE_UNIX.load(Ordering::Acquire);
+    let progressed = summary.rows_written > 0 || summary.buckets_cleared > 0;
+    FLOOR_BLOCKED_SINCE_UNIX.store(
+        next_floor_blocked_since(
+            prev,
+            summary.stop,
+            progressed,
+            chrono::Utc::now().timestamp(),
+        ),
+        Ordering::Release,
+    );
+}
+
+/// Unix second since which every finished pass stopped at the disk floor;
+/// `None` when the last pass did not (or none finished tonight). O(1).
+#[must_use]
+pub fn floor_blocked_since_unix() -> Option<i64> {
+    let v = FLOOR_BLOCKED_SINCE_UNIX.load(Ordering::Acquire);
+    (v > 0).then_some(v)
 }
 
 /// Buckets the last finished pass left that a rerun could still finish;
@@ -570,18 +783,24 @@ const fn endpoint_matches(endpoint: WalEndpoint, kinds: u8) -> bool {
 }
 
 /// Waits until the pacing rule says run. `Err` carries the stop reason.
+///
+/// PR DP review M4: runs under the depth-partition hold, so the disk floor
+/// is read WITHOUT the reclaim wait ([`disk_low`]), and only inside the
+/// window (outside it the step stops on the clock and no `statvfs` is read).
 fn wait_for_run(
     signals: &PassSignals<'_>,
     wal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<(), PassStop> {
     loop {
+        let secs_ist = (signals.now_secs_ist)();
+        let low = in_after_close_window(secs_ist) && disk_low(signals, wal_dir);
         match after_close_step(
-            (signals.now_secs_ist)(),
+            secs_ist,
             (signals.lag_growing_tables)(),
             (signals.apply_lag)(),
             (signals.sink_suspect)(),
-            disk_below_pass_floor((signals.disk_free_fraction)(wal_dir)),
+            low,
             cancel.load(Ordering::Acquire),
         ) {
             PassStep::Run => return Ok(()),
@@ -596,16 +815,25 @@ fn wait_for_run(
 /// unfinished buckets stay marked and their segments stay pinned.
 fn report_disk_floor_stop(signals: &PassSignals<'_>, wal_dir: &Path, bucket: u64) {
     metrics::counter!(DEFERRED_DEPTH_PASS_COUNTER, "outcome" => "disk_floor").increment(1);
+    // PR DP-4: the stop asks the reclaim sweep and the raw uploader to free
+    // space for the next round (one stored permit, never a second sweep),
+    // only above the pinned-delete line (PR DP review M5).
+    let asked = request_space_if_safe(signals, wal_dir);
     let free = (signals.disk_free_fraction)(wal_dir);
+    let free_bytes = (signals.disk_free_bytes)(wal_dir);
     warn!(
         code = ErrorCode::WsSpill01WriterRespawn.code_str(),
         source = "deferred_depth_disk_floor",
         bucket,
         free_fraction = ?free,
-        floor = AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION,
+        free_bytes = ?free_bytes,
+        floor_min_bytes = AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES,
+        rewrite_estimate_bytes = AFTER_CLOSE_PARTITION_REWRITE_ESTIMATE_BYTES,
+        space_requested = asked,
         "after-close depth pass stopped early: free disk on the frame-log volume is below its \
-         floor (or unmeasured). Buckets already finished are settled and released; the rest \
-         stay marked, and their segments stay on disk for the next evening's pass"
+         floor (5% line + one partition rewrite + 2 GiB, at least 10 GiB; or unmeasured). \
+         Buckets already finished are settled and released; the rest stay marked, and their \
+         segments stay on disk for the next pass"
     );
 }
 
@@ -698,6 +926,17 @@ pub fn run_after_close_pass(
         });
     }
     if work.is_empty() {
+        return summary;
+    }
+    // PR DP review M4: the disk floor's reclaim wait (up to 3 minutes) runs
+    // HERE, before the depth-partition hold, and only inside the window, so
+    // it never blocks the archiver that could be freeing that space. Under
+    // the hold the floor is read without waiting.
+    if in_after_close_window((signals.now_secs_ist)()) && disk_stays_low(signals, wal_dir, cancel) {
+        let first = work.first().map_or(0, |&(id, _)| id);
+        report_disk_floor_stop(signals, wal_dir, first);
+        summary.buckets_carried = u64::try_from(work.len()).unwrap_or(u64::MAX);
+        summary.stop = Some(PassStop::DiskFloor);
         return summary;
     }
     // DA-13d: no depth partition is archived (exported, recounted, dropped)
@@ -849,9 +1088,7 @@ pub fn run_after_close_pass(
                 // Re-check the disk floor before every late commit (one
                 // `statvfs` per 16 MiB batch): a bucket can hold many
                 // batches, and each commit rewrites an hour partition.
-                if sink.late_flush_due()
-                    && disk_below_pass_floor((signals.disk_free_fraction)(wal_dir))
-                {
+                if sink.late_flush_due() && disk_low(signals, wal_dir) {
                     disk_stop = true;
                     failed = true;
                     break 'segments;
@@ -1044,6 +1281,7 @@ pub fn spawn_after_close_supervisor(
                 // that outlives a day never reads yesterday's "nothing left" as
                 // tonight's (hostile review, 2026-10-21).
                 LAST_PASS_RETRYABLE_LEFT.store(PASS_OUTCOME_UNKNOWN, Ordering::Release);
+                FLOOR_BLOCKED_SINCE_UNIX.store(0, Ordering::Release);
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 continue;
             }
@@ -1282,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_pass_outcome_reads_back_via_last_pass_retryable_left() {
+    fn test_publish_pass_outcome_reads_back_via_retryable_left_and_floor_blocked_since_unix() {
         publish_pass_outcome(&PassSummary {
             buckets_carried: 2,
             ..PassSummary::default()
@@ -1290,8 +1528,152 @@ mod tests {
         assert_eq!(last_pass_retryable_left(), Some(2));
         publish_pass_outcome(&PassSummary::default());
         assert_eq!(last_pass_retryable_left(), Some(0));
+        // PR DP-4: a floor stop starts the floor-blocked clock; a pass that
+        // ends any other way clears it. (One test owns these globals.)
+        assert_eq!(floor_blocked_since_unix(), None);
+        publish_pass_outcome(&PassSummary {
+            stop: Some(PassStop::DiskFloor),
+            buckets_carried: 3,
+            ..PassSummary::default()
+        });
+        let since = floor_blocked_since_unix().expect("blocked");
+        publish_pass_outcome(&PassSummary {
+            stop: Some(PassStop::DiskFloor),
+            ..PassSummary::default()
+        });
+        assert_eq!(floor_blocked_since_unix(), Some(since), "earliest kept");
+        publish_pass_outcome(&PassSummary::default());
+        assert_eq!(floor_blocked_since_unix(), None);
     }
 
+    #[test]
+    fn test_next_floor_blocked_since_keeps_the_earliest_and_clears_on_any_other_end() {
+        assert_eq!(
+            next_floor_blocked_since(0, Some(PassStop::DiskFloor), false, 100),
+            100
+        );
+        assert_eq!(
+            next_floor_blocked_since(50, Some(PassStop::DiskFloor), false, 100),
+            50
+        );
+        assert_eq!(next_floor_blocked_since(50, None, false, 100), 0);
+        assert_eq!(
+            next_floor_blocked_since(50, Some(PassStop::Deadline), false, 100),
+            0
+        );
+        assert_eq!(
+            next_floor_blocked_since(50, Some(PassStop::Cancelled), true, 100),
+            0
+        );
+        // Regression: PR DP review M2 — a floor stop after progress restarts
+        // the clock, so the one-hour cap counts time blocked with no progress.
+        assert_eq!(
+            next_floor_blocked_since(50, Some(PassStop::DiskFloor), true, 100),
+            100
+        );
+    }
+
+    // Regression: PR DP review M5 — the 6% / 9 GB floor sat below one
+    // partition rewrite above the 5% pinned-delete line.
+    #[test]
+    fn test_regression_m5_after_close_floor_bytes_and_space_request_safe() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        let total: u64 = 150 * 1_000_000_000;
+        let floor = after_close_floor_bytes(total);
+        let pinned_line = total / 20;
+        assert!(
+            floor
+                >= pinned_line
+                    + AFTER_CLOSE_PARTITION_REWRITE_ESTIMATE_BYTES
+                    + AFTER_CLOSE_FLOOR_HEADROOM_BYTES
+                    - 1
+        );
+        assert!(
+            (floor as f64 / total as f64)
+                < tickvault_common::ingest_shed::SHED_INLINE_DEPTH_BELOW_FREE,
+            "below the inline shed threshold on the 150 GB root"
+        );
+        // A small volume still gets the 10 GiB minimum.
+        assert_eq!(
+            after_close_floor_bytes(20 * gib),
+            AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES
+        );
+        // The reclaim is never woken at or below the pinned-delete line.
+        assert!(!space_request_safe(Some(0.05)));
+        assert!(!space_request_safe(Some(0.03)));
+        assert!(!space_request_safe(None));
+        assert!(!space_request_safe(Some(f64::NAN)));
+        assert!(space_request_safe(Some(0.08)));
+    }
+
+    // Regression: PR DP review M4 — the 3-minute reclaim wait ran while the
+    // pass held the depth partitions, blocking the archiver. It now runs
+    // before the hold: with the hold already taken (as an archive pass in
+    // flight would), a pass at its floor still returns instead of waiting
+    // for it.
+    #[test]
+    fn test_regression_m4_floor_wait_runs_before_the_depth_partition_hold() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU32;
+        let (dir, seq) = wal_with_refused_frames("m4-floor-before-hold", 1);
+        let marks = Arc::new(DeferredDepth::new_for_tests());
+        marks.note_shed(seq, ShedDepth::Inline);
+        // Take the hold the way an archive pass would (another test may hold
+        // it briefly; wait for it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let guard = loop {
+            if let Some(g) = tickvault_storage::partition_archive::try_hold_depth_partitions() {
+                break g;
+            }
+            assert!(std::time::Instant::now() < deadline, "the hold never freed");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let sleeps = Arc::new(AtomicU32::new(0));
+        let requests = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (thread_marks, thread_dir) = (Arc::clone(&marks), dir.clone());
+        let (thread_sleeps, thread_requests) = (Arc::clone(&sleeps), Arc::clone(&requests));
+        std::thread::spawn(move || {
+            let sleep = |_: Duration| {
+                thread_sleeps.fetch_add(1, Ordering::Relaxed);
+            };
+            let request = || {
+                thread_requests.fetch_add(1, Ordering::Relaxed);
+            };
+            let signals = PassSignals {
+                now_secs_ist: &|| IN_WINDOW,
+                lag_growing_tables: &|| 0,
+                apply_lag: &|| Some(0),
+                sink_suspect: &|| false,
+                disk_free_fraction: &|_| Some(0.08),
+                disk_free_bytes: &|_| Some(1024),
+                request_space: &request,
+                sleep: &sleep,
+            };
+            let summary = run_after_close_pass(
+                &mut DepthIngest::for_test(),
+                &thread_marks,
+                &thread_dir,
+                &AtomicBool::new(false),
+                &signals,
+            );
+            let _ = tx.send(summary);
+        });
+        let summary = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the pass must not wait for the depth-partition hold at its floor");
+        drop(guard);
+        assert_eq!(summary.stop, Some(PassStop::DiskFloor));
+        assert_eq!(summary.rows_written, 0);
+        assert_eq!(
+            sleeps.load(Ordering::Relaxed),
+            AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS
+        );
+        assert!(requests.load(Ordering::Relaxed) >= 1);
+        assert!(summary.retryable_left() >= 1);
+        assert_eq!(marks.snapshot().marked_buckets().len(), 1, "still marked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn next_round_gap_secs_backs_off_only_when_a_round_made_no_progress() {
         let idle = PassSummary {
@@ -1491,6 +1873,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let cancel = AtomicBool::new(false);
@@ -1523,6 +1907,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &|_| {},
         };
         let cancel = AtomicBool::new(true);
@@ -1545,6 +1931,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &|_| {},
         };
         let cancel = AtomicBool::new(false);
@@ -1603,6 +1991,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1673,6 +2063,8 @@ mod tests {
                 apply_lag: &|| Some(0),
                 sink_suspect: &|| false,
                 disk_free_fraction: &|_| Some(HEALTHY_FREE),
+                disk_free_bytes: &|_| Some(u64::MAX),
+                request_space: &|| {},
                 sleep: &sleep,
             };
             let summary = run_after_close_pass(
@@ -1716,6 +2108,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1757,6 +2151,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1812,6 +2208,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(DAY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1836,23 +2234,113 @@ mod tests {
     /// shed never stops the pass on its own.
     #[test]
     fn test_disk_floor_sits_between_the_pinned_delete_floor_and_the_inline_shed() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        let total: u64 = 150 * 1_000_000_000;
+        let floor = after_close_floor_bytes(total);
+        // APPROVED: test ratio of byte counts
+        #[allow(clippy::cast_precision_loss)]
+        let floor_fraction = floor as f64 / total as f64;
         assert!(
-            AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION
-                > tickvault_storage::ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION
+            floor_fraction > tickvault_storage::ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION
         );
+        assert!(floor_fraction < tickvault_common::ingest_shed::SHED_INLINE_DEPTH_BELOW_FREE);
+        let plenty = Some(u64::MAX);
+        assert!(!disk_below_pass_floor(Some(0.15), plenty));
         assert!(
-            AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION
-                < tickvault_common::ingest_shed::SHED_INLINE_DEPTH_BELOW_FREE
+            disk_below_pass_floor(Some(0.05), plenty),
+            "at the pinned line"
         );
-        assert!(!disk_below_pass_floor(Some(0.15)));
-        assert!(!disk_below_pass_floor(Some(
-            AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION
-        )));
-        assert!(disk_below_pass_floor(Some(0.079)));
-        assert!(disk_below_pass_floor(Some(0.0)));
+        assert!(disk_below_pass_floor(Some(0.0), plenty));
         // Unmeasured or nonsense reads as low: never add rows blind.
-        assert!(disk_below_pass_floor(None));
-        assert!(disk_below_pass_floor(Some(f64::NAN)));
+        assert!(disk_below_pass_floor(None, plenty));
+        assert!(disk_below_pass_floor(Some(f64::NAN), plenty));
+        assert!(disk_below_pass_floor(Some(0.5), None));
+        // The byte floor binds: 20 GiB free on a 40 GiB volume is above the
+        // 10 GiB minimum; 9 GiB free on a 18 GiB volume is below it.
+        assert!(!disk_below_pass_floor(Some(0.5), Some(20 * gib)));
+        assert!(disk_below_pass_floor(Some(0.5), Some(9 * gib)));
+    }
+
+    // Regression: 2026-11-05 (PR DP-7) then PR DP review M5 — the floor on
+    // the 150 GB root is about 16 GiB: 12.9 GB free (where the disk sat all
+    // night on 5 Nov) is below it, 20 GB free is above it.
+    #[test]
+    fn test_regression_dp7_m5_the_floor_on_150_gb() {
+        let total: u64 = 150 * 1_000_000_000;
+        // APPROVED: test ratio of byte counts
+        #[allow(clippy::cast_precision_loss)]
+        let at = |free: u64| disk_below_pass_floor(Some(free as f64 / total as f64), Some(free));
+        assert!(at(12_900_000_000), "12.9 GB is below one rewrite above 5%");
+        assert!(!at(20_000_000_000));
+        const {
+            assert!(AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS >= 12);
+        }
+    }
+    /// PR DP-4/DP-7: a low disk asks for a reclaim and waits; a reclaim that
+    /// frees space lets the pass go on instead of stopping.
+    #[test]
+    fn test_disk_stays_low_waits_for_a_reclaim_and_resumes() {
+        // 8% free (above the 5% pinned line, so asking is safe) with 1 KiB
+        // free reads below the floor; u64::MAX free bytes reads above it.
+        let probes = Cell::new(0u32);
+        let bytes = |_: &Path| {
+            probes.set(probes.get() + 1);
+            if probes.get() <= 3 {
+                Some(1024)
+            } else {
+                Some(u64::MAX)
+            }
+        };
+        let sleeps = Cell::new(0u32);
+        let sleep = |_: Duration| sleeps.set(sleeps.get() + 1);
+        let requests = Cell::new(0u32);
+        let request = || requests.set(requests.get() + 1);
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(0.08),
+            disk_free_bytes: &bytes,
+            request_space: &request,
+            sleep: &sleep,
+        };
+        let dir = std::env::temp_dir();
+        assert!(!disk_stays_low(&signals, &dir, &AtomicBool::new(false)));
+        assert_eq!(sleeps.get(), 3, "waited three pauses for the reclaim");
+        assert_eq!(requests.get(), 1, "asked for space once before waiting");
+        // Never recovers: waits the full budget, then reports low.
+        let low = PassSignals {
+            disk_free_bytes: &|_| Some(1024),
+            ..signals
+        };
+        sleeps.set(0);
+        assert!(disk_stays_low(&low, &dir, &AtomicBool::new(false)));
+        assert_eq!(sleeps.get(), AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS);
+        // Cancellation ends the wait at once.
+        sleeps.set(0);
+        assert!(disk_stays_low(&low, &dir, &AtomicBool::new(true)));
+        assert_eq!(sleeps.get(), 0);
+        // PR DP review M5: at or below the 5% pinned line nothing is asked
+        // for (the sweep would delete this pass's pinned segments) and the
+        // pass does not wait.
+        let pinned = PassSignals {
+            disk_free_fraction: &|_| Some(0.04),
+            ..low
+        };
+        requests.set(0);
+        assert!(disk_stays_low(&pinned, &dir, &AtomicBool::new(false)));
+        assert_eq!(sleeps.get(), 0);
+        assert_eq!(requests.get(), 0);
+        // Healthy: no wait at all, and nothing asked for.
+        let healthy = PassSignals {
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            ..low
+        };
+        assert!(!disk_stays_low(&healthy, &dir, &AtomicBool::new(false)));
+        assert_eq!(sleeps.get(), 0);
+        assert_eq!(requests.get(), 0);
     }
 
     /// Two marked buckets; the disk falls below the floor after the first.
@@ -1867,10 +2355,12 @@ mod tests {
         marks.note_shed(seq2, ShedDepth::Inline);
         assert_eq!(marks.snapshot().marked_buckets().len(), 2);
 
+        // Probe 1 is the pre-hold floor check (PR DP review M4), 2 the first
+        // bucket's pacing check; from 3 on the disk is low.
         let probes = Cell::new(0u32);
         let disk = |_: &Path| {
             probes.set(probes.get() + 1);
-            if probes.get() == 1 {
+            if probes.get() <= 2 {
                 Some(HEALTHY_FREE)
             } else {
                 Some(0.01)
@@ -1884,6 +2374,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &disk,
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1916,6 +2408,8 @@ mod tests {
             apply_lag: &|| Some(0),
             sink_suspect: &|| false,
             disk_free_fraction: &|_| None,
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &|_| {},
         };
         let summary = run_after_close_pass(

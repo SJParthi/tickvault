@@ -544,12 +544,41 @@ impl Default for HostSampler {
     }
 }
 
+/// The process's core count, read once in `main` BEFORE any thread is pinned
+/// (PR DP-6, 2026-11-06); 0 until recorded.
+static PROCESS_CORE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads the number of cores this process may use and records it for
+/// [`HostSampler`]. Call once, from `main`, before the background-core pin:
+/// `available_parallelism` reads the CALLING thread's affinity, and the
+/// `tv-telemetry` thread inherits the core-0 pin, so read there it said 1 on
+/// the 2-core box and `process_cpu_pct` was a share of ONE core (measured
+/// 2026-11-06: `host_cores = 1`). Returns the count. Cold, one syscall.
+pub fn record_process_core_count() -> u64 {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as u64;
+    PROCESS_CORE_COUNT.store(cores, std::sync::atomic::Ordering::Release);
+    cores
+}
+
+/// The recorded core count when one was recorded (non-zero), else
+/// `fallback()`. The fallback runs ONLY when nothing was recorded (PR DP
+/// review): on the pinned telemetry thread `available_parallelism` reads 1,
+/// so it must never be read first. O(1).
+#[must_use]
+pub fn resolve_core_count(recorded: u64, fallback: impl FnOnce() -> u64) -> u64 {
+    if recorded > 0 { recorded } else { fallback() }
+}
+
 impl HostSampler {
-    /// Reads the core count and the data device once (cold).
+    /// Reads the core count and the data device once (cold). The core count
+    /// is the one `main` recorded before the background pin
+    /// ([`record_process_core_count`]); without one (tests) it is read here.
     #[must_use]
     pub fn new() -> Self {
-        let cores =
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as u64;
+        let cores = resolve_core_count(
+            PROCESS_CORE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            || std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as u64,
+        );
         Self {
             reader: WaitSum::default(),
             drain: WaitSum::default(),
@@ -1612,7 +1641,7 @@ mod tests {
             p99_ns: Some(p99),
             p999_ns: Some(p99),
             max_ns: max,
-            samples_over_1024ns: 0,
+            samples_over_1024ns: Some(0),
             publishes: 60,
             strict_version: None,
             strict_samples: None,
@@ -2211,6 +2240,28 @@ mod tests {
         assert_eq!(r.ticks_accepted, Some(250), "new IST day counts from zero");
         assert_eq!(r.ticks_lost, None, "tally not read");
         assert_eq!(r.disk_total_bytes_per_s(), None);
+    }
+
+    // Regression: 2026-11-06 (PR DP-6) — the sampler read its core count on
+    // the pinned telemetry thread and got 1 on the 2-core box.
+    #[test]
+    fn test_regression_dp6_record_process_core_count_and_resolve_core_count_beat_the_pinned_read() {
+        assert_eq!(
+            resolve_core_count(2, || panic!("the fallback is never read when recorded")),
+            2,
+            "recorded before the pin"
+        );
+        assert_eq!(
+            resolve_core_count(0, || 1),
+            1,
+            "nothing recorded: read here"
+        );
+        let recorded = record_process_core_count();
+        assert!(recorded >= 1);
+        assert_eq!(
+            PROCESS_CORE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            recorded
+        );
     }
 
     #[test]

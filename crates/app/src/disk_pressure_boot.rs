@@ -38,12 +38,85 @@ use tickvault_common::ingest_shed::{
     INGEST_SHED, decide_shed_level_all_signals, free_fraction_from_used_pct, runway_sessions,
     seconds_to_disk_full, wal_apply_lag_growing,
 };
+use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
-    PressureAction, PressureProbe, PressureState, ProbeHealth, ProbeHealthTransition, apply_action,
-    decide_pressure_action, pressure_hot_days, thresholds_are_sane, used_pct_from,
+    GatedStallTracker, PRESSURE_EMERGENCY_USED_PCT, PressureAction, PressureGateReason,
+    PressureProbe, PressureSessionDay, PressureState, ProbeHealth, ProbeHealthTransition,
+    REGULAR_SESSION_GATE, apply_action, decide_pressure_action, in_session_rerun_skippable,
+    lift_rearm_limit, pressure_hot_days, pressure_pass_limits, rearm_window_key,
+    refresh_rearm_budget, thresholds_are_sane, used_pct_from,
 };
-use tickvault_storage::partition_archive::PartitionArchiver;
+
+/// Minutes before a Muhurat session's published start that its pressure
+/// gate opens: the same quarter hour the regular 08:45 gate leaves before
+/// the 09:00 capture window (PR DP review L1).
+const MUHURAT_GATE_LEAD_SECS: u32 = 15 * 60;
+
+/// Days ahead the next session day is searched for. NSE never closes for
+/// longer; past it the pass gets no deadline (the calendar cannot say).
+const NEXT_SESSION_LOOKAHEAD_DAYS: i64 = 14;
+
+/// The pressure gate window on `date`, from the calendar (PR DP review L1):
+/// a regular trading day is 08:45 to 15:40 IST; a Muhurat session (weekend
+/// or holiday, Quote 49) runs from 15 minutes before its published start to
+/// its end; a Muhurat date whose times are not published yet is gated all
+/// day (the safe side: one-partition passes, never an unlimited one in a
+/// session we cannot place). `None` on a day with no session. O(1).
+#[must_use]
+pub fn pressure_gate_on(calendar: &TradingCalendar, date: chrono::NaiveDate) -> Option<(u32, u32)> {
+    if calendar.is_trading_day(date) {
+        return Some(REGULAR_SESSION_GATE);
+    }
+    if !calendar.is_session_day(date) {
+        return None;
+    }
+    Some(match calendar.muhurat_session_secs(date) {
+        Some((start, end)) => (start.saturating_sub(MUHURAT_GATE_LEAD_SECS), end),
+        None => (0, 86_400),
+    })
+}
+
+/// What the calendar says about the session around `now_unix_secs` (PR DP
+/// review L1): today's gate window and the Unix second the next session
+/// day's gate opens. O(14) calendar lookups, once a poll, cold.
+#[must_use]
+pub fn pressure_session_day(calendar: &TradingCalendar, now_unix_secs: i64) -> PressureSessionDay {
+    let offset = i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    let ist_day = now_unix_secs.saturating_add(offset).div_euclid(86_400);
+    let date_of = |day: i64| {
+        chrono::DateTime::from_timestamp(day.saturating_mul(86_400), 0).map(|t| t.date_naive())
+    };
+    let today_gate = date_of(ist_day).and_then(|d| pressure_gate_on(calendar, d));
+    let next_gate_start_unix = (1..=NEXT_SESSION_LOOKAHEAD_DAYS).find_map(|ahead| {
+        let day = ist_day.saturating_add(ahead);
+        let (start, _) = pressure_gate_on(calendar, date_of(day)?)?;
+        Some(
+            day.saturating_mul(86_400)
+                .saturating_add(i64::from(start))
+                .saturating_sub(offset),
+        )
+    });
+    PressureSessionDay {
+        today_gate,
+        next_gate_start_unix,
+    }
+}
+use tickvault_storage::partition_archive::{ArchivePassLimits, PartitionArchiver};
+
+/// Counter: pressure passes limited by the session gate (PR DP-2), by
+/// `reason` (`in_session`, `in_session_emergency`, `pre_open_deadline`, and
+/// `deadline_stopped` for a pass that actually stopped at 08:45 IST). Local
+/// `/metrics` only, registered at 0 when the loop starts.
+pub const PASS_GATED_COUNTER: &str = "tv_disk_pressure_pass_gated_total";
+
+/// `reason` of [`PASS_GATED_COUNTER`] for a pass that reached its stop time.
+pub const PASS_GATED_DEADLINE_STOPPED: &str = "deadline_stopped";
+
+/// Counter: re-arm budgets refilled on a new date, the session close or a
+/// newly eligible depth hour (PR DP-3/DP-10). Local `/metrics` only,
+/// registered at 0 when the loop starts.
+pub const REARM_RESET_COUNTER: &str = "tv_disk_pressure_rearm_reset_total";
 use tracing::{error, info, warn};
 
 /// Poll cadence. 60s matches the disk-health watcher: fast enough that a
@@ -167,6 +240,7 @@ pub fn spawn_supervised_disk_pressure_loop(
     data_dir: PathBuf,
     questdb: QuestDbConfig,
     cfg: PartitionRetentionConfig,
+    calendar: std::sync::Arc<TradingCalendar>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.pressure_archive_enabled {
         info!("disk-pressure archival disabled — daily age-based archival only");
@@ -201,7 +275,8 @@ pub fn spawn_supervised_disk_pressure_loop(
             let d = data_dir.clone();
             let q = questdb.clone();
             let c = cfg.clone();
-            let handle = tokio::spawn(async move { run_disk_pressure_loop(d, q, c).await });
+            let cal = std::sync::Arc::clone(&calendar);
+            let handle = tokio::spawn(async move { run_disk_pressure_loop(d, q, c, cal).await });
             match handle.await {
                 Ok(()) => {
                     // The inner loop never returns on its own; reaching here
@@ -231,10 +306,22 @@ async fn run_disk_pressure_loop(
     data_dir: PathBuf,
     questdb: QuestDbConfig,
     cfg: PartitionRetentionConfig,
+    calendar: std::sync::Arc<TradingCalendar>,
 ) {
+    // Registered at 0 so the first increment is not eaten as a baseline.
+    for reason in PressureGateReason::ALL {
+        metrics::counter!(PASS_GATED_COUNTER, "reason" => reason.as_str()).increment(0);
+    }
+    metrics::counter!(PASS_GATED_COUNTER, "reason" => PASS_GATED_DEADLINE_STOPPED).increment(0);
+    metrics::counter!(REARM_RESET_COUNTER).increment(0);
     let mut state = PressureState::default();
     // DA-13d: the last pass stood aside for the after-close depth pass.
     let mut last_stood_aside = false;
+    // PR DP review M7: the (re-arm window key, at-or-above-90%) of the last
+    // in-session pass that stood aside; the same conditions skip the rerun.
+    let mut last_in_session_aside: Option<(u64, bool)> = None;
+    // PR DP review M1: refunded passes that did not lower the volume.
+    let mut gated_stall = GatedStallTracker::default();
     // Edge latch for a PERSISTENTLY blind probe — fed every poll, pages once
     // per episode (2026-09-02, audit finding 10). It changes no action.
     let mut probe_health = ProbeHealth::new();
@@ -305,8 +392,38 @@ async fn run_disk_pressure_loop(
             }
         };
 
-        let action = decide_pressure_action(probe, &state, &cfg, now_secs);
+        // PR DP-3/DP-10: refill an escalated episode's re-arm budget when the
+        // reclaimable set can have grown (a new IST date, the 15:40 close, a
+        // depth hour past its hot window). Before, three re-arms spent by
+        // 11:37 IST held the volume at 92% all night (2026-11-05).
+        let now_unix = chrono::Utc::now().timestamp();
+        let window_key = rearm_window_key(now_unix, cfg.depth_hot_hours);
+        if refresh_rearm_budget(&mut state, window_key) {
+            metrics::counter!(REARM_RESET_COUNTER).increment(1);
+            info!(
+                "disk-pressure episode: re-arm budget refilled (new date, the close, or a \
+                 depth hour newly eligible) — the next pass runs now"
+            );
+        }
         let used = probe.used_pct.unwrap_or(0);
+        // PR DP-2 / review L1: the session gate, from the calendar (a Muhurat
+        // session is a session day with its own window).
+        let (limits, gate) =
+            pressure_pass_limits(now_unix, pressure_session_day(&calendar, now_unix), used);
+        let in_session = gate.is_some_and(PressureGateReason::is_in_session);
+        let emergency = used >= PRESSURE_EMERGENCY_USED_PCT;
+        // PR DP review M3: after the session gate closes (and on a day with
+        // no session) an escalated episode re-arms at every poll with no cap,
+        // so the window before the 16:30 IST stop reclaims back to back. The
+        // box is not kept up for it (cost lock); the Critical stays latched.
+        let off_session = matches!(gate, None | Some(PressureGateReason::OffSessionDeadline));
+        if off_session && lift_rearm_limit(&mut state) {
+            tracing::debug!(
+                used_pct = used,
+                "disk-pressure episode re-armed off-session (no re-arm cap after the close)"
+            );
+        }
+        let action = decide_pressure_action(probe, &state, &cfg, now_secs);
 
         // A probe that has been blind for PRESSURE_PROBE_FAILING_AFTER_SECS
         // has idled the whole pressure archiver for that long: every poll
@@ -454,6 +571,8 @@ async fn run_disk_pressure_loop(
                     "disk-pressure episode ENDED — volume back below low water"
                 );
                 apply_action(&mut state, action, now_secs, None);
+                gated_stall.reset();
+                last_in_session_aside = None;
             }
             PressureAction::StartEpisode | PressureAction::ContinuePass => {
                 if matches!(action, PressureAction::StartEpisode) {
@@ -462,10 +581,33 @@ async fn run_disk_pressure_loop(
                         used_pct = used,
                         high_water_pct = cfg.pressure_high_water_pct,
                         hot_days = pressure_hot_days(&cfg),
+                        // PR DP-9 (2026-11-06): this said "today and
+                        // yesterday are never eligible", which is true of the
+                        // day-partitioned tables only. `market_depth` is
+                        // archived by the HOUR: under pressure an hour is
+                        // eligible once `depth_hot_hours` (4) have passed, so
+                        // yesterday's hours and today's older ones can leave
+                        // the box, each only after its S3 copy is verified.
                         "disk-pressure episode STARTED — archiving aged partitions to S3 \
-                         now (verified before every drop; today and yesterday are never \
-                         eligible)"
+                         now (verified before every drop; today's and yesterday's DAY \
+                         partitions are never eligible, but market_depth hours older than \
+                         depth_hot_hours, including yesterday's and today's earlier ones, \
+                         are)"
                     );
+                }
+                // PR DP review M7: between 75% and 89% inside the session
+                // every pass stands aside; rerun it only when the re-arm
+                // window key moved or the volume crossed 90%.
+                if in_session
+                    && matches!(action, PressureAction::ContinuePass)
+                    && in_session_rerun_skippable(last_in_session_aside, window_key, emergency)
+                {
+                    tracing::debug!(
+                        used_pct = used,
+                        "disk-pressure pass skipped: the last in-session pass stood aside \
+                         and nothing it depends on has changed"
+                    );
+                    continue;
                 }
                 // Wake the spill/WAL reclaim sweep NOW rather than letting it
                 // wait out its 6-hourly timer (2026-09-01).
@@ -487,7 +629,12 @@ async fn run_disk_pressure_loop(
                 // The prune now deletes only segments with a verified S3
                 // copy (plan item 45e-1), so the uploader is woken too; it
                 // wakes the prune again once it has marked a segment.
-                crate::reclaim_signal::request_raw_upload();
+                // PR DP review M7: not inside the session below 90% — the
+                // upload gzips and copies a 128 MiB segment beside the hot
+                // path, and the in-session pass there frees almost nothing.
+                if raw_upload_wanted(in_session, emergency) {
+                    crate::reclaim_signal::request_raw_upload();
+                }
 
                 // DA-13d: after a pass stood aside, hold further passes while the
                 // after-close depth pass still has the depth partitions: another
@@ -504,10 +651,37 @@ async fn run_disk_pressure_loop(
                 }
 
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
-                let pass = run_one_pass(&questdb, &cfg).await;
+                // PR DP-2: the session gate (computed above). Measured
+                // 2026-11-06 08:31-09:13 IST: an unlimited pass at 95%
+                // exported 41 partitions, nine of them market_depth hours of
+                // 95-115M rows, through QuestDB while the session opened;
+                // every ILP write waited.
+                if let Some(reason) = gate {
+                    metrics::counter!(PASS_GATED_COUNTER, "reason" => reason.as_str()).increment(1);
+                }
+                let pass = refund_off_session_progress(
+                    run_one_pass(&questdb, &cfg, limits).await,
+                    off_session,
+                );
                 last_stood_aside = matches!(pass, PressurePass::StoodAside);
+                last_in_session_aside = (in_session && matches!(pass, PressurePass::StoodAside))
+                    .then_some((window_key, emergency));
+                // PR DP review M1: a refunded pass (gated progress, or an
+                // in-session stand-aside at 90%+) that did not lower the volume five
+                // times in a row escalates the episode as an ungated one would.
+                let stalled = match pass {
+                    PressurePass::GatedProgress(_) => gated_stall.observe_gated_pass(used),
+                    PressurePass::StoodAside if in_session && emergency => {
+                        gated_stall.observe_gated_pass(used)
+                    }
+                    PressurePass::Dropped(_) => {
+                        gated_stall.reset();
+                        false
+                    }
+                    PressurePass::NotRun | PressurePass::StoodAside => false,
+                };
                 let dropped = match pass {
-                    PressurePass::Dropped(n) => Some(n),
+                    PressurePass::Dropped(n) | PressurePass::GatedProgress(n) => Some(n),
                     PressurePass::NotRun | PressurePass::StoodAside => None,
                 };
                 if let Some(n) = dropped {
@@ -537,6 +711,17 @@ async fn run_disk_pressure_loop(
                     );
                 }
                 fold_pressure_pass(&mut state, action, now_secs, pass);
+                if stalled && let Some(ep) = state.episode.as_mut() {
+                    if !ep.gated_stalled {
+                        warn!(
+                            used_pct = used,
+                            passes = tickvault_storage::disk_pressure::GATED_STALL_PASSES,
+                            "disk-pressure episode: the limited passes are not lowering \
+                             the volume — escalating as an unlimited episode would"
+                        );
+                    }
+                    ep.gated_stalled = true;
+                }
             }
             PressureAction::Escalate => {
                 // Escalation is the state where this matters MOST: the
@@ -548,7 +733,9 @@ async fn run_disk_pressure_loop(
                 // The prune now deletes only segments with a verified S3
                 // copy (plan item 45e-1), so the uploader is woken too; it
                 // wakes the prune again once it has marked a segment.
-                crate::reclaim_signal::request_raw_upload();
+                if raw_upload_wanted(in_session, emergency) {
+                    crate::reclaim_signal::request_raw_upload();
+                }
 
                 metrics::counter!("tv_disk_pressure_unrelievable_total").increment(1);
                 error!(
@@ -581,10 +768,21 @@ pub enum PressurePass {
     /// DA-13d: the pass ran, dropped nothing, and held depth partitions
     /// because the after-close depth pass is writing rows back into them.
     /// Those partitions are reclaimable once that pass ends (at most
-    /// ~17:16 IST), so this is not "nothing left to reclaim".
+    /// ~17:16 IST, and since 2026-10-21 the pass runs [15:45, 07:15) IST),
+    /// so this is not "nothing left to reclaim".
+    ///
+    /// PR DP-2 (2026-11-06): also a pass the session gate held
+    /// ([`ArchivePassLimits`]) that dropped nothing: the held partitions are
+    /// reclaimable by a later pass, so it must not escalate either.
     StoodAside,
     /// The pass ran and dropped this many partitions (`0` escalates).
     Dropped(u64),
+    /// PR DP-2: the pass dropped this many partitions (more than 0) and the
+    /// session gate held the rest. Progress, recorded as a drop, but NOT
+    /// counted against `pressure_max_passes`: one partition a pass inside
+    /// the session would otherwise spend the four passes on four partitions
+    /// and page "could not be relieved" while relieving it.
+    GatedProgress(u64),
 }
 
 /// Reads an archive summary as a [`PressurePass`]. Pure, O(1).
@@ -602,17 +800,48 @@ pub const fn classify_pressure_pass(
     if !summary.pass_ran {
         return PressurePass::NotRun;
     }
+    // PR DP review H1: a CAPPED in-session pass (`pass_gated`) that dropped
+    // nothing because a table's WAL was behind is standing aside, not
+    // "nothing reclaimable"; an off-session or pre-open pass escalates.
+    let held = summary.held_deferred_depth > 0 || summary.held_by_gate > 0;
+    let gated_wal_only = summary.pass_gated && summary.tables_wal_not_applied > 0;
     if summary.dropped == 0
-        && summary.held_deferred_depth > 0
+        && (held || gated_wal_only)
         && summary.failed == 0
         && summary.tables_wal_suspended == 0
-        && summary.tables_wal_not_applied == 0
+        && (summary.tables_wal_not_applied == 0 || summary.pass_gated)
         && summary.tables_list_failed == 0
     {
         return PressurePass::StoodAside;
     }
+    if summary.dropped > 0 && summary.held_by_gate > 0 {
+        // APPROVED: cast — u32 to u64 widening, lossless (`From` is not const).
+        return PressurePass::GatedProgress(summary.dropped as u64);
+    }
     // APPROVED: cast — u32 to u64 widening, lossless (`From` is not const).
     PressurePass::Dropped(summary.dropped as u64)
+}
+
+/// Whether a pressure poll wakes the raw-frame uploader (PR DP review M7):
+/// not inside the session below [`PRESSURE_EMERGENCY_USED_PCT`], where the
+/// upload's gzip and S3 copy of a 128 MiB WAL segment runs beside the hot
+/// path for a pass that frees almost nothing. Pure, O(1).
+#[must_use]
+pub const fn raw_upload_wanted(in_session: bool, emergency: bool) -> bool {
+    !in_session || emergency
+}
+
+/// Off-session (after the gate, or a day with no session) a pass that
+/// dropped partitions is refunded like a gated one (PR DP review M3): the
+/// passes run back to back until the stop, and `pressure_max_passes` would
+/// otherwise page "could not be relieved" while each pass is relieving it.
+/// A pass that dropped nothing still escalates. Pure, O(1).
+#[must_use]
+pub const fn refund_off_session_progress(pass: PressurePass, off_session: bool) -> PressurePass {
+    match pass {
+        PressurePass::Dropped(n) if off_session && n > 0 => PressurePass::GatedProgress(n),
+        other => other,
+    }
 }
 
 /// Whether this poll runs a pressure pass (DA-13d re-review). Pure, O(1).
@@ -648,6 +877,14 @@ pub fn fold_pressure_pass(
 ) {
     match pass {
         PressurePass::Dropped(n) => apply_action(state, action, now_secs, Some(n)),
+        PressurePass::GatedProgress(n) => {
+            // Recorded as a drop (it reclaimed), the pass refunded (PR DP-2).
+            let passes_before = state.episode.map_or(0, |e| e.passes_used);
+            apply_action(state, action, now_secs, Some(n));
+            if let Some(ep) = state.episode.as_mut() {
+                ep.passes_used = passes_before;
+            }
+        }
         PressurePass::NotRun => apply_action(state, action, now_secs, None),
         PressurePass::StoodAside => {
             if matches!(action, PressureAction::StartEpisode) {
@@ -667,10 +904,15 @@ pub fn fold_pressure_pass(
 /// the pass ran and found nothing reclaimable, which escalates; `NotRun`
 /// means the pass never happened, which should not be read as "nothing left
 /// to reclaim". `StoodAside` is neither (DA-13d).
-async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -> PressurePass {
+async fn run_one_pass(
+    questdb: &QuestDbConfig,
+    cfg: &PartitionRetentionConfig,
+    limits: ArchivePassLimits,
+) -> PressurePass {
     let pressure_cfg = pressure_config(cfg);
     match PartitionArchiver::new(questdb, &pressure_cfg).await {
-        Ok(Some(mut archiver)) => {
+        Ok(Some(archiver)) => {
+            let mut archiver = archiver.with_pass_limits(limits);
             let summary = archiver.archive_and_drop_old_partitions().await;
             // The pass may have returned WITHOUT running — the daily leg holds
             // the concurrency guard, or the WAL probe failed closed. Both hand
@@ -696,8 +938,14 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 held_deferred_depth = summary.held_deferred_depth,
+                held_by_gate = summary.held_by_gate,
+                stopped_at_deadline = summary.stopped_at_deadline,
                 "disk-pressure archive pass complete (every drop had a verified S3 copy)"
             );
+            if summary.stopped_at_deadline {
+                metrics::counter!(PASS_GATED_COUNTER, "reason" => PASS_GATED_DEADLINE_STOPPED)
+                    .increment(1);
+            }
             classify_pressure_pass(&summary)
         }
         Ok(None) => {
@@ -726,6 +974,218 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_calendar() -> std::sync::Arc<TradingCalendar> {
+        std::sync::Arc::new(
+            TradingCalendar::from_config(&tickvault_common::config::TradingConfig {
+                market_open_time: "09:15:00".to_owned(),
+                market_close_time: "15:30:00".to_owned(),
+                order_cutoff_time: "15:29:00".to_owned(),
+                data_collection_start: "09:00:00".to_owned(),
+                data_collection_end: "16:00:00".to_owned(),
+                timezone: "Asia/Kolkata".to_owned(),
+                max_orders_per_second: 10,
+                nse_holidays: Vec::new(),
+                muhurat_trading_dates: Vec::new(),
+                nse_mock_trading_dates: Vec::new(),
+            })
+            .expect("calendar"),
+        )
+    }
+
+    /// IST wall time as Unix seconds.
+    fn ist_unix(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .and_then(|day| day.and_hms_opt(hh, mm, 0))
+            .map(|t| t.and_utc().timestamp())
+            .expect("valid time")
+            - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+    }
+
+    // Regression: PR DP review L1 — the gate used is_trading_day, so a
+    // Muhurat session ran unlimited passes, and a pass after 15:40 or on a
+    // holiday eve had no stop time.
+    #[test]
+    fn test_regression_l1_pressure_session_day_and_pressure_gate_on_read_muhurat_and_holidays() {
+        let calendar = TradingCalendar::from_config(&tickvault_common::config::TradingConfig {
+            market_open_time: "09:15:00".to_owned(),
+            market_close_time: "15:30:00".to_owned(),
+            order_cutoff_time: "15:29:00".to_owned(),
+            data_collection_start: "09:00:00".to_owned(),
+            data_collection_end: "16:00:00".to_owned(),
+            timezone: "Asia/Kolkata".to_owned(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![tickvault_common::config::NseHolidayEntry {
+                date: "2026-11-09".to_owned(),
+                name: "test holiday".to_owned(),
+            }],
+            muhurat_trading_dates: vec![tickvault_common::config::MuhuratTradingEntry {
+                date: "2026-11-08".to_owned(),
+                name: "test muhurat".to_owned(),
+                session_start_ist: "18:00".to_owned(),
+                session_end_ist: "19:15".to_owned(),
+            }],
+            nse_mock_trading_dates: Vec::new(),
+        })
+        .expect("calendar");
+        // Friday: regular gate; the next gate is Sunday's Muhurat 17:45.
+        let friday = pressure_session_day(&calendar, ist_unix(2026, 11, 6, 18, 0));
+        assert_eq!(friday.today_gate, Some(REGULAR_SESSION_GATE));
+        assert_eq!(
+            friday.next_gate_start_unix,
+            Some(ist_unix(2026, 11, 8, 17, 45))
+        );
+        // A Friday-evening pass stops at that gate.
+        let (limits, gate) = pressure_pass_limits(ist_unix(2026, 11, 6, 18, 0), friday, 95);
+        assert_eq!(gate, Some(PressureGateReason::OffSessionDeadline));
+        assert_eq!(
+            limits.stop_at_unix_secs,
+            Some(ist_unix(2026, 11, 8, 17, 45))
+        );
+        // Sunday (Muhurat): gated around its own session; the next gate skips
+        // Monday's holiday to Tuesday 08:45.
+        let sunday = pressure_session_day(&calendar, ist_unix(2026, 11, 8, 12, 0));
+        assert_eq!(
+            sunday.today_gate,
+            Some((17 * 3_600 + 45 * 60, 19 * 3_600 + 15 * 60))
+        );
+        assert_eq!(
+            sunday.next_gate_start_unix,
+            Some(ist_unix(2026, 11, 10, 8, 45))
+        );
+        assert_eq!(
+            pressure_pass_limits(ist_unix(2026, 11, 8, 18, 30), sunday, 80).1,
+            Some(PressureGateReason::InSession)
+        );
+        // Monday holiday and Saturday: no session.
+        assert_eq!(
+            pressure_session_day(&calendar, ist_unix(2026, 11, 9, 10, 0)).today_gate,
+            None
+        );
+        assert_eq!(
+            pressure_gate_on(
+                &calendar,
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("d")
+            ),
+            None
+        );
+    }
+
+    // Regression: PR DP review H1 — a gated pass whose only problem was a
+    // table still being written read Dropped(0) and paged a false Critical.
+    #[test]
+    fn test_regression_h1_gated_wal_lag_only_stands_aside_ungated_escalates() {
+        use tickvault_storage::partition_archive::ArchiveRunSummary;
+        let gated = ArchiveRunSummary {
+            pass_ran: true,
+            pass_gated: true,
+            tables_wal_not_applied: 1,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(classify_pressure_pass(&gated), PressurePass::StoodAside);
+        let ungated = ArchiveRunSummary {
+            pass_gated: false,
+            ..gated
+        };
+        assert_eq!(classify_pressure_pass(&ungated), PressurePass::Dropped(0));
+        let gated_with_failure = ArchiveRunSummary { failed: 1, ..gated };
+        assert_eq!(
+            classify_pressure_pass(&gated_with_failure),
+            PressurePass::Dropped(0)
+        );
+    }
+
+    // Regression: PR DP review M3/M7 — off-session progress is refunded; the
+    // in-session raw upload waits for 90%.
+    #[test]
+    fn test_regression_m3_m7_refund_off_session_progress_and_raw_upload_wanted() {
+        assert_eq!(
+            refund_off_session_progress(PressurePass::Dropped(3), true),
+            PressurePass::GatedProgress(3)
+        );
+        assert_eq!(
+            refund_off_session_progress(PressurePass::Dropped(0), true),
+            PressurePass::Dropped(0),
+            "nothing dropped still escalates"
+        );
+        assert_eq!(
+            refund_off_session_progress(PressurePass::Dropped(3), false),
+            PressurePass::Dropped(3)
+        );
+        assert_eq!(
+            refund_off_session_progress(PressurePass::StoodAside, true),
+            PressurePass::StoodAside
+        );
+        assert!(!raw_upload_wanted(true, false));
+        assert!(raw_upload_wanted(true, true));
+        assert!(raw_upload_wanted(false, false));
+    }
+
+    // Regression: 2026-11-06 (PR DP-2) — a gated pass that dropped nothing
+    // must not escalate, and a gated pass that dropped one partition must not
+    // spend one of the four passes.
+    #[test]
+    fn test_regression_dp2_gated_passes_never_escalate_or_spend_passes() {
+        use tickvault_storage::partition_archive::ArchiveRunSummary;
+        let gated_nothing = ArchiveRunSummary {
+            pass_ran: true,
+            held_by_gate: 3,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(
+            classify_pressure_pass(&gated_nothing),
+            PressurePass::StoodAside
+        );
+        let gated_one = ArchiveRunSummary {
+            dropped: 1,
+            ..gated_nothing
+        };
+        assert_eq!(
+            classify_pressure_pass(&gated_one),
+            PressurePass::GatedProgress(1)
+        );
+        assert_eq!(
+            classify_pressure_pass(&ArchiveRunSummary {
+                failed: 1,
+                ..gated_nothing
+            }),
+            PressurePass::Dropped(0),
+            "a failure still escalates"
+        );
+        assert_eq!(
+            classify_pressure_pass(&ArchiveRunSummary {
+                pass_ran: true,
+                dropped: 2,
+                ..ArchiveRunSummary::default()
+            }),
+            PressurePass::Dropped(2)
+        );
+
+        let cfg = cfg();
+        let over = PressureProbe::used(cfg.pressure_high_water_pct.saturating_add(5).min(100));
+        let mut state = PressureState::default();
+        // Twenty one-partition passes in the session: never Escalate.
+        for poll in 0..20_u64 {
+            let action = decide_pressure_action(over, &state, &cfg, poll * 60);
+            assert!(
+                matches!(
+                    action,
+                    PressureAction::StartEpisode | PressureAction::ContinuePass
+                ),
+                "poll {poll}: {action:?}"
+            );
+            fold_pressure_pass(
+                &mut state,
+                action,
+                poll * 60,
+                PressurePass::GatedProgress(1),
+            );
+        }
+        let ep = state.episode.expect("episode");
+        assert_eq!(ep.passes_used, 0, "gated passes are refunded");
+        assert_eq!(ep.last_pass_dropped, Some(1));
+        assert!(!ep.escalated);
+    }
 
     fn test_questdb() -> QuestDbConfig {
         QuestDbConfig {
@@ -985,8 +1445,13 @@ mod tests {
         let mut c = cfg();
         c.pressure_archive_enabled = false;
         assert!(
-            spawn_supervised_disk_pressure_loop(PathBuf::from("/tmp"), test_questdb(), c,)
-                .is_none(),
+            spawn_supervised_disk_pressure_loop(
+                PathBuf::from("/tmp"),
+                test_questdb(),
+                c,
+                test_calendar()
+            )
+            .is_none(),
             "a disabled build must not even spawn the task"
         );
     }
@@ -996,8 +1461,13 @@ mod tests {
         let mut c = cfg();
         c.pressure_low_water_pct = 90; // above the 75 high water
         assert!(
-            spawn_supervised_disk_pressure_loop(PathBuf::from("/tmp"), test_questdb(), c,)
-                .is_none(),
+            spawn_supervised_disk_pressure_loop(
+                PathBuf::from("/tmp"),
+                test_questdb(),
+                c,
+                test_calendar()
+            )
+            .is_none(),
             "a threshold pair the operator did not mean must be visible, not quietly fixed"
         );
     }
