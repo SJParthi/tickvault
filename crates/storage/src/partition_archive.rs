@@ -5231,6 +5231,10 @@ mod stub_integration_tests {
 
     use super::*;
 
+    // PR TG (2026-11-06 incident): `/exp` 429 and slow-export regressions,
+    // in their own file so they reuse this harness without growing it.
+    mod tg_export_regressions_tests;
+
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]
     struct SeenRequest {
