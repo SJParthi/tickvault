@@ -243,6 +243,29 @@ services:
       # slots hold little memory. /exec (the Stocks page, /api/*) is a
       # separate pool and is unaffected. ROLLBACK: delete this line.
       QDB_HTTP_EXPORT_CONNECTION_LIMIT: "4"
+      # --- HTTP worker pool of its own (2026-11-06, PR DP-1) ---
+      # Measured live 2026-11-06 08:31-09:13 IST (SHOW PARAMETERS):
+      # http.worker.count=0 and shared.network.worker.count=1, so every HTTP
+      # request rode the ONE shared network thread. The disk-pressure
+      # archiver's /exp export of one market_depth hour (95-115M rows) held
+      # that thread 4-5 minutes at a time, and every ILP /write (ticks,
+      # depth, candles: all ILP over HTTP on :9000) and every /exec waited
+      # behind it: 14 BOOT-01, 30 reconnects, 2,935,971 tick rows and
+      # 2,331,360 depth levels rescued to spill.
+      # 2 = one thread an export may hold plus one for /write and /exec.
+      # HTTP threads mostly wait on the socket and the disk, so they are not
+      # held to the cpuset width the way the WAL-apply and shared pools are
+      # (cpu_partition_guard pins those two only). The cpuset and the quota
+      # are unchanged.
+      # ROLLBACK: TV_QDB_HTTP_WORKERS=0 in deploy/docker/.env (0 = HTTP back
+      # on the shared network pool, the pre-2026-11-06 behaviour).
+      QDB_HTTP_WORKER_COUNT: "${TV_QDB_HTTP_WORKERS:-2}"
+      # The shared NETWORK pool (PG wire, ILP over TCP) sized on its own key,
+      # so `tickvault host-tuning`'s core isolation (TV_QDB_SHARED_WORKERS=1)
+      # no longer forces it to one thread as a side effect.
+      # ROLLBACK: delete this line (QuestDB then sizes it from the shared
+      # worker count, as before).
+      QDB_SHARED_NETWORK_WORKER_COUNT: "${TV_QDB_NETWORK_WORKERS:-2}"
       # --- Commit mode (2026-10-12, deep audit QDB-7) ---
       # cairo.commit.mode is LEFT at QuestDB's default, nosync, ON PURPOSE: an
       # ILP 2xx means the rows reached the page cache, not the disk. sync was

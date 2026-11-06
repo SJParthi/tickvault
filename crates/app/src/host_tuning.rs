@@ -417,6 +417,14 @@ const QDB_CORE_ISOLATION_APPLIED_KEY: &str = "TV_QDB_CORE_ISOLATION_APPLIED";
 /// What the switch sets: one core, a one-core quota, one WAL-apply and one
 /// shared worker (more workers than cores buy throttling, the compose file
 /// records the measurement), and the marker last.
+///
+/// It deliberately leaves the HTTP pool (`TV_QDB_HTTP_WORKERS`) and the
+/// shared network pool (`TV_QDB_NETWORK_WORKERS`) alone (PR DP-1,
+/// 2026-11-06): with `TV_QDB_SHARED_WORKERS=1` the network pool used to
+/// follow the shared count down to one thread, and one `/exp` export then
+/// held the thread every ILP `/write` needs for minutes. Those two pools
+/// wait on sockets and the disk, not the CPU, so the one-core quota does not
+/// argue for shrinking them.
 const QDB_CORE_ISOLATION_VALUES: [(&str, &str); 5] = [
     ("TV_QDB_CPUSET", "0"),
     ("TV_QDB_CPUS", "1.0"),
@@ -1329,6 +1337,24 @@ mod tests {
         // `on` works the same.
         let on = plan_questdb_host_env(2, 15, "TV_QDB_CORE_ISOLATION=on\n", false).expect("change");
         assert!(on.contains("TV_QDB_CPUSET=0\n"));
+    }
+
+    // Regression: 2026-11-06 (PR DP-1) — core isolation set the shared pool
+    // to 1, which pulled QuestDB's network pool down with it; one /exp export
+    // then held the thread every ILP /write needed for 4-5 minutes.
+    #[test]
+    fn test_regression_dp1_core_isolation_never_shrinks_the_http_or_network_pool() {
+        for (key, _) in QDB_CORE_ISOLATION_VALUES {
+            assert_ne!(key, "TV_QDB_HTTP_WORKERS");
+            assert_ne!(key, "TV_QDB_NETWORK_WORKERS");
+        }
+        let env = "TV_QDB_CORE_ISOLATION=1\nTV_QDB_HTTP_WORKERS=2\nTV_QDB_NETWORK_WORKERS=2\n";
+        let next = plan_questdb_host_env(2, 15, env, false).expect("change");
+        assert_eq!(dotenv_value(&next, "TV_QDB_HTTP_WORKERS"), Some("2"));
+        assert_eq!(dotenv_value(&next, "TV_QDB_NETWORK_WORKERS"), Some("2"));
+        let bare = plan_questdb_host_env(2, 15, "TV_QDB_CORE_ISOLATION=1\n", false).expect("on");
+        assert!(!bare.contains("TV_QDB_HTTP_WORKERS"), "{bare}");
+        assert!(!bare.contains("TV_QDB_NETWORK_WORKERS"), "{bare}");
     }
 
     #[test]
