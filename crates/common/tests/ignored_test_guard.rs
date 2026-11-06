@@ -50,6 +50,16 @@ fn repo_root() -> PathBuf {
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // 2026-11-02: the two evening-state defect tests now run unignored.
+    // Added 2026-11-06 with plan item PF-5: the per-seal vs per-frame-batched
+    // seal hand-off measurement that decided PF-5 is NOT built (numbers in
+    // the plan and the CLAUDE.md `SealSender` row). It prints percentiles and
+    // gates nothing; no production code depends on it. Re-run it with:
+    //
+    //   cargo test --release -p tickvault-storage --test seal_handoff_burst_harness -- --ignored --nocapture
+    (
+        "crates/storage/tests/seal_handoff_burst_harness.rs",
+        "seal_handoff_burst_cost_per_seal_vs_batched",
+    ),
     // Added 2026-10-30 with plan item DT0: a wall-clock yardstick for the
     // ring-dwell + decode part of the `receipt_to_fold` stage, quiet and with
     // two busy threads competing for the CPUs (the r8g.large has two). It
