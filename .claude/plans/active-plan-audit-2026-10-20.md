@@ -698,7 +698,7 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 
 ### PR W4 — confirm parked live acks once they are durable (storage, app) — 2026-10-27 wave
 
-- [ ] W4. Parked live acks under latched apply lag (the "Follow-up" below,
+- [x] W4. Parked live acks under latched apply lag (the "Follow-up" below,
   now its own item, owner: "go ahead with next wave ... fix and resolve and
   implement everything", 2026-10-27). While any table is latched untrusted,
   every QuestDB probe is unclean, live acks park, and a session pins its whole
@@ -713,9 +713,24 @@ CONTRACT FOR AT LEAST 10 MINUTES".
   had clean probes at all; if none did, say so and confirm only what the rule
   allows (no relaxation of the probe rule).
   - Files: crates/storage/src/wal_applied_watermark.rs, crates/storage/src/wal_unapplied_ranges.rs, CLAUDE.md (the unapplied-ranges row)
-  - Tests (to write): test_parked_ack_is_confirmed_after_lag_and_two_clean_probes,
+  - Tests: test_parked_ack_is_confirmed_after_lag_and_two_clean_probes,
     test_episode_before_confirmation_keeps_the_range,
-    a property test that no frame acked inside or before an episode is ever trimmed
+    proptest_w4_no_frame_is_trimmed_outside_the_rule (all in
+    `wal_applied_watermark.rs::w4_parked_confirm_tests`)
+  - Done (ticked 2026-11-06): the code is already on main, ported in #2187
+    (2026-11-03) as the newer lineage inside `wal_applied_watermark.rs`
+    (`ParkedConfirm`, `confirm_parked_if_due`, `ProbeVerdict`,
+    `UnappliedRanges::remove_span`, `tv_wal_parked_confirm_total{outcome}`),
+    wired from `wal_suspension_watcher.rs` (`note_questdb_probe_verdict`).
+    The never-opened `claude/assurance-fix-w4` commit (78087502e, separate
+    `wal_parked_confirm.rs` module) is SUPERSEDED and was not cherry-picked:
+    it would add a second, conflicting implementation of the same rule
+    (two `ProbeVerdict` types, two counter families). Re-reviewed against
+    current code; the missing CLAUDE.md O(1) row is added. The live
+    measurement in the branch commit (26 Oct: 0 suspicion episodes, 0
+    suspect seconds, 225 GB pinned flat) shows W4 does not shrink that
+    backlog; what pins it there is Unknown (candidates, not measured: boot
+    tails, shed buckets, a migrated backlog that is not draining).
 
 ### Follow-up (own plan item, not in this plan)
 
@@ -2288,6 +2303,7 @@ Revert the PR.
 - [x] CI-2 nightly updates one open issue instead of opening a new one each night, and prints the failing test names — one step "Report regression on the one open issue" (search, comment, else create; `grep -m 60` of FAILED/panicked/error[/No space left first)
 - [x] CI-3 `feed_drain_main_feed_full` = 2,500 ns key for Full-packet frames (owner card above); Quote frames keep `feed_drain_main_feed` = 1,000 ns; CLAUDE.md key count updated — `quality/benchmark-budgets.toml` (key above `feed_drain_main_feed`; Full ids renamed `feed_drain/main_feed_full_frame_4[_own]`), `drain_tail_gate::MAIN_FEED_FULL_DRAIN_BUDGET_KEY` + `test_real_budget_file_routes_full_and_quote_ids_to_their_own_keys`, `benches/feed_drain.rs::full_feed_drain_tail_gates`, `feed_drain_full_frame_evidence.rs::test_full_and_quote_tail_gates_read_their_own_budget_keys`, CLAUDE.md 37 → 38 keys
 - [ ] CI-4 finish and ship the never-opened `claude/assurance-fix-w4` (confirm parked live acks, W4) as its own PR after these
+  - 2026-11-06: the W4 code is already on main (#2187); the branch is superseded, not cherry-picked (see W4). What is left to ship is the W4 tick and its CLAUDE.md O(1) row (branch `w4-2026-11-06`); tick this once that merges.
 
 ### PR TG — 2026-11-06: tests for the incident's worst-case combinations (storage, app)
 - [ ] TG-1 slow-QuestDB boot: the six audit/rollup ensures retry, DEDUP keys reach the table before the first ILP row (`cov_audit_ddl_slow_boot.rs`)
