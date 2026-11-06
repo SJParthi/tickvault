@@ -1246,9 +1246,12 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // owner-requested in rust-only-forever-lock-2026-07-19.md §0.18.
     // 34,714 → 34,627 on 2026-11-06 (plan PR MV review): the in-flight lock on
     // the movers table cost bytes, a shared `$$` helper saved more.
+    // 34,627 → 34,696 the same day (PR MV combined review): a generation stamp
+    // on each reply so an older filter's rows never render under a newer one;
+    // still under the 34,714 §0.18 approved.
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        34_627,
+        34_696,
     ),
 ];
 

@@ -1377,3 +1377,9 @@ unchanged at 21. Every other allowance is unchanged.
 Scope is this date and time selection only. It authorizes no other budget
 increase, order or depth activation, or deployment. It is not a latency,
 coverage, zero-loss or security guarantee.
+
+**Note 2026-11-06 (plan PR MV review, no new allowance):** the movers speed fix
+first compacted the script to 34,627 bytes; the follow-up fix that stops a
+reply for an older filter from rendering under a newer one (a generation stamp
+on each reply) brings it to **34,696**, still under the 34,714 this section
+approved. No line, tag or handler change.
