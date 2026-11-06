@@ -317,7 +317,8 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 
 /// Records one NEW trade's delivery delay into the window maximum.
 ///
-/// The caller passes only folded, non-repeat ticks from a live socket. O(1):
+/// The caller passes only folded NEW trades (`IngestOutcome::Folded` with
+/// `advanced` true and `repeat_quote` false, plan PR AL-1) from a live socket. O(1):
 /// a few integer operations, one relaxed load and, only when the lag raises
 /// the maximum, one uncontended `fetch_max` ([`fetch_max_if_above`]); no
 /// allocation.
@@ -1409,6 +1410,14 @@ pub enum IngestOutcome {
         /// happened, so its exchange stamp is NOT a delivery-lag sample: the
         /// lag histogram excludes it (2026-09-23, FIFTH scope-lock row).
         repeat_quote: bool,
+        /// The packet carried a REAL NEW TRADE: its contract was already
+        /// seeded (never the first packet after a subscribe) and its
+        /// day-cumulative strictly increased, or, for a zero-volume index, its
+        /// trade second moved forward (`ConsumeStats::advanced`). Only such a
+        /// packet is a delivery-lag sample (plan PR AL-1, 2026-11-06): a stale
+        /// cumulative regression, a backup copy accepted late, or an illiquid
+        /// contract's first packet all carry an old trade time that is not lag.
+        advanced: bool,
     },
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
@@ -3440,6 +3449,7 @@ impl LiveIngest {
             sealed: stats.sealed_count,
             amended: stats.amended_count,
             repeat_quote: stats.repeat_quote,
+            advanced: stats.advanced,
         }
     }
 
@@ -8829,10 +8839,20 @@ pub fn drain_main_feed_frame(
                 // as option sockets #1-#3 delivering most packets over 60 s,
                 // while the socket-to-disk-log stage measured 99.8% at or under
                 // 131 us. Each excluded tick is counted, never dropped silently.
+                //
+                // ⚠ CHANGED 2026-11-06 (plan PR AL-1): a folded packet that is
+                // not a NEW trade (`advanced` false: the first packet after a
+                // subscribe, a stale cumulative regression, a backup copy
+                // accepted late) is excluded too. Live that day the F&O worst
+                // delay read 4,038,655 ms while the index/spot class read
+                // 1,923 ms: an illiquid contract's old trade time is not lag.
                 match outcome {
                     IngestOutcome::Folded {
                         repeat_quote: true, ..
                     } => record_ws_lag_repeat_excluded(),
+                    IngestOutcome::Folded {
+                        advanced: false, ..
+                    } => record_ws_lag_not_a_trade_excluded(),
                     IngestOutcome::Folded { .. } => {
                         record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
@@ -20021,6 +20041,15 @@ mod tests {
             folded_arm < measured && measured < other,
             "the lag sample must sit inside the Folded arm, before the catch-all"
         );
+        // Plan PR AL-1 (2026-11-06): a folded packet that is not a new trade
+        // is excluded BEFORE the arm that records lag.
+        let not_advanced = arm
+            .find("advanced: false, ..")
+            .expect("a not-advanced fold must be excluded from the lag sample");
+        assert!(
+            not_advanced < folded_arm,
+            "the not-advanced exclusion must come before the recording arm"
+        );
         assert!(
             src.contains("\"reason\" => \"not_a_trade\""),
             "the exclusion reason label must be registered"
@@ -22971,6 +23000,42 @@ mod tests {
             ingest.seq_refused(),
             0,
             "a representable sequence must not be refused"
+        );
+    }
+
+    /// Plan PR AL-1 (2026-11-06): only a NEW trade is a delivery-lag sample.
+    /// The first packet of an instrument never is; a later index print is.
+    #[test]
+    fn test_regression_ingest_reports_advanced_only_on_a_new_trade() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let first = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let ParsedFrame::Tick(tick) = dispatch_frame(&first, 1_779_355_000_000_000_000)
+            .expect("a well-formed ticker packet must parse")
+        else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        let outcome = ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Folded {
+                    advanced: false,
+                    ..
+                }
+            ),
+            "the first packet after a subscribe is never a new trade, got {outcome:?}"
+        );
+
+        let later = ticker_packet(13, 23_147.0, 1_779_355_001);
+        let ParsedFrame::Tick(tick) = dispatch_frame(&later, 1_779_355_001_000_000_000)
+            .expect("a well-formed ticker packet must parse")
+        else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        let outcome = ingest.ingest_tick(&tick, 43, 1_779_355_001_000);
+        assert!(
+            matches!(outcome, IngestOutcome::Folded { advanced: true, .. }),
+            "a later index print is a new trade, got {outcome:?}"
         );
     }
 
