@@ -114,9 +114,13 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
   # ⚠ CORRECTED 2026-10-11 (audit QDB-10): the description named a "100K
   # rescue ring" that no longer exists. Text only; the alarm is unchanged.
   alarm_name          = "tv-${var.environment}-questdb-disconnected"
-  alarm_description   = "QuestDB has been disconnected for > 30 seconds. Rows are held in writer retry buffers and disk spill (finite reserve). See BOOT-01/BOOT-02 runbook."
+  alarm_description   = "QuestDB has been disconnected for > 30 seconds in at least 3 of the last 5 minutes. Rows are held in writer retry buffers and disk spill (finite reserve). See BOOT-01/BOOT-02 runbook."
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
+  # 2026-11-06 (noise lock dated row, owner card "Yes, quieter
+  # (Recommended)"): 3 bad minutes out of 5 instead of any single minute.
+  # One-minute stalls were paging and clearing all session.
+  evaluation_periods  = 5
+  datapoints_to_alarm = 3
   metric_name         = "tv_questdb_disconnected_seconds"
   namespace           = local.app_namespace
   period              = 60

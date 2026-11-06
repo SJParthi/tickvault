@@ -734,9 +734,18 @@ locals {
     # "the feed is healthy again" from "one sparse contract happened to trade".
     # An OK page that means the second while reading as the first is worse than
     # no page at all.
+    #
+    # 2026-11-06 (noise lock dated row, owner card "Yes, quieter
+    # (Recommended)"): period 3600 -> 300. With an hour-long window one
+    # emit held the alarm in ALARM for up to an hour after the condition
+    # ended, so it read as a live problem long after silence cleared. At
+    # 300 s the alarm clears 5 minutes after the last emit. The emit side's
+    # 30-minute cooldown between pages is unchanged, so a 300 s window does
+    # not bring back the 2026-08-14 burst of ~50 messages; ok_recovery stays
+    # false (no OK page).
     "risk-gap-03" = {
       pattern     = "{ $.code = \"RISK-GAP-03\" && $.level = \"ERROR\" }"
-      period      = 3600
+      period      = 300
       threshold   = 1
       eval        = 1
       dta         = 1

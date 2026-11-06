@@ -28890,11 +28890,31 @@ mod silence_latch_tests {
         // were present three lines further down.
         let entry = &entry[..entry.find("desc").unwrap_or(entry.len())];
 
+        // ⚠ CHANGED 2026-11-06 (noise lock §2.16, owner card "Yes, quieter
+        // (Recommended)"): the window is 300 s, so the alarm clears 5 minutes
+        // after the last emit instead of holding ALARM for up to an hour. What
+        // keeps a 300 s window from flapping on the residual oscillation (the
+        // 2026-08-14 session, ~25 transitions) is the EMIT side: one coded
+        // RISK-GAP-03 line at most every `SILENCE_PAGE_COOLDOWN_SECS` (1,800 s),
+        // so the alarm can enter ALARM at most once per 30 minutes. Both halves
+        // are pinned here: the period may not exceed 300 s (§2.16 REJECT), and
+        // the cooldown may not shrink below 1,800 s.
         assert!(
-            entry.contains("period      = 3600"),
-            "the risk-gap-03 alarm window shrank below an hour. A 5-minute \
-             window flaps on the residual oscillation and pages on every edge \
-             — the 2026-08-14 session would have produced ~25 transitions"
+            entry.contains("period      = 300\n"),
+            "the risk-gap-03 alarm window is not 300 s. Noise lock §2.16 \
+             (2026-11-06) set it to 300 s so the alarm clears 5 minutes after the \
+             last emit; raising it again needs a further dated row"
+        );
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dhan_feed_stack.rs"),
+        )
+        .expect("dhan_feed_stack.rs must be readable");
+        assert!(
+            src.contains("const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;"),
+            "the 30-minute RISK-GAP-03 emit cooldown changed. A 300 s alarm \
+             window only stays quiet because the emit side pages at most every \
+             30 minutes; without it the 2026-08-14 oscillation would page on \
+             every edge (~25 transitions)"
         );
         assert!(
             entry.contains("ok_recovery = false"),
