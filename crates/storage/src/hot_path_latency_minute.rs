@@ -80,7 +80,8 @@
 //!
 //! ## Cost
 //!
-//! 7 rows a minute, ~3,400 rows a day at the box's ~8 hours. QuestDB only;
+//! 8 rows a minute (one per stage, `ALL_STAGES`), ~3,900 rows a day at the
+//! box's ~8 hours. QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -695,7 +696,8 @@ impl HotPathLatencyMinuteWriter {
         self.pending
     }
 
-    /// Appends one row. Cold path: seven a minute, on the writer thread.
+    /// Appends one row. Cold path: one per stage a minute (`ALL_STAGES`, eight
+    /// since PR DP-6), on the writer thread.
     ///
     /// # Errors
     /// Propagates ILP buffer errors.
@@ -754,7 +756,7 @@ impl HotPathLatencyMinuteWriter {
         Ok(())
     }
 
-    /// Appends one queued item whole: a minute's seven latency rows and its
+    /// Appends one queued item whole: a minute's latency rows (one per stage) and its
     /// host row, or a day's verdict row. A failure part-way rewinds the
     /// buffer to before the item, so a half-built row can never poison later
     /// flushes (hostile review, 2026-10-30). Writer thread only.

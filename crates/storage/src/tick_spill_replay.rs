@@ -1993,12 +1993,12 @@ pub async fn replay_spill_dir(
     // size independent of how large any spill file has grown.
     let mut buf = vec![0_u8; REPLAY_STREAM_BUFFER_BYTES];
     // The writer appends to the file for the CURRENT hour, and `list_spill_files`
-    // sorts by name (hour). The LAST entry is always treated as live; since
-    // audit DA-13b an earlier entry is closed only when its hour has passed AND
-    // it has been quiet for `SPILL_LIVE_FILE_QUIET_SECS`, because the writer
-    // names files from the wall clock and a clock step makes it append to a
-    // file that is not last. A closed file has no appender, so emptying it
-    // cannot destroy anything.
+    // sorts by name (hour). Every entry, the LAST one included (PR DP-8,
+    // 2026-11-06; before, the last was always live), is closed only when its
+    // hour has passed AND it has been quiet for `SPILL_LIVE_FILE_QUIET_SECS`
+    // (audit DA-13b), because the writer names files from the wall clock and
+    // a clock step makes it append to a file that is not last. A closed file
+    // has no appender, so emptying it cannot destroy anything.
     let label = dir_label(dir);
     let files = list_spill_files(dir);
     let last_index = files.len().saturating_sub(1);

@@ -183,8 +183,15 @@ pub enum Stage {
     /// ([`record_stage_nanos_weighted`]). A frame stacks many packets, so the
     /// per-frame stage cannot say what one tick costs; this is the per-tick
     /// AVERAGE within each frame (a multi-packet frame contributes its mean
-    /// once per tick, not each tick's own time). A frame with no tick packet
-    /// records nothing. Never paged.
+    /// once per tick, not each tick's own time). The frame's time is its
+    /// decode + fold + row append for EVERY packet in it, non-tick packets
+    /// (open interest, market status, previous close) included, divided by
+    /// its tick packets only. A frame with no tick packet records nothing.
+    /// Never paged.
+    ///
+    /// Reading it (PR DP review): the histogram's buckets are powers of two,
+    /// so a green "under 1 µs" tile means the p99 sits in the bucket ending
+    /// at 1,024 ns, not at or under 1,000 ns.
     DrainMainTick = 7,
 }
 

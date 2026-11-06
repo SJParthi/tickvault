@@ -7251,23 +7251,24 @@ async fn run_frame_drain(
                         // own work. One clock read and four relaxed atomics,
                         // no allocation.
                         let frame_work_end = std::time::Instant::now();
+                        // The frame's duration, computed once for both stages.
+                        let frame_work =
+                            frame_work_end.saturating_duration_since(frame_work_start);
                         tickvault_storage::hot_path_telemetry::record_stage(
                             tickvault_storage::hot_path_telemetry::Stage::DrainMainFrame,
-                            frame_work_end.saturating_duration_since(frame_work_start),
+                            frame_work,
                         );
                         // PR DP-6: one tick's share of the frame (its time
-                        // over its ticks), weighted by the tick count; four
-                        // relaxed atomics, nothing for a frame with no tick.
+                        // over its tick packets; the frame's non-tick packets
+                        // are inside its time), weighted by the tick count;
+                        // four relaxed atomics, nothing for a frame with no
+                        // tick.
                         tickvault_storage::hot_path_telemetry::record_stage_nanos_weighted(
                             tickvault_storage::hot_path_telemetry::Stage::DrainMainTick,
-                            u64::try_from(
-                                frame_work_end
-                                    .saturating_duration_since(frame_work_start)
-                                    .as_nanos(),
-                            )
-                            .unwrap_or(u64::MAX)
-                            .checked_div(outcome.tick_packets)
-                            .unwrap_or(0),
+                            u64::try_from(frame_work.as_nanos())
+                                .unwrap_or(u64::MAX)
+                                .checked_div(outcome.tick_packets)
+                                .unwrap_or(0),
                             outcome.tick_packets,
                         );
                         // DT0 (2026-10-29): socket receipt -> folded, on the

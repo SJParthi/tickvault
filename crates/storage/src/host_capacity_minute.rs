@@ -561,10 +561,12 @@ pub fn record_process_core_count() -> u64 {
 }
 
 /// The recorded core count when one was recorded (non-zero), else
-/// `fallback`. Pure, O(1).
+/// `fallback()`. The fallback runs ONLY when nothing was recorded (PR DP
+/// review): on the pinned telemetry thread `available_parallelism` reads 1,
+/// so it must never be read first. O(1).
 #[must_use]
-pub const fn resolve_core_count(recorded: u64, fallback: u64) -> u64 {
-    if recorded > 0 { recorded } else { fallback }
+pub fn resolve_core_count(recorded: u64, fallback: impl FnOnce() -> u64) -> u64 {
+    if recorded > 0 { recorded } else { fallback() }
 }
 
 impl HostSampler {
@@ -575,7 +577,7 @@ impl HostSampler {
     pub fn new() -> Self {
         let cores = resolve_core_count(
             PROCESS_CORE_COUNT.load(std::sync::atomic::Ordering::Acquire),
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as u64,
+            || std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as u64,
         );
         Self {
             reader: WaitSum::default(),
@@ -2244,8 +2246,16 @@ mod tests {
     // the pinned telemetry thread and got 1 on the 2-core box.
     #[test]
     fn test_regression_dp6_record_process_core_count_wins_over_the_pinned_read() {
-        assert_eq!(resolve_core_count(2, 1), 2, "recorded before the pin");
-        assert_eq!(resolve_core_count(0, 1), 1, "nothing recorded: read here");
+        assert_eq!(
+            resolve_core_count(2, || panic!("the fallback is never read when recorded")),
+            2,
+            "recorded before the pin"
+        );
+        assert_eq!(
+            resolve_core_count(0, || 1),
+            1,
+            "nothing recorded: read here"
+        );
         let recorded = record_process_core_count();
         assert!(recorded >= 1);
         assert_eq!(
