@@ -220,6 +220,12 @@ const KNOWN_GAUGES: &[&str] = &[
     // `metrics::gauge!(..).set(..)`, published verbatim, so there is no delta
     // and no dropped first sample.
     "tv_dhan_ws_lag_max_ms",
+    // ADDED 2026-11-06 (plan PR AL-4, noise-lock §2.6 dated row):
+    // `dhan-feed-delay-high` now reads the index/spot class maximum. It is set
+    // with `metrics::gauge!(..).set(..)` through the same 60 s peak hold as
+    // `tv_dhan_ws_lag_max_ms` above, so there is no delta and no dropped
+    // first sample to seed.
+    "tv_dhan_ws_lag_max_ms_by_class",
     "tv_dhan_ws_main_reconnect_recovery_max_ms",
 ];
 
