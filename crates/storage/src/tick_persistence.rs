@@ -8647,3 +8647,7 @@ mod spill_held_bytes_cache_tests {
 #[cfg(test)]
 #[path = "tick_row_identity_tests.rs"]
 mod tick_row_identity_tests;
+
+#[cfg(test)]
+#[path = "tick_stage_golden_tests.rs"]
+mod tick_stage_golden_tests;
