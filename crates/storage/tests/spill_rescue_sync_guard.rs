@@ -227,8 +227,11 @@ fn every_blocking_writer_step_runs_off_the_worker() {
         for line in src.lines().filter(|l| l.contains("sender.flush(")) {
             if line.trim_start().starts_with("//")
                 || line.contains("sender.flush(&mut batch.buffer)")
+                || line.contains("sender.flush(&mut self.encode_buf)")
             {
-                // Comments, and the sink thread's own flush (a plain OS thread).
+                // Comments, and the sink thread's own flush (a plain OS thread;
+                // since PF-4, 2026-11-06, the tick sink sends the text it wrote
+                // into its own `encode_buf`).
                 continue;
             }
             producer_flushes += 1;

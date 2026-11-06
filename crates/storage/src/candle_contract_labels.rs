@@ -38,6 +38,10 @@
 //!   were NULL). A future writes NO `contract` (futures are no longer
 //!   subscribed). A name is never fabricated: an id absent from both tables
 //!   stays NULL.
+//! * A name longer than [`CONTRACT_LABEL_MAX_CHARS`] (64) characters is cut
+//!   to 64 at publish and counted on `tv_candle_contract_labels_truncated_total`
+//!   (owner decision 2026-11-06, plan item PF-4), so the longest row a writer
+//!   can produce is a constant. Real names are about 30 characters.
 //! * A seal re-ingested by the BOOT drain (spill/DLQ) can reach the writer
 //!   before the day's table is published. That bar is written with a NULL
 //!   `contract` — the same omission, never a guess.
@@ -112,6 +116,7 @@ pub fn publish_candle_contract_labels_if_empty(labels: CandleContractLabels) -> 
 /// that is already clean keeps its allocation; only a dirty one is replaced.
 /// O(names), cold.
 fn sanitize_labels(mut labels: CandleContractLabels) -> CandleContractLabels {
+    let mut truncated = 0_u64;
     // O(1) EXEMPT: begin — publish only (boot and contract attach), never per row
     for name in labels.values_mut() {
         if let std::borrow::Cow::Owned(clean) =
@@ -119,9 +124,34 @@ fn sanitize_labels(mut labels: CandleContractLabels) -> CandleContractLabels {
         {
             *name = Arc::from(clean);
         }
+        if let Some(cut) = truncate_label(name).map(Arc::<str>::from) {
+            *name = cut;
+            truncated += 1;
+        }
     }
     // O(1) EXEMPT: end
+    // Registered at 0 by every publish, so the series exists from boot.
+    metrics::counter!(CONTRACT_LABELS_TRUNCATED_COUNTER).increment(truncated);
     labels
+}
+
+/// Characters a published contract name keeps (owner decision 2026-11-06,
+/// plan item PF-4, "Cap at 64 characters"). Real names are about 30
+/// characters (`BANKNIFTY-27Nov2026-51200-PE` is 28); the cap makes the
+/// longest ILP line a tick row can write a constant
+/// (`tick_stage::MAX_ILP_LINE_BYTES`), so the writer's row cut bounds its text.
+pub const CONTRACT_LABEL_MAX_CHARS: usize = 64;
+
+/// Names cut to [`CONTRACT_LABEL_MAX_CHARS`] at publish, over the process's
+/// life. Expected to stay at zero.
+pub const CONTRACT_LABELS_TRUNCATED_COUNTER: &str = "tv_candle_contract_labels_truncated_total";
+
+/// `name` cut to its first [`CONTRACT_LABEL_MAX_CHARS`] characters, or `None`
+/// when it is already that short. Cuts on a character boundary, never inside
+/// one. O(len), publish only.
+fn truncate_label(name: &str) -> Option<&str> {
+    let (end, _) = name.char_indices().nth(CONTRACT_LABEL_MAX_CHARS)?;
+    name.get(..end)
 }
 
 /// True when `name` is already what `sanitize_ilp_symbol` would write, i.e.
@@ -258,6 +288,63 @@ mod tests {
         assert!(!label_is_ilp_clean("A,B"));
         assert!(!label_is_ilp_clean("A=B"));
         assert!(!label_is_ilp_clean("A\nB"));
+    }
+
+    /// PF-4 owner decision (2026-11-06): a name longer than 64 characters is
+    /// cut to 64 at publish, by both publish paths, on a character boundary;
+    /// a name at or under the cap is untouched.
+    #[test]
+    fn test_publish_cuts_a_name_over_64_characters_to_64() {
+        let _g = lock();
+        let long: String = "N".repeat(70);
+        let exact: String = "E".repeat(CONTRACT_LABEL_MAX_CHARS);
+        let wide: String = "\u{1F600}".repeat(65);
+        let mut m = CandleContractLabels::default();
+        m.insert((9_100_401, "NSE_FNO"), Arc::<str>::from(long.as_str()));
+        m.insert((9_100_402, "NSE_FNO"), Arc::<str>::from(exact.as_str()));
+        m.insert((9_100_403, "NSE_FNO"), Arc::<str>::from(wide.as_str()));
+        publish_candle_contract_labels(m);
+        let t = candle_contract_labels();
+        assert_eq!(
+            t.get(&(9_100_401, "NSE_FNO")).map(|s| s.to_string()),
+            Some("N".repeat(64))
+        );
+        assert_eq!(
+            t.get(&(9_100_402, "NSE_FNO")).map(|s| s.to_string()),
+            Some(exact.clone()),
+            "exactly 64 is kept whole"
+        );
+        let cut = t.get(&(9_100_403, "NSE_FNO")).map(|s| s.to_string());
+        assert_eq!(cut.as_deref().map(|s| s.chars().count()), Some(64));
+        assert!(
+            t.values()
+                .all(|n| n.chars().count() <= CONTRACT_LABEL_MAX_CHARS)
+        );
+        drop(t);
+
+        publish_candle_contract_labels(CandleContractLabels::default());
+        let mut boot = CandleContractLabels::default();
+        boot.insert((13, "IDX_I"), Arc::<str>::from(long.as_str()));
+        assert!(publish_candle_contract_labels_if_empty(boot));
+        assert_eq!(
+            candle_contract_labels()
+                .get(&(13, "IDX_I"))
+                .map(|s| s.chars().count()),
+            Some(64)
+        );
+        publish_candle_contract_labels(CandleContractLabels::default());
+    }
+
+    #[test]
+    fn test_truncate_label_boundaries() {
+        assert_eq!(truncate_label(""), None);
+        assert_eq!(truncate_label(&"a".repeat(64)), None);
+        assert_eq!(
+            truncate_label(&"a".repeat(65)),
+            Some("a".repeat(64).as_str())
+        );
+        let wide = "\u{e9}".repeat(65);
+        assert_eq!(truncate_label(&wide).map(|s| s.chars().count()), Some(64));
     }
 
     /// A clean name keeps its allocation; only a dirty one is replaced.

@@ -18,6 +18,15 @@
 //!   - `tick_row_append/tick_quotes_row`: the same Full ticks routed to
 //!     `tick_quotes` (arrival `ts` plus `exchange_timestamp`).
 //!
+//! ⚠ CHANGED 2026-11-06 (plan item PF-4): the drain no longer writes the ILP
+//! line. The timed region is now what the drain pays after PF-4: building the
+//! `TickRow`, the session-window gate, pinning the contract-name table (one
+//! table load and one pointer compare) and pushing the row into the writer's
+//! pre-sized, pre-touched staged batch. The text is written by the writer
+//! thread (`TickWriterSink::write`), not timed here. Both encoders still run:
+//! the drain cost is the same for both now; the encoder only changes the
+//! writer thread's work. Before/after figures: the plan's PF-4 entry.
+//!
 //! Companion zero-allocation evidence: `tests/dhat_tick_row_append.rs`.
 //! Byte-identity evidence: the proptests in `src/tick_row_identity_tests.rs`.
 //!
