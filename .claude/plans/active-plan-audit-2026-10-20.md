@@ -2344,9 +2344,17 @@ Revert the PR.
   - 2026-11-06: the W4 code is already on main (#2187); the branch is superseded, not cherry-picked (see W4). What is left to ship is the W4 tick and its CLAUDE.md O(1) row (branch `w4-2026-11-06`); tick this once that merges.
 
 ### PR TG — 2026-11-06: tests for the incident's worst-case combinations (storage, app)
-- [ ] TG-1 slow-QuestDB boot: the six audit/rollup ensures retry, DEDUP keys reach the table before the first ILP row (`cov_audit_ddl_slow_boot.rs`)
-- [ ] TG-2 WAL catch-up against a stalling QuestDB (ack timeout, lag pause, clock run-out) (`chaos_catchup_slow_questdb.rs`)
-- [ ] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
+- [x] TG-1 slow-QuestDB boot: the six audit/rollup ensures retry, DEDUP keys reach the table before the first ILP row (`cov_audit_ddl_slow_boot.rs`)
+  - Files: crates/app/tests/cov_audit_ddl_slow_boot.rs (local stand-in QuestDB; no production change)
+  - Tests: `test_regression_tg1_audit_ensures_retry_until_all_six_tables_are_keyed` (two refused attempts, then all six DEDUP keys accepted, each carrying `feed`), `test_regression_tg1_spill_drain_writes_nothing_while_the_dedup_key_is_refused`, `test_regression_tg1_spill_drain_keys_the_table_before_the_first_write`
+  - Honest limit (unchanged, recorded at `DdlTables::AuditTables`): only the spill-replay path is gated on the key; a live consumer row written before the background re-run lands can still auto-create its table unkeyed.
+- [x] TG-2 WAL catch-up against a stalling QuestDB (ack timeout, lag pause, clock run-out) (`chaos_catchup_slow_questdb.rs`)
+  - Files: crates/app/tests/chaos_catchup_slow_questdb.rs (decision logic: `AppliedWatermark` ack accounting, `wal_catchup_lag_step`, `wal_catchup_budget_secs`; the pause-loop model is source-pinned to the loop in `dhan_feed_stack.rs`)
+  - Tests: `test_regression_tg2_ack_wait_times_out_on_a_writer_stalled_by_questdb`, `test_regression_tg2_ack_wait_refuses_when_only_the_depth_writer_is_stalled`, `test_regression_tg2_ack_wait_succeeds_when_questdb_recovers_inside_the_bound`, `test_regression_tg2_ack_wait_refuses_a_batch_that_landed_nowhere_without_waiting_out_the_bound`, `test_regression_tg2_acks_during_a_questdb_stall_do_not_raise_the_skip_watermark`, `test_regression_tg2_lag_pause_against_a_stalled_questdb_ends_within_its_bounds_all_day`, `test_regression_tg2_lag_pause_resumes_on_the_first_poll_after_questdb_recovers`, `test_regression_tg2_pause_model_matches_the_catch_up_loop_source`
+- [x] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
+  - Files: crates/storage/src/partition_archive.rs (one `mod` line), crates/storage/src/partition_archive/stub_integration_tests/tg_export_regressions_tests.rs (reuses the stub QuestDB + S3 harness)
+  - Tests: `test_regression_tg3_export_429_keeps_every_partition_and_uploads_nothing` (429 body is a valid 3-row CSV; bite-checked: removing the `/exp` status check fails it), `test_regression_tg3_a_partition_kept_by_429_is_archived_once_exp_answers`, `test_regression_tg3_stalled_export_keeps_partition_and_pass_ends_within_bound`, `test_regression_tg3_trickling_export_keeps_partition_and_pass_ends_within_bound`
+  - Bound tested on main: per-run cap + one `/exp` per partition per pass + the export client timeout. The in-session time cap (`ArchivePassLimits`, PR DP #2196) is not on main and is not covered here.
 - [ ] TG-4 nightly contention test: production compose limits, one hour of depth, archiver export concurrent with ILP writes and /exec probes
 
 ### PR PF — 2026-11-06: per-tick in-memory path toward under 1 µs with live proof (storage, app, config)
