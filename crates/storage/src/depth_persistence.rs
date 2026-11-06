@@ -7315,7 +7315,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dp5_book_self_heal_decision_and_wal_reading() {
+    fn test_dp5_book_self_heal_decision_and_book_wal_applied() {
         assert_eq!(book_self_heal_decision(Some(0), Some(true)), Ok(()));
         assert_eq!(
             book_self_heal_decision(Some(1), Some(true)),

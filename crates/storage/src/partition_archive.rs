@@ -6372,7 +6372,7 @@ mod stub_integration_tests {
     // partitions back to back, nine of them market_depth hours, through
     // QuestDB's one HTTP thread while the session opened.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_stub_pass_limits_skip_depth_cap_and_deadline() {
+    async fn test_stub_with_pass_limits_skip_depth_cap_and_deadline() {
         let (qdb_url, qdb_log) = spawn_stub(qdb_responder(
             vec!["2026-04-01T11", "2026-04-01T09", "2026-04-01T10"],
             3,

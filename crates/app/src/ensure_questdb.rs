@@ -262,7 +262,11 @@ fn dotenv_value(dotenv: &str, key: &str) -> Option<String> {
 /// An operator value safe to hand docker as one argument: short, and only
 /// characters a worker count, a cpuset, a CPU quota or a memory size uses.
 fn is_safe_override(value: &str) -> bool {
-    !value.is_empty()
+    // Starts with a letter or digit, so nothing reads as a docker flag.
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
         && value.len() <= 32
         && value
             .bytes()

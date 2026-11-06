@@ -2243,7 +2243,7 @@ mod tests {
     // Regression: 2026-11-06 (PR DP-6) — the sampler read its core count on
     // the pinned telemetry thread and got 1 on the 2-core box.
     #[test]
-    fn test_regression_dp6_the_recorded_core_count_wins_over_the_pinned_read() {
+    fn test_regression_dp6_record_process_core_count_wins_over_the_pinned_read() {
         assert_eq!(resolve_core_count(2, 1), 2, "recorded before the pin");
         assert_eq!(resolve_core_count(0, 1), 1, "nothing recorded: read here");
         let recorded = record_process_core_count();

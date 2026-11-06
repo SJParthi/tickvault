@@ -791,6 +791,21 @@ mod tests {
     }
 
     #[test]
+    fn test_deferred_floor_blocked_only_past_the_cap_and_floor_blocked_buckets_while_blocked() {
+        let work = |secs: Option<u64>| DayWork {
+            deferred_marks: 7,
+            deferred_retryable_left: Some(7),
+            deferred_floor_blocked_secs: secs,
+            ..done_work()
+        };
+        assert!(!work(None).deferred_floor_blocked());
+        assert!(!work(Some(1)).deferred_floor_blocked(), "inside the hour");
+        assert!(work(Some(DRAIN_HOLD_FLOOR_BLOCKED_CAP_SECS)).deferred_floor_blocked());
+        assert_eq!(work(Some(1)).floor_blocked_buckets(), 7);
+        assert_eq!(work(None).floor_blocked_buckets(), 0);
+    }
+
+    #[test]
     fn test_floor_blocked_secs_from_the_published_start() {
         assert_eq!(floor_blocked_secs(None, 1_000), None);
         assert_eq!(floor_blocked_secs(Some(400), 1_000), Some(600));

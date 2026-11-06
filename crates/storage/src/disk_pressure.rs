@@ -1164,7 +1164,7 @@ mod dp_gate_and_rearm_tests {
     // market_depth hours through the open; inside the session it is now one
     // partition and no depth below 90%.
     #[test]
-    fn test_regression_dp2_in_session_pass_is_one_partition_and_no_depth_below_90() {
+    fn test_regression_dp2_pressure_pass_limits_in_session_one_partition_no_depth_below_90() {
         let (limits, reason) = pressure_pass_limits(ist(9, 0), true, 89);
         assert_eq!(reason, Some(PressureGateReason::InSession));
         assert!(limits.skip_depth);

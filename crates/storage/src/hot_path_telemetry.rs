@@ -1612,7 +1612,7 @@ mod tests {
     // `drain_main_tick` records the per-tick average with the frame's tick
     // count as its weight. Only this test records it in this binary.
     #[test]
-    fn test_regression_dp6_drain_main_tick_records_a_weighted_per_tick_sample() {
+    fn test_regression_dp6_record_stage_nanos_weighted_records_a_per_tick_sample() {
         assert_eq!(Stage::DrainMainTick.as_str(), "drain_main_tick");
         assert_eq!(*ALL_STAGES.last().expect("stages"), Stage::DrainMainTick);
         assert!(

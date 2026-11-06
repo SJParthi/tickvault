@@ -344,8 +344,7 @@ fn disk_stays_low(signals: &PassSignals<'_>, wal_dir: &Path, cancel: &AtomicBool
     if !disk_low(signals, wal_dir) {
         return false;
     }
-    crate::reclaim_signal::request_reclaim();
-    crate::reclaim_signal::request_raw_upload();
+    (signals.request_space)();
     for _ in 0..AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS {
         if cancel.load(Ordering::Acquire) {
             return true;
@@ -384,7 +383,17 @@ pub struct PassSignals<'a> {
     /// Free bytes of the same volume; `None` when it cannot be measured
     /// (PR DP-7).
     pub disk_free_bytes: &'a dyn Fn(&Path) -> Option<u64>,
+    /// Asks the reclaim sweep and the raw uploader to free space (PR
+    /// DP-4/DP-7). Live: one stored permit each, never a second sweep.
+    pub request_space: &'a dyn Fn(),
     pub sleep: &'a dyn Fn(Duration),
+}
+
+/// The live [`PassSignals::request_space`]: wakes the reclaim sweep and the
+/// raw uploader (one stored permit each). Cold path.
+fn request_reclaim_and_raw_upload() {
+    crate::reclaim_signal::request_reclaim();
+    crate::reclaim_signal::request_raw_upload();
 }
 
 /// Free bytes of the volume holding `path`: one `statvfs` call, `None` when
@@ -426,6 +435,7 @@ pub fn live_signals() -> PassSignals<'static> {
         },
         disk_free_fraction: &probe_free_fraction,
         disk_free_bytes: &probe_free_bytes,
+        request_space: &request_reclaim_and_raw_upload,
         sleep: &|d| std::thread::sleep(d),
     }
 }
@@ -710,8 +720,7 @@ fn report_disk_floor_stop(signals: &PassSignals<'_>, wal_dir: &Path, bucket: u64
     // PR DP-4: the stop asks the reclaim sweep and the raw uploader to free
     // space for the next round (the wait in `disk_stays_low` already asked;
     // asking again is one stored permit, never a second sweep).
-    crate::reclaim_signal::request_reclaim();
-    crate::reclaim_signal::request_raw_upload();
+    (signals.request_space)();
     let free = (signals.disk_free_fraction)(wal_dir);
     let free_bytes = (signals.disk_free_bytes)(wal_dir);
     warn!(
@@ -1400,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_pass_outcome_reads_back_via_last_pass_retryable_left() {
+    fn test_publish_pass_outcome_reads_back_via_retryable_left_and_floor_blocked_since_unix() {
         publish_pass_outcome(&PassSummary {
             buckets_carried: 2,
             ..PassSummary::default()
@@ -1647,6 +1656,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let cancel = AtomicBool::new(false);
@@ -1680,6 +1690,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &|_| {},
         };
         let cancel = AtomicBool::new(true);
@@ -1703,6 +1714,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &|_| {},
         };
         let cancel = AtomicBool::new(false);
@@ -1762,6 +1774,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1833,6 +1846,7 @@ mod tests {
                 sink_suspect: &|| false,
                 disk_free_fraction: &|_| Some(HEALTHY_FREE),
                 disk_free_bytes: &|_| Some(u64::MAX),
+                request_space: &|| {},
                 sleep: &sleep,
             };
             let summary = run_after_close_pass(
@@ -1877,6 +1891,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1919,6 +1934,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1975,6 +1991,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| Some(DAY_FREE),
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -2059,6 +2076,8 @@ mod tests {
         };
         let sleeps = Cell::new(0u32);
         let sleep = |_: Duration| sleeps.set(sleeps.get() + 1);
+        let requests = Cell::new(0u32);
+        let request = || requests.set(requests.get() + 1);
         let signals = PassSignals {
             now_secs_ist: &|| IN_WINDOW,
             lag_growing_tables: &|| 0,
@@ -2066,11 +2085,13 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &fraction,
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &request,
             sleep: &sleep,
         };
         let dir = std::env::temp_dir();
         assert!(!disk_stays_low(&signals, &dir, &AtomicBool::new(false)));
         assert_eq!(sleeps.get(), 3, "waited three pauses for the reclaim");
+        assert_eq!(requests.get(), 1, "asked for space once before waiting");
         // Never recovers: waits the full budget, then reports low.
         let low = PassSignals {
             disk_free_fraction: &|_| Some(0.01),
@@ -2083,13 +2104,15 @@ mod tests {
         sleeps.set(0);
         assert!(disk_stays_low(&low, &dir, &AtomicBool::new(true)));
         assert_eq!(sleeps.get(), 0);
-        // Healthy: no wait at all.
+        // Healthy: no wait at all, and nothing asked for.
         let healthy = PassSignals {
             disk_free_fraction: &|_| Some(HEALTHY_FREE),
             ..low
         };
+        requests.set(0);
         assert!(!disk_stays_low(&healthy, &dir, &AtomicBool::new(false)));
         assert_eq!(sleeps.get(), 0);
+        assert_eq!(requests.get(), 0);
     }
 
     /// Two marked buckets; the disk falls below the floor after the first.
@@ -2122,6 +2145,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &disk,
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -2155,6 +2179,7 @@ mod tests {
             sink_suspect: &|| false,
             disk_free_fraction: &|_| None,
             disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
             sleep: &|_| {},
         };
         let summary = run_after_close_pass(
