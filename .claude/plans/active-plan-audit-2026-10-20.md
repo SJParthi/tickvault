@@ -2197,8 +2197,8 @@ zero bugs/loss, exhaustive coverage or universal O(1)/submicrosecond latency.
 
 #### Design
 - Shared pure selection: the per-filter selection (`finish` and the list/status branching in `compute`) moves into a common module as `select(universe, filter) -> Reply`, and `/api/stock-movers` itself becomes `build_universe` (one QuestDB query over the union of the F&O list and the index-membership list) then `select`, so the API and the portal answer from one code path.
-- The app publishes the universe every 5 s inside 09:00–15:40 IST on a trading day and every 60 s otherwise to `s3://tv-<env>-live-view/movers/universe.json` (new bucket: no versioning, public access blocked, SSE-S3, objects expire after 2 days; the cold bucket is not used because it is versioned and may never expire noncurrent versions).
-- The Lambda reads that object (2 s timeout) for a live-view filter and selects in memory; a missing, unreadable or stale object (older than 20 s in session, 300 s outside), or any `as_of` filter, falls back to the existing SSM path unchanged.
+- The app publishes the universe ON DEMAND (review 2026-11-06: no standing QuestDB load): every 5 s it reads the Lambda's viewer heartbeat `movers/viewer.json` and builds + publishes only while it is unexpired (written on a live movers call, at most once per 30 s per container, valid 120 s); after the close the rows are queried once per (IST date, window end) and re-stamped; no query while QuestDB reports a suspended table or a growing apply backlog; failures back off 5 s × 2^n up to 120 s; every request names the expected bucket owner. Destination `s3://tv-<env>-live-view/movers/universe.json` (new bucket: no versioning, public access blocked, SSE-S3, objects expire after 2 days; the cold bucket is not used because it is versioned and may never expire noncurrent versions).
+- The Lambda reads that object (2 s timeout) for a live-view filter and selects in memory; a missing, unreadable or stale object (older than 20 s, open or closed, or built in the other session state than the Lambda's own clock), or any `as_of` filter, falls back to the existing SSM path unchanged.
 - The portal keeps the previous rows visible while a refresh runs.
 
 #### Edge Cases
@@ -2219,18 +2219,22 @@ Property test: for random universes and random filters, `select` over the publis
 - [x] MV-1 shared `select` in common + API refactor (identity proptest)
   - Files: crates/common/src/operator_movers_universe.rs, crates/api/src/handlers/stock_movers.rs, crates/api/src/handlers/fno_stocks.rs
   - Tests: proptest_select_equals_the_per_filter_path, test_select_equals_the_per_filter_path_on_named_edge_cases, test_select_filters_sorts_and_pages_one_universe_for_every_filter, test_universe_constants_match_the_common_constants
+  - Review fixes (2026-11-06): one clock reading (`LiveClock`), security-id tie-break in both sorts, two-slot list caches, file loads and body parse on the blocking pool, constants pinned in the api crate. Tests: test_live_clock_takes_session_state_and_time_from_one_instant, test_is_trading_session_at_reads_the_given_second_and_its_ist_date, test_file_cache_keeps_today_and_one_other_date, test_universe_constants_equal_the_fno_stocks_constants, test_usable_at_refuses_other_day_stale_future_and_session_changed_universes, test_weekday_session_open_at_follows_the_ist_clock_and_weekday
 - [x] MV-2 app publisher task + config switch + counters
   - Files: crates/app/src/movers_universe_publisher.rs, crates/app/src/main.rs, crates/common/src/config.rs, config/base.toml
-  - Tests: test_publish_universe_counts_put_failures_and_never_puts_a_failed_build, test_failure_episode_warns_once_and_reports_the_recovery, test_spawn_target_honours_the_switch_and_fails_closed_without_a_bucket, test_operator_movers_publish_defaults_on_and_parses_overrides
+  - Tests: test_encode_refuses_failed_queries_and_invalid_universes, test_failure_episode_warns_once_and_reports_the_recovery, test_operator_movers_publish_defaults_on_and_parses_overrides
+  - Review fixes (2026-11-06): on-demand publishing on the viewer heartbeat, backoff, closed-read reuse, QuestDB health hold, expected bucket owner, bucket-name validation, failure reason on the warn. Tests: test_no_active_viewer_builds_nothing_and_never_queries, test_an_active_viewer_builds_and_publishes_unless_questdb_is_busy, test_after_the_close_one_query_serves_the_evening_until_the_key_changes, test_next_interval_doubles_from_five_seconds_to_a_two_minute_ceiling, test_failures_reset_on_success_and_no_viewer_and_hold_on_questdb_busy, test_questdb_quiet_needs_a_measured_healthy_reading, test_publisher_target_validates_the_bucket_name_and_fails_closed, test_account_id_is_read_from_the_identity_document_and_validated, test_read_bounded_refuses_an_oversize_body_without_a_length, test_closed_read_key_names_the_date_and_window_end_of_a_closed_read_only, test_restamped_moves_only_the_observation_and_only_for_the_same_closed_read, test_viewer_heartbeat_written_at_parse_and_active_at, test_valid_live_view_bucket_name_and_valid_account_id
 - [x] MV-3 terraform live-view bucket + two scoped IAM grants
   - Files: deploy/aws/terraform/live-view-bucket.tf, deploy/aws/terraform/main.tf, deploy/aws/terraform/operator-control-lambda.tf
-  - Tests: test_live_view_bucket_is_unversioned_expiring_private_encrypted_and_tls_only, test_live_view_grants_name_the_one_object_only
+  - Tests: test_live_view_bucket_is_unversioned_expiring_private_encrypted_and_tls_only, test_live_view_grants_name_one_object_per_action_only (review: heartbeat grants, BucketOwnerEnforced, abort incomplete multipart uploads)
 - [x] MV-4 Lambda S3 read + fallback + timing log
   - Files: crates/aws-lambdas/src/operator_stock_movers.rs, crates/aws-lambdas/src/operator_control.rs, .github/workflows/terraform-apply.yml
   - Tests: test_stock_movers_answer_from_a_fresh_published_universe_without_ssm, test_from_published_refuses_every_unusable_universe_and_the_box_answers, test_from_published_times_out_and_the_box_answers
+  - Review fixes (2026-11-06): heartbeat write, session-state refusal, bounded body read returned as Bytes, expected bucket owner. Tests: test_a_live_movers_call_writes_the_viewer_heartbeat_once_per_interval, test_claim_heartbeat_once_per_interval_and_after_a_clock_step, test_live_view_target_refuses_a_bad_bucket_or_owner, test_read_body_bounded_refuses_over_the_limit_and_keeps_one_chunk_whole
 - [x] MV-5 portal keeps rows while refreshing
   - Files: crates/aws-lambdas/src/operator_control_console.html
   - Tests: console_html_content_pin
+  - Review fix (2026-11-06): the table is inert and dimmed and Previous, Next and Refresh are disabled while a refresh is in flight.
 
 ### PR DP — 2026-11-06 live incident: the disk-pressure archiver starved QuestDB 08:31–09:13 IST (app, storage, deploy)
 
