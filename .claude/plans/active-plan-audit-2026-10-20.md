@@ -2250,16 +2250,17 @@ Revert the PR; the compose line is one deletion.
 #### Observability
 `tv_disk_pressure_pass_gated_total{reason}`, `tv_disk_pressure_rearm_reset_total`, `tv_depth_book_self_heal_total{outcome}`, `tv_drain_hold_floor_blocked_buckets` (local /metrics only, no new page).
 
-- [ ] DP-1 QuestDB HTTP worker pool + host tuning
-- [ ] DP-2 in-session gate + one partition per pass + pre-open deadline
-- [ ] DP-3 re-arm reset on date change / session close
-- [ ] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
-- [ ] DP-5 market_depth_book zero-row self-heal
-- [ ] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (packets per frame recorded at the record site) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
-- [ ] DP-7 after-close depth pass floor: 8% (12.9 GB on the 150 GB box, where the disk sat all night: 795 early stops 15:45 Nov 5 → 05:35 Nov 6) replaced by one point above the 5% pinned-delete floor plus a 2 GiB byte floor, after asking for a reclaim and waiting up to 3 minutes; stale 644 GB comment fixed
-- [ ] DP-8 spill replay retires the LAST spill file too once its hour has closed and it has been quiet (`spill_file_may_still_be_appended`); before, `depth-dhan-498258.dspl` (2.6 GB, 3 Nov) was replayed every evening
-- [ ] DP-9 the pressure-episode log text and the `pressure_hot_days` config comment say that market_depth HOURS (yesterday's included) are eligible; only DAY partitions keep the today+yesterday floor
-- [ ] DP-10 the re-arm budget also refills when a session depth hour passes its hot window (`rearm_window_key`), not only at the date change and the close; config comment carries the measured ~45 GB/day DB + ~20 GB WAL on 150 GB
+- [x] DP-1 QuestDB HTTP worker pool + host tuning
+- [x] DP-2 in-session gate + one partition per pass + pre-open deadline
+- [x] DP-3 re-arm reset on date change / session close
+- [x] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
+- [x] DP-5 market_depth_book zero-row self-heal
+- [x] DP-7 after-close depth pass floor: 8% (12.9 GB on the 150 GB box, where the disk sat all night: 795 early stops 15:45 Nov 5 → 05:35 Nov 6) replaced by one point above the 5% pinned-delete floor plus a 2 GiB byte floor, after asking for a reclaim and waiting up to 3 minutes; stale 644 GB comment fixed
+- [x] DP-8 spill replay retires the LAST spill file too once its hour has closed and it has been quiet (`spill_file_may_still_be_appended`); before, `depth-dhan-498258.dspl` (2.6 GB, 3 Nov) was replayed every evening
+- [x] DP-9 the pressure-episode log text and the `pressure_hot_days` config comment say that market_depth HOURS (yesterday's included) are eligible; only DAY partitions keep the today+yesterday floor
+- [x] DP-10 the re-arm budget also refills when a session depth hour passes its hot window (`rearm_window_key`), not only at the date change and the close; config comment carries the measured ~45 GB/day DB + ~20 GB WAL on 150 GB
+- Implemented 2026-11-06 on branch `dp-2026-11-06`: `disk_pressure::{pressure_pass_limits, rearm_window_key, refresh_rearm_budget}`, `partition_archive::{ArchivePassLimits, apply_pass_limits, pass_deadline_reached}`, `disk_pressure_boot` (gate, refill, GatedProgress), `depth_persistence::self_heal_empty_market_depth_book`, `tick_spill_replay::spill_file_may_still_be_appended`, `deferred_depth_pass::disk_stays_low`, `drain_hold::DayWork::deferred_floor_blocked`, `hot_path_telemetry::record_stage_nanos_weighted`, `host_capacity_minute::record_process_core_count`, `ensure_questdb::QUESTDB_ENV`, `questdb_compose_env_guard.rs`. Deviation: the pre-open pass stops at its next partition boundary after **08:45** IST (the gate start, per the coordinator brief), not 09:00 as the Design line says.
+- [x] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (an eighth, never-paged stage `drain_main_tick`: each main-feed frame's drain time divided by its tick packets, recorded with weight = tick packets through the O(1) `record_stage_nanos_weighted`, DHAT-gated; a per-tick AVERAGE within a frame, and since 1,024 ns is a bucket edge, `p99_ns <= 1024` means under 1 µs) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
 
 ### PR AL — 2026-11-06 live incident: alarm truth and retries (app, storage)
 
