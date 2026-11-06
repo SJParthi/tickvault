@@ -2283,9 +2283,9 @@ Revert the PR.
 #### Observability
 `tv_scoreboard_rollup_attempts_total{outcome}` local only; no new page.
 
-- [ ] AL-1 feed-delay recorder counts new trades only
-- [ ] AL-2 scoreboard / ws-connection rollup + boot DDL retries
-- [ ] AL-3 (needs a dated noise-lock row first) questdb-disconnected 3-of-5 datapoints; risk-gap-03 period 300 s
+- [x] AL-1 feed-delay recorder counts new trades only
+- [x] AL-2 scoreboard / ws-connection rollup + boot DDL retries
+- [x] AL-3 (needs a dated noise-lock row first) questdb-disconnected 3-of-5 datapoints; risk-gap-03 period 300 s
 
 #### Owner decisions, 2026-11-06 (decision card, recorded verbatim)
 - Feed-delay page: **"Index feed only (Recommended)"** — page only when the index/spot class is over 60 s late; stock options keep a dashboard-only number; count only real new trades. (Noise-lock §2.6 row edited in the same PR, rule-file-first.)
@@ -2293,7 +2293,10 @@ Revert the PR.
 - Main-feed depth data: **"Keep, compact form (Recommended)"** — keep saving it, as 2 book rows per packet (DP-5).
 - 1 µs gate: **"Honest 2.5 µs for now (Recommended)"** — Full-packet frames get their own measured 2.5 µs key; Quote frames keep 1 µs; lower it as the code improves.
 
-- [ ] AL-4 feed-delay alarm re-pointed to the index/spot class gauge (EMF selector + live-lane-alarms.tf), noise-lock §2.6 dated row
+- [x] AL-4 feed-delay alarm re-pointed to the index/spot class gauge (EMF selector + live-lane-alarms.tf), noise-lock §2.6 dated row
+- [x] AL-5 RISK-GAP-03 late-attach noise: the live lane's silence detector (`DetectorConfig::live_lane`, crates/core tick_gap_detector + crates/app dhan_feed_stack) gives a seeded `NSE_FNO` contract a 10-minute warmup and floors its judged cadence at 60 s; indices and cash stocks are judged exactly as before (dead-class rollup not delayed). Tests: `test_regression_a_late_attached_sparse_option_is_not_judged_for_ten_minutes`, `test_in_attach_warmup_never_applies_to_an_index_or_a_cash_stock`, `test_index_and_cash_stocks_are_judged_as_before_from_the_first_scan`
+- [x] AL-6 holiday-calendar reminder noise: `HolidayCalendarCoverageLow` pages at most once per ISO week while more than 14 days of coverage remain (week persisted in `data/state/calendar-staleness-week`, temp file + rename), every boot at 14 or fewer, run out or empty; gauge every check (crates/app calendar_staleness). Tests: `test_more_than_14_days_left_pages_once_per_iso_week`, `test_14_or_fewer_days_run_out_or_empty_page_every_boot`, `test_last_paged_week_round_trips_through_the_file`, `test_a_damaged_week_file_reads_as_not_paged`
+- Note (AL-2): only the same-day run retries (`is_same_day_run`); a past-day `TICKVAULT_SCOREBOARD_DATE` backfill makes one attempt. DDL retries stop after one statement exhausts its budget (later statements one attempt each). Tests: `test_run_scoreboard_ddl_statements_*`, `test_exec_scoreboard_ddl_with_retry_*`, `test_rollup_retry_delay_secs_*`
 
 ### PR CI — 2026-11-06: nightly CI truth (workflows, benches)
 
