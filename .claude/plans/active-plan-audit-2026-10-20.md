@@ -2173,3 +2173,40 @@ Observability: keep source hashes, command outcomes, actual workflow heads,
 plan actions, selected live safety fields and actual screenshots. Error paths
 report typed failure without provider bodies. No finite test set establishes
 zero bugs/loss, exhaustive coverage or universal O(1)/submicrosecond latency.
+
+### PR MV — 2026-11-06 live incident: portal Stocks movers fast path (common, api, app, aws-lambdas, terraform, portal)
+
+**Approved by:** Parthiban, 2026-11-06: "go ahead fix everything dude approved" / "go ahead fix everything dude dont stop".
+
+**Measured (live, 2026-11-06 10:59 IST):** the movers SQL takes 0.11–0.37 s and the box-side `tv-movers` helper 0.12–0.33 s, but every portal click goes portal → Lambda → EC2 DescribeInstances → SSM SendCommand → agent → helper → SSM poll every 400 ms, and the operator-control Lambda ran 2.6–8.0 s per call (CloudWatch REPORT lines). The Lambda cache holds one filter for 20 s, so a sort, page or filter click pays the whole trip; the page blanks its table while it waits; a second click while one is in flight returns Busy.
+
+#### Design
+- Shared pure selection: the per-filter selection (`finish` and the list/status branching in `compute`) moves into a common module as `select(universe, filter) -> Reply`, and `/api/stock-movers` itself becomes `build_universe` (one QuestDB query over the union of the F&O list and the index-membership list) then `select`, so the API and the portal answer from one code path.
+- The app publishes the universe every 5 s inside 09:00–15:40 IST on a trading day and every 60 s otherwise to `s3://tv-<env>-live-view/movers/universe.json` (new bucket: no versioning, public access blocked, SSE-S3, objects expire after 2 days; the cold bucket is not used because it is versioned and may never expire noncurrent versions).
+- The Lambda reads that object (2 s timeout) for a live-view filter and selects in memory; a missing, unreadable or stale object (older than 20 s in session, 300 s outside), or any `as_of` filter, falls back to the existing SSM path unchanged.
+- The portal keeps the previous rows visible while a refresh runs.
+
+#### Edge Cases
+Empty or partial membership/F&O lists; index filter naming an index absent today; `fno_only` with no F&O list; market closed before 09:15; a publish in flight across 15:30/15:40; clock skew between box and Lambda; object larger than the wire bound; a universe from a previous IST day; duplicate security ids; NaN/zero prices; offsets past the end.
+
+#### Failure Modes
+S3 unreachable from the box (publish counted and skipped, portal falls back to SSM); S3 unreachable from the Lambda (fallback); corrupt object (rejected, fallback); stale object (fallback); QuestDB slow (publish times out, previous object ages out, fallback). Nothing on the tick path changes.
+
+#### Test Plan
+Property test: for random universes and random filters, `select` over the published universe equals the reply the old per-filter `compute` produced (old code kept under `#[cfg(test)]` as the oracle). Unit tests for staleness, day rollover, fallback, oversize. Lambda tests with a fake S3 shell. Terraform shape guard for the bucket (no versioning, PAB, lifecycle, IAM scoped to one key).
+
+#### Rollback
+`[operator_movers] publish_enabled = false` stops the publisher; the Lambda then always falls back (object ages out). Reverting the PR restores the old path.
+
+#### Observability
+`tv_movers_universe_publish_total{outcome}` and `tv_movers_universe_publish_duration_ms` (local /metrics only, no page); the Lambda logs `source=s3|ssm` and the elapsed ms per movers call.
+
+- [ ] MV-1 shared `select` in common + API refactor (identity proptest)
+- [ ] MV-2 app publisher task + config switch + counters
+- [ ] MV-3 terraform live-view bucket + two scoped IAM grants
+- [ ] MV-4 Lambda S3 read + fallback + timing log
+- [ ] MV-5 portal keeps rows while refreshing
+
+### PR BR — 2026-11-06 live incident: boot WAL catch-up must not starve the box (app, storage)
+
+**Measured:** 08:31–08:56 IST main-runtime freezes up to 1.03 s and 100–180 ms every minute, process CPU 75–81% of 2 cores, WAL writer waiting 5.8–5.9 s per minute for CPU, QuestDB (pinned to 1 core) reported disconnected 15 times, ticks spilled until ~09:14. Design and items are added after the boot-outage investigation returns verified root cause.
