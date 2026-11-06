@@ -6,8 +6,12 @@
 //! At 25,000 instruments the fold's slot table is about 72 MB, twice the L3 of
 //! the r8g host, so the slot of an instrument that last traded a few seconds
 //! ago is usually in memory, not in cache. The fold then walks the timeframes
-//! one by one, and each open bucket (160 bytes, three cache lines) is a fresh
-//! miss that the core only meets when it reaches that timeframe.
+//! one by one, and each open bucket is a fresh miss that the core only meets
+//! when it reaches that timeframe. A bucket is 160 bytes, and the buckets sit
+//! 160 bytes apart inside slots 2,864 bytes apart, so where a bucket starts
+//! inside a 64-byte line varies: it spans three lines when it starts at most
+//! 32 bytes into one, four otherwise. `covers_every_line` holds for any
+//! start, so the reads reach every line in both cases.
 //!
 //! Right after the index lookup, `AggregatorCell::warm_for_tick` reads one
 //! field on each cache line of every open bucket, and of the sealed bucket and
@@ -21,9 +25,13 @@
 //! A prefetch instruction would do the same with less work, but this crate
 //! forbids `unsafe` (`deny(unsafe_code)`), the x86-64 `_mm_prefetch` needs an
 //! `unsafe` block to call, and the aarch64 prefetch intrinsic (the production
-//! host) is still unstable in Rust 1.95. Plain loads are safe, run on both
-//! targets, and measured within the noise of a whole-slot `prefetcht0` on the
-//! x86 dev container (`benches/candle_fold_cold.rs`).
+//! host) is still unstable in Rust 1.95. Plain loads are safe and run on both
+//! targets. How close they come to a real prefetch was measured once, on the
+//! x86 dev container, with an `unsafe` `prefetcht0` of the whole slot that was
+//! never committed (so nothing in the tree reproduces it): cold rolling shape
+//! p50 0.91–1.05 µs per tick with that prefetch, against 0.98–0.99 µs with
+//! these loads and 1.28–1.31 µs with neither (report pass of
+//! `benches/candle_fold_cold.rs`, which does reproduce the last two).
 //!
 //! # Correctness
 //!
