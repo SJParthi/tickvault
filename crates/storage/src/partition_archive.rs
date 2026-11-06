@@ -1349,6 +1349,69 @@ pub struct ArchiveRunSummary {
     pub held_deferred_depth: u32,
     // `held_top_volume_spill` REMOVED 2026-10-22 (plan item 62): nothing can
     // replay rows into a `top_volume_<tf>` hour any more.
+    /// Partitions HELD this run by the caller's [`ArchivePassLimits`] (PR
+    /// DP-2, 2026-11-06): a depth partition skipped inside the session, a
+    /// partition past the per-pass cap, or a partition left when the pass
+    /// reached its stop time. Not a failure: a later pass exports it.
+    pub held_by_gate: u32,
+    /// The pass stopped at a partition boundary because it reached
+    /// [`ArchivePassLimits::stop_at_unix_secs`] (PR DP-2).
+    pub stopped_at_deadline: bool,
+}
+
+/// Limits the CALLER puts on one archive pass (PR DP-2, 2026-11-06).
+///
+/// Measured 2026-11-06 08:31–09:13 IST: a disk-pressure pass at 95% used
+/// exported 41 partitions back to back, nine of them `market_depth` hours of
+/// 95–115M rows at 4–5 minutes each, through QuestDB's single HTTP thread.
+/// Every ILP `/write` waited behind each export; 2.9M tick rows went to the
+/// spill. The default (no limits) is the behaviour before this change and is
+/// what the daily leg passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArchivePassLimits {
+    /// Skip every depth table (`market_depth`, `market_depth_book`).
+    pub skip_depth: bool,
+    /// At most this many partitions this pass (tighter of this and the
+    /// configured per-run cap).
+    pub max_partitions: Option<u32>,
+    /// Stop at the next partition boundary once the wall clock (Unix seconds)
+    /// reaches this instant. Checked before every partition, so a partition
+    /// already being exported finishes.
+    pub stop_at_unix_secs: Option<i64>,
+}
+
+/// Applies the [`ArchivePassLimits`] depth skip and cap to a worklist.
+/// Returns the kept worklist and how many partitions the limits held. Pure,
+/// O(worklist).
+#[must_use]
+pub fn apply_pass_limits(
+    worklist: Vec<(&'static str, String)>,
+    limits: ArchivePassLimits,
+) -> (Vec<(&'static str, String)>, u32) {
+    let before = worklist.len();
+    let mut kept: Vec<(&'static str, String)> = if limits.skip_depth {
+        worklist
+            .into_iter()
+            .filter(|(table, _)| !is_depth_rewrite_table(table))
+            .collect() // O(1) EXEMPT: cold once-per-run worklist filter
+    } else {
+        worklist
+    };
+    if let Some(cap) = limits.max_partitions {
+        kept.truncate(cap as usize);
+    }
+    let held = u32::try_from(before.saturating_sub(kept.len())).unwrap_or(u32::MAX);
+    (kept, held)
+}
+
+/// Whether a pass with stop time `stop_at_unix_secs` must stop before its
+/// next partition, at wall time `now_unix_secs`. Pure, O(1).
+#[must_use]
+pub const fn pass_deadline_reached(stop_at_unix_secs: Option<i64>, now_unix_secs: i64) -> bool {
+    match stop_at_unix_secs {
+        Some(at) => now_unix_secs >= at,
+        None => false,
+    }
 }
 
 /// How one `process_one` call ended, as far as the run loop cares.
@@ -1389,6 +1452,8 @@ pub struct PartitionArchiver {
     /// pass is ungated (the disk-pressure leg). Set ONLY by the daily leg,
     /// per `no-rest-except-live-feed-2026-06-27.md` §12.15.2.
     verified_day_gate: Option<VerifiedDayGate>,
+    /// Limits the caller put on this pass (PR DP-2); default = none.
+    pass_limits: ArchivePassLimits,
 }
 
 /// Predicate the daily archive leg injects: `true` when day D is verified
@@ -1582,6 +1647,7 @@ impl PartitionArchiver {
             cfg: cfg.clone(),
             audit: PartitionArchiveAuditWriter::new(questdb),
             verified_day_gate: None,
+            pass_limits: ArchivePassLimits::default(),
         }))
     }
 
@@ -1619,6 +1685,7 @@ impl PartitionArchiver {
             cfg,
             audit,
             verified_day_gate: None,
+            pass_limits: ArchivePassLimits::default(),
         })
     }
 
@@ -1631,6 +1698,16 @@ impl PartitionArchiver {
     // TEST-EXEMPT: builder setter that stores the gate; the hold it drives is tested through crossverify_hold_decision
     pub fn with_verified_day_gate(mut self, gate: VerifiedDayGate) -> Self {
         self.verified_day_gate = Some(gate);
+        self
+    }
+
+    /// Puts the caller's [`ArchivePassLimits`] on this archiver's passes
+    /// (PR DP-2). The disk-pressure leg sets them inside the session; the
+    /// daily leg does not.
+    #[must_use]
+    // TEST-EXEMPT: builder setter that stores the limits; what they do is tested through apply_pass_limits, pass_deadline_reached and the stub-server pass test test_stub_pass_limits_skip_depth_cap_and_deadline
+    pub fn with_pass_limits(mut self, limits: ArchivePassLimits) -> Self {
+        self.pass_limits = limits;
         self
     }
 
@@ -1928,7 +2005,25 @@ impl PartitionArchiver {
         // Cross-verification hold BEFORE the per-run cap, so a held partition
         // never consumes budget a verified one could have used.
         let worklist = self.apply_crossverify_hold(worklist, &mut summary);
+        // PR DP-2: the caller's depth skip BEFORE the per-run cap, so a held
+        // depth partition never takes a slot another table could use; the
+        // caller's (tighter) cap AFTER the fair share.
+        let (worklist, held_depth) = apply_pass_limits(
+            worklist,
+            ArchivePassLimits {
+                max_partitions: None,
+                ..self.pass_limits
+            },
+        );
         let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
+        let (worklist, held_cap) = apply_pass_limits(
+            worklist,
+            ArchivePassLimits {
+                skip_depth: false,
+                ..self.pass_limits
+            },
+        );
+        summary.held_by_gate = held_depth.saturating_add(held_cap);
         summary.partitions_considered = worklist.len() as u32;
 
         // Tables whose WAL could not be proven applied this run. A table
@@ -1936,7 +2031,25 @@ impl PartitionArchiver {
         // the run: its WAL state is a property of the whole table, and
         // probing it again per partition would only repeat the refusal.
         let mut wal_blocked: Vec<&'static str> = Vec::new();
-        for (table, partition) in worklist {
+        let planned = worklist.len();
+        for (index, (table, partition)) in worklist.into_iter().enumerate() {
+            // PR DP-2: a pass started before the session gate stops at the
+            // next partition boundary once its stop time has come; the
+            // partition being exported when the time came has finished.
+            if pass_deadline_reached(
+                self.pass_limits.stop_at_unix_secs,
+                chrono::Utc::now().timestamp(),
+            ) {
+                let left = u32::try_from(planned.saturating_sub(index)).unwrap_or(u32::MAX);
+                summary.held_by_gate = summary.held_by_gate.saturating_add(left);
+                summary.stopped_at_deadline = true;
+                info!(
+                    partitions_left = left,
+                    "partition archive pass STOPPED at its stop time (the session gate is \
+                     near); the partitions left are archived by a later pass"
+                );
+                break;
+            }
             // O(1) EXEMPT: begin — at most one entry per swept table, cold
             // once-per-run loop.
             if wal_blocked.contains(&table) {
@@ -1992,6 +2105,8 @@ impl PartitionArchiver {
             failed = summary.failed,
             rows_archived = summary.rows_archived,
             held_unverified = summary.held_unverified,
+            held_by_gate = summary.held_by_gate,
+            stopped_at_deadline = summary.stopped_at_deadline,
             tables_wal_not_applied = summary.tables_wal_not_applied,
             gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
             csv_bytes_exported = summary.csv_bytes_exported,
@@ -6251,6 +6366,124 @@ mod stub_integration_tests {
                 .contains_key("tv-test-cold/questdb-partitions/ticks/2026-04-01T09.csv.gz"),
             "the OLDEST partition goes first (monotonic progress)"
         );
+    }
+
+    // Regression: 2026-11-06 (PR DP-2) — a pressure pass exported 41
+    // partitions back to back, nine of them market_depth hours, through
+    // QuestDB's one HTTP thread while the session opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_pass_limits_skip_depth_cap_and_deadline() {
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder(
+            vec!["2026-04-01T11", "2026-04-01T09", "2026-04-01T10"],
+            3,
+            CSV,
+            vec![],
+            200,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        // One partition, no depth.
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.partitions_considered, 1, "one partition a pass");
+        assert!(summary.held_by_gate >= 2, "the rest are held: {summary:?}");
+        assert!(!summary.stopped_at_deadline);
+        let exports: Vec<String> = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp"))
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert!(
+            exports.iter().all(|t| !t.contains("market_depth")),
+            "no depth export while skip_depth: {exports:?}"
+        );
+
+        // A stop time already passed: nothing is exported, everything held.
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder(
+            vec!["2026-04-01T09", "2026-04-01T10"],
+            3,
+            CSV,
+            vec![],
+            200,
+        ))
+        .await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                stop_at_unix_secs: Some(0),
+                ..ArchivePassLimits::default()
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert!(summary.stopped_at_deadline);
+        assert_eq!(summary.dropped, 0);
+        assert!(summary.held_by_gate > 0);
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.starts_with("/exp")),
+            "nothing exported after the stop time"
+        );
+    }
+
+    #[test]
+    fn test_apply_pass_limits_skips_depth_and_caps() {
+        let worklist = vec![
+            ("market_depth", "2026-04-01T09".to_string()),
+            ("ticks", "2026-04-01".to_string()),
+            ("market_depth_book", "2026-04-01T10".to_string()),
+            ("candles_1m", "2026-04-01".to_string()),
+        ];
+        let (kept, held) = apply_pass_limits(worklist.clone(), ArchivePassLimits::default());
+        assert_eq!((kept.len(), held), (4, 0), "no limits = unchanged");
+        let (kept, held) = apply_pass_limits(
+            worklist.clone(),
+            ArchivePassLimits {
+                skip_depth: true,
+                ..ArchivePassLimits::default()
+            },
+        );
+        assert_eq!(held, 2);
+        assert!(kept.iter().all(|(t, _)| !t.starts_with("market_depth")));
+        let (kept, held) = apply_pass_limits(
+            worklist,
+            ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            },
+        );
+        assert_eq!((kept.len(), held), (1, 3));
+        assert_eq!(kept[0].0, "ticks");
+        let (kept, held) = apply_pass_limits(
+            Vec::new(),
+            ArchivePassLimits {
+                max_partitions: Some(0),
+                ..ArchivePassLimits::default()
+            },
+        );
+        assert_eq!((kept.len(), held), (0, 0));
+    }
+
+    #[test]
+    fn test_pass_deadline_reached_boundaries() {
+        assert!(!pass_deadline_reached(None, i64::MAX));
+        assert!(!pass_deadline_reached(Some(100), 99));
+        assert!(pass_deadline_reached(Some(100), 100));
+        assert!(pass_deadline_reached(Some(100), 101));
     }
 
     /// `read_body_capped` (shared with the WAL watcher since plan item 51d)

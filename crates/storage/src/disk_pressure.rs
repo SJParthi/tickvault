@@ -153,8 +153,15 @@ pub struct EpisodeState {
     pub escalated_at_secs: Option<u64>,
     /// Re-arms already spent in this episode. Bounded by
     /// [`PRESSURE_MAX_REARMS`] so a volume that is genuinely unreclaimable
-    /// cannot loop exports forever.
+    /// cannot loop exports forever. Refilled by [`refresh_rearm_budget`]
+    /// whenever the reclaimable set can have grown (PR DP-3/DP-10).
     pub rearms_used: u32,
+    /// The [`rearm_window_key`] this episode last saw; `None` until the first
+    /// [`refresh_rearm_budget`] after the episode opened.
+    pub rearm_window: Option<u64>,
+    /// Set by [`refresh_rearm_budget`]: the next re-arm is due at once,
+    /// without the hour wait. Cleared when that re-arm runs.
+    pub rearm_now: bool,
 }
 
 /// What the caller should do next.
@@ -262,7 +269,8 @@ pub fn decide_pressure_action(
                 // alerting; only the ability to try again is restored.
                 let rearm_due = ep
                     .escalated_at_secs
-                    .is_some_and(|at| now_secs.saturating_sub(at) >= PRESSURE_REARM_AFTER_SECS);
+                    .is_some_and(|at| now_secs.saturating_sub(at) >= PRESSURE_REARM_AFTER_SECS)
+                    || ep.rearm_now;
                 if rearm_due && ep.rearms_used < PRESSURE_MAX_REARMS {
                     return PressureAction::ContinuePass;
                 }
@@ -312,6 +320,8 @@ pub fn apply_action(
                 escalated: false,
                 escalated_at_secs: None,
                 rearms_used: 0,
+                rearm_window: None,
+                rearm_now: false,
             });
         }
         PressureAction::ContinuePass => {
@@ -331,6 +341,7 @@ pub fn apply_action(
                     // minutes against a volume that just told us it has
                     // nothing to give.
                     ep.escalated_at_secs = Some(now_secs);
+                    ep.rearm_now = false;
                 }
             }
         }
@@ -353,6 +364,172 @@ pub fn apply_action(
         | PressureAction::Idle
         | PressureAction::Cooldown
         | PressureAction::Hold => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR DP-2 — the in-session gate on a pressure pass (2026-11-06)
+// ---------------------------------------------------------------------------
+
+/// IST second of day from which a pressure pass is limited: 08:45, a quarter
+/// hour before the 09:00 capture window opens, so the box is not exporting
+/// through QuestDB's HTTP threads while the sockets dial and the first frames
+/// arrive.
+pub const PRESSURE_SESSION_GATE_START_SECS_IST: u32 = 8 * 3_600 + 45 * 60;
+
+/// IST second of day at which the limit lifts: the end of the capture window
+/// (15:40, `TICK_PERSIST_END_SECS_OF_DAY_IST`).
+pub const PRESSURE_SESSION_GATE_END_SECS_IST: u32 =
+    tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+
+/// Used percentage at or above which an in-session pass may export a depth
+/// partition anyway: past it the volume is close enough to full that a stall
+/// of the writers is the lesser harm.
+pub const PRESSURE_EMERGENCY_USED_PCT: u8 = 90;
+
+/// Why a pass was limited, for `tv_disk_pressure_pass_gated_total{reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureGateReason {
+    /// Inside the session: depth skipped, one partition.
+    InSession,
+    /// Inside the session at or above [`PRESSURE_EMERGENCY_USED_PCT`]: depth
+    /// allowed, still one partition.
+    InSessionEmergency,
+    /// Before the session gate: the pass stops at 08:45 IST.
+    PreOpenDeadline,
+}
+
+impl PressureGateReason {
+    /// The `reason` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InSession => "in_session",
+            Self::InSessionEmergency => "in_session_emergency",
+            Self::PreOpenDeadline => "pre_open_deadline",
+        }
+    }
+
+    /// Every reason, for the boot-time zero registration.
+    pub const ALL: [Self; 3] = [
+        Self::InSession,
+        Self::InSessionEmergency,
+        Self::PreOpenDeadline,
+    ];
+}
+
+/// The limits on one pressure pass started at `now_unix_secs`. Pure, O(1).
+///
+/// On a trading day:
+/// * from 08:45 to 15:40 IST: at most one partition, and no depth partition
+///   unless `used_pct` is at least [`PRESSURE_EMERGENCY_USED_PCT`];
+/// * before 08:45 IST: no limit on what, but the pass stops at its next
+///   partition boundary once it is 08:45 (a pass already exporting a
+///   partition finishes that partition first).
+///
+/// A weekend or holiday, and a trading day after 15:40, are not limited.
+#[must_use]
+pub fn pressure_pass_limits(
+    now_unix_secs: i64,
+    trading_day: bool,
+    used_pct: u8,
+) -> (
+    crate::partition_archive::ArchivePassLimits,
+    Option<PressureGateReason>,
+) {
+    use crate::partition_archive::ArchivePassLimits;
+    if !trading_day {
+        return (ArchivePassLimits::default(), None);
+    }
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    // `rem_euclid` keeps a pre-1970 clock from reading as a negative second.
+    let secs_of_day = u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0);
+    if secs_of_day < PRESSURE_SESSION_GATE_START_SECS_IST {
+        let until = i64::from(PRESSURE_SESSION_GATE_START_SECS_IST - secs_of_day);
+        return (
+            ArchivePassLimits {
+                stop_at_unix_secs: Some(now_unix_secs.saturating_add(until)),
+                ..ArchivePassLimits::default()
+            },
+            Some(PressureGateReason::PreOpenDeadline),
+        );
+    }
+    if secs_of_day < PRESSURE_SESSION_GATE_END_SECS_IST {
+        let emergency = used_pct >= PRESSURE_EMERGENCY_USED_PCT;
+        return (
+            ArchivePassLimits {
+                skip_depth: !emergency,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            },
+            Some(if emergency {
+                PressureGateReason::InSessionEmergency
+            } else {
+                PressureGateReason::InSession
+            }),
+        );
+    }
+    (ArchivePassLimits::default(), None)
+}
+
+// ---------------------------------------------------------------------------
+// PR DP-3 / DP-10 — the re-arm budget refills when reclaim can have grown
+// ---------------------------------------------------------------------------
+
+/// First and last IST hour of the session whose `market_depth` partitions
+/// (named in IST hours) the hour-granular archive can reclaim: 09..=15.
+const SESSION_FIRST_HOUR_IST: u32 = 9;
+const SESSION_LAST_HOUR_IST: u32 = 15;
+
+/// A key that changes exactly when the set of partitions a pressure pass can
+/// reclaim may have grown: a new IST date (yesterday's day partitions become
+/// eligible), the session close at 15:40 IST, or a session hour's depth
+/// partition passing its hot window (`depth_hot_hours`, floored at the
+/// archiver's 4-hour minimum; `0` = depth is on the day path, no hourly
+/// change). Monotonic within a day. Pure, O(1).
+///
+/// Measured 2026-11-05: the pressure episode spent its three re-arms by
+/// 11:37 IST and then held at 92% used all night, because the budget only
+/// refilled when the episode ended (below 60%), which needs a pass.
+#[must_use]
+pub fn rearm_window_key(now_unix_secs: i64, depth_hot_hours: u32) -> u64 {
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    let day = u64::try_from(ist.div_euclid(86_400)).unwrap_or(0);
+    let secs_of_day = u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0);
+    let hour = secs_of_day / 3_600;
+    let eligible_hours =
+        match crate::partition_archive::hot_window_hours("market_depth", depth_hot_hours) {
+            Some(hot) => (SESSION_FIRST_HOUR_IST..=SESSION_LAST_HOUR_IST)
+                .filter(|h| h + 1 + hot <= hour)
+                .count() as u64,
+            None => 0,
+        };
+    let after_close = u64::from(secs_of_day >= PRESSURE_SESSION_GATE_END_SECS_IST);
+    day * 64 + after_close * 32 + eligible_hours
+}
+
+/// Refills an escalated episode's re-arm budget when [`rearm_window_key`]
+/// moved since the episode last looked, and makes the next re-arm due at
+/// once. Returns `true` when it refilled (the caller counts it on
+/// `tv_disk_pressure_rearm_reset_total`). The page is NOT re-armed:
+/// `escalated` stays latched, so the Critical still fires once per episode.
+/// Call once per poll, before [`decide_pressure_action`]. O(1).
+pub fn refresh_rearm_budget(state: &mut PressureState, window_key: u64) -> bool {
+    let Some(ep) = state.episode.as_mut() else {
+        return false;
+    };
+    let previous = ep.rearm_window.replace(window_key);
+    match previous {
+        Some(key) if key != window_key && ep.escalated => {
+            ep.rearms_used = 0;
+            ep.rearm_now = true;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -629,6 +806,8 @@ mod tests {
                 escalated: true,
                 escalated_at_secs: Some(at),
                 rearms_used: rearms,
+                rearm_window: None,
+                rearm_now: false,
             }),
             last_episode_end_secs: None,
         };
@@ -705,6 +884,8 @@ mod tests {
                 escalated: true,
                 escalated_at_secs: Some(0),
                 rearms_used: 0,
+                rearm_window: None,
+                rearm_now: false,
             }),
             last_episode_end_secs: None,
         };
@@ -963,5 +1144,189 @@ mod tests {
             decide_pressure_action(PressureProbe::used(88), &state, &c, 10),
             PressureAction::Hold
         );
+    }
+}
+
+#[cfg(test)]
+mod dp_gate_and_rearm_tests {
+    use super::*;
+
+    /// Unix seconds of `hh:mm` IST on 2026-11-06.
+    fn ist(hh: u32, mm: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 6)
+            .and_then(|d| d.and_hms_opt(hh, mm, 0))
+            .map(|t| t.and_utc().timestamp())
+            .expect("valid time")
+            - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
+    }
+
+    // Regression: 2026-11-06 (PR DP-2) — a pass at 95% exported nine
+    // market_depth hours through the open; inside the session it is now one
+    // partition and no depth below 90%.
+    #[test]
+    fn test_regression_dp2_in_session_pass_is_one_partition_and_no_depth_below_90() {
+        let (limits, reason) = pressure_pass_limits(ist(9, 0), true, 89);
+        assert_eq!(reason, Some(PressureGateReason::InSession));
+        assert!(limits.skip_depth);
+        assert_eq!(limits.max_partitions, Some(1));
+        assert_eq!(limits.stop_at_unix_secs, None);
+
+        let (limits, reason) = pressure_pass_limits(ist(11, 0), true, 90);
+        assert_eq!(reason, Some(PressureGateReason::InSessionEmergency));
+        assert!(!limits.skip_depth, "90% and above may export depth");
+        assert_eq!(limits.max_partitions, Some(1));
+
+        // 08:45 is the first gated second; 15:40 the first free one.
+        assert_eq!(
+            pressure_pass_limits(ist(8, 45), true, 80).1,
+            Some(PressureGateReason::InSession)
+        );
+        assert_eq!(pressure_pass_limits(ist(15, 40), true, 95).1, None);
+        assert_eq!(
+            pressure_pass_limits(ist(15, 39), true, 95).1,
+            Some(PressureGateReason::InSessionEmergency)
+        );
+    }
+
+    #[test]
+    fn test_dp2_a_pre_open_pass_stops_at_0845() {
+        let (limits, reason) = pressure_pass_limits(ist(8, 31), true, 95);
+        assert_eq!(reason, Some(PressureGateReason::PreOpenDeadline));
+        assert_eq!(limits.stop_at_unix_secs, Some(ist(8, 45)));
+        assert!(!limits.skip_depth);
+        assert_eq!(limits.max_partitions, None);
+        // Just after midnight the deadline is still this morning's 08:45.
+        assert_eq!(
+            pressure_pass_limits(ist(0, 5), true, 95)
+                .0
+                .stop_at_unix_secs,
+            Some(ist(8, 45))
+        );
+    }
+
+    #[test]
+    fn test_dp2_holidays_and_evenings_are_not_limited() {
+        for t in [ist(8, 0), ist(10, 0), ist(20, 0)] {
+            let (limits, reason) = pressure_pass_limits(t, false, 99);
+            assert_eq!(
+                limits,
+                crate::partition_archive::ArchivePassLimits::default()
+            );
+            assert_eq!(reason, None);
+        }
+        let (limits, reason) = pressure_pass_limits(ist(18, 0), true, 99);
+        assert_eq!(
+            limits,
+            crate::partition_archive::ArchivePassLimits::default()
+        );
+        assert_eq!(reason, None);
+        for r in PressureGateReason::ALL {
+            assert!(!r.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_rearm_window_key_moves_on_date_close_and_depth_eligibility() {
+        let hot = 4;
+        // The 09:00 hour is eligible from 09 + 1 + 4 = 14:00 IST.
+        assert_eq!(
+            rearm_window_key(ist(13, 59), hot),
+            rearm_window_key(ist(9, 0), hot)
+        );
+        assert_ne!(
+            rearm_window_key(ist(14, 0), hot),
+            rearm_window_key(ist(13, 59), hot)
+        );
+        assert_ne!(
+            rearm_window_key(ist(15, 40), hot),
+            rearm_window_key(ist(15, 39), hot),
+            "the close moves the key"
+        );
+        assert_ne!(
+            rearm_window_key(ist(23, 59), hot),
+            rearm_window_key(ist(23, 59) + 120, hot),
+            "a new IST date moves the key"
+        );
+        // Monotonic within a day.
+        let mut last = 0;
+        for minute in 0..(24 * 60) {
+            let k = rearm_window_key(ist(0, 0) + minute * 60, hot);
+            assert!(k >= last);
+            last = k;
+        }
+        // Depth on the day path: only the date and the close move it.
+        assert_eq!(
+            rearm_window_key(ist(15, 0), 0),
+            rearm_window_key(ist(9, 0), 0)
+        );
+    }
+
+    // Regression: 2026-11-05 — three re-arms spent by 11:37 IST, then the
+    // episode held at 92% all night.
+    #[test]
+    fn test_regression_dp3_exhausted_rearms_refill_on_a_new_window() {
+        let c = PartitionRetentionConfig {
+            pressure_archive_enabled: true,
+            ..PartitionRetentionConfig::default()
+        };
+        let mut state = PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 4,
+                last_pass_dropped: Some(0),
+                escalated: true,
+                escalated_at_secs: Some(10_000),
+                rearms_used: PRESSURE_MAX_REARMS,
+                rearm_window: None,
+                rearm_now: false,
+            }),
+            last_episode_end_secs: None,
+        };
+        let over = PressureProbe::used(92);
+        let morning = rearm_window_key(ist(11, 37), 4);
+        assert!(
+            !refresh_rearm_budget(&mut state, morning),
+            "first look records"
+        );
+        assert_eq!(
+            decide_pressure_action(over, &state, &c, 20_000),
+            PressureAction::Hold,
+            "budget spent"
+        );
+        assert!(!refresh_rearm_budget(&mut state, morning), "same window");
+        // The close: refilled and due at once.
+        let close = rearm_window_key(ist(15, 40), 4);
+        assert!(refresh_rearm_budget(&mut state, close));
+        assert_eq!(
+            decide_pressure_action(over, &state, &c, 20_001),
+            PressureAction::ContinuePass
+        );
+        apply_action(&mut state, PressureAction::ContinuePass, 20_001, Some(0));
+        let ep = state.episode.expect("episode");
+        assert!(ep.escalated, "the page stays latched");
+        assert_eq!(ep.rearms_used, 1);
+        assert_eq!(ep.escalated_at_secs, Some(20_001));
+        // A date change refills again.
+        let next_day = rearm_window_key(ist(23, 59) + 120, 4);
+        assert!(refresh_rearm_budget(&mut state, next_day));
+        assert_eq!(state.episode.expect("episode").rearms_used, 0);
+    }
+
+    #[test]
+    fn test_refresh_rearm_budget_leaves_a_live_or_absent_episode_alone() {
+        let mut none = PressureState::default();
+        assert!(!refresh_rearm_budget(&mut none, 1));
+        let mut live = PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 1,
+                rearm_window: Some(1),
+                ..EpisodeState::default()
+            }),
+            last_episode_end_secs: None,
+        };
+        assert!(
+            !refresh_rearm_budget(&mut live, 2),
+            "not escalated: nothing to refill"
+        );
+        assert_eq!(live.episode.expect("episode").rearm_window, Some(2));
     }
 }
