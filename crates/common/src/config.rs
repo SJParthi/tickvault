@@ -229,6 +229,38 @@ pub struct ApplicationConfig {
     /// heartbeats gets (plan item 4). Absent section ⇒ counted only.
     #[serde(default)]
     pub task_heartbeat: TaskHeartbeatConfig,
+    /// `[operator_movers]` — publishing the Stocks movers universe for the
+    /// operator Lambda (plan PR MV, 2026-11-06). Absent section ⇒ ON: the
+    /// publisher only writes one read-only S3 object; turning it off makes
+    /// the portal fall back to the slower box path.
+    #[serde(default)]
+    pub operator_movers: OperatorMoversConfig,
+}
+
+/// `[operator_movers]` — the movers universe publisher (plan PR MV).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OperatorMoversConfig {
+    /// Publish the universe to `s3://<live_view_bucket>/movers/universe.json`
+    /// every 5 s in session and every 60 s otherwise. Default `true`.
+    #[serde(default = "default_operator_movers_publish_enabled")]
+    pub publish_enabled: bool,
+    /// Bucket name; empty derives `tv-<env>-live-view` from `TV_ENVIRONMENT`
+    /// (no environment ⇒ not published, fail closed).
+    #[serde(default)]
+    pub live_view_bucket: String,
+}
+
+const fn default_operator_movers_publish_enabled() -> bool {
+    true
+}
+
+impl Default for OperatorMoversConfig {
+    fn default() -> Self {
+        Self {
+            publish_enabled: default_operator_movers_publish_enabled(),
+            live_view_bucket: String::new(),
+        }
+    }
 }
 
 /// What the memory watchdog does (plan item 4).
@@ -3994,6 +4026,7 @@ mod tests {
             raw_frame_archive: RawFrameArchiveConfig::default(),
             memory_watchdog: MemoryWatchdogConfig::default(),
             task_heartbeat: TaskHeartbeatConfig::default(),
+            operator_movers: OperatorMoversConfig::default(),
         }
     }
 
@@ -5070,6 +5103,32 @@ mod tests {
             .extract()
             .expect("true parses");
         assert!(on.dhan_universe.depth_sockets_enabled);
+    }
+
+    #[test]
+    fn test_operator_movers_publish_defaults_on_and_parses_overrides() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            operator_movers: OperatorMoversConfig,
+        }
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string(""))
+            .extract()
+            .expect("absent section must default");
+        assert!(absent.operator_movers.publish_enabled);
+        assert!(absent.operator_movers.live_view_bucket.is_empty());
+        let set: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[operator_movers]\npublish_enabled = false\nlive_view_bucket = \"b\"\n",
+            ))
+            .extract()
+            .expect("section must parse");
+        assert!(!set.operator_movers.publish_enabled);
+        assert_eq!(set.operator_movers.live_view_bucket, "b");
     }
 
     #[test]

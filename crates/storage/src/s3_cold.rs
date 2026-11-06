@@ -149,7 +149,7 @@ pub(crate) fn resolve_environment_from(
 /// `ENVIRONMENT`); `None` when neither env var is set — archival is then
 /// skipped for the run (F1b fail-closed).
 // TEST-EXEMPT: two env reads; the decision is resolve_environment_from, tested directly
-pub(crate) fn runtime_environment() -> Option<String> {
+pub fn runtime_environment() -> Option<String> {
     resolve_environment_from(
         std::env::var("TV_ENVIRONMENT").ok().as_deref(),
         std::env::var("ENVIRONMENT").ok().as_deref(),
@@ -533,6 +533,18 @@ mod tests {
         // skipped. A dev box can never default onto the prod cold bucket.
         assert_eq!(resolve_archive_bucket("", None), None);
         assert_eq!(resolve_archive_bucket("   ", None), None);
+    }
+
+    #[test]
+    fn test_runtime_environment_matches_the_pure_resolver_over_the_process_env() {
+        // Read-only: compares the env-reading shim with the pure decision.
+        assert_eq!(
+            runtime_environment(),
+            resolve_environment_from(
+                std::env::var("TV_ENVIRONMENT").ok().as_deref(),
+                std::env::var("ENVIRONMENT").ok().as_deref(),
+            )
+        );
     }
 
     #[test]
