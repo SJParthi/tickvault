@@ -96,3 +96,15 @@ dhan_enabled = true
 # keeps the default OFF. Rollback: set false and redeploy; the next boot
 # removes the instant and writes `market_depth` only.
 array_rows = true
+
+[tick_storage]
+# 2026-11-06 — our own ILP encoder turned ON for production (plan PR PF,
+# item PF-1; owner, 2026-11-06: "i need always less than one microsecodn
+# across the entore codebase workspace woth a real tiem proof" and "go ahead
+# fix everything dude approved"). Tick, repeat-quote, aux and candle rows are
+# written by `tick_ilp` instead of the questdb-rs buffer: byte-identical text
+# (proptests against the library, an exhaustive f32 price sweep, a local
+# server test of the HTTP request), measured p99 ~0.8 us a row against the
+# library's 1.8-2.4 us. base.toml keeps the default OFF. Rollback: set false
+# and redeploy; nothing on disk or in QuestDB changes either way.
+own_ilp_encoder = true

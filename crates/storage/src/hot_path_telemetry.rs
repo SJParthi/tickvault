@@ -177,10 +177,26 @@ pub enum Stage {
     /// histogram), which runs every 5 s on the MAIN tokio runtime, the one
     /// the frame drain shares (plan item DT0). Never paged.
     MetricsUpkeep = 6,
+    /// One main-feed TICK's share of the drain's work (PR DP-6, 2026-11-06):
+    /// the [`Stage::DrainMainFrame`] time of a frame divided by the frame's
+    /// tick packets, recorded with that many as its weight
+    /// ([`record_stage_nanos_weighted`]). A frame stacks many packets, so the
+    /// per-frame stage cannot say what one tick costs; this is the per-tick
+    /// AVERAGE within each frame (a multi-packet frame contributes its mean
+    /// once per tick, not each tick's own time). The frame's time is its
+    /// decode + fold + row append for EVERY packet in it, non-tick packets
+    /// (open interest, market status, previous close) included, divided by
+    /// its tick packets only. A frame with no tick packet records nothing.
+    /// Never paged.
+    ///
+    /// Reading it (PR DP review): the histogram's buckets are powers of two,
+    /// so a green "under 1 µs" tile means the p99 sits in the bucket ending
+    /// at 1,024 ns, not at or under 1,000 ns.
+    DrainMainTick = 7,
 }
 
 /// Every stage, in index order.
-pub const ALL_STAGES: [Stage; 7] = [
+pub const ALL_STAGES: [Stage; 8] = [
     Stage::SocketToWal,
     Stage::RingDwell,
     Stage::MainRuntimeLag,
@@ -188,6 +204,7 @@ pub const ALL_STAGES: [Stage; 7] = [
     Stage::DrainMainFrame,
     Stage::ReceiptToFold,
     Stage::MetricsUpkeep,
+    Stage::DrainMainTick,
 ];
 
 const STAGE_COUNT: usize = ALL_STAGES.len();
@@ -202,6 +219,7 @@ const PAGED_STAGE_COUNT: usize = 5;
 const _: () = assert!(PAGED_STAGE_COUNT <= STAGE_COUNT);
 const _: () = assert!(Stage::ReceiptToFold as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::MetricsUpkeep as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainMainTick as usize >= PAGED_STAGE_COUNT);
 
 impl Stage {
     /// The `stage` label value.
@@ -215,6 +233,7 @@ impl Stage {
             Self::DrainMainFrame => "drain_main_frame",
             Self::ReceiptToFold => "receipt_to_fold",
             Self::MetricsUpkeep => "metrics_upkeep",
+            Self::DrainMainTick => "drain_main_tick",
         }
     }
 
@@ -241,6 +260,9 @@ impl Stage {
             Self::RingDwell => 100_000_000,
             Self::MainRuntimeLag | Self::ReaderRuntimeLag => 10_000_000,
             Self::DrainMainFrame | Self::ReceiptToFold | Self::MetricsUpkeep => 1_000_000,
+            // PR DP-6: one tick's share; never paged, the over-budget count
+            // and the per-episode p99 warn use 1 ms like the frame stage.
+            Self::DrainMainTick => 1_000_000,
         }
     }
 }
@@ -323,6 +345,22 @@ impl StageStats {
         self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
         if nanos > stage.stall_budget_nanos() {
             self.over_budget.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `weight` samples of `nanos` each, in one go (PR DP-6). Four relaxed
+    /// atomics, the same as [`Self::record`]; `weight == 0` records nothing.
+    #[inline]
+    fn record_weighted(&self, stage: Stage, nanos: u64, weight: u64) {
+        if weight == 0 {
+            return;
+        }
+        self.buckets[raw_bucket_index(nanos)].fetch_add(weight, Ordering::Relaxed);
+        self.sum_nanos
+            .fetch_add(nanos.saturating_mul(weight), Ordering::Relaxed);
+        self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+        if nanos > stage.stall_budget_nanos() {
+            self.over_budget.fetch_add(weight, Ordering::Relaxed);
         }
     }
 
@@ -426,6 +464,14 @@ pub const fn bucket_upper_bound_nanos(k: usize) -> Option<u64> {
 #[inline]
 pub fn record_stage_nanos(stage: Stage, nanos: u64) {
     STAGES[stage as usize].record(stage, nanos);
+}
+
+/// Records `weight` samples of `nanos` each (PR DP-6): the per-tick average
+/// of a frame, once per tick in it. O(1), four relaxed atomics, zero
+/// allocation, lock-free; `weight == 0` records nothing.
+#[inline]
+pub fn record_stage_nanos_weighted(stage: Stage, nanos: u64, weight: u64) {
+    STAGES[stage as usize].record_weighted(stage, nanos, weight);
 }
 
 /// Records one sample given as a `Duration`.
@@ -1566,6 +1612,35 @@ mod tests {
             1,
             "exactly the budget is not a stall, one nanosecond over is"
         );
+    }
+
+    // Regression: 2026-11-06 (PR DP-6) — `drain_main_frame` timed whole
+    // frames, so a frame of 70 ticks read as one sample of 70 ticks' cost.
+    // `drain_main_tick` records the per-tick average with the frame's tick
+    // count as its weight. Only this test records it in this binary.
+    #[test]
+    fn test_regression_dp6_record_stage_nanos_weighted_records_a_per_tick_sample() {
+        assert_eq!(Stage::DrainMainTick.as_str(), "drain_main_tick");
+        assert_eq!(*ALL_STAGES.last().expect("stages"), Stage::DrainMainTick);
+        assert!(
+            Stage::DrainMainTick as usize >= PAGED_STAGE_COUNT,
+            "never paged"
+        );
+        let before = stage_snapshot(Stage::DrainMainTick);
+        // A 70-tick frame at 700 ns a tick, then a one-tick frame at 2,000 ns.
+        record_stage_nanos_weighted(Stage::DrainMainTick, 700, 70);
+        record_stage_nanos_weighted(Stage::DrainMainTick, 2_000, 1);
+        // A zero weight records nothing.
+        record_stage_nanos_weighted(Stage::DrainMainTick, 9_999, 0);
+        let after = stage_snapshot(Stage::DrainMainTick);
+        assert_eq!(after.count - before.count, 71, "weighted by ticks");
+        assert_eq!(after.sum_nanos - before.sum_nanos, 70 * 700 + 2_000);
+        assert_eq!(
+            after.buckets[0] - before.buckets[0],
+            70,
+            "the 700 ns ticks sit in the <= 1,024 ns bucket"
+        );
+        assert_eq!(after.buckets[1] - before.buckets[1], 1);
     }
 
     #[test]

@@ -139,6 +139,189 @@ struct Settings {
     run_timeout: Duration,
     http_bind: String,
     path: String,
+    /// Operator values for the compose `${VAR:-default}` keys the last-resort
+    /// `docker run` passes (environment first, then the `.env` beside the
+    /// compose file, as compose reads them). A key absent here takes the
+    /// compose default.
+    overrides: Vec<(&'static str, String)>,
+}
+
+/// One value in the compose spec's `tv-questdb` service, as the last-resort
+/// `docker run` must pass it (test gap T2, 2026-11-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeValue {
+    /// A fixed value.
+    Literal(&'static str),
+    /// `${VAR:-default}`: the operator's value, else the default.
+    Interpolated {
+        var: &'static str,
+        default: &'static str,
+    },
+    /// A credential: passed by NAME (`-e NAME`), its value only in the
+    /// child's environment.
+    ByName,
+}
+
+/// Every `QDB_*` key of the compose spec's `tv-questdb` environment block,
+/// mirrored for the last-resort `docker run`. Pinned both ways against
+/// `deploy/docker/docker-compose.yml` by
+/// `test_docker_run_env_mirrors_every_compose_qdb_key`: a key added there and
+/// not here (the 2026-11-06 HTTP worker pool, for one) fails the build.
+/// Before, the fallback passed four of the eleven keys, so a recreate without
+/// compose ran QuestDB on its own defaults: one HTTP thread, a one-slot /exp
+/// pool and auto-sized workers.
+const QUESTDB_ENV: [(&str, ComposeValue); 13] = [
+    ("QDB_LOG_W_STDOUT_LEVEL", ComposeValue::Literal("ERROR")),
+    ("QDB_TELEMETRY_ENABLED", ComposeValue::Literal("false")),
+    ("QDB_METRICS_ENABLED", ComposeValue::Literal("TRUE")),
+    (
+        "QDB_HTTP_EXPORT_CONNECTION_LIMIT",
+        ComposeValue::Literal("2"),
+    ),
+    (
+        "QDB_HTTP_WORKER_COUNT",
+        ComposeValue::Interpolated {
+            var: "TV_QDB_HTTP_WORKERS",
+            default: "3",
+        },
+    ),
+    (
+        "QDB_SHARED_NETWORK_WORKER_COUNT",
+        ComposeValue::Interpolated {
+            var: "TV_QDB_NETWORK_WORKERS",
+            default: "2",
+        },
+    ),
+    (
+        "QDB_CAIRO_MAX_UNCOMMITTED_ROWS",
+        ComposeValue::Literal("2000000"),
+    ),
+    ("QDB_CAIRO_O3_MAX_LAG", ComposeValue::Literal("600000000")),
+    (
+        "QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE",
+        ComposeValue::Literal("16777216"),
+    ),
+    (
+        "QDB_WAL_APPLY_WORKER_COUNT",
+        ComposeValue::Interpolated {
+            var: "TV_QDB_WAL_WORKERS",
+            default: "2",
+        },
+    ),
+    (
+        "QDB_SHARED_WORKER_COUNT",
+        ComposeValue::Interpolated {
+            var: "TV_QDB_SHARED_WORKERS",
+            default: "2",
+        },
+    ),
+    ("QDB_PG_USER", ComposeValue::ByName),
+    ("QDB_PG_PASSWORD", ComposeValue::ByName),
+];
+
+/// The operator's cpuset variable (PR DP review L2: the fallback passes a
+/// cpuset only when this is set).
+const CPUSET_VAR: &str = "TV_QDB_CPUSET";
+
+/// The compose service's resource limits, mirrored for `docker run`.
+const CPUSET: ComposeValue = ComposeValue::Interpolated {
+    var: CPUSET_VAR,
+    default: "2,3",
+};
+
+/// The `-p` spec for the console port on `http_bind`; an IPv6 address is
+/// bracketed, as docker requires (PR DP review L2). O(1).
+fn console_port_spec(http_bind: &str) -> String {
+    if http_bind.contains(':') && !http_bind.starts_with('[') {
+        format!("[{http_bind}]:9000:9000")
+    } else {
+        format!("{http_bind}:9000:9000")
+    }
+}
+const CPUS: ComposeValue = ComposeValue::Interpolated {
+    var: "TV_QDB_CPUS",
+    default: "2.0",
+};
+const MEM_LIMIT: ComposeValue = ComposeValue::Interpolated {
+    var: "QDB_MEM_LIMIT",
+    default: "6g",
+};
+const MEM_RESERVATION: &str = "2g";
+const OOM_SCORE_ADJ: &str = "-500";
+const SHM_SIZE: &str = "512m";
+
+/// Every `${VAR:-default}` variable the fallback resolves.
+fn interpolated_vars() -> impl Iterator<Item = &'static str> {
+    QUESTDB_ENV
+        .iter()
+        .map(|(_, v)| *v)
+        .chain([CPUSET, CPUS, MEM_LIMIT])
+        .filter_map(|v| match v {
+            ComposeValue::Interpolated { var, .. } => Some(var),
+            _ => None,
+        })
+}
+
+/// The last `KEY=` line of a `.env` file, trimmed and unquoted; `None` when
+/// absent or empty (compose treats an empty value as unset for `:-`).
+fn dotenv_value(dotenv: &str, key: &str) -> Option<String> {
+    dotenv
+        .lines()
+        .filter_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .next_back()
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// An operator value safe to hand docker as one argument: short, and only
+/// characters a worker count, a cpuset, a CPU quota or a memory size uses.
+fn is_safe_override(value: &str) -> bool {
+    // Starts with a letter or digit, so nothing reads as a docker flag.
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b',' | b'-'))
+}
+
+/// The environment value wins, then the `.env` value; an unsafe value is
+/// dropped loudly and the compose default applies.
+fn resolve_overrides(
+    var: &impl Fn(&str) -> Option<String>,
+    dotenv: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for name in interpolated_vars() {
+        let chosen = var(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| dotenv.and_then(|d| dotenv_value(d, name)));
+        match chosen {
+            Some(v) if is_safe_override(&v) => out.push((name, v)),
+            Some(v) => emit(&format!(
+                "WARN: {name}={v:?} is not a plain count, core list or size — using the compose default"
+            )),
+            None => {}
+        }
+    }
+    out
+}
+
+/// A compose value as the fallback passes it.
+fn compose_value(value: ComposeValue, overrides: &[(&'static str, String)]) -> Option<String> {
+    match value {
+        ComposeValue::Literal(v) => Some(v.to_string()),
+        ComposeValue::Interpolated { var, default } => Some(
+            overrides
+                .iter()
+                .find(|(name, _)| *name == var)
+                .map_or_else(|| default.to_string(), |(_, v)| v.clone()),
+        ),
+        ComposeValue::ByName => None,
+    }
 }
 
 /// A positive whole number of seconds, else the default.
@@ -210,6 +393,7 @@ impl Settings {
             run_timeout: timeout_from(var(RUN_TIMEOUT_VAR), DEFAULT_RUN_TIMEOUT_SECS),
             http_bind: resolve_http_bind(var(HTTP_BIND_VAR), dotenv.as_deref()),
             path: hardened_path(var("PATH")),
+            overrides: resolve_overrides(&var, dotenv.as_deref()),
             compose_file,
         }
     }
@@ -227,11 +411,17 @@ fn compose_ladder() -> impl Iterator<Item = ComposeCli> {
 }
 
 /// The arguments of the last-resort `docker run`, mirroring the compose spec's
-/// ports, volume and limits. The credentials are passed by NAME (`-e NAME`),
-/// their values only in the child's environment, never on the command line.
-fn docker_run_args(http_bind: &str) -> Vec<String> {
-    let console_port = format!("{http_bind}:9000:9000");
-    [
+/// ports, volume, limits and every `QDB_*` environment key
+/// ([`QUESTDB_ENV`]). The credentials are passed by NAME (`-e NAME`), their
+/// values only in the child's environment, never on the command line.
+///
+/// Known deviations from compose, all of the last-resort rung only: no
+/// `tv-network` attachment (compose creates the network; the app reaches
+/// QuestDB through the published ports) and no `platform` pin (docker picks
+/// the host's architecture from the multi-arch digest).
+fn docker_run_args(http_bind: &str, overrides: &[(&'static str, String)]) -> Vec<String> {
+    let console_port = console_port_spec(http_bind);
+    let mut args: Vec<String> = [
         "run",
         "-d",
         "--name",
@@ -251,22 +441,35 @@ fn docker_run_args(http_bind: &str) -> Vec<String> {
         "-v",
         "tv-questdb-data:/var/lib/questdb",
         "--shm-size",
-        "512m",
-        "--memory",
-        "2g",
-        "-e",
-        "QDB_TELEMETRY_ENABLED=false",
-        "-e",
-        "QDB_METRICS_ENABLED=TRUE",
-        "-e",
-        "QDB_PG_USER",
-        "-e",
-        "QDB_PG_PASSWORD",
-        IMAGE,
+        SHM_SIZE,
     ]
     .iter()
     .map(|s| (*s).to_string())
-    .collect()
+    .collect();
+    // `--flag=value` so an operator value can never be read as another flag.
+    // PR DP review L2: the cpuset is passed only when the operator set one.
+    // Compose's default (`2,3`) names CPUs a 2-vCPU box does not have, and
+    // docker refuses to create the container with it; before PR DP-1 the
+    // fallback passed no cpuset at all, which is kept.
+    if let Some((_, cpuset)) = overrides.iter().find(|(name, _)| *name == CPUSET_VAR) {
+        args.push(format!("--cpuset-cpus={cpuset}"));
+    }
+    for (flag, value) in [("--cpus", CPUS), ("--memory", MEM_LIMIT)] {
+        if let Some(v) = compose_value(value, overrides) {
+            args.push(format!("{flag}={v}"));
+        }
+    }
+    args.push(format!("--memory-reservation={MEM_RESERVATION}"));
+    args.push(format!("--oom-score-adj={OOM_SCORE_ADJ}"));
+    for (key, value) in QUESTDB_ENV {
+        args.push("-e".to_string());
+        match compose_value(value, overrides) {
+            Some(v) => args.push(format!("{key}={v}")),
+            None => args.push(key.to_string()),
+        }
+    }
+    args.push(IMAGE.to_string());
+    args
 }
 
 /// Make sure the image is present: skip at once when it is (a deploy must
@@ -379,7 +582,7 @@ async fn ensure(host: &impl Host, settings: &Settings) -> i32 {
         ("QDB_PG_USER", pg_user),
         ("QDB_PG_PASSWORD", pg_pass),
     ];
-    let run_args = docker_run_args(&settings.http_bind);
+    let run_args = docker_run_args(&settings.http_bind, &settings.overrides);
     let run_args: Vec<&str> = run_args.iter().map(String::as_str).collect();
     if host
         .docker(&run_args, &run_env, settings.run_timeout)
@@ -720,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_docker_run_args_keep_credentials_off_the_command_line() {
-        let a = docker_run_args("0.0.0.0");
+        let a = docker_run_args("0.0.0.0", &[]);
         let joined = a.join(" ");
         assert!(joined.starts_with(
             "run -d --name tv-questdb --hostname tv-questdb --restart unless-stopped"
@@ -729,7 +932,10 @@ mod tests {
             joined
                 .contains("-p 0.0.0.0:9000:9000 -p 8812:8812 -p 9009:9009 -p 127.0.0.1:9003:9003")
         );
-        assert!(joined.contains("-v tv-questdb-data:/var/lib/questdb --shm-size 512m --memory 2g"));
+        assert!(joined.contains(
+            "-v tv-questdb-data:/var/lib/questdb --shm-size 512m --cpus=2.0 \
+             --memory=6g --memory-reservation=2g --oom-score-adj=-500"
+        ));
         assert!(joined.contains("-e QDB_PG_USER -e QDB_PG_PASSWORD"));
         assert!(
             a.iter()
@@ -737,6 +943,239 @@ mod tests {
             "credentials are passed by name only"
         );
         assert_eq!(a.last().map(String::as_str), Some(IMAGE));
+    }
+
+    /// Reads the `QDB_*` entries of the `tv-questdb` service's `environment:`
+    /// block of the compose file, as `(key, parsed value)`.
+    fn compose_questdb_env(compose: &str) -> Vec<(String, ComposeValueOwned)> {
+        let mut in_service = false;
+        let mut in_env = false;
+        let mut out = Vec::new();
+        for line in compose.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let body = line.trim();
+            if body.is_empty() || body.starts_with('#') {
+                continue;
+            }
+            if indent == 2 {
+                in_service = body == "tv-questdb:";
+                in_env = false;
+                continue;
+            }
+            if !in_service {
+                continue;
+            }
+            if indent == 4 {
+                in_env = body == "environment:";
+                continue;
+            }
+            if in_env
+                && indent == 6
+                && let Some((key, raw)) = body.split_once(':')
+                && key.starts_with("QDB_")
+            {
+                out.push((key.to_string(), ComposeValueOwned::parse(raw.trim())));
+            }
+        }
+        out
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ComposeValueOwned {
+        Literal(String),
+        Interpolated { var: String, default: String },
+        ByName,
+    }
+
+    impl ComposeValueOwned {
+        fn parse(raw: &str) -> Self {
+            let raw = raw.trim_matches('"');
+            if let Some(inner) = raw.strip_prefix("${").and_then(|r| r.split('}').next()) {
+                if let Some((var, default)) = inner.split_once(":-") {
+                    return Self::Interpolated {
+                        var: var.to_string(),
+                        default: default.to_string(),
+                    };
+                }
+                if inner.contains(":?") {
+                    return Self::ByName;
+                }
+            }
+            Self::Literal(raw.to_string())
+        }
+
+        fn from_const(v: ComposeValue) -> Self {
+            match v {
+                ComposeValue::Literal(l) => Self::Literal(l.to_string()),
+                ComposeValue::Interpolated { var, default } => Self::Interpolated {
+                    var: var.to_string(),
+                    default: default.to_string(),
+                },
+                ComposeValue::ByName => Self::ByName,
+            }
+        }
+    }
+
+    /// Compose `QDB_*` keys the fallback deliberately does NOT pass, each with
+    /// its reason. Empty: every key is mirrored. A future deviation is written
+    /// down here, with its reason, rather than silently left out.
+    const QUESTDB_ENV_NOT_MIRRORED: [(&str, &str); 0] = [];
+
+    // Test gap T2 (2026-11-06): the fallback passed 4 of the compose file's
+    // QDB_* keys, so a recreate without compose ran QuestDB on its own
+    // defaults (one HTTP thread, a one-slot /exp pool).
+    #[test]
+    fn test_docker_run_env_mirrors_every_compose_qdb_key() {
+        let compose = include_str!("../../../deploy/docker/docker-compose.yml");
+        let parsed = compose_questdb_env(compose);
+        assert!(
+            parsed.iter().any(|(k, _)| k == "QDB_HTTP_WORKER_COUNT"),
+            "the parser must reach the HTTP worker pool key: {parsed:?}"
+        );
+        assert!(parsed.len() >= 10, "parser read too few keys: {parsed:?}");
+        let args = docker_run_args("127.0.0.1", &[]);
+        for (key, value) in &parsed {
+            if QUESTDB_ENV_NOT_MIRRORED.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            let mirrored = QUESTDB_ENV
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("compose key {key} is not in QUESTDB_ENV"));
+            assert_eq!(
+                &ComposeValueOwned::from_const(mirrored.1),
+                value,
+                "{key} differs between docker-compose.yml and QUESTDB_ENV"
+            );
+            let expected = match value {
+                ComposeValueOwned::Literal(v) => format!("{key}={v}"),
+                ComposeValueOwned::Interpolated { default, .. } => format!("{key}={default}"),
+                ComposeValueOwned::ByName => key.clone(),
+            };
+            assert!(
+                args.contains(&expected),
+                "docker run must pass {expected}: {args:?}"
+            );
+        }
+        for (key, _) in QUESTDB_ENV {
+            assert!(
+                parsed.iter().any(|(k, _)| k == key),
+                "{key} is in QUESTDB_ENV but no longer in docker-compose.yml"
+            );
+        }
+    }
+
+    #[test]
+    fn test_docker_run_limits_match_the_compose_service() {
+        let compose = include_str!("../../../deploy/docker/docker-compose.yml");
+        let service = compose
+            .split("\n  tv-questdb:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  tv-loki:").next())
+            .expect("tv-questdb service block");
+        let value_of = |key: &str| {
+            service
+                .lines()
+                .find(|l| {
+                    l.starts_with("    ")
+                        && !l.starts_with("     ")
+                        && l.trim_start().starts_with(key)
+                })
+                .map(|l| {
+                    l.trim_start()[key.len()..]
+                        .trim()
+                        .trim_matches('"')
+                        .to_string()
+                })
+                .unwrap_or_else(|| panic!("compose tv-questdb has no {key}"))
+        };
+        assert_eq!(
+            ComposeValueOwned::parse(&value_of("cpuset:")),
+            ComposeValueOwned::from_const(CPUSET)
+        );
+        assert_eq!(
+            ComposeValueOwned::parse(&value_of("cpus:")),
+            ComposeValueOwned::from_const(CPUS)
+        );
+        assert_eq!(
+            ComposeValueOwned::parse(&value_of("mem_limit:")),
+            ComposeValueOwned::from_const(MEM_LIMIT)
+        );
+        assert_eq!(value_of("mem_reservation:"), MEM_RESERVATION);
+        assert_eq!(value_of("oom_score_adj:"), OOM_SCORE_ADJ);
+        assert_eq!(value_of("shm_size:"), SHM_SIZE);
+    }
+
+    // Regression: PR DP review L2 — the fallback passed compose's default
+    // cpuset `2,3`, which docker refuses on the 2-vCPU box; and an IPv6 bind
+    // made an unbracketed port spec docker cannot parse.
+    #[test]
+    fn test_regression_l2_no_default_cpuset_and_bracketed_ipv6_port() {
+        let bare = docker_run_args("127.0.0.1", &[]);
+        assert!(
+            !bare.iter().any(|a| a.starts_with("--cpuset-cpus")),
+            "no cpuset unless the operator set one: {bare:?}"
+        );
+        assert!(bare.contains(&"127.0.0.1:9000:9000".to_string()));
+        let set = docker_run_args("127.0.0.1", &[(CPUSET_VAR, "0-1".to_string())]);
+        assert!(set.contains(&"--cpuset-cpus=0-1".to_string()), "{set:?}");
+        assert_eq!(console_port_spec("::1"), "[::1]:9000:9000");
+        assert_eq!(console_port_spec("[::1]"), "[::1]:9000:9000");
+        assert_eq!(console_port_spec("0.0.0.0"), "0.0.0.0:9000:9000");
+        let v6 = docker_run_args("::", &[]);
+        assert!(v6.contains(&"[::]:9000:9000".to_string()), "{v6:?}");
+    }
+
+    #[test]
+    fn test_docker_run_takes_operator_values_from_env_then_dotenv() {
+        let s = Settings::resolve(
+            |name| match name {
+                "TV_QDB_HTTP_WORKERS" => Some("3".to_string()),
+                "TV_QDB_CPUS" => Some("--privileged".to_string()),
+                _ => None,
+            },
+            |_| {
+                Some(
+                    "TV_QDB_CPUSET=0-1\nTV_QDB_HTTP_WORKERS=9\nQDB_MEM_LIMIT=\"5g\"\n\
+                     TV_QDB_WAL_WORKERS=1;rm\n"
+                        .to_string(),
+                )
+            },
+        );
+        let a = docker_run_args("127.0.0.1", &s.overrides);
+        assert!(
+            a.contains(&"QDB_HTTP_WORKER_COUNT=3".to_string()),
+            "env wins: {a:?}"
+        );
+        assert!(
+            a.contains(&"--cpuset-cpus=0-1".to_string()),
+            "dotenv: {a:?}"
+        );
+        assert!(
+            a.contains(&"--memory=5g".to_string()),
+            "quotes stripped: {a:?}"
+        );
+        assert!(
+            a.contains(&"--cpus=2.0".to_string()),
+            "unsafe env value refused: {a:?}"
+        );
+        assert!(
+            a.contains(&"QDB_WAL_APPLY_WORKER_COUNT=2".to_string()),
+            "unsafe dotenv value refused: {a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("privileged") || x.contains(";rm"))
+        );
+        assert!(is_safe_override("0-1,3"));
+        assert!(!is_safe_override(""));
+        assert!(!is_safe_override(&"9".repeat(33)));
+        assert_eq!(dotenv_value("A=1\nA=\n", "A"), None);
+        assert_eq!(
+            dotenv_value("AB=1\n", "A"),
+            None,
+            "anchored to the whole key"
+        );
     }
 
     #[tokio::test]

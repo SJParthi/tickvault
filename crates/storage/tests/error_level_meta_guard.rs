@@ -254,6 +254,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "a sizing probe; the spill keeps working at its fixed floor",
     ),
     (
+        "crates/storage/src/depth_persistence.rs",
+        "market_depth_book self-heal: rename table failed",
+        "2026-11-06 (PR DP-5): no row is written or lost; the boot keeps the wrong-timestamp table and every depth row goes to market_depth as before (coded HOT-PATH-02 warn, counted on tv_depth_book_self_heal_total{outcome=\"rename_failed\"}); an ERROR would page a loss that does not exist (the 2026-10-29 LH-01 review)",
+    ),
+    (
         "crates/storage/src/wal_deferred_depth.rs",
         "deferred-depth marks could not be persisted",
         "coded WS-SPILL-01 and latched once per episode; paged by durability-sync-failing on its counter",

@@ -288,6 +288,9 @@ fn every_partition_knob_is_reversible_by_configuration_alone() {
         "cpus:",
         "QDB_WAL_APPLY_WORKER_COUNT:",
         "QDB_SHARED_WORKER_COUNT:",
+        // 2026-11-06 (PR DP-1): the HTTP pool and the shared network pool.
+        "QDB_HTTP_WORKER_COUNT:",
+        "QDB_SHARED_NETWORK_WORKER_COUNT:",
     ] {
         let line = compose
             .lines()

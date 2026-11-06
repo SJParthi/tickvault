@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c956e3a378c5fa93c07901e1b80e3fe50b83dbc85cbe051bbc789df5f0ef7712 # shrinks to clock_kind = 0, open = false, read_kind = 0, fno_mask = None, mem_mask = None, labels = 0, per_stock = [0], partial = false, name_kind = 0, rows = [], failure_kind = 0, allow_duplicates = 0, fno_only = false, index = 0, search = 0, direction = 0, offset = 0, sort = None
+cc bf63ce9be4eab8a4abc45597cf62a3730dd21e8d8f119ede664814387dcf8623 # shrinks to clock_kind = 0, open = false, read_kind = 0, fno_mask = None, mem_mask = Some(2), labels = 0, per_stock = [0], partial = false, name_kind = 0, rows = [], failure_kind = 0, allow_duplicates = 0, fno_only = false, index = 0, search = 0, direction = 0, offset = 0, sort = None
+cc 08aeca01c5962328fb9583a2d9b453f2240407183bec332609ae5f798558777b # shrinks to clock_kind = 3, open = false, read_kind = 0, fno_mask = Some(496605184), mem_mask = None, labels = 0, per_stock = [0], partial = false, name_kind = 0, rows = [(12, 1, 14, 4, 0, 0), (11, 1, 6, 4, 0, 0)], failure_kind = 0, allow_duplicates = 0, fno_only = true, index = 0, search = 0, direction = 0, offset = 0, sort = None

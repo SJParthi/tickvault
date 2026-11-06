@@ -1,7 +1,19 @@
 //! Canonical index/F&O enrichment and full-universe filtering before pagination.
 //! Reads existing daily artifacts and captured ticks only. No subscription,
-//! broker request, strategy activation or database write. Cold O(n + k log k).
-use super::fno_stocks::{self, FnoStocksInputs, FnoStocksResponse, FnoUnderlyings};
+//! broker request, strategy activation or database write.
+//!
+//! Plan PR MV (2026-11-06): the route builds ONE movers universe (one QuestDB
+//! query over the union of today's F&O list and index-membership list, plus
+//! both lists) and answers every filter from it with the shared pure
+//! [`select`]; the universe is cached for 2 s, so a sort, page or filter
+//! change inside that window reads no file and runs no query. The app
+//! publishes the same universe for the operator Lambda
+//! ([`build_live_universe`]). The per-filter path this replaced is kept as the
+//! test oracle (`oracle` module) and a property test proves the two equal.
+//!
+//! Complexity: cold path. Per build O(list rows) to read the lists and one
+//! bounded query; per request O(n log n) in [`select`], n ≤ 2,000 rows.
+use super::fno_stocks::{self, FnoStocksInputs, FnoUnderlyings, QueryFailure, TickRow};
 use crate::response_cache::cached_json_response;
 use crate::state::SharedAppState;
 use axum::extract::{Query, State};
@@ -9,20 +21,20 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tickvault_common::constants::{
-    EXCHANGE_SEGMENT_NSE_EQ, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_NANOS,
-    IST_UTC_OFFSET_SECONDS_I64, TICK_PERSIST_END_SECS_OF_DAY_IST,
-    TICK_PERSIST_START_SECS_OF_DAY_IST,
+    EXCHANGE_SEGMENT_NSE_EQ, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
 };
-use tickvault_common::operator_movers_wire::{
-    BridgeError, MAX_SOURCE_ROWS, MAX_WIRE_BYTES, SELECTION_LIMIT, SourceStatus, Stock,
+use tickvault_common::operator_movers_universe::{
+    ListedStock, MAX_UNIVERSE_PRICE_ROWS, MoversUniverse, PriceRow, StockIndices,
+    UNIVERSE_DEFAULT_WINDOW_SECS, UNIVERSE_FORMAT_VERSION, UniverseMembership, UniversePrices,
+    select, snapshot_deadline,
 };
+use tickvault_common::operator_movers_wire::{BridgeError, MAX_SOURCE_BYTES, MAX_SOURCE_ROWS};
 use tickvault_common::operator_stock_movers_wire::{
-    Direction, FILTERED_PROTOCOL_VERSION, Filter, MAX_INDEX_NAME_BYTES, MAX_INDEX_NAMES,
-    MemberStock, MembershipStatus, Outcome, Reply, Snapshot,
+    Filter, MAX_INDEX_NAME_BYTES, MAX_INDEX_NAMES, Reply,
 };
 
 /// Existing writer path, pinned against app::dhan_universe by an integration test.
@@ -33,12 +45,16 @@ const CACHE_TTL_SECONDS: u64 = 2;
 const QUERY_TIMEOUT_SECONDS: u64 = 3;
 const CACHE_TTL: Duration = Duration::from_secs(CACHE_TTL_SECONDS);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(QUERY_TIMEOUT_SECONDS);
-const ACTUAL_VALUE_UNAVAILABLE: &str =
-    "Actual traded value is not captured; Value (Cr.) is unavailable.";
+/// Body bound of the union query: two lists' worth of rows.
+const UNIVERSE_SOURCE_BYTES: usize = 2 * MAX_SOURCE_BYTES;
+
+/// One cached universe: built at, the `as_of` it was built for (`None` =
+/// live), the universe, its reply deadline and the session state it saw.
+type CachedUniverse = (Instant, Option<String>, Arc<MoversUniverse>, i64, bool);
 
 #[derive(Default)]
 pub(crate) struct MoversCache {
-    slot: tokio::sync::Mutex<Option<(Instant, Filter, String, i64, bool)>>,
+    slot: tokio::sync::Mutex<Option<CachedUniverse>>,
 }
 #[derive(Deserialize)]
 struct MappingArtifact {
@@ -61,7 +77,6 @@ struct Memberships {
     by_stock: HashMap<(u64, u8), Vec<usize>>,
     partial: bool,
 }
-
 fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
     if bytes.len() > MAX_MAPPING_BYTES {
         return None;
@@ -129,9 +144,9 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
     })
 }
 
-/// One current file cached by path and observed metadata, never yesterday's list.
-type MembershipCache = Option<(PathBuf, u64, SystemTime, Arc<Memberships>)>;
-static MEMBERSHIP_CACHE: Mutex<MembershipCache> = Mutex::new(None);
+/// The two most recent membership files by path and observed metadata
+/// (today's and one chosen other date), never a stale version of either.
+static MEMBERSHIP_CACHE: fno_stocks::FileCache<Memberships> = fno_stocks::FileCache::new();
 fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
     let path = dir.join(format!("{INDEX_MAPPING_PREFIX}{date}.json"));
     let mut file = std::fs::File::open(&path).ok()?;
@@ -140,15 +155,8 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
         return None;
     }
     let modified = metadata.modified().ok()?;
-    let mut cache = MEMBERSHIP_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((held, len, mtime, data)) = cache.as_ref()
-        && held == &path
-        && *len == metadata.len()
-        && *mtime == modified
-    {
-        return Some(Arc::clone(data));
+    if let Some(data) = MEMBERSHIP_CACHE.get(&path, metadata.len(), modified) {
+        return Some(data);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
@@ -156,224 +164,313 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
         .read_to_end(&mut bytes)
         .ok()?;
     let data = Arc::new(parse_memberships(&bytes, date)?);
-    *cache = Some((path, metadata.len(), modified, Arc::clone(&data)));
+    MEMBERSHIP_CACHE.put(&path, metadata.len(), modified, Arc::clone(&data));
     Some(data)
-}
-fn stock(row: fno_stocks::FnoStockRow) -> Stock {
-    Stock {
-        security_id: row.security_id,
-        segment: row.segment.into(),
-        name: row.name,
-        ltp: row.ltp,
-        prev_close: row.prev_close,
-        change: row.change,
-        change_pct: row.change_pct,
-        // Ticker packets persist their default zero without a packet-kind
-        // column. It cannot prove a reported zero, so preserve only positive
-        // cumulative values and leave the ambiguous zero/NULL unavailable.
-        volume: row.volume.filter(|volume| *volume > 0),
-        // The canonical F&O value is explicitly an estimate (volume x average
-        // price). Stocks' actual-Value column must not relabel that estimate.
-        value_cr: None,
-        last_trade_ist: row.last_trade_ist,
-    }
-}
-/// Canonical time boundaries are an expiry fence, not a second holiday decision.
-fn snapshot_deadline(observed: i64) -> Option<i64> {
-    const SECONDS_PER_DAY: i64 = 86_400;
-    let local = observed.checked_add(IST_UTC_OFFSET_SECONDS_I64)?;
-    let midnight = local
-        .div_euclid(SECONDS_PER_DAY)
-        .checked_mul(SECONDS_PER_DAY)?
-        .checked_sub(IST_UTC_OFFSET_SECONDS_I64)?;
-    let mut deadline = observed.checked_add(60)?;
-    for seconds in [
-        i64::from(TICK_PERSIST_START_SECS_OF_DAY_IST),
-        i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST),
-        SECONDS_PER_DAY,
-    ] {
-        let boundary = midnight.checked_add(seconds)?;
-        if boundary > observed {
-            deadline = deadline.min(boundary);
-        }
-    }
-    Some(deadline)
 }
 fn cache_current(deadline: i64, captured_open: bool, now: i64, current_open: bool) -> bool {
     now < deadline && captured_open == current_open
 }
 
-fn finish(
-    prices: FnoStocksResponse,
-    filter: Filter,
-    membership: Option<&Memberships>,
-    fno: Option<&FnoUnderlyings>,
-) -> Reply {
-    let status =
-        serde_json::from_value::<SourceStatus>(serde_json::Value::String(prices.status.into()));
-    let Ok(status) = status else {
-        return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+/// When and what one universe build reads (the clock half of the old
+/// per-filter `compute` + `compute_for_list`).
+struct ReadPlan {
+    /// UTC epoch seconds of the observation.
+    observed: i64,
+    /// Session open AND a live read.
+    open: bool,
+    /// The read instant: now, or the chosen minute (never after now).
+    at: chrono::NaiveDateTime,
+    /// `(start, end, closed)` of the query window; `None` before the day's
+    /// 09:15 on a closed read (nothing is queried).
+    window: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime, bool)>,
+}
+
+fn plan_read(
+    now_ist: chrono::NaiveDateTime,
+    market_open: bool,
+    read_at_ist: Option<chrono::NaiveDateTime>,
+) -> ReadPlan {
+    let observed = now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+    let read_at = read_at_ist.map(|at| at.min(now_ist));
+    let open = market_open && read_at.is_none();
+    let at = read_at.unwrap_or(now_ist);
+    let window = if open {
+        Some((
+            fno_stocks::window_start(now_ist),
+            now_ist + chrono::Duration::seconds(fno_stocks::FNO_STOCKS_FUTURE_SKEW_SECS),
+            false,
+        ))
+    } else {
+        fno_stocks::closed_session_window(at).map(|(start, end)| (start, end, true))
     };
-    let index_names = membership.map_or_else(Vec::new, |m| m.indices.clone());
-    let membership_status = match membership {
-        None => MembershipStatus::Unavailable,
-        Some(m) if m.partial => MembershipStatus::Partial,
-        Some(_) => MembershipStatus::Available,
-    };
-    let mut ids = HashSet::with_capacity(prices.stocks.len());
-    let mut selected = Vec::with_capacity(prices.stocks.len());
-    for price in prices.stocks.into_iter().map(stock) {
-        if !price.valid() || !ids.insert(price.security_id) {
-            return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
-        }
-        if !filter.matches_price(&price) {
-            continue;
-        }
-        let key = (price.security_id, EXCHANGE_SEGMENT_NSE_EQ);
-        let indices = membership
-            .and_then(|m| m.by_stock.get(&key))
-            .cloned()
-            .unwrap_or_default();
-        let eligible = fno.map(|f| f.name_of(key.0, key.1).is_some());
-        let volume_text = price.volume.map(|volume| volume.to_string());
-        selected.push(MemberStock {
-            price,
-            // The canonical mapping persists the symbol, not the company name.
-            company_name: None,
-            volume_text,
-            indices,
-            fno: eligible,
-        });
+    ReadPlan {
+        observed,
+        open,
+        at,
+        window,
     }
-    if filter.sort_by.is_some() {
-        selected.sort_unstable_by(|left, right| filter.compare_rows(left, right));
-    } else if filter.direction == Direction::Losers {
-        selected.reverse();
-    }
-    let matching_total = selected.len();
-    let rows = selected
+}
+
+/// Security ids of the union of both lists, ascending (all `NSE_EQ`). O(n log n).
+fn union_ids(fno: Option<&FnoUnderlyings>, membership: Option<&Memberships>) -> Vec<u64> {
+    let mut ids: Vec<u64> = fno
+        .map(|f| f.sorted_ids())
+        .unwrap_or_default()
         .into_iter()
-        .skip(filter.offset)
-        .take(SELECTION_LIMIT)
+        .chain(
+            membership
+                .into_iter()
+                .flat_map(|m| m.names.keys().map(|(id, _)| *id)),
+        )
         .collect();
-    let snapshot = Snapshot {
-        filter: filter.clone(),
-        status,
-        market_open: prices.market_open,
-        as_of_ist: prices.as_of_ist,
-        data_age_secs: prices.data_age_secs,
-        universe_available: (if filter.fno_only {
-            fno.is_some()
-        } else {
-            membership.is_some()
-        }) && filter
-            .index
-            .as_ref()
-            .is_none_or(|name| membership.is_some_and(|m| m.indices.binary_search(name).is_ok())),
-        universe_total: prices.fno_stocks_total,
-        stocks_priced: prices.stocks_priced,
-        matching_total,
-        selection_limit: SELECTION_LIMIT,
-        window_secs: prices.window_secs,
-        value_basis: ACTUAL_VALUE_UNAVAILABLE.into(),
-        index_names,
-        membership_status,
-        fno_list_available: fno.is_some(),
-        rows,
-    };
-    let Some(valid_until_epoch_secs) = snapshot_deadline(prices.observed_at_epoch_secs) else {
-        return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
-    };
-    let reply = Reply {
-        valid_until_epoch_secs,
-        version: FILTERED_PROTOCOL_VERSION,
-        captured_at_epoch_secs: prices.observed_at_epoch_secs,
-        outcome: Outcome::Snapshot {
-            snapshot: Box::new(snapshot),
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// What the union query gave.
+enum Fetched {
+    /// Closed and before 09:15: nothing is read.
+    BeforeSession,
+    /// Neither list exists: no query (no filter can reach the prices).
+    NoQuery,
+    Rows(Vec<TickRow>),
+    Failed(QueryFailure),
+}
+
+fn sorted_listed(names: &HashMap<(u64, u8), String>) -> Vec<ListedStock> {
+    let mut list: Vec<ListedStock> = names
+        .iter()
+        .map(|((security_id, segment_code), name)| ListedStock {
+            security_id: *security_id,
+            segment_code: *segment_code,
+            name: name.clone(),
+        })
+        .collect();
+    list.sort_unstable_by_key(|s| (s.security_id, s.segment_code));
+    list
+}
+
+/// Pure: the universe from a read plan, the two lists and what the query
+/// gave. Keeps only rows the per-filter path accepted (finite positive last
+/// price, inside the window), in database order. O(rows + list rows log).
+fn assemble_universe(
+    plan: &ReadPlan,
+    fno: Option<&FnoUnderlyings>,
+    membership: Option<&Memberships>,
+    fetched: Fetched,
+) -> MoversUniverse {
+    let prices = match (fetched, plan.window) {
+        (Fetched::BeforeSession, _) | (Fetched::Rows(_), None) => UniversePrices::BeforeSession,
+        (Fetched::NoQuery, _) => UniversePrices::Rows { rows: Vec::new() },
+        (Fetched::Failed(QueryFailure::Unreachable), _) => UniversePrices::Unreachable,
+        (Fetched::Failed(QueryFailure::Refused), _) => UniversePrices::QueryFailed,
+        (Fetched::Rows(rows), Some((start, end, _))) => UniversePrices::Rows {
+            rows: rows
+                .into_iter()
+                .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
+                .map(|r| PriceRow {
+                    security_id: r.security_id,
+                    segment_code: r.segment_code,
+                    ltp: r.ltp,
+                    prev_close: r.close.filter(|p| p.is_finite() && *p > 0.0),
+                    volume: r.volume,
+                    ts_ist_secs: r.ts.and_utc().timestamp(),
+                })
+                .collect(),
         },
     };
-    let Outcome::Snapshot { snapshot } = &reply.outcome else {
-        return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+    let window_secs = match plan.window {
+        Some((start, end, true)) => (end - start)
+            .num_seconds()
+            .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS),
+        _ => UNIVERSE_DEFAULT_WINDOW_SECS,
     };
-    if !snapshot.valid() {
-        return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+    MoversUniverse {
+        format_version: UNIVERSE_FORMAT_VERSION,
+        trading_date_ist: plan.at.format("%Y-%m-%d").to_string(),
+        observed_at_epoch_secs: plan.observed,
+        read_at_ist_secs: plan.at.and_utc().timestamp(),
+        market_open: plan.open,
+        window_secs,
+        prices,
+        fno: fno.map(|f| sorted_listed(&f.names)),
+        membership: membership.map(|m| {
+            let mut by_stock: Vec<StockIndices> = m
+                .by_stock
+                .iter()
+                .map(|((security_id, segment_code), indices)| StockIndices {
+                    security_id: *security_id,
+                    segment_code: *segment_code,
+                    indices: indices.clone(),
+                })
+                .collect();
+            by_stock.sort_unstable_by_key(|s| (s.security_id, s.segment_code));
+            UniverseMembership {
+                names: sorted_listed(&m.names),
+                indices: m.indices.clone(),
+                by_stock,
+                partial: m.partial,
+            }
+        }),
     }
-    if serde_json::to_vec(&reply).map_or(true, |bytes| bytes.len() > MAX_WIRE_BYTES) {
-        return Reply::error(BridgeError::ResponseTooLarge, prices.observed_at_epoch_secs);
-    }
-    reply
 }
 
-async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
-    let now = inputs.now_ist.and_utc().timestamp()
-        - chrono::Duration::nanoseconds(IST_UTC_OFFSET_NANOS).num_seconds();
-    // A chosen minute reads that day's lists; otherwise today's.
-    let at = inputs
-        .read_at_ist
-        .map_or(inputs.now_ist, |at| at.min(inputs.now_ist));
-    let open = inputs.market_open && inputs.read_at_ist.is_none();
-    let date = at.format("%Y-%m-%d").to_string();
-    let fno = fno_stocks::load_fno_underlyings(&fno_stocks::fno_underlying_artifact_path(
-        inputs.artifact_dir,
-        &date,
-    ));
-    let membership = load_memberships(inputs.artifact_dir, &date);
-    let finish_empty = |status| {
-        finish(
-            FnoStocksResponse::empty(status, open, 0, now),
-            filter.clone(),
-            membership.as_deref(),
-            fno.as_deref(),
+/// Reads the day's lists and runs ONE query over their union. Never panics;
+/// every failure is carried as a price state. A union over
+/// [`MAX_UNIVERSE_PRICE_ROWS`] ids reads `query_failed` (Limitation: the
+/// per-filter path could still serve the smaller list then).
+async fn build_universe(inputs: FnoStocksInputs<'_>) -> MoversUniverse {
+    let plan = plan_read(inputs.now_ist, inputs.market_open, inputs.read_at_ist);
+    let date = plan.at.format("%Y-%m-%d").to_string();
+    // File reads and JSON parsing are blocking work: on the blocking pool,
+    // never a runtime worker (plan PR MV review). A failed hand-off reads as
+    // both lists unavailable, which the reply reports as such.
+    let dir = inputs.artifact_dir.to_path_buf();
+    let (fno, membership) = tokio::task::spawn_blocking(move || {
+        (
+            fno_stocks::load_fno_underlyings(&fno_stocks::fno_underlying_artifact_path(
+                &dir, &date,
+            )),
+            load_memberships(&dir, &date),
         )
+    })
+    .await
+    .unwrap_or((None, None));
+    let ids = union_ids(fno.as_deref(), membership.as_deref());
+    let fetched = match plan.window {
+        None => Fetched::BeforeSession,
+        Some(_) if ids.is_empty() => Fetched::NoQuery,
+        Some(_) if ids.len() > MAX_UNIVERSE_PRICE_ROWS => Fetched::Failed(QueryFailure::Refused),
+        Some((start, window_end, closed)) => {
+            let end = closed.then_some(window_end);
+            let bound = ids.len().max(fno_stocks::FNO_STOCKS_MAX_ROWS);
+            let sql = fno_stocks::build_fno_stocks_sql(&ids, start, end, bound + 1);
+            let timeout = if closed {
+                inputs.timeout.max(Duration::from_secs(
+                    fno_stocks::FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS,
+                ))
+            } else {
+                inputs.timeout
+            };
+            match fno_stocks::query_fno_rows(
+                inputs.client,
+                inputs.base_url,
+                &sql,
+                timeout,
+                bound,
+                UNIVERSE_SOURCE_BYTES,
+            )
+            .await
+            {
+                Ok(rows) => Fetched::Rows(rows),
+                Err(failure) => Fetched::Failed(failure),
+            }
+        }
     };
-    if filter.fno_only && fno.is_none() {
-        return finish_empty(if open { "no_fno_list" } else { "closed" });
-    }
-    if (!filter.fno_only || filter.index.is_some()) && membership.is_none() {
-        return finish_empty(if open { "no_index_list" } else { "closed" });
-    }
-    let names = if filter.fno_only {
-        fno.as_ref().map(|f| &f.names)
-    } else {
-        membership.as_ref().map(|m| &m.names)
-    };
-    let Some(names) = names else {
-        return finish_empty(if open { "no_index_list" } else { "closed" });
-    };
-    let selected_index = filter
-        .index
-        .as_ref()
-        .and_then(|name| membership.as_ref()?.indices.binary_search(name).ok());
-    if filter.index.is_some() && selected_index.is_none() {
-        return finish_empty(if open { "no_index_list" } else { "closed" });
-    }
-    let names: HashMap<_, _> = names
-        .iter()
-        .filter(|(key, _)| {
-            selected_index.is_none_or(|index| {
-                membership
-                    .as_ref()
-                    .and_then(|m| m.by_stock.get(key))
-                    .is_some_and(|indices| indices.binary_search(&index).is_ok())
-            })
-        })
-        .map(|(key, name)| (*key, name.clone()))
-        .collect();
-    if names.len() > MAX_SOURCE_ROWS {
-        return Reply::error(BridgeError::ResponseTooLarge, now);
-    }
-    if names.is_empty() {
-        return finish_empty(if open { "no_data" } else { "closed" });
-    }
-    // Closed or open, the price engine decides: after the close it reads the
-    // session that just ended so stored prices always show (owner 2026-11-03).
-    let prices =
-        fno_stocks::compute_for_list(inputs, Some(Arc::new(FnoUnderlyings { names }))).await;
-    finish(prices, filter, membership.as_deref(), fno.as_deref())
+    assemble_universe(&plan, fno.as_deref(), membership.as_deref(), fetched)
 }
 
-/// Same bearer gate and shared limiter as /api/fno-stocks. One bounded keyed
-/// slot holds at most one response; concurrent computes return typed Busy.
+/// One clock reading: the session state and the IST time of the SAME instant
+/// (plan PR MV review: reading them separately could straddle 09:00 or
+/// 15:40 and build an "open" universe for a closed minute). O(1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveClock {
+    pub market_open: bool,
+    pub now_ist: chrono::NaiveDateTime,
+    /// UTC epoch seconds of the same instant.
+    pub now_epoch: i64,
+}
+
+impl LiveClock {
+    /// The clock at one UTC instant.
+    #[must_use]
+    pub fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
+        let now_epoch = now.timestamp();
+        Self {
+            market_open: tickvault_common::market_hours::is_trading_session_at(now_epoch),
+            now_ist: (now + chrono::Duration::seconds(IST_UTC_OFFSET_SECONDS_I64)).naive_utc(),
+            now_epoch,
+        }
+    }
+
+    /// The clock now (one `Utc::now()` read).
+    #[must_use]
+    pub fn now() -> Self {
+        Self::at(chrono::Utc::now())
+    }
+}
+
+/// What makes a stored-session (closed) live read the same read as an
+/// earlier one: its IST date and its window end. Two reads with the same key
+/// query the same rows, so the publisher may reuse the first one's price rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedReadKey {
+    pub date_ist: String,
+    pub window_end_ist_secs: i64,
+}
+
+/// The reuse key of a live read at this clock: `Some` only for a closed read
+/// that queries (after the day's 09:15), `None` for an open read (its window
+/// moves every second) or a read that queries nothing. O(1).
+#[must_use]
+pub fn closed_read_key(clock: LiveClock) -> Option<ClosedReadKey> {
+    let plan = plan_read(clock.now_ist, clock.market_open, None);
+    match plan.window {
+        Some((_, end, true)) if !plan.open => Some(ClosedReadKey {
+            date_ist: plan.at.format("%Y-%m-%d").to_string(),
+            window_end_ist_secs: end.and_utc().timestamp(),
+        }),
+        _ => None,
+    }
+}
+
+/// An earlier closed universe re-stamped as observed at this clock: the same
+/// price rows and lists, the observation and read instants of `clock`
+/// (exactly what a fresh build at `clock` with the same rows would carry).
+/// `None` unless `clock` is a closed read with the universe's key. O(n) copy.
+#[must_use]
+pub fn restamped(
+    universe: &MoversUniverse,
+    key: &ClosedReadKey,
+    clock: LiveClock,
+) -> Option<MoversUniverse> {
+    if closed_read_key(clock).as_ref() != Some(key)
+        || universe.market_open
+        || universe.trading_date_ist != key.date_ist
+    {
+        return None;
+    }
+    let plan = plan_read(clock.now_ist, clock.market_open, None);
+    let mut out = universe.clone();
+    out.observed_at_epoch_secs = plan.observed;
+    out.read_at_ist_secs = plan.at.and_utc().timestamp();
+    Some(out)
+}
+
+/// The live universe (today's lists, at `clock`) for the app's publisher,
+/// read with this API state's QuestDB client. Cold path: two small file reads
+/// (cached by metadata, on the blocking pool) and one bounded query.
+// TEST-EXEMPT: thin wrapper over build_universe (driven by every route test below); needs a live QuestDB
+pub async fn build_live_universe(state: &SharedAppState, clock: LiveClock) -> MoversUniverse {
+    let cfg = state.questdb_config();
+    let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
+    build_universe(FnoStocksInputs {
+        client: state.questdb_http_client(),
+        base_url: &base_url,
+        artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
+        market_open: clock.market_open,
+        now_ist: clock.now_ist,
+        read_at_ist: None,
+        timeout: QUERY_TIMEOUT,
+    })
+    .await
+}
+
+/// Same bearer gate and shared limiter as /api/fno-stocks. One bounded slot
+/// holds at most one universe (keyed on `as_of`); every filter is selected
+/// from it, so sort, page and filter changes inside 2 s hit the cache.
+/// Concurrent builds return typed Busy.
 // TEST-EXEMPT: exercised by the async authenticated route and cache tests below.
 pub async fn get_stock_movers(
     State(state): State<SharedAppState>,
@@ -394,8 +491,9 @@ pub async fn get_stock_movers(
             }
         },
     };
-    let market_open = tickvault_common::market_hours::is_trading_session_now();
-    let now = chrono::Utc::now().timestamp();
+    let clock = LiveClock::now();
+    let market_open = clock.market_open;
+    let now = clock.now_epoch;
     let Ok(mut slot) = state.stock_movers_cache().slot.try_lock() else {
         return axum::Json(Reply::error(
             BridgeError::Busy,
@@ -403,28 +501,44 @@ pub async fn get_stock_movers(
         ))
         .into_response();
     };
-    if let Some((stored, held, body, deadline, captured_open)) = slot.as_ref()
-        && *held == filter
-        && stored.elapsed() < CACHE_TTL
-        && cache_current(*deadline, *captured_open, now, market_open)
-    {
-        return cached_json_response(body.clone(), "hit");
-    }
-    let cfg = state.questdb_config();
-    let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
-    let reply = compute(
-        FnoStocksInputs {
-            client: state.questdb_http_client(),
-            base_url: &base_url,
-            artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
-            market_open,
-            now_ist: fno_stocks::now_ist_naive(),
-            read_at_ist,
-            timeout: QUERY_TIMEOUT,
-        },
-        filter.clone(),
-    )
-    .await;
+    let cached = slot
+        .as_ref()
+        .filter(|(stored, as_of, _, deadline, captured_open)| {
+            *as_of == filter.as_of
+                && stored.elapsed() < CACHE_TTL
+                && cache_current(*deadline, *captured_open, now, market_open)
+        })
+        .map(|(_, _, universe, _, _)| Arc::clone(universe));
+    let (universe, cache_label) = if let Some(universe) = cached {
+        (universe, "hit")
+    } else {
+        let cfg = state.questdb_config();
+        let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
+        let universe = Arc::new(
+            build_universe(FnoStocksInputs {
+                client: state.questdb_http_client(),
+                base_url: &base_url,
+                artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
+                market_open,
+                now_ist: clock.now_ist,
+                read_at_ist,
+                timeout: QUERY_TIMEOUT,
+            })
+            .await,
+        );
+        if let Some(deadline) = snapshot_deadline(universe.observed_at_epoch_secs) {
+            *slot = Some((
+                Instant::now(),
+                filter.as_of.clone(),
+                Arc::clone(&universe),
+                deadline,
+                market_open,
+            ));
+        }
+        (universe, "miss")
+    };
+    drop(slot);
+    let reply = select(&universe, &filter);
     let reply = if market_open != tickvault_common::market_hours::is_trading_session_now()
         || !reply.valid_at(chrono::Utc::now().timestamp(), &filter)
     {
@@ -433,16 +547,7 @@ pub async fn get_stock_movers(
         reply
     };
     match serde_json::to_string(&reply) {
-        Ok(body) => {
-            *slot = Some((
-                Instant::now(),
-                filter,
-                body.clone(),
-                reply.valid_until_epoch_secs,
-                market_open,
-            ));
-            cached_json_response(body, "miss")
-        }
+        Ok(body) => cached_json_response(body, cache_label),
         Err(_) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Movers unavailable",
@@ -451,10 +556,307 @@ pub async fn get_stock_movers(
     }
 }
 
+/// Test-only: one filter's reply through the production path (build the
+/// universe, then select). Every route-level test below drives this.
+#[cfg(test)]
+async fn compute(inputs: FnoStocksInputs<'_>, filter: Filter) -> Reply {
+    select(&build_universe(inputs).await, &filter)
+}
+
+/// The per-filter path this module ran until 2026-11-06 (plan PR MV), kept
+/// verbatim in logic as the oracle `select` is proven equal to. The only
+/// change: the price query is an injected closure, so it runs synchronously
+/// in a property test.
+#[cfg(test)]
+mod oracle {
+    use super::fno_stocks::FnoStocksResponse;
+    use super::*;
+    use tickvault_common::operator_movers_universe::ACTUAL_VALUE_UNAVAILABLE;
+    use tickvault_common::operator_movers_wire::{
+        MAX_WIRE_BYTES, SELECTION_LIMIT, SourceStatus, Stock,
+    };
+    use tickvault_common::operator_stock_movers_wire::{
+        Direction, FILTERED_PROTOCOL_VERSION, MemberStock, MembershipStatus, Outcome, Snapshot,
+    };
+
+    pub(super) fn stock(row: fno_stocks::FnoStockRow) -> Stock {
+        Stock {
+            security_id: row.security_id,
+            segment: row.segment.into(),
+            name: row.name,
+            ltp: row.ltp,
+            prev_close: row.prev_close,
+            change: row.change,
+            change_pct: row.change_pct,
+            volume: row.volume.filter(|volume| *volume > 0),
+            value_cr: None,
+            last_trade_ist: row.last_trade_ist,
+        }
+    }
+
+    pub(super) fn finish(
+        prices: FnoStocksResponse,
+        filter: Filter,
+        membership: Option<&Memberships>,
+        fno: Option<&FnoUnderlyings>,
+    ) -> Reply {
+        let status =
+            serde_json::from_value::<SourceStatus>(serde_json::Value::String(prices.status.into()));
+        let Ok(status) = status else {
+            return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+        };
+        let index_names = membership.map_or_else(Vec::new, |m| m.indices.clone());
+        let membership_status = match membership {
+            None => MembershipStatus::Unavailable,
+            Some(m) if m.partial => MembershipStatus::Partial,
+            Some(_) => MembershipStatus::Available,
+        };
+        let mut ids = HashSet::with_capacity(prices.stocks.len());
+        let mut selected = Vec::with_capacity(prices.stocks.len());
+        for price in prices.stocks.into_iter().map(stock) {
+            if !price.valid() || !ids.insert(price.security_id) {
+                return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+            }
+            if !filter.matches_price(&price) {
+                continue;
+            }
+            let key = (price.security_id, EXCHANGE_SEGMENT_NSE_EQ);
+            let indices = membership
+                .and_then(|m| m.by_stock.get(&key))
+                .cloned()
+                .unwrap_or_default();
+            let eligible = fno.map(|f| f.name_of(key.0, key.1).is_some());
+            let volume_text = price.volume.map(|volume| volume.to_string());
+            selected.push(MemberStock {
+                price,
+                company_name: None,
+                volume_text,
+                indices,
+                fno: eligible,
+            });
+        }
+        if filter.sort_by.is_some() {
+            selected.sort_unstable_by(|left, right| filter.compare_rows(left, right));
+        } else if filter.direction == Direction::Losers {
+            selected.reverse();
+        }
+        let matching_total = selected.len();
+        let rows = selected
+            .into_iter()
+            .skip(filter.offset)
+            .take(SELECTION_LIMIT)
+            .collect();
+        let snapshot = Snapshot {
+            filter: filter.clone(),
+            status,
+            market_open: prices.market_open,
+            as_of_ist: prices.as_of_ist,
+            data_age_secs: prices.data_age_secs,
+            universe_available: (if filter.fno_only {
+                fno.is_some()
+            } else {
+                membership.is_some()
+            }) && filter.index.as_ref().is_none_or(|name| {
+                membership.is_some_and(|m| m.indices.binary_search(name).is_ok())
+            }),
+            universe_total: prices.fno_stocks_total,
+            stocks_priced: prices.stocks_priced,
+            matching_total,
+            selection_limit: SELECTION_LIMIT,
+            window_secs: prices.window_secs,
+            value_basis: ACTUAL_VALUE_UNAVAILABLE.into(),
+            index_names,
+            membership_status,
+            fno_list_available: fno.is_some(),
+            rows,
+        };
+        let Some(valid_until_epoch_secs) = snapshot_deadline(prices.observed_at_epoch_secs) else {
+            return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+        };
+        let reply = Reply {
+            valid_until_epoch_secs,
+            version: FILTERED_PROTOCOL_VERSION,
+            captured_at_epoch_secs: prices.observed_at_epoch_secs,
+            outcome: Outcome::Snapshot {
+                snapshot: Box::new(snapshot),
+            },
+        };
+        let Outcome::Snapshot { snapshot } = &reply.outcome else {
+            return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+        };
+        if !snapshot.valid() {
+            return Reply::error(BridgeError::InvalidResponse, prices.observed_at_epoch_secs);
+        }
+        if serde_json::to_vec(&reply).map_or(true, |bytes| bytes.len() > MAX_WIRE_BYTES) {
+            return Reply::error(BridgeError::ResponseTooLarge, prices.observed_at_epoch_secs);
+        }
+        reply
+    }
+
+    /// The old `fno_stocks::compute_for_list`, with the query injected.
+    fn compute_for_list(
+        now_ist: chrono::NaiveDateTime,
+        market_open: bool,
+        read_at_ist: Option<chrono::NaiveDateTime>,
+        list: &FnoUnderlyings,
+        query: &dyn Fn(&[u64]) -> Result<Vec<TickRow>, QueryFailure>,
+    ) -> FnoStocksResponse {
+        let observed_at_epoch_secs = now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let total = list.len();
+        let read_at = read_at_ist.map(|at| at.min(now_ist));
+        let open = market_open && read_at.is_none();
+        let at = read_at.unwrap_or(now_ist);
+        let closed_window = if open {
+            None
+        } else {
+            match fno_stocks::closed_session_window(at) {
+                Some(window) => Some(window),
+                None => {
+                    return FnoStocksResponse::empty(
+                        "closed",
+                        false,
+                        total,
+                        observed_at_epoch_secs,
+                    );
+                }
+            }
+        };
+        let (start, end) = closed_window.unwrap_or((
+            fno_stocks::window_start(now_ist),
+            now_ist + chrono::Duration::seconds(fno_stocks::FNO_STOCKS_FUTURE_SKEW_SECS),
+        ));
+        let rows = match query(&list.sorted_ids()) {
+            Ok(rows) => rows,
+            Err(QueryFailure::Unreachable) => {
+                return FnoStocksResponse::empty(
+                    "unreachable",
+                    open,
+                    total,
+                    observed_at_epoch_secs,
+                );
+            }
+            Err(QueryFailure::Refused) => {
+                return FnoStocksResponse::empty(
+                    "query_failed",
+                    open,
+                    total,
+                    observed_at_epoch_secs,
+                );
+            }
+        };
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
+            .collect();
+        let newest = rows
+            .iter()
+            .filter(|r| list.name_of(r.security_id, r.segment_code).is_some())
+            .map(|r| r.ts)
+            .max();
+        let stocks = fno_stocks::build_rows(list, rows);
+        let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
+            let status = if open { "no_data" } else { "closed" };
+            return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
+        };
+        let age = (at - newest).num_seconds().max(0);
+        let window_secs = closed_window.map_or(fno_stocks::FNO_STOCKS_WINDOW_SECS, |(s, e)| {
+            (e - s)
+                .num_seconds()
+                .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS)
+        });
+        let mut response = FnoStocksResponse::empty("closed", open, total, observed_at_epoch_secs);
+        response.status = if !open {
+            "closed"
+        } else if age <= fno_stocks::FNO_STOCKS_LIVE_MAX_AGE_SECS {
+            "live"
+        } else {
+            "stale"
+        };
+        response.as_of_ist = Some(newest.format("%H:%M:%S").to_string());
+        response.data_age_secs = Some(age);
+        response.stocks_priced = stocks.len();
+        response.window_secs = window_secs;
+        response.stocks = stocks;
+        response
+    }
+
+    /// The old per-filter `compute`, with the lists and the query injected.
+    pub(super) fn reply(
+        now_ist: chrono::NaiveDateTime,
+        market_open: bool,
+        read_at_ist: Option<chrono::NaiveDateTime>,
+        fno: Option<&FnoUnderlyings>,
+        membership: Option<&Memberships>,
+        filter: Filter,
+        query: &dyn Fn(&[u64]) -> Result<Vec<TickRow>, QueryFailure>,
+    ) -> Reply {
+        let now = now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let open = market_open && read_at_ist.is_none();
+        let finish_empty = |status| {
+            finish(
+                FnoStocksResponse::empty(status, open, 0, now),
+                filter.clone(),
+                membership,
+                fno,
+            )
+        };
+        if filter.fno_only && fno.is_none() {
+            return finish_empty(if open { "no_fno_list" } else { "closed" });
+        }
+        if (!filter.fno_only || filter.index.is_some()) && membership.is_none() {
+            return finish_empty(if open { "no_index_list" } else { "closed" });
+        }
+        let names = if filter.fno_only {
+            fno.map(|f| &f.names)
+        } else {
+            membership.map(|m| &m.names)
+        };
+        let Some(names) = names else {
+            return finish_empty(if open { "no_index_list" } else { "closed" });
+        };
+        let selected_index = filter
+            .index
+            .as_ref()
+            .and_then(|name| membership?.indices.binary_search(name).ok());
+        if filter.index.is_some() && selected_index.is_none() {
+            return finish_empty(if open { "no_index_list" } else { "closed" });
+        }
+        let names: HashMap<_, _> = names
+            .iter()
+            .filter(|(key, _)| {
+                selected_index.is_none_or(|index| {
+                    membership
+                        .and_then(|m| m.by_stock.get(key))
+                        .is_some_and(|indices| indices.binary_search(&index).is_ok())
+                })
+            })
+            .map(|(key, name)| (*key, name.clone()))
+            .collect();
+        if names.len() > MAX_SOURCE_ROWS {
+            return Reply::error(BridgeError::ResponseTooLarge, now);
+        }
+        if names.is_empty() {
+            return finish_empty(if open { "no_data" } else { "closed" });
+        }
+        let list = FnoUnderlyings { names };
+        let prices = compute_for_list(now_ist, market_open, read_at_ist, &list, query);
+        finish(prices, filter, membership, fno)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::oracle::finish;
     use super::*;
+    use fno_stocks::FnoStocksResponse;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+    use tickvault_common::operator_movers_universe::ACTUAL_VALUE_UNAVAILABLE;
+    use tickvault_common::operator_movers_wire::{MAX_WIRE_BYTES, SourceStatus};
+    use tickvault_common::operator_stock_movers_wire::{
+        Direction, MembershipStatus, Outcome, Snapshot,
+    };
     use tickvault_common::operator_stock_movers_wire::{SortColumn, SortOrder};
     const DATE: &str = "2026-10-30";
     fn at(text: &str) -> chrono::NaiveDateTime {
@@ -727,43 +1129,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_cache_does_not_reuse_a_differently_sorted_snapshot() {
+    async fn api_cache_never_serves_a_differently_sorted_snapshot() {
+        // Plan PR MV: the cache holds the universe, not a body, so each sort
+        // is selected afresh from it and echoes its own filter.
         let state = fno_stocks::tests::mock_state(1);
+        let observed = chrono::Utc::now().timestamp();
+        let universe = cached_universe(observed);
+        seed_cache(&state, None, Arc::clone(&universe)).await;
         let filter = Filter {
             sort_by: Some(SortColumn::Volume),
             sort_order: Some(SortOrder::Desc),
             ..Filter::default()
         };
-        let body = r#"{"sort_fixture":"volume_desc"}"#.to_owned();
-        *state.stock_movers_cache().slot.lock().await = Some((
-            Instant::now(),
-            filter.clone(),
-            body.clone(),
-            chrono::Utc::now().timestamp() + 60,
-            tickvault_common::market_hours::is_trading_session_now(),
-        ));
-        let hit = get_stock_movers(State(state.clone()), Query(filter.clone())).await;
-        assert_eq!(hit.headers()["x-tv-cache"], "hit");
-        assert_eq!(
-            axum::body::to_bytes(hit.into_body(), 1000)
-                .await
-                .unwrap()
-                .as_ref(),
-            body.as_bytes()
-        );
         let changed = Filter {
             sort_order: Some(SortOrder::Asc),
-            ..filter
+            ..filter.clone()
         };
-        let miss = get_stock_movers(State(state), Query(changed)).await;
-        assert_eq!(miss.headers()["x-tv-cache"], "miss");
-        assert_ne!(
-            axum::body::to_bytes(miss.into_body(), MAX_WIRE_BYTES)
-                .await
-                .unwrap()
-                .as_ref(),
-            body.as_bytes()
-        );
+        for f in [filter, changed] {
+            let hit = get_stock_movers(State(state.clone()), Query(f.clone())).await;
+            assert_eq!(hit.headers()["x-tv-cache"], "hit");
+            let reply = reply_of(hit).await;
+            assert_eq!(reply, select(&universe, &f));
+            assert_eq!(snapshot(reply).filter, f);
+        }
     }
 
     #[test]
@@ -1094,32 +1482,101 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn api_cache_separates_filters_and_retains_original_clock() {
+    async fn api_cache_answers_every_live_filter_from_one_universe_and_retains_original_clock() {
         let state = fno_stocks::tests::mock_state(1);
-        let f = Filter::default();
-        let body = r#"{"original_capture":1800000000}"#.to_owned();
-        *state.stock_movers_cache().slot.lock().await = Some((
-            Instant::now(),
-            f.clone(),
-            body.clone(),
-            chrono::Utc::now().timestamp() + 60,
-            tickvault_common::market_hours::is_trading_session_now(),
-        ));
-        let response = get_stock_movers(State(state.clone()), Query(f)).await;
-        assert_eq!(response.headers()["x-tv-cache"], "hit");
-        let bytes = axum::body::to_bytes(response.into_body(), 1000)
-            .await
-            .unwrap();
-        assert_eq!(bytes.as_ref(), body.as_bytes());
+        let observed = chrono::Utc::now().timestamp() - 10;
+        seed_cache(&state, None, cached_universe(observed)).await;
+        for f in [
+            Filter::default(),
+            Filter {
+                fno_only: false,
+                ..Filter::default()
+            },
+        ] {
+            let response = get_stock_movers(State(state.clone()), Query(f.clone())).await;
+            assert_eq!(response.headers()["x-tv-cache"], "hit", "{f:?}");
+            let reply = reply_of(response).await;
+            assert_eq!(
+                reply.captured_at_epoch_secs, observed,
+                "original clock kept"
+            );
+            assert_eq!(snapshot(reply).filter, f);
+        }
+        // A chosen minute is a different universe: never served from the live one.
         let response = get_stock_movers(
             State(state),
             Query(Filter {
-                fno_only: false,
+                as_of: Some("2026-11-03T15:29".into()),
                 ..Filter::default()
             }),
         )
         .await;
         assert_eq!(response.headers()["x-tv-cache"], "miss");
+    }
+    #[tokio::test]
+    async fn test_build_live_universe_never_panics_and_builds_a_valid_universe() {
+        // No lists in the test working directory and no QuestDB: the build
+        // still returns a well-formed universe (no query, no lists).
+        let state = fno_stocks::tests::mock_state(1);
+        let clock = LiveClock::now();
+        let universe = build_live_universe(&state, clock).await;
+        assert!(universe.valid(), "{universe:?}");
+        assert_eq!(universe.market_open, clock.market_open);
+        assert_eq!(universe.observed_at_epoch_secs, clock.now_epoch);
+        assert_eq!(
+            universe.read_at_ist_secs - universe.observed_at_epoch_secs,
+            19_800
+        );
+        assert!(universe.fno.is_none() && universe.membership.is_none());
+    }
+    fn cached_universe(observed: i64) -> Arc<MoversUniverse> {
+        use tickvault_common::operator_movers_universe::{
+            UNIVERSE_IST_OFFSET_SECS, ist_date_of_epoch,
+        };
+        let listed = ListedStock {
+            security_id: 1,
+            segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+            name: "STOCK001".into(),
+        };
+        Arc::new(MoversUniverse {
+            format_version: UNIVERSE_FORMAT_VERSION,
+            trading_date_ist: ist_date_of_epoch(observed).unwrap(),
+            observed_at_epoch_secs: observed,
+            read_at_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS,
+            market_open: tickvault_common::market_hours::is_trading_session_now(),
+            window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
+            prices: UniversePrices::Rows { rows: Vec::new() },
+            fno: Some(vec![listed.clone()]),
+            membership: Some(UniverseMembership {
+                names: vec![listed],
+                indices: vec!["Nifty 50".into()],
+                by_stock: vec![StockIndices {
+                    security_id: 1,
+                    segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+                    indices: vec![0],
+                }],
+                partial: false,
+            }),
+        })
+    }
+    async fn seed_cache(
+        state: &SharedAppState,
+        as_of: Option<String>,
+        universe: Arc<MoversUniverse>,
+    ) {
+        *state.stock_movers_cache().slot.lock().await = Some((
+            Instant::now(),
+            as_of,
+            universe,
+            chrono::Utc::now().timestamp() + 60,
+            tickvault_common::market_hours::is_trading_session_now(),
+        ));
+    }
+    async fn reply_of(response: Response) -> Reply {
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_WIRE_BYTES)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
     #[tokio::test]
     async fn invalid_or_future_newest_rows_cannot_refresh_old_valid_prices() {
@@ -1367,13 +1824,12 @@ mod tests {
         use tower::ServiceExt;
         let state = fno_stocks::tests::mock_state(1);
         state.fno_stocks_cache().put("{}".into());
-        *state.stock_movers_cache().slot.lock().await = Some((
-            Instant::now(),
-            Filter::default(),
-            "{}".into(),
-            chrono::Utc::now().timestamp() + 60,
-            tickvault_common::market_hours::is_trading_session_now(),
-        ));
+        seed_cache(
+            &state,
+            None,
+            cached_universe(chrono::Utc::now().timestamp()),
+        )
+        .await;
         let auth = crate::middleware::ApiAuthConfig::from_token(SecretString::from(
             "configured-test-token".to_owned(),
         ));
@@ -1400,5 +1856,496 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------- plan PR MV review fixes
+    /// UTC instant of an IST wall time.
+    fn utc_of(ist_text: &str) -> chrono::DateTime<chrono::Utc> {
+        (at(ist_text) - chrono::Duration::seconds(IST_UTC_OFFSET_SECONDS_I64)).and_utc()
+    }
+
+    #[test]
+    fn test_universe_constants_equal_the_fno_stocks_constants() {
+        use tickvault_common::operator_movers_universe::UNIVERSE_LIVE_MAX_AGE_SECS;
+        assert_eq!(
+            UNIVERSE_LIVE_MAX_AGE_SECS,
+            fno_stocks::FNO_STOCKS_LIVE_MAX_AGE_SECS
+        );
+        assert_eq!(
+            UNIVERSE_DEFAULT_WINDOW_SECS,
+            fno_stocks::FNO_STOCKS_WINDOW_SECS
+        );
+    }
+
+    #[test]
+    fn test_live_clock_takes_session_state_and_time_from_one_instant() {
+        // Fri 2026-10-30 15:39:59 and 15:40:00 IST.
+        let before = LiveClock::at(utc_of("2026-10-30 15:39:59"));
+        let after = LiveClock::at(utc_of("2026-10-30 15:40:00"));
+        assert_eq!(before.now_ist, at("2026-10-30 15:39:59"));
+        assert_eq!(after.now_ist, at("2026-10-30 15:40:00"));
+        assert_eq!(after.now_epoch, utc_of("2026-10-30 15:40:00").timestamp());
+        assert!(!after.market_open, "15:40 is closed");
+        assert_eq!(
+            before.market_open,
+            tickvault_common::market_hours::is_trading_session_at(before.now_epoch)
+        );
+        // Saturday: never open.
+        assert!(!LiveClock::at(utc_of("2026-10-31 11:00:00")).market_open);
+        let now = LiveClock::now();
+        assert!((now.now_epoch - chrono::Utc::now().timestamp()).abs() <= 1);
+    }
+
+    fn clock(ist_text: &str, market_open: bool) -> LiveClock {
+        let at_utc = utc_of(ist_text);
+        LiveClock {
+            market_open,
+            now_ist: at(ist_text),
+            now_epoch: at_utc.timestamp(),
+        }
+    }
+
+    #[test]
+    fn test_closed_read_key_names_the_date_and_window_end_of_a_closed_read_only() {
+        assert_eq!(closed_read_key(clock("2026-10-30 11:00:00", true)), None);
+        assert_eq!(
+            closed_read_key(clock("2026-10-30 09:10:00", false)),
+            None,
+            "before 09:15 nothing is queried"
+        );
+        let evening = closed_read_key(clock("2026-10-30 16:05:00", false)).unwrap();
+        assert_eq!(evening.date_ist, DATE);
+        assert_eq!(
+            evening.window_end_ist_secs,
+            at("2026-10-30 15:40:00").and_utc().timestamp()
+        );
+        assert_eq!(
+            closed_read_key(clock("2026-10-30 22:30:00", false)),
+            Some(evening.clone()),
+            "the same read all evening"
+        );
+        assert_ne!(
+            closed_read_key(clock("2026-10-31 16:05:00", false)),
+            Some(evening),
+            "a new date is a new read"
+        );
+        // A closed day inside the session hours: the window end moves.
+        assert_ne!(
+            closed_read_key(clock("2026-10-31 11:00:00", false)),
+            closed_read_key(clock("2026-10-31 11:00:05", false))
+        );
+    }
+
+    #[test]
+    fn test_restamped_moves_only_the_observation_and_only_for_the_same_closed_read() {
+        let first = clock("2026-10-30 16:05:00", false);
+        let key = closed_read_key(first).unwrap();
+        let plan = plan_read(first.now_ist, false, None);
+        let fetched = Fetched::Rows(vec![TickRow {
+            security_id: 2,
+            segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+            ltp: 110.0,
+            close: Some(100.0),
+            volume: Some(5),
+            avg_price: None,
+            ts: at("2026-10-30 15:29:00"),
+        }]);
+        let built = assemble_universe(&plan, None, None, fetched);
+        let later = clock("2026-10-30 18:00:00", false);
+        let again = restamped(&built, &key, later).unwrap();
+        let fresh_plan = plan_read(later.now_ist, false, None);
+        assert_eq!(again.observed_at_epoch_secs, fresh_plan.observed);
+        assert_eq!(again.observed_at_epoch_secs, later.now_epoch);
+        assert_eq!(
+            again.read_at_ist_secs,
+            at("2026-10-30 18:00:00").and_utc().timestamp()
+        );
+        let mut expected = built.clone();
+        expected.observed_at_epoch_secs = again.observed_at_epoch_secs;
+        expected.read_at_ist_secs = again.read_at_ist_secs;
+        assert_eq!(again, expected, "rows, lists and window unchanged");
+        assert!(again.valid());
+        assert!(restamped(&built, &key, clock("2026-10-31 16:05:00", false)).is_none());
+        assert!(restamped(&built, &key, clock("2026-10-30 16:05:00", true)).is_none());
+        let mut open = built.clone();
+        open.market_open = true;
+        assert!(restamped(&open, &key, later).is_none());
+    }
+
+    #[test]
+    fn test_file_cache_keeps_today_and_one_other_date() {
+        let cache: fno_stocks::FileCache<u32> = fno_stocks::FileCache::new();
+        let t = SystemTime::UNIX_EPOCH;
+        let today = Path::new("/x/today.json");
+        let other = Path::new("/x/other.json");
+        let third = Path::new("/x/third.json");
+        assert!(cache.get(today, 1, t).is_none());
+        cache.put(today, 1, t, Arc::new(1));
+        cache.put(other, 1, t, Arc::new(2));
+        assert_eq!(
+            cache.get(today, 1, t).as_deref(),
+            Some(&1),
+            "today survives"
+        );
+        assert_eq!(cache.get(other, 1, t).as_deref(), Some(&2));
+        assert!(cache.get(today, 2, t).is_none(), "a changed file is a miss");
+        cache.put(today, 2, t, Arc::new(3));
+        assert_eq!(cache.get(today, 2, t).as_deref(), Some(&3));
+        assert_eq!(cache.get(other, 1, t).as_deref(), Some(&2));
+        // A third path evicts the least recently used one (today, here).
+        cache.put(third, 1, t, Arc::new(4));
+        assert!(cache.get(today, 2, t).is_none());
+        assert_eq!(cache.get(other, 1, t).as_deref(), Some(&2));
+        assert_eq!(cache.get(third, 1, t).as_deref(), Some(&4));
+    }
+}
+
+/// Plan PR MV identity proof: for random lists, memberships, database rows,
+/// clocks, query outcomes and filters, `select` over the universe equals the
+/// reply the per-filter path (`oracle`) produced from the same inputs, and a
+/// JSON round trip of the universe changes nothing.
+#[cfg(test)]
+mod select_equivalence {
+    use super::*;
+    use proptest::prelude::*;
+    use tickvault_common::operator_stock_movers_wire::{Direction, Outcome, SortColumn, SortOrder};
+
+    const INDEX_LABELS: [&str; 3] = ["Nifty 50", "Nifty Bank", "Nifty IT"];
+
+    fn clock(hour: u32, minute: u32, second: u32, millis: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 30)
+            .unwrap()
+            .and_hms_milli_opt(hour, minute, second, millis)
+            .unwrap()
+    }
+    fn name_for(id: u64, kind: u8) -> String {
+        match (kind, id % 6) {
+            (1, 0 | 3) => "DUP".into(),
+            (2, 0) => String::new(),
+            (2, 5) => "L".repeat(130),
+            _ => format!("STOCK{id:02}"),
+        }
+    }
+    fn fno_list(mask: u32, kind: u8) -> FnoUnderlyings {
+        FnoUnderlyings {
+            names: (1..=24u64)
+                .filter(|id| mask & (1 << id) != 0)
+                .map(|id| ((id, EXCHANGE_SEGMENT_NSE_EQ), name_for(id, kind)))
+                .collect(),
+        }
+    }
+    fn memberships(
+        mask: u32,
+        labels: u8,
+        per_stock: &[u8],
+        partial: bool,
+        kind: u8,
+    ) -> Memberships {
+        let indices: Vec<String> = INDEX_LABELS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| labels & (1 << i) != 0)
+            .map(|(_, s)| (*s).to_string())
+            .collect();
+        let ids: Vec<u64> = (1..=24u64).filter(|id| mask & (1 << id) != 0).collect();
+        let names = ids
+            .iter()
+            .map(|id| ((*id, EXCHANGE_SEGMENT_NSE_EQ), name_for(*id, kind)))
+            .collect();
+        let by_stock = ids
+            .iter()
+            .map(|id| {
+                let bits = per_stock[(*id as usize) % per_stock.len()];
+                let positions: Vec<usize> = (0..indices.len())
+                    .filter(|i| bits & (1 << i) != 0)
+                    .collect();
+                ((*id, EXCHANGE_SEGMENT_NSE_EQ), positions)
+            })
+            .collect();
+        Memberships {
+            names,
+            indices,
+            by_stock,
+            partial,
+        }
+    }
+    fn tick_row(
+        id: u64,
+        seg: u8,
+        ltp: u8,
+        close: u8,
+        volume: u8,
+        offset: i64,
+        base: chrono::NaiveDateTime,
+    ) -> TickRow {
+        let ltp = match ltp {
+            0 => 0.0,
+            1 => -5.0,
+            2 => f64::NAN,
+            3 => f64::INFINITY,
+            // Few distinct prices, so equal change % (tie-breaks) is common.
+            n => 97.5 + f64::from(n % 4) * 2.5,
+        };
+        let close = match close {
+            0 => None,
+            1 => Some(0.0),
+            2 => Some(f64::NAN),
+            3 => Some(-1.0),
+            _ => Some(100.0),
+        };
+        let volume = match volume {
+            0 => None,
+            1 => Some(0),
+            2 => Some(u64::MAX),
+            _ => Some(1_000 + id),
+        };
+        let base = base.with_nanosecond(0).unwrap();
+        TickRow {
+            security_id: id,
+            segment_code: if seg == 0 { 0 } else { EXCHANGE_SEGMENT_NSE_EQ },
+            ltp,
+            close,
+            volume,
+            avg_price: Some(101.0),
+            ts: base + chrono::Duration::seconds(offset),
+        }
+    }
+    use chrono::Timelike as _;
+
+    /// Both paths for one input; returns (new, old).
+    #[allow(clippy::too_many_arguments)] // APPROVED: test oracle harness, one call site per input shape
+    fn both(
+        now: chrono::NaiveDateTime,
+        open: bool,
+        read_at: Option<chrono::NaiveDateTime>,
+        fno: Option<&FnoUnderlyings>,
+        membership: Option<&Memberships>,
+        db: &[TickRow],
+        failure: Option<QueryFailure>,
+        filter: &Filter,
+    ) -> (Reply, Reply, MoversUniverse) {
+        let query = |ids: &[u64]| -> Result<Vec<TickRow>, QueryFailure> {
+            match failure {
+                Some(f) => Err(f),
+                None => Ok(db
+                    .iter()
+                    .filter(|r| ids.binary_search(&r.security_id).is_ok())
+                    .cloned()
+                    .collect()),
+            }
+        };
+        let old = oracle::reply(now, open, read_at, fno, membership, filter.clone(), &query);
+        let plan = plan_read(now, open, read_at);
+        let ids = union_ids(fno, membership);
+        let fetched = match plan.window {
+            None => Fetched::BeforeSession,
+            Some(_) if ids.is_empty() => Fetched::NoQuery,
+            Some(_) => match query(&ids) {
+                Ok(rows) => Fetched::Rows(rows),
+                Err(f) => Fetched::Failed(f),
+            },
+        };
+        let universe = assemble_universe(&plan, fno, membership, fetched);
+        (select(&universe, filter), old, universe)
+    }
+
+    fn filter_from(
+        fno_only: bool,
+        index: u8,
+        search: u8,
+        direction: u8,
+        offset: u8,
+        sort: Option<(u8, bool)>,
+    ) -> Filter {
+        Filter {
+            fno_only,
+            index: match index {
+                0 => None,
+                1 => Some("Zzz unknown".into()),
+                n => Some(INDEX_LABELS[usize::from(n - 2)].into()),
+            },
+            search: ["", "STOCK1", "stock0", "DUP", "q"][usize::from(search)].into(),
+            direction: [Direction::All, Direction::Gainers, Direction::Losers]
+                [usize::from(direction)],
+            offset: usize::from(offset) * 20,
+            sort_by: sort.map(|(c, _)| {
+                [
+                    SortColumn::Name,
+                    SortColumn::Ltp,
+                    SortColumn::Change,
+                    SortColumn::ChangePct,
+                    SortColumn::ValueCr,
+                    SortColumn::Volume,
+                ][usize::from(c)]
+            }),
+            sort_order: sort.map(|(_, asc)| if asc { SortOrder::Asc } else { SortOrder::Desc }),
+            as_of: None,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+        #[test]
+        fn proptest_select_equals_the_per_filter_path(
+            clock_kind in 0u8..10,
+            open in any::<bool>(),
+            read_kind in 0u8..8,
+            fno_mask in proptest::option::weighted(0.9, any::<u32>()),
+            mem_mask in proptest::option::weighted(0.9, any::<u32>()),
+            labels in 0u8..8,
+            per_stock in proptest::collection::vec(any::<u8>(), 1..6),
+            partial in any::<bool>(),
+            name_kind in 0u8..3,
+            rows in proptest::collection::vec(
+                (1u64..=26, 0u8..4, 0u8..16, 0u8..8, 0u8..4, -950i64..=10),
+                0..60,
+            ),
+            failure_kind in 0u8..12,
+            allow_duplicates in 0u8..8,
+            fno_only in any::<bool>(),
+            index in 0u8..10,
+            search in 0u8..10,
+            direction in 0u8..6,
+            offset in 0u8..4,
+            sort in proptest::option::weighted(0.4, (0u8..6, any::<bool>())),
+        ) {
+            let now = [
+                clock(8, 0, 0, 0),
+                clock(9, 10, 0, 0),
+                clock(9, 20, 0, 400),
+                clock(11, 15, 30, 700),
+                clock(15, 35, 0, 0),
+                clock(16, 0, 0, 0),
+            ][usize::from(match clock_kind {
+                0..=2 => clock_kind,
+                3..=6 => 3,
+                7 | 8 => 4,
+                _ => 5,
+            })];
+            let read_at = [
+                None,
+                Some(clock(9, 10, 0, 0)),
+                Some(clock(11, 0, 0, 0)),
+                Some(clock(15, 29, 0, 0)),
+                Some(clock(23, 59, 0, 0)),
+            ][usize::from(read_kind.saturating_sub(3))];
+            let fno = fno_mask.map(|m| fno_list(m, name_kind));
+            let membership = mem_mask.map(|m| memberships(m, labels, &per_stock, partial, name_kind));
+            let base = read_at.map_or(now, |r| r.min(now));
+            // One row per (id, segment), as `LATEST ON` returns, except in one
+            // case in eight, which keeps duplicates (the refusal path).
+            let mut seen = std::collections::HashSet::new();
+            let db: Vec<TickRow> = rows
+                .iter()
+                .filter(|(id, seg, ..)| allow_duplicates == 0 || seen.insert((*id, *seg == 0)))
+                .map(|(id, seg, ltp, close, vol, off)| tick_row(*id, *seg, *ltp, *close, *vol, *off, base))
+                .collect();
+            let failure = match failure_kind {
+                10 => Some(QueryFailure::Unreachable),
+                11 => Some(QueryFailure::Refused),
+                _ => None,
+            };
+            // Weighted toward the informative cases: no index and no search
+            // six times in ten, so most cases select priced rows.
+            let code = |kind: u8| kind.saturating_sub(5);
+            let direction = direction.saturating_sub(3);
+            let offset = u8::from(offset == 3);
+            let filter = filter_from(fno_only, code(index), code(search), direction, offset, sort);
+            prop_assume!(filter.valid());
+            let (new, old, universe) = both(now, open, read_at, fno.as_ref(), membership.as_ref(), &db, failure, &filter);
+            prop_assert_eq!(&new, &old);
+            prop_assert!(universe.valid());
+            let text = serde_json::to_string(&universe).unwrap();
+            let back: MoversUniverse = serde_json::from_str(&text).unwrap();
+            prop_assert_eq!(&select(&back, &filter), &new);
+        }
+    }
+
+    #[test]
+    fn test_select_equals_the_per_filter_path_on_named_edge_cases() {
+        let now = clock(11, 15, 30, 700);
+        let fno = fno_list(0b1111_0000, 0);
+        let membership = memberships(0b1111_1110, 0b011, &[1, 2, 3], false, 0);
+        let db: Vec<TickRow> = (1..=8)
+            .map(|id| tick_row(id, 1, 6, 4, 3, -5, now))
+            .chain([tick_row(3, 1, 7, 4, 3, -5, now)]) // duplicate identity
+            .collect();
+        let cases: Vec<(bool, Option<&FnoUnderlyings>, Option<&Memberships>, Filter)> = vec![
+            // fno_only with no F&O list
+            (true, None, Some(&membership), Filter::default()),
+            // index filter naming an index absent today
+            (
+                true,
+                Some(&fno),
+                Some(&membership),
+                filter_from(false, 4, 0, 0, 0, None),
+            ),
+            // empty membership list
+            (true, Some(&fno), None, filter_from(false, 0, 0, 0, 0, None)),
+            // offset past the end
+            (
+                true,
+                Some(&fno),
+                Some(&membership),
+                filter_from(true, 0, 0, 0, 1, Some((1, true))),
+            ),
+            // duplicate security id among all equities
+            (
+                true,
+                Some(&fno),
+                Some(&membership),
+                filter_from(false, 0, 0, 0, 0, None),
+            ),
+            // market closed (reads the ended session)
+            (
+                false,
+                Some(&fno),
+                Some(&membership),
+                filter_from(true, 2, 0, 2, 0, None),
+            ),
+        ];
+        for (open, fno, membership, filter) in cases {
+            let (new, old, _) = both(now, open, None, fno, membership, &db, None, &filter);
+            assert_eq!(new, old, "{filter:?}");
+        }
+        // Equal change % everywhere: the name breaks the tie, in both paths.
+        let tied: Vec<TickRow> = (1..=8)
+            .map(|id| tick_row(id, 1, 6, 4, 3, -5, now))
+            .collect();
+        let all = filter_from(false, 0, 0, 0, 0, None);
+        let (new, old, _) = both(
+            now,
+            true,
+            None,
+            Some(&fno),
+            Some(&membership),
+            &tied,
+            None,
+            &all,
+        );
+        assert_eq!(new, old);
+        let Outcome::Snapshot { snapshot } = &new.outcome else {
+            panic!("expected a snapshot, got {new:?}");
+        };
+        let names: Vec<&str> = snapshot
+            .rows
+            .iter()
+            .map(|r| r.price.name.as_str())
+            .collect();
+        assert_eq!(names.first(), Some(&"STOCK01"), "{names:?}");
+        // Before 09:15 on a closed read: no query, closed for every filter.
+        let early = clock(9, 10, 0, 0);
+        let (new, old, universe) = both(
+            early,
+            false,
+            None,
+            Some(&fno),
+            Some(&membership),
+            &db,
+            None,
+            &Filter::default(),
+        );
+        assert_eq!(new, old);
+        assert_eq!(universe.prices, UniversePrices::BeforeSession);
     }
 }

@@ -1458,6 +1458,19 @@ pub trait OpsShell {
         )
         .await
     }
+    /// Plan PR MV (2026-11-06): the published movers universe object
+    /// (`s3://<LIVE_VIEW_BUCKET>/movers/universe.json`), at most
+    /// `MAX_UNIVERSE_BYTES`. `Err` on any failure; the caller then falls back
+    /// to the box. Test shells default to "absent".
+    async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+        Err("absent".to_string())
+    }
+    /// Plan PR MV review: writes the viewer heartbeat
+    /// (`s3://<LIVE_VIEW_BUCKET>/movers/viewer.json`) that keeps the box
+    /// publishing. `Err` on any failure. Test shells default to "absent".
+    async fn put_viewer_heartbeat(&self, _body: Vec<u8>) -> Result<(), String> {
+        Err("absent".to_string())
+    }
     /// Per-container bounded read cache; test shells may opt out.
     fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
         None
@@ -2275,6 +2288,13 @@ pub struct AwsShell {
     stock_movers_cache: crate::operator_stock_movers::MoversCache,
     movers_cache: crate::operator_movers::MoversCache,
     ec2: aws_sdk_ec2::Client,
+    /// Plan PR MV: reads the published movers universe.
+    s3: aws_sdk_s3::Client,
+    /// `LIVE_VIEW_BUCKET` (terraform); empty or invalid = no published universe.
+    live_view_bucket: String,
+    /// `BUDGET_ACCOUNT_ID` (terraform), the live-view bucket's expected owner;
+    /// empty or invalid = no published universe.
+    live_view_owner: String,
     ssm: aws_sdk_ssm::Client,
     cloudwatch: aws_sdk_cloudwatch::Client,
     /// AWS Budgets (free) for the month-to-date cost, since 2026-10-22
@@ -2298,6 +2318,47 @@ pub struct AwsShell {
     auth_failures: AuthFailureGuard,
 }
 
+/// The live-view bucket and its expected owner, when both are configured
+/// and well formed (plan PR MV review: a mis-set name or account is refused,
+/// never sent). O(len).
+fn live_view_target<'a>(bucket: &'a str, owner: &'a str) -> Result<(&'a str, &'a str), String> {
+    if !crate::operator_movers_universe::valid_live_view_bucket_name(bucket) {
+        return Err("no valid live-view bucket".to_string());
+    }
+    if !crate::operator_movers_universe::valid_account_id(owner) {
+        return Err("no valid bucket owner account".to_string());
+    }
+    Ok((bucket, owner))
+}
+
+/// Reads an S3 body, refusing more than `limit` bytes even when no length was
+/// sent. A one-chunk body is returned as is (no copy). O(bytes).
+async fn read_body_bounded(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    limit: usize,
+) -> Result<bytes::Bytes, String> {
+    let mut first: Option<bytes::Bytes> = None;
+    let mut joined: Vec<u8> = Vec::new();
+    let mut total = 0_usize;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| err.to_string())?;
+        total = total.saturating_add(chunk.len());
+        if total > limit {
+            return Err("too large".to_string());
+        }
+        match first.take() {
+            None if joined.is_empty() => first = Some(chunk),
+            None => joined.extend_from_slice(&chunk),
+            Some(head) => {
+                joined.reserve(total);
+                joined.extend_from_slice(&head);
+                joined.extend_from_slice(&chunk);
+            }
+        }
+    }
+    Ok(first.unwrap_or_else(|| bytes::Bytes::from(joined)))
+}
+
 fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -2319,6 +2380,12 @@ impl AwsShell {
             .ok();
         Self {
             ec2: crate::clients::ec2(&config),
+            s3: crate::clients::s3(&config),
+            live_view_bucket: std::env::var("LIVE_VIEW_BUCKET").unwrap_or_default(),
+            live_view_owner: std::env::var(crate::budget_spend::BUDGET_ACCOUNT_ID_ENV)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
             stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
             movers_cache: crate::operator_movers::MoversCache::default(),
             ssm: crate::clients::ssm(&config),
@@ -2405,6 +2472,42 @@ impl AwsShell {
 impl OpsShell for AwsShell {
     fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
         Some(&self.stock_movers_cache)
+    }
+    async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+        let (bucket, owner) = live_view_target(&self.live_view_bucket, &self.live_view_owner)?;
+        let out = self
+            .s3
+            .get_object()
+            .bucket(bucket)
+            .key(crate::operator_movers_universe::MOVERS_UNIVERSE_OBJECT_KEY)
+            .expected_bucket_owner(owner)
+            .send()
+            .await
+            .map_err(|err| aws_sdk_s3::error::DisplayErrorContext(&err).to_string())?;
+        if out.content_length().is_some_and(|n| {
+            n < 0 || n as u64 > crate::operator_movers_universe::MAX_UNIVERSE_BYTES as u64
+        }) {
+            return Err("too large".to_string());
+        }
+        read_body_bounded(
+            out.body,
+            crate::operator_movers_universe::MAX_UNIVERSE_BYTES,
+        )
+        .await
+    }
+    async fn put_viewer_heartbeat(&self, body: Vec<u8>) -> Result<(), String> {
+        let (bucket, owner) = live_view_target(&self.live_view_bucket, &self.live_view_owner)?;
+        self.s3
+            .put_object()
+            .bucket(bucket)
+            .key(crate::operator_movers_universe::MOVERS_VIEWER_OBJECT_KEY)
+            .expected_bucket_owner(owner)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|err| aws_sdk_s3::error::DisplayErrorContext(&err).to_string())
     }
     fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
         Some(&self.movers_cache)
@@ -3001,6 +3104,12 @@ mod tests {
         captured: std::sync::Mutex<Vec<Vec<String>>>,
         captured_sync: std::sync::Mutex<Vec<Vec<String>>>,
         auth_failures: AuthFailureGuard,
+        /// Plan PR MV: the published movers universe object.
+        published_universe: Result<Vec<u8>, String>,
+        /// Plan PR MV: how long reading it takes (paused-clock tests).
+        published_delay_ms: u64,
+        /// Plan PR MV review: viewer heartbeats written.
+        heartbeats: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl Default for MockShell {
@@ -3027,6 +3136,9 @@ mod tests {
                 captured: std::sync::Mutex::new(Vec::new()),
                 captured_sync: std::sync::Mutex::new(Vec::new()),
                 auth_failures: AuthFailureGuard::new(),
+                published_universe: Err("absent".to_string()),
+                published_delay_ms: 0,
+                heartbeats: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -3046,6 +3158,16 @@ mod tests {
     impl OpsShell for MockShell {
         fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
             Some(&self.stock_movers_cache)
+        }
+        async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+            if self.published_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.published_delay_ms)).await;
+            }
+            self.published_universe.clone().map(bytes::Bytes::from)
+        }
+        async fn put_viewer_heartbeat(&self, body: Vec<u8>) -> Result<(), String> {
+            self.heartbeats.lock().unwrap().push(body);
+            Ok(())
         }
         fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
             Some(&self.movers_cache)
@@ -3315,6 +3437,204 @@ mod tests {
         );
         assert!(stopped.captured_sync.lock().unwrap().is_empty());
     }
+    // ------------------------------------------------ plan PR MV: S3 fast path
+    fn published_universe(observed: i64, market_open: bool) -> Vec<u8> {
+        use crate::operator_movers_universe::*;
+        let listed = ListedStock {
+            security_id: 2,
+            segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+            name: "STOCK002".into(),
+        };
+        serde_json::to_vec(&MoversUniverse {
+            format_version: UNIVERSE_FORMAT_VERSION,
+            trading_date_ist: ist_date_of_epoch(observed).unwrap(),
+            observed_at_epoch_secs: observed,
+            read_at_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS,
+            market_open,
+            window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
+            prices: UniversePrices::Rows {
+                rows: vec![PriceRow {
+                    security_id: 2,
+                    segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                    ltp: 110.0,
+                    prev_close: Some(100.0),
+                    volume: Some(10),
+                    ts_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS - 3,
+                }],
+            },
+            fno: Some(vec![listed.clone()]),
+            membership: Some(UniverseMembership {
+                names: vec![listed],
+                indices: vec!["Nifty 50".into()],
+                by_stock: vec![StockIndices {
+                    security_id: 2,
+                    segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                    indices: vec![0],
+                }],
+                partial: false,
+            }),
+        })
+        .unwrap()
+    }
+    fn box_shell(published: Result<Vec<u8>, String>) -> MockShell {
+        MockShell {
+            sync_output: serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                crate::operator_movers_wire::BridgeError::AppUnavailable,
+                MockShell::default().now,
+            ))
+            .unwrap(),
+            published_universe: published,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stock_movers_answer_from_a_fresh_published_universe_without_ssm() {
+        let now = MockShell::default().now;
+        for filter in [
+            json!({}),
+            json!({"fno_only":false,"sort_by":"name","sort_order":"asc"}),
+            json!({"fno_only":false,"index":"Nifty 50","direction":"gainers"}),
+        ] {
+            // 01:56 IST: the session is closed, as the universe says.
+            let shell = box_shell(Ok(published_universe(now - 3, false)));
+            let response = post(&shell, json!({"action":"stock-movers","filter":filter})).await;
+            let movers = &body_of(&response)["movers"];
+            assert_eq!(movers["result"], "snapshot", "{movers}");
+            assert_eq!(movers["captured_at_epoch_secs"], now - 3);
+            assert_eq!(movers["snapshot"]["rows"][0]["security_id"], 2);
+            assert!(
+                shell.captured_sync.lock().unwrap().is_empty(),
+                "no SSM round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_published_refuses_every_unusable_universe_and_the_box_answers() {
+        let now = MockShell::default().now;
+        let mut oversize = published_universe(now, true);
+        oversize.resize(
+            crate::operator_movers_universe::MAX_UNIVERSE_BYTES + 1,
+            b' ',
+        );
+        let cases: Vec<(&str, Result<Vec<u8>, String>, Value)> = vec![
+            ("unavailable", Err("NoSuchKey".into()), json!({})),
+            ("corrupt", Ok(b"{not json".to_vec()), json!({})),
+            ("too_large", Ok(oversize), json!({})),
+            ("stale", Ok(published_universe(now - 21, false)), json!({})),
+            (
+                "session_changed",
+                Ok(published_universe(now - 3, true)),
+                json!({}),
+            ),
+            (
+                "other_day",
+                Ok(published_universe(now - 86_400, false)),
+                json!({}),
+            ),
+            ("future", Ok(published_universe(now + 6, true)), json!({})),
+            (
+                "as_of",
+                Ok(published_universe(now, true)),
+                json!({"as_of":"2026-11-03T15:29"}),
+            ),
+        ];
+        for (reason, published, filter) in cases {
+            let shell = box_shell(published);
+            let parsed: crate::operator_stock_movers_wire::Filter =
+                serde_json::from_value(filter.clone()).unwrap();
+            assert_eq!(
+                crate::operator_stock_movers::from_published(&shell, &parsed).await,
+                Err(reason)
+            );
+            let response = post(&shell, json!({"action":"stock-movers","filter":filter})).await;
+            assert_eq!(
+                body_of(&response)["movers"]["code"],
+                "app_unavailable",
+                "{reason}: the box answered"
+            );
+            assert_eq!(shell.captured_sync.lock().unwrap().len(), 1, "{reason}");
+        }
+        // A closed-session universe has the same 20 s bound as an open one
+        // (the publisher refreshes it every 5 s while viewed).
+        let shell = box_shell(Ok(published_universe(now - 120, false)));
+        assert_eq!(
+            crate::operator_stock_movers::from_published(
+                &shell,
+                &crate::operator_stock_movers_wire::Filter::default()
+            )
+            .await,
+            Err("stale")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_live_movers_call_writes_the_viewer_heartbeat_once_per_interval() {
+        use crate::operator_movers_universe::{VIEWER_HEARTBEAT_TTL_SECS, ViewerHeartbeat};
+        let now = MockShell::default().now;
+        let shell = box_shell(Err("absent".into()));
+        for _ in 0..3 {
+            let _ = post(&shell, json!({"action":"stock-movers","filter":{}})).await;
+        }
+        let beats = shell.heartbeats.lock().unwrap().clone();
+        assert_eq!(beats.len(), 1, "once per 30 s per container");
+        assert_eq!(
+            ViewerHeartbeat::parse(&beats[0]),
+            Some(ViewerHeartbeat {
+                until_epoch_secs: now + VIEWER_HEARTBEAT_TTL_SECS
+            })
+        );
+        // A chosen minute is always answered by the box: no heartbeat.
+        let shell = box_shell(Err("absent".into()));
+        let _ = post(
+            &shell,
+            json!({"action":"stock-movers","filter":{"as_of":"2026-11-03T15:29"}}),
+        )
+        .await;
+        assert!(shell.heartbeats.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_live_view_target_refuses_a_bad_bucket_or_owner() {
+        assert_eq!(
+            live_view_target("tv-prod-live-view", "123456789012"),
+            Ok(("tv-prod-live-view", "123456789012"))
+        );
+        assert!(live_view_target("", "123456789012").is_err());
+        assert!(live_view_target("Bad_Bucket", "123456789012").is_err());
+        assert!(live_view_target("tv-prod-live-view", "").is_err());
+        assert!(live_view_target("tv-prod-live-view", "12345").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_body_bounded_refuses_over_the_limit_and_keeps_one_chunk_whole() {
+        let limit = 64;
+        let one = aws_sdk_s3::primitives::ByteStream::from(vec![b'a'; limit]);
+        assert_eq!(read_body_bounded(one, limit).await.unwrap().len(), limit);
+        let over = aws_sdk_s3::primitives::ByteStream::from(vec![b'a'; limit + 1]);
+        assert!(read_body_bounded(over, limit).await.is_err());
+        let empty = aws_sdk_s3::primitives::ByteStream::from(Vec::new());
+        assert!(read_body_bounded(empty, limit).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_from_published_times_out_and_the_box_answers() {
+        let now = MockShell::default().now;
+        let shell = MockShell {
+            published_delay_ms: 2_500,
+            ..box_shell(Ok(published_universe(now, true)))
+        };
+        assert_eq!(
+            crate::operator_stock_movers::from_published(
+                &shell,
+                &crate::operator_stock_movers_wire::Filter::default()
+            )
+            .await,
+            Err("timeout")
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn filtered_movers_cache_is_keyed_and_shell_receives_hex_only() {
         use crate::operator_stock_movers_wire::{Filter, Reply};
@@ -3626,13 +3946,25 @@ mod tests {
         // after the close). Text only, no JavaScript change.
         // 2026-11-03: date and IST time inputs on Stocks → Price Movers; the
         // chosen minute goes out as the filter's `as_of` (rust-only lock §0.18).
+        // 2026-11-06 (plan PR MV): a movers refresh keeps the previous rows on
+        // screen under the loading status instead of blanking the table; a
+        // reply that fails the checks still clears it. Fewer script bytes.
+        // Review: while a refresh is in flight the table is inert and dimmed
+        // (rows, select-all, row checkboxes and sort buttons) and Previous,
+        // Next and Refresh are disabled, so a double Next cannot skip a page
+        // and a new sort mark never shows over old-order rows unmarked.
+        // `$$` is document.querySelectorAll, to stay inside the script budget.
+        // Combined review, same day: each accepted reply carries the filter
+        // generation it answered, and a snapshot from an older generation is
+        // reloaded instead of rendered, so an older filter's rows never show
+        // under newer controls (tab hidden mid-load was the path).
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "23e776dd428983649c095226bbbef2d38f7dc8c29934cf8060171e483984bea4"
+            "801ba17e37712bf3930d06274f9b45a7ee1217c0c536200ede769675f23bfc1a"
         );
-        assert_eq!(CONSOLE_HTML.len(), 85_508);
+        assert_eq!(CONSOLE_HTML.len(), 85_542);
     }
 
     // ------------------------------------------------ audit L4 source scans

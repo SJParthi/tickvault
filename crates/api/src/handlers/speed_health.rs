@@ -408,6 +408,7 @@ pub(crate) const fn stage_label(stage: Stage) -> &'static str {
         Stage::DrainMainFrame => "Processing one main-feed frame",
         Stage::ReceiptToFold => "Receipt to finishing one live main-feed frame",
         Stage::MetricsUpkeep => "Metrics housekeeping run (diagnostic)",
+        Stage::DrainMainTick => "Processing one main-feed tick (average within its frame)",
     }
 }
 
@@ -515,6 +516,7 @@ fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
             Stage::RingDwell => "received frame, all endpoints; overlaps receive time",
             Stage::DrainMainFrame => "main-feed frame; decode/fold/append combined",
             Stage::ReceiptToFold => "live main-feed frame; overlaps earlier stages; ring-refused frames excluded",
+            Stage::DrainMainTick => "main-feed tick; the frame's decode/fold/append time over its ticks (per-tick average within each frame)",
             Stage::MainRuntimeLag | Stage::ReaderRuntimeLag | Stage::MetricsUpkeep => return None,
         };
         let (bound, recorded_failure) = if stage_samples_valid(fig) {
@@ -2009,8 +2011,9 @@ mod tests {
         assert!(strict.note.contains("not Monday proof"));
         assert_eq!(
             strict.tiles.len(),
-            4,
-            "runtime timers and metrics upkeep are not frame stages"
+            5,
+            "runtime timers and metrics upkeep are not frame stages; the \
+             per-tick drain stage (PR DP-6) is"
         );
         let first = &strict.tiles[0];
         assert_eq!(first.status, Light::Grey);
@@ -2091,7 +2094,7 @@ mod tests {
             assert_eq!(*maximum, Some(2_000 + u64::try_from(index).expect("index")));
         }
         let operational = speed_section(&inputs.stages, Some(&readings));
-        assert_eq!(operational.tiles.len(), 7);
+        assert_eq!(operational.tiles.len(), ALL_STAGES.len());
         for (tile, stage) in operational.tiles.iter().zip(ALL_STAGES) {
             assert_eq!(tile.label, stage_label(stage));
             assert!(tile.detail.contains("0 of 100 over the stall budget"));
@@ -2110,6 +2113,7 @@ mod tests {
                 stage_label(Stage::RingDwell),
                 stage_label(Stage::DrainMainFrame),
                 stage_label(Stage::ReceiptToFold),
+                stage_label(Stage::DrainMainTick),
             ],
         );
         assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));

@@ -133,6 +133,24 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = [aws_budgets_budget.tv_monthly.arn]
   }
 
+  # Plan PR MV (2026-11-06): read the published movers universe (one key
+  # only) so a Stocks movers click is answered without an SSM round trip.
+  statement {
+    sid       = "ReadMoversUniverse"
+    effect    = "Allow"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.tv_live_view.arn}/movers/universe.json"]
+  }
+
+  # Plan PR MV review: the viewer heartbeat that makes the box publish (one
+  # key only; the box publishes nothing and queries nothing without it).
+  statement {
+    sid       = "WriteMoversViewer"
+    effect    = "Allow"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.tv_live_view.arn}/movers/viewer.json"]
+  }
+
   # Review finding 7: pin logs to THIS account + this Lambda's log group only.
   statement {
     sid    = "LambdaLogs"
@@ -215,6 +233,8 @@ resource "aws_lambda_function" "operator_control" {
       # month-to-date cost from (free DescribeBudget).
       BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
       BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+      # Plan PR MV: where the movers universe is published (live-view-bucket.tf).
+      LIVE_VIEW_BUCKET = aws_s3_bucket.tv_live_view.bucket
     }
   }
 }

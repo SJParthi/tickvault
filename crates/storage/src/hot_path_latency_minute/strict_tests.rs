@@ -45,7 +45,7 @@ fn test_minute_strict_counts_aggregate_exact_windows_without_reinterpreting_1024
         Some(1_024),
         "historical upper bound is unchanged"
     );
-    assert_eq!(row.samples_over_1024ns, 0);
+    assert_eq!(row.samples_over_1024ns, Some(0));
     assert_eq!(row.histogram, HISTOGRAM_LOG2);
     for ns in [1_000, 1_001, 1_024] {
         let row = one_row(stage, &[ns; 100]);

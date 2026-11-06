@@ -2197,8 +2197,8 @@ zero bugs/loss, exhaustive coverage or universal O(1)/submicrosecond latency.
 
 #### Design
 - Shared pure selection: the per-filter selection (`finish` and the list/status branching in `compute`) moves into a common module as `select(universe, filter) -> Reply`, and `/api/stock-movers` itself becomes `build_universe` (one QuestDB query over the union of the F&O list and the index-membership list) then `select`, so the API and the portal answer from one code path.
-- The app publishes the universe every 5 s inside 09:00–15:40 IST on a trading day and every 60 s otherwise to `s3://tv-<env>-live-view/movers/universe.json` (new bucket: no versioning, public access blocked, SSE-S3, objects expire after 2 days; the cold bucket is not used because it is versioned and may never expire noncurrent versions).
-- The Lambda reads that object (2 s timeout) for a live-view filter and selects in memory; a missing, unreadable or stale object (older than 20 s in session, 300 s outside), or any `as_of` filter, falls back to the existing SSM path unchanged.
+- The app publishes the universe ON DEMAND (review 2026-11-06: no standing QuestDB load): every 5 s it reads the Lambda's viewer heartbeat `movers/viewer.json` and builds + publishes only while it is unexpired (written on a live movers call, at most once per 30 s per container, valid 120 s); after the close the rows are queried once per (IST date, window end) and re-stamped; no query while QuestDB reports a suspended table or a growing apply backlog; failures back off 5 s × 2^n up to 120 s; every request names the expected bucket owner. Destination `s3://tv-<env>-live-view/movers/universe.json` (new bucket: no versioning, public access blocked, SSE-S3, objects expire after 2 days; the cold bucket is not used because it is versioned and may never expire noncurrent versions).
+- The Lambda reads that object (2 s timeout) for a live-view filter and selects in memory; a missing, unreadable or stale object (older than 20 s, open or closed, or built in the other session state than the Lambda's own clock), or any `as_of` filter, falls back to the existing SSM path unchanged.
 - The portal keeps the previous rows visible while a refresh runs.
 
 #### Edge Cases
@@ -2216,11 +2216,25 @@ Property test: for random universes and random filters, `select` over the publis
 #### Observability
 `tv_movers_universe_publish_total{outcome}` and `tv_movers_universe_publish_duration_ms` (local /metrics only, no page); the Lambda logs `source=s3|ssm` and the elapsed ms per movers call.
 
-- [ ] MV-1 shared `select` in common + API refactor (identity proptest)
-- [ ] MV-2 app publisher task + config switch + counters
-- [ ] MV-3 terraform live-view bucket + two scoped IAM grants
-- [ ] MV-4 Lambda S3 read + fallback + timing log
-- [ ] MV-5 portal keeps rows while refreshing
+- [x] MV-1 shared `select` in common + API refactor (identity proptest)
+  - Files: crates/common/src/operator_movers_universe.rs, crates/api/src/handlers/stock_movers.rs, crates/api/src/handlers/fno_stocks.rs
+  - Tests: proptest_select_equals_the_per_filter_path, test_select_equals_the_per_filter_path_on_named_edge_cases, test_select_filters_sorts_and_pages_one_universe_for_every_filter, test_universe_constants_match_the_common_constants
+  - Review fixes (2026-11-06): one clock reading (`LiveClock`), security-id tie-break in both sorts, two-slot list caches, file loads and body parse on the blocking pool, constants pinned in the api crate. Tests: test_live_clock_takes_session_state_and_time_from_one_instant, test_is_trading_session_at_reads_the_given_second_and_its_ist_date, test_file_cache_keeps_today_and_one_other_date, test_universe_constants_equal_the_fno_stocks_constants, test_usable_at_refuses_other_day_stale_future_and_session_changed_universes, test_weekday_session_open_at_follows_the_ist_clock_and_weekday
+- [x] MV-2 app publisher task + config switch + counters
+  - Files: crates/app/src/movers_universe_publisher.rs, crates/app/src/main.rs, crates/common/src/config.rs, config/base.toml
+  - Tests: test_encode_refuses_failed_queries_and_invalid_universes, test_failure_episode_warns_once_and_reports_the_recovery, test_operator_movers_publish_defaults_on_and_parses_overrides
+  - Review fixes (2026-11-06): on-demand publishing on the viewer heartbeat, backoff, closed-read reuse, QuestDB health hold, expected bucket owner, bucket-name validation, failure reason on the warn. Tests: test_no_active_viewer_builds_nothing_and_never_queries, test_an_active_viewer_builds_and_publishes_unless_questdb_is_busy, test_after_the_close_one_query_serves_the_evening_until_the_key_changes, test_next_interval_doubles_from_five_seconds_to_a_two_minute_ceiling, test_failures_reset_on_success_and_no_viewer_and_hold_on_questdb_busy, test_questdb_quiet_needs_a_measured_healthy_reading, test_publisher_target_validates_the_bucket_name_and_fails_closed, test_account_id_is_read_from_the_identity_document_and_validated, test_read_bounded_refuses_an_oversize_body_without_a_length, test_closed_read_key_names_the_date_and_window_end_of_a_closed_read_only, test_restamped_moves_only_the_observation_and_only_for_the_same_closed_read, test_viewer_heartbeat_written_at_parse_and_active_at, test_valid_live_view_bucket_name_and_valid_account_id
+- [x] MV-3 terraform live-view bucket + two scoped IAM grants
+  - Files: deploy/aws/terraform/live-view-bucket.tf, deploy/aws/terraform/main.tf, deploy/aws/terraform/operator-control-lambda.tf
+  - Tests: test_live_view_bucket_is_unversioned_expiring_private_encrypted_and_tls_only, test_live_view_grants_name_one_object_per_action_only (review: heartbeat grants, BucketOwnerEnforced, abort incomplete multipart uploads)
+- [x] MV-4 Lambda S3 read + fallback + timing log
+  - Files: crates/aws-lambdas/src/operator_stock_movers.rs, crates/aws-lambdas/src/operator_control.rs, .github/workflows/terraform-apply.yml
+  - Tests: test_stock_movers_answer_from_a_fresh_published_universe_without_ssm, test_from_published_refuses_every_unusable_universe_and_the_box_answers, test_from_published_times_out_and_the_box_answers
+  - Review fixes (2026-11-06): heartbeat write, session-state refusal, bounded body read returned as Bytes, expected bucket owner. Tests: test_a_live_movers_call_writes_the_viewer_heartbeat_once_per_interval, test_claim_heartbeat_once_per_interval_and_after_a_clock_step, test_live_view_target_refuses_a_bad_bucket_or_owner, test_read_body_bounded_refuses_over_the_limit_and_keeps_one_chunk_whole
+- [x] MV-5 portal keeps rows while refreshing
+  - Files: crates/aws-lambdas/src/operator_control_console.html
+  - Tests: console_html_content_pin
+  - Review fix (2026-11-06): the table is inert and dimmed and Previous, Next and Refresh are disabled while a refresh is in flight.
 
 ### PR DP — 2026-11-06 live incident: the disk-pressure archiver starved QuestDB 08:31–09:13 IST (app, storage, deploy)
 
@@ -2229,17 +2243,17 @@ Property test: for random universes and random filters, `select` over the publis
 **Verified root cause (live logs, QuestDB SHOW PARAMETERS, errors.jsonl):** the box booted at 95% disk used; the disk-pressure leg exported 41 partitions back to back 08:31:05–09:13:11 (nine market_depth hours of 95–115M rows, 4–5 min each) through QuestDB HTTP /exp. QuestDB runs one shared network worker (`shared.network.worker.count=1`, `http.worker.count=0`) on one core, so each export held the thread every ILP /write and /exec needs: 14 BOOT-01, 30 reconnects, 2,935,971 tick rows and 2,331,360 depth levels rescued to spill, WAL probe blind x4. Underneath: `market_depth_book` exists with designated timestamp `timestamp` and 0 rows, so array rows are refused and inline depth writes 10 level rows per Full packet (~7 GiB/h); the Nov 5 pressure episode spent its 3 re-arms by 11:37 and held all night at 92%; the after-close depth pass stopped ~700 times at its 8% free floor while the drain hold kept the box up to 07:30. Same pattern Nov 4 and Nov 5. Ruled out: boot WAL replay (refused), evening restart (none), #2191, CPU quota throttling.
 
 #### Design
-- QuestDB gets its own HTTP worker pool (`QDB_HTTP_WORKER_COUNT=2`) so an /exp stream cannot hold the thread ILP /write and /exec use; host tuning stops forcing the network pool to 1.
+- QuestDB gets its own HTTP worker pool (`QDB_HTTP_WORKER_COUNT=3`, review M6: export limit 4 → 2, workers = export limit + 1) so an /exp stream cannot hold the thread ILP /write and /exec use; host tuning stops forcing the network pool to 1.
 - The pressure pass is gated: inside 08:45–15:40 IST it exports no market_depth partition unless used ≥ 90%, and exports at most one partition per in-session pass; a pass started before the open stops at its next partition boundary after 09:00.
-- The pressure episode re-arm budget resets when the IST trading date changes or the session closes, so reclaim runs overnight instead of at the next boot.
+- The pressure episode re-arm budget resets when the IST trading date changes or the session closes, and (review M3) after the 15:40 gate and on no-session days an escalated episode re-arms every poll with no cap and refunds passes that drop partitions, so 15:40 to the 16:30 stop reclaims back to back; the box is NOT kept up for it (cost lock).
 - The after-close depth pass that stops at its disk floor requests a reclaim, and the drain hold no longer counts floor-blocked depth buckets (a floor-blocked hold is capped at one hour and counted).
-- Boot self-heal: when `market_depth_book` exists with the wrong designated timestamp AND `count()` is 0, drop and re-create it with `ts` (never when it holds a row; a non-empty wrong table keeps todays refusal).
+- Boot self-heal: when `market_depth_book` exists with the wrong designated timestamp AND `count()` is 0 AND its WAL is applied AND `sequencerTxn` is unchanged around the count AND the depth spill replay is held (08:00–15:40 IST), RENAME it to `market_depth_book_lh01_<yyyymmdd>` (nothing ever deleted) and re-create it with `ts`; anything else keeps today's refusal (review fix: the first draft DROPPED it, racing the depth replay).
 
 #### Edge Cases
 Pressure at ≥ 90% inside the session; a partition export already running at 09:00; trading-date change while an episode is open; holiday and weekend; non-empty wrong-ts book table; QuestDB unreachable during the self-heal; HTTP worker count on a 1-core cpuset.
 
 #### Failure Modes
-Disk fills inside the session below 90% (ingest shed path unchanged, alarms unchanged); export refused (counted, retried next pass); self-heal drop fails (falls back to level rows exactly as today, coded warn).
+Disk fills inside the session below 90%: the ingest shed steps (85%/92%) take their trigger from an escalated episode, and a gated in-session episode now escalates after five refunded passes with used% not falling (review M1; before, every gated pass was refunded and the shed lost its trigger), alarms unchanged; export refused (counted, retried next pass); self-heal rename fails (falls back to level rows exactly as today, coded warn).
 
 #### Test Plan
 Unit tests for the gate (time × used% × table), the re-arm reset on date change, the drain-hold exclusion, the self-heal guard (0 rows only), a compose/host-tuning guard that the HTTP pool is separate. Scoped `cargo test -p` for app and storage.
@@ -2250,12 +2264,31 @@ Revert the PR; the compose line is one deletion.
 #### Observability
 `tv_disk_pressure_pass_gated_total{reason}`, `tv_disk_pressure_rearm_reset_total`, `tv_depth_book_self_heal_total{outcome}`, `tv_drain_hold_floor_blocked_buckets` (local /metrics only, no new page).
 
-- [ ] DP-1 QuestDB HTTP worker pool + host tuning
-- [ ] DP-2 in-session gate + one partition per pass + pre-open deadline
-- [ ] DP-3 re-arm reset on date change / session close
-- [ ] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
-- [ ] DP-5 market_depth_book zero-row self-heal
-- [ ] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (packets per frame recorded at the record site) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
+- [x] DP-1 QuestDB HTTP worker pool + host tuning
+- [x] DP-2 in-session gate + one partition per pass + pre-open deadline
+- [x] DP-3 re-arm reset on date change / session close
+- [x] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
+- [x] DP-5 market_depth_book zero-row self-heal: RENAMED aside (`market_depth_book_lh01_<yyyymmdd>`), never dropped, only inside the depth replay hold with an unchanged `sequencerTxn` around the count (review fix)
+- [x] DP-7 after-close depth pass floor: 8% (12.9 GB on the 150 GB box, where the disk sat all night: 795 early stops 15:45 Nov 5 → 05:35 Nov 6) replaced by one point above the 5% pinned-delete floor plus a 2 GiB byte floor, after asking for a reclaim and waiting up to 3 minutes; stale 644 GB comment fixed (floor value superseded by review M5 below)
+- [x] DP-8 spill replay retires the LAST spill file too once its hour has closed and it has been quiet (`spill_file_may_still_be_appended`); before, `depth-dhan-498258.dspl` (2.6 GB, 3 Nov) was replayed every evening
+- [x] DP-9 the pressure-episode log text and the `pressure_hot_days` config comment say that market_depth HOURS (yesterday's included) are eligible; only DAY partitions keep the today+yesterday floor
+- [x] DP-10 the re-arm budget also refills when a session depth hour passes its hot window (`rearm_window_key`), not only at the date change and the close; config comment carries the measured ~45 GB/day DB + ~20 GB WAL on 150 GB
+- Implemented 2026-11-06 on branch `dp-2026-11-06`: `disk_pressure::{pressure_pass_limits, rearm_window_key, refresh_rearm_budget}`, `partition_archive::{ArchivePassLimits, apply_pass_limits, pass_deadline_reached}`, `disk_pressure_boot` (gate, refill, GatedProgress), `depth_persistence::self_heal_empty_market_depth_book`, `tick_spill_replay::spill_file_may_still_be_appended`, `deferred_depth_pass::disk_stays_low`, `drain_hold::DayWork::deferred_floor_blocked`, `hot_path_telemetry::record_stage_nanos_weighted`, `host_capacity_minute::record_process_core_count`, `ensure_questdb::QUESTDB_ENV`, `questdb_compose_env_guard.rs`. Deviation: the pre-open pass stops at its next partition boundary after **08:45** IST (the gate start, per the coordinator brief), not 09:00 as the Design line says.
+- [x] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (an eighth, never-paged stage `drain_main_tick`: each main-feed frame's drain time divided by its tick packets, recorded with weight = tick packets through the O(1) `record_stage_nanos_weighted`, DHAT-gated; a per-tick AVERAGE within a frame, and since 1,024 ns is a bucket edge, `p99_ns <= 1024` means under 1 µs) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
+
+##### PR DP review fixes, 2026-11-06 (three reviewers: hot-path, security, hostile)
+
+- [x] H1 a gated (capped) pressure pass drops every table the run-start `wal_tables()` probe found behind BEFORE its cap, the cap counts partitions actually EXPORTED, and a gated pass whose only problem is `wal_not_applied` classifies StoodAside (before: the cap took a ticks day still being written, read Dropped(0) and paged a false STORAGE-GAP-05) — `partition_archive::{wal_lagging_tables, drop_wal_lagging, ArchiveRunSummary::pass_gated}`, `disk_pressure_boot::classify_pressure_pass`
+- [x] M1 refunded passes (gated progress, or an in-session stand-aside at 90%+) that do not lower used% five times in a row set `EpisodeState::gated_stalled`, which escalates — `disk_pressure::{GatedStallTracker, GATED_STALL_PASSES}`
+- [x] M2 a floor stop by a pass that wrote rows or cleared a bucket restarts `FLOOR_BLOCKED_SINCE_UNIX` — `deferred_depth_pass::next_floor_blocked_since`
+- [x] M3 after the 15:40 gate and on no-session days: no re-arm cap (`lift_rearm_limit`), passes that drop partitions are refunded (`refund_off_session_progress`); box NOT kept up longer; base.toml comment corrected
+- [x] M4 the 3-minute floor wait runs BEFORE the depth-partition hold and only inside the window; under the hold the floor is read without waiting — `deferred_depth_pass::run_after_close_pass`, `wait_for_run`
+- [x] M5 after-close floor = `max(5% line + 7 GiB rewrite + 2 GiB, 10 GiB)` (`after_close_floor_bytes`, ~16 GiB on 150 GB); the reclaim is woken only above the 5% line (`space_request_safe`)
+- [x] M6 `QDB_HTTP_EXPORT_CONNECTION_LIMIT` 4 → 2, `QDB_HTTP_WORKER_COUNT` 2 → 3; guard pins workers > export limit; `ensure_questdb` mirror follows
+- [x] M7 a stood-aside in-session pass reruns only when the re-arm key moves or used% crosses 90 (`in_session_rerun_skippable`); the raw uploader is woken in session only at 90%+ (`raw_upload_wanted`)
+- [x] L1 the gate reads the calendar (`pressure_session_day`: `is_session_day`, Muhurat window from `muhurat_session_secs`), and a pass started after the gate or on a no-session day stops at the next session day's gate (`OffSessionDeadline`)
+- [x] L2 the fallback `docker run` passes a cpuset only when `TV_QDB_CPUSET` is set; an IPv6 bind is bracketed in the `-p` spec
+- [x] L5 `drain_main_tick` docs: the frame time includes non-tick packets, and a green tile is the 1,024 ns bucket, not ≤1,000 ns; frame duration computed once; `PROCESS_CORE_COUNT` read before `available_parallelism`; stale "seven a minute" and spill-replay comments fixed
 
 ### PR AL — 2026-11-06 live incident: alarm truth and retries (app, storage)
 
@@ -2311,18 +2344,28 @@ Revert the PR.
   - 2026-11-06: the W4 code is already on main (#2187); the branch is superseded, not cherry-picked (see W4). What is left to ship is the W4 tick and its CLAUDE.md O(1) row (branch `w4-2026-11-06`); tick this once that merges.
 
 ### PR TG — 2026-11-06: tests for the incident's worst-case combinations (storage, app)
-- [ ] TG-1 slow-QuestDB boot: the six audit/rollup ensures retry, DEDUP keys reach the table before the first ILP row (`cov_audit_ddl_slow_boot.rs`)
-- [ ] TG-2 WAL catch-up against a stalling QuestDB (ack timeout, lag pause, clock run-out) (`chaos_catchup_slow_questdb.rs`)
-- [ ] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
+- [x] TG-1 slow-QuestDB boot: the six audit/rollup ensures retry, DEDUP keys reach the table before the first ILP row (`cov_audit_ddl_slow_boot.rs`)
+  - Files: crates/app/tests/cov_audit_ddl_slow_boot.rs (local stand-in QuestDB; no production change)
+  - Tests: `test_regression_tg1_audit_ensures_retry_until_all_six_tables_are_keyed` (two refused attempts, then all six DEDUP keys accepted, each carrying `feed`), `test_regression_tg1_spill_drain_writes_nothing_while_the_dedup_key_is_refused`, `test_regression_tg1_spill_drain_keys_the_table_before_the_first_write`
+  - Honest limit (unchanged, recorded at `DdlTables::AuditTables`): only the spill-replay path is gated on the key; a live consumer row written before the background re-run lands can still auto-create its table unkeyed.
+- [x] TG-2 WAL catch-up against a stalling QuestDB (ack timeout, lag pause, clock run-out) (`chaos_catchup_slow_questdb.rs`)
+  - Files: crates/app/tests/chaos_catchup_slow_questdb.rs (decision logic: `AppliedWatermark` ack accounting, `wal_catchup_lag_step`, `wal_catchup_budget_secs`; the pause-loop model is source-pinned to the loop in `dhan_feed_stack.rs`)
+  - Tests: `test_regression_tg2_ack_wait_times_out_on_a_writer_stalled_by_questdb`, `test_regression_tg2_ack_wait_refuses_when_only_the_depth_writer_is_stalled`, `test_regression_tg2_ack_wait_succeeds_when_questdb_recovers_inside_the_bound`, `test_regression_tg2_ack_wait_refuses_a_batch_that_landed_nowhere_without_waiting_out_the_bound`, `test_regression_tg2_acks_during_a_questdb_stall_do_not_raise_the_skip_watermark`, `test_regression_tg2_lag_pause_against_a_stalled_questdb_ends_within_its_bounds_all_day`, `test_regression_tg2_lag_pause_resumes_on_the_first_poll_after_questdb_recovers`, `test_regression_tg2_pause_model_matches_the_catch_up_loop_source`
+- [x] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
+  - Files: crates/storage/src/partition_archive.rs (one `mod` line), crates/storage/src/partition_archive/stub_integration_tests/tg_export_regressions_tests.rs (reuses the stub QuestDB + S3 harness)
+  - Tests: `test_regression_tg3_export_429_keeps_every_partition_and_uploads_nothing` (429 body is a valid 3-row CSV; bite-checked: removing the `/exp` status check fails it), `test_regression_tg3_a_partition_kept_by_429_is_archived_once_exp_answers`, `test_regression_tg3_stalled_export_keeps_partition_and_pass_ends_within_bound`, `test_regression_tg3_trickling_export_keeps_partition_and_pass_ends_within_bound`
+  - Bound tested here: per-run cap + one `/exp` per partition per pass + the export client timeout. The in-session time cap (`ArchivePassLimits`, PR DP #2196, merged after these tests were written) is covered by DP's own tests (`test_stub_with_pass_limits_skip_depth_cap_and_deadline`, `test_regression_deadline_only_pass_is_not_gated_on_wal_lag`, `test_pass_deadline_reached_boundaries`), not here.
 - [ ] TG-4 nightly contention test: production compose limits, one hour of depth, archiver export concurrent with ILP writes and /exec probes
 
 ### PR PF — 2026-11-06: per-tick in-memory path toward under 1 µs with live proof (storage, app, config)
 **Approved by:** Parthiban, 2026-11-06 ("i need always less than one microsecodn across the entore codebase workspace woth a real tiem proof"; "go ahead fix everything dude approved"). Honest scope: in-memory per-tick steps only; network, disk and database steps cannot be under 1 µs.
-- [ ] PF-1 turn on `[tick_storage] own_ilp_encoder` in production config (byte-identical proof exists, bench p99 ~0.8 µs vs library 1.8–2.4 µs), with a one-session live read of `hot_path_latency_minute` per-tick figures before/after
+- [x] PF-1 turn on `[tick_storage] own_ilp_encoder` in production config (byte-identical proof exists, bench p99 ~0.8 µs vs library 1.8–2.4 µs), with a one-session live read of `hot_path_latency_minute` per-tick figures before/after — `config/production.toml` `[tick_storage] own_ilp_encoder = true`, `production_config_wiring.rs::test_production_turns_on_the_own_ilp_encoder`; base.toml stays OFF. Live read: the before figures are the 2026-11-06 session (library encoder); the after read is the first session after deploy
 - [ ] PF-2 measure core placement (QuestDB cpuset 0 vs main runtime workers) with `tv_hot_thread_run_delay_ns_total` and decide; no change without numbers
 - [ ] PF-3 profile the drain's per-packet cost on the live shape (cold 25k-instrument maps) and cut the largest step
 - PF measurement 2026-11-06 (x86, loaded host, 25,000 instruments, 1 packet/frame, DRAM-cold mode): production shape (Full, library encoder, 10 level rows) p50 7.5 µs / p99 22–30 µs per tick; with book rows 4.1 / 10.7 µs; plus own encoder 3.2 / 8.3 µs. Under 1 µs is not reachable while the drain encodes ILP text (~1.5 µs per Full tick alone). Ranked cuts, each with an old-vs-new proof:
 - [ ] PF-4 move ILP encoding off the drain: drain pushes a fixed ~200 B binary record per tick into a pre-allocated per-flush buffer; the writer thread encodes with the same write functions (byte-identical proptest over random tick streams; rescue/spill/watermark tests)
+  - 2026-11-06 design panel (3 designs, 2 judges, read-only; `.claude/plans/research/pf4-design-2026-11-06.md`): corrections to this line: the staged record is 80 B (a copy of the persisted `ParsedTick` fields) or ~290 B (the existing `TickRow`), not ~200 B; the buffer is per batch and recycled; tick_quotes and feed_aux rows are included; three places encode (writer thread, rescue thread, the drain's cold inline fallback); depth book rows need a PF-4b of the same shape. Must-fix before code: per-batch contract-label pins (byte identity when labels republish mid-batch), encode-failure accounting on the writer before the ack, text bounds restated as row/RAM bounds plus a writer-side 32 MiB ceiling, golden fixtures recorded on today's code in an earlier commit. Owner decisions pending (see plan PF-4 open questions). Not measured: every ns figure is Assumed.
+  - Owner decisions 2026-11-06 (decision card, verbatim labels): build it, **"Build it, existing row"** (the drain stages today's `TickRow` / `AuxPacketRow`, ~290 B; the text step moves to the writer and rescue threads; the 80 B record (PF-4c) is not built); encode failures **"Yes, count on writer (Recommended)"** (same drop counter, not-landed total and WAL replay; `IngestOutcome::WriteFailed` keeps `TickRowError` only); contract names **"Cap at 64 characters (Recommended)"** (longer names cut to 64 at publish with a counter, so the row size bound is a constant). Base design: the panel winner (risk-first, per-batch label pins).
 - [ ] PF-5 batch the seal hand-off per frame (same `BufferedSeal` sequence, escalation path tested)
 - [ ] PF-6 one shared instrument index (gap detector, backup dedup, spot store keyed by the aggregator slot; identical verdicts under proptest)
 - [ ] PF-7 candle slot layout split (per-tick vs seal-only fields) + prefetch after the index lookup (restart_differential + consume_tick equality proptest)

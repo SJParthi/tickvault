@@ -88,7 +88,7 @@ const FNO_STOCKS_QUERY_TIMEOUT_SECS: u64 = 3;
 pub const FNO_STOCKS_WINDOW_SECS: i64 = 900;
 
 /// Upper bound on a reported window (one day), the wire's own limit.
-const FNO_STOCKS_MAX_WINDOW_SECS: i64 = 86_400;
+pub(super) const FNO_STOCKS_MAX_WINDOW_SECS: i64 = 86_400;
 
 /// The newest row may be at most this old for the answer to read `live`.
 pub const FNO_STOCKS_LIVE_MAX_AGE_SECS: i64 = 60;
@@ -99,11 +99,11 @@ pub const FNO_STOCKS_LIVE_MAX_AGE_SECS: i64 = 60;
 /// falling back to an older row. Same value as the spot price store's
 /// `FUTURE_TRADE_TIME_SKEW_SECS`; a row further ahead is a wrong clock and is
 /// still refused.
-const FNO_STOCKS_FUTURE_SKEW_SECS: i64 = 5;
+pub(super) const FNO_STOCKS_FUTURE_SKEW_SECS: i64 = 5;
 
 /// Upper bound on rows the query may return. The F&O list is about 220
 /// stocks; the bound only stops a malformed list from asking for more.
-const FNO_STOCKS_MAX_ROWS: usize = 1_000;
+pub(super) const FNO_STOCKS_MAX_ROWS: usize = 1_000;
 const FNO_STOCKS_QUERY_ROWS: usize = FNO_STOCKS_MAX_ROWS + 1;
 const FNO_ARTIFACT_MAX_BYTES: usize = 256 * 1024;
 
@@ -216,7 +216,7 @@ impl FnoUnderlyings {
     }
 
     /// Security ids on the list, ascending (all `NSE_EQ`).
-    fn sorted_ids(&self) -> Vec<u64> {
+    pub(super) fn sorted_ids(&self) -> Vec<u64> {
         let mut ids: Vec<u64> = self.names.keys().map(|(id, _)| *id).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -277,9 +277,55 @@ pub fn parse_fno_underlyings(bytes: &[u8]) -> Option<FnoUnderlyings> {
     Some(FnoUnderlyings { names })
 }
 
-/// The last list read, keyed by its path (the path carries the IST date).
-type FnoListCache = Option<(PathBuf, u64, SystemTime, Arc<FnoUnderlyings>)>;
-static FNO_LIST_CACHE: Mutex<FnoListCache> = Mutex::new(None);
+/// One cached file: its path, length, modification time and parsed value.
+type CachedFile<T> = (PathBuf, u64, SystemTime, Arc<T>);
+
+/// The two most recently read versions of a daily file, keyed by path (the
+/// path carries the IST date). Two slots so a chosen-minute read of another
+/// day does not evict today's list (plan PR MV review: one slot re-read and
+/// re-parsed today's file after every `as_of` request). O(1): two compares.
+pub(super) struct FileCache<T> {
+    slots: Mutex<[Option<CachedFile<T>>; 2]>,
+}
+
+impl<T> FileCache<T> {
+    pub(super) const fn new() -> Self {
+        Self {
+            slots: Mutex::new([None, None]),
+        }
+    }
+
+    /// The cached value for exactly this file version, moved to the front.
+    pub(super) fn get(&self, path: &Path, len: u64, modified: SystemTime) -> Option<Arc<T>> {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|(p, l, m, _)| p == path && *l == len && *m == modified)
+        })?;
+        slots.swap(0, at);
+        slots[0].as_ref().map(|(_, _, _, value)| Arc::clone(value))
+    }
+
+    /// Stores a freshly read version at the front: it replaces an older
+    /// version of the same path, else the least recently used slot.
+    pub(super) fn put(&self, path: &Path, len: u64, modified: SystemTime, value: Arc<T>) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = slots
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|(p, _, _, _)| p == path))
+            .unwrap_or(1);
+        slots[at] = Some((path.to_path_buf(), len, modified, value));
+        slots.swap(0, at);
+    }
+}
+
+static FNO_LIST_CACHE: FileCache<FnoUnderlyings> = FileCache::new();
 
 /// Loads the day's list, re-reading after path, length or modification time
 /// changes. Missing or invalid replacement files never reuse a cached list. `None` when the file is missing,
@@ -291,15 +337,8 @@ pub(super) fn load_fno_underlyings(path: &Path) -> Option<Arc<FnoUnderlyings>> {
         return None;
     }
     let modified = metadata.modified().ok()?;
-    let mut slot = FNO_LIST_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_path, len, mtime, list)) = slot.as_ref()
-        && cached_path == path
-        && *len == metadata.len()
-        && *mtime == modified
-    {
-        return Some(Arc::clone(list));
+    if let Some(list) = FNO_LIST_CACHE.get(path, metadata.len(), modified) {
+        return Some(list);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
@@ -311,12 +350,7 @@ pub(super) fn load_fno_underlyings(path: &Path) -> Option<Arc<FnoUnderlyings>> {
         return None;
     }
     let list = Arc::new(list);
-    *slot = Some((
-        path.to_path_buf(),
-        metadata.len(),
-        modified,
-        Arc::clone(&list),
-    ));
+    FNO_LIST_CACHE.put(path, metadata.len(), modified, Arc::clone(&list));
     Some(list)
 }
 
@@ -330,7 +364,7 @@ pub(super) fn now_ist_naive() -> chrono::NaiveDateTime {
 /// ended instead of the last 15 minutes. Measured 2026-11-03 on the live box:
 /// 743 NSE_EQ stocks over 09:15–15:40 answered inside the portal's 4 s round
 /// trip. Stays under the helper's 12 s capture bound.
-const FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS: u64 = 8;
+pub(super) const FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS: u64 = 8;
 
 /// The session whose final stored prices the movers show while the market is
 /// closed: `[date 09:15, min(now, date 15:40)]` IST. Owner, 2026-11-03: the
@@ -338,7 +372,7 @@ const FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS: u64 = 8;
 /// the close. `None` before the date's 09:15 (nothing traded yet that day).
 /// A weekend or holiday yields a window with no rows, which reads `closed`.
 #[must_use]
-fn closed_session_window(
+pub(super) fn closed_session_window(
     now_ist: chrono::NaiveDateTime,
 ) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
     let midnight = now_ist.date().and_time(chrono::NaiveTime::MIN);
@@ -349,7 +383,7 @@ fn closed_session_window(
 
 /// Start of the query window: `now − window`, never before IST midnight.
 #[must_use]
-fn window_start(now_ist: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+pub(super) fn window_start(now_ist: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
     let midnight = now_ist.date().and_time(chrono::NaiveTime::MIN);
     let start = now_ist - chrono::Duration::seconds(FNO_STOCKS_WINDOW_SECS);
     start.max(midnight)
@@ -358,10 +392,11 @@ fn window_start(now_ist: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
 /// The movers SQL. Every interpolated value is a number or a constant; no
 /// caller text reaches it.
 #[must_use]
-fn build_fno_stocks_sql(
+pub(super) fn build_fno_stocks_sql(
     ids: &[u64],
     window_start_ist: chrono::NaiveDateTime,
     window_end_ist: Option<chrono::NaiveDateTime>,
+    row_limit: usize,
 ) -> String {
     let id_list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
     let end = window_end_ist.map_or_else(String::new, |end| {
@@ -371,7 +406,7 @@ fn build_fno_stocks_sql(
         "SELECT security_id, segment, ltp, close, volume, avg_price, ts FROM ticks \
          WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}'{end} \
          AND security_id IN ({id_list}) \
-         LATEST ON ts PARTITION BY security_id, segment LIMIT {FNO_STOCKS_QUERY_ROWS}",
+         LATEST ON ts PARTITION BY security_id, segment LIMIT {row_limit}",
         segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ),
         window_start_ist.format("%Y-%m-%dT%H:%M:%S%.6fZ"),
     )
@@ -379,14 +414,14 @@ fn build_fno_stocks_sql(
 
 /// One parsed `ticks` row.
 #[derive(Debug, Clone, PartialEq)]
-struct TickRow {
-    security_id: u64,
-    segment_code: u8,
-    ltp: f64,
-    close: Option<f64>,
-    volume: Option<u64>,
-    avg_price: Option<f64>,
-    ts: chrono::NaiveDateTime,
+pub(super) struct TickRow {
+    pub(super) security_id: u64,
+    pub(super) segment_code: u8,
+    pub(super) ltp: f64,
+    pub(super) close: Option<f64>,
+    pub(super) volume: Option<u64>,
+    pub(super) avg_price: Option<f64>,
+    pub(super) ts: chrono::NaiveDateTime,
 }
 
 /// Parses one row in [`build_fno_stocks_sql`] column order. `None` for a row
@@ -406,8 +441,8 @@ fn parse_tick_row(row: &[serde_json::Value]) -> Option<TickRow> {
 }
 
 /// Why the query gave no rows.
-#[derive(Debug, PartialEq, Eq)]
-enum QueryFailure {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueryFailure {
     /// No answer (refused, timed out).
     Unreachable,
     /// An answer that was an error or not a dataset.
@@ -416,11 +451,13 @@ enum QueryFailure {
 
 /// Runs the movers query. Malformed rows are skipped (counted by the caller
 /// as unpriced), a malformed body is a failure.
-async fn query_fno_rows(
+pub(super) async fn query_fno_rows(
     client: &reqwest::Client,
     base_url: &str,
     sql: &str,
     timeout: Duration,
+    max_rows: usize,
+    body_limit: usize,
 ) -> Result<Vec<TickRow>, QueryFailure> {
     let mut resp = client
         .get(format!("{base_url}/exec"))
@@ -432,24 +469,33 @@ async fn query_fno_rows(
     if !resp.status().is_success() {
         return Err(QueryFailure::Refused);
     }
-    const BODY_LIMIT: usize = tickvault_common::operator_movers_wire::MAX_SOURCE_BYTES;
-    if resp.content_length().is_some_and(|n| n > BODY_LIMIT as u64) {
+    if resp.content_length().is_some_and(|n| n > body_limit as u64) {
         return Err(QueryFailure::Refused);
     }
-    let mut bytes = Vec::with_capacity(BODY_LIMIT);
+    let mut bytes = Vec::with_capacity(body_limit);
     while let Some(chunk) = resp.chunk().await.map_err(|_| QueryFailure::Refused)? {
-        if chunk.len() > BODY_LIMIT.saturating_sub(bytes.len()) {
+        if chunk.len() > body_limit.saturating_sub(bytes.len()) {
             return Err(QueryFailure::Refused);
         }
         bytes.extend_from_slice(&chunk);
     }
+    // Parsing up to two lists' worth of JSON is CPU work: it runs on the
+    // blocking pool, never on a runtime worker (plan PR MV review).
+    tokio::task::spawn_blocking(move || parse_query_body(&bytes, max_rows))
+        .await
+        .map_err(|_| QueryFailure::Refused)?
+}
+
+/// Parses a QuestDB `/exec` body into rows. Malformed rows are skipped, a
+/// malformed body or more than `max_rows` rows is a failure. O(bytes).
+fn parse_query_body(bytes: &[u8], max_rows: usize) -> Result<Vec<TickRow>, QueryFailure> {
     let body: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| QueryFailure::Refused)?;
+        serde_json::from_slice(bytes).map_err(|_| QueryFailure::Refused)?;
     let dataset = body
         .get("dataset")
         .and_then(serde_json::Value::as_array)
         .ok_or(QueryFailure::Refused)?;
-    if dataset.len() > FNO_STOCKS_MAX_ROWS {
+    if dataset.len() > max_rows {
         return Err(QueryFailure::Refused);
     }
     Ok(dataset
@@ -484,7 +530,7 @@ fn value_crore(volume: Option<u64>, avg_price: Option<f64>) -> Option<f64> {
 
 /// Builds the page rows from the query rows: drops rows not on the list
 /// (another segment with the same id included), sorts by change % descending.
-fn build_rows(list: &FnoUnderlyings, rows: Vec<TickRow>) -> Vec<FnoStockRow> {
+pub(super) fn build_rows(list: &FnoUnderlyings, rows: Vec<TickRow>) -> Vec<FnoStockRow> {
     let mut out: Vec<FnoStockRow> = rows
         .into_iter()
         .filter_map(|r| {
@@ -508,11 +554,17 @@ fn build_rows(list: &FnoUnderlyings, rows: Vec<TickRow>) -> Vec<FnoStockRow> {
         })
         .collect();
     // O(k log k), k ≤ the list size.
-    out.sort_by(|a, b| match (a.change_pct, b.change_pct) {
-        (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.name.cmp(&b.name),
+    // Security id breaks a name tie, so the order never depends on the
+    // database's row order (plan PR MV: the universe's union query and the
+    // per-list query return rows in different orders).
+    out.sort_by(|a, b| {
+        match (a.change_pct, b.change_pct) {
+            (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        }
+        .then_with(|| a.security_id.cmp(&b.security_id))
     });
     out
 }
@@ -572,7 +624,12 @@ pub(super) async fn compute_for_list(
         window_start(inputs.now_ist),
         inputs.now_ist + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS),
     ));
-    let sql = build_fno_stocks_sql(&list.sorted_ids(), start, closed_window.map(|w| w.1));
+    let sql = build_fno_stocks_sql(
+        &list.sorted_ids(),
+        start,
+        closed_window.map(|w| w.1),
+        FNO_STOCKS_QUERY_ROWS,
+    );
     let timeout = if open {
         inputs.timeout
     } else {
@@ -580,7 +637,16 @@ pub(super) async fn compute_for_list(
             .timeout
             .max(Duration::from_secs(FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS))
     };
-    let rows = match query_fno_rows(inputs.client, inputs.base_url, &sql, timeout).await {
+    let rows = match query_fno_rows(
+        inputs.client,
+        inputs.base_url,
+        &sql,
+        timeout,
+        FNO_STOCKS_MAX_ROWS,
+        tickvault_common::operator_movers_wire::MAX_SOURCE_BYTES,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(QueryFailure::Unreachable) => {
             return FnoStocksResponse::empty("unreachable", open, total, observed_at_epoch_secs);
@@ -751,7 +817,12 @@ pub(super) mod tests {
 
     #[test]
     fn test_build_fno_stocks_sql_is_bounded_keyed_and_constant() {
-        let sql = build_fno_stocks_sql(&[1594, 2885], window_start(at(NOW)), None);
+        let sql = build_fno_stocks_sql(
+            &[1594, 2885],
+            window_start(at(NOW)),
+            None,
+            FNO_STOCKS_QUERY_ROWS,
+        );
         assert!(
             sql.contains("FROM ticks WHERE segment = 'NSE_EQ' AND feed = 'dhan'"),
             "{sql}"
@@ -909,14 +980,24 @@ pub(super) mod tests {
     #[test]
     fn test_closed_sql_carries_the_upper_bound_and_live_sql_does_not() {
         let end = at("2026-10-30 15:40:00");
-        let closed = build_fno_stocks_sql(&[1594], at("2026-10-30 09:15:00"), Some(end));
+        let closed = build_fno_stocks_sql(
+            &[1594],
+            at("2026-10-30 09:15:00"),
+            Some(end),
+            FNO_STOCKS_QUERY_ROWS,
+        );
         assert!(
             closed.contains(
                 "ts >= '2026-10-30T09:15:00.000000Z' AND ts <= '2026-10-30T15:40:00.000000Z'"
             ),
             "{closed}"
         );
-        let live = build_fno_stocks_sql(&[1594], at("2026-10-30 09:15:00"), None);
+        let live = build_fno_stocks_sql(
+            &[1594],
+            at("2026-10-30 09:15:00"),
+            None,
+            FNO_STOCKS_QUERY_ROWS,
+        );
         assert!(!live.contains("ts <="), "{live}");
     }
 
