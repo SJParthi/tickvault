@@ -9551,6 +9551,9 @@ impl DepthIngest {
             .spawn(move || {
                 while let Ok(batch) = rescue_rx.recv() {
                     rescue_sink.rescue(&batch);
+                    // PF-4b: the spent staged batch goes back to the drain's
+                    // spare lane, cleared (its name pins dropped) here.
+                    rescue_sink.recycle(batch);
                 }
                 info!("depth rescue thread exiting — the drain closed its queue");
             })?;
@@ -9734,14 +9737,15 @@ impl DepthIngest {
     }
 
     /// The array-row writer's buffered bytes (binary ILP v2), empty when array
-    /// rows are off.
+    /// rows are off. PF-4b (2026-11-06): the book rows are staged, so this
+    /// writes them as the writer thread will (allocates; tests only).
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the array-row drain tests.
-    pub fn pending_book_bytes(&self) -> &[u8] {
+    pub fn pending_book_bytes(&self) -> Vec<u8> {
         if self.book.is_some() {
-            self.writer.buffer_bytes()
+            self.writer.pending_ilp_bytes()
         } else {
-            &[]
+            Vec::new()
         }
     }
 
@@ -22025,14 +22029,14 @@ mod tests {
             "{:?}",
             &bytes[..20]
         );
-        assert!(holds(bytes, b"depth_kind=d20"));
+        assert!(holds(&bytes, b"depth_kind=d20"));
         let expected: Vec<f64> = (0..20).map(|i| 100.0 + f64::from(i)).collect();
         assert!(
-            holds(bytes, &le_prices(&expected)),
+            holds(&bytes, &le_prices(&expected)),
             "all 20 prices, best first, contiguous in the price array"
         );
         assert!(
-            !String::from_utf8_lossy(bytes).contains("market_depth,"),
+            !String::from_utf8_lossy(&bytes).contains("market_depth,"),
             "nothing goes to the level table for a frame after the switch"
         );
     }
@@ -22062,7 +22066,7 @@ mod tests {
         let mut expected: Vec<f64> = (0..20).map(|i| 100.0 + f64::from(i)).collect();
         expected[3] = f64::NAN;
         assert!(
-            holds(depth.pending_book_bytes(), &le_prices(&expected)),
+            holds(&depth.pending_book_bytes(), &le_prices(&expected)),
             "the refused level keeps its slot as NaN; later levels do not shift"
         );
     }
@@ -29299,7 +29303,7 @@ mod inline_depth_tests {
             "one bid row and one ask row, counted as their ten levels"
         );
         let bytes = sink.pending_book_bytes();
-        let text = String::from_utf8_lossy(bytes);
+        let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("depth_kind=d5"));
         assert!(text.contains("side=bid") && text.contains("side=ask"));
         // f32_to_f64_clean: 10.2, never 10.199999809265137.

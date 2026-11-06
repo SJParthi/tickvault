@@ -21,6 +21,9 @@
 //!   - `feed_drain/main_feed_full_frame_4_own`: identical Full bytes and
 //!     depth path through the existing Own tick encoder. The original Full
 //!     case remains Library; the production default remains unchanged.
+//!   - `feed_drain/main_feed_full_frame_4_own_nodepth` (PF-4b, 2026-11-06):
+//!     the same Full bytes with no inline depth, so the depth share of the
+//!     Full drain is a measurement (budget: the Full key it matches).
 //!   - `feed_drain/depth20_frame_4x20`: one frame stacking four depth-20
 //!     packets (80 levels). Budget per level.
 //!   - `feed_drain/depth200_packet`: one depth-200 packet (200 levels).
@@ -492,6 +495,32 @@ fn bench_feed_drain(c: &mut Criterion) {
                 iters,
                 &full_frames,
                 || full_ingest(TickIlpEncoder::Own),
+                |ingest, frame, i| {
+                    black_box(drain_main_feed_frame(
+                        ingest,
+                        black_box(frame),
+                        SESSION_RECEIPT_NANOS,
+                        1_000 + i,
+                        drain_counters,
+                    ));
+                },
+            )
+        });
+    });
+
+    // PF-4b (2026-11-06): the same Full frames with NO inline depth, so the
+    // depth share of the Full drain is measured rather than assumed.
+    c.bench_function("feed_drain/main_feed_full_frame_4_own_nodepth", |b| {
+        b.iter_custom(|iters| {
+            run_timed(
+                iters,
+                &full_frames,
+                || {
+                    LiveIngest::new(
+                        TickWriter::for_test_with_encoder(Feed::Dhan, TickIlpEncoder::Own),
+                        8,
+                    )
+                },
                 |ingest, frame, i| {
                     black_box(drain_main_feed_frame(
                         ingest,

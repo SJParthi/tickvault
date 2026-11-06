@@ -226,13 +226,19 @@ pub(super) fn append_random_side(
 }
 
 /// The batch's ILP bytes exactly as the writer thread would send them.
+/// (PF-4b: the text buffer, then the staged rows as the writer thread
+/// writes them; before PF-4b the text buffer alone.)
 fn flush_bytes(batch: &DepthFlushBatch) -> Vec<u8> {
-    batch.buffer.as_bytes().to_vec()
+    let mut out = batch.buffer.as_bytes().to_vec();
+    out.extend_from_slice(&batch.staged.encode_readonly(Feed::Dhan));
+    out
 }
 
 /// The rescue batch's ILP bytes exactly as the rescue thread would spill them.
 fn rescue_bytes(batch: &DepthRescueBatch) -> Vec<u8> {
-    batch.buffer.as_bytes().to_vec()
+    let mut out = batch.buffer.as_bytes().to_vec();
+    out.extend_from_slice(&batch.staged.encode_readonly(Feed::Dhan));
+    out
 }
 
 /// Runs one seeded stream through a split book writer; returns its batches.

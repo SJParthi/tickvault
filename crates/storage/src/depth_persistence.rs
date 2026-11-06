@@ -1149,10 +1149,81 @@ const _: () = assert!(
 
 /// An empty row buffer for `layout`, reserved to its pre-size. One
 /// allocation, at construction; never per row.
+/// PF-4b (2026-11-06): a book writer stages its rows, so its producer text
+/// buffer (the cold paths' scratch) is NOT reserved; the pre-size now sizes
+/// the writer thread's encode buffer and the staged batch.
 fn presized_depth_row_buffer(layout: DepthLayout) -> Buffer {
     let mut buffer = Buffer::new(layout.protocol());
-    buffer.reserve(layout.row_buffer_presize_bytes());
+    if layout == DepthLayout::Levels {
+        buffer.reserve(layout.row_buffer_presize_bytes());
+    }
     buffer
+}
+
+/// Writes one `market_depth_book` array-row line into `buffer` (ILP v2).
+///
+/// The line writer the drain used until PF-4b (2026-11-06), moved out of
+/// `DepthWriter` unchanged so the writer and rescue threads write the same
+/// bytes: only the contract name now arrives as an argument (`name`, the
+/// value the drain's per-run cache used to hold) instead of being read from
+/// that cache. Callers wrap it in a marker so a refused row leaves the
+/// buffer as it was. O(levels).
+pub(crate) fn write_book_line_into(
+    buffer: &mut Buffer,
+    feed: Feed,
+    row: &DepthBookRow<'_>,
+    levels: usize,
+    name: Option<&str>,
+) -> Result<()> {
+    let feed = feed.as_str();
+    // Same closed sets as the level writer, proven ILP-safe at compile
+    // time by the `const _` block; see `append_row_inner`.
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.segment));
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        row.depth_kind
+    ));
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.side));
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
+    buffer
+        .table(depth_table(MARKET_DEPTH_BOOK_TABLE))
+        .context("table")?
+        .symbol(depth_col("segment"), row.segment)
+        .context("segment")?
+        .symbol(depth_col("depth_kind"), row.depth_kind)
+        .context("depth_kind")?
+        .symbol(depth_col("side"), row.side)
+        .context("side")?
+        .symbol(depth_col("feed"), feed)
+        .context("feed")?;
+    // `contract`, resolved once per instrument run by the drain; omitted
+    // (NULL) when the day's table does not know it.
+    if let Some(name) = name {
+        // Made ILP-safe once at publish (J1, 2026-10-26), so the stored
+        // name is written as it is; no per-row scan.
+        debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
+        buffer
+            .symbol(depth_col("contract"), name)
+            .context("contract")?;
+    }
+    buffer
+        .column_i64(depth_col("security_id"), row.security_id)
+        .context("security_id")?
+        .column_i64(
+            depth_col("levels"),
+            i64::try_from(levels).unwrap_or(i64::MAX),
+        )
+        .context("levels")?
+        .column_arr(depth_col("price"), &row.prices)
+        .context("price")?
+        .column_arr(depth_col("quantity"), &row.quantities)
+        .context("quantity")?
+        .column_arr(depth_col("orders"), &row.orders)
+        .context("orders")?
+        .column_i64(depth_col("capture_seq"), row.capture_seq)
+        .context("capture_seq")?
+        .at(TimestampNanos::new(row.ts_nanos))
+        .context("designated timestamp")?;
+    Ok(())
 }
 
 /// One side of one depth packet, prepared for an array-row append.
@@ -2012,6 +2083,21 @@ pub struct DepthWriter {
     /// Cleared on every flush, so a table republished mid-session is picked
     /// up at the next batch at the latest.
     contract_label: Option<(i64, &'static str, Option<std::sync::Arc<str>>)>,
+    /// PF-4b (2026-11-06): the staged `market_depth_book` rows, written as
+    /// ILP text by the thread that needs it (see [`crate::depth_stage`]).
+    /// Always empty on a level writer, whose rows are still text in `buffer`.
+    staged: crate::depth_stage::DepthStagedBatch,
+    /// PF-4b: the book writer's per-run name cache, the twin of
+    /// `contract_label`: `(security_id, segment, pin, name length)`, where
+    /// `pin` names the table in `staged` the run's name came from. Cleared
+    /// at the same points as `contract_label`.
+    book_label: Option<(i64, &'static str, u8, Option<usize>)>,
+    /// PF-4b: spent staged batches coming back from the writer and rescue
+    /// threads (cleared there), so a hand-off does not reserve a fresh one.
+    spare_staged: Option<std::sync::mpsc::Receiver<crate::depth_stage::DepthStagedBatch>>,
+    /// PF-4b: the return lane's sender, kept so the rescue split can hand a
+    /// clone to the rescue thread.
+    spare_staged_tx: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
 }
 
 /// A unique temp spill directory, so a test writer never touches
@@ -2183,7 +2269,11 @@ impl DepthWriter {
             Ok(s) => {
                 let mut b = s.new_buffer();
                 // DT-A2: reserved up front, so no batch regrows on the drain.
-                b.reserve(layout.row_buffer_presize_bytes());
+                // PF-4b: a book writer's drain stages rows instead; its text
+                // buffer is only the cold paths' scratch and stays empty.
+                if layout == DepthLayout::Levels {
+                    b.reserve(layout.row_buffer_presize_bytes());
+                }
                 Self {
                     layout,
                     sender: Some(s),
@@ -2208,6 +2298,10 @@ impl DepthWriter {
                     flush_counters: DepthFlushCounters::new(feed),
                     spare_buffers: None,
                     contract_label: None,
+                    staged: crate::depth_stage::DepthStagedBatch::for_layout(layout),
+                    book_label: None,
+                    spare_staged: None,
+                    spare_staged_tx: None,
                 }
             }
             Err(err) => {
@@ -2240,6 +2334,10 @@ impl DepthWriter {
                     flush_counters: DepthFlushCounters::new(feed),
                     spare_buffers: None,
                     contract_label: None,
+                    staged: crate::depth_stage::DepthStagedBatch::for_layout(layout),
+                    book_label: None,
+                    spare_staged: None,
+                    spare_staged_tx: None,
                 }
             }
         }
@@ -2278,6 +2376,10 @@ impl DepthWriter {
             flush_counters: DepthFlushCounters::new(feed),
             spare_buffers: None,
             contract_label: None,
+            staged: crate::depth_stage::DepthStagedBatch::new(),
+            book_label: None,
+            spare_staged: None,
+            spare_staged_tx: None,
         }
     }
 
@@ -2289,6 +2391,7 @@ impl DepthWriter {
         Self {
             layout: DepthLayout::Book,
             buffer: presized_depth_row_buffer(DepthLayout::Book),
+            staged: crate::depth_stage::DepthStagedBatch::for_layout(DepthLayout::Book),
             ..Self::for_test(feed)
         }
     }
@@ -2376,14 +2479,30 @@ impl DepthWriter {
     // see their own label mapping.
     // TEST-EXEMPT: observability accessor, asserted by the tests it enables.
     pub fn buffer_utf8(&self) -> String {
-        String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
+        String::from_utf8(self.pending_ilp_bytes()).unwrap_or_default()
     }
 
     /// The buffered bytes as written, for a binary ILP v2 (array-row) buffer
     /// that `buffer_utf8` cannot show. Borrowed, no copy.
+    ///
+    /// ⚠ PF-4b (2026-11-06): a book writer STAGES its rows, so this text
+    /// buffer is empty on it outside a cold-path encode; read
+    /// [`Self::pending_ilp_bytes`] for the rows it holds.
     #[must_use]
     pub fn buffer_bytes(&self) -> &[u8] {
         self.buffer.as_bytes()
+    }
+
+    /// The ILP bytes the pending rows will be written as: the text buffer,
+    /// then (book writer) the staged rows encoded exactly as the writer
+    /// thread will encode them. Tests and diagnostics only: allocates,
+    /// O(pending bytes); touches no counter.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the book drain tests and the PF-4b oracle.
+    pub fn pending_ilp_bytes(&self) -> Vec<u8> {
+        let mut out = self.buffer.as_bytes().to_vec();
+        out.extend_from_slice(&self.staged.encode_readonly(self.feed));
+        out
     }
 
     /// Marks the pending rows as having NO write-ahead-log record behind them
@@ -2461,14 +2580,16 @@ impl DepthWriter {
     /// ([`DEPTH_BOOK_FLUSH_BYTES`]), never on a row count.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.buffer.len()
+        // PF-4b: a book writer's rows are staged; their EXACT text size is
+        // kept as they are staged, so this reads what the buffer would hold.
+        self.buffer.len().saturating_add(self.staged.text_bytes())
     }
 
     /// True once an array-row buffer has reached [`DEPTH_BOOK_FLUSH_BYTES`].
     /// Always false for a level writer, which keeps its row threshold.
     #[must_use]
     pub fn book_flush_due(&self) -> bool {
-        self.layout == DepthLayout::Book && self.buffer.len() >= DEPTH_BOOK_FLUSH_BYTES
+        self.layout == DepthLayout::Book && self.pending_bytes() >= DEPTH_BOOK_FLUSH_BYTES
     }
 
     /// Appends one side of one depth packet as ONE array row to
@@ -2516,21 +2637,35 @@ impl DepthWriter {
                 MAX_DEPTH_BOOK_LEVELS
             );
         }
-        // A marker before the line, so an error part-way through rewinds the
-        // half-written line instead of leaving it to fail every later row.
-        self.buffer.set_marker().context("marker")?;
-        if let Err(err) = self.write_book_line(row, levels) {
-            // Cannot fail: the marker was set just above. If it ever did, the
-            // half line stays, the next flush fails on it, and that flush's
-            // rescue keeps every buffered row; nothing is discarded here.
-            return Err(match self.buffer.rewind_to_marker() {
-                Ok(()) => err,
-                Err(rewind_err) => err
-                    .context(rewind_err)
-                    .context("depth book append: rewinding the half-written line also failed"),
-            });
+        // PF-4b (2026-11-06): the row is STAGED here and written as ILP text
+        // by the thread that needs it (see `crate::depth_stage`). The contract
+        // name is resolved once per instrument run exactly as before, but the
+        // cache records the name TABLE (as a pin in the batch) instead of the
+        // name, so the encoder later reads the same name the old line held.
+        let hit = matches!(
+            &self.book_label,
+            Some((id, seg, _, _)) if *id == row.security_id && *seg == row.segment
+        );
+        if !hit {
+            let labels = crate::candle_contract_labels::candle_contract_labels();
+            let name_len = labels
+                .get(&(row.security_id, row.segment))
+                .map(|n| crate::depth_stage::escaped_symbol_len(n));
+            let pin = match self.staged.try_pin(labels) {
+                Ok(pin) => pin,
+                Err(labels) => self.stage_pin_after_cut(labels),
+            };
+            self.book_label = Some((row.security_id, row.segment, pin, name_len));
         }
-        self.buffer.clear_marker();
+        let (pin, name_len) = match &self.book_label {
+            Some((_, _, pin, name_len)) => (*pin, *name_len),
+            None => (0, None),
+        };
+        let text_len = crate::depth_stage::book_line_len(self.feed, row, levels, name_len);
+        if self.staged.push(row, pin, text_len) {
+            // Past the pre-size: one reallocation on the drain, counted.
+            self.flush_counters.stage_grow.increment(1);
+        }
         // Counted in LEVELS, the unit the level layout counts, so every
         // flush, rescue and loss counter reads the same whichever table is
         // written. A side with no levels still counts one, so a buffered row
@@ -2540,69 +2675,55 @@ impl DepthWriter {
         Ok(())
     }
 
-    /// Writes one array-row line into the buffer. Only
-    /// [`Self::append_book_row_inner`] calls it, inside a marker.
-    fn write_book_line(&mut self, row: &DepthBookRow<'_>, levels: usize) -> Result<()> {
-        let feed = self.feed.as_str();
-        // Same closed sets as the level writer, proven ILP-safe at compile
-        // time by the `const _` block; see `append_row_inner`.
-        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.segment));
-        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
-            row.depth_kind
-        ));
-        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.side));
-        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
-        self.buffer
-            .table(depth_table(MARKET_DEPTH_BOOK_TABLE))
-            .context("table")?
-            .symbol(depth_col("segment"), row.segment)
-            .context("segment")?
-            .symbol(depth_col("depth_kind"), row.depth_kind)
-            .context("depth_kind")?
-            .symbol(depth_col("side"), row.side)
-            .context("side")?
-            .symbol(depth_col("feed"), feed)
-            .context("feed")?;
-        // `contract`, resolved once per instrument run exactly as the level
-        // writer does; omitted (NULL) when the day's table does not know it.
-        let hit = matches!(
-            &self.contract_label,
-            Some((id, seg, _)) if *id == row.security_id && *seg == row.segment
-        );
-        if !hit {
-            let labels = crate::candle_contract_labels::candle_contract_labels();
-            let name = labels
-                .get(&(row.security_id, row.segment))
-                .map(std::sync::Arc::clone);
-            self.contract_label = Some((row.security_id, row.segment, name));
+    /// A ninth contract-name table arrived inside one staged batch (PF-4b,
+    /// the depth twin of `TickWriter::pin_after_cut`): the batch is handed
+    /// off early, then the table is pinned in the fresh batch. A hand-off the
+    /// full queue refuses is rescued through `discard_pending` (durable,
+    /// counted), never dropped. Counted on `tv_depth_stage_pin_cut_total`.
+    /// Cold: names are published a few times a day.
+    #[cold]
+    fn stage_pin_after_cut(
+        &mut self,
+        labels: arc_swap::Guard<
+            std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>,
+        >,
+    ) -> u8 {
+        self.flush_counters.stage_pin_cut.increment(1);
+        // The unbacked mark is set for a frame BEFORE its rows are staged; a
+        // cut on that frame's first row hands the old batch off and clears
+        // the mark, so keep it (a stale `true` costs an inline spill, never a
+        // row; PF-4 review round 1).
+        let unbacked = self.pending_unbacked;
+        // The cut is on a cache miss: the cached run is over either way.
+        self.book_label = None;
+        if self.offload.is_some() {
+            if let DepthOffloadOutcome::QueueFull(_) = self.offload_flush() {
+                self.retained_spans = 0;
+                let _rescued = self.discard_pending();
+            }
+        } else {
+            // The synchronous arm: sends, or rescues the rows on failure.
+            let _sent_or_rescued = self.flush().is_ok();
         }
-        if let Some((_, _, Some(name))) = &self.contract_label {
-            // Made ILP-safe once at publish (J1, 2026-10-26), so the stored
-            // name is written as it is; no per-row scan.
-            debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
-            self.buffer
-                .symbol(depth_col("contract"), &**name)
-                .context("contract")?;
+        self.pending_unbacked |= unbacked;
+        match self.staged.try_pin(labels) {
+            Ok(pin) => pin,
+            Err(labels) => {
+                // A split writer keeps a batch's pins when the drain clears
+                // its rows (a WAL deferral, an inline spill), so the batch can
+                // come back with no rows and every slot full of tables no row
+                // uses. Rescue any rows still held, then drop those stale
+                // pins: the ONE place the drain releases pins, reached only
+                // when a ninth table arrives while the writer queue refused
+                // the hand-off.
+                let unbacked = self.pending_unbacked;
+                let _rescued = self.discard_pending();
+                self.pending_unbacked |= unbacked;
+                self.book_label = None;
+                self.staged.clear();
+                self.staged.try_pin(labels).unwrap_or(0)
+            }
         }
-        self.buffer
-            .column_i64(depth_col("security_id"), row.security_id)
-            .context("security_id")?
-            .column_i64(
-                depth_col("levels"),
-                i64::try_from(levels).unwrap_or(i64::MAX),
-            )
-            .context("levels")?
-            .column_arr(depth_col("price"), &row.prices)
-            .context("price")?
-            .column_arr(depth_col("quantity"), &row.quantities)
-            .context("quantity")?
-            .column_arr(depth_col("orders"), &row.orders)
-            .context("orders")?
-            .column_i64(depth_col("capture_seq"), row.capture_seq)
-            .context("capture_seq")?
-            .at(TimestampNanos::new(row.ts_nanos))
-            .context("designated timestamp")?;
-        Ok(())
     }
 
     fn append_row_inner(&mut self, row: &DepthRow) -> Result<()> {
@@ -2779,6 +2900,12 @@ impl DepthWriter {
     /// frame path; never per tick or per row. Before, that path allocated
     /// nothing there and the next batch's appends did the regrowing instead.
     fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
+        if self.layout == DepthLayout::Book {
+            // PF-4b: a book writer's batch is its staged rows; its text
+            // buffer is the cold paths' scratch and is never reserved.
+            self.install_spare_staged();
+            return;
+        }
         if let Some(spares) = self.spare_buffers.as_ref()
             && let Ok(mut spare) = spares.try_recv()
             && spare.protocol_version() == protocol
@@ -2802,6 +2929,72 @@ impl DepthWriter {
             }
             self.buffer.reserve(presize.saturating_sub(have));
         }
+    }
+
+    /// PF-4b: replaces the just-handed-off staged batch with a spare from
+    /// the writer or rescue thread (already cleared there, pins dropped
+    /// there), or reserves a fresh one. One allocation per spare-less
+    /// hand-off, never per row; `try_recv`, never a wait.
+    fn install_spare_staged(&mut self) {
+        if self.staged.is_empty()
+            && let Some(spares) = self.spare_staged.as_ref()
+            && let Ok(spare) = spares.try_recv()
+        {
+            self.staged = spare;
+        }
+        self.staged.reserve_presize();
+    }
+
+    /// PF-4b: the name table the running instrument's cached name came
+    /// from, taken (one `Arc` increment) before its batch leaves, so the next
+    /// row of the same run reads the same name from the next batch (the old
+    /// cache held the name itself across a hand-off). `None` with no run.
+    fn carry_cached_table(
+        &self,
+    ) -> Option<std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>> {
+        let (_, _, pin, _) = self.book_label.as_ref()?;
+        self.staged.pinned_table(*pin)
+    }
+
+    /// PF-4b: pins a carried table in the fresh batch and points the run
+    /// cache at it. A fresh batch has free pin slots; if it somehow has none
+    /// the cache is cleared, so the next row resolves its name again.
+    fn repin_carried_table(
+        &mut self,
+        carry: Option<std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>>,
+    ) {
+        let Some(table) = carry else {
+            return;
+        };
+        match self.staged.pin_table(table) {
+            Ok(pin) => {
+                if let Some((_, _, cached_pin, _)) = self.book_label.as_mut() {
+                    *cached_pin = pin;
+                }
+            }
+            Err(_table) => self.book_label = None,
+        }
+    }
+
+    /// PF-4b: writes the staged rows into the text buffer, on the drain's
+    /// COLD paths only (the inline spill, the unsplit synchronous flush),
+    /// inside `off_worker`. A row the encoder refuses is counted there and
+    /// leaves `pending`. Returns the levels refused. Pins are kept (the
+    /// drain never drops them). O(staged bytes).
+    fn materialize_staged(&mut self) -> usize {
+        if self.staged.is_empty() {
+            return 0;
+        }
+        let feed = self.feed;
+        let staged = &mut self.staged;
+        let buffer = &mut self.buffer;
+        crate::off_worker::off_worker(|| {
+            let _written = staged.encode_into(feed, buffer);
+        });
+        let refused = self.staged.refused_levels();
+        self.staged.clear_rows();
+        self.pending = self.pending.saturating_sub(refused);
+        refused
     }
 
     /// Rescues every buffered-but-unflushed row to the depth spill tier, then
@@ -2860,12 +3053,14 @@ impl DepthWriter {
         let rows = self.pending;
         if rows == 0 {
             self.buffer.clear();
+            self.staged.clear_rows();
             return 0;
         }
 
         // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
         // MOVED, and the replacement is the same empty one `offload_flush`
-        // already installs on every successful hand-off.
+        // already installs on every successful hand-off. PF-4b: a book
+        // writer's staged batch moves the same way.
         // H4: older parked batches go to the thread first.
         self.retry_parked_rescue();
         let range = self.take_pending_range();
@@ -2883,8 +3078,10 @@ impl DepthWriter {
                 range.0,
                 range.1,
             );
+            let carry = self.carry_cached_table();
             let batch = DepthRescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+                staged: std::mem::take(&mut self.staged),
                 rows,
                 min_seq: range.0,
                 max_seq: range.1,
@@ -2907,6 +3104,7 @@ impl DepthWriter {
                     // The buffer left with the rescue batch; reuse a spare
                     // from the writer thread instead of regrowing from zero.
                     self.install_spare_buffer(protocol);
+                    self.repin_carried_table(carry);
                     return rows;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -2921,6 +3119,7 @@ impl DepthWriter {
                         self.pending = 0;
                         self.dropped = self.dropped.saturating_add(rows as u64);
                         self.install_spare_buffer(protocol);
+                        self.repin_carried_table(carry);
                         return rows;
                     }
                     // Never reached the thread: retract its floor; the arms
@@ -2929,6 +3128,7 @@ impl DepthWriter {
                         wm.release_rescue_floor(floor);
                     }
                     self.buffer = returned.buffer;
+                    self.staged = returned.staged;
                     self.flush_counters.rescue_fallback_queue_full.increment(1);
                     rescue_unavailable = true;
                 }
@@ -2937,6 +3137,7 @@ impl DepthWriter {
                         wm.release_rescue_floor(floor);
                     }
                     self.buffer = returned.buffer;
+                    self.staged = returned.staged;
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
                     rescue_unavailable = true;
                 }
@@ -2973,6 +3174,8 @@ impl DepthWriter {
                  replays them."
             );
             self.buffer.clear();
+            // PF-4b: the rows only; the name pins stay (never dropped here).
+            self.staged.clear_rows();
             self.pending = 0;
             self.dropped = self.dropped.saturating_add(rows as u64);
             return rows;
@@ -2980,15 +3183,20 @@ impl DepthWriter {
 
         // Past the park's bound, a gone thread, or no rescue split at all:
         // the drain's inline spill, NOT synced (see `spill_on_drain`).
-        let landed = self.spill_on_drain(
-            self.buffer.as_bytes(),
-            spill_version_of(self.buffer.protocol_version()),
-            rows,
-            crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked),
-        );
+        // PF-4b: a book writer's staged rows are written as text first, on
+        // this already-cold path; a row the encoder refuses is counted there.
+        let refused = self.materialize_staged();
+        let spilled_rows = rows.saturating_sub(refused);
+        let landed = spilled_rows == 0
+            || self.spill_on_drain(
+                self.buffer.as_bytes(),
+                spill_version_of(self.buffer.protocol_version()),
+                spilled_rows,
+                crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked),
+            );
         note_rescue_outcome_depth(landed, range, false);
         if landed {
-            self.rescued = self.rescued.saturating_add(rows as u64);
+            self.rescued = self.rescued.saturating_add(spilled_rows as u64);
         }
         self.buffer.clear();
         self.pending = 0;
@@ -3027,16 +3235,24 @@ impl DepthWriter {
         // deeper lane could never fill and a shallower one would drop spares
         // the producer is about to need (2026-09-22, item 44g).
         let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH);
+        // PF-4b: the staged-batch return lane, shared by the writer and the
+        // rescue thread, so it holds as many batches as both queues.
+        let (staged_tx, staged_rx) =
+            std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH + DEPTH_RESCUE_QUEUE_DEPTH);
         let sink = DepthWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
             spill_min_free_headroom: self.spill_min_free_headroom,
             spare_return: Some(spare_tx),
+            staged_return: Some(staged_tx.clone()), // APPROVED: channel sender cloned once per process at the offload split
+            scratch: Buffer::new(DepthLayout::Book.protocol()),
             counters: DepthSinkCounters::new(self.feed),
         };
         self.offload = Some(tx);
         self.spare_buffers = Some(spare_rx);
+        self.spare_staged = Some(staged_rx);
+        self.spare_staged_tx = Some(staged_tx);
         (self, sink, rx)
     }
     /// Hands the depth rescue write to a dedicated thread.
@@ -3053,6 +3269,8 @@ impl DepthWriter {
             spill_min_free_headroom: self.spill_min_free_headroom,
             feed: self.feed,
             spill_sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+            // PF-4b: spent staged batches go back to the drain from here too.
+            staged_return: self.spare_staged_tx.clone(), // APPROVED: channel sender cloned once per process at the rescue split
         };
         self.rescue = Some(tx);
         // Once per process, so a park on the drain never allocates.
@@ -3079,9 +3297,8 @@ impl DepthWriter {
         if let Some(tx) = self.rescue.take() {
             let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
             while let Some(batch) = self.parked_rescue.pop_front() {
-                self.parked_rescue_bytes = self
-                    .parked_rescue_bytes
-                    .saturating_sub(batch.buffer.as_bytes().len());
+                self.parked_rescue_bytes =
+                    self.parked_rescue_bytes.saturating_sub(batch.park_bytes());
                 let rows = batch.rows;
                 match hand_off_before(&tx, batch, deadline) {
                     ShutdownHandOff::Sent => {
@@ -3109,18 +3326,14 @@ impl DepthWriter {
     /// True when `batch` fits in the park without passing either bound.
     fn park_rescue_fits(&self, batch: &DepthRescueBatch) -> bool {
         self.parked_rescue.len() < DEPTH_PARKED_RESCUE_MAX_BATCHES
-            && self
-                .parked_rescue_bytes
-                .saturating_add(batch.buffer.as_bytes().len())
+            && self.parked_rescue_bytes.saturating_add(batch.park_bytes())
                 <= DEPTH_PARKED_RESCUE_MAX_BYTES
     }
 
     /// Parks one refused depth rescue batch in RAM (H4). O(1), no allocation,
     /// floor kept.
     fn park_rescue(&mut self, batch: DepthRescueBatch) {
-        self.parked_rescue_bytes = self
-            .parked_rescue_bytes
-            .saturating_add(batch.buffer.as_bytes().len());
+        self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_add(batch.park_bytes());
         self.flush_counters
             .rescue_parked
             .increment(batch.rows as u64);
@@ -3138,7 +3351,7 @@ impl DepthWriter {
             return;
         }
         while let Some(batch) = self.parked_rescue.pop_front() {
-            let bytes = batch.buffer.as_bytes().len();
+            let bytes = batch.park_bytes();
             let rows = batch.rows as u64;
             let Some(tx) = self.rescue.as_ref() else {
                 self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
@@ -3170,10 +3383,8 @@ impl DepthWriter {
     /// the rescue thread would: outcome, floor, completion count. Its rows
     /// were already counted as rescued and dropped when it was parked.
     fn spill_parked_on_drain(&self, batch: DepthRescueBatch) {
-        let landed = self.spill_on_drain(
-            batch.buffer.as_bytes(),
-            spill_version_of(batch.buffer.protocol_version()),
-            batch.rows,
+        let landed = self.spill_batch_on_drain(
+            &batch,
             crate::wal_applied_watermark::rescue_failure_fate(
                 batch.min_seq,
                 batch.max_seq,
@@ -3198,12 +3409,7 @@ impl DepthWriter {
             batch.unbacked,
         );
         let rows = batch.rows;
-        let landed = self.spill_on_drain(
-            batch.buffer.as_bytes(),
-            spill_version_of(batch.buffer.protocol_version()),
-            batch.rows,
-            fate,
-        );
+        let landed = self.spill_batch_on_drain(&batch, fate);
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
         if let Some(floor) = batch.floor {
@@ -3223,6 +3429,25 @@ impl DepthWriter {
                  not hold its rows. These depth rows are LOST."
             );
         }
+    }
+
+    /// A parked rescue batch written on the drain (a gone rescue thread, or
+    /// shutdown), NOT synced. PF-4b: a staged batch is written as text first,
+    /// inside the same `off_worker` call as the file write; a row the encoder
+    /// refuses is counted there and left out of the spilled count. Allocates
+    /// one text buffer for a staged batch (cold path).
+    fn spill_batch_on_drain(&self, batch: &DepthRescueBatch, fate: &'static str) -> bool {
+        // The text is written inside `off_worker`; each file write is the
+        // drain's one unsynced spill, inside its own `off_worker` call.
+        let staged_text = crate::off_worker::off_worker(|| batch.staged_text(self.feed));
+        batch.spill_payloads(staged_text.as_ref(), |payload, rows| {
+            self.spill_on_drain(
+                payload.as_bytes(),
+                spill_version_of(payload.protocol_version()),
+                rows,
+                fate,
+            )
+        })
     }
 
     /// The drain's only depth spill write, NOT synced (see
@@ -3279,8 +3504,10 @@ impl DepthWriter {
         // will not let both happen in one expression.
         let protocol = self.buffer.protocol_version();
         let (min_seq, max_seq) = self.take_pending_range();
+        let carry = self.carry_cached_table();
         let batch = DepthFlushBatch {
             buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+            staged: std::mem::take(&mut self.staged),
             rows,
             min_seq,
             max_seq,
@@ -3293,6 +3520,7 @@ impl DepthWriter {
             // silently succeeding, because "we sent it" when nothing was sent
             // is the one report that must never be wrong.
             self.buffer = batch.buffer;
+            self.staged = batch.staged;
             self.restore_pending_range((batch.min_seq, batch.max_seq));
             return DepthOffloadOutcome::SinkGone(rows);
         };
@@ -3309,6 +3537,7 @@ impl DepthWriter {
                 // retained buffer comes back into `self.buffer`, and a spare
                 // installed earlier would be discarded (2026-09-22, item 44g).
                 self.install_spare_buffer(protocol);
+                self.repin_carried_table(carry);
                 DepthOffloadOutcome::Sent(rows)
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -3318,8 +3547,15 @@ impl DepthWriter {
                 // queue safe: without it a full queue would either block the
                 // drain (the original defect) or drop rows (a worse one).
                 self.flush_counters.queue_full.increment(1);
-                let held = returned.buffer.as_bytes().len();
+                // PF-4b: a staged batch's EXACT text size, so the byte cut
+                // lands where it did on the text buffer.
+                let held = returned
+                    .buffer
+                    .as_bytes()
+                    .len()
+                    .saturating_add(returned.staged.text_bytes());
                 self.buffer = returned.buffer;
+                self.staged = returned.staged;
                 self.retained_spans = self.retained_spans.saturating_add(1);
                 // TWO independent cuts. Spans is the primary bound; bytes is
                 // the belt-and-braces one that matters MORE on this path than
@@ -3346,6 +3582,7 @@ impl DepthWriter {
                 // buffer, or the rescue below reports `(0, 0)` and a failed
                 // rescue marks nothing — the tick twin always did this.
                 self.buffer = returned.buffer;
+                self.staged = returned.staged;
                 self.restore_pending_range((returned.min_seq, returned.max_seq));
                 let dropped = self.discard_pending();
                 DepthOffloadOutcome::SinkGone(dropped)
@@ -3366,6 +3603,8 @@ impl DepthWriter {
     pub fn flush(&mut self) -> Result<()> {
         // A republished name table is picked up at the next batch at the latest.
         self.contract_label = None;
+        // PF-4b: the book writer's run cache, cleared at the same point.
+        self.book_label = None;
         // H4: a parked rescue goes to its thread first, even with nothing
         // pending.
         self.retry_parked_rescue();
@@ -3400,6 +3639,20 @@ impl DepthWriter {
                     )
                 }
             };
+        }
+        // PF-4b: the unsplit (synchronous) arm writes a book writer's staged
+        // rows as text here, on this already-blocking path (`off_worker`). A
+        // row the encoder refuses is counted there; if none is left, nothing
+        // is sent and nothing is acknowledged (the refused frames are marked
+        // unapplied, so a replay offers them again).
+        if !self.staged.is_empty() {
+            let _refused = self.materialize_staged();
+            if self.pending == 0 {
+                let _refused_range = self.take_pending_range();
+                self.pending_unbacked = false;
+                self.buffer.clear();
+                return Ok(());
+            }
         }
         let Some(sender) = self.sender.as_mut() else {
             let rescued_before = self.rescued;
@@ -3675,6 +3928,10 @@ pub const DEPTH_RESCUE_ABANDONED_COUNTER: &str = "tv_depth_rescue_abandoned_tota
 /// One oversized depth ILP payload on its way to the spill tier.
 pub struct DepthRescueBatch {
     buffer: Buffer,
+    /// PF-4b: a book writer's staged rows; the rescue thread (or a cold
+    /// drain path) writes them as text before the spill. Empty for a level
+    /// writer.
+    staged: crate::depth_stage::DepthStagedBatch,
     rows: usize,
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
@@ -3695,6 +3952,58 @@ impl DepthRescueBatch {
     pub fn rows(&self) -> usize {
         self.rows
     }
+
+    /// RAM a parked batch holds against `DEPTH_PARKED_RESCUE_MAX_BYTES`:
+    /// its text bytes plus (PF-4b) its staged batch by CAPACITY, since a
+    /// parked staged batch pins its whole reservation. O(1).
+    #[must_use]
+    pub(crate) fn park_bytes(&self) -> usize {
+        self.buffer
+            .as_bytes()
+            .len()
+            .saturating_add(self.staged.ram_bytes())
+    }
+
+    /// Spills this batch through `spill(payload, rows)`, which returns
+    /// whether the payload landed: first its text buffer (a level batch, or
+    /// a book batch a cold path already wrote as text), then (PF-4b) its
+    /// staged rows as [`Self::staged_text`] wrote them, less the levels the
+    /// encoder refused (counted there). `true` only when every payload with
+    /// rows landed. The rescue thread or a cold drain path only. O(batches).
+    fn spill_payloads(
+        &self,
+        staged_text: Option<&(Buffer, usize)>,
+        mut spill: impl FnMut(&Buffer, usize) -> bool,
+    ) -> bool {
+        let staged_rows = self.staged.pending_levels();
+        let text_rows = self.rows.saturating_sub(staged_rows);
+        let mut landed = true;
+        if text_rows > 0 && !self.buffer.as_bytes().is_empty() {
+            landed &= spill(&self.buffer, text_rows);
+        }
+        if let Some((out, refused)) = staged_text {
+            let rows = staged_rows.saturating_sub(*refused);
+            if rows > 0 {
+                landed &= spill(out, rows);
+            }
+        }
+        landed
+    }
+
+    /// PF-4b: the staged rows written as text into one fresh buffer, with
+    /// the levels the encoder refused (counted there, never twice: the batch
+    /// is spilled once and then cleared). `None` when nothing is staged.
+    /// Allocates one buffer; the rescue thread, or a cold drain path inside
+    /// `off_worker`. O(staged bytes).
+    fn staged_text(&self, feed: Feed) -> Option<(Buffer, usize)> {
+        if self.staged.is_empty() {
+            return None;
+        }
+        let mut out = Buffer::new(DepthLayout::Book.protocol());
+        out.reserve(self.staged.text_bytes());
+        let refused = self.staged.encode_counted(feed, &mut out);
+        Some((out, refused))
+    }
 }
 
 /// The depth rescue thread's half: everything the write needs, and nothing else.
@@ -3704,6 +4013,9 @@ pub struct DepthRescueSink {
     feed: Feed,
     /// `SPILL_SYNC_OFF_DRAIN` in production; a test injects a failing sync.
     spill_sync: Option<crate::tick_persistence::SpillSyncFn>,
+    /// PF-4b: the drain's spare lane for spent staged batches (`None` when
+    /// the writer was never split for offload).
+    staged_return: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
 }
 
 impl DepthRescueSink {
@@ -3711,22 +4023,28 @@ impl DepthRescueSink {
     ///
     /// Identical code to the inline fallback — both call
     /// [`perform_depth_rescue`] — so an operator cannot tell which path ran,
-    /// and should not have to.
+    /// and should not have to. PF-4b: a book batch's staged rows are written
+    /// as text here first; a row the encoder refuses is counted before the
+    /// batch's floor is released.
     pub fn rescue(&self, batch: &DepthRescueBatch) {
-        let landed = perform_depth_rescue(
-            &self.spill_dir,
-            batch.buffer.as_bytes(),
-            spill_version_of(batch.buffer.protocol_version()),
-            self.feed,
-            batch.rows,
-            self.spill_min_free_headroom,
-            self.spill_sync,
-            crate::wal_applied_watermark::rescue_failure_fate(
-                batch.min_seq,
-                batch.max_seq,
-                batch.unbacked,
-            ),
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
         );
+        let staged_text = batch.staged_text(self.feed);
+        let landed = batch.spill_payloads(staged_text.as_ref(), |payload, rows| {
+            perform_depth_rescue(
+                &self.spill_dir,
+                payload.as_bytes(),
+                spill_version_of(payload.protocol_version()),
+                self.feed,
+                rows,
+                self.spill_min_free_headroom,
+                self.spill_sync,
+                fate,
+            )
+        });
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
         // Released only now: the spill is synced (Z8a) or the range is marked
@@ -3736,6 +4054,45 @@ impl DepthRescueSink {
         }
         wm.note_depth_completed();
     }
+
+    /// PF-4b: after [`Self::rescue`], hands the batch's staged allocation
+    /// back to the drain's spare lane, cleared HERE (its name pins dropped
+    /// on this thread, never the drain), so a stall does not make the drain
+    /// reserve a fresh batch for every rescue. Dropped instead when there is
+    /// no lane, the lane is full, the drain is gone, or the batch grew past
+    /// [`MAX_DEPTH_STAGED_SPARE_RAM_BYTES`]. Never waits.
+    pub fn recycle(&self, mut batch: DepthRescueBatch) {
+        recycle_staged(self.staged_return.as_ref(), &mut batch.staged);
+    }
+}
+
+/// A spent staged batch bigger than this (it grew under a depth-200 burst)
+/// is dropped by the thread that spent it rather than returned to the drain,
+/// so a burst-sized reservation is not pinned for the session. Twice the
+/// pre-size.
+pub const MAX_DEPTH_STAGED_SPARE_RAM_BYTES: usize = 2
+    * (crate::depth_stage::DEPTH_STAGED_ROWS_PRESIZE * crate::depth_stage::STAGED_BOOK_ROW_BYTES
+        + crate::depth_stage::DEPTH_STAGED_VALUES_PRESIZE * 8);
+
+/// Clears a spent staged batch ON THE CALLING THREAD (the writer or rescue
+/// thread: its pins are dropped here) and offers it to the drain's spare
+/// lane. `try_send`, never a wait; a refused or oversized batch is dropped
+/// here. O(pins).
+fn recycle_staged(
+    lane: Option<&std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    staged: &mut crate::depth_stage::DepthStagedBatch,
+) {
+    let mut spent = std::mem::take(staged);
+    spent.clear();
+    let Some(lane) = lane else {
+        return;
+    };
+    let ram = spent.ram_bytes();
+    if ram == 0 || ram > MAX_DEPTH_STAGED_SPARE_RAM_BYTES {
+        return;
+    }
+    // Full or disconnected: dropped here, never waited on.
+    let _dropped_if_refused = lane.try_send(spent);
 }
 
 /// A rescued depth payload is APPLIED from the WAL's point of view — the spill
@@ -3918,6 +4275,9 @@ pub const MAX_DEPTH_RETAINED_FLUSH_SPANS: u32 = 2;
 /// thing to do with one is hand it to the network or rescue the whole thing.
 pub struct DepthFlushBatch {
     buffer: Buffer,
+    /// PF-4b: a book writer's staged rows; the writer thread writes them as
+    /// text before the POST. Empty for a level writer.
+    staged: crate::depth_stage::DepthStagedBatch,
     rows: usize,
     /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
     min_seq: u64,
@@ -3974,6 +4334,11 @@ pub struct DepthWriterSink {
     spill_min_free_headroom: u64,
     /// Return lane for spent buffers — see [`DepthWriterSink::return_spare_buffer`].
     spare_return: Option<std::sync::mpsc::SyncSender<Buffer>>,
+    /// PF-4b: return lane for spent staged batches (cleared on this thread).
+    staged_return: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    /// PF-4b: the text buffer a book batch is written into before the POST,
+    /// reused across batches (reserved to the book pre-size on first use).
+    scratch: Buffer,
     /// Rescue-arm counter handles, resolved once at the split (item 44g).
     counters: DepthSinkCounters,
 }
@@ -4004,6 +4369,11 @@ struct DepthFlushCounters {
     rescue_deferred_to_wal: metrics::Counter,
     /// `tv_depth_rows_dropped_total`, pre-resolved for the deferral arm.
     rows_dropped: metrics::Counter,
+    /// PF-4b: a staged book batch grew past its pre-size (one reallocation
+    /// on the drain; local `/metrics` only, no alarm).
+    stage_grow: metrics::Counter,
+    /// PF-4b: a ninth name table cut a staged batch early (local only).
+    stage_pin_cut: metrics::Counter,
 }
 
 impl DepthFlushCounters {
@@ -4032,6 +4402,8 @@ impl DepthFlushCounters {
                 "feed" => feed
             ),
             rows_dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
+            stage_grow: metrics::counter!("tv_depth_stage_grow_total", "feed" => feed),
+            stage_pin_cut: metrics::counter!("tv_depth_stage_pin_cut_total", "feed" => feed),
         }
     }
 }
@@ -4084,7 +4456,17 @@ impl DepthWriterSink {
     /// retry would have carried a drain-shaped mitigation onto a thread that no
     /// longer has a drain to protect.
     pub fn write(&mut self, batch: &mut DepthFlushBatch) -> usize {
+        // PF-4b: a book batch's staged rows become text HERE, before the
+        // POST and before any ack or rescue; a refused row is counted here
+        // and leaves the batch's row count.
+        let swapped = self.encode_staged(batch);
         let landed = self.write_inner(batch);
+        if swapped {
+            // The scratch comes back to this sink, emptied; the batch keeps
+            // the empty buffer it arrived with.
+            std::mem::swap(&mut batch.buffer, &mut self.scratch);
+            self.scratch.clear();
+        }
         // The batch is DONE — landed or rescued — whatever the outcome. This
         // is what the replay confirm waits on, and the watermark file is
         // refreshed from here at most once a second, off the drain.
@@ -4113,9 +4495,16 @@ impl DepthWriterSink {
     /// The buffer is cleared before it leaves, so a spare can never carry a
     /// row into the next batch.
     pub fn return_spare_buffer(&self, batch: &mut DepthFlushBatch) {
+        // PF-4b: the staged allocation goes back on its own lane, cleared
+        // here (pins dropped on this thread, never on the drain).
+        recycle_staged(self.staged_return.as_ref(), &mut batch.staged);
         let Some(spare_return) = self.spare_return.as_ref() else {
             return;
         };
+        if batch.buffer.capacity() == 0 {
+            // A book batch's empty buffer: nothing worth returning.
+            return;
+        }
         let protocol = batch.buffer.protocol_version();
         // `Buffer::new` does not allocate (its `Vec` starts empty).
         let mut spent = std::mem::replace(&mut batch.buffer, Buffer::new(protocol));
@@ -4125,6 +4514,33 @@ impl DepthWriterSink {
         spent.clear();
         // Full or disconnected: the buffer is dropped here, never waited on.
         let _dropped_if_refused = spare_return.try_send(spent);
+    }
+
+    /// PF-4b: writes a book batch's staged rows as text, through the
+    /// unchanged line writer, into this sink's reusable scratch, swapped into
+    /// the batch so every later step (the POST, the retry, the rescue) reads
+    /// `batch.buffer` exactly as before. Returns whether the swap happened
+    /// (the caller swaps back). A row the encoder refuses is counted here,
+    /// before the ack or the rescue, and its levels leave `batch.rows`.
+    /// O(batch bytes), on the writer thread.
+    fn encode_staged(&mut self, batch: &mut DepthFlushBatch) -> bool {
+        if batch.staged.is_empty() {
+            return false;
+        }
+        // A book batch arrives with an empty text buffer; if it ever does
+        // not, the rows are appended after its text, never in place of it.
+        let swapped = batch.buffer.as_bytes().is_empty();
+        if swapped {
+            if self.scratch.capacity() < DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES {
+                // Once per sink: reserved from empty, so exactly the size.
+                self.scratch = Buffer::new(DepthLayout::Book.protocol());
+                self.scratch.reserve(DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES);
+            }
+            std::mem::swap(&mut batch.buffer, &mut self.scratch);
+        }
+        let _written = batch.staged.encode_into(self.feed, &mut batch.buffer);
+        batch.rows = batch.rows.saturating_sub(batch.staged.refused_levels());
+        swapped
     }
 
     fn write_inner(&mut self, batch: &mut DepthFlushBatch) -> usize {
@@ -4601,9 +5017,33 @@ mod tests {
 
     /// The contract name the writer resolved for its last row, if any.
     fn resolved_contract(w: &DepthWriter) -> Option<String> {
+        if w.layout == DepthLayout::Book {
+            // PF-4b: the book run cache names a pinned TABLE; read the name
+            // the encoder will read from it.
+            let (id, seg, pin, _) = w.book_label?;
+            let table = w.staged.pinned_table(pin)?;
+            return table.get(&(id, seg)).map(|n| n.to_string());
+        }
         w.contract_label
             .as_ref()
             .and_then(|(_, _, name)| name.as_deref().map(str::to_owned))
+    }
+
+    /// PF-4b: the book twin of injecting `contract_label`: pins a one-entry
+    /// name table for `(id, seg)` and points the book run cache at it.
+    fn set_book_contract_for_test(w: &mut DepthWriter, id: i64, seg: &'static str, name: &str) {
+        let mut labels = crate::candle_contract_labels::CandleContractLabels::default();
+        labels.insert((id, seg), std::sync::Arc::from(name));
+        let pin = w
+            .staged
+            .pin_table(std::sync::Arc::new(labels))
+            .expect("a free pin slot");
+        w.book_label = Some((
+            id,
+            seg,
+            pin,
+            Some(crate::depth_stage::escaped_symbol_len(name)),
+        ));
     }
 
     /// Every level of one packet, appended by the writer and by the checked
@@ -4715,7 +5155,7 @@ mod tests {
         let mut reference = buffer_like(&w);
         let label = resolved_contract(&w);
         checked_book_line(&mut reference, &book, Feed::Dhan.as_str(), label.as_deref());
-        assert_eq!(w.buffer_bytes(), reference.as_bytes());
+        assert_eq!(w.pending_ilp_bytes(), reference.as_bytes());
     }
 
     /// Any f64 bit pattern, including every NaN payload and both infinities.
@@ -4776,7 +5216,7 @@ mod tests {
             };
             let mut w = DepthWriter::for_test_book(Feed::Dhan);
             if let Some(name) = contract {
-                w.contract_label = Some((security_id, "NSE_FNO", Some(std::sync::Arc::from(name))));
+                set_book_contract_for_test(&mut w, security_id, "NSE_FNO", name);
             }
             w.append_book_row(&book).map_err(|e| {
                 proptest::test_runner::TestCaseError::fail(format!("append_book_row: {e:#}"))
@@ -4784,7 +5224,7 @@ mod tests {
             let mut reference = buffer_like(&w);
             let label = resolved_contract(&w);
             checked_book_line(&mut reference, &book, Feed::Dhan.as_str(), label.as_deref());
-            proptest::prop_assert_eq!(w.buffer_bytes(), reference.as_bytes());
+            proptest::prop_assert_eq!(w.pending_ilp_bytes(), reference.as_bytes());
         }
     }
 
@@ -5939,6 +6379,7 @@ mod tests {
         buffer.reserve(capacity);
         DepthFlushBatch {
             buffer,
+            staged: crate::depth_stage::DepthStagedBatch::new(),
             rows: 0,
             min_seq: 0,
             max_seq: 0,
@@ -6075,10 +6516,20 @@ mod tests {
             (DepthLayout::Levels, DepthWriter::for_test(Feed::Dhan)),
             (DepthLayout::Book, DepthWriter::for_test_book(Feed::Dhan)),
         ] {
-            assert!(
-                w.buffer.capacity() >= layout.row_buffer_presize_bytes(),
-                "{layout:?}: a new writer's row buffer is reserved up front"
-            );
+            // PF-4b (2026-11-06): a book writer stages its rows; its STAGED
+            // batch is the one reserved up front, its text buffer is not.
+            match layout {
+                DepthLayout::Levels => assert!(
+                    w.buffer.capacity() >= layout.row_buffer_presize_bytes(),
+                    "{layout:?}: a new writer's row buffer is reserved up front"
+                ),
+                DepthLayout::Book => assert!(
+                    w.staged.ram_bytes()
+                        >= crate::depth_stage::DEPTH_STAGED_ROWS_PRESIZE
+                            * crate::depth_stage::STAGED_BOOK_ROW_BYTES,
+                    "{layout:?}: a new writer's staged batch is reserved up front"
+                ),
+            }
             assert_eq!(w.buffer.protocol_version(), layout.protocol());
         }
 
@@ -6347,6 +6798,7 @@ mod tests {
         sink.spill_dir.clone_from(&dir);
         let mut empty = DepthFlushBatch {
             buffer: Buffer::new(questdb::ingress::ProtocolVersion::V1),
+            staged: crate::depth_stage::DepthStagedBatch::new(),
             rows: 0,
             min_seq: 0,
             max_seq: 0,
@@ -6952,8 +7404,8 @@ mod tests {
             200,
             "pending counts the levels the row carries"
         );
-        let bytes = w.buffer.as_bytes();
-        let text = String::from_utf8_lossy(bytes);
+        let bytes = w.pending_ilp_bytes();
+        let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("market_depth_book,"), "{}", &text[..40]);
         assert!(text.contains("levels=200i"));
         assert!(text.contains("depth_kind=d200"));
@@ -6975,7 +7427,7 @@ mod tests {
         w.append_book_row(&book_row(&p[..20], &q[..20], &o[..20], 9))
             .expect("a NaN slot is kept, never skipped");
         assert_eq!(w.pending(), 20, "the NaN slot still counts as a level");
-        assert!(String::from_utf8_lossy(w.buffer.as_bytes()).contains("levels=20i"));
+        assert!(String::from_utf8_lossy(&w.pending_ilp_bytes()).contains("levels=20i"));
     }
 
     #[test]
@@ -6984,7 +7436,7 @@ mod tests {
         w.append_book_row(&book_row(&[], &[], &[], 11))
             .expect("empty book");
         assert_eq!(w.pending(), 1, "a side with no levels still counts one");
-        assert!(String::from_utf8_lossy(w.buffer.as_bytes()).contains("levels=0i"));
+        assert!(String::from_utf8_lossy(&w.pending_ilp_bytes()).contains("levels=0i"));
     }
 
     #[test]
@@ -7713,7 +8165,11 @@ mod tests {
         let (p, q, o) = book_levels(3);
         w.append_book_row(&book_row(&p[..3], &q[..3], &o[..3], 7))
             .expect("append");
-        let bytes = w.buffer_bytes();
+        // PF-4b (2026-11-06): the drain stages the row, so the text buffer
+        // stays empty and `pending_ilp_bytes` writes it as the writer would;
+        // `pending_bytes` is that text's exact size.
+        assert!(w.buffer_bytes().is_empty(), "the drain wrote no text");
+        let bytes = w.pending_ilp_bytes();
         assert!(bytes.starts_with(MARKET_DEPTH_BOOK_TABLE.as_bytes()));
         assert_eq!(bytes.len(), w.pending_bytes());
     }
@@ -7985,7 +8441,10 @@ mod tests {
     /// shrunk); below it the buffer is reserved up to the pre-size.
     #[test]
     fn test_install_spare_buffer_keeps_or_reserves_at_the_presize_boundary() {
-        for layout in [DepthLayout::Levels, DepthLayout::Book] {
+        // PF-4b (2026-11-06): a BOOK writer stages its rows, so its text buffer
+        // is no longer recycled; its staged batch is (see the depth_stage
+        // oracle tests). The level layout keeps this contract.
+        for layout in [DepthLayout::Levels] {
             let pre = layout.row_buffer_presize_bytes();
             for spare_cap in [0, pre - 1, pre, pre + 1, MAX_DEPTH_PRODUCER_BUFFER_BYTES] {
                 let writer = match layout {
@@ -8037,7 +8496,8 @@ mod tests {
     /// page is committed) and still under the producer bound.
     #[test]
     fn test_install_spare_buffer_reserves_exactly_the_presize_below_it() {
-        for layout in [DepthLayout::Levels, DepthLayout::Book] {
+        // PF-4b: the level layout only (see the test above).
+        for layout in [DepthLayout::Levels] {
             let pre = layout.row_buffer_presize_bytes();
             for spare_cap in [0, pre / 2 + 1, pre - 1] {
                 let writer = match layout {
@@ -8076,3 +8536,7 @@ mod tests {
 #[cfg(test)]
 #[path = "depth_stage_golden_tests.rs"]
 mod depth_stage_golden_tests;
+
+#[cfg(test)]
+#[path = "depth_stage_oracle_tests.rs"]
+mod depth_stage_oracle_tests;
