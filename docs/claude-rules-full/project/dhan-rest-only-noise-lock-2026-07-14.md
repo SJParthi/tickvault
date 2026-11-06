@@ -4382,6 +4382,46 @@ two stale texts. All three are fixed before any of the three alarms has run.
 before forgetting the departure; forgets on a REFUSED swap (the old contract is
 still held); or describes the reconnect alarm as timing one dial.
 
+### §2.6-iv — 2026-11-06: the feed-delay page reads the INDEX/SPOT class only, and counts new trades only
+
+**The owner's decision (2026-11-06 decision card, option label verbatim):**
+
+> **"Index feed only (Recommended)"**
+
+Approved by Parthiban, 2026-11-06 ("go ahead fix everything dude approved"),
+plan PR AL items AL-1 and AL-4 (`.claude/plans/active-plan-audit-2026-10-20.md`).
+Recorded here BEFORE the terraform, per the rule-file-first law.
+
+**Measured that day (Verified):** `tv_dhan_ws_lag_max_ms_by_class{class="fno"}`
+read **4,038,655 ms** (67 minutes) while `{class="index_spot"}` read
+**1,923 ms**, and the hand-off timings were microseconds. An illiquid
+option's old last-trade time was being counted as delivery lag, so
+`dhan-feed-delay-high` sat in ALARM all session.
+
+| Item | Before | After (2026-11-06) |
+|---|---|---|
+| Alarm metric | `tv_dhan_ws_lag_max_ms` (every segment) | `tv_dhan_ws_lag_max_ms_by_class`, dimensions `host` + `class = "index_spot"` |
+| Which packets are lag samples | every folded non-repeat packet | only NEW trades: the contract was already seeded (never the first packet after a subscribe) and its day volume rose, or, for a zero-volume index, its trade second moved forward. Stale cumulative regressions and backup copies accepted late are excluded too |
+| Shipping | the by-class gauge was local `/metrics` only | a second EMF declaration ships ONE series, `class = "index_spot"` (label matcher), never per instrument, never per connection |
+| Stock options (`class = "fno"`) | paged through the all-segment gauge | dashboard-only (local `/metrics`), no page |
+| Statistic, threshold, periods, `notBreaching`, no `ok_actions` | `Minimum`, 60,000 ms, 2 of 2 × 300 s | unchanged |
+
+**Cost:** one more EMF series, about $0.30/mo. No new alarm, page, filter or
+error code. The all-segment gauge stays EMF-selected for the dashboard.
+
+**What a PR that violates §2.6-iv looks like (REJECT):**
+- Pages on the `fno` class, or ships the `fno` class to CloudWatch, without a
+  further dated row.
+- Counts the first packet after a subscribe, a stale cumulative regression or
+  a repeat quote as a lag sample.
+- Adds a per-instrument or per-connection dimension to the shipped series.
+- Changes the statistic, threshold, periods or `ok_actions` under cover of
+  this row.
+
+**NOT claimed:** that a cash stock's new trade can never carry an old trade
+second (a sparse cash stock can still look late), or that this detects ticks
+the vendor never sent.
+
 ### §2.3w addendum — 2026-09-25: the held-today refusal is a LOG-ONLY `WS-GAP-02` source
 
 `depth_subscription_view.rs` keeps the day's set of contracts held by either
@@ -5133,3 +5173,42 @@ reached nobody.
   `skip_alarms` add a name that is not in `ALARM_NAMES`.
 - Opens earlier than session start + 20 minutes, or types the session times in
   terraform without the same change in `config/base.toml`.
+
+## §2.16 — 2026-11-06: two pages made quieter (`questdb-disconnected`, `RISK-GAP-03`; no new page)
+
+**The owner's decision (2026-11-06 decision card, option label verbatim):**
+
+> **"Yes, quieter (Recommended)"**
+
+The card read: questdb-disconnected fires on 3 bad minutes out of 5;
+RISK-GAP-03 clears 5 minutes after the condition ends. Approved by Parthiban,
+2026-11-06 ("go ahead fix everything dude approved"), plan PR AL item AL-3.
+Recorded here BEFORE the terraform, per the rule-file-first law.
+
+| Alarm | Before | After (2026-11-06) |
+|---|---|---|
+| `tv-<env>-questdb-disconnected` (`app-alarms.tf`) | `Maximum > 30` s in any single 60 s period (`evaluation_periods = 1`) | `evaluation_periods = 5`, `datapoints_to_alarm = 3`, period 60 s: 3 bad minutes out of 5 |
+| `tv-<env>-errcode-risk-gap-03` (`error-code-alarms.tf`) | period 3600 s: one emit held ALARM for up to an hour | period **300 s**: the alarm clears 5 minutes after the last emit |
+
+Unchanged: the threshold, statistic and `ok_actions` of `questdb-disconnected`;
+the `RISK-GAP-03` filter pattern, threshold 1, `ok_recovery = false`, the
+emit side's 30-minute `SILENCE_PAGE_COOLDOWN_SECS` between pages, and §2.11.
+
+**Cost:** zero. No alarm, metric, filter or EMF name added.
+
+**Honest limit (review, 2026-11-06).** The 30-minute cooldown covers only the
+per-instrument silence page. Two other coded `RISK-GAP-03` lines share the
+filter and can page on their own, each already bounded: the dead-class report
+(edge-latched once per class per episode, inside the continuous session) and
+the detector-blind line (once per process, when the silence detector's slot
+table refuses an instrument). So with the 300 s window the alarm can enter
+ALARM more than once in 30 minutes when those coincide with a silence page.
+They are deliberately NOT put behind the silence cooldown: a dead index class
+must never wait 30 minutes behind an unrelated silence page.
+
+**What a PR that violates §2.16 looks like (REJECT):**
+- Lowers `questdb-disconnected` back to a single bad minute, or below 3 of 5,
+  without a further dated row.
+- Raises the `RISK-GAP-03` period above 300 s, adds an OK page to it, or removes
+  the emit side's 30-minute cooldown (which is what keeps a 300 s window from
+  bringing back the 2026-08-14 burst).

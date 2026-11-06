@@ -1335,20 +1335,27 @@ resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
 
 resource "aws_cloudwatch_metric_alarm" "dhan_feed_delay_high" {
   alarm_name        = "tv-${var.environment}-dhan-feed-delay-high"
-  alarm_description = "Dhan price updates carried trade timestamps at least 60 seconds older than local receipt time. Minimum of the peak-held gauge over two 300-second periods means every observed gauge sample in those periods breached, not every trade or every instant. Exact repeated quotes, refused ticks and WAL replay are excluded; first snapshots and changed price, volume or session extremes with an old trade time can still count. Check clock-probe freshness, lag by class/connection, ring dwell and socket freshness. This does not isolate vendor transport delay or detect ticks never sent. No recovery page is sent, so a later ALARM can follow an unannounced OK."
+  alarm_description = "Dhan INDEX and CASH-STOCK price updates (class index_spot) carried trade timestamps at least 60 seconds older than local receipt time. Only new trades count: a packet whose volume rose (or, for an index, whose trade second moved forward); first packets after a subscribe, repeated quotes, stale copies, refused ticks and WAL replay are excluded. Minimum of the peak-held gauge over two 300-second periods means every observed gauge sample in those periods breached, not every trade or every instant. Stock options (class fno) are dashboard-only: a sparse contract's new trade can carry an old trade second. Check clock-probe freshness, ring dwell and socket freshness. This does not isolate vendor transport delay or detect ticks never sent. No recovery page is sent, so a later ALARM can follow an unannounced OK."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 60000
   evaluation_periods  = 2
   datapoints_to_alarm = 2
-  metric_name         = "tv_dhan_ws_lag_max_ms"
-  namespace           = local.app_namespace
-  period              = 300
+  # 2026-11-06 (noise lock §2.6 dated row, owner card "Index feed only
+  # (Recommended)"): re-pointed from the all-segment `tv_dhan_ws_lag_max_ms`
+  # to the index/spot class of the by-class gauge. Live that day the F&O
+  # class read 4,038,655 ms while index_spot read 1,923 ms, so the page sat in
+  # ALARM all session for illiquid options. The class dimension is shipped by
+  # the agent's second EMF declaration, filtered to index_spot only (one
+  # series; never per instrument, never per connection).
+  metric_name = "tv_dhan_ws_lag_max_ms_by_class"
+  namespace   = local.app_namespace
+  period      = 300
   # Minimum (§2.6): all observed samples of the minute-peak gauge must
   # breach in both periods. This is recurring observed trade age, not a
   # continuous-delay or all-trades guarantee; missing samples are not proof.
   statistic  = "Minimum"
-  dimensions = local.app_dimensions
+  dimensions = merge(local.app_dimensions, { class = "index_spot" })
 
   # Published only while the drain runs; the box is stopped overnight.
   treat_missing_data = "notBreaching"

@@ -384,7 +384,7 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
     ),
     (
         "dhan-feed-delay-high",
-        "🔷 DHAN: repeated checks found received price updates with trade times at least a minute old — investigate feed timing",
+        "🔷 DHAN: repeated checks found index and cash-stock price updates with trade times at least a minute old — investigate feed timing",
     ),
     (
         "dhan-main-reconnect-slow",

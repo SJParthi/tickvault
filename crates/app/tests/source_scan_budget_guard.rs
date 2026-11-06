@@ -108,7 +108,15 @@ const BUDGET: &[(&str, usize)] = &[
     // sleeps until 15:50 and cannot run in a test); paired behaviour test
     // `test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_trading_day_once`.
     ("expiry_scope_check_tests.rs", 7),
-    ("feed_scoreboard_boot.rs", 2),
+    // 2 -> 3 (2026-11-06, plan PR AL-2 review): pins that every QuestDB
+    // failure site in the ~900-line scoreboard attempt logs through
+    // `scoreboard_failure!` and returns Retry before the final attempt (a new
+    // direct coded `error!` there would page on a non-final attempt; staging
+    // each of seven reads failing in a unit test needs a live QuestDB).
+    // Paired behaviour tests: `test_scoreboard_finding_is_coded_once_across_attempts`,
+    // `test_write_daily_rows_once_never_reports_landed_without_a_row`,
+    // `test_rollup_attempt_is_final_caps_at_eight_attempts_and_the_deadline`.
+    ("feed_scoreboard_boot.rs", 3),
     ("index_constituency_boot.rs", 1),
     ("infra.rs", 3),
     // 2026-10-28 (Quote 44 review, finding 3): 1 doc scan, the module header

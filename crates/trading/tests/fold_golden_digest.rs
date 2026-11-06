@@ -382,7 +382,18 @@ fn run_stream(class: Class, seed: u64, d: &mut Digest) {
             emit(d, f, s, g, tf.as_ordinal(), &bar);
         });
         d.1.add(&stats);
-        d.text(&format!("{stats:?}"));
+        // 2026-11-06 (plan PR AL-1): `advanced` was added to ConsumeStats AFTER
+        // the golden digests were recorded. It is a per-tick verdict the drain
+        // reads for the feed-delay recorder only; it never feeds a bar. It is
+        // left out of the digest text so the ORIGINAL goldens still pin every
+        // sealed bar, amendment and every pre-existing verdict bit for bit
+        // (a changed candle still fails here). `advanced` itself is pinned by
+        // the unit tests in `multi_tf_aggregator::advanced_tests`.
+        let stats_text = format!("{stats:?}");
+        let stats_text = stats_text
+            .replace(", advanced: false", "")
+            .replace(", advanced: true", "");
+        d.text(&stats_text);
     }
 
     // End of stream.

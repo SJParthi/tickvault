@@ -165,6 +165,34 @@ pub const DEFAULT_SPARSE_BASELINE_MILLIS: u64 = 30_000;
 /// conflated, so large deltas are normal.
 pub const DEFAULT_VOLUME_JUMP_MULTIPLIER: u64 = 20;
 
+/// Live lane (plan PR AL-5, 2026-11-06): an `NSE_FNO` contract seeded or
+/// first seen (whichever came first) in the last this-many milliseconds does
+/// not count toward `RISK-GAP-03` ([`SilenceReport::warming_up`]); its
+/// verdict is still reported raw. Indices and cash stocks never warm up, so
+/// the dead-class rollup is not delayed after a mid-session restart.
+/// Measured 5 and 6 Nov: the ~09:08 IST late attach of ~22,000 stock options
+/// paged `RISK-GAP-03` at ~09:17 for 97 sparse contracts whose cadence had
+/// been learned from the first few post-subscribe packets.
+pub const LIVE_ATTACH_WARMUP_MILLIS: u64 = 600_000;
+
+/// Live lane (plan PR AL-5): the learned cadence of an `NSE_FNO` contract is
+/// floored at this many milliseconds when its silence is judged, so its
+/// silence ceiling is at least 10 × 60 s = 600 s, and a contract that has
+/// ticked is judged sparse on the floored cadence
+/// ([`SilenceReport::alarm_sparse`]).
+///
+/// MEASURED live 2026-11-06 (10:00 to 11:00 IST, about 10,329 stock option
+/// contracts, ticks plus repeat quotes): median 207 packets an hour (about
+/// 17 s apart), p10 107 an hour (about 34 s), and the quietest contracts sent
+/// 2 packets in the whole hour. A silence ceiling cannot be set below those
+/// gaps, and the learned cadence only learns a long gap when the packet
+/// ending it arrives. So in the live lane a stock option that has ticked
+/// NEVER counts toward `RISK-GAP-03` through silence; only a seeded option
+/// that sends nothing at all (not even its subscribe snapshot) past the
+/// warmup still counts. The raw `sparse` flag keeps the learned cadence for
+/// the class rollup.
+pub const LIVE_FNO_CADENCE_FLOOR_MILLIS: u64 = 60_000;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -182,6 +210,12 @@ pub struct DetectorConfig {
     pub sparse_baseline_millis: u64,
     /// Multiple of the learned volume delta that raises a suspected gap.
     pub volume_jump_multiplier: u64,
+    /// An `NSE_FNO` contract seeded within this many milliseconds of a scan
+    /// is reported `Warming`, whatever its other state. `0` = off.
+    pub attach_warmup_millis: u64,
+    /// Floor applied to an `NSE_FNO` contract's learned cadence when its
+    /// silence ceiling is computed. `0` = off.
+    pub fno_cadence_floor_millis: u64,
 }
 
 impl Default for DetectorConfig {
@@ -192,7 +226,54 @@ impl Default for DetectorConfig {
             baseline_warmup_samples: DEFAULT_BASELINE_WARMUP_SAMPLES,
             sparse_baseline_millis: DEFAULT_SPARSE_BASELINE_MILLIS,
             volume_jump_multiplier: DEFAULT_VOLUME_JUMP_MULTIPLIER,
+            attach_warmup_millis: 0,
+            fno_cadence_floor_millis: 0,
         }
+    }
+}
+
+impl DetectorConfig {
+    /// The live Dhan lane's tunables (plan PR AL-5, 2026-11-06): the defaults
+    /// plus a [`LIVE_ATTACH_WARMUP_MILLIS`] warmup after each seed and a
+    /// [`LIVE_FNO_CADENCE_FLOOR_MILLIS`] cadence floor, both for `NSE_FNO`
+    /// contracts only. Index (`IDX_I`) and cash (`NSE_EQ`) instruments are
+    /// judged exactly as by [`Default`], from their first scan.
+    #[must_use]
+    pub fn live_lane() -> Self {
+        Self {
+            attach_warmup_millis: LIVE_ATTACH_WARMUP_MILLIS,
+            fno_cadence_floor_millis: LIVE_FNO_CADENCE_FLOOR_MILLIS,
+            ..Self::default()
+        }
+    }
+
+    /// The learned cadence used to judge `segment`'s silence: the raw
+    /// cadence, floored at [`Self::fno_cadence_floor_millis`] for `NSE_FNO`.
+    /// O(1), pure.
+    #[must_use]
+    pub fn judged_cadence_millis(&self, segment: ExchangeSegment, learned_millis: u64) -> u64 {
+        if segment == ExchangeSegment::NseFno {
+            learned_millis.max(self.fno_cadence_floor_millis)
+        } else {
+            learned_millis
+        }
+    }
+
+    /// `true` while an `NSE_FNO` contract seeded at `attached_millis` is still
+    /// inside its warmup at `now_millis`. Only `NSE_FNO` warms up: the
+    /// 2026-11-06 pages were late-attached stock options, while an index or a
+    /// cash stock left unjudged for 10 minutes would delay the dead-class
+    /// rollup after a mid-session restart. O(1), pure.
+    #[must_use]
+    pub fn in_attach_warmup(
+        &self,
+        segment: ExchangeSegment,
+        attached_millis: Option<u64>,
+        now_millis: u64,
+    ) -> bool {
+        segment == ExchangeSegment::NseFno
+            && attached_millis
+                .is_some_and(|at| now_millis.saturating_sub(at) < self.attach_warmup_millis)
     }
 }
 
@@ -545,18 +626,32 @@ pub struct SilenceReport {
     pub verdict: SilenceVerdict,
     /// Legitimately-sparse instrument (far-month option, INDIA VIX class).
     /// Excluded from alarm counting; visibility retained (§36.4 precedent).
+    /// Read from the RAW learned cadence.
     pub sparse: bool,
+    /// Inside the live lane's attach warmup (an `NSE_FNO` contract seeded or
+    /// first seen in the last [`LIVE_ATTACH_WARMUP_MILLIS`]; plan PR AL-5).
+    /// Gates only [`Self::counts_toward_alarm`]; `verdict` is not rewritten.
+    pub warming_up: bool,
+    /// [`Self::sparse`] judged on the cadence the silence ceiling uses (the
+    /// `NSE_FNO` floor in the live lane) for an instrument that has ticked.
+    /// Gates only [`Self::counts_toward_alarm`]. Equal to `sparse` under the
+    /// default config.
+    pub alarm_sparse: bool,
 }
 
 impl SilenceReport {
-    /// True when this report should increment an operator-facing alarm count.
+    /// True when this report should increment an operator-facing alarm count
+    /// (RISK-GAP-03).
     ///
     /// Sparse instruments are visible but never counted — that exclusion is
     /// what keeps the detector from crying wolf on legitimately quiet
-    /// contracts.
+    /// contracts. A contract inside its attach warmup is not counted either.
+    /// Both are read from the alarm-only fields; `verdict` and `sparse` stay
+    /// raw for the other readers (subscribe reconcile, the class rollup).
     #[must_use]
     pub fn counts_toward_alarm(self) -> bool {
-        !self.sparse
+        !self.alarm_sparse
+            && !self.warming_up
             && matches!(
                 self.verdict,
                 SilenceVerdict::Exceeded | SilenceVerdict::NeverTicked
@@ -589,10 +684,15 @@ struct InstrumentState {
     /// ROSE (a trade), 0 = none seen. Read by the depth-200 cross-feed
     /// silence check (scope lock 2026-10-10).
     last_trade_millis: u64,
+    /// Monotonic millis of whichever came first: the seed that registered
+    /// this instrument, or its first packet. Never moved after it is set.
+    /// Drives [`DetectorConfig::attach_warmup_millis`] (plan PR AL-5).
+    attached_millis: Option<u64>,
 }
 
 impl InstrumentState {
     const EMPTY: Self = Self {
+        attached_millis: None,
         key: (0, ExchangeSegment::IdxI),
         used: false,
         last_ltt: None,
@@ -664,6 +764,11 @@ impl TickGapDetector {
                 let state = &mut self.slots[slot as usize];
                 if state.samples == 0 && state.last_ltt.is_none() {
                     state.last_seen_millis = now_millis;
+                    // The FIRST seed starts the attach warmup; a re-seed of a
+                    // still-silent instrument never restarts it.
+                    if state.attached_millis.is_none() {
+                        state.attached_millis = Some(now_millis);
+                    }
                 }
                 true
             }
@@ -741,6 +846,15 @@ impl TickGapDetector {
         );
         let oi = classify_oi(state.last_oi, obs.open_interest);
 
+        // Plan PR AL-5 review (2026-11-06): the attach warmup starts at the
+        // FIRST of the contract's seed or its first packet. A contract that
+        // ticks before its seed step (the 09:08 late attach delivers packets
+        // before the idle arm reaches its batch) used to get no warmup at all,
+        // because `seed` only stamps a still-silent slot. One compare, O(1).
+        if state.attached_millis.is_none() && state.last_ltt.is_none() {
+            state.attached_millis = Some(obs.recv_monotonic_millis);
+        }
+
         // Interval baseline. The first tick after seeding yields no interval,
         // so `samples` counts intervals rather than ticks.
         if state.last_ltt.is_some() {
@@ -792,21 +906,47 @@ impl TickGapDetector {
                 continue;
             }
             let silent_millis = now_millis.saturating_sub(state.last_seen_millis);
-            let (verdict, expected_millis) = classify_silence(
-                state.interval_ewma_millis,
+            // Plan PR AL-5: an NSE_FNO cadence is floored before it is
+            // judged, and a freshly seeded instrument is not judged at all.
+            // Two compares, no allocation; the scan stays O(n).
+            let judged_cadence = self
+                .config
+                .judged_cadence_millis(state.key.1, state.interval_ewma_millis);
+            let (classified, expected_millis) = classify_silence(
+                judged_cadence,
                 state.samples,
                 silent_millis,
                 state.last_ltt.is_some(),
                 &self.config,
             );
+            // The verdict stays RAW: subscribe reconcile and the dead-class
+            // rollup read it, and a never-ticked contract rewritten to
+            // `Warming` read there as healthy (review, 2026-11-06). The warmup
+            // and the floored sparse flag only gate the page
+            // (`counts_toward_alarm`).
+            let warming_up =
+                self.config
+                    .in_attach_warmup(state.key.1, state.attached_millis, now_millis);
+            let sparse = state.interval_ewma_millis >= self.config.sparse_baseline_millis;
+            // A contract that has ticked is judged sparse on its FLOORED
+            // cadence: the EWMA learns a long gap only when the packet ending
+            // it arrives, so a contract that bursts and then sends 1 to 3
+            // packets an hour (measured live 2026-11-06) would otherwise read
+            // as a 3 s instrument that went silent. A never-ticked contract
+            // keeps the raw flag, so a dead stream still counts.
+            let alarm_sparse = sparse
+                || (state.last_ltt.is_some()
+                    && judged_cadence >= self.config.sparse_baseline_millis);
             sink(SilenceReport {
                 key: state.key,
                 silent_millis,
                 expected_millis,
                 baseline_millis: state.interval_ewma_millis,
                 samples: state.samples,
-                verdict,
-                sparse: state.interval_ewma_millis >= self.config.sparse_baseline_millis,
+                verdict: classified,
+                sparse,
+                warming_up,
+                alarm_sparse,
             });
         }
     }
@@ -923,6 +1063,259 @@ mod tests {
             let t = u64::from(i) * cadence_millis;
             d.observe(obs(key, 1_000 + i, i * 100, 500, t));
         }
+    }
+
+    // ---- plan PR AL-5 (2026-11-06): attach warmup and NSE_FNO cadence floor ----
+
+    const STOCK_OPTION: InstrumentKey = (52_175, ExchangeSegment::NseFno);
+    const CASH_STOCK: InstrumentKey = (2_885, ExchangeSegment::NseEquity);
+
+    fn verdict_of(d: &TickGapDetector, key: InstrumentKey, now: u64) -> Option<SilenceReport> {
+        let mut found = None;
+        d.scan_silence(now, |r| {
+            if r.key == key {
+                found = Some(r);
+            }
+        });
+        found
+    }
+
+    #[test]
+    fn test_live_lane_config_keeps_the_defaults_and_adds_the_two_al5_tunables() {
+        let live = DetectorConfig::live_lane();
+        let base = DetectorConfig::default();
+        assert_eq!(live.attach_warmup_millis, LIVE_ATTACH_WARMUP_MILLIS);
+        assert_eq!(live.fno_cadence_floor_millis, LIVE_FNO_CADENCE_FLOOR_MILLIS);
+        assert_eq!(
+            DetectorConfig {
+                attach_warmup_millis: 0,
+                fno_cadence_floor_millis: 0,
+                ..live
+            },
+            base,
+            "every other tunable is the default"
+        );
+        assert_eq!(
+            base.attach_warmup_millis, 0,
+            "the default config is unchanged"
+        );
+        assert_eq!(base.fno_cadence_floor_millis, 0);
+    }
+
+    #[test]
+    fn test_judged_cadence_millis_floors_only_nse_fno() {
+        let live = DetectorConfig::live_lane();
+        assert_eq!(
+            live.judged_cadence_millis(ExchangeSegment::NseFno, 25_000),
+            60_000
+        );
+        assert_eq!(
+            live.judged_cadence_millis(ExchangeSegment::NseFno, 90_000),
+            90_000
+        );
+        assert_eq!(live.judged_cadence_millis(ExchangeSegment::IdxI, 200), 200);
+        assert_eq!(
+            live.judged_cadence_millis(ExchangeSegment::NseEquity, 1_500),
+            1_500
+        );
+    }
+
+    #[test]
+    fn test_in_attach_warmup_ends_after_ten_minutes() {
+        let live = DetectorConfig::live_lane();
+        let fno = ExchangeSegment::NseFno;
+        assert!(live.in_attach_warmup(fno, Some(1_000), 1_000));
+        assert!(live.in_attach_warmup(fno, Some(1_000), 1_000 + LIVE_ATTACH_WARMUP_MILLIS - 1));
+        assert!(!live.in_attach_warmup(fno, Some(1_000), 1_000 + LIVE_ATTACH_WARMUP_MILLIS));
+        assert!(
+            !live.in_attach_warmup(fno, None, 5),
+            "no recorded start means no warmup"
+        );
+        assert!(
+            !DetectorConfig::default().in_attach_warmup(fno, Some(1_000), 1_000),
+            "warmup off by default"
+        );
+    }
+
+    #[test]
+    fn test_in_attach_warmup_never_applies_to_an_index_or_a_cash_stock() {
+        let live = DetectorConfig::live_lane();
+        for segment in [ExchangeSegment::IdxI, ExchangeSegment::NseEquity] {
+            assert!(
+                !live.in_attach_warmup(segment, Some(1_000), 1_000),
+                "{segment:?} must be judged from its first scan (dead-class rollup)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_regression_a_late_attached_sparse_option_is_not_judged_for_ten_minutes() {
+        // Regression: 2026-11-06 — the 09:08 late attach paged RISK-GAP-03 at
+        // ~09:17 for sparse stock options with a cadence learned from the
+        // first post-subscribe packets.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        let attach = 1_000_000;
+        assert!(d.seed(STOCK_OPTION, attach));
+        // A burst: nine packets 3 s apart, then silence.
+        for i in 1..=9_u32 {
+            let t = attach + u64::from(i) * 3_000;
+            d.observe(obs(STOCK_OPTION, 1_000 + i, i * 100, 500, t));
+        }
+        let last = attach + 27_000;
+        // 9 minutes after the attach and 8.5 minutes quiet: warming, so not
+        // counted; the verdict itself is reported raw.
+        let r = verdict_of(&d, STOCK_OPTION, attach + 540_000).expect("tracked");
+        assert!(r.warming_up);
+        assert!(!r.counts_toward_alarm());
+        // Past the warmup: judged against the 60 s floor, so 10 × 60 s = 600 s.
+        let r = verdict_of(&d, STOCK_OPTION, attach + 610_000).expect("tracked");
+        assert!(!r.warming_up);
+        assert_eq!(
+            r.expected_millis, 600_000,
+            "the floor, not the 3 s burst, sets the ceiling"
+        );
+        assert_eq!(
+            r.verdict,
+            SilenceVerdict::Live,
+            "583 s quiet is within 600 s"
+        );
+        let r = verdict_of(&d, STOCK_OPTION, last + 600_001).expect("tracked");
+        assert_eq!(
+            r.verdict,
+            SilenceVerdict::Exceeded,
+            "the raw verdict still reports the stall (reconcile reads it)"
+        );
+        assert!(
+            !r.sparse,
+            "the raw sparse flag reads the learned 3 s cadence"
+        );
+        assert!(
+            r.alarm_sparse,
+            "judged on the 60 s floor, a stock option that ticked is sparse"
+        );
+        assert!(
+            !r.counts_toward_alarm(),
+            "a burst-then-quiet stock option never pages RISK-GAP-03"
+        );
+    }
+
+    #[test]
+    fn test_regression_a_contract_that_ticks_before_its_seed_still_gets_the_warmup() {
+        // Regression: 2026-11-06 review — a contract whose first packet came
+        // before its seed step never had its warmup start, because `seed`
+        // only stamps a still-silent slot.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        let first = 2_000_000;
+        d.observe(obs(STOCK_OPTION, 5_000, 100, 10, first));
+        assert!(d.seed(STOCK_OPTION, first + 30_000), "seed after the tick");
+        let r = verdict_of(&d, STOCK_OPTION, first + 60_000).expect("tracked");
+        assert!(r.warming_up, "the warmup starts at the first packet");
+        // It ends 10 minutes after the FIRST of the two, not after the seed.
+        let r = verdict_of(&d, STOCK_OPTION, first + LIVE_ATTACH_WARMUP_MILLIS).expect("tracked");
+        assert!(!r.warming_up);
+        // An index first seen by a packet still never warms up.
+        d.observe(obs(NIFTY, 5_000, 0, 0, first));
+        let r = verdict_of(&d, NIFTY, first + 1).expect("tracked");
+        assert!(!r.warming_up);
+    }
+
+    #[test]
+    fn test_warmup_never_rewrites_the_raw_verdict_for_reconcile_and_the_class_rollup() {
+        // Review, 2026-11-06: rewriting NeverTicked to Warming made subscribe
+        // reconcile and the dead-class rollup read a dead subscribe as healthy.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(STOCK_OPTION, 0));
+        let r = verdict_of(&d, STOCK_OPTION, 60_000).expect("tracked");
+        assert_eq!(r.verdict, SilenceVerdict::NeverTicked, "raw verdict kept");
+        assert!(!r.sparse);
+        assert!(r.warming_up);
+        assert!(!r.counts_toward_alarm(), "only the page is held back");
+    }
+
+    #[test]
+    fn test_a_one_packet_per_40_minutes_contract_never_counts_toward_risk_gap_03() {
+        // MEASURED live 2026-11-06 10:00-11:00 IST: the quietest stock options
+        // sent 1 to 3 packets in the whole hour.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        const FORTY_MIN: u64 = 40 * 60_000;
+        assert!(d.seed(STOCK_OPTION, 0));
+        let mut t = 0;
+        for i in 0..12_u32 {
+            t = u64::from(i) * FORTY_MIN;
+            d.observe(obs(STOCK_OPTION, 30_000 + i * 2_400, 100 + i, 10, t));
+            // Every scan between packets, at every point in the gap.
+            for probe in [t + 1, t + 600_001, t + FORTY_MIN - 1] {
+                let r = verdict_of(&d, STOCK_OPTION, probe).expect("tracked");
+                assert!(!r.counts_toward_alarm(), "packet {i}, probe {probe}: {r:?}");
+            }
+        }
+        // Its own cadence is learned as sparse.
+        let r = verdict_of(&d, STOCK_OPTION, t + 1).expect("tracked");
+        assert!(r.samples >= DEFAULT_BASELINE_WARMUP_SAMPLES);
+        assert!(r.sparse, "the learned 40-minute cadence is sparse");
+        // Even hours of silence after that do not count.
+        let r = verdict_of(&d, STOCK_OPTION, t + 6 * FORTY_MIN).expect("tracked");
+        assert!(!r.counts_toward_alarm());
+    }
+
+    #[test]
+    fn test_a_contract_that_only_sent_its_subscribe_snapshot_never_counts() {
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(STOCK_OPTION, 0));
+        d.observe(obs(STOCK_OPTION, 30_000, 0, 10, 5_000));
+        for probe in [
+            60_000,
+            LIVE_ATTACH_WARMUP_MILLIS + 1,
+            3_600_000,
+            6 * 3_600_000,
+        ] {
+            let r = verdict_of(&d, STOCK_OPTION, probe).expect("tracked");
+            assert_ne!(r.verdict, SilenceVerdict::NeverTicked, "it did tick");
+            assert!(!r.counts_toward_alarm(), "probe {probe}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn test_index_and_cash_stocks_are_judged_as_before_from_the_first_scan() {
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        let mut base = TickGapDetector::with_capacity(4, DetectorConfig::default());
+        for det in [&mut d, &mut base] {
+            assert!(det.seed(NIFTY, 0));
+            assert!(det.seed(CASH_STOCK, 0));
+            warm_up(det, NIFTY, 1_000, 20);
+            warm_up(det, CASH_STOCK, 2_000, 20);
+        }
+        // Inside what would be an option's warmup, and well after it: an index
+        // and a cash stock read exactly as under the default config.
+        for now in [100_000, LIVE_ATTACH_WARMUP_MILLIS + 100_000] {
+            for key in [NIFTY, CASH_STOCK] {
+                let live = verdict_of(&d, key, now).expect("tracked");
+                let default = verdict_of(&base, key, now).expect("tracked");
+                assert_eq!(live, default, "{key:?} unchanged by the live-lane tunables");
+            }
+        }
+        // A seeded index that never ticks reports at once, as before (the
+        // dead-class rollup reads this).
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(NIFTY, 0));
+        let r = verdict_of(&d, NIFTY, 60_000).expect("tracked");
+        assert_eq!(r.verdict, SilenceVerdict::NeverTicked);
+    }
+
+    #[test]
+    fn test_a_never_ticked_option_still_reports_after_the_warmup() {
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(STOCK_OPTION, 0));
+        let r = verdict_of(&d, STOCK_OPTION, 60_000).expect("tracked");
+        assert!(r.warming_up);
+        assert!(!r.counts_toward_alarm());
+        let r = verdict_of(&d, STOCK_OPTION, LIVE_ATTACH_WARMUP_MILLIS + 1).expect("tracked");
+        assert_eq!(r.verdict, SilenceVerdict::NeverTicked);
+        assert!(!r.alarm_sparse, "a dead stream keeps the raw (false) flag");
+        assert!(
+            r.counts_toward_alarm(),
+            "a subscribe that never took still counts"
+        );
     }
 
     #[test]
@@ -1759,8 +2152,21 @@ mod tests {
             samples: 32,
             verdict,
             sparse,
+            warming_up: false,
+            alarm_sparse: sparse,
         };
         assert!(report(SilenceVerdict::Exceeded, false).counts_toward_alarm());
+        // Plan PR AL-5: the alarm-only fields gate the page by themselves.
+        let warming = SilenceReport {
+            warming_up: true,
+            ..report(SilenceVerdict::NeverTicked, false)
+        };
+        assert!(!warming.counts_toward_alarm());
+        let floored = SilenceReport {
+            alarm_sparse: true,
+            ..report(SilenceVerdict::Exceeded, false)
+        };
+        assert!(!floored.counts_toward_alarm());
         assert!(report(SilenceVerdict::NeverTicked, false).counts_toward_alarm());
         // The far-month / INDIA VIX case: visible in the sweep, never paging.
         assert!(!report(SilenceVerdict::Exceeded, true).counts_toward_alarm());

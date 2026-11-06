@@ -2283,9 +2283,9 @@ Revert the PR.
 #### Observability
 `tv_scoreboard_rollup_attempts_total{outcome}` local only; no new page.
 
-- [ ] AL-1 feed-delay recorder counts new trades only
-- [ ] AL-2 scoreboard / ws-connection rollup + boot DDL retries
-- [ ] AL-3 (needs a dated noise-lock row first) questdb-disconnected 3-of-5 datapoints; risk-gap-03 period 300 s
+- [x] AL-1 feed-delay recorder counts new trades only
+- [x] AL-2 scoreboard / ws-connection rollup + boot DDL retries
+- [x] AL-3 (needs a dated noise-lock row first) questdb-disconnected 3-of-5 datapoints; risk-gap-03 period 300 s
 
 #### Owner decisions, 2026-11-06 (decision card, recorded verbatim)
 - Feed-delay page: **"Index feed only (Recommended)"** — page only when the index/spot class is over 60 s late; stock options keep a dashboard-only number; count only real new trades. (Noise-lock §2.6 row edited in the same PR, rule-file-first.)
@@ -2293,7 +2293,12 @@ Revert the PR.
 - Main-feed depth data: **"Keep, compact form (Recommended)"** — keep saving it, as 2 book rows per packet (DP-5).
 - 1 µs gate: **"Honest 2.5 µs for now (Recommended)"** — Full-packet frames get their own measured 2.5 µs key; Quote frames keep 1 µs; lower it as the code improves.
 
-- [ ] AL-4 feed-delay alarm re-pointed to the index/spot class gauge (EMF selector + live-lane-alarms.tf), noise-lock §2.6 dated row
+- [x] AL-4 feed-delay alarm re-pointed to the index/spot class gauge (EMF selector + live-lane-alarms.tf), noise-lock §2.6 dated row
+- [x] AL-5 RISK-GAP-03 late-attach noise: the live lane's silence detector (`DetectorConfig::live_lane`, crates/core tick_gap_detector + crates/app dhan_feed_stack) gives a seeded `NSE_FNO` contract a 10-minute warmup and floors its judged cadence at 60 s; indices and cash stocks are judged exactly as before (dead-class rollup not delayed). Tests: `test_regression_a_late_attached_sparse_option_is_not_judged_for_ten_minutes`, `test_in_attach_warmup_never_applies_to_an_index_or_a_cash_stock`, `test_index_and_cash_stocks_are_judged_as_before_from_the_first_scan`
+  - Verified (2026-11-06 live, measured on the box, NSE_FNO, 10:00-11:00 IST, about 10,329 contracts, ticks plus tick_quotes): median 207 packets an hour (about 17 s apart), p10 107 an hour (about 34 s), and the quietest contracts sent 1 to 3 packets in the whole hour (minimum 2 an hour, 3 contracts). So the Dhan "every ~30 s" assumption is false for the quietest contracts. In the live lane a stock option that has ticked never counts toward RISK-GAP-03 through silence (judged sparse on the 60 s floored cadence); a contract that only sent its subscribe snapshot never counts; only a seeded option that sends nothing at all past the warmup still counts. Tests: `test_a_one_packet_per_40_minutes_contract_never_counts_toward_risk_gap_03`, `test_a_contract_that_only_sent_its_subscribe_snapshot_never_counts`
+- [x] AL-6 holiday-calendar reminder noise: `HolidayCalendarCoverageLow` pages at most once per ISO week while more than 14 days of coverage remain (week persisted in `data/state/calendar-staleness-week`, temp file + rename), every boot at 14 or fewer, run out or empty; gauge every check (crates/app calendar_staleness). Tests: `test_more_than_14_days_left_pages_once_per_iso_week`, `test_14_or_fewer_days_run_out_or_empty_page_every_boot`, `test_last_paged_week_round_trips_through_the_file`, `test_a_damaged_week_file_reads_as_not_paged`
+- Note (AL-2): only the same-day run retries (`is_same_day_run`); a past-day `TICKVAULT_SCOREBOARD_DATE` backfill makes one attempt. DDL retries stop after one statement exhausts its budget (later statements one attempt each). Tests: `test_run_scoreboard_ddl_statements_*`, `test_exec_scoreboard_ddl_with_retry_*`, `test_rollup_retry_delay_secs_*`
+- Review fixes (2026-11-06, three reviewers): AL-2 retries the WHOLE attempt (DDL, reads, build, write); every QuestDB failure before the final attempt logs `info!` with no code and returns before anything else is written; at most 8 attempts and none after 16:20 IST (`rollup_attempt_is_final`); zero appended rows is never counted `ok`. AL-1 `advanced` also excludes the replay hand-over gap packet; its exclusions count under reason `not_new_trade`. AL-5 keeps the detector verdict RAW (subscribe reconcile and the dead-class rollup read it) and gates only the page through `SilenceReport::warming_up` and `alarm_sparse`; the warmup starts at the first of seed or first packet. AL-6 week file: regular-file check, 2 s read timeout, exclusive 0o600 temp file. RISK-GAP-03 honest limit recorded in noise lock §2.16. Tests: `every_questdb_failure_in_the_attempt_is_quiet_until_the_final_attempt`, `test_rollup_attempt_is_final_caps_at_eight_attempts_and_the_deadline`, `test_regression_advanced_is_false_on_the_packet_that_ends_the_hand_over_gap`, `test_warmup_never_rewrites_the_raw_verdict_for_reconcile_and_the_class_rollup`, `test_a_warming_up_never_ticked_contract_still_reads_missing`, `test_regression_a_contract_that_ticks_before_its_seed_still_gets_the_warmup`
 
 ### PR CI — 2026-11-06: nightly CI truth (workflows, benches)
 

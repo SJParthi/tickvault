@@ -715,6 +715,24 @@ pub struct ConsumeStats {
     /// packet was accepted and its row is written; it simply carried no new
     /// trade for a candle to count.
     pub repeat_quote: bool,
+    /// `true` when this packet carried a REAL NEW TRADE for its instrument
+    /// (plan PR AL-1, 2026-11-06): the slot was already seeded (never the
+    /// first packet after a subscribe or a slot's creation), and either the
+    /// day-cumulative volume strictly increased, or, for an instrument whose
+    /// cumulative is always 0 (an index), the trade time moved strictly
+    /// forward. A stale cumulative regression, a repeat quote, a counter
+    /// restart, a seeding packet, and the packet that ends a replay gap
+    /// (including the WAL-replay to live hand-over gap, whose trade time can
+    /// be an old downtime trade) all read `false`.
+    ///
+    /// Informational only, like [`Self::repeat_quote`], and deliberately NOT
+    /// part of [`Self::folded`]: it decides nothing in the fold and changes no
+    /// stored candle. The live drain uses it to measure delivery lag only on a
+    /// new trade, because an old last-trade time on a book update or on the
+    /// first packet of an illiquid contract is not delivery lag (measured
+    /// 2026-11-06: 4,038,655 ms read on the F&O class while the index/spot
+    /// class read 1,923 ms).
+    pub advanced: bool,
     /// Timeframes whose seal or late amendment was NOT emitted because a WAL
     /// replay could only partly see that bar (plan ITEM 47). The complete bar
     /// the live process stored survives. `0..=TF_COUNT`.
@@ -2231,6 +2249,21 @@ impl MultiTfAggregator {
         // this tick replaces it: after a gap, only a bucket that holds it can
         // take the skipped span (plan ITEM 47, review round 4).
         let last_counted_secs = slot.last_trade_ts;
+        // A REAL NEW TRADE (plan PR AL-1, 2026-11-06), read BEFORE the seed and
+        // the baseline below move: an already-seeded slot whose cumulative
+        // strictly increased, or, for a zero-volume instrument (an index), whose
+        // trade second moved strictly forward. Never the seeding packet, never
+        // a stale regression (its cumulative is lower), never a repeat (same
+        // second, same cumulative), and never the packet that ends a replay
+        // gap (`gap_now`): after a hand-over its delta spans the downtime and
+        // its trade time can be an old downtime trade, which is not delivery
+        // lag (review 2026-11-06). Informational only; three compares, O(1).
+        let advanced = slot.volume_baseline_seeded
+            && !gap_now
+            && (cumulative_volume > slot.last_cumulative
+                || (cumulative_volume == 0
+                    && slot.last_cumulative == 0
+                    && fold_secs > slot.last_trade_ts));
         if !is_stale_packet {
             slot.last_ltp = prices.last_traded_price;
             slot.last_trade_ts = fold_secs;
@@ -2906,6 +2939,7 @@ impl MultiTfAggregator {
                 .cumulative_regression
                 .increment(1);
         }
+        stats.advanced = advanced;
         stats
     }
 
@@ -3924,6 +3958,9 @@ impl MultiTfAggregator {
 }
 
 #[cfg(test)]
+#[path = "multi_tf_aggregator_advanced_tests.rs"]
+mod advanced_tests;
+#[cfg(test)]
 #[path = "multi_tf_aggregator_l3_tests.rs"]
 mod l3_tests;
 
@@ -3935,7 +3972,7 @@ mod tests {
     /// An exact multiple of 86_400, so `DAY + 33_300` is 09:15:00 IST.
     pub(super) const DAY: u32 = 1_779_321_600;
     /// 09:15:00 IST of [`DAY`].
-    const OPEN: u32 = DAY + 33_300;
+    pub(super) const OPEN: u32 = DAY + 33_300;
     /// 09:00:00 IST of [`DAY`], the start of the pre-open auction. From
     /// 2026-08-28 to 2026-10-05 this was also the candle session open; the
     /// candle session opens at 09:15 again (`OPEN`), so a tick here is
@@ -10474,7 +10511,13 @@ mod tests {
     const REPEAT_SID: u64 = 4_242;
     const SEG_FNO: u8 = 2;
 
-    fn quote(ts: u32, price: f32, cum: u32, oi: u32, received_at_nanos: i64) -> ParsedTick {
+    pub(super) fn quote(
+        ts: u32,
+        price: f32,
+        cum: u32,
+        oi: u32,
+        received_at_nanos: i64,
+    ) -> ParsedTick {
         let mut t = tick(REPEAT_SID, SEG_FNO, ts, price, cum);
         t.open_interest = oi;
         t.received_at_nanos = received_at_nanos;
@@ -10667,6 +10710,8 @@ mod tests {
             out_of_band_timestamp: _,
             // Informational, not a refusal — see the field doc.
             repeat_quote: _,
+            // Informational, not a refusal: a new trade or not (plan PR AL-1).
+            advanced: _,
             // Not a refusal either: the tick WAS folded; only the output of a
             // bar a replay could partly see was held back (plan ITEM 47).
             replay_partial_suppressed: _,

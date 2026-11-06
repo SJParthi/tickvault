@@ -16,9 +16,14 @@
 //!   commodity contracts too, none of which the lane subscribes today).
 //!
 //! Same samples, same 60 s peak hold, published beside the existing gauge.
-//! The existing gauge, its alarm, the EMF selector (anchored `^(...)$`, so the
-//! new name does not match it), the metric filters and every Telegram page are
-//! unchanged: local `/metrics` only (noise lock).
+//!
+//! ⚠ CHANGED 2026-11-06 (plan PR AL-4, noise lock §2.6 dated row, owner card
+//! "Index feed only (Recommended)"): the `index_spot` class is now shipped to
+//! CloudWatch by a second EMF declaration in `deploy/aws/cloudwatch-agent.json`
+//! (dimensions `host` + `class`, label matcher `index_spot` only, one series),
+//! and `tv-<env>-dhan-feed-delay-high` pages on it instead of the all-segment
+//! gauge. The `fno` class stays local `/metrics` only (dashboard). Both
+//! classes now count only NEW trades (`IngestOutcome::Folded::advanced`).
 //!
 //! # Cost
 //!

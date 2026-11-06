@@ -311,15 +311,38 @@ fn the_emf_declaration_still_folds_labels_to_host() {
     {
         let rel = "deploy/aws/cloudwatch-agent.json";
         let text = fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        // 2026-11-06 (plan PR AL-4, noise-lock §2.6 dated row): ONE second
+        // declaration is allowed, and only this exact one. It ships
+        // `tv_dhan_ws_lag_max_ms_by_class` alone, dimensioned `[host, class]`,
+        // matched to `class="index_spot"` only, for `dhan-feed-delay-high`.
+        // Its selector names no metric the `[host]` declaration ships, so it
+        // changes no `{host}` series and the reasoning above still holds for
+        // every other alarm. Anything wider must be re-checked again.
+        const CLASS_DECLARATION: &str = "{\"source_labels\":[\"host\",\"class\"],\
+             \"label_matcher\":\"^tickvault-prod;index_spot$\",\
+             \"dimensions\":[[\"host\",\"class\"]],\
+             \"metric_selectors\":[\"^tv_dhan_ws_lag_max_ms_by_class$\"]}";
         let declarations = text.matches("\"dimensions\":").count();
         assert_eq!(
-            declarations, 1,
-            "{rel} no longer declares exactly one EMF dimension set.\n\
+            declarations, 2,
+            "{rel} no longer declares exactly two EMF dimension sets (the \
+             [host] one and the AL-4 [host, class] one).\n\
              live-lane-alarms.tf reasons that labelled metrics FOLD to {{host}} \
              because there is exactly one `\"dimensions\": [[\"host\"]]` \
              declaration. Adding another changes which dimension sets are \
              published, and the alarms that watch {{host}} must be re-checked \
              against it."
+        );
+        let compacted = compact(&text);
+        assert!(
+            compacted.contains(CLASS_DECLARATION),
+            "{rel}: the second EMF declaration is not exactly the AL-4 \
+             index_spot class declaration for tv_dhan_ws_lag_max_ms_by_class"
+        );
+        assert_eq!(
+            compacted.matches("\"dimensions\":[[\"host\"]]").count(),
+            1,
+            "{rel}: exactly one [host] declaration expected"
         );
         assert!(
             compact(&text).contains("\"dimensions\":[[\"host\"]]"),

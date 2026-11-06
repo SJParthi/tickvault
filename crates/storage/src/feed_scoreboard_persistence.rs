@@ -106,6 +106,188 @@ pub const SCOREBOARD_SESSION_MINUTES: i64 = 375;
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
+/// Attempts per scoreboard/episode DDL statement (plan PR AL-2, 2026-11-06).
+/// Measured 2026-11-05/06: the boot DDL made ONE 10 s attempt against a
+/// stalled QuestDB, so the tables could be auto-created by a later ILP write
+/// without their DEDUP keys. Each statement now retries on a transport error
+/// or a 5xx with backoff [`scoreboard_ddl_backoff_secs`]: 5, 10, 20 s, so a
+/// statement gives up after at most 4 × 10 s + 35 s = 75 s. A 4xx (the SQL
+/// itself refused) is not retried. Cold path, own task, never the drain.
+pub const SCOREBOARD_DDL_MAX_ATTEMPTS: u32 = 4;
+
+/// First backoff between DDL attempts; doubles each retry.
+const SCOREBOARD_DDL_BACKOFF_BASE_SECS: u64 = 5;
+
+/// The wait before the next DDL attempt after `attempts_made` failed
+/// attempts, or `None` when [`SCOREBOARD_DDL_MAX_ATTEMPTS`] are spent. Pure.
+#[must_use]
+pub fn scoreboard_ddl_backoff_secs(attempts_made: u32) -> Option<u64> {
+    if attempts_made == 0 || attempts_made >= SCOREBOARD_DDL_MAX_ATTEMPTS {
+        return None;
+    }
+    SCOREBOARD_DDL_BACKOFF_BASE_SECS.checked_shl(attempts_made.saturating_sub(1))
+}
+
+/// Runs one DDL statement against QuestDB's `/exec`, making at most
+/// `max_attempts` attempts (clamped to `1..=`[`SCOREBOARD_DDL_MAX_ATTEMPTS`])
+/// and retrying a transport error or a 5xx with
+/// [`scoreboard_ddl_backoff_secs`]. Returns `Err` with the last failure's
+/// text after the final attempt, or at once on a 4xx. The caller logs the one
+/// coded error. Cold path.
+///
+/// # Errors
+/// The last failure, as text: `status=<code> body=<first 200 chars>` or the
+/// transport error.
+pub async fn exec_scoreboard_ddl_with_retry(
+    client: &reqwest::Client,
+    base_url: &str,
+    ddl: &str,
+    max_attempts: u32,
+) -> std::result::Result<(), String> {
+    let max_attempts = max_attempts.clamp(1, SCOREBOARD_DDL_MAX_ATTEMPTS);
+    let mut attempts_made = 0_u32;
+    loop {
+        attempts_made = attempts_made.saturating_add(1);
+        let failure = match client.get(base_url).query(&[("query", ddl)]).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let text = format!(
+                    "status={status} body={}",
+                    body.chars().take(200).collect::<String>()
+                );
+                if status.is_client_error() {
+                    return Err(text);
+                }
+                text
+            }
+            Err(err) => format!("request failed: {err}"),
+        };
+        let backoff = if attempts_made >= max_attempts {
+            None
+        } else {
+            scoreboard_ddl_backoff_secs(attempts_made)
+        };
+        match backoff {
+            Some(wait) => {
+                tracing::info!(
+                    attempt = attempts_made,
+                    retry_in_secs = wait,
+                    failure = failure.as_str(),
+                    "scoreboard DDL did not succeed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            None => return Err(failure),
+        }
+    }
+}
+
+/// Runs `statements` in order through [`exec_scoreboard_ddl_with_retry`],
+/// logging one coded `SCOREBOARD-01` per failed statement (`what` names the
+/// tables in the message). Once one statement has used all `max_attempts`
+/// on a transport error or a 5xx, QuestDB is treated as down and every later
+/// statement gets a single attempt, so a down QuestDB costs one backoff
+/// window per call, not one per statement: worst case
+/// 4 × 10 s + 35 s + (statements − 1) × 10 s. A 4xx never opens it (the
+/// statement's own SQL was refused). Cold path. Returns the failed count.
+///
+/// `report_failures` false (plan PR AL-2 review, 2026-11-06): a caller that
+/// will try again later (a non-final rollup attempt) logs each failure at
+/// `info!` with no code, so SCOREBOARD-01 pages only when the last attempt
+/// before 16:20 IST fails.
+pub async fn run_scoreboard_ddl_statements(
+    client: &reqwest::Client,
+    base_url: &str,
+    statements: &[String],
+    max_attempts: u32,
+    what: &str,
+    report_failures: bool,
+) -> usize {
+    let mut questdb_down = false;
+    let mut failed = 0_usize;
+    for ddl in statements {
+        let attempts = if questdb_down { 1 } else { max_attempts };
+        if let Err(failure) = exec_scoreboard_ddl_with_retry(client, base_url, ddl, attempts).await
+        {
+            failed = failed.saturating_add(1);
+            if !failure.starts_with("status=4") {
+                questdb_down = true;
+            }
+            if report_failures {
+                error!(
+                    code = "SCOREBOARD-01",
+                    stage = "ensure_ddl",
+                    ddl = ddl.as_str(),
+                    failure = failure.as_str(),
+                    "SCOREBOARD-01: {what} DDL failed after its retries (dedup may be \
+                     missing — duplicate-row window until a later ensure succeeds)"
+                );
+            } else {
+                tracing::info!(
+                    stage = "ensure_ddl",
+                    ddl = ddl.as_str(),
+                    failure = failure.as_str(),
+                    "{what} DDL did not succeed on this attempt (will retry)"
+                );
+            }
+        }
+    }
+    failed
+}
+
+/// Runs the DDL client and statements for one ensure call: builds the
+/// `/exec` client (a build failure counts every statement as failed) and
+/// hands off to [`run_scoreboard_ddl_statements`]. Cold path. Returns the
+/// failed count.
+pub(crate) async fn run_ensure_statements(
+    questdb_config: &QuestDbConfig,
+    statements: &[String],
+    max_attempts: u32,
+    what: &str,
+    report_failures: bool,
+) -> usize {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            if report_failures {
+                error!(
+                    code = "SCOREBOARD-01",
+                    stage = "ensure_client_build",
+                    ?err,
+                    "SCOREBOARD-01: HTTP client build failed — {what} tables not \
+                     ensured (first ILP write may auto-create them WITHOUT dedup — \
+                     duplicate-row window until a later ensure succeeds)"
+                );
+            } else {
+                tracing::info!(
+                    stage = "ensure_client_build",
+                    ?err,
+                    "{what} DDL client build failed on this attempt (will retry)"
+                );
+            }
+            return statements.len();
+        }
+    };
+    run_scoreboard_ddl_statements(
+        &client,
+        &base_url,
+        statements,
+        max_attempts,
+        what,
+        report_failures,
+    )
+    .await
+}
+
 /// Where the coverage numbers came from (`coverage_source` SYMBOL).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoverageSource {
@@ -329,27 +511,20 @@ pub fn feed_coverage_daily_create_ddl() -> String {
 /// duplicate-row window until a later boot's ensure succeeds.
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL strings unit-tested via the create_ddl tests)
 pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            error!(
-                code = "SCOREBOARD-01",
-                stage = "ensure_client_build",
-                ?err,
-                "SCOREBOARD-01: HTTP client build failed — scoreboard tables not \
-                 ensured (first ILP write may auto-create them WITHOUT dedup — \
-                 duplicate-row window until the next successful boot)"
-            );
-            return;
-        }
-    };
+    let _ =
+        ensure_feed_scoreboard_tables_with(questdb_config, SCOREBOARD_DDL_MAX_ATTEMPTS, true).await;
+}
+
+/// [`ensure_feed_scoreboard_tables`] with an explicit per-statement attempt
+/// budget and reporting (plan PR AL-2): a non-final daily attempt passes
+/// `report_failures` false so a transient QuestDB stall logs `info!`; the
+/// final attempt reports with the coded error. Returns the failed statement
+/// count (0 = ensured).
+pub async fn ensure_feed_scoreboard_tables_with(
+    questdb_config: &QuestDbConfig,
+    max_attempts: u32,
+    report_failures: bool,
+) -> usize {
     let statements = [
         feed_scoreboard_daily_create_ddl(),
         format!("ALTER TABLE {FEED_SCOREBOARD_DAILY_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL;"),
@@ -362,32 +537,16 @@ pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
             "ALTER TABLE {FEED_COVERAGE_DAILY_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_FEED_COVERAGE_DAILY});"
         ),
     ];
-    for ddl in &statements {
-        match client
-            .get(&base_url)
-            .query(&[("query", ddl.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                error!(code = "SCOREBOARD-01", stage = "ensure_ddl",
-                    %status, ddl = ddl.as_str(),
-                    body = %body.chars().take(200).collect::<String>(),
-                    "SCOREBOARD-01: scoreboard DDL returned non-2xx (dedup may be \
-                     missing — duplicate-row window until a later ensure succeeds)");
-            }
-            Err(err) => error!(
-                code = "SCOREBOARD-01",
-                stage = "ensure_ddl",
-                ?err,
-                ddl = ddl.as_str(),
-                "SCOREBOARD-01: scoreboard DDL request failed"
-            ),
-        }
-    }
+    // Plan PR AL-2: each statement retries with backoff; one coded error
+    // only when its last attempt fails and this is a reporting call.
+    run_ensure_statements(
+        questdb_config,
+        &statements,
+        max_attempts,
+        "scoreboard",
+        report_failures,
+    )
+    .await
 }
 
 /// Builds the ILP-over-HTTP conf string (per-flush server ACK — the
@@ -627,6 +786,168 @@ impl FeedScoreboardWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- plan PR AL-2: DDL retries ----
+
+    #[test]
+    fn test_scoreboard_ddl_backoff_secs_doubles_then_stops() {
+        assert_eq!(scoreboard_ddl_backoff_secs(0), None, "no attempt made yet");
+        assert_eq!(scoreboard_ddl_backoff_secs(1), Some(5));
+        assert_eq!(scoreboard_ddl_backoff_secs(2), Some(10));
+        assert_eq!(scoreboard_ddl_backoff_secs(3), Some(20));
+        assert_eq!(
+            scoreboard_ddl_backoff_secs(SCOREBOARD_DDL_MAX_ATTEMPTS),
+            None
+        );
+        assert_eq!(scoreboard_ddl_backoff_secs(u32::MAX), None);
+    }
+
+    #[test]
+    fn test_scoreboard_ddl_worst_case_wait_is_bounded() {
+        let total_wait: u64 = (1..SCOREBOARD_DDL_MAX_ATTEMPTS)
+            .filter_map(scoreboard_ddl_backoff_secs)
+            .sum();
+        // 5 + 10 + 20 s of backoff, plus 4 × the 10 s request timeout.
+        assert_eq!(total_wait, 35);
+        assert!(
+            total_wait + u64::from(SCOREBOARD_DDL_MAX_ATTEMPTS) * QUESTDB_DDL_TIMEOUT_SECS <= 75
+        );
+    }
+
+    /// Serves one canned HTTP response per accepted connection, `n` times,
+    /// and returns the URL plus a counter of requests seen.
+    async fn canned_server(
+        status_line: &'static str,
+        n: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_task = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            for _ in 0..n {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0_u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                seen_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply =
+                    format!("{status_line}\r\ncontent-length: 3\r\nconnection: close\r\n\r\nbad");
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}/exec"), seen)
+    }
+
+    #[tokio::test]
+    async fn test_exec_scoreboard_ddl_with_retry_does_not_retry_a_4xx() {
+        let (url, seen) = canned_server("HTTP/1.1 400 Bad Request", 4).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result =
+            exec_scoreboard_ddl_with_retry(&client, &url, "SELECT 1;", SCOREBOARD_DDL_MAX_ATTEMPTS)
+                .await;
+        let failure = result.expect_err("a 4xx must end in Err");
+        assert!(
+            failure.contains("400"),
+            "the failure names the status: {failure}"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a refused statement is not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_scoreboard_ddl_with_retry_succeeds_on_a_2xx() {
+        let (url, seen) = canned_server("HTTP/1.1 200 OK", 1).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(
+            exec_scoreboard_ddl_with_retry(&client, &url, "SELECT 1;", SCOREBOARD_DDL_MAX_ATTEMPTS)
+                .await
+                .is_ok()
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_exec_scoreboard_ddl_with_retry_retries_a_5xx_up_to_the_budget() {
+        // Two attempts: one 5 s backoff in between.
+        let (url, seen) = canned_server("HTTP/1.1 503 Service Unavailable", 4).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let failure = exec_scoreboard_ddl_with_retry(&client, &url, "SELECT 1;", 2)
+            .await
+            .expect_err("a 5xx on every attempt ends in Err");
+        assert!(failure.contains("503"), "{failure}");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_exec_scoreboard_ddl_with_retry_clamps_a_zero_budget_to_one_attempt() {
+        let (url, seen) = canned_server("HTTP/1.1 503 Service Unavailable", 2).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(
+            exec_scoreboard_ddl_with_retry(&client, &url, "SELECT 1;", 0)
+                .await
+                .is_err()
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_scoreboard_ddl_statements_gives_later_statements_one_attempt_once_questdb_is_down()
+     {
+        // Statement 1 uses its 2 attempts on a 5xx; statements 2 and 3 get one
+        // each: 4 requests, not 6, and only one backoff is slept.
+        let (url, seen) = canned_server("HTTP/1.1 503 Service Unavailable", 8).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let statements = ["A;".to_string(), "B;".to_string(), "C;".to_string()];
+        let failed =
+            run_scoreboard_ddl_statements(&client, &url, &statements, 2, "test", true).await;
+        assert_eq!(failed, 3);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_run_scoreboard_ddl_statements_a_4xx_does_not_mark_questdb_down() {
+        // A refused statement is its own SQL's fault: each statement still
+        // gets its own (single, since a 4xx is never retried) attempt.
+        let (url, seen) = canned_server("HTTP/1.1 400 Bad Request", 8).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let statements = ["A;".to_string(), "B;".to_string(), "C;".to_string()];
+        let failed =
+            run_scoreboard_ddl_statements(&client, &url, &statements, 2, "test", true).await;
+        assert_eq!(failed, 3);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_run_scoreboard_ddl_statements_quiet_mode_counts_the_same_failures() {
+        // Plan PR AL-2 review (2026-11-06): a non-final attempt logs `info!`
+        // instead of the coded error, but makes the same requests and returns
+        // the same count, so the caller still knows to retry.
+        let (url, seen) = canned_server("HTTP/1.1 503 Service Unavailable", 8).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let statements = ["A;".to_string(), "B;".to_string(), "C;".to_string()];
+        let failed =
+            run_scoreboard_ddl_statements(&client, &url, &statements, 2, "test", false).await;
+        assert_eq!(failed, 3);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_run_scoreboard_ddl_statements_all_succeed() {
+        let (url, seen) = canned_server("HTTP/1.1 200 OK", 4).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let statements = ["A;".to_string(), "B;".to_string()];
+        assert_eq!(
+            run_scoreboard_ddl_statements(&client, &url, &statements, 4, "test", true).await,
+            0
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     fn sample_daily_row() -> FeedScoreboardDailyRow {
         FeedScoreboardDailyRow {
@@ -909,13 +1230,61 @@ mod tests {
         // Non-2xx path: every DDL statement takes the log-and-continue arm
         // (best-effort degrade — SCOREBOARD-01, never a panic, never blocks).
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_feed_scoreboard_tables(&mock_cfg(port)).await;
+        ensure_feed_scoreboard_tables_with(&mock_cfg(port), 1, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_feed_scoreboard_tables_with_counts_zero_on_2xx_and_every_statement_on_5xx()
+    {
+        // Plan PR AL-2: the caller decides "ensured" from this count, so a
+        // 2xx run must read 0 and a refused run every one of the 6 statements
+        // (in both reporting modes).
+        let ok_port = spawn_mock_http(MOCK_HTTP_200).await;
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&mock_cfg(ok_port), 1, false).await,
+            0
+        );
+        let bad_port = spawn_mock_http(MOCK_HTTP_500).await;
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&mock_cfg(bad_port), 1, false).await,
+            6
+        );
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&mock_cfg(bad_port), 1, true).await,
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_ensure_statements_returns_the_failed_count() {
+        let statements = ["A;".to_string(), "B;".to_string()];
+        // Unreachable: every statement fails (one attempt each once QuestDB
+        // reads as down).
+        assert_eq!(
+            run_ensure_statements(&unreachable_cfg(), &statements, 2, "test", false).await,
+            2
+        );
+        // 2xx: nothing failed.
+        let port = spawn_mock_http(MOCK_HTTP_200).await;
+        assert_eq!(
+            run_ensure_statements(&mock_cfg(port), &statements, 2, "test", true).await,
+            0
+        );
+        // No statements: nothing to fail.
+        assert_eq!(
+            run_ensure_statements(&unreachable_cfg(), &[], 2, "test", true).await,
+            0
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_feed_scoreboard_tables_unreachable_degrades_without_panic() {
         // Transport-error path: every DDL send Err arm logs and continues.
-        ensure_feed_scoreboard_tables(&unreachable_cfg()).await;
+        assert_eq!(
+            ensure_feed_scoreboard_tables_with(&unreachable_cfg(), 1, false).await,
+            6,
+            "a non-reporting call still returns every failed statement"
+        );
     }
 
     #[tokio::test]
