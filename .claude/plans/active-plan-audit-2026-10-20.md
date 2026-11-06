@@ -2271,3 +2271,26 @@ Revert the PR.
 - [ ] AL-1 feed-delay recorder counts new trades only
 - [ ] AL-2 scoreboard / ws-connection rollup + boot DDL retries
 - [ ] AL-3 (needs a dated noise-lock row first) questdb-disconnected 3-of-5 datapoints; risk-gap-03 period 300 s
+
+#### Owner decisions, 2026-11-06 (decision card, recorded verbatim)
+- Feed-delay page: **"Index feed only (Recommended)"** — page only when the index/spot class is over 60 s late; stock options keep a dashboard-only number; count only real new trades. (Noise-lock §2.6 row edited in the same PR, rule-file-first.)
+- Noisy alarms: **"Yes, quieter (Recommended)"** — questdb-disconnected fires on 3 bad minutes out of 5; RISK-GAP-03 clears 5 minutes after the condition ends (period 300 s). (Noise-lock dated row in the same PR.)
+- Main-feed depth data: **"Keep, compact form (Recommended)"** — keep saving it, as 2 book rows per packet (DP-5).
+- 1 µs gate: **"Honest 2.5 µs for now (Recommended)"** — Full-packet frames get their own measured 2.5 µs key; Quote frames keep 1 µs; lower it as the code improves.
+
+- [ ] AL-4 feed-delay alarm re-pointed to the index/spot class gauge (EMF selector + live-lane-alarms.tf), noise-lock §2.6 dated row
+
+### PR CI — 2026-11-06: nightly CI truth (workflows, benches)
+
+**Verified:** full-test-nightly fails on "No space left on device" while linking ~159 app test binaries with full debuginfo (no test assertion failed; 8 nights red); the aarch64 job is killed by runner shutdown; the bench gate fails Full-packet frames at 1.5–4.6 µs/tick against a 1 µs key that was set from Quote frames; `order_path_oms_order_update_fill` failed +8.3% (10 ns on 128 ns) with no code change since its baseline.
+
+- [ ] CI-1 nightly test jobs build with `CARGO_PROFILE_DEV_DEBUG=0` / `CARGO_PROFILE_TEST_DEBUG=0`, docker prune and a `df -h` before/after (x86 and aarch64)
+- [ ] CI-2 nightly updates one open issue instead of opening a new one each night, and prints the failing test names
+- [ ] CI-3 `feed_drain_main_feed_full` = 2,500 ns key for Full-packet frames (owner card above); Quote frames keep `feed_drain_main_feed` = 1,000 ns; CLAUDE.md key count updated
+- [ ] CI-4 finish and ship the never-opened `claude/assurance-fix-w4` (confirm parked live acks, W4) as its own PR after these
+
+### PR TG — 2026-11-06: tests for the incident's worst-case combinations (storage, app)
+- [ ] TG-1 slow-QuestDB boot: the six audit/rollup ensures retry, DEDUP keys reach the table before the first ILP row (`cov_audit_ddl_slow_boot.rs`)
+- [ ] TG-2 WAL catch-up against a stalling QuestDB (ack timeout, lag pause, clock run-out) (`chaos_catchup_slow_questdb.rs`)
+- [ ] TG-3 archiver /exp 429 and slow export keep the partition and stop within a bound
+- [ ] TG-4 nightly contention test: production compose limits, one hour of depth, archiver export concurrent with ILP writes and /exec probes
