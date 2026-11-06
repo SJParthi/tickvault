@@ -317,7 +317,8 @@ static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 
 /// Records one NEW trade's delivery delay into the window maximum.
 ///
-/// The caller passes only folded, non-repeat ticks from a live socket. O(1):
+/// The caller passes only folded NEW trades (`IngestOutcome::Folded` with
+/// `advanced` true and `repeat_quote` false, plan PR AL-1) from a live socket. O(1):
 /// a few integer operations, one relaxed load and, only when the lag raises
 /// the maximum, one uncontended `fetch_max` ([`fetch_max_if_above`]); no
 /// allocation.
@@ -1409,6 +1410,14 @@ pub enum IngestOutcome {
         /// happened, so its exchange stamp is NOT a delivery-lag sample: the
         /// lag histogram excludes it (2026-09-23, FIFTH scope-lock row).
         repeat_quote: bool,
+        /// The packet carried a REAL NEW TRADE: its contract was already
+        /// seeded (never the first packet after a subscribe) and its
+        /// day-cumulative strictly increased, or, for a zero-volume index, its
+        /// trade second moved forward (`ConsumeStats::advanced`). Only such a
+        /// packet is a delivery-lag sample (plan PR AL-1, 2026-11-06): a stale
+        /// cumulative regression, a backup copy accepted late, or an illiquid
+        /// contract's first packet all carry an old trade time that is not lag.
+        advanced: bool,
     },
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
@@ -1961,7 +1970,8 @@ impl LiveIngest {
     /// REPLACES the detector, discarding whatever it had learned.
     #[must_use]
     pub fn with_detector_capacity(mut self, capacity: usize) -> Self {
-        self.detector = TickGapDetector::with_capacity(capacity.max(1), DetectorConfig::default());
+        self.detector =
+            TickGapDetector::with_capacity(capacity.max(1), DetectorConfig::live_lane());
         self
     }
 
@@ -2005,7 +2015,11 @@ impl LiveIngest {
         Self {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
-            detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            // Plan PR AL-5 (2026-11-06): the live lane's detector gives each
+            // seeded NSE_FNO contract a 10-minute warmup and floors its judged
+            // cadence at 60 s (`DetectorConfig::live_lane`); indices and cash
+            // stocks are judged as before.
+            detector: TickGapDetector::with_capacity(capacity, DetectorConfig::live_lane()),
             subscribe_reconcile: None,
             depth200_cross_feed_latched: [0; MAX_TOTAL_DHAN_CONNECTIONS as usize],
             dead_class_latch: AtomicU8::new(0),
@@ -3435,6 +3449,7 @@ impl LiveIngest {
             sealed: stats.sealed_count,
             amended: stats.amended_count,
             repeat_quote: stats.repeat_quote,
+            advanced: stats.advanced,
         }
     }
 
@@ -5002,6 +5017,9 @@ fn seed_drain_loss_baselines() {
     for reason in [
         "ltt_not_advanced",
         "not_a_trade",
+        // Plan PR AL-1 review (2026-11-06): a folded packet that is not a
+        // new trade.
+        "not_new_trade",
         "clamped_negative",
         "implausible_ltt",
         "unknown_connection_slot",
@@ -8824,10 +8842,20 @@ pub fn drain_main_feed_frame(
                 // as option sockets #1-#3 delivering most packets over 60 s,
                 // while the socket-to-disk-log stage measured 99.8% at or under
                 // 131 us. Each excluded tick is counted, never dropped silently.
+                //
+                // ⚠ CHANGED 2026-11-06 (plan PR AL-1): a folded packet that is
+                // not a NEW trade (`advanced` false: the first packet after a
+                // subscribe, a stale cumulative regression, a backup copy
+                // accepted late) is excluded too. Live that day the F&O worst
+                // delay read 4,038,655 ms while the index/spot class read
+                // 1,923 ms: an illiquid contract's old trade time is not lag.
                 match outcome {
                     IngestOutcome::Folded {
                         repeat_quote: true, ..
                     } => record_ws_lag_repeat_excluded(),
+                    IngestOutcome::Folded {
+                        advanced: false, ..
+                    } => record_ws_lag_not_new_trade_excluded(),
                     IngestOutcome::Folded { .. } => {
                         record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
@@ -10664,6 +10692,12 @@ struct WsLagHandles {
     /// has not traded today carrying an earlier day's trade time. Counted, not
     /// recorded (2026-10-05).
     excluded_not_a_trade: metrics::Counter,
+    /// A folded packet that carried no NEW trade (plan PR AL-1, 2026-11-06):
+    /// the first packet after a subscribe, a book or OI update with the same
+    /// cumulative, a stale regression, or the packet ending a replay gap. Its
+    /// trade time can be hours old. Counted under its own reason so the
+    /// 2026-10-05 `not_a_trade` series keeps its meaning.
+    excluded_not_new_trade: metrics::Counter,
 }
 
 impl WsLagHandles {
@@ -10692,6 +10726,10 @@ impl WsLagHandles {
             excluded_not_a_trade: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "not_a_trade"
+            ),
+            excluded_not_new_trade: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "not_new_trade"
             ),
         }
     }
@@ -11367,6 +11405,13 @@ pub fn record_ws_lag_repeat_excluded() {
 /// relaxed atomic add; no allocation (2026-10-05).
 pub fn record_ws_lag_not_a_trade_excluded() {
     ws_lag_handles().excluded_not_a_trade.increment(1);
+}
+
+/// Counts a folded packet that carried no NEW trade (plan PR AL-1,
+/// 2026-11-06) as excluded from the delivery-lag measurement, under reason
+/// `not_new_trade`. One relaxed atomic add; no allocation.
+fn record_ws_lag_not_new_trade_excluded() {
+    ws_lag_handles().excluded_not_new_trade.increment(1);
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -20016,10 +20061,27 @@ mod tests {
             folded_arm < measured && measured < other,
             "the lag sample must sit inside the Folded arm, before the catch-all"
         );
+        // Plan PR AL-1 (2026-11-06): a folded packet that is not a new trade
+        // is excluded BEFORE the arm that records lag.
+        let not_advanced = arm
+            .find("advanced: false, ..")
+            .expect("a not-advanced fold must be excluded from the lag sample");
+        assert!(
+            not_advanced < folded_arm,
+            "the not-advanced exclusion must come before the recording arm"
+        );
         assert!(
             src.contains("\"reason\" => \"not_a_trade\""),
             "the exclusion reason label must be registered"
         );
+        // Review 2026-11-06: a not-NEW-trade packet is counted under its own
+        // reason, so the 2026-10-05 `not_a_trade` series keeps its meaning.
+        let after: String = arm[not_advanced..].chars().take(120).collect();
+        assert!(
+            after.contains("record_ws_lag_not_new_trade_excluded()"),
+            "the not-advanced arm must count `not_new_trade`"
+        );
+        assert!(src.contains("\"reason\" => \"not_new_trade\""));
     }
 
     use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
@@ -22969,6 +23031,42 @@ mod tests {
         );
     }
 
+    /// Plan PR AL-1 (2026-11-06): only a NEW trade is a delivery-lag sample.
+    /// The first packet of an instrument never is; a later index print is.
+    #[test]
+    fn test_regression_ingest_reports_advanced_only_on_a_new_trade() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let first = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let ParsedFrame::Tick(tick) = dispatch_frame(&first, 1_779_355_000_000_000_000)
+            .expect("a well-formed ticker packet must parse")
+        else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        let outcome = ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Folded {
+                    advanced: false,
+                    ..
+                }
+            ),
+            "the first packet after a subscribe is never a new trade, got {outcome:?}"
+        );
+
+        let later = ticker_packet(13, 23_147.0, 1_779_355_001);
+        let ParsedFrame::Tick(tick) = dispatch_frame(&later, 1_779_355_001_000_000_000)
+            .expect("a well-formed ticker packet must parse")
+        else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        let outcome = ingest.ingest_tick(&tick, 43, 1_779_355_001_000);
+        assert!(
+            matches!(outcome, IngestOutcome::Folded { advanced: true, .. }),
+            "a later index print is a new trade, got {outcome:?}"
+        );
+    }
+
     // ---- the cross-verification tests: REMOVED 2026-09-16 with the comparator ----
     //
     // Five tests lived here and every one pinned a piece of the 15:41
@@ -23803,6 +23901,39 @@ mod tests {
             "the sweep runs every 30s and a dead class stays dead all session; \
              re-reporting would emit ~1,100 identical lines per session and \
              bury the signal it exists to raise"
+        );
+    }
+
+    /// Review 2026-11-06 (plan PR AL-5): the class rollup reads the RAW
+    /// verdict, so a stock-option class that never delivered is still found
+    /// dead under the live-lane config, and none of its contracts is counted
+    /// toward the per-instrument RISK-GAP-03 page while it warms up.
+    #[test]
+    fn the_dead_class_rollup_still_sees_a_never_ticked_option_class_under_the_live_lane() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let seeded_at = IN_SESSION_1000_IST_MILLIS;
+        for sid in [40_001u64, 40_002, 40_003] {
+            assert!(ingest.seed(sid, ExchangeSegment::NseFno, seeded_at));
+        }
+        let bit = 1u8 << segment_class_index(ExchangeSegment::NseFno);
+        // Inside the warmup: nothing is counted for the page.
+        let (silent, never) = ingest.scan_silence(seeded_at + 60_000);
+        assert_eq!((silent, never), (0, 0), "warming contracts never page");
+        // Past the 600 s option ceiling, two consecutive dead sweeps latch the
+        // class from the raw NeverTicked verdict.
+        let ceiling =
+            10 * tickvault_core::pipeline::tick_gap_detector::LIVE_FNO_CADENCE_FLOOR_MILLIS;
+        let _ = ingest.scan_silence(seeded_at + ceiling + 1);
+        let (silent, never) = ingest.scan_silence(seeded_at + ceiling + 2);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            bit,
+            "an option class that never delivered is a dead class"
+        );
+        assert_eq!(
+            (silent, never),
+            (3, 3),
+            "and each contract counts past the warmup"
         );
     }
 
@@ -28890,11 +29021,33 @@ mod silence_latch_tests {
         // were present three lines further down.
         let entry = &entry[..entry.find("desc").unwrap_or(entry.len())];
 
+        // ⚠ CHANGED 2026-11-06 (noise lock §2.16, owner card "Yes, quieter
+        // (Recommended)"): the window is 300 s, so the alarm clears 5 minutes
+        // after the last emit instead of holding ALARM for up to an hour. What
+        // keeps a 300 s window from flapping on the residual oscillation (the
+        // 2026-08-14 session, ~25 transitions) is the EMIT side: one coded
+        // per-instrument silence page at most every `SILENCE_PAGE_COOLDOWN_SECS`
+        // (1,800 s). The dead-class report (edge-latched per class) and the
+        // detector-blind line (once per process) share the filter and can page
+        // separately (§2.16 honest limit). Both halves are pinned here: the
+        // period may not exceed 300 s (§2.16 REJECT), and the cooldown may not
+        // shrink below 1,800 s.
         assert!(
-            entry.contains("period      = 3600"),
-            "the risk-gap-03 alarm window shrank below an hour. A 5-minute \
-             window flaps on the residual oscillation and pages on every edge \
-             — the 2026-08-14 session would have produced ~25 transitions"
+            entry.contains("period      = 300\n"),
+            "the risk-gap-03 alarm window is not 300 s. Noise lock §2.16 \
+             (2026-11-06) set it to 300 s so the alarm clears 5 minutes after the \
+             last emit; raising it again needs a further dated row"
+        );
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dhan_feed_stack.rs"),
+        )
+        .expect("dhan_feed_stack.rs must be readable");
+        assert!(
+            src.contains("const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;"),
+            "the 30-minute RISK-GAP-03 emit cooldown changed. A 300 s alarm \
+             window only stays quiet because the emit side pages at most every \
+             30 minutes; without it the 2026-08-14 oscillation would page on \
+             every edge (~25 transitions)"
         );
         assert!(
             entry.contains("ok_recovery = false"),

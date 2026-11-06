@@ -6738,6 +6738,9 @@ fn spawn_feed_scoreboard_tasks(
     };
     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 
+    // Plan PR AL-2 (2026-11-06): the rollup retry counter starts at a known 0.
+    tickvault_app::ws_connection_rollup::register_rollup_attempt_counters();
+
     // Config sanity (round-2 hostile review 2026-07-10): a typo'd trigger
     // ≥ 86400 slept past the 16:30 auto-stop every day — the task died at
     // shutdown as silent teardown, so a config typo disabled the whole

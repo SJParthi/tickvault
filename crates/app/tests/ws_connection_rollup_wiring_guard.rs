@@ -105,8 +105,12 @@ fn an_unreadable_event_body_aborts_instead_of_writing_zeros() {
         .nth(1)
         .expect("the rollup must fold the ws_event body");
     let window: String = parse_arm.chars().take(1200).collect();
+    // Since plan PR AL-2 (2026-11-06) one attempt returns `RollupOnce`, so the
+    // abort is `return RollupOnce::Done { rows: None, .. }` (no rows built,
+    // nothing written, not retried).
     assert!(
-        window.contains("return None"),
+        window.contains("return None")
+            || (window.contains("return RollupOnce::Done") && window.contains("rows: None")),
         "an unparsable ws_event_audit body must abort the rollup, not write \
          a table of zeros that reads as a clean day"
     );

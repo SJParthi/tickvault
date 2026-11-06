@@ -203,12 +203,23 @@ fn emf_selected(root: &Path) -> BTreeSet<String> {
     let path = root.join("deploy/aws/cloudwatch-agent.json");
     let content =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
-    let at = content
-        .find("\"metric_selectors\"")
-        .expect("the deployed CloudWatch agent config carries a metric_selectors key");
-    let tail = &content[at..];
-    let end = tail.find(']').expect("metric_selectors list is closed");
-    tv_names(&tail[..end]).into_iter().collect()
+    // The UNION across every `metric_selectors` entry (2026-11-06, plan PR
+    // AL-4): the second declaration ships `tv_dhan_ws_lag_max_ms_by_class`
+    // (index_spot only) for `dhan-feed-delay-high`. Reading only the first
+    // list would call that alarm unroutable.
+    let mut out = BTreeSet::new();
+    let mut rest = content.as_str();
+    while let Some(at) = rest.find("\"metric_selectors\"") {
+        let tail = &rest[at..];
+        let end = tail.find(']').expect("metric_selectors list is closed");
+        out.extend(tv_names(&tail[..end]));
+        rest = &tail[end..];
+    }
+    assert!(
+        !out.is_empty(),
+        "the deployed CloudWatch agent config carries a metric_selectors key"
+    );
+    out
 }
 
 /// Expand a `for_each` filter name such as `tv_loss_${each.value.group}_total`

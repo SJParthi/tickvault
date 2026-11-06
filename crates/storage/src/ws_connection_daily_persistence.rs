@@ -76,7 +76,7 @@
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use tracing::warn;
 
 use tickvault_common::config::QuestDbConfig;
 
@@ -87,8 +87,6 @@ pub const WS_CONNECTION_DAILY_TABLE: &str = "ws_connection_daily";
 /// `(ws_type, connection_index)` composite connection identity.
 pub const DEDUP_KEY_WS_CONNECTION_DAILY: &str =
     "ts, trading_date_ist, feed, ws_type, connection_index";
-
-const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// One connection's whole day, ready for ILP write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -304,61 +302,27 @@ pub fn ws_connection_daily_ddl_statements() -> Vec<String> {
 /// failed ensure leaves the table to be auto-created by the first ILP write
 /// WITHOUT DEDUP UPSERT KEYS, i.e. a duplicate-row window until a later
 /// boot's ensure succeeds.
-// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via ws_connection_daily_create_ddl tests)
-pub async fn ensure_ws_connection_daily_table(questdb_config: &QuestDbConfig) {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            error!(
-                code = "SCOREBOARD-01",
-                stage = "ensure_client_build",
-                ?err,
-                "SCOREBOARD-01: HTTP client build failed — ws_connection_daily \
-                 not ensured (first ILP write may auto-create it WITHOUT dedup \
-                 — duplicate-row window until the next successful boot)"
-            );
-            return;
-        }
-    };
+///
+/// Plan PR AL-2 review (2026-11-06): runs through the shared scoreboard DDL
+/// runner, so `max_attempts` bounds the per-statement retries and a
+/// non-final rollup attempt (`report_failures` false) logs `info!` with no
+/// code; only the last attempt before 16:20 IST reports SCOREBOARD-01.
+/// Returns the failed statement count (0 = ensured).
+// TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via ws_connection_daily_create_ddl tests; the runner via run_scoreboard_ddl_statements tests)
+pub async fn ensure_ws_connection_daily_table(
+    questdb_config: &QuestDbConfig,
+    max_attempts: u32,
+    report_failures: bool,
+) -> usize {
     let statements = ws_connection_daily_ddl_statements();
-    for ddl in &statements {
-        match client
-            .get(&base_url)
-            .query(&[("query", ddl.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                error!(
-                    code = "SCOREBOARD-01",
-                    stage = "ensure_ddl",
-                    %status,
-                    ddl = ddl.as_str(),
-                    body = %body.chars().take(200).collect::<String>(),
-                    "SCOREBOARD-01: ws_connection_daily DDL returned non-2xx \
-                     (dedup may be missing — duplicate-row window until a later \
-                     ensure succeeds)"
-                );
-            }
-            Err(err) => error!(
-                code = "SCOREBOARD-01",
-                stage = "ensure_ddl",
-                ?err,
-                ddl = ddl.as_str(),
-                "SCOREBOARD-01: ws_connection_daily DDL request failed"
-            ),
-        }
-    }
+    crate::feed_scoreboard_persistence::run_ensure_statements(
+        questdb_config,
+        &statements,
+        max_attempts,
+        "ws_connection_daily",
+        report_failures,
+    )
+    .await
 }
 
 /// Builds the ILP-over-HTTP conf string. HTTP (NOT ILP TCP) so every flush
@@ -595,6 +559,27 @@ mod tests {
             "a socket the lane dialed that never connected is the loudest \
              possible non-clean day"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_ws_connection_daily_table_unreachable_returns_every_failed_statement() {
+        // Plan PR AL-2 review (2026-11-06): the rollup's non-final attempts
+        // call this with `report_failures` false; the failure count still
+        // reaches the caller so the attempt can be retried. Port 1 is
+        // reserved and never listening.
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let total = ws_connection_daily_ddl_statements().len();
+        assert!(total > 0);
+        assert_eq!(
+            ensure_ws_connection_daily_table(&cfg, 1, false).await,
+            total
+        );
+        assert_eq!(ensure_ws_connection_daily_table(&cfg, 1, true).await, total);
     }
 
     #[test]
