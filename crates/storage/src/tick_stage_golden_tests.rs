@@ -99,8 +99,12 @@ struct Golden {
 }
 
 /// The batch's ILP text, exactly as the writer thread would send it.
-fn batch_bytes(batch: &FlushBatch) -> Vec<u8> {
-    batch.encode_ilp_for_test(Feed::Dhan)
+///
+/// Written in the run's OWN encoder (review round 1, 2026-11-06): both runs
+/// used to be written with the library encoder, so the "the two encoders
+/// differ" check below compared the library with itself.
+fn batch_bytes(batch: &FlushBatch, encoder: TickIlpEncoder) -> Vec<u8> {
+    batch.encode_ilp_with_for_test(Feed::Dhan, encoder)
 }
 
 fn price(rng: &mut Rng) -> f32 {
@@ -249,7 +253,7 @@ fn run_stream(seed: u64, encoder: TickIlpEncoder, heavy: bool) -> Vec<Golden> {
                 min_seq: batch.min_seq,
                 max_seq: batch.max_seq,
                 unbacked: batch.unbacked,
-                bytes: batch_bytes(&batch),
+                bytes: batch_bytes(&batch, encoder),
             });
         }
     };

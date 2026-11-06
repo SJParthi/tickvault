@@ -125,9 +125,18 @@ const _: () = assert!(
 
 /// Rows every staged batch is reserved (and pre-touched) for. The old 2 MiB
 /// text buffer held about 15,000 rows at the measured ~133 bytes a row; this
-/// keeps at least that many. SPACE: 16,384 × [`STAGED_ROW_BYTES`] (about
-/// 4.6 MiB) per batch; at most nine batches (producer, four queued, four
-/// spares), committed from the split.
+/// keeps at least that many. SPACE: 16,384 × [`STAGED_ROW_BYTES`] (4.5 MiB)
+/// per batch. ⚠ CORRECTED 2026-11-06 (review round 1): "at most nine
+/// batches" counted only the steady state (producer, four spares, four
+/// queued). The real worst case, during a QuestDB stall, is the producer,
+/// four queued and one in flight on the writer thread, four spares, two
+/// queued and one in flight on the rescue thread (13 batches, about
+/// 58.5 MiB at the pre-size) plus the park, bounded by its own row slots
+/// (`PARKED_RESCUE_MAX_BYTES`, 36 MiB): about 95 MiB per tick writer. A batch
+/// that grew past the pre-size holds more (counted on
+/// `tv_tick_stage_grow_total`). Spent batches come back to the producer from
+/// BOTH the writer and the rescue thread (cleared there), so a stall does
+/// not keep allocating fresh ones on the drain.
 pub const TICK_STAGED_ROWS_PRESIZE: usize = 16_384;
 
 /// The longest ILP line one staged row can encode to, in either encoder:
@@ -259,6 +268,25 @@ impl StagedBatch {
         self.pins = [const { None }; TICK_STAGE_LABEL_PINS];
         self.pin_count = 0;
         self.refused = 0;
+    }
+
+    /// Empties the rows but KEEPS the name pins and the capacity (review
+    /// round 1, 2026-11-06). This is the clear a split writer uses on the
+    /// drain: dropping a pin there could free the last reference to a
+    /// replaced name table (about 120,000 entries) inside a frame. The pins
+    /// go when the batch next reaches the writer or rescue thread, whose
+    /// [`Self::clear`] drops them; until then they stay deduplicated and at
+    /// most [`TICK_STAGE_LABEL_PINS`] (a ninth table hands the batch off
+    /// early). O(1).
+    pub(crate) fn clear_rows(&mut self) {
+        self.rows.clear();
+        self.refused = 0;
+    }
+
+    /// Name tables this batch pins (tests).
+    #[cfg(test)]
+    pub(crate) fn pin_count(&self) -> usize {
+        usize::from(self.pin_count)
     }
 
     /// Rows an encode of this batch refused and already counted.

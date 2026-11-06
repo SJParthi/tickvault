@@ -389,3 +389,41 @@ fn test_encode_ilp_for_test_writes_the_batch_text() {
     assert!(text.starts_with(b"ticks,"));
     assert_eq!(batch.encode_ilp_for_test(Feed::Dhan), text, "read-only");
 }
+
+/// `FlushBatch::encode_ilp_with_for_test` writes the batch in the encoder it
+/// is given; both encoders write the same bytes (review round 1: the golden
+/// test now writes each run in its own encoder through this).
+#[test]
+fn test_encode_ilp_with_for_test_writes_both_encoders_identically() {
+    let (mut w, sink, rx) =
+        crate::tick_persistence::TickWriter::for_test(Feed::Dhan).split_for_offload();
+    drop(sink);
+    w.append_row(&row(10)).expect("stage");
+    w.flush().expect("hand off");
+    let batch = rx.try_recv().expect("queued");
+    let library = batch.encode_ilp_with_for_test(Feed::Dhan, TickIlpEncoder::Library);
+    let own = batch.encode_ilp_with_for_test(Feed::Dhan, TickIlpEncoder::Own);
+    assert!(library.starts_with(b"ticks,"));
+    assert_eq!(library, own);
+    assert_eq!(batch.encode_ilp_for_test(Feed::Dhan), library);
+}
+
+/// `clear_rows` empties the rows (and the refused count) but keeps the pins
+/// and the capacity; `clear` drops the pins too (review round 1).
+#[test]
+fn test_clear_rows_keeps_pins_and_capacity_and_pin_count_tracks_them() {
+    let _g = lock();
+    publish_candle_contract_labels(CandleContractLabels::default());
+    let mut b = StagedBatch::presized();
+    let pin = b.try_pin(candle_contract_labels()).expect("pin");
+    b.push(StagedRow::Tick { row: row(1), pin });
+    let cap = b.capacity();
+    b.clear_rows();
+    assert!(b.is_empty());
+    assert_eq!(b.refused(), 0);
+    assert_eq!(b.pin_count(), 1, "pins kept");
+    assert_eq!(b.capacity(), cap);
+    b.clear();
+    assert_eq!(b.pin_count(), 0, "pins dropped");
+    assert_eq!(b.capacity(), cap);
+}

@@ -2408,8 +2408,10 @@ pub struct TickWriter {
     /// at shutdown. Each keeps its watermark floor while parked. Pre-sized by
     /// [`TickWriter::split_rescue_offload`], so parking never allocates.
     parked_rescue: std::collections::VecDeque<RescueBatch>,
-    /// Staged rows held in `parked_rescue` (PF-4: was its ILP bytes).
-    parked_rescue_rows: usize,
+    /// Row SLOTS (capacity) held in `parked_rescue` (PF-4: was its ILP bytes;
+    /// review round 1, 2026-11-06: was its rows, which under-stated the RAM a
+    /// pre-sized batch holds).
+    parked_rescue_slots: usize,
     /// Consecutive flushes whose rows the producer RETAINED because the queue
     /// was full. Reset to zero on every successful hand-off.
     ///
@@ -2421,8 +2423,13 @@ pub struct TickWriter {
     flush_counters: TickFlushCounters,
     /// Cleared buffers the writer thread hands back for reuse, so a hand-off
     /// does not start the next batch from a zero-capacity buffer. `None`
-    /// until [`TickWriter::split_for_offload`] runs (item 44g).
+    /// until [`TickWriter::split_for_offload`] runs (item 44g). Review round
+    /// 1 (2026-11-06): the rescue thread returns its spent batches through
+    /// the same lane, so the lane opens at whichever split runs first.
     spare_buffers: Option<std::sync::mpsc::Receiver<StagedBatch>>,
+    /// The sending end of the spare lane, cloned into the writer and rescue
+    /// sinks at their splits. `None` until a split opens the lane.
+    spare_lane: Option<std::sync::mpsc::SyncSender<StagedBatch>>,
     /// `tv_feed_aux_rows_total{kind}` handles, one per
     /// [`AuxPacketKind`], resolved once so an append is a counter increment
     /// and never a label-vector allocation (plan item 45h).
@@ -2790,10 +2797,11 @@ impl TickWriter {
             offload: None,
             rescue: None,
             parked_rescue: std::collections::VecDeque::new(),
-            parked_rescue_rows: 0,
+            parked_rescue_slots: 0,
             retained_spans: 0,
             flush_counters: TickFlushCounters::new(feed),
             spare_buffers: None,
+            spare_lane: None,
             aux_counters: aux_row_counters(),
             aux_rows_appended: 0,
             quote_rows_appended: 0,
@@ -3267,6 +3275,12 @@ impl TickWriter {
         >,
     ) -> u8 {
         self.flush_counters.stage_pin_cut.increment(1);
+        // The unbacked mark is set for a frame BEFORE its rows are staged
+        // (`mark_frame_unbacked` in the app). A cut on that frame's first row
+        // hands the old batch off and clears the mark, so the frame's own rows
+        // would land in the new batch unmarked. Keep it: a stale `true` costs
+        // one inline spill, never a row (review round 1, 2026-11-06).
+        let unbacked = self.pending_unbacked;
         if self.offload.is_some() {
             if let OffloadOutcome::QueueFull(_) = self.offload_flush() {
                 self.retained_spans = 0;
@@ -3276,12 +3290,24 @@ impl TickWriter {
             // The synchronous arm: sends, or rescues the rows on failure.
             let _sent_or_rescued = self.flush().is_ok();
         }
+        self.pending_unbacked |= unbacked;
         match self.staged.try_pin(labels) {
             Ok(pin) => pin,
             Err(labels) => {
-                // Unreachable: every arm above leaves an empty batch. Kept
-                // total rather than trusted: rescue, then pin.
+                // Review round 1 (2026-11-06): a split writer keeps a batch's
+                // pins when the drain clears its rows (a WAL deferral, an
+                // inline spill, an empty discard), so the batch can come back
+                // from the arms above with no rows and every pin slot full of
+                // tables no row uses. Rescue any rows still held, then drop
+                // those stale pins: the ONE place a split writer still
+                // releases pins on the drain, reached only when a ninth name
+                // table arrives while the writer queue refused the hand-off.
+                // At most `TICK_STAGE_LABEL_PINS` `Arc` drops; counted on
+                // `tv_tick_stage_pin_cut_total` above.
+                let unbacked = self.pending_unbacked;
                 let _rescued = self.discard_pending();
+                self.pending_unbacked |= unbacked;
+                self.staged.clear();
                 self.staged.try_pin(labels).unwrap_or(0)
             }
         }
@@ -3415,7 +3441,7 @@ impl TickWriter {
         scratch.clear();
         match flushed {
             Some(Ok(())) => {
-                self.staged.clear();
+                self.clear_staged_on_drain();
                 self.pending = 0;
                 // Every pending row landed, so the unbacked mark goes with them
                 // (review of G4-audit, 2026-10-11). Left set, it read every
@@ -3494,11 +3520,7 @@ impl TickWriter {
         mut self,
     ) -> (Self, TickWriterSink, std::sync::mpsc::Receiver<FlushBatch>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
-        // The return lane for spent buffers (item 44g). Same depth as the
-        // hand-off queue: there can never be more spares in flight than
-        // batches that produced them, and a full lane drops the spare rather
-        // than waiting.
-        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
+        let spare_tx = self.spare_lane();
         let sink = TickWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
@@ -3510,8 +3532,39 @@ impl TickWriter {
             encode_buf: presized_row_buffer(self.encoder),
         };
         self.offload = Some(tx);
-        self.spare_buffers = Some(spare_rx);
         (self, sink, rx)
+    }
+
+    /// The sending end of the spare lane, opened on first use (cold: once per
+    /// split). The return lane for spent batches (item 44g): same depth as the
+    /// hand-off queue, and a full lane drops the spare (on the returning
+    /// thread) rather than waiting. Review round 1 (2026-11-06): the writer
+    /// sink AND the rescue sink return through it, so whichever split runs
+    /// first opens it.
+    fn spare_lane(&mut self) -> std::sync::mpsc::SyncSender<StagedBatch> {
+        if let Some(tx) = self.spare_lane.as_ref() {
+            return tx.clone(); // APPROVED: one sender handle per split, cold
+        }
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
+        self.spare_buffers = Some(spare_rx);
+        self.spare_lane = Some(spare_tx.clone()); // APPROVED: one sender handle per split, cold
+        spare_tx
+    }
+
+    /// Empties the staged batch ON THE DRAIN (review round 1, 2026-11-06).
+    ///
+    /// A split writer (a spare lane is open) clears only the rows and keeps
+    /// the name pins: dropping a pin here could free the last reference to a
+    /// replaced name table (about 120,000 entries) inside a frame. The pins
+    /// travel with the batch to the writer or rescue thread, whose clear drops
+    /// them. An unsplit writer (tests and cold synchronous paths) has no other
+    /// thread to drop them on, so it drops them here. O(1) either way.
+    fn clear_staged_on_drain(&mut self) {
+        if self.spare_lane.is_some() {
+            self.staged.clear_rows();
+        } else {
+            self.staged.clear();
+        }
     }
 
     /// Closes the hand-off queue, so the writer thread sees the end of the
@@ -3542,11 +3595,13 @@ impl TickWriter {
         &mut self,
     ) -> (TickRescueSink, std::sync::mpsc::Receiver<RescueBatch>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(RESCUE_QUEUE_DEPTH);
+        let spare_return = Some(self.spare_lane());
         let sink = TickRescueSink {
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             feed: self.feed,
             spill_sync: SPILL_SYNC_OFF_DRAIN,
             scratch: std::cell::RefCell::new(TickRowBuffer::new(self.encoder)),
+            spare_return,
         };
         self.rescue = Some(tx);
         // Once per process, so a park on the drain never allocates.
@@ -3572,7 +3627,7 @@ impl TickWriter {
         if let Some(tx) = self.rescue.take() {
             let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
             while let Some(batch) = self.parked_rescue.pop_front() {
-                self.parked_rescue_rows = self.parked_rescue_rows.saturating_sub(batch.rows);
+                self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(batch.slots());
                 let rows = batch.rows;
                 match hand_off_before(&tx, batch, deadline) {
                     ShutdownHandOff::Sent => {
@@ -3593,30 +3648,33 @@ impl TickWriter {
         while let Some(batch) = self.parked_rescue.pop_front() {
             self.spill_parked_at_shutdown(batch);
         }
-        self.parked_rescue_rows = 0;
+        self.parked_rescue_slots = 0;
         self.flush_counters.rescue_parked_bytes.set(0.0);
     }
 
     /// True when `batch` fits in the park without passing either bound.
-    /// PF-4: the second bound is rows ([`PARKED_RESCUE_MAX_ROWS`]), the old
-    /// 128 MiB text bound restated at the worst-case line.
+    /// PF-4: the second bound is row SLOTS ([`PARKED_RESCUE_MAX_ROWS`]), the
+    /// old 128 MiB text bound restated at the worst-case line. Review round 1
+    /// (2026-11-06): counted on each batch's CAPACITY, not its rows, because
+    /// a parked batch holds its whole pre-touched allocation however few rows
+    /// it carries; so the bound is the RAM the park really holds.
     fn park_rescue_fits(&self, batch: &RescueBatch) -> bool {
         self.parked_rescue.len() < PARKED_RESCUE_MAX_BATCHES
-            && self.parked_rescue_rows.saturating_add(batch.rows) <= PARKED_RESCUE_MAX_ROWS
+            && self.parked_rescue_slots.saturating_add(batch.slots()) <= PARKED_RESCUE_MAX_ROWS
     }
 
-    /// Publishes the RAM the park holds (PF-4: staged rows, see
-    /// [`TICK_RESCUE_PARKED_BYTES_GAUGE`]).
+    /// Publishes the RAM the park holds (PF-4: staged row slots, capacity and
+    /// not just rows; see [`TICK_RESCUE_PARKED_BYTES_GAUGE`]).
     fn publish_parked_bytes(&self) {
         self.flush_counters
             .rescue_parked_bytes
-            .set(self.parked_rescue_rows.saturating_mul(STAGED_ROW_BYTES) as f64);
+            .set(self.parked_rescue_slots.saturating_mul(STAGED_ROW_BYTES) as f64);
     }
 
     /// Parks one refused rescue batch in RAM (H4). O(1), no allocation (the
     /// queue was pre-sized when the rescue was split), floor kept.
     fn park_rescue(&mut self, batch: RescueBatch) {
-        self.parked_rescue_rows = self.parked_rescue_rows.saturating_add(batch.rows);
+        self.parked_rescue_slots = self.parked_rescue_slots.saturating_add(batch.slots());
         self.flush_counters
             .rescue_parked
             .increment(batch.rows as u64);
@@ -3634,16 +3692,16 @@ impl TickWriter {
             return;
         }
         while let Some(batch) = self.parked_rescue.pop_front() {
-            let parked = batch.rows;
+            let parked = batch.slots();
             let rows = batch.rows as u64;
             let Some(tx) = self.rescue.as_ref() else {
-                self.parked_rescue_rows = self.parked_rescue_rows.saturating_sub(parked);
+                self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(parked);
                 self.spill_parked_on_drain(batch);
                 continue;
             };
             match tx.try_send(batch) {
                 Ok(()) => {
-                    self.parked_rescue_rows = self.parked_rescue_rows.saturating_sub(parked);
+                    self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(parked);
                     self.flush_counters.rescue_queued.increment(rows);
                 }
                 Err(std::sync::mpsc::TrySendError::Full(batch)) => {
@@ -3652,7 +3710,7 @@ impl TickWriter {
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => {
-                    self.parked_rescue_rows = self.parked_rescue_rows.saturating_sub(parked);
+                    self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(parked);
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
                     self.spill_parked_on_drain(batch);
                 }
@@ -3677,6 +3735,16 @@ impl TickWriter {
             wm.release_rescue_floor(floor);
         }
         wm.note_ticks_completed();
+        // Review round 1 (2026-11-06): not dropped here, where its pins could
+        // free a replaced name table inside a frame. Rows cleared, pins kept,
+        // it goes to the spare lane; the next hand-off carries the pins to a
+        // thread that drops them. A full lane drops it here (thread-gone
+        // path only, cold).
+        let mut spent = batch.staged;
+        spent.clear_rows();
+        if let Some(lane) = self.spare_lane.as_ref() {
+            let _dropped_if_refused = lane.try_send(spent);
+        }
     }
 
     /// [`Self::spill_parked_on_drain`] at shutdown (audit K1): a batch whose
@@ -3852,7 +3920,7 @@ impl TickWriter {
         if let Some(spares) = self.spare_buffers.as_ref()
             && let Ok(mut spare) = spares.try_recv()
         {
-            spare.clear();
+            spare.clear_rows();
             self.staged = spare;
         }
         // K6 / PF-4: no spare (or a smaller one) means the next batch would
@@ -3903,7 +3971,7 @@ impl TickWriter {
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped == 0 {
-            self.staged.clear();
+            self.clear_staged_on_drain();
             self.pending = 0;
             return 0;
         }
@@ -4035,7 +4103,7 @@ impl TickWriter {
                  to disk on the tick task. They are NOT in QuestDB until the WAL \
                  replays them."
             );
-            self.staged.clear();
+            self.clear_staged_on_drain();
             self.pending = 0;
             return dropped;
         }
@@ -4047,8 +4115,8 @@ impl TickWriter {
         let mut staged = std::mem::take(&mut self.staged);
         let landed = self.spill_on_drain(&mut staged, fate);
         note_rescue_outcome_ticks(landed, range, false);
-        staged.clear();
         self.staged = staged;
+        self.clear_staged_on_drain();
         self.pending = 0;
         dropped
     }
@@ -4210,15 +4278,19 @@ const _: () = assert!(
     "tick rescue queue + park + in-flight must fit the rescue floor table"
 );
 
-/// Row bound on the park: four producer batches at their cut-over size
+/// Row-SLOT bound on the park: four producer batches at their cut-over size
 /// (PF-4, 2026-11-06: the old 128 MiB TEXT bound, four producer buffers,
 /// restated in rows at the worst-case line; their text is still at most
-/// 4 × 32 MiB). Held only while the disk is slower than the drain.
+/// 4 × 32 MiB). ⚠ CORRECTED 2026-11-06 (review round 1): it is counted on
+/// each parked batch's CAPACITY, not its rows, since a parked batch holds its
+/// whole pre-touched allocation; 131,072 slots is eight pre-sized batches.
+/// Held only while the disk is slower than the drain.
 pub const PARKED_RESCUE_MAX_ROWS: usize = 4 * MAX_PRODUCER_ROWS;
 
-/// RAM the park may hold, in bytes: [`PARKED_RESCUE_MAX_ROWS`] staged rows
-/// (PF-4: this was the 128 MiB of ILP text; the rows are now staged, so the
-/// bound is their RAM, about 38 MiB per sink).
+/// RAM the park may hold, in bytes: [`PARKED_RESCUE_MAX_ROWS`] staged row
+/// slots (PF-4: this was the 128 MiB of ILP text; the rows are now staged, so
+/// the bound is their RAM). 131,072 × 288 B = 36 MiB per sink, the real worst
+/// case since the park counts capacity (review round 1, 2026-11-06).
 pub const PARKED_RESCUE_MAX_BYTES: usize = PARKED_RESCUE_MAX_ROWS * STAGED_ROW_BYTES;
 
 const _: () = assert!(
@@ -4232,7 +4304,8 @@ pub const TICK_RESCUE_PARKED_COUNTER: &str = "tv_tick_rescue_parked_total";
 
 /// RAM the parked rescue batches hold right now, in bytes (H4). ⚠ CHANGED
 /// 2026-11-06 (PF-4): the parked rows are staged, not text, so this is their
-/// RAM (rows × [`STAGED_ROW_BYTES`]); before, it was their ILP text bytes.
+/// RAM (row slots, i.e. each batch's capacity, × [`STAGED_ROW_BYTES`]; review
+/// round 1 corrected rows to capacity); before, it was their ILP text bytes.
 /// Same name; no alarm or filter reads it.
 pub const TICK_RESCUE_PARKED_BYTES_GAUGE: &str = "tv_tick_rescue_parked_bytes";
 
@@ -4350,6 +4423,12 @@ impl RescueBatch {
     pub fn rows(&self) -> usize {
         self.rows
     }
+
+    /// Row slots this payload's batch holds (its capacity): the RAM it keeps
+    /// while parked, whatever its row count (review round 1, 2026-11-06).
+    fn slots(&self) -> usize {
+        self.staged.capacity()
+    }
 }
 
 /// The rescue thread's half: everything the write needs, and nothing else.
@@ -4366,6 +4445,11 @@ pub struct TickRescueSink {
     /// the writer's encoder. Empty, with no allocation, until the first
     /// rescue; a cell because the thread's `rescue` takes `&self`.
     scratch: std::cell::RefCell<TickRowBuffer>,
+    /// The producer's spare lane (review round 1, 2026-11-06): a spent
+    /// batch is cleared here and handed back, so a QuestDB stall does not
+    /// make the drain reserve and pre-touch a fresh 4.5 MiB batch for every
+    /// rescue.
+    spare_return: Option<std::sync::mpsc::SyncSender<StagedBatch>>,
 }
 
 impl TickRescueSink {
@@ -4410,6 +4494,28 @@ impl TickRescueSink {
         // The hand-off was counted when the producer queued this payload; the
         // replay confirm waits for this completion like any writer batch.
         wm.note_ticks_completed();
+    }
+
+    /// Hands a rescued payload's batch back to the producer for reuse
+    /// (review round 1, 2026-11-06). Call after [`Self::rescue`], on the
+    /// rescue thread.
+    ///
+    /// The batch is cleared HERE, so its name pins (and possibly the last
+    /// reference to a replaced name table) are dropped on this thread, never
+    /// on the drain. `try_send`, never a wait: a full lane, a gone producer or
+    /// a batch over [`MAX_PRODUCER_ROWS`] slots drops it here instead, still
+    /// off the drain. O(1) apart from that drop.
+    pub fn recycle(&self, batch: RescueBatch) {
+        let mut spent = batch.staged;
+        spent.clear();
+        let Some(spare_return) = self.spare_return.as_ref() else {
+            return;
+        };
+        if spent.capacity() > MAX_PRODUCER_ROWS {
+            return;
+        }
+        // Full or disconnected: dropped here, on this thread.
+        let _dropped_if_refused = spare_return.try_send(spent);
     }
 }
 // ---------------------------------------------------------------------------
@@ -4575,6 +4681,14 @@ impl FlushBatch {
     #[must_use]
     pub fn encode_ilp_for_test(&self, feed: Feed) -> Vec<u8> {
         self.staged.encode_readonly(feed, TickIlpEncoder::Library)
+    }
+
+    /// [`Self::encode_ilp_for_test`] in a chosen encoder, so a test can
+    /// write a batch exactly as a writer of THAT encoder would (the golden
+    /// test runs both). Tests only.
+    #[cfg(test)]
+    pub(crate) fn encode_ilp_with_for_test(&self, feed: Feed, encoder: TickIlpEncoder) -> Vec<u8> {
+        self.staged.encode_readonly(feed, encoder)
     }
 }
 
@@ -7451,7 +7565,7 @@ mod tests {
             w.parked_rescue.is_empty(),
             "the park emptied into the queue"
         );
-        assert_eq!(w.parked_rescue_rows, 0);
+        assert_eq!(w.parked_rescue_slots, 0);
         settled.extend(rx.try_iter());
         assert_eq!(
             settled.len(),
@@ -8868,3 +8982,7 @@ mod tick_stage_oracle_tests;
 #[cfg(test)]
 #[path = "tick_test_writers.rs"]
 mod tick_test_writers;
+
+#[cfg(test)]
+#[path = "tick_stage_reuse_tests.rs"]
+mod tick_stage_reuse_tests;
