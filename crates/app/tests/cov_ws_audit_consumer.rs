@@ -734,6 +734,38 @@ async fn test_ws_audit_consumer_spawn_live_feed_lifecycle_audit_stalled_writer_d
         dropped,
         "rows past the channel bound are counted as dropped"
     );
+    // Regression (2026-11-06, CI flake on PR #2197): `send().await` returns
+    // once a row is in the forwarder's own inbox, so up to 1,024 flood rows
+    // could still be unforwarded at the release below. Draining them after
+    // the writer resumed closed the drop episode and then opened a SECOND one
+    // (the code is right; the test assumed one), failing the one-line-per-
+    // episode check about one run in many. Wait until the forwarder has taken
+    // every row and the drop count has stopped moving.
+    let inbox_empty = wait_until(Duration::from_secs(5), || {
+        tx.capacity() == tx.max_capacity()
+    })
+    .await;
+    assert!(
+        inbox_empty,
+        "the forwarder takes every flood row while the writer is held"
+    );
+    let mut last = dropped_rows(metrics_handle);
+    let mut stable_reads = 0_u32;
+    let settled = wait_until(Duration::from_secs(5), || {
+        let now = dropped_rows(metrics_handle);
+        if (now - last).abs() < f64::EPSILON {
+            stable_reads += 1;
+        } else {
+            stable_reads = 0;
+            last = now;
+        }
+        stable_reads >= 5
+    })
+    .await;
+    assert!(
+        settled,
+        "the drop count stops moving once every row is forwarded or dropped"
+    );
     // Still held: nothing past the first write has reached the stub.
     assert_eq!(
         writes_containing(&seen, "flood_row").len(),
