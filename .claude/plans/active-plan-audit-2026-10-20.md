@@ -2241,3 +2241,33 @@ Revert the PR; the compose line is one deletion.
 - [ ] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
 - [ ] DP-5 market_depth_book zero-row self-heal
 - [ ] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (packets per frame recorded at the record site) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
+
+### PR AL — 2026-11-06 live incident: alarm truth and retries (app, storage)
+
+**Approved by:** Parthiban, 2026-11-06 ("go ahead fix everything dude approved").
+
+**Verified:** `tv_dhan_ws_lag_max_ms{class="fno"}` read 4,038,655 ms (67 min) while `{class="index_spot"}` read 1,923 ms and steady hand-off timings are microseconds: an illiquid option's old last-trade time is counted as delivery lag, so `dhan-feed-delay-high` stays in ALARM all session. SCOREBOARD-01 fires daily because the boot DDL and the 15:45 rollup make one 10 s attempt against a stalled QuestDB and never retry (5 Nov `ws_connection_daily` / `feed_scoreboard_daily` rows missing).
+
+#### Design
+- Feed-delay worst-lag recorder counts a packet only when that contract's trade time moved forward since its last packet (a new trade), and never the first packet after a subscribe.
+- Scoreboard and ws-connection rollups retry every 5 min until success or 16:20 IST; boot DDL for the scoreboard and episode tables retries with backoff instead of one 10 s attempt.
+- Backfill 5 Nov with the existing `TICKVAULT_SCOREBOARD_DATE` re-run after deploy (operator step, idempotent).
+
+#### Edge Cases
+A contract whose first packet carries a trade newer than subscribe; counter restarts; repeat quotes routed to tick_quotes; rollup succeeding on the last retry; process stop during a retry.
+
+#### Failure Modes
+QuestDB down all evening: rollup gives up at 16:20 with one coded error (as today), nothing worse.
+
+#### Test Plan
+Unit tests: lag recorder ignores non-advancing trade times and first packets; retry schedule; DHAT unchanged on the drain.
+
+#### Rollback
+Revert the PR.
+
+#### Observability
+`tv_scoreboard_rollup_attempts_total{outcome}` local only; no new page.
+
+- [ ] AL-1 feed-delay recorder counts new trades only
+- [ ] AL-2 scoreboard / ws-connection rollup + boot DDL retries
+- [ ] AL-3 (needs a dated noise-lock row first) questdb-disconnected 3-of-5 datapoints; risk-gap-03 period 300 s
