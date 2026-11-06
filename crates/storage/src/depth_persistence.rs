@@ -183,7 +183,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ColumnName, ProtocolVersion, Sender, TableName, TimestampNanos};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
@@ -635,9 +635,11 @@ impl BookTimestampProblem {
     }
 }
 
-/// The manual repair for a [`BookTimestampProblem`]. The boot never drops,
-/// renames or alters the table itself: a table with rows is market data (zero
-/// loss, Quotes 27 + 28), and only the operator can confirm it is empty.
+/// The manual repair for a [`BookTimestampProblem`]. The boot never drops a
+/// table with rows, and never renames or alters it (since PR DP-5 it drops
+/// one only when it holds 0 rows with its WAL fully applied):
+/// a table with rows is market data (zero
+/// loss, Quotes 27 + 28), and only the operator decides what happens to it.
 ///
 /// Why the start time matters (review, 2026-10-29): the depth spill replay is
 /// spawned in `main` BEFORE the Dhan lane runs this ensure, and outside 08:00 to
@@ -659,7 +661,8 @@ const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app st
      start outside that window replays data/spill/depth first, and a spilled \
      market_depth_book row would auto-create the table with the wrong timestamp \
      again. Until then depth is written to market_depth and nothing is lost. \
-     The boot never drops, renames or alters this table itself";
+     The boot drops this table itself only when it holds 0 rows with its WAL \
+     fully applied; it never drops one with rows, and never renames or alters it";
 
 /// Counts boots that found `market_depth_book` with a designated timestamp
 /// other than `ts` and kept depth in `market_depth` (review, 2026-10-29).
@@ -711,6 +714,152 @@ fn report_book_layout_refusal(problem: &BookTimestampProblem) {
          market_depth, nothing is lost. Repair the table outside market hours \
          (see remedy)"
     );
+}
+
+/// Counts the boot self-heal of a `market_depth_book` with the wrong
+/// designated timestamp (PR DP-5, 2026-11-06), by `outcome`
+/// ([`BookSelfHeal::as_str`]). Local `/metrics` only, registered at 0 at the
+/// ensure.
+pub const MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER: &str = "tv_depth_book_self_heal_total";
+
+/// What the self-heal of a wrong-timestamp `market_depth_book` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookSelfHeal {
+    /// The table held 0 rows with its WAL fully applied; it was dropped, and
+    /// the ensure re-creates it with `ts`.
+    Healed,
+    /// The table holds rows: kept, refused as before (never dropped).
+    RefusedRows,
+    /// The row count or the WAL state could not be read: kept, refused.
+    RefusedUnknown,
+    /// The `DROP TABLE` itself failed: refused as before.
+    DropFailed,
+}
+
+impl BookSelfHeal {
+    /// Every outcome, for the zero registration.
+    pub const ALL: [Self; 4] = [
+        Self::Healed,
+        Self::RefusedRows,
+        Self::RefusedUnknown,
+        Self::DropFailed,
+    ];
+
+    /// The `outcome` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healed => "healed",
+            Self::RefusedRows => "refused_rows",
+            Self::RefusedUnknown => "refused_unknown",
+            Self::DropFailed => "drop_failed",
+        }
+    }
+}
+
+/// Whether an existing wrong-timestamp `market_depth_book` may be dropped.
+///
+/// `row_count` is `SELECT count()` (`None` = unreadable); `wal_applied` is
+/// whether `wal_tables()` reports the table with its writer at the
+/// sequencer's transaction and not suspended (`None` = unreadable or the
+/// table not listed). Only `Some(0)` rows AND `Some(true)` applied may drop:
+/// a count of 0 with WAL transactions still to apply can be rows QuestDB has
+/// accepted and not yet made visible. `Err` carries the refusal. Pure, O(1).
+///
+/// # Errors
+/// [`BookSelfHeal::RefusedRows`] when the table holds rows,
+/// [`BookSelfHeal::RefusedUnknown`] when either reading is missing or the
+/// WAL is behind.
+pub const fn book_self_heal_decision(
+    row_count: Option<i64>,
+    wal_applied: Option<bool>,
+) -> Result<(), BookSelfHeal> {
+    match (row_count, wal_applied) {
+        (Some(0), Some(true)) => Ok(()),
+        (Some(n), _) if n > 0 => Err(BookSelfHeal::RefusedRows),
+        _ => Err(BookSelfHeal::RefusedUnknown),
+    }
+}
+
+/// `true` when `rows` lists `market_depth_book` fully applied (writer at the
+/// sequencer's transaction) and not suspended; `false` when listed but
+/// behind or suspended; `None` when not listed or a transaction is missing.
+/// Pure, O(rows).
+#[must_use]
+pub fn book_wal_applied(rows: &[crate::wal_suspension_watcher::WalTableRow]) -> Option<bool> {
+    // O(1) EXEMPT: boot-only scan over the few dozen wal_tables() rows.
+    let row = rows.iter().find(|r| r.name == MARKET_DEPTH_BOOK_TABLE)?;
+    let (writer, sequencer) = (row.writer_txn?, row.sequencer_txn?);
+    Some(!row.suspended && writer == sequencer)
+}
+
+/// Drops `market_depth_book` when it is empty and fully applied, so the
+/// ensure can re-create it with `ts` (PR DP-5). Every step that cannot be
+/// read refuses: the table is never dropped on a guess. Boot only, three
+/// `/exec` calls.
+async fn self_heal_empty_market_depth_book(questdb_config: &QuestDbConfig) -> BookSelfHeal {
+    // APPROVED: QuestDB base URL, once per boot ensure
+    let exec_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    else {
+        return BookSelfHeal::RefusedUnknown;
+    };
+    // APPROVED: boot-only probe query
+    let count_sql = format!("SELECT count() FROM {MARKET_DEPTH_BOOK_TABLE}");
+    let row_count = match client
+        .get(&exec_url)
+        .query(&[("query", count_sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .text()
+            .await
+            .ok()
+            .and_then(|body| crate::fresh_start_reset::parse_count(&body)),
+        _ => None,
+    };
+    let wal_applied =
+        match crate::wal_suspension_watcher::fetch_wal_tables(&client, &exec_url).await {
+            Ok(rows) => book_wal_applied(&rows),
+            Err(_) => None,
+        };
+    if let Err(refusal) = book_self_heal_decision(row_count, wal_applied) {
+        warn!(
+            table = MARKET_DEPTH_BOOK_TABLE,
+            row_count = ?row_count,
+            wal_applied = ?wal_applied,
+            outcome = refusal.as_str(),
+            "market_depth_book self-heal REFUSED: the table is not proven empty and \
+             applied, so it is kept and depth stays in market_depth (nothing lost)"
+        );
+        return refusal;
+    }
+    // APPROVED: boot-only DDL, only after the table was proven empty
+    let drop_sql = format!("DROP TABLE {MARKET_DEPTH_BOOK_TABLE}");
+    match client
+        .get(&exec_url)
+        .query(&[("query", drop_sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => BookSelfHeal::Healed,
+        _ => {
+            warn!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                stage = "self_heal_book_drop",
+                table = MARKET_DEPTH_BOOK_TABLE,
+                "market_depth_book self-heal: DROP TABLE failed; the table is kept and \
+                 depth stays in market_depth (nothing lost)"
+            );
+            BookSelfHeal::DropFailed
+        }
+    }
 }
 
 /// Reads QuestDB's `/exec` answer to `SELECT * FROM table_columns('..')` by
@@ -961,13 +1110,36 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
 pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> BookEnsureOutcome {
     metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
+    for outcome in BookSelfHeal::ALL {
+        metrics::counter!(MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER, "outcome" => outcome.as_str())
+            .increment(0);
+    }
     // LH-01: an existing table whose designated timestamp is not `ts` can never
     // take the DEDUP key, so refuse with the cause and the remedy instead of the
-    // generic DEDUP failure. Nothing is dropped or altered here, and no row is
-    // lost, so it is not counted or logged as a persistence failure.
+    // generic DEDUP failure. No row is lost, so it is not counted or logged as
+    // a persistence failure.
+    //
+    // PR DP-5 (2026-11-06): an EMPTY such table is dropped and re-created
+    // first (`self_heal_empty_market_depth_book`). Measured live: the table
+    // existed with designated timestamp `timestamp` and 0 rows, so every boot
+    // refused array rows and inline depth wrote 10 level rows per Full packet
+    // (~7 GiB an hour). Only a table proven empty AND fully applied is
+    // dropped; anything else keeps today's refusal.
     if let Some(problem) = probe_market_depth_book_ts(questdb_config).await {
-        report_book_layout_refusal(&problem);
-        return BookEnsureOutcome::LayoutRefused;
+        let healed = self_heal_empty_market_depth_book(questdb_config).await;
+        metrics::counter!(MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER, "outcome" => healed.as_str())
+            .increment(1);
+        if healed != BookSelfHeal::Healed {
+            report_book_layout_refusal(&problem);
+            return BookEnsureOutcome::LayoutRefused;
+        }
+        info!(
+            table = MARKET_DEPTH_BOOK_TABLE,
+            cause = %problem.cause(),
+            "market_depth_book self-healed: it had the wrong designated timestamp and \
+             held 0 rows, so it was dropped and is re-created with ts now (nothing was \
+             deleted: the table was empty and its WAL fully applied)"
+        );
     }
     if run_depth_ddl(
         questdb_config,
@@ -6999,6 +7171,203 @@ mod tests {
             }
         });
         port
+    }
+
+    /// PR DP-5 stub QuestDB: the auto-created (wrong-timestamp) columns for
+    /// the `table_columns` probe, `count_answer` for `SELECT count()`,
+    /// `wal_answer` for `wal_tables()`, `drop_answer` for `DROP TABLE`, `[]`
+    /// (200) for everything else. Returns the port and whether a DROP and a
+    /// DEDUP statement were seen.
+    async fn dp5_spawn_stub(
+        count_answer: &'static str,
+        wal_answer: &'static str,
+        drop_answer: &'static str,
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let other = lh01_http_200("[]");
+        let columns = lh01_http_200(LH01_AUTO_CREATED_COLUMNS);
+        let drop_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (drop_flag, dedup_flag) = (
+            std::sync::Arc::clone(&drop_seen),
+            std::sync::Arc::clone(&dedup_seen),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let (drop_flag, dedup_flag) = (
+                    std::sync::Arc::clone(&drop_flag),
+                    std::sync::Arc::clone(&dedup_flag),
+                );
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let first = request.lines().next().unwrap_or("");
+                    if first.contains("DEDUP") {
+                        dedup_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let resp = if first.contains("wal_tables") {
+                        wal_answer
+                    } else if first.contains("count%28%29") {
+                        count_answer
+                    } else if first.contains("DROP") {
+                        drop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        drop_answer
+                    } else if first.contains("table_columns") {
+                        columns
+                    } else {
+                        other
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (port, drop_seen, dedup_seen)
+    }
+
+    fn dp5_count(n: i64) -> &'static str {
+        lh01_http_200(&format!(
+            r#"{{"query":"x","columns":[{{"name":"count","type":"LONG"}}],"dataset":[[{n}]],"count":1}}"#
+        ))
+    }
+
+    fn dp5_wal(writer: i64, sequencer: i64, suspended: bool) -> &'static str {
+        lh01_http_200(&format!(
+            r#"{{"query":"x","columns":[{{"name":"name","type":"STRING"}},{{"name":"suspended","type":"BOOLEAN"}},{{"name":"writerTxn","type":"LONG"}},{{"name":"sequencerTxn","type":"LONG"}}],"dataset":[["market_depth_book",{suspended},{writer},{sequencer}]],"count":1}}"#
+        ))
+    }
+
+    // Regression: 2026-11-06 (PR DP-5) — market_depth_book existed with
+    // designated timestamp `timestamp` and 0 rows, so every boot refused
+    // array rows and inline depth wrote ~7 GiB an hour of level rows.
+    #[tokio::test]
+    async fn test_regression_dp5_an_empty_applied_wrong_ts_book_is_dropped_and_re_ensured() {
+        let (port, drop_seen, dedup_seen) =
+            dp5_spawn_stub(dp5_count(0), dp5_wal(7, 7, false), lh01_http_200("{}")).await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::Ensured
+        );
+        assert!(drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            dedup_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "re-created with its DEDUP key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dp5_a_book_with_rows_is_never_dropped() {
+        let (port, drop_seen, _) =
+            dp5_spawn_stub(dp5_count(5), dp5_wal(7, 7, false), lh01_http_200("{}")).await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(!drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_dp5_unreadable_count_or_unapplied_wal_refuses_and_keeps_the_table() {
+        for (count, wal) in [
+            (lh01_http_200("[]"), dp5_wal(7, 7, false)),
+            (
+                lh01_http_200("HTTP/1.1 500 Internal Server Error\r\n\r\n"),
+                dp5_wal(7, 7, false),
+            ),
+            (dp5_count(0), dp5_wal(6, 7, false)),
+            (dp5_count(0), dp5_wal(7, 7, true)),
+            (dp5_count(0), lh01_http_200("[]")),
+        ] {
+            let (port, drop_seen, _) = dp5_spawn_stub(count, wal, lh01_http_200("{}")).await;
+            assert_eq!(
+                ensure_market_depth_book_table(&lh01_cfg(port)).await,
+                BookEnsureOutcome::LayoutRefused
+            );
+            assert!(
+                !drop_seen.load(std::sync::atomic::Ordering::SeqCst),
+                "never dropped on a guess"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dp5_a_failed_drop_keeps_the_refusal() {
+        let failed = "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}";
+        let (port, drop_seen, dedup_seen) =
+            dp5_spawn_stub(dp5_count(0), dp5_wal(7, 7, false), failed).await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!dedup_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_dp5_book_self_heal_decision_and_wal_reading() {
+        assert_eq!(book_self_heal_decision(Some(0), Some(true)), Ok(()));
+        assert_eq!(
+            book_self_heal_decision(Some(1), Some(true)),
+            Err(BookSelfHeal::RefusedRows)
+        );
+        assert_eq!(
+            book_self_heal_decision(Some(9), None),
+            Err(BookSelfHeal::RefusedRows)
+        );
+        for (rows, wal) in [
+            (None, Some(true)),
+            (Some(0), Some(false)),
+            (Some(0), None),
+            (Some(-1), Some(true)),
+        ] {
+            assert_eq!(
+                book_self_heal_decision(rows, wal),
+                Err(BookSelfHeal::RefusedUnknown)
+            );
+        }
+        let row = |name: &str, suspended, w, s| crate::wal_suspension_watcher::WalTableRow {
+            name: name.to_string(),
+            suspended,
+            writer_txn: w,
+            sequencer_txn: s,
+            error_tag: None,
+            error_message: None,
+        };
+        assert_eq!(book_wal_applied(&[]), None);
+        assert_eq!(
+            book_wal_applied(&[row("ticks", false, Some(1), Some(1))]),
+            None
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, Some(3), Some(3))]),
+            Some(true)
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, Some(2), Some(3))]),
+            Some(false)
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, true, Some(3), Some(3))]),
+            Some(false)
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, None, Some(3))]),
+            None
+        );
+        for o in BookSelfHeal::ALL {
+            assert!(!o.as_str().is_empty());
+        }
     }
 
     fn lh01_cfg(http_port: u16) -> QuestDbConfig {
