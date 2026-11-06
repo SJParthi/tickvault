@@ -23904,6 +23904,39 @@ mod tests {
         );
     }
 
+    /// Review 2026-11-06 (plan PR AL-5): the class rollup reads the RAW
+    /// verdict, so a stock-option class that never delivered is still found
+    /// dead under the live-lane config, and none of its contracts is counted
+    /// toward the per-instrument RISK-GAP-03 page while it warms up.
+    #[test]
+    fn the_dead_class_rollup_still_sees_a_never_ticked_option_class_under_the_live_lane() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let seeded_at = IN_SESSION_1000_IST_MILLIS;
+        for sid in [40_001u64, 40_002, 40_003] {
+            assert!(ingest.seed(sid, ExchangeSegment::NseFno, seeded_at));
+        }
+        let bit = 1u8 << segment_class_index(ExchangeSegment::NseFno);
+        // Inside the warmup: nothing is counted for the page.
+        let (silent, never) = ingest.scan_silence(seeded_at + 60_000);
+        assert_eq!((silent, never), (0, 0), "warming contracts never page");
+        // Past the 600 s option ceiling, two consecutive dead sweeps latch the
+        // class from the raw NeverTicked verdict.
+        let ceiling =
+            10 * tickvault_core::pipeline::tick_gap_detector::LIVE_FNO_CADENCE_FLOOR_MILLIS;
+        let _ = ingest.scan_silence(seeded_at + ceiling + 1);
+        let (silent, never) = ingest.scan_silence(seeded_at + ceiling + 2);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            bit,
+            "an option class that never delivered is a dead class"
+        );
+        assert_eq!(
+            (silent, never),
+            (3, 3),
+            "and each contract counts past the warmup"
+        );
+    }
+
     /// The grace is DERIVED from the per-instrument one, not restated.
     ///
     /// The class rollup inherited the 2026-09-10 session gate from its sibling

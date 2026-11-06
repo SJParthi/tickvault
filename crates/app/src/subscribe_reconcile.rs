@@ -1504,6 +1504,8 @@ mod tests {
             samples: 0,
             verdict,
             sparse: false,
+            warming_up: false,
+            alarm_sparse: false,
         }
     }
 
@@ -1695,6 +1697,26 @@ mod tests {
         assert_eq!(s.missing, 1);
         assert_eq!(s.dispatched, 0);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_a_warming_up_never_ticked_contract_still_reads_missing() {
+        // Review 2026-11-06 (plan PR AL-5): the attach warmup gates only the
+        // RISK-GAP-03 page. Reconcile reads the raw verdict, so a contract
+        // inside its warmup that never ticked is still missing, never
+        // delivering or recovered.
+        let (book, _rx) = SubscribeReconcile::new(true);
+        let (tx, _sock) = socket();
+        let t0 = Instant::now();
+        book.record_subscribed_at(&tx, &sis(&[1, 2]), t0);
+        let mut sweep = book.sweep_at(t0 + delta());
+        sweep.note(&report(1, SilenceVerdict::Live));
+        sweep.note(&SilenceReport {
+            warming_up: true,
+            ..report(2, SilenceVerdict::NeverTicked)
+        });
+        let s = sweep.finish_at(IN_SESSION, DAY);
+        assert_eq!(s.missing, 1, "the warming contract is counted missing");
     }
 
     #[test]
