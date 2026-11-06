@@ -71,9 +71,8 @@ use tickvault_app::boot_helpers::{
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
 use tickvault_app::holiday_gate::trading_day_gate_exit_code;
-use tickvault_app::{
-    host_limits, infra, movers_universe_publisher, observability, subsystem_memory,
-};
+use tickvault_app::movers_universe_publisher;
+use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
 
@@ -5215,8 +5214,7 @@ async fn build_shared_infra(
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
     );
-    // Owner 2026-10-30: the dashboard's speed-and-health panel reads a few
-    // figures from this process's own metrics page. Only when metrics are on.
+    // Owner 2026-10-30: the speed-and-health panel reads this process's metrics.
     if config.observability.metrics_enabled {
         api_state.set_metrics_scrape_url(
             tickvault_api::handlers::speed_health::metrics_scrape_url_for(
@@ -5225,14 +5223,12 @@ async fn build_shared_infra(
             ),
         );
     }
-    // Plan PR MV (2026-11-06): publish the movers universe to S3 for the portal.
     let _movers = movers_universe_publisher::spawn(api_state.clone(), &config.operator_movers);
     // Infra sweep row 12 (2026-09-08): this was ONE SSM call on the boot path
     // with no retry — a transient SSM throttle or a cold-start DNS blip at
     // 08:30 failed the whole boot, and the start-watchdog then paged for a
-    // box that had nothing wrong with it. Bounded: a local doubling
-    // backoff (`API_BEARER_FETCH_BACKOFF_SECS`), capped at `API_BEARER_FETCH_MAX_ATTEMPTS`, never
-    // infinite (an SSM that is truly down must still fail the boot loudly).
+    // box that had nothing wrong with it. Bounded: doubling backoff, capped at
+    // `API_BEARER_FETCH_MAX_ATTEMPTS` (an SSM that is truly down still fails the boot).
     let mut bearer_from_retry = None;
     let mut attempt: u32 = 1;
     while attempt < API_BEARER_FETCH_MAX_ATTEMPTS {
