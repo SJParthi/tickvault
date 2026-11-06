@@ -238,9 +238,15 @@ fn seal_handoff_burst_cost_per_seal_vs_batched() {
         for burst in BURSTS {
             // Warm both channels' pages and caches, untimed.
             let _ = run_per_seal(mode, burst, &pool);
-            let (a50, a99, a999, amean) = summarise(run_per_seal(mode, burst, &pool));
+            let per_seal = run_per_seal(mode, burst, &pool);
             let _ = run_batched(mode, burst, &pool);
-            let (b50, b99, b999, bmean) = summarise(run_batched(mode, burst, &pool));
+            let batched = run_batched(mode, burst, &pool);
+            // Every round must have produced a sample, or the percentiles
+            // below would summarise a short run.
+            assert_eq!(per_seal.len(), ROUNDS, "per-seal run lost rounds");
+            assert_eq!(batched.len(), ROUNDS, "batched run lost rounds");
+            let (a50, a99, a999, amean) = summarise(per_seal);
+            let (b50, b99, b999, bmean) = summarise(batched);
             println!(
                 "consumer {:8} burst {burst:3}: per-seal p50 {a50:6.1} p99 {a99:6.1} \
                  p99.9 {a999:7.1} mean {amean:6.1} | batched p50 {b50:6.1} p99 {b99:6.1} \
