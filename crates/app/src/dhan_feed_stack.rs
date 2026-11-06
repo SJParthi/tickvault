@@ -2386,12 +2386,15 @@ impl LiveIngest {
             .spawn(move || {
                 while let Some(batch) = rescue_queue.next() {
                     rescue_sink.rescue(&batch);
+                    // Rows are spilled or marked by now: report done before
+                    // the housekeeping below, so a shutdown deadline never
+                    // counts this batch as abandoned (PF-4 review round 2).
+                    rescue_queue.finished();
                     // PF-4 review round 1: the spent batch goes back to the
                     // drain's spare lane, cleared (its name pins dropped)
                     // here, so a stall does not make the drain reserve a
                     // fresh batch for every rescue.
                     rescue_sink.recycle(batch);
-                    rescue_queue.finished();
                 }
                 info!("tick rescue thread exiting — the drain closed its queue");
             })?;
