@@ -800,9 +800,9 @@ pub const fn classify_pressure_pass(
     if !summary.pass_ran {
         return PressurePass::NotRun;
     }
-    // PR DP review H1: a GATED pass that dropped nothing because a table's
-    // WAL was behind (a day partition still being written) is standing
-    // aside, not "nothing reclaimable"; an ungated one still escalates.
+    // PR DP review H1: a CAPPED in-session pass (`pass_gated`) that dropped
+    // nothing because a table's WAL was behind is standing aside, not
+    // "nothing reclaimable"; an off-session or pre-open pass escalates.
     let held = summary.held_deferred_depth > 0 || summary.held_by_gate > 0;
     let gated_wal_only = summary.pass_gated && summary.tables_wal_not_applied > 0;
     if summary.dropped == 0

@@ -778,6 +778,11 @@ pub struct BookSelfHealReadings {
     pub replay_held: bool,
     /// `SELECT count()` (`None` = unreadable).
     pub row_count: Option<i64>,
+    /// From the FIRST `wal_tables()` read, BEFORE the count: writer at the
+    /// sequencer and not suspended. Required too (2026-11-06 combined
+    /// review): a count taken while transactions are still to apply can
+    /// miss rows QuestDB accepted and applies just before the second read.
+    pub wal_applied_before: Option<bool>,
     /// From the SECOND `wal_tables()` read: writer at the sequencer and not
     /// suspended (`None` = unreadable or not listed).
     pub wal_applied: Option<bool>,
@@ -792,7 +797,7 @@ pub struct BookSelfHealReadings {
 ///
 /// Only while the depth spill replay is held (it is spawned before this
 /// ensure and, outside 08:00 to 15:40 IST, can post a row at any moment), with
-/// `Some(0)` rows, the WAL fully applied, and the same `sequencerTxn` before
+/// `Some(0)` rows, the WAL fully applied on BOTH reads, and the same `sequencerTxn` before
 /// and after the count (no writer reached the table in between; a count of 0
 /// with transactions still to apply can be rows QuestDB has accepted and not
 /// yet made visible). `Err` carries the refusal. Pure, O(1).
@@ -809,12 +814,13 @@ pub const fn book_self_heal_decision(r: BookSelfHealReadings) -> Result<(), Book
     }
     match (
         r.row_count,
+        r.wal_applied_before,
         r.wal_applied,
         r.sequencer_before,
         r.sequencer_after,
     ) {
-        (Some(n), _, _, _) if n > 0 => Err(BookSelfHeal::RefusedRows),
-        (Some(0), Some(true), Some(before), Some(after)) => {
+        (Some(n), _, _, _, _) if n > 0 => Err(BookSelfHeal::RefusedRows),
+        (Some(0), Some(true), Some(true), Some(before), Some(after)) => {
             if before == after {
                 Ok(())
             } else {
@@ -911,7 +917,7 @@ async fn self_heal_empty_market_depth_book(
     else {
         return BookSelfHeal::RefusedUnknown;
     };
-    let (_, sequencer_before) = book_wal_reading(&client, &exec_url).await;
+    let (wal_applied_before, sequencer_before) = book_wal_reading(&client, &exec_url).await;
     // APPROVED: boot-only probe query
     let count_sql = format!("SELECT count() FROM {MARKET_DEPTH_BOOK_TABLE}");
     let row_count = match client
@@ -931,6 +937,7 @@ async fn self_heal_empty_market_depth_book(
     let readings = BookSelfHealReadings {
         replay_held,
         row_count,
+        wal_applied_before,
         wal_applied,
         sequencer_before,
         sequencer_after,
@@ -939,6 +946,7 @@ async fn self_heal_empty_market_depth_book(
         warn!(
             table = MARKET_DEPTH_BOOK_TABLE,
             row_count = ?row_count,
+            wal_applied_before = ?wal_applied_before,
             wal_applied = ?wal_applied,
             sequencer_before = ?sequencer_before,
             sequencer_after = ?sequencer_after,
@@ -7511,6 +7519,7 @@ mod tests {
         let ok = BookSelfHealReadings {
             replay_held: true,
             row_count: Some(0),
+            wal_applied_before: Some(true),
             wal_applied: Some(true),
             sequencer_before: Some(7),
             sequencer_after: Some(7),
@@ -7556,6 +7565,16 @@ mod tests {
             },
             BookSelfHealReadings {
                 wal_applied: None,
+                ..ok
+            },
+            // Regression: 2026-11-06 combined review — rows committed but not
+            // yet applied at the count, applied by the second read.
+            BookSelfHealReadings {
+                wal_applied_before: Some(false),
+                ..ok
+            },
+            BookSelfHealReadings {
+                wal_applied_before: None,
                 ..ok
             },
             BookSelfHealReadings {

@@ -18,7 +18,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use tickvault_app::disk_pressure_boot::{
     DISK_PRESSURE_POLL_INTERVAL_SECS, PRESSURE_PROBE_FAILING_POLLS, PressurePass,
     classify_pressure_pass, fold_pressure_pass, pressure_config, pressure_pass_due,
-    spawn_supervised_disk_pressure_loop,
+    pressure_session_day, spawn_supervised_disk_pressure_loop,
 };
 use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
 use tickvault_storage::disk_pressure::{PressureAction, PressureState};
@@ -304,6 +304,29 @@ async fn test_disk_pressure_boot_loop_over_high_water_starts_episode_then_escala
     let before = episode_counters();
     let config = cfg(1, 0);
     let max_passes = u64::from(config.pressure_max_passes);
+    // PR DP review M3 re-arms an escalated episode at every poll OFF-session
+    // (after the gate closes, or a day with no session). The loop reads the
+    // wall clock, so the expected pass count follows the same gate the loop
+    // computes (2026-11-06: this test failed after 15:40 IST only).
+    let off_session_now = || {
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after 1970")
+                .as_secs(),
+        )
+        .expect("seconds fit i64");
+        let (_, gate) = tickvault_storage::disk_pressure::pressure_pass_limits(
+            now,
+            pressure_session_day(&calendar(), now),
+            50,
+        );
+        matches!(
+            gate,
+            None | Some(tickvault_storage::disk_pressure::PressureGateReason::OffSessionDeadline)
+        )
+    };
+    let off_session = off_session_now();
 
     let handle = spawn_supervised_disk_pressure_loop(dir.clone(), questdb(), config, calendar())
         .expect("a sane, enabled config spawns the loop");
@@ -348,12 +371,21 @@ async fn test_disk_pressure_boot_loop_over_high_water_starts_episode_then_escala
             "not-run passes escalate: {text}"
         );
         // Exact, for this loop alone (every loop in the binary is serialised):
-        // one episode, max_passes passes plus one re-armed pass, one page.
-        assert_eq!(
-            delta,
-            vec![1, max_passes + 1, 1],
-            "episodes, passes, unrelievable for used_pct={used}"
-        );
+        // one episode and one page. In session: max_passes passes plus one
+        // re-armed pass. Off-session: max_passes passes, the escalation poll,
+        // then a re-armed pass at every one of the remaining 66 polls (71
+        // polls in all, so 70 passes). A run that crossed the gate boundary
+        // checks only the episode and the page.
+        let expected_passes = if off_session { 70 } else { max_passes + 1 };
+        if off_session == off_session_now() {
+            assert_eq!(
+                delta,
+                vec![1, expected_passes, 1],
+                "episodes, passes, unrelievable for used_pct={used} off_session={off_session}"
+            );
+        } else {
+            assert_eq!((delta[0], delta[2]), (1, 1), "used_pct={used}: {delta:?}");
+        }
     }
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }

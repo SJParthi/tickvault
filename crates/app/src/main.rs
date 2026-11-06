@@ -690,8 +690,7 @@ fn main() -> Result<()> {
     );
     // Plan ITEM DT: the drain's placement, and (when asked) this thread
     // pinned to the background core so the main runtime built below, and
-    // every thread it spawns, inherits it. Off by default; see hot_thread_boot.
-    // PR DP-6: core count read BEFORE the pin (the telemetry thread inherits it).
+    // every thread it spawns, inherits it (off by default). DP-6: cores read before the pin.
     let _process_cores = tickvault_storage::host_capacity_minute::record_process_core_count();
     tickvault_app::hot_thread_boot::place_drain_and_background(rt_decision);
 

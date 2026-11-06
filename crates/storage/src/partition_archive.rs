@@ -1357,10 +1357,12 @@ pub struct ArchiveRunSummary {
     /// The pass stopped at a partition boundary because it reached
     /// [`ArchivePassLimits::stop_at_unix_secs`] (PR DP-2).
     pub stopped_at_deadline: bool,
-    /// The pass ran with caller limits ([`ArchivePassLimits`] other than the
-    /// default): a pressure pass the session gate or a stop time limited
-    /// (PR DP review H1). A gated pass that dropped nothing because a table's
-    /// WAL was behind is standing aside, not "nothing reclaimable".
+    /// The pass ran with the in-session partition cap
+    /// ([`ArchivePassLimits::max_partitions`] set) (PR DP review H1). A capped
+    /// pass that dropped nothing because a table's WAL was behind is standing
+    /// aside, not "nothing reclaimable". A pass limited only by a stop time
+    /// (off-session or pre-open) is NOT capped: its WAL-lagging partitions
+    /// still escalate and page, as before PR DP (combined review 2026-11-06).
     pub pass_gated: bool,
 }
 
@@ -2090,7 +2092,7 @@ impl PartitionArchiver {
                 ..self.pass_limits
             },
         );
-        summary.pass_gated = self.pass_limits != ArchivePassLimits::default();
+        summary.pass_gated = self.pass_limits.max_partitions.is_some();
         // PR DP review H1: a capped (in-session) pass drops every table whose
         // WAL the run-start probe found behind BEFORE its cap. The oldest
         // partition is usually a ticks / candles / tick_quotes day still
@@ -6613,6 +6615,37 @@ mod stub_integration_tests {
             .collect();
         assert_eq!(exports.len(), 1, "{exports:?}");
         assert!(exports[0].contains("tick_quotes"), "{exports:?}");
+    }
+
+    // Regression: 2026-11-06 combined review — a pass limited only by a stop
+    // time (off-session / pre-open) is NOT the capped in-session pass, so a
+    // WAL-lagging table must leave `pass_gated` false and the pass escalates
+    // (the first DP version marked every limited pass gated and an overnight
+    // pass on a lagging table stood aside silently).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_deadline_only_pass_is_not_gated_on_wal_lag() {
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &["ticks"])));
+        let (qdb_url, _qdb_log) = spawn_stub(qdb_responder_tables(
+            vec![("ticks", vec!["2026-04-01T09"])],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: false,
+                max_partitions: None,
+                stop_at_unix_secs: Some(i64::MAX),
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert!(!summary.pass_gated, "{summary:?}");
+        assert_eq!(summary.dropped, 0, "{summary:?}");
+        assert!(summary.tables_wal_not_applied >= 1, "{summary:?}");
     }
 
     // Regression: PR DP review H1 — the cap counts EXPORTED partitions: one
