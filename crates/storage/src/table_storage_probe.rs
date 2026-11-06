@@ -359,7 +359,10 @@ impl TableStorageDailyWriter {
         // Seeded here so an absent discard series can never read as a healthy
         // zero — see `ilp_overflow::register_overflow_baseline`.
         crate::ilp_overflow::register_overflow_baseline(TABLE_STORAGE_DAILY_TABLE);
-        let conf = format!("http::addr={}:{};", config.host, config.http_port);
+        let conf = format!(
+            "http::addr={}:{};protocol_version=1;",
+            config.host, config.http_port
+        );
         match Sender::from_conf(&conf) {
             Ok(s) => {
                 let b = s.new_buffer();

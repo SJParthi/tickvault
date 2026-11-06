@@ -1392,6 +1392,14 @@ Requested: owner, 2026-11-03 ("in top movers we should always see the data ... w
   - Files: crates/common/src/operator_stock_movers_wire.rs, crates/api/src/handlers/fno_stocks.rs, crates/api/src/handlers/stock_movers.rs, crates/aws-lambdas/src/operator_control_console.html, crates/aws-lambdas/src/operator_control.rs, crates/common/tests/browser_surface_and_toolchain_guard.rs, docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md, .claude/rules/project/rust-only-forever-lock-2026-07-19.md
   - Tests: test_valid_as_of_shape_accepts_only_a_full_ist_minute, chosen_minute_reads_the_stored_session_even_while_the_market_is_open, console_html_content_pin, javascript_bytes_inside_script_tags_stay_under_the_ceiling
 
+### ITEM ILP1 — cold-path ILP writers pin the protocol so a slow QuestDB at boot cannot leave them dead all day (2026-11-03)
+
+Found live 2026-11-03: `ws_event_audit` (19:19 IST) and `feed_gap_audit` (17:21 IST) logged "QuestDB unreachable — buffering locally" at construction. Their conf had no `protocol_version`, so `Sender::from_conf` read QuestDB's `/settings` while building; it timed out, the writer kept `sender: None`, and `flush` bails for the rest of the process. Design: pin `protocol_version=1;` in the seven storage confs that lack it (the tick, depth, order and latency writers already pin it), so building makes no network call and a slow QuestDB is a retried flush error with rows retained (bounded by `ilp_overflow`). Edge cases: the disconnected buffer was already V1, so a pinned V1 sender never mismatches it; these tables hold no array columns, so V1 text doubles carry the same values. Failure modes: QuestDB down keeps flush failing and retrying, never a silent drop beyond the existing overflow bound. Rollback: revert; behaviour returns to probe-at-build. Observability: unchanged (existing flush-error logs and `ilp_overflow` counters).
+
+- [x] ILP1. Pin `protocol_version=1;` in the seven storage ILP confs without it, plus a source-scan guard and a no-network build test
+  - Files: crates/storage/src/ws_event_audit_persistence.rs, crates/storage/src/feed_gap_audit_persistence.rs, crates/storage/src/feed_episode_audit_persistence.rs, crates/storage/src/feed_scoreboard_persistence.rs, crates/storage/src/ws_connection_daily_persistence.rs, crates/storage/src/tick_conservation_audit_persistence.rs, crates/storage/src/table_storage_probe.rs, crates/storage/tests/ilp_conf_pins_protocol_guard.rs
+  - Tests: every_ilp_http_conf_in_storage_pins_the_protocol_version, a_pinned_conf_builds_a_sender_without_reaching_questdb
+
 ## Design
 
 PR A: a tiny clock (`UnbackedDepthClock`, Option<tokio Instant>) owned by the
@@ -2165,3 +2173,71 @@ Observability: keep source hashes, command outcomes, actual workflow heads,
 plan actions, selected live safety fields and actual screenshots. Error paths
 report typed failure without provider bodies. No finite test set establishes
 zero bugs/loss, exhaustive coverage or universal O(1)/submicrosecond latency.
+
+### PR MV — 2026-11-06 live incident: portal Stocks movers fast path (common, api, app, aws-lambdas, terraform, portal)
+
+**Approved by:** Parthiban, 2026-11-06: "go ahead fix everything dude approved" / "go ahead fix everything dude dont stop".
+
+**Measured (live, 2026-11-06 10:59 IST):** the movers SQL takes 0.11–0.37 s and the box-side `tv-movers` helper 0.12–0.33 s, but every portal click goes portal → Lambda → EC2 DescribeInstances → SSM SendCommand → agent → helper → SSM poll every 400 ms, and the operator-control Lambda ran 2.6–8.0 s per call (CloudWatch REPORT lines). The Lambda cache holds one filter for 20 s, so a sort, page or filter click pays the whole trip; the page blanks its table while it waits; a second click while one is in flight returns Busy.
+
+#### Design
+- Shared pure selection: the per-filter selection (`finish` and the list/status branching in `compute`) moves into a common module as `select(universe, filter) -> Reply`, and `/api/stock-movers` itself becomes `build_universe` (one QuestDB query over the union of the F&O list and the index-membership list) then `select`, so the API and the portal answer from one code path.
+- The app publishes the universe every 5 s inside 09:00–15:40 IST on a trading day and every 60 s otherwise to `s3://tv-<env>-live-view/movers/universe.json` (new bucket: no versioning, public access blocked, SSE-S3, objects expire after 2 days; the cold bucket is not used because it is versioned and may never expire noncurrent versions).
+- The Lambda reads that object (2 s timeout) for a live-view filter and selects in memory; a missing, unreadable or stale object (older than 20 s in session, 300 s outside), or any `as_of` filter, falls back to the existing SSM path unchanged.
+- The portal keeps the previous rows visible while a refresh runs.
+
+#### Edge Cases
+Empty or partial membership/F&O lists; index filter naming an index absent today; `fno_only` with no F&O list; market closed before 09:15; a publish in flight across 15:30/15:40; clock skew between box and Lambda; object larger than the wire bound; a universe from a previous IST day; duplicate security ids; NaN/zero prices; offsets past the end.
+
+#### Failure Modes
+S3 unreachable from the box (publish counted and skipped, portal falls back to SSM); S3 unreachable from the Lambda (fallback); corrupt object (rejected, fallback); stale object (fallback); QuestDB slow (publish times out, previous object ages out, fallback). Nothing on the tick path changes.
+
+#### Test Plan
+Property test: for random universes and random filters, `select` over the published universe equals the reply the old per-filter `compute` produced (old code kept under `#[cfg(test)]` as the oracle). Unit tests for staleness, day rollover, fallback, oversize. Lambda tests with a fake S3 shell. Terraform shape guard for the bucket (no versioning, PAB, lifecycle, IAM scoped to one key).
+
+#### Rollback
+`[operator_movers] publish_enabled = false` stops the publisher; the Lambda then always falls back (object ages out). Reverting the PR restores the old path.
+
+#### Observability
+`tv_movers_universe_publish_total{outcome}` and `tv_movers_universe_publish_duration_ms` (local /metrics only, no page); the Lambda logs `source=s3|ssm` and the elapsed ms per movers call.
+
+- [ ] MV-1 shared `select` in common + API refactor (identity proptest)
+- [ ] MV-2 app publisher task + config switch + counters
+- [ ] MV-3 terraform live-view bucket + two scoped IAM grants
+- [ ] MV-4 Lambda S3 read + fallback + timing log
+- [ ] MV-5 portal keeps rows while refreshing
+
+### PR DP — 2026-11-06 live incident: the disk-pressure archiver starved QuestDB 08:31–09:13 IST (app, storage, deploy)
+
+**Approved by:** Parthiban, 2026-11-06 ("go ahead fix everything dude approved").
+
+**Verified root cause (live logs, QuestDB SHOW PARAMETERS, errors.jsonl):** the box booted at 95% disk used; the disk-pressure leg exported 41 partitions back to back 08:31:05–09:13:11 (nine market_depth hours of 95–115M rows, 4–5 min each) through QuestDB HTTP /exp. QuestDB runs one shared network worker (`shared.network.worker.count=1`, `http.worker.count=0`) on one core, so each export held the thread every ILP /write and /exec needs: 14 BOOT-01, 30 reconnects, 2,935,971 tick rows and 2,331,360 depth levels rescued to spill, WAL probe blind x4. Underneath: `market_depth_book` exists with designated timestamp `timestamp` and 0 rows, so array rows are refused and inline depth writes 10 level rows per Full packet (~7 GiB/h); the Nov 5 pressure episode spent its 3 re-arms by 11:37 and held all night at 92%; the after-close depth pass stopped ~700 times at its 8% free floor while the drain hold kept the box up to 07:30. Same pattern Nov 4 and Nov 5. Ruled out: boot WAL replay (refused), evening restart (none), #2191, CPU quota throttling.
+
+#### Design
+- QuestDB gets its own HTTP worker pool (`QDB_HTTP_WORKER_COUNT=2`) so an /exp stream cannot hold the thread ILP /write and /exec use; host tuning stops forcing the network pool to 1.
+- The pressure pass is gated: inside 08:45–15:40 IST it exports no market_depth partition unless used ≥ 90%, and exports at most one partition per in-session pass; a pass started before the open stops at its next partition boundary after 09:00.
+- The pressure episode re-arm budget resets when the IST trading date changes or the session closes, so reclaim runs overnight instead of at the next boot.
+- The after-close depth pass that stops at its disk floor requests a reclaim, and the drain hold no longer counts floor-blocked depth buckets (a floor-blocked hold is capped at one hour and counted).
+- Boot self-heal: when `market_depth_book` exists with the wrong designated timestamp AND `count()` is 0, drop and re-create it with `ts` (never when it holds a row; a non-empty wrong table keeps todays refusal).
+
+#### Edge Cases
+Pressure at ≥ 90% inside the session; a partition export already running at 09:00; trading-date change while an episode is open; holiday and weekend; non-empty wrong-ts book table; QuestDB unreachable during the self-heal; HTTP worker count on a 1-core cpuset.
+
+#### Failure Modes
+Disk fills inside the session below 90% (ingest shed path unchanged, alarms unchanged); export refused (counted, retried next pass); self-heal drop fails (falls back to level rows exactly as today, coded warn).
+
+#### Test Plan
+Unit tests for the gate (time × used% × table), the re-arm reset on date change, the drain-hold exclusion, the self-heal guard (0 rows only), a compose/host-tuning guard that the HTTP pool is separate. Scoped `cargo test -p` for app and storage.
+
+#### Rollback
+Revert the PR; the compose line is one deletion.
+
+#### Observability
+`tv_disk_pressure_pass_gated_total{reason}`, `tv_disk_pressure_rearm_reset_total`, `tv_depth_book_self_heal_total{outcome}`, `tv_drain_hold_floor_blocked_buckets` (local /metrics only, no new page).
+
+- [ ] DP-1 QuestDB HTTP worker pool + host tuning
+- [ ] DP-2 in-session gate + one partition per pass + pre-open deadline
+- [ ] DP-3 re-arm reset on date change / session close
+- [ ] DP-4 after-close floor → reclaim request; drain-hold exclusion and cap
+- [ ] DP-5 market_depth_book zero-row self-heal
+- [ ] DP-6 telemetry: `HostSampler` reads the core count before the background pin (it read 1 on a 2-core box, so `process_cpu_pct` is a share of one core); `hot_path_latency_minute` gets a per-tick figure for `drain_main_frame` (packets per frame recorded at the record site) and writes NULL for `samples_over_1024ns` on the lag, dwell and receipt stages, where it is 100% by construction; runbook note that `ts` is IST written as Z (compare with `dateadd('m', 330, now())`)
