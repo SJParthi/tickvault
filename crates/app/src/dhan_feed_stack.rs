@@ -5017,6 +5017,9 @@ fn seed_drain_loss_baselines() {
     for reason in [
         "ltt_not_advanced",
         "not_a_trade",
+        // Plan PR AL-1 review (2026-11-06): a folded packet that is not a
+        // new trade.
+        "not_new_trade",
         "clamped_negative",
         "implausible_ltt",
         "unknown_connection_slot",
@@ -8852,7 +8855,7 @@ pub fn drain_main_feed_frame(
                     } => record_ws_lag_repeat_excluded(),
                     IngestOutcome::Folded {
                         advanced: false, ..
-                    } => record_ws_lag_not_a_trade_excluded(),
+                    } => record_ws_lag_not_new_trade_excluded(),
                     IngestOutcome::Folded { .. } => {
                         record_ws_lag(frame.connection_index, tick, received_at_nanos);
                         // Worst delay on a LIVE socket only: a replayed WAL
@@ -10689,6 +10692,12 @@ struct WsLagHandles {
     /// has not traded today carrying an earlier day's trade time. Counted, not
     /// recorded (2026-10-05).
     excluded_not_a_trade: metrics::Counter,
+    /// A folded packet that carried no NEW trade (plan PR AL-1, 2026-11-06):
+    /// the first packet after a subscribe, a book or OI update with the same
+    /// cumulative, a stale regression, or the packet ending a replay gap. Its
+    /// trade time can be hours old. Counted under its own reason so the
+    /// 2026-10-05 `not_a_trade` series keeps its meaning.
+    excluded_not_new_trade: metrics::Counter,
 }
 
 impl WsLagHandles {
@@ -10717,6 +10726,10 @@ impl WsLagHandles {
             excluded_not_a_trade: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "not_a_trade"
+            ),
+            excluded_not_new_trade: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "not_new_trade"
             ),
         }
     }
@@ -11392,6 +11405,13 @@ pub fn record_ws_lag_repeat_excluded() {
 /// relaxed atomic add; no allocation (2026-10-05).
 pub fn record_ws_lag_not_a_trade_excluded() {
     ws_lag_handles().excluded_not_a_trade.increment(1);
+}
+
+/// Counts a folded packet that carried no NEW trade (plan PR AL-1,
+/// 2026-11-06) as excluded from the delivery-lag measurement, under reason
+/// `not_new_trade`. One relaxed atomic add; no allocation.
+pub fn record_ws_lag_not_new_trade_excluded() {
+    ws_lag_handles().excluded_not_new_trade.increment(1);
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -20054,6 +20074,14 @@ mod tests {
             src.contains("\"reason\" => \"not_a_trade\""),
             "the exclusion reason label must be registered"
         );
+        // Review 2026-11-06: a not-NEW-trade packet is counted under its own
+        // reason, so the 2026-10-05 `not_a_trade` series keeps its meaning.
+        let after: String = arm[not_advanced..].chars().take(120).collect();
+        assert!(
+            after.contains("record_ws_lag_not_new_trade_excluded()"),
+            "the not-advanced arm must count `not_new_trade`"
+        );
+        assert!(src.contains("\"reason\" => \"not_new_trade\""));
     }
 
     use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;

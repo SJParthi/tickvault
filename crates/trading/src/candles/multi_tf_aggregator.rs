@@ -721,7 +721,9 @@ pub struct ConsumeStats {
     /// day-cumulative volume strictly increased, or, for an instrument whose
     /// cumulative is always 0 (an index), the trade time moved strictly
     /// forward. A stale cumulative regression, a repeat quote, a counter
-    /// restart and a seeding packet all read `false`.
+    /// restart, a seeding packet, and the packet that ends a replay gap
+    /// (including the WAL-replay to live hand-over gap, whose trade time can
+    /// be an old downtime trade) all read `false`.
     ///
     /// Informational only, like [`Self::repeat_quote`], and deliberately NOT
     /// part of [`Self::folded`]: it decides nothing in the fold and changes no
@@ -2252,8 +2254,12 @@ impl MultiTfAggregator {
         // strictly increased, or, for a zero-volume instrument (an index), whose
         // trade second moved strictly forward. Never the seeding packet, never
         // a stale regression (its cumulative is lower), never a repeat (same
-        // second, same cumulative). Informational only; two compares, O(1).
+        // second, same cumulative), and never the packet that ends a replay
+        // gap (`gap_now`): after a hand-over its delta spans the downtime and
+        // its trade time can be an old downtime trade, which is not delivery
+        // lag (review 2026-11-06). Informational only; three compares, O(1).
         let advanced = slot.volume_baseline_seeded
+            && !gap_now
             && (cumulative_volume > slot.last_cumulative
                 || (cumulative_volume == 0
                     && slot.last_cumulative == 0
@@ -10756,6 +10762,45 @@ mod tests {
             ignore_seal,
         );
         assert!(!older.advanced, "an older index print is not new");
+    }
+
+    #[test]
+    fn test_regression_advanced_is_false_on_the_packet_that_ends_the_hand_over_gap() {
+        // Review 2026-11-06 (plan PR AL-1): after a WAL replay, the first live
+        // packet ends the hand-over gap; its delta spans the downtime and its
+        // trade time can be an old downtime trade, so it is not a lag sample.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 10, 75.0, 4_000, 0, 0),
+            None,
+            ignore_seal,
+        );
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 20, 75.5, 4_100, 0, 0),
+            None,
+            ignore_seal,
+        );
+        agg.finish_replay(false, ignore_seal);
+        let first_live = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 600, 76.0, 4_600, 0, 0),
+            None,
+            ignore_seal,
+        );
+        assert!(
+            !first_live.advanced,
+            "the packet that ends the hand-over gap is never a new-trade sample"
+        );
+        let next = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 602, 76.25, 4_700, 0, 0),
+            None,
+            ignore_seal,
+        );
+        assert!(next.advanced, "the following trade is new again");
     }
 
     /// `folded()` reports success by the ABSENCE of every refusal flag, so a

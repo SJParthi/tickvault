@@ -221,9 +221,11 @@ fn the_ws_lag_exclusion_family_is_seeded_on_every_label_set() {
         .skip(1)
         .filter_map(|rest| rest.split('"').next())
         .collect();
+    // 5 → 6 on 2026-11-06 (plan PR AL-1 review): `not_new_trade`, a folded
+    // packet that carried no new trade, counted apart from `not_a_trade`.
     assert_eq!(
         emitted.len(),
-        5,
+        6,
         "WsLagHandles::new reasons changed: {emitted:?}"
     );
     for reason in emitted {
