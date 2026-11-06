@@ -8072,3 +8072,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "depth_stage_golden_tests.rs"]
+mod depth_stage_golden_tests;
