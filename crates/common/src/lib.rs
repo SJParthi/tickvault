@@ -66,3 +66,6 @@ pub mod url_join;
 pub mod ws_event_types;
 
 pub mod operator_stock_movers_wire;
+// Plan PR MV (2026-11-06): the movers universe + pure per-filter selection,
+// shared with the operator Lambda through `#[path]`.
+pub mod operator_movers_universe;
