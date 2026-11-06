@@ -2284,9 +2284,9 @@ Revert the PR.
 
 **Verified:** full-test-nightly fails on "No space left on device" while linking ~159 app test binaries with full debuginfo (no test assertion failed; 8 nights red); the aarch64 job is killed by runner shutdown; the bench gate fails Full-packet frames at 1.5–4.6 µs/tick against a 1 µs key that was set from Quote frames; `order_path_oms_order_update_fill` failed +8.3% (10 ns on 128 ns) with no code change since its baseline.
 
-- [ ] CI-1 nightly test jobs build with `CARGO_PROFILE_DEV_DEBUG=0` / `CARGO_PROFILE_TEST_DEBUG=0`, docker prune and a `df -h` before/after (x86 and aarch64)
-- [ ] CI-2 nightly updates one open issue instead of opening a new one each night, and prints the failing test names
-- [ ] CI-3 `feed_drain_main_feed_full` = 2,500 ns key for Full-packet frames (owner card above); Quote frames keep `feed_drain_main_feed` = 1,000 ns; CLAUDE.md key count updated
+- [x] CI-1 nightly test jobs build with `CARGO_PROFILE_DEV_DEBUG=0` / `CARGO_PROFILE_TEST_DEBUG=0`, docker prune and a `df -h` before/after (x86 and aarch64) — `.github/workflows/full-test-nightly.yml` (job env, prune + `df -h /` trap, duplicate `cargo check` step removed), `github_workflow_guard.rs::nightly_builds_without_debug_info_and_keeps_one_issue`, `shell_budget_guard.rs` ceiling 83 → 60
+- [x] CI-2 nightly updates one open issue instead of opening a new one each night, and prints the failing test names — one step "Report regression on the one open issue" (search, comment, else create; `grep -m 60` of FAILED/panicked/error[/No space left first)
+- [x] CI-3 `feed_drain_main_feed_full` = 2,500 ns key for Full-packet frames (owner card above); Quote frames keep `feed_drain_main_feed` = 1,000 ns; CLAUDE.md key count updated — `quality/benchmark-budgets.toml` (key above `feed_drain_main_feed`; Full ids renamed `feed_drain/main_feed_full_frame_4[_own]`), `drain_tail_gate::MAIN_FEED_FULL_DRAIN_BUDGET_KEY` + `test_real_budget_file_routes_full_and_quote_ids_to_their_own_keys`, `benches/feed_drain.rs::full_feed_drain_tail_gates`, `feed_drain_full_frame_evidence.rs::test_full_and_quote_tail_gates_read_their_own_budget_keys`, CLAUDE.md 37 → 38 keys
 - [ ] CI-4 finish and ship the never-opened `claude/assurance-fix-w4` (confirm parked live acks, W4) as its own PR after these
 
 ### PR TG — 2026-11-06: tests for the incident's worst-case combinations (storage, app)

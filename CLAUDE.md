@@ -789,7 +789,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## BENCHMARK BUDGETS
 
-`quality/benchmark-budgets.toml` is the executable source of truth (37 keys — 23 latency budgets + 12 per-element divisors + max_regression_pct + min_regression_delta_ns, the 1 ns noise floor added 2026-10-11 — enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
+`quality/benchmark-budgets.toml` is the executable source of truth (38 keys — 24 latency budgets + 12 per-element divisors + max_regression_pct + min_regression_delta_ns, the 1 ns noise floor added 2026-10-11 — enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
 
 | Budget key (benchmark-budgets.toml) | Real Criterion bench | Budget |
 |-------------------------------------|----------------------|--------|
@@ -801,7 +801,8 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 | config_toml_load | `config/toml_load` | 10 ms |
 | ~~composite_quote_tick_compute_only~~ | ~~`composite/quote_tick_compute_only`~~ | ~~10 μs~~ |
 | ~~composite_quote_tick_full_chain~~ | ~~`composite/quote_tick_full_chain`~~ | ~~10 μs~~ |
-| feed_drain_main_feed | `feed_drain/main_feed_frame_4_quotes`, `feed_drain/main_feed_frame_4_full`, `feed_drain/main_feed_frame_4_full_own` | 1 μs/tick (2.5 μs until 2026-10-29, plan ITEM DT step 0; CI multiplies by 2.5) |
+| feed_drain_main_feed | `feed_drain/main_feed_frame_4_quotes` | 1 μs/tick (2.5 μs until 2026-10-29, plan ITEM DT step 0; CI multiplies by 2.5) |
+| feed_drain_main_feed_full | `feed_drain/main_feed_full_frame_4`, `feed_drain/main_feed_full_frame_4_own` (renamed from `main_feed_frame_4_full[_own]` 2026-11-06) | 2.5 μs/tick (own key since 2026-11-06, owner card "Honest 2.5 µs for now (Recommended)": Full frames measured 1.5–4.6 μs/tick by runner CPU; listed above `feed_drain_main_feed` in the TOML because bench-gate takes the first matching key; CI multiplies by 2.5) |
 | feed_drain_depth | `feed_drain/depth20_frame_4x20`, `feed_drain/depth200_packet` | 1 μs/level (1.5 μs until 2026-10-30, plan ITEM DT depth row stage) |
 
 > **⚠ CORRECTED 2026-10-20 (audit item D3) — the two struck rows gate nothing.**

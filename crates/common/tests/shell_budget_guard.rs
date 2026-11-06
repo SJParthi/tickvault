@@ -1567,7 +1567,11 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/deploy-aws.yml", 640),
     (".github/workflows/downsize-instance.yml", 425),
     (".github/workflows/emergency-fs-recover.yml", 126),
-    (".github/workflows/full-test-nightly.yml", 83),
+    // 2026-11-06 (PR CI, CI-1/CI-2): 83 → 60. The duplicate `cargo check`
+    // step went, the issue body is written to a file in one step (one open
+    // issue, failure lines first), and both jobs print `df -h /` around the
+    // build.
+    (".github/workflows/full-test-nightly.yml", 60),
     (".github/workflows/fuzz.yml", 107),
     (".github/workflows/grow-ebs-volume.yml", 157),
     (".github/workflows/local-branch-sync.yml", 34),
