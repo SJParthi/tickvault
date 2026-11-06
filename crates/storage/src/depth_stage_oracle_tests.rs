@@ -719,3 +719,94 @@ fn test_ninth_name_table_cuts_the_batch_and_keeps_every_byte() {
     assert!(!got.is_empty());
     assert_eq!(got, legacy.buffer.as_bytes());
 }
+
+// ---- Behaviour of the moved line writer and the park size (pub-fn test guard, 2026-11-06) ----
+
+fn guard_row<'a>(values: &'a [f64], ts_nanos: i64) -> DepthBookRow<'a> {
+    DepthBookRow {
+        security_id: 42,
+        segment: "NSE_FNO",
+        depth_kind: DEPTH_KIND_5,
+        side: DEPTH_SIDE_BID,
+        prices: values,
+        quantities: values,
+        orders: values,
+        capture_seq: 7,
+        ts_nanos,
+    }
+}
+
+#[test]
+fn test_write_book_line_into_writes_the_contract_only_when_named_and_refuses_a_negative_ts() {
+    let values = [100.5, 101.0];
+    let r = guard_row(&values, SESSION_TS_NANOS);
+    let mut named = Buffer::new(DepthLayout::Book.protocol());
+    write_book_line_into(&mut named, Feed::Dhan, &r, 2, Some("NIFTY-X")).expect("named");
+    let mut bare = Buffer::new(DepthLayout::Book.protocol());
+    write_book_line_into(&mut bare, Feed::Dhan, &r, 2, None).expect("bare");
+    let prefix = format!("{MARKET_DEPTH_BOOK_TABLE},segment=NSE_FNO,depth_kind={DEPTH_KIND_5},");
+    assert!(named.as_bytes().starts_with(prefix.as_bytes()));
+    assert!(bare.as_bytes().starts_with(prefix.as_bytes()));
+    assert!(named.as_bytes().ends_with(b"\n"), "one whole line");
+    let contract = b",contract=NIFTY-X";
+    assert!(
+        named
+            .as_bytes()
+            .windows(contract.len())
+            .any(|w| w == contract),
+        "the name is written as the contract symbol"
+    );
+    assert!(
+        !bare.as_bytes().windows(9).any(|w| w == b"contract="),
+        "no name, no contract column (NULL)"
+    );
+    assert_eq!(named.len(), bare.len() + contract.len());
+    let mut refused = Buffer::new(DepthLayout::Book.protocol());
+    assert!(
+        write_book_line_into(&mut refused, Feed::Dhan, &guard_row(&values, -1), 2, None).is_err(),
+        "a negative designated timestamp is refused"
+    );
+}
+
+#[test]
+fn test_park_bytes_is_the_text_length_plus_the_staged_capacity() {
+    let empty = DepthRescueBatch {
+        buffer: Buffer::new(DepthLayout::Book.protocol()),
+        staged: crate::depth_stage::DepthStagedBatch::new(),
+        rows: 0,
+        min_seq: 0,
+        max_seq: 0,
+        unbacked: false,
+        floor: None,
+    };
+    assert_eq!(empty.park_bytes(), 0, "an empty batch pins nothing");
+    let values = [1.0];
+    let mut buffer = Buffer::new(DepthLayout::Book.protocol());
+    write_book_line_into(
+        &mut buffer,
+        Feed::Dhan,
+        &guard_row(&values, SESSION_TS_NANOS),
+        1,
+        None,
+    )
+    .expect("write");
+    let text = buffer.len();
+    assert!(text > 0);
+    let staged = crate::depth_stage::DepthStagedBatch::with_capacity_for_test(4, 12);
+    let staged_ram = staged.ram_bytes();
+    assert!(staged_ram > 0, "a reserved batch holds RAM while empty");
+    let batch = DepthRescueBatch {
+        buffer,
+        staged,
+        rows: 1,
+        min_seq: 7,
+        max_seq: 7,
+        unbacked: false,
+        floor: None,
+    };
+    assert_eq!(
+        batch.park_bytes(),
+        text + staged_ram,
+        "text by length, staged rows by capacity"
+    );
+}

@@ -463,3 +463,152 @@ fn test_a_batch_grown_to_the_flush_trigger_is_still_recycled() {
         fill_to_the_text_bound(200, None).ram_bytes() > DepthStagedBatch::presized().ram_bytes()
     );
 }
+
+// ---- Behaviour of the small batch accessors (pub-fn test guard, 2026-11-06) ----
+
+#[test]
+fn test_for_layout_presizes_a_book_batch_and_leaves_a_level_batch_empty() {
+    let (rows, values) = DepthStagedBatch::for_layout(DepthLayout::Book).capacities_for_test();
+    assert!(rows >= DEPTH_STAGED_ROWS_PRESIZE, "book rows {rows}");
+    assert!(
+        values >= DEPTH_STAGED_VALUES_PRESIZE,
+        "book values {values}"
+    );
+    assert_eq!(
+        DepthStagedBatch::for_layout(DepthLayout::Levels).capacities_for_test(),
+        (0, 0),
+        "a level writer never stages, so its batch allocates nothing"
+    );
+}
+
+#[test]
+fn test_text_bytes_sums_every_pushed_row_and_clear_rows_resets_it() {
+    let mut batch = DepthStagedBatch::presized();
+    assert_eq!(batch.text_bytes(), 0);
+    let prices = [10.5, 11.0];
+    let a = row(1, &prices, &prices, &prices, 1);
+    let b = row(2, &prices[..1], &prices[..1], &prices[..1], 2);
+    let a_len = book_line_len(Feed::Dhan, &a, 2, None);
+    let b_len = book_line_len(Feed::Dhan, &b, 1, None);
+    let _ = batch.push(&a, 0, a_len);
+    let _ = batch.push(&b, 0, b_len);
+    assert_eq!(batch.text_bytes(), a_len + b_len);
+    assert_eq!(
+        batch.text_bytes(),
+        batch.encode_readonly(Feed::Dhan).len(),
+        "the counted bytes are the bytes the encoder writes"
+    );
+    batch.clear_rows();
+    assert_eq!(batch.text_bytes(), 0);
+}
+
+#[test]
+fn test_pending_levels_counts_each_level_and_an_empty_side_as_one() {
+    let mut batch = DepthStagedBatch::presized();
+    assert_eq!(batch.pending_levels(), 0);
+    let prices = [1.0, 2.0, 3.0];
+    let three = row(1, &prices, &prices, &prices, 1);
+    let empty = row(2, &[], &[], &[], 2);
+    let _ = batch.push(&three, 0, book_line_len(Feed::Dhan, &three, 3, None));
+    assert_eq!(batch.pending_levels(), 3);
+    let _ = batch.push(&empty, 0, book_line_len(Feed::Dhan, &empty, 0, None));
+    assert_eq!(batch.pending_levels(), 4, "an empty side counts one level");
+    batch.clear();
+    assert_eq!(batch.pending_levels(), 0);
+}
+
+#[test]
+fn test_refused_levels_counts_the_levels_of_refused_rows_and_clear_rows_resets_it() {
+    let _g = ENCODE_FAILURE_COUNT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut batch = DepthStagedBatch::presized();
+    let prices = [1.0, 2.0];
+    let good = row(3, &prices, &prices, &prices, 10);
+    let mut bad = row(4, &prices, &prices, &prices, 11);
+    bad.ts_nanos = -1;
+    let _ = batch.push(&good, 0, book_line_len(Feed::Dhan, &good, 2, None));
+    let _ = batch.push(&bad, 0, 0);
+    assert_eq!(
+        batch.refused_levels(),
+        0,
+        "nothing refused before an encode"
+    );
+    assert_eq!(batch.encode_into(Feed::Dhan, &mut book_buffer()), 1);
+    assert_eq!(batch.refused_levels(), 2, "the refused row had two levels");
+    assert_eq!(
+        batch.encode_into(Feed::Dhan, &mut book_buffer()),
+        1,
+        "a marked row is skipped"
+    );
+    assert_eq!(batch.refused_levels(), 2, "and is not counted twice");
+    batch.clear_rows();
+    assert_eq!(batch.refused_levels(), 0);
+}
+
+#[test]
+fn test_pin_table_reuses_the_last_slot_and_hands_the_table_back_when_full() {
+    let mut batch = DepthStagedBatch::new();
+    let a = labels_with(1, "A");
+    let b = labels_with(2, "B");
+    assert_eq!(batch.pin_table(Arc::clone(&a)).expect("pin a"), 0);
+    assert_eq!(
+        batch.pin_table(Arc::clone(&a)).expect("a again"),
+        0,
+        "the last pinned table reuses its slot"
+    );
+    assert_eq!(batch.pin_count(), 1);
+    assert_eq!(batch.pin_table(Arc::clone(&b)).expect("pin b"), 1);
+    assert_eq!(
+        batch.pin_table(Arc::clone(&a)).expect("a after b"),
+        2,
+        "only the LAST table is deduplicated"
+    );
+    while batch.pin_count() < DEPTH_STAGE_LABEL_PINS {
+        let next = batch.pin_count() as i64;
+        let _ = batch.pin_table(labels_with(next, "X")).expect("free slot");
+    }
+    let extra = labels_with(99, "Z");
+    let back = batch
+        .pin_table(Arc::clone(&extra))
+        .expect_err("every slot holds another table");
+    assert!(Arc::ptr_eq(&back, &extra), "the same table is handed back");
+    assert_eq!(batch.pin_count(), DEPTH_STAGE_LABEL_PINS);
+}
+
+#[test]
+fn test_escaped_symbol_len_adds_one_byte_per_escaped_character() {
+    assert_eq!(escaped_symbol_len(""), 0);
+    assert_eq!(escaped_symbol_len("NIFTY-25Nov2026-24500-CE"), 24);
+    // Space, comma, equals, newline, carriage return and backslash each
+    // take one backslash before them.
+    assert_eq!(escaped_symbol_len("a b,c=d\ne\rf\\g"), 13 + 6);
+    assert_eq!(escaped_symbol_len("é"), 2, "bytes, not characters");
+    // The questdb-rs writer escapes the same set: a symbol adds `,s=` plus
+    // the escaped value to the line.
+    for value in ["plain", "with space", "a,b=c", "back\\slash"] {
+        let mut plain = book_buffer();
+        plain
+            .table("t")
+            .expect("table")
+            .column_i64("x", 1)
+            .expect("col")
+            .at(questdb::ingress::TimestampNanos::new(TS))
+            .expect("at");
+        let mut named = book_buffer();
+        named
+            .table("t")
+            .expect("table")
+            .symbol("s", value)
+            .expect("symbol")
+            .column_i64("x", 1)
+            .expect("col")
+            .at(questdb::ingress::TimestampNanos::new(TS))
+            .expect("at");
+        assert_eq!(
+            named.len() - plain.len(),
+            ",s=".len() + escaped_symbol_len(value),
+            "{value:?}"
+        );
+    }
+}

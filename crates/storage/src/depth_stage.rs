@@ -388,6 +388,7 @@ impl DepthStagedBatch {
 
     /// The value arena's allocation (tests).
     #[cfg(test)]
+    // TEST-EXEMPT: test-only accessor (`#[cfg(test)]`), read by the reuse tests to compare allocations
     pub(crate) fn values_ptr_for_test(&self) -> *const f64 {
         self.values.as_ptr()
     }
