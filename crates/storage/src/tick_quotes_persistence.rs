@@ -350,7 +350,7 @@ mod tests {
             .expect("append"); // APPROVED: test
         producer.flush().expect("hand-off"); // APPROVED: test
         let batch = rx.try_recv().expect("queued"); // APPROVED: test
-        let text = String::from_utf8_lossy(batch.ilp_bytes()).into_owned();
+        let text = String::from_utf8_lossy(&batch.encode_ilp_for_test(Feed::Dhan)).into_owned();
         assert!(text.starts_with("tick_quotes,"), "{text}");
         assert!(
             text.trim_end()

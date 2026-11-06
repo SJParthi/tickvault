@@ -5,6 +5,7 @@
 //! ([`super::write_tick_line_into`]) are each compared with the code they
 //! replaced, kept here verbatim as the oracle.
 
+use super::tick_test_writers::write_tick_line_into;
 use super::*;
 use proptest::prelude::*;
 use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
@@ -474,11 +475,11 @@ proptest! {
             own.append_tick_with_seq(&tick, seq)
         };
         prop_assert_eq!(own_appended.is_ok(), appended.is_ok(), "own encoder accept differs");
-        prop_assert_eq!(own.buffer.as_bytes(), writer.buffer.as_bytes(), "own encoder bytes differ");
+        prop_assert_eq!(pending_bytes(&own), pending_bytes(&writer), "own encoder bytes differ");
         let Some(old) = old else { return Ok(()) };
         // Only a row the window and band gates accepted is a `ticks` /
         // `tick_quotes` line; a refused one is a `feed_aux_packets` row.
-        let bytes = writer.buffer.as_bytes().to_vec();
+        let bytes = pending_bytes(&writer);
         let aux = bytes.starts_with(crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE.as_bytes());
         if aux || bytes.is_empty() {
             return Ok(());
@@ -587,9 +588,15 @@ fn legacy_oracle_is_not_vacuous() {
     );
     assert!(line.ends_with('\n'));
 }
+/// The pending rows as the ILP text the writer's own encoder will write
+/// (PF-4: the rows are staged; this encodes a copy and counts nothing).
+fn pending_bytes(w: &TickWriter) -> Vec<u8> {
+    w.staged.encode_readonly(w.feed, w.encoder)
+}
 
 #[test]
 fn test_new_with_encoder_own_has_our_sender_and_buffer() {
+    use crate::tick_ilp::TickRowBufferKind;
     let config = tickvault_common::config::QuestDbConfig {
         host: "127.0.0.1".to_owned(),
         http_port: 9,
@@ -599,12 +606,15 @@ fn test_new_with_encoder_own_has_our_sender_and_buffer() {
     // Building a sender never dials, for either encoder.
     let own = TickWriter::new_with_encoder(&config, Feed::Dhan, TickIlpEncoder::Own);
     assert!(matches!(own.sender, Some(TickIlpSender::Own(_))));
-    assert_eq!(own.buffer.kind(), TickRowBufferKind::Own);
-    assert!(own.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES);
+    // PF-4: the drain stages rows; every text is written in the writer's
+    // encoder (its cold scratch here; the sink's at the split).
+    assert_eq!(own.encoder, TickIlpEncoder::Own);
+    assert_eq!(own.cold_encode.kind(), TickRowBufferKind::Own);
+    assert!(own.staged.capacity() >= crate::tick_stage::TICK_STAGED_ROWS_PRESIZE);
     let lib = TickWriter::new(&config, Feed::Dhan);
     assert!(matches!(lib.sender, Some(TickIlpSender::Library(_))));
     assert_eq!(
-        lib.buffer.kind(),
+        lib.cold_encode.kind(),
         TickRowBufferKind::Library(ProtocolVersion::V1)
     );
 }
@@ -614,23 +624,28 @@ fn test_for_test_with_encoder_is_disconnected_and_presized() {
     for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
         let w = TickWriter::for_test_with_encoder(Feed::Dhan, encoder);
         assert!(w.sender.is_none());
-        assert_eq!(w.buffer.kind(), TickRowBuffer::new(encoder).kind());
-        assert!(w.buffer.capacity() >= TICK_ROW_BUFFER_PRESIZE_BYTES);
+        assert_eq!(w.cold_encode.kind(), TickRowBuffer::new(encoder).kind());
+        assert!(w.staged.capacity() >= crate::tick_stage::TICK_STAGED_ROWS_PRESIZE);
     }
 }
 
-/// The offload path recycles our buffers too, and never installs a spare of
-/// the other encoder.
+/// The offload path recycles staged batches (PF-4: a staged batch carries
+/// no encoder, so any spare is reused), and every text the writer's rows
+/// become is still written in the writer's own encoder: the sink's buffer and
+/// the rescue thread's scratch are built from it at the split.
 #[test]
 fn test_own_encoder_offload_recycles_only_own_spares() {
+    use crate::tick_ilp::TickRowBufferKind;
     let (mut producer, sink, _rx) =
         TickWriter::for_test_with_encoder(Feed::Dhan, TickIlpEncoder::Own).split_for_offload();
-    let mut foreign = TickRowBuffer::new(TickIlpEncoder::Library);
-    foreign.reserve(4_096);
+    let (rescue, _rescue_rx) = producer.split_rescue_offload();
+    assert_eq!(sink.encode_buf.kind(), TickRowBufferKind::Own);
+    assert_eq!(rescue.scratch.borrow().kind(), TickRowBufferKind::Own);
+    let spare = crate::tick_stage::StagedBatch::presized();
     assert!(
         sink.spare_return
             .as_ref()
-            .is_some_and(|lane| lane.try_send(foreign).is_ok())
+            .is_some_and(|lane| lane.try_send(spare).is_ok())
     );
     let tick = ParsedTick {
         security_id: RESERVED_ID_BASE + 3,
@@ -642,5 +657,8 @@ fn test_own_encoder_offload_recycles_only_own_spares() {
     };
     assert!(producer.append_tick_with_seq(&tick, 1).is_ok());
     assert!(producer.flush().is_ok());
-    assert_eq!(producer.buffer.kind(), TickRowBufferKind::Own);
+    assert_eq!(producer.encoder, TickIlpEncoder::Own);
+    assert!(producer.staged.is_empty(), "the spare arrives empty");
+    assert!(producer.staged.capacity() >= crate::tick_stage::TICK_STAGED_ROWS_PRESIZE);
+    assert_eq!(producer.cold_encode.kind(), TickRowBufferKind::Own);
 }

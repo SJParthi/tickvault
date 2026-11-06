@@ -80,7 +80,7 @@ fn take_row(
     if batch.rows() != 1 || rx.try_recv().is_ok() {
         return None;
     }
-    let text = batch.ilp_bytes().to_vec();
+    let text = batch.encode_ilp_for_test(Feed::Dhan);
     let table = match quotes {
         1 if text.starts_with(b"tick_quotes,") => true,
         0 if text.starts_with(b"ticks,") => false,

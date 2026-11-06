@@ -11,6 +11,11 @@
 //! the questdb-rs library and our own (`[tick_storage] own_ilp_encoder`,
 //! plan ITEM DT, owner 2026-10-30).
 //!
+//! ⚠ CHANGED 2026-11-06 (plan item PF-4): the drain no longer writes the ILP
+//! line; it stages the row (and pins the contract-name table) in a pre-sized,
+//! pre-touched batch, and the writer thread writes the text. The gate is the
+//! same: zero allocation per tick, now also across a contract-name republish.
+//!
 //! Companion bench: `benches/tick_row_append.rs`.
 
 #[global_allocator]
@@ -150,5 +155,29 @@ fn dhat_tick_row_append_is_zero_allocation() {
              write into the pre-sized buffer only — no String, no Vec, no format!."
         );
         assert_rows_landed(writer, before, encoder);
+    }
+
+    // PF-4 (2026-11-06): the drain stages typed rows and PINS the contract-
+    // name table each row saw. A publish mid-stream (here, between windows)
+    // makes the next row pin the new table: one `Arc` increment, never an
+    // allocation. Measured with the table published before the window.
+    let mut republished = CandleContractLabels::default();
+    for id in (40_001_i64..40_064).step_by(2) {
+        republished.insert((id, "NSE_EQ"), Arc::from("RELIANCE"));
+    }
+    assert!(publish_candle_contract_labels(republished) > 0);
+    for (encoder, writer) in [
+        (TickIlpEncoder::Library, &mut library),
+        (TickIlpEncoder::Own, &mut own),
+    ] {
+        let before = writer.pending();
+        let (bytes, blocks) = measure_rows(writer, &ticks, 100_000);
+        assert!(
+            bytes == BUDGET_BYTES && blocks == BUDGET_BLOCKS,
+            "{encoder:?}: staging across a contract-name republish allocated {bytes} bytes / \
+             {blocks} blocks over {ROWS_PER_ATTEMPT} rows; pinning the new table must be one \
+             reference-count increment, never an allocation."
+        );
+        assert!(writer.pending() >= before + ROWS_PER_ATTEMPT);
     }
 }

@@ -64,7 +64,7 @@ async fn run(plan: DrainThreadPlan) -> ([u64; 7], u64, Vec<u8>, bool) {
     let collector = std::thread::spawn(move || {
         let mut all = Vec::new();
         while let Ok(batch) = batches.recv() {
-            all.extend_from_slice(batch.ilp_bytes());
+            all.extend_from_slice(&batch.encode_ilp_for_test(Feed::Dhan));
         }
         all
     });
