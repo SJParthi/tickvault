@@ -1357,6 +1357,11 @@ pub struct ArchiveRunSummary {
     /// The pass stopped at a partition boundary because it reached
     /// [`ArchivePassLimits::stop_at_unix_secs`] (PR DP-2).
     pub stopped_at_deadline: bool,
+    /// The pass ran with caller limits ([`ArchivePassLimits`] other than the
+    /// default): a pressure pass the session gate or a stop time limited
+    /// (PR DP review H1). A gated pass that dropped nothing because a table's
+    /// WAL was behind is standing aside, not "nothing reclaimable".
+    pub pass_gated: bool,
 }
 
 /// Limits the CALLER puts on one archive pass (PR DP-2, 2026-11-06).
@@ -1371,8 +1376,11 @@ pub struct ArchiveRunSummary {
 pub struct ArchivePassLimits {
     /// Skip every depth table (`market_depth`, `market_depth_book`).
     pub skip_depth: bool,
-    /// At most this many partitions this pass (tighter of this and the
-    /// configured per-run cap).
+    /// At most this many partitions EXPORTED this pass (tighter of this and
+    /// the configured per-run cap). The run loop counts exports (PR DP review
+    /// H1): a partition refused at its pre-export WAL gate or held for the
+    /// after-close depth pass takes no slot, and a table whose WAL the
+    /// run-start probe found behind is dropped from the worklist first.
     pub max_partitions: Option<u32>,
     /// Stop at the next partition boundary once the wall clock (Unix seconds)
     /// reaches this instant. Checked before every partition, so a partition
@@ -1420,10 +1428,71 @@ enum PartitionStep {
     /// Dropped, kept, or failed for a partition-local reason — the next
     /// partition of the same table is still attempted.
     Done,
-    /// The table's WAL could not be proven fully applied (before the export
-    /// or before the drop). The partition is kept and the rest of the
-    /// table's partitions are skipped this run.
-    WalNotApplied,
+    /// The table's WAL could not be proven fully applied BEFORE the export:
+    /// nothing was exported, so it does not count against a caller's
+    /// partition cap (PR DP review H1). The partition is kept and the rest of
+    /// the table's partitions are skipped this run.
+    WalNotAppliedBeforeExport,
+    /// The table's WAL fell behind between the export and the drop: the
+    /// export ran (it counts against the cap), the partition is kept, and the
+    /// rest of the table's partitions are skipped this run.
+    WalNotAppliedBeforeDrop,
+}
+
+impl PartitionStep {
+    /// Whether this step exported a partition (counts against a caller's
+    /// [`ArchivePassLimits::max_partitions`]). O(1).
+    const fn exported(self) -> bool {
+        !matches!(self, Self::WalNotAppliedBeforeExport)
+    }
+
+    /// Whether the table's WAL could not be proven applied. O(1).
+    const fn wal_not_applied(self) -> bool {
+        !matches!(self, Self::Done)
+    }
+}
+
+/// The tables in `rows` whose WAL is BEHIND (`writerTxn < sequencerTxn`, not
+/// suspended), from one `wal_tables()` probe. A gated pressure pass drops
+/// their partitions from its worklist BEFORE its one-partition cap, so the
+/// cap is never spent on a table still being written (PR DP review H1). Pure,
+/// O(rows).
+#[must_use]
+pub(crate) fn wal_lagging_tables(rows: &[WalTableRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| {
+            matches!(
+                wal_apply_verdict(rows, &r.name),
+                WalApplyVerdict::Lagging { .. }
+            )
+        })
+        .map(|r| r.name.clone())
+        .collect() // O(1) EXEMPT: cold once-per-run probe of a few dozen rows
+}
+
+/// Drops from `worklist` every partition of a table in `lagging`. Returns the
+/// kept worklist and the DISTINCT tables it removed. Pure,
+/// O(worklist × lagging).
+#[must_use]
+pub(crate) fn drop_wal_lagging(
+    worklist: Vec<(&'static str, String)>,
+    lagging: &[String],
+) -> (Vec<(&'static str, String)>, Vec<&'static str>) {
+    let mut removed: Vec<&'static str> = Vec::new();
+    let mut kept = Vec::with_capacity(worklist.len());
+    // O(1) EXEMPT: begin — cold once-per-run worklist filter over a few
+    // dozen lagging table names.
+    for (table, partition) in worklist {
+        if lagging.iter().any(|l| l == table) {
+            if !removed.contains(&table) {
+                removed.push(table);
+            }
+        } else {
+            kept.push((table, partition));
+        }
+    }
+    // O(1) EXEMPT: end
+    (kept, removed)
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
@@ -1907,22 +1976,29 @@ impl PartitionArchiver {
         // unapplied WAL backlog would be destroyed on `RESUME WAL` if we
         // dropped its partitions. Probe failure = cannot prove ANY table is
         // safe → skip the ENTIRE run (fail-closed; next daily run retries).
-        let suspended: Vec<String> = match self.fetch_wal_tables().await {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|r| r.suspended)
-                .map(|r| r.name)
-                .collect(), // O(1) EXEMPT: cold-path once-per-run probe
-            Err(err) => {
-                error!(
-                    ?err,
-                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-                    "partition archive: wal_tables() probe failed — SKIPPING the whole \
+        // PR DP review H1: the same probe names the tables whose WAL is
+        // behind, which a gated pass drops before its cap.
+        let (suspended, wal_lagging): (Vec<String>, Vec<String>) =
+            match self.fetch_wal_tables().await {
+                Ok(rows) => {
+                    let lagging = wal_lagging_tables(&rows);
+                    let suspended = rows
+                        .into_iter()
+                        .filter(|r| r.suspended)
+                        .map(|r| r.name)
+                        .collect(); // O(1) EXEMPT: cold-path once-per-run probe
+                    (suspended, lagging)
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        "partition archive: wal_tables() probe failed — SKIPPING the whole \
                      run (cannot prove tables are not WAL-suspended; fail-closed)"
-                );
-                return summary;
-            }
-        };
+                    );
+                    return summary;
+                }
+            };
         for table in &suspended {
             warn!(
                 table,
@@ -2006,8 +2082,7 @@ impl PartitionArchiver {
         // never consumes budget a verified one could have used.
         let worklist = self.apply_crossverify_hold(worklist, &mut summary);
         // PR DP-2: the caller's depth skip BEFORE the per-run cap, so a held
-        // depth partition never takes a slot another table could use; the
-        // caller's (tighter) cap AFTER the fair share.
+        // depth partition never takes a slot another table could use.
         let (worklist, held_depth) = apply_pass_limits(
             worklist,
             ArchivePassLimits {
@@ -2015,15 +2090,37 @@ impl PartitionArchiver {
                 ..self.pass_limits
             },
         );
+        summary.pass_gated = self.pass_limits != ArchivePassLimits::default();
+        // PR DP review H1: a capped (in-session) pass drops every table whose
+        // WAL the run-start probe found behind BEFORE its cap. The oldest
+        // partition is usually a ticks / candles / tick_quotes day still
+        // being written; with the cap applied first, the pass spent its one
+        // slot on it, read WalNotApplied, and dropped nothing.
+        let worklist = if self.pass_limits.max_partitions.is_some() {
+            let (kept, removed) = drop_wal_lagging(worklist, &wal_lagging);
+            for table in &removed {
+                metrics::counter!(
+                    "tv_partition_archive_skipped_total",
+                    "reason" => "wal_not_applied",
+                    "cause" => "lagging",
+                    "stage" => "pass_start"
+                )
+                .increment(1);
+                info!(
+                    table,
+                    "partition archive (gated pass): table WAL is behind at the run start — \
+                     its partitions are left for a later pass and take no slot of this one"
+                );
+            }
+            summary.tables_wal_not_applied = summary
+                .tables_wal_not_applied
+                .saturating_add(u32::try_from(removed.len()).unwrap_or(u32::MAX));
+            kept
+        } else {
+            worklist
+        };
         let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
-        let (worklist, held_cap) = apply_pass_limits(
-            worklist,
-            ArchivePassLimits {
-                skip_depth: false,
-                ..self.pass_limits
-            },
-        );
-        summary.held_by_gate = held_depth.saturating_add(held_cap);
+        summary.held_by_gate = held_depth;
         summary.partitions_considered = worklist.len() as u32;
 
         // Tables whose WAL could not be proven applied this run. A table
@@ -2032,7 +2129,20 @@ impl PartitionArchiver {
         // probing it again per partition would only repeat the refusal.
         let mut wal_blocked: Vec<&'static str> = Vec::new();
         let planned = worklist.len();
+        // PR DP review H1: the caller's cap counts partitions actually
+        // EXPORTED. One refused at its pre-export WAL gate, or held for the
+        // after-close depth pass, takes no slot, so the next is tried.
+        let cap = self.pass_limits.max_partitions;
+        let mut exported: u32 = 0;
+        let mut attempted: u32 = 0;
         for (index, (table, partition)) in worklist.into_iter().enumerate() {
+            if let Some(cap) = cap
+                && exported >= cap
+            {
+                let left = u32::try_from(planned.saturating_sub(index)).unwrap_or(u32::MAX);
+                summary.held_by_gate = summary.held_by_gate.saturating_add(left);
+                break;
+            }
             // PR DP-2: a pass started before the session gate stops at the
             // next partition boundary once its stop time has come; the
             // partition being exported when the time came has finished.
@@ -2069,12 +2179,19 @@ impl PartitionArchiver {
             } else {
                 None
             };
-            if self.process_one(table, &partition, &mut summary).await
-                == PartitionStep::WalNotApplied
-            {
+            attempted = attempted.saturating_add(1);
+            let step = self.process_one(table, &partition, &mut summary).await;
+            if step.exported() {
+                exported = exported.saturating_add(1);
+            }
+            if step.wal_not_applied() {
                 wal_blocked.push(table);
                 summary.tables_wal_not_applied = summary.tables_wal_not_applied.saturating_add(1);
             }
+        }
+        if cap.is_some() {
+            // A capped pass reports what it handed to the export steps.
+            summary.partitions_considered = attempted;
         }
         if summary.held_deferred_depth > 0 {
             info!(
@@ -2356,7 +2473,7 @@ impl PartitionArchiver {
         //     Probed fresh here, per partition, because the run-start snapshot
         //     can be minutes old by the time a late worklist item is reached.
         if !self.wal_applied_gate(table, partition, "pre_export").await {
-            return PartitionStep::WalNotApplied;
+            return PartitionStep::WalNotAppliedBeforeExport;
         }
 
         // 1. Export (stream + gzip + count) — one partition on disk at a time.
@@ -2477,7 +2594,7 @@ impl PartitionArchiver {
         //     or writes a content-addressed sidecar beside it.
         if !self.wal_applied_gate(table, partition, "pre_drop").await {
             metrics::counter!("tv_partition_drop_withheld_total").increment(1);
-            return PartitionStep::WalNotApplied;
+            return PartitionStep::WalNotAppliedBeforeDrop;
         }
         //     The re-read compares count AND max(ts) with the values taken
         //     right after the export; any difference keeps the partition.
@@ -5382,9 +5499,23 @@ mod stub_integration_tests {
         csv_body: &'static str,
         wal: WalStub,
     ) -> Responder {
+        qdb_responder_tables(vec![(listed_table, partitions)], tally, csv_body, wal)
+    }
+
+    /// [`qdb_responder_with`] listing each `(table, partitions)` pair (every
+    /// other table lists none).
+    fn qdb_responder_tables(
+        listed: Vec<(&'static str, Vec<&'static str>)>,
+        tally: TallyStub,
+        csv_body: &'static str,
+        wal: WalStub,
+    ) -> Responder {
         let wal_probes = Arc::new(AtomicU64::new(0));
         let tally_calls = Arc::new(AtomicU64::new(0));
-        let listed = format!("table_partitions('{listed_table}')");
+        let listed: Vec<(String, Vec<&'static str>)> = listed
+            .into_iter()
+            .map(|(table, parts)| (format!("table_partitions('{table}')"), parts))
+            .collect();
         Arc::new(move |req: &SeenRequest| {
             let t = &req.target;
             if t.starts_with("/exp") {
@@ -5410,7 +5541,7 @@ mod stub_integration_tests {
                 );
                 return (200, Vec::new(), body.into_bytes());
             }
-            if t.contains(listed.as_str()) {
+            if let Some((_, partitions)) = listed.iter().find(|(q, _)| t.contains(q.as_str())) {
                 let rows: Vec<String> = partitions
                     .iter()
                     .map(|p| format!("[\"{p}\",false]"))
@@ -6439,6 +6570,124 @@ mod stub_integration_tests {
         );
     }
 
+    // Regression: PR DP review H1 — the in-session cap took the oldest
+    // partition first; that is usually a ticks day still being written, so
+    // the pass read WalNotApplied, dropped nothing, and escalated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_h1_gated_pass_drops_wal_lagging_tables_before_its_cap() {
+        // `ticks` (older partition) lags on every probe; `tick_quotes` is applied.
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &["ticks"])));
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_tables(
+            vec![
+                ("ticks", vec!["2026-04-01T09"]),
+                ("tick_quotes", vec!["2026-04-01T10"]),
+            ],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert!(summary.pass_gated);
+        assert_eq!(summary.tables_wal_not_applied, 1, "{summary:?}");
+        assert_eq!(
+            summary.dropped, 1,
+            "the applied table took the slot: {summary:?}"
+        );
+        let exports: Vec<String> = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp"))
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert!(exports[0].contains("tick_quotes"), "{exports:?}");
+    }
+
+    // Regression: PR DP review H1 — the cap counts EXPORTED partitions: one
+    // refused at its pre-export WAL gate (the table fell behind after the
+    // run-start probe) takes no slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_h1_gated_cap_counts_only_exported_partitions() {
+        // Probe 0 (run start): all applied. Later probes: `ticks` lags.
+        let wal: WalStub = Arc::new(|probe| {
+            let lagging: &[&str] = if probe >= 1 { &["ticks"] } else { &[] };
+            (200, wal_tables_body(&[], lagging))
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_tables(
+            vec![
+                ("ticks", vec!["2026-04-01T09"]),
+                ("tick_quotes", vec!["2026-04-01T10"]),
+            ],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 1, "{summary:?}");
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        let exports = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp"))
+            .count();
+        assert_eq!(exports, 1, "exactly one export under the cap");
+    }
+
+    #[test]
+    fn test_wal_lagging_tables_and_drop_wal_lagging() {
+        let row = |name: &str, suspended, w, s| WalTableRow {
+            name: name.to_string(),
+            suspended,
+            writer_txn: w,
+            sequencer_txn: s,
+            error_tag: None,
+            error_message: None,
+        };
+        let rows = vec![
+            row("ticks", false, Some(5), Some(7)),
+            row("candles_1m", false, Some(7), Some(7)),
+            row("tick_quotes", true, Some(5), Some(7)),
+            row("feed_aux_packets", false, None, Some(7)),
+        ];
+        assert_eq!(wal_lagging_tables(&rows), vec!["ticks".to_string()]);
+        let worklist = vec![
+            ("ticks", "2026-04-01T09".to_string()),
+            ("candles_1m", "2026-04-01".to_string()),
+            ("ticks", "2026-04-01T10".to_string()),
+        ];
+        let (kept, removed) = drop_wal_lagging(worklist, &["ticks".to_string()]);
+        assert_eq!(kept, vec![("candles_1m", "2026-04-01".to_string())]);
+        assert_eq!(removed, vec!["ticks"]);
+        assert!(PartitionStep::Done.exported());
+        assert!(PartitionStep::WalNotAppliedBeforeDrop.exported());
+        assert!(!PartitionStep::WalNotAppliedBeforeExport.exported());
+        assert!(!PartitionStep::Done.wal_not_applied());
+        assert!(PartitionStep::WalNotAppliedBeforeExport.wal_not_applied());
+    }
     #[test]
     fn test_apply_pass_limits_skips_depth_and_caps() {
         let worklist = vec![

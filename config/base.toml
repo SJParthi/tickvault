@@ -403,8 +403,12 @@ pressure_min_interval_secs = 900
 # session. An escalated episode used to get three hourly re-arms and then
 # hold until the next boot (5 Nov: re-arms spent by 11:37 IST, held at 92%
 # all night). The re-arm budget now refills on a new IST date, at the 15:40
-# close, and each time a session depth hour passes depth_hot_hours, so
-# reclaim continues through the evening and the night. Not changed here: the
+# close, and each time a session depth hour passes depth_hot_hours. After the
+# 15:40 close (and on a day with no session) an escalated episode re-arms at
+# every poll with no cap and a pass that drops partitions is not counted, so
+# reclaim runs back to back from 15:40 until the 16:30 IST stop. It does NOT
+# run through the night: the box stops at 16:30 (cost lock, Quote 37) unless
+# the drain hold keeps it up for the day's own data. Not changed here: the
 # four numbers in this block.
 pressure_max_passes = 4
 

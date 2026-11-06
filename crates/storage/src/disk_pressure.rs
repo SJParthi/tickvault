@@ -162,6 +162,49 @@ pub struct EpisodeState {
     /// Set by [`refresh_rearm_budget`]: the next re-arm is due at once,
     /// without the hour wait. Cleared when that re-arm runs.
     pub rearm_now: bool,
+    /// Set by the caller when [`GATED_STALL_PASSES`] gated passes in a row
+    /// (each refunded, PR DP-2) saw used% not fall (PR DP review M1): the
+    /// one-partition in-session passes are not keeping up, so the episode
+    /// escalates as an ungated one would. Without it, an in-session episode
+    /// at 90%+ refunded every pass and could never escalate.
+    pub gated_stalled: bool,
+}
+
+/// Gated (one-partition, refunded) passes in a row with used% not falling
+/// after which a pressure episode escalates (PR DP review M1). Five passes
+/// at the 60 s poll is five minutes of in-session reclaim that did not move
+/// the volume.
+pub const GATED_STALL_PASSES: u32 = 5;
+
+/// Tracks whether gated passes are freeing space (PR DP review M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatedStallTracker {
+    /// The lowest used% seen since the last fall.
+    lowest_used_pct: Option<u8>,
+    /// Gated passes in a row that did not lower it.
+    passes_without_fall: u32,
+}
+
+impl GatedStallTracker {
+    /// Records one gated pass that ended at `used_pct`; returns `true` once
+    /// [`GATED_STALL_PASSES`] in a row have not lowered the volume. O(1).
+    pub fn observe_gated_pass(&mut self, used_pct: u8) -> bool {
+        match self.lowest_used_pct {
+            Some(low) if used_pct >= low => {
+                self.passes_without_fall = self.passes_without_fall.saturating_add(1);
+            }
+            _ => {
+                self.lowest_used_pct = Some(used_pct);
+                self.passes_without_fall = 0;
+            }
+        }
+        self.passes_without_fall >= GATED_STALL_PASSES
+    }
+
+    /// Forgets the history (an ungated pass ran, or the episode ended). O(1).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// What the caller should do next.
@@ -285,6 +328,11 @@ pub fn decide_pressure_action(
             if ep.last_pass_dropped == Some(0) {
                 return PressureAction::Escalate;
             }
+            // PR DP review M1: refunded in-session passes that did not lower
+            // the volume escalate too.
+            if ep.gated_stalled {
+                return PressureAction::Escalate;
+            }
             if ep.passes_used >= cfg.pressure_max_passes {
                 return PressureAction::Escalate;
             }
@@ -322,6 +370,7 @@ pub fn apply_action(
                 rearms_used: 0,
                 rearm_window: None,
                 rearm_now: false,
+                gated_stalled: false,
             });
         }
         PressureAction::ContinuePass => {
@@ -395,8 +444,11 @@ pub enum PressureGateReason {
     /// Inside the session at or above [`PRESSURE_EMERGENCY_USED_PCT`]: depth
     /// allowed, still one partition.
     InSessionEmergency,
-    /// Before the session gate: the pass stops at 08:45 IST.
+    /// Before today's session gate: the pass stops when the gate opens.
     PreOpenDeadline,
+    /// After today's session, or on a day with no session: unlimited, but
+    /// the pass stops at the next session day's gate (PR DP review L1).
+    OffSessionDeadline,
 }
 
 impl PressureGateReason {
@@ -407,71 +459,144 @@ impl PressureGateReason {
             Self::InSession => "in_session",
             Self::InSessionEmergency => "in_session_emergency",
             Self::PreOpenDeadline => "pre_open_deadline",
+            Self::OffSessionDeadline => "off_session_deadline",
         }
     }
 
+    /// Whether this is the one-partition in-session gate. O(1).
+    #[must_use]
+    pub const fn is_in_session(self) -> bool {
+        matches!(self, Self::InSession | Self::InSessionEmergency)
+    }
+
     /// Every reason, for the boot-time zero registration.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::InSession,
         Self::InSessionEmergency,
         Self::PreOpenDeadline,
+        Self::OffSessionDeadline,
     ];
 }
 
+/// What the calendar says about the session around a pressure pass (PR DP
+/// review L1). Built by the caller from the trading calendar, so a Muhurat
+/// session (weekend or holiday) is a session day with its own window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PressureSessionDay {
+    /// Today's gate window as IST seconds of day `[start, end)`; `None` when
+    /// today has no session.
+    pub today_gate: Option<(u32, u32)>,
+    /// Unix second at which the NEXT session day's gate opens (after today);
+    /// `None` when the calendar cannot say (no deadline is set then).
+    pub next_gate_start_unix: Option<i64>,
+}
+
+/// The gate window of a regular trading day: 08:45 to 15:40 IST.
+pub const REGULAR_SESSION_GATE: (u32, u32) = (
+    PRESSURE_SESSION_GATE_START_SECS_IST,
+    PRESSURE_SESSION_GATE_END_SECS_IST,
+);
+
 /// The limits on one pressure pass started at `now_unix_secs`. Pure, O(1).
 ///
-/// On a trading day:
-/// * from 08:45 to 15:40 IST: at most one partition, and no depth partition
-///   unless `used_pct` is at least [`PRESSURE_EMERGENCY_USED_PCT`];
-/// * before 08:45 IST: no limit on what, but the pass stops at its next
-///   partition boundary once it is 08:45 (a pass already exporting a
-///   partition finishes that partition first).
-///
-/// A weekend or holiday, and a trading day after 15:40, are not limited.
+/// * Before today's gate: unlimited, but the pass stops at its next
+///   partition boundary once the gate opens (a partition already exporting
+///   finishes first).
+/// * Inside today's gate: at most one partition, and no depth partition
+///   unless `used_pct` is at least [`PRESSURE_EMERGENCY_USED_PCT`].
+/// * After today's gate, or on a day with no session: unlimited, but the
+///   pass stops at the next session day's gate (`next_gate_start_unix`), so
+///   a long evening or holiday pass never runs into the next open (PR DP
+///   review L1). No deadline when the calendar cannot name the next day.
 #[must_use]
 pub fn pressure_pass_limits(
     now_unix_secs: i64,
-    trading_day: bool,
+    day: PressureSessionDay,
     used_pct: u8,
 ) -> (
     crate::partition_archive::ArchivePassLimits,
     Option<PressureGateReason>,
 ) {
     use crate::partition_archive::ArchivePassLimits;
-    if !trading_day {
-        return (ArchivePassLimits::default(), None);
-    }
     let ist = now_unix_secs.saturating_add(i64::from(
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
     ));
     // `rem_euclid` keeps a pre-1970 clock from reading as a negative second.
     let secs_of_day = u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0);
-    if secs_of_day < PRESSURE_SESSION_GATE_START_SECS_IST {
-        let until = i64::from(PRESSURE_SESSION_GATE_START_SECS_IST - secs_of_day);
-        return (
+    if let Some((start, end)) = day.today_gate {
+        if secs_of_day < start {
+            let until = i64::from(start - secs_of_day);
+            return (
+                ArchivePassLimits {
+                    stop_at_unix_secs: Some(now_unix_secs.saturating_add(until)),
+                    ..ArchivePassLimits::default()
+                },
+                Some(PressureGateReason::PreOpenDeadline),
+            );
+        }
+        if secs_of_day < end {
+            let emergency = used_pct >= PRESSURE_EMERGENCY_USED_PCT;
+            return (
+                ArchivePassLimits {
+                    skip_depth: !emergency,
+                    max_partitions: Some(1),
+                    stop_at_unix_secs: None,
+                },
+                Some(if emergency {
+                    PressureGateReason::InSessionEmergency
+                } else {
+                    PressureGateReason::InSession
+                }),
+            );
+        }
+    }
+    match day.next_gate_start_unix {
+        Some(at) if at > now_unix_secs => (
             ArchivePassLimits {
-                stop_at_unix_secs: Some(now_unix_secs.saturating_add(until)),
+                stop_at_unix_secs: Some(at),
                 ..ArchivePassLimits::default()
             },
-            Some(PressureGateReason::PreOpenDeadline),
-        );
+            Some(PressureGateReason::OffSessionDeadline),
+        ),
+        _ => (ArchivePassLimits::default(), None),
     }
-    if secs_of_day < PRESSURE_SESSION_GATE_END_SECS_IST {
-        let emergency = used_pct >= PRESSURE_EMERGENCY_USED_PCT;
-        return (
-            ArchivePassLimits {
-                skip_depth: !emergency,
-                max_partitions: Some(1),
-                stop_at_unix_secs: None,
-            },
-            Some(if emergency {
-                PressureGateReason::InSessionEmergency
-            } else {
-                PressureGateReason::InSession
-            }),
-        );
+}
+
+/// Whether a pressure pass may be skipped this poll because an in-session
+/// pass already stood aside under the same conditions (PR DP review M7).
+///
+/// Between 75% and 89% used inside the session every pass stands aside (no
+/// depth, nothing else eligible), and rerunning it every 60 s rebuilt the
+/// archiver, listed every table, probed the WAL and woke the raw uploader for
+/// nothing. A stood-aside in-session pass is rerun only when the re-arm
+/// window key moves (a depth hour newly eligible, the close, a new date) or
+/// the volume crosses the [`PRESSURE_EMERGENCY_USED_PCT`] line. Pure, O(1).
+#[must_use]
+pub const fn in_session_rerun_skippable(
+    last_stood_aside: Option<(u64, bool)>,
+    window_key: u64,
+    emergency_now: bool,
+) -> bool {
+    match last_stood_aside {
+        Some((key, emergency)) => key == window_key && emergency == emergency_now,
+        None => false,
     }
-    (ArchivePassLimits::default(), None)
+}
+
+/// Off-session (after the gate closes, or a day with no session), an
+/// escalated episode may re-arm at every poll with no re-arm cap, so the
+/// window before the box stops reclaims as much as it can (PR DP review M3).
+/// The page is NOT re-armed: `escalated` stays latched. Returns `true` when
+/// it re-armed. O(1).
+pub fn lift_rearm_limit(state: &mut PressureState) -> bool {
+    match state.episode.as_mut() {
+        Some(ep) if ep.escalated => {
+            ep.rearms_used = 0;
+            ep.rearm_now = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +830,7 @@ mod probe_health_tests {
 mod tests {
     use super::*;
 
-    fn cfg() -> PartitionRetentionConfig {
+    pub(super) fn cfg() -> PartitionRetentionConfig {
         PartitionRetentionConfig {
             pressure_archive_enabled: true,
             pressure_high_water_pct: 75,
@@ -808,6 +933,7 @@ mod tests {
                 rearms_used: rearms,
                 rearm_window: None,
                 rearm_now: false,
+                gated_stalled: false,
             }),
             last_episode_end_secs: None,
         };
@@ -886,6 +1012,7 @@ mod tests {
                 rearms_used: 0,
                 rearm_window: None,
                 rearm_now: false,
+                gated_stalled: false,
             }),
             last_episode_end_secs: None,
         };
@@ -1160,71 +1287,192 @@ mod dp_gate_and_rearm_tests {
             - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS)
     }
 
+    /// 2026-11-06 as a regular trading day whose next session is 2026-11-07.
+    fn trading_day() -> PressureSessionDay {
+        PressureSessionDay {
+            today_gate: Some(REGULAR_SESSION_GATE),
+            next_gate_start_unix: Some(ist(8, 45) + 86_400),
+        }
+    }
+
     // Regression: 2026-11-06 (PR DP-2) — a pass at 95% exported nine
     // market_depth hours through the open; inside the session it is now one
     // partition and no depth below 90%.
     #[test]
     fn test_regression_dp2_pressure_pass_limits_in_session_one_partition_no_depth_below_90() {
-        let (limits, reason) = pressure_pass_limits(ist(9, 0), true, 89);
+        let (limits, reason) = pressure_pass_limits(ist(9, 0), trading_day(), 89);
         assert_eq!(reason, Some(PressureGateReason::InSession));
         assert!(limits.skip_depth);
         assert_eq!(limits.max_partitions, Some(1));
         assert_eq!(limits.stop_at_unix_secs, None);
 
-        let (limits, reason) = pressure_pass_limits(ist(11, 0), true, 90);
+        let (limits, reason) = pressure_pass_limits(ist(11, 0), trading_day(), 90);
         assert_eq!(reason, Some(PressureGateReason::InSessionEmergency));
         assert!(!limits.skip_depth, "90% and above may export depth");
         assert_eq!(limits.max_partitions, Some(1));
 
         // 08:45 is the first gated second; 15:40 the first free one.
         assert_eq!(
-            pressure_pass_limits(ist(8, 45), true, 80).1,
+            pressure_pass_limits(ist(8, 45), trading_day(), 80).1,
             Some(PressureGateReason::InSession)
         );
-        assert_eq!(pressure_pass_limits(ist(15, 40), true, 95).1, None);
         assert_eq!(
-            pressure_pass_limits(ist(15, 39), true, 95).1,
+            pressure_pass_limits(ist(15, 40), trading_day(), 95).1,
+            Some(PressureGateReason::OffSessionDeadline)
+        );
+        assert_eq!(
+            pressure_pass_limits(ist(15, 39), trading_day(), 95).1,
             Some(PressureGateReason::InSessionEmergency)
         );
+        for r in [
+            PressureGateReason::InSession,
+            PressureGateReason::InSessionEmergency,
+        ] {
+            assert!(r.is_in_session());
+        }
+        assert!(!PressureGateReason::PreOpenDeadline.is_in_session());
+        assert!(!PressureGateReason::OffSessionDeadline.is_in_session());
     }
 
     #[test]
     fn test_dp2_a_pre_open_pass_stops_at_0845() {
-        let (limits, reason) = pressure_pass_limits(ist(8, 31), true, 95);
+        let (limits, reason) = pressure_pass_limits(ist(8, 31), trading_day(), 95);
         assert_eq!(reason, Some(PressureGateReason::PreOpenDeadline));
         assert_eq!(limits.stop_at_unix_secs, Some(ist(8, 45)));
         assert!(!limits.skip_depth);
         assert_eq!(limits.max_partitions, None);
         // Just after midnight the deadline is still this morning's 08:45.
         assert_eq!(
-            pressure_pass_limits(ist(0, 5), true, 95)
+            pressure_pass_limits(ist(0, 5), trading_day(), 95)
                 .0
                 .stop_at_unix_secs,
             Some(ist(8, 45))
         );
     }
 
+    // Regression: PR DP review L1 — a pass started after 15:40, or on a
+    // holiday, had no stop time and could run into the next open.
     #[test]
-    fn test_dp2_holidays_and_evenings_are_not_limited() {
+    fn test_regression_l1_evening_and_holiday_passes_stop_at_the_next_gate() {
+        let tomorrow_gate = ist(8, 45) + 86_400;
+        let evening = PressureSessionDay {
+            today_gate: Some(REGULAR_SESSION_GATE),
+            next_gate_start_unix: Some(tomorrow_gate),
+        };
+        let (limits, reason) = pressure_pass_limits(ist(18, 0), evening, 99);
+        assert_eq!(reason, Some(PressureGateReason::OffSessionDeadline));
+        assert_eq!(limits.stop_at_unix_secs, Some(tomorrow_gate));
+        assert!(!limits.skip_depth);
+        assert_eq!(limits.max_partitions, None);
+        let holiday = PressureSessionDay {
+            today_gate: None,
+            next_gate_start_unix: Some(tomorrow_gate),
+        };
         for t in [ist(8, 0), ist(10, 0), ist(20, 0)] {
-            let (limits, reason) = pressure_pass_limits(t, false, 99);
-            assert_eq!(
-                limits,
-                crate::partition_archive::ArchivePassLimits::default()
-            );
-            assert_eq!(reason, None);
+            let (limits, reason) = pressure_pass_limits(t, holiday, 99);
+            assert_eq!(reason, Some(PressureGateReason::OffSessionDeadline));
+            assert_eq!(limits.stop_at_unix_secs, Some(tomorrow_gate));
+            assert_eq!(limits.max_partitions, None);
         }
-        let (limits, reason) = pressure_pass_limits(ist(18, 0), true, 99);
+        // No next day known: no limit at all.
+        let (limits, reason) = pressure_pass_limits(ist(20, 0), PressureSessionDay::default(), 99);
         assert_eq!(
             limits,
             crate::partition_archive::ArchivePassLimits::default()
         );
         assert_eq!(reason, None);
+        // A Muhurat window gates its own evening.
+        let muhurat = PressureSessionDay {
+            today_gate: Some((17 * 3_600 + 45 * 60, 19 * 3_600 + 25 * 60)),
+            next_gate_start_unix: Some(tomorrow_gate),
+        };
+        assert_eq!(
+            pressure_pass_limits(ist(18, 30), muhurat, 80).1,
+            Some(PressureGateReason::InSession)
+        );
+        assert_eq!(
+            pressure_pass_limits(ist(10, 0), muhurat, 80)
+                .0
+                .stop_at_unix_secs,
+            Some(ist(17, 45))
+        );
         for r in PressureGateReason::ALL {
             assert!(!r.as_str().is_empty());
         }
     }
 
+    // Regression: PR DP review M7 — a stood-aside in-session pass reran
+    // every 60 s between 75% and 89%.
+    #[test]
+    fn test_regression_m7_in_session_rerun_skippable_only_while_nothing_changed() {
+        assert!(!in_session_rerun_skippable(None, 5, false));
+        assert!(in_session_rerun_skippable(Some((5, false)), 5, false));
+        assert!(
+            !in_session_rerun_skippable(Some((5, false)), 6, false),
+            "key moved"
+        );
+        assert!(
+            !in_session_rerun_skippable(Some((5, false)), 5, true),
+            "crossed 90%"
+        );
+    }
+
+    // Regression: PR DP review M3 — off-session the escalated episode re-arms
+    // every poll; the page latch stays.
+    #[test]
+    fn test_regression_m3_lift_rearm_limit_rearms_an_escalated_episode_only() {
+        let mut state = PressureState::default();
+        assert!(!lift_rearm_limit(&mut state));
+        state.episode = Some(EpisodeState {
+            passes_used: 4,
+            escalated: true,
+            rearms_used: PRESSURE_MAX_REARMS,
+            ..EpisodeState::default()
+        });
+        assert!(lift_rearm_limit(&mut state));
+        let ep = state.episode.expect("episode");
+        assert_eq!(ep.rearms_used, 0);
+        assert!(ep.rearm_now);
+        assert!(ep.escalated, "the page is not re-armed");
+        let mut fresh = PressureState {
+            episode: Some(EpisodeState::default()),
+            last_episode_end_secs: None,
+        };
+        assert!(!lift_rearm_limit(&mut fresh));
+    }
+
+    // Regression: PR DP review M1 — refunded in-session passes at 90%+ could
+    // never escalate.
+    #[test]
+    fn test_regression_m1_gated_stall_escalates_after_five_passes_without_a_fall() {
+        let mut tracker = GatedStallTracker::default();
+        assert!(
+            !tracker.observe_gated_pass(92),
+            "first reading sets the floor"
+        );
+        for _ in 0..(GATED_STALL_PASSES - 1) {
+            assert!(!tracker.observe_gated_pass(92));
+        }
+        assert!(tracker.observe_gated_pass(93), "five passes, no fall");
+        tracker.reset();
+        assert!(!tracker.observe_gated_pass(95));
+        assert!(!tracker.observe_gated_pass(95));
+        assert!(!tracker.observe_gated_pass(94), "a fall resets the count");
+        let c = super::tests::cfg();
+        let state = PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 1,
+                last_pass_dropped: Some(1),
+                gated_stalled: true,
+                ..EpisodeState::default()
+            }),
+            last_episode_end_secs: None,
+        };
+        assert_eq!(
+            decide_pressure_action(PressureProbe::used(92), &state, &c, 0),
+            PressureAction::Escalate
+        );
+    }
     #[test]
     fn test_rearm_window_key_moves_on_date_close_and_depth_eligibility() {
         let hot = 4;
@@ -1278,6 +1526,7 @@ mod dp_gate_and_rearm_tests {
                 rearms_used: PRESSURE_MAX_REARMS,
                 rearm_window: None,
                 rearm_now: false,
+                gated_stalled: false,
             }),
             last_episode_end_secs: None,
         };
