@@ -2128,6 +2128,14 @@ impl MultiTfAggregator {
                 ..ConsumeStats::default()
             };
         };
+        // PF-7 (2026-11-06): start every cache miss of this slot's buckets now,
+        // together, instead of one timeframe at a time inside the fold. Loads
+        // only; see `fold_warm_up.rs` for the measurement and the proof.
+        if crate::candles::fold_warm_up::warm_up_enabled()
+            && let Some(slot) = self.slots.get(idx)
+        {
+            std::hint::black_box(slot.cell.warm_for_tick(fold_secs));
+        }
         let strategy = self.strategy;
         // Read before the slot borrow below (plan ITEM 47).
         let replay_mode = self.replay_mode;
@@ -3963,6 +3971,9 @@ mod advanced_tests;
 #[cfg(test)]
 #[path = "multi_tf_aggregator_l3_tests.rs"]
 mod l3_tests;
+#[cfg(test)]
+#[path = "multi_tf_aggregator_pf7_tests.rs"]
+mod pf7_tests;
 
 #[cfg(test)]
 mod tests {

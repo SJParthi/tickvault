@@ -903,6 +903,39 @@ impl AggregatorCell {
         self.slots[tf.as_ordinal()]
     }
 
+    /// Cache warm-up for the tick about to fold (plan item PF-7, 2026-11-06):
+    /// reads one field on each cache line of every open bucket, and of the
+    /// sealed bucket and the carry of each timeframe this tick will roll, and
+    /// returns the bits folded into one word for the caller to pass to
+    /// `black_box`. The loads are independent, so their cache misses overlap
+    /// instead of being met one timeframe at a time inside the fold. See
+    /// `fold_warm_up.rs`.
+    ///
+    /// Reads only (`&self`, no interior mutability): it changes no value the
+    /// fold computes. The roll test is `fold_secs` past the open bucket's end,
+    /// one add and one compare; it only chooses what to read ahead, so a tick
+    /// it misjudges costs time, never a value.
+    ///
+    /// # Performance
+    /// O(`TF_COUNT`) loads, no allocation. Measured on the x86 dev container
+    /// (`benches/candle_fold_cold.rs`, 25,000-slot tables out of cache): p50
+    /// 1.28–1.31 → 0.98–0.99 µs per tick on the rolling shape (interleaved A/B,
+    /// 4 rounds); a fully cache-hot fold pays about 25 ns more.
+    #[inline]
+    #[must_use]
+    pub(crate) fn warm_for_tick(&self, fold_secs: u32) -> u64 {
+        let mut acc = 0u64;
+        for (ord, tf) in TfIndex::ALL.iter().enumerate() {
+            let open = &self.slots[ord];
+            acc ^= crate::candles::fold_warm_up::touch_state(open);
+            if !open.is_uninitialised() && fold_secs >= tf.bucket_end(open.bucket_start_ist_secs) {
+                acc ^= crate::candles::fold_warm_up::touch_state(&self.last_sealed[ord])
+                    ^ self.carried_upto[ord];
+            }
+        }
+        acc
+    }
+
     /// `true` when a tick at `fold_secs` would SEAL this frame's open bucket:
     /// a bucket is open and the tick's bucket starts after it. The exact rule
     /// `consume_tick` applies (plan ITEM 47 uses it to release a held bar

@@ -60,6 +60,12 @@ harness = false
 name = "candle_fold"
 harness = false
 
+# Plan item PF-7 (2026-11-06): the same fold with the slot out of the CPU
+# cache (25,000-slot tables, several times the L3).
+[[bench]]
+name = "candle_fold_cold"
+harness = false
+
 # bar_cache_lookup bench DELETED with the dead `in_mem::bar_cache` module
 # (dead live-WS sweep stage 1, 2026-07-17); its `bar_cache_lookup` budget
 # key was removed from quality/benchmark-budgets.toml in the same PR.
