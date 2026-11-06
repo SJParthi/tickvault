@@ -635,10 +635,10 @@ impl BookTimestampProblem {
     }
 }
 
-/// The manual repair for a [`BookTimestampProblem`]. The boot never drops a
-/// table with rows, and never renames or alters it (since PR DP-5 it drops
-/// one only when it holds 0 rows with its WAL fully applied):
-/// a table with rows is market data (zero
+/// The manual repair for a [`BookTimestampProblem`]. The boot never drops or
+/// alters this table, and renames one only when it is EMPTY (PR DP-5: 0 rows,
+/// WAL fully applied and unmoved around the count, inside the depth spill
+/// replay hold); a table with rows is market data (zero
 /// loss, Quotes 27 + 28), and only the operator decides what happens to it.
 ///
 /// Why the start time matters (review, 2026-10-29): the depth spill replay is
@@ -661,8 +661,9 @@ const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app st
      start outside that window replays data/spill/depth first, and a spilled \
      market_depth_book row would auto-create the table with the wrong timestamp \
      again. Until then depth is written to market_depth and nothing is lost. \
-     The boot drops this table itself only when it holds 0 rows with its WAL \
-     fully applied; it never drops one with rows, and never renames or alters it";
+     A boot from 08:00 to 15:40 IST renames this table aside itself \
+     (market_depth_book_lh01_<yyyymmdd>) only when it holds 0 rows with its WAL \
+     fully applied and untouched; it never drops it, and never renames one with rows";
 
 /// Counts boots that found `market_depth_book` with a designated timestamp
 /// other than `ts` and kept depth in `market_depth` (review, 2026-10-29).
@@ -725,24 +726,34 @@ pub const MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER: &str = "tv_depth_book_self_heal_t
 /// What the self-heal of a wrong-timestamp `market_depth_book` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookSelfHeal {
-    /// The table held 0 rows with its WAL fully applied; it was dropped, and
-    /// the ensure re-creates it with `ts`.
+    /// The table held 0 rows with its WAL fully applied and unmoved while the
+    /// depth spill replay was held; it was RENAMED aside (nothing deleted),
+    /// and the ensure re-creates `market_depth_book` with `ts`.
     Healed,
-    /// The table holds rows: kept, refused as before (never dropped).
+    /// The table holds rows: kept, refused as before.
     RefusedRows,
     /// The row count or the WAL state could not be read: kept, refused.
     RefusedUnknown,
-    /// The `DROP TABLE` itself failed: refused as before.
-    DropFailed,
+    /// The depth spill replay is not held at this hour (outside 08:00 to
+    /// 15:40 IST it can post a `market_depth_book` row at any moment): kept,
+    /// refused.
+    RefusedReplayLive,
+    /// `wal_tables()` showed a new sequencer transaction between the two
+    /// reads around the count (a writer reached the table): kept, refused.
+    RefusedTxnMoved,
+    /// The `RENAME TABLE` itself failed: refused as before.
+    RenameFailed,
 }
 
 impl BookSelfHeal {
     /// Every outcome, for the zero registration.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Healed,
         Self::RefusedRows,
         Self::RefusedUnknown,
-        Self::DropFailed,
+        Self::RefusedReplayLive,
+        Self::RefusedTxnMoved,
+        Self::RenameFailed,
     ];
 
     /// The `outcome` label.
@@ -752,31 +763,64 @@ impl BookSelfHeal {
             Self::Healed => "healed",
             Self::RefusedRows => "refused_rows",
             Self::RefusedUnknown => "refused_unknown",
-            Self::DropFailed => "drop_failed",
+            Self::RefusedReplayLive => "refused_replay_live",
+            Self::RefusedTxnMoved => "refused_txn_moved",
+            Self::RenameFailed => "rename_failed",
         }
     }
 }
 
-/// Whether an existing wrong-timestamp `market_depth_book` may be dropped.
+/// The readings the self-heal decides on (PR DP-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookSelfHealReadings {
+    /// `tick_spill_replay::depth_replay_held_at(now)`: the depth spill replay
+    /// cannot post a row right now.
+    pub replay_held: bool,
+    /// `SELECT count()` (`None` = unreadable).
+    pub row_count: Option<i64>,
+    /// From the SECOND `wal_tables()` read: writer at the sequencer and not
+    /// suspended (`None` = unreadable or not listed).
+    pub wal_applied: Option<bool>,
+    /// `sequencerTxn` from the `wal_tables()` read BEFORE the count.
+    pub sequencer_before: Option<i64>,
+    /// `sequencerTxn` from the read AFTER the count.
+    pub sequencer_after: Option<i64>,
+}
+
+/// Whether an existing wrong-timestamp `market_depth_book` may be renamed
+/// aside.
 ///
-/// `row_count` is `SELECT count()` (`None` = unreadable); `wal_applied` is
-/// whether `wal_tables()` reports the table with its writer at the
-/// sequencer's transaction and not suspended (`None` = unreadable or the
-/// table not listed). Only `Some(0)` rows AND `Some(true)` applied may drop:
-/// a count of 0 with WAL transactions still to apply can be rows QuestDB has
-/// accepted and not yet made visible. `Err` carries the refusal. Pure, O(1).
+/// Only while the depth spill replay is held (it is spawned before this
+/// ensure and, outside 08:00 to 15:40 IST, can post a row at any moment), with
+/// `Some(0)` rows, the WAL fully applied, and the same `sequencerTxn` before
+/// and after the count (no writer reached the table in between; a count of 0
+/// with transactions still to apply can be rows QuestDB has accepted and not
+/// yet made visible). `Err` carries the refusal. Pure, O(1).
 ///
 /// # Errors
+/// [`BookSelfHeal::RefusedReplayLive`] outside the replay hold,
 /// [`BookSelfHeal::RefusedRows`] when the table holds rows,
-/// [`BookSelfHeal::RefusedUnknown`] when either reading is missing or the
-/// WAL is behind.
-pub const fn book_self_heal_decision(
-    row_count: Option<i64>,
-    wal_applied: Option<bool>,
-) -> Result<(), BookSelfHeal> {
-    match (row_count, wal_applied) {
-        (Some(0), Some(true)) => Ok(()),
-        (Some(n), _) if n > 0 => Err(BookSelfHeal::RefusedRows),
+/// [`BookSelfHeal::RefusedTxnMoved`] when the sequencer moved,
+/// [`BookSelfHeal::RefusedUnknown`] when a reading is missing or the WAL is
+/// behind.
+pub const fn book_self_heal_decision(r: BookSelfHealReadings) -> Result<(), BookSelfHeal> {
+    if !r.replay_held {
+        return Err(BookSelfHeal::RefusedReplayLive);
+    }
+    match (
+        r.row_count,
+        r.wal_applied,
+        r.sequencer_before,
+        r.sequencer_after,
+    ) {
+        (Some(n), _, _, _) if n > 0 => Err(BookSelfHeal::RefusedRows),
+        (Some(0), Some(true), Some(before), Some(after)) => {
+            if before == after {
+                Ok(())
+            } else {
+                Err(BookSelfHeal::RefusedTxnMoved)
+            }
+        }
         _ => Err(BookSelfHeal::RefusedUnknown),
     }
 }
@@ -793,11 +837,69 @@ pub fn book_wal_applied(rows: &[crate::wal_suspension_watcher::WalTableRow]) -> 
     Some(!row.suspended && writer == sequencer)
 }
 
-/// Drops `market_depth_book` when it is empty and fully applied, so the
-/// ensure can re-create it with `ts` (PR DP-5). Every step that cannot be
-/// read refuses: the table is never dropped on a guess. Boot only, three
-/// `/exec` calls.
-async fn self_heal_empty_market_depth_book(questdb_config: &QuestDbConfig) -> BookSelfHeal {
+/// `market_depth_book`'s `sequencerTxn` in `rows`; `None` when not listed or
+/// missing. Pure, O(rows).
+#[must_use]
+pub fn book_sequencer_txn(rows: &[crate::wal_suspension_watcher::WalTableRow]) -> Option<i64> {
+    // O(1) EXEMPT: boot-only scan over the few dozen wal_tables() rows.
+    rows.iter()
+        .find(|r| r.name == MARKET_DEPTH_BOOK_TABLE)?
+        .sequencer_txn
+}
+
+/// The name a wrong-timestamp `market_depth_book` is renamed to:
+/// `market_depth_book_lh01_<yyyymmdd>` with the IST date of `now_unix_secs`
+/// (the module's own manual remedy, dated). Pure, O(1).
+#[must_use]
+pub fn book_self_heal_rename_target(now_unix_secs: i64) -> String {
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    // A clock chrono cannot place falls back to the Unix epoch's date.
+    let date = chrono::DateTime::from_timestamp(ist, 0).unwrap_or_default();
+    // APPROVED: boot-only DDL name, once per self-heal
+    format!("{MARKET_DEPTH_BOOK_TABLE}_lh01_{}", date.format("%Y%m%d"))
+}
+
+/// IST second of day of `now_unix_secs`. Pure, O(1).
+fn ist_secs_of_day(now_unix_secs: i64) -> u32 {
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0)
+}
+
+/// One `wal_tables()` read: `(applied, sequencer)` for `market_depth_book`.
+async fn book_wal_reading(client: &reqwest::Client, exec_url: &str) -> (Option<bool>, Option<i64>) {
+    match crate::wal_suspension_watcher::fetch_wal_tables(client, exec_url).await {
+        Ok(rows) => (book_wal_applied(&rows), book_sequencer_txn(&rows)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Renames `market_depth_book` aside when it is empty, fully applied, the
+/// sequencer did not move around the count, and the depth spill replay is
+/// held, so the ensure can re-create it with `ts` (PR DP-5). NOTHING is ever
+/// deleted: the old table keeps whatever it holds under its dated name.
+/// Every step that cannot be read refuses. Boot only, at most four `/exec`
+/// calls.
+async fn self_heal_empty_market_depth_book(
+    questdb_config: &QuestDbConfig,
+    now_unix_secs: i64,
+) -> BookSelfHeal {
+    let replay_held =
+        crate::tick_spill_replay::depth_replay_held_at(ist_secs_of_day(now_unix_secs));
+    if !replay_held {
+        warn!(
+            table = MARKET_DEPTH_BOOK_TABLE,
+            outcome = BookSelfHeal::RefusedReplayLive.as_str(),
+            "market_depth_book self-heal REFUSED: outside 08:00 to 15:40 IST the depth \
+             spill replay can post a row at any moment, so the table is kept and depth \
+             stays in market_depth (nothing lost); the next boot inside the window \
+             renames it aside"
+        );
+        return BookSelfHeal::RefusedReplayLive;
+    }
     // APPROVED: QuestDB base URL, once per boot ensure
     let exec_url = format!(
         "http://{}:{}/exec",
@@ -809,6 +911,7 @@ async fn self_heal_empty_market_depth_book(questdb_config: &QuestDbConfig) -> Bo
     else {
         return BookSelfHeal::RefusedUnknown;
     };
+    let (_, sequencer_before) = book_wal_reading(&client, &exec_url).await;
     // APPROVED: boot-only probe query
     let count_sql = format!("SELECT count() FROM {MARKET_DEPTH_BOOK_TABLE}");
     let row_count = match client
@@ -824,27 +927,33 @@ async fn self_heal_empty_market_depth_book(questdb_config: &QuestDbConfig) -> Bo
             .and_then(|body| crate::fresh_start_reset::parse_count(&body)),
         _ => None,
     };
-    let wal_applied =
-        match crate::wal_suspension_watcher::fetch_wal_tables(&client, &exec_url).await {
-            Ok(rows) => book_wal_applied(&rows),
-            Err(_) => None,
-        };
-    if let Err(refusal) = book_self_heal_decision(row_count, wal_applied) {
+    let (wal_applied, sequencer_after) = book_wal_reading(&client, &exec_url).await;
+    let readings = BookSelfHealReadings {
+        replay_held,
+        row_count,
+        wal_applied,
+        sequencer_before,
+        sequencer_after,
+    };
+    if let Err(refusal) = book_self_heal_decision(readings) {
         warn!(
             table = MARKET_DEPTH_BOOK_TABLE,
             row_count = ?row_count,
             wal_applied = ?wal_applied,
+            sequencer_before = ?sequencer_before,
+            sequencer_after = ?sequencer_after,
             outcome = refusal.as_str(),
-            "market_depth_book self-heal REFUSED: the table is not proven empty and \
-             applied, so it is kept and depth stays in market_depth (nothing lost)"
+            "market_depth_book self-heal REFUSED: the table is not proven empty, applied \
+             and untouched, so it is kept and depth stays in market_depth (nothing lost)"
         );
         return refusal;
     }
-    // APPROVED: boot-only DDL, only after the table was proven empty
-    let drop_sql = format!("DROP TABLE {MARKET_DEPTH_BOOK_TABLE}");
+    let target = book_self_heal_rename_target(now_unix_secs);
+    // APPROVED: boot-only DDL, only after the table was proven empty; a rename, never a drop
+    let rename_sql = format!("RENAME TABLE {MARKET_DEPTH_BOOK_TABLE} TO {target}");
     match client
         .get(&exec_url)
-        .query(&[("query", drop_sql.as_str())])
+        .query(&[("query", rename_sql.as_str())])
         .send()
         .await
     {
@@ -852,16 +961,16 @@ async fn self_heal_empty_market_depth_book(questdb_config: &QuestDbConfig) -> Bo
         _ => {
             warn!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                stage = "self_heal_book_drop",
+                stage = "self_heal_book_rename",
                 table = MARKET_DEPTH_BOOK_TABLE,
-                "market_depth_book self-heal: DROP TABLE failed; the table is kept and \
+                target = %target,
+                "market_depth_book self-heal: RENAME TABLE failed; the table is kept and \
                  depth stays in market_depth (nothing lost)"
             );
-            BookSelfHeal::DropFailed
+            BookSelfHeal::RenameFailed
         }
     }
 }
-
 /// Reads QuestDB's `/exec` answer to `SELECT * FROM table_columns('..')` by
 /// column NAME (`column`, `type`, `designated`), so an added or reordered
 /// result column does not break it. `None` for anything it cannot read (an
@@ -1109,6 +1218,15 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
 /// do.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
 pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> BookEnsureOutcome {
+    ensure_market_depth_book_table_at(questdb_config, chrono::Utc::now().timestamp()).await
+}
+
+/// [`ensure_market_depth_book_table`] at wall time `now_unix_secs` (the
+/// self-heal reads the IST hour and date from it; tests pass a fixed one).
+async fn ensure_market_depth_book_table_at(
+    questdb_config: &QuestDbConfig,
+    now_unix_secs: i64,
+) -> BookEnsureOutcome {
     metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
     for outcome in BookSelfHeal::ALL {
         metrics::counter!(MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER, "outcome" => outcome.as_str())
@@ -1119,14 +1237,15 @@ pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> B
     // generic DEDUP failure. No row is lost, so it is not counted or logged as
     // a persistence failure.
     //
-    // PR DP-5 (2026-11-06): an EMPTY such table is dropped and re-created
+    // PR DP-5 (2026-11-06): an EMPTY such table is RENAMED aside and re-created
     // first (`self_heal_empty_market_depth_book`). Measured live: the table
     // existed with designated timestamp `timestamp` and 0 rows, so every boot
     // refused array rows and inline depth wrote 10 level rows per Full packet
-    // (~7 GiB an hour). Only a table proven empty AND fully applied is
-    // dropped; anything else keeps today's refusal.
+    // (~7 GiB an hour). Only while the depth spill replay is held, with the
+    // table proven empty, fully applied and its sequencer unmoved around the
+    // count; nothing is ever deleted. Anything else keeps today's refusal.
     if let Some(problem) = probe_market_depth_book_ts(questdb_config).await {
-        let healed = self_heal_empty_market_depth_book(questdb_config).await;
+        let healed = self_heal_empty_market_depth_book(questdb_config, now_unix_secs).await;
         metrics::counter!(MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER, "outcome" => healed.as_str())
             .increment(1);
         if healed != BookSelfHeal::Healed {
@@ -1135,10 +1254,12 @@ pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> B
         }
         info!(
             table = MARKET_DEPTH_BOOK_TABLE,
+            renamed_to = %book_self_heal_rename_target(now_unix_secs),
             cause = %problem.cause(),
             "market_depth_book self-healed: it had the wrong designated timestamp and \
-             held 0 rows, so it was dropped and is re-created with ts now (nothing was \
-             deleted: the table was empty and its WAL fully applied)"
+             held 0 rows, so it was RENAMED aside (nothing deleted) and is re-created \
+             with ts now (it was empty, its WAL fully applied and untouched, and the \
+             depth spill replay was held)"
         );
     }
     if run_depth_ddl(
@@ -7174,40 +7295,52 @@ mod tests {
     }
 
     /// PR DP-5 stub QuestDB: the auto-created (wrong-timestamp) columns for
-    /// the `table_columns` probe, `count_answer` for `SELECT count()`,
-    /// `wal_answer` for `wal_tables()`, `drop_answer` for `DROP TABLE`, `[]`
-    /// (200) for everything else. Returns the port and whether a DROP and a
-    /// DEDUP statement were seen.
+    /// the `table_columns` probe, `count_answer` for `SELECT count()`, the
+    /// i-th of `wal_answers` for the i-th `wal_tables()` read (the last one
+    /// repeats), `rename_answer` for `RENAME TABLE`, `[]` (200) for everything
+    /// else. Returns the port, whether a RENAME, a DROP and a DEDUP statement
+    /// were seen.
     async fn dp5_spawn_stub(
         count_answer: &'static str,
-        wal_answer: &'static str,
-        drop_answer: &'static str,
+        wal_answers: Vec<&'static str>,
+        rename_answer: &'static str,
     ) -> (
         u16,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let other = lh01_http_200("[]");
         let columns = lh01_http_200(LH01_AUTO_CREATED_COLUMNS);
-        let drop_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (rename_seen, drop_seen, dedup_seen) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let wal_reads = Arc::new(AtomicUsize::new(0));
+        let wal_answers = Arc::new(wal_answers);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let (drop_flag, dedup_flag) = (
-            std::sync::Arc::clone(&drop_seen),
-            std::sync::Arc::clone(&dedup_seen),
+        let flags = (
+            Arc::clone(&rename_seen),
+            Arc::clone(&drop_seen),
+            Arc::clone(&dedup_seen),
         );
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (drop_flag, dedup_flag) = (
-                    std::sync::Arc::clone(&drop_flag),
-                    std::sync::Arc::clone(&dedup_flag),
+                let (rename_flag, drop_flag, dedup_flag) = (
+                    Arc::clone(&flags.0),
+                    Arc::clone(&flags.1),
+                    Arc::clone(&flags.2),
                 );
+                let (wal_reads, wal_answers) = (Arc::clone(&wal_reads), Arc::clone(&wal_answers));
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 8192];
@@ -7215,15 +7348,19 @@ mod tests {
                     let request = String::from_utf8_lossy(&buf[..n]);
                     let first = request.lines().next().unwrap_or("");
                     if first.contains("DEDUP") {
-                        dedup_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        dedup_flag.store(true, Ordering::SeqCst);
                     }
                     let resp = if first.contains("wal_tables") {
-                        wal_answer
+                        let i = wal_reads.fetch_add(1, Ordering::SeqCst);
+                        wal_answers[i.min(wal_answers.len() - 1)]
                     } else if first.contains("count%28%29") {
                         count_answer
+                    } else if first.contains("RENAME") {
+                        rename_flag.store(true, Ordering::SeqCst);
+                        rename_answer
                     } else if first.contains("DROP") {
-                        drop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        drop_answer
+                        drop_flag.store(true, Ordering::SeqCst);
+                        other
                     } else if first.contains("table_columns") {
                         columns
                     } else {
@@ -7233,7 +7370,7 @@ mod tests {
                 });
             }
         });
-        (port, drop_seen, dedup_seen)
+        (port, rename_seen, drop_seen, dedup_seen)
     }
 
     fn dp5_count(n: i64) -> &'static str {
@@ -7248,32 +7385,85 @@ mod tests {
         ))
     }
 
+    /// 2026-11-06 10:00 IST (inside the depth spill replay hold).
+    const DP5_IN_HOLD_UNIX: i64 = 1_793_939_400;
+    /// 2026-11-06 17:00 IST (outside it: the replay can post a row).
+    const DP5_OUT_OF_HOLD_UNIX: i64 = DP5_IN_HOLD_UNIX + 7 * 3_600;
+
     // Regression: 2026-11-06 (PR DP-5) — market_depth_book existed with
     // designated timestamp `timestamp` and 0 rows, so every boot refused
     // array rows and inline depth wrote ~7 GiB an hour of level rows.
     #[tokio::test]
-    async fn test_regression_dp5_an_empty_applied_wrong_ts_book_is_dropped_and_re_ensured() {
-        let (port, drop_seen, dedup_seen) =
-            dp5_spawn_stub(dp5_count(0), dp5_wal(7, 7, false), lh01_http_200("{}")).await;
+    async fn test_regression_dp5_an_empty_applied_wrong_ts_book_is_renamed_never_dropped() {
+        let (port, rename_seen, drop_seen, dedup_seen) = dp5_spawn_stub(
+            dp5_count(0),
+            vec![dp5_wal(7, 7, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
         assert_eq!(
-            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
             BookEnsureOutcome::Ensured
         );
-        assert!(drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !drop_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing is ever dropped"
+        );
         assert!(
             dedup_seen.load(std::sync::atomic::Ordering::SeqCst),
             "re-created with its DEDUP key"
         );
     }
 
+    // Review (PR DP): outside 08:00-15:40 IST the depth spill replay is live
+    // and can ack a row between the count and the rename.
     #[tokio::test]
-    async fn test_dp5_a_book_with_rows_is_never_dropped() {
-        let (port, drop_seen, _) =
-            dp5_spawn_stub(dp5_count(5), dp5_wal(7, 7, false), lh01_http_200("{}")).await;
+    async fn test_dp5_outside_the_depth_replay_hold_the_book_is_kept() {
+        let (port, rename_seen, drop_seen, _) = dp5_spawn_stub(
+            dp5_count(0),
+            vec![dp5_wal(7, 7, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
         assert_eq!(
-            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_OUT_OF_HOLD_UNIX).await,
             BookEnsureOutcome::LayoutRefused
         );
+        assert!(!rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // Review (PR DP): a sequencer transaction landing between the two reads
+    // around the count means a writer reached the table: kept.
+    #[tokio::test]
+    async fn test_dp5_a_sequencer_moving_around_the_count_keeps_the_book() {
+        let (port, rename_seen, _, _) = dp5_spawn_stub(
+            dp5_count(0),
+            vec![dp5_wal(7, 7, false), dp5_wal(8, 8, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(!rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_dp5_a_book_with_rows_is_never_renamed() {
+        let (port, rename_seen, drop_seen, _) = dp5_spawn_stub(
+            dp5_count(5),
+            vec![dp5_wal(7, 7, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(!rename_seen.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!drop_seen.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -7289,50 +7479,95 @@ mod tests {
             (dp5_count(0), dp5_wal(7, 7, true)),
             (dp5_count(0), lh01_http_200("[]")),
         ] {
-            let (port, drop_seen, _) = dp5_spawn_stub(count, wal, lh01_http_200("{}")).await;
+            let (port, rename_seen, _, _) =
+                dp5_spawn_stub(count, vec![wal], lh01_http_200("{}")).await;
             assert_eq!(
-                ensure_market_depth_book_table(&lh01_cfg(port)).await,
+                ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
                 BookEnsureOutcome::LayoutRefused
             );
             assert!(
-                !drop_seen.load(std::sync::atomic::Ordering::SeqCst),
-                "never dropped on a guess"
+                !rename_seen.load(std::sync::atomic::Ordering::SeqCst),
+                "never renamed on a guess"
             );
         }
     }
 
     #[tokio::test]
-    async fn test_dp5_a_failed_drop_keeps_the_refusal() {
+    async fn test_dp5_a_failed_rename_keeps_the_refusal() {
         let failed = "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}";
-        let (port, drop_seen, dedup_seen) =
-            dp5_spawn_stub(dp5_count(0), dp5_wal(7, 7, false), failed).await;
+        let (port, rename_seen, _, dedup_seen) =
+            dp5_spawn_stub(dp5_count(0), vec![dp5_wal(7, 7, false)], failed).await;
         assert_eq!(
-            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
             BookEnsureOutcome::LayoutRefused
         );
-        assert!(drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(rename_seen.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!dedup_seen.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
     fn test_dp5_book_self_heal_decision_and_book_wal_applied() {
-        assert_eq!(book_self_heal_decision(Some(0), Some(true)), Ok(()));
+        let ok = BookSelfHealReadings {
+            replay_held: true,
+            row_count: Some(0),
+            wal_applied: Some(true),
+            sequencer_before: Some(7),
+            sequencer_after: Some(7),
+        };
+        assert_eq!(book_self_heal_decision(ok), Ok(()));
         assert_eq!(
-            book_self_heal_decision(Some(1), Some(true)),
+            book_self_heal_decision(BookSelfHealReadings {
+                replay_held: false,
+                ..ok
+            }),
+            Err(BookSelfHeal::RefusedReplayLive)
+        );
+        assert_eq!(
+            book_self_heal_decision(BookSelfHealReadings {
+                sequencer_after: Some(8),
+                ..ok
+            }),
+            Err(BookSelfHeal::RefusedTxnMoved)
+        );
+        assert_eq!(
+            book_self_heal_decision(BookSelfHealReadings {
+                row_count: Some(1),
+                ..ok
+            }),
             Err(BookSelfHeal::RefusedRows)
         );
         assert_eq!(
-            book_self_heal_decision(Some(9), None),
+            book_self_heal_decision(BookSelfHealReadings {
+                row_count: Some(9),
+                wal_applied: None,
+                ..ok
+            }),
             Err(BookSelfHeal::RefusedRows)
         );
-        for (rows, wal) in [
-            (None, Some(true)),
-            (Some(0), Some(false)),
-            (Some(0), None),
-            (Some(-1), Some(true)),
+        for r in [
+            BookSelfHealReadings {
+                row_count: None,
+                ..ok
+            },
+            BookSelfHealReadings {
+                wal_applied: Some(false),
+                ..ok
+            },
+            BookSelfHealReadings {
+                wal_applied: None,
+                ..ok
+            },
+            BookSelfHealReadings {
+                row_count: Some(-1),
+                ..ok
+            },
+            BookSelfHealReadings {
+                sequencer_before: None,
+                ..ok
+            },
         ] {
             assert_eq!(
-                book_self_heal_decision(rows, wal),
+                book_self_heal_decision(r),
                 Err(BookSelfHeal::RefusedUnknown)
             );
         }
@@ -7365,11 +7600,28 @@ mod tests {
             book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, None, Some(3))]),
             None
         );
+        assert_eq!(
+            book_sequencer_txn(&[row(MARKET_DEPTH_BOOK_TABLE, false, None, Some(3))]),
+            Some(3)
+        );
+        assert_eq!(
+            book_sequencer_txn(&[row("ticks", false, None, Some(3))]),
+            None
+        );
+        assert_eq!(
+            book_self_heal_rename_target(DP5_IN_HOLD_UNIX),
+            "market_depth_book_lh01_20261106"
+        );
+        assert!(crate::tick_spill_replay::depth_replay_held_at(
+            ist_secs_of_day(DP5_IN_HOLD_UNIX)
+        ));
+        assert!(!crate::tick_spill_replay::depth_replay_held_at(
+            ist_secs_of_day(DP5_OUT_OF_HOLD_UNIX)
+        ));
         for o in BookSelfHeal::ALL {
             assert!(!o.as_str().is_empty());
         }
     }
-
     fn lh01_cfg(http_port: u16) -> QuestDbConfig {
         QuestDbConfig {
             host: "127.0.0.1".to_string(),
