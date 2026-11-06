@@ -5196,6 +5196,16 @@ emit side's 30-minute `SILENCE_PAGE_COOLDOWN_SECS` between pages, and §2.11.
 
 **Cost:** zero. No alarm, metric, filter or EMF name added.
 
+**Honest limit (review, 2026-11-06).** The 30-minute cooldown covers only the
+per-instrument silence page. Two other coded `RISK-GAP-03` lines share the
+filter and can page on their own, each already bounded: the dead-class report
+(edge-latched once per class per episode, inside the continuous session) and
+the detector-blind line (once per process, when the silence detector's slot
+table refuses an instrument). So with the 300 s window the alarm can enter
+ALARM more than once in 30 minutes when those coincide with a silence page.
+They are deliberately NOT put behind the silence cooldown: a dead index class
+must never wait 30 minutes behind an unrelated silence page.
+
 **What a PR that violates §2.16 looks like (REJECT):**
 - Lowers `questdb-disconnected` back to a single bad minute, or below 3 of 5,
   without a further dated row.

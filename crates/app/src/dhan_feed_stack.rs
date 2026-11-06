@@ -29026,10 +29026,12 @@ mod silence_latch_tests {
         // after the last emit instead of holding ALARM for up to an hour. What
         // keeps a 300 s window from flapping on the residual oscillation (the
         // 2026-08-14 session, ~25 transitions) is the EMIT side: one coded
-        // RISK-GAP-03 line at most every `SILENCE_PAGE_COOLDOWN_SECS` (1,800 s),
-        // so the alarm can enter ALARM at most once per 30 minutes. Both halves
-        // are pinned here: the period may not exceed 300 s (§2.16 REJECT), and
-        // the cooldown may not shrink below 1,800 s.
+        // per-instrument silence page at most every `SILENCE_PAGE_COOLDOWN_SECS`
+        // (1,800 s). The dead-class report (edge-latched per class) and the
+        // detector-blind line (once per process) share the filter and can page
+        // separately (§2.16 honest limit). Both halves are pinned here: the
+        // period may not exceed 300 s (§2.16 REJECT), and the cooldown may not
+        // shrink below 1,800 s.
         assert!(
             entry.contains("period      = 300\n"),
             "the risk-gap-03 alarm window is not 300 s. Noise lock §2.16 \
