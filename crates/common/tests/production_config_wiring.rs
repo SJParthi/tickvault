@@ -219,3 +219,23 @@ fn test_staging_and_dev_configs_are_retired() {
         "there must be no config/dev.toml (single prod env)"
     );
 }
+
+// 2026-11-06 (plan PR PF, item PF-1): production runs our own ILP encoder.
+// The encoder's text is byte-identical to the library's (proptests in
+// `tick_ilp` / `tick_row_identity_tests`); this pins the switch so a later
+// edit cannot turn the live box back to the slower path unnoticed.
+#[test]
+fn test_production_turns_on_the_own_ilp_encoder() {
+    let content = std::fs::read_to_string(workspace_root().join("config").join("production.toml"))
+        .unwrap_or_else(|e| panic!("production.toml not readable: {e}")); // APPROVED: test
+    let section = content
+        .split_once("\n[tick_storage]")
+        .map(|(_, rest)| rest.split("\n[").next().unwrap_or(""))
+        .expect("production.toml must carry a [tick_storage] section");
+    assert!(
+        section
+            .lines()
+            .any(|l| l.trim() == "own_ilp_encoder = true"),
+        "{section}"
+    );
+}
