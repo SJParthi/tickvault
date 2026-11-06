@@ -60,11 +60,12 @@ use tickvault_common::feed_blame::{
 };
 use tickvault_storage::feed_episode_audit_persistence::{
     FeedEpisodeAuditRow, FeedEpisodeAuditWriter, ensure_feed_episode_audit_table,
+    ensure_feed_episode_audit_table_with,
 };
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
-    ScoreboardOutcome, ensure_feed_scoreboard_tables,
+    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_DDL_MAX_ATTEMPTS, SCOREBOARD_SESSION_MINUTES,
+    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables_with,
 };
 
 // ---- `SPOT_1M_REST_TABLE` is RETIRED 2026-09-17 ----
@@ -2569,6 +2570,75 @@ pub async fn day_already_scored_complete(questdb: &QuestDbConfig, target_ist_day
     }
 }
 
+/// Writes the day's scoreboard rows, retrying every 5 minutes until they land
+/// or the next attempt would start after 16:20 IST (plan PR AL-2,
+/// 2026-11-06). Each attempt builds a fresh writer (a writer built while
+/// QuestDB was unreachable has no sender and could never flush). Only the
+/// last failed attempt logs the coded `SCOREBOARD-01` error; earlier ones log
+/// `info!` and count `retry`. With `retry_until_deadline` false (a past-day
+/// backfill) it makes exactly one attempt. Returns `true` when the rows
+/// landed. Cold path: at most 8 attempts a day, a few rows each.
+async fn write_daily_rows_with_retry(
+    questdb: &QuestDbConfig,
+    rows: &[FeedScoreboardDailyRow],
+    retry_until_deadline: bool,
+) -> bool {
+    use crate::ws_connection_rollup::{
+        ROLLUP_RETRY_INTERVAL_SECS, RollupAttemptOutcome, note_rollup_attempt, now_secs_of_day_ist,
+        rollup_retry_delay_secs,
+    };
+    let mut first_attempt = true;
+    loop {
+        let final_attempt =
+            !retry_until_deadline || rollup_retry_delay_secs(now_secs_of_day_ist()).is_none();
+        let mut writer = FeedScoreboardWriter::new(questdb);
+        for row in rows {
+            // An append error is a row-encoding failure, not QuestDB being
+            // down, so it is reported once (first attempt) and not retried.
+            if let Err(err) = writer.append_daily_row(row)
+                && first_attempt
+            {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "daily_append",
+                    feed = row.feed,
+                    ?err,
+                    "SCOREBOARD-01: daily row append failed"
+                );
+            }
+        }
+        first_attempt = false;
+        match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
+            Ok(()) => {
+                note_rollup_attempt(RollupAttemptOutcome::Ok);
+                return true;
+            }
+            Err(err) if final_attempt => {
+                note_rollup_attempt(RollupAttemptOutcome::GaveUp);
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "daily_flush",
+                    ?err,
+                    "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
+                     DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
+                );
+                return false;
+            }
+            Err(err) => {
+                note_rollup_attempt(RollupAttemptOutcome::Retry);
+                info!(
+                    ?err,
+                    retry_in_secs = ROLLUP_RETRY_INTERVAL_SECS,
+                    "feed_scoreboard: daily rows did not land (QuestDB unreachable \
+                     or slow) — retrying; the coded error is logged only if the \
+                     last attempt before 16:20 IST fails"
+                );
+                tokio::time::sleep(Duration::from_secs(ROLLUP_RETRY_INTERVAL_SECS)).await;
+            }
+        }
+    }
+}
+
 /// Runs the daily scoreboard aggregation once. Cold path (once/day at the
 /// configured trigger). Fail-soft: missing sources record sentinels + an
 /// honest `partial`/`degraded` outcome — the summary is ALWAYS returned so
@@ -2595,8 +2665,18 @@ pub async fn run_feed_scoreboard(
     boot_reconciled_rows: &[FeedEpisodeAuditRow],
     runtime_enabled_now: Option<(bool, bool)>,
 ) -> Result<ScoreboardSummary, String> {
-    ensure_feed_scoreboard_tables(questdb).await;
-    ensure_feed_episode_audit_table(questdb).await;
+    // Plan PR AL-2 (2026-11-06): only the same-day run retries (DDL, daily
+    // rows, connection rollup, each bounded by 16:20 IST). A past-day
+    // backfill (`TICKVAULT_SCOREBOARD_DATE`) makes one attempt, as before:
+    // the operator re-runs it, and a loop there would hold the run for hours.
+    let retry_until_deadline = is_same_day_run;
+    let ddl_attempts = if retry_until_deadline {
+        SCOREBOARD_DDL_MAX_ATTEMPTS
+    } else {
+        1
+    };
+    ensure_feed_scoreboard_tables_with(questdb, ddl_attempts).await;
+    ensure_feed_episode_audit_table_with(questdb, ddl_attempts).await;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(SCOREBOARD_HTTP_TIMEOUT_SECS))
@@ -3311,8 +3391,12 @@ pub async fn run_feed_scoreboard(
         outcome = ScoreboardOutcome::Degraded;
     }
 
-    // 8. Write the two daily rows (deterministic ts — re-runs UPSERT).
-    let mut writer = FeedScoreboardWriter::new(questdb);
+    // 8. Write the two daily rows (deterministic ts — re-runs UPSERT). The
+    //    rows are built first and written by `write_daily_rows_with_retry`,
+    //    which retries every 5 minutes until they land or 16:20 IST (plan PR
+    //    AL-2, 2026-11-06: the 5 Nov rows were lost to one 10 s attempt).
+    let mut daily_rows: Vec<FeedScoreboardDailyRow> =
+        Vec::with_capacity(tickvault_common::feed::Feed::ALL.len());
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         let n = feed_numbers
@@ -3386,25 +3470,9 @@ pub async fn run_feed_scoreboard(
                 outcome
             },
         };
-        if let Err(err) = writer.append_daily_row(&row) {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                stage = "daily_append",
-                feed = label,
-                ?err,
-                "SCOREBOARD-01: daily row append failed"
-            );
-        }
+        daily_rows.push(row);
     }
-    if let Err(err) = tickvault_storage::off_worker::off_worker(|| writer.flush()) {
-        error!(
-            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-            stage = "daily_flush",
-            ?err,
-            "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
-             DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
-        );
-    }
+    write_daily_rows_with_retry(questdb, &daily_rows, retry_until_deadline).await;
 
     // 8b. Per-instrument coverage detail rows (scoreboard PR-D) — config-
     //     gated ([scoreboard] coverage_detail_rows), same deterministic ts
@@ -3456,6 +3524,7 @@ pub async fn run_feed_scoreboard(
         target_ist_day,
         trading_date_ist_nanos,
         &build_episode_day_sql(target_ist_day),
+        retry_until_deadline,
     )
     .await;
 

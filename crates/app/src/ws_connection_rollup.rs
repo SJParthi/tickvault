@@ -416,6 +416,106 @@ use tracing::{error, info};
 /// HTTP timeout for the two `/exec` reads. Matches the scoreboard's own.
 const ROLLUP_HTTP_TIMEOUT_SECS: u64 = 20;
 
+// ---------------------------------------------------------------------------
+// Bounded retries for the daily rollups (plan PR AL-2, 2026-11-06)
+// ---------------------------------------------------------------------------
+//
+// Measured 2026-11-05/06: SCOREBOARD-01 fired daily because the 15:45 IST
+// rollups made ONE 10-20 s attempt against a stalled QuestDB and never
+// retried, so the 5 Nov `ws_connection_daily` and `feed_scoreboard_daily`
+// rows are missing. Each rollup write now retries every
+// `ROLLUP_RETRY_INTERVAL_SECS` until it lands or the next attempt would start
+// after `ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST` (16:20 IST, inside the 16:30
+// stop). Only the LAST failed attempt logs the coded error; earlier ones log
+// `info!` and are counted. Cold path: at most a handful of attempts a day.
+
+/// Wait between two rollup attempts.
+pub const ROLLUP_RETRY_INTERVAL_SECS: u64 = 300;
+
+/// No rollup attempt starts after 16:20:00 IST (seconds of the IST day).
+pub const ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST: u32 = 16 * 3_600 + 20 * 60;
+
+/// Counter: one increment per rollup attempt result, label `outcome`
+/// (`ok`, `retry`, `gave_up`). Local `/metrics` only.
+pub const ROLLUP_ATTEMPTS_COUNTER: &str = "tv_scoreboard_rollup_attempts_total";
+
+/// The result of one rollup write attempt, for the counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupAttemptOutcome {
+    /// The rows landed.
+    Ok,
+    /// The attempt failed and another one is scheduled.
+    Retry,
+    /// The attempt failed and no further attempt fits before the deadline.
+    GaveUp,
+}
+
+impl RollupAttemptOutcome {
+    /// The `outcome` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Retry => "retry",
+            Self::GaveUp => "gave_up",
+        }
+    }
+}
+
+/// Every outcome, in label order.
+const ALL_ROLLUP_OUTCOMES: [RollupAttemptOutcome; 3] = [
+    RollupAttemptOutcome::Ok,
+    RollupAttemptOutcome::Retry,
+    RollupAttemptOutcome::GaveUp,
+];
+
+/// Registers every `outcome` series at 0, so the first real attempt is a
+/// change from a known zero. Called once at boot beside the scoreboard
+/// tasks. O(3).
+pub fn register_rollup_attempt_counters() {
+    for outcome in ALL_ROLLUP_OUTCOMES {
+        metrics::counter!(ROLLUP_ATTEMPTS_COUNTER, "outcome" => outcome.label()).increment(0);
+    }
+}
+
+/// Counts one rollup attempt result. O(1), cold.
+pub fn note_rollup_attempt(outcome: RollupAttemptOutcome) {
+    metrics::counter!(ROLLUP_ATTEMPTS_COUNTER, "outcome" => outcome.label()).increment(1);
+}
+
+/// The wait before the next rollup attempt, or `None` when the next attempt
+/// would start after the 16:20 IST deadline (the current attempt is then
+/// the last). Pure.
+#[must_use]
+pub fn rollup_retry_delay_secs(now_secs_of_day_ist: u32) -> Option<u64> {
+    let next_start = u64::from(now_secs_of_day_ist).saturating_add(ROLLUP_RETRY_INTERVAL_SECS);
+    (next_start <= u64::from(ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST))
+        .then_some(ROLLUP_RETRY_INTERVAL_SECS)
+}
+
+/// The current IST second of the day, from the wall clock.
+#[must_use]
+pub fn now_secs_of_day_ist() -> u32 {
+    let ist = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ))
+        .rem_euclid(86_400);
+    u32::try_from(ist).unwrap_or(0)
+}
+
+/// One rollup attempt's result.
+enum RollupOnce {
+    /// Finished: the rows built (if any) and whether they landed.
+    Done {
+        rows: Option<Vec<WsConnectionDailyRow>>,
+        landed: bool,
+    },
+    /// Failed on a QuestDB read or write and another attempt is allowed.
+    Retryable,
+}
+
 /// Build the day's per-connection rollup and persist it. Best-effort by
 /// design: this table SUMMARISES `ws_event_audit` + `feed_episode_audit`,
 /// both of which are already durable, so a failure here loses a convenience
@@ -433,7 +533,55 @@ pub async fn run_ws_connection_rollup(
     target_ist_day: u64,
     day_ist_midnight_nanos: i64,
     episode_day_sql: &str,
+    retry_until_deadline: bool,
 ) -> Option<Vec<WsConnectionDailyRow>> {
+    // Plan PR AL-2: retry every 5 minutes until the rows land or 16:20 IST.
+    // A run after the deadline, or a past-day backfill
+    // (`retry_until_deadline` false), makes one attempt, as before.
+    loop {
+        let final_attempt =
+            !retry_until_deadline || rollup_retry_delay_secs(now_secs_of_day_ist()).is_none();
+        match run_ws_connection_rollup_once(
+            questdb,
+            target_ist_day,
+            day_ist_midnight_nanos,
+            episode_day_sql,
+            final_attempt,
+        )
+        .await
+        {
+            RollupOnce::Done { rows, landed } => {
+                note_rollup_attempt(if landed {
+                    RollupAttemptOutcome::Ok
+                } else {
+                    RollupAttemptOutcome::GaveUp
+                });
+                return rows;
+            }
+            RollupOnce::Retryable => {
+                note_rollup_attempt(RollupAttemptOutcome::Retry);
+                info!(
+                    retry_in_secs = ROLLUP_RETRY_INTERVAL_SECS,
+                    "ws_connection_daily: rollup attempt did not land (QuestDB \
+                     unreachable or slow) — retrying; the coded error is \
+                     logged only if the last attempt before 16:20 IST fails"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(ROLLUP_RETRY_INTERVAL_SECS))
+                    .await;
+            }
+        }
+    }
+}
+
+/// One rollup attempt. `final_attempt` decides whether a QuestDB failure is
+/// reported (coded `error!`) or handed back as [`RollupOnce::Retryable`].
+async fn run_ws_connection_rollup_once(
+    questdb: &QuestDbConfig,
+    target_ist_day: u64,
+    day_ist_midnight_nanos: i64,
+    episode_day_sql: &str,
+    final_attempt: bool,
+) -> RollupOnce {
     ensure_ws_connection_daily_table(questdb).await;
 
     let client = match reqwest::Client::builder()
@@ -451,10 +599,15 @@ pub async fn run_ws_connection_rollup(
                  lives in ws_event_audit and feed_episode_audit); only the daily \
                  per-connection summary row is missing for this day."
             );
-            return None;
+            return RollupOnce::Done {
+                rows: None,
+                landed: false,
+            };
         }
     };
     let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    // A QuestDB read failure is reported only on the final attempt; an earlier
+    // one logs `info!` and the caller retries (plan PR AL-2).
     let fetch = |sql: String| {
         let client = client.clone();
         let url = url.clone();
@@ -466,7 +619,7 @@ pub async fn run_ws_connection_rollup(
                 .await
             {
                 Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
-                Ok(resp) => {
+                Ok(resp) if final_attempt => {
                     error!(
                         code = "SCOREBOARD-01",
                         stage = "ws_connection_rollup_query",
@@ -475,12 +628,26 @@ pub async fn run_ws_connection_rollup(
                     );
                     None
                 }
-                Err(err) => {
+                Err(err) if final_attempt => {
                     error!(
                         code = "SCOREBOARD-01",
                         stage = "ws_connection_rollup_query",
                         ?err,
                         "SCOREBOARD-01: ws_connection_daily rollup query failed"
+                    );
+                    None
+                }
+                Ok(resp) => {
+                    info!(
+                        status = %resp.status(),
+                        "ws_connection_daily: rollup query returned non-2xx (will retry)"
+                    );
+                    None
+                }
+                Err(err) => {
+                    info!(
+                        ?err,
+                        "ws_connection_daily: rollup query did not answer (will retry)"
                     );
                     None
                 }
@@ -493,7 +660,16 @@ pub async fn run_ws_connection_rollup(
     // The connection SET comes from the event table. Without it there is no
     // honest denominator, so an unreadable body ABORTS rather than producing
     // a table of zeros that would read as a clean day.
-    let ws_body = fetch(build_ws_connection_day_sql(target_ist_day)).await?;
+    let Some(ws_body) = fetch(build_ws_connection_day_sql(target_ist_day)).await else {
+        return if final_attempt {
+            RollupOnce::Done {
+                rows: None,
+                landed: false,
+            }
+        } else {
+            RollupOnce::Retryable
+        };
+    };
     let ws_folded = match fold_ws_event_rows(&mut folded, &ws_body) {
         Some(n) => n,
         None => {
@@ -504,16 +680,25 @@ pub async fn run_ws_connection_rollup(
                  NOT written for this day. Writing it would have produced zeros, \
                  which is indistinguishable from a day with no disconnects."
             );
-            return None;
+            return RollupOnce::Done {
+                rows: None,
+                landed: false,
+            };
         }
     };
 
     // Episodes are additive detail. A failure here degrades the row (counts
     // present, blame absent) rather than losing it — so it is reported, not
-    // fatal.
+    // fatal. Before the final attempt an unread episode table is retried
+    // instead (plan PR AL-2), so the row is written whole when QuestDB
+    // recovers in time.
     let mut episodes_folded = 0_usize;
     let mut episodes_complete = false;
-    if let Some(ep_body) = fetch(episode_day_sql.to_string()).await {
+    let episode_body = fetch(episode_day_sql.to_string()).await;
+    if episode_body.is_none() && !final_attempt {
+        return RollupOnce::Retryable;
+    }
+    if let Some(ep_body) = episode_body {
         match fold_episode_rows_per_connection(&mut folded, &ep_body) {
             Some(n) => {
                 episodes_folded = n;
@@ -538,7 +723,10 @@ pub async fn run_ws_connection_rollup(
              no per-connection rows written. On a trading day this is itself a \
              finding: it means no connection produced any event at all."
         );
-        return Some(rows);
+        return RollupOnce::Done {
+            rows: Some(rows),
+            landed: true,
+        };
     }
 
     let mut writer = WsConnectionDailyWriter::new(questdb);
@@ -559,6 +747,14 @@ pub async fn run_ws_connection_rollup(
         appended += 1;
     }
     if let Err(err) = tickvault_storage::off_worker::off_worker(|| writer.flush()) {
+        if !final_attempt {
+            info!(
+                rows = appended,
+                ?err,
+                "ws_connection_daily: flush did not land (will retry)"
+            );
+            return RollupOnce::Retryable;
+        }
         error!(
             code = "SCOREBOARD-01",
             stage = "ws_connection_rollup_flush",
@@ -568,7 +764,10 @@ pub async fn run_ws_connection_rollup(
              summary is missing for this day (the underlying ws_event_audit and \
              feed_episode_audit rows are unaffected)"
         );
-        return Some(rows);
+        return RollupOnce::Done {
+            rows: Some(rows),
+            landed: false,
+        };
     }
 
     let (seen, with_incidents, total_incidents) = day_verdict(&rows);
@@ -597,7 +796,10 @@ pub async fn run_ws_connection_rollup(
              episode tables disagree about whether those sockets existed"
         );
     }
-    Some(rows)
+    RollupOnce::Done {
+        rows: Some(rows),
+        landed: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +809,65 @@ pub async fn run_ws_connection_rollup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- plan PR AL-2: bounded rollup retries ----
+
+    #[test]
+    fn test_rollup_retry_delay_secs_retries_until_the_1620_deadline() {
+        // 15:45 IST: the first attempt, more fit before 16:20.
+        assert_eq!(
+            rollup_retry_delay_secs(15 * 3_600 + 45 * 60),
+            Some(ROLLUP_RETRY_INTERVAL_SECS)
+        );
+        // 16:15:00: the next attempt starts exactly at 16:20, still allowed.
+        assert_eq!(
+            rollup_retry_delay_secs(16 * 3_600 + 15 * 60),
+            Some(ROLLUP_RETRY_INTERVAL_SECS)
+        );
+        // 16:15:01: the next would start after 16:20, so this one is the last.
+        assert_eq!(rollup_retry_delay_secs(16 * 3_600 + 15 * 60 + 1), None);
+        // A manual re-run in the evening makes one attempt, as before.
+        assert_eq!(rollup_retry_delay_secs(18 * 3_600), None);
+        // Saturating at the end of the day never panics.
+        assert_eq!(rollup_retry_delay_secs(u32::MAX), None);
+    }
+
+    #[test]
+    fn test_rollup_retry_schedule_from_1545_makes_eight_attempts() {
+        let mut now = 15 * 3_600 + 45 * 60;
+        let mut attempts = 1;
+        while let Some(delay) = rollup_retry_delay_secs(now) {
+            now += u32::try_from(delay).unwrap_or(u32::MAX);
+            attempts += 1;
+        }
+        // 15:45, 15:50, ..., 16:20.
+        assert_eq!(attempts, 8);
+        assert_eq!(now, ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST);
+    }
+
+    #[test]
+    fn test_rollup_attempt_outcome_labels_are_stable_and_distinct() {
+        assert_eq!(RollupAttemptOutcome::Ok.label(), "ok");
+        assert_eq!(RollupAttemptOutcome::Retry.label(), "retry");
+        assert_eq!(RollupAttemptOutcome::GaveUp.label(), "gave_up");
+        assert_eq!(
+            ROLLUP_ATTEMPTS_COUNTER,
+            "tv_scoreboard_rollup_attempts_total"
+        );
+    }
+
+    #[test]
+    fn test_register_and_note_rollup_attempts_do_not_panic_without_a_recorder() {
+        register_rollup_attempt_counters();
+        note_rollup_attempt(RollupAttemptOutcome::Retry);
+        note_rollup_attempt(RollupAttemptOutcome::GaveUp);
+        note_rollup_attempt(RollupAttemptOutcome::Ok);
+    }
+
+    #[test]
+    fn test_now_secs_of_day_ist_is_inside_one_day() {
+        assert!(now_secs_of_day_ist() < 86_400);
+    }
 
     fn ws_body(rows: &str) -> String {
         format!("{{\"dataset\":[{rows}]}}")

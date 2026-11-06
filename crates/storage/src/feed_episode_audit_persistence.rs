@@ -145,6 +145,20 @@ pub fn feed_episode_audit_create_ddl() -> String {
 /// duplicate-row window until a later boot's ensure succeeds.
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via feed_episode_audit_create_ddl tests)
 pub async fn ensure_feed_episode_audit_table(questdb_config: &QuestDbConfig) {
+    ensure_feed_episode_audit_table_with(
+        questdb_config,
+        crate::feed_scoreboard_persistence::SCOREBOARD_DDL_MAX_ATTEMPTS,
+    )
+    .await;
+}
+
+/// [`ensure_feed_episode_audit_table`] with an explicit per-statement attempt
+/// budget (plan PR AL-2): the boot reconcile and the same-day 15:45 run
+/// retry; a past-day backfill makes one attempt per statement.
+pub async fn ensure_feed_episode_audit_table_with(
+    questdb_config: &QuestDbConfig,
+    max_attempts: u32,
+) {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -180,32 +194,17 @@ pub async fn ensure_feed_episode_audit_table(questdb_config: &QuestDbConfig) {
             "ALTER TABLE {FEED_EPISODE_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_FEED_EPISODE_AUDIT});"
         ),
     ];
-    for ddl in &statements {
-        match client
-            .get(&base_url)
-            .query(&[("query", ddl.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                error!(code = "SCOREBOARD-01", stage = "ensure_ddl",
-                    %status, ddl = ddl.as_str(),
-                    body = %body.chars().take(200).collect::<String>(),
-                    "SCOREBOARD-01: episode DDL returned non-2xx (dedup may be \
-                     missing — duplicate-row window until a later ensure succeeds)");
-            }
-            Err(err) => error!(
-                code = "SCOREBOARD-01",
-                stage = "ensure_ddl",
-                ?err,
-                ddl = ddl.as_str(),
-                "SCOREBOARD-01: episode DDL request failed"
-            ),
-        }
-    }
+    // Plan PR AL-2 (2026-11-06): each statement retries with backoff (the
+    // shared scoreboard DDL runner); one coded error only when its last
+    // attempt fails.
+    let _ = crate::feed_scoreboard_persistence::run_scoreboard_ddl_statements(
+        &client,
+        &base_url,
+        &statements,
+        max_attempts,
+        "episode",
+    )
+    .await;
 }
 
 /// Builds the ILP-over-HTTP conf string. HTTP (NOT ILP TCP) so every flush
@@ -608,13 +607,13 @@ mod tests {
         // Non-2xx path: every DDL statement takes the log-and-continue arm
         // (best-effort degrade — SCOREBOARD-01, never a panic, never blocks).
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_feed_episode_audit_table(&mock_cfg(port)).await;
+        ensure_feed_episode_audit_table_with(&mock_cfg(port), 1).await;
     }
 
     #[tokio::test]
     async fn test_ensure_feed_episode_audit_table_unreachable_degrades_without_panic() {
         // Transport-error path: every DDL send Err arm logs and continues.
-        ensure_feed_episode_audit_table(&unreachable_cfg()).await;
+        ensure_feed_episode_audit_table_with(&unreachable_cfg(), 1).await;
     }
 
     #[tokio::test]
