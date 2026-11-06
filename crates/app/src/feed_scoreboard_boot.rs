@@ -2570,71 +2570,107 @@ pub async fn day_already_scored_complete(questdb: &QuestDbConfig, target_ist_day
     }
 }
 
-/// Writes the day's scoreboard rows, retrying every 5 minutes until they land
-/// or the next attempt would start after 16:20 IST (plan PR AL-2,
-/// 2026-11-06). Each attempt builds a fresh writer (a writer built while
-/// QuestDB was unreachable has no sender and could never flush). Only the
-/// last failed attempt logs the coded `SCOREBOARD-01` error; earlier ones log
-/// `info!` and count `retry`. With `retry_until_deadline` false (a past-day
-/// backfill) it makes exactly one attempt. Returns `true` when the rows
-/// landed. Cold path: at most 8 attempts a day, a few rows each.
-async fn write_daily_rows_with_retry(
+/// Logs a QuestDB read or write failure inside one scoreboard attempt (plan
+/// PR AL-2 review, 2026-11-06): the coded `SCOREBOARD-01` error on the final
+/// attempt, `info!` with no code on an earlier one (the attempt is retried
+/// whole, so a transient stall never pages).
+macro_rules! scoreboard_failure {
+    ($final_attempt:expr, $($field:tt)+) => {
+        if $final_attempt {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                $($field)+
+            );
+        } else {
+            info!(will_retry = true, $($field)+);
+        }
+    };
+}
+
+/// Logs a scoreboard FINDING (a keep-better regression, an audit drop): a
+/// real result of data that WAS read, so it is coded on whichever attempt
+/// first sees it, and `info!` on a later attempt that sees it again (one
+/// page per run, not one per retry).
+macro_rules! scoreboard_finding {
+    ($ctx:expr, $($field:tt)+) => {{
+        if $ctx.findings_reported {
+            info!(repeated_on_retry = true, $($field)+);
+        } else {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                $($field)+
+            );
+        }
+        $ctx.findings_logged_this_attempt = true;
+    }};
+}
+
+/// State carried across the attempts of one scoreboard run (plan PR AL-2).
+#[derive(Debug, Default)]
+struct ScoreboardAttempt {
+    /// This attempt is the last one: failures are reported with the code.
+    final_attempt: bool,
+    /// The scoreboard and episode tables were ensured by an earlier attempt.
+    ddl_ok: bool,
+    /// A finding was already logged (coded) by an earlier attempt.
+    findings_reported: bool,
+    /// This attempt logged a finding.
+    findings_logged_this_attempt: bool,
+}
+
+/// How one scoreboard attempt ended.
+#[allow(clippy::large_enum_variant)] // APPROVED: built and moved once per attempt (at most 8 a day), cold path; boxing would add an allocation for nothing.
+enum ScoreboardAttemptEnd {
+    /// A QuestDB read or write failed before the final attempt: retry the
+    /// whole attempt (nothing was written for the day's rows).
+    Retry,
+    /// Finished. `rows_landed` is whether the daily rows reached QuestDB.
+    Finished {
+        result: Result<ScoreboardSummary, String>,
+        rows_landed: bool,
+    },
+}
+
+/// Writes the day's scoreboard rows once (a fresh writer each attempt: one
+/// built while QuestDB was unreachable has no sender and could never flush).
+/// Returns `true` only when at least one row was appended and the flush
+/// landed, so an all-append-failure is never counted `ok` (review
+/// 2026-11-06). A flush failure is reported per [`scoreboard_failure!`].
+/// Cold path, a few rows.
+async fn write_daily_rows_once(
     questdb: &QuestDbConfig,
     rows: &[FeedScoreboardDailyRow],
-    retry_until_deadline: bool,
+    final_attempt: bool,
 ) -> bool {
-    use crate::ws_connection_rollup::{
-        ROLLUP_RETRY_INTERVAL_SECS, RollupAttemptOutcome, note_rollup_attempt, now_secs_of_day_ist,
-        rollup_retry_delay_secs,
-    };
-    let mut first_attempt = true;
-    loop {
-        let final_attempt =
-            !retry_until_deadline || rollup_retry_delay_secs(now_secs_of_day_ist()).is_none();
-        let mut writer = FeedScoreboardWriter::new(questdb);
-        for row in rows {
-            // An append error is a row-encoding failure, not QuestDB being
-            // down, so it is reported once (first attempt) and not retried.
-            if let Err(err) = writer.append_daily_row(row)
-                && first_attempt
-            {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "daily_append",
-                    feed = row.feed,
-                    ?err,
-                    "SCOREBOARD-01: daily row append failed"
-                );
-            }
+    let mut writer = FeedScoreboardWriter::new(questdb);
+    let mut appended = 0_usize;
+    for row in rows {
+        // An append error is a row-encoding failure, not QuestDB being down.
+        match writer.append_daily_row(row) {
+            Ok(()) => appended += 1,
+            Err(err) => scoreboard_failure!(
+                final_attempt,
+                stage = "daily_append",
+                feed = row.feed,
+                ?err,
+                "SCOREBOARD-01: daily row append failed"
+            ),
         }
-        first_attempt = false;
-        match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
-            Ok(()) => {
-                note_rollup_attempt(RollupAttemptOutcome::Ok);
-                return true;
-            }
-            Err(err) if final_attempt => {
-                note_rollup_attempt(RollupAttemptOutcome::GaveUp);
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "daily_flush",
-                    ?err,
-                    "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
-                     DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
-                );
-                return false;
-            }
-            Err(err) => {
-                note_rollup_attempt(RollupAttemptOutcome::Retry);
-                info!(
-                    ?err,
-                    retry_in_secs = ROLLUP_RETRY_INTERVAL_SECS,
-                    "feed_scoreboard: daily rows did not land (QuestDB unreachable \
-                     or slow) — retrying; the coded error is logged only if the \
-                     last attempt before 16:20 IST fails"
-                );
-                tokio::time::sleep(Duration::from_secs(ROLLUP_RETRY_INTERVAL_SECS)).await;
-            }
+    }
+    if appended == 0 {
+        return false;
+    }
+    match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
+        Ok(()) => true,
+        Err(err) => {
+            scoreboard_failure!(
+                final_attempt,
+                stage = "daily_flush",
+                ?err,
+                "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
+                 DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
+            );
+            false
         }
     }
 }
@@ -2665,23 +2701,122 @@ pub async fn run_feed_scoreboard(
     boot_reconciled_rows: &[FeedEpisodeAuditRow],
     runtime_enabled_now: Option<(bool, bool)>,
 ) -> Result<ScoreboardSummary, String> {
-    // Plan PR AL-2 (2026-11-06): only the same-day run retries (DDL, daily
-    // rows, connection rollup, each bounded by 16:20 IST). A past-day
-    // backfill (`TICKVAULT_SCOREBOARD_DATE`) makes one attempt, as before:
-    // the operator re-runs it, and a loop there would hold the run for hours.
-    let retry_until_deadline = is_same_day_run;
-    let ddl_attempts = if retry_until_deadline {
-        SCOREBOARD_DDL_MAX_ATTEMPTS
-    } else {
-        1
+    use crate::ws_connection_rollup::{
+        ROLLUP_RETRY_INTERVAL_SECS, RollupAttemptOutcome, note_rollup_attempt, now_secs_of_day_ist,
+        rollup_attempt_is_final,
     };
-    ensure_feed_scoreboard_tables_with(questdb, ddl_attempts).await;
-    ensure_feed_episode_audit_table_with(questdb, ddl_attempts).await;
+    // Plan PR AL-2 (2026-11-06, review fixes the same day): only the
+    // same-day run retries, and it retries the WHOLE aggregation (DDL, reads,
+    // build, write), so a retried row is never built from reads that failed.
+    // At most `ROLLUP_MAX_ATTEMPTS` (8) attempts, none starting after 16:20
+    // IST. A past-day backfill (`TICKVAULT_SCOREBOARD_DATE`) makes one
+    // attempt, as before: the operator re-runs it.
+    let retry_until_deadline = is_same_day_run;
+    let mut ctx = ScoreboardAttempt::default();
+    let mut attempts_made = 0_u32;
+    loop {
+        ctx.final_attempt =
+            rollup_attempt_is_final(retry_until_deadline, attempts_made, now_secs_of_day_ist());
+        ctx.findings_logged_this_attempt = false;
+        attempts_made = attempts_made.saturating_add(1);
+        match run_feed_scoreboard_attempt(
+            questdb,
+            metrics_port,
+            target_ist_day,
+            trading_date_label.clone(),
+            forced_early_run,
+            coverage_detail_rows,
+            is_same_day_run,
+            boot_synthesized_deaths,
+            boot_reconciled_rows,
+            runtime_enabled_now,
+            &mut ctx,
+        )
+        .await
+        {
+            ScoreboardAttemptEnd::Finished {
+                result,
+                rows_landed,
+            } => {
+                note_rollup_attempt(if rows_landed {
+                    RollupAttemptOutcome::Ok
+                } else {
+                    RollupAttemptOutcome::GaveUp
+                });
+                return result;
+            }
+            ScoreboardAttemptEnd::Retry => {
+                note_rollup_attempt(RollupAttemptOutcome::Retry);
+                ctx.findings_reported |= ctx.findings_logged_this_attempt;
+                info!(
+                    attempt = attempts_made,
+                    retry_in_secs = ROLLUP_RETRY_INTERVAL_SECS,
+                    "feed_scoreboard: a QuestDB read or write did not succeed — \
+                     retrying the whole aggregation; the coded error is logged \
+                     only if the last attempt before 16:20 IST fails"
+                );
+                tokio::time::sleep(Duration::from_secs(ROLLUP_RETRY_INTERVAL_SECS)).await;
+            }
+        }
+    }
+}
 
-    let client = reqwest::Client::builder()
+/// One attempt of [`run_feed_scoreboard`]: steps 1 to 8d. Returns
+/// [`ScoreboardAttemptEnd::Retry`] (before the final attempt only) when a
+/// QuestDB read or write failed; nothing for the day's daily rows is written
+/// by a retried attempt. Cold path.
+#[allow(clippy::too_many_arguments)] // APPROVED: the run's own argument list plus the attempt state; one caller.
+#[allow(clippy::too_many_lines)] // APPROVED: the existing once-a-day orchestration body, moved unchanged into an attempt.
+async fn run_feed_scoreboard_attempt(
+    questdb: &QuestDbConfig,
+    metrics_port: u16,
+    target_ist_day: u64,
+    trading_date_label: String,
+    forced_early_run: bool,
+    coverage_detail_rows: bool,
+    is_same_day_run: bool,
+    boot_synthesized_deaths: usize,
+    boot_reconciled_rows: &[FeedEpisodeAuditRow],
+    runtime_enabled_now: Option<(bool, bool)>,
+    ctx: &mut ScoreboardAttempt,
+) -> ScoreboardAttemptEnd {
+    let retry_until_deadline = is_same_day_run;
+    let final_attempt = ctx.final_attempt;
+    // Every QuestDB read or write failure below returns `Retry` at once when
+    // this is not the final attempt (before anything else is written), and
+    // logs the coded error only on the final attempt (`scoreboard_failure!`).
+    if !ctx.ddl_ok {
+        // A past-day backfill makes one attempt per statement, as before the
+        // retries existed; the same-day run retries each statement.
+        let ddl_attempts = if retry_until_deadline {
+            SCOREBOARD_DDL_MAX_ATTEMPTS
+        } else {
+            1
+        };
+        let failed = ensure_feed_scoreboard_tables_with(questdb, ddl_attempts, final_attempt)
+            .await
+            .saturating_add(
+                ensure_feed_episode_audit_table_with(questdb, ddl_attempts, final_attempt).await,
+            );
+        if failed == 0 {
+            ctx.ddl_ok = true;
+        } else if !final_attempt {
+            return ScoreboardAttemptEnd::Retry;
+        }
+    }
+
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(SCOREBOARD_HTTP_TIMEOUT_SECS))
         .build()
-        .map_err(|e| format!("HTTP client build failed: {e}"))?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ScoreboardAttemptEnd::Finished {
+                result: Err(format!("HTTP client build failed: {e}")),
+                rows_landed: false,
+            };
+        }
+    };
 
     let (day_start, _) = day_bounds_nanos(target_ist_day);
     let trading_date_ist_nanos = day_start;
@@ -2759,24 +2894,32 @@ pub async fn run_feed_scoreboard(
                 Some(body) => match parse_existing_episode_partiality(&body) {
                     Some(map) => map,
                     None => {
-                        error!(
-                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        scoreboard_failure!(
+                            final_attempt,
                             stage = "keep_better_read",
                             "SCOREBOARD-01: existing-episode read-back unparsable — \
                              the keep-better guard is OFF this run; a partial-evidence \
                              re-run may overwrite evidence-backed blame"
                         );
+                        // Before the final attempt, stop HERE: step 2 would
+                        // write episode rows without the keep-better guard.
+                        if !final_attempt {
+                            return ScoreboardAttemptEnd::Retry;
+                        }
                         HashMap::new()
                     }
                 },
                 None => {
-                    error!(
-                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    scoreboard_failure!(
+                        final_attempt,
                         stage = "keep_better_read",
                         "SCOREBOARD-01: existing-episode read-back failed — the \
                          keep-better guard is OFF this run; a partial-evidence \
                          re-run may overwrite evidence-backed blame"
                     );
+                    if !final_attempt {
+                        return ScoreboardAttemptEnd::Retry;
+                    }
                     HashMap::new()
                 }
             }
@@ -2875,8 +3018,8 @@ pub async fn run_feed_scoreboard(
                                 episode.run_partial,
                             )
                         {
-                            error!(
-                                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                            scoreboard_finding!(
+                                ctx,
                                 stage = "blame_regression",
                                 feed = %episode.feed,
                                 ws_type = %episode.ws_type,
@@ -2904,8 +3047,8 @@ pub async fn run_feed_scoreboard(
                         match writer.append_row(&episode) {
                             Ok(()) => appended += 1,
                             Err(err) => {
-                                error!(
-                                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                                scoreboard_finding!(
+                                    ctx,
                                     stage = "episode_append",
                                     ?err,
                                     "SCOREBOARD-01: episode append failed"
@@ -2921,12 +3064,15 @@ pub async fn run_feed_scoreboard(
                             .increment(appended);
                     }
                     Err(err) => {
-                        error!(
-                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        scoreboard_failure!(
+                            final_attempt,
                             stage = "episode_flush",
                             ?err,
                             "SCOREBOARD-01: episode flush failed (QuestDB down?)"
                         );
+                        if !final_attempt {
+                            return ScoreboardAttemptEnd::Retry;
+                        }
                         sources_complete = false;
                     }
                 }
@@ -2935,20 +3081,26 @@ pub async fn run_feed_scoreboard(
                 up_signals = Some(ups);
             }
             None => {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_failure!(
+                    final_attempt,
                     stage = "ws_events_parse",
                     "SCOREBOARD-01: could not parse today's connection events"
                 );
+                if !final_attempt {
+                    return ScoreboardAttemptEnd::Retry;
+                }
                 sources_complete = false;
             }
         },
         None => {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            scoreboard_failure!(
+                final_attempt,
                 stage = "ws_events_read",
                 "SCOREBOARD-01: could not read today's connection events"
             );
+            if !final_attempt {
+                return ScoreboardAttemptEnd::Retry;
+            }
             sources_complete = false;
         }
     }
@@ -2987,22 +3139,28 @@ pub async fn run_feed_scoreboard(
             match exec_query(&client, questdb, &boot_sql).await {
                 Some(body) => {
                     if fold_episode_readback_rows(&mut mem, &body, &skip_keys).is_none() {
-                        error!(
-                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        scoreboard_failure!(
+                            final_attempt,
                             stage = "boot_reconciled_parse",
                             "SCOREBOARD-01: boot-reconciled episode read-back \
                              unparsable — restart counts may under-count"
                         );
+                        if !final_attempt {
+                            return ScoreboardAttemptEnd::Retry;
+                        }
                         sources_complete = false;
                     }
                 }
                 None => {
-                    error!(
-                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    scoreboard_failure!(
+                        final_attempt,
                         stage = "boot_reconciled_read",
                         "SCOREBOARD-01: boot-reconciled episode read-back failed \
                          — restart counts may under-count"
                     );
+                    if !final_attempt {
+                        return ScoreboardAttemptEnd::Retry;
+                    }
                     sources_complete = false;
                 }
             }
@@ -3019,8 +3177,8 @@ pub async fn run_feed_scoreboard(
                     None => None,
                 };
             if fallback.is_none() {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_failure!(
+                    final_attempt,
                     stage = "episode_aggregate",
                     "SCOREBOARD-01: episode blame aggregate unavailable — recording sentinels"
                 );
@@ -3059,6 +3217,17 @@ pub async fn run_feed_scoreboard(
             n.streaming_minutes = i64::try_from(s.len()).unwrap_or(i64::MAX);
         }
         if n.ticks < 0 || n.instruments < 0 || set.is_none() {
+            // A count read failed (an empty day still answers 0). Before the
+            // final attempt this is retried, never written as -1 sentinels.
+            if !final_attempt {
+                info!(
+                    will_retry = true,
+                    feed = label,
+                    "feed_scoreboard: a tick / instrument / minute count read \
+                     did not answer"
+                );
+                return ScoreboardAttemptEnd::Retry;
+            }
             sources_complete = false;
         }
         feed_numbers.insert(label, n);
@@ -3079,14 +3248,17 @@ pub async fn run_feed_scoreboard(
         {
             Some(Some(existing)) => Some(existing),
             Some(None) | None => {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_failure!(
+                    final_attempt,
                     stage = "outcome_keep_better_read",
                     "SCOREBOARD-01: existing daily-outcome read failed/unparsable \
                      — the daily keep-better guards are OFF this run; a rerun may \
                      erase a 'degraded'/'feed_off' verdict or a measured lag \
                      distribution"
                 );
+                if !final_attempt {
+                    return ScoreboardAttemptEnd::Retry;
+                }
                 None
             }
         }
@@ -3144,8 +3316,8 @@ pub async fn run_feed_scoreboard(
             should_keep_feed_off_outcome(m.get(label).map(String::as_str), inferred, ticks)
         });
         if kept {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            scoreboard_finding!(
+                ctx,
                 stage = "outcome_regression",
                 feed = label,
                 "SCOREBOARD-01: this rerun would ERASE the day's existing \
@@ -3240,8 +3412,8 @@ pub async fn run_feed_scoreboard(
         if let Some(n) = feed_numbers.get_mut(label) {
             let existing = existing_lag.as_ref().and_then(|m| m.get(label));
             if fold_existing_lag_keep_better(n, existing) {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_finding!(
+                    ctx,
                     stage = "lag_regression",
                     feed = label,
                     kept_samples = n.lag_samples,
@@ -3269,8 +3441,8 @@ pub async fn run_feed_scoreboard(
         if let Some(n) = feed_numbers.get_mut(label) {
             let existing = existing_coverage.as_ref().and_then(|m| m.get(label));
             if fold_existing_coverage_keep_better(n, existing) {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_finding!(
+                    ctx,
                     stage = "coverage_regression",
                     feed = label,
                     "SCOREBOARD-01: this rerun's coverage came from a \
@@ -3314,8 +3486,8 @@ pub async fn run_feed_scoreboard(
             && dropped > 0
         {
             degraded = true;
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            scoreboard_finding!(
+                ctx,
                 stage = "audit_drop_crosscheck",
                 dropped,
                 "SCOREBOARD-01: ws_event_audit dropped rows this session — the \
@@ -3378,8 +3550,8 @@ pub async fn run_feed_scoreboard(
         && let Some(ref existing) = existing_daily
         && should_keep_degraded_outcome(existing, outcome)
     {
-        error!(
-            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+        scoreboard_finding!(
+            ctx,
             stage = "outcome_regression",
             new_outcome = outcome.as_str(),
             "SCOREBOARD-01: this rerun would ERASE the day's \
@@ -3392,9 +3564,10 @@ pub async fn run_feed_scoreboard(
     }
 
     // 8. Write the two daily rows (deterministic ts — re-runs UPSERT). The
-    //    rows are built first and written by `write_daily_rows_with_retry`,
-    //    which retries every 5 minutes until they land or 16:20 IST (plan PR
-    //    AL-2, 2026-11-06: the 5 Nov rows were lost to one 10 s attempt).
+    //    rows are built from THIS attempt's reads and written once by
+    //    `write_daily_rows_once`; a failed write before the final attempt
+    //    retries the whole aggregation (plan PR AL-2, 2026-11-06: the 5 Nov
+    //    rows were lost to one 10 s attempt).
     let mut daily_rows: Vec<FeedScoreboardDailyRow> =
         Vec::with_capacity(tickvault_common::feed::Feed::ALL.len());
     for feed in tickvault_common::feed::Feed::ALL {
@@ -3472,7 +3645,10 @@ pub async fn run_feed_scoreboard(
         };
         daily_rows.push(row);
     }
-    write_daily_rows_with_retry(questdb, &daily_rows, retry_until_deadline).await;
+    let rows_landed = write_daily_rows_once(questdb, &daily_rows, final_attempt).await;
+    if !rows_landed && !final_attempt {
+        return ScoreboardAttemptEnd::Retry;
+    }
 
     // 8b. Per-instrument coverage detail rows (scoreboard PR-D) — config-
     //     gated ([scoreboard] coverage_detail_rows), same deterministic ts
@@ -3559,20 +3735,26 @@ pub async fn run_feed_scoreboard(
     // vacuously true — the check has always been the Dhan-and-no-tallies one
     // it now says it is.
     if dhan.ticks < 0 && tallies.is_none() {
-        return Err("every data source was unreachable — nothing measured".to_string());
+        return ScoreboardAttemptEnd::Finished {
+            result: Err("every data source was unreachable — nothing measured".to_string()),
+            rows_landed,
+        };
     }
-    Ok(ScoreboardSummary {
-        trading_date_ist: trading_date_label,
-        dhan,
-        session_minutes: SCOREBOARD_SESSION_MINUTES,
-        partial_coverage,
-        degraded,
-        early_run: forced_early_run,
-        // Threaded to the card footnote (round 3: the persisted row said
-        // partial while the card rendered no restart caveat).
-        restart_partial: restart_day_floor,
-        dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
-    })
+    ScoreboardAttemptEnd::Finished {
+        result: Ok(ScoreboardSummary {
+            trading_date_ist: trading_date_label,
+            dhan,
+            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            partial_coverage,
+            degraded,
+            early_run: forced_early_run,
+            // Threaded to the card footnote (round 3: the persisted row said
+            // partial while the card rendered no restart caveat).
+            restart_partial: restart_day_floor,
+            dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
+        }),
+        rows_landed,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3621,6 +3803,81 @@ mod tests {
             down_secs: 0,
             market_hours,
         }
+    }
+
+    // ---- plan PR AL-2 review (2026-11-06): the whole attempt retries ----
+
+    /// Every QuestDB read or flush failure inside one scoreboard attempt logs
+    /// through `scoreboard_failure!` (coded only on the final attempt) and
+    /// returns `Retry` before the final attempt. Source scan of the attempt
+    /// body, so a new `error!` on a read path is caught.
+    #[test]
+    fn every_questdb_failure_in_the_attempt_is_quiet_until_the_final_attempt() {
+        let src = include_str!("feed_scoreboard_boot.rs");
+        let body = src
+            .split_once("async fn run_feed_scoreboard_attempt(")
+            .expect("the attempt exists")
+            .1;
+        let body = body
+            .split_once("\n#[cfg(test)]")
+            .map_or(body, |(head, _)| head);
+        for stage in [
+            "keep_better_read",
+            "episode_flush",
+            "ws_events_parse",
+            "ws_events_read",
+            "boot_reconciled_parse",
+            "boot_reconciled_read",
+            "outcome_keep_better_read",
+        ] {
+            let needle = format!("stage = \"{stage}\"");
+            let mut found = 0;
+            for (at, _) in body.match_indices(&needle) {
+                found += 1;
+                let before = &body[at.saturating_sub(120)..at];
+                assert!(
+                    before.contains("scoreboard_failure!("),
+                    "{stage}: must log through scoreboard_failure!"
+                );
+                let after: String = body[at..].chars().take(900).collect();
+                assert!(
+                    after.contains("if !final_attempt {")
+                        && after.contains("return ScoreboardAttemptEnd::Retry;"),
+                    "{stage}: must return Retry before the final attempt"
+                );
+            }
+            assert!(found > 0, "{stage}: stage not found in the attempt");
+        }
+        // No coded error is written directly in the attempt any more.
+        assert!(
+            !body.contains("code = ErrorCode::Scoreboard01AggregationDegraded"),
+            "a direct coded error in the attempt would page on a non-final attempt"
+        );
+    }
+
+    #[test]
+    fn test_scoreboard_finding_is_coded_once_across_attempts() {
+        let mut ctx = ScoreboardAttempt::default();
+        scoreboard_finding!(ctx, stage = "test_finding", "a finding");
+        assert!(ctx.findings_logged_this_attempt);
+        // The run loop carries it forward after a retried attempt.
+        ctx.findings_reported |= ctx.findings_logged_this_attempt;
+        ctx.findings_logged_this_attempt = false;
+        scoreboard_finding!(ctx, stage = "test_finding", "the same finding again");
+        assert!(ctx.findings_reported && ctx.findings_logged_this_attempt);
+    }
+
+    #[tokio::test]
+    async fn test_write_daily_rows_once_never_reports_landed_without_a_row() {
+        // Review 2026-11-06: zero appended rows is never counted `ok`.
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert!(!write_daily_rows_once(&cfg, &[], false).await);
+        assert!(!write_daily_rows_once(&cfg, &[], true).await);
     }
 
     #[test]

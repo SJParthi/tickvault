@@ -423,17 +423,40 @@ const ROLLUP_HTTP_TIMEOUT_SECS: u64 = 20;
 // Measured 2026-11-05/06: SCOREBOARD-01 fired daily because the 15:45 IST
 // rollups made ONE 10-20 s attempt against a stalled QuestDB and never
 // retried, so the 5 Nov `ws_connection_daily` and `feed_scoreboard_daily`
-// rows are missing. Each rollup write now retries every
-// `ROLLUP_RETRY_INTERVAL_SECS` until it lands or the next attempt would start
-// after `ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST` (16:20 IST, inside the 16:30
-// stop). Only the LAST failed attempt logs the coded error; earlier ones log
-// `info!` and are counted. Cold path: at most a handful of attempts a day.
+// rows are missing. Each rollup now re-runs the WHOLE attempt (DDL, reads,
+// build, write) every `ROLLUP_RETRY_INTERVAL_SECS` until it lands, stopping
+// at whichever comes first: `ROLLUP_MAX_ATTEMPTS` (8) attempts, or the next
+// attempt would start after `ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST` (16:20
+// IST, inside the 16:30 stop). The attempt cap matters for a forced
+// same-day run started early in the session, which the deadline alone would
+// let loop about 75 times. Only the LAST attempt logs a failure with the
+// coded error; earlier ones log `info!` with no code and are counted. Cold
+// path: at most 8 attempts a day.
 
 /// Wait between two rollup attempts.
 pub const ROLLUP_RETRY_INTERVAL_SECS: u64 = 300;
 
 /// No rollup attempt starts after 16:20:00 IST (seconds of the IST day).
 pub const ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST: u32 = 16 * 3_600 + 20 * 60;
+
+/// At most this many attempts per rollup per run (plan PR AL-2 review).
+pub const ROLLUP_MAX_ATTEMPTS: u32 = 8;
+
+/// `true` when the attempt about to start is the last one: no retries
+/// (`retry_until_deadline` false, a past-day backfill), the attempt cap is
+/// reached (`attempts_made` already made, so this one is number
+/// `attempts_made + 1`), or another attempt would start after 16:20 IST.
+/// Pure.
+#[must_use]
+pub fn rollup_attempt_is_final(
+    retry_until_deadline: bool,
+    attempts_made: u32,
+    now_secs_of_day_ist: u32,
+) -> bool {
+    !retry_until_deadline
+        || attempts_made.saturating_add(1) >= ROLLUP_MAX_ATTEMPTS
+        || rollup_retry_delay_secs(now_secs_of_day_ist).is_none()
+}
 
 /// Counter: one increment per rollup attempt result, label `outcome`
 /// (`ok`, `retry`, `gave_up`). Local `/metrics` only.
@@ -535,18 +558,28 @@ pub async fn run_ws_connection_rollup(
     episode_day_sql: &str,
     retry_until_deadline: bool,
 ) -> Option<Vec<WsConnectionDailyRow>> {
-    // Plan PR AL-2: retry every 5 minutes until the rows land or 16:20 IST.
-    // A run after the deadline, or a past-day backfill
-    // (`retry_until_deadline` false), makes one attempt, as before.
+    // Plan PR AL-2: retry the whole attempt every 5 minutes until the rows
+    // land, at most `ROLLUP_MAX_ATTEMPTS` times and never past 16:20 IST. A
+    // past-day backfill (`retry_until_deadline` false) makes one attempt.
+    let mut attempts_made = 0_u32;
+    let mut ddl_ok = false;
     loop {
         let final_attempt =
-            !retry_until_deadline || rollup_retry_delay_secs(now_secs_of_day_ist()).is_none();
+            rollup_attempt_is_final(retry_until_deadline, attempts_made, now_secs_of_day_ist());
+        attempts_made = attempts_made.saturating_add(1);
         match run_ws_connection_rollup_once(
             questdb,
             target_ist_day,
             day_ist_midnight_nanos,
             episode_day_sql,
             final_attempt,
+            // A past-day backfill makes one attempt per DDL statement.
+            if retry_until_deadline {
+                tickvault_storage::feed_scoreboard_persistence::SCOREBOARD_DDL_MAX_ATTEMPTS
+            } else {
+                1
+            },
+            &mut ddl_ok,
         )
         .await
         {
@@ -581,8 +614,21 @@ async fn run_ws_connection_rollup_once(
     day_ist_midnight_nanos: i64,
     episode_day_sql: &str,
     final_attempt: bool,
+    ddl_attempts: u32,
+    ddl_ok: &mut bool,
 ) -> RollupOnce {
-    ensure_ws_connection_daily_table(questdb).await;
+    // The table DDL runs until one attempt ensures it. A failure before the
+    // final attempt logs `info!` (no code) and retries the whole attempt, so
+    // rows are never written into a table auto-created without its DEDUP key
+    // while QuestDB is merely slow (review 2026-11-06).
+    if !*ddl_ok {
+        let failed = ensure_ws_connection_daily_table(questdb, ddl_attempts, final_attempt).await;
+        if failed == 0 {
+            *ddl_ok = true;
+        } else if !final_attempt {
+            return RollupOnce::Retryable;
+        }
+    }
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(ROLLUP_HTTP_TIMEOUT_SECS))
@@ -746,6 +792,15 @@ async fn run_ws_connection_rollup_once(
         }
         appended += 1;
     }
+    // Every append failed (a row-encoding fault, not QuestDB): nothing can
+    // land, so this is never counted `ok` (review 2026-11-06), and retrying
+    // would only rebuild the same rows.
+    if appended == 0 {
+        return RollupOnce::Done {
+            rows: Some(rows),
+            landed: false,
+        };
+    }
     if let Err(err) = tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         if !final_attempt {
             info!(
@@ -843,6 +898,35 @@ mod tests {
         // 15:45, 15:50, ..., 16:20.
         assert_eq!(attempts, 8);
         assert_eq!(now, ROLLUP_RETRY_DEADLINE_SECS_OF_DAY_IST);
+    }
+
+    #[test]
+    fn test_rollup_attempt_is_final_caps_at_eight_attempts_and_the_deadline() {
+        let ten_am = 10 * 3_600;
+        // A past-day backfill: the first attempt is the only one.
+        assert!(rollup_attempt_is_final(false, 0, ten_am));
+        // A forced same-day run at 10:00: the deadline is far away, so only
+        // the cap stops it (it would otherwise loop about 75 times).
+        for made in 0..ROLLUP_MAX_ATTEMPTS - 1 {
+            assert!(!rollup_attempt_is_final(true, made, ten_am), "{made}");
+        }
+        assert!(rollup_attempt_is_final(
+            true,
+            ROLLUP_MAX_ATTEMPTS - 1,
+            ten_am
+        ));
+        // Simulating the loop from 10:00 makes exactly 8 attempts.
+        let mut made = 0_u32;
+        loop {
+            let last = rollup_attempt_is_final(true, made, ten_am);
+            made += 1;
+            if last {
+                break;
+            }
+        }
+        assert_eq!(made, ROLLUP_MAX_ATTEMPTS);
+        // Near the deadline the clock decides first.
+        assert!(rollup_attempt_is_final(true, 0, 16 * 3_600 + 16 * 60));
     }
 
     #[test]
