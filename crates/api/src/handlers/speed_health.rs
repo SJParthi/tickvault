@@ -2011,8 +2011,9 @@ mod tests {
         assert!(strict.note.contains("not Monday proof"));
         assert_eq!(
             strict.tiles.len(),
-            4,
-            "runtime timers and metrics upkeep are not frame stages"
+            5,
+            "runtime timers and metrics upkeep are not frame stages; the \
+             per-tick drain stage (PR DP-6) is"
         );
         let first = &strict.tiles[0];
         assert_eq!(first.status, Light::Grey);
@@ -2112,6 +2113,7 @@ mod tests {
                 stage_label(Stage::RingDwell),
                 stage_label(Stage::DrainMainFrame),
                 stage_label(Stage::ReceiptToFold),
+                stage_label(Stage::DrainMainTick),
             ],
         );
         assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
