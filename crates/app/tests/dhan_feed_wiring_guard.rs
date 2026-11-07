@@ -530,7 +530,9 @@ fn depth_rescue_thread_recycles_each_batch_after_rescuing_it() {
         .collect::<Vec<_>>()
         .join("\n");
     let looped = body
-        .find("while let Ok(batch) = rescue_rx.recv() {")
+        // 2026-11-07: the loop reads through `OffloadQueue` so an abandoned
+        // rescue thread is counted in rows (the tick path's J2).
+        .find("while let Some(batch) = rescue_queue.next() {")
         .expect("the rescue thread must drain its queue in a receive loop");
     let rescue = body
         .find("rescue_sink.rescue(&batch);")

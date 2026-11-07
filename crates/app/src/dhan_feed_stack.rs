@@ -9250,6 +9250,15 @@ pub struct DepthIngest {
     /// shutdown path: a payload still in its queue at exit is rows the producer
     /// already counted as rescued that never reached the spill file.
     rescue_thread: Option<std::thread::JoinHandle<()>>,
+    /// The depth writer and rescue threads' queues, shared so an abandoned
+    /// thread's batches are counted in ROWS, the tick path's J2 accounting
+    /// (2026-11-07). `None` until [`Self::spawn_offload_writer`].
+    writer_queue: Option<
+        shutdown_residue::OffloadQueue<tickvault_storage::depth_persistence::DepthFlushBatch>,
+    >,
+    rescue_queue: Option<
+        shutdown_residue::OffloadQueue<tickvault_storage::depth_persistence::DepthRescueBatch>,
+    >,
 }
 
 impl DepthIngest {
@@ -9283,6 +9292,8 @@ impl DepthIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
         }
     }
 
@@ -9308,6 +9319,8 @@ impl DepthIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
         }
     }
 
@@ -9322,6 +9335,8 @@ impl DepthIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
         }
     }
 
@@ -9338,6 +9353,8 @@ impl DepthIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
         }
     }
 
@@ -9354,6 +9371,8 @@ impl DepthIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            writer_queue: None,
+            rescue_queue: None,
         }
     }
 
@@ -9498,24 +9517,28 @@ impl DepthIngest {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (sink_tx, sink_rx) = std::sync::mpsc::sync_channel::<(
             tickvault_storage::depth_persistence::DepthWriterSink,
-            std::sync::mpsc::Receiver<tickvault_storage::depth_persistence::DepthFlushBatch>,
+            shutdown_residue::OffloadQueue<tickvault_storage::depth_persistence::DepthFlushBatch>,
         )>(1);
         let handle = std::thread::Builder::new()
             .name("tv-depth-writer".to_owned())
             .spawn(move || {
-                let Ok((mut sink, rx)) = sink_rx.recv() else {
+                let Ok((mut sink, queue)) = sink_rx.recv() else {
                     return;
                 };
-                // `recv` ends only when every sender is dropped, i.e. when the
+                // `next` ends only when every sender is dropped, i.e. when the
                 // drain itself is gone. There is no other exit, deliberately: a
                 // writer that could stop on its own would leave the producer
-                // handing rows to a closed queue.
-                while let Ok(mut batch) = rx.recv() {
+                // handing rows to a closed queue. The queue records the batch
+                // in flight so an abandoned thread is counted in rows (J2 twin,
+                // 2026-11-07).
+                while let Some(mut batch) = queue.next() {
                     tickvault_storage::hot_path_telemetry::busy_begin_at(
                         tickvault_storage::hot_path_telemetry::HotTask::DepthWriter,
                         std::time::Instant::now(),
                     );
                     let _landed = sink.write(&mut batch);
+                    // Landed or rescued: no longer the shutdown's to count.
+                    queue.finished();
                     tickvault_storage::hot_path_telemetry::busy_end_at(
                         tickvault_storage::hot_path_telemetry::HotTask::DepthWriter,
                         std::time::Instant::now(),
@@ -9533,7 +9556,9 @@ impl DepthIngest {
         let live = std::mem::replace(&mut self.writer, placeholder);
         let (producer, sink, rx) = live.split_for_offload();
         self.writer = producer;
-        if sink_tx.send((sink, rx)).is_err() {
+        let queue = shutdown_residue::OffloadQueue::new(rx, shutdown_residue::measure_depth_flush);
+        self.writer_queue = Some(queue.clone());
+        if sink_tx.send((sink, queue)).is_err() {
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 "the depth writer thread vanished before the hand-off — the writer is split \
@@ -9546,11 +9571,17 @@ impl DepthIngest {
         // the queue above: it exists for the cases where that queue is full or
         // its thread is gone.
         let (rescue_sink, rescue_rx) = self.writer.split_rescue_offload();
+        let rescue_queue =
+            shutdown_residue::OffloadQueue::new(rescue_rx, shutdown_residue::measure_depth_rescue);
+        self.rescue_queue = Some(rescue_queue.clone());
         let rescue_handle = std::thread::Builder::new()
             .name("tv-depth-rescue".to_owned())
             .spawn(move || {
-                while let Ok(batch) = rescue_rx.recv() {
+                while let Some(batch) = rescue_queue.next() {
                     rescue_sink.rescue(&batch);
+                    // Spilled or marked by now: done before the housekeeping
+                    // below, so a deadline never counts it abandoned.
+                    rescue_queue.finished();
                     // PF-4b: the spent staged batch goes back to the drain's
                     // spare lane, cleared (its name pins dropped) here.
                     rescue_sink.recycle(batch);
@@ -9625,11 +9656,29 @@ impl DepthIngest {
                 "writer" => "depth"
             )
             .increment(1);
+            // 2026-11-07 (the tick path's J2): that counter is one per EVENT.
+            // The rows still held are counted here; the unbacked share is a
+            // real loss on `tv_ticks_lost_total{source="depth_rescue_abandoned"}`,
+            // and a dropped batch keeps its watermark floor, so the backed
+            // share replays.
+            let residue = self.rescue_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::DEPTH_RESCUE_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                source = shutdown_residue::DEPTH_RESCUE_ABANDONED_SOURCE,
+                batches,
+                rows,
+                unbacked_rows,
                 "the depth RESCUE thread did not finish within the shutdown budget — a \
                  rescued payload may never have reached the depth spill file. Those levels \
-                 were counted as rescued and are not in QuestDB either."
+                 were counted as rescued and are not in QuestDB either. It still held \
+                 {batches} batch(es) of {rows} row(s); {unbacked_rows} had no WAL record \
+                 and are counted lost, the rest replay from the WAL (-1 = the queue could \
+                 not be read)."
             );
             return;
         }
@@ -9639,10 +9688,22 @@ impl DepthIngest {
                 "writer" => "depth"
             )
             .increment(1);
+            // A dead thread wrote nothing still queued: counted in rows.
+            let residue = self.rescue_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::DEPTH_RESCUE_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                source = shutdown_residue::DEPTH_RESCUE_ABANDONED_SOURCE,
+                batches,
+                rows,
+                unbacked_rows,
                 "the depth rescue thread PANICKED — a rescued payload may never have \
-                 reached the depth spill file."
+                 reached the depth spill file. It still held {batches} batch(es) of \
+                 {rows} row(s); {unbacked_rows} had no WAL record and are counted lost."
             );
         }
     }
@@ -9672,8 +9733,21 @@ impl DepthIngest {
         if !finished {
             metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth")
                 .increment(1);
+            // 2026-11-07 (the tick path's J2): what the thread still held is
+            // counted in rows; its unbacked rows (no WAL record, so no replay)
+            // on `tv_ticks_lost_total{source="depth_writer_abandoned"}`.
+            let residue = self.writer_queue.take().and_then(|q| q.abandoned_residue());
+            shutdown_residue::count_abandoned_rows(
+                shutdown_residue::DEPTH_WRITER_ABANDONED_SOURCE,
+                residue,
+            );
+            let (batches, rows, unbacked_rows) = shutdown_residue::residue_fields(residue);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                source = shutdown_residue::DEPTH_WRITER_ABANDONED_SOURCE,
+                batches,
+                rows,
+                unbacked_rows,
                 grace_secs = OFFLOAD_SHUTDOWN_GRACE_SECS,
                 // Shares ONE deadline with the tick writer join, never its own
                 // grace: `main` gives this whole task a single flush budget, so
@@ -9683,7 +9757,9 @@ impl DepthIngest {
                 // threads drain in parallel and the total is the MAX, not the sum.
                 "the depth writer did not finish within the shutdown grace — its last \
                  batch may not have reached QuestDB. Rows it failed to write are on the \
-                 depth spill tier and are re-ingestable; rows still in the queue are not."
+                 depth spill tier and are re-ingestable. It still held {batches} batch(es) \
+                 of {rows} row(s); {unbacked_rows} had no WAL record and are counted lost, \
+                 the rest replay from the WAL (-1 = the queue could not be read)."
             );
             // Deliberately NOT joined after a timeout: joining here is the
             // unbounded wait the grace exists to avoid.
@@ -22038,6 +22114,112 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&bytes).contains("market_depth,"),
             "nothing goes to the level table for a frame after the switch"
+        );
+    }
+
+    /// `tv_ticks_lost_total{source}` as rendered, `None` when absent.
+    fn rendered_ticks_lost(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        source: &str,
+    ) -> Option<u64> {
+        let prefix = format!("tv_ticks_lost_total{{source=\"{source}\"}} ");
+        handle
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_owned))
+            .and_then(|v| v.trim().parse().ok())
+    }
+
+    /// One Full depth-20 side into `depth` as array rows (20 levels). The
+    /// frame sequence is a real (packet-slot aligned) one, so its rows carry
+    /// a WAL capture sequence and read as backed unless marked.
+    fn drain_one_book_side(depth: &mut DepthIngest) {
+        let frame = depth_frame(
+            depth20_packet(13, 0, 41),
+            DhanEndpointType::Depth20,
+            1_u64 << 40,
+        );
+        let out = drain_depth_frame(depth, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        assert_eq!(out.rows, 20, "one book side carries 20 levels");
+    }
+
+    // Regression: 2026-11-07 — an abandoned depth writer thread's batches were
+    // counted +1 per event, so `market_depth_book` rows from a frame the WAL
+    // refused (no replay) reached no row-level loss counter. The tick twin got
+    // this in J2 (2026-10-26).
+    #[test]
+    fn test_regression_abandoned_depth_writer_counts_unbacked_book_rows_lost() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut depth = DepthIngest::for_test_book(BOOK_RX);
+        // Split exactly as `spawn_offload_writer` does; the thread is simulated.
+        let live = std::mem::replace(
+            &mut depth.writer,
+            DepthWriter::placeholder_for_offload_swap(Feed::Dhan),
+        );
+        let (producer, _sink, rx) = live.split_for_offload();
+        depth.writer = producer;
+        let queue = shutdown_residue::OffloadQueue::new(rx, shutdown_residue::measure_depth_flush);
+        depth.writer_queue = Some(queue.clone());
+        // One batch from a frame the WAL refused, then one backed batch.
+        depth.mark_all_pending_unbacked();
+        drain_one_book_side(&mut depth);
+        depth.writer.flush().expect("hand off the unbacked batch");
+        drain_one_book_side(&mut depth);
+        depth.writer.flush().expect("hand off the backed batch");
+        // The thread took the unbacked batch and is stuck writing it.
+        let in_flight = queue.next().expect("the unbacked batch");
+        assert!(in_flight.has_unbacked_rows());
+        let (_done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        depth.writer_done = Some(done_rx);
+        depth.writer_thread = Some(std::thread::spawn(|| {}));
+        metrics::with_local_recorder(&recorder, || {
+            depth.shutdown_offload_writer(std::time::Instant::now());
+        });
+        assert_eq!(
+            rendered_ticks_lost(&handle, shutdown_residue::DEPTH_WRITER_ABANDONED_SOURCE),
+            Some(20),
+            "the 20 unbacked levels are lost; the 20 backed ones replay from the WAL"
+        );
+        assert!(depth.writer_queue.is_none(), "the residue is read once");
+    }
+
+    // Regression: 2026-11-07 — the depth rescue thread's twin of the above.
+    #[test]
+    fn test_regression_abandoned_depth_rescue_counts_unbacked_book_rows_lost() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut depth = DepthIngest::for_test_book(BOOK_RX);
+        let (_rescue_sink, rescue_rx) = depth.writer.split_rescue_offload();
+        let queue =
+            shutdown_residue::OffloadQueue::new(rescue_rx, shutdown_residue::measure_depth_rescue);
+        depth.rescue_queue = Some(queue);
+        depth.mark_all_pending_unbacked();
+        drain_one_book_side(&mut depth);
+        assert_eq!(
+            depth.writer.discard_pending(),
+            20,
+            "queued to the rescue thread"
+        );
+        drain_one_book_side(&mut depth);
+        assert_eq!(
+            depth.writer.discard_pending(),
+            20,
+            "a backed batch queued too"
+        );
+        // A rescue thread stuck on a slow disk past the deadline.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        depth.rescue_thread = Some(std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        }));
+        metrics::with_local_recorder(&recorder, || {
+            depth.shutdown_rescue_writer(std::time::Instant::now());
+        });
+        drop(release_tx);
+        assert_eq!(
+            rendered_ticks_lost(&handle, shutdown_residue::DEPTH_RESCUE_ABANDONED_SOURCE),
+            Some(20),
+            "only the batch from the frame the WAL refused is lost"
         );
     }
 
