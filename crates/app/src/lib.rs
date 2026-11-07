@@ -86,6 +86,8 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// STAGE-C: which boot replay outcomes may archive `replaying/` (2026-11-07).
+pub mod boot_wal_confirm;
 /// After-close repair of `contract` names a boot wrote blank (2026-10-09).
 pub mod contract_name_repair_boot;
 /// The previous close per instrument, fed from the response-code-6 packets
