@@ -567,3 +567,42 @@ fn depth_rescue_thread_recycles_each_batch_after_rescuing_it() {
         "`rescue_sink.recycle(batch)` must be the last statement INSIDE the receive loop"
     );
 }
+
+/// 2026-11-07 review: each rescue thread's shared queue handle is stored on
+/// the ingest only AFTER `spawn(...)?` returns. Stored before it, a failed
+/// spawn kept the receiver alive, so the producer's rescue `try_send` queued
+/// rows into a queue no thread reads and the shutdown never counted them
+/// (it returns early when there is no thread handle). Stored after it, the
+/// receiver closes with the failed closure and the producer falls back inline.
+#[test]
+fn rescue_queue_handle_is_stored_only_after_the_rescue_thread_exists() {
+    for name in ["tv-tick-rescue", "tv-depth-rescue"] {
+        let spawn = format!(".name(\"{name}\".to_owned())");
+        let at = STACK_SRC
+            .find(&spawn)
+            .unwrap_or_else(|| panic!("the {name} thread must exist"));
+        let before = &STACK_SRC[..at];
+        let open = before
+            .rfind("fn spawn_offload_writer")
+            .unwrap_or_else(|| panic!("{name} must be spawned inside spawn_offload_writer"));
+        assert!(
+            !before[open..].contains("self.rescue_queue = Some("),
+            "{name}: self.rescue_queue must not be set before the thread is spawned"
+        );
+        let after = &STACK_SRC[at..];
+        let spawned = after
+            .find("})?;")
+            .unwrap_or_else(|| panic!("{name}: the spawn must propagate its error with `?`"));
+        let stored = after
+            .find("self.rescue_queue = Some(")
+            .unwrap_or_else(|| panic!("{name}: the rescue queue handle must be stored"));
+        assert!(
+            stored > spawned,
+            "{name}: self.rescue_queue must be set after `spawn(...)?` succeeds"
+        );
+        assert!(
+            stored < after.find("Ok(())").unwrap_or(usize::MAX),
+            "{name}: the handle must be stored before spawn_offload_writer returns"
+        );
+    }
+}

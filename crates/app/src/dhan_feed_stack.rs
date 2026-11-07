@@ -2380,7 +2380,11 @@ impl LiveIngest {
         let rescue_queue = shutdown_residue::OffloadQueue::new(rescue_rx, |b| {
             (b.rows() as u64, b.has_unbacked_rows())
         });
-        self.rescue_queue = Some(rescue_queue.clone());
+        // Stored only after the thread exists (2026-11-07 review): on a spawn
+        // failure the closure's copy and this local copy are both dropped, the
+        // receiver closes, and the producer's rescue falls back inline instead
+        // of queueing rows nobody will read.
+        let rescue_queue_handle = rescue_queue.clone();
         let rescue_handle = std::thread::Builder::new()
             .name("tv-tick-rescue".to_owned())
             .spawn(move || {
@@ -2398,6 +2402,7 @@ impl LiveIngest {
                 }
                 info!("tick rescue thread exiting — the drain closed its queue");
             })?;
+        self.rescue_queue = Some(rescue_queue_handle);
         self.rescue_thread = Some(rescue_handle);
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
@@ -9573,7 +9578,11 @@ impl DepthIngest {
         let (rescue_sink, rescue_rx) = self.writer.split_rescue_offload();
         let rescue_queue =
             shutdown_residue::OffloadQueue::new(rescue_rx, shutdown_residue::measure_depth_rescue);
-        self.rescue_queue = Some(rescue_queue.clone());
+        // Stored only after the thread exists (2026-11-07 review): on a spawn
+        // failure the closure's copy and this local copy are both dropped, the
+        // receiver closes, and the producer's rescue falls back inline instead
+        // of queueing rows nobody will read.
+        let rescue_queue_handle = rescue_queue.clone();
         let rescue_handle = std::thread::Builder::new()
             .name("tv-depth-rescue".to_owned())
             .spawn(move || {
@@ -9588,6 +9597,7 @@ impl DepthIngest {
                 }
                 info!("depth rescue thread exiting — the drain closed its queue");
             })?;
+        self.rescue_queue = Some(rescue_queue_handle);
         self.rescue_thread = Some(rescue_handle);
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
