@@ -19,6 +19,14 @@
 #     (scheduler-independent stale-binary catch + redeploy) and, for
 #     bot-merged (push-suppressed) commits, postmerge-catchup's overnight
 #     deploy-aws backfill.
+#     ⚠ CORRECTED 2026-11-07: there is no overnight catch-up deploy any more.
+#     It self-started the stopped box at weekends, so postmerge-catchup now
+#     dispatches deploy-aws only on an ordinary IST trading day (not Muhurat) between 15:45 and
+#     16:05 IST, beside this file's 15:46 / 16:16 crons. Every "overnight
+#     deploy coverage is postmerge-catchup" line below is stale: a weekend or
+#     overnight bot merge goes live via the deploy-watchdog at box start (it
+#     needs /tickvault/<env>/operator/github-token) or else after the next
+#     trading day's close.
 #   • 10:16 UTC = 15:46 IST → POST-MARKET window, just AFTER the 15:45 IST end of
 #     the no-deploy band (moved from 15:31 so it is no longer blocked by the
 #     guard). ~16 min after NSE close — redeploys anything merged during hours.
