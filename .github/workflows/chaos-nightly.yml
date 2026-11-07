@@ -65,7 +65,10 @@ jobs:
   chaos:
     runs-on: ubuntu-latest
     # 60 min ceiling: 30 min typical + 10 min slow + 20 min safety margin.
-    timeout-minutes: 60
+    # 2026-11-07 (TG-4): +20 min for the archiver contention step (build of
+    # the storage lib tests, seeding 5M depth rows, the export pass). Not
+    # measured yet: the first scheduled run is the measurement.
+    timeout-minutes: 80
     env:
       CARGO_TERM_COLOR: always
       # Point the test env vars at the Docker compose stack's published ports.
@@ -151,9 +154,12 @@ jobs:
         # mutated by a test. Scoped to the chaos_* test binaries only — the
         # full workspace test build is normal CI's job and was the widest
         # pre-test failure surface in this lane.
-        run: |
-          set -euo pipefail
-          cargo test --workspace --no-run --test 'chaos_*' 2>&1 | tee /tmp/build.log
+        # `shell: bash` runs with `-eo pipefail`, so the one-line form fails on
+        # a cargo error exactly as the old `set -euo pipefail` block did (the
+        # line reads no variable, so `-u` changed nothing). Folded 2026-11-07
+        # to pay for the TG-4 step's line under the run-line budget.
+        shell: bash
+        run: cargo test --workspace --no-run --test 'chaos_*' 2>&1 | tee /tmp/build.log
 
       - name: Run chaos tests (--include-ignored)
         id: chaos
@@ -182,6 +188,27 @@ jobs:
             --test 'chaos_*' \
             --no-fail-fast \
             -- --include-ignored --nocapture 2>&1 | tee /tmp/chaos.log
+
+      - name: Archiver export contention vs real QuestDB (TG-4)
+        # Plan item TG-4 (2026-11-06 incident: the archiver's /exp export held
+        # QuestDB's one HTTP thread and ILP writes and /exec probes stalled
+        # behind it). Seeds one market_depth hour, runs the REAL archive pass
+        # against this stack's QuestDB (production image, memory limit, cpuset
+        # and HTTP worker settings from the compose file) with ILP writes,
+        # /exec probes and a second /exp stream running beside it, and fails
+        # when a flush exceeds 5 s, a probe exceeds 2 s, or either fails.
+        # Lives in the storage crate's lib tests (it drives the archiver's
+        # test constructor), so `--test 'chaos_*'` above does not pick it up.
+        # TV_QDB_REAL_REQUIRED=1 turns a missing or unreachable QuestDB into a
+        # failure, never a skip. Runs after the chaos step whether it passed
+        # or failed, as long as the stack came up. Output is appended to
+        # /tmp/chaos.log so the regression issue quotes it.
+        if: ${{ !cancelled() && (steps.chaos.outcome == 'success' || steps.chaos.outcome == 'failure') }}
+        shell: bash
+        env:
+          TV_QDB_REAL_HTTP: 127.0.0.1:9000
+          TV_QDB_REAL_REQUIRED: '1'
+        run: cargo test -p tickvault-storage --lib tg4_archiver_export_contention -- --ignored --nocapture 2>&1 | tee -a /tmp/chaos.log
 
       - name: Tear down Docker compose stack
         if: always()

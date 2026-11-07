@@ -5234,6 +5234,8 @@ mod stub_integration_tests {
     // PR TG (2026-11-06 incident): `/exp` 429 and slow-export regressions,
     // in their own file so they reuse this harness without growing it.
     mod tg_export_regressions_tests;
+    // PR TG-4: the real-QuestDB export contention test (#[ignore]d, weekly lane).
+    mod tg4_export_contention_tests;
 
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]
