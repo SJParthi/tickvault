@@ -38,38 +38,56 @@ fn production(path: &str) -> String {
 }
 
 /// Boot must NOT confirm on the path where the lane will re-fold.
+///
+/// 2026-11-07: the confirm moved into `boot_wal_confirm::settle_boot_replay_staging`,
+/// whose decision (refold pending, refused, failed, read) is tested
+/// behaviourally on real files in that module. This pins the wiring: `main`
+/// calls it exactly once with the refold condition, and the module archives
+/// only on its `Archived` arm.
 #[test]
 fn boot_does_not_confirm_when_the_lane_will_refold() {
     let src = production("src/main.rs");
-    let confirms: Vec<&str> = src
-        .lines()
-        .filter(|l| l.contains("confirm_replayed("))
-        .collect();
-    assert_eq!(
-        confirms.len(),
-        1,
-        "boot should carry exactly ONE confirm_replayed call, on the no-refold \
-         branch. Found {}: {confirms:?}",
-        confirms.len()
-    );
-
-    // The surviving call must sit inside a branch guarded on the refold NOT
-    // happening. Checked by locating the guard and the call, and asserting the
-    // guard comes first — an unguarded confirm is the defect itself.
-    let guard = src
-        .find("dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty()")
-        .expect(
-            "boot must branch on `dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty()` \
-             before confirming — without that guard the confirm archives frames the lane has \
-             not folded yet, and a crash in between loses them",
-        );
-    let call = src
-        .find("confirm_replayed(")
-        .expect("the no-refold branch must still confirm, or unreadable segments re-stage forever");
     assert!(
-        guard < call,
-        "the refold guard must precede the confirm in source order — otherwise the \
-         confirm is unconditional again"
+        !src.contains("confirm_replayed("),
+        "boot must not call confirm_replayed directly; the STAGE-C decision lives in \
+         boot_wal_confirm so it can be tested"
+    );
+    let calls = src
+        .matches("boot_wal_confirm::settle_boot_replay_staging(")
+        .count();
+    assert_eq!(
+        calls, 1,
+        "boot must settle the staged segments exactly once"
+    );
+    let call = src
+        .find("boot_wal_confirm::settle_boot_replay_staging(")
+        .expect("checked above");
+    let args = &src[call..];
+    let args = &args[..args.find(");").expect("the call must end")];
+    for needle in [
+        "ws_wal_replay_pass,",
+        "dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty()",
+    ] {
+        assert!(
+            args.contains(needle),
+            "the STAGE-C confirm must receive `{needle}` — without it the confirm archives \
+             frames the lane has not folded yet, or segments a failed pass never read"
+        );
+    }
+
+    let decide = production("src/boot_wal_confirm.rs");
+    assert_eq!(
+        decide.matches("confirm_replayed(").count(),
+        1,
+        "boot_wal_confirm must archive at exactly one site"
+    );
+    let archived_arm = decide
+        .find("StageCConfirm::Archived => {")
+        .expect("the archive must sit on the Archived arm");
+    let call = decide.find("confirm_replayed(").expect("checked above");
+    assert!(
+        archived_arm < call && !decide[archived_arm..call].contains("StageCConfirm::Held"),
+        "confirm_replayed must be called only on the Archived arm"
     );
 }
 

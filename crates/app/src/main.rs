@@ -1346,16 +1346,13 @@ async fn async_main() -> Result<()> {
     // catch-up drain can see a process boundary across the pass boundary.
     let mut ws_wal_replay_last_fold_receipt: Option<i64> = None;
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
-    // A REFUSED pass (disk floor, per-boot frame cap) returns no frames AND
-    // touches nothing — including whatever an earlier boot left staged in
-    // `replaying/`. That must not read as "nothing to replay": the else-branch
-    // below confirms in that case, and confirming archives the staged
-    // leftovers UNREAD. The refusal is most likely on exactly the full-disk
-    // boot, which is the boot that can least afford to lose them.
-    let mut ws_wal_replay_refused = false;
-    match tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path) {
+    // A REFUSED or FAILED pass touches nothing, including `replaying/`; only a
+    // pass that READ may archive it (`boot_wal_confirm`, 2026-11-07).
+    let ws_wal_replay_result = tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path);
+    let ws_wal_replay_pass =
+        tickvault_app::boot_wal_confirm::BootReplayPass::of(&ws_wal_replay_result);
+    match ws_wal_replay_result {
         Ok(batch) => {
-            ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap;
             let boot_pass_trailing_gap = batch.trailing_gap;
             let recovered = batch.frames;
             if recovered.is_empty() {
@@ -1453,7 +1450,8 @@ async fn async_main() -> Result<()> {
                 source = "boot_replay_failed",
                 ?err,
                 dir = %ws_wal_dir,
-                "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
+                "STAGE-C: WAL replay failed — continuing boot; nothing staged is archived, \
+                 every segment stays for the catch-up drain or the next boot"
             );
         }
     }
@@ -3537,58 +3535,16 @@ async fn async_main() -> Result<()> {
         ws_wal_replay_trailing_gap = None;
         ws_wal_replay_last_fold_receipt = None;
     }
-    if dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty() {
-        // DELIBERATELY NOT CONFIRMING HERE (2026-08-21).
-        //
-        // The live-feed frames have been read into memory but NOT yet folded
-        // into the database — the Dhan lane does that, thousands of lines
-        // below, right after `LiveIngest` exists. `confirm_replayed` moves the
-        // staged segments out of `replaying/`, where the next boot looks, and
-        // its own doc says to call it "ONLY after the frames have been durably
-        // re-captured into the live pipeline".
-        //
-        // Calling it here made that sentence false: between this point and the
-        // refold the segments sat in `archive/` while their frames existed
-        // only in memory, so a crash in that window lost them permanently —
-        // and `prune_archived_segments` then deleted the raw bytes on a timer,
-        // under a doc-comment asserting they were already persisted. That is
-        // the foundation of the zero-tick-loss claim, inverted.
-        //
-        // The lane now confirms after its refold. If this process dies first,
-        // the segments stay in `replaying/` and the next boot replays them
-        // again — idempotent, because every affected table dedups on its
-        // upsert key.
-        info!(
-            frames = ws_wal_replay_live_feed.len(),
-            "STAGE-C.2c: staged write-ahead-log segments are held UNCONFIRMED — the Dhan \
-             lane will fold these frames and confirm them itself. A crash before that \
-             replays them again next boot rather than losing them."
-        );
-    } else if ws_wal_replay_refused {
-        // The pass was REFUSED before it read anything. Segments an earlier
-        // boot staged are still in `replaying/`, unread; confirming would
-        // archive them with a zero count. Leave them for a boot with the disk
-        // and the frame budget to read them. The refusal itself already
-        // fired a coded error in the storage layer.
-        warn!(
-            "STAGE-C: the WAL replay was refused (disk floor or per-boot frame cap), so \
-             nothing staged is confirmed — `replaying/` is left exactly as found for the \
-             next boot"
-        );
-    } else {
-        // No refold is coming — either the lane will not run (the frames were
-        // just dropped loudly above) or there were none. Archiving here is
-        // correct and necessary: NOT confirming would re-stage the same
-        // unreadable segments on every boot forever (the WS-REINJECT-01
-        // growth-storm class).
-        //
-        // Honest envelope (round-2 note, 2026-07-14): this also runs when
-        // `replay_all` itself ERRORED above — segments staged but never read
-        // are archived with a zero count (raw frames preserved on disk, count
-        // lost).
-        let confirm_ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
-        tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
-    }
+    // STAGE-C confirm (2026-11-07). A lane refold confirms itself after its
+    // flush (2026-08-21); a refused or FAILED pass read nothing, so archiving
+    // would bury unread `replaying/` leftovers; only a pass that read its
+    // segments with no refold coming archives (`boot_wal_confirm`).
+    tickvault_app::boot_wal_confirm::settle_boot_replay_staging(
+        &tickvault_app::boot_helpers::ws_wal_dir(),
+        ws_wal_replay_pass,
+        dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty(),
+        ws_wal_replay_live_feed.len(),
+    );
 
     // =======================================================================
     // DHAN REST-ONLY STACK (PR-C2, 2026-07-13 — the only Dhan surface).

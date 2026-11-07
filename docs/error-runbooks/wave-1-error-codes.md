@@ -58,6 +58,22 @@ becomes fresh again.
 
 **Source:** `crates/core/src/pipeline/prev_close_writer.rs::try_enqueue_global`
 
+### 2026-11-07 — depth writer and rescue threads abandoned at shutdown
+
+HOT-PATH-02 is also the code on the shutdown joins of the Dhan lane's
+writer threads (`crates/app/src/dhan_feed_stack.rs`). Since 2026-11-07 the
+depth pair carries the tick pair's J2 row accounting: when the depth writer
+or depth rescue thread misses the shared shutdown deadline, the coded line
+names `source = "depth_writer_abandoned"` or `"depth_rescue_abandoned"` and
+the batches, rows and unbacked rows it still held. Unbacked rows (from a
+frame the WAL refused, so no replay) are counted lost on
+`tv_ticks_lost_total{source="depth_writer_abandoned"|"depth_rescue_abandoned"}`,
+which pages through the existing `ticks-lost-spill` alarm; the rest replay
+from the WAL on the next boot. Rows are in the depth writer's `pending` unit
+(one per level; a `market_depth_book` side counts its levels). `-1` means
+the queue could not be read at that instant. Triage as for the tick twin:
+check QuestDB and the depth spill volume around the 16:30 stop.
+
 ## HOT-PATH-03 — socket reader threads run unpinned (core pin refused)
 
 **Added 2026-10-02** with reader-thread core pinning (owner-approved `libc`

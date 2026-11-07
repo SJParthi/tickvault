@@ -33,7 +33,9 @@ const PINS: &[(&str, usize)] = &[
     // 2026-10-14 (ITEM 57): lowered 14 (the file is 14 lines below main) after
     // `contract_attach_tests` moved out and ITEM 57 code moved in.
     ("crates/app/src/dhan_feed_stack.rs", 33_752),
-    ("crates/app/src/main.rs", 7_002),
+    // 2026-11-07: lowered 7,002 -> 6,958 after the STAGE-C confirm decision
+    // moved to `boot_wal_confirm` (main.rs 7,202 -> 7,158 lines).
+    ("crates/app/src/main.rs", 6_958),
     // 2026-10-26 (PR K): lowered 26,621 -> 25,984 after the frame-silence
     // evidence tests moved to `pool_supervisor/frame_silence_evidence_tests.rs`.
     ("crates/core/src/websocket/pool_supervisor.rs", 25_984),
