@@ -115,25 +115,26 @@ impl Drop for TempDir {
     }
 }
 
-/// The stand-in bench program, compiled once.
+/// The stand-in bench program, compiled once per test process into cargo's
+/// test scratch folder (inside the target dir, so `cargo clean` removes it).
 fn fake_bench() -> &'static Path {
-    static FAKE: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
-    &FAKE
-        .get_or_init(|| {
-            let dir = TempDir::new("fake");
-            let src = dir.0.join("fake.rs");
-            std::fs::write(&src, FAKE_SRC).expect("write fake source"); // APPROVED: test
-            let exe = dir.0.join("fake");
-            let status = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-                .args(["--edition", "2021", "-o"])
-                .arg(&exe)
-                .arg(&src)
-                .status()
-                .expect("rustc runs"); // APPROVED: test
-            assert!(status.success(), "the fake bench program must compile");
-            (dir, exe)
-        })
-        .1
+    static FAKE: OnceLock<PathBuf> = OnceLock::new();
+    FAKE.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("bench-ab-fake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fake dir"); // APPROVED: test
+        let src = dir.join("fake.rs");
+        std::fs::write(&src, FAKE_SRC).expect("write fake source"); // APPROVED: test
+        let exe = dir.join("fake");
+        let status = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+            .args(["--edition", "2021", "-o"])
+            .arg(&exe)
+            .arg(&src)
+            .status()
+            .expect("rustc runs"); // APPROVED: test
+        assert!(status.success(), "the fake bench program must compile");
+        exe
+    })
 }
 
 fn place_fake(at: &Path) {
