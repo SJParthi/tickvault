@@ -1037,6 +1037,13 @@ pub fn run_after_close_pass(
         let mut disk_stop = false;
         let mut damaged = false;
         let mut bucket_no_receipt = 0u64;
+        // PR AA (owner Quote 51): this bucket's rows go into OLD depth
+        // hours, so the bucket is written and flushed only while no archiver
+        // is copying and dropping one of them. Waits behind at most the one
+        // partition an archive pass has in flight (this is the pass's own OS
+        // thread, never an async one); released at the end of this
+        // iteration, after the bucket-edge flush below.
+        let _quiesce = tickvault_storage::archive_quiesce::archive_quiesce_shared_blocking();
         'segments: for path in &bucket.paths {
             let read = match read_segment_frames_matching(path, &keep) {
                 Ok(read) => read,
@@ -1356,6 +1363,44 @@ mod tests {
 
     /// A free fraction well clear of every shed and floor threshold.
     const HEALTHY_FREE: f64 = 0.5;
+
+    /// PR AA step 1: each bucket takes the archive quiesce lock before its
+    /// first write and keeps it through the bucket-edge flush, inside the
+    /// per-bucket loop (so it is released between buckets, never held all
+    /// night). A source scan, because the lock is process-wide and a
+    /// behavioural test holding it would stall every other pass test.
+    #[test]
+    fn test_each_bucket_holds_the_archive_quiesce_lock_through_its_flush() {
+        let src = include_str!("deferred_depth_pass.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let loop_at = production
+            .find("for &(id, kinds) in &work {")
+            .expect("the per-bucket loop must exist");
+        let body = &production[loop_at..];
+        let lock_at = body
+            .find("archive_quiesce_shared_blocking()")
+            .expect("each bucket must take the archive quiesce lock");
+        let write_at = body
+            .find("'segments: for path in &bucket.paths")
+            .expect("the bucket's write loop must exist");
+        let flush_at = body
+            .find("if !failed && sink.flush().is_err()")
+            .expect("the bucket-edge flush must exist");
+        assert!(
+            lock_at < write_at,
+            "the lock is taken before the first write"
+        );
+        assert!(write_at < flush_at);
+        let guard_line = body[..write_at]
+            .lines()
+            .rev()
+            .find(|l| l.contains("archive_quiesce_shared_blocking()"))
+            .unwrap_or_default();
+        assert!(
+            guard_line.trim_start().starts_with("let _quiesce ="),
+            "the guard must be bound for the iteration, not dropped at once: {guard_line}"
+        );
+    }
 
     #[test]
     fn after_close_step_over_the_full_grid() {

@@ -82,6 +82,10 @@ mod global_qcfg_tests {
     }
 }
 
+// PR AA (owner Quote 51, 2026-11-07): the lock every writer that can post into
+// an old hour shares, and the partition archiver holds alone while it copies
+// and drops one partition. Cold path, O(1) per call.
+pub mod archive_quiesce;
 pub mod boot_probe;
 // 2026-09-22 ("no views anywhere"): `console_views` no longer creates any
 // view. It DROPS every retired console view name at boot, before any table

@@ -23,6 +23,9 @@ pub(super) const STOP_INCOMPLETE: &str = "incomplete";
 pub(super) const STOP_REPLAY_FAILED: &str = "replay_failed";
 /// A replayed batch was never acknowledged by the sinks.
 pub(super) const STOP_ACK_TIMEOUT: &str = "ack_timeout";
+/// The partition archiver held the old-hour writers out for longer than the
+/// bounded wait (PR AA, owner Quote 51): the segments wait for the next drain.
+pub(super) const STOP_ARCHIVE_QUIESCE: &str = "archive_quiesce";
 
 /// The reason for an early stop when the final replay pass returned no
 /// frames: `frame_cap`, `memory`, `disk` or `deferred`, in that order of
@@ -119,6 +122,90 @@ mod tests {
         );
     }
 
+    /// PR AA step 1: a drain the archive quiesce lock stopped reports
+    /// `archive_quiesce`, never `drained`.
+    #[test]
+    fn test_catchup_stops_with_archive_quiesce_reason() {
+        assert_eq!(
+            residual_stop_reason(false, STOP_ARCHIVE_QUIESCE),
+            "archive_quiesce"
+        );
+        assert_eq!(residual_stop_reason(true, STOP_ARCHIVE_QUIESCE), "drained");
+    }
+
+    /// The lane's code, with its comments removed.
+    fn lane_code() -> String {
+        include_str!("../dhan_feed_stack.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// PR AA step 1: each catch-up chunk takes the archive quiesce lock
+    /// BEFORE its refold, and a miss stops the drain with `archive_quiesce`
+    /// before the segment settles.
+    #[test]
+    fn test_catchup_chunk_takes_the_quiesce_lock_before_its_refold() {
+        let code = lane_code();
+        let chunk = code
+            .find("if !chunk.is_empty() {")
+            .expect("the catch-up chunk loop must exist");
+        let body = &code[chunk..];
+        let lock = body
+            .find("aq::QuiesceWriter::CatchUp")
+            .expect("each chunk must take the quiesce lock");
+        let refold = body
+            .find("refold_wal_frames(&mut ingest, chunk")
+            .expect("the chunk refold must exist");
+        let ack = body
+            .find("replay_rows_landed(&mut ingest, \"catchup\"")
+            .expect("the chunk ack must exist");
+        let settle = body
+            .find("settle_confirm_segments(")
+            .expect("the segment settle must exist");
+        assert!(lock < refold && refold < ack && ack < settle);
+        assert!(
+            body[lock..refold].contains("round_quiesce_held = true;"),
+            "a miss must record the stop before any refold"
+        );
+        assert!(
+            code.contains("catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;"),
+            "a quiesce-held round must name its stop"
+        );
+    }
+
+    /// PR AA step 1: the boot refold takes the lock (try-only in session)
+    /// before it folds, folds nothing on a miss, and lets go right after its
+    /// flush and ack, before the catch-up drain.
+    #[test]
+    fn test_boot_refold_takes_the_quiesce_lock_and_releases_it_before_catchup() {
+        let code = lane_code();
+        let lock = code
+            .find("QuiesceWriter::BootRefold")
+            .expect("the boot refold must take the quiesce lock");
+        let miss = code
+            .find("} else if boot_quiesce.is_none() {")
+            .expect("a miss must fold nothing");
+        let refold = code
+            .find("refold_wal_frames(&mut ingest, boot_frames")
+            .expect("the boot refold must exist");
+        let ack = code
+            .find("replay_rows_landed(&mut ingest, \"boot_refold\"")
+            .expect("the boot ack must exist");
+        let release = code
+            .find("drop(boot_quiesce);")
+            .expect("the lock must be released explicitly");
+        let catchup = code
+            .find("let catchup_budget_secs")
+            .expect("the catch-up drain must exist");
+        assert!(lock < miss && miss < refold && refold < ack && ack < release);
+        assert!(
+            release < catchup,
+            "never held into the catch-up or the live lane"
+        );
+    }
+
     /// Regression: 2026-10-20 — a catch-up whose last pass stopped at its
     /// frame cap reported `stop_reason = "drained"` while segments waited.
     #[test]
@@ -140,7 +227,12 @@ mod tests {
     /// that matter (three flags and whether segments were deferred).
     #[test]
     fn test_residual_stop_reason_is_drained_only_when_the_backlog_emptied() {
-        let early_stops = [STOP_INCOMPLETE, STOP_REPLAY_FAILED, STOP_ACK_TIMEOUT];
+        let early_stops = [
+            STOP_INCOMPLETE,
+            STOP_REPLAY_FAILED,
+            STOP_ACK_TIMEOUT,
+            STOP_ARCHIVE_QUIESCE,
+        ];
         for &early in &early_stops {
             assert_eq!(residual_stop_reason(true, early), "drained");
             assert_eq!(residual_stop_reason(false, early), early);
@@ -164,6 +256,9 @@ mod tests {
         assert_ne!(STOP_INCOMPLETE, STOP_REPLAY_FAILED);
         assert_ne!(STOP_INCOMPLETE, STOP_ACK_TIMEOUT);
         assert_ne!(STOP_REPLAY_FAILED, STOP_ACK_TIMEOUT);
+        for other in [STOP_INCOMPLETE, STOP_REPLAY_FAILED, STOP_ACK_TIMEOUT] {
+            assert_ne!(STOP_ARCHIVE_QUIESCE, other);
+        }
         assert!(early_stops.iter().all(|s| *s != "drained"));
     }
 }

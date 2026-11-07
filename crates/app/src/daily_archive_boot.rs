@@ -527,6 +527,8 @@ async fn run_daily_archive_loop(
     for outcome in SEEDED_ATTEMPT_OUTCOMES {
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome).increment(0);
     }
+    // PR AA (owner Quote 51): every `writer` of the archive quiesce counter.
+    tickvault_storage::archive_quiesce::register_quiesce_counters();
     let completed_gauge = metrics::gauge!("tv_daily_archive_completed_today");
     // 2026-10-06 (plan item 51a): the day this process latched, held in RAM.
     // The marker can fail to save; without this latch every tick would
@@ -1269,6 +1271,47 @@ mod pass_ran_tests {
             })
             .unwrap_or_else(|| panic!("hold series not seeded; got:\n{rendered}"));
         assert!(line.ends_with(" 0"), "seeded at 0, got {line}");
+    }
+
+    // PR AA step 1: the archive quiesce counter puts every `writer` series on
+    // /metrics at 0 (seeded by the daily archive loop), and a deferral adds
+    // one to its own writer only. Local /metrics only: no page, no alarm.
+    #[test]
+    fn test_archive_quiesce_counters_seed_at_zero_and_count() {
+        use tickvault_storage::archive_quiesce::{
+            QUIESCE_HELD_COUNTER, QuiesceWriter, note_quiesce_held, register_quiesce_counters,
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_quiesce_counters();
+            note_quiesce_held(QuiesceWriter::CatchUp);
+        });
+        let rendered = handle.render();
+        for writer in QuiesceWriter::ALL {
+            let label = format!("writer=\"{}\"", writer.label());
+            let line = rendered
+                .lines()
+                .find(|l| l.starts_with(&format!("{QUIESCE_HELD_COUNTER}{{")) && l.contains(&label))
+                .unwrap_or_else(|| panic!("{label} not seeded; got:\n{rendered}"));
+            let expected = if writer == QuiesceWriter::CatchUp {
+                " 1"
+            } else {
+                " 0"
+            };
+            assert!(line.ends_with(expected), "{line}");
+        }
+        // The daily loop is the seeding site.
+        let src = include_str!("daily_archive_boot.rs");
+        let body = src
+            .split("async fn run_daily_archive_loop(")
+            .nth(1)
+            .expect("the loop exists");
+        let seed = body.find("register_quiesce_counters();").expect("seeded");
+        assert!(
+            seed < body.find("loop {").expect("loop"),
+            "seeded before the loop"
+        );
     }
 
     // Regression: 2026-10-13 (DA-13d review) — the new outcome label was not

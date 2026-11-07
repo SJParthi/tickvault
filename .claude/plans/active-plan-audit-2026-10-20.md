@@ -2430,7 +2430,8 @@ Revert the PR; config switches restore the old windows.
 #### Observability
 `tv_partition_archive_wal_snapshot_wait_secs`, `tv_archive_backlog_bytes`, `tv_partition_archive_quiesce_held_total` (local `/metrics` only, no page).
 
-- [ ] AA-1 snapshot WAL gate + quiesce lock
+- [x] AA-1a quiesce lock + config keys (step 1): `crates/storage/src/archive_quiesce.rs` (`ArchiveQuiesce`, `hold_writers_for_archive`, `archive_quiesce_shared`, `try_archive_quiesce_shared`, `archive_quiesce_shared_blocking`, `archive_quiesce_for_replay`); writers wired: boot refold and catch-up chunks (`dhan_feed_stack.rs`, stop reason `archive_quiesce`), `replay_spill_dir`, `replay_framed_spill_dir`, the after-close depth pass per bucket; the eleven `[partition_retention]` keys with their defaults (`config.rs`, `base.toml`). Tests: `test_quiesce_writer_waits_behind_queued_archiver`, `test_archiver_write_times_out_against_held_reader`, `test_boot_refold_in_session_never_waits_on_quiesce`, `test_catchup_stops_with_archive_quiesce_reason`, `test_spill_round_ends_when_quiesce_busy_files_kept`, `test_framed_spill_round_ends_when_quiesce_busy_files_kept`, `test_partition_retention_pr_aa_keys_default_and_parse`. Nothing takes the archiver side yet, so no writer waits in production until step 2.
+- [ ] AA-1b snapshot WAL gate (step 2; the archiver takes `hold_writers_for_archive`)
 - [ ] AA-2 hour path for the four tables
 - [ ] AA-3 projected-fill trigger
 - [ ] AA-4 daily leg until done

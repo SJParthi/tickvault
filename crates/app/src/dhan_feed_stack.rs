@@ -17582,6 +17582,20 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ))
             .await;
         }
+        // PR AA (owner Quote 51): the boot refold writes rows into OLD hours,
+        // so it runs only while no archiver is copying and dropping one of
+        // them. 09:00 to 15:40 IST it only tries (the morning boot never
+        // waits on an archive); outside it waits at most 60 s. Released
+        // right after the refold's flush and ack (`drop` below the chain).
+        let boot_quiesce = if seal_writer_ready && !shutdown_requested() {
+            tickvault_storage::archive_quiesce::archive_quiesce_for_replay(
+                now_ist_secs_of_day(),
+                tickvault_storage::archive_quiesce::QuiesceWriter::BootRefold,
+            )
+            .await
+        } else {
+            None
+        };
         if !seal_writer_ready {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
@@ -17604,6 +17618,19 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "Dhan live feed: shutdown arrived before the WAL refold — the staged \
                  write-ahead log frames are not folded now and are re-offered on the \
                  next boot"
+            );
+        } else if boot_quiesce.is_none() {
+            // The partition archiver held the old-hour writers out: fold
+            // nothing. The staged segments stay unconfirmed, so the catch-up
+            // drain below or the next boot reads them again. Counted on
+            // `tv_partition_archive_quiesce_held_total{writer="boot_refold"}`.
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_refold_archive_quiesce",
+                staged_frames = params.wal_replay_live_feed.len(),
+                "Dhan live feed: the partition archiver was copying an old hour to S3, so \
+                 the boot WAL refold did not run. The staged write-ahead log frames are \
+                 kept and re-offered (deferred, not lost)."
             );
         } else {
             let unlanded_before =
@@ -17718,6 +17745,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
         }
+        // PR AA: the refold, its flush and its ack are done; let an archiver in.
+        drop(boot_quiesce);
 
         // ---- CATCH-UP DRAIN --------------------------------------------
         //
@@ -18152,6 +18181,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // refused the whole round, and the next boot re-read the same
             // segments: zero progress from 21 to 26 Oct.
             let mut round_landed = true;
+            let mut round_quiesce_held = false;
             let mut round_frames = 0usize;
             let mut round_ticks = 0u64;
             let mut round_lost = 0u64;
@@ -18171,7 +18201,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 // DA-13c review: the suspicion count BEFORE this chunk's first ack.
                 let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
                 if !chunk.is_empty() {
+                    use tickvault_storage::archive_quiesce as aq;
                     use tickvault_storage::wal_applied_watermark::applied_watermark;
+                    // PR AA (owner Quote 51): hold the old-hour writers' lock
+                    // through this chunk's refold, flush and ack. A miss
+                    // stops the drain here, before this segment settles; it
+                    // stays waiting for the next drain or boot.
+                    let now = now_ist_secs_of_day();
+                    let quiesce = aq::archive_quiesce_for_replay(now, aq::QuiesceWriter::CatchUp);
+                    let Some(_quiesce) = quiesce.await else {
+                        round_quiesce_held = true;
+                        break;
+                    };
                     let unlanded_before = applied_watermark().unlanded_total();
                     let outcome =
                         refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
@@ -18210,6 +18251,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             catchup_ticks = catchup_ticks.saturating_add(round_ticks);
             if !round_landed {
                 catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
+                break;
+            }
+            if round_quiesce_held {
+                catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;
                 break;
             }
             rounds = rounds.saturating_add(1);
