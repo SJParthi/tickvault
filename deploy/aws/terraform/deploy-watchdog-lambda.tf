@@ -246,6 +246,14 @@ resource "aws_lambda_permission" "deploy_watchdog_postmarket" {
 # THIS instance only. SSM agent is up within ~30-60s of `running`; the
 # dispatched GitHub deploy takes ~1-2 min to reach its SSM step, by which the
 # box is ready.
+#
+# 2026-11-07 (owner: "see today is saturday why the fuck server started dude
+# why?"): an event pattern cannot filter by day, so this rule still fires on
+# every start, weekends and holidays included. The day gate lives in the
+# handler: crates/aws-lambdas/src/deploy_watchdog.rs `non_trading_day_skip`
+# returns before any read, page or dispatch unless the IST date is a regular
+# NSE trading day (nse_calendar, pinned to config/base.toml). A Muhurat date
+# is skipped too (every deploy workflow refuses it, Quote 49).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_event_rule" "deploy_watchdog_instance_start" {
   name        = "tv-${var.environment}-deploy-watchdog-instance-start"
@@ -301,9 +309,14 @@ resource "aws_cloudwatch_metric_alarm" "binary_sha_stale" {
   statistic           = "Minimum"
   threshold           = 1
   dimensions          = { host = "tickvault-prod" }
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.tv_alerts.arn]
-  ok_actions          = [aws_sns_topic.tv_alerts.arn]
+  # 2026-11-07: "ignore", was "notBreaching". The watchdog publishes nothing on
+  # a weekend or NSE holiday (non_trading_day_skip), so a Friday ALARM read the
+  # empty Saturday window as OK and sent a false "recovered". With "ignore" a
+  # missing day keeps the current state: it still never pages, and the OK
+  # (with its recovery message) comes only from a real 0 sample.
+  treat_missing_data = "ignore"
+  alarm_actions      = [aws_sns_topic.tv_alerts.arn]
+  ok_actions         = [aws_sns_topic.tv_alerts.arn]
 
   tags = {
     Project = "tickvault"

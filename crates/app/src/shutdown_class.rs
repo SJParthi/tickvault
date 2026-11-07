@@ -123,6 +123,40 @@ pub const HOLIDAY_GATE_STOP_LAG_SECS: u32 = 600;
 pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
     crate::holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST + HOLIDAY_GATE_STOP_LAG_SECS;
 
+/// How long after a Muhurat session's end the start watchdog stops the box
+/// it started (2026-11-07): the Lambda's
+/// `muhurat_window::MUHURAT_BOX_STOP_TAIL_MINUTES` (60) in seconds. The app
+/// cannot import that crate, so the value is pinned to it by
+/// `test_muhurat_box_stop_tail_matches_the_start_watchdog`.
+pub const MUHURAT_BOX_STOP_TAIL_SECS: u32 = 3_600;
+
+/// How long after the Muhurat box-stop instant the app's SIGTERM can land
+/// (2026-11-07): the start watchdog's `muhurat_check` fires every 15 minutes,
+/// so its first after-window stop lands up to 15 minutes after the stop
+/// instant, a failed stop is retried 15 minutes later, and EC2 then has to
+/// deliver the shutdown (Assumed under 10 minutes, as for the holiday gate).
+pub const MUHURAT_STOP_WINDOW_TRAIL_SECS: u32 = 2_400;
+
+/// Whether `ist_secs_of_day` falls in the window in which the start watchdog
+/// stops a box after today's Muhurat session (2026-11-07): from session end
+/// plus [`MUHURAT_BOX_STOP_TAIL_SECS`] for [`MUHURAT_STOP_WINDOW_TRAIL_SECS`].
+/// `muhurat_session` is today's `(start, end)` in IST seconds of day, `None`
+/// on any day without a timed Muhurat session. A window that would cross
+/// midnight is not recognised (the stop then stays loud). O(1).
+///
+/// Owner, 2026-11-07: "I dont need any hallucination or illusion I just need
+/// the working guaranteed assurance solution". Before this, the planned stop
+/// after the Sunday 2026-11-08 session paged "Unexpected stop".
+#[must_use]
+pub fn in_muhurat_stop_window(muhurat_session: Option<(u32, u32)>, ist_secs_of_day: u32) -> bool {
+    let Some((_, end)) = muhurat_session else {
+        return false;
+    };
+    let start = end.saturating_add(MUHURAT_BOX_STOP_TAIL_SECS);
+    let stop = start.saturating_add(MUHURAT_STOP_WINDOW_TRAIL_SECS);
+    stop <= 86_400 && (start..stop).contains(&ist_secs_of_day)
+}
+
 /// Classify a graceful shutdown. Inputs are all in-process:
 ///
 /// - `signal`: the signal name `wait_for_shutdown_signal` already produces
@@ -276,6 +310,13 @@ pub fn take_planned_deploy_marker(path: &Path, now_epoch_secs: i64) -> bool {
 /// input — Ctrl+C, a local stop, an unknown signal, no marker — classifies
 /// exactly as [`classify_shutdown`] does, so the marker can only ever quiet a
 /// stop the deploy positively announced.
+///
+/// `muhurat_session` (2026-11-07) is today's Muhurat session as IST seconds
+/// of day (`TradingCalendar::muhurat_session_secs`), `None` on every other
+/// day. An AWS SIGTERM inside [`in_muhurat_stop_window`] is the start
+/// watchdog's planned stop after that session and classifies as
+/// [`ShutdownClass::ScheduledStop`]; a stop at any other hour of a Muhurat
+/// date (the session itself included) stays loud.
 #[must_use]
 pub fn classify_shutdown_with_deploy_marker(
     signal: &str,
@@ -284,6 +325,7 @@ pub fn classify_shutdown_with_deploy_marker(
     is_weekday: bool,
     is_trading_day: bool,
     planned_deploy_marker: bool,
+    muhurat_session: Option<(u32, u32)>,
 ) -> ShutdownClass {
     if planned_deploy_marker && is_aws && signal == "sigterm" {
         return ShutdownClass::PlannedDeployRestart;
@@ -301,6 +343,13 @@ pub fn classify_shutdown_with_deploy_marker(
         && signal == "sigterm"
         && crate::drain_hold::stop_follows_tonights_hold(ist_secs_of_day)
     {
+        return ShutdownClass::ScheduledStop;
+    }
+    // 2026-11-07: the start watchdog stops the box it started for a Muhurat
+    // session one hour after the session ends. No marker announces it, and a
+    // Muhurat date is a weekend or a holiday, so neither quiet window below
+    // covers it.
+    if is_aws && signal == "sigterm" && in_muhurat_stop_window(muhurat_session, ist_secs_of_day) {
         return ShutdownClass::ScheduledStop;
     }
     classify_shutdown(signal, is_aws, ist_secs_of_day, is_weekday, is_trading_day)
@@ -386,11 +435,163 @@ mod tests {
         ];
         for (signal, is_aws, secs, marker, expected) in cases {
             assert_eq!(
-                classify_shutdown_with_deploy_marker(signal, is_aws, secs, true, true, marker),
+                classify_shutdown_with_deploy_marker(
+                    signal, is_aws, secs, true, true, marker, None
+                ),
                 expected,
                 "signal={signal} is_aws={is_aws} secs={secs} marker={marker}"
             );
         }
+    }
+
+    /// 2026-11-08 Diwali Muhurat: session 14:05-15:40 IST (config/base.toml).
+    const MUHURAT_2026: Option<(u32, u32)> = Some((14 * 3600 + 5 * 60, 15 * 3600 + 40 * 60));
+
+    /// Regression (2026-11-07): the start watchdog's stop after the Sunday
+    /// Muhurat session (16:40 IST, first `muhurat_check` fire 16:45) paged
+    /// "Unexpected stop". It is now a scheduled stop, on a Sunday that is not
+    /// a trading day, with no deploy marker and no drain hold.
+    #[test]
+    fn test_regression_muhurat_after_session_stop_is_scheduled() {
+        let box_stop = 16 * 3600 + 40 * 60;
+        for secs in [
+            box_stop,
+            16 * 3600 + 45 * 60,
+            17 * 3600,
+            box_stop + MUHURAT_STOP_WINDOW_TRAIL_SECS - 1,
+        ] {
+            assert_eq!(
+                classify_shutdown_with_deploy_marker(
+                    "sigterm",
+                    true,
+                    secs,
+                    false,
+                    false,
+                    false,
+                    MUHURAT_2026
+                ),
+                ShutdownClass::ScheduledStop,
+                "secs={secs}"
+            );
+        }
+    }
+
+    /// The Muhurat arm quiets only the after-session stop: a kill during the
+    /// session, before the box-stop instant, after the window, on a day with
+    /// no Muhurat session, a local stop and Ctrl+C all classify as before.
+    #[test]
+    fn test_muhurat_arm_quiets_only_the_after_session_window() {
+        let box_stop = 16 * 3600 + 40 * 60;
+        for secs in [
+            14 * 3600 + 30 * 60, // mid-session kill
+            15 * 3600 + 45 * 60, // after the session, before the box stop
+            box_stop - 1,
+            box_stop + MUHURAT_STOP_WINDOW_TRAIL_SECS,
+            20 * 3600,
+        ] {
+            assert_eq!(
+                classify_shutdown_with_deploy_marker(
+                    "sigterm",
+                    true,
+                    secs,
+                    false,
+                    false,
+                    false,
+                    MUHURAT_2026
+                ),
+                ShutdownClass::ExternalStop,
+                "secs={secs}"
+            );
+        }
+        assert_eq!(
+            classify_shutdown_with_deploy_marker(
+                "sigterm", true, box_stop, false, false, false, None
+            ),
+            ShutdownClass::ExternalStop
+        );
+        assert_eq!(
+            classify_shutdown_with_deploy_marker(
+                "sigterm",
+                false,
+                box_stop,
+                false,
+                false,
+                false,
+                MUHURAT_2026
+            ),
+            ShutdownClass::OperatorStop
+        );
+        assert_eq!(
+            classify_shutdown_with_deploy_marker(
+                "sighup",
+                true,
+                box_stop,
+                false,
+                false,
+                false,
+                MUHURAT_2026
+            ),
+            ShutdownClass::ExternalStop
+        );
+    }
+
+    #[test]
+    fn test_in_muhurat_stop_window_boundaries_and_midnight() {
+        let end = 15 * 3600 + 40 * 60;
+        let start = end + MUHURAT_BOX_STOP_TAIL_SECS;
+        assert!(in_muhurat_stop_window(Some((0, end)), start));
+        assert!(!in_muhurat_stop_window(Some((0, end)), start - 1));
+        assert!(!in_muhurat_stop_window(
+            Some((0, end)),
+            start + MUHURAT_STOP_WINDOW_TRAIL_SECS
+        ));
+        assert!(!in_muhurat_stop_window(None, start));
+        // A late session whose stop window crosses midnight is not
+        // recognised: the stop stays loud rather than quieting a wrong hour.
+        assert!(!in_muhurat_stop_window(
+            Some((0, 23 * 3600)),
+            23 * 3600 + 3600
+        ));
+        assert!(!in_muhurat_stop_window(Some((0, u32::MAX)), 0));
+    }
+
+    /// The tail and the 15-minute cadence must match what the start watchdog
+    /// actually does, or the quiet window and the real stop drift apart.
+    #[test]
+    fn test_muhurat_box_stop_tail_matches_the_start_watchdog() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let window = std::fs::read_to_string(root.join("crates/aws-lambdas/src/muhurat_window.rs"))
+            .expect("muhurat_window.rs readable");
+        assert!(
+            window.contains(&format!(
+                "pub const MUHURAT_BOX_STOP_TAIL_MINUTES: i64 = {};",
+                MUHURAT_BOX_STOP_TAIL_SECS / 60
+            )),
+            "MUHURAT_BOX_STOP_TAIL_SECS must equal the start watchdog's tail"
+        );
+        let tf =
+            std::fs::read_to_string(root.join("deploy/aws/terraform/start-watchdog-lambda.tf"))
+                .expect("start-watchdog-lambda.tf readable");
+        assert!(
+            tf.contains("\"cron(0/15 0-18 %d %d ? %s)\""),
+            "the muhurat_check cadence the trail is sized for is every 15 minutes"
+        );
+        assert!(MUHURAT_STOP_WINDOW_TRAIL_SECS >= 2 * 15 * 60);
+    }
+
+    /// main.rs must hand today's Muhurat session to the classifier.
+    #[test]
+    fn test_main_passes_todays_muhurat_session_to_the_classifier() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main = std::fs::read_to_string(root.join("src/main.rs")).expect("main.rs readable");
+        let call = main
+            .find("shutdown_class::classify_shutdown_with_deploy_marker(")
+            .expect("main.rs classifies the stop");
+        let block = &main[call..(call + 600).min(main.len())];
+        assert!(
+            block.contains("trading_calendar.muhurat_session_secs(today_ist)"),
+            "main.rs must pass today's Muhurat session"
+        );
     }
 
     #[test]

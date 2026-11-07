@@ -121,7 +121,7 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/auto-fix-refresh-instruments.sh", 65),
     ("scripts/auto-fix-rotate-token-rollback.sh", 56),
     ("scripts/auto-fix-rotate-token.sh", 97),
-    ("scripts/aws-autopilot.sh", 471),
+    ("scripts/aws-autopilot.sh", 468),
     ("scripts/aws-bootstrap-state-backend.sh", 94),
     ("scripts/aws-one-shot-bootstrap.sh", 323),
     ("scripts/aws-seed-ssm-parameters.sh", 250),

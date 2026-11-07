@@ -821,6 +821,18 @@ pub async fn run_watchdog<E: Ec2Api, S: SsmApi, N: SnsApi>(
     }
 
     if mode == "ping" {
+        // 2026-11-07: the 08:30 ping said "the app should report live" on a
+        // weekday NSE holiday (the holiday gate stops the box minutes later)
+        // and while a budget stop holds the box down this month. Neither day
+        // starts the app, so the ping stays silent.
+        if !crate::nse_calendar::is_nse_trading_day_at(now) {
+            info!("ping — not an NSE trading day; start message not sent");
+            return Ok(json!({"mode": "ping", "published": false, "skipped": "non_trading_day"}));
+        }
+        if budget_stop_is_this_month(ssm, &env.budget_stop_param, now).await {
+            info!("ping — budget stop holds this month; start message not sent");
+            return Ok(json!({"mode": "ping", "published": false, "skipped": "budget_stop"}));
+        }
         let mut message = "🟢 8:30 AM IST instance start triggered (Mon-Fri). \
 The app should report live in ~3 minutes. \
 If you do NOT get a 'tickvault started' message by 8:40 AM, the \
@@ -1171,6 +1183,18 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
         info!("check OK — instance is running; staying silent");
         return Ok(json!({
             "mode": "check", "state": state, "alerted": false, "self_started": false
+        }));
+    }
+
+    // 2026-11-07 (review of the holiday fixes): on a weekday NSE holiday the
+    // box is meant to be stopped, so a missing holiday marker (the gate's
+    // marker write failed, or the 08:30 start never ran) must not start it
+    // here and page. The compiled calendar decides first, as the ping does.
+    if !crate::nse_calendar::is_nse_trading_day_at(now) {
+        info!(state = %state, "check — not an NSE trading day; no self-start, no page");
+        return Ok(json!({
+            "mode": "check", "state": state, "alerted": false, "self_started": false,
+            "skipped": "non_trading_day"
         }));
     }
 
@@ -1663,6 +1687,51 @@ mod tests {
         assert!(!published[0].message.contains("08:00"));
     }
 
+    /// Regression (2026-11-07): no "start triggered, app should report live"
+    /// on a weekday NSE holiday (Tue 2026-11-10 08:30 IST) or while a budget
+    /// stop holds this month; a normal weekday still sends it.
+    #[tokio::test]
+    async fn test_regression_ping_silent_on_holiday_and_budget_stop() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).ip("13.200.1.2");
+        let out = run(
+            json!({"mode": "ping"}),
+            &ec2,
+            &FakeSsm::raising(),
+            &sns,
+            utc(2026, 11, 10, 3, 0),
+        )
+        .await;
+        assert_eq!(out["published"], json!(false));
+        assert_eq!(out["skipped"], json!("non_trading_day"));
+
+        let out = run(
+            json!({"mode": "ping"}),
+            &ec2,
+            &FakeSsm::empty().budget("2026-06"),
+            &sns,
+            in_window_now(),
+        )
+        .await;
+        assert_eq!(out["published"], json!(false));
+        assert_eq!(out["skipped"], json!("budget_stop"));
+        assert!(sns.published.borrow().is_empty());
+
+        let out = run(
+            json!({"mode": "ping"}),
+            &ec2,
+            &FakeSsm::empty().budget("2026-05"),
+            &sns,
+            in_window_now(),
+        )
+        .await;
+        assert_eq!(
+            out["published"],
+            json!(true),
+            "a stale latch never silences it"
+        );
+    }
+
     #[tokio::test]
     async fn test_ping_includes_dashboard_link() {
         // The operator's 08:30 start ping must carry a tappable Feed Control
@@ -1960,6 +2029,39 @@ mod tests {
         assert_eq!(out["skipped"], json!("holiday_stop"));
         assert!(ec2.start_calls.borrow().is_empty()); // the restart war never begins
         assert!(sns.published.borrow().is_empty()); // no false Critical page
+    }
+
+    #[tokio::test]
+    async fn test_check_stopped_on_nse_holiday_without_marker_stays_silent_no_start() {
+        // Tue 2026-11-10 is an NSE holiday; 03:15 UTC = 08:45 IST. The holiday
+        // marker is missing (its write failed, or the 08:30 start never ran):
+        // the calendar alone must keep the box stopped and the pager quiet.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::empty();
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &ssm,
+            &sns,
+            utc(2026, 11, 10, 3, 15),
+        )
+        .await;
+        assert_eq!(out["self_started"], json!(false));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["skipped"], json!("non_trading_day"));
+        assert!(ec2.start_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+        // The trading day after it still self-heals with no marker.
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &ssm,
+            &sns,
+            utc(2026, 11, 11, 3, 15),
+        )
+        .await;
+        assert_eq!(out["self_started"], json!(true));
     }
 
     #[tokio::test]
@@ -3618,6 +3720,14 @@ mod sdk_loopback_tests {
                     .await
                     .expect("ping succeeds");
                 assert!(out.is_object(), "{out}");
+                // `handle` reads the real clock. Since 2026-11-07 the ping is
+                // silent on a weekend or NSE holiday, so on such a day the
+                // SDK path ends at the calendar check (the publish path is
+                // covered by the fake-clock ping tests above).
+                if !crate::nse_calendar::is_nse_trading_day_at(Utc::now()) {
+                    assert_eq!(out["skipped"], json!("non_trading_day"), "{out}");
+                    return;
+                }
                 let ops = operations(&requests);
                 assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
                 let publish = recorded(&requests)
