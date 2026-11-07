@@ -13,7 +13,9 @@
 //!    [`SHUTDOWN_RING_DEFERRED_COUNTER`], unbacked ones on
 //!    `tv_ticks_lost_total{source="shutdown_ring_unbacked"}`.
 //!
-//! 2. **The tick writer and rescue threads.** An abandoned thread counted `+1`
+//! 2. **The tick and depth writer and rescue threads.** (The depth pair joined
+//!    on 2026-11-07: inline-depth `market_depth_book` rows from a frame the WAL
+//!    refused had the same gap.) An abandoned thread counted `+1`
 //!    per event, never rows, so the rows of an unbacked batch it was holding
 //!    reached no row-level loss counter. Each thread now takes batches through
 //!    an [`OffloadQueue`] that records the batch it holds (rows, and whether any
@@ -53,6 +55,16 @@ pub(super) const RESCUE_ABANDONED_SOURCE: &str = "rescue_abandoned";
 /// held when the shutdown gave up on it.
 pub(super) const WRITER_ABANDONED_SOURCE: &str = "writer_abandoned";
 
+/// `tv_ticks_lost_total` source for unbacked inline-depth rows the depth
+/// writer thread still held when the shutdown gave up on it (2026-11-07, the
+/// depth twin of [`WRITER_ABANDONED_SOURCE`]). Rows are in the depth writer's
+/// `pending` unit: one per level row, one per staged level for array rows.
+pub(super) const DEPTH_WRITER_ABANDONED_SOURCE: &str = "depth_writer_abandoned";
+
+/// `tv_ticks_lost_total` source for unbacked inline-depth rows the depth
+/// rescue thread still held when the shutdown gave up on it (2026-11-07).
+pub(super) const DEPTH_RESCUE_ABANDONED_SOURCE: &str = "depth_rescue_abandoned";
+
 /// WAL-backed frames still in the ring when the drain stopped. Not a loss: the
 /// next boot's WAL replay folds them. Local `/metrics` only.
 pub(super) const SHUTDOWN_RING_DEFERRED_COUNTER: &str = "tv_dhan_feed_shutdown_ring_deferred_total";
@@ -76,6 +88,8 @@ pub(super) fn seed_shutdown_loss_baselines() {
         SHUTDOWN_RING_UNBACKED_SOURCE,
         RESCUE_ABANDONED_SOURCE,
         WRITER_ABANDONED_SOURCE,
+        DEPTH_WRITER_ABANDONED_SOURCE,
+        DEPTH_RESCUE_ABANDONED_SOURCE,
     ] {
         metrics::counter!("tv_ticks_lost_total", "source" => source).increment(0);
     }
@@ -273,6 +287,22 @@ impl<T> OffloadQueue<T> {
         }
         Some(residue)
     }
+}
+
+/// [`OffloadQueue`] measure for the depth writer queue: rows in the writer's
+/// `pending` unit (levels for array rows, staged levels included) and whether
+/// any has no WAL record. O(1).
+pub(super) fn measure_depth_flush(
+    b: &tickvault_storage::depth_persistence::DepthFlushBatch,
+) -> (u64, bool) {
+    (b.rows() as u64, b.has_unbacked_rows())
+}
+
+/// [`OffloadQueue`] measure for the depth rescue queue. O(1).
+pub(super) fn measure_depth_rescue(
+    b: &tickvault_storage::depth_persistence::DepthRescueBatch,
+) -> (u64, bool) {
+    (b.rows() as u64, b.has_unbacked_rows())
 }
 
 /// Counts an abandoned thread's unbacked rows on `tv_ticks_lost_total`.

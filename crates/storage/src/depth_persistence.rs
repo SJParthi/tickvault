@@ -3993,6 +3993,14 @@ impl DepthRescueBatch {
         self.rows
     }
 
+    /// `true` when some row has no WAL record behind it (the rescue twin of
+    /// [`DepthFlushBatch::has_unbacked_rows`]; 2026-11-07). O(1).
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by test_depth_rescue_batch_carries_unbacked and the app's abandoned-depth-rescue regression test.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+
     /// RAM a parked batch holds against `DEPTH_PARKED_RESCUE_MAX_BYTES`:
     /// its text bytes plus (PF-4b) its staged batch by CAPACITY, since a
     /// parked staged batch pins its whole reservation. O(1).
@@ -4360,6 +4368,16 @@ impl DepthFlushBatch {
     // TEST-EXEMPT: accessor, exercised by the offload tests below.
     pub const fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// `true` when some row has no WAL record behind it, so it cannot be
+    /// replayed if this batch is lost. The shutdown join counts such rows as
+    /// lost when it abandons the depth writer thread (2026-11-07, the depth
+    /// twin of the tick `FlushBatch::has_unbacked_rows`). O(1).
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by a_sent_depth_batch_takes_the_unbacked_mark_with_it and the app's abandoned-depth-writer regression test.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
     }
 }
 
@@ -4895,6 +4913,7 @@ mod tests {
         assert_eq!(w.discard_pending(), 1);
         let batch = rx.try_recv().expect("queued");
         assert!(!batch.unbacked, "a WAL-sequenced depth row is backed");
+        assert!(!batch.has_unbacked_rows(), "the accessor reads the mark");
         assert_ne!(batch.min_seq, 0);
         sink.rescue(&batch);
 
@@ -4903,6 +4922,8 @@ mod tests {
         assert_eq!(w.discard_pending(), 1);
         let batch = rx.try_recv().expect("queued");
         assert!(batch.unbacked, "a frame the WAL refused is unbacked");
+        assert!(batch.has_unbacked_rows(), "the accessor reads the mark");
+        assert_eq!(batch.rows(), 1);
         sink.rescue(&batch);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6750,6 +6771,7 @@ mod tests {
         w.flush().expect("hand-off");
         let first = rx.try_recv().expect("first batch");
         assert!(first.unbacked, "the marked batch carries the mark");
+        assert!(first.has_unbacked_rows(), "the accessor reads the mark");
         assert!(!w.pending_unbacked(), "the Sent arm clears the mark");
 
         w.append_row(&row()).expect("append");
@@ -6759,6 +6781,7 @@ mod tests {
             !second.unbacked,
             "a later, fully sequenced batch must read as backed"
         );
+        assert!(!second.has_unbacked_rows(), "the accessor reads the mark");
     }
 
     #[test]

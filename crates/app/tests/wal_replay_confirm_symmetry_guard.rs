@@ -31,6 +31,13 @@
 
 use std::path::PathBuf;
 
+/// The one STAGE-C confirm site in `main.rs`. Since 2026-11-07 boot settles
+/// `replaying/` through `boot_wal_confirm` (which archives only a pass that
+/// read its segments, never a failed or refused one) instead of calling
+/// `ws_frame_spill::confirm_replayed(` directly; the counting and ordering
+/// below are unchanged and now read this call.
+const CONFIRM_SITE: &str = "boot_wal_confirm::settle_boot_replay_staging(";
+
 /// Strip `//` line comments so PROSE about the confirm can neither satisfy
 /// nor break an assertion about the CODE.
 ///
@@ -64,7 +71,7 @@ fn main_rs() -> String {
 fn confirm_replayed_called_from_both_boot_paths() {
     // PR-C2: single boot path → exactly one confirm site.
     let body = main_rs();
-    let calls = body.matches("ws_frame_spill::confirm_replayed(").count();
+    let calls = body.matches(CONFIRM_SITE).count();
     assert_eq!(
         calls, 1,
         "ws_frame_spill::confirm_replayed must be called exactly once (the \
@@ -90,7 +97,7 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
     // and the next reader's cheapest fix is to weaken it.
     let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let flat_confirm = flat
-        .find("ws_frame_spill::confirm_replayed(")
+        .find(CONFIRM_SITE)
         .expect("confirm_replayed must exist in the normalised body too");
     for ws_type in ["live_feed", "order_update"] {
         let needle =

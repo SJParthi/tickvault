@@ -183,16 +183,27 @@ fn the_unfolded_frames_message_no_longer_claims_the_segments_were_archived() {
 
 #[test]
 fn a_refused_boot_replay_never_confirms_the_staged_leftovers() {
+    // 2026-11-07: the decision moved to `boot_wal_confirm` (behaviourally
+    // tested there, failed pass included); this pins the wiring.
     let main = production("src/main.rs");
     assert!(
-        main.contains(
-            "ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap"
-        ),
-        "STAGE-C must read the refusal flags off the batch, not infer 'nothing to replay' from an empty frame list"
+        main.contains("BootReplayPass::of(&ws_wal_replay_result)"),
+        "STAGE-C must classify the pass from the whole result (refusal flags and Err), \
+         not infer 'nothing to replay' from an empty frame list"
     );
     assert!(
-        main.contains("} else if ws_wal_replay_refused {"),
-        "the confirm branch must be gated on the refusal — a refused pass leaves `replaying/` untouched"
+        main.contains("ws_wal_replay_pass,"),
+        "the classified pass must reach the confirm step"
+    );
+    let decide = production("src/boot_wal_confirm.rs");
+    assert!(
+        decide.contains("batch.stopped_for_disk || batch.stopped_for_frame_cap => Self::Refused"),
+        "the refusal flags must classify the pass as refused"
+    );
+    assert!(
+        decide.contains("BootReplayPass::Refused => StageCConfirm::HeldRefused")
+            && decide.contains("BootReplayPass::Failed => StageCConfirm::HeldFailed"),
+        "a refused or failed pass must hold `replaying/` untouched"
     );
 }
 

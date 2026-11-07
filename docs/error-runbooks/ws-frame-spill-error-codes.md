@@ -167,6 +167,30 @@ Two more codes in this family, both Medium and neither alarmed. Their runbook is
   `tv_wal_replay_corrupted_segments_total`; WS-SPILL-02 was not reused because it
   would page the same event a second time.
 
+### 2026-11-07 — a failed boot replay no longer archives `replaying/`
+
+Until this date, a STAGE-C boot replay that returned an error (a segment
+folder could not be listed, K2 fail-closed) fell through in `main.rs` to
+`confirm_replayed`, which archived the segments an earlier boot had staged in
+`replaying/` without reading them. Archived segments are never replayed, so
+their rows were lost from the database.
+
+The decision now lives in `crates/app/src/boot_wal_confirm.rs`: only a pass
+that read its segments, with no lane refold pending, archives. A failed pass
+logs `WS-SPILL-04` with `source = "boot_replay_error_staging_kept"` (a refused
+pass logs `WS-SPILL-01` with `source = "boot_replay_refused_staging_kept"`),
+both `warn!`, no page; `replaying/` stays for the WAL catch-up drain or the
+next boot. Every outcome is counted on `tv_wal_boot_replay_confirm_total{outcome}`
+(`held_for_lane_refold`, `held_refused`, `held_failed`, `archived`; local
+`/metrics` only, all four registered at 0 each boot).
+
+Triage for `boot_replay_error_staging_kept`: the preceding `WS-SPILL-04` line
+from the storage layer names the folder that could not be listed. Fix its
+permissions or the volume (`ls -la data/ws_wal data/ws_wal/replaying`), then restart
+or let the catch-up drain retry; nothing is lost while the segments stay put.
+The boot-time `WS-SPILL-02 source="boot_replay_failed"` line still pages as
+before; its text now says nothing staged was archived.
+
 ---
 
 ## §3. Trigger / auto-load
