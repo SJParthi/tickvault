@@ -24,6 +24,11 @@
 //! * every tick round trip runs through BOTH tick encoders: the library one
 //!   and our own (`TickIlpEncoder::Own`), which production runs
 //!   (`config/production.toml` `own_ilp_encoder = true`, audit 2026-11-07);
+//!   so does every candle round trip, since the same switch picks the candle
+//!   writer's encoder;
+//! * ticks also round-trip through the OFFLOADED writer (`split_for_offload`,
+//!   producer, bounded queue, writer-thread sink), the shape the live lane
+//!   runs, with both encoders;
 //! * a row the server refuses (wrong column type) is classified the same by
 //!   both senders, keeps its bytes for the rescue, and does not poison the
 //!   connection for the next good row.
@@ -373,6 +378,111 @@ async fn tick_captures_and_segments_round_trip(
     );
 }
 
+/// Ticks through the OFFLOADED writer, the shape the live lane runs: the
+/// producer stages rows and hands each flush to a writer thread over the
+/// bounded queue, and that thread's sink makes the HTTP round trip. Both
+/// encoders. Every row the sink reports landed is read back, a replayed row
+/// collapses, and nothing stays pending or queued (audit 2026-11-07: the
+/// real-QuestDB tick tests used only the synchronous flush).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offloaded_ticks_land_through_the_writer_thread_with_both_encoders() {
+    let Some(cfg) = qdb() else { return };
+    assert!(ensure_ticks_table(&cfg).await, "ticks");
+    const ROWS: u32 = 40;
+    for (encoder, offset) in ENCODERS {
+        let sid = 915_001 + offset;
+        let writer = TickWriter::new_with_encoder(&cfg, Feed::Dhan, encoder);
+        let (mut producer, sink, queue) = writer.split_for_offload();
+        // The writer thread, as the live lane runs it: write every batch
+        // until the producer closes the queue.
+        let writer_thread = std::thread::spawn(move || {
+            let mut sink = sink;
+            let mut landed = 0_usize;
+            let mut batches = 0_usize;
+            for mut batch in queue {
+                landed += sink.write(&mut batch);
+                batches += 1;
+            }
+            (landed, batches)
+        });
+        for seq in 1..=ROWS {
+            let t = tick(sid, SEG_NSE_FNO, TEN, 300.05, seq);
+            producer
+                .append_tick_with_seq(&t, i64::from(seq))
+                .expect("append"); // APPROVED: test-only
+            if seq % 20 == 0 {
+                producer.flush().expect("hand-off to the writer thread"); // APPROVED: test-only
+            }
+        }
+        // A WAL replay of the first row: same capture_seq, same key.
+        producer
+            .append_tick_with_seq(&tick(sid, SEG_NSE_FNO, TEN, 300.05, 1), 1)
+            .expect("append"); // APPROVED: test-only
+        producer.flush().expect("hand-off to the writer thread"); // APPROVED: test-only
+        assert_eq!(
+            producer.pending(),
+            0,
+            "{encoder:?}: every row left the producer"
+        );
+        producer.close_offload();
+        let (landed, batches) =
+            tokio::task::block_in_place(|| writer_thread.join()).expect("writer thread"); // APPROVED: test-only
+        assert_eq!(
+            landed,
+            ROWS as usize + 1,
+            "{encoder:?}: the sink must report every handed-off row landed"
+        );
+        assert_eq!(batches, 3, "{encoder:?}: one batch per hand-off");
+        wait_applied(&cfg, "ticks").await;
+        assert_eq!(
+            tick_count(&cfg, sid).await,
+            u64::from(ROWS),
+            "{encoder:?}: {ROWS} captures land, the replayed row collapses"
+        );
+        // The count alone would also read 40 if one capture were lost and
+        // another duplicated: every capture_seq 1..=ROWS must be there once.
+        let seqs = rows(
+            &cfg,
+            &format!(
+                "SELECT capture_seq, count() FROM ticks WHERE security_id = {sid} \
+                 ORDER BY capture_seq"
+            ),
+        )
+        .await;
+        let got: Vec<(Option<i64>, Option<i64>)> = seqs
+            .iter()
+            .map(|r| {
+                (
+                    r.get(0).and_then(Value::as_i64),
+                    r.get(1).and_then(Value::as_i64),
+                )
+            })
+            .collect();
+        let want: Vec<(Option<i64>, Option<i64>)> =
+            (1..=i64::from(ROWS)).map(|s| (Some(s), Some(1))).collect();
+        assert_eq!(
+            got, want,
+            "{encoder:?}: each capture_seq 1..={ROWS} lands exactly once"
+        );
+        let r = rows(
+            &cfg,
+            &format!("SELECT ltp, feed FROM ticks WHERE security_id = {sid} LIMIT 1"),
+        )
+        .await;
+        let row = r.first().expect("an offloaded tick row"); // APPROVED: test-only
+        assert_eq!(
+            row.get(0).and_then(Value::as_f64),
+            Some(300.05),
+            "{encoder:?}"
+        );
+        assert_eq!(
+            row.get(1).and_then(Value::as_str),
+            Some("dhan"),
+            "{encoder:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn depth_keeps_every_level_side_and_segment_and_collapses_a_replay() {
     let Some(cfg) = qdb() else { return };
@@ -423,24 +533,41 @@ async fn a_candle_written_twice_keeps_the_later_values_per_segment() {
     // The candle writer refuses to flush until the tables are keyed in this
     // process, exactly as at boot.
     assert!(ensure_shadow_candle_tables(&cfg).await, "candle tables");
-    const SID: i64 = 930_001;
+    // Both encoders, each on its own `security_id`: production runs the
+    // candle writer with our own encoder (`[tick_storage] own_ilp_encoder =
+    // true`, `config/production.toml`), which this test did not exercise
+    // until 2026-11-07.
+    for (encoder, offset) in ENCODERS {
+        let sid = 930_001 + offset as i64;
+        candle_upsert_round_trip(&cfg, encoder, sid).await;
+    }
+}
 
-    let mut w = ShadowCandleWriter::new(&cfg).expect("candle writer"); // APPROVED: test-only
-    w.append_row(&candle(SID, "NSE_FNO", 101.0, 10))
+/// One encoder's half of
+/// `a_candle_written_twice_keeps_the_later_values_per_segment`.
+async fn candle_upsert_round_trip(cfg: &QuestDbConfig, encoder: TickIlpEncoder, sid: i64) {
+    let mut w = ShadowCandleWriter::new_with_encoder(cfg, encoder).expect("candle writer"); // APPROVED: test-only
+    assert!(
+        w.is_connected(),
+        "{encoder:?}: the production constructor builds a real sender"
+    );
+    w.append_row(&candle(sid, "NSE_FNO", 101.0, 10))
         .expect("append"); // APPROVED: test-only
-    w.append_row(&candle(SID, "NSE_EQ", 99.0, 4))
+    w.append_row(&candle(sid, "NSE_EQ", 99.0, 4))
         .expect("append"); // APPROVED: test-only
-    tokio::task::block_in_place(|| w.flush()).expect("candle flush acknowledged"); // APPROVED: test-only
+    tokio::task::block_in_place(|| w.flush())
+        .unwrap_or_else(|e| panic!("{encoder:?}: candle flush not acknowledged: {e}"));
     // An amended bar for the same minute (a late tick): the same key.
-    w.append_row(&candle(SID, "NSE_FNO", 102.5, 25))
+    w.append_row(&candle(sid, "NSE_FNO", 102.5, 25))
         .expect("append"); // APPROVED: test-only
-    tokio::task::block_in_place(|| w.flush()).expect("candle flush acknowledged"); // APPROVED: test-only
-    wait_applied(&cfg, "candles_1m").await;
+    tokio::task::block_in_place(|| w.flush())
+        .unwrap_or_else(|e| panic!("{encoder:?}: candle flush not acknowledged: {e}"));
+    wait_applied(cfg, "candles_1m").await;
 
     let r = rows(
-        &cfg,
+        cfg,
         &format!(
-            "SELECT segment, close, volume FROM candles_1m WHERE security_id = {SID} \
+            "SELECT segment, close, volume FROM candles_1m WHERE security_id = {sid} \
              ORDER BY segment"
         ),
     )
@@ -448,18 +575,31 @@ async fn a_candle_written_twice_keeps_the_later_values_per_segment() {
     assert_eq!(
         r.len(),
         2,
-        "one row per segment, the amendment upserted: {r:?}"
+        "{encoder:?}: one row per segment, the amendment upserted: {r:?}"
     );
     let eq = &r[0];
     let fno = &r[1];
-    assert_eq!(eq.get(0).and_then(Value::as_str), Some("NSE_EQ"));
-    assert_eq!(eq.get(2).and_then(Value::as_i64), Some(4));
-    assert_eq!(fno.get(0).and_then(Value::as_str), Some("NSE_FNO"));
-    assert_eq!(fno.get(1).and_then(Value::as_f64), Some(102.5));
+    assert_eq!(
+        eq.get(0).and_then(Value::as_str),
+        Some("NSE_EQ"),
+        "{encoder:?}"
+    );
+    assert_eq!(eq.get(1).and_then(Value::as_f64), Some(99.0), "{encoder:?}");
+    assert_eq!(eq.get(2).and_then(Value::as_i64), Some(4), "{encoder:?}");
+    assert_eq!(
+        fno.get(0).and_then(Value::as_str),
+        Some("NSE_FNO"),
+        "{encoder:?}"
+    );
+    assert_eq!(
+        fno.get(1).and_then(Value::as_f64),
+        Some(102.5),
+        "{encoder:?}"
+    );
     assert_eq!(
         fno.get(2).and_then(Value::as_i64),
         Some(25),
-        "the later write must win (DEDUP UPSERT), not the first"
+        "{encoder:?}: the later write must win (DEDUP UPSERT), not the first"
     );
 }
 
@@ -484,10 +624,14 @@ async fn rows_survive_a_questdb_restart() {
             }
             tokio::task::block_in_place(|| tw.flush()).expect("tick flush"); // APPROVED: test-only
         }
-        let mut cw = ShadowCandleWriter::new(&cfg).expect("candle writer"); // APPROVED: test-only
-        cw.append_row(&candle(SID as i64, "NSE_FNO", 250.25, 3))
-            .expect("append"); // APPROVED: test-only
-        tokio::task::block_in_place(|| cw.flush()).expect("candle flush"); // APPROVED: test-only
+        for (encoder, offset) in ENCODERS {
+            let mut cw =
+                ShadowCandleWriter::new_with_encoder(&cfg, encoder).expect("candle writer"); // APPROVED: test-only
+            cw.append_row(&candle((SID + offset) as i64, "NSE_FNO", 250.25, 3))
+                .expect("append"); // APPROVED: test-only
+            tokio::task::block_in_place(|| cw.flush())
+                .unwrap_or_else(|e| panic!("{encoder:?}: candle flush: {e}"));
+        }
         wait_applied(&cfg, "ticks").await;
         wait_applied(&cfg, "candles_1m").await;
         for (encoder, offset) in ENCODERS {
@@ -506,15 +650,20 @@ async fn rows_survive_a_questdb_restart() {
             "{encoder:?}: ticks written before the restart are gone or duplicated"
         );
     }
-    assert_eq!(
-        count(
-            &cfg,
-            &format!("SELECT count() FROM candles_1m WHERE security_id = {SID}")
-        )
-        .await,
-        1,
-        "the candle written before the restart is gone or duplicated"
-    );
+    for (encoder, offset) in ENCODERS {
+        assert_eq!(
+            count(
+                &cfg,
+                &format!(
+                    "SELECT count() FROM candles_1m WHERE security_id = {}",
+                    SID + offset
+                )
+            )
+            .await,
+            1,
+            "{encoder:?}: the candle written before the restart is gone or duplicated"
+        );
+    }
     // And the restarted database takes new rows, through either encoder.
     for (encoder, offset) in ENCODERS {
         let mut tw = TickWriter::new_with_encoder(&cfg, Feed::Dhan, encoder);
