@@ -462,7 +462,8 @@ jobs:
       # Mitigations: the disk pre-clean step below (signature a) and the
       # retry-exactly-once wrapper around the llvm-cov invocation
       # (signature b). A SECOND consecutive llvm-cov failure is a real red —
-      # there is no continue-on-error anywhere in this job, and the
+      # the only continue-on-error in this job is the report-only
+      # production-coverage step after the gate (2026-11-07), and the
       # threshold-enforcement step is untouched.
       - name: Free runner disk space (flake signature a — see comment above)
         shell: bash
@@ -554,6 +555,16 @@ jobs:
 
       - name: Enforce per-crate coverage thresholds
         run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
+
+      # 2026-11-07 audit (tests-coverage): REPORT ONLY. The gate above counts
+      # `#[cfg(test)]` code inside src as covered; this prints per-crate
+      # production-only line coverage beside the floors (unchanged) and in the
+      # step summary. It can never fail the job. std only, so one `rustc` call
+      # builds it and no dependency is compiled a second time in this job.
+      - name: Report production-only coverage (informational)
+        if: always()
+        continue-on-error: true
+        run: rustc --edition 2024 -O -o target/llvm-cov/coverage-prod-report crates/common/src/bin/coverage_prod_report.rs && target/llvm-cov/coverage-prod-report target/llvm-cov/coverage.json quality/crate-coverage-thresholds.toml
 
       # PROOF-12 (2026-10-12): per-FILE floors live in the [files] table and
       # are checked by the Rust bin `coverage_file_floors`. It is NOT run in
