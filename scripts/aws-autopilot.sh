@@ -199,30 +199,27 @@ if [ "$STATE" = "running" ]; then
   note_ok "EC2 instance running"
 elif [ "$STATE" = "stopped" ]; then
   if is_box_up_window; then
-    # NSE-holiday intentional stop (2026-07-07 round-3 review fix):
-    # the holiday gate self-stops the box at boot on a weekday NSE
-    # holiday and stamps today's IST date into this SSM param. Before this
-    # check, autopilot's holiday-blind up-window self-start re-booted the
-    # stopped box every 15 min all holiday — a boot/stop war whose 1-3 min
-    # up-bursts can bracket the 09:20 IST market-hours alarm-gate sample and
-    # restore the holiday false page. Marker == today => the stop is
-    # intentional; leave the box alone. FAIL-OPEN: a missing/stale/unreadable
-    # marker keeps the self-start (a real trading day never loses the heal).
+    # Holiday-stop marker (2026-07-07): the holiday gate stops the box on a
+    # weekday NSE holiday and stamps today's IST date here; never fight it.
     HOLIDAY_MARKER=$(aws ssm get-parameter --region "$REGION" \
       --name "/tickvault/${ENVIRONMENT}/holiday-stop-date" \
       --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-    # Budget-stop latch (audit PR30, 2026-09-27): the hourly hard-stop guard
-    # or the AWS-Budgets kill-switch stopped the box this UTC billing month
-    # and wrote the month here. Starting it would only run until the guard
-    # stops it again. FAIL-OPEN like the holiday marker: an unreadable or
-    # missing latch keeps the self-start.
+    # Budget-stop latch (audit PR30): a budget stop this UTC month; fail-open.
     BUDGET_LATCH=$(aws ssm get-parameter --region "$REGION" \
       --name "/tickvault-guard/${ENVIRONMENT}/budget-stop-month" \
       --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-    if [ -n "$HOLIDAY_MARKER" ] && [ "$HOLIDAY_MARKER" = "$(TZ='Asia/Kolkata' date +%F)" ]; then
+    # 2026-11-07: read the calendar itself (config/base.toml, the app's one
+    # source), so a missing marker never starts the box on a holiday. FAIL
+    # CLOSED: an unreadable calendar means no start after 09:00 IST.
+    CAL=config/base.toml; TODAY_IST=$(TZ='Asia/Kolkata' date +%F); NOW_HM=$(TZ='Asia/Kolkata' date +%H%M)
+    if [ -n "$HOLIDAY_MARKER" ] && [ "$HOLIDAY_MARKER" = "$TODAY_IST" ]; then
       note_ok "EC2 instance stopped (expected — NSE-holiday self-stop marker for today)"
     elif [ -n "$BUDGET_LATCH" ] && [ "$BUDGET_LATCH" = "$(date -u +%Y-%m)" ]; then
       note_ok "EC2 instance stopped (expected — budget-stop latch holds for ${BUDGET_LATCH}; delete /tickvault-guard/${ENVIRONMENT}/budget-stop-month to allow a restart)"
+    elif grep -A1 -xF '[[trading.nse_holidays]]' "$CAL" 2>/dev/null | grep -qxF "date = \"$TODAY_IST\""; then
+      note_ok "EC2 instance stopped (expected — ${TODAY_IST} is an NSE holiday in ${CAL}; never started on a holiday)"
+    elif ! grep -qxF '[[trading.nse_holidays]]' "$CAL" 2>/dev/null && [ "$((10#$NOW_HM))" -ge 900 ]; then
+      note_issue "EC2 instance stopped and the trading calendar ${CAL} is unreadable — not starting it after 09:00 IST (today could be a holiday)"
     else
       # The box should be RUNNING for the whole 08:30-16:30 IST window. Stopped
       # here = the 08:30 EventBridge start failed. Diagnose WHICH layer broke,
