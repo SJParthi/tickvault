@@ -650,6 +650,14 @@ impl BookTimestampProblem {
 /// CREATE runs first. That replay is one path that can make this table; that
 /// it made the live LH-01 table is Assumed, not read from the box.
 /// A non-empty table is RENAMED, never dropped, so no row is deleted.
+///
+/// ⚠ CHANGED 2026-11-07 (`ilp_table_gate`): the spill replay no longer
+/// depends on the clock for this. It holds every file with a row for a table
+/// this process has not ensured, and this table is marked ensured only when
+/// [`ensure_market_depth_book_table`] returns `Ensured`, so a spilled book
+/// record can no longer reach a QuestDB without the table, at any hour. The
+/// window advice in the remedy still matters for one thing: the empty-table
+/// self-heal runs only from 08:00 to 15:40 IST.
 const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app stopped \
      (after the 16:30 IST stop): run SELECT count() FROM market_depth_book. If it \
      is 0, DROP TABLE market_depth_book. If it has rows, keep them: RENAME TABLE \
@@ -1281,12 +1289,18 @@ fn spill_version_of(protocol: ProtocolVersion) -> u8 {
 #[must_use = "a false verdict means the depth_kind DEDUP key may be missing; retry it"]
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line, directly above the fn — the guard reads only that line, so it must sit BELOW the attribute).
 pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
-    run_depth_ddl(
+    let ensured = run_depth_ddl(
         questdb_config,
         MARKET_DEPTH_TABLE,
         &market_depth_ensure_statements(),
     )
-    .await
+    .await;
+    // 2026-11-07 (`ilp_table_gate`): the spill replay may post this table's
+    // rows only from here on.
+    if ensured {
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::MarketDepth);
+    }
+    ensured
 }
 
 /// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run by
@@ -1348,6 +1362,14 @@ async fn ensure_market_depth_book_table_at(
     )
     .await
     {
+        // 2026-11-07 (`ilp_table_gate`): only now may the spill replay post a
+        // framed book record. Before this, the depth replay (spawned in `main`
+        // before this ensure runs, and posting at once outside 08:00 to 15:40
+        // IST) could reach a QuestDB with no such table, and QuestDB created
+        // it itself with its designated timestamp named `timestamp` (LH-01).
+        crate::ilp_table_gate::mark_table_ensured(
+            crate::ilp_table_gate::GatedTable::MarketDepthBook,
+        );
         BookEnsureOutcome::Ensured
     } else {
         BookEnsureOutcome::Failed
