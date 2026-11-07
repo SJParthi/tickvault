@@ -7,9 +7,11 @@
 //! deploy-aws's "Ensure instance running" step, so each run self-started the
 //! stopped box, deployed and stopped it again.
 //!
-//! The catch-up now dispatches `deploy-aws.yml` only on an IST trading day
-//! (a calendar Muhurat date counts; a Saturday, Sunday or
-//! `[[trading.nse_holidays]]` date does not) AND only between 15:45 and 16:05
+//! The catch-up now dispatches `deploy-aws.yml` only on an ordinary IST
+//! trading day (never a Saturday, Sunday, `[[trading.nse_holidays]]` date or
+//! `[[trading.muhurat_trading_dates]]` date: deploy-aws's market-hours guard
+//! refuses the whole Muhurat date, so a dispatch there only leaves a red run
+//! that counts as covering the SHA) AND only between 15:45 and 16:05
 //! IST, when the box is up by schedule (it stops at 16:30), so deploy-aws
 //! finds it running. Outside that it dispatches nothing, so no run exists for
 //! the SHA and the next in-window firing or the after-close crons deploy it.
@@ -28,13 +30,14 @@ const DEPLOY: &str = ".github/workflows/deploy-aws.yml";
 const CALENDAR: &str = "config/base.toml";
 
 /// IST date, weekday and time from ONE clock read, plus the window test.
-const INPUTS_AND_WINDOW: &str = "read -r ist_day ist_dow ist_hhmm < <(TZ=Asia/Kolkata date '+%F %u %H%M'); trading_day=yes; in_window=no; if [ \"$((10#${ist_hhmm}))\" -ge 1545 ] && [ \"$((10#${ist_hhmm}))\" -le 1605 ]; then in_window=yes; fi";
+const INPUTS_AND_WINDOW: &str = "read -r ist_day ist_dow ist_hhmm < <(TZ=Asia/Kolkata date '+%F %u %H%M'); deploy_day=yes; in_window=no; if [ \"$((10#${ist_hhmm}))\" -ge 1545 ] && [ \"$((10#${ist_hhmm}))\" -le 1605 ]; then in_window=yes; fi";
 
-/// The trading-day decision (Muhurat first, then weekend, then holiday).
-const TRADING_DAY_LINE: &str = "if ! grep -qxF \"date = \\\"${ist_day}\\\"\" <(grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml 2>/dev/null) && { [ \"${ist_dow}\" -ge 6 ] || grep -qxF \"date = \\\"${ist_day}\\\"\" <(grep -A1 -xF '[[trading.nse_holidays]]' config/base.toml 2>/dev/null); }; then trading_day=no; fi";
+/// The deploy-day decision: a weekend, an NSE holiday or a Muhurat date is
+/// not a deploy day.
+const DEPLOY_DAY_LINE: &str = "if [ \"${ist_dow}\" -ge 6 ] || grep -qxF \"date = \\\"${ist_day}\\\"\" <(grep -A1 -xF -e '[[trading.nse_holidays]]' -e '[[trading.muhurat_trading_dates]]' config/base.toml 2>/dev/null); then deploy_day=no; fi";
 
 /// The skip inside the dispatch loop: either condition holds the dispatch.
-const DEPLOY_SKIP: &str = "if [ \"${wf}\" = \"deploy-aws.yml\" ] && { [ \"${trading_day}\" = \"no\" ] || [ \"${in_window}\" = \"no\" ]; }; then";
+const DEPLOY_SKIP: &str = "if [ \"${wf}\" = \"deploy-aws.yml\" ] && { [ \"${deploy_day}\" = \"no\" ] || [ \"${in_window}\" = \"no\" ]; }; then";
 
 /// The dispatch the skip must come before.
 const DISPATCH: &str = "if gh workflow run \"${wf}\" --ref main; then";
@@ -62,7 +65,7 @@ fn find(text: &str, needle: &str, what: &str) -> usize {
 fn catchup_dispatches_deploy_only_on_a_trading_day_inside_the_window() {
     let wf = read(CATCHUP);
     let inputs = find(&wf, INPUTS_AND_WINDOW, "IST clock read + window test");
-    let decide = find(&wf, TRADING_DAY_LINE, "trading-day decision");
+    let decide = find(&wf, DEPLOY_DAY_LINE, "deploy-day decision");
     let loop_start = find(
         &wf,
         "for wf in ci.yml bench.yml deploy-aws.yml terraform-apply.yml; do",
@@ -93,9 +96,9 @@ fn catchup_dispatches_deploy_only_on_a_trading_day_inside_the_window() {
 fn only_the_deploy_lane_is_held() {
     let wf = read(CATCHUP);
     assert_eq!(
-        wf.matches("\"${trading_day}\" = \"no\"").count(),
+        wf.matches("\"${deploy_day}\" = \"no\"").count(),
         1,
-        "{CATCHUP}: only the deploy-aws lane may be held on a non-trading day; \
+        "{CATCHUP}: only the deploy-aws lane may be held on a non-deploy day; \
          ci.yml, bench.yml and terraform-apply.yml start no box"
     );
     assert_eq!(
@@ -221,7 +224,37 @@ fn calendar_date_is_the_first_line_after_each_header() {
     );
 }
 
-/// Rust model of `INPUTS_AND_WINDOW` + `TRADING_DAY_LINE` + `DEPLOY_SKIP`:
+/// A calendar Muhurat date is not a deploy day: deploy-aws's market-hours
+/// guard refuses the whole date (`deploy-aws.yml` "Check current IST time
+/// against market window"), so a dispatch there only leaves a red run that
+/// counts as covering the SHA. The decision line must read the Muhurat
+/// header beside the holiday header, and must not treat a Muhurat date as an
+/// exception that dispatches.
+#[test]
+fn a_muhurat_date_never_dispatches() {
+    let wf = read(CATCHUP);
+    let decide_at = find(&wf, DEPLOY_DAY_LINE, "deploy-day decision");
+    let line = wf[decide_at..].lines().next().unwrap_or_default();
+    assert!(
+        line.contains("-e '[[trading.muhurat_trading_dates]]'")
+            && line.contains("-e '[[trading.nse_holidays]]'")
+            && line.trim_end().ends_with("then deploy_day=no; fi"),
+        "{CATCHUP}: a Muhurat date must set deploy_day=no like a holiday: `{line}`"
+    );
+    assert!(
+        !line.contains("if !"),
+        "{CATCHUP}: the deploy-day decision must not exempt any calendar date: `{line}`"
+    );
+    // The shell decides on any weekday too: a weekday Muhurat date skips.
+    let weekday_muhurat =
+        "[[trading.muhurat_trading_dates]]\ndate = \"2026-11-11\"\nname = \"weekday\"\n";
+    assert!(!dispatches_deploy(weekday_muhurat, "2026-11-11", 3, 1550));
+    assert!(dispatches_deploy(weekday_muhurat, "2026-11-12", 4, 1550));
+    // The real calendar's Sunday Muhurat date.
+    assert!(!dispatches_deploy(&read(CALENDAR), "2026-11-08", 7, 1550));
+}
+
+/// Rust model of `INPUTS_AND_WINDOW` + `DEPLOY_DAY_LINE` + `DEPLOY_SKIP`:
 /// true when the catch-up dispatches deploy-aws.
 fn dispatches_deploy(cal: &str, ist_day: &str, ist_dow: u32, ist_hhmm: u32) -> bool {
     let listed = |header: &str| {
@@ -233,10 +266,11 @@ fn dispatches_deploy(cal: &str, ist_day: &str, ist_dow: u32, ist_hhmm: u32) -> b
             .filter(|(_, l)| **l == header)
             .any(|(i, _)| lines.get(i + 1).is_some_and(|n| *n == want))
     };
-    let trading_day = listed("[[trading.muhurat_trading_dates]]")
-        || !(ist_dow >= 6 || listed("[[trading.nse_holidays]]"));
+    let deploy_day = !(ist_dow >= 6
+        || listed("[[trading.nse_holidays]]")
+        || listed("[[trading.muhurat_trading_dates]]"));
     let in_window = (WINDOW_START_HHMM..=WINDOW_END_HHMM).contains(&ist_hhmm);
-    trading_day && in_window
+    deploy_day && in_window
 }
 
 #[test]
@@ -264,8 +298,7 @@ fn decision_model_matches_the_shell_rows() {
     // No calendar file: weekends still never dispatch.
     assert!(!dispatches_deploy("", "2026-11-07", 6, 1550));
     assert!(dispatches_deploy("", "2026-11-09", 1, 1550));
-    // A Muhurat date is a trading day even on a Sunday.
+    // A Muhurat date never dispatches (deploy-aws refuses the whole date).
     let muhurat = "[[trading.muhurat_trading_dates]]\ndate = \"2026-11-08\"\nname = \"Diwali\"\n";
-    assert!(dispatches_deploy(muhurat, "2026-11-08", 7, 1550));
-    assert!(!dispatches_deploy(muhurat, "2026-11-08", 7, 1400));
+    assert!(!dispatches_deploy(muhurat, "2026-11-08", 7, 1550));
 }

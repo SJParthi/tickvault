@@ -51,7 +51,7 @@
 # redeploy is the watchdog's on the next weekday boot (binary_stale), not this.
 # 2026-11-07: CORRECTED — "within ~30 min of ANY merge" no longer holds for
 # deploy-aws. It self-started the stopped box twice on Sat 2026-11-07, so the
-# deploy-aws lane is now dispatched ONLY on an IST trading day between 15:45
+# deploy-aws lane is now dispatched ONLY on an ordinary IST trading day (never a Muhurat date) between 15:45
 # and 16:05 IST, when the box is up by schedule: the catch-up never causes a
 # box start. A bot merge outside that window deploys at the next one (or via
 # deploy-aws-after-close's 15:46 / 16:16 IST crons); there is no pre-open
@@ -181,10 +181,13 @@ jobs:
           # Sat 2026-11-07); a workflow_dispatch sets SHOULD_BE_UP=yes in its
           # "Ensure instance running" step, which self-started the stopped box,
           # deployed, then stopped it. The rule now: this job dispatches
-          # deploy-aws.yml ONLY on an IST trading day (Muhurat counts; a
-          # Saturday, Sunday or [[trading.nse_holidays]] date does not) AND
-          # only inside the after-close window 15:45-16:05 IST, when the box is
-          # up by schedule (stop 16:30), so deploy-aws finds it running.
+          # deploy-aws.yml ONLY on an ordinary IST trading day (not a
+          # Saturday, Sunday, [[trading.nse_holidays]] date, or a calendar
+          # Muhurat date: deploy-aws's guard refuses the whole Muhurat date, so
+          # a dispatch there only leaves a red run that counts as covering the
+          # SHA) AND only inside the after-close window 15:45-16:05 IST, when
+          # the box is up by schedule (stop 16:30), so deploy-aws finds it
+          # running.
           #   - 15:45: the earliest swap the market-hours guard allows.
           #   - 16:05: dispatch to swap measured at ~12.5 min and to done at
           #     ~14.5 min (run 42331877828: created 02:59:47Z, build 10m15s,
@@ -203,9 +206,9 @@ jobs:
           # ci.yml, bench.yml and terraform-apply.yml start no box and are
           # still backfilled at every firing. Pinned by
           # crates/common/tests/postmerge_catchup_trading_day_guard.rs.
-          read -r ist_day ist_dow ist_hhmm < <(TZ=Asia/Kolkata date '+%F %u %H%M'); trading_day=yes; in_window=no; if [ "$((10#${ist_hhmm}))" -ge 1545 ] && [ "$((10#${ist_hhmm}))" -le 1605 ]; then in_window=yes; fi
-          if ! grep -qxF "date = \"${ist_day}\"" <(grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml 2>/dev/null) && { [ "${ist_dow}" -ge 6 ] || grep -qxF "date = \"${ist_day}\"" <(grep -A1 -xF '[[trading.nse_holidays]]' config/base.toml 2>/dev/null); }; then trading_day=no; fi
-          echo "IST ${ist_day} ${ist_hhmm} dow=${ist_dow} trading_day=${trading_day} deploy_window=${in_window}"; dispatched=0
+          read -r ist_day ist_dow ist_hhmm < <(TZ=Asia/Kolkata date '+%F %u %H%M'); deploy_day=yes; in_window=no; if [ "$((10#${ist_hhmm}))" -ge 1545 ] && [ "$((10#${ist_hhmm}))" -le 1605 ]; then in_window=yes; fi
+          if [ "${ist_dow}" -ge 6 ] || grep -qxF "date = \"${ist_day}\"" <(grep -A1 -xF -e '[[trading.nse_holidays]]' -e '[[trading.muhurat_trading_dates]]' config/base.toml 2>/dev/null); then deploy_day=no; fi
+          echo "IST ${ist_day} ${ist_hhmm} dow=${ist_dow} deploy_day=${deploy_day} deploy_window=${in_window}"; dispatched=0
           # deploy-aws.yml is included so a bot-merged (push-suppressed) commit
           # still gets its ARM build + a real deploy run, as a second chance
           # beside the scheduler-drop-fragile deploy-aws-after-close crons
@@ -252,7 +255,7 @@ jobs:
               echo "terraform-apply.yml: HEAD commit touched no terraform-filtered paths — skipping (path-filtered lane)"
               continue
             fi
-            if [ "${wf}" = "deploy-aws.yml" ] && { [ "${trading_day}" = "no" ] || [ "${in_window}" = "no" ]; }; then echo "::notice::deploy-aws.yml: NOT dispatched (IST ${ist_day} ${ist_hhmm}, trading_day=${trading_day}). The catch-up dispatches it only on an NSE trading day between 15:45 and 16:05 IST, when the box is up by schedule, so it never starts the box. The next such firing, or the 15:46 / 16:16 IST after-close crons, deploy it. To deploy now, run deploy-aws.yml from the Actions tab."; continue; fi
+            if [ "${wf}" = "deploy-aws.yml" ] && { [ "${deploy_day}" = "no" ] || [ "${in_window}" = "no" ]; }; then echo "::notice::deploy-aws.yml: NOT dispatched (IST ${ist_day} ${ist_hhmm}, deploy_day=${deploy_day}). The catch-up dispatches it only on an ordinary NSE trading day (never a weekend, holiday or Muhurat date) between 15:45 and 16:05 IST, when the box is up by schedule, so it never starts the box. The next such firing, or the 15:46 / 16:16 IST after-close crons, deploy it. To deploy now, run deploy-aws.yml from the Actions tab."; continue; fi
             # Any run (any event: push, pull_request, workflow_dispatch,
             # schedule; any status — queued/in_progress/success/failed/
             # cancelled) for this exact SHA counts as covered. So a deploy-aws
@@ -291,7 +294,7 @@ jobs:
 
           # 2026-11-07: one printf (was a 6-line block) pays for the
           # trading-day check above; the run-line budget only shrinks.
-          printf '## Post-merge catch-up\n\n- main HEAD: `%s`\n- IST %s trading day: %s\n- catch-up runs dispatched: %s\n' "${head_sha}" "${ist_day}" "${trading_day}" "${dispatched}" >> "$GITHUB_STEP_SUMMARY"
+          printf '## Post-merge catch-up\n\n- main HEAD: `%s`\n- IST %s deploy day: %s\n- catch-up runs dispatched: %s\n' "${head_sha}" "${ist_day}" "${deploy_day}" "${dispatched}" >> "$GITHUB_STEP_SUMMARY"
 
       # 2026-09-02 — MIRROR main HEAD into SSM for the deploy-watchdog.
       #
