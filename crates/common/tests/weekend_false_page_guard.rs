@@ -143,6 +143,46 @@ fn every_did_it_run_alarm_is_gated_and_ships_disarmed() {
     }
 }
 
+const BUDGET_GUARDS: &str = include_str!("../../../deploy/aws/terraform/budget-guards.tf");
+
+/// The value of `key = N` inside one alarm block, if present.
+fn int_setting(block: &str, key: &str) -> Option<u32> {
+    block.lines().find_map(|line| {
+        let t = line.trim();
+        let rest = t.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+        rest.trim().parse().ok()
+    })
+}
+
+/// 2026-11-07: the fourth MON-FRI did-it-run alarm, the daily budget digest's,
+/// was missed by the 2026-09-01 gating and paged every weekend. It cannot use
+/// the gate (the digest runs at 17:30 IST, so a 09:20 Monday arm would see an
+/// empty 24 h and page every Monday). It must instead need at least FOUR
+/// consecutive missing days: a weekend is two, plus one for a Monday run that
+/// lands a minute late, plus one of margin.
+#[test]
+fn daily_budget_digest_not_invoked_survives_a_weekend() {
+    let code = code_only(BUDGET_GUARDS);
+    let block = alarm_block(&code, "tv_daily_budget_digest_not_invoked");
+    assert!(
+        block.contains(r#"treat_missing_data = "breaching""#),
+        "absence is the condition this alarm detects; keep it breaching"
+    );
+    assert!(
+        code.contains("cron(0 12 ? * MON-FRI *)"),
+        "the digest schedule changed: re-derive the weekend arithmetic"
+    );
+    assert_eq!(int_setting(block, "period"), Some(86_400));
+    let eval = int_setting(block, "evaluation_periods").unwrap_or(1);
+    let dta = int_setting(block, "datapoints_to_alarm").unwrap_or(eval);
+    assert!(
+        eval >= 4 && dta == eval,
+        "tv_daily_budget_digest_not_invoked needs >= 4 consecutive breaching days \
+         (evaluation_periods = datapoints_to_alarm = 4); with {eval}/{dta} it pages \
+         on an ordinary weekend"
+    );
+}
+
 #[test]
 fn the_watched_lambdas_really_are_weekday_only() {
     // The whole premise is "the schedule is MON-FRI, so the weekend absence is
