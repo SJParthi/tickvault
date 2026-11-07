@@ -388,6 +388,10 @@ enum Walk {
     /// QuestDB refused transiently or could not be reached, or a quarantine
     /// write failed: stop the round.
     Failed,
+    /// The next record holds rows for a table this process has not ensured
+    /// (2026-11-07, `ilp_table_gate`): nothing of it is posted, the file is
+    /// kept from this record on, and the round moves to the next file.
+    HeldTableNotEnsured(crate::ilp_table_gate::GatedTable),
 }
 
 /// Replays every framed depth spill file in `dir` into QuestDB.
@@ -522,6 +526,7 @@ pub async fn replay_framed_spill_dir(
             &mut sent_bytes,
             &mut outcome,
             &mut scratch,
+            view.ensured_tables,
         )
         .await;
         // Stamp on ANY progress, not only `sent_bytes`: a refused record whose
@@ -548,6 +553,20 @@ pub async fn replay_framed_spill_dir(
             // isolated record), never for a round that only set bytes aside
             // (2026-10-13 (DA-13b review)).
             Walk::WaitForWriter => {
+                if sent_bytes > 0 {
+                    outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                }
+                continue;
+            }
+            // Held, not failed (2026-11-07): the offset of the last record
+            // dealt with is already recorded above; the file is never emptied
+            // here, and the round moves on.
+            Walk::HeldTableNotEnsured(table) => {
+                crate::ilp_table_gate::note_replay_held_table_not_ensured(
+                    "depth", table, &path, offset,
+                );
+                outcome.files_held_table_not_ensured =
+                    outcome.files_held_table_not_ensured.saturating_add(1);
                 if sent_bytes > 0 {
                     outcome.files_replayed = outcome.files_replayed.saturating_add(1);
                 }
@@ -639,6 +658,7 @@ async fn walk_file(
     sent_bytes: &mut u64,
     outcome: &mut SpillReplayOutcome,
     scratch: &mut Vec<u8>,
+    ensured: crate::ilp_table_gate::EnsuredTables,
 ) -> Walk {
     let mut accepted_in_file = *offset > 0;
     while *offset < file_len {
@@ -719,6 +739,15 @@ async fn walk_file(
                 }
             }
         };
+        // The ensure gate (2026-11-07, `ilp_table_gate`): a record for a table
+        // this process has not ensured is never posted, so QuestDB cannot
+        // auto-create that table with its timestamp named `timestamp`. This is
+        // the path that made the live `market_depth_book` with that shape.
+        if let Some(table) =
+            crate::ilp_table_gate::first_unensured_in_record(version, scratch, ensured)
+        {
+            return Walk::HeldTableNotEnsured(table);
+        }
         let body = bytes::Bytes::copy_from_slice(scratch);
         match client.post(url).body(body.clone()).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -1147,6 +1176,64 @@ mod tests {
             "closed file emptied"
         );
         forget_resume_offset(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (2026-11-07, `ilp_table_gate`): THE path that made the live
+    /// `market_depth_book` with its timestamp named `timestamp`. The depth
+    /// replay is spawned before the lane ensures the book table and, outside
+    /// 08:00 to 15:40 IST, posts at once; a framed book (ILP v2) record that
+    /// reaches a QuestDB with no such table makes QuestDB create it. A record
+    /// for a table not ensured is now HELD: not posted, the file kept from it
+    /// on, the round not failed, the next file still drained.
+    ///
+    /// Bite: remove the gate in `walk_file` and the book record is posted
+    /// (first assert).
+    #[tokio::test]
+    async fn test_regression_a_book_record_is_held_until_its_table_is_ensured() {
+        use crate::ilp_table_gate::{EnsuredTables, GatedTable};
+        let dir = temp_dir("book-held");
+        let book = dir.join("depth-dhan-1.dspl");
+        let book_v2: &[u8] = b"market_depth_book,security_id=1 bid=\x0e\n\x01 7";
+        write_records(&book, &[(b"market_depth,a=1 b=1i 1\n", 1), (book_v2, 2)]);
+        let levels = dir.join("depth-dhan-2.dspl");
+        write_records(&levels, &[(b"market_depth,a=2 b=2i 2\n", 1)]);
+        let mut view = crate::tick_spill_replay::tests::test_spill_view();
+        view.ensured_tables = EnsuredTables::NONE.with(GatedTable::MarketDepth);
+        let (url, bodies, server) = spawn_recording_server().await;
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        let posted = bodies.lock().expect("lock").clone();
+        assert!(
+            !posted.iter().any(|b| b.as_slice() == book_v2),
+            "a book record must never be posted before its table is ensured"
+        );
+        assert_eq!(
+            posted,
+            vec![
+                b"market_depth,a=1 b=1i 1\n".to_vec(),
+                b"market_depth,a=2 b=2i 2\n".to_vec()
+            ],
+            "the level record before it and the next file still drain"
+        );
+        assert_eq!(out.files_held_table_not_ensured, 1);
+        assert_eq!(out.files_failed, 0, "a hold is not a failure");
+        let held_at = crate::tick_spill_replay::resume_offset_for(&book);
+        assert!(held_at > 0, "the posted level record is kept as progress");
+        assert!(
+            held_at < std::fs::metadata(&book).expect("m").len(),
+            "the book record is still waiting in the file"
+        );
+
+        // Once the table is ensured, the book record is posted.
+        bodies.lock().expect("lock").clear();
+        view.ensured_tables = EnsuredTables::ALL;
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        server.abort();
+        let posted = bodies.lock().expect("lock").clone();
+        assert_eq!(posted, vec![book_v2.to_vec()]);
+        assert_eq!(out.files_held_table_not_ensured, 0);
+        crate::tick_spill_replay::forget_resume_offset(&book);
+        crate::tick_spill_replay::forget_resume_offset(&levels);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -543,6 +543,13 @@ pub async fn ensure_feed_aux_table(questdb_config: &QuestDbConfig) -> bool {
             }
         }
     }
+    // 2026-11-07 (`ilp_table_gate`): the spill replay may post this table's
+    // rows only from here on.
+    if every_statement_accepted {
+        crate::ilp_table_gate::mark_table_ensured(
+            crate::ilp_table_gate::GatedTable::FeedAuxPackets,
+        );
+    }
     every_statement_accepted
 }
 

@@ -319,6 +319,10 @@ pub mod feed_aux_persistence;
 // Real-time proof that the live path is not waiting (2026-10-02): per-stage
 // latency buckets, stall counters and task heartbeats, Prometheus only.
 pub mod hot_path_telemetry;
+// 2026-11-07: which spilled tables this process may POST over ILP. The spill
+// replay holds a file until its table was ensured here, so QuestDB can never
+// auto-create one of them with the wrong designated timestamp.
+pub mod ilp_table_gate;
 // Live audit F2/F5/F6 (2026-10-29): the durable market-data floor. Spill
 // replay sets aside rows older than the last reset instead of posting them.
 pub mod market_data_floor;

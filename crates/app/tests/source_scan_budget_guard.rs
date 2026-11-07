@@ -33,7 +33,12 @@ const BUDGET: &[(&str, usize)] = &[
     // refusal at the one moment a consumer starts cannot be staged in a unit
     // test). Paired behaviour tests: `audit_tables_ensure_reads_not_keyed_when_unreachable`,
     // `test_spawn_audit_ensure_until_keyed_once_starts_once_per_process`.
-    ("candle_ddl_boot.rs", 6),
+    // 2026-11-07 (market_depth_book auto-create fix): 6 -> 7, one wiring scan
+    // pinning that the Dhan lane starts the book DDL re-run when its one boot
+    // ensure is refused (the same can-not-be-staged refusal as J3). Paired
+    // behaviour tests: `market_depth_book_ensure_reads_not_keyed_when_unreachable`,
+    // `ensure_until_keyed_returns_once_every_statement_is_accepted`.
+    ("candle_ddl_boot.rs", 7),
     ("contract_name_repair_boot.rs", 1),
     ("daily_archive_boot.rs", 1),
     ("daily_task_marker.rs", 2),

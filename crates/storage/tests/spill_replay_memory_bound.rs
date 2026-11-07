@@ -188,13 +188,12 @@ security_id=1234i,level=7i,price=24273.15,quantity=50i,orders=3i,capture_seq=99i
     // already in the high-water mark and cannot be credited to the replay.
     let before = peak_rss_bytes();
 
-    let outcome = tickvault_storage::tick_spill_replay::replay_spill_dir(
-        &dir,
-        &url,
-        &client,
-        &tickvault_storage::tick_spill_replay::SpillSinkView::current(),
-    )
-    .await;
+    // Every table ensured: this harness runs no boot ensures (2026-11-07,
+    // `ilp_table_gate`), and it measures memory, not the gate.
+    let mut view = tickvault_storage::tick_spill_replay::SpillSinkView::current();
+    view.ensured_tables = tickvault_storage::ilp_table_gate::EnsuredTables::ALL;
+    let outcome =
+        tickvault_storage::tick_spill_replay::replay_spill_dir(&dir, &url, &client, &view).await;
 
     let after = peak_rss_bytes();
     let growth = after.saturating_sub(before);

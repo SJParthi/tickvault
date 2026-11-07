@@ -408,6 +408,9 @@ fn quiet_view() -> SpillSinkView {
             .unwrap_or(0),
         live: false,
         market_data_floor_unix_nanos: None,
+        // This test runs no boot ensures; it tests the burst, not the
+        // ensure gate (2026-11-07).
+        ensured_tables: tickvault_storage::ilp_table_gate::EnsuredTables::ALL,
     }
 }
 
