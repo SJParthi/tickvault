@@ -39,14 +39,25 @@ use tickvault_common::ingest_shed::{
     seconds_to_disk_full, wal_apply_lag_growing,
 };
 use tickvault_common::trading_calendar::TradingCalendar;
-use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
+use tickvault_storage::disk_health_watcher::{
+    DiskHealthOutcome, probe_disk_free_bytes, published_hours_left,
+};
 use tickvault_storage::disk_pressure::{
     GatedStallTracker, PRESSURE_EMERGENCY_USED_PCT, PressureAction, PressureGateReason,
     PressureProbe, PressureSessionDay, PressureState, ProbeHealth, ProbeHealthTransition,
-    REGULAR_SESSION_GATE, apply_action, decide_pressure_action, in_session_rerun_skippable,
-    lift_rearm_limit, pressure_hot_days, pressure_pass_limits, rearm_window_key,
+    REGULAR_SESSION_GATE, apply_action, decide_pressure_action, hours_to_stop,
+    in_session_rerun_skippable, lift_rearm_limit, note_episode_level, pressure_hot_days,
+    pressure_pass_limits, projected_session_limits, projected_short, rearm_window_key,
     refresh_rearm_budget, thresholds_are_sane, used_pct_from,
 };
+
+/// PR AA step 4: the latest the box stays up after the stop (the drain
+/// hold's 07:30 IST cap), as the projected-fill trigger's horizon outside the
+/// session. Derived from the one drain-hold constant.
+// APPROVED: cast — 27,000 fits u32; the assert below proves it at compile time.
+#[allow(clippy::cast_possible_truncation)]
+const PROJECTION_STOP_CEILING_SECS_IST: u32 = crate::drain_hold::DRAIN_HOLD_CEILING_SECS_IST as u32;
+const _: () = assert!(crate::drain_hold::DRAIN_HOLD_CEILING_SECS_IST <= u32::MAX as u64);
 
 /// Minutes before a Muhurat session's published start that its pressure
 /// gate opens: the same quarter hour the regular 08:45 gate leaves before
@@ -317,8 +328,10 @@ async fn run_disk_pressure_loop(
     let mut state = PressureState::default();
     // DA-13d: the last pass stood aside for the after-close depth pass.
     let mut last_stood_aside = false;
-    // PR DP review M7: the (re-arm window key, at-or-above-90%) of the last
+    // PR DP review M7: the (re-arm window key, depth allowed) of the last
     // in-session pass that stood aside; the same conditions skip the rerun.
+    // Depth is allowed at 90%+ used or, since PR AA step 4, while the disk is
+    // projected to fill before the stop.
     let mut last_in_session_aside: Option<(u64, bool)> = None;
     // PR DP review M1: refunded passes that did not lower the volume.
     let mut gated_stall = GatedStallTracker::default();
@@ -406,12 +419,36 @@ async fn run_disk_pressure_loop(
             );
         }
         let used = probe.used_pct.unwrap_or(0);
+        let session_day = pressure_session_day(&calendar, now_unix);
+        // PR AA step 4 (Quote 51): the disk-health watcher's projection. A
+        // fresh figure shorter than the hours left until the box stops (16:30
+        // IST on a session day, else the drain hold's 07:30 cap) plus one
+        // hour reads "short". Stale, unknown or not filling is never short.
+        let projection_short = cfg.pressure_projected_fill_enabled
+            && projected_short(
+                published_hours_left(now_unix),
+                hours_to_stop(
+                    now_unix,
+                    session_day.today_gate,
+                    crate::shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST,
+                    PROJECTION_STOP_CEILING_SECS_IST,
+                ),
+            );
+        let probe = probe.with_projected_short(projection_short);
         // PR DP-2 / review L1: the session gate, from the calendar (a Muhurat
-        // session is a session day with its own window).
-        let (limits, gate) =
-            pressure_pass_limits(now_unix, pressure_session_day(&calendar, now_unix), used);
+        // session is a session day with its own window). PR AA step 4: a
+        // short projection lets the in-session pass take a depth partition
+        // (still one partition a pass).
+        let (limits, gate) = projected_session_limits(
+            pressure_pass_limits(now_unix, session_day, used),
+            projection_short,
+        );
         let in_session = gate.is_some_and(PressureGateReason::is_in_session);
         let emergency = used >= PRESSURE_EMERGENCY_USED_PCT;
+        // PR AA step 4: whether this poll's in-session pass may take depth
+        // (90%+ used, or a short projection). A stood-aside pass reruns when
+        // this changes.
+        let depth_allowed = !limits.skip_depth;
         // PR DP review M3: after the session gate closes (and on a day with
         // no session) an escalated episode re-arms at every poll with no cap,
         // so the window before the 16:30 IST stop reclaims back to back. The
@@ -424,6 +461,9 @@ async fn run_disk_pressure_loop(
             );
         }
         let action = decide_pressure_action(probe, &state, &cfg, now_secs);
+        // PR AA step 4: an open episode that reads at or above high water is a
+        // used-space episode from now on (it may page as before).
+        note_episode_level(&mut state, action, probe.used_pct, &cfg);
 
         // A probe that has been blind for PRESSURE_PROBE_FAILING_AFTER_SECS
         // has idled the whole pressure archiver for that long: every poll
@@ -565,11 +605,25 @@ async fn run_disk_pressure_loop(
                 apply_action(&mut state, action, now_secs, None);
             }
             PressureAction::EndEpisode => {
-                info!(
-                    used_pct = used,
-                    low_water_pct = cfg.pressure_low_water_pct,
-                    "disk-pressure episode ENDED — volume back below low water"
-                );
+                if used < cfg.pressure_low_water_pct {
+                    info!(
+                        used_pct = used,
+                        low_water_pct = cfg.pressure_low_water_pct,
+                        "disk-pressure episode ENDED — volume back below low water"
+                    );
+                } else {
+                    // PR AA step 4: an episode opened by the projection (below
+                    // high water) that could free nothing more ends without a
+                    // page; the cooldown spaces the next try.
+                    info!(
+                        used_pct = used,
+                        high_water_pct = cfg.pressure_high_water_pct,
+                        projection_short,
+                        "disk-pressure episode ENDED — it was opened by the projected \
+                         fill and found nothing more it may free now; it retries after \
+                         the cooldown"
+                    );
+                }
                 apply_action(&mut state, action, now_secs, None);
                 gated_stall.reset();
                 last_in_session_aside = None;
@@ -600,7 +654,7 @@ async fn run_disk_pressure_loop(
                 // window key moved or the volume crossed 90%.
                 if in_session
                     && matches!(action, PressureAction::ContinuePass)
-                    && in_session_rerun_skippable(last_in_session_aside, window_key, emergency)
+                    && in_session_rerun_skippable(last_in_session_aside, window_key, depth_allowed)
                 {
                     tracing::debug!(
                         used_pct = used,
@@ -672,7 +726,7 @@ async fn run_disk_pressure_loop(
                 );
                 last_stood_aside = matches!(pass, PressurePass::StoodAside);
                 last_in_session_aside = (in_session && matches!(pass, PressurePass::StoodAside))
-                    .then_some((window_key, emergency));
+                    .then_some((window_key, depth_allowed));
                 // PR DP review M1: a refunded pass (gated progress, or an
                 // in-session stand-aside at 90%+) that did not lower the volume five
                 // times in a row escalates the episode as an ungated one would.
@@ -718,6 +772,9 @@ async fn run_disk_pressure_loop(
                     );
                 }
                 fold_pressure_pass(&mut state, action, now_secs, pass);
+                // PR AA step 4: an episode opened below high water was opened by
+                // the projection; it ends quietly instead of paging.
+                note_episode_level(&mut state, action, probe.used_pct, &cfg);
                 if stalled && let Some(ep) = state.episode.as_mut() {
                     if !ep.gated_stalled {
                         warn!(
@@ -1734,7 +1791,7 @@ mod self_measured_burn_tests {
 mod probe_health_wiring_tests {
     use super::{
         DISK_PRESSURE_POLL_INTERVAL_SECS, PRESSURE_PROBE_FAILING_AFTER_SECS,
-        PRESSURE_PROBE_FAILING_POLLS,
+        PRESSURE_PROBE_FAILING_POLLS, PROJECTION_STOP_CEILING_SECS_IST,
     };
 
     /// 2026-09-02 (audit finding 10): the sustained-failure threshold is
@@ -1778,6 +1835,52 @@ mod probe_health_wiring_tests {
         assert!(
             prod.contains("ProbeHealthTransition::Recovered =>"),
             "the recovery edge must be logged"
+        );
+    }
+
+    /// PR AA step 4: the projection reaches the decision, the in-session
+    /// gate and the episode marker, and the horizon is the drain hold's
+    /// 07:30 IST cap and the 16:30 IST daily stop.
+    #[test]
+    fn test_projected_fill_is_wired_into_the_loop() {
+        assert_eq!(PROJECTION_STOP_CEILING_SECS_IST, 7 * 3_600 + 30 * 60);
+        let src = include_str!("disk_pressure_boot.rs");
+        let cutoff = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cutoff];
+        for needle in [
+            "cfg.pressure_projected_fill_enabled",
+            "published_hours_left(now_unix)",
+            "crate::shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST",
+            "PROJECTION_STOP_CEILING_SECS_IST",
+            "let probe = probe.with_projected_short(projection_short);",
+            "projected_session_limits(",
+            "in_session_rerun_skippable(last_in_session_aside, window_key, depth_allowed)",
+        ] {
+            assert!(prod.contains(needle), "missing in the loop: {needle}");
+        }
+        // The projection is attached before the decision reads the probe.
+        let attach = prod
+            .find("let probe = probe.with_projected_short(projection_short);")
+            .expect("attached");
+        let decide = prod
+            .find("let action = decide_pressure_action(probe, &state, &cfg, now_secs);")
+            .expect("decided");
+        assert!(
+            attach < decide,
+            "the probe must carry the projection when decided"
+        );
+        // The episode marker runs after the decision and after the fold.
+        assert_eq!(
+            prod.matches("note_episode_level(&mut state, action, probe.used_pct, &cfg);")
+                .count(),
+            2
+        );
+        let fold = prod
+            .find("fold_pressure_pass(&mut state, action, now_secs, pass);")
+            .expect("folded");
+        assert!(
+            prod[fold..].contains("note_episode_level(&mut state, action, probe.used_pct, &cfg);"),
+            "a just-opened episode is marked after the fold"
         );
     }
 }

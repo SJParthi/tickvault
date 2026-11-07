@@ -86,6 +86,10 @@ pub const PRESSURE_MAX_REARMS: u32 = 3;
 pub struct PressureProbe {
     /// Percentage of the volume in use, 0–100.
     pub used_pct: Option<u8>,
+    /// PR AA step 4: a fresh projection says the disk fills before the box
+    /// stops ([`projected_short`]). `false` when there is no fresh
+    /// projection; an unknown projection is never read as short.
+    pub projected_short: bool,
 }
 
 impl PressureProbe {
@@ -94,13 +98,115 @@ impl PressureProbe {
     pub const fn used(pct: u8) -> Self {
         Self {
             used_pct: Some(pct),
+            projected_short: false,
         }
     }
 
     /// A failed probe — treated as [`PressureAction::Idle`], never pressure.
     #[must_use]
     pub const fn failed() -> Self {
-        Self { used_pct: None }
+        Self {
+            used_pct: None,
+            projected_short: false,
+        }
+    }
+
+    /// The same probe with the projected-fill verdict attached (PR AA
+    /// step 4). A failed probe stays idle whatever the projection says:
+    /// [`decide_pressure_action`] acts only on a used percentage it measured.
+    #[must_use]
+    pub const fn with_projected_short(self, short: bool) -> Self {
+        Self {
+            used_pct: self.used_pct,
+            projected_short: short,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR AA step 4 — the projected-fill trigger (Quote 51, 2026-11-07)
+// ---------------------------------------------------------------------------
+//
+// The used-percentage trigger starts at 75%. On a heavy day the disk can go
+// from well under that to full inside one session, before any episode has
+// started. So an episode also starts when the disk-health watcher's
+// projection (hours until full at the last hour's fill rate) is shorter than
+// the hours left until the box stops, plus a one-hour margin, and the volume
+// is at least `pressure_projected_min_used_pct` used.
+//
+// Starting early only RUNS the existing archive pass sooner; every drop still
+// needs its verified S3 copy. An episode opened by the projection below high
+// water never pages STORAGE-GAP-05: when it cannot free anything it ends
+// quietly and the cooldown applies (see `decide_pressure_action`).
+
+/// Margin added to the hours left until the stop: the projection must reach
+/// at least an hour past the stop before it reads "not short".
+pub const PROJECTED_FILL_MARGIN_HOURS: f64 = 1.0;
+
+/// Hours from `now_unix_secs` until the box is due to stop. Pure, O(1).
+///
+/// * Before `ceiling_secs_ist` (07:30 IST, the drain hold's cap): until then.
+/// * On a session day (`today_gate` is `Some`) before the later of
+///   `daily_stop_secs_ist` (16:30 IST) and the gate's end (a Muhurat session
+///   can end later): until that stop.
+/// * Otherwise (after the stop, or a day with no session): until the next
+///   07:30 IST, the latest the drain hold can keep the box up.
+#[must_use]
+pub fn hours_to_stop(
+    now_unix_secs: i64,
+    today_gate: Option<(u32, u32)>,
+    daily_stop_secs_ist: u32,
+    ceiling_secs_ist: u32,
+) -> f64 {
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    let secs_of_day = u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0);
+    let secs = if secs_of_day < ceiling_secs_ist {
+        ceiling_secs_ist - secs_of_day
+    } else {
+        match today_gate {
+            Some((_, gate_end)) if secs_of_day < daily_stop_secs_ist.max(gate_end) => {
+                daily_stop_secs_ist.max(gate_end) - secs_of_day
+            }
+            _ => 86_400 - secs_of_day + ceiling_secs_ist,
+        }
+    };
+    f64::from(secs) / 3_600.0
+}
+
+/// Whether the disk is projected to fill before the stop: a fresh
+/// projection shorter than `hours_to_stop` plus
+/// [`PROJECTED_FILL_MARGIN_HOURS`]. No projection (unknown, stale, or not
+/// filling) and a non-finite figure are never short. Pure, O(1).
+#[must_use]
+pub fn projected_short(hours_left: Option<f64>, hours_to_stop: f64) -> bool {
+    matches!(hours_left, Some(h) if h.is_finite()
+        && hours_to_stop.is_finite()
+        && h < hours_to_stop + PROJECTED_FILL_MARGIN_HOURS)
+}
+
+/// Keeps [`EpisodeState::projected_only`] in step with the volume. Call it
+/// once after the decision and once after the action is folded in. Pure,
+/// O(1).
+///
+/// * An episode just opened ([`PressureAction::StartEpisode`]) below high
+///   water was opened by the projection: it is marked projected-only.
+/// * Any open episode that reads at or above high water is a used-space
+///   episode from then on, and escalates as one.
+pub fn note_episode_level(
+    state: &mut PressureState,
+    action: PressureAction,
+    used_pct: Option<u8>,
+    cfg: &PartitionRetentionConfig,
+) {
+    let (Some(ep), Some(used)) = (state.episode.as_mut(), used_pct) else {
+        return;
+    };
+    if used >= cfg.pressure_high_water_pct {
+        ep.projected_only = false;
+    } else if matches!(action, PressureAction::StartEpisode) {
+        ep.projected_only = true;
     }
 }
 
@@ -168,6 +274,12 @@ pub struct EpisodeState {
     /// escalates as an ungated one would. Without it, an in-session episode
     /// at 90%+ refunded every pass and could never escalate.
     pub gated_stalled: bool,
+    /// PR AA step 4: the episode was opened by the projected-fill trigger
+    /// below high water and has not read at or above high water since. Such
+    /// an episode never escalates (no STORAGE-GAP-05 page): when it cannot
+    /// free anything it ends quietly and the cooldown applies. Kept by
+    /// [`note_episode_level`].
+    pub projected_only: bool,
 }
 
 /// Gated (one-partition, refunded) passes in a row with used% not falling
@@ -275,11 +387,17 @@ pub fn decide_pressure_action(
         return PressureAction::Idle;
     };
 
+    // PR AA step 4: the projected-fill verdict counts only behind its switch.
+    let projection = cfg.pressure_projected_fill_enabled && probe.projected_short;
+
     match state.episode {
         Some(ep) => {
             // Exit first, so a recovered volume always ends the episode even
-            // if it also happens to be out of passes.
-            if used < cfg.pressure_low_water_pct {
+            // if it also happens to be out of passes. PR AA step 4: while the
+            // disk is still projected to fill before the stop, the episode
+            // stays open below low water too; it ends once used space is
+            // under low water AND the projection is no longer short.
+            if used < cfg.pressure_low_water_pct && !projection {
                 return PressureAction::EndEpisode;
             }
             if ep.escalated {
@@ -325,21 +443,31 @@ pub fn decide_pressure_action(
             // trying again, and both need a human — so escalate on the FIRST
             // zero-reclaim pass rather than burning three more exports to
             // reach the same answer slower.
-            if ep.last_pass_dropped == Some(0) {
-                return PressureAction::Escalate;
-            }
+            //
             // PR DP review M1: refunded in-session passes that did not lower
-            // the volume escalate too.
-            if ep.gated_stalled {
-                return PressureAction::Escalate;
-            }
-            if ep.passes_used >= cfg.pressure_max_passes {
-                return PressureAction::Escalate;
+            // the volume escalate too, and so do exhausted passes.
+            let stuck = ep.last_pass_dropped == Some(0)
+                || ep.gated_stalled
+                || ep.passes_used >= cfg.pressure_max_passes;
+            if stuck {
+                // PR AA step 4: only a used-space episode at or above low
+                // water pages, as before. An episode the projection opened
+                // below high water (and that never reached it), or one kept
+                // open below low water by the projection, ends quietly: the
+                // projection can over-read (the opening burst), and the page
+                // would be new. The cooldown then spaces the next try.
+                if used >= cfg.pressure_low_water_pct && !ep.projected_only {
+                    return PressureAction::Escalate;
+                }
+                return PressureAction::EndEpisode;
             }
             PressureAction::ContinuePass
         }
         None => {
-            if used < cfg.pressure_high_water_pct {
+            // PR AA step 4: the projection starts an episode below high
+            // water, but never below `pressure_projected_min_used_pct`.
+            let projected_start = projection && used >= cfg.pressure_projected_min_used_pct;
+            if used < cfg.pressure_high_water_pct && !projected_start {
                 return PressureAction::Idle;
             }
             if let Some(end) = state.last_episode_end_secs
@@ -371,6 +499,7 @@ pub fn apply_action(
                 rearm_window: None,
                 rearm_now: false,
                 gated_stalled: false,
+                projected_only: false,
             });
         }
         PressureAction::ContinuePass => {
@@ -444,6 +573,10 @@ pub enum PressureGateReason {
     /// Inside the session at or above [`PRESSURE_EMERGENCY_USED_PCT`]: depth
     /// allowed, still one partition.
     InSessionEmergency,
+    /// Inside the session below [`PRESSURE_EMERGENCY_USED_PCT`] while the disk
+    /// is projected to fill before the stop (PR AA step 4): depth allowed,
+    /// still one partition.
+    InSessionProjected,
     /// Before today's session gate: the pass stops when the gate opens.
     PreOpenDeadline,
     /// After today's session, or on a day with no session: unlimited, but
@@ -458,6 +591,7 @@ impl PressureGateReason {
         match self {
             Self::InSession => "in_session",
             Self::InSessionEmergency => "in_session_emergency",
+            Self::InSessionProjected => "in_session_projected",
             Self::PreOpenDeadline => "pre_open_deadline",
             Self::OffSessionDeadline => "off_session_deadline",
         }
@@ -466,13 +600,17 @@ impl PressureGateReason {
     /// Whether this is the one-partition in-session gate. O(1).
     #[must_use]
     pub const fn is_in_session(self) -> bool {
-        matches!(self, Self::InSession | Self::InSessionEmergency)
+        matches!(
+            self,
+            Self::InSession | Self::InSessionEmergency | Self::InSessionProjected
+        )
     }
 
     /// Every reason, for the boot-time zero registration.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::InSession,
         Self::InSessionEmergency,
+        Self::InSessionProjected,
         Self::PreOpenDeadline,
         Self::OffSessionDeadline,
     ];
@@ -559,6 +697,38 @@ pub fn pressure_pass_limits(
             Some(PressureGateReason::OffSessionDeadline),
         ),
         _ => (ArchivePassLimits::default(), None),
+    }
+}
+
+/// Applies the projected-fill verdict to the limits [`pressure_pass_limits`]
+/// returned (PR AA step 4). Inside the session below the emergency line, a
+/// disk projected to fill before the stop may export a depth partition, still
+/// at most one partition a pass: the plain in-session gate (no depth) becomes
+/// [`PressureGateReason::InSessionProjected`] with depth allowed. Every other
+/// gate, and a projection that is not short, passes through unchanged. Pure,
+/// O(1).
+#[must_use]
+pub const fn projected_session_limits(
+    gated: (
+        crate::partition_archive::ArchivePassLimits,
+        Option<PressureGateReason>,
+    ),
+    projected_short: bool,
+) -> (
+    crate::partition_archive::ArchivePassLimits,
+    Option<PressureGateReason>,
+) {
+    let (limits, gate) = gated;
+    match gate {
+        Some(PressureGateReason::InSession) if projected_short => (
+            crate::partition_archive::ArchivePassLimits {
+                skip_depth: false,
+                max_partitions: limits.max_partitions,
+                stop_at_unix_secs: limits.stop_at_unix_secs,
+            },
+            Some(PressureGateReason::InSessionProjected),
+        ),
+        _ => (limits, gate),
     }
 }
 
@@ -934,6 +1104,7 @@ mod tests {
                 rearm_window: None,
                 rearm_now: false,
                 gated_stalled: false,
+                projected_only: false,
             }),
             last_episode_end_secs: None,
         };
@@ -1013,6 +1184,7 @@ mod tests {
                 rearm_window: None,
                 rearm_now: false,
                 gated_stalled: false,
+                projected_only: false,
             }),
             last_episode_end_secs: None,
         };
@@ -1277,6 +1449,7 @@ mod tests {
 #[cfg(test)]
 mod dp_gate_and_rearm_tests {
     use super::*;
+    use crate::disk_pressure::tests::cfg;
 
     /// Unix seconds of `hh:mm` IST on 2026-11-06.
     fn ist(hh: u32, mm: u32) -> i64 {
@@ -1527,6 +1700,7 @@ mod dp_gate_and_rearm_tests {
                 rearm_window: None,
                 rearm_now: false,
                 gated_stalled: false,
+                projected_only: false,
             }),
             last_episode_end_secs: None,
         };
@@ -1577,5 +1751,308 @@ mod dp_gate_and_rearm_tests {
             "not escalated: nothing to refill"
         );
         assert_eq!(live.episode.expect("episode").rearm_window, Some(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // PR AA step 4 — the projected-fill trigger
+    // -----------------------------------------------------------------------
+
+    /// The 16:30 IST daily stop and the 07:30 IST drain-hold cap, as the app
+    /// passes them.
+    const STOP_1630: u32 = 16 * 3_600 + 30 * 60;
+    const CAP_0730: u32 = 7 * 3_600 + 30 * 60;
+
+    fn to_stop(hh: u32, mm: u32, gate: Option<(u32, u32)>) -> f64 {
+        hours_to_stop(ist(hh, mm), gate, STOP_1630, CAP_0730)
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn test_projected_short_around_1630_and_0730() {
+        let gate = Some(REGULAR_SESSION_GATE);
+        // Session day: the stop is 16:30.
+        assert!(close(to_stop(10, 0, gate), 6.5));
+        assert!(close(to_stop(16, 29, gate), 1.0 / 60.0));
+        // At and after 16:30 the next stop is 07:30 (the drain hold's cap).
+        assert!(close(to_stop(16, 30, gate), 15.0));
+        assert!(close(to_stop(23, 0, gate), 8.5));
+        // Before 07:30 the stop is 07:30, session day or not.
+        assert!(close(to_stop(3, 0, gate), 4.5));
+        assert!(close(to_stop(3, 0, None), 4.5));
+        assert!(close(to_stop(7, 29, None), 1.0 / 60.0));
+        assert!(close(to_stop(7, 30, None), 24.0));
+        // A day with no session: 07:30 the next morning.
+        assert!(close(to_stop(12, 0, None), 19.5));
+        // A Muhurat gate that ends after 16:30 moves the stop to its end.
+        let late = Some((18 * 3_600, 19 * 3_600 + 15 * 60));
+        assert!(close(to_stop(18, 0, late), 1.25));
+        assert!(close(to_stop(10, 0, late), 9.25));
+
+        // Short means: projection under hours-to-stop plus one hour.
+        let at_10 = to_stop(10, 0, gate); // 6.5 h
+        assert!(projected_short(Some(7.49), at_10));
+        assert!(
+            !projected_short(Some(7.5), at_10),
+            "exactly stop + 1 h is not short"
+        );
+        assert!(!projected_short(Some(20.0), at_10));
+        // Just before 16:30 the window is about an hour; at 16:30 it jumps
+        // to the night, so the same projection turns short.
+        assert!(!projected_short(Some(2.0), to_stop(16, 29, gate)));
+        assert!(projected_short(Some(2.0), to_stop(16, 30, gate)));
+        // Just before 07:30 the window is tiny; after 07:30 it is a day.
+        assert!(!projected_short(Some(1.5), to_stop(7, 29, None)));
+        assert!(projected_short(Some(1.5), to_stop(7, 30, None)));
+        // Unknown and non-finite are never short.
+        assert!(!projected_short(None, at_10));
+        assert!(!projected_short(Some(f64::NAN), at_10));
+        assert!(!projected_short(Some(1.0), f64::NAN));
+    }
+
+    fn short_probe(pct: u8) -> PressureProbe {
+        PressureProbe::used(pct).with_projected_short(true)
+    }
+
+    #[test]
+    fn test_projected_start_needs_min_used_pct_and_the_switch() {
+        let c = cfg();
+        let s = PressureState::default();
+        assert_eq!(c.pressure_projected_min_used_pct, 50);
+        assert_eq!(
+            decide_pressure_action(short_probe(50), &s, &c, 0),
+            PressureAction::StartEpisode
+        );
+        assert_eq!(
+            decide_pressure_action(short_probe(49), &s, &c, 0),
+            PressureAction::Idle,
+            "below the projected floor"
+        );
+        assert_eq!(
+            decide_pressure_action(PressureProbe::used(70), &s, &c, 0),
+            PressureAction::Idle,
+            "no projection, below high water"
+        );
+        let off = PartitionRetentionConfig {
+            pressure_projected_fill_enabled: false,
+            ..c.clone()
+        };
+        assert_eq!(
+            decide_pressure_action(short_probe(70), &s, &off, 0),
+            PressureAction::Idle,
+            "the switch off restores the used-space trigger alone"
+        );
+        // A failed probe stays idle whatever the projection says.
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::failed().with_projected_short(true),
+                &s,
+                &c,
+                0
+            ),
+            PressureAction::Idle
+        );
+        // The cooldown still spaces a projected start.
+        let cooling = PressureState {
+            episode: None,
+            last_episode_end_secs: Some(1_000),
+        };
+        assert_eq!(
+            decide_pressure_action(short_probe(55), &cooling, &c, 1_100),
+            PressureAction::Cooldown
+        );
+    }
+
+    #[test]
+    fn test_projected_episode_not_ended_first_poll() {
+        let c = cfg();
+        let mut s = PressureState::default();
+        let a = decide_pressure_action(short_probe(55), &s, &c, 0);
+        assert_eq!(a, PressureAction::StartEpisode);
+        apply_action(&mut s, a, 0, Some(1));
+        note_episode_level(&mut s, a, Some(55), &c);
+        assert!(s.episode.expect("open").projected_only);
+        // 55% is under the 60% low water, but the projection is still
+        // short: the episode stays open and runs another pass.
+        assert_eq!(
+            decide_pressure_action(short_probe(55), &s, &c, 60),
+            PressureAction::ContinuePass
+        );
+        // Under low water AND no longer short: it ends.
+        assert_eq!(
+            decide_pressure_action(PressureProbe::used(55), &s, &c, 120),
+            PressureAction::EndEpisode
+        );
+        // At or above low water without a projection it keeps going.
+        assert_eq!(
+            decide_pressure_action(PressureProbe::used(65), &s, &c, 120),
+            PressureAction::ContinuePass
+        );
+    }
+
+    #[test]
+    fn test_projected_only_episode_ends_quietly_never_escalates() {
+        let c = cfg();
+        for used in [55_u8, 65, 74] {
+            for stuck in 0..3 {
+                let mut ep = EpisodeState {
+                    passes_used: 1,
+                    last_pass_dropped: Some(3),
+                    projected_only: true,
+                    ..EpisodeState::default()
+                };
+                match stuck {
+                    0 => ep.last_pass_dropped = Some(0),
+                    1 => ep.gated_stalled = true,
+                    _ => ep.passes_used = c.pressure_max_passes,
+                }
+                let s = PressureState {
+                    episode: Some(ep),
+                    last_episode_end_secs: None,
+                };
+                assert_eq!(
+                    decide_pressure_action(short_probe(used), &s, &c, 60),
+                    PressureAction::EndEpisode,
+                    "used {used} stuck {stuck}: no page for a projection episode"
+                );
+            }
+        }
+        // A used-space episode kept open below low water by the projection
+        // ends quietly too: below low water never paged before.
+        let s = PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 1,
+                last_pass_dropped: Some(0),
+                ..EpisodeState::default()
+            }),
+            last_episode_end_secs: None,
+        };
+        assert_eq!(
+            decide_pressure_action(short_probe(58), &s, &c, 60),
+            PressureAction::EndEpisode
+        );
+        // At or above low water the used-space episode still escalates.
+        assert_eq!(
+            decide_pressure_action(short_probe(65), &s, &c, 60),
+            PressureAction::Escalate
+        );
+        assert_eq!(
+            decide_pressure_action(PressureProbe::used(65), &s, &c, 60),
+            PressureAction::Escalate
+        );
+    }
+
+    #[test]
+    fn test_note_episode_level_marks_and_clears_projected_only() {
+        let c = cfg();
+        let mut s = PressureState::default();
+        apply_action(&mut s, PressureAction::StartEpisode, 0, Some(1));
+        note_episode_level(&mut s, PressureAction::StartEpisode, Some(80), &c);
+        assert!(
+            !s.episode.expect("open").projected_only,
+            "opened at high water"
+        );
+        let mut s = PressureState::default();
+        // No episode yet: nothing to mark.
+        note_episode_level(&mut s, PressureAction::StartEpisode, Some(55), &c);
+        assert_eq!(s.episode, None);
+        apply_action(&mut s, PressureAction::StartEpisode, 0, Some(1));
+        note_episode_level(&mut s, PressureAction::StartEpisode, Some(55), &c);
+        assert!(s.episode.expect("open").projected_only);
+        // A blind reading changes nothing.
+        note_episode_level(&mut s, PressureAction::ContinuePass, None, &c);
+        assert!(s.episode.expect("open").projected_only);
+        // Below high water on a later pass changes nothing.
+        note_episode_level(&mut s, PressureAction::ContinuePass, Some(70), &c);
+        assert!(s.episode.expect("open").projected_only);
+        // Reaching high water makes it a used-space episode for good.
+        note_episode_level(&mut s, PressureAction::ContinuePass, Some(75), &c);
+        assert!(!s.episode.expect("open").projected_only);
+        note_episode_level(&mut s, PressureAction::ContinuePass, Some(70), &c);
+        assert!(!s.episode.expect("open").projected_only);
+    }
+
+    #[test]
+    fn test_projection_off_keeps_todays_decisions() {
+        // With the switch off, a short projection changes no decision at any
+        // used percentage, open episode or not.
+        let off = PartitionRetentionConfig {
+            pressure_projected_fill_enabled: false,
+            ..cfg()
+        };
+        let states = [
+            PressureState::default(),
+            PressureState {
+                episode: Some(EpisodeState {
+                    passes_used: 1,
+                    last_pass_dropped: Some(0),
+                    ..EpisodeState::default()
+                }),
+                last_episode_end_secs: None,
+            },
+            PressureState {
+                episode: Some(EpisodeState {
+                    passes_used: 1,
+                    last_pass_dropped: Some(2),
+                    ..EpisodeState::default()
+                }),
+                last_episode_end_secs: None,
+            },
+        ];
+        for s in states {
+            for used in 0..=100_u8 {
+                assert_eq!(
+                    decide_pressure_action(short_probe(used), &s, &off, 60),
+                    decide_pressure_action(PressureProbe::used(used), &s, &off, 60),
+                    "used {used}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_in_session_projected_allows_one_depth_partition() {
+        let day = trading_day();
+        // 80% in session: plain gate, no depth, one partition.
+        let plain = pressure_pass_limits(ist(11, 0), day, 80);
+        assert_eq!(plain.1, Some(PressureGateReason::InSession));
+        assert!(plain.0.skip_depth);
+        // Projected short: depth allowed, still one partition.
+        let (limits, gate) = projected_session_limits(plain, true);
+        assert_eq!(gate, Some(PressureGateReason::InSessionProjected));
+        assert!(!limits.skip_depth);
+        assert_eq!(limits.max_partitions, Some(1));
+        assert_eq!(limits.stop_at_unix_secs, None);
+        assert!(gate.is_some_and(PressureGateReason::is_in_session));
+        // Not short: unchanged.
+        assert_eq!(projected_session_limits(plain, false), plain);
+        // Emergency, pre-open, off-session and no gate pass through.
+        for (t, used) in [(ist(11, 0), 95_u8), (ist(8, 0), 80), (ist(18, 0), 80)] {
+            let g = pressure_pass_limits(t, day, used);
+            assert_eq!(projected_session_limits(g, true), g);
+        }
+        let none = pressure_pass_limits(ist(20, 0), PressureSessionDay::default(), 80);
+        assert_eq!(projected_session_limits(none, true), none);
+    }
+
+    #[test]
+    fn test_in_session_projected_registered_at_zero() {
+        // The pressure loop registers every reason in ALL at 0 at boot; the
+        // new reason must be in it, with its own label.
+        assert!(PressureGateReason::ALL.contains(&PressureGateReason::InSessionProjected));
+        assert_eq!(
+            PressureGateReason::InSessionProjected.as_str(),
+            "in_session_projected"
+        );
+        let mut labels: Vec<&str> = PressureGateReason::ALL.iter().map(|r| r.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            PressureGateReason::ALL.len(),
+            "labels are distinct"
+        );
     }
 }
