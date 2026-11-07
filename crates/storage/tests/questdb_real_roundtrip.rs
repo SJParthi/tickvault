@@ -439,6 +439,31 @@ async fn offloaded_ticks_land_through_the_writer_thread_with_both_encoders() {
             u64::from(ROWS),
             "{encoder:?}: {ROWS} captures land, the replayed row collapses"
         );
+        // The count alone would also read 40 if one capture were lost and
+        // another duplicated: every capture_seq 1..=ROWS must be there once.
+        let seqs = rows(
+            &cfg,
+            &format!(
+                "SELECT capture_seq, count() FROM ticks WHERE security_id = {sid} \
+                 ORDER BY capture_seq"
+            ),
+        )
+        .await;
+        let got: Vec<(Option<i64>, Option<i64>)> = seqs
+            .iter()
+            .map(|r| {
+                (
+                    r.get(0).and_then(Value::as_i64),
+                    r.get(1).and_then(Value::as_i64),
+                )
+            })
+            .collect();
+        let want: Vec<(Option<i64>, Option<i64>)> =
+            (1..=i64::from(ROWS)).map(|s| (Some(s), Some(1))).collect();
+        assert_eq!(
+            got, want,
+            "{encoder:?}: each capture_seq 1..={ROWS} lands exactly once"
+        );
         let r = rows(
             &cfg,
             &format!("SELECT ltp, feed FROM ticks WHERE security_id = {sid} LIMIT 1"),
