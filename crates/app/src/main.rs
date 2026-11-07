@@ -5665,9 +5665,8 @@ async fn run_process_runloop(
         shutdown_reason
     };
 
-    // Classify the stop (pure fn; fails toward ExternalStop — loud — on any
-    // doubt). Inputs are all in-process: the signal kind, the runtime
-    // source badge, the IST clock, and the trading calendar.
+    // Classify the stop (pure fn; loud on any doubt). In-process inputs: signal,
+    // runtime badge, IST clock, trading calendar and today's Muhurat session.
     let shutdown_class = {
         use chrono::{Datelike, Timelike};
         let now_ist =
@@ -5695,6 +5694,7 @@ async fn run_process_runloop(
             is_weekday,
             trading_calendar.is_trading_day(today_ist),
             planned_deploy,
+            trading_calendar.muhurat_session_secs(today_ist),
         )
     };
     info!(
