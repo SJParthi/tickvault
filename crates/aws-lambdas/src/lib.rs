@@ -40,6 +40,7 @@ pub mod logging;
 pub mod market_hours_gate;
 pub mod market_open_readiness;
 pub mod muhurat_window;
+pub mod nse_calendar;
 pub mod operator_control;
 pub mod operator_control_action_commands;
 pub mod operator_control_commands;
