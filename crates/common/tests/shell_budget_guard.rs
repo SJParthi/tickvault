@@ -169,8 +169,10 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/verify-stack.sh", 125),
 ];
 
-/// Developer-tooling hooks that a GitHub workflow runs, directly or through
-/// another hook a workflow runs, with their line count PINNED EXACTLY.
+/// Developer-tooling hooks that a GitHub workflow or local composite action
+/// runs, directly or through another hook or shell script it runs (by path,
+/// `./name.sh` after `cd` or `working-directory:`, or a variable folder), with
+/// their line count PINNED EXACTLY.
 /// Sorted. Added 2026-11-07 (deep audit, rust-only finding): the developer
 /// list above froze these files by name only, yet `ci.yml` (Design-First
 /// Wall, Repo Guards) and `secret-scan.yml` run them inside All Green, so
@@ -465,13 +467,17 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
-/// True when the occurrence of a hook's base name at byte `at` of `line` (a
-/// non-comment line) can refer to that hook. The name must stand alone
-/// (`plan-verify.sh` inside `plan-verify.selftest.sh` does not count), and a
-/// path in front of it must be the hooks folder, a variable or a
-/// substitution (`$HOOKS_DIR/`, `$(pwd)/`), never another literal folder
-/// (`scripts/doctor.sh` is not a hook). Errs toward counting a reference.
-fn is_hook_reference(line: &str, at: usize, name: &str) -> bool {
+/// True when the occurrence of the base name of `path` (repo-relative, e.g.
+/// `.claude/hooks/x.sh`) at byte `at` of `line` (a non-comment line) can refer
+/// to that file. The name must stand alone (`plan-verify.sh` inside
+/// `plan-verify.selftest.sh` does not count). A path in front of it must be
+/// the file's own folder, the current or parent folder (`./x.sh`, `../x.sh`,
+/// as after `cd .claude/hooks` or with `working-directory: .claude/hooks`), a
+/// variable or a substitution (`$HOOKS_DIR/`, `$(pwd)/`), never another
+/// literal folder (`scripts/doctor.sh` is not `.claude/hooks/doctor.sh`).
+/// Errs toward counting a reference.
+fn is_file_reference(line: &str, at: usize, path: &str) -> bool {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
     let before = &line[..at];
     let after = &line[at + name.len()..];
     let mut tail = after.chars();
@@ -494,43 +500,62 @@ fn is_hook_reference(line: &str, at: usize, name: &str) -> bool {
     if prev != '/' {
         return true;
     }
-    let dir_part = &before[..before.len() - 1];
-    let segment_start = dir_part
-        .char_indices()
-        .rev()
-        .find(|(_, c)| !is_name_char(*c))
-        .map_or(0, |(i, c)| i + c.len_utf8());
-    let segment = &dir_part[segment_start..];
-    if segment.is_empty() {
-        return true;
+    // Walk back over the folders in front of the name, innermost first,
+    // matching them against the file's own folders. The path counts when it
+    // reaches the start of a relative path (`hooks/x.sh`, `lib/inner.sh`),
+    // the current or parent folder, a variable or substitution
+    // (`$D/`, `${D}/`, `$(pwd)/`), or covers the file's whole folder path
+    // (whatever root is in front of it). A literal folder that is not the
+    // file's own is another file.
+    let mut rest = &before[..before.len() - 1];
+    let mut own = dir.rsplit('/').filter(|c| !c.is_empty());
+    let mut matched_any = false;
+    loop {
+        let segment_start = rest
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !is_name_char(*c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let segment = &rest[segment_start..];
+        let head = &rest[..segment_start];
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return true;
+        }
+        if head.ends_with(['$', '{']) {
+            return true;
+        }
+        match own.next() {
+            Some(folder) if folder == segment => {
+                matched_any = true;
+                let Some(outer) = head.strip_suffix('/') else {
+                    return true;
+                };
+                rest = outer;
+            }
+            Some(_) => return false,
+            None => return matched_any,
+        }
     }
-    if dir_part[..segment_start].ends_with(['$', '{']) {
-        return true;
-    }
-    if segment == "hooks" {
-        return dir_part.ends_with(".claude/hooks") || segment_start == 0;
-    }
-    false
 }
 
-/// The hooks (`.claude/hooks/<name>`) a text refers to on its non-comment
-/// lines. `hooks` holds full paths under `HOOKS_DIR`. Sorted, unique.
-fn hooks_referenced_in(text: &str, hooks: &[&str]) -> Vec<String> {
+/// The files (repo-relative `paths`) a text refers to on its non-comment
+/// lines. Sorted, unique.
+fn files_referenced_in(text: &str, paths: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
         if line.trim_start().starts_with('#') {
             continue;
         }
-        for hook in hooks {
-            let name = hook.strip_prefix(HOOKS_DIR).unwrap_or(hook);
-            if out.iter().any(|h| h == hook) {
+        for path in paths {
+            let name = path.rsplit_once('/').map_or(*path, |(_, n)| n);
+            if out.iter().any(|h| h == path) {
                 continue;
             }
             if line
                 .match_indices(name)
-                .any(|(at, _)| is_hook_reference(line, at, name))
+                .any(|(at, _)| is_file_reference(line, at, path))
             {
-                out.push((*hook).to_string());
+                out.push((*path).to_string());
             }
         }
     }
@@ -539,32 +564,48 @@ fn hooks_referenced_in(text: &str, hooks: &[&str]) -> Vec<String> {
     out
 }
 
-/// Every hook a workflow runs: the hooks the workflows name, plus every hook
-/// those hooks name on a non-comment line, to a fixed point. `workflows` and
-/// `hook_texts` are `(path, content)`. Sorted, unique.
+/// Every hook a workflow runs: the hooks the workflow texts name, plus every
+/// hook named, on a non-comment line, by a hook or by another shell file
+/// (`scripts`) that a workflow, a hook or such a script names, to a fixed
+/// point. So a hook a workflow reaches through `scripts/x.sh` counts too.
+/// `workflows`, `hook_texts` and `script_texts` are `(path, content)`.
+/// Returns hooks only. Sorted, unique.
 fn hooks_run_by_workflows(
     workflows: &[(String, String)],
     hook_texts: &[(String, String)],
+    script_texts: &[(String, String)],
 ) -> Vec<String> {
-    let names: Vec<&str> = hook_texts.iter().map(|(p, _)| p.as_str()).collect();
-    let mut run: Vec<String> = Vec::new();
+    let mut targets: Vec<&str> = hook_texts.iter().map(|(p, _)| p.as_str()).collect();
+    targets.extend(script_texts.iter().map(|(p, _)| p.as_str()));
+    let mut reached: Vec<String> = Vec::new();
     for (_, text) in workflows {
-        run.extend(hooks_referenced_in(text, &names));
+        for f in files_referenced_in(text, &targets) {
+            if !reached.contains(&f) {
+                reached.push(f);
+            }
+        }
     }
-    run.sort();
-    run.dedup();
     let mut i = 0;
-    while i < run.len() {
-        let current = run[i].clone();
-        if let Some((_, text)) = hook_texts.iter().find(|(p, _)| *p == current) {
-            for h in hooks_referenced_in(text, &names) {
-                if !run.contains(&h) {
-                    run.push(h);
+    while i < reached.len() {
+        let current = reached[i].clone();
+        let text = hook_texts
+            .iter()
+            .chain(script_texts)
+            .find(|(p, _)| *p == current)
+            .map(|(_, t)| t.as_str());
+        if let Some(text) = text {
+            for f in files_referenced_in(text, &targets) {
+                if !reached.contains(&f) {
+                    reached.push(f);
                 }
             }
         }
         i += 1;
     }
+    let mut run: Vec<String> = reached
+        .into_iter()
+        .filter(|f| hook_texts.iter().any(|(p, _)| p == f))
+        .collect();
     run.sort();
     run
 }
@@ -579,28 +620,56 @@ fn off_pin(lines: &[(String, usize)], pins: &[(&str, usize)]) -> Vec<(String, us
         .collect()
 }
 
-/// The workflows (`.github/workflows/*.yml|yaml`) and the hooks
-/// (`.claude/hooks/*.sh`, top level) in the tree, each with its content.
-fn workflows_and_hooks() -> (Vec<(String, String)>, Vec<(String, String)>) {
+/// True for a top-level hook, `.claude/hooks/<name>.sh`.
+fn is_top_level_hook(path: &str) -> bool {
+    path.strip_prefix(HOOKS_DIR)
+        .is_some_and(|rest| rest.ends_with(".sh") && !rest.contains('/'))
+}
+
+/// True for a file GitHub Actions reads as CI steps: a workflow
+/// (`.github/workflows/*.yml|yaml`) or a local composite action
+/// (`.github/actions/**/action.yml|yaml`).
+fn is_ci_definition(path: &str) -> bool {
+    let yaml = path.ends_with(".yml") || path.ends_with(".yaml");
+    let workflow = path.starts_with(".github/workflows/");
+    let action = path.starts_with(".github/actions/")
+        && matches!(path.rsplit('/').next(), Some("action.yml" | "action.yaml"));
+    yaml && (workflow || action)
+}
+
+/// `(path, content)` lists: workflows, hooks, other shell files.
+type CiTexts = (
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+);
+
+/// `(workflows, hooks, scripts)`, each `(path, content)`: the CI definitions
+/// (`is_ci_definition`), the top-level hooks (`.claude/hooks/*.sh`), and every
+/// other shell file in the tree (docs excluded), which a workflow can run and
+/// which can in turn run a hook.
+fn workflows_and_hooks() -> CiTexts {
     let files = all_files();
     let workflows: Vec<(String, String)> = files
         .iter()
-        .filter(|p| {
-            p.starts_with(".github/workflows/") && (p.ends_with(".yml") || p.ends_with(".yaml"))
-        })
+        .filter(|p| is_ci_definition(p))
         .map(|p| (p.clone(), read_listed(p)))
         .collect();
     let hooks: Vec<(String, String)> = files
         .iter()
-        .filter(|p| {
-            p.strip_prefix(HOOKS_DIR)
-                .is_some_and(|rest| rest.ends_with(".sh") && !rest.contains('/'))
-        })
+        .filter(|p| is_top_level_hook(p))
         .map(|p| (p.clone(), read_listed(p)))
         .collect();
-    (workflows, hooks)
+    let scripts: Vec<(String, String)> = files
+        .iter()
+        .filter(|p| !p.ends_with(".md") && !is_top_level_hook(p))
+        .filter_map(|p| {
+            let text = read_text(p)?;
+            is_shell_file(p, &text).then(|| (p.clone(), text))
+        })
+        .collect();
+    (workflows, hooks, scripts)
 }
-
 #[test]
 fn workflow_run_hooks_have_ceilings() {
     let names: Vec<&str> = WORKFLOW_RUN_HOOK_LINES.iter().map(|(p, _)| *p).collect();
@@ -611,15 +680,16 @@ fn workflow_run_hooks_have_ceilings() {
             "`{p}` is pinned in WORKFLOW_RUN_HOOK_LINES but not in SHELL_DEV_TOOLING_FILES"
         );
     }
-    let (workflows, hooks) = workflows_and_hooks();
-    // Anti-vacuity: the scan must see the workflows and hooks it guards.
+    let (workflows, hooks, scripts) = workflows_and_hooks();
+    // Anti-vacuity: the scan must see the workflows, hooks and scripts it guards.
     assert!(
-        workflows.len() > 10 && hooks.len() > 20,
-        "only {} workflows / {} hooks found; the scan is broken",
+        workflows.len() > 10 && hooks.len() > 20 && scripts.len() > 5,
+        "only {} workflows / {} hooks / {} other shell files found; the scan is broken",
         workflows.len(),
-        hooks.len()
+        hooks.len(),
+        scripts.len()
     );
-    let run = hooks_run_by_workflows(&workflows, &hooks);
+    let run = hooks_run_by_workflows(&workflows, &hooks, &scripts);
     assert!(
         run.len() >= 10,
         "only {} hooks found run by workflows ({run:?}); the reference scan is broken",
@@ -687,38 +757,66 @@ fn workflow_run_hook_scan_bites() {
     let names: Vec<&str> = hooks.iter().map(|(p, _)| p.as_str()).collect();
     // Direct, prefixed, bare after `cd`, variable dir, substitution dir.
     assert_eq!(
-        hooks_referenced_in("run: bash .claude/hooks/a.sh \"$X\"\n", &names),
+        files_referenced_in("run: bash .claude/hooks/a.sh \"$X\"\n", &names),
         vec![".claude/hooks/a.sh"]
     );
     assert_eq!(
-        hooks_referenced_in("run: ./.claude/hooks/e.sh\n", &names),
+        files_referenced_in("run: ./.claude/hooks/e.sh\n", &names),
         vec![".claude/hooks/e.sh"]
     );
     assert_eq!(
-        hooks_referenced_in("run: cd .claude/hooks && bash e.sh\n", &names),
+        files_referenced_in("run: cd .claude/hooks && bash e.sh\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    // Current or parent folder, as with `working-directory: .claude/hooks`
+    // or after `cd .claude/hooks` (review 2026-11-07: `./e.sh` was missed).
+    assert_eq!(
+        files_referenced_in(
+            "        working-directory: .claude/hooks\n        run: ./e.sh\n",
+            &names
+        ),
         vec![".claude/hooks/e.sh"]
     );
     assert_eq!(
-        hooks_referenced_in("bash \"$HOOKS_DIR/e.sh\"\n", &names),
+        files_referenced_in("run: cd .claude/hooks && ./e.sh --all\n", &names),
         vec![".claude/hooks/e.sh"]
     );
     assert_eq!(
-        hooks_referenced_in("bash \"${D}/e.sh\" ; bash $(pwd)/d.sh\n", &names),
+        files_referenced_in("run: cd .claude/hooks/x && ../e.sh\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    // An absolute or workspace-rooted path to the hooks folder counts too.
+    assert_eq!(
+        files_referenced_in("run: /home/runner/work/t/t/.claude/hooks/e.sh\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    assert_eq!(
+        files_referenced_in("run: bash $GITHUB_WORKSPACE/.claude/hooks/e.sh\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    // A different literal folder of the same last name is not the hook.
+    assert!(files_referenced_in("run: bash other/hooks/e.sh\n", &names).is_empty());
+    assert_eq!(
+        files_referenced_in("bash \"$HOOKS_DIR/e.sh\"\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    assert_eq!(
+        files_referenced_in("bash \"${D}/e.sh\" ; bash $(pwd)/d.sh\n", &names),
         vec![".claude/hooks/d.sh", ".claude/hooks/e.sh"]
     );
     // Not a reference: comment line, another folder, longer name, extension.
-    assert!(hooks_referenced_in("  # bash .claude/hooks/a.sh\n", &names).is_empty());
-    assert!(hooks_referenced_in("run: bash scripts/doctor.sh\n", &names).is_empty());
-    assert!(hooks_referenced_in("run: bash scripts/tv-tunnel/doctor.sh\n", &names).is_empty());
+    assert!(files_referenced_in("  # bash .claude/hooks/a.sh\n", &names).is_empty());
+    assert!(files_referenced_in("run: bash scripts/doctor.sh\n", &names).is_empty());
+    assert!(files_referenced_in("run: bash scripts/tv-tunnel/doctor.sh\n", &names).is_empty());
     assert!(
-        hooks_referenced_in("bash .claude/hooks/c.selftest.sh\n", &names)
+        files_referenced_in("bash .claude/hooks/c.selftest.sh\n", &names)
             .iter()
             .all(|h| h != ".claude/hooks/c.sh")
     );
-    assert!(hooks_referenced_in("cat e.sh.bak; bash ee.sh; bash xe.sh\n", &names).is_empty());
+    assert!(files_referenced_in("cat e.sh.bak; bash ee.sh; bash xe.sh\n", &names).is_empty());
     // A sentence-ending dot still counts as the name.
     assert_eq!(
-        hooks_referenced_in("echo \"see e.sh.\"\n", &names),
+        files_referenced_in("echo \"see e.sh.\"\n", &names),
         vec![".claude/hooks/e.sh"]
     );
     // Closure: a workflow runs a.sh and c.selftest.sh; c.selftest.sh runs c.sh,
@@ -729,13 +827,56 @@ fn workflow_run_hook_scan_bites() {
             .to_string(),
     )];
     assert_eq!(
-        hooks_run_by_workflows(&workflows, &hooks),
+        hooks_run_by_workflows(&workflows, &hooks, &[]),
         vec![
             ".claude/hooks/a.sh",
             ".claude/hooks/c.selftest.sh",
             ".claude/hooks/c.sh",
             ".claude/hooks/d.sh",
         ]
+    );
+    // Through a non-hook shell file: a workflow runs `scripts/gate.sh`, which
+    // runs `scripts/lib/inner.sh`, which runs hook e.sh. A script no workflow
+    // reaches (`scripts/idle.sh`) adds nothing, and a script is never returned.
+    let scripts: Vec<(String, String)> = vec![
+        (
+            "scripts/gate.sh".into(),
+            "# bash .claude/hooks/b.sh\nbash \"$(dirname \"$0\")/lib/inner.sh\"\n".into(),
+        ),
+        (
+            "scripts/lib/inner.sh".into(),
+            "bash \"$ROOT/.claude/hooks/e.sh\"\n".into(),
+        ),
+        ("scripts/idle.sh".into(), "bash .claude/hooks/b.sh\n".into()),
+    ];
+    let via_script = vec![(
+        ".github/workflows/y.yml".to_string(),
+        "      - run: bash scripts/gate.sh\n".to_string(),
+    )];
+    assert_eq!(
+        hooks_run_by_workflows(&via_script, &hooks, &scripts),
+        vec![".claude/hooks/e.sh"]
+    );
+    // Without the script texts the hook is not reachable: the closure is what
+    // finds it.
+    assert!(hooks_run_by_workflows(&via_script, &hooks, &[]).is_empty());
+    // CI definitions: workflows and local composite actions, nothing else.
+    assert!(is_ci_definition(".github/workflows/ci.yml"));
+    assert!(is_ci_definition(".github/workflows/ci.yaml"));
+    assert!(is_ci_definition(".github/actions/setup/action.yml"));
+    assert!(is_ci_definition(".github/actions/a/b/action.yaml"));
+    assert!(!is_ci_definition(".github/actions/setup/notes.yml"));
+    assert!(!is_ci_definition(".github/dependabot.yml"));
+    assert!(!is_ci_definition(".github/workflows/README.md"));
+    // A hook named by a composite action counts like one named by a workflow.
+    let action = vec![(
+        ".github/actions/gate/action.yml".to_string(),
+        "    - shell: bash\n      run: ${{ github.action_path }}/../../../.claude/hooks/e.sh\n"
+            .to_string(),
+    )];
+    assert_eq!(
+        hooks_run_by_workflows(&action, &hooks, &[]),
+        vec![".claude/hooks/e.sh"]
     );
     // Pins: exact match passes; one line more or one line less both fail.
     let lines = vec![(".claude/hooks/a.sh".to_string(), 10_usize)];
