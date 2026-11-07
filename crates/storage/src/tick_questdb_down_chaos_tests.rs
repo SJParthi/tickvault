@@ -22,6 +22,9 @@
 //!    ([`crate::tick_spill_replay::replay_spill_dir`]) delivers every rescued
 //!    row, each `capture_seq` exactly once, and a second round after the acks
 //!    are confirmed sends nothing more.
+//! 3. (2026-11-07) A QuestDB that is UP but refuses every batch (HTTP 400)
+//!    takes the same rescue: each row is sent once, never retried, and every
+//!    refused row reaches the spill exactly once.
 //!
 //! A child of `tick_persistence`, so it can assert the sink really holds a
 //! network sender (the rescue is caused by the network, not by the test
@@ -140,6 +143,24 @@ fn expected_seqs() -> Vec<i64> {
 /// An in-process "QuestDB came back": answers every request 204 on
 /// keep-alive connections and records each `POST /write` body.
 fn recording_questdb() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+    answering_questdb(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+}
+
+/// A QuestDB-shaped refusal (HTTP 400 with QuestDB's JSON body): what the
+/// server answers for a row whose column type does not match its table.
+const REFUSAL_REPLY: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
+Content-Type: application/json\r\nContent-Length: 78\r\n\r\n\
+{\"code\":\"invalid\",\"message\":\"cast error for line\",\"line\":1,\"errorId\":\"a1b2-3\"}";
+
+/// An in-process QuestDB that is UP but refuses every batch (HTTP 400), and
+/// records each `POST /write` body it refused.
+fn refusing_questdb() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+    answering_questdb(REFUSAL_REPLY)
+}
+
+/// Answers every request with `reply` on keep-alive connections and records
+/// each `POST /write` body.
+fn answering_questdb(reply: &'static [u8]) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -148,13 +169,13 @@ fn recording_questdb() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
             let seen = Arc::clone(&seen);
-            std::thread::spawn(move || serve_connection(stream, &seen));
+            std::thread::spawn(move || serve_connection(stream, &seen, reply));
         }
     });
     (port, bodies)
 }
 
-fn serve_connection(stream: std::net::TcpStream, seen: &Mutex<Vec<Vec<u8>>>) {
+fn serve_connection(stream: std::net::TcpStream, seen: &Mutex<Vec<Vec<u8>>>, reply: &[u8]) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut writer = stream;
     loop {
@@ -185,10 +206,7 @@ fn serve_connection(stream: std::net::TcpStream, seen: &Mutex<Vec<Vec<u8>>>) {
         if request_line.starts_with("POST /write") {
             seen.lock().expect("bodies").push(body);
         }
-        if writer
-            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-            .is_err()
-        {
+        if writer.write_all(reply).is_err() {
             return;
         }
     }
@@ -197,10 +215,20 @@ fn serve_connection(stream: std::net::TcpStream, seen: &Mutex<Vec<Vec<u8>>>) {
 /// LEG 1 of the scenario for one encoder: QuestDB unreachable, the live
 /// offloaded writer rescues every row. Returns the spill directory.
 fn assert_rows_survive_an_unreachable_questdb(encoder: TickIlpEncoder) -> PathBuf {
-    let dir = scratch_dir(match encoder {
-        TickIlpEncoder::Library => "library",
-        TickIlpEncoder::Own => "own",
-    });
+    assert_offloaded_rows_spill(encoder, closed_port(), "down")
+}
+
+/// The offloaded writer pointed at `port`, whose every flush fails (nothing
+/// listening, or a server that refuses every batch): every appended row must
+/// reach the spill exactly once. Returns the spill directory.
+fn assert_offloaded_rows_spill(encoder: TickIlpEncoder, port: u16, tag: &str) -> PathBuf {
+    let dir = scratch_dir(&format!(
+        "{tag}-{}",
+        match encoder {
+            TickIlpEncoder::Library => "library",
+            TickIlpEncoder::Own => "own",
+        }
+    ));
     // The spill refuses a write that would leave less than
     // SPILL_MIN_FREE_HEADROOM_BYTES free, by design. On a host that full the
     // rows below would be refused and counted, and this test would fail with
@@ -214,13 +242,13 @@ fn assert_rows_survive_an_unreachable_questdb(encoder: TickIlpEncoder) -> PathBu
          (SPILL_MIN_FREE_HEADROOM_BYTES). Free up disk and re-run; do NOT lower the floor.",
         dir.display()
     );
-    let writer = TickWriter::new_with_encoder(&questdb_config(closed_port()), Feed::Dhan, encoder)
+    let writer = TickWriter::new_with_encoder(&questdb_config(port), Feed::Dhan, encoder)
         .with_spill_dir_for_test(dir.clone());
     let (mut producer, sink, rx) = writer.split_for_offload();
     assert!(
         sink.sender.is_some(),
         "{encoder:?}: the sink must hold a real network sender, so the rescue below is \
-         caused by the refused connection and not by a writer built without one"
+         caused by the failed send and not by a writer built without one"
     );
     assert_eq!(sink.spill_dir, dir, "the sink spills where the writer does");
 
@@ -265,7 +293,7 @@ fn assert_rows_survive_an_unreachable_questdb(encoder: TickIlpEncoder) -> PathBu
 
     assert_eq!(
         landed, 0,
-        "{encoder:?}: QuestDB is unreachable, so the writer must report nothing landed"
+        "{encoder:?}: every flush fails, so the writer must report nothing landed"
     );
     assert!(
         batches >= 1,
@@ -360,6 +388,57 @@ fn chaos_cascade_01_leg2_questdb_down_offloaded_tick_rows_spill_then_land_once()
     for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
         let dir = assert_rows_survive_an_unreachable_questdb(encoder);
         assert_spilled_rows_land_once_questdb_is_back(encoder, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The refusal fixture is a well-formed HTTP answer: its `Content-Length`
+/// is the length of its body, so both senders read a whole 400 and never a
+/// truncated or overlong reply.
+#[test]
+fn refusal_reply_fixture_declares_its_body_length() {
+    let text = std::str::from_utf8(REFUSAL_REPLY).expect("ASCII reply");
+    let (head, body) = text.split_once("\r\n\r\n").expect("head and body");
+    assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+    let declared: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .expect("Content-Length header")
+        .parse()
+        .expect("a number");
+    assert_eq!(declared, body.len(), "Content-Length must match the body");
+}
+
+/// QuestDB is UP but REFUSES every batch (HTTP 400, its answer to a row whose
+/// column type does not match the table), both encoders: the live offloaded
+/// writer sends each row exactly once (a refusal is never retried), reports
+/// nothing landed, and every refused row reaches the spill exactly once. Until
+/// 2026-11-07 only a closed port was tested, so a refusal arm that dropped the
+/// batch instead of rescuing it would have passed.
+#[test]
+fn chaos_cascade_01_refused_offloaded_tick_batches_are_spilled_not_lost() {
+    for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+        let (port, refused) = refusing_questdb();
+        let dir = assert_offloaded_rows_spill(encoder, port, "refused");
+        let mut sent: Vec<i64> = refused
+            .lock()
+            .expect("bodies")
+            .iter()
+            .flat_map(|body| capture_seqs(body))
+            .collect();
+        let posted = sent.len();
+        sent.sort_unstable();
+        sent.dedup();
+        assert_eq!(
+            posted,
+            expected_seqs().len(),
+            "{encoder:?}: every row reached the server exactly once; a refusal is not retried"
+        );
+        assert_eq!(
+            sent,
+            expected_seqs(),
+            "{encoder:?}: the rescue was caused by the server's refusal of these rows"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
