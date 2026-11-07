@@ -165,6 +165,12 @@ pub struct DayWork {
     /// Non-empty files waiting in the tick, depth, top-volume and audit
     /// spill folders.
     pub spill_files: usize,
+    /// Pending tick and depth spill files the replay holds because their
+    /// table is not yet ensured in this process (2026-11-07,
+    /// `ilp_table_gate`). Shown in [`DayWork::left_text`] but NOT work: they
+    /// cannot drain tonight, so they never keep the hold. Their rows stay on
+    /// disk and replay once the table is ensured.
+    pub spill_files_held_unensured: usize,
     /// Today's sealed-candle spill files not yet confirmed in the database,
     /// plus parked ones; `None` when the folder could not be read.
     pub seal_staged: Option<usize>,
@@ -249,7 +255,14 @@ impl DayWork {
             },
             show(self.wal_backlog),
             if self.wal_holding { "+replaying" } else { "" },
-        )
+        ) + &if self.spill_files_held_unensured > 0 {
+            format!(
+                " spill_files_held_for_table={}",
+                self.spill_files_held_unensured
+            )
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -281,14 +294,49 @@ pub fn hold_value(holding: bool, until_unix: i64, written_unix: i64, left: &str)
 /// confirmed (`spill_file_pending`, O(1) per file). After a restart the
 /// offset is forgotten, so a file counts until the first round re-sends it.
 fn waiting_spill_files(dir: &Path) -> usize {
-    tickvault_storage::tick_spill_replay::list_spill_files(dir)
+    spill_file_counts(
+        dir,
+        tickvault_storage::tick_spill_replay::spill_file_held_for_unensured_table,
+    )
+    .waiting
+}
+
+/// Pending spill files in one folder, split by whether they can drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SpillFileCounts {
+    /// Files the replay can still drain tonight: work that keeps the hold.
+    waiting: usize,
+    /// Files the replay holds for a table this process has not ensured
+    /// (2026-11-07, `ilp_table_gate`). They cannot drain whatever the box
+    /// does, so they do not keep the hold; their bytes stay on disk and
+    /// replay once the table is ensured. Before, they held the box to 07:30
+    /// IST every night (~14 paid hours) and blocked the evening restarts.
+    held_unensured: usize,
+}
+
+/// [`waiting_spill_files`] with the held-file test `held_unensured` passed
+/// in, so a test can drive it without the process-wide ensure flags. A file
+/// with bytes past its drained offset or unconfirmed acks is pending; a
+/// pending file `held_unensured` accepts is counted apart. O(files).
+fn spill_file_counts(dir: &Path, held_unensured: impl Fn(&Path) -> bool) -> SpillFileCounts {
+    let mut counts = SpillFileCounts::default();
+    for path in tickvault_storage::tick_spill_replay::list_spill_files(dir)
         .into_iter()
         .chain(tickvault_storage::depth_spill_frame::list_framed_spill_files(dir))
-        .filter(|p| {
-            std::fs::metadata(p)
-                .is_ok_and(|m| tickvault_storage::tick_spill_replay::spill_file_pending(p, m.len()))
-        })
-        .count()
+    {
+        let pending = std::fs::metadata(&path).is_ok_and(|m| {
+            tickvault_storage::tick_spill_replay::spill_file_pending(&path, m.len())
+        });
+        if !pending {
+            continue;
+        }
+        if held_unensured(&path) {
+            counts.held_unensured = counts.held_unensured.saturating_add(1);
+        } else {
+            counts.waiting = counts.waiting.saturating_add(1);
+        }
+    }
+    counts
 }
 
 /// Seconds the after-close pass has been floor-blocked at `now_unix`, from
@@ -309,13 +357,20 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
     // The top_volume spill folder left this list on 2026-10-22 (plan item
     // 62, operator Quote 34): nothing replays it any more, so a file left in
     // it would hold the box up all night for work no task will ever do.
-    let mut spill_files = [
+    let mut spill_files = 0_usize;
+    let mut spill_files_held_unensured = 0_usize;
+    for dir in [
         tickvault_storage::tick_persistence::TICK_SPILL_DIR,
         tickvault_storage::depth_persistence::DEPTH_SPILL_DIR,
-    ]
-    .iter()
-    .map(|d| waiting_spill_files(Path::new(d)))
-    .sum::<usize>();
+    ] {
+        let counts = spill_file_counts(
+            Path::new(dir),
+            tickvault_storage::tick_spill_replay::spill_file_held_for_unensured_table,
+        );
+        spill_files = spill_files.saturating_add(counts.waiting);
+        spill_files_held_unensured =
+            spill_files_held_unensured.saturating_add(counts.held_unensured);
+    }
     for table in AuditSpillTable::ALL {
         spill_files += waiting_spill_files(&table.default_dir());
     }
@@ -333,6 +388,7 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
             chrono::Utc::now().timestamp(),
         ),
         spill_files,
+        spill_files_held_unensured,
         seal_staged,
         apply_lag: tickvault_common::ingest_shed::wal_apply_lag_max(),
         suspended: tickvault_common::ingest_shed::wal_suspended_tables(),
@@ -1172,6 +1228,45 @@ mod tests {
         assert_eq!(waiting_spill_files(&dir), 0, "an emptied file is not work");
         std::fs::write(dir.join("ticks-dhan-2.ilp"), b"row\n").unwrap();
         assert_eq!(waiting_spill_files(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: 2026-11-07 — a spill file the replay holds for a table this
+    // process has not ensured cannot drain, yet it counted as work and held
+    // the box to 07:30 IST every night. It is now counted apart, never as
+    // work, and never touched. Bite: count a held file as `waiting` and the
+    // second assert fails.
+    #[test]
+    fn test_regression_spill_files_held_for_an_unensured_table_are_not_night_work() {
+        let dir = std::env::temp_dir().join(format!("tv-drain-hold-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("depth-dhan-1.dspl");
+        std::fs::write(&held, b"framed book record").unwrap();
+        std::fs::write(dir.join("depth-dhan-2.dspl"), b"framed level record").unwrap();
+        let counts = spill_file_counts(&dir, |p| p == held.as_path());
+        assert_eq!(counts.held_unensured, 1, "the held file is counted apart");
+        assert_eq!(counts.waiting, 1, "only the file that can drain is work");
+        assert_eq!(
+            std::fs::read(&held).unwrap(),
+            b"framed book record",
+            "the held file is never touched"
+        );
+        let work = DayWork {
+            spill_files: 0,
+            spill_files_held_unensured: 3,
+            ..done_work()
+        };
+        assert!(work.is_done(), "held files alone never keep the box up");
+        assert!(
+            work.left_text().ends_with(" spill_files_held_for_table=3"),
+            "{}",
+            work.left_text()
+        );
+        assert!(
+            !done_work().left_text().contains("held_for_table"),
+            "nothing held: the summary is unchanged"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

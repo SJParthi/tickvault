@@ -54,7 +54,24 @@
 //! * With `array_rows` off the book table is never ensured, so framed book
 //!   records left from an earlier on-period are held until it is turned on
 //!   again (kept on disk, counted, never posted into an auto-created table).
+//! * A refused book ensure is retried in the background on the doubling
+//!   delay (30 s to 10 min, `candle_ddl_boot::DdlTables::MarketDepthBook`),
+//!   which sets the flag on success; the book WRITER stays armed only from
+//!   the boot's outcome. A table with the wrong shape keeps refusing outside
+//!   08:00 to 15:40 IST (the self-heal runs only inside it), so its records
+//!   wait for the next in-window boot or retry.
+//! * A file held here does NOT keep the after-close drain hold up
+//!   ([`file_waits_only_on_unensured_table`], read by `drain_hold`): a held
+//!   file cannot drain whatever the box does, and counting it held the box
+//!   to 07:30 IST every night (~14 paid hours). The remaining cost: its rows
+//!   are not in the database that night; they stay in the spill folder and
+//!   replay once the table is ensured (the next boot that ensures it). At
+//!   most [`HELD_FILES_MAX`] files are recorded; a file past it counts as
+//!   work, the direction that keeps the box up.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The tables the spill replay writes. Every name is the writer's own
@@ -197,13 +214,61 @@ pub fn first_unensured_in_record(
 /// per table, one line per table per process.
 static HOLD_LOGGED: AtomicU8 = AtomicU8::new(0);
 
-/// Counts and (once per table per process) logs a spill file held because
-/// `table` is not yet ensured. Cold path, once per held file per round.
+/// The most held files [`HELD_FILES`] records. A spill folder holds about
+/// one file per hour per tier, so a real backlog is far below this; past it a
+/// held file is not recorded and counts as work (keeps the box up).
+pub const HELD_FILES_MAX: usize = 4_096;
+
+/// Spill files the replay last held, with the resume offset it held at and
+/// the table it waited for. Read by `drain_hold` through
+/// [`file_waits_only_on_unensured_table`]. An entry goes stale on its own
+/// (the offset moves, or the table becomes ensured), so nothing removes one.
+static HELD_FILES: Mutex<Option<HashMap<PathBuf, (u64, GatedTable)>>> = Mutex::new(None);
+
+/// Records that the replay held `path` at resume offset `held_at` for
+/// `table`. One lock and one hash insert per held file per round; cold.
+fn record_held_file(path: &Path, held_at: u64, table: GatedTable) {
+    let Ok(mut guard) = HELD_FILES.lock() else {
+        return; // poisoned: the file then counts as work, the safe direction
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() < HELD_FILES_MAX || map.contains_key(path) {
+        map.insert(path.to_path_buf(), (held_at, table));
+    }
+}
+
+/// Whether the only thing left in `path` from resume offset `resume_offset`
+/// is rows the replay is holding for a table this process has not ensured.
+/// `false` (counts as work) when the replay recorded no hold for it, held it
+/// at another offset, or the table has since been ensured (the next round
+/// will post it). One lock and one hash probe; cold (the drain-hold
+/// supervisor, once a minute per spill file).
+#[must_use]
+pub fn file_waits_only_on_unensured_table(path: &Path, resume_offset: u64) -> bool {
+    held_and_unensured(path, resume_offset, EnsuredTables::current())
+}
+
+/// [`file_waits_only_on_unensured_table`] against the snapshot `ensured`.
+pub(crate) fn held_and_unensured(path: &Path, resume_offset: u64, ensured: EnsuredTables) -> bool {
+    let Ok(guard) = HELD_FILES.lock() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .and_then(|map| map.get(path))
+        .is_some_and(|(held_at, table)| *held_at == resume_offset && !ensured.contains(*table))
+}
+
+/// Counts, records for `drain_hold` and (once per table per process) logs a
+/// spill file held at resume offset `held_at` because `table` is not yet
+/// ensured. Cold path, once per held file per round.
 pub fn note_replay_held_table_not_ensured(
     dir_label: &'static str,
     table: GatedTable,
-    path: &std::path::Path,
+    path: &Path,
+    held_at: u64,
 ) {
+    record_held_file(path, held_at, table);
     metrics::counter!(
         crate::tick_spill_replay::SPILL_REPLAY_HELD_COUNTER,
         "dir" => dir_label,
@@ -335,84 +400,156 @@ mod tests {
     #[test]
     fn test_note_replay_held_table_not_ensured_runs() {
         // Twice: the second call takes the latched arm (no second log line).
-        note_replay_held_table_not_ensured(
-            "depth",
-            GatedTable::MarketDepthBook,
-            std::path::Path::new("/x/a.dspl"),
-        );
-        note_replay_held_table_not_ensured(
-            "depth",
-            GatedTable::MarketDepthBook,
-            std::path::Path::new("/x/a.dspl"),
-        );
+        let path = Path::new("/x/note-held.dspl");
+        note_replay_held_table_not_ensured("depth", GatedTable::MarketDepthBook, path, 7);
+        note_replay_held_table_not_ensured("depth", GatedTable::MarketDepthBook, path, 7);
         assert_ne!(
             HOLD_LOGGED.load(Ordering::Acquire) & GatedTable::MarketDepthBook.bit(),
             0
         );
+        // And it is recorded for the drain hold.
+        assert!(held_and_unensured(path, 7, EnsuredTables::NONE));
     }
 
-    /// Every gated table is marked by the ensure that creates it, and only on
-    /// success. A table nobody marks would hold its spill forever; a mark
-    /// placed before the verdict would let the replay post into a table the
-    /// ensure did not create. Source scan: each ensure function's body,
-    /// up to the next `pub async fn`, must call `mark_table_ensured` for its
-    /// table, after the line that decides success.
+    /// A held file stops counting as night work only while it is held at its
+    /// current offset for a table still not ensured.
+    #[test]
+    fn test_held_and_unensured_and_file_waits_only_on_unensured_table() {
+        let path = Path::new("/x/held-only.dspl");
+        let never = Path::new("/x/never-held.dspl");
+        record_held_file(path, 100, GatedTable::MarketDepthBook);
+        assert!(held_and_unensured(path, 100, EnsuredTables::NONE));
+        assert!(
+            !held_and_unensured(path, 101, EnsuredTables::NONE),
+            "the offset moved: work"
+        );
+        assert!(
+            !held_and_unensured(
+                path,
+                100,
+                EnsuredTables::NONE.with(GatedTable::MarketDepthBook)
+            ),
+            "the table is ensured now: the next round posts it, so it is work"
+        );
+        assert!(!held_and_unensured(never, 0, EnsuredTables::NONE));
+        // The process-global form reads the same record (the book bit may be
+        // set by another test, so only the never-held path is asserted).
+        assert!(!file_waits_only_on_unensured_table(never, 0));
+    }
+
+    /// The body of the function whose signature starts with `signature`:
+    /// from its opening brace to the matching closing one.
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect(signature);
+        let open = start + source[start..].find('{').expect("a body");
+        &source[open..=matching_brace(source, open)]
+    }
+
+    /// The index of the `}` matching the `{` at `open`. The bodies scanned
+    /// here hold no brace inside a string or comment on the paths checked.
+    fn matching_brace(source: &str, open: usize) -> usize {
+        let mut depth = 0_usize;
+        for (i, b) in source.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces from {open}");
+    }
+
+    fn compact(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    /// Every gated table is marked by the ensure that creates it, and ONLY on
+    /// its success path. A table nobody marks would hold its spill forever; a
+    /// mark outside the success block would let the replay post into a table
+    /// the ensure did not create (the auto-create this gate exists to stop).
     ///
-    /// Bite: delete any of the four mark calls and this fails.
+    /// Source scan, per ensure: the verdict is the real expression (the
+    /// all-statements-accepted flag that every failure arm clears, or the
+    /// `run_depth_ddl` result); its success block is brace-matched, and EVERY
+    /// `mark_table_ensured` in the function must lie inside it and name the
+    /// expected tables.
+    ///
+    /// Bite: move any mark out of its success block, or delete one, and this
+    /// fails.
     #[test]
     fn test_every_gated_table_is_marked_by_its_ensure_after_the_verdict() {
-        let cases: [(&str, &str, &str, &[&str]); 4] = [
+        // (source, function signature, the verdict's success-block opener,
+        //  facts the verdict must rest on, tables the block must mark)
+        let cases: [(&str, &str, &str, &[&str], &[&str]); 4] = [
             (
                 include_str!("tick_persistence.rs"),
                 "fn ensure_ticks_table(",
                 "if every_statement_accepted {",
+                &[
+                    "let mut every_statement_accepted = true;",
+                    "every_statement_accepted = false;",
+                ],
                 &["GatedTable::Ticks)", "GatedTable::TickQuotes)"],
             ),
             (
                 include_str!("feed_aux_persistence.rs"),
                 "fn ensure_feed_aux_table(",
                 "if every_statement_accepted {",
-                &["GatedTable::FeedAuxPackets"],
+                &[
+                    "let mut every_statement_accepted = true;",
+                    "every_statement_accepted = false;",
+                ],
+                &["GatedTable::FeedAuxPackets,"],
             ),
             (
                 include_str!("depth_persistence.rs"),
                 "fn ensure_market_depth_table(",
                 "if ensured {",
+                &["let ensured = run_depth_ddl("],
                 &["GatedTable::MarketDepth)"],
             ),
             (
                 include_str!("depth_persistence.rs"),
                 "async fn ensure_market_depth_book_table_at(",
-                "{\n        // 2026-11-07 (`ilp_table_gate`)",
-                &["GatedTable::MarketDepthBook"],
+                "if run_depth_ddl(",
+                &["BookEnsureOutcome::Failed"],
+                &["GatedTable::MarketDepthBook,"],
             ),
         ];
-        for (source, signature, verdict, marks) in cases {
-            let start = source.find(signature).expect(signature);
-            let rest = &source[start + signature.len()..];
-            let end = rest
-                .find("\nfn ")
-                .into_iter()
-                .chain(rest.find("\nasync fn "))
-                .chain(rest.find("\npub "))
-                .min()
-                .unwrap_or(rest.len());
-            let body = &rest[..end];
-            let verdict_at = body
-                .find(verdict)
-                .unwrap_or_else(|| panic!("{signature}: no `{verdict}`"));
-            for mark in marks {
-                let needle = format!("mark_table_ensured(crate::ilp_table_gate::{mark}");
-                let compact: String = body.split_whitespace().collect::<Vec<_>>().join("");
-                let compact_needle: String = needle.split_whitespace().collect::<Vec<_>>().join("");
+        for (source, signature, opener, facts, tables) in cases {
+            let body = function_body(source, signature);
+            for fact in facts {
+                assert!(body.contains(fact), "{signature}: no `{fact}`");
+            }
+            let anchor = body
+                .find(opener)
+                .unwrap_or_else(|| panic!("{signature}: no `{opener}`"));
+            let open = anchor + body[anchor..].find('{').expect("a success block");
+            let close = matching_brace(body, open);
+            let block = &body[open..=close];
+            let marks: Vec<usize> = body
+                .match_indices("mark_table_ensured")
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!marks.is_empty(), "{signature} marks nothing");
+            for at in marks {
                 assert!(
-                    compact.contains(&compact_needle),
-                    "{signature} must mark {mark}"
+                    open < at && at < close,
+                    "{signature}: a mark at byte {at} lies outside the success block \
+                     {open}..{close}"
                 );
-                let at = body.find("mark_table_ensured").expect("a mark");
+            }
+            for table in tables {
                 assert!(
-                    at > verdict_at,
-                    "{signature}: the mark must follow the success check"
+                    compact(block).contains(&compact(&format!(
+                        "mark_table_ensured(crate::ilp_table_gate::{table}"
+                    ))),
+                    "{signature}: the success block must mark {table}"
                 );
             }
         }

@@ -62,6 +62,7 @@ fn done_work() -> DayWork {
         deferred_retryable_left: None,
         deferred_floor_blocked_secs: None,
         spill_files: 0,
+        spill_files_held_unensured: 0,
         seal_staged: Some(0),
         apply_lag: Some(0),
         suspended: Some(0),

@@ -562,7 +562,9 @@ pub async fn replay_framed_spill_dir(
             // dealt with is already recorded above; the file is never emptied
             // here, and the round moves on.
             Walk::HeldTableNotEnsured(table) => {
-                crate::ilp_table_gate::note_replay_held_table_not_ensured("depth", table, &path);
+                crate::ilp_table_gate::note_replay_held_table_not_ensured(
+                    "depth", table, &path, offset,
+                );
                 outcome.files_held_table_not_ensured =
                     outcome.files_held_table_not_ensured.saturating_add(1);
                 if sent_bytes > 0 {
