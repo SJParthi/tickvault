@@ -923,6 +923,13 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
             }
         }
     }
+    // 2026-11-07 (`ilp_table_gate`): only now may the spill replay post rows
+    // for these two tables; before, a spilled row could let QuestDB create
+    // them itself with the wrong designated timestamp.
+    if every_statement_accepted {
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::Ticks);
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::TickQuotes);
+    }
     every_statement_accepted
 }
 

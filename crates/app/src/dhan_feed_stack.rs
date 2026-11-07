@@ -17376,6 +17376,17 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     } else {
         None
     };
+    // 2026-11-07 (`ilp_table_gate`): a refused book ensure is re-run in the
+    // background on the doubling delay. Its success sets the spill replay's
+    // ensure flag, so framed book records held since boot drain this process;
+    // the book WRITER stays armed only from the outcome above (this process
+    // keeps writing `market_depth` until the next boot).
+    if book_outcome.is_some_and(|o| !o.is_ensured()) {
+        drop(crate::candle_ddl_boot::spawn_ensure_until_keyed(
+            params.questdb.clone(),
+            crate::candle_ddl_boot::DdlTables::MarketDepthBook,
+        ));
+    }
     let depth_book_since = if let Some(outcome) = book_outcome.filter(|o| !o.is_ensured()) {
         if outcome == tickvault_storage::depth_persistence::BookEnsureOutcome::Failed {
             error!(

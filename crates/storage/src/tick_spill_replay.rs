@@ -133,6 +133,10 @@ pub struct SpillReplayOutcome {
     /// Framed depth files older than the market-data floor, moved whole to
     /// `quarantine/` and never posted.
     pub files_below_floor: usize,
+    /// Files HELD (kept as they are, nothing posted from the held point)
+    /// because they hold a row for a table this process has not yet ensured
+    /// (2026-11-07, `ilp_table_gate`).
+    pub files_held_table_not_ensured: usize,
 }
 
 impl SpillReplayOutcome {
@@ -158,6 +162,9 @@ impl SpillReplayOutcome {
         self.files_below_floor = self
             .files_below_floor
             .saturating_add(other.files_below_floor);
+        self.files_held_table_not_ensured = self
+            .files_held_table_not_ensured
+            .saturating_add(other.files_held_table_not_ensured);
     }
 }
 
@@ -940,6 +947,11 @@ pub struct SpillSinkView {
     /// timestamp is below it is set aside, never posted. `None`: no floor,
     /// the replay behaves as before it existed.
     pub market_data_floor_unix_nanos: Option<i64>,
+    /// Which gated tables this process has ensured (2026-11-07,
+    /// `ilp_table_gate`). A file holding a row for a table not in it is held,
+    /// never posted, so QuestDB cannot auto-create that table with the wrong
+    /// designated timestamp. Test views use `EnsuredTables::ALL`.
+    pub ensured_tables: crate::ilp_table_gate::EnsuredTables,
 }
 
 impl SpillSinkView {
@@ -979,6 +991,7 @@ impl SpillSinkView {
             live: true,
             market_data_floor_unix_nanos:
                 crate::market_data_floor::installed_market_data_floor_unix_nanos(),
+            ensured_tables: crate::ilp_table_gate::EnsuredTables::current(),
         }
     }
 }
@@ -1322,6 +1335,30 @@ pub fn spill_file_pending(path: &Path, len: u64) -> bool {
         return true;
     }
     len > resume_offset_for(path)
+}
+
+/// Whether the after-close drain hold may leave the spill file `path` out of
+/// the night's work (2026-11-07, `ilp_table_gate`): the replay holds it at its
+/// current resume offset for a table this process has not ensured, and no ack
+/// before that offset is still waiting to be confirmed. Such a file cannot
+/// drain whatever the box does; counting it held the box to 07:30 IST every
+/// night. Its bytes stay on disk and replay once the table is ensured.
+/// O(1): two offset reads around one held-file probe, then one ack probe.
+#[must_use]
+// WIRING-EXEMPT: wired as a function value (no call parentheses) in `drain_hold::waiting_spill_files` and `drain_hold::measure_day_work`.
+pub fn spill_file_held_for_unensured_table(path: &Path) -> bool {
+    spill_file_held_for_unensured_table_at(path, crate::ilp_table_gate::EnsuredTables::current())
+}
+
+/// [`spill_file_held_for_unensured_table`] against the snapshot `ensured`.
+fn spill_file_held_for_unensured_table_at(
+    path: &Path,
+    ensured: crate::ilp_table_gate::EnsuredTables,
+) -> bool {
+    let offset = resume_offset_for(path);
+    crate::ilp_table_gate::held_and_unensured(path, offset, ensured)
+        && resume_offset_for(path) == offset
+        && !has_unconfirmed_ack(path)
 }
 
 /// Whether a fully drained, closed spill file may be emptied now: `Ok` when it
@@ -2103,6 +2140,8 @@ pub async fn replay_spill_dir(
         // The HTTP status a whole-file quarantine carried (audit K1).
         let mut quarantined_status: Option<u16> = None;
         let mut over_long_line = false;
+        // The gated table that held this file (2026-11-07, `ilp_table_gate`).
+        let mut held_table: Option<crate::ilp_table_gate::GatedTable> = None;
         // At least one chunk of this file got a 2xx this round (audit
         // DA-13b): the ack is stamped so the empty-out can wait for it to be
         // confirmed.
@@ -2292,6 +2331,18 @@ pub async fn replay_spill_dir(
                 // still advance it or the round would re-read the same bytes
                 // forever and never converge.
                 let len = raw.len() as u64;
+                // The ensure gate BEFORE anything else (2026-11-07,
+                // `ilp_table_gate`): a row for a table this process has not
+                // ensured would let QuestDB auto-create that table with its
+                // timestamp named `timestamp`. Hold the file here, before the
+                // floor and window steps set anything aside or count it, so
+                // the next round sees this chunk exactly as it is now.
+                if let Some(table) =
+                    crate::ilp_table_gate::first_unensured_in_lines(raw, view.ensured_tables)
+                {
+                    held_table = Some(table);
+                    break 'file;
+                }
                 // The market-data floor FIRST (live audit F2/F5/F6,
                 // 2026-10-29): the window filter judges the time of day only,
                 // so after a wipe a file holding rows from earlier days was
@@ -2707,6 +2758,24 @@ pub async fn replay_spill_dir(
         // then no recovery and is not reported as one (2026-10-13 (DA-13b
         // review)).
         let landed = accepted.saturating_sub(refused_bytes);
+        if let Some(table) = held_table {
+            // HELD, not failed (2026-11-07, `ilp_table_gate`): keep what this
+            // round finished, exactly as the failure arm below does, and move
+            // on to the next file instead of stopping the round. The file is
+            // never emptied or truncated here; its bytes from the resume
+            // offset on wait for the table's ensure.
+            if accepted > 0 {
+                record_resume_offset(&path, drained_to);
+                outcome.bytes_replayed = outcome.bytes_replayed.saturating_add(landed);
+                metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(landed);
+            }
+            crate::ilp_table_gate::note_replay_held_table_not_ensured(
+                label, table, &path, drained_to,
+            );
+            outcome.files_held_table_not_ensured =
+                outcome.files_held_table_not_ensured.saturating_add(1);
+            continue;
+        }
         if failed {
             // Keep what this round finished. `accepted` counts only chunks
             // that were fully handled (POSTed and accepted, refused as out of
@@ -3274,6 +3343,9 @@ pub(crate) mod tests {
         view.live = false;
         view.episode_start = None;
         view.now_unix_secs = view.now_unix_secs.saturating_add(2 * SPILL_FILE_HOUR_SECS);
+        // Every table ensured: these tests predate the ensure gate and run
+        // without the boot ensures. The gate's own tests clear it.
+        view.ensured_tables = crate::ilp_table_gate::EnsuredTables::ALL;
         view
     }
 
@@ -7009,6 +7081,166 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         )
         .expect("the below-floor line is kept in quarantine"); // APPROVED: test
         assert_eq!(kept, old, "kept byte for byte");
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (2026-11-07, `ilp_table_gate`): the live `market_depth_book`
+    /// was created by QuestDB itself, with its timestamp named `timestamp`,
+    /// because a spilled row reached it before this process ran the table's
+    /// ensure. A file holding a row for a table not yet ensured is HELD:
+    /// nothing from the held point is posted, the file and its resume offset
+    /// are untouched, nothing is failed or set aside, and the round carries
+    /// on with the next file, whose table IS ensured.
+    ///
+    /// Bite: remove the gate in the chunk loop and the held file's line is
+    /// posted (first assert).
+    #[tokio::test]
+    async fn test_regression_a_spill_row_for_an_unensured_table_is_held_not_posted() {
+        let dir = temp_dir("unensured-table");
+        let held = dir.join("ticks-dhan-1.ilp");
+        let held_line = tick_line_on_day(7);
+        std::fs::write(&held, &held_line).expect("write"); // APPROVED: test
+        let other = dir.join("ticks-dhan-2.ilp");
+        let level_line = tick_line_on_day(7).replacen("ticks,", "market_depth,", 1);
+        std::fs::write(&other, &level_line).expect("write"); // APPROVED: test
+        let (url, seen, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.ensured_tables = crate::ilp_table_gate::EnsuredTables::NONE
+            .with(crate::ilp_table_gate::GatedTable::MarketDepth);
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            !posted.contains(&held_line),
+            "a row for an unensured table must never be posted"
+        );
+        assert!(
+            posted.contains(&level_line),
+            "the next file (ensured table) still drains"
+        );
+        assert_eq!(out.files_held_table_not_ensured, 1);
+        assert_eq!(out.files_failed, 0, "a hold is not a failure");
+        assert_eq!(out.lines_set_aside, 0, "nothing is set aside");
+        assert_eq!(
+            std::fs::read_to_string(&held).expect("read"),
+            held_line,
+            "the held file is kept byte for byte"
+        );
+        assert_eq!(resume_offset_for(&held), 0, "its offset does not move");
+        assert!(!dir.join(QUARANTINE_DIR).exists());
+
+        // Once the table is ensured, the same file drains.
+        seen.lock().expect("lock").clear();
+        view.ensured_tables = crate::ilp_table_gate::EnsuredTables::ALL;
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(posted.contains(&held_line), "posted once ensured");
+        assert_eq!(out.files_held_table_not_ensured, 0);
+        forget_resume_offset(&held);
+        forget_resume_offset(&other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production wiring (2026-11-07): the round's view reads the process's
+    /// ensure flags, never a constant. Test views set `EnsuredTables::ALL`, so
+    /// without this a revert of `SpillSinkView::current` to `ALL` would pass
+    /// every other test while posting into tables the process never ensured.
+    ///
+    /// Bite: set `ensured_tables` to `EnsuredTables::ALL` in `current()` and
+    /// the source pin fails (and the runtime check too, whenever any flag is
+    /// still unset in this test process).
+    #[test]
+    fn test_spill_sink_view_current_reads_the_process_ensure_flags() {
+        use crate::ilp_table_gate::{EnsuredTables, GatedTable};
+        let before = EnsuredTables::current();
+        let view = SpillSinkView::current();
+        let after = EnsuredTables::current();
+        // The flags only ever grow, so the view lies between the two reads.
+        for table in GatedTable::ALL {
+            if before.contains(table) {
+                assert!(view.ensured_tables.contains(table), "{table:?} lost");
+            }
+            if view.ensured_tables.contains(table) {
+                assert!(
+                    after.contains(table),
+                    "{table:?} read as ensured but the process never marked it"
+                );
+            }
+        }
+        let src = include_str!("tick_spill_replay.rs");
+        let current = src
+            .split("    pub fn current() -> Self {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("SpillSinkView::current");
+        assert!(
+            current.contains("ensured_tables: crate::ilp_table_gate::EnsuredTables::current(),"),
+            "SpillSinkView::current must read the process ensure flags"
+        );
+    }
+
+    /// The drain hold may leave a held file out of the night's work only while
+    /// the replay holds it at its current offset for a table still not
+    /// ensured, and no earlier ack waits for confirmation (2026-11-07).
+    #[test]
+    fn test_spill_file_held_for_unensured_table_needs_hold_offset_and_no_ack() {
+        use crate::ilp_table_gate::{EnsuredTables, GatedTable};
+        let path = PathBuf::from("/x/held-for-drain-hold/depth-dhan-5.dspl");
+        let none = EnsuredTables::NONE;
+        assert!(
+            !spill_file_held_for_unensured_table_at(&path, none),
+            "never held: work"
+        );
+        crate::ilp_table_gate::note_replay_held_table_not_ensured(
+            "depth",
+            GatedTable::MarketDepthBook,
+            &path,
+            0,
+        );
+        assert!(spill_file_held_for_unensured_table_at(&path, none));
+        assert!(
+            !spill_file_held_for_unensured_table_at(&path, EnsuredTables::ALL),
+            "the table is ensured now: work"
+        );
+        // An ack not yet confirmed: still work (a rewind may re-send it).
+        let mut unconfirmed = test_spill_view();
+        unconfirmed.clean_probes = u64::MAX / 2;
+        note_spill_ack(&path, &unconfirmed, 0, 10);
+        assert!(!spill_file_held_for_unensured_table_at(&path, none));
+        forget_resume_offset(&path);
+        // The offset moved past the held point: work.
+        record_resume_offset(&path, 5);
+        assert!(!spill_file_held_for_unensured_table_at(&path, none));
+        forget_resume_offset(&path);
+    }
+
+    /// A file whose first chunk was already posted keeps that progress when a
+    /// later chunk is held: the resume offset moves to the end of the posted
+    /// chunk, never past the held one.
+    #[tokio::test]
+    async fn test_a_hold_after_a_posted_chunk_keeps_the_posted_offset() {
+        let dir = temp_dir("unensured-after-posted");
+        let path = dir.join("ticks-dhan-1.ilp");
+        // One line longer than a whole chunk, so the two lines are two chunks.
+        let pad = "x".repeat(REPLAY_MAX_CHUNK_BYTES);
+        let first =
+            tick_line_on_day(7).replacen("ltp=100.5", &format!("ltp=100.5,pad=\"{pad}\""), 1);
+        let second = tick_line_on_day(7).replacen("ticks,", "market_depth_book,", 1);
+        std::fs::write(&path, format!("{first}{second}")).expect("write"); // APPROVED: test
+        let (url, seen, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.ensured_tables = crate::ilp_table_gate::EnsuredTables::NONE
+            .with(crate::ilp_table_gate::GatedTable::Ticks);
+        let out = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        let posted = String::from_utf8(seen.lock().expect("lock").clone()).expect("utf8");
+        assert!(posted.contains(&first), "the ensured first chunk is posted");
+        assert!(!posted.contains(&second), "the held chunk is not");
+        assert_eq!(out.files_held_table_not_ensured, 1);
+        assert_eq!(resume_offset_for(&path), first.len() as u64);
         forget_resume_offset(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }

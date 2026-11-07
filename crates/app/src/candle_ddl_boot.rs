@@ -341,6 +341,14 @@ pub enum DdlTables {
     /// `ticks`, `market_depth` and `feed_aux_packets`
     /// ([`run_live_table_ddl_at_boot`]'s ensures).
     Live,
+    /// `market_depth_book` (2026-11-07). The Dhan lane runs its ensure once,
+    /// with `[depth_storage] array_rows` on, and starts this re-run when it is
+    /// refused (QuestDB still replaying its WAL, or the wrong-timestamp table
+    /// outside the self-heal window). A success sets the spill replay's ensure
+    /// flag (`ilp_table_gate`), so held book records drain; the book WRITER
+    /// stays armed only from the boot's outcome. Each attempt runs the whole
+    /// ensure, the empty-table self-heal included.
+    MarketDepthBook,
     /// The order-side and socket audit tables: `order_audit`, `pnl_audit`,
     /// `order_update_events`, `position_update_events`, `order_leg_pnl` and
     /// `ws_event_audit`.
@@ -380,6 +388,11 @@ async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool 
             let feed_aux_ok =
                 tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
             ticks_ok && depth_ok && feed_aux_ok
+        }
+        DdlTables::MarketDepthBook => {
+            tickvault_storage::depth_persistence::ensure_market_depth_book_table(questdb)
+                .await
+                .is_ensured()
         }
         DdlTables::AuditTables => {
             use tickvault_storage::{
@@ -650,6 +663,36 @@ mod tests {
             ensure_until_keyed(&questdb, DdlTables::AuditTables, quick, quick).await,
             1
         );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::MarketDepthBook, quick, quick).await,
+            1
+        );
+    }
+
+    /// 2026-11-07: the Dhan lane starts the book re-run when its one boot
+    /// ensure is refused. A source pin, because the refusal needs a QuestDB
+    /// that refuses at the one moment the lane starts. Bite: delete the spawn
+    /// and this fails.
+    #[test]
+    fn the_lane_starts_the_book_re_run_on_a_refused_ensure() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let compact: String = prod.split_whitespace().collect();
+        assert!(
+            compact.contains(
+                "ifbook_outcome.is_some_and(|o|!o.is_ensured()){drop(crate::candle_ddl_boot::\
+                 spawn_ensure_until_keyed(params.questdb.clone(),crate::candle_ddl_boot::\
+                 DdlTables::MarketDepthBook,));}"
+            ),
+            "the lane must re-run a refused market_depth_book ensure in the background"
+        );
+    }
+
+    /// 2026-11-07: a refused book ensure must not read as keyed, so its
+    /// re-run keeps going (and the replay keeps its book records held).
+    #[tokio::test]
+    async fn market_depth_book_ensure_reads_not_keyed_when_unreachable() {
+        assert!(!ensure_tables_once(&unreachable_questdb(), DdlTables::MarketDepthBook).await);
     }
 
     /// Audit J3 (2026-10-26): a refused audit ensure must not read as keyed,
