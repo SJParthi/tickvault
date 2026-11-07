@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! CASCADE-01 LEG 2, rebuilt 2026-11-07 against the LIVE tick writer.
 //!
 //! "QuestDB down" was retired from `crates/core/tests/chaos_cascade_triple_failure.rs`
