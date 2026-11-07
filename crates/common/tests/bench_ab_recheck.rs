@@ -62,6 +62,9 @@ fn main() {
     let file = me.file_name().unwrap().to_string_lossy().to_string();
     let target = file.rsplit_once('-').unwrap().0.to_string();
     let folder = me.parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+    if let Some(secs) = env::var(format!("FAKE_SLEEP_SECS_{folder}_{target}")).ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
     let mean: f64 = env::var(format!("FAKE_MEAN_NS_{folder}_{target}")).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| exit(7));
     let inner = filter.strip_prefix("^(?:").and_then(|f| f.strip_suffix(")$")).unwrap_or_else(|| exit(6));
     let ids: Vec<String> = inner.split('|').map(|s| s.replace('\\', "")).collect();
@@ -250,7 +253,18 @@ impl Fixture {
     /// The tool, with the restored cache key's commit and per-build means
     /// (`deps_<target>` = head, `tv_ab_bins_<target>` = saved baseline).
     fn recheck(&self, key_sha: &str, means: &[(&str, f64)]) -> (i32, String) {
+        self.recheck_with(key_sha, means, &[])
+    }
+
+    /// As `recheck`, plus extra environment variables.
+    fn recheck_with(
+        &self,
+        key_sha: &str,
+        means: &[(&str, f64)],
+        extra_env: &[(&str, &str)],
+    ) -> (i32, String) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bench_ab_recheck"));
+        cmd.envs(extra_env.iter().copied());
         cmd.current_dir(&self.ws.0)
             .args(["target/criterion", "bench-output.log", "gate-output.log"])
             .env(
@@ -440,13 +454,63 @@ fn a_binary_outside_the_two_folders_is_never_started() {
         .expect("read") // APPROVED: test
         .replace("target/release/deps/", "elsewhere/");
     std::fs::write(&log, text).expect("write"); // APPROVED: test
+    // Both binaries really exist there and would run cleanly, so only the
+    // folder check stands between them and a successful re-measure.
     place_fake(&fx.ws.0.join("elsewhere").join(PIPELINE_BIN));
-    let (rc, out) = fx.recheck(HEAD_SHA, &[("elsewhere_pipeline", 1200.0)]);
+    place_fake(&fx.ws.0.join("elsewhere").join(SEAL_BIN));
+    let (rc, out) = fx.recheck(
+        HEAD_SHA,
+        &[
+            ("elsewhere_pipeline", 1200.0),
+            ("elsewhere_seal_path", 400.0),
+        ],
+    );
     assert_eq!(rc, 1, "{out}");
     assert!(
-        out.contains("not a bench binary this tool may run"),
+        out.contains("not in release/deps or the saved-binaries folder"),
         "{out}"
     );
+}
+
+#[test]
+fn a_hung_bench_binary_is_killed_at_its_deadline_and_the_red_stands() {
+    let fx = Fixture::new(400.0, false);
+    assert_eq!(fx.first_gate().0, 2);
+    let before = fx.read("pipeline/batch_100_mixed/new/estimates.json");
+    let started = std::time::Instant::now();
+    // The head pipeline binary hangs for 60 s; the per-run deadline is 1 s.
+    let (rc, out) = fx.recheck_with(
+        HEAD_SHA,
+        &[("deps_pipeline", 1200.0), ("deps_seal_path", 400.0)],
+        &[
+            ("FAKE_SLEEP_SECS_deps_pipeline", "60"),
+            ("BENCH_AB_RUN_TIMEOUT_SECS", "1"),
+        ],
+    );
+    assert_eq!(rc, 1, "a timeout must never let the gate run again: {out}");
+    assert!(out.contains("killed after its deadline"), "{out}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the hung binary was waited for, not killed"
+    );
+    assert_eq!(
+        before,
+        fx.read("pipeline/batch_100_mixed/new/estimates.json"),
+        "the original measurement is back after a timeout"
+    );
+}
+
+#[test]
+fn the_overall_deadline_stops_the_re_measure() {
+    let fx = Fixture::new(400.0, false);
+    assert_eq!(fx.first_gate().0, 2);
+    let (rc, out) = fx.recheck_with(
+        HEAD_SHA,
+        &[("deps_pipeline", 1200.0), ("deps_seal_path", 400.0)],
+        &[("BENCH_AB_TOTAL_TIMEOUT_SECS", "0")],
+    );
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains("overall A/B deadline passed"), "{out}");
 }
 
 #[test]
@@ -516,8 +580,49 @@ fn the_workflow_runs_the_re_measure_only_on_a_regression_and_regates() {
     // The head binaries are kept for the NEXT run only after this run's A/B
     // has used the restored ones.
     let keep = find("grep -o 'target/release/deps/[^)]*' bench-output.log");
-    let out = find("echo \"gate_rc=$rc\"");
-    assert!(first < tool && tool < regate && regate < keep && keep < out);
+    // gate_rc is written right after the first gate run, so a step killed
+    // during the A/B still carries that verdict, and again at the end.
+    let rc_line = "echo \"gate_rc=$rc\" >> \"$GITHUB_OUTPUT\"";
+    let early = find(rc_line);
+    let late = gate.rfind(rc_line).expect("final gate_rc"); // APPROVED: test
+    assert!(
+        first < early && early < tool,
+        "gate_rc must be written before the A/B"
+    );
+    assert!(tool < regate && regate < keep && keep < late);
     // The saved binaries ride in the Criterion dir, which the save step saves.
     assert!(gate.contains("target/criterion/tv_ab_bins"));
+}
+
+#[test]
+fn the_baseline_is_saved_only_with_a_verdict_from_a_gate_step_that_finished() {
+    let wf = std::fs::read_to_string(repo_root().join(".github/workflows/bench.yml"))
+        .expect("bench.yml"); // APPROVED: test
+    let at = wf
+        .find("- name: Save Criterion baseline")
+        .expect("save step"); // APPROVED: test
+    let save = &wf[at..];
+    let save = &save[..save.find("uses:").expect("save uses")]; // APPROVED: test
+    for needed in [
+        "steps.bench.outcome == 'success'",
+        "steps.gate.outcome != 'cancelled'",
+        "steps.gate.outputs.gate_rc != ''",
+        "steps.gate.outputs.gate_rc != '2'",
+    ] {
+        assert!(
+            save.contains(needed),
+            "save condition lost `{needed}`:\n{save}"
+        );
+    }
+    // `cmd | tee log && rc=0 || rc=$?` keeps cmd's exit code only under
+    // pipefail, which `shell: bash` gives the bench and gate steps.
+    for id in ["id: bench", "id: gate"] {
+        let at = wf.find(id).expect("step id"); // APPROVED: test
+        let step = &wf[at..];
+        let step = &step[..step.find("run: |").expect("run block")]; // APPROVED: test
+        assert!(
+            step.contains("\n        shell: bash\n"),
+            "the `{id}` step must run as `bash -eo pipefail`"
+        );
+    }
 }

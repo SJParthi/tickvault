@@ -152,6 +152,8 @@ jobs:
       # median arm below uses, so a slower runner moves both ceilings alike.
       - name: Run benchmarks (workspace)
         id: bench
+        # `bash -eo pipefail`, so `cargo bench | tee` keeps cargo's exit code.
+        shell: bash
         env:
           BENCH_BUDGET_MULTIPLIER: '2.5'
           # A p99 tail-gate miss prints BENCH-TAIL-GATE-FAILED and exits 0, so
@@ -159,7 +161,6 @@ jobs:
           # fails the run on that line (PR #2143 review, 2026-10-30).
           BENCH_TAIL_GATE_DEFER: '1'
         run: |
-          set -o pipefail
           cargo bench --workspace --bench '*' 2>&1 | tee bench-output.log
 
       # BENCH_BUDGET_MULTIPLIER rationale (measured, 2026-07-06 audit of all
@@ -183,12 +184,15 @@ jobs:
       # stays 2. Proof: crates/common/tests/bench_ab_recheck.rs.
       - name: Run bench-gate (absolute budgets + 5% regression)
         id: gate
+        # `bash -eo pipefail`: `cmd | tee log && rc=0 || rc=$?` keeps cmd's
+        # exit code only under pipefail (workflow_tee_pipefail_guard).
+        shell: bash
         env:
           BENCH_BUDGET_MULTIPLIER: '2.5'
           BENCH_AB_BASELINE_KEY: ${{ steps.restore.outputs.cache-matched-key }}
         run: |
-          set -o pipefail
           bash scripts/bench-gate.sh | tee gate-output.log && rc=0 || rc=$?
+          echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" = 2 ] && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck -- target/criterion bench-output.log gate-output.log 2>&1 | tee -a gate-output.log; then rc=0; bash scripts/bench-gate.sh | tee -a gate-output.log || rc=$?; fi
           rm -rf target/criterion/tv_ab_bins && mkdir target/criterion/tv_ab_bins && grep -o 'target/release/deps/[^)]*' bench-output.log | sort -u | xargs -r cp -t target/criterion/tv_ab_bins/ || true
           echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
@@ -205,9 +209,15 @@ jobs:
       # (the wedged-baseline escape hatch; the run still fails on rc=2).
       # The key carries the hardware fingerprint so this baseline is only
       # ever consumed by a future run on the same hardware class.
+      # FAIL CLOSED (2026-11-07): the gate step writes gate_rc right after the
+      # first gate run and again at its end (the later line wins), so a step
+      # killed during the A/B re-measure (job timeout, cancel) leaves the first
+      # verdict, and nothing is saved without a verdict or from a cancelled
+      # gate step: a regressed run must never become the next baseline.
       - name: Save Criterion baseline (benches ok, no regression)
         if: >-
           always() && steps.bench.outcome == 'success' &&
+          steps.gate.outcome != 'cancelled' && steps.gate.outputs.gate_rc != '' &&
           (steps.gate.outputs.gate_rc != '2' ||
            (github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6

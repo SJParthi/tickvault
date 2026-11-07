@@ -34,11 +34,16 @@
 //!
 //! Usage: `bench_ab_recheck <criterion-dir> <bench-output.log> <gate-output.log>`,
 //! run from the workspace root. Env: `BENCH_AB_BASELINE_KEY` (the restored
-//! cache key), `GITHUB_SHA` (the head commit).
+//! cache key), `GITHUB_SHA` (the head commit), and optionally
+//! `BENCH_AB_RUN_TIMEOUT_SECS` / `BENCH_AB_TOTAL_TIMEOUT_SECS`, which can only
+//! SHORTEN the 300 s per-run and 20 min overall deadlines. A bench binary
+//! still running at its deadline is killed and the tool refuses (exit 1), so
+//! a hang can never turn the red into a re-gate.
 //!
 //! It spawns nothing but Criterion bench binaries, and only after
-//! `checked_bench_exe` has confirmed the path is a cargo-built bench binary
-//! in one of the two places named above.
+//! `checked_bench_exe` has confirmed the path is a regular file (not a
+//! symlink) with a cargo bench-binary name in one of the two places named
+//! above.
 //!
 //! HONEST LIMITS: a cache saved before 2026-11-07 has neither saved binaries
 //! nor a commit in its key, so a run that restores one refuses, until a run
@@ -55,6 +60,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// Criterion baseline name the A/B pair is saved under.
 const AB_BASELINE: &str = "tv_ab";
@@ -66,6 +72,25 @@ const SAVED_BINS: &str = "tv_ab_bins";
 /// More flagged benchmarks than this is not runner noise worth an A/B (and
 /// would not fit the job's time limit): the red stands.
 const MAX_AB_BENCHES: usize = 16;
+/// Longest one bench binary may run (one A/B half). A hung binary is killed
+/// and the tool refuses, so the gate's exit 2 stands.
+const RUN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Longest the whole re-measure may take, inside the job's 60 minutes (the
+/// benches themselves take about 30).
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// How often a running bench binary is checked against its deadline.
+const WAIT_POLL: Duration = Duration::from_millis(100);
+
+/// A deadline from `env_var` in whole seconds, never LONGER than `default`
+/// (a shorter one can only make the tool refuse sooner, which keeps the red).
+fn deadline_from_env(env_var: &str, default: Duration) -> Duration {
+    capped_secs(std::env::var(env_var).ok().as_deref(), default)
+}
+
+fn capped_secs(raw: Option<&str>, default: Duration) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(default, |secs| Duration::from_secs(secs).min(default))
+}
 
 /// One flagged benchmark, resolved to its Criterion directory and binary.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,11 +144,11 @@ fn sha_from_cache_key(key: &str) -> Option<String> {
 }
 
 /// The gate's key for a `<root>/change` record, computed the way its awk
-/// does: drop the FIRST `/change`, turn `/` into `_`, lowercase.
+/// does: drop EVERY `/change`, turn `/` into `_`, lowercase.
 fn gate_key(root: &str) -> String {
+    // The awk is `gsub(/\/change/, "", bench)`: EVERY occurrence goes.
     let rel = format!("{root}/change");
-    let rel = rel.replacen("/change", "", 1);
-    rel.replace('/', "_").to_lowercase()
+    rel.replace("/change", "").replace('/', "_").to_lowercase()
 }
 
 /// Every benchmark root (relative to the Criterion dir) with a change record.
@@ -218,23 +243,33 @@ fn bench_target(file_name: &str) -> Option<&str> {
     (target_ok && hash_ok).then_some(target)
 }
 
-/// The ONLY gate in front of a spawn: `path` must be a regular file named
-/// like a cargo bench binary, sitting directly in a `release/deps` folder or
-/// in the saved-binaries folder. Anything else is refused, so this tool can
-/// only ever start a bench binary cargo built for this workspace.
+/// The ONLY gate in front of a spawn: `path` must be a regular file (not a
+/// symlink, which could point anywhere) named like a cargo bench binary,
+/// sitting directly in a `release/deps` folder or in the saved-binaries
+/// folder. Anything else is refused, so this tool can only ever start a bench
+/// binary cargo built for this workspace. Each of the three conditions is
+/// pinned by its own unit test on real files.
 fn checked_bench_exe(path: &Path, saved_bins: &Path) -> Result<PathBuf, String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "{}: not a bench binary this tool may run ({why})",
+            path.display()
+        ))
+    };
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    if bench_target(&name).is_none() {
+        return refuse("name is not <target>-<16 hex>");
+    }
     let parent = path.parent().unwrap_or(Path::new(""));
-    let in_deps = parent.ends_with("release/deps");
-    let in_saved = parent == saved_bins;
-    if bench_target(&name).is_none() || !(in_deps || in_saved) || !path.is_file() {
-        return Err(format!(
-            "{}: not a bench binary this tool may run",
-            path.display()
-        ));
+    if !(parent.ends_with("release/deps") || parent == saved_bins) {
+        return refuse("not in release/deps or the saved-binaries folder");
+    }
+    let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
+    if !regular {
+        return refuse("not a regular file");
     }
     Ok(path.to_path_buf())
 }
@@ -288,6 +323,12 @@ struct Inputs {
     gate_output: String,
     baseline_key: String,
     head_sha: String,
+    /// Per bench-binary run (`BENCH_AB_RUN_TIMEOUT_SECS`, never above 300 s).
+    run_timeout: Duration,
+    /// For the whole re-measure (`BENCH_AB_TOTAL_TIMEOUT_SECS`, never above 20 min).
+    total_timeout: Duration,
+    /// `total_timeout` after the tool started.
+    deadline: Instant,
 }
 
 /// Resolves every flagged benchmark, or refuses.
@@ -323,19 +364,47 @@ fn resolve(inp: &Inputs) -> Result<Vec<Flagged>, String> {
 /// Runs one bench binary on the flagged ids.
 fn run_bench(inp: &Inputs, exe: &Path, mode: &str, filter: &str) -> Result<(), String> {
     let program = checked_bench_exe(exe, &inp.criterion.join(SAVED_BINS))?;
-    let status = Command::new(&program)
+    let now = Instant::now();
+    let left = inp.deadline.saturating_duration_since(now);
+    if left.is_zero() {
+        return Err(format!(
+            "the {}s overall A/B deadline passed",
+            inp.total_timeout.as_secs()
+        ));
+    }
+    let stop_at = now + inp.run_timeout.min(left);
+    let mut child = Command::new(&program)
         .current_dir(&inp.root)
         .args(["--bench", "--noplot", mode, AB_BASELINE, filter])
         .env("CRITERION_HOME", &inp.criterion)
         // The p99 tail gates were judged on the first run's log; a re-measure
         // must not exit on them before writing its records.
         .env("BENCH_TAIL_GATE_DEFER", "1")
-        .status()
+        .spawn()
         .map_err(|e| format!("{}: could not start: {e}", program.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{} {mode}: exited {status}", program.display()))
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("{} {mode}: exited {status}", program.display()));
+            }
+            Ok(None) if Instant::now() < stop_at => std::thread::sleep(WAIT_POLL),
+            outcome => {
+                // Past the deadline (or the wait itself failed): kill it and
+                // refuse, so the gate's exit 2 stands.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match outcome {
+                    Err(e) => format!("{} {mode}: wait failed: {e}", program.display()),
+                    _ => format!(
+                        "{} {mode}: killed after its deadline ({}s per run, {}s overall)",
+                        program.display(),
+                        inp.run_timeout.as_secs(),
+                        inp.total_timeout.as_secs()
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -418,7 +487,11 @@ fn outcome(args: &[String]) -> (String, i32) {
     let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
     let inputs = (|| -> Result<Inputs, String> {
         let root = std::env::current_dir().map_err(|e| e.to_string())?;
+        let total_timeout = deadline_from_env("BENCH_AB_TOTAL_TIMEOUT_SECS", TOTAL_TIMEOUT);
         Ok(Inputs {
+            run_timeout: deadline_from_env("BENCH_AB_RUN_TIMEOUT_SECS", RUN_TIMEOUT),
+            deadline: Instant::now() + total_timeout,
+            total_timeout,
             criterion: root.join(criterion),
             bench_log: read(bench_log)?,
             gate_output: read(gate_out)?,
@@ -490,8 +563,9 @@ mod tests {
             "pipeline_batch_100_mixed"
         );
         assert_eq!(gate_key("Seal_Path/Take_Submit"), "seal_path_take_submit");
-        // The awk drops the FIRST "/change", wherever it is.
-        assert_eq!(gate_key("x/changes"), "xs_change");
+        // The awk drops EVERY "/change" (gsub), as checked against awk itself.
+        assert_eq!(gate_key("x/changes"), "xs");
+        assert_eq!(gate_key("a/change/b"), "a_b");
     }
 
     #[test]
@@ -545,19 +619,107 @@ mod tests {
 
     #[test]
     fn only_bench_binaries_in_the_two_places_may_run() {
+        // Missing files of the right shape, in the right places: refused.
         let saved = Path::new("/nonexistent/criterion/tv_ab_bins");
-        // Right shape but missing: refused.
-        assert!(checked_bench_exe(&saved.join("pipeline-6d4df94fc326a801"), saved).is_err());
-        assert!(
-            checked_bench_exe(
-                Path::new("target/release/deps/pipeline-6d4df94fc326a801"),
-                saved
-            )
-            .is_err()
-        );
-        // Wrong place or wrong name: refused before the file is even looked at.
-        assert!(checked_bench_exe(Path::new("/usr/bin/env"), saved).is_err());
-        assert!(checked_bench_exe(Path::new("/tmp/pipeline-6d4df94fc326a801"), saved).is_err());
+        assert!(checked_bench_exe(&saved.join(BENCH), saved).is_err());
+        assert!(checked_bench_exe(&Path::new("target/release/deps").join(BENCH), saved).is_err());
+    }
+
+    const BENCH: &str = "pipeline-6d4df94fc326a801";
+
+    /// A scratch tree of REAL files, removed on drop, so each spawn-check
+    /// test fails exactly one condition and passes the others.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("tv-bench-ab-unit-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for dir in [
+                "target/release/deps",
+                "target/criterion/tv_ab_bins",
+                "elsewhere",
+            ] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            Scratch(root)
+        }
+        fn file(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            std::fs::write(&p, b"bench").unwrap();
+            p
+        }
+        fn saved(&self) -> PathBuf {
+            self.0.join("target/criterion/tv_ab_bins")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_real_bench_binary_in_either_folder_is_accepted() {
+        let s = Scratch::new("ok");
+        let deps = s.file(&format!("target/release/deps/{BENCH}"));
+        let saved = s.file(&format!("target/criterion/tv_ab_bins/{BENCH}"));
+        assert_eq!(checked_bench_exe(&deps, &s.saved()), Ok(deps.clone()));
+        assert_eq!(checked_bench_exe(&saved, &s.saved()), Ok(saved.clone()));
+    }
+
+    #[test]
+    fn a_bench_named_file_in_another_folder_is_refused() {
+        // Right name, real regular file: only the folder check can refuse it.
+        let s = Scratch::new("folder");
+        let elsewhere = s.file(&format!("elsewhere/{BENCH}"));
+        let err = checked_bench_exe(&elsewhere, &s.saved()).unwrap_err();
+        assert!(err.contains("not in release/deps"), "{err}");
+    }
+
+    #[test]
+    fn a_wrongly_named_file_in_the_right_folder_is_refused() {
+        // Right folder, real regular file: only the name check can refuse it.
+        let s = Scratch::new("name");
+        for name in [
+            "evil.sh",
+            "node",
+            "pipeline-6d4df94fc326a8",
+            "pipeline-6d4df94fc326a801.d",
+        ] {
+            for dir in ["target/release/deps", "target/criterion/tv_ab_bins"] {
+                let path = s.file(&format!("{dir}/{name}"));
+                let err = checked_bench_exe(&path, &s.saved()).unwrap_err();
+                assert!(err.contains("name is not"), "{name}: {err}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_refused_even_with_a_bench_name_in_the_right_folder() {
+        // Right name, right folder, pointing at a real file: only the
+        // regular-file check can refuse it.
+        let s = Scratch::new("link");
+        let target = s.file("elsewhere/real");
+        let link = s.0.join(format!("target/release/deps/{BENCH}"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(link.is_file(), "is_file() follows the link");
+        let err = checked_bench_exe(&link, &s.saved()).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn deadlines_from_the_environment_can_only_shorten() {
+        let five = Duration::from_secs(300);
+        assert_eq!(capped_secs(None, five), five);
+        assert_eq!(capped_secs(Some("2"), five), Duration::from_secs(2));
+        assert_eq!(capped_secs(Some(" 2 "), five), Duration::from_secs(2));
+        assert_eq!(capped_secs(Some("99999"), five), five);
+        assert_eq!(capped_secs(Some("soon"), five), five);
+        assert_eq!(capped_secs(Some("-1"), five), five);
     }
 
     #[test]
