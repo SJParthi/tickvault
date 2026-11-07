@@ -1576,7 +1576,10 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/grow-ebs-volume.yml", 157),
     (".github/workflows/local-branch-sync.yml", 34),
     (".github/workflows/mutation.yml", 79),
-    (".github/workflows/postmerge-catchup.yml", 75),
+    // 2026-11-07: 75 → 74. The trading-day check (+3) and the deploy-aws skip
+    // in the dispatch loop (+1) are paid by writing the step summary with one
+    // printf (−5): no box start on an IST weekend or NSE holiday.
+    (".github/workflows/postmerge-catchup.yml", 74),
     (".github/workflows/safety.yml", 410),
     (".github/workflows/secret-scan.yml", 29),
     (".github/workflows/security-audit.yml", 2),
