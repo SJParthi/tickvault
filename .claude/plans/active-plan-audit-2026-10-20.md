@@ -2400,3 +2400,40 @@ Revert the PR.
   - Review round 1 (2026-11-06): the bench now checks the shape it times (`ShapeCount::check` on the untimed settling pass, on the Criterion ticks and on every report pass: no refusal, no seal for Hit, a seal on more than half the ticks for Roll; `shape_check_self_test` proves it fails a Roll run labelled Hit, a Hit run labelled Roll and a refusal). Header states that the indexes (~1 MB per table) stay in the dev L3 so the slot is what misses, and that every figure includes one `Instant` pair (measured p50 29–39 ns, p99 39–48 ns over two runs). Criterion medians for the gate ids (one run each, not interleaved): `candles_cold/consume_tick_hit_25k` 1,011 ns and `consume_tick_roll_25k` 1,124 ns with the warm-up, 1,309 / 1,424 ns without it. `bench-gate.sh` reads Criterion's median, the median of the 30 per-sample MEANS, not the per-tick p50 above, so it reads higher than the report.
 - [ ] PF-8 per-frame batching of per-tick atomic counters (ingest_ticks, conservation ledger, tick_ts_placement, tick_quotes count, repeat_quote)
   - Measured 2026-11-06, NOT shipped (no gain on the measured live shape). x86 dev container, release bench profile, production metrics recorder installed (`PrometheusBuilder::build_recorder`), `feed_drain` Full fixture with the own encoder and inline depth book rows; a temporary harness, not committed. The per-tick counters on the drain path are five: `tv_dhan_feed_ingest_ticks_total`, the conservation ledger (`note_row_appended`: load + `fetch_add`), the placement mark and counter (`fetch_max` + add), the `tick_quotes` counter, and one delivery-lag exclusion counter (repeat / not-new-trade / not-a-trade). Micro, the five per tick with a recorder: 4-tick frame p50 361 ns (about 80 ns per tick after the clock pair), one add per frame batched 81 ns. Drain, per-tick p50 (12 unbatched runs, 6 per batched build, interleaved): 4-packet frames 1,637-1,698 ns unbatched (median 1,648), 1,607-1,630 ns batched (median 1,614) and 1,615-1,650 ns with the batch only on stacked frames (median 1,619): about 30 ns per tick, 2%. 1-packet frames 1,665-1,761 ns unbatched (median 1,675), 1,690-1,769 ns batched (median 1,699) and 1,697-1,709 ns with the batch skipped for one-packet frames (median 1,703, one 2,331 outlier left out): about 25 ns slower in both builds, so the cause there is not the batch bookkeeping (Assumed: code layout between builds; not isolated). Without a recorder the drain read 1,581-1,640 ns, so every recorder-backed counter on the drain together is about 55 ns per tick. Built and tested before the decision: storage `tick_frame_counts` (`FrameCounts` held per frame, published on every way out; proptest against the row-by-row oracle, 1,024 cases, with ledger day-slot resets and the placement mark), app `begin_frame_counts` / `end_frame_counts` around the frame walk with the lag exclusions in `FrameTally`. Storage subset tests passed (30); the app tests were written but not run. Not shipped because the PF measurement's production shape is one packet per frame (live frames-per-tick ratio Unknown: `hot_path_latency_minute` `drain_main_frame` vs `drain_main_tick` samples would give it). Revisit only if that ratio shows stacked frames are common; the gain cap is about 55 ns per tick.
+
+### PR AA — 2026-11-07: the box copies to S3 and deletes by itself (storage, app, config)
+
+**Approved by:** Parthiban, 2026-11-07 (Quote 51: cards "Copy 6 Nov to S3, then delete" and "Approve both (Recommended)"; "ensure to cover al these cases before copying and deleting").
+
+**Verified root cause (CloudWatch 3–7 Nov, S3 listing, code read):** the archiver dropped 201 partitions with verified copies but (1) deletes by age only (~24.5 h; `MIN_HOT_DAYS = 2` under pressure; hour path for `market_depth` only), (2) skips a whole table when `writerTxn != sequencerTxn` (233 skips, 15 pressure episodes freeing 0 bytes at 75–93%), (3) the daily leg latches done at ~15:47 while hours become eligible later, (4) runs ~50 min before the 16:30 stop and the drain hold does not count copy work, (5) a non-empty spill folder turns the `market_depth` hour path off for the daily leg.
+
+#### Design
+- AA-1 snapshot WAL gate: for a table with an old partition to copy, read `sequencerTxn` S, wait (bounded) until `writerTxn >= S`, while a process-wide archive quiesce lock holds every writer that can post into an old hour (WAL catch-up replay, spill replay, after-close depth pass); export, recount, verify, audit, re-check recount, drop. Live writers only post into the current hour.
+- AA-2 hour path for `ticks`, `tick_quotes`, `market_depth_book`, `feed_aux_packets` (each table's `ts` meaning checked; IST correction as `market_depth`), 4 h floor, oldest hour first, never an hour with deferred-depth marks; the spill-folder switch-off of the hour path removed where the quiesce lock covers the spill replay.
+- AA-3 projected-fill trigger: pressure also starts when hours-to-full (`DiskFillWindow`) is under hours-to-stop + 1; in session one depth partition per pass allowed then.
+- AA-4 daily leg stays open until no eligible partition remains, re-runs every poll after the close until free space reaches max(1.5 × p95 session bytes, 30% of disk).
+- AA-5 drain hold counts bytes still waiting to be copied; never past 07:30 IST.
+- AA-6 local `/metrics` counters only; no new page.
+
+#### Edge Cases
+WAL never catches up inside the wait (skip, counted); S3 down or checksum mismatch (keep, counted); crash between upload and drop, between audit and drop, mid-export; replay writing an old hour during the copy (quiesce lock; recount mismatch keeps the partition and deletes this run's upload only); partition re-created after drop (copied again to a sidecar key); open (current) partition never selected; IST/UTC boundary at midnight; holiday, weekend, Muhurat; 6 Nov-sized day (10× volume); export over 600 s; upload over 5 GB; disk at 98% with the gzip temp file on the same disk; QuestDB restart mid-pass; deploy mid-pass; two passes racing (daily and pressure).
+
+#### Failure Modes
+Every failure keeps the partition (no drop without verified copy); the disk can still fill if S3 is down longer than the headroom or one session writes more than the free space (STORAGE-GAP-05 pages as today).
+
+#### Test Plan
+Unit tests for each gate; randomized 30-day simulation (volumes 0.5–10×, WAL lag, S3/verify failures, restarts, replays, crashes at every step) checking: no drop without verified copy, no drop of unapplied rows, SEBI/audit/candles untouched, deferred-depth hours kept, disk below the line except the stated cases; bite tests showing the old exact-equality gate fails the disk check; scoped `cargo test -p tickvault-storage -p tickvault-app`.
+
+#### Rollback
+Revert the PR; config switches restore the old windows.
+
+#### Observability
+`tv_partition_archive_wal_snapshot_wait_secs`, `tv_archive_backlog_bytes`, `tv_partition_archive_quiesce_held_total` (local `/metrics` only, no page).
+
+- [ ] AA-1 snapshot WAL gate + quiesce lock
+- [ ] AA-2 hour path for the four tables
+- [ ] AA-3 projected-fill trigger
+- [ ] AA-4 daily leg until done
+- [ ] AA-5 drain hold counts copy backlog
+- [ ] AA-6 metrics
+- [ ] AA-7 randomized proof + bite tests
