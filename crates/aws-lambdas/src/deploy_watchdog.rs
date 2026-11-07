@@ -43,6 +43,10 @@
 //! before the gate has written the marker in that same boot; that one
 //! firing still dispatches, and the deploy it starts skips at the marker
 //! once the box is stopped, or meets the stop during its verify.
+//! *(2026-11-07: closed for listed holidays. `non_trading_day_skip` returns
+//! first on any weekend, NSE holiday or Muhurat date, from the compiled
+//! `nse_calendar`, so the instance-start firing no longer waits for the
+//! marker. The marker check stays for a holiday the list does not know.)*
 //!
 //! Behavior-parity ledger (deliberate deviations from the legacy runtime):
 //! * env vars are read PER INVOCATION (the legacy runtime read them at module import;
@@ -580,6 +584,29 @@ fn verified_behind_alert(
     (subject, message)
 }
 
+/// The watchdog acts only on a regular NSE trading day (2026-11-07). Returns
+/// the result JSON to send when `now_utc` falls on a weekend, an NSE holiday
+/// or a Muhurat date (`nse_calendar`), `None` on a trading day. Pure.
+#[must_use]
+pub fn non_trading_day_skip(window: &str, now_utc: chrono::DateTime<chrono::Utc>) -> Option<Value> {
+    if crate::nse_calendar::is_nse_trading_day_at(now_utc) {
+        return None;
+    }
+    let date = crate::nse_calendar::ist_date(now_utc);
+    info!(
+        window,
+        date = %date,
+        "deploy watchdog skipped: not an NSE trading day (weekend, holiday or Muhurat) — \
+         no metric, no page, no redeploy"
+    );
+    Some(json!({
+        "window": window,
+        "stale": Value::Null,
+        "dispatched": false,
+        "skipped": "non_trading_day",
+    }))
+}
+
 /// Entry point. Idempotent — safe to run on every 5-minutes-after
 /// schedule. Result JSON preserves legacy fields and adds explicit ancestry;
 /// `stale`/`binary_stale` are null when the comparison is unresolved.
@@ -589,6 +616,22 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
+
+    // 2026-11-07 (owner: "see today is saturday why the fuck server started
+    // dude why?"): the instance-start rule fires on EVERY start, any day.
+    // On a weekend or NSE holiday a stale verdict paged and dispatched
+    // deploy-aws-after-close, whose deploy self-starts a stopped box. A
+    // Muhurat date (always a weekend or holiday) is skipped too: every deploy
+    // workflow refuses that whole date (Quote 49), so a dispatch could only
+    // fail, and the page would be noise. Nothing is read, published, paged or
+    // dispatched; the next weekday's 08:30 instance start and 08:50 cron
+    // catch up. Checked FIRST so even the mismatch metric (which feeds the
+    // 24h binary-sha-stale page) is not sampled on a non-trading day.
+    let now = chrono::Utc::now();
+    if let Some(skip) = non_trading_day_skip(&window, now) {
+        return Ok(skip);
+    }
+
     let gh_repo = std::env::var("GH_REPO").unwrap_or_else(|_| DEFAULT_GH_REPO.to_string());
     let gh_desired_ref =
         std::env::var("GH_DESIRED_REF").unwrap_or_else(|_| DEFAULT_GH_DESIRED_REF.to_string());
@@ -1143,6 +1186,70 @@ mod tests {
         )
         .await;
         assert_eq!(equal, BuildComparison::current());
+    }
+
+    /// Regression (2026-11-07): weekend, holiday and Muhurat starts must not
+    /// page or dispatch; a trading day proceeds.
+    #[test]
+    fn test_regression_non_trading_day_skip_covers_weekend_holiday_and_muhurat() {
+        use chrono::TimeZone;
+        // Sat 2026-11-07 12:00 IST, Sun 2026-11-08 13:05 IST (Muhurat start),
+        // Tue 2026-11-10 08:30 IST (NSE holiday).
+        for (y, m, d, h, min) in [
+            (2026, 11, 7, 6, 30),
+            (2026, 11, 8, 7, 35),
+            (2026, 11, 10, 3, 0),
+        ] {
+            let now = chrono::Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap();
+            let skip = non_trading_day_skip("instance-start", now)
+                .unwrap_or_else(|| panic!("{now} must be skipped"));
+            assert_eq!(skip["skipped"], "non_trading_day");
+            assert_eq!(skip["dispatched"], false);
+        }
+        // Mon 2026-11-09 08:30 IST: a trading day, the watchdog runs.
+        let monday = chrono::Utc.with_ymd_and_hms(2026, 11, 9, 3, 0, 0).unwrap();
+        assert!(non_trading_day_skip("instance-start", monday).is_none());
+    }
+
+    /// Regression (2026-11-07): with no samples on non-trading days, a
+    /// `notBreaching` binary-sha-stale alarm sent a false "recovered" every
+    /// Saturday after a Friday ALARM. Missing data must keep the state.
+    #[test]
+    fn binary_sha_stale_alarm_ignores_missing_data() {
+        let tf = include_str!("../../../deploy/aws/terraform/deploy-watchdog-lambda.tf");
+        let start = tf
+            .find("resource \"aws_cloudwatch_metric_alarm\" \"binary_sha_stale\"")
+            .expect("binary_sha_stale alarm");
+        let block = &tf[start..];
+        let block = &block[..block.find("\n\u{7d}\n").unwrap()];
+        let code: String = block
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("treat_missing_data = \"ignore\""));
+        assert!(!code.contains("notBreaching"));
+    }
+
+    /// The skip runs FIRST in `handle`: before any SSM, GitHub, metric,
+    /// page or dispatch call.
+    #[test]
+    fn handle_checks_the_trading_day_before_any_call() {
+        let src = include_str!("deploy_watchdog.rs");
+        let handle = &src[src.find("pub async fn handle(").unwrap()..];
+        let handle = &handle[..handle.find("\n\u{7d}\n").unwrap()];
+        let skip = handle
+            .find("if let Some(skip) = non_trading_day_skip(&window, now)")
+            .expect("handle must gate on the trading day");
+        for later in [
+            "crate::clients::sdk_config()",
+            "publish_binary_mismatch_metric(",
+            "let dispatched = dispatch_deploy(",
+            "publish(&sns,",
+        ] {
+            let at = handle.find(later).unwrap_or_else(|| panic!("{later}"));
+            assert!(skip < at, "the trading-day skip must precede `{later}`");
+        }
     }
 
     #[test]

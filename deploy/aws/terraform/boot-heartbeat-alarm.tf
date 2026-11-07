@@ -205,6 +205,10 @@ resource "aws_cloudwatch_log_group" "tv_boot_heartbeat_gate" {
 # Open the boot-heartbeat window at 08:50 IST (03:20 UTC) Mon-Fri — 10 min after
 # the 08:40 IST soft boot deadline (§10), giving the app time to publish its
 # first health signal on a healthy boot.
+# 2026-11-07: the cron is weekday-only and not holiday-aware; on a weekday NSE
+# holiday the handler (alarm_gate::effective_mode, nse_calendar pinned to
+# config/base.toml) runs the open as a close, so the alarm stays disarmed and
+# no "boot heartbeat ABSENT" page fires for a box the holiday gate stopped.
 resource "aws_cloudwatch_event_rule" "tv_boot_heartbeat_open" {
   name                = "tv-${var.environment}-boot-heartbeat-open"
   description         = "Enable boot-heartbeat alarm actions at 08:50 IST (Mon-Fri)"

@@ -520,13 +520,29 @@ resource "aws_cloudwatch_metric_alarm" "tv_hard_stop_guard_not_invoked" {
 #
 # ok_actions = [] - recovery here means "a datapoint appeared again", which is
 # worth seeing in the console and is not worth a second page.
+#
+# 2026-11-07 (owner: "see today is saturday why the fuck server started dude
+# why?"): with evaluation_periods = 1 this paged EVERY weekend - the digest
+# cron is MON-FRI, so Saturday's datapoint is legitimately missing and
+# breaching turns that into an ALARM. It was missed when the three sibling
+# did-it-run alarms were gated on 2026-09-01. Their fix (actions disabled,
+# armed by the market-hours gate 09:20-15:35 IST) does NOT fit this one: the
+# digest runs at 17:30 IST, so at Monday 09:20 the last 24 hours hold no
+# invocation and the gate would page every Monday morning. Instead, the
+# market_hours_liveness_gate_not_invoked pattern: N consecutive missing days.
+# A weekend is at most 2 missing days (the cron ignores holidays, so a weekday
+# holiday is not one), and FOUR periods rather than three keeps a Monday
+# whose 17:30 invocation lands a minute late (Friday's is then just over 72 h
+# old) from paging. Cost: a dropped schedule pages after ~4 days, not 1.
+# Pinned by crates/common/tests/weekend_false_page_guard.rs.
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "tv_daily_budget_digest_not_invoked" {
   alarm_name          = "tv-${var.environment}-daily-budget-digest-not-invoked"
-  alarm_description   = "The daily spend digest did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). The digest is the operator-facing view of AWS spend; while it is not running the bill is unobserved between the hourly kill-switch checks, and its Errors alarm cannot see this (no invocation = no error)."
+  alarm_description   = "The daily spend digest did NOT RUN for ~4 days - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). The digest is the operator-facing view of AWS spend; while it is not running the bill is unobserved between the hourly kill-switch checks, and its Errors alarm cannot see this (no invocation = no error)."
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 1
+  evaluation_periods  = 4
+  datapoints_to_alarm = 4
   metric_name         = "Invocations"
   namespace           = "AWS/Lambda"
   period              = 86400
