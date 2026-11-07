@@ -3368,6 +3368,19 @@ const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
     // The other three infra.rs slots are unchanged: two were already non-literal
     // before the seam, and the seam-routing of them added no new site.
     ("crates/app/src/infra.rs", 5),
+    // 0 -> 1 on 2026-11-07 (nightly bench false-red, run 42315415324). The
+    // CI-only `bench_ab_recheck` bin re-runs flagged Criterion benches on the
+    // same runner, so its program is a bench binary path from the bench log
+    // or from the restored baseline cache: a variable by nature. The
+    // allowlist AT THE CALL SITE is `checked_bench_exe`, the only way to
+    // reach the one `Command::new(&program)`: a regular file named
+    // `<identifier>-<16 hex>` (cargo's bench naming) directly inside a
+    // `release/deps` folder or the Criterion dir's `tv_ab_bins` folder. It
+    // cannot start a shell, an interpreter or anything on PATH. Pinned by
+    // its unit test `only_bench_binaries_in_the_two_places_may_run`. The
+    // literal alternative, `cargo bench`, would add a package manager to the
+    // spawn allowlist, which needs a dated operator note.
+    ("crates/common/src/bin/bench_ab_recheck.rs", 1),
     ("crates/tickvault-logs-mcp/src/tools.rs", 1),
 ];
 
