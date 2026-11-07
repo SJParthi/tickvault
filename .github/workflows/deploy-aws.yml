@@ -689,7 +689,7 @@ jobs:
         #      The REAL cover splits by merge type:
         #        - BOT merge (auto-merge, GITHUB_TOKEN): the push run is
         #          suppressed, so NO run exists for the SHA and
-        #          postmerge-catchup (every 30 min, 7 days) dispatches
+        #          postmerge-catchup (every 30 min, IST trading days only since 2026-11-07) dispatches
         #          deploy-aws, which self-starts the box and stops it again.
         #        - HUMAN merge: the push run DID fire and skipped green, and
         #          catchup counts any run as covered -- so catchup will NOT
@@ -741,7 +741,7 @@ jobs:
 
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
-            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one within ~30 min, ANY day, self-starting the box and stopping it again. If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
+            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one within ~30 min on an IST trading day (never on a weekend or NSE holiday: there it waits for the next trading day, 00:00 IST), self-starting the box and stopping it again. If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
             # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
             # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
             # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
