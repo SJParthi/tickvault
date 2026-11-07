@@ -231,23 +231,38 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
     // from a REAL post-export recount + a REAL post-upload S3 HeadObject —
     // a refactor stubbing either input (e.g. `Some(exported.rows)`) would
     // make the verify vacuously true and let a corrupt archive gate a drop.
+    // 2026-11-07 (PR AA step 2): export, upload and verify moved out of
+    // `process_one` into `copy_and_verify_partition`, which BOTH gates use:
+    // `process_one` (the exact WAL gate) and the snapshot gate, through the
+    // `ArchiveIo::copy_and_verify` impl. The input checks below read that
+    // shared body, and both callers must still reach it.
     let archive_src = read_workspace_file("crates/storage/src/partition_archive.rs");
     let process_one = extract_fn_body(&archive_src, "async fn process_one");
     assert!(
-        process_one.contains("self.recount_rows("),
-        "process_one must obtain the recount from the real recount_rows() call"
+        process_one.contains(".copy_and_verify_partition("),
+        "process_one must copy and verify through copy_and_verify_partition"
+    );
+    let snapshot_copy = extract_fn_body(&archive_src, "async fn copy_and_verify(");
+    assert!(
+        snapshot_copy.contains("self.copy_and_verify_partition("),
+        "the snapshot gate's copy must go through copy_and_verify_partition"
+    );
+    let copy = extract_fn_body(&archive_src, "async fn copy_and_verify_partition");
+    assert!(
+        copy.contains("self.recount_rows("),
+        "copy_and_verify_partition must obtain the recount from the real recount_rows() call"
     );
     assert!(
-        process_one.contains("self.head_object_meta("),
-        "process_one must obtain the S3 length + checksum from the real \
+        copy.contains("self.head_object_meta("),
+        "copy_and_verify_partition must obtain the S3 length + checksum from the real \
          head_object_meta() call"
     );
     // The two fetched values must be the ones handed to verify_archive —
     // pin the binding names appearing in the verify_archive call.
-    let verify_call_idx = process_one
+    let verify_call_idx = copy
         .find("verify_archive(")
-        .expect("process_one must call verify_archive");
-    let verify_call = &process_one[verify_call_idx..];
+        .expect("copy_and_verify_partition must call verify_archive");
+    let verify_call = &copy[verify_call_idx..];
     for needle in ["recount", "s3_len"] {
         assert!(
             verify_call.contains(needle),
@@ -260,9 +275,8 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
     // `process_one` into `place_archive`, which the rebuild copy shares, so
     // the reuse arm is checked there and `process_one` must still reach it.
     assert!(
-        process_one.contains("self\n            .place_archive(")
-            || process_one.contains("self.place_archive("),
-        "process_one must place the archive through place_archive"
+        copy.contains("self\n            .place_archive(") || copy.contains("self.place_archive("),
+        "copy_and_verify_partition must place the archive through place_archive"
     );
     let place_archive = extract_fn_body(&archive_src, "async fn place_archive");
     assert!(
@@ -276,8 +290,8 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
     // Vacuous-pass tripwires: verify inputs must never be self-satisfied.
     for forbidden in ["Some(exported.rows)", "Some(exported.gzip_bytes)"] {
         assert!(
-            !process_one.contains(forbidden),
-            "process_one must never feed verify_archive a self-satisfied \
+            !process_one.contains(forbidden) && !copy.contains(forbidden),
+            "the copy must never feed verify_archive a self-satisfied \
              input ({forbidden}) — that makes the verify vacuous"
         );
     }

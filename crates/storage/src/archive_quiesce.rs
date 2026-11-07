@@ -151,7 +151,7 @@ impl ArchiveQuiesce {
     /// A writer's side for a plain OS thread (the after-close depth pass):
     /// waits in the queue, behind at most the one partition an archive pass
     /// has in flight. Must NOT be called inside an async context (tokio
-    /// panics there), exactly like `hold_depth_partitions_for_rewrite`.
+    /// panics there). Cold path, once per after-close bucket.
     pub fn shared_blocking(&self) -> RwLockReadGuard<'_, ()> {
         self.lock.blocking_read()
     }
@@ -182,7 +182,6 @@ static ARCHIVE_QUIESCE: ArchiveQuiesce = ArchiveQuiesce::new();
 
 /// The archiver's side of the process lock: holds every writer that can post
 /// into an old hour out, waiting at most `wait`. `None` on timeout.
-// WIRING-EXEMPT: the archiver takes it around each hour-path partition in PR AA step 2 (plan item AA-1); step 1 adds the lock and wires the writers only
 pub async fn hold_writers_for_archive(wait: Duration) -> Option<RwLockWriteGuard<'static, ()>> {
     ARCHIVE_QUIESCE.hold_writers(wait).await
 }

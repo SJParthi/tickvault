@@ -119,6 +119,14 @@ use crate::s3_cold::{
 };
 use crate::wal_suspension_watcher::WalTableRow;
 
+// PR AA step 2 (owner Quote 51): the WAL snapshot gate for hour-path tables.
+mod snapshot_gate;
+
+use snapshot_gate::{
+    ArchiveIo, CopiedPartition, HourFrameSpan, InFlightReader, InFlightVerdict, SnapshotGate,
+    archive_with_snapshot_gate, recheck_and_drop, snapshot_gate_table,
+};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -149,50 +157,28 @@ pub const ARCHIVE_TEMP_DIR: &str = "data/tmp/partition-archive";
 /// costs nothing until first contention and needs no lazy initialiser.
 static ARCHIVE_PASS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Mutual exclusion between the after-close deferred-depth pass and the
-/// archiving of a depth partition (DA-13d).
-///
-/// The pass rewrites shed depth rows at their ORIGINAL receipt time, so it
-/// writes into `market_depth` / `market_depth_book` partitions this archiver
-/// can select. A row it committed after the pre-drop recount and before the
-/// `DROP PARTITION` was dropped with the partition; the pass then saw its
-/// flush acked, cleared its mark, and the rows were gone with no counter.
-///
-/// The pass holds this from its first write until its marks are cleared
-/// ([`hold_depth_partitions_for_rewrite`]). The archiver `try_lock`s it around
-/// each depth partition, export to drop: busy means the partition is HELD for
-/// a later pass, counted, never exported. So a depth partition is never
-/// exported while the pass writes, and the pass never writes while one is
-/// between its recount and its drop. A tokio mutex hands a released permit
-/// to a queued waiter first, so a waiting pass is not starved by the next
-/// partition's `try_lock`.
-static DEPTH_REWRITE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// The after-close deferred-depth pass and the depth archive (DA-13d,
+// 2026-10-13; reworked by PR AA step 2, 2026-11-07).
+//
+// The pass rewrites shed depth rows at their ORIGINAL receipt time, so it
+// writes into `market_depth` / `market_depth_book` partitions this archiver
+// can select. Until PR AA it held a process-wide gate (`DEPTH_REWRITE_GATE`)
+// from its first write until its marks were cleared, which on a long night
+// kept every depth partition on the box for hours. It now takes the shared
+// side of the archive quiesce lock per bucket (`archive_quiesce`), and the
+// snapshot gate holds any hour whose frames still carry an after-close mark
+// (`snapshot_gate::InFlightVerdict::DeferredDepth`), so an hour is never
+// copied while rows of it are still to be written back, and the pass never
+// writes while a depth partition is between its recount and its drop.
 
-/// Takes [`DEPTH_REWRITE_GATE`] for the after-close deferred-depth pass,
-/// waiting for at most the one depth partition an archive pass may have in
-/// flight. Hold the guard until the pass has cleared its marks.
-///
-/// Call it ONLY from a plain OS thread (the pass's own `tv-deferred-depth`
-/// thread): it blocks, and inside an async context it would panic. Cold path,
-/// once per pass.
-pub fn hold_depth_partitions_for_rewrite() -> tokio::sync::MutexGuard<'static, ()> {
-    DEPTH_REWRITE_GATE.blocking_lock()
-}
-
-/// The archiver's side of [`DEPTH_REWRITE_GATE`]: `None` while the
-/// after-close pass holds it (or a pass is queued for it). Never waits.
-/// O(1), cold path, once per depth partition.
-#[must_use]
-pub fn try_hold_depth_partitions() -> Option<tokio::sync::MutexGuard<'static, ()>> {
-    DEPTH_REWRITE_GATE.try_lock().ok()
-}
-
-/// Whether `table` is one the after-close deferred-depth pass writes.
-fn is_depth_rewrite_table(table: &str) -> bool {
+/// Whether `table` is one of the depth tables (`market_depth`,
+/// `market_depth_book`). Pure, O(1).
+fn is_depth_table(table: &str) -> bool {
     DEPTH_TABLES.contains(&table)
 }
 
-/// Counts one depth partition held because the after-close pass is writing.
+/// Counts one depth partition held because the after-close pass still has
+/// rows of its hour to write back.
 fn note_depth_partition_held(summary: &mut ArchiveRunSummary) {
     summary.held_deferred_depth = summary.held_deferred_depth.saturating_add(1);
     count_depth_partitions_held(1);
@@ -202,15 +188,30 @@ fn note_depth_partition_held(summary: &mut ArchiveRunSummary) {
 /// (DA-13d). The ONE place the series' labels are written, so the boot seed
 /// (`n = 0`, from `main.rs`) and every hold land on the same series. Local
 /// `/metrics` only. O(1).
-// TEST-EXEMPT: the series is asserted with a real Prometheus recorder by app's daily_archive_boot::test_regression_da13d_depth_hold_counter_seeds_at_zero (storage has no exporter dev-dependency); the hold path that adds 1 is driven by the archiver gate test above
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 2): `cause` is `marks_waiting` (the hour
+/// still has after-close marks), not `rewrite_in_flight`: the all-night gate
+/// it named is gone.
+// TEST-EXEMPT: the series is asserted with a real Prometheus recorder by app's daily_archive_boot::test_regression_da13d_depth_hold_counter_seeds_at_zero (storage has no exporter dev-dependency); the hold path that adds 1 is driven by the snapshot-gate tests
 pub fn count_depth_partitions_held(n: u64) {
     metrics::counter!(
         "tv_partition_archive_skipped_total",
         "reason" => "deferred_depth_pass",
-        "cause" => "rewrite_in_flight",
+        "cause" => "marks_waiting",
         "stage" => "pre_export"
     )
     .increment(n);
+}
+
+/// Whether the after-close depth pass still has rows to write back anywhere
+/// (any after-close mark is set). The disk-pressure leg reads it to hold a
+/// pass that last stood aside only for depth hours, while the pass runs.
+/// One snapshot of the mark table, O(`DEFERRED_BUCKETS`), cold.
+#[must_use]
+pub fn deferred_depth_marks_waiting() -> bool {
+    !crate::wal_deferred_depth::deferred_depth()
+        .snapshot()
+        .is_empty()
 }
 
 /// Free-space level below which an archive pass is reported as WEDGED.
@@ -1342,11 +1343,23 @@ pub struct ArchiveRunSummary {
     /// hold itself is bounded by [`MAX_CROSSVERIFY_HOLD_DAYS`].
     pub held_unverified: u32,
     /// Depth partitions HELD this run because the after-close deferred-depth
-    /// pass was writing back shed rows (DA-13d, [`DEPTH_REWRITE_GATE`]). Not
+    /// pass still has rows of their hour to write back (DA-13d; since PR AA
+    /// step 2, the hour's after-close marks, read by the snapshot gate). Not
     /// a failure: the partition is exported by a later pass, once the
     /// rewritten rows are in it. The daily scheduler reads it as
     /// "incomplete, retry".
     pub held_deferred_depth: u32,
+    /// Hour-path partitions HELD this run because the archive quiesce lock
+    /// could not be taken in time: a WAL replay, a spill replay or the
+    /// after-close depth pass was writing old hours (PR AA step 2). Not a
+    /// failure; the daily scheduler gives the attempt back.
+    pub held_quiesce_busy: u32,
+    /// Hour-path partitions HELD this run because rows of their hour may
+    /// still be on their way to QuestDB: unapplied frames, an unsettled
+    /// rescue batch, not yet acknowledged, no WAL bound, or a clock that
+    /// stepped back (PR AA step 2). Not a failure and not a stand-aside: a
+    /// later pass archives the hour once its frames are in.
+    pub held_in_flight: u32,
     // `held_top_volume_spill` REMOVED 2026-10-22 (plan item 62): nothing can
     // replay rows into a `top_volume_<tf>` hour any more.
     /// Partitions HELD this run by the caller's [`ArchivePassLimits`] (PR
@@ -1402,7 +1415,7 @@ pub fn apply_pass_limits(
     let mut kept: Vec<(&'static str, String)> = if limits.skip_depth {
         worklist
             .into_iter()
-            .filter(|(table, _)| !is_depth_rewrite_table(table))
+            .filter(|(table, _)| !is_depth_table(table))
             .collect() // O(1) EXEMPT: cold once-per-run worklist filter
     } else {
         worklist
@@ -1439,18 +1452,29 @@ enum PartitionStep {
     /// export ran (it counts against the cap), the partition is kept, and the
     /// rest of the table's partitions are skipped this run.
     WalNotAppliedBeforeDrop,
+    /// Snapshot gate (PR AA step 2): rows of this hour may still be on their
+    /// way to QuestDB, or the after-close depth pass still has rows of it to
+    /// write back. Nothing was exported; the next partition is still tried.
+    Held,
+    /// Snapshot gate (PR AA step 2): the quiesce lock could not be taken in
+    /// time. Nothing was exported; the run holds every further hour-path
+    /// partition without waiting again.
+    QuiesceBusy,
 }
 
 impl PartitionStep {
     /// Whether this step exported a partition (counts against a caller's
     /// [`ArchivePassLimits::max_partitions`]). O(1).
     const fn exported(self) -> bool {
-        !matches!(self, Self::WalNotAppliedBeforeExport)
+        matches!(self, Self::Done | Self::WalNotAppliedBeforeDrop)
     }
 
     /// Whether the table's WAL could not be proven applied. O(1).
     const fn wal_not_applied(self) -> bool {
-        !matches!(self, Self::Done)
+        matches!(
+            self,
+            Self::WalNotAppliedBeforeExport | Self::WalNotAppliedBeforeDrop
+        )
     }
 }
 
@@ -1460,13 +1484,19 @@ impl PartitionStep {
 /// cap is never spent on a table still being written (PR DP review H1). Pure,
 /// O(rows).
 #[must_use]
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 2): a snapshot-gate table (the depth
+/// tables) is never listed. Its old hours are archived once QuestDB reaches
+/// a snapshot taken under the quiesce lock, so a WAL that is merely behind
+/// (the live writer committing) is not a reason to skip it.
 pub(crate) fn wal_lagging_tables(rows: &[WalTableRow]) -> Vec<String> {
     rows.iter()
         .filter(|r| {
-            matches!(
-                wal_apply_verdict(rows, &r.name),
-                WalApplyVerdict::Lagging { .. }
-            )
+            !snapshot_gate_table(&r.name)
+                && matches!(
+                    wal_apply_verdict(rows, &r.name),
+                    WalApplyVerdict::Lagging { .. }
+                )
         })
         .map(|r| r.name.clone())
         .collect() // O(1) EXEMPT: cold once-per-run probe of a few dozen rows
@@ -1525,6 +1555,16 @@ pub struct PartitionArchiver {
     verified_day_gate: Option<VerifiedDayGate>,
     /// Limits the caller put on this pass (PR DP-2); default = none.
     pass_limits: ArchivePassLimits,
+    /// The quiesce lock the snapshot gate holds (PR AA step 2). `None` is the
+    /// process lock ([`crate::archive_quiesce::hold_writers_for_archive`]);
+    /// tests set a private one so they never contend with the process lock.
+    quiesce: Option<&'static crate::archive_quiesce::ArchiveQuiesce>,
+    /// Reads the in-flight state of an hour (PR AA step 2): the process
+    /// reader in production, a scripted one in tests.
+    in_flight_reader: InFlightReader,
+    /// Replaces the snapshot gate's poll interval in tests (`None` in
+    /// production: [`snapshot_gate::SNAPSHOT_POLL`]).
+    pause_override: Option<Duration>,
 }
 
 /// Predicate the daily archive leg injects: `true` when day D is verified
@@ -1719,6 +1759,9 @@ impl PartitionArchiver {
             audit: PartitionArchiveAuditWriter::new(questdb),
             verified_day_gate: None,
             pass_limits: ArchivePassLimits::default(),
+            quiesce: None,
+            in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
+            pause_override: None,
         }))
     }
 
@@ -1757,6 +1800,9 @@ impl PartitionArchiver {
             audit,
             verified_day_gate: None,
             pass_limits: ArchivePassLimits::default(),
+            quiesce: None,
+            in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
+            pause_override: None,
         })
     }
 
@@ -1779,6 +1825,21 @@ impl PartitionArchiver {
     // TEST-EXEMPT: builder setter that stores the limits; what they do is tested through apply_pass_limits, pass_deadline_reached and the stub-server pass test test_stub_pass_limits_skip_depth_cap_and_deadline
     pub fn with_pass_limits(mut self, limits: ArchivePassLimits) -> Self {
         self.pass_limits = limits;
+        self
+    }
+
+    /// Test seam for the snapshot gate (PR AA step 2): a private quiesce lock
+    /// and a scripted in-flight reader, so a stub test never contends with
+    /// the process lock or depends on this process's WAL state.
+    #[cfg(test)]
+    pub(crate) fn with_test_snapshot_gate(
+        mut self,
+        quiesce: &'static crate::archive_quiesce::ArchiveQuiesce,
+        in_flight_reader: InFlightReader,
+    ) -> Self {
+        self.quiesce = Some(quiesce);
+        self.in_flight_reader = in_flight_reader;
+        self.pause_override = Some(Duration::from_millis(10));
         self
     }
 
@@ -1911,6 +1972,9 @@ impl PartitionArchiver {
     async fn run_archive_pass(&mut self) -> ArchiveRunSummary {
         let mut summary = ArchiveRunSummary::default();
 
+        // PR AA step 2: the quiesce-busy series exists from the first pass, so
+        // the first hold is a visible change rather than a new series.
+        snapshot_gate::count_quiesce_busy_held(0);
         self.ensure_audit_table().await;
         self.clean_temp_dir();
 
@@ -2137,6 +2201,8 @@ impl PartitionArchiver {
         let cap = self.pass_limits.max_partitions;
         let mut exported: u32 = 0;
         let mut attempted: u32 = 0;
+        // PR AA step 2: set once the quiesce lock was busy for a full wait.
+        let mut quiesce_busy = false;
         for (index, (table, partition)) in worklist.into_iter().enumerate() {
             if let Some(cap) = cap
                 && exported >= cap
@@ -2168,21 +2234,30 @@ impl PartitionArchiver {
                 continue;
             }
             // O(1) EXEMPT: end
-            // DA-13d: a depth partition is archived only while the after-close
-            // pass is not writing depth back; held for the whole of
-            // `process_one`, export to drop. Released at the end of this
-            // iteration, so a waiting pass gets it before the next partition.
-            let _depth_gate = if is_depth_rewrite_table(table) {
-                let Some(guard) = try_hold_depth_partitions() else {
-                    note_depth_partition_held(&mut summary);
+            // PR AA step 2: a depth partition goes through the snapshot gate,
+            // which holds every writer that can post into an old hour for the
+            // whole of its copy and drop, and holds an hour the after-close
+            // depth pass still has rows of (it replaces the DA-13d all-night
+            // gate). Once the quiesce lock was busy for a full wait this run,
+            // every further hour-path partition is held without waiting
+            // again: the writer that held it is still at work.
+            let step = if snapshot_gate_table(table) {
+                if quiesce_busy {
+                    summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
+                    snapshot_gate::count_quiesce_busy_held(1);
                     continue;
-                };
-                Some(guard)
+                }
+                let gate = SnapshotGate::from_config(&self.cfg);
+                archive_with_snapshot_gate(self, table, &partition, gate, &mut summary).await
             } else {
-                None
+                self.process_one(table, &partition, &mut summary).await
             };
-            attempted = attempted.saturating_add(1);
-            let step = self.process_one(table, &partition, &mut summary).await;
+            if !matches!(step, PartitionStep::Held | PartitionStep::QuiesceBusy) {
+                attempted = attempted.saturating_add(1);
+            }
+            if step == PartitionStep::QuiesceBusy {
+                quiesce_busy = true;
+            }
             if step.exported() {
                 exported = exported.saturating_add(1);
             }
@@ -2198,9 +2273,17 @@ impl PartitionArchiver {
         if summary.held_deferred_depth > 0 {
             info!(
                 held_deferred_depth = summary.held_deferred_depth,
-                "partition archive: depth partitions HELD while the after-close pass writes \
-                 back order-book rows skipped under load (not a failure; a later pass \
+                "partition archive: depth hours HELD while the after-close pass still has \
+                 order-book rows of them to write back (not a failure; a later pass \
                  archives them with those rows in)"
+            );
+        }
+        if summary.held_quiesce_busy > 0 || summary.held_in_flight > 0 {
+            info!(
+                held_quiesce_busy = summary.held_quiesce_busy,
+                held_in_flight = summary.held_in_flight,
+                "partition archive: hour partitions HELD (an old-hour writer was busy, or rows \
+                 of the hour may still be on their way to QuestDB; not a failure)"
             );
         }
 
@@ -2439,7 +2522,9 @@ impl PartitionArchiver {
         Some((s3_key, uploaded_this_run))
     }
 
-    /// One partition: export → upload → verify → audit-first → drop.
+    /// One partition through the EXACT WAL gate: export → upload → verify →
+    /// audit-first → drop. Every table except the snapshot-gate tables
+    /// (`snapshot_gate::snapshot_gate_table`) goes this way.
     async fn process_one(
         &mut self,
         table: &'static str,
@@ -2458,12 +2543,6 @@ impl PartitionArchiver {
             );
             return PartitionStep::Done;
         };
-        // Did THIS run put the object there, or did it reuse an existing one?
-        // The 4b mismatch arm below needs to tell those apart: deleting an
-        // object we did not write could destroy the only copy of already-
-        // dropped data, which is exactly what the never-overwrite policy
-        // exists to prevent. `place_archive` (step 2) returns both the key
-        // and that fact.
 
         // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
         //     probe only refuses SUSPENDED tables. A table that is merely
@@ -2478,83 +2557,13 @@ impl PartitionArchiver {
             return PartitionStep::WalNotAppliedBeforeExport;
         }
 
-        // 1. Export (stream + gzip + count) — one partition on disk at a time.
-        let exported = match self
-            .export_partition_csv(table, partition, &start, &end)
-            .await
-        {
-            Ok(e) => e,
-            Err(err) => {
-                self.record_failure(
-                    table,
-                    partition,
-                    ArchiveOutcome::ExportFailed,
-                    &format!("{err:#}"),
-                    summary,
-                );
-                return PartitionStep::Done;
-            }
-        };
-        summary.csv_bytes_exported = summary
-            .csv_bytes_exported
-            .saturating_add(exported.csv_bytes);
-
-        // 2. Never-overwrite upload (F1): HeadObject first; reuse only on
-        //    content identity; a different object at the canonical key gets a
-        //    content-addressed sidecar instead. See `place_archive`.
-        let Some((s3_key, uploaded_this_run)) = self
-            .place_archive(table, partition, &exported, summary)
+        // 1–4. Export, never-overwrite upload, verify, audit-first.
+        let Some(copied) = self
+            .copy_and_verify_partition(table, partition, &start, &end, summary)
             .await
         else {
             return PartitionStep::Done;
         };
-
-        // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
-        // The tally (count AND max(ts)) taken here is what the pre-drop
-        // re-read must reproduce exactly.
-        let verified_tally = self.recount_rows(table, &start, &end).await;
-        let recount = verified_tally.as_ref().map(|t| t.rows);
-        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
-        let proof = match verify_archive(
-            table,
-            partition,
-            exported.rows,
-            exported.csv_bytes,
-            exported.gzip_bytes,
-            &exported.gzip_sha256_hex,
-            recount,
-            s3_len,
-        ) {
-            Ok(proof) => proof,
-            Err(failure) => {
-                self.record_failure(
-                    table,
-                    partition,
-                    failure.outcome(),
-                    &format!("{failure:?}"),
-                    summary,
-                );
-                remove_temp_file(&exported.path);
-                return PartitionStep::Done;
-            }
-        };
-        remove_temp_file(&exported.path);
-        summary.verified = summary.verified.saturating_add(1);
-        metrics::counter!("tv_partition_archive_verified_total").increment(1);
-
-        // 4. Audit-GATED (F2): the `verified` row must be ACK-flushed
-        //    (ILP-over-HTTP) BEFORE the drop — a failed flush WITHHOLDS the
-        //    drop (the partition is kept; retried next run).
-        if let Err(err) = self.append_verified_audit_gated(table, partition, &proof, &s3_key) {
-            self.record_failure(
-                table,
-                partition,
-                ArchiveOutcome::AuditFailed,
-                &format!("verified-audit flush not ACKed — drop withheld: {err:#}"),
-                summary,
-            );
-            return PartitionStep::Done;
-        }
 
         // 4b. LAST-MOMENT RECOUNT (2026-08-19) — close the write-during-drop
         //     window.
@@ -2582,7 +2591,8 @@ impl PartitionArchiver {
         //     check and the DROP statement; it cannot close it entirely
         //     without a table lock QuestDB does not offer. What it converts
         //     is the FAILURE MODE: silent loss becomes a counted, coded
-        //     refusal that retries.
+        //     refusal that retries. (PR AA step 2: the snapshot-gate tables
+        //     close it with the archive quiesce lock instead.)
         //
         //     WAL-APPLIED GATE, again (2026-10-02), and deliberately BEFORE
         //     the recount rather than after it. The recount can only see
@@ -2598,88 +2608,131 @@ impl PartitionArchiver {
             metrics::counter!("tv_partition_drop_withheld_total").increment(1);
             return PartitionStep::WalNotAppliedBeforeDrop;
         }
-        //     The re-read compares count AND max(ts) with the values taken
-        //     right after the export; any difference keeps the partition.
-        let recheck = self.recount_rows(table, &start, &end).await;
-        match recheck {
-            Some(ref now) if Some(now) == verified_tally.as_ref() && now.rows == proof.rows => {}
-            other => {
-                let verified_max = verified_tally
-                    .as_ref()
-                    .and_then(|t| t.max_ts.clone())
-                    .unwrap_or_default();
-                let detail = match other {
-                    Some(now) => format!(
-                        "partition CHANGED between verify and drop: verified \
-                         {} rows (max ts '{verified_max}'), now {} rows (max ts \
-                         '{}') — a writer touched this partition (15:31 sweep / \
-                         WAL replay / DLQ drain / deferred depth). The S3 copy is \
-                         stale, so the partition is KEPT, the stale object is \
-                         removed, and it is re-exported next run",
-                        proof.rows,
-                        now.rows,
-                        now.max_ts.unwrap_or_default()
-                    ),
-                    None => format!(
-                        "pre-drop recount UNAVAILABLE (verified {} rows) — \
-                         cannot prove the partition is unchanged, so the drop is \
-                         withheld and retried next run",
-                        proof.rows
-                    ),
-                };
-                metrics::counter!("tv_partition_drop_withheld_total").increment(1);
-                // CLEAR THE STALE OBJECT so the next run is not deadlocked
-                // (2026-08-19, found by the adversarial audit — the comment
-                // above said "re-exported next run", and that was FALSE).
-                //
-                // The partition changed, so the object we just uploaded no
-                // longer matches it. On the next run the export produces
-                // DIFFERENT bytes, the never-overwrite policy compares
-                // SHA-256, sees a mismatch, and raises S3Conflict — "keep the
-                // partition, never overwrite". That repeats forever: the
-                // partition is never dropped and the disk grows without
-                // bound. A safety check that silently converts into a
-                // permanent leak is worse than the race it closed.
-                //
-                // Deleting is safe ONLY for an object this run uploaded. If
-                // the object was REUSED, some earlier run wrote it and its
-                // partition may already have been dropped — deleting it could
-                // destroy the only surviving copy of that data, which is the
-                // precise scenario the never-overwrite policy protects. So a
-                // reused object is left alone and the operator is told, which
-                // is the honest end of the fail-closed path rather than a
-                // silent one.
-                if uploaded_this_run && let Err(err) = self.delete_s3_object(&s3_key).await {
-                    warn!(
-                            table,
-                            partition,
-                            s3_key = %s3_key,
-                            error = %format!("{err:#}"),
-                            "could not remove the stale archive object after a \
-                             pre-drop mismatch — the next run will raise \
-                             S3Conflict on this key until it is removed"
-                    );
-                }
+        // 4b/5. The re-read (count AND max(ts) against the values taken right
+        // after the export) and the drop, shared with the snapshot gate. On a
+        // mismatch the stale object THIS run uploaded is removed (2026-08-19:
+        // otherwise the next export's different bytes raise S3Conflict
+        // forever and the partition is never dropped); a reused object, which
+        // an earlier run wrote and may be the only copy of dropped data, is
+        // left alone.
+        recheck_and_drop(self, table, partition, &start, &end, copied, summary).await
+    }
+
+    /// Steps 1–4 of an archive, shared by both gates: export (stream + gzip +
+    /// count, one partition on disk at a time), never-overwrite upload (F1),
+    /// verify (recount AFTER the export and S3 head, fail-closed), and the
+    /// audit-gated `verified` row (F2). `None` after a recorded failure: the
+    /// partition is kept and the temp file removed.
+    async fn copy_and_verify_partition(
+        &mut self,
+        table: &str,
+        partition: &str,
+        start: &str,
+        end: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> Option<CopiedPartition> {
+        // 1. Export (stream + gzip + count) — one partition on disk at a time.
+        let exported = match self
+            .export_partition_csv(table, partition, start, end)
+            .await
+        {
+            Ok(e) => e,
+            Err(err) => {
                 self.record_failure(
                     table,
                     partition,
-                    ArchiveOutcome::CountMismatch,
-                    &detail,
+                    ArchiveOutcome::ExportFailed,
+                    &format!("{err:#}"),
                     summary,
                 );
-                return PartitionStep::Done;
+                return None;
             }
-        }
+        };
+        summary.csv_bytes_exported = summary
+            .csv_bytes_exported
+            .saturating_add(exported.csv_bytes);
 
-        // 5. Drop — the ONLY destructive step, gated on the type-state proof.
+        // 2. Never-overwrite upload (F1): HeadObject first; reuse only on
+        //    content identity; a different object at the canonical key gets a
+        //    content-addressed sidecar instead. See `place_archive`. It also
+        //    reports whether THIS run put the object there: the pre-drop
+        //    mismatch arm may delete only an object this run uploaded.
+        let (s3_key, uploaded_this_run) = self
+            .place_archive(table, partition, &exported, summary)
+            .await?;
+
+        // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
+        // The tally (count AND max(ts)) taken here is what the pre-drop
+        // re-read must reproduce exactly.
+        let verified_tally = self.recount_rows(table, start, end).await;
+        let recount = verified_tally.as_ref().map(|t| t.rows);
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
+        let proof = match verify_archive(
+            table,
+            partition,
+            exported.rows,
+            exported.csv_bytes,
+            exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
+            recount,
+            s3_len,
+        ) {
+            Ok(proof) => proof,
+            Err(failure) => {
+                self.record_failure(
+                    table,
+                    partition,
+                    failure.outcome(),
+                    &format!("{failure:?}"),
+                    summary,
+                );
+                remove_temp_file(&exported.path);
+                return None;
+            }
+        };
+        remove_temp_file(&exported.path);
+        summary.verified = summary.verified.saturating_add(1);
+        metrics::counter!("tv_partition_archive_verified_total").increment(1);
+
+        // 4. Audit-GATED (F2): the `verified` row must be ACK-flushed
+        //    (ILP-over-HTTP) BEFORE the drop — a failed flush WITHHOLDS the
+        //    drop (the partition is kept; retried next run).
+        if let Err(err) = self.append_verified_audit_gated(table, partition, &proof, &s3_key) {
+            self.record_failure(
+                table,
+                partition,
+                ArchiveOutcome::AuditFailed,
+                &format!("verified-audit flush not ACKed — drop withheld: {err:#}"),
+                summary,
+            );
+            return None;
+        }
+        Some(CopiedPartition {
+            proof,
+            s3_key,
+            uploaded_this_run,
+            verified_tally,
+        })
+    }
+
+    /// Step 5 — the DROP, the ONLY destructive step, gated on the type-state
+    /// proof inside `copied`, with its audit row and counters.
+    async fn drop_copied_partition(
+        &mut self,
+        copied: CopiedPartition,
+        summary: &mut ArchiveRunSummary,
+    ) {
+        let CopiedPartition { proof, s3_key, .. } = copied;
+        let table = proof.table().to_string();
+        let partition = proof.partition().to_string();
         match self.drop_partition(&proof).await {
             Ok(()) => {
                 summary.dropped = summary.dropped.saturating_add(1);
                 summary.rows_archived = summary.rows_archived.saturating_add(proof.rows);
                 metrics::counter!("tv_partition_dropped_total").increment(1);
                 self.append_audit(
-                    table,
-                    partition,
+                    &table,
+                    &partition,
                     ArchiveOutcome::Dropped,
                     &proof,
                     &s3_key,
@@ -2697,8 +2750,8 @@ impl PartitionArchiver {
             Err(err) => {
                 // S3 copy already verified — safe; retried next run.
                 self.append_audit(
-                    table,
-                    partition,
+                    &table,
+                    &partition,
                     ArchiveOutcome::DropFailed,
                     &proof,
                     &s3_key,
@@ -2717,7 +2770,6 @@ impl PartitionArchiver {
                 );
             }
         }
-        PartitionStep::Done
     }
 
     /// F3 (review round 1): probes `wal_tables()` and returns every row via
@@ -3308,6 +3360,66 @@ impl PartitionArchiver {
                 remove_temp_file(&path);
             }
         }
+    }
+}
+
+/// The production I/O behind the snapshot gate (PR AA step 2). Each method
+/// is the existing archiver step; the gate only fixes their ORDER.
+impl ArchiveIo for PartitionArchiver {
+    type Hold = tokio::sync::RwLockWriteGuard<'static, ()>;
+
+    async fn read_wal_rows(&mut self) -> Result<Vec<WalTableRow>> {
+        self.fetch_wal_tables().await
+    }
+
+    async fn hold_old_hour_writers(&mut self, wait: Duration) -> Option<Self::Hold> {
+        match self.quiesce {
+            Some(lock) => lock.hold_writers(wait).await,
+            None => crate::archive_quiesce::hold_writers_for_archive(wait).await,
+        }
+    }
+
+    fn in_flight_now(&mut self, table: &str, span: HourFrameSpan) -> InFlightVerdict {
+        (self.in_flight_reader)(table, span)
+    }
+
+    async fn pause_for(&mut self, duration: Duration) {
+        tokio::time::sleep(self.pause_override.unwrap_or(duration)).await;
+    }
+
+    async fn copy_and_verify(
+        &mut self,
+        table: &str,
+        partition: &str,
+        start: &str,
+        end: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> Option<CopiedPartition> {
+        self.copy_and_verify_partition(table, partition, start, end, summary)
+            .await
+    }
+
+    async fn recount_range(&mut self, table: &str, start: &str, end: &str) -> Option<RangeTally> {
+        self.recount_rows(table, start, end).await
+    }
+
+    async fn delete_own_upload(&mut self, key: &str) -> Result<()> {
+        self.delete_s3_object(key).await
+    }
+
+    fn note_failure(
+        &mut self,
+        table: &str,
+        partition: &str,
+        outcome: ArchiveOutcome,
+        detail: &str,
+        summary: &mut ArchiveRunSummary,
+    ) {
+        self.record_failure(table, partition, outcome, detail, summary);
+    }
+
+    async fn drop_verified(&mut self, copied: CopiedPartition, summary: &mut ArchiveRunSummary) {
+        self.drop_copied_partition(copied, summary).await;
     }
 }
 
@@ -5720,16 +5832,17 @@ mod stub_integration_tests {
         assert!(qdb_reqs.iter().any(|r| r.target.contains("wal_tables()")));
     }
 
-    // Regression: 2026-10-13 (DA-13d) — the after-close deferred-depth pass
-    // and the archiver ran on the same depth partitions with nothing between
-    // them, so a rewrite committed between the recount and the DROP was
-    // dropped with the partition and its mark then cleared, uncounted.
-    //
-    // The ONLY test that touches DEPTH_REWRITE_GATE in this crate, so it
-    // cannot race another test for it; every other stub lists `ticks` only.
+    // Regression: 2026-10-13 (DA-13d), reworked for PR AA step 2 — the
+    // after-close deferred-depth pass and the archiver ran on the same depth
+    // partitions with nothing between them, so a rewrite committed between
+    // the recount and the DROP was dropped with the partition. The all-night
+    // gate that fixed it is gone; the snapshot gate now holds an hour whose
+    // frames still carry after-close marks, and archives it once they clear.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_regression_da13d_try_hold_depth_partitions_refused_while_hold_depth_partitions_for_rewrite_holds()
-     {
+    async fn test_regression_da13d_depth_hour_with_after_close_marks_is_held_until_cleared() {
+        use snapshot_gate::InFlightVerdict;
+        use std::sync::atomic::AtomicBool;
+
         let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
             crate::depth_persistence::MARKET_DEPTH_TABLE,
             vec!["2026-04-01T09"],
@@ -5741,21 +5854,26 @@ mod stub_integration_tests {
         let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
         let objects = Arc::new(Mutex::new(HashMap::new()));
         let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
-        let mut archiver =
-            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-
-        // The pass's own entry point, on a blocking thread as in production.
-        let pass_guard = tokio::task::spawn_blocking(hold_depth_partitions_for_rewrite)
+        let marks_waiting = Arc::new(AtomicBool::new(true));
+        let reader_marks = Arc::clone(&marks_waiting);
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200))
             .await
-            .expect("the pass takes the gate");
-        assert!(
-            try_hold_depth_partitions().is_none(),
-            "the archiver must not get the gate while the pass holds it"
-        );
+            .with_test_snapshot_gate(
+                quiesce,
+                Arc::new(move |_table, _span| {
+                    if reader_marks.load(Ordering::SeqCst) {
+                        InFlightVerdict::DeferredDepth
+                    } else {
+                        InFlightVerdict::Clear
+                    }
+                }),
+            );
 
         let held = archiver.run_archive_pass().await;
-        assert_eq!(held.held_deferred_depth, 1, "the depth partition is held");
-        assert_eq!(held.dropped, 0, "nothing is dropped while the pass writes");
+        assert_eq!(held.held_deferred_depth, 1, "the marked hour is held");
+        assert_eq!(held.dropped, 0, "nothing is dropped while marks wait");
         assert_eq!(held.failed, 0, "a hold is not a failure");
         let exported_while_held = qdb_log
             .lock()
@@ -5765,13 +5883,77 @@ mod stub_integration_tests {
             .count();
         assert_eq!(
             exported_while_held, 0,
-            "a held depth partition is neither exported nor dropped"
+            "a held depth hour is neither exported nor dropped"
         );
 
-        drop(pass_guard);
+        marks_waiting.store(false, Ordering::SeqCst);
         let freed = archiver.run_archive_pass().await;
         assert_eq!(freed.held_deferred_depth, 0);
-        assert_eq!(freed.dropped, 1, "once the pass is done the partition goes");
+        assert_eq!(freed.dropped, 1, "once the marks clear the hour goes");
+    }
+
+    /// PR AA step 2, the reason for the snapshot gate: the live writer keeps
+    /// committing, so `writerTxn` NEVER equals `sequencerTxn` on any probe.
+    /// The exact gate would skip the table forever; the snapshot gate reads
+    /// its target under the quiesce lock, waits until the writer reaches it,
+    /// and archives the old hour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_depth_hour_archived_while_the_live_writer_keeps_committing() {
+        use snapshot_gate::InFlightVerdict;
+
+        // Probe i: writerTxn 10 + 2i, sequencerTxn 12 + 2i — always behind.
+        let probe_body = |i: usize| -> String {
+            let writer = 10 + 2 * i64::try_from(i).unwrap_or(0);
+            let rows: Vec<String> = swept_tables()
+                .into_iter()
+                .map(|n| format!("[\"{n}\",false,{writer},{}]", writer + 2))
+                .collect();
+            format!(
+                "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"suspended\"}},\
+                 {{\"name\":\"writerTxn\"}},{{\"name\":\"sequencerTxn\"}}],\
+                 \"dataset\":[{}]}}",
+                rows.join(",")
+            )
+        };
+        // The exact gate refuses every one of these probes.
+        for i in 0..32 {
+            let body: serde_json::Value =
+                serde_json::from_str(&probe_body(i)).expect("stub body is JSON");
+            let (rows, _) = crate::wal_suspension_watcher::parse_wal_tables_response(&body)
+                .expect("stub body parses");
+            assert_ne!(
+                wal_apply_verdict(&rows, crate::depth_persistence::MARKET_DEPTH_TABLE),
+                WalApplyVerdict::Applied
+            );
+        }
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(move |probe| (200, probe_body(probe))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear));
+
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 1, "the old hour is archived and dropped");
+        assert_eq!(summary.tables_wal_not_applied, 0);
+        assert_eq!(summary.failed, 0);
+        let drops = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.contains("DROP PARTITION"))
+            .count();
+        assert_eq!(drops, 1);
     }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
@@ -6726,6 +6908,49 @@ mod stub_integration_tests {
         assert!(!PartitionStep::WalNotAppliedBeforeExport.exported());
         assert!(!PartitionStep::Done.wal_not_applied());
         assert!(PartitionStep::WalNotAppliedBeforeExport.wal_not_applied());
+        assert!(!PartitionStep::Held.exported() && !PartitionStep::Held.wal_not_applied());
+        assert!(
+            !PartitionStep::QuiesceBusy.exported() && !PartitionStep::QuiesceBusy.wal_not_applied()
+        );
+    }
+
+    /// PR AA step 2: every hour-path partition goes through the snapshot
+    /// gate, every other table keeps the exact gate, and a depth table whose
+    /// WAL is merely behind is never dropped from a gated pass's worklist.
+    #[test]
+    fn test_non_hour_tables_keep_exact_gate() {
+        for table in swept_tables() {
+            assert_eq!(
+                snapshot_gate_table(table),
+                is_depth_table(table),
+                "{table}: only the depth tables take the snapshot gate"
+            );
+        }
+        let row = |name: &str| WalTableRow {
+            name: name.to_string(),
+            suspended: false,
+            writer_txn: Some(5),
+            sequencer_txn: Some(7),
+            error_tag: None,
+            error_message: None,
+        };
+        let rows = vec![row("ticks"), row("market_depth"), row("market_depth_book")];
+        assert_eq!(wal_lagging_tables(&rows), vec!["ticks".to_string()]);
+        // The exact gate still refuses a lagging non-hour table.
+        assert!(matches!(
+            wal_apply_verdict(&rows, "ticks"),
+            WalApplyVerdict::Lagging { .. }
+        ));
+    }
+
+    /// The marks-waiting accessor reads the process mark table.
+    #[test]
+    fn test_deferred_depth_marks_waiting_reads_the_process_marks() {
+        // No test in this crate marks the process table, so both reads agree.
+        let expected = !crate::wal_deferred_depth::deferred_depth()
+            .snapshot()
+            .is_empty();
+        assert_eq!(deferred_depth_marks_waiting(), expected);
     }
     #[test]
     fn test_apply_pass_limits_skips_depth_and_caps() {

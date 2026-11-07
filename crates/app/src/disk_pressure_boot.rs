@@ -637,10 +637,17 @@ async fn run_disk_pressure_loop(
                 }
 
                 // DA-13d: after a pass stood aside, hold further passes while the
-                // after-close depth pass still has the depth partitions: another
-                // pass would find the same hold and nothing else to reclaim.
+                // after-close depth pass still has depth rows to write back:
+                // another pass would find the same holds and nothing else to
+                // reclaim. PR AA step 2 (2026-11-07): the all-night gate this
+                // read is gone; it is now "marks are waiting, inside the
+                // after-close window" (`depth_marks_hold_busy`), so in session a
+                // stood-aside pass is retried at the next poll, as before.
                 let depth_gate_busy = last_stood_aside
-                    && tickvault_storage::partition_archive::try_hold_depth_partitions().is_none();
+                    && depth_marks_hold_busy(
+                        u64::from(secs_of_day_ist()),
+                        tickvault_storage::partition_archive::deferred_depth_marks_waiting(),
+                    );
                 if !pressure_pass_due(action, last_stood_aside, depth_gate_busy) {
                     tracing::debug!(
                         used_pct = used,
@@ -803,7 +810,14 @@ pub const fn classify_pressure_pass(
     // PR DP review H1: a CAPPED in-session pass (`pass_gated`) that dropped
     // nothing because a table's WAL was behind is standing aside, not
     // "nothing reclaimable"; an off-session or pre-open pass escalates.
-    let held = summary.held_deferred_depth > 0 || summary.held_by_gate > 0;
+    // PR AA step 2: a partition held because an old-hour writer had the
+    // archive quiesce lock is the same "another job is doing this right now"
+    // stand-aside. A partition held because its rows may still be in flight
+    // (`held_in_flight`) is NOT: that can persist, and a pass that frees
+    // nothing for that reason must still escalate.
+    let held = summary.held_deferred_depth > 0
+        || summary.held_by_gate > 0
+        || summary.held_quiesce_busy > 0;
     let gated_wal_only = summary.pass_gated && summary.tables_wal_not_applied > 0;
     if summary.dropped == 0
         && (held || gated_wal_only)
@@ -859,6 +873,18 @@ pub const fn pressure_pass_due(
     depth_gate_busy: bool,
 ) -> bool {
     !(matches!(action, PressureAction::ContinuePass) && last_stood_aside && depth_gate_busy)
+}
+
+/// Whether the after-close depth pass is still busy writing depth back, as
+/// far as a stood-aside pressure pass cares (PR AA step 2): after-close marks
+/// are waiting AND the clock is inside the pass's after-close window. In
+/// session the marks wait for the evening pass, while newly old hours keep
+/// becoming archivable, so the next poll runs a pass as it did before the
+/// DA-13d gate was replaced. Pure, O(1).
+#[must_use]
+pub(crate) const fn depth_marks_hold_busy(now_secs_ist: u64, marks_waiting: bool) -> bool {
+    marks_waiting
+        && crate::dhan_feed_stack::deferred_depth_pass::in_after_close_window(now_secs_ist)
 }
 
 /// Folds one pass's result into the episode state (DA-13d).
@@ -1265,6 +1291,41 @@ mod tests {
             decide_pressure_action(over, &state, &cfg, 91 * 60),
             PressureAction::Escalate
         );
+    }
+
+    /// PR AA step 2: a pass held only because an old-hour writer had the
+    /// archive quiesce lock stands aside; a pass held only because rows may
+    /// still be in flight does NOT (it can persist, so it must escalate).
+    #[test]
+    fn test_quiesce_busy_stands_aside_but_in_flight_holds_escalate() {
+        use tickvault_storage::partition_archive::ArchiveRunSummary;
+        let busy = ArchiveRunSummary {
+            pass_ran: true,
+            held_quiesce_busy: 3,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(classify_pressure_pass(&busy), PressurePass::StoodAside);
+        let in_flight = ArchiveRunSummary {
+            pass_ran: true,
+            held_in_flight: 3,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(classify_pressure_pass(&in_flight), PressurePass::Dropped(0));
+    }
+
+    /// PR AA step 2: the stood-aside hold of further passes needs marks AND
+    /// the after-close window; in session (marks waiting for the evening)
+    /// the next poll runs a pass, since newly old hours become archivable.
+    #[test]
+    fn test_depth_marks_hold_busy_only_after_close_with_marks() {
+        let in_session = 11 * 3_600;
+        let evening = 18 * 3_600;
+        let before_dawn = 3 * 3_600;
+        assert!(!depth_marks_hold_busy(in_session, true));
+        assert!(depth_marks_hold_busy(evening, true));
+        assert!(depth_marks_hold_busy(before_dawn, true));
+        assert!(!depth_marks_hold_busy(evening, false));
+        assert!(!depth_marks_hold_busy(before_dawn, false));
     }
 
     // Regression: 2026-10-13 (DA-13d re-review) — a pass that held depth AND

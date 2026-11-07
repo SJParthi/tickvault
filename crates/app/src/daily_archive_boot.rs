@@ -228,6 +228,8 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         && summary
             .partitions_considered
             .saturating_sub(summary.held_deferred_depth)
+            .saturating_sub(summary.held_quiesce_busy)
+            .saturating_sub(summary.held_in_flight)
             >= max_partitions_per_run
     {
         return PassVerdict::Incomplete("budget_exhausted");
@@ -244,6 +246,17 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // still past retention at the next day's sweep and go then.
         return PassVerdict::Incomplete("deferred_depth_pass");
     }
+    if summary.held_quiesce_busy > 0 {
+        // PR AA step 2: hour partitions were held because a WAL replay, a
+        // spill replay or the after-close depth pass had the archive quiesce
+        // lock. Another job is doing work right now, exactly like
+        // `contended`: the caller refunds the attempt and polls again.
+        return PassVerdict::Incomplete("quiesce_busy");
+    }
+    // `held_in_flight` (PR AA step 2) does NOT keep the day open: an hour
+    // whose rows may still be on their way to QuestDB (most often the last
+    // depth hour, not acknowledged until the next session's first ack) is a
+    // partition not yet old enough, like any other; a later pass archives it.
     // The `top_volume_spill_pending` verdict (2026-10-13) went with the
     // top_volume spill and its archive hold on 2026-10-22 (plan item 62).
     PassVerdict::Complete
@@ -251,23 +264,26 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
 
 /// Whether an attempt with this outcome is given back rather than spent.
 ///
-/// Only the two "another job is doing this right now" verdicts: `contended`
-/// (the disk-pressure leg holds the archive lock) and `deferred_depth_pass`
-/// (DA-13d: the after-close depth pass holds the depth partitions while it
-/// writes rows back into them, ~15:45 to at most ~17:16 IST). Spending an
-/// attempt on either would exhaust the day's six attempts by ~16:10 and page
-/// STORAGE-GAP-04 on a box that is working. Pure, O(1).
+/// Only the "another job is doing this right now" verdicts: `contended`
+/// (the disk-pressure leg holds the archive lock), `deferred_depth_pass`
+/// (DA-13d: the after-close depth pass still has rows of a depth hour to
+/// write back) and `quiesce_busy` (PR AA step 2: a WAL replay, a spill
+/// replay or the after-close depth pass had the archive quiesce lock).
+/// Spending an attempt on any of them would exhaust the day's six attempts
+/// and page STORAGE-GAP-04 on a box that is working. Pure, O(1).
 #[must_use]
 pub fn refunds_attempt(outcome: PassOutcome) -> bool {
     matches!(
         outcome,
-        PassOutcome::Ran(PassVerdict::Incomplete("contended" | "deferred_depth_pass"))
+        PassOutcome::Ran(PassVerdict::Incomplete(
+            "contended" | "deferred_depth_pass" | "quiesce_busy"
+        ))
     )
 }
 
 /// Every `tv_daily_archive_attempts_total{outcome}` value, seeded at 0 when
 /// the loop starts so a first event never lands on a missing series.
-pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
+pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 12] = [
     "complete",
     "contended",
     "did_not_run",
@@ -277,6 +293,7 @@ pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
     "partition_failed",
     "budget_exhausted",
     "deferred_depth_pass",
+    "quiesce_busy",
     "skipped",
     "failed",
 ];
@@ -1217,6 +1234,48 @@ mod pass_ran_tests {
         assert!(!refunds_attempt(PassOutcome::Failed));
     }
 
+    /// PR AA step 2: a pass whose hour partitions were held because an
+    /// old-hour writer had the archive quiesce lock is incomplete and gives
+    /// its attempt back; held partitions take no budget; an hour held only
+    /// because its rows may still be in flight does not keep the day open.
+    #[test]
+    fn test_quiesce_busy_refunds_and_in_flight_does_not_hold_the_day() {
+        let ran = ArchiveRunSummary {
+            pass_ran: true,
+            ..ArchiveRunSummary::default()
+        };
+        let busy = ArchiveRunSummary {
+            held_quiesce_busy: 2,
+            ..ran
+        };
+        let verdict = pass_verdict(&busy, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("quiesce_busy"));
+        assert!(refunds_attempt(PassOutcome::Ran(verdict)));
+        assert!(SEEDED_ATTEMPT_OUTCOMES.contains(&"quiesce_busy"));
+        // A real failure in the same pass still spends the attempt.
+        let busy_and_failed = ArchiveRunSummary { failed: 1, ..busy };
+        assert_eq!(
+            pass_verdict(&busy_and_failed, 200),
+            PassVerdict::Incomplete("partition_failed")
+        );
+        let in_flight = ArchiveRunSummary {
+            held_in_flight: 3,
+            ..ran
+        };
+        assert_eq!(pass_verdict(&in_flight, 200), PassVerdict::Complete);
+        // Held partitions take worklist slots but no budget.
+        let full_of_holds = ArchiveRunSummary {
+            partitions_considered: 200,
+            held_in_flight: 100,
+            held_quiesce_busy: 100,
+            ..ran
+        };
+        assert_eq!(
+            pass_verdict(&full_of_holds, 200),
+            PassVerdict::Incomplete("quiesce_busy")
+        );
+    }
+
     // Regression: 2026-10-13 (DA-13d re-review) — held depth partitions took
     // slots in the per-run budget, so a backlog of 200 read as
     // budget_exhausted, was not refunded, and the attempts still ran out.
@@ -1348,6 +1407,10 @@ mod pass_ran_tests {
             },
             ArchiveRunSummary {
                 held_deferred_depth: 1,
+                ..ran
+            },
+            ArchiveRunSummary {
+                held_quiesce_busy: 1,
                 ..ran
             },
             ran,
