@@ -672,6 +672,7 @@ fn scan_source(source: &str) -> SourceScan {
             Token::Punct(b'#') if depth == 0 => {
                 // One or more outer attributes, then maybe a module item.
                 let first_line = *line;
+                let start = index;
                 let mut is_test = false;
                 let mut path_attribute = None;
                 while matches!(tokens.get(index), Some((Token::Punct(b'#'), _))) {
@@ -710,6 +711,13 @@ fn scan_source(source: &str) -> SourceScan {
                     {
                         path_attribute = Some(path.to_string());
                     }
+                }
+                if index == start {
+                    // A `#` that opens no attribute (`r#ident`, a `#` inside a
+                    // `(..)` or `[..]` macro call): step over it, or the walk
+                    // would stand on it forever.
+                    index += 1;
+                    continue;
                 }
                 // Visibility: `pub`, `pub(crate)`, `pub(super)`, `pub(in ..)`.
                 let mut cursor = index;
@@ -1506,5 +1514,222 @@ mod tests {
         );
         assert_eq!(crate_of("/x/crates/"), None);
         assert_eq!(crate_of("/x/y.rs"), None);
+    }
+
+    /// A `#` at the top level that opens no attribute must be stepped over.
+    /// Each of these used to spin forever (the walk stood on the `#`).
+    #[test]
+    fn test_scan_steps_over_a_top_level_hash_that_opens_no_attribute() {
+        let sources = [
+            "pub fn r#match() {}\n#[cfg(test)]\nmod t {\n}\n",
+            "pub struct r#Type;\npub mod r#async;\n#[cfg(test)]\nmod t {\n}\n",
+            "m!(# x);\nm![# y];\n#[cfg(test)]\nmod t {\n}\n",
+            "#! x\n#[cfg(test)]\nmod t {\n}\n",
+            "#[allow(dead_code)] # z\n#[cfg(test)]\nmod t {\n}\n",
+        ];
+        for source in sources {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let owned = source.to_string();
+            std::thread::spawn(move || {
+                let _ = sender.send(scan_source(&owned));
+            });
+            let scan = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("scan_source did not finish on {source:?}"));
+            let last = source.lines().count() as u64;
+            assert_eq!(scan.test_spans, vec![(last - 2, last)], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn test_string_decodes_every_escape() {
+        let mut reader = JsonReader::new(br#""a\nb\tc\rd\be\ff\u00e9\"\\\/""#);
+        assert_eq!(
+            reader.string().expect("escaped string decodes"),
+            "a\nb\tc\rd\u{8}e\u{c}f\u{e9}\"\\/"
+        );
+        let mut lone = JsonReader::new(br#""\ud800""#);
+        assert_eq!(lone.string().expect("lone surrogate decodes"), "\u{fffd}");
+        let mut bad = JsonReader::new(br#""\u12""#);
+        assert!(bad.string().is_err());
+        let mut not_utf8 = JsonReader::new(b"\"\xff\"");
+        assert!(not_utf8.string().is_err());
+        let mut unterminated = JsonReader::new(b"\"abc");
+        assert!(unterminated.string().is_err());
+    }
+
+    #[test]
+    fn test_reader_errors_on_wrong_types() {
+        assert!(JsonReader::new(b"x").boolean().is_err());
+        assert!(JsonReader::new(b"-1").unsigned().is_err());
+        assert!(JsonReader::new(b"").skip_value().is_err());
+        assert!(JsonReader::new(b"[1,").skip_value().is_err());
+        let mut scalar = JsonReader::new(b" 12.5e3 ,");
+        scalar.skip_value().expect("scalar skips");
+        assert_eq!(scalar.peek(), Some(b','));
+        assert!(parse_export(b"{\"data\":[{\"files\":[[1]]}]}").is_err());
+        assert!(parse_export(b"{\"data\" 1}").is_err());
+        // A segment with extra trailing fields still reads.
+        let mut extra = JsonReader::new(b"[3,1,2,true,true,false,9,\"x\"]");
+        assert_eq!(
+            extra.segment().expect("segment with extra fields"),
+            seg(3, 2, true, true, false)
+        );
+        // An older five-field segment reads with no gap flag.
+        let mut short = JsonReader::new(b"[4,1,0,false,true]");
+        assert_eq!(
+            short.segment().expect("five-field segment"),
+            seg(4, 0, false, true, false)
+        );
+    }
+
+    #[test]
+    fn test_tokenize_char_literals_of_every_width_and_byte_strings() {
+        let source = "const A: [char; 4] = ['a', 'é', '€', '😀'];\n\
+                      const N: char = '\n';\n\
+                      const E: char = '\\'';\n\
+                      const S: &[u8] = b\"{\";\n\
+                      const C: &CStr = c\"}\";\n\
+                      const R: &[u8] = br\"{\";\n\
+                      #[cfg(test)]\n\
+                      mod t {\n\
+                      }\n";
+        let scan = scan_source(source);
+        assert_eq!(scan.test_spans, vec![(8, 10)]);
+        let strings: Vec<String> = tokenize(source)
+            .into_iter()
+            .filter_map(|(token, _)| match token {
+                Token::Str(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strings, vec!["{", "}", "{"]);
+        // A lone quote at the end of the input is one `Other` token.
+        assert_eq!(tokenize("'"), vec![(Token::Other, 1)]);
+    }
+
+    #[test]
+    fn test_normalize_and_child_candidates_resolve_dot_segments() {
+        assert_eq!(
+            normalize(Path::new("/w/src/./a/../b.rs")),
+            PathBuf::from("/w/src/b.rs")
+        );
+        // `Path::components` keeps a `.` only at the start.
+        assert_eq!(
+            normalize(Path::new("./src/a/../b.rs")),
+            PathBuf::from("src/b.rs")
+        );
+        let child = ChildModule {
+            name: "x".into(),
+            path_attribute: Some("../other/x_tests.rs".into()),
+            is_test: true,
+        };
+        assert_eq!(
+            child_candidates(Path::new("/w/src/a/lib.rs"), &child),
+            vec![PathBuf::from("/w/src/other/x_tests.rs")]
+        );
+        assert!(is_directory_owner(Path::new("/w/src/bin/tool.rs")));
+        assert!(!is_directory_owner(Path::new("/w/src/tool.rs")));
+    }
+
+    /// Writes `text` at `<temp>/coverage_prod_report_unit_<pid>/<relative>`.
+    fn temp_file(relative: &str, text: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("coverage_prod_report_unit_{}", std::process::id()))
+            .join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("temp dir"); // APPROVED: test
+        }
+        std::fs::write(&path, text).expect("temp file"); // APPROVED: test
+        path
+    }
+
+    #[test]
+    fn test_outcome_reports_parse_errors_empty_exports_and_success() {
+        let malformed = temp_file("malformed.json", "{\"data\":[");
+        let (text, code) = outcome(&["x".into(), malformed.to_string_lossy().into_owned()]);
+        assert_eq!(code, 1);
+        assert!(text.starts_with("coverage JSON:"), "{text}");
+
+        let empty = temp_file("empty.json", "{\"data\":[{\"files\":[]}]}");
+        let (text, code) = outcome(&["x".into(), empty.to_string_lossy().into_owned()]);
+        assert_eq!(code, 1);
+        assert!(text.contains("lists no files"), "{text}");
+
+        let source = temp_file("crates/app/src/lib.rs", FIXTURE_LIB);
+        let json = FIXTURE.replace("/w/crates/app/src/lib.rs", &source.to_string_lossy());
+        let good = temp_file("good.json", &json);
+        let floors = temp_file("floors.toml", "default = 63.0\n[crates]\nother = 9.0\n");
+        let (text, code) = outcome(&[
+            "x".into(),
+            good.to_string_lossy().into_owned(),
+            floors.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("floors unchanged"), "{text}");
+        // lib.rs is read from disk, so its test module is split out exactly as
+        // in `test_report_arithmetic_on_fixture`: production 5 of 13.
+        let app_row = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("| app |"))
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        let row = app_row(&text);
+        assert!(row.contains("| 38.46 | 5 of 13 | 5 |"), "{text}");
+        assert!(row.ends_with("| 63.0 (default) |"), "{text}");
+        // No floors file: the app row's floor column reads "-".
+        let (text, code) = outcome(&["x".into(), good.to_string_lossy().into_owned()]);
+        assert_eq!(code, 0);
+        assert!(app_row(&text).ends_with("| - |"), "{text}");
+    }
+
+    #[test]
+    fn test_reader_empty_containers_and_bad_separators() {
+        assert_eq!(parse_export(b"{}").expect("empty object"), Vec::new());
+        assert_eq!(
+            parse_export(b"{\"data\":[{}]}").expect("empty entry"),
+            Vec::new()
+        );
+        assert!(parse_export(b"{\"data\":[] x}").is_err());
+        assert!(line_stats(&[]).is_empty());
+        assert_eq!(Tally::default().percent(), "n/a");
+    }
+
+    #[test]
+    fn test_scan_skips_comments_escapes_inner_attributes_and_odd_mod_items() {
+        // Line 1 inner attribute, 2-3 a block comment over two lines, 4 an
+        // escaped string and a `\u{..}` char, 5-6 the module's two attributes.
+        let source = "#![allow(dead_code)]\n\
+                      /* a {\n b */\n\
+                      const S: &str = \"a\\\"{\"; const C: char = '\\u{7b}';\n\
+                      #[cfg_attr(x, y = 1)]\n\
+                      #[cfg(test)]\n\
+                      mod t {\n\
+                      }\n";
+        assert_eq!(scan_source(source).test_spans, vec![(5, 8)]);
+        // `mod` with no name, and a named `mod` at the end of input.
+        assert_eq!(scan_source("#[cfg(test)]\nmod").test_spans, Vec::new());
+        assert_eq!(scan_source("#[cfg(test)]\nmod x").test_spans, Vec::new());
+        // An unterminated block comment ends the input.
+        assert!(tokenize("/* {").is_empty());
+    }
+
+    #[test]
+    fn test_whole_test_file_without_segments_counts_as_test() {
+        let json = br#"{"data":[{"files":[
+          {"filename":"/w/crates/app/src/a_tests.rs","summary":{"lines":{"count":4,"covered":3}}}
+        ]}]}"#;
+        let files = parse_export(json).expect("parses");
+        let report = build_report(&files, |_| Some(String::new()));
+        let app = report.crates.get("app").expect("app row");
+        assert_eq!(
+            app.test,
+            Tally {
+                lines: 4,
+                covered: 3
+            }
+        );
+        assert_eq!(app.production, Tally::default());
     }
 }

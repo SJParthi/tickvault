@@ -564,6 +564,7 @@ jobs:
       - name: Report production-only coverage (informational)
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         run: rustc --edition 2024 -O -o target/llvm-cov/coverage-prod-report crates/common/src/bin/coverage_prod_report.rs && target/llvm-cov/coverage-prod-report target/llvm-cov/coverage.json quality/crate-coverage-thresholds.toml
 
       # PROOF-12 (2026-10-12): per-FILE floors live in the [files] table and
