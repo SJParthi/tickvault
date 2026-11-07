@@ -163,6 +163,13 @@ jobs:
 
       - name: Run chaos tests (--include-ignored)
         id: chaos
+        # 2026-11-07: the one ignored chaos test (the QuestDB pause in
+        # chaos_cascade_triple_failure.rs) FAILS instead of skipping when the
+        # stack is not running, and probes this address to prove the pause
+        # really took QuestDB down and that it came back.
+        env:
+          TV_QDB_REAL_HTTP: 127.0.0.1:9000
+          TV_QDB_REAL_REQUIRED: '1'
         run: |
           set -euo pipefail
           # `--include-ignored`, NOT `--ignored` (corrected 2026-08-18).
@@ -170,7 +177,8 @@ jobs:
           # In libtest, `--ignored` runs ONLY the ignored tests; it EXCLUDES
           # every normal one. Across all 11 `chaos_*.rs` files there is exactly
           # ONE `#[ignore]` attribute today (chaos_cascade_triple_failure.rs),
-          # and that test's body self-skips when the stack is unreachable. So
+          # and that test's body self-skipped when the stack was unreachable
+          # (since 2026-11-07 the env above makes that a failure). So
           # this lane was running ONE test that could return immediately while
           # the other 43 chaos test functions never executed here at all — and
           # it reported green while doing so, which is the false-OK class audit
