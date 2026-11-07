@@ -115,7 +115,12 @@ const BUDGET: &[(&str, usize)] = &[
     // source. Paired behaviour test for the count itself:
     // `test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy`.
     ("dhan_universe.rs", 4),
-    ("disk_pressure_boot.rs", 7),
+    // 7 -> 8 (2026-11-07, PR AA step 4, owner Quote 51): the pressure loop
+    // cannot run without QuestDB and S3, so `test_projected_fill_is_wired_into_the_loop`
+    // pins the wiring by source. Paired behaviour tests for the decisions:
+    // `test_projected_start_needs_min_used_pct_and_the_switch` and
+    // `test_in_session_projected_allows_one_depth_partition`.
+    ("disk_pressure_boot.rs", 8),
     ("ensure_questdb.rs", 1),
     // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
     // hold supervisor); paired behaviour tests `evening_step_*`,

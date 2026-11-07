@@ -3126,6 +3126,10 @@ async fn async_main() -> Result<()> {
     // `partition_archive` itself rather than by luck of timing.
     let _daily_archive_supervisor =
         tickvault_app::daily_archive_boot::spawn_supervised_daily_archive_loop(
+            // The data volume the free-space target is measured on, and the
+            // home of `state/archive_session_bytes.json` (PR AA step 5); the
+            // same path the disk-pressure loop probes.
+            std::path::PathBuf::from("data"),
             config.questdb.clone(),
             config.partition_retention.clone(),
             config.trading.market_close_time.clone(),

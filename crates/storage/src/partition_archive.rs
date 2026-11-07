@@ -110,8 +110,9 @@ use tickvault_common::sanitize::capture_rest_error_body;
 
 use crate::partition_manager::{
     DAY_PARTITIONED_TABLES, HOUR_PARTITIONED_TABLES, RETENTION_EXEMPT_TABLES,
-    build_closed_hour_list_sql, build_detach_list_sql, is_valid_partition_name,
-    parse_partition_rows, select_partitions_to_detach,
+    build_closed_hour_list_sql, build_detach_list_sql, build_partition_size_sql,
+    is_valid_partition_name, parse_partition_rows, parse_partition_sizes,
+    select_partitions_to_detach, sum_partition_bytes_on_day,
 };
 use crate::s3_cold::{
     S3Cold, S3ObjectMeta, Sha256Writer, base64_encode, hex_encode, resolve_archive_bucket,
@@ -125,8 +126,8 @@ mod snapshot_gate;
 mod hour_path;
 
 use hour_path::{
-    TICK_SPILL_TABLES, hot_hour_floor, hour_window_for, may_force_with_spill_pending,
-    uses_snapshot_gate,
+    HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
+    may_force_with_spill_pending, uses_snapshot_gate,
 };
 use snapshot_gate::{
     ArchiveIo, CopiedPartition, HourFrameSpan, InFlightReader, InFlightVerdict, SnapshotGate,
@@ -1943,6 +1944,50 @@ impl PartitionArchiver {
             );
         }
         kept
+    }
+
+    /// Bytes the five Quote 51 tables hold on disk for IST day `day` (PR AA
+    /// step 5): the sum of `diskSize` over every partition of
+    /// [`HOUR_PATH_TABLES`] whose name is that day. The daily leg reads it
+    /// once after 15:40 to size its free-space target.
+    ///
+    /// A table QuestDB reports as not existing counts 0 (nothing on disk).
+    /// Any other failure, a non-2xx answer or a body missing `diskSize` on
+    /// any row, is an error, so a partial sum is never recorded as a whole
+    /// session. Five list queries, O(partitions), cold path.
+    ///
+    /// # Errors
+    /// The list query failed, answered non-2xx, or could not be parsed.
+    pub async fn session_bytes_on(&self, day: chrono::NaiveDate) -> Result<u64> {
+        let mut total: u64 = 0;
+        for table in HOUR_PATH_TABLES {
+            let sql = build_partition_size_sql(table);
+            let response = self
+                .ddl_client
+                .get(&self.exec_url)
+                .query(&[("query", &sql)])
+                .send()
+                .await
+                .context("partition size query failed")?;
+            let status = response.status();
+            let body = read_body_capped(response)
+                .await
+                .context("failed to read partition size response")?;
+            if is_table_absent_response(&body) {
+                continue;
+            }
+            if !status.is_success() {
+                anyhow::bail!(
+                    "partition size list for {table} returned {status}: {}",
+                    capture_rest_error_body(&body)
+                );
+            }
+            let rows = parse_partition_sizes(&body).with_context(|| {
+                format!("partition size list for {table} had no readable diskSize")
+            })?;
+            total = total.saturating_add(sum_partition_bytes_on_day(&rows, day));
+        }
+        Ok(total)
     }
 
     /// Runs one archive→verify→drop cycle over every retention-swept table.
@@ -5846,6 +5891,83 @@ mod stub_integration_tests {
 
     const CSV: &str = "ts,security_id\n1,13\n2,25\n3,51\n"; // header + 3 rows
     const TICKS_KEY: &str = "tv-test-cold/questdb-partitions/ticks/2026-04-01T09.csv.gz";
+
+    /// PR AA step 5: the session size is today's partitions of the five
+    /// Quote 51 tables, an absent table is 0, and one unreadable table makes
+    /// the whole reading an error (never a partial sum).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_sums_the_days_partitions_of_the_five_tables() {
+        let sizes = |rows: &str| -> StubResponse {
+            let body = format!(
+                "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"diskSize\"}}],\
+                 \"dataset\":[{rows}]}}"
+            );
+            (200, Vec::new(), body.into_bytes())
+        };
+        let responder = |broken: bool| -> Responder {
+            Arc::new(move |req: &SeenRequest| {
+                let t = &req.target;
+                if t.contains("table_partitions('market_depth')") {
+                    return sizes(
+                        "[\"2026-11-07T09\",100],[\"2026-11-07T10\",50],[\"2026-11-06T15\",9999]",
+                    );
+                }
+                if t.contains("table_partitions('tick_quotes')") {
+                    if broken {
+                        return (500, Vec::new(), b"{\"error\":\"boom\"}".to_vec());
+                    }
+                    return sizes("[\"2026-11-07T11\",7]");
+                }
+                if t.contains("table_partitions('ticks')") {
+                    return sizes("[\"2026-11-07\",3]");
+                }
+                if t.contains("table_partitions('feed_aux_packets')") {
+                    return (
+                        400,
+                        Vec::new(),
+                        b"{\"error\":\"table does not exist [table=feed_aux_packets]\"}".to_vec(),
+                    );
+                }
+                sizes("")
+            })
+        };
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("date");
+        let (qdb_url, log) = spawn_stub(responder(false)).await;
+        let archiver = build_archiver(
+            &qdb_url,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            PartitionRetentionConfig::default(),
+        )
+        .await;
+        assert_eq!(archiver.session_bytes_on(day).await.expect("reads"), 160);
+        let seen: Vec<String> = log
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|r| r.target.clone())
+            .collect();
+        for table in HOUR_PATH_TABLES {
+            assert!(
+                seen.iter()
+                    .any(|t| t.contains(&format!("diskSize FROM table_partitions('{table}')"))),
+                "{table} not read: {seen:?}"
+            );
+        }
+
+        let (qdb_url, _) = spawn_stub(responder(true)).await;
+        let archiver = build_archiver(
+            &qdb_url,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            PartitionRetentionConfig::default(),
+        )
+        .await;
+        assert!(
+            archiver.session_bytes_on(day).await.is_err(),
+            "one unreadable table must fail the whole reading"
+        );
+    }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
     // a current_thread runtime would starve the stub server tasks while
