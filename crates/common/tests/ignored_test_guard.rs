@@ -50,6 +50,19 @@ fn repo_root() -> PathBuf {
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // 2026-11-02: the two evening-state defect tests now run unignored.
+    // Added 2026-11-07 with plan item TG-4 (2026-11-06 archiver incident):
+    // the archiver's /exp export against a REAL QuestDB while ILP writes and
+    // /exec probes run beside it. It needs a running QuestDB and minutes of
+    // wall clock, so it cannot gate a PR; the weekly chaos lane
+    // (`chaos-nightly.yml`, step "Archiver export contention vs real QuestDB
+    // (TG-4)") runs it with TV_QDB_REAL_REQUIRED=1, which turns a missing
+    // QuestDB into a failure. Run it with:
+    //
+    //   TV_QDB_REAL_HTTP=127.0.0.1:9000 TV_QDB_REAL_REQUIRED=1 cargo test -p tickvault-storage --lib tg4_archiver_export_contention -- --ignored --nocapture
+    (
+        "crates/storage/src/partition_archive/stub_integration_tests/tg4_export_contention_tests.rs",
+        "tg4_archiver_export_contention_against_real_questdb",
+    ),
     // Added 2026-11-06 with plan item PF-5: the per-seal vs per-frame-batched
     // seal hand-off measurement that decided PF-5 is NOT built (numbers in
     // the plan and the CLAUDE.md `SealSender` row). It prints percentiles and

@@ -497,6 +497,28 @@ whole chain exists to prevent.
 `crates/app/src/disk_pressure_boot.rs` (the supervised loop),
 `crates/storage/src/partition_archive.rs` (the unchanged verified drop path).
 
+**2026-11-06 incident (archiver export blocked writes) — regression check.**
+On 2026-11-06 the pressure pass's `/exp` exports held QuestDB's one HTTP
+thread for minutes, and ILP writes and `/exec` probes waited behind them
+(BOOT-01 lines, reconnects, tick rows rescued to spill). PR DP gave QuestDB
+its own HTTP workers (3, export limit 2) and gated the in-session pass. The
+weekly chaos lane re-checks the worker side against a real QuestDB started
+from the compose file (plan item TG-4): it exports a seeded `market_depth`
+hour while writing ticks and probing `/exec`, and fails if a write takes over
+5 s or a probe over 2 s. A red run means exports are blocking writes again:
+check `QDB_HTTP_WORKER_COUNT` and `QDB_HTTP_EXPORT_CONNECTION_LIMIT` in
+`deploy/docker/docker-compose.yml` (workers must stay above the export
+limit). Run it by hand with:
+
+```text
+docker compose -f deploy/docker/docker-compose.yml up -d tv-questdb
+TV_QDB_REAL_HTTP=127.0.0.1:9000 TV_QDB_REAL_REQUIRED=1 cargo test -p tickvault-storage \
+    --lib tg4_archiver_export_contention -- --ignored --nocapture
+```
+
+Starting QuestDB with `TV_QDB_HTTP_WORKERS=0` (the pre-fix setting) should
+make it fail; that has not been tried yet.
+
 ## DISK-WATCHER-01 — spill disk-health watcher respawned (zero-tick-loss PR-5, G3)
 
 **Trigger:** the spill disk-health watcher task
