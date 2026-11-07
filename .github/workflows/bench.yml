@@ -117,10 +117,9 @@ jobs:
         id: hw
         run: |
           cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs || true)
-          cpu_model="${cpu_model:-unknown}"
-          hw_hash=$(printf '%s' "$cpu_model" | sha256sum | cut -c1-12)
+          hw_hash=$(printf '%s' "${cpu_model:-unknown}" | sha256sum | cut -c1-12)
           echo "fingerprint=$hw_hash" >> "$GITHUB_OUTPUT"
-          echo "Runner CPU: $cpu_model (fingerprint: $hw_hash)"
+          echo "Runner CPU: ${cpu_model:-unknown} (fingerprint: $hw_hash)"
 
       # Restore the previous green run's Criterion baseline so this run's
       # `cargo bench` writes <id>/change/estimates.json (Criterion compares
@@ -129,11 +128,14 @@ jobs:
       # saved baseline FOR THIS HARDWARE CLASS; an exact key hit is
       # impossible (run_id is unique), which is intentional — we always want
       # "latest previous same-hardware baseline".
+      # The key ENDS IN THE COMMIT (2026-11-07) so the A/B re-measure in the
+      # gate step knows which commit the restored baseline measured.
       - name: Restore Criterion baseline (previous same-hardware main run)
+        id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: target/criterion
-          key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
+          key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}-${{ github.sha }}
           restore-keys: |
             criterion-baseline-${{ steps.hw.outputs.fingerprint }}-
 
@@ -166,14 +168,29 @@ jobs:
       # that worst case with modest headroom while still failing anything
       # slower than 2.5x the dev-hardware truth. Applied ONLY to the absolute
       # arm; the 5% regression arm is unaffected.
+      #
+      # SAME-RUNNER A/B (2026-11-07, run 42315415324: +54..66% "confident"
+      # regressions against a baseline of the SAME commit and CPU model, i.e.
+      # the runner, not the code). Only on exit 2, bench_ab_recheck re-runs
+      # the flagged benches on THIS runner, baseline build then head, and
+      # puts their original `new/` back; the gate then runs again unchanged
+      # (same budgets, same 5%, same CI lower bound). The baseline build is
+      # the bench binaries the baseline run kept in target/criterion/tv_ab_bins
+      # (copied below, saved and restored with its records), or the head
+      # binary when the key's commit is the head commit. A real regression is
+      # slower on the same runner too and still fails; if the tool cannot
+      # re-measure (no saved binary, bench failure, more than 16 flagged), rc
+      # stays 2. Proof: crates/common/tests/bench_ab_recheck.rs.
       - name: Run bench-gate (absolute budgets + 5% regression)
         id: gate
         env:
           BENCH_BUDGET_MULTIPLIER: '2.5'
+          BENCH_AB_BASELINE_KEY: ${{ steps.restore.outputs.cache-matched-key }}
         run: |
           set -o pipefail
-          rc=0
-          bash scripts/bench-gate.sh | tee gate-output.log || rc=$?
+          bash scripts/bench-gate.sh | tee gate-output.log && rc=0 || rc=$?
+          if [ "$rc" = 2 ] && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck -- target/criterion bench-output.log gate-output.log 2>&1 | tee -a gate-output.log; then rc=0; bash scripts/bench-gate.sh | tee -a gate-output.log || rc=$?; fi
+          rm -rf target/criterion/tv_ab_bins && mkdir target/criterion/tv_ab_bins && grep -o 'target/release/deps/[^)]*' bench-output.log | sort -u | xargs -r cp -t target/criterion/tv_ab_bins/ || true
           echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
           printf '## Bench Gate Results\n```\n%s\n```\n' "$(cat gate-output.log)" >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
@@ -196,7 +213,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: target/criterion
-          key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
+          key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}-${{ github.sha }}
 
       # The p99 tail gates (seal_path, feed_drain) defer a miss to here under
       # BENCH_TAIL_GATE_DEFER, after the baseline save, so a tail miss fails
