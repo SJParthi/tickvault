@@ -1186,6 +1186,18 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
         }));
     }
 
+    // 2026-11-07 (review of the holiday fixes): on a weekday NSE holiday the
+    // box is meant to be stopped, so a missing holiday marker (the gate's
+    // marker write failed, or the 08:30 start never ran) must not start it
+    // here and page. The compiled calendar decides first, as the ping does.
+    if !crate::nse_calendar::is_nse_trading_day_at(now) {
+        info!(state = %state, "check — not an NSE trading day; no self-start, no page");
+        return Ok(json!({
+            "mode": "check", "state": state, "alerted": false, "self_started": false,
+            "skipped": "non_trading_day"
+        }));
+    }
+
     // Box is NOT running at 08:45 IST. NSE-holiday intentional stop: marker
     // == today -> the stop is intentional: stay silent, do NOT self-start.
     // FAIL-OPEN: a missing/stale/unreadable marker keeps the self-heal.
@@ -2017,6 +2029,39 @@ mod tests {
         assert_eq!(out["skipped"], json!("holiday_stop"));
         assert!(ec2.start_calls.borrow().is_empty()); // the restart war never begins
         assert!(sns.published.borrow().is_empty()); // no false Critical page
+    }
+
+    #[tokio::test]
+    async fn test_check_stopped_on_nse_holiday_without_marker_stays_silent_no_start() {
+        // Tue 2026-11-10 is an NSE holiday; 03:15 UTC = 08:45 IST. The holiday
+        // marker is missing (its write failed, or the 08:30 start never ran):
+        // the calendar alone must keep the box stopped and the pager quiet.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::empty();
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &ssm,
+            &sns,
+            utc(2026, 11, 10, 3, 15),
+        )
+        .await;
+        assert_eq!(out["self_started"], json!(false));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["skipped"], json!("non_trading_day"));
+        assert!(ec2.start_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+        // The trading day after it still self-heals with no marker.
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &ssm,
+            &sns,
+            utc(2026, 11, 11, 3, 15),
+        )
+        .await;
+        assert_eq!(out["self_started"], json!(true));
     }
 
     #[tokio::test]
