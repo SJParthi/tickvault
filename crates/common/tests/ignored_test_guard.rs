@@ -276,7 +276,7 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     ),
     (
         "crates/core/tests/chaos_cascade_triple_failure.rs",
-        "cascade_01_triple_failure_live_docker_zero_loss",
+        "cascade_01_wal_capture_survives_a_real_questdb_pause_live_docker",
     ),
     // Added 2026-09-03 with the streaming spill-replay repair it proves.
     //

@@ -8986,3 +8986,7 @@ mod tick_test_writers;
 #[cfg(test)]
 #[path = "tick_stage_reuse_tests.rs"]
 mod tick_stage_reuse_tests;
+
+#[cfg(test)]
+#[path = "tick_questdb_down_chaos_tests.rs"]
+mod tick_questdb_down_chaos_tests;
