@@ -582,6 +582,17 @@ fn refusal_row(buf: &mut TickRowBuffer, table: &'static str, as_string: bool) {
 /// QuestDB stamps a fresh error id on every answer, so only the rest can be
 /// compared across two requests.
 fn without_error_id(message: &str) -> String {
+    // QuestDB's JSON body carries it as `"errorId":"…"` (measured in CI on
+    // 2026-11-07: `"errorId":"aaa2042e54ef-3"` then `…-4` on the next
+    // request); drop that value and keep the key.
+    const JSON_KEY: &str = "\"errorId\":\"";
+    if let Some(at) = message.rfind(JSON_KEY) {
+        let start = at + JSON_KEY.len();
+        let end = message[start..]
+            .find('"')
+            .map_or(message.len(), |rel| start + rel);
+        return format!("{}{}", &message[..start], &message[end..]);
+    }
     // The bracketed suffix is `[id: …, code: …, line: …]`; anchor on the
     // bracket so an `id: ` inside the server's own text is never cut.
     let Some(bracket) = message.rfind("[id: ") else {
@@ -608,6 +619,24 @@ fn without_error_id_drops_only_the_per_request_id() {
     assert_eq!(
         without_error_id("column security_id: x"),
         "column security_id: x"
+    );
+    // Regression: 2026-11-07 — the real server's JSON body carries a fresh
+    // `"errorId"` per request, so two refusals of the same row differed only
+    // there and the encoder comparison failed in CI.
+    let body = |id: &str| {
+        format!(
+            "Could not flush buffer: {{\"code\":\"invalid\",\"message\":\"cast error\",\
+             \"line\":1,\"errorId\":\"{id}\"}}"
+        )
+    };
+    assert_eq!(
+        without_error_id(&body("aaa2042e54ef-3")),
+        without_error_id(&body("aaa2042e54ef-4"))
+    );
+    assert_eq!(
+        without_error_id(&body("aaa2042e54ef-3")),
+        "Could not flush buffer: {\"code\":\"invalid\",\"message\":\"cast error\",\
+         \"line\":1,\"errorId\":\"\"}"
     );
 }
 
