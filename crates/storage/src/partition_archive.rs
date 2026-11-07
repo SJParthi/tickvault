@@ -110,7 +110,7 @@ use tickvault_common::sanitize::capture_rest_error_body;
 
 use crate::partition_manager::{
     DAY_PARTITIONED_TABLES, HOUR_PARTITIONED_TABLES, RETENTION_EXEMPT_TABLES,
-    build_detach_list_sql, build_detach_list_sql_hours, is_valid_partition_name,
+    build_closed_hour_list_sql, build_detach_list_sql, is_valid_partition_name,
     parse_partition_rows, select_partitions_to_detach,
 };
 use crate::s3_cold::{
@@ -121,7 +121,13 @@ use crate::wal_suspension_watcher::WalTableRow;
 
 // PR AA step 2 (owner Quote 51): the WAL snapshot gate for hour-path tables.
 mod snapshot_gate;
+// PR AA step 3 (owner Quote 51): which tables take the hour path in a pass.
+mod hour_path;
 
+use hour_path::{
+    TICK_SPILL_TABLES, hot_hour_floor, hour_window_for, may_force_with_spill_pending,
+    uses_snapshot_gate,
+};
 use snapshot_gate::{
     ArchiveIo, CopiedPartition, HourFrameSpan, InFlightReader, InFlightVerdict, SnapshotGate,
     archive_with_snapshot_gate, recheck_and_drop, snapshot_gate_table,
@@ -546,6 +552,12 @@ pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u3
 /// arriving more than an hour behind. Archiving `ticks` by the hour would
 /// therefore race live writes into a partition being detached. Day-granular
 /// eligibility is what makes that safe today, and it stays.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3, owner Quote 51): this list is now the
+/// tables on the hour path in EVERY pass. Three more arrival-stamped tables
+/// (`market_depth_book`, `tick_quotes`, `feed_aux_packets`) take the hour path
+/// only while a pass carries disk pressure, and `ticks` only behind its own
+/// switch (`ticks_hour_path_enabled`, off); see `hour_path::hour_window_for`.
 pub(crate) const ARRIVAL_STAMPED_HOUR_TABLES: &[&str] = &["market_depth"];
 
 /// Floor on the hour-granular hot window. Never smaller, whatever config says.
@@ -574,14 +586,12 @@ pub(crate) fn hot_window_hours(table: &str, configured_hours: u32) -> Option<u32
     if !ARRIVAL_STAMPED_HOUR_TABLES.contains(&table) {
         return None;
     }
-    if configured_hours == 0 {
-        // 0 is the OFF switch, not "archive everything". Treating it as a
-        // window would make the cutoff `now()`, which matches the partition
-        // being actively written — the exact hazard MIN_HOT_DAYS_MARKET_DATA's
-        // own comment warns about, one unit down.
-        return None;
-    }
-    Some(configured_hours.max(MIN_HOT_HOURS))
+    // 0 is the OFF switch, not "archive everything". Treating it as a window
+    // would make the cutoff `now()`, which matches the partition being
+    // actively written — the exact hazard MIN_HOT_DAYS_MARKET_DATA's own
+    // comment warns about, one unit down. The floor is shared with the
+    // hour path's other tables (`hour_path::hot_hour_floor`).
+    hot_hour_floor(configured_hours)
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,39 +1650,70 @@ pub(crate) enum HourWindowDecision {
     DaysByClass,
 }
 
+impl HourWindowDecision {
+    /// Whether the pass lists this table by the hour. O(1).
+    pub(crate) const fn is_hour_granular(self) -> bool {
+        matches!(self, Self::Hours(_) | Self::ForcedHours(_))
+    }
+}
+
 /// Pure window choice, so the rule is testable without HTTP or a recorder.
 ///
-/// `hours` is `None` for every table outside `ARRIVAL_STAMPED_HOUR_TABLES`
-/// and for a configured `0`, which is what keeps the day path the default.
+/// `hours` is `None` for every table `hour_path::hour_window_for` keeps off
+/// the hour path in this pass and for a configured `0`, which is what keeps
+/// the day path the default.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3): `may_force` says whether a pending
+/// spill file may be overridden under pressure
+/// (`hour_path::may_force_with_spill_pending`: `market_depth` only, behind
+/// `market_depth_force_with_spill_pending`). Without it a pending spill
+/// defers the table to its day window, pressure or not.
 #[must_use]
 pub(crate) fn hour_window_decision(
     hours: Option<u32>,
     spill_pending: bool,
     under_disk_pressure: bool,
+    may_force: bool,
 ) -> HourWindowDecision {
     match hours {
         None => HourWindowDecision::DaysByClass,
         Some(h) if !spill_pending => HourWindowDecision::Hours(h),
-        Some(h) if under_disk_pressure => HourWindowDecision::ForcedHours(h),
+        Some(h) if under_disk_pressure && may_force => HourWindowDecision::ForcedHours(h),
         Some(_) => HourWindowDecision::DeferredToDays,
     }
 }
 
 /// The spill folders whose pending rows a replay could still post into a
-/// swept table: the depth and tick folders.
+/// swept table.
 ///
 /// ⚠ CHANGED 2026-10-22 (plan item 62, operator Quote 34): the top_volume
 /// branch is gone with the top_volume writer, spill and replay. Nothing posts
 /// rows into a `top_volume_<tf>` table any more, so its partitions are no
 /// longer held for a pending spill file (`held_top_volume_spill` is removed);
 /// they are archived like every other table, then detached.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3): each table sees only the folder its
+/// writer spills to. The depth writer spills both depth tables to the depth
+/// folder (text and framed files); the tick writer spills `ticks`,
+/// `tick_quotes` and `feed_aux_packets` to the tick folder. A pending tick
+/// file therefore no longer keeps `market_depth` off its hour path. Any other
+/// table keeps both folders (it never takes the hour path, so this is only
+/// the conservative answer).
 #[must_use]
-pub(crate) fn spill_dirs_for_table(_table: &str) -> &'static [&'static str] {
+pub(crate) fn spill_dirs_for_table(table: &str) -> &'static [&'static str] {
+    const DEPTH: [&str; 1] = [crate::depth_persistence::DEPTH_SPILL_DIR];
+    const TICK: [&str; 1] = [crate::tick_persistence::TICK_SPILL_DIR];
     const TICKS_AND_DEPTH: [&str; 2] = [
         crate::depth_persistence::DEPTH_SPILL_DIR,
         crate::tick_persistence::TICK_SPILL_DIR,
     ];
-    &TICKS_AND_DEPTH
+    if DEPTH_TABLES.contains(&table) {
+        &DEPTH
+    } else if TICK_SPILL_TABLES.contains(&table) {
+        &TICK
+    } else {
+        &TICKS_AND_DEPTH
+    }
 }
 
 /// What a partition-list query found for one table.
@@ -2093,6 +2134,10 @@ impl PartitionArchiver {
         // table's class hot window, active partition excluded, hostile names
         // rejected — the SAME selection primitives the detach path uses.
         let mut worklist: Vec<(&'static str, String)> = Vec::new();
+        // PR AA step 3: the tables listed by the hour in this pass. Each of
+        // them goes through the WAL snapshot gate (`uses_snapshot_gate`) and
+        // is never dropped from a gated pass for a WAL that is merely behind.
+        let mut hour_path_tables: Vec<&'static str> = Vec::new();
         for table in swept_tables() {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
@@ -2102,7 +2147,11 @@ impl PartitionArchiver {
             }
             summary.tables_scanned = summary.tables_scanned.saturating_add(1);
             let hot_days = hot_window_days(table, &self.cfg);
-            match self.list_eligible_partitions(table, hot_days).await {
+            let window = self.hour_window(table);
+            if window.is_hour_granular() {
+                hour_path_tables.push(table);
+            }
+            match self.list_eligible_partitions(table, window, hot_days).await {
                 Ok(PartitionListing::Eligible(names)) => {
                     for name in names {
                         worklist.push((table, name));
@@ -2162,6 +2211,12 @@ impl PartitionArchiver {
         // partition is usually a ticks / candles / tick_quotes day still
         // being written; with the cap applied first, the pass spent its one
         // slot on it, read WalNotApplied, and dropped nothing.
+        // PR AA step 3: a table on the hour path this pass goes through the
+        // snapshot gate, so a WAL that is merely behind does not take it out.
+        let wal_lagging: Vec<String> = wal_lagging
+            .into_iter()
+            .filter(|t| !hour_path_tables.contains(&t.as_str()))
+            .collect(); // O(1) EXEMPT: cold once-per-run filter of a few dozen names
         let worklist = if self.pass_limits.max_partitions.is_some() {
             let (kept, removed) = drop_wal_lagging(worklist, &wal_lagging);
             for table in &removed {
@@ -2241,7 +2296,9 @@ impl PartitionArchiver {
             // gate). Once the quiesce lock was busy for a full wait this run,
             // every further hour-path partition is held without waiting
             // again: the writer that held it is still at work.
-            let step = if snapshot_gate_table(table) {
+            // PR AA step 3: and so does every table on the hour path this
+            // pass (`tick_quotes`, `feed_aux_packets` under pressure).
+            let step = if uses_snapshot_gate(table, &hour_path_tables) {
                 if quiesce_busy {
                     summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
                     snapshot_gate::count_quiesce_busy_held(1);
@@ -2903,11 +2960,42 @@ impl PartitionArchiver {
             .any(|dir| spill_dir_has_pending_data(std::path::Path::new(dir)))
     }
 
+    /// The window `table` gets in this pass: the hour window from
+    /// `hour_path::hour_window_for`, judged against the table's OWN spill
+    /// folder, or its day window. Counts a forced or deferred hour window.
+    /// The spill folder is read only for a table that could take the hour
+    /// path (one folder listing, off the runtime worker). Cold, once per
+    /// table per pass.
+    fn hour_window(&self, table: &str) -> HourWindowDecision {
+        let hours = hour_window_for(table, &self.cfg);
+        // See `list_eligible_partitions` for why a pending spill file matters.
+        let spill_pending = hours.is_some()
+            && crate::off_worker::off_worker(|| Self::spill_dirs_have_pending_data(table));
+        let decision = hour_window_decision(
+            hours,
+            spill_pending,
+            self.cfg.under_disk_pressure,
+            may_force_with_spill_pending(table, &self.cfg),
+        );
+        match decision {
+            HourWindowDecision::ForcedHours(_) => {
+                metrics::counter!("tv_partition_archive_hour_window_forced_total").increment(1);
+            }
+            HourWindowDecision::DeferredToDays => {
+                metrics::counter!("tv_partition_archive_hour_window_deferred_total").increment(1);
+            }
+            HourWindowDecision::Hours(_) | HourWindowDecision::DaysByClass => {}
+        }
+        decision
+    }
+
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
-    /// partitions via the SAME primitives the detach path uses.
+    /// partitions via the SAME primitives the detach path uses, by the hour
+    /// or by the day as `window` says ([`Self::hour_window`]).
     async fn list_eligible_partitions(
         &self,
         table: &str,
+        window: HourWindowDecision,
         hot_days: u32,
     ) -> Result<PartitionListing> {
         // Hour-granular where the table allows it, day-granular everywhere
@@ -2962,23 +3050,19 @@ impl PartitionArchiver {
         // alternative under pressure is a full volume, which WAL-suspends
         // EVERY table at once (precedent: 2026-08-25, 14 tables suspended,
         // writes ACKed and never applied, box unreachable by SSM).
-        let spill_pending =
-            crate::off_worker::off_worker(|| Self::spill_dirs_have_pending_data(table));
-        let list_sql = match hour_window_decision(
-            hot_window_hours(table, self.cfg.depth_hot_hours),
-            spill_pending,
-            self.cfg.under_disk_pressure,
-        ) {
-            HourWindowDecision::Hours(hours) => build_detach_list_sql_hours(table, hours),
-            HourWindowDecision::ForcedHours(hours) => {
-                metrics::counter!("tv_partition_archive_hour_window_forced_total").increment(1);
-                build_detach_list_sql_hours(table, hours)
+        //
+        // ⚠ CHANGED 2026-11-07 (PR AA step 3): the decision is made by
+        // `hour_window` (each table sees its OWN spill folder; only
+        // `market_depth` may be forced, behind
+        // `market_depth_force_with_spill_pending`), and an hour is judged by
+        // its END (`build_closed_hour_list_sql`).
+        let list_sql = match window {
+            HourWindowDecision::Hours(hours) | HourWindowDecision::ForcedHours(hours) => {
+                build_closed_hour_list_sql(table, hours)
             }
-            HourWindowDecision::DeferredToDays => {
-                metrics::counter!("tv_partition_archive_hour_window_deferred_total").increment(1);
+            HourWindowDecision::DeferredToDays | HourWindowDecision::DaysByClass => {
                 build_detach_list_sql(table, hot_days)
             }
-            HourWindowDecision::DaysByClass => build_detach_list_sql(table, hot_days),
         };
         let response = self
             .ddl_client
@@ -7035,7 +7119,7 @@ mod stub_integration_tests {
 #[cfg(test)]
 mod hour_granular_eligibility_tests {
     use super::*;
-    use crate::partition_manager::{build_detach_list_sql, build_detach_list_sql_hours};
+    use crate::partition_manager::{build_closed_hour_list_sql, build_detach_list_sql};
 
     /// THE safety property. `ticks` carries the exchange last-trade time, and
     /// ~10% of a session's ticks arrive more than an hour behind it — into
@@ -7094,10 +7178,13 @@ mod hour_granular_eligibility_tests {
         // — the hour path would behave exactly like the day path it replaced,
         // and the 78 GB would still not be reclaimed. Cheap to assert, and the
         // failure is otherwise invisible.
-        let hours = build_detach_list_sql_hours("market_depth", 6);
-        let days = build_detach_list_sql("market_depth", 6);
+        //
+        // PR AA step 3: the hour query is judged by the hour's END, so a
+        // 6-hour window reads `-7` hours on `minTimestamp`.
+        let hours = build_closed_hour_list_sql("market_depth", 6);
+        let days = build_detach_list_sql("market_depth", 7);
 
-        assert!(hours.contains("dateadd('h', -6,"), "{hours}");
+        assert!(hours.contains("dateadd('h', -7,"), "{hours}");
         assert!(
             !hours.contains("dateadd('d'"),
             "hour query still says days: {hours}"
@@ -7133,7 +7220,7 @@ mod hour_granular_eligibility_tests {
         // after the box stops. A 14:00 pressure episode selected ZERO
         // partitions while the disk filled — the exact reclaim this path
         // exists to perform, never once performed.
-        let sql = build_detach_list_sql_hours("market_depth", 4);
+        let sql = build_closed_hour_list_sql("market_depth", 4);
         assert!(
             sql.contains(&format!(
                 "dateadd('s', {}, now())",
@@ -7155,7 +7242,7 @@ mod hour_granular_eligibility_tests {
         // `table_partitions(.market_depth.)`, which QuestDB rejects. The
         // detach path treats a failed list query as "no eligible partitions",
         // so a malformed query reclaims nothing and says nothing.
-        let sql = build_detach_list_sql_hours("market_depth", 6);
+        let sql = build_closed_hour_list_sql("market_depth", 6);
         assert!(
             sql.contains("table_partitions('market_depth')"),
             "table name must be single-quoted: {sql}"
@@ -7171,16 +7258,11 @@ mod hour_granular_eligibility_tests {
     // that session.
 
     #[test]
-    fn test_spill_dirs_for_table_is_tick_and_depth_for_every_table() {
-        // 2026-10-22 (plan item 62): every table, `top_volume_<tf>` included,
-        // now sees only the depth + tick folders.
-        for table in [
-            "ticks",
-            "market_depth",
-            "candles_1m",
-            "order_audit",
-            "top_volume_1m",
-        ] {
+    fn test_spill_dirs_for_table_is_own_folder_for_hour_tables() {
+        // 2026-10-22 (plan item 62): `top_volume_<tf>` sees no folder of its
+        // own. 2026-11-07 (PR AA step 3): each hour-path table sees only the
+        // folder its writer spills to; any other table keeps both.
+        for table in ["candles_1m", "order_audit", "top_volume_1m"] {
             assert_eq!(
                 spill_dirs_for_table(table),
                 [
@@ -7190,32 +7272,49 @@ mod hour_granular_eligibility_tests {
                 "{table} keeps the depth + tick check"
             );
         }
+        assert_eq!(
+            spill_dirs_for_table("market_depth"),
+            [crate::depth_persistence::DEPTH_SPILL_DIR]
+        );
+        assert_eq!(
+            spill_dirs_for_table("ticks"),
+            [crate::tick_persistence::TICK_SPILL_DIR]
+        );
     }
 
     /// Exhaustive truth table for `hour_window_decision`.
     ///
-    /// Every (hours, spill_pending, under_pressure) combination, so a future
-    /// edit cannot change one arm silently. The four arms are the whole rule:
+    /// Every (hours, spill_pending, under_pressure, may_force) combination,
+    /// so a future edit cannot change one arm silently. The rule:
     /// off-allowlist stays on days; no spill takes hours; a spill under
-    /// pressure FORCES hours and is counted; a spill without pressure defers.
+    /// pressure FORCES hours (counted) only where forcing is allowed
+    /// (`market_depth` behind its switch); every other spill defers.
     #[test]
     fn hour_window_decision_truth_table_is_exhaustive() {
         use HourWindowDecision as D;
         let cases = [
-            (None, false, false, D::DaysByClass),
-            (None, false, true, D::DaysByClass),
-            (None, true, false, D::DaysByClass),
-            (None, true, true, D::DaysByClass),
-            (Some(4), false, false, D::Hours(4)),
-            (Some(4), false, true, D::Hours(4)),
-            (Some(4), true, false, D::DeferredToDays),
-            (Some(4), true, true, D::ForcedHours(4)),
+            (None, false, false, false, D::DaysByClass),
+            (None, false, true, false, D::DaysByClass),
+            (None, true, false, false, D::DaysByClass),
+            (None, true, true, false, D::DaysByClass),
+            (None, false, false, true, D::DaysByClass),
+            (None, false, true, true, D::DaysByClass),
+            (None, true, false, true, D::DaysByClass),
+            (None, true, true, true, D::DaysByClass),
+            (Some(4), false, false, false, D::Hours(4)),
+            (Some(4), false, true, false, D::Hours(4)),
+            (Some(4), true, false, false, D::DeferredToDays),
+            (Some(4), true, true, false, D::DeferredToDays),
+            (Some(4), false, false, true, D::Hours(4)),
+            (Some(4), false, true, true, D::Hours(4)),
+            (Some(4), true, false, true, D::DeferredToDays),
+            (Some(4), true, true, true, D::ForcedHours(4)),
         ];
-        for (hours, spill, pressure, want) in cases {
+        for (hours, spill, pressure, force, want) in cases {
             assert_eq!(
-                hour_window_decision(hours, spill, pressure),
+                hour_window_decision(hours, spill, pressure, force),
                 want,
-                "hours={hours:?} spill_pending={spill} under_pressure={pressure}"
+                "hours={hours:?} spill_pending={spill} under_pressure={pressure} may_force={force}"
             );
         }
     }
@@ -7224,23 +7323,30 @@ mod hour_granular_eligibility_tests {
     fn pressure_keeps_the_hour_window_when_a_spill_is_pending() {
         // The exact incident shape: hour-capable table, spill pending,
         // pressure episode active. Before the fix this returned the day
-        // window and the pass reclaimed nothing.
+        // window and the pass reclaimed nothing. Since PR AA step 3 only
+        // `market_depth` (behind `market_depth_force_with_spill_pending`,
+        // on by default) may be forced.
         assert_eq!(
-            hour_window_decision(Some(4), true, true),
+            hour_window_decision(Some(4), true, true, true),
             HourWindowDecision::ForcedHours(4),
             "under pressure the hour window must survive a pending spill — \
              deferring is what made the 93%-full volume unreclaimable"
         );
+        let cfg = PartitionRetentionConfig::default();
+        assert!(cfg.market_depth_force_with_spill_pending);
+        assert!(may_force_with_spill_pending("market_depth", &cfg));
     }
 
     #[test]
     fn without_pressure_a_pending_spill_still_defers() {
         // The conservative default is UNCHANGED off-pressure. This is the
         // half that must not regress: the deferral exists for a real race.
-        assert_eq!(
-            hour_window_decision(Some(4), true, false),
-            HourWindowDecision::DeferredToDays
-        );
+        for force in [false, true] {
+            assert_eq!(
+                hour_window_decision(Some(4), true, false, force),
+                HourWindowDecision::DeferredToDays
+            );
+        }
     }
 
     #[test]
@@ -7248,11 +7354,11 @@ mod hour_granular_eligibility_tests {
         // Forcing must be distinguishable from the ordinary hour path, or
         // the counter cannot tell an operator that a race window was opened.
         assert_eq!(
-            hour_window_decision(Some(4), false, false),
+            hour_window_decision(Some(4), false, false, true),
             HourWindowDecision::Hours(4)
         );
         assert_eq!(
-            hour_window_decision(Some(4), false, true),
+            hour_window_decision(Some(4), false, true, true),
             HourWindowDecision::Hours(4),
             "pressure alone must not mark the decision forced when there is \
              no spill to race against"
@@ -7261,16 +7367,18 @@ mod hour_granular_eligibility_tests {
 
     #[test]
     fn a_table_off_the_allowlist_never_reaches_the_hour_path() {
-        // `hours = None` is how every table except `market_depth` arrives
-        // here. Pressure must not promote one onto an hour window it was
-        // never proven safe for.
+        // `hours = None` is how every table `hour_window_for` keeps off the
+        // hour path arrives here. Pressure must not promote one onto an hour
+        // window it was never proven safe for.
         for pressure in [false, true] {
             for spill in [false, true] {
-                assert_eq!(
-                    hour_window_decision(None, spill, pressure),
-                    HourWindowDecision::DaysByClass,
-                    "pressure={pressure} spill={spill} must stay on days"
-                );
+                for force in [false, true] {
+                    assert_eq!(
+                        hour_window_decision(None, spill, pressure, force),
+                        HourWindowDecision::DaysByClass,
+                        "pressure={pressure} spill={spill} force={force} must stay on days"
+                    );
+                }
             }
         }
     }

@@ -45,8 +45,12 @@
 //!
 //! [`snapshot_gate_table`]: the two depth tables, whose `ts` is the frame's
 //! ARRIVAL time in IST (`market_depth`, and `market_depth_book`, both
-//! stamped `received_at + IST offset` by the depth writer). Step 3 of PR AA
-//! extends the hour path; until then every other table keeps the exact gate.
+//! stamped `received_at + IST offset` by the depth writer), in every pass.
+//! Since step 3 of PR AA, also every table on the hour path in that pass
+//! (`super::hour_path::uses_snapshot_gate`: `tick_quotes` and
+//! `feed_aux_packets` under pressure, `ticks` only behind its switch); their
+//! acknowledgements are the tick sink's ([`sink_for_table`]). Every other
+//! table keeps the exact gate.
 //!
 //! # Complexity
 //!
@@ -93,9 +97,11 @@ pub(crate) const CLOCK_AHEAD_LIMIT_NANOS: u64 = 1_000_000_000;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
-/// Whether `table` is archived through the snapshot gate. The two depth
-/// tables only (their `ts` is the arrival instant in IST); every other table
-/// keeps the exact `writerTxn == sequencerTxn` gate. Pure, O(1).
+/// Whether `table` is archived through the snapshot gate in EVERY pass. The
+/// two depth tables only (their `ts` is the arrival instant in IST). A table
+/// on the hour path in one pass also takes the gate in that pass
+/// (`super::hour_path::uses_snapshot_gate`); every other table keeps the
+/// exact `writerTxn == sequencerTxn` gate. Pure, O(1).
 #[must_use]
 pub(crate) fn snapshot_gate_table(table: &str) -> bool {
     DEPTH_TABLES.contains(&table)

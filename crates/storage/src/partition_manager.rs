@@ -701,18 +701,26 @@ pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     )
 }
 
-/// Hour-granular twin of [`build_detach_list_sql`].
+/// Hour-granular twin of [`build_detach_list_sql`], judged by each hour's END.
 ///
-/// Byte-for-byte the same query but for the unit: `dateadd('h', -N, now())`
-/// instead of `'d'`. Kept as a separate function rather than a unit parameter
-/// so the two call paths are visibly different at every call site — the day
-/// path is safe for every table, the hour path is safe only for the arrival-
-/// stamped allowlist, and a shared signature would make that distinction easy
-/// to lose in a refactor.
+/// The same query as the day builder but for the unit (`'h'`), the IST shift
+/// of `now()` (below) and the window: it selects
+/// `minTimestamp < now_ist − (N + 1) h`. An hour partition starts at or
+/// before its `minTimestamp` and ends one hour after its start, so every
+/// partition selected ENDED at least `N` hours ago. Kept as a separate
+/// function rather than a unit parameter so the two call paths are visibly
+/// different at every call site: the day path is safe for every table, the
+/// hour path only for the closed list `partition_archive::HOUR_PATH_TABLES`.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3, owner Quote 51 "more than 4 hours
+/// old"): this used `now_ist − N h` on `minTimestamp`, which judged an hour
+/// by its START, so an hour that ended only `N − 1` hours ago was selected
+/// (the 11:00 hour at 15:00 with `N = 4`). Judging by the end keeps one more
+/// hour on the box and makes the 4-hour floor a floor on the hour's end.
 ///
 /// `table` is the same trusted-constant class as the day builder: it comes
-/// from `ARRIVAL_STAMPED_HOUR_TABLES`, never from external input.
-pub(crate) fn build_detach_list_sql_hours(table: &str, cutoff_hours: u32) -> String {
+/// from `partition_archive::HOUR_PATH_TABLES`, never from external input.
+pub(crate) fn build_closed_hour_list_sql(table: &str, cutoff_hours: u32) -> String {
     // `now()` is UTC. `minTimestamp` on these tables is IST-SHIFTED — the
     // stamping sites add IST_UTC_OFFSET_NANOS, which `depth_persistence`'s own
     // header records as a deliberate 2026-08-19 correction. Comparing the two
@@ -729,11 +737,13 @@ pub(crate) fn build_detach_list_sql_hours(table: &str, cutoff_hours: u32) -> Str
     // against a 1-day unit is noise — which is exactly why it went unnoticed
     // until the unit shrank to hours and the bias became larger than the
     // window itself.
+    //
+    // `+ 1`: the window is measured from the hour's END (see the doc above).
     format!(
         "SELECT name, active FROM table_partitions('{}') \
          WHERE minTimestamp < dateadd('h', -{}, dateadd('s', {}, now()))",
         table,
-        cutoff_hours,
+        cutoff_hours.saturating_add(1),
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS
     )
 }
