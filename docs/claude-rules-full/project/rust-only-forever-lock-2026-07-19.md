@@ -1054,6 +1054,26 @@ reaches by name. **Honest limits:** lines, not logic; a flow-style
 `run: "a; b"` counts as one line; a shell named through a variable in Rust is
 not seen (the non-literal spawn budget pins how many such sites exist).
 
+### 2026-11-07 — hooks a workflow runs are CI gate scripts and carry a pin (deep audit)
+
+"Developer tooling (`.claude/**`) … never runs in the product path" was true
+of where those files run on a developer machine, and false of 13 of them:
+`ci.yml` (Design-First Wall, Repo Guards) and `secret-scan.yml` run them
+inside All Green, so they gate merges, and their roughly 3,500 lines had no
+ceiling. They stay on the developer list (the file set stays frozen there),
+and each now also has its line count pinned EXACTLY in
+`WORKFLOW_RUN_HOOK_LINES` (`shell_budget_guard.rs`):
+
+| Test | What it pins |
+|---|---|
+| `workflow_run_hooks_have_ceilings` | every `.claude/hooks/*.sh` a workflow names on a non-comment line, plus every hook those hooks name (today: `plan-verify.sh`, run by `plan-verify.selftest.sh`), has a row; a row whose hook no workflow runs is stale |
+| `workflow_run_hooks_pinned_exactly` | each pinned hook's line count equals its pin: growth fails, and a shrink fails until the pin is lowered in the same PR |
+| `workflow_run_hook_scan_bites` | the reference scan on synthetic workflows and hooks (prefix, bare name, `$VAR/`, `$(…)/`, comment, other folder, longer name) |
+
+No script was ported to Rust in this change. **Honest limits:** lines, not
+logic; a hook reached only through a name built at run time is not seen; a
+hook a workflow names only in a comment is not counted as run.
+
 ### What a PR that violates §0.10 looks like (REJECT)
 
 - Adds any shell file, anywhere, or a new shell `Exec*=` line to a systemd unit.
@@ -1068,6 +1088,10 @@ not seen (the non-literal spawn budget pins how many such sites exist).
   and no row, or re-adds any `actions/github-script` step, without a fresh
   dated operator quote recorded in this file first (the same escape the
   ceiling row above has).
+- (2026-11-07) Raises a `WORKFLOW_RUN_HOOK_LINES` pin, removes a row whose
+  hook a workflow still runs, or makes a workflow run a `.claude/hooks/*.sh`
+  that has no row, without a fresh dated operator quote recorded in this file
+  first.
 
 ## §0.11. 2026-10-02 — `libc` becomes a DIRECT dependency (owner-approved)
 

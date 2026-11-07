@@ -31,7 +31,12 @@
 //! Developer tooling (`.claude/**`, `scripts/git-hooks/*`) is frozen by file
 //! set only: those files run on a developer machine or in a Claude session,
 //! never in the product path, and the lock's scope is the product path.
-//! Their lines may change.
+//! Their lines may change, EXCEPT the hooks a GitHub workflow runs:
+//! ~~Their lines may change.~~ CORRECTED 2026-11-07 (deep audit): `ci.yml`
+//! and `secret-scan.yml` run 13 of these hooks inside All Green (and one more
+//! through a self-test), so they gate merges and are CI gate scripts. Each
+//! has its line count pinned exactly in `WORKFLOW_RUN_HOOK_LINES`
+//! (`workflow_run_hooks_have_ceilings`, `workflow_run_hooks_pinned_exactly`).
 //!
 //! HONEST LIMITS, stated rather than hidden:
 //! - A shell program with no `.sh` name and no shebang that is run as
@@ -55,7 +60,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Developer-tooling shell files: frozen set, lines free. Sorted.
+/// Developer-tooling shell files: frozen set, lines free (except the hooks a
+/// workflow runs, pinned in `WORKFLOW_RUN_HOOK_LINES`). Sorted.
 /// ADDITIONS ARE FORBIDDEN. A deletion removes the entry in the same PR.
 const SHELL_DEV_TOOLING_FILES: &[&str] = &[
     ".claude/hooks/auto-save-remote.sh",
@@ -162,6 +168,41 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/validate-deploy-ssm-quoting.sh", 81),
     ("scripts/verify-stack.sh", 125),
 ];
+
+/// Developer-tooling hooks that a GitHub workflow runs, directly or through
+/// another hook a workflow runs, with their line count PINNED EXACTLY.
+/// Sorted. Added 2026-11-07 (deep audit, rust-only finding): the developer
+/// list above froze these files by name only, yet `ci.yml` (Design-First
+/// Wall, Repo Guards) and `secret-scan.yml` run them inside All Green, so
+/// about 3,500 lines of merge-gate shell could grow with no limit.
+///
+/// Each row must also be in `SHELL_DEV_TOOLING_FILES` (the file set stays
+/// frozen there). `workflow_run_hooks_have_ceilings` fails when a workflow
+/// runs a hook with no row, or a row names a hook no workflow runs any more.
+/// `workflow_run_hooks_pinned_exactly` fails when a file is longer OR shorter
+/// than its pin: growth means porting the new logic to Rust; a shrink lowers
+/// the pin in the same PR. Raising a pin needs a dated operator quote in the
+/// rust-only lock first, as for `SHELL_OPS_FILES`.
+const WORKFLOW_RUN_HOOK_LINES: &[(&str, usize)] = &[
+    (".claude/hooks/banned-pattern-scanner.sh", 930),
+    (".claude/hooks/boot-symmetry-guard.sh", 116),
+    (".claude/hooks/data-integrity-guard.sh", 263),
+    (".claude/hooks/dedup-latency-scanner.sh", 230),
+    (".claude/hooks/dep-freshness-scanner.sh", 209),
+    (".claude/hooks/financial-test-guard.sh", 138),
+    (".claude/hooks/hot-path-scanner-selftest.sh", 272),
+    (".claude/hooks/plan-gate.sh", 217),
+    (".claude/hooks/plan-verify.selftest.sh", 105),
+    // Not named by a workflow: `plan-verify.selftest.sh` runs it (line 11).
+    (".claude/hooks/plan-verify.sh", 244),
+    (".claude/hooks/pub-fn-test-guard.sh", 269),
+    (".claude/hooks/pub-fn-wiring-guard.sh", 177),
+    (".claude/hooks/secret-scanner.sh", 185),
+    (".claude/hooks/test-count-guard.sh", 101),
+];
+
+/// Directory whose `*.sh` files are the hooks `WORKFLOW_RUN_HOOK_LINES` covers.
+const HOOKS_DIR: &str = ".claude/hooks/";
 
 /// Per systemd unit: how many `Exec*=` lines run a shell. Pinned EXACTLY:
 /// it may only go down, and the pin moves down in the same PR.
@@ -414,6 +455,297 @@ fn ops_shell_files_never_grow() {
         "shell file(s) grew past their ceiling (path, lines, ceiling): {over:?}. \
          Put the new logic in Rust instead, or make the edit line-neutral. Raising \
          a ceiling needs a dated operator quote in the rust-only lock first."
+    );
+}
+
+// ===================== HOOKS A WORKFLOW RUNS (2026-11-07) =====================
+
+/// A character that can be part of a file or directory name.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// True when the occurrence of a hook's base name at byte `at` of `line` (a
+/// non-comment line) can refer to that hook. The name must stand alone
+/// (`plan-verify.sh` inside `plan-verify.selftest.sh` does not count), and a
+/// path in front of it must be the hooks folder, a variable or a
+/// substitution (`$HOOKS_DIR/`, `$(pwd)/`), never another literal folder
+/// (`scripts/doctor.sh` is not a hook). Errs toward counting a reference.
+fn is_hook_reference(line: &str, at: usize, name: &str) -> bool {
+    let before = &line[..at];
+    let after = &line[at + name.len()..];
+    let mut tail = after.chars();
+    let next = tail.next();
+    // A dot ends the name only when no name follows it (`x.sh.` vs `x.sh.bak`).
+    let longer_name = match next {
+        Some('.') => tail.next().is_some_and(|n| n.is_ascii_alphanumeric()),
+        Some(c) => is_name_char(c),
+        None => false,
+    };
+    if longer_name {
+        return false;
+    }
+    let Some(prev) = before.chars().next_back() else {
+        return true;
+    };
+    if is_name_char(prev) {
+        return false;
+    }
+    if prev != '/' {
+        return true;
+    }
+    let dir_part = &before[..before.len() - 1];
+    let segment_start = dir_part
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_name_char(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let segment = &dir_part[segment_start..];
+    if segment.is_empty() {
+        return true;
+    }
+    if dir_part[..segment_start].ends_with(['$', '{']) {
+        return true;
+    }
+    if segment == "hooks" {
+        return dir_part.ends_with(".claude/hooks") || segment_start == 0;
+    }
+    false
+}
+
+/// The hooks (`.claude/hooks/<name>`) a text refers to on its non-comment
+/// lines. `hooks` holds full paths under `HOOKS_DIR`. Sorted, unique.
+fn hooks_referenced_in(text: &str, hooks: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        for hook in hooks {
+            let name = hook.strip_prefix(HOOKS_DIR).unwrap_or(hook);
+            if out.iter().any(|h| h == hook) {
+                continue;
+            }
+            if line
+                .match_indices(name)
+                .any(|(at, _)| is_hook_reference(line, at, name))
+            {
+                out.push((*hook).to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every hook a workflow runs: the hooks the workflows name, plus every hook
+/// those hooks name on a non-comment line, to a fixed point. `workflows` and
+/// `hook_texts` are `(path, content)`. Sorted, unique.
+fn hooks_run_by_workflows(
+    workflows: &[(String, String)],
+    hook_texts: &[(String, String)],
+) -> Vec<String> {
+    let names: Vec<&str> = hook_texts.iter().map(|(p, _)| p.as_str()).collect();
+    let mut run: Vec<String> = Vec::new();
+    for (_, text) in workflows {
+        run.extend(hooks_referenced_in(text, &names));
+    }
+    run.sort();
+    run.dedup();
+    let mut i = 0;
+    while i < run.len() {
+        let current = run[i].clone();
+        if let Some((_, text)) = hook_texts.iter().find(|(p, _)| *p == current) {
+            for h in hooks_referenced_in(text, &names) {
+                if !run.contains(&h) {
+                    run.push(h);
+                }
+            }
+        }
+        i += 1;
+    }
+    run.sort();
+    run
+}
+
+/// `(path, lines, pin)` for every pinned hook whose length differs from its pin.
+fn off_pin(lines: &[(String, usize)], pins: &[(&str, usize)]) -> Vec<(String, usize, usize)> {
+    pins.iter()
+        .filter_map(|(p, pin)| {
+            let n = lines.iter().find(|(f, _)| f == p).map_or(0, |(_, n)| *n);
+            (n != *pin).then(|| ((*p).to_string(), n, *pin))
+        })
+        .collect()
+}
+
+/// The workflows (`.github/workflows/*.yml|yaml`) and the hooks
+/// (`.claude/hooks/*.sh`, top level) in the tree, each with its content.
+fn workflows_and_hooks() -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let files = all_files();
+    let workflows: Vec<(String, String)> = files
+        .iter()
+        .filter(|p| {
+            p.starts_with(".github/workflows/") && (p.ends_with(".yml") || p.ends_with(".yaml"))
+        })
+        .map(|p| (p.clone(), read_listed(p)))
+        .collect();
+    let hooks: Vec<(String, String)> = files
+        .iter()
+        .filter(|p| {
+            p.strip_prefix(HOOKS_DIR)
+                .is_some_and(|rest| rest.ends_with(".sh") && !rest.contains('/'))
+        })
+        .map(|p| (p.clone(), read_listed(p)))
+        .collect();
+    (workflows, hooks)
+}
+
+#[test]
+fn workflow_run_hooks_have_ceilings() {
+    let names: Vec<&str> = WORKFLOW_RUN_HOOK_LINES.iter().map(|(p, _)| *p).collect();
+    assert_sorted_unique(&names, "WORKFLOW_RUN_HOOK_LINES");
+    for p in &names {
+        assert!(
+            SHELL_DEV_TOOLING_FILES.contains(p),
+            "`{p}` is pinned in WORKFLOW_RUN_HOOK_LINES but not in SHELL_DEV_TOOLING_FILES"
+        );
+    }
+    let (workflows, hooks) = workflows_and_hooks();
+    // Anti-vacuity: the scan must see the workflows and hooks it guards.
+    assert!(
+        workflows.len() > 10 && hooks.len() > 20,
+        "only {} workflows / {} hooks found; the scan is broken",
+        workflows.len(),
+        hooks.len()
+    );
+    let run = hooks_run_by_workflows(&workflows, &hooks);
+    assert!(
+        run.len() >= 10,
+        "only {} hooks found run by workflows ({run:?}); the reference scan is broken",
+        run.len()
+    );
+    let missing: Vec<&String> = run
+        .iter()
+        .filter(|h| !names.contains(&h.as_str()))
+        .collect();
+    let stale: Vec<&&str> = names
+        .iter()
+        .filter(|p| !run.iter().any(|h| h == *p))
+        .collect();
+    assert!(
+        missing.is_empty() && stale.is_empty(),
+        "hooks run by a workflow without a line pin: {missing:?}. Pinned hooks no \
+         workflow runs any more: {stale:?}. A workflow may not start running a hook \
+         that has no pin; write the check in Rust instead (a `crates/*/tests/*_guard.rs` \
+         test). A row whose hook left CI is removed in the same PR. Run by workflows \
+         now: {run:?}"
+    );
+}
+
+#[test]
+fn workflow_run_hooks_pinned_exactly() {
+    let lines = shell_files_with_lines();
+    let off = off_pin(&lines, WORKFLOW_RUN_HOOK_LINES);
+    let report: Vec<String> = WORKFLOW_RUN_HOOK_LINES
+        .iter()
+        .map(|(p, _)| {
+            let n = lines.iter().find(|(f, _)| f == p).map_or(0, |(_, n)| *n);
+            format!("    (\"{p}\", {n}),")
+        })
+        .collect();
+    assert!(
+        off.is_empty(),
+        "a hook that a workflow runs changed length (path, lines, pin): {off:?}. Growth \
+         is forbidden (port the new logic to Rust, or make the edit line-neutral; \
+         raising a pin needs a dated operator quote in the rust-only lock first). A \
+         shrink lowers the pin in this PR. Measured now:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn workflow_run_hook_scan_bites() {
+    let hooks: Vec<(String, String)> = vec![
+        (
+            ".claude/hooks/a.sh".into(),
+            "# runs b.sh in a comment only\necho a\n".into(),
+        ),
+        (".claude/hooks/b.sh".into(), "echo b\n".into()),
+        (
+            ".claude/hooks/c.selftest.sh".into(),
+            "X=\"$(cd \"$(dirname \"$0\")\" && pwd)/c.sh\"\n".into(),
+        ),
+        (
+            ".claude/hooks/c.sh".into(),
+            "bash \"$HOOKS_DIR/d.sh\"\n".into(),
+        ),
+        (".claude/hooks/d.sh".into(), "echo d\n".into()),
+        (".claude/hooks/doctor.sh".into(), "echo doctor\n".into()),
+        (".claude/hooks/e.sh".into(), "echo e\n".into()),
+    ];
+    let names: Vec<&str> = hooks.iter().map(|(p, _)| p.as_str()).collect();
+    // Direct, prefixed, bare after `cd`, variable dir, substitution dir.
+    assert_eq!(
+        hooks_referenced_in("run: bash .claude/hooks/a.sh \"$X\"\n", &names),
+        vec![".claude/hooks/a.sh"]
+    );
+    assert_eq!(
+        hooks_referenced_in("run: ./.claude/hooks/e.sh\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    assert_eq!(
+        hooks_referenced_in("run: cd .claude/hooks && bash e.sh\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    assert_eq!(
+        hooks_referenced_in("bash \"$HOOKS_DIR/e.sh\"\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    assert_eq!(
+        hooks_referenced_in("bash \"${D}/e.sh\" ; bash $(pwd)/d.sh\n", &names),
+        vec![".claude/hooks/d.sh", ".claude/hooks/e.sh"]
+    );
+    // Not a reference: comment line, another folder, longer name, extension.
+    assert!(hooks_referenced_in("  # bash .claude/hooks/a.sh\n", &names).is_empty());
+    assert!(hooks_referenced_in("run: bash scripts/doctor.sh\n", &names).is_empty());
+    assert!(hooks_referenced_in("run: bash scripts/tv-tunnel/doctor.sh\n", &names).is_empty());
+    assert!(
+        hooks_referenced_in("bash .claude/hooks/c.selftest.sh\n", &names)
+            .iter()
+            .all(|h| h != ".claude/hooks/c.sh")
+    );
+    assert!(hooks_referenced_in("cat e.sh.bak; bash ee.sh; bash xe.sh\n", &names).is_empty());
+    // A sentence-ending dot still counts as the name.
+    assert_eq!(
+        hooks_referenced_in("echo \"see e.sh.\"\n", &names),
+        vec![".claude/hooks/e.sh"]
+    );
+    // Closure: a workflow runs a.sh and c.selftest.sh; c.selftest.sh runs c.sh,
+    // which runs d.sh. b.sh is named only in a comment of a.sh.
+    let workflows = vec![(
+        ".github/workflows/x.yml".to_string(),
+        "      - run: bash .claude/hooks/a.sh\n      - run: bash .claude/hooks/c.selftest.sh\n"
+            .to_string(),
+    )];
+    assert_eq!(
+        hooks_run_by_workflows(&workflows, &hooks),
+        vec![
+            ".claude/hooks/a.sh",
+            ".claude/hooks/c.selftest.sh",
+            ".claude/hooks/c.sh",
+            ".claude/hooks/d.sh",
+        ]
+    );
+    // Pins: exact match passes; one line more or one line less both fail.
+    let lines = vec![(".claude/hooks/a.sh".to_string(), 10_usize)];
+    assert!(off_pin(&lines, &[(".claude/hooks/a.sh", 10)]).is_empty());
+    assert_eq!(off_pin(&lines, &[(".claude/hooks/a.sh", 9)]).len(), 1);
+    assert_eq!(off_pin(&lines, &[(".claude/hooks/a.sh", 11)]).len(), 1);
+    // A pin for a file that is gone reads as 0 lines and fails.
+    assert_eq!(
+        off_pin(&lines, &[(".claude/hooks/gone.sh", 5)]),
+        vec![(".claude/hooks/gone.sh".to_string(), 0, 5)]
     );
 }
 
