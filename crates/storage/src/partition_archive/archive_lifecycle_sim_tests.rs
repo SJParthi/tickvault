@@ -20,6 +20,12 @@
 //! the current hour after the close, the tick sink's acknowledgements, and
 //! QuestDB dropping a partition with committed but unapplied rows of it
 //! (assumed the worst: those rows are lost, owner decision 2 is still open).
+//! A late row a spill replay commits into an hour ALREADY dropped is the
+//! other way round: the model assumes the favourable answer (QuestDB
+//! re-creates the hour and a later pass copies it to a sidecar key), and it
+//! models neither that row being lost nor depth spill rows. In production
+//! the spill-pending refusal of the drop is what protects that case, not
+//! this model (PR AA finding 14).
 //! The pass lock (`ARCHIVE_PASS_LOCK`) is not exercised: passes run one after
 //! another here, which is what that lock enforces.
 //!
@@ -92,10 +98,12 @@ const HOT_HOURS: u32 = 4;
 const TOO_BIG_ROWS: u64 = 60_000;
 /// A clean night's DISK check covers hours eligible at least this long
 /// before the last pass (several passes to retry a random failure). PR AA
-/// review: 7, not 11, so the session's last hour (15:00, eligible about
-/// 20:00) and a Muhurat 18:00 hour are checked the morning after; the limit
-/// is anchored to the floor (`HOT_HOURS + 1`), never to the hour offset the
-/// code under test produced.
+/// review: 7, not 11; the limit is anchored to the floor (`HOT_HOURS + 1`),
+/// never to the hour offset the code under test produced. PR AA finding 15:
+/// the session's last hour (15:00) and a Muhurat 18:00 hour are NOT checked
+/// the morning after. The DISK check skips them as unacked, because nothing
+/// in the model raises the acked high after the last session batch, so they
+/// are first judged after the next session (Tuesday for a Friday hour).
 const DISK_CHECK_MARGIN_HOURS: i64 = 7;
 /// How many hours late [`Mutation::LateHourSql`] lists an hour.
 const LATE_SQL_EXTRA_HOURS: i64 = 8;

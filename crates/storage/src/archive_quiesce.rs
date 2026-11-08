@@ -307,10 +307,12 @@ pub async fn archive_quiesce_shared(wait: Duration) -> Option<RwLockReadGuard<'s
     ARCHIVE_QUIESCE.shared(wait).await
 }
 
-/// A writer's side of the process lock, without waiting.
+/// A writer's side of the process lock, without waiting. Test-only (PR AA
+/// finding 18): no production writer takes the lock without the writers'
+/// try-only-in-session rule and the held counter, which this skipped.
+#[cfg(test)]
 #[must_use]
-// TEST-EXEMPT: covered by test_process_accessors_take_and_release_the_one_lock
-pub fn try_archive_quiesce_shared() -> Option<RwLockReadGuard<'static, ()>> {
+fn try_archive_quiesce_shared() -> Option<RwLockReadGuard<'static, ()>> {
     ARCHIVE_QUIESCE.try_shared()
 }
 
@@ -628,6 +630,15 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the depth pass proceeds after the archiver");
         thread.join().expect("thread");
+    }
+
+    /// Regression, PR AA finding 18: the bare no-wait shared accessor had no
+    /// production caller and was public; it is test-only now.
+    #[test]
+    fn test_regression_no_public_try_shared_accessor() {
+        let code = include_str!("archive_quiesce.rs");
+        let needle = ["pub fn try_archive", "_quiesce_shared("].concat();
+        assert!(!code.contains(&needle));
     }
 
     /// The process accessors work. Held only for an instant, so other tests

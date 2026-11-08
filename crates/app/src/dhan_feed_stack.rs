@@ -18323,6 +18323,17 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             }
             if round_quiesce_held {
                 catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;
+                if catchup_stop::quiesce_stop_needs_own_line(rounds, catchup_early_stop) {
+                    warn!(
+                        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                        source = "wal_catchup_archive_quiesce_stop",
+                        stop_reason = catchup_early_stop,
+                        frames = catchup_frames,
+                        "WAL catch-up drain stopped in its first round: the partition archiver \
+                         held the old-hour lock. Nothing is lost; the segments wait for the next \
+                         drain or boot."
+                    );
+                }
                 break;
             }
             rounds = rounds.saturating_add(1);

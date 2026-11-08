@@ -27,8 +27,11 @@
 //!     --test questdb_dropped_partition_probe -- --ignored --nocapture
 //! ```
 //!
-//! With `TV_QDB_REAL_HTTP` unset it prints why and returns. It creates one
-//! table named for its process id and drops it at the end.
+//! With `TV_QDB_REAL_HTTP` unset it prints SKIPPED and returns, so `cargo
+//! test` reports `ok` with nothing measured; `TV_QDB_REAL_REQUIRED=1` turns
+//! that into a failure. It writes the late row through `/exec`, not the ILP
+//! `/write` path a spill replay uses. It creates one table named for its
+//! process id and drops it at the end.
 
 use std::time::{Duration, Instant};
 
@@ -83,13 +86,24 @@ fn test_probe_outcome_judge_fails_accepted_and_lost() {
     );
 }
 
-/// The QuestDB HTTP base URL, or `None` when no QuestDB is configured.
+/// The QuestDB HTTP base URL, or `None` when no QuestDB is configured and
+/// none is required. A skip still reports `ok` without measuring anything, so
+/// it says so plainly (PR AA finding 13); with `TV_QDB_REAL_REQUIRED=1` a
+/// missing endpoint fails the test instead.
 fn base_url() -> Option<String> {
     let Some(addr) = std::env::var("TV_QDB_REAL_HTTP")
         .ok()
         .filter(|v| !v.is_empty())
     else {
-        eprintln!("questdb_dropped_partition_probe: skipped, set TV_QDB_REAL_HTTP=host:port");
+        assert!(
+            !std::env::var("TV_QDB_REAL_REQUIRED").is_ok_and(|v| v == "1"),
+            "TV_QDB_REAL_REQUIRED=1 but TV_QDB_REAL_HTTP is unset: the dropped-partition \
+             probe would skip and report ok without measuring"
+        );
+        eprintln!(
+            "questdb_dropped_partition_probe: SKIPPED (NOT RUN, NOT PASSED, NOTHING MEASURED) \
+             - set TV_QDB_REAL_HTTP=host:port to a running QuestDB"
+        );
         return None;
     };
     Some(format!("http://{addr}"))

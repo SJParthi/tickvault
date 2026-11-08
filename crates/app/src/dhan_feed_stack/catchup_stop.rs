@@ -73,9 +73,41 @@ pub(super) const fn residual_stop_reason(drained: bool, early_stop: &'static str
     if drained { "drained" } else { early_stop }
 }
 
+/// Whether a quiesce stop needs a line of its own. The catch-up summary is
+/// written only after a completed round or a named stop, so a drain the
+/// archive lock stopped in round 0 (the usual case, the first chunk of an
+/// evening drain) left only a counter (PR AA finding 16).
+#[must_use]
+pub(super) fn quiesce_stop_needs_own_line(rounds: u32, early_stop: &str) -> bool {
+    rounds == 0 && early_stop == STOP_ARCHIVE_QUIESCE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression, PR AA finding 16: a quiesce stop in round 0 logged no
+    /// `stop_reason`. It now gets its own line; a later round's stop is
+    /// already named by the summary, and other stops never take this line.
+    #[test]
+    fn test_regression_round_zero_quiesce_stop_is_logged() {
+        assert!(quiesce_stop_needs_own_line(0, STOP_ARCHIVE_QUIESCE));
+        assert!(!quiesce_stop_needs_own_line(1, STOP_ARCHIVE_QUIESCE));
+        for other in [STOP_INCOMPLETE, STOP_REPLAY_FAILED, STOP_ACK_TIMEOUT] {
+            assert!(!quiesce_stop_needs_own_line(0, other));
+        }
+        let code = lane_code();
+        let stop = code
+            .find("catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;")
+            .expect("the quiesce stop");
+        let tail = &code[stop..];
+        let line = tail
+            .find("quiesce_stop_needs_own_line(rounds, catchup_early_stop)")
+            .expect("the round-0 line");
+        let brk = tail.find("break;").expect("the stop breaks");
+        assert!(line < brk, "the line is written before the drain stops");
+        assert!(tail[line..brk].contains("stop_reason = catchup_early_stop"));
+    }
 
     #[test]
     fn test_batch_stop_reason_reads_the_batch_flags() {
