@@ -1138,6 +1138,7 @@ impl WsFrameSpill {
         // The deferred-depth marks (item 45a) sit beside it for the same reason:
         // a shed frame's segment must stay protected across a restart.
         crate::wal_deferred_depth::deferred_depth().bind(&wal_dir);
+        crate::wal_clock_step::bind_clock_step_log(&wal_dir); // PR AA finding 2 recheck
         // 2026-10-20 (plan item PR W): fold earlier processes' unapplied marks
         // into bounded ranges and register the boot tail, BEFORE the writer
         // thread spawns and before any sink or socket exists.
@@ -3283,7 +3284,7 @@ pub fn refresh_receipt_anchor() {
     // It is counted (`outcome = "adopted_backward_step"`) and logged. A small
     // rewind (slew) is still refused, and repeated refusals now end too: once
     // the accumulated slew passes the threshold it is adopted as a step.
-    match cell.refresh_with(take_anchor) {
+    match cell.refresh_noting_step(take_anchor, crate::wal_clock_step::note_clock_step) {
         AnchorRefresh::Adopt => {
             metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
         }
@@ -4001,6 +4002,7 @@ fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let (nanos, clamped) = next_segment_name_nanos(wal_dir, now_nanos);
+    crate::wal_clock_step::note_segment_rotation(now_nanos, nanos);
     if clamped {
         metrics::counter!(WAL_SEGMENT_NAME_CLAMPED_COUNTER).increment(1);
         warn!(

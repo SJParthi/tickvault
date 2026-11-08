@@ -2949,6 +2949,24 @@ impl AppliedWatermark {
             .any(|c| c.load(Ordering::Acquire) == min_seq)
     }
 
+    /// The lowest held rescue floor for `sink`, or `u64::MAX` when none is
+    /// held. The partition archiver's snapshot gate (PR AA step 2) holds an
+    /// hour while a rescue batch that can carry a frame of it is unsettled.
+    /// O(`RESCUE_FLOOR_SLOTS`), cold.
+    #[must_use]
+    // TEST-EXEMPT: covered by test_in_flight_holds_while_a_rescue_batch_can_carry_the_hour
+    pub(crate) fn rescue_floor_lowest(&self, sink: AppliedSink) -> u64 {
+        self.rescue_floor_min(sink)
+    }
+
+    /// Whether [`Self::bind`] bound this watermark to a WAL directory in this
+    /// process. Until then it holds no record of this process's frames, and
+    /// the archiver's snapshot gate refuses to vouch for any hour. One load.
+    #[must_use]
+    pub(crate) fn is_bound(&self) -> bool {
+        self.dir_tag.load(Ordering::Acquire) != 0
+    }
+
     /// The lowest held floor for `sink`, or `u64::MAX` when none is held.
     fn rescue_floor_min(&self, sink: AppliedSink) -> u64 {
         let mut lowest = u64::MAX;

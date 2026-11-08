@@ -4880,6 +4880,8 @@ impl TickWriterSink {
         // Item 45a: ticks are never shed, so this writer keeps the shed-depth
         // marks persisted even while every depth write is shed.
         crate::wal_deferred_depth::deferred_depth().persist_if_due_now();
+        // PR AA finding 2 recheck: the wall-clock step window, when it changed.
+        crate::wal_clock_step::persist_clock_step_log_if_dirty();
         self.return_spare_buffer(batch);
         landed
     }

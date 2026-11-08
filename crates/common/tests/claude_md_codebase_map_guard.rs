@@ -240,3 +240,44 @@ fn scanner_handles_multi_file_cells() {
         "multi-file cell not fully extracted: {found:?}"
     );
 }
+
+/// The CLAUDE.md O(1) table row whose first cell starts with `prefix`.
+fn table_row_starting_with<'a>(claude_md: &'a str, prefix: &str) -> &'a str {
+    claude_md
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("CLAUDE.md has no table row starting with {prefix:?}"))
+}
+
+/// PR AA finding 7: the archive quiesce and snapshot gate rows went stale in
+/// the reassuring direction the day they were written. The snapshot gate row
+/// said only the two depth tables take it, while `tick_quotes` and
+/// `feed_aux_packets` take it on every hour-path pass; the quiesce row never
+/// named `ReplayIntent`, which makes the archiver stand aside at once.
+#[test]
+fn archive_quiesce_and_snapshot_gate_rows_name_what_the_code_does() {
+    let root = repo_root();
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md"))
+        .unwrap_or_else(|e| panic!("cannot read CLAUDE.md: {e}"));
+
+    let gate_row = table_row_starting_with(
+        &claude_md,
+        "| `crates/storage/src/partition_archive/snapshot_gate.rs::",
+    );
+    for table in ["tick_quotes", "feed_aux_packets"] {
+        assert!(
+            gate_row.contains(table),
+            "the snapshot_gate row must name `{table}`: it takes the snapshot \
+             gate and the exclusive lock on every hour-path pass \
+             (partition_archive/hour_path.rs::uses_snapshot_gate)"
+        );
+    }
+
+    let quiesce_row =
+        table_row_starting_with(&claude_md, "| `crates/storage/src/archive_quiesce.rs::");
+    assert!(
+        quiesce_row.contains("ReplayIntent"),
+        "the archive_quiesce row must name `ReplayIntent`: while one is \
+         registered the archiver refuses at once (ArchiveQuiesce::hold_writers)"
+    );
+}

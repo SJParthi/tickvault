@@ -3426,3 +3426,30 @@ After the run Quote 50 is SPENT for deletion; its "Keep, always" row stays bindi
 - Deleting without the listing before and the listing after, or a cloud delete without the dry listing.
 - Changing versioning, lifecycle, object lock or bucket policy under Quote 50.
 - A second deletion run under Quote 50.
+
+#### Quote 51 (2026-11-07, ~21:30–00:30 IST) — THE BOX COPIES TO S3 AND DELETES BY ITSELF; NO MANUAL MOVE, NO BIGGER DISK (preserve EXACTLY)
+
+Owner messages (2026-11-07), verbatim: "dude always our plan is to move the data to s3 and then dleete right dude then whyt he fuck eevrytime disk issue and why again and again manually evrytime why the fuck we need to move this fuckign data usign claude cod emtoherfucker or increasing the disk to 200 g by inreasign the rpcie mtoehrfucker why?" and "Bro but ensure to cover al these cases before copying and deleting it dude okY?Especially cover all kinds of extreme permuations combiantions of excpeitons errors situations conditions bugs scenarios ideas etc etc etc inclduign out of box also dude okay? do you understand what in askign dude?". Decision cards, verbatim labels: on the disk card the owner tapped "Copy 6 Nov to S3, then delete" (card text: "Frees about 51 GB on the server. The copy is checked first, then the 6 Nov order-book data is deleted from the server only and kept in S3. Permanent on the server; needs your dated approval naming that data."); on the automation card the owner tapped "Approve both (Recommended)" (card text: "(1) When the disk is filling fast, delete data from the server hour by hour once it is over 4 hours old, not only after 1 to 2 days, and always only after its S3 copy is checked. Today only one table may do this. (2) After the close, keep the server on until the day's data is copied and deleted, at most until 7:30 AM, at about $0.19 per extra hour. With both, no manual moves and no bigger disk are needed.").
+
+Measured the same evening (CloudWatch, S3 listing, code read): the archiver dropped 201 partitions 3–7 Nov, each after a verified copy, but deletes by age (about 24.5 hours), skips a whole table when its WAL is even one transaction behind (233 skips, 15 pressure episodes that freed 0 bytes at 75–93% used), latches the daily run done at about 15:47, and runs only about 50 minutes before the 16:30 stop. The 6 Nov `market_depth` volume (about 51 GB) came from the `market_depth_book` designated-timestamp bug fixed by #2212.
+
+| Item | What Quote 51 authorizes |
+|---|---|
+| Automatic copy-then-delete, hour by hour | The app's own archiver (`partition_archive`, `disk_pressure`) may copy, verify and drop hour partitions of `ticks`, `tick_quotes`, `market_depth`, `market_depth_book` and `feed_aux_packets` once they are more than 4 hours old, when the disk is under pressure or projected to fill before the stop. Always the existing order: export, upload with checksum, verify (recount and size), audit row acked, WAL and recount re-checked, then `DROP PARTITION LIST`. Candles, SEBI and audit tables keep their day windows and are not touched by the hour path |
+| The applied-WAL check | The archiver may treat a table as applied for an OLD partition when QuestDB has applied every transaction that existed when the check started (a snapshot), instead of requiring the whole table to be fully caught up, provided every writer that can post into an old hour (WAL replay, spill replay, the after-close depth pass) is held for the copy and the drop |
+| Daily run until done | The after-close run does not mark the day done while partitions old enough to drop remain, and keeps running after the close until free space reaches its target |
+| Keep the box on | The drain hold (Quote 31) also counts data still waiting to be copied to S3 and deleted; never past 07:30 IST, only while that work remains |
+| The 6 Nov data | `market_depth` hour partitions dated 2026-11-06 leave the box through this same automatic path, after a verified S3 copy. No manual delete, no SSM delete, no new tool |
+| Proof first | Before it ships: randomized tests over many days with extreme day volumes, S3 failures, WAL lag, restarts, replays and crashes between copy and delete, checking that nothing is dropped without a verified copy, nothing is dropped while its rows are unapplied, SEBI and audit tables are never touched, and the disk stays below the line unless S3 is down or one session writes more than the free space |
+
+Quote 50's "Keep, always" row and Quote 27 are unchanged: every copy stays in `tv-prod-cold`, and the box keeps only its hot window.
+
+##### What violates Quote 51 (REJECT)
+- Any drop without a verified S3 copy (export, checksummed upload, recount, size check, acked audit row), or deleting or overwriting any S3 copy.
+- An hour floor under 4 hours, or the hour path on candles, SEBI, audit or any table not named above.
+- Dropping a partition while one of its rows is unapplied, or while a writer that can post into that hour is running; dropping an hour with deferred-depth marks still waiting.
+- A drain hold past 07:30 IST, or one held when no copy work remains.
+- Any manual or SSM delete of market data under Quote 51.
+- A new page, alarm, metric filter or EMF name for this work.
+- Growing the disk, raising IOPS or throughput, or changing the instance under Quote 51.
+- Shipping before the randomized proof above passes.

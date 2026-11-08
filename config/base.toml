@@ -455,6 +455,31 @@ ingest_shed_session_burn_bytes = 0
 # that can move backwards into a closed hour.
 depth_hot_hours = 4
 
+# PR AA (owner Quote 51, 2026-11-07): the box copies old data to S3 and
+# deletes it by itself, hour by hour once it is over 4 hours old, only after
+# its S3 copy is checked. Each switch is a rollback lever.
+# Hours are judged by their END: an hour leaves the box at least
+# depth_hot_hours after it closed (step 3).
+archive_wal_snapshot_wait_secs = 300
+archive_quiesce_wait_secs = 120
+# Under disk pressure, market_depth_book, tick_quotes and feed_aux_packets
+# also go hour by hour; false keeps them on their day windows (step 3).
+pressure_hour_tables_enabled = true
+# ticks stays on its day window: a live tick can land in an earlier hour.
+ticks_hour_path_enabled = false
+# Only market_depth may be archived by the hour under pressure while one of
+# its spill files is still waiting; the other tables wait for their folder.
+market_depth_force_with_spill_pending = true
+# The keys below are read by the later steps of PR AA (the projected-fill
+# trigger, the daily leg, the drain hold); until then they change nothing.
+pressure_projected_fill_enabled = true
+pressure_projected_min_used_pct = 50
+daily_free_target_pct = 30
+daily_free_target_session_multiplier_pct = 150
+# 40 GiB, used until five sessions have been measured.
+daily_free_target_fallback_session_bytes = 42949672960
+drain_hold_counts_archive = true
+
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
 # in PR #764.

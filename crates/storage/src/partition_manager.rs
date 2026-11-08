@@ -693,6 +693,7 @@ pub(crate) struct PartitionRow {
 /// `candle_table_names()`) — never external input — so it is not
 /// injection-validated here; the untrusted `name` values are validated by
 /// [`is_valid_partition_name`] before they reach a DETACH statement.
+// TEST-EXEMPT: covered by test_eligibility_boundary_hot_days_minus_one_stays_hot
 pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     format!(
         "SELECT name, active FROM table_partitions('{}') \
@@ -701,18 +702,27 @@ pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     )
 }
 
-/// Hour-granular twin of [`build_detach_list_sql`].
+/// Hour-granular twin of [`build_detach_list_sql`], judged by each hour's END.
 ///
-/// Byte-for-byte the same query but for the unit: `dateadd('h', -N, now())`
-/// instead of `'d'`. Kept as a separate function rather than a unit parameter
-/// so the two call paths are visibly different at every call site — the day
-/// path is safe for every table, the hour path is safe only for the arrival-
-/// stamped allowlist, and a shared signature would make that distinction easy
-/// to lose in a refactor.
+/// The same query as the day builder but for the unit (`'h'`), the IST shift
+/// of `now()` (below) and the window: it selects
+/// `minTimestamp < now_ist − (N + 1) h`. An hour partition starts at or
+/// before its `minTimestamp` and ends one hour after its start, so every
+/// partition selected ENDED at least `N` hours ago. Kept as a separate
+/// function rather than a unit parameter so the two call paths are visibly
+/// different at every call site: the day path is safe for every table, the
+/// hour path only for the closed list `partition_archive::HOUR_PATH_TABLES`.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3, owner Quote 51 "more than 4 hours
+/// old"): this used `now_ist − N h` on `minTimestamp`, which judged an hour
+/// by its START, so an hour that ended only `N − 1` hours ago was selected
+/// (the 11:00 hour at 15:00 with `N = 4`). Judging by the end keeps one more
+/// hour on the box and makes the 4-hour floor a floor on the hour's end.
 ///
 /// `table` is the same trusted-constant class as the day builder: it comes
-/// from `ARRIVAL_STAMPED_HOUR_TABLES`, never from external input.
-pub(crate) fn build_detach_list_sql_hours(table: &str, cutoff_hours: u32) -> String {
+/// from `partition_archive::HOUR_PATH_TABLES`, never from external input.
+// TEST-EXEMPT: covered by the_hour_query_differs_from_the_day_query_only_in_its_unit
+pub(crate) fn build_closed_hour_list_sql(table: &str, cutoff_hours: u32) -> String {
     // `now()` is UTC. `minTimestamp` on these tables is IST-SHIFTED — the
     // stamping sites add IST_UTC_OFFSET_NANOS, which `depth_persistence`'s own
     // header records as a deliberate 2026-08-19 correction. Comparing the two
@@ -729,11 +739,13 @@ pub(crate) fn build_detach_list_sql_hours(table: &str, cutoff_hours: u32) -> Str
     // against a 1-day unit is noise — which is exactly why it went unnoticed
     // until the unit shrank to hours and the bias became larger than the
     // window itself.
+    //
+    // `+ 1`: the window is measured from the hour's END (see the doc above).
     format!(
         "SELECT name, active FROM table_partitions('{}') \
          WHERE minTimestamp < dateadd('h', -{}, dateadd('s', {}, now()))",
         table,
-        cutoff_hours,
+        cutoff_hours.saturating_add(1),
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS
     )
 }
@@ -830,6 +842,64 @@ pub(crate) fn parse_partition_rows(json: &str) -> Vec<PartitionRow> {
         })
         .collect()
     // O(1) EXEMPT: end
+}
+
+/// The SQL that lists every partition of `table` with its size on disk
+/// (PR AA step 5, owner Quote 51): `name` and `diskSize` (bytes) from
+/// QuestDB's `table_partitions`. The daily leg sums one session day's
+/// partitions to size its free-space target.
+///
+/// No filter in SQL: the day is matched on the partition NAME in Rust
+/// ([`sum_partition_bytes_on_day`]), which needs no knowledge of how each
+/// table stamps `ts`. `table` is a trusted constant from
+/// `partition_archive::HOUR_PATH_TABLES`, never external input.
+pub(crate) fn build_partition_size_sql(table: &str) -> String {
+    format!("SELECT name, diskSize FROM table_partitions('{table}')")
+}
+
+/// Parses `(name, diskSize)` rows from QuestDB's `/exec` JSON.
+///
+/// Columns are found by name. Fails CLOSED: `None` when the body is not
+/// JSON, a column is missing, or any row has a missing, negative or
+/// non-integer size, so a half-read answer is never summed as if it were
+/// whole. An empty dataset is `Some(vec![])`. O(rows), cold path.
+pub(crate) fn parse_partition_sizes(json: &str) -> Option<Vec<(String, u64)>> {
+    // O(1) EXEMPT: begin — JSON parsing of a once-a-day size listing (cold path)
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    let columns = parsed.get("columns")?.as_array()?;
+    let mut name_idx: Option<usize> = None;
+    let mut size_idx: Option<usize> = None;
+    for (idx, col) in columns.iter().enumerate() {
+        match col.get("name").and_then(|n| n.as_str()) {
+            Some("name") => name_idx = Some(idx),
+            Some("diskSize") => size_idx = Some(idx),
+            _ => {}
+        }
+    }
+    let (name_idx, size_idx) = (name_idx?, size_idx?);
+    let dataset = parsed.get("dataset")?.as_array()?;
+    let mut rows = Vec::with_capacity(dataset.len());
+    for row in dataset {
+        let cols = row.as_array()?;
+        let name = cols.get(name_idx)?.as_str()?.to_string();
+        let size = cols.get(size_idx)?.as_u64()?;
+        rows.push((name, size));
+    }
+    Some(rows)
+    // O(1) EXEMPT: end
+}
+
+/// Bytes of the partitions that belong to IST day `day`: a DAY partition
+/// named `YYYY-MM-DD` or an HOUR partition named `YYYY-MM-DDTHH`.
+/// Saturating, so a hostile size can never wrap. O(rows), pure.
+pub(crate) fn sum_partition_bytes_on_day(rows: &[(String, u64)], day: chrono::NaiveDate) -> u64 {
+    let prefix = day.format("%Y-%m-%d").to_string();
+    rows.iter()
+        .filter(|(name, _)| {
+            name.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('T'))
+        })
+        .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,5 +1398,90 @@ mod tests {
         assert!(
             SCRATCH_TABLES.contains(&crate::contract_name_repair::CONTRACT_NAME_REPAIR_MAP_TABLE)
         );
+    }
+
+    // ---- PR AA step 5: session bytes for the daily free target ----------
+
+    #[test]
+    fn test_build_partition_size_sql_lists_name_and_disk_size() {
+        assert_eq!(
+            build_partition_size_sql("tick_quotes"),
+            "SELECT name, diskSize FROM table_partitions('tick_quotes')"
+        );
+    }
+
+    /// `diskSize` is a real `table_partitions` column (QuestDB 9.x; Assumed,
+    /// checked here on the documented response shape), found by NAME.
+    #[test]
+    fn test_disk_size_column_parsed() {
+        let json = r#"{"query":"x","columns":[{"name":"index","type":"INT"},
+            {"name":"name","type":"STRING"},{"name":"diskSize","type":"LONG"},
+            {"name":"active","type":"BOOLEAN"}],
+            "dataset":[[0,"2026-11-06T09",1024,false],[1,"2026-11-07T09",4096,true]],
+            "count":2}"#;
+        let rows = parse_partition_sizes(json).expect("parses");
+        assert_eq!(
+            rows,
+            vec![
+                ("2026-11-06T09".to_string(), 1024),
+                ("2026-11-07T09".to_string(), 4096)
+            ]
+        );
+        // Column order does not matter.
+        let swapped = r#"{"columns":[{"name":"diskSize"},{"name":"name"}],
+            "dataset":[[7,"2026-11-07"]]}"#;
+        assert_eq!(
+            parse_partition_sizes(swapped),
+            Some(vec![("2026-11-07".to_string(), 7)])
+        );
+        assert_eq!(
+            parse_partition_sizes(
+                r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[]}"#
+            ),
+            Some(vec![])
+        );
+    }
+
+    /// Fails closed: a half-read answer must never be summed as whole.
+    #[test]
+    fn test_parse_partition_sizes_refuses_partial_answers() {
+        for bad in [
+            "not json",
+            r#"{"columns":[{"name":"name"}],"dataset":[["2026-11-07"]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07",null]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07",-5]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07",1.5]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07"]]}"#,
+        ] {
+            assert_eq!(parse_partition_sizes(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_sum_partition_bytes_on_day_matches_day_and_hour_names_only() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("date");
+        let rows = vec![
+            ("2026-11-07".to_string(), 10),
+            ("2026-11-07T09".to_string(), 20),
+            ("2026-11-07T15".to_string(), 30),
+            ("2026-11-06T15".to_string(), 1_000),
+            ("2026-11-08".to_string(), 1_000),
+            ("2026-11-070".to_string(), 1_000),
+            ("2026-11-07X".to_string(), 1_000),
+        ];
+        assert_eq!(sum_partition_bytes_on_day(&rows, day), 60);
+        assert_eq!(
+            sum_partition_bytes_on_day(
+                &[
+                    ("2026-11-07".to_string(), u64::MAX),
+                    ("2026-11-07T09".to_string(), 5)
+                ],
+                day
+            ),
+            u64::MAX,
+            "saturates, never wraps"
+        );
+        assert_eq!(sum_partition_bytes_on_day(&[], day), 0);
     }
 }

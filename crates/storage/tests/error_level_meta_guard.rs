@@ -274,6 +274,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "2026-10-20 (plan item PR W): coded WS-SPILL-01, latched once per episode, counted on the same persist-failed counter durability-sync-failing pages on; the watermark file then names no sidecar generation, so the next boot reads the ranges as whole buckets or, when they do not fit, as an unbounded overflow (replay more, never less)",
     ),
     (
+        "crates/storage/src/wal_clock_step.rs",
+        "wall clock step window could not be persisted",
+        "2026-11-08 (PR AA finding 2 recheck): coded WS-SPILL-01, latched once per episode and retried on every tick-writer batch; the window stays in RAM, so only a restart while the write fails forgets the step; the file sits beside applied.tvaw, whose persist failing on the same folder pages durability-sync-failing",
+    ),
+    (
         "crates/storage/src/wal_unapplied_ranges.rs",
         "could not be persisted at the boot",
         "2026-10-21 (PR W review round 6): the boot fold runs before logging starts, so this re-reports, once per process, the same persist failure the two wal_applied_watermark.rs entries above review; it is coded WS-SPILL-01, already counted on the persist-failed counter durability-sync-failing pages on, and fails toward replaying more",

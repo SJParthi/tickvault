@@ -2314,6 +2314,58 @@ pub struct PartitionRetentionConfig {
     /// there before anything is dropped.
     #[serde(default = "default_depth_hot_hours")]
     pub depth_hot_hours: u32,
+    // ---- PR AA (owner Quote 51, 2026-11-07): the box copies to S3 and
+    // ---- deletes by itself. Added in step 1 with their defaults; each is
+    // ---- read by the step named on it. Until then none changes behaviour.
+    /// Longest the archiver waits, per hour-path partition, for QuestDB to
+    /// apply every WAL transaction that existed when it took its snapshot
+    /// (step 2). On timeout the partition is kept and counted.
+    #[serde(default = "default_archive_wal_snapshot_wait_secs")]
+    pub archive_wal_snapshot_wait_secs: u64,
+    /// Longest the archiver waits for every writer that can post into an old
+    /// hour (WAL replay, spill replay, the after-close depth pass) to stand
+    /// aside (step 2). On timeout the partition is kept and counted.
+    #[serde(default = "default_archive_quiesce_wait_secs")]
+    pub archive_quiesce_wait_secs: u64,
+    /// Rollback switch for the hour path on `tick_quotes`,
+    /// `market_depth_book` and `feed_aux_packets` (step 3). `false` keeps
+    /// them on their day windows.
+    #[serde(default = "default_archive_switch_on")]
+    pub pressure_hour_tables_enabled: bool,
+    /// Whether `ticks` joins the hour path (step 3). Ships `false`: a live
+    /// tick can land in an earlier hour of the day, so `ticks` stays on its
+    /// day window until the owner decides otherwise.
+    #[serde(default)]
+    pub ticks_hour_path_enabled: bool,
+    /// `market_depth` keeps its existing forced hour path under pressure
+    /// while a depth spill file is still pending (today's behaviour, shipped
+    /// 2026-09-01), until the owner decides (step 3).
+    #[serde(default = "default_archive_switch_on")]
+    pub market_depth_force_with_spill_pending: bool,
+    /// Pressure also starts when the disk is projected to fill before the
+    /// stop (step 4). `false` restores the used-percentage trigger alone.
+    #[serde(default = "default_archive_switch_on")]
+    pub pressure_projected_fill_enabled: bool,
+    /// The projected-fill trigger starts an episode only at or above this
+    /// used percentage (step 4).
+    #[serde(default = "default_pressure_projected_min_used_pct")]
+    pub pressure_projected_min_used_pct: u8,
+    /// The daily leg keeps running after the close until free space reaches
+    /// at least this percentage of the disk (step 5).
+    #[serde(default = "default_daily_free_target_pct")]
+    pub daily_free_target_pct: u8,
+    /// The daily leg's free-space target is also at least this percentage of
+    /// the p95 bytes one session wrote (step 5; 150 = 1.5 sessions).
+    #[serde(default = "default_daily_free_target_session_multiplier_pct")]
+    pub daily_free_target_session_multiplier_pct: u32,
+    /// The session size the daily target uses until five days are measured
+    /// (step 5): 40 GiB.
+    #[serde(default = "default_daily_free_target_fallback_session_bytes")]
+    pub daily_free_target_fallback_session_bytes: u64,
+    /// Whether the after-close drain hold also counts bytes still waiting to
+    /// be copied to S3 and dropped (step 6). Never past 07:30 IST.
+    #[serde(default = "default_archive_switch_on")]
+    pub drain_hold_counts_archive: bool,
     /// Internal marker: this config drives a DISK-PRESSURE archive pass.
     ///
     /// NOT a config knob. `#[serde(skip)]` means no TOML can set it and an
@@ -2358,9 +2410,57 @@ impl Default for PartitionRetentionConfig {
             pressure_max_passes: default_pressure_max_passes(),
             ingest_shed_session_burn_bytes: default_ingest_shed_session_burn_bytes(),
             depth_hot_hours: default_depth_hot_hours(),
+            archive_wal_snapshot_wait_secs: default_archive_wal_snapshot_wait_secs(),
+            archive_quiesce_wait_secs: default_archive_quiesce_wait_secs(),
+            pressure_hour_tables_enabled: true,
+            ticks_hour_path_enabled: false,
+            market_depth_force_with_spill_pending: true,
+            pressure_projected_fill_enabled: true,
+            pressure_projected_min_used_pct: default_pressure_projected_min_used_pct(),
+            daily_free_target_pct: default_daily_free_target_pct(),
+            daily_free_target_session_multiplier_pct:
+                default_daily_free_target_session_multiplier_pct(),
+            daily_free_target_fallback_session_bytes:
+                default_daily_free_target_fallback_session_bytes(),
+            drain_hold_counts_archive: true,
             under_disk_pressure: false,
         }
     }
+}
+
+/// PR AA: the four switches that ship ON (each a rollback lever).
+const fn default_archive_switch_on() -> bool {
+    true
+}
+
+/// PR AA: five minutes for QuestDB to apply the snapshot's transactions.
+const fn default_archive_wal_snapshot_wait_secs() -> u64 {
+    300
+}
+
+/// PR AA: two minutes for the old-hour writers to stand aside.
+const fn default_archive_quiesce_wait_secs() -> u64 {
+    120
+}
+
+/// PR AA: the projected-fill trigger needs the disk at least half used.
+const fn default_pressure_projected_min_used_pct() -> u8 {
+    50
+}
+
+/// PR AA: after the close, free at least 30% of the disk.
+const fn default_daily_free_target_pct() -> u8 {
+    30
+}
+
+/// PR AA: after the close, free at least 1.5 × the p95 session bytes.
+const fn default_daily_free_target_session_multiplier_pct() -> u32 {
+    150
+}
+
+/// PR AA: 40 GiB per session until five sessions are measured.
+const fn default_daily_free_target_fallback_session_bytes() -> u64 {
+    40 * 1024 * 1024 * 1024
 }
 
 /// Hour-granular depth archival ships OFF: it changes what sits on local
@@ -3622,6 +3722,54 @@ mod tests {
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
         assert!(!cfg.archive_enabled);
+    }
+
+    /// PR AA step 1: the eleven new `[partition_retention]` keys. An absent
+    /// key reads the same value as `Default`, so a config written before
+    /// PR AA parses unchanged, and every value is the one the design names.
+    #[test]
+    fn test_partition_retention_pr_aa_keys_default_and_parse() {
+        let from_toml: PartitionRetentionConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        for cfg in [PartitionRetentionConfig::default(), from_toml] {
+            assert_eq!(cfg.archive_wal_snapshot_wait_secs, 300);
+            assert_eq!(cfg.archive_quiesce_wait_secs, 120);
+            assert!(cfg.pressure_hour_tables_enabled);
+            assert!(
+                !cfg.ticks_hour_path_enabled,
+                "ticks stays off the hour path"
+            );
+            assert!(cfg.market_depth_force_with_spill_pending);
+            assert!(cfg.pressure_projected_fill_enabled);
+            assert_eq!(cfg.pressure_projected_min_used_pct, 50);
+            assert_eq!(cfg.daily_free_target_pct, 30);
+            assert_eq!(cfg.daily_free_target_session_multiplier_pct, 150);
+            assert_eq!(
+                cfg.daily_free_target_fallback_session_bytes,
+                40 * 1024 * 1024 * 1024
+            );
+            assert!(cfg.drain_hold_counts_archive);
+        }
+        let set: PartitionRetentionConfig = toml::from_str(
+            "archive_wal_snapshot_wait_secs = 60\narchive_quiesce_wait_secs = 30\n\
+             pressure_hour_tables_enabled = false\nticks_hour_path_enabled = true\n\
+             market_depth_force_with_spill_pending = false\n\
+             pressure_projected_fill_enabled = false\npressure_projected_min_used_pct = 70\n\
+             daily_free_target_pct = 25\ndaily_free_target_session_multiplier_pct = 200\n\
+             daily_free_target_fallback_session_bytes = 1024\ndrain_hold_counts_archive = false\n",
+        )
+        .expect("every PR AA key must parse");
+        assert_eq!(set.archive_wal_snapshot_wait_secs, 60);
+        assert_eq!(set.archive_quiesce_wait_secs, 30);
+        assert!(!set.pressure_hour_tables_enabled);
+        assert!(set.ticks_hour_path_enabled);
+        assert!(!set.market_depth_force_with_spill_pending);
+        assert!(!set.pressure_projected_fill_enabled);
+        assert_eq!(set.pressure_projected_min_used_pct, 70);
+        assert_eq!(set.daily_free_target_pct, 25);
+        assert_eq!(set.daily_free_target_session_multiplier_pct, 200);
+        assert_eq!(set.daily_free_target_fallback_session_bytes, 1024);
+        assert!(!set.drain_hold_counts_archive);
     }
 
     #[test]

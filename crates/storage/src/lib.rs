@@ -82,6 +82,10 @@ mod global_qcfg_tests {
     }
 }
 
+// PR AA (owner Quote 51, 2026-11-07): the lock every writer that can post into
+// an old hour shares, and the partition archiver holds alone while it copies
+// and drops one partition. Cold path, O(1) per call.
+pub mod archive_quiesce;
 pub mod boot_probe;
 // 2026-09-22 ("no views anywhere"): `console_views` no longer creates any
 // view. It DROPS every retired console view name at boot, before any table
@@ -376,6 +380,9 @@ pub mod wal_deferred_depth;
 // Frame fate (2026-10-04, audit M1): a shed frame whose WAL record the writer
 // then loses is counted as a lost frame, not a WAL hiccup.
 pub mod wal_frame_fate;
+// Wall-clock steps seen by this process (PR AA review, finding 2): the archive
+// holds an hour whose frame sequences a step moved away from its receipt hour.
+pub(crate) mod wal_clock_step;
 // WAL replay settle step (2026-10-13, DA-13c): an acked replay batch is archived
 // only after the durability lag and two clean QuestDB probes.
 pub mod wal_replay_settle;

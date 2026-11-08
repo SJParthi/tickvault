@@ -11699,6 +11699,14 @@ pub struct DhanFeedStackParams {
     /// catch-up drain can flag a process boundary across the pass boundary
     /// (plan ITEM 47, `process_boundary_is_gap`).
     pub wal_replay_last_fold_receipt: Option<i64>,
+    /// The old-hour replay registration `main.rs` takes BEFORE it spawns the
+    /// archive loops when the boot read staged frames ([`boot_replay_intent`],
+    /// PR AA finding 6), so an evening restart's archiver cannot start a
+    /// partition while this lane waits for its token, seeds and finds the
+    /// seal writer. Held through the refold and the catch-up drain; released
+    /// early if the dial wait outlasts the authentication grace, when the
+    /// lane registers again at the refold. `None` with no staged frames.
+    pub boot_replay_intent: Option<tickvault_storage::archive_quiesce::ReplayIntent<'static>>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -17089,6 +17097,27 @@ pub fn refold_wal_frames(
     out
 }
 
+/// The old-hour replay registration for a boot that read staged WAL frames
+/// (PR AA finding 6). `main.rs` takes it BEFORE it spawns the archive loops
+/// and hands it to the lane in [`DhanFeedStackParams::boot_replay_intent`],
+/// so the archiver cannot start a partition in the minutes before the lane
+/// reaches its refold. `None` when nothing was staged. O(1).
+#[must_use]
+pub fn boot_replay_intent<T>(
+    staged_frames: &[T],
+) -> Option<tickvault_storage::archive_quiesce::ReplayIntent<'static>> {
+    (!staged_frames.is_empty()).then(tickvault_storage::archive_quiesce::intend_old_hour_replay)
+}
+
+/// How long the lane keeps the boot's early replay registration while it
+/// waits for its token and dual-instance lock: the authentication grace.
+/// Past it the registration is released (the dial wait has no end of its
+/// own, and a registration held all night would keep every archive pass,
+/// the disk-pressure leg's included, standing aside); the lane registers
+/// again at the refold.
+const BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS: u64 =
+    TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS;
+
 pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task::JoinHandle<()>> {
     let env_opt_in = std::env::var(DHAN_LIVE_FEED_ENV).ok();
     let gate = feed_stack_gate(params.dhan_enabled, env_opt_in.as_deref());
@@ -17161,7 +17190,7 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
 /// halts the process, never blocks boot.
 // Private bring-up body: every decision it makes (gate, universe, plan,
 // budget) is unit-tested below, and it performs no I/O of its own.
-async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
+async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     // Rule 11: the lane reads DOWN until it is provably carrying data, so a
     // half-wired stack is never presented as up.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
@@ -17294,16 +17323,35 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // dial would notice). Both now wait on a capped backoff for as long as
     // the process lives; see `wait_for_dial_preconditions`. Nothing dials
     // before both hold.
-    let client_id =
-        match wait_for_dial_preconditions(&params.instance_lock_held, &params.shutdown, plan.len())
-            .await
-        {
-            Ok(client_id) => client_id,
-            Err(waited_secs) => {
-                note_wal_frames_deferred_by_shutdown(&params.wal_replay_live_feed, waited_secs);
-                return;
+    // PR AA finding 6: the boot's early replay registration is kept through
+    // this wait only up to the authentication grace (see
+    // `BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS`).
+    let dial_wait =
+        wait_for_dial_preconditions(&params.instance_lock_held, &params.shutdown, plan.len());
+    tokio::pin!(dial_wait);
+    let dial_ready = loop {
+        tokio::select! {
+            ready = &mut dial_wait => break ready,
+            () = tokio::time::sleep(std::time::Duration::from_secs(
+                BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS,
+            )), if params.boot_replay_intent.is_some() => {
+                params.boot_replay_intent = None;
+                info!(
+                    waited_secs = BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS,
+                    "Dhan live feed: still waiting to dial, so the archiver is no longer \
+                     held back for the staged WAL refold; the lane registers again when \
+                     it refolds"
+                );
             }
-        };
+        }
+    };
+    let client_id = match dial_ready {
+        Ok(client_id) => client_id,
+        Err(waited_secs) => {
+            note_wal_frames_deferred_by_shutdown(&params.wal_replay_live_feed, waited_secs);
+            return;
+        }
+    };
 
     // ---- the fold ----------------------------------------------------------
     // DISTINCT slots across all three pools — not the sum of their lengths.
@@ -17544,6 +17592,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // and catch-up round 0 reads the same frames again (review round 7).
     let mut boot_refold_confirmed = false;
     if !params.wal_replay_live_feed.is_empty() {
+        // PR AA review (owner Quote 51): register this replay with the
+        // archive quiesce lock for the boot refold AND the catch-up drain
+        // below. The archiver finishes the partition it may already hold and
+        // starts no other until this guard drops at the end of the block, so
+        // an evening restart's replay is not locked out all night by
+        // back-to-back archive partitions. Finding 6: the registration
+        // `main.rs` took before it spawned the archive loops is reused, so it
+        // has covered the whole bring-up; a fresh one only when it is gone.
+        let _old_hour_replay = params
+            .boot_replay_intent
+            .take()
+            .unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay);
         // ORDERING PIN -- added 2026-08-28.
         //
         // Every candle this refold seals goes through the seal closure, which
@@ -17582,6 +17642,20 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ))
             .await;
         }
+        // PR AA (owner Quote 51): the boot refold writes rows into OLD hours,
+        // so it runs only while no archiver is copying and dropping one of
+        // them. 09:00 to 15:40 IST it only tries (the morning boot never
+        // waits on an archive); outside it waits at most 60 s. Released
+        // right after the refold's flush and ack (`drop` below the chain).
+        let boot_quiesce = if seal_writer_ready && !shutdown_requested() {
+            tickvault_storage::archive_quiesce::archive_quiesce_for_replay(
+                now_ist_secs_of_day(),
+                tickvault_storage::archive_quiesce::QuiesceWriter::BootRefold,
+            )
+            .await
+        } else {
+            None
+        };
         if !seal_writer_ready {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
@@ -17604,6 +17678,19 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "Dhan live feed: shutdown arrived before the WAL refold — the staged \
                  write-ahead log frames are not folded now and are re-offered on the \
                  next boot"
+            );
+        } else if boot_quiesce.is_none() {
+            // The partition archiver held the old-hour writers out: fold
+            // nothing. The staged segments stay unconfirmed, so the catch-up
+            // drain below or the next boot reads them again. Counted on
+            // `tv_partition_archive_quiesce_held_total{writer="boot_refold"}`.
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_refold_archive_quiesce",
+                staged_frames = params.wal_replay_live_feed.len(),
+                "Dhan live feed: the partition archiver was copying an old hour to S3, so \
+                 the boot WAL refold did not run. The staged write-ahead log frames are \
+                 kept and re-offered (deferred, not lost)."
             );
         } else {
             let unlanded_before =
@@ -17718,6 +17805,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
         }
+        // PR AA: the refold, its flush and its ack are done; let an archiver in.
+        drop(boot_quiesce);
 
         // ---- CATCH-UP DRAIN --------------------------------------------
         //
@@ -18152,6 +18241,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // refused the whole round, and the next boot re-read the same
             // segments: zero progress from 21 to 26 Oct.
             let mut round_landed = true;
+            let mut round_quiesce_held = false;
             let mut round_frames = 0usize;
             let mut round_ticks = 0u64;
             let mut round_lost = 0u64;
@@ -18171,7 +18261,26 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 // DA-13c review: the suspicion count BEFORE this chunk's first ack.
                 let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
                 if !chunk.is_empty() {
+                    use tickvault_storage::archive_quiesce as aq;
                     use tickvault_storage::wal_applied_watermark::applied_watermark;
+                    // PR AA (owner Quote 51): hold the old-hour writers' lock
+                    // through this chunk's refold, flush and ack. A miss
+                    // stops the drain here, before this segment settles; it
+                    // stays waiting for the next drain or boot. PR AA
+                    // review: outside the capture window the chunk waits up
+                    // to the drain's own deadline (one archive partition can
+                    // hold the lock longer than 60 s), so the wait is charged
+                    // against that clock and never runs past it.
+                    let now = now_ist_secs_of_day();
+                    let quiesce = aq::archive_quiesce_for_replay_until(
+                        now,
+                        aq::QuiesceWriter::CatchUp,
+                        catchup_deadline,
+                    );
+                    let Some(_quiesce) = quiesce.await else {
+                        round_quiesce_held = true;
+                        break;
+                    };
                     let unlanded_before = applied_watermark().unlanded_total();
                     let outcome =
                         refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
@@ -18210,6 +18319,21 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             catchup_ticks = catchup_ticks.saturating_add(round_ticks);
             if !round_landed {
                 catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
+                break;
+            }
+            if round_quiesce_held {
+                catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;
+                if catchup_stop::quiesce_stop_needs_own_line(rounds, catchup_early_stop) {
+                    warn!(
+                        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                        source = "wal_catchup_archive_quiesce_stop",
+                        stop_reason = catchup_early_stop,
+                        frames = catchup_frames,
+                        "WAL catch-up drain stopped in its first round: the partition archiver \
+                         held the old-hour lock. Nothing is lost; the segments wait for the next \
+                         drain or boot."
+                    );
+                }
                 break;
             }
             rounds = rounds.saturating_add(1);
@@ -21714,6 +21838,7 @@ mod tests {
             wal_replay_gaps: Vec::new(),
             wal_replay_trailing_gap: None,
             wal_replay_last_fold_receipt: None,
+            boot_replay_intent: None,
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -26784,7 +26909,7 @@ mod tests {
             .expect("the lane function must exist")
             .1;
         let wait = lane
-            .find("match wait_for_dial_preconditions(")
+            .find("wait_for_dial_preconditions(&params.instance_lock_held")
             .expect("the lane must wait for the token manager and the lock before dialing");
         let dial = lane
             .find("dial_planned_connections(")

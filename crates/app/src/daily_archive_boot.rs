@@ -60,16 +60,49 @@
 //! window. Mutual exclusion lives in `partition_archive` itself — at the
 //! function, not at the call sites — so neither leg has to know about the
 //! other and no future caller can forget. See `ARCHIVE_PASS_LOCK` there.
+//!
+//! # Until done, not until 15:47 (PR AA step 5, owner Quote 51, 2026-11-07)
+//!
+//! Measured 3–7 Nov: the leg latched the day at about 15:47, while later
+//! hours only became old enough afterwards, and the box stopped with the
+//! disk still filling. Three changes:
+//!
+//! - **The window runs to 07:30 IST.** [`archive_session_day`] reads a clock
+//!   before 07:30 as the previous session day, so the loop no longer stops at
+//!   midnight; 07:30 is the drain hold's cap.
+//! - **The day latches only when it is done.** [`daily_latch_decision`]:
+//!   a clean pass that dropped nothing AND free space at or above the target
+//!   (`archive_free_target`, `max(1.5 × p95 session bytes, 30% of disk)`).
+//!   A pass that dropped something, or a clean pass below the target, gives
+//!   its attempt back, so the six-attempt cap counts only passes that failed
+//!   without progress.
+//! - **Below the target the pass uses the hour path** ([`daily_pass_config`]):
+//!   the Quote 51 tables are archived by the hour, each hour more than four
+//!   hours past its end, with every gate of the snapshot path. Day windows of
+//!   every other table are unchanged.
+//!
+//! The session size is read once a day after 15:40, before this process
+//! drops any partition of that day ([`should_measure_session`]).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
-use tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS;
+use tickvault_common::constants::{
+    MARKET_CLOSE_DRAIN_BUFFER_SECS, TICK_PERSIST_END_SECS_OF_DAY_IST,
+};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::ist_offset;
-use tickvault_storage::partition_archive::{ArchiveRunSummary, PartitionArchiver, VerifiedDayGate};
+use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
+use tickvault_storage::partition_archive::{
+    ArchivePassLimits, ArchiveRunSummary, PartitionArchiver, VerifiedDayGate,
+};
 use tracing::{debug, error, info, warn};
+
+use crate::archive_free_target::{
+    SessionBytesRing, free_target_bytes, load_session_bytes, save_session_bytes, session_bytes_path,
+};
 
 /// How often the loop asks whether the sweep is due.
 ///
@@ -87,7 +120,10 @@ const DAILY_ARCHIVE_POLL: Duration = Duration::from_secs(DAILY_ARCHIVE_POLL_INTE
 
 /// Attempts allowed per IST day before the loop stops retrying.
 ///
-/// Six, against a ~two-hour window at a five-minute poll. The cap exists so a
+/// Six attempts that fail WITHOUT progress (PR AA review: since step 5 the
+/// window runs from the close to 07:30 IST, and a pass that dropped
+/// something, was stood off by another job or only waited on QuestDB's WAL
+/// is given back, so only a real fault spends one). The cap exists so a
 /// persistently broken QuestDB is not hammered for the whole evening; it is
 /// deliberately larger than one so a single transient failure at 15:35 does
 /// not cost the day's archival, which is what latching on first attempt would
@@ -205,18 +241,21 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // before the day is out.
         return PassVerdict::Incomplete("wal_suspended");
     }
+    // PR AA review: the two real faults are named BEFORE a lagging WAL, so
+    // a pass that both waited on QuestDB and failed a partition spends its
+    // attempt (`wal_not_applied` alone is given back, `refunds_attempt`).
+    if summary.tables_list_failed > 0 {
+        return PassVerdict::Incomplete("table_list_failed");
+    }
+    if summary.failed > 0 {
+        return PassVerdict::Incomplete("partition_failed");
+    }
     if summary.tables_wal_not_applied > 0 {
         // A table's WAL could not be proven fully applied at the
         // per-partition gate (most often: it was merely behind), so its
         // partitions were kept. A later attempt the same day usually finds
         // it caught up.
         return PassVerdict::Incomplete("wal_not_applied");
-    }
-    if summary.tables_list_failed > 0 {
-        return PassVerdict::Incomplete("table_list_failed");
-    }
-    if summary.failed > 0 {
-        return PassVerdict::Incomplete("partition_failed");
     }
     // `>=` and not `>`: hitting the cap exactly means the worklist was
     // truncated at it, which is the same "there is more" as exceeding it.
@@ -228,6 +267,8 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         && summary
             .partitions_considered
             .saturating_sub(summary.held_deferred_depth)
+            .saturating_sub(summary.held_quiesce_busy)
+            .saturating_sub(summary.held_in_flight)
             >= max_partitions_per_run
     {
         return PassVerdict::Incomplete("budget_exhausted");
@@ -244,6 +285,17 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // still past retention at the next day's sweep and go then.
         return PassVerdict::Incomplete("deferred_depth_pass");
     }
+    if summary.held_quiesce_busy > 0 {
+        // PR AA step 2: hour partitions were held because a WAL replay, a
+        // spill replay or the after-close depth pass had the archive quiesce
+        // lock. Another job is doing work right now, exactly like
+        // `contended`: the caller refunds the attempt and polls again.
+        return PassVerdict::Incomplete("quiesce_busy");
+    }
+    // `held_in_flight` (PR AA step 2) does NOT keep the day open: an hour
+    // whose rows may still be on their way to QuestDB (most often the last
+    // depth hour, not acknowledged until the next session's first ack) is a
+    // partition not yet old enough, like any other; a later pass archives it.
     // The `top_volume_spill_pending` verdict (2026-10-13) went with the
     // top_volume spill and its archive hold on 2026-10-22 (plan item 62).
     PassVerdict::Complete
@@ -251,23 +303,34 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
 
 /// Whether an attempt with this outcome is given back rather than spent.
 ///
-/// Only the two "another job is doing this right now" verdicts: `contended`
-/// (the disk-pressure leg holds the archive lock) and `deferred_depth_pass`
-/// (DA-13d: the after-close depth pass holds the depth partitions while it
-/// writes rows back into them, ~15:45 to at most ~17:16 IST). Spending an
-/// attempt on either would exhaust the day's six attempts by ~16:10 and page
-/// STORAGE-GAP-04 on a box that is working. Pure, O(1).
+/// Only the "another job is doing this right now" verdicts: `contended`
+/// (the disk-pressure leg holds the archive lock), `deferred_depth_pass`
+/// (DA-13d: the after-close depth pass still has rows of a depth hour to
+/// write back) and `quiesce_busy` (PR AA step 2: a WAL replay, a spill
+/// replay or the after-close depth pass had the archive quiesce lock).
+/// Spending an attempt on any of them would exhaust the day's six attempts
+/// and page STORAGE-GAP-04 on a box that is working.
+///
+/// PR AA review: also `wal_not_applied`, a pass that only waited on a WAL
+/// QuestDB had not applied yet (no listing failure, no failed partition:
+/// [`pass_verdict`] names those first). Since the window runs to 07:30 IST,
+/// six such passes (about an hour of evening apply lag at a 300 s snapshot
+/// wait each) used to end the leg for the whole night, and the hours that
+/// became old enough afterwards were never archived. The 07:30 window end
+/// bounds those passes now; apply lag has its own watchers. Pure, O(1).
 #[must_use]
 pub fn refunds_attempt(outcome: PassOutcome) -> bool {
     matches!(
         outcome,
-        PassOutcome::Ran(PassVerdict::Incomplete("contended" | "deferred_depth_pass"))
+        PassOutcome::Ran(PassVerdict::Incomplete(
+            "contended" | "deferred_depth_pass" | "quiesce_busy" | "wal_not_applied"
+        ))
     )
 }
 
 /// Every `tv_daily_archive_attempts_total{outcome}` value, seeded at 0 when
 /// the loop starts so a first event never lands on a missing series.
-pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
+pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 12] = [
     "complete",
     "contended",
     "did_not_run",
@@ -277,6 +340,7 @@ pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
     "partition_failed",
     "budget_exhausted",
     "deferred_depth_pass",
+    "quiesce_busy",
     "skipped",
     "failed",
 ];
@@ -396,14 +460,198 @@ fn now_ist() -> (NaiveDate, u32) {
     (now.date_naive(), now.time().num_seconds_from_midnight())
 }
 
+/// The seconds-of-day (IST) at which a session day's archive window ends:
+/// 07:30, the drain hold's cap (owner Quote 31; Quote 51 "at most until
+/// 7:30 AM").
+pub const ARCHIVE_WINDOW_END_SECS_IST: u32 = crate::drain_hold::DRAIN_HOLD_CEILING_SECS_IST as u32;
+const _: () = assert!(crate::drain_hold::DRAIN_HOLD_CEILING_SECS_IST <= u32::MAX as u64);
+
+/// Seconds in a day, for the after-midnight half of a window.
+const SECS_PER_DAY: u32 = 86_400;
+
+/// Which session day's archive window `now` belongs to, and how far into
+/// that day it is (PR AA step 5, owner Quote 51 "keeps running after the
+/// close until free space reaches its target").
+///
+/// Before 07:30 IST the clock still belongs to the PREVIOUS day's window, and
+/// its seconds run past 86,400 (00:05 reads as 86,700), so [`archive_tick`]
+/// keeps answering `Run` after midnight instead of stopping at it. From
+/// 07:30 the session day is today and the window has not opened yet. If the
+/// previous day does not exist (the first date chrono knows), the clock is
+/// read as today. Pure, O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_loop_continues_past_midnight_until_0730
+pub fn archive_session_day(date_ist: NaiveDate, secs_of_day_ist: u32) -> (NaiveDate, u32) {
+    if secs_of_day_ist >= ARCHIVE_WINDOW_END_SECS_IST {
+        return (date_ist, secs_of_day_ist);
+    }
+    match date_ist.pred_opt() {
+        Some(previous) => (previous, secs_of_day_ist.saturating_add(SECS_PER_DAY)),
+        None => (date_ist, secs_of_day_ist),
+    }
+}
+
+/// The instant (Unix seconds) a daily pass of `session_day` must stop at:
+/// 07:30 IST the next calendar day, the end of its window (PR AA review).
+/// Without it a pass started at 07:29 ran its whole worklist (up to 200
+/// partitions, each holding the quiesce lock and a QuestDB export) into the
+/// 08:30 boot and the 09:00 session; the pressure leg already stops at its
+/// gate for the same reason. The pass stops at the next partition boundary
+/// once this passes. `None` only past chrono's last date. Pure, O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_daily_pass_stops_at_the_window_end
+pub fn daily_pass_stop_unix_secs(session_day: NaiveDate) -> Option<i64> {
+    let end_day = session_day.succ_opt()?;
+    let end = end_day.and_hms_opt(0, 0, 0)?
+        + chrono::TimeDelta::seconds(i64::from(ARCHIVE_WINDOW_END_SECS_IST));
+    Some(end.and_utc().timestamp() - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
+}
+
+/// What one pass means for the day (PR AA step 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatchDecision {
+    /// The day is done: latch it.
+    Latch,
+    /// The day stays open. `refund` gives the attempt back, so the attempt
+    /// cap counts only passes that made no progress and found a real fault.
+    KeepOpen {
+        /// Stable label for the log line.
+        reason: &'static str,
+        /// Whether the attempt is given back.
+        refund: bool,
+    },
+}
+
+/// Decides whether a pass closes the day (PR AA step 5, owner Quote 51:
+/// "does not mark the day done while partitions old enough to drop remain,
+/// and keeps running after the close until free space reaches its target").
+///
+/// Latches ONLY when the pass was clean ([`PassVerdict::Complete`]), it
+/// dropped nothing (so nothing it could act on was left), and free space
+/// is known and at or above the target. Otherwise the day stays open:
+/// - an incomplete pass keeps its own reason; its attempt is given back when
+///   another job stood in its way ([`refunds_attempt`]) or when it dropped
+///   at least one partition (it made progress);
+/// - a clean pass that dropped something is given back and polls again,
+///   since more may have become old enough while it ran;
+/// - a clean pass with free space below the target, or unknown, is given
+///   back too: nothing is broken, the leg just keeps polling until the
+///   window ends at 07:30 IST.
+///
+/// So the attempt cap still bounds a pass that keeps failing without
+/// progress, and the 07:30 window end bounds the rest. Pure, O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_no_latch_while_eligible_or_below_target
+pub fn daily_latch_decision(
+    outcome: PassOutcome,
+    dropped: u32,
+    free_and_target_bytes: Option<(u64, u64)>,
+) -> LatchDecision {
+    if !outcome.latches_the_day() {
+        return LatchDecision::KeepOpen {
+            reason: outcome.as_str(),
+            refund: refunds_attempt(outcome) || dropped > 0,
+        };
+    }
+    if dropped > 0 {
+        return LatchDecision::KeepOpen {
+            reason: "dropped_this_pass",
+            refund: true,
+        };
+    }
+    match free_and_target_bytes {
+        None => LatchDecision::KeepOpen {
+            reason: "free_space_unknown",
+            refund: true,
+        },
+        Some((free, target)) if free < target => LatchDecision::KeepOpen {
+            reason: "below_free_target",
+            refund: true,
+        },
+        Some(_) => LatchDecision::Latch,
+    }
+}
+
+/// Whether this tick should read the session day's size (PR AA step 5): not
+/// yet measured, the session's writes have ended (15:40 IST,
+/// `TICK_PERSIST_END_SECS_OF_DAY_IST`), still the same calendar day (an
+/// after-midnight reading would come after the night's drops), and this
+/// process has not dropped any partition of that day yet. Pure, O(1).
+#[must_use]
+pub fn should_measure_session(
+    already_measured: bool,
+    secs_into_session_day: u32,
+    dropped_this_session_day: u64,
+) -> bool {
+    !already_measured
+        && (TICK_PERSIST_END_SECS_OF_DAY_IST..SECS_PER_DAY).contains(&secs_into_session_day)
+        && dropped_this_session_day == 0
+}
+
+/// The config a daily pass runs with (PR AA step 5, owner decision 3:
+/// "below target after the close, the daily leg uses the hour path").
+///
+/// Above the target, or with free space unknown, the config is unchanged.
+/// Below it, the pass carries the hour-path marker, so `tick_quotes`,
+/// `market_depth_book` and `feed_aux_packets` (and `ticks` behind its own
+/// switch) are archived by the hour, each hour more than 4 hours past its
+/// end. Two things are deliberately NOT taken from the disk-pressure config:
+/// the day windows stay as configured (candles, SEBI and audit tables keep
+/// them), and `market_depth` is never forced onto the hour path while a
+/// depth spill file is pending (that override is the pressure leg's). Pure.
+#[must_use]
+pub fn daily_pass_config(
+    cfg: &PartitionRetentionConfig,
+    below_target: bool,
+) -> PartitionRetentionConfig {
+    if !below_target {
+        return cfg.clone();
+    }
+    PartitionRetentionConfig {
+        under_disk_pressure: true,
+        market_depth_force_with_spill_pending: false,
+        ..cfg.clone()
+    }
+}
+
+/// One `statvfs` of the data volume, off the runtime worker:
+/// `(free bytes, total bytes)`, or `None` when it fails.
+async fn probe_data_volume(data_dir: &Path) -> Option<(u64, u64)> {
+    let dir = data_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || probe_disk_free_bytes(&dir)).await {
+        Ok(DiskHealthOutcome::Ok {
+            free_bytes,
+            total_bytes,
+        }) => Some((free_bytes, total_bytes)),
+        Ok(DiskHealthOutcome::ProbeFailed { .. }) | Err(_) => None,
+    }
+}
+
+/// What one attempt produced: its outcome, the pass summary, and (when
+/// asked for) the session day's size read before the pass.
+struct PassReport {
+    outcome: PassOutcome,
+    summary: ArchiveRunSummary,
+    session_bytes: Option<anyhow::Result<u64>>,
+}
+
 /// Runs ONE sweep and classifies it. Never panics; never returns `Err`.
+///
+/// With `measure_day` set, the session day's size is read first, before the
+/// pass can drop any partition of it (PR AA step 5).
 async fn run_one_pass(
     questdb: &QuestDbConfig,
     cfg: &PartitionRetentionConfig,
     verified_day_gate: Option<&VerifiedDayGate>,
-) -> (PassOutcome, ArchiveRunSummary) {
+    measure_day: Option<NaiveDate>,
+    stop_at_unix_secs: Option<i64>,
+) -> PassReport {
     match PartitionArchiver::new(questdb, cfg).await {
         Ok(Some(archiver)) => {
+            let session_bytes = match measure_day {
+                Some(day) => Some(archiver.session_bytes_on(day).await),
+                None => None,
+            };
             // The cross-verification hold (no-rest lock §12.15): a day's
             // partitions wait for that day's 1-minute check. Only THIS leg
             // carries the gate — the disk-pressure leg never waits on it.
@@ -411,6 +659,17 @@ async fn run_one_pass(
                 Some(gate) => archiver.with_verified_day_gate(std::sync::Arc::clone(gate)),
                 None => archiver,
             };
+            // PR AA step 6: the daily leg measures the copy work it leaves
+            // for the drain hold.
+            if cfg.drain_hold_counts_archive {
+                archiver = archiver.with_backlog_measure();
+            }
+            // PR AA review: the pass stops at its window's end (07:30 IST),
+            // never running into the 08:30 boot and the 09:00 session.
+            archiver = archiver.with_pass_limits(ArchivePassLimits {
+                stop_at_unix_secs,
+                ..ArchivePassLimits::default()
+            });
             let summary = archiver.archive_and_drop_old_partitions().await;
             let verdict = pass_verdict(&summary, cfg.max_partitions_per_run);
             info!(
@@ -428,12 +687,20 @@ async fn run_one_pass(
                 verdict = ?verdict,
                 "daily partition archive pass complete (verified S3 copy before every drop)"
             );
-            (PassOutcome::Ran(verdict), summary)
+            PassReport {
+                outcome: PassOutcome::Ran(verdict),
+                summary,
+                session_bytes,
+            }
         }
         // No explicit archive bucket and no resolvable environment — archival
         // skipped rather than guessing the prod bucket. The constructor
         // already logged the actionable warn. Never latches the day.
-        Ok(None) => (PassOutcome::Skipped, ArchiveRunSummary::default()),
+        Ok(None) => PassReport {
+            outcome: PassOutcome::Skipped,
+            summary: ArchiveRunSummary::default(),
+            session_bytes: None,
+        },
         Err(err) => {
             error!(
                 ?err,
@@ -441,7 +708,11 @@ async fn run_one_pass(
                 "partition archiver construction failed — this attempt is a loud no-op \
                  and the day stays UNLATCHED so the next tick retries"
             );
-            (PassOutcome::Failed, ArchiveRunSummary::default())
+            PassReport {
+                outcome: PassOutcome::Failed,
+                summary: ArchiveRunSummary::default(),
+                session_bytes: None,
+            }
         }
     }
 }
@@ -450,7 +721,12 @@ async fn run_one_pass(
 ///
 /// Returning `None` is always a deliberate refusal with a log line naming the
 /// reason — never a silent no-op.
+///
+/// `data_dir` is the data volume the free-space target is measured on, and the
+/// home of `state/archive_session_bytes.json` (PR AA step 5); `main.rs` passes
+/// the same path the disk-pressure loop probes.
 pub fn spawn_supervised_daily_archive_loop(
+    data_dir: PathBuf,
     questdb: QuestDbConfig,
     cfg: PartitionRetentionConfig,
     market_close_time: String,
@@ -484,11 +760,12 @@ pub fn spawn_supervised_daily_archive_loop(
 
     Some(tokio::spawn(async move {
         loop {
+            let d = data_dir.clone();
             let q = questdb.clone();
             let c = cfg.clone();
             let g = verified_day_gate.clone();
             let handle =
-                tokio::spawn(async move { run_daily_archive_loop(q, c, window_open, g).await });
+                tokio::spawn(async move { run_daily_archive_loop(d, q, c, window_open, g).await });
             match handle.await {
                 Ok(()) => {
                     info!("daily archive loop returned cleanly — not respawning");
@@ -512,6 +789,7 @@ pub fn spawn_supervised_daily_archive_loop(
 /// The loop body. The pass is awaited INLINE — never spawned — so a sweep that
 /// outlives the poll interval cannot have a second sweep started on top of it.
 async fn run_daily_archive_loop(
+    data_dir: PathBuf,
     questdb: QuestDbConfig,
     cfg: PartitionRetentionConfig,
     window_open: u32,
@@ -527,20 +805,49 @@ async fn run_daily_archive_loop(
     for outcome in SEEDED_ATTEMPT_OUTCOMES {
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome).increment(0);
     }
+    // PR AA (owner Quote 51): every `writer` of the archive quiesce counter.
+    tickvault_storage::archive_quiesce::register_quiesce_counters();
+    // PR AA step 6 (AA-5, AA-6): the backlog the drain hold reads and the
+    // snapshot-wait gauge, both at 0 before the first pass.
+    crate::archive_backlog::register_archive_backlog_gauge();
+    tickvault_storage::partition_archive::register_archive_snapshot_wait_gauge();
     let completed_gauge = metrics::gauge!("tv_daily_archive_completed_today");
     // 2026-10-06 (plan item 51a): the day this process latched, held in RAM.
     // The marker can fail to save; without this latch every tick would
     // re-run a finished sweep until the attempt cap, then log a false
     // "did NOT complete" error.
     let mut latched_day: Option<i32> = None;
+    // PR AA step 5: the measured session sizes behind the free-space target.
+    // A refused file is replaced by the next save; until five days are
+    // measured again the target uses the configured fallback.
+    let ring_path = session_bytes_path(&data_dir);
+    let mut ring = match load_session_bytes(&ring_path) {
+        Ok(ring) => ring,
+        Err(reason) => {
+            warn!(
+                code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                source = "archive_session_bytes_refused",
+                path = %ring_path.display(),
+                reason = %reason,
+                "daily archive: the session-size file was refused; the free-space \
+                 target uses the fallback session size until five days are measured again"
+            );
+            SessionBytesRing::default()
+        }
+    };
+    // Partitions this process dropped per session day: a session is measured
+    // only before the first of them.
+    let mut dropped_on: (i32, u64) = (0, 0);
 
     loop {
         ticker.tick().await;
 
         // Read the day ONCE, before anything else, and use this captured value
         // for the whole tick. A sweep that crosses midnight must latch the day
-        // it STARTED, or tomorrow opens already sealed.
-        let (today_date, now_secs) = now_ist();
+        // it STARTED, or tomorrow opens already sealed. PR AA step 5: the day
+        // is the SESSION day, so the window runs past midnight until 07:30 IST.
+        let (calendar_date, calendar_secs) = now_ist();
+        let (today_date, now_secs) = archive_session_day(calendar_date, calendar_secs);
         let today = today_date.num_days_from_ce();
 
         let completed_today =
@@ -591,9 +898,106 @@ async fn run_daily_archive_loop(
             "daily partition archive sweep starting"
         );
 
-        let (outcome, _summary) = run_one_pass(&questdb, &cfg, verified_day_gate.as_ref()).await;
+        // PR AA step 5: below the free-space target the pass also archives
+        // the Quote 51 tables by the hour (owner decision 3).
+        let disk_before = probe_data_volume(&data_dir).await;
+        let below_target =
+            disk_before.is_some_and(|(free, total)| free < free_target_bytes(&ring, &cfg, total));
+        let dropped_today = if dropped_on.0 == today {
+            dropped_on.1
+        } else {
+            0
+        };
+        let measure_day = should_measure_session(ring.has_day(today_date), now_secs, dropped_today)
+            .then_some(today_date);
+        let pass_cfg = daily_pass_config(&cfg, below_target);
+
+        // PR AA step 6: a running pass keeps the last backlog reading fresh
+        // for the drain hold. The process's first pass has no reading yet,
+        // so it writes a provisional one from the probe above (PR AA
+        // finding 5): the box stays up while that first pass runs.
+        if cfg.drain_hold_counts_archive {
+            crate::archive_backlog::ARCHIVE_BACKLOG
+                .note_pass_started(chrono::Utc::now().timestamp(), below_target);
+        }
+        let report = run_one_pass(
+            &questdb,
+            &pass_cfg,
+            verified_day_gate.as_ref(),
+            measure_day,
+            daily_pass_stop_unix_secs(today_date),
+        )
+        .await;
+        let outcome = report.outcome;
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome.as_str())
             .increment(1);
+
+        match report.session_bytes {
+            // A day that wrote nothing (a holiday) is not recorded, so it
+            // never pulls the p95 down; it is not read again either way once
+            // the next session day starts.
+            Some(Ok(0)) | None => {}
+            Some(Ok(bytes)) => {
+                ring.record(today_date, bytes);
+                info!(
+                    session_day = %today_date,
+                    session_bytes = bytes,
+                    measured_days = ring.len(),
+                    "daily archive: session size measured for the free-space target"
+                );
+                if let Err(err) = save_session_bytes(&ring_path, &ring) {
+                    // APPROVED: the reading is kept in memory for this process; the file is a sizing estimate, not market data, and a lost save only makes a restart use fewer measured days
+                    warn!(
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        source = "archive_session_bytes_not_saved",
+                        path = %ring_path.display(),
+                        ?err,
+                        "daily archive: the session size could not be saved; it is kept for \
+                         this process"
+                    );
+                }
+            }
+            Some(Err(err)) => warn!(
+                code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                source = "archive_session_bytes_unread",
+                session_day = %today_date,
+                ?err,
+                "daily archive: the session size could not be read; the next tick tries \
+                 again until a partition of the day is dropped"
+            ),
+        }
+
+        let dropped = report.summary.dropped;
+        dropped_on = (today, dropped_today.saturating_add(u64::from(dropped)));
+        let disk_after = probe_data_volume(&data_dir).await;
+        let free_and_target =
+            disk_after.map(|(free, total)| (free, free_target_bytes(&ring, &cfg, total)));
+        let latch = daily_latch_decision(outcome, dropped, free_and_target);
+        // PR AA step 6 (AA-5): the copy work this pass left, for the drain
+        // hold. Off with `drain_hold_counts_archive = false`.
+        if cfg.drain_hold_counts_archive {
+            let cell = &crate::archive_backlog::ARCHIVE_BACKLOG;
+            if report.summary.pass_ran {
+                cell.publish(
+                    report.summary.archive_backlog_bytes,
+                    free_and_target.is_some_and(|(free, target)| free < target),
+                    chrono::Utc::now().timestamp(),
+                );
+            } else {
+                cell.note_pass_ended();
+            }
+        }
+        info!(
+            attempt,
+            outcome = outcome.as_str(),
+            dropped,
+            hour_path_for_free_target = below_target,
+            archive_backlog_bytes = report.summary.archive_backlog_bytes,
+            free_bytes = free_and_target.map(|(free, _)| free),
+            target_free_bytes = free_and_target.map(|(_, target)| target),
+            decision = ?latch,
+            "daily archive pass judged"
+        );
 
         // REFUND before anything else reads the ledger. A contended pass never
         // started — the disk-pressure leg holds the lock and is doing exactly
@@ -601,20 +1005,26 @@ async fn run_daily_archive_loop(
         // the budget on someone else's success and then abandon the daily
         // sweep once the lock freed. Found by adversarial review 2026-09-01.
         // DA-13d: a pass that held depth partitions for the after-close depth
-        // pass is refunded the same way (see `refunds_attempt`).
-        if refunds_attempt(outcome) {
+        // pass is refunded the same way (see `refunds_attempt`). PR AA step 5:
+        // a pass that dropped something, or a clean pass below the free-space
+        // target, is given back too (see `daily_latch_decision`).
+        if let LatchDecision::KeepOpen {
+            reason,
+            refund: true,
+        } = latch
+        {
             ledger.refund(today);
             debug!(
                 attempt,
-                outcome = outcome.as_str(),
-                "daily archive tick stood aside — another job (the disk-pressure leg, \
-                 or the after-close depth pass) holds what this pass needs; attempt \
-                 refunded, not spent, and the next tick retries"
+                reason,
+                "daily archive tick keeps the day open — another job held what this pass \
+                 needs, or the pass made progress, or free space is still below the target; \
+                 attempt refunded, not spent, and the next tick retries"
             );
             continue;
         }
 
-        if outcome.latches_the_day() {
+        if latch == LatchDecision::Latch {
             // Latch in RAM FIRST, so this process never repeats a finished
             // sweep even if the marker cannot be saved. The marker makes it
             // durable, so a crash-restart three seconds later does not re-run
@@ -1039,6 +1449,9 @@ mod tests {
             body.contains("|| latched_day == Some(today);"),
             "completed_today must OR the in-process latch"
         );
+        // PR AA review: each pass stops at its window's end, 07:30 IST.
+        assert!(body.contains("daily_pass_stop_unix_secs(today_date),"));
+        assert!(prod.contains("archiver = archiver.with_pass_limits(ArchivePassLimits {"));
         let latch = body
             .find("latched_day = Some(today);")
             .unwrap_or(usize::MAX);
@@ -1063,6 +1476,300 @@ mod tests {
         );
         assert!(failure.contains("archive COMPLETED"));
         assert!(!prod.contains("daily_task_marker::write_daily_marker("));
+    }
+
+    // ---- PR AA step 5 (owner Quote 51): the daily leg runs until done ----
+
+    fn ist(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> (NaiveDate, u32) {
+        (
+            NaiveDate::from_ymd_opt(y, m, d).expect("date"),
+            hh * 3_600 + mm * 60 + ss,
+        )
+    }
+
+    /// The window no longer stops at midnight: a clock before 07:30 IST
+    /// still belongs to the previous session day, and from 07:30 the new day
+    /// is before its own window.
+    #[test]
+    fn test_loop_continues_past_midnight_until_0730() {
+        let open = window_open_secs_of_day("15:40:00").expect("opens");
+        let fri = NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+        let sat = NaiveDate::from_ymd_opt(2026, 11, 7).expect("date");
+        let tick_at = |(date, secs): (NaiveDate, u32), completed: Option<NaiveDate>| {
+            let (session, into) = archive_session_day(date, secs);
+            (
+                session,
+                archive_tick(
+                    into,
+                    open,
+                    completed == Some(session),
+                    0,
+                    MAX_DAILY_ARCHIVE_ATTEMPTS,
+                ),
+            )
+        };
+        for (clock, want_day, want) in [
+            (ist(2026, 11, 6, 15, 45, 0), fri, ArchiveTick::Run),
+            (ist(2026, 11, 6, 23, 59, 59), fri, ArchiveTick::Run),
+            (ist(2026, 11, 7, 0, 0, 0), fri, ArchiveTick::Run),
+            (ist(2026, 11, 7, 0, 5, 0), fri, ArchiveTick::Run),
+            (ist(2026, 11, 7, 7, 29, 59), fri, ArchiveTick::Run),
+            (ist(2026, 11, 7, 7, 30, 0), sat, ArchiveTick::BeforeWindow),
+            (ist(2026, 11, 7, 8, 30, 0), sat, ArchiveTick::BeforeWindow),
+            (ist(2026, 11, 7, 15, 39, 59), sat, ArchiveTick::BeforeWindow),
+            (ist(2026, 11, 7, 15, 40, 2), sat, ArchiveTick::Run),
+        ] {
+            assert_eq!(tick_at(clock, None), (want_day, want), "{clock:?}");
+        }
+        // A day latched before midnight stays completed after it, and the
+        // new day is not sealed by it.
+        assert_eq!(
+            tick_at(ist(2026, 11, 7, 2, 0, 0), Some(fri)),
+            (fri, ArchiveTick::AlreadyCompleted)
+        );
+        assert_eq!(
+            tick_at(ist(2026, 11, 7, 15, 45, 0), Some(fri)),
+            (sat, ArchiveTick::Run)
+        );
+        // Attempts stay on the session day across midnight.
+        let mut ledger = AttemptLedger::default();
+        ledger.record(fri.num_days_from_ce());
+        let (session, _) = archive_session_day(sat, 3_600);
+        assert_eq!(ledger.attempts_on(session.num_days_from_ce()), 1);
+        // 00:05 reads as 86,700 seconds into Friday.
+        assert_eq!(archive_session_day(sat, 300), (fri, 86_700));
+        // The first date chrono knows has no previous day: read as today.
+        assert_eq!(
+            archive_session_day(NaiveDate::MIN, 10),
+            (NaiveDate::MIN, 10)
+        );
+        assert_eq!(ARCHIVE_WINDOW_END_SECS_IST, 27_000);
+    }
+
+    /// The day latches only on a clean pass that dropped nothing with free
+    /// space at or above the target; every other case keeps it open.
+    #[test]
+    fn test_no_latch_while_eligible_or_below_target() {
+        let complete = PassOutcome::Ran(PassVerdict::Complete);
+        let target = 60;
+        assert_eq!(
+            daily_latch_decision(complete, 0, Some((60, target))),
+            LatchDecision::Latch
+        );
+        assert_eq!(
+            daily_latch_decision(complete, 0, Some((u64::MAX, target))),
+            LatchDecision::Latch
+        );
+        assert_eq!(
+            daily_latch_decision(complete, 0, Some((59, target))),
+            LatchDecision::KeepOpen {
+                reason: "below_free_target",
+                refund: true
+            }
+        );
+        assert_eq!(
+            daily_latch_decision(complete, 0, None),
+            LatchDecision::KeepOpen {
+                reason: "free_space_unknown",
+                refund: true
+            }
+        );
+        // Something was dropped, so more may now be old enough: poll again,
+        // even with the disk well above the target.
+        assert_eq!(
+            daily_latch_decision(complete, 3, Some((u64::MAX, target))),
+            LatchDecision::KeepOpen {
+                reason: "dropped_this_pass",
+                refund: true
+            }
+        );
+        // No incomplete pass ever latches, whatever the disk says.
+        let incomplete = [
+            PassOutcome::Skipped,
+            PassOutcome::Failed,
+            PassOutcome::Ran(PassVerdict::Incomplete("budget_exhausted")),
+            PassOutcome::Ran(PassVerdict::Incomplete("partition_failed")),
+            PassOutcome::Ran(PassVerdict::Incomplete("wal_not_applied")),
+            PassOutcome::Ran(PassVerdict::Incomplete("contended")),
+            PassOutcome::Ran(PassVerdict::Incomplete("quiesce_busy")),
+            PassOutcome::Ran(PassVerdict::Incomplete("did_not_run")),
+        ];
+        for outcome in incomplete {
+            for disk in [None, Some((0, target)), Some((u64::MAX, target))] {
+                for dropped in [0, 1] {
+                    let LatchDecision::KeepOpen { reason, .. } =
+                        daily_latch_decision(outcome, dropped, disk)
+                    else {
+                        panic!("{outcome:?} {dropped} {disk:?} latched");
+                    };
+                    assert_eq!(reason, outcome.as_str());
+                }
+            }
+        }
+    }
+
+    /// A pass that drops something gives its attempt back, so a backlog
+    /// larger than one pass is never cut off by the cap; a pass that fails
+    /// without progress still spends one, so the cap still ends a day that
+    /// keeps failing.
+    #[test]
+    fn test_drop_refunds_attempt_and_attempts_cap_bounds() {
+        let open = window_open_secs_of_day("15:40:00").expect("opens");
+        let day = 740_000;
+        let mut ledger = AttemptLedger::default();
+        let run = |ledger: &mut AttemptLedger, outcome: PassOutcome, dropped: u32| {
+            let tick = archive_tick(
+                open + 60,
+                open,
+                false,
+                ledger.attempts_on(day),
+                MAX_DAILY_ARCHIVE_ATTEMPTS,
+            );
+            if tick != ArchiveTick::Run {
+                return tick;
+            }
+            ledger.record(day);
+            if let LatchDecision::KeepOpen { refund: true, .. } =
+                daily_latch_decision(outcome, dropped, Some((0, 1)))
+            {
+                ledger.refund(day);
+            }
+            tick
+        };
+        let exhausted = PassOutcome::Ran(PassVerdict::Incomplete("budget_exhausted"));
+        let failed = PassOutcome::Ran(PassVerdict::Incomplete("partition_failed"));
+        // Fifty budget-capped passes that each dropped partitions: none spent.
+        for _ in 0..50 {
+            assert_eq!(run(&mut ledger, exhausted, 200), ArchiveTick::Run);
+        }
+        assert_eq!(ledger.attempts_on(day), 0);
+        // Clean passes below the target are given back too.
+        for _ in 0..50 {
+            run(&mut ledger, PassOutcome::Ran(PassVerdict::Complete), 0);
+        }
+        assert_eq!(ledger.attempts_on(day), 0);
+        // A pass that fails and drops nothing spends one; the sixth such
+        // pass is the last, and the seventh tick reads exhausted.
+        for n in 1..=MAX_DAILY_ARCHIVE_ATTEMPTS {
+            assert_eq!(run(&mut ledger, failed, 0), ArchiveTick::Run);
+            assert_eq!(ledger.attempts_on(day), n);
+        }
+        assert_eq!(run(&mut ledger, failed, 0), ArchiveTick::AttemptsExhausted);
+        // A failing pass that still dropped something is progress, not spent.
+        let mut fresh = AttemptLedger::default();
+        run(&mut fresh, failed, 1);
+        assert_eq!(fresh.attempts_on(day), 0);
+    }
+
+    /// PR AA review: passes that drop nothing only because QuestDB had not
+    /// applied a WAL yet (evening apply backlog) are given back. Before the
+    /// fix six of them (about an hour) ended the leg for the night, and the
+    /// hours old enough from 18:00 to 20:00 were never archived. A pass that
+    /// also failed a partition reads `partition_failed` and still spends.
+    #[test]
+    fn test_regression_wal_lag_passes_never_exhaust_the_night() {
+        let day = 740_000;
+        let mut ledger = AttemptLedger::default();
+        let lagging = ArchiveRunSummary {
+            pass_ran: true,
+            tables_wal_not_applied: 1,
+            partitions_considered: 4,
+            ..ArchiveRunSummary::default()
+        };
+        // 18:00 to 07:30 at the five-minute poll.
+        for tick in 0..162_u32 {
+            let now = 18 * 3_600 + tick * 300;
+            assert_eq!(
+                archive_tick(
+                    now,
+                    56_400,
+                    false,
+                    ledger.attempts_on(day),
+                    MAX_DAILY_ARCHIVE_ATTEMPTS
+                ),
+                ArchiveTick::Run,
+                "tick {tick}"
+            );
+            ledger.record(day);
+            let outcome = PassOutcome::Ran(pass_verdict(&lagging, 200));
+            if let LatchDecision::KeepOpen { refund: true, .. } =
+                daily_latch_decision(outcome, 0, Some((0, 1)))
+            {
+                ledger.refund(day);
+            }
+        }
+        assert_eq!(ledger.attempts_on(day), 0);
+        let lagging_and_failed = ArchiveRunSummary {
+            failed: 1,
+            ..lagging
+        };
+        let verdict = pass_verdict(&lagging_and_failed, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("partition_failed"));
+        assert!(!refunds_attempt(PassOutcome::Ran(verdict)));
+    }
+
+    /// PR AA review: a daily pass stops at its window's end, 07:30 IST the
+    /// next calendar day, and the loop hands that stop to the archiver.
+    #[test]
+    fn test_daily_pass_stops_at_the_window_end() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).expect("date");
+        let stop = daily_pass_stop_unix_secs(day).expect("stop");
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 11, 10)
+            .and_then(|d| d.and_hms_opt(2, 0, 0))
+            .expect("02:00 UTC = 07:30 IST")
+            .and_utc()
+            .timestamp();
+        assert_eq!(stop, expected);
+        let started_0729 = expected - 60;
+        assert!(
+            !tickvault_storage::partition_archive::pass_deadline_reached(Some(stop), started_0729)
+        );
+        assert!(tickvault_storage::partition_archive::pass_deadline_reached(
+            Some(stop),
+            expected
+        ));
+        // The wiring is pinned in `test_latch_marker_failure_still_latches_in_process`.
+    }
+
+    /// A session is read once, after 15:40, the same calendar day, and only
+    /// before this process dropped any of its partitions.
+    #[test]
+    fn test_should_measure_session_once_after_1540_before_any_drop() {
+        let end = TICK_PERSIST_END_SECS_OF_DAY_IST;
+        assert!(should_measure_session(false, end, 0));
+        assert!(should_measure_session(false, 86_399, 0));
+        assert!(!should_measure_session(false, end - 1, 0), "before 15:40");
+        assert!(!should_measure_session(false, 86_400, 0), "after midnight");
+        assert!(!should_measure_session(false, 86_700, 0), "after midnight");
+        assert!(!should_measure_session(true, end, 0), "already measured");
+        assert!(!should_measure_session(false, end, 1), "after a drop");
+    }
+
+    /// Below the target the daily pass gets the hour-path marker and nothing
+    /// else from the pressure config: day windows stay, and `market_depth`
+    /// is not forced past a pending spill file.
+    #[test]
+    fn test_daily_pass_config_below_target_uses_hour_path_only() {
+        let cfg = PartitionRetentionConfig {
+            depth_hot_hours: 4,
+            market_depth_force_with_spill_pending: true,
+            ..PartitionRetentionConfig::default()
+        };
+        // The config has no `PartialEq`; its `Debug` text names every field.
+        let text = |c: &PartitionRetentionConfig| format!("{c:?}");
+        assert_eq!(text(&daily_pass_config(&cfg, false)), text(&cfg));
+        let below = daily_pass_config(&cfg, true);
+        assert!(below.under_disk_pressure);
+        assert!(!below.market_depth_force_with_spill_pending);
+        assert_eq!(
+            text(&PartitionRetentionConfig {
+                under_disk_pressure: false,
+                market_depth_force_with_spill_pending: true,
+                ..below
+            }),
+            text(&cfg),
+            "every other field, the day windows included, is unchanged"
+        );
     }
 }
 
@@ -1215,6 +1922,48 @@ mod pass_ran_tests {
         assert!(!refunds_attempt(PassOutcome::Failed));
     }
 
+    /// PR AA step 2: a pass whose hour partitions were held because an
+    /// old-hour writer had the archive quiesce lock is incomplete and gives
+    /// its attempt back; held partitions take no budget; an hour held only
+    /// because its rows may still be in flight does not keep the day open.
+    #[test]
+    fn test_quiesce_busy_refunds_and_in_flight_does_not_hold_the_day() {
+        let ran = ArchiveRunSummary {
+            pass_ran: true,
+            ..ArchiveRunSummary::default()
+        };
+        let busy = ArchiveRunSummary {
+            held_quiesce_busy: 2,
+            ..ran
+        };
+        let verdict = pass_verdict(&busy, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("quiesce_busy"));
+        assert!(refunds_attempt(PassOutcome::Ran(verdict)));
+        assert!(SEEDED_ATTEMPT_OUTCOMES.contains(&"quiesce_busy"));
+        // A real failure in the same pass still spends the attempt.
+        let busy_and_failed = ArchiveRunSummary { failed: 1, ..busy };
+        assert_eq!(
+            pass_verdict(&busy_and_failed, 200),
+            PassVerdict::Incomplete("partition_failed")
+        );
+        let in_flight = ArchiveRunSummary {
+            held_in_flight: 3,
+            ..ran
+        };
+        assert_eq!(pass_verdict(&in_flight, 200), PassVerdict::Complete);
+        // Held partitions take worklist slots but no budget.
+        let full_of_holds = ArchiveRunSummary {
+            partitions_considered: 200,
+            held_in_flight: 100,
+            held_quiesce_busy: 100,
+            ..ran
+        };
+        assert_eq!(
+            pass_verdict(&full_of_holds, 200),
+            PassVerdict::Incomplete("quiesce_busy")
+        );
+    }
+
     // Regression: 2026-10-13 (DA-13d re-review) — held depth partitions took
     // slots in the per-run budget, so a backlog of 200 read as
     // budget_exhausted, was not refunded, and the attempts still ran out.
@@ -1271,6 +2020,47 @@ mod pass_ran_tests {
         assert!(line.ends_with(" 0"), "seeded at 0, got {line}");
     }
 
+    // PR AA step 1: the archive quiesce counter puts every `writer` series on
+    // /metrics at 0 (seeded by the daily archive loop), and a deferral adds
+    // one to its own writer only. Local /metrics only: no page, no alarm.
+    #[test]
+    fn test_archive_quiesce_counters_seed_at_zero_and_count() {
+        use tickvault_storage::archive_quiesce::{
+            QUIESCE_HELD_COUNTER, QuiesceWriter, note_quiesce_held, register_quiesce_counters,
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_quiesce_counters();
+            note_quiesce_held(QuiesceWriter::CatchUp);
+        });
+        let rendered = handle.render();
+        for writer in QuiesceWriter::ALL {
+            let label = format!("writer=\"{}\"", writer.label());
+            let line = rendered
+                .lines()
+                .find(|l| l.starts_with(&format!("{QUIESCE_HELD_COUNTER}{{")) && l.contains(&label))
+                .unwrap_or_else(|| panic!("{label} not seeded; got:\n{rendered}"));
+            let expected = if writer == QuiesceWriter::CatchUp {
+                " 1"
+            } else {
+                " 0"
+            };
+            assert!(line.ends_with(expected), "{line}");
+        }
+        // The daily loop is the seeding site.
+        let src = include_str!("daily_archive_boot.rs");
+        let body = src
+            .split("async fn run_daily_archive_loop(")
+            .nth(1)
+            .expect("the loop exists");
+        let seed = body.find("register_quiesce_counters();").expect("seeded");
+        assert!(
+            seed < body.find("loop {").expect("loop"),
+            "seeded before the loop"
+        );
+    }
+
     // Regression: 2026-10-13 (DA-13d review) — the new outcome label was not
     // seeded at 0. Every reason `pass_verdict` can return, and every other
     // outcome, must be in the seeded set.
@@ -1305,6 +2095,10 @@ mod pass_ran_tests {
             },
             ArchiveRunSummary {
                 held_deferred_depth: 1,
+                ..ran
+            },
+            ArchiveRunSummary {
+                held_quiesce_busy: 1,
                 ..ran
             },
             ran,
@@ -1372,8 +2166,14 @@ mod spawn_refusal_tests {
             ..PartitionRetentionConfig::default()
         };
         assert!(
-            spawn_supervised_daily_archive_loop(test_questdb(), cfg, "15:30:00".to_string(), None)
-                .is_none(),
+            spawn_supervised_daily_archive_loop(
+                PathBuf::from("data"),
+                test_questdb(),
+                cfg,
+                "15:30:00".to_string(),
+                None,
+            )
+            .is_none(),
             "archive_enabled = false must spawn no task at all"
         );
     }
@@ -1388,6 +2188,7 @@ mod spawn_refusal_tests {
         for bad in ["", "half past three", "15:30", "99:99:99"] {
             assert!(
                 spawn_supervised_daily_archive_loop(
+                    PathBuf::from("data"),
                     test_questdb(),
                     enabled_cfg(),
                     bad.to_string(),
@@ -1405,6 +2206,7 @@ mod spawn_refusal_tests {
     #[tokio::test]
     async fn a_valid_config_does_spawn_the_loop() {
         let handle = spawn_supervised_daily_archive_loop(
+            PathBuf::from("data"),
             test_questdb(),
             enabled_cfg(),
             "15:30:00".to_string(),

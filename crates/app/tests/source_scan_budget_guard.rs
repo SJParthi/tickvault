@@ -40,7 +40,11 @@ const BUDGET: &[(&str, usize)] = &[
     // `ensure_until_keyed_returns_once_every_statement_is_accepted`.
     ("candle_ddl_boot.rs", 7),
     ("contract_name_repair_boot.rs", 1),
-    ("daily_archive_boot.rs", 1),
+    // 1 -> 2 (2026-11-07, PR AA step 1, owner Quote 51): pins that the daily
+    // loop seeds the quiesce counters before its first pass (the loop cannot
+    // run without QuestDB and S3). Paired behaviour half in the same test:
+    // every `writer` series renders at 0 and a held catch-up counts 1.
+    ("daily_archive_boot.rs", 2),
     ("daily_task_marker.rs", 2),
     ("depth200_ranked_steer.rs", 1),
     ("depth20_track.rs", 1),
@@ -70,7 +74,31 @@ const BUDGET: &[(&str, usize)] = &[
     // the lag class split is reached from the drain and the publish (paired
     // behaviour test: `test_ws_lag_max_takes_the_largest_and_resets`).
     ("dhan_feed_stack.rs", 84),
+    // 2026-11-07 (PR AA step 1, owner Quote 51): 1 wiring scan of the lane,
+    // read by two tests: each catch-up chunk takes the archive quiesce lock
+    // before its refold, and the boot refold takes it and lets go before the
+    // catch-up (the lane's select! loop cannot be driven from a unit test).
+    // Paired behaviour tests: `test_catchup_stops_with_archive_quiesce_reason`,
+    // and in `archive_quiesce` `test_boot_refold_in_session_never_waits_on_quiesce`
+    // and `test_quiesce_writer_waits_behind_queued_archiver`.
+    // 1 -> 2 (2026-11-08, PR AA finding 6): `main.rs` registers the boot
+    // replay before either archive loop spawns, which no unit test can drive.
+    // Paired behaviour tests: `test_boot_replay_intent_only_for_staged_frames`
+    // and, in `archive_quiesce`,
+    // `test_regression_archiver_stands_aside_while_a_replay_is_registered`.
+    ("dhan_feed_stack/catchup_stop.rs", 2),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
+    // 2026-11-07 (PR AA steps 1 and 2, owner Quote 51): 3 scans. Each bucket
+    // binds the archive quiesce guard through its flush, the floor wait runs
+    // before the first bucket lock, and the all-night depth-partition hold
+    // does not come back (a blocking lock held on a plain thread would stall
+    // every other pass test). Paired behaviour halves in the same tests,
+    // `test_regression_m4_floor_wait_runs_before_the_first_bucket` (the pass
+    // returns at its floor, writing nothing) and
+    // `test_regression_da13d_marks_stay_set_through_the_settle_and_no_all_night_hold`
+    // (the marks stay set through the settle), plus `archive_quiesce`'s
+    // `test_shared_blocking_waits_for_the_archiver_on_a_plain_thread`.
+    ("dhan_feed_stack/deferred_depth_pass.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     // 2026-10-26 (audit PR M / M4): 1 wiring scan, every dial batch republishes
     // the reserved-connections gauge (the widen dials long after bring-up and
@@ -92,7 +120,17 @@ const BUDGET: &[(&str, usize)] = &[
     // source. Paired behaviour test for the count itself:
     // `test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy`.
     ("dhan_universe.rs", 4),
-    ("disk_pressure_boot.rs", 7),
+    // 7 -> 8 (2026-11-07, PR AA step 4, owner Quote 51): the pressure loop
+    // cannot run without QuestDB and S3, so `test_projected_fill_is_wired_into_the_loop`
+    // pins the wiring by source. Paired behaviour tests for the decisions:
+    // `test_projected_start_needs_min_used_pct_and_the_switch` and
+    // `test_in_session_projected_allows_one_depth_partition`.
+    // 8 -> 9 (2026-11-08, PR AA finding 4 and its recheck):
+    // `test_projected_only_reaches_the_pass_config` pins that the loop's
+    // day-window decision reaches the pass config. Paired behaviour tests:
+    // `test_pressure_day_keeps_candle_day_windows_unless_used_space_drives_the_pass`
+    // and `test_regression_used_space_episode_below_low_water_keeps_the_day_windows`.
+    ("disk_pressure_boot.rs", 9),
     ("ensure_questdb.rs", 1),
     // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
     // hold supervisor); paired behaviour tests `evening_step_*`,
