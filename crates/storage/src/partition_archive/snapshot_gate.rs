@@ -29,8 +29,9 @@
 //!    counted (`quiesce_busy`); the daily leg gives the attempt back.
 //! 3. In-flight check ([`hour_in_flight_verdict`]): the hour is held when any
 //!    of its frames is still on its way to QuestDB (unapplied ranges,
-//!    after-close depth marks, a rescue batch, not yet acknowledged, or a
-//!    clock that stepped back). For a table on the hour path that was not
+//!    after-close depth marks, a rescue batch, not yet acknowledged, a clock
+//!    that stepped back, or a wall-clock step this process saw near the hour,
+//!    `crate::wal_clock_step`). For a table on the hour path that was not
 //!    forced past a pending spill file, the archiver also reads the table's
 //!    own spill folder again here, under the lock (PR AA review): a batch
 //!    rescued to a spill file counts as acknowledged, so only the folder
@@ -270,6 +271,12 @@ pub(crate) enum InFlightVerdict {
     /// The newest frame sequence is ahead of the wall clock, so frame
     /// sequences no longer map to hours.
     ClockAhead,
+    /// This process saw a wall-clock step (receipt anchor, or a segment
+    /// rotation that found the frame counter ahead of the wall) whose window
+    /// overlaps the hour: its rows can carry frame sequences outside the
+    /// hour's span, so no frame check can clear it (PR AA review, finding 2).
+    /// Held until the next restart, which forgets the step (RAM only).
+    ClockStepped,
     /// The table's own spill folder holds a file the spill replay has not
     /// read yet (PR AA review). A rescued batch counts as acknowledged, so
     /// none of the frame checks above sees its rows; the folder is read
@@ -288,6 +295,7 @@ impl InFlightVerdict {
             Self::RescueFloor => "rescue_floor",
             Self::NotAcked => "not_acked",
             Self::ClockAhead => "clock_ahead",
+            Self::ClockStepped => "clock_stepped",
             Self::SpillPending => "spill_pending",
         }
     }
@@ -310,6 +318,9 @@ pub(crate) struct InFlightInputs<'a> {
     pub(crate) last_frame_seq: u64,
     /// The wall clock now, UTC nanoseconds.
     pub(crate) wall_nanos: u64,
+    /// The wall-clock step window this process recorded (UTC nanos), or
+    /// `None` (`crate::wal_clock_step::clock_step_window`).
+    pub(crate) clock_step: Option<(u64, u64)>,
 }
 
 /// Whether any row of the hour spanning `span` may still be on its way to
@@ -347,6 +358,9 @@ pub(crate) fn hour_in_flight_verdict(
     if inputs.last_frame_seq > inputs.wall_nanos.saturating_add(CLOCK_AHEAD_LIMIT_NANOS) {
         return InFlightVerdict::ClockAhead;
     }
+    if crate::wal_clock_step::window_overlaps(inputs.clock_step, span.lo, span.hi) {
+        return InFlightVerdict::ClockStepped;
+    }
     InFlightVerdict::Clear
 }
 
@@ -374,6 +388,7 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
         acked_high,
         last_frame_seq: crate::ws_frame_spill::current_frame_seq(),
         wall_nanos: crate::wal_applied_watermark::wall_nanos(),
+        clock_step: crate::wal_clock_step::clock_step_window(),
     };
     hour_in_flight_verdict(span, &inputs)
 }
@@ -804,7 +819,9 @@ fn note_in_flight(
     )
     .increment(1);
     match verdict {
-        InFlightVerdict::ClockAhead | InFlightVerdict::WalNotBound => {
+        InFlightVerdict::ClockAhead
+        | InFlightVerdict::ClockStepped
+        | InFlightVerdict::WalNotBound => {
             warn!(
                 code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
                 table,
@@ -1046,6 +1063,7 @@ mod tests {
             acked_high: span.hi + REPLAY_REORDER_SLACK_SEQ + 1,
             last_frame_seq: span.hi + 3_600 * SEC,
             wall_nanos: span.hi + 3_600 * SEC,
+            clock_step: None,
         }
     }
 
@@ -1201,6 +1219,63 @@ mod tests {
         );
     }
 
+    /// PR AA review finding 2. A 600 s step back at 11:05 IST: rows land in
+    /// hour 10 with frame sequences of about 11:05, so a mark on them is
+    /// outside hour 10's span. Every frame check reads clear (acked past the
+    /// span, no ranges, counter not ahead of the wall); only the recorded
+    /// step holds the hour. UTC epochs computed with `date -u -d`.
+    #[test]
+    fn test_in_flight_holds_an_hour_near_a_backward_clock_step() {
+        let applied = AppliedSnapshot::default();
+        let span = hour_frame_seq_span("2026-11-07T10").expect("span");
+        // 2026-11-07 11:05:00 IST = 05:35:00 UTC.
+        let step_at = 1_794_029_700 * SEC;
+        let window = crate::wal_clock_step::step_window(step_at, 600 * SEC);
+        let stepped = InFlightInputs {
+            clock_step: window,
+            ..clear_inputs(&applied, span)
+        };
+        assert!(stepped.last_frame_seq <= stepped.wall_nanos);
+        assert_eq!(
+            hour_in_flight_verdict(span, &stepped),
+            InFlightVerdict::ClockStepped
+        );
+        // The same inputs with no step recorded read clear.
+        assert_eq!(
+            hour_in_flight_verdict(span, &clear_inputs(&applied, span)),
+            InFlightVerdict::Clear
+        );
+        // An hour the window does not reach is not held for it.
+        let far = hour_frame_seq_span("2026-11-07T08").expect("span");
+        let far_inputs = InFlightInputs {
+            clock_step: window,
+            ..clear_inputs(&applied, far)
+        };
+        assert_eq!(
+            hour_in_flight_verdict(far, &far_inputs),
+            InFlightVerdict::Clear
+        );
+    }
+
+    /// PR AA review finding 2. A 600 s step forward at 11:59:45 IST: frame
+    /// sequences jump to about 12:09:45 while receipts stay in hour 11 until
+    /// the anchor refresh, so hour 11 is held.
+    #[test]
+    fn test_in_flight_holds_an_hour_near_a_forward_clock_step() {
+        let applied = AppliedSnapshot::default();
+        let span = hour_frame_seq_span("2026-11-07T11").expect("span");
+        // 2026-11-07 11:59:45 IST = 06:29:45 UTC.
+        let step_at = 1_794_032_985 * SEC;
+        let inputs = InFlightInputs {
+            clock_step: crate::wal_clock_step::step_window(step_at, 600 * SEC),
+            ..clear_inputs(&applied, span)
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &inputs),
+            InFlightVerdict::ClockStepped
+        );
+    }
+
     #[test]
     fn test_in_flight_labels_are_stable_and_distinct() {
         let all = [
@@ -1211,6 +1286,7 @@ mod tests {
             InFlightVerdict::RescueFloor,
             InFlightVerdict::NotAcked,
             InFlightVerdict::ClockAhead,
+            InFlightVerdict::ClockStepped,
             InFlightVerdict::SpillPending,
         ];
         let mut labels: Vec<&str> = all.iter().map(|v| v.as_str()).collect();

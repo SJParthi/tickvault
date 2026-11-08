@@ -510,6 +510,7 @@ impl World {
             acked_high,
             last_frame_seq: self.max_seq,
             wall_nanos: Self::seq_at(self.wall_ist()),
+            clock_step: None,
         };
         hour_in_flight_verdict(span, &inputs)
     }

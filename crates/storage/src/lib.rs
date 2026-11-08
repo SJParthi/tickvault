@@ -380,6 +380,9 @@ pub mod wal_deferred_depth;
 // Frame fate (2026-10-04, audit M1): a shed frame whose WAL record the writer
 // then loses is counted as a lost frame, not a WAL hiccup.
 pub mod wal_frame_fate;
+// Wall-clock steps seen by this process (PR AA review, finding 2): the archive
+// holds an hour whose frame sequences a step moved away from its receipt hour.
+pub(crate) mod wal_clock_step;
 // WAL replay settle step (2026-10-13, DA-13c): an acked replay batch is archived
 // only after the durability lag and two clean QuestDB probes.
 pub mod wal_replay_settle;
