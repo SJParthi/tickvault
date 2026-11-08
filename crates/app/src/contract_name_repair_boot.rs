@@ -33,7 +33,7 @@ use tracing::{info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_storage::contract_name_repair::{
-    CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS, NameRow, RepairDayTally,
+    CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS, NameRow, RepairDayTally, begin_repair_run,
     repair_contract_names_for_day,
 };
 
@@ -135,8 +135,11 @@ pub fn exec_url(config: &QuestDbConfig) -> String {
 }
 
 /// Repair every day of [`repair_days`] whose files still read. Returns the
-/// summed tally.
+/// summed tally. The run's days are published to the partition archiver for
+/// as long as it lasts ([`begin_repair_run`]), so a run that crosses IST
+/// midnight keeps its oldest day locked.
 async fn run_once(client: &reqwest::Client, url: &str, today: &str) -> RepairDayTally {
+    let _run_days = begin_repair_run(today);
     let tables = repair_tables();
     let mut total = RepairDayTally::default();
     for day in repair_days(today) {

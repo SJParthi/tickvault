@@ -57,28 +57,39 @@
 //!   the archiver side across the copy and the drop of every partition this
 //!   repair can rewrite: on the hour path every partition of the table, on
 //!   the day path a partition of one of the repair's days
-//!   ([`repair_may_rewrite_partition`]: today and
-//!   [`CONTRACT_NAME_REPAIR_LOOKBACK_DAYS`] before, plus one day of midnight
-//!   margin). A table whose lock wait runs out is left for the next attempt.
-//! - The statement can hold the lock for up to
-//!   [`CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS`] (600 s), and twice that
-//!   when it gets no answer (below), longer than the archiver waits for it
-//!   (`archive_quiesce_wait_secs`). Such an archive pass then keeps every
-//!   further locked partition (`quiesce_busy`) and stands aside until a
-//!   later pass; an older day-path partition does not wait. Nothing is
-//!   lost; the archive waits.
+//!   ([`repair_may_rewrite_partition`]: the days the run in progress
+//!   published at its start ([`begin_repair_run`]: its `today` and
+//!   [`CONTRACT_NAME_REPAIR_LOOKBACK_DAYS`] before), however many IST
+//!   midnights it crosses, and today and the eight days before on the
+//!   archiver's clock). A table whose lock wait runs out is left for the next
+//!   attempt.
+//! - The lock is held, per table, for up to
+//!   [`CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS`] (600 s) for the statement
+//!   and, when it gets no answer, about
+//!   [`CONTRACT_NAME_REPAIR_SETTLE_WAIT_SECS`] (600 s) plus one poll more
+//!   (every settle poll is cut off at one poll interval), so about 20 minutes
+//!   at worst, and the repair takes it again for each table (at most 10
+//!   tables, 8 days, 3 runs a day). That is longer than the archiver waits
+//!   for it (`archive_quiesce_wait_secs`); such an archive pass keeps every
+//!   further locked partition (`quiesce_busy`) and the pressure leg stands
+//!   aside until a later pass, so on an evening when QuestDB is wedged the
+//!   pressure leg can free little for hours. An older day-path partition does
+//!   not wait. Nothing is lost; the archive waits.
 //! - Unknown (not verified against QuestDB 9.3.5): whether QuestDB cancels
 //!   an `/exec` `INSERT … SELECT` when the client gives up at that timeout.
-//!   So a statement that got no answer keeps the lock until the table reads
-//!   applied with the same committed transaction on two polls
-//!   [`TABLE_QUIET_POLL_SECS`] apart, for at most
-//!   [`CONTRACT_NAME_REPAIR_SETTLE_WAIT_SECS`] more; past that the lock is
+//!   So a statement that got no answer keeps the lock while QuestDB lists a
+//!   query starting `INSERT INTO <table> (` in `query_activity()` (the 9.3.5
+//!   console reads that function; its `query` column is Assumed, not checked
+//!   on a live 9.3.5), sends it `CANCEL QUERY` once at half the settle
+//!   budget, and then needs two polls [`TABLE_QUIET_POLL_SECS`] apart with no
+//!   such query and the same committed, applied transaction. An unreadable
+//!   query list counts as "still running". Past the budget the lock is
 //!   released, the day stays unfinished and one coded `warn!` says so. What
-//!   this does not close: a statement QuestDB is still running (reading, not
-//!   yet committed) when both polls are taken reads quiet too, and
-//!   `query_activity()` is not consulted. If it commits after the release,
-//!   an hour copied in that window can keep its blank names in S3, because
-//!   the archiver's re-count compares only the row count and `max(ts)`.
+//!   this does not close: a statement QuestDB still runs (or that its list
+//!   cannot show) at the end of the budget after the cancel. If it commits
+//!   after the release, an hour copied in that window can keep its blank
+//!   names in S3, because the archiver's re-count compares only the row
+//!   count and `max(ts)`.
 //!
 //! Cold path: runs from the app's once-a-day after-close task, never on the
 //! frame drain.
@@ -172,19 +183,83 @@ pub fn repair_may_rewrite(table: &str) -> bool {
 /// are kept seven days, so an older day has no names to give.
 pub const CONTRACT_NAME_REPAIR_LOOKBACK_DAYS: u32 = 7;
 
+/// The oldest IST day (`NaiveDate::num_days_from_ce`) the after-close repair
+/// run in progress may rewrite, or `i32::MAX` while none runs. Set from the
+/// run's own `today` when it starts ([`begin_repair_run`]) and cleared when
+/// it ends, so a run that crosses any number of IST midnights keeps every one
+/// of its days locked (recheck of PR AA finding 1, 2026-11-08: the archiver
+/// recomputed the days from its own clock with one day of margin, and a run
+/// can last longer than a day).
+static RUNNING_REPAIR_OLDEST_DAY: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MAX);
+
+/// Held for one repair run: the archiver treats the run's days as reachable
+/// until it is dropped.
+#[derive(Debug)]
+pub struct RepairRunDays {
+    _held: (),
+}
+
+impl Drop for RepairRunDays {
+    fn drop(&mut self) {
+        RUNNING_REPAIR_OLDEST_DAY.store(i32::MAX, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Publishes the days of a repair run that starts with IST day `today`
+/// (`YYYY-MM-DD`): `today` and [`CONTRACT_NAME_REPAIR_LOOKBACK_DAYS`] before
+/// it stay reachable for the archiver until the returned guard drops. A
+/// `today` that does not parse publishes every day (fail closed). One store,
+/// O(1). The process runs one repair loop, so one run at a time.
+#[must_use]
+pub fn begin_repair_run(today: &str) -> RepairRunDays {
+    RUNNING_REPAIR_OLDEST_DAY.store(run_oldest_day(today), std::sync::atomic::Ordering::Release);
+    RepairRunDays { _held: () }
+}
+
+/// The oldest day (`num_days_from_ce`) a run starting on `today` visits;
+/// `i32::MIN` (every day) when `today` does not parse. Pure, O(1).
+fn run_oldest_day(today: &str) -> i32 {
+    chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| {
+            d.checked_sub_days(chrono::Days::new(u64::from(
+                CONTRACT_NAME_REPAIR_LOOKBACK_DAYS,
+            )))
+        })
+        .map_or(i32::MIN, |d| chrono::Datelike::num_days_from_ce(&d))
+}
+
 /// Whether the repair can rewrite `partition` of `table` when the archiver's
 /// IST day is `today_ist` (recheck of PR AA finding 1, narrowed on its
 /// recheck): [`repair_may_rewrite`] and the partition's IST day (its first
-/// ten characters; `ts` holds IST) is at most
-/// [`CONTRACT_NAME_REPAIR_LOOKBACK_DAYS`] + 1 days old. The extra day covers
-/// a repair that started before IST midnight and still uses its own `today`.
-/// A day after `today_ist` (a clock step) or a name that does not parse is
-/// treated as reachable, so the lock is kept. Pure, O(1).
+/// ten characters; `ts` holds IST) is either a day of the run in progress
+/// ([`begin_repair_run`]) or at most [`CONTRACT_NAME_REPAIR_LOOKBACK_DAYS`] +
+/// 1 days old. The extra day covers a run that read its `today` just before
+/// IST midnight and has not published it yet. A day after `today_ist` (a
+/// clock step) or a name that does not parse is treated as reachable, so the
+/// lock is kept. O(1): one atomic load.
 #[must_use]
 pub fn repair_may_rewrite_partition(
     table: &str,
     partition: &str,
     today_ist: chrono::NaiveDate,
+) -> bool {
+    partition_in_repair_days(
+        table,
+        partition,
+        today_ist,
+        RUNNING_REPAIR_OLDEST_DAY.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// [`repair_may_rewrite_partition`] with the running run's oldest day given.
+/// Pure, O(1).
+fn partition_in_repair_days(
+    table: &str,
+    partition: &str,
+    today_ist: chrono::NaiveDate,
+    running_oldest_day: i32,
 ) -> bool {
     if !repair_may_rewrite(table) {
         return false;
@@ -195,8 +270,9 @@ pub fn repair_may_rewrite_partition(
     else {
         return true;
     };
-    today_ist.signed_duration_since(day).num_days()
-        <= i64::from(CONTRACT_NAME_REPAIR_LOOKBACK_DAYS) + 1
+    chrono::Datelike::num_days_from_ce(&day) >= running_oldest_day
+        || today_ist.signed_duration_since(day).num_days()
+            <= i64::from(CONTRACT_NAME_REPAIR_LOOKBACK_DAYS) + 1
 }
 
 /// `true` when `day` is exactly `YYYY-MM-DD` in ASCII digits. Every SQL string
@@ -508,6 +584,9 @@ enum QuietPoll {
     Suspended,
     /// Not applied and quiet within the budget.
     StillWritten,
+    /// After an unanswered statement: QuestDB still listed it as running, or
+    /// its query list could not be read, at the end of the budget.
+    StillRunning,
 }
 
 /// How long and how often a WAL wait polls.
@@ -529,9 +608,55 @@ const SETTLE_TIMING: PollTiming = PollTiming {
     poll: Duration::from_secs(TABLE_QUIET_POLL_SECS),
 };
 
+/// Time left until `deadline` (zero once past it).
+fn time_left(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+/// [`exec`] bounded by `limit` (recheck of PR AA finding 1, 2026-11-08):
+/// every poll of a wait is cut off at one poll interval and at the wait's own
+/// deadline, so a wait never runs a full client timeout past its budget.
+/// `None` when it ran out.
+async fn exec_within(
+    client: &Client,
+    exec_url: &str,
+    sql: &str,
+    limit: Duration,
+) -> Option<String> {
+    tokio::time::timeout(limit, exec(client, exec_url, sql))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The ids of every query QuestDB is running whose text starts like the
+/// repair statement for `table` (`INSERT INTO <table> (`). Only this module
+/// sends SQL inserts into these tables (the live writers use ILP), so a match
+/// is the repair statement or one like it; matching more keeps the lock
+/// longer, never shorter.
+fn repair_activity_sql(table: &str) -> String {
+    format!("SELECT query_id FROM query_activity() WHERE query LIKE 'INSERT INTO {table} (%'")
+}
+
+/// Cancels the running query `query_id`.
+fn cancel_query_sql(query_id: i64) -> String {
+    format!("CANCEL QUERY {query_id}")
+}
+
+/// The `query_id`s of a [`repair_activity_sql`] answer; `None` when it does
+/// not parse (read as "may still be running").
+fn parse_query_ids(body: &str) -> Option<Vec<i64>> {
+    dataset(body)?
+        .iter()
+        .map(|row| row.as_array()?.first()?.as_i64())
+        .collect()
+}
+
 /// Polls `table`'s WAL progress every `timing.poll` until it is applied and
 /// quiet (see [`table_is_quiet`]), it reads suspended, or `timing.budget`
-/// runs out. Cold, at most budget / poll + 1 statements.
+/// runs out. Each poll is cut off at one poll interval and at the deadline,
+/// so the wait ends within the budget plus about one poll. Cold, at most
+/// budget / poll + 2 statements.
 async fn poll_until_quiet(
     client: &Client,
     exec_url: &str,
@@ -541,7 +666,8 @@ async fn poll_until_quiet(
     let deadline = tokio::time::Instant::now() + timing.budget;
     let mut previous: Option<i64> = None;
     loop {
-        let progress = exec(client, exec_url, &wal_progress_sql(table))
+        let limit = timing.poll.min(time_left(deadline));
+        let progress = exec_within(client, exec_url, &wal_progress_sql(table), limit)
             .await
             .and_then(|b| parse_wal_progress(&b));
         match progress {
@@ -557,7 +683,78 @@ async fn poll_until_quiet(
         if tokio::time::Instant::now() >= deadline {
             return QuietPoll::StillWritten;
         }
-        tokio::time::sleep(timing.poll).await;
+        tokio::time::sleep(timing.poll.min(time_left(deadline))).await;
+    }
+}
+
+/// The wait after a repair statement that got no answer, with the writer
+/// side of the archive lock still held (recheck of PR AA finding 1,
+/// 2026-11-08). A table that reads applied and quiet is not enough: a
+/// statement QuestDB is still running has written no transaction yet, so its
+/// WAL reads quiet until it commits. So each poll first asks QuestDB's
+/// running queries ([`repair_activity_sql`]); only while none matches (and
+/// the list was read) does it check the WAL, and only two such polls with
+/// the same committed transaction, applied, settle it. A statement still
+/// listed after half the budget is cancelled once (`CANCEL QUERY`), so it
+/// cannot commit later; the wait then runs on until it is gone and the WAL
+/// is quiet. Every poll is cut off at one poll interval and at the deadline.
+/// Cold, at most about 2 × budget / poll + 3 statements.
+async fn settle_unanswered_repair(
+    client: &Client,
+    exec_url: &str,
+    table: &str,
+    timing: PollTiming,
+) -> QuietPoll {
+    let started = tokio::time::Instant::now();
+    let deadline = started + timing.budget;
+    let mut previous: Option<i64> = None;
+    let mut cancelled = false;
+    loop {
+        let limit = timing.poll.min(time_left(deadline));
+        let running = exec_within(client, exec_url, &repair_activity_sql(table), limit)
+            .await
+            .and_then(|b| parse_query_ids(&b));
+        let mut at_deadline = QuietPoll::StillRunning;
+        match running {
+            Some(ids) if ids.is_empty() => {
+                let limit = timing.poll.min(time_left(deadline));
+                let progress = exec_within(client, exec_url, &wal_progress_sql(table), limit)
+                    .await
+                    .and_then(|b| parse_wal_progress(&b));
+                match progress {
+                    Some((_, _, true)) => return QuietPoll::Suspended,
+                    Some((applied, committed, false)) => {
+                        if table_is_quiet(applied, committed, previous) {
+                            return QuietPoll::Quiet;
+                        }
+                        previous = Some(committed);
+                    }
+                    None => previous = None,
+                }
+                at_deadline = QuietPoll::StillWritten;
+            }
+            Some(ids) => {
+                previous = None;
+                if !cancelled && started.elapsed() >= timing.budget / 2 {
+                    cancelled = true;
+                    for id in &ids {
+                        let limit = timing.poll.min(time_left(deadline));
+                        let _ = exec_within(client, exec_url, &cancel_query_sql(*id), limit).await;
+                    }
+                    info!(
+                        table,
+                        queries = ids.len(),
+                        "contract name repair: the unanswered repair statement is still running; \
+                         cancel sent, the archive lock is kept until it is gone"
+                    );
+                }
+            }
+            None => previous = None,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return at_deadline;
+        }
+        tokio::time::sleep(timing.poll.min(time_left(deadline))).await;
     }
 }
 
@@ -574,7 +771,7 @@ async fn wait_until_quiet(client: &Client, exec_url: &str, table: &str) -> bool 
             );
             false
         }
-        QuietPoll::StillWritten => {
+        QuietPoll::StillWritten | QuietPoll::StillRunning => {
             warn!(
                 table,
                 wait_secs = CONTRACT_NAME_REPAIR_QUIET_WAIT_SECS,
@@ -737,9 +934,10 @@ async fn repair_quiet_table(
         // PR AA recheck: no answer does not mean the statement stopped.
         // QuestDB may still commit it after the client gave up, and the
         // archiver's re-count cannot see that commit (same count, same
-        // max(ts)). So the lock is kept until the table reads applied and
-        // quiet, for at most one more statement timeout.
-        let settled = poll_until_quiet(client, exec_url, table, settle).await;
+        // max(ts)). So the lock is kept until QuestDB no longer runs it and
+        // the table reads applied and quiet (it is cancelled at half the
+        // budget), for at most one more statement timeout.
+        let settled = settle_unanswered_repair(client, exec_url, table, settle).await;
         if settled != QuietPoll::Quiet {
             warn!(
                 code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
@@ -748,8 +946,9 @@ async fn repair_quiet_table(
                 day,
                 outcome = ?settled,
                 waited_secs = settle.budget.as_secs(),
-                "contract name repair: the repair statement got no answer and the table did \
-                 not read applied and quiet in time; the archive lock is released and the day \
+                "contract name repair: the repair statement got no answer and QuestDB still ran it \
+                 (or its query list could not be read) or the table did not read applied and \
+                 quiet in time; the archive lock is released and the day \
                  is tried again (an hour of this day archived before the statement commits \
                  can keep its blank names in the cold copy)"
             );
@@ -1200,6 +1399,11 @@ mod tests {
                         let target = head.split(' ').nth(1).unwrap_or_default().to_string();
                         let (status, body) = answer(&target);
                         log.lock().expect("stub log").push(target);
+                        if status == 0 {
+                            // A database that never answers: hold the socket.
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return;
+                        }
                         let resp = format!(
                             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                             body.len()
@@ -1289,12 +1493,32 @@ mod tests {
 
     /// A stub whose repair INSERT gets no usable answer (500) and whose
     /// `wal_tables()` answers come from `progress` in order (the last one
-    /// repeats); every other query reads a count of 3.
+    /// repeats); every other query reads a count of 3. `query_activity()`
+    /// lists the repair statement (query id 42) for the first
+    /// `running_polls` polls and nothing after.
     async fn spawn_unanswered_repair_stub(
         progress: &'static [(i64, i64)],
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_running_repair_stub(progress, 0).await
+    }
+
+    /// [`spawn_unanswered_repair_stub`] with the statement still listed as
+    /// running for the first `running_polls` activity polls.
+    async fn spawn_running_repair_stub(
+        progress: &'static [(i64, i64)],
+        running_polls: usize,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let activity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         spawn_scripted_exec_stub(std::sync::Arc::new(move |target: &str| {
+            if target.contains("query_activity") {
+                let i = activity.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let rows = if i < running_polls { "[[42]]" } else { "[]" };
+                return (200, format!(r#"{{"dataset":{rows},"count":0}}"#));
+            }
+            if target.contains("CANCEL") {
+                return (200, r#"{"ddl":"OK"}"#.to_string());
+            }
             if target.contains("INSERT") {
                 return (500, "{}".to_string());
             }
@@ -1309,6 +1533,14 @@ mod tests {
             (200, r#"{"dataset":[[3]],"count":1}"#.to_string())
         }))
         .await
+    }
+
+    fn polls_of(log: &std::sync::Mutex<Vec<String>>, needle: &str) -> usize {
+        log.lock()
+            .expect("stub log")
+            .iter()
+            .filter(|t| t.contains(needle))
+            .count()
     }
 
     const TEST_SETTLE: PollTiming = PollTiming {
@@ -1424,6 +1656,256 @@ mod tests {
                 .await
                 .is_some(),
             "released after the budget"
+        );
+    }
+
+    /// Regression: recheck of the settle wait (2026-11-08). An unanswered
+    /// statement QuestDB is still running has written no transaction, so the
+    /// table read applied and quiet at once and the lock was let go after two
+    /// polls, while the statement could still commit. The lock is now kept
+    /// while `query_activity()` lists it, and the WAL is judged only after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_unanswered_repair_holds_the_lock_while_questdb_still_runs_it() {
+        // Quiet WAL all along; the statement is listed for three polls.
+        let (url, log) = spawn_running_repair_stub(&[(6, 6)], 3).await;
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
+        let repair_sql =
+            repair_insert_sql("ticks", "2026-10-09", &cols(&STUB_REPAIR_COLUMNS)).expect("builds");
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let guard = quiesce.shared(Duration::from_millis(50)).await;
+        assert!(guard.is_some(), "a free lock lets a writer in");
+        let timing = PollTiming {
+            budget: Duration::from_secs(4),
+            poll: Duration::from_millis(100),
+        };
+        let repair = tokio::spawn(async move {
+            let mut tally = RepairDayTally::default();
+            repair_quiet_table(
+                &client,
+                &url,
+                "ticks",
+                "2026-10-09",
+                &repair_sql,
+                guard,
+                timing,
+                &mut tally,
+            )
+            .await;
+            tally
+        });
+        let seen_running = tokio::time::timeout(Duration::from_secs(5), async {
+            while polls_of(&log, "query_activity") < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            seen_running.is_ok(),
+            "an unanswered repair asks QuestDB whether it still runs: {:?}",
+            log.lock().expect("stub log")
+        );
+        assert_eq!(
+            polls_of(&log, "wal_tables"),
+            0,
+            "a quiet WAL proves nothing while the statement runs"
+        );
+        assert!(
+            quiesce
+                .hold_writers(Duration::from_millis(20))
+                .await
+                .is_none(),
+            "the archiver stays out while QuestDB still runs the statement"
+        );
+        let tally = repair.await.expect("repair task");
+        assert_eq!(tally.failures, 1);
+        assert_eq!(
+            polls_of(&log, "wal_tables"),
+            2,
+            "two quiet polls after it ended"
+        );
+        assert_eq!(polls_of(&log, "CANCEL"), 0, "ended before half the budget");
+        assert!(
+            quiesce
+                .hold_writers(Duration::from_millis(20))
+                .await
+                .is_some(),
+            "released once it ended and the table settled"
+        );
+    }
+
+    /// A statement still running at half the settle budget is cancelled once,
+    /// and one still listed at the end keeps the lock until the budget runs
+    /// out, then lets go with the day unfinished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_statement_still_running_at_half_the_budget_is_cancelled_once() {
+        let (url, log) = spawn_running_repair_stub(&[(6, 6)], usize::MAX).await;
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
+        let timing = PollTiming {
+            budget: Duration::from_millis(600),
+            poll: Duration::from_millis(100),
+        };
+        let started = tokio::time::Instant::now();
+        let outcome = settle_unanswered_repair(&client, &url, "ticks", timing).await;
+        let waited = started.elapsed();
+        assert_eq!(outcome, QuietPoll::StillRunning);
+        assert!(waited >= timing.budget, "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        let cancels: Vec<String> = log
+            .lock()
+            .expect("stub log")
+            .iter()
+            .filter(|t| t.contains("CANCEL"))
+            .cloned()
+            .collect();
+        assert_eq!(cancels.len(), 1, "{cancels:?}");
+        assert!(cancels[0].contains("42"), "{cancels:?}");
+        assert_eq!(polls_of(&log, "wal_tables"), 0);
+    }
+
+    /// An unreadable query list counts as "may still run", never as gone.
+    #[test]
+    fn test_parse_query_ids_and_the_activity_and_cancel_statements() {
+        assert_eq!(
+            parse_query_ids(r#"{"dataset":[[42],[7]],"count":2}"#),
+            Some(vec![42, 7])
+        );
+        assert_eq!(parse_query_ids(r#"{"dataset":[],"count":0}"#), Some(vec![]));
+        assert_eq!(parse_query_ids(r#"{"error":"no such function"}"#), None);
+        assert_eq!(parse_query_ids(r#"{"dataset":[["x"]]}"#), None);
+        let sql = repair_activity_sql("ticks");
+        assert!(sql.contains("query_activity()"), "{sql}");
+        assert!(sql.contains("LIKE 'INSERT INTO ticks (%'"), "{sql}");
+        let repair =
+            repair_insert_sql("ticks", "2026-10-09", &cols(&STUB_REPAIR_COLUMNS)).expect("builds");
+        assert!(
+            repair.starts_with("INSERT INTO ticks ("),
+            "the activity pattern matches the repair statement: {repair}"
+        );
+        assert_eq!(cancel_query_sql(42), "CANCEL QUERY 42");
+    }
+
+    /// Regression: recheck of the settle wait (2026-11-08). Each poll used
+    /// the client's statement timeout (600 s in production), so against a
+    /// QuestDB that never answers the wait ran up to a full timeout past its
+    /// budget. Every poll is now cut off at one poll interval and at the
+    /// deadline, here 0.6 s against a 5 s client timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_waits_end_within_their_budget_when_questdb_hangs() {
+        let (url, log) =
+            spawn_scripted_exec_stub(std::sync::Arc::new(|_: &str| (0, String::new()))).await;
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
+        let timing = PollTiming {
+            budget: Duration::from_millis(600),
+            poll: Duration::from_millis(150),
+        };
+        let started = tokio::time::Instant::now();
+        let settled = settle_unanswered_repair(&client, &url, "ticks", timing).await;
+        let waited = started.elapsed();
+        assert_eq!(settled, QuietPoll::StillRunning);
+        assert!(waited >= timing.budget, "{waited:?}");
+        assert!(waited < Duration::from_millis(1_500), "{waited:?}");
+        let started = tokio::time::Instant::now();
+        let quiet = poll_until_quiet(&client, &url, "ticks", timing).await;
+        let waited = started.elapsed();
+        assert_eq!(quiet, QuietPoll::StillWritten);
+        assert!(waited < Duration::from_millis(1_500), "{waited:?}");
+        assert!(polls_of(&log, "query_activity") >= 2);
+    }
+
+    /// Recheck of the day-scoped lock (2026-11-08): a run publishes its own
+    /// days at its start, so a partition of its oldest day stays locked even
+    /// when the archiver's clock has moved two days past the run's `today`.
+    #[test]
+    fn test_partition_in_repair_days_keeps_the_running_days_locked_after_midnights() {
+        let run_today = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).expect("date");
+        let oldest = chrono::Datelike::num_days_from_ce(
+            &run_today
+                .checked_sub_days(chrono::Days::new(u64::from(
+                    CONTRACT_NAME_REPAIR_LOOKBACK_DAYS,
+                )))
+                .expect("date"),
+        );
+        let two_days_later = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date");
+        // 2026-11-01 is the run's oldest day, ten days before the archiver's.
+        assert!(partition_in_repair_days(
+            "ticks",
+            "2026-11-01T09",
+            two_days_later,
+            oldest
+        ));
+        assert!(partition_in_repair_days(
+            "ticks",
+            "2026-11-01",
+            two_days_later,
+            oldest
+        ));
+        assert!(!partition_in_repair_days(
+            "ticks",
+            "2026-10-31T23",
+            two_days_later,
+            oldest
+        ));
+        // With no run, only the archiver's own range.
+        assert!(!partition_in_repair_days(
+            "ticks",
+            "2026-11-01T09",
+            two_days_later,
+            i32::MAX
+        ));
+        assert!(partition_in_repair_days(
+            "ticks",
+            "2026-11-02T09",
+            two_days_later,
+            i32::MAX
+        ));
+        // A table the repair never touches, whatever runs.
+        assert!(!partition_in_repair_days(
+            "market_depth_book",
+            "2026-11-08T10",
+            run_today,
+            i32::MIN
+        ));
+    }
+
+    /// `begin_repair_run` publishes the run's oldest day and its guard clears
+    /// it. The day is far in the future, so no other test's partition reads
+    /// as reachable while this one runs (and a reachable one only keeps a
+    /// lock, never drops one); an unparseable day publishes every day.
+    #[test]
+    fn test_begin_repair_run_publishes_the_run_days_until_dropped() {
+        let archiver_today = chrono::NaiveDate::from_ymd_opt(2999, 12, 31).expect("date");
+        assert!(!repair_may_rewrite_partition(
+            "ticks",
+            "2999-12-01T10",
+            archiver_today
+        ));
+        {
+            let _run = begin_repair_run("2999-12-08");
+            assert!(repair_may_rewrite_partition(
+                "ticks",
+                "2999-12-01T10",
+                archiver_today
+            ));
+            assert!(!repair_may_rewrite_partition(
+                "ticks",
+                "2999-11-30T10",
+                archiver_today
+            ));
+        }
+        assert!(!repair_may_rewrite_partition(
+            "ticks",
+            "2999-12-01T10",
+            archiver_today
+        ));
+        // An unparseable day publishes every day (fail closed); checked on
+        // the pure helper so no other test sees every partition reachable.
+        assert_eq!(run_oldest_day("garbage"), i32::MIN);
+        assert_eq!(
+            run_oldest_day("2026-11-08"),
+            chrono::Datelike::num_days_from_ce(
+                &chrono::NaiveDate::from_ymd_opt(2026, 11, 1).expect("date")
+            )
         );
     }
 
