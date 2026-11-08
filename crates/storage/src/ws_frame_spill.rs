@@ -1138,6 +1138,7 @@ impl WsFrameSpill {
         // The deferred-depth marks (item 45a) sit beside it for the same reason:
         // a shed frame's segment must stay protected across a restart.
         crate::wal_deferred_depth::deferred_depth().bind(&wal_dir);
+        crate::wal_clock_step::bind_clock_step_log(&wal_dir); // PR AA finding 2 recheck
         // 2026-10-20 (plan item PR W): fold earlier processes' unapplied marks
         // into bounded ranges and register the boot tail, BEFORE the writer
         // thread spawns and before any sink or socket exists.

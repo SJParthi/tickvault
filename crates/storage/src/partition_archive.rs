@@ -2584,6 +2584,19 @@ impl PartitionArchiver {
                 }
                 let gate = SnapshotGate::from_config(&self.cfg);
                 archive_with_snapshot_gate(self, table, &partition, gate, &mut summary).await
+            } else if crate::contract_name_repair::repair_may_rewrite(table) {
+                // Recheck of PR AA finding 1: the after-close contract name
+                // repair rewrites old partitions of this table in place (same
+                // count, same max(ts)), so its day path holds the old-hour
+                // writers out across the copy and the drop too. A busy lock
+                // holds this and every further locked partition, as above.
+                if quiesce_busy {
+                    summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
+                    snapshot_gate::count_quiesce_busy_held(1);
+                    continue;
+                }
+                self.archive_one_quiesced(table, &partition, &mut summary)
+                    .await
             } else {
                 self.process_one(table, &partition, &mut summary).await
             };
@@ -2871,6 +2884,38 @@ impl PartitionArchiver {
             }
         }
         Some((s3_key, uploaded_this_run))
+    }
+
+    /// [`Self::process_one`] with the archiver side of the archive quiesce
+    /// lock held from before the export to after the drop (recheck of PR AA
+    /// finding 1), for a table the after-close contract name repair can
+    /// rewrite ([`crate::contract_name_repair::repair_may_rewrite`]). The
+    /// repair takes the writer side around its statement, so no repair
+    /// statement runs between this export and this drop. A lock that cannot
+    /// be taken within `archive_quiesce_wait_secs` keeps the partition
+    /// (`QuiesceBusy`, counted). Cold, once per such partition.
+    async fn archive_one_quiesced(
+        &mut self,
+        table: &'static str,
+        partition: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> PartitionStep {
+        let wait = SnapshotGate::from_config(&self.cfg).quiesce_wait;
+        let Some(hold) = ArchiveIo::hold_old_hour_writers(self, wait).await else {
+            summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
+            snapshot_gate::count_quiesce_busy_held(1);
+            info!(
+                table,
+                partition,
+                waited_secs = wait.as_secs(),
+                "partition archive: an old-hour writer (a replay, or the contract name \
+                 repair) is writing — partition KEPT for a later pass (not a failure)"
+            );
+            return PartitionStep::QuiesceBusy;
+        };
+        let step = self.process_one(table, partition, summary).await;
+        drop(hold);
+        step
     }
 
     /// One partition through the EXACT WAL gate: export → upload → verify →
@@ -6251,6 +6296,64 @@ mod stub_integration_tests {
             archiver.session_bytes_on(day).await.is_err(),
             "one unreadable table must fail the whole reading"
         );
+    }
+
+    // Regression: recheck of PR AA finding 1 (2026-11-08). `ticks` is off
+    // the hour path on the shipped config, so its old hours went through the
+    // day path, which never took the quiesce lock. The after-close contract
+    // name repair could rewrite an hour between its export and its drop
+    // (same count, same max(ts)), and S3 kept the blank names. The day path
+    // of a table the repair can rewrite now holds the old-hour writers out:
+    // while a writer holds the shared side, nothing is exported or dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_day_path_of_a_repaired_table_waits_for_the_repair() {
+        use snapshot_gate::InFlightVerdict;
+
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let cfg = PartitionRetentionConfig {
+            archive_quiesce_wait_secs: 1,
+            ..test_retention_cfg(200)
+        };
+        assert!(!cfg.ticks_hour_path_enabled, "ticks takes the day path");
+        assert!(!uses_snapshot_gate("ticks", &[]));
+        assert!(crate::contract_name_repair::repair_may_rewrite("ticks"));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear));
+
+        // The repair holds the writer side across its statement.
+        let repair = quiesce
+            .shared(Duration::from_secs(1))
+            .await
+            .expect("a free lock lets the repair in");
+        let held = archiver.run_archive_pass().await;
+        assert_eq!(held.dropped, 0, "{held:?}");
+        assert_eq!(held.held_quiesce_busy, 1, "{held:?}");
+        assert_eq!(
+            held.failed, 0,
+            "a held partition is not a failure: {held:?}"
+        );
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.starts_with("/exp") || r.target.contains("DROP PARTITION")),
+            "nothing is exported or dropped while the repair may write"
+        );
+        assert!(objects.lock().expect("objects").is_empty());
+
+        // Once the repair is done the hour goes.
+        drop(repair);
+        let freed = archiver.run_archive_pass().await;
+        assert_eq!(freed.dropped, 1, "{freed:?}");
+        assert_eq!(freed.held_quiesce_busy, 0, "{freed:?}");
     }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;

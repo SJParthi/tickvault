@@ -20,9 +20,16 @@
 //!
 //! Each writer takes the SHARED (read) side. The archiver takes the EXCLUSIVE
 //! (write) side for one partition, from before its WAL snapshot to after its
-//! drop (wired in PR AA step 2). While the archiver holds it, no writer that
-//! can reach an old hour is posting. The live drain never takes this lock and
-//! never waits on it.
+//! drop (wired in PR AA step 2), but only for some partitions: every
+//! partition that goes through the snapshot gate (the depth tables, and each
+//! table on the hour path in that pass), and every partition of a table the
+//! contract name repair can rewrite
+//! ([`crate::contract_name_repair::repair_may_rewrite`]: `ticks`,
+//! `feed_aux_packets` and the candle tables), on the day path too (recheck
+//! of PR AA finding 1). Any other table's day-path partition is archived
+//! without the lock, under the exact WAL gate and the re-count. While the
+//! archiver holds it, no writer that can reach an old hour is posting. The
+//! live drain never takes this lock and never waits on it.
 //!
 //! # Why tokio's `RwLock`
 //!

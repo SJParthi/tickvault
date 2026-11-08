@@ -199,8 +199,10 @@ pub const PRESSURE_PROBE_FAILING_POLLS: u32 = {
 /// Quote 51 lets the projection act on the hour partitions of the five hour
 /// tables only: "Candles, SEBI and audit tables keep their day windows". Such
 /// a pass therefore keeps every day window as configured and sets only the
-/// hour-path marker, as `daily_pass_config` does. Day-window compression is
-/// for used-space episodes (at or above high water).
+/// hour-path marker, as `daily_pass_config` does: it also keeps
+/// `market_depth` off a pending spill file (recheck of finding 4), the same
+/// as the daily leg. Day-window compression is for used-space episodes (at
+/// or above high water, and down to low water while the episode lasts).
 #[must_use]
 pub fn pressure_config(
     cfg: &PartitionRetentionConfig,
@@ -209,6 +211,7 @@ pub fn pressure_config(
     if projected_only {
         return PartitionRetentionConfig {
             under_disk_pressure: true,
+            market_depth_force_with_spill_pending: false,
             ..cfg.clone()
         };
     }
@@ -239,12 +242,22 @@ pub fn pressure_config(
 /// projection could have opened it. Every later pass reads the episode's
 /// `projected_only`, which `note_episode_level` clears once the volume reads
 /// high water. Pure, O(1).
+///
+/// Below low water every pass keeps the day windows, whatever the episode's
+/// flag says (recheck of finding 4). A used-space episode ends below low
+/// water unless the projection is short, so a pass there runs only because
+/// of the projection, and Quote 51 lets the projection move the hour tables
+/// only. Between low and high water a used-space episode keeps compressing,
+/// as before.
 fn pass_is_projected_only(
     state: &PressureState,
     action: PressureAction,
     used_pct: u8,
     cfg: &PartitionRetentionConfig,
 ) -> bool {
+    if used_pct < cfg.pressure_low_water_pct {
+        return true;
+    }
     if matches!(action, PressureAction::StartEpisode) {
         return used_pct < cfg.pressure_high_water_pct;
     }
@@ -1745,10 +1758,15 @@ mod tests {
         assert_eq!(p.intraday_hot_days, 4);
         assert_eq!(p.retention_days, 90);
         assert!(p.under_disk_pressure, "the hour path still runs");
-        assert_eq!(
-            p.market_depth_force_with_spill_pending, c.market_depth_force_with_spill_pending,
-            "nothing else changes"
+        // Recheck of finding 4: the same as the daily leg, which never forces
+        // `market_depth` past a pending spill file.
+        let mut forcing = c.clone();
+        forcing.market_depth_force_with_spill_pending = true;
+        assert!(
+            !pressure_config(&forcing, true).market_depth_force_with_spill_pending,
+            "a projected-only pass never forces market_depth past a spill file"
         );
+        assert!(pressure_config(&forcing, false).market_depth_force_with_spill_pending);
         let used_space = pressure_config(&c, false);
         assert_eq!(used_space.market_data_hot_days, 2, "used-space compresses");
         assert!(used_space.under_disk_pressure);
@@ -1773,13 +1791,14 @@ mod tests {
             high,
             &c
         ));
-        // Later passes follow the episode's own flag.
+        // Later passes in the low-to-high band follow the episode's own flag.
+        let band = c.pressure_low_water_pct;
         let mut st = PressureState::default();
         apply_action(&mut st, PressureAction::StartEpisode, 0, Some(1));
         assert!(!pass_is_projected_only(
             &st,
             PressureAction::ContinuePass,
-            high - 17,
+            band,
             &c
         ));
         if let Some(ep) = st.episode.as_mut() {
@@ -1788,15 +1807,113 @@ mod tests {
         assert!(pass_is_projected_only(
             &st,
             PressureAction::ContinuePass,
-            high - 17,
+            band,
             &c
         ));
         assert!(!pass_is_projected_only(
             &none,
             PressureAction::ContinuePass,
-            high - 17,
+            band,
             &c
         ));
+    }
+
+    // Regression: recheck of PR AA finding 4 (2026-11-08). A used-space
+    // episode opened at 76% fell to 58% (below the 60% low water) while the
+    // projection stayed short, so the episode stayed open, and its passes
+    // took the compressing config: candle day partitions 3 to 15 days old
+    // went at 58% used, only because of the projection.
+    #[test]
+    fn test_regression_used_space_episode_below_low_water_keeps_the_day_windows() {
+        let mut c = cfg();
+        c.market_data_hot_days = 15;
+        let low = c.pressure_low_water_pct;
+        let mut st = PressureState::default();
+        apply_action(&mut st, PressureAction::StartEpisode, 0, Some(1));
+        note_episode_level(&mut st, PressureAction::StartEpisode, Some(76), &c);
+        assert!(
+            !st.episode.expect("open").projected_only,
+            "a used-space episode"
+        );
+        assert!(pass_is_projected_only(
+            &st,
+            PressureAction::ContinuePass,
+            low - 2,
+            &c
+        ));
+        let p = pressure_config(
+            &c,
+            pass_is_projected_only(&st, PressureAction::ContinuePass, low - 2, &c),
+        );
+        assert_eq!(
+            p.market_data_hot_days, 15,
+            "candle day window kept below low water"
+        );
+    }
+
+    /// Recheck of PR AA finding 4: the decision sequence of one day through the
+    /// real decision, episode-level and fold functions. Every pass below low
+    /// water, and every pass of an episode the projection opened below high
+    /// water, keeps the candle day window; only a pass at or above high water
+    /// (or in the band after high water was read) compresses.
+    #[test]
+    fn test_pressure_day_keeps_candle_day_windows_unless_used_space_drives_the_pass() {
+        let mut c = cfg();
+        c.market_data_hot_days = 15;
+        c.pressure_projected_fill_enabled = true;
+        c.pressure_projected_min_used_pct = 50;
+        c.pressure_max_passes = 1_000;
+        let high = c.pressure_high_water_pct;
+        let low = c.pressure_low_water_pct;
+        // (used %, projection short) per poll, two days: a projection-only
+        // day at 58%, then a used-space episode that falls below low water
+        // while the projection stays short.
+        let polls: [(u8, bool); 10] = [
+            (58, true),
+            (58, true),
+            (59, true),
+            (52, false),
+            (76, true),
+            (70, true),
+            (62, true),
+            (58, true),
+            (55, true),
+            (55, false),
+        ];
+        let mut st = PressureState::default();
+        let mut now = 1_000_000_u64;
+        let mut passes = 0_u32;
+        for (used, short) in polls {
+            now += 3_600;
+            let probe = PressureProbe {
+                used_pct: Some(used),
+                projected_short: short,
+            };
+            let action = decide_pressure_action(probe, &st, &c, now);
+            note_episode_level(&mut st, action, Some(used), &c);
+            if matches!(
+                action,
+                PressureAction::StartEpisode | PressureAction::ContinuePass
+            ) {
+                passes += 1;
+                let keep = pass_is_projected_only(&st, action, used, &c);
+                let days = pressure_config(&c, keep).market_data_hot_days;
+                if used < high && (used < low || keep) {
+                    assert_eq!(days, 15, "pass at {used}% must keep the day window");
+                } else {
+                    assert_eq!(days, 2, "a used-space pass at {used}% compresses");
+                }
+                if used < low {
+                    assert_eq!(days, 15, "below low water nothing compresses ({used}%)");
+                }
+            }
+            apply_action(&mut st, action, now, Some(1));
+            note_episode_level(&mut st, action, Some(used), &c);
+        }
+        assert!(
+            passes >= 7,
+            "the sequence must reach its passes, ran {passes}"
+        );
     }
 
     #[test]

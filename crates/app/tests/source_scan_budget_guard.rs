@@ -81,7 +81,12 @@ const BUDGET: &[(&str, usize)] = &[
     // Paired behaviour tests: `test_catchup_stops_with_archive_quiesce_reason`,
     // and in `archive_quiesce` `test_boot_refold_in_session_never_waits_on_quiesce`
     // and `test_quiesce_writer_waits_behind_queued_archiver`.
-    ("dhan_feed_stack/catchup_stop.rs", 1),
+    // 1 -> 2 (2026-11-08, PR AA finding 6): `main.rs` registers the boot
+    // replay before either archive loop spawns, which no unit test can drive.
+    // Paired behaviour tests: `test_boot_replay_intent_only_for_staged_frames`
+    // and, in `archive_quiesce`,
+    // `test_regression_archiver_stands_aside_while_a_replay_is_registered`.
+    ("dhan_feed_stack/catchup_stop.rs", 2),
     ("dhan_feed_stack/contract_attach_tests.rs", 3),
     // 2026-11-07 (PR AA steps 1 and 2, owner Quote 51): 3 scans. Each bucket
     // binds the archive quiesce guard through its flush, the floor wait runs
@@ -120,7 +125,12 @@ const BUDGET: &[(&str, usize)] = &[
     // pins the wiring by source. Paired behaviour tests for the decisions:
     // `test_projected_start_needs_min_used_pct_and_the_switch` and
     // `test_in_session_projected_allows_one_depth_partition`.
-    ("disk_pressure_boot.rs", 8),
+    // 8 -> 9 (2026-11-08, PR AA finding 4 and its recheck):
+    // `test_projected_only_reaches_the_pass_config` pins that the loop's
+    // day-window decision reaches the pass config. Paired behaviour tests:
+    // `test_pressure_day_keeps_candle_day_windows_unless_used_space_drives_the_pass`
+    // and `test_regression_used_space_episode_below_low_water_keeps_the_day_windows`.
+    ("disk_pressure_boot.rs", 9),
     ("ensure_questdb.rs", 1),
     // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
     // hold supervisor); paired behaviour tests `evening_step_*`,

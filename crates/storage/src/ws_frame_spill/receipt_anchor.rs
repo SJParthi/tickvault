@@ -150,19 +150,21 @@ impl AnchorCell {
     /// halves are stored.
     #[cfg(test)]
     pub(super) fn refresh_with(&self, new_anchor: impl FnOnce() -> ReceiptAnchor) -> AnchorRefresh {
-        self.refresh_noting_step(new_anchor, |_, _| {})
+        self.refresh_noting_step(new_anchor, |_, _, _| {})
     }
 
     /// [`Self::refresh_with`], and when the adopted anchor moves the projected
     /// time by more than one second either way (a wall-clock step, PR AA
-    /// review finding 2), calls `note_step(new wall nanos, size of the move)`.
+    /// review finding 2), calls `note_step(previous anchor's wall nanos, new wall nanos, size of
+    /// the move)`. The previous anchor bounds where the step can have begun:
+    /// the refresh can run late on a busy drain (recheck of finding 2).
     /// The production refresh passes `wal_clock_step::note_clock_step`; the
     /// cell tests pass nothing, so synthetic anchors never reach the process
     /// window. O(1).
     pub(super) fn refresh_noting_step(
         &self,
         new_anchor: impl FnOnce() -> ReceiptAnchor,
-        note_step: impl FnOnce(u64, u64),
+        note_step: impl FnOnce(u64, u64, u64),
     ) -> AnchorRefresh {
         let _writer = self
             .writer
@@ -175,7 +177,11 @@ impl AnchorCell {
             self.publish(new);
             let jump = anchor_jump_nanos(old, new);
             if jump > crate::wal_clock_step::CLOCK_STEP_MIN_NANOS {
-                note_step(u64::try_from(new.nanos).unwrap_or(0), jump);
+                note_step(
+                    u64::try_from(old.nanos).unwrap_or(0),
+                    u64::try_from(new.nanos).unwrap_or(0),
+                    jump,
+                );
             }
         }
         decision
@@ -363,22 +369,28 @@ mod tests {
             instant: t0 + Duration::from_secs(after),
             nanos,
         };
-        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let mut seen: Vec<(u64, u64, u64)> = Vec::new();
         // Normal refresh, 5 ms of forward slew: adopted, no step.
         let normal = at(30, base_nanos + secs(30) + 5_000_000);
-        cell.refresh_noting_step(|| normal, |w, m| seen.push((w, m)));
+        cell.refresh_noting_step(|| normal, |o, w, m| seen.push((o, w, m)));
         // Slew-sized rewind: refused, no step.
         let slew = at(60, base_nanos + secs(60) - 10_000_000);
-        cell.refresh_noting_step(|| slew, |w, m| seen.push((w, m)));
+        cell.refresh_noting_step(|| slew, |o, w, m| seen.push((o, w, m)));
         assert!(seen.is_empty(), "no step expected, got {seen:?}");
         // A 600 s step back.
         let back = at(90, base_nanos + secs(90) + 5_000_000 - secs(600));
-        cell.refresh_noting_step(|| back, |w, m| seen.push((w, m)));
-        assert_eq!(seen, vec![(back.nanos as u64, secs(600) as u64)]);
+        cell.refresh_noting_step(|| back, |o, w, m| seen.push((o, w, m)));
+        assert_eq!(
+            seen,
+            vec![(normal.nanos as u64, back.nanos as u64, secs(600) as u64)]
+        );
         // A 600 s step forward.
         let fwd = at(120, back.nanos + secs(30) + secs(600));
-        cell.refresh_noting_step(|| fwd, |w, m| seen.push((w, m)));
-        assert_eq!(seen[1], (fwd.nanos as u64, secs(600) as u64));
+        cell.refresh_noting_step(|| fwd, |o, w, m| seen.push((o, w, m)));
+        assert_eq!(
+            seen[1],
+            (back.nanos as u64, fwd.nanos as u64, secs(600) as u64)
+        );
         assert_eq!(seen.len(), 2);
     }
 

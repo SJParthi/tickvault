@@ -15,7 +15,9 @@
 //! (the boot WAL refold, the WAL catch-up drain, the spill replays, the
 //! after-close depth pass and the after-close contract name repair) takes
 //! the shared side of the archive quiesce lock
-//! ([`crate::archive_quiesce`]). So, with that lock held by the archiver,
+//! ([`crate::archive_quiesce`]). (The archiver takes the other side on
+//! this gate, and on the day path for a table the contract name repair can
+//! rewrite; see that module.) So, with that lock held by the archiver,
 //! an old hour's rows are all in transactions that already exist, and
 //! waiting until `writerTxn >= S` (S = `sequencerTxn` read UNDER the lock)
 //! proves they are applied, whatever the live writer commits meanwhile.
@@ -30,8 +32,8 @@
 //! 3. In-flight check ([`hour_in_flight_verdict`]): the hour is held when any
 //!    of its frames is still on its way to QuestDB (unapplied ranges,
 //!    after-close depth marks, a rescue batch, not yet acknowledged, a clock
-//!    that stepped back, or a wall-clock step this process saw near the hour,
-//!    `crate::wal_clock_step`). For a table on the hour path that was not
+//!    that stepped back, or a frame still on its way anywhere in the window
+//!    of a wall-clock step recorded near the hour, `crate::wal_clock_step`). For a table on the hour path that was not
 //!    forced past a pending spill file, the archiver also reads the table's
 //!    own spill folder again here, under the lock (PR AA review): a batch
 //!    rescued to a spill file counts as acknowledged, so only the folder
@@ -271,11 +273,12 @@ pub(crate) enum InFlightVerdict {
     /// The newest frame sequence is ahead of the wall clock, so frame
     /// sequences no longer map to hours.
     ClockAhead,
-    /// This process saw a wall-clock step (receipt anchor, or a segment
-    /// rotation that found the frame counter ahead of the wall) whose window
-    /// overlaps the hour: its rows can carry frame sequences outside the
-    /// hour's span, so no frame check can clear it (PR AA review, finding 2).
-    /// Held until the next restart, which forgets the step (RAM only).
+    /// A wall-clock step this process (or the one before it: the window is
+    /// persisted) recorded overlaps the hour, and a frame check holds a
+    /// frame somewhere in the step's window: the hour's rows can carry frame
+    /// sequences outside its own span, so its own span cannot clear it (PR AA
+    /// review, finding 2). Held until every frame of the window is
+    /// acknowledged and unmarked.
     ClockStepped,
     /// The table's own spill folder holds a file the spill replay has not
     /// read yet (PR AA review). A rescued batch counts as acknowledged, so
@@ -343,25 +346,70 @@ pub(crate) fn hour_in_flight_verdict(
     if !inputs.wal_bound {
         return InFlightVerdict::WalNotBound;
     }
-    if inputs.applied.range_has_unapplied(span.lo, span.hi) {
-        return InFlightVerdict::Unapplied;
-    }
-    if inputs.rescue_floor_lowest <= span.hi {
-        return InFlightVerdict::RescueFloor;
-    }
-    // Every frame up to `hi` was handed to the sink before any frame past
-    // `hi + slack` (reordering is bounded by the slack), and the sink acks
-    // batches in order, so an ack past that point covers the whole hour.
-    if inputs.acked_high <= span.hi.saturating_add(REPLAY_REORDER_SLACK_SEQ) {
-        return InFlightVerdict::NotAcked;
+    if let Some(verdict) = frame_hold(span, inputs) {
+        return verdict;
     }
     if inputs.last_frame_seq > inputs.wall_nanos.saturating_add(CLOCK_AHEAD_LIMIT_NANOS) {
         return InFlightVerdict::ClockAhead;
     }
-    if crate::wal_clock_step::window_overlaps(inputs.clock_step, span.lo, span.hi) {
-        return InFlightVerdict::ClockStepped;
+    // PR AA review finding 2 (reworked on its recheck): an hour a recorded
+    // clock step reaches is judged against the step's whole window too, since
+    // its rows can carry any sequence of the window.
+    if let Some(window) = inputs.clock_step
+        && crate::wal_clock_step::window_overlaps(Some(window), span.lo, span.hi)
+    {
+        let widened = HourFrameSpan {
+            lo: span.lo.min(window.0),
+            hi: span.hi.max(window.1),
+        };
+        if frame_hold(widened, inputs).is_some() {
+            return InFlightVerdict::ClockStepped;
+        }
     }
     InFlightVerdict::Clear
+}
+
+/// The frame checks of [`hour_in_flight_verdict`] over `span`: after-close
+/// depth marks, unapplied frames, a rescue floor, and an acknowledgement
+/// that has not passed `span`. The first hit, or `None`. Pure, O(1) plus
+/// the snapshot lookups.
+fn frame_hold(span: HourFrameSpan, inputs: &InFlightInputs<'_>) -> Option<InFlightVerdict> {
+    if let Some(deferred) = inputs.deferred
+        && deferred.segment_is_deferred(span.lo, Some(span.hi))
+    {
+        return Some(InFlightVerdict::DeferredDepth);
+    }
+    if inputs.applied.range_has_unapplied(span.lo, span.hi) {
+        return Some(InFlightVerdict::Unapplied);
+    }
+    if inputs.rescue_floor_lowest <= span.hi {
+        return Some(InFlightVerdict::RescueFloor);
+    }
+    // Every frame up to `hi` was handed to the sink before any frame past
+    // `hi + slack` (reordering is bounded by the slack), and the sink acks
+    // batches in order, so an ack past that point covers the whole span.
+    if inputs.acked_high <= span.hi.saturating_add(REPLAY_REORDER_SLACK_SEQ) {
+        return Some(InFlightVerdict::NotAcked);
+    }
+    None
+}
+
+/// Whether nothing the step window `window` can have displaced is still on
+/// its way, for BOTH sinks: every frame check of [`frame_hold`] reads clear
+/// over the window for the tick inputs and for the depth inputs (which carry
+/// the after-close marks). Then the window protects nothing and may be
+/// dropped. Pure, O(1) plus the snapshot lookups.
+#[must_use]
+pub(crate) fn clock_step_window_settled(
+    window: (u64, u64),
+    ticks: &InFlightInputs<'_>,
+    depth: &InFlightInputs<'_>,
+) -> bool {
+    let span = HourFrameSpan {
+        lo: window.0,
+        hi: window.1,
+    };
+    ticks.wal_bound && frame_hold(span, ticks).is_none() && frame_hold(span, depth).is_none()
 }
 
 /// [`hour_in_flight_verdict`] over this process's live state: the applied
@@ -380,6 +428,34 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
         AppliedSink::Depth => applied.hwm_depth,
         AppliedSink::Ticks => applied.hwm_ticks,
     };
+    let mut clock_step = crate::wal_clock_step::clock_step_window();
+    // PR AA finding 2 recheck: a step window that holds nothing on its way
+    // for either sink is dropped (and the drop persisted), so a window from
+    // a step long ago does not keep judging later hours against all of it.
+    if let Some(window) = clock_step {
+        let depth_marks = crate::wal_deferred_depth::deferred_depth().snapshot();
+        let sink_inputs = |sink: AppliedSink, deferred| InFlightInputs {
+            wal_bound: watermark.is_bound(),
+            applied: &applied,
+            deferred,
+            rescue_floor_lowest: watermark.rescue_floor_lowest(sink),
+            acked_high: match sink {
+                AppliedSink::Depth => applied.hwm_depth,
+                AppliedSink::Ticks => applied.hwm_ticks,
+            },
+            last_frame_seq: 0,
+            wall_nanos: 0,
+            clock_step: None,
+        };
+        let settled = clock_step_window_settled(
+            window,
+            &sink_inputs(AppliedSink::Ticks, None),
+            &sink_inputs(AppliedSink::Depth, Some(&depth_marks)),
+        );
+        if crate::wal_clock_step::retire_clock_step_window_if_settled(window, settled) {
+            clock_step = crate::wal_clock_step::clock_step_window();
+        }
+    }
     let inputs = InFlightInputs {
         wal_bound: watermark.is_bound(),
         applied: &applied,
@@ -388,7 +464,7 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
         acked_high,
         last_frame_seq: crate::ws_frame_spill::current_frame_seq(),
         wall_nanos: crate::wal_applied_watermark::wall_nanos(),
-        clock_step: crate::wal_clock_step::clock_step_window(),
+        clock_step,
     };
     hour_in_flight_verdict(span, &inputs)
 }
@@ -1230,7 +1306,7 @@ mod tests {
         let span = hour_frame_seq_span("2026-11-07T10").expect("span");
         // 2026-11-07 11:05:00 IST = 05:35:00 UTC.
         let step_at = 1_794_029_700 * SEC;
-        let window = crate::wal_clock_step::step_window(step_at, 600 * SEC);
+        let window = crate::wal_clock_step::step_window(step_at - 30 * SEC, step_at, 600 * SEC);
         let stepped = InFlightInputs {
             clock_step: window,
             ..clear_inputs(&applied, span)
@@ -1267,13 +1343,150 @@ mod tests {
         // 2026-11-07 11:59:45 IST = 06:29:45 UTC.
         let step_at = 1_794_032_985 * SEC;
         let inputs = InFlightInputs {
-            clock_step: crate::wal_clock_step::step_window(step_at, 600 * SEC),
+            clock_step: crate::wal_clock_step::step_window(step_at - 30 * SEC, step_at, 600 * SEC),
             ..clear_inputs(&applied, span)
         };
         assert_eq!(
             hour_in_flight_verdict(span, &inputs),
             InFlightVerdict::ClockStepped
         );
+    }
+
+    /// Recheck of finding 2: the step hold ends once nothing of the window
+    /// is on its way (acknowledged past it, unmarked), and a mark anywhere in
+    /// the window keeps it, although the mark lies outside the hour's own
+    /// span. A 600 s step back at 11:05 IST.
+    #[test]
+    fn test_in_flight_step_hold_follows_the_frames_of_the_window() {
+        let span = hour_frame_seq_span("2026-11-07T10").expect("span");
+        // 2026-11-07 11:05:00 IST = 05:35:00 UTC.
+        let step_at = 1_794_029_700 * SEC;
+        let window = crate::wal_clock_step::step_window(step_at - 30 * SEC, step_at, 600 * SEC)
+            .expect("a step");
+        let past_window = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        let applied = AppliedSnapshot::default();
+        let settled = InFlightInputs {
+            clock_step: Some(window),
+            acked_high: past_window,
+            last_frame_seq: past_window,
+            wall_nanos: past_window,
+            ..clear_inputs(&applied, span)
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &settled),
+            InFlightVerdict::Clear,
+            "nothing of the window is on its way"
+        );
+        // A row of hour 10 shed with a sequence of about 11:05.
+        let watermark = AppliedWatermark::new_for_tests();
+        watermark.note_unapplied_range(step_at - 5 * SEC, step_at);
+        let marked = watermark.snapshot();
+        let held = InFlightInputs {
+            applied: &marked,
+            ..settled
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &held),
+            InFlightVerdict::ClockStepped
+        );
+        // The mark is outside the hour's own span: without the step it reads
+        // clear, which is the defect.
+        let unstepped = InFlightInputs {
+            clock_step: None,
+            applied: &marked,
+            ..settled
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &unstepped),
+            InFlightVerdict::Clear
+        );
+    }
+
+    /// Regression: recheck of PR AA finding 2 (2026-11-08). A forward step
+    /// of 600 s 10 s after the last anchor refresh (11:59:40 IST), seen by a
+    /// refresh that ran 60 s late (a busy ring starves the timer arm). Rows
+    /// received 11:59:50 to 12:00:00 are in hour 11 with sequences of about
+    /// 12:10. The window used to start at `new - S - 30 s` = 12:00:10, past
+    /// hour 11's span, so a mark on those rows read clear. It now starts at
+    /// the previous anchor.
+    #[test]
+    fn test_regression_late_refresh_forward_step_holds_the_hour_it_began_in() {
+        let span = hour_frame_seq_span("2026-11-07T11").expect("span");
+        // 2026-11-07 11:59:40 IST = 06:29:40 UTC.
+        let old_anchor = 1_794_032_980 * SEC;
+        let new_anchor = old_anchor + 60 * SEC + 600 * SEC;
+        let window = crate::wal_clock_step::step_window(old_anchor, new_anchor, 600 * SEC);
+        let past_window = window.expect("a step").1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        // Rows received at 11:59:55 IST carry sequences of 12:09:55 IST.
+        let watermark = AppliedWatermark::new_for_tests();
+        let shed_seq = old_anchor + 15 * SEC + 600 * SEC;
+        watermark.note_unapplied_range(shed_seq, shed_seq + SEC);
+        let marked = watermark.snapshot();
+        let inputs = InFlightInputs {
+            applied: &marked,
+            clock_step: window,
+            acked_high: past_window,
+            last_frame_seq: past_window,
+            wall_nanos: past_window,
+            ..clear_inputs(&marked, span)
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &inputs),
+            InFlightVerdict::ClockStepped
+        );
+        // The window seen from the new anchor alone misses the hour.
+        let seen_only = InFlightInputs {
+            clock_step: crate::wal_clock_step::step_window(new_anchor, new_anchor, 600 * SEC),
+            ..inputs
+        };
+        assert_eq!(
+            hour_in_flight_verdict(span, &seen_only),
+            InFlightVerdict::Clear
+        );
+    }
+
+    #[test]
+    fn test_clock_step_window_settled_needs_both_sinks_clear() {
+        let window = (1_000 * SEC, 2_000 * SEC);
+        let past = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        let applied = AppliedSnapshot::default();
+        let span = HourFrameSpan {
+            lo: window.0,
+            hi: window.1,
+        };
+        let clear = InFlightInputs {
+            acked_high: past,
+            ..clear_inputs(&applied, span)
+        };
+        assert!(clock_step_window_settled(window, &clear, &clear));
+        let behind = InFlightInputs {
+            acked_high: window.1,
+            ..clear_inputs(&applied, span)
+        };
+        assert!(
+            !clock_step_window_settled(window, &clear, &behind),
+            "depth behind"
+        );
+        assert!(
+            !clock_step_window_settled(window, &behind, &clear),
+            "ticks behind"
+        );
+        let marks = DeferredDepth::new_for_tests();
+        marks.note_shed(window.0 + 10 * SEC, ShedDepth::Inline);
+        let snapshot = marks.snapshot();
+        let marked = InFlightInputs {
+            deferred: Some(&snapshot),
+            ..clear
+        };
+        assert!(
+            !clock_step_window_settled(window, &clear, &marked),
+            "a depth mark"
+        );
+        let unbound = InFlightInputs {
+            wal_bound: false,
+            ..clear
+        };
+        assert!(!clock_step_window_settled(window, &unbound, &clear));
     }
 
     #[test]

@@ -53,9 +53,23 @@
 //!   not a certainty; it is not closed.
 //! - The repair rewrites each touched partition (copy-on-write). The
 //!   re-count and the statement run under the writer side of the archive
-//!   quiesce lock ([`crate::archive_quiesce`], PR AA), so the archiver never
-//!   copies or drops a partition while a statement runs; a table whose lock
-//!   wait runs out is left for the next attempt.
+//!   quiesce lock ([`crate::archive_quiesce`], PR AA), and the archiver holds
+//!   the archiver side across the copy and the drop of every partition of a
+//!   table this repair can rewrite ([`repair_may_rewrite`]), on the hour path
+//!   and the day path alike. A table whose lock wait runs out is left for
+//!   the next attempt.
+//! - The statement can hold the lock for up to
+//!   [`CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS`] (600 s), longer than the
+//!   archiver waits for it (`archive_quiesce_wait_secs`). Such an archive
+//!   pass then keeps every further locked partition (`quiesce_busy`) and the
+//!   pressure leg stands aside until a later pass. Nothing is lost; the
+//!   archive waits.
+//! - Unknown (not verified against QuestDB 9.3.5): whether QuestDB cancels
+//!   an `/exec` `INSERT … SELECT` when the client gives up at that timeout.
+//!   If it does not, the lock is released while the statement may still
+//!   commit. The archiver's re-count after its export then catches only a
+//!   statement that changed the row count or `max(ts)`, which this one does
+//!   not; an hour copied in that window can keep its blank names in S3.
 //!
 //! Cold path: runs from the app's once-a-day after-close task, never on the
 //! frame drain.
@@ -122,6 +136,20 @@ pub struct RepairDayTally {
     /// (a character [`tickvault_common::sanitize::sanitize_ilp_symbol`]
     /// strips, or too long).
     pub names_refused: u32,
+}
+
+/// Whether the repair can rewrite rows of `table`: every candle table the
+/// fold emits, `ticks` and `feed_aux_packets`, the set the app's after-close
+/// task repairs. The partition archiver holds the old-hour writers out
+/// across the copy and the drop of every partition of such a table (recheck
+/// of PR AA finding 1), because the repair's rewrite keeps the row count and
+/// `max(ts)` that the archiver's re-count compares. Cold, O(candle tables)
+/// per call (one per archived partition).
+#[must_use]
+pub fn repair_may_rewrite(table: &str) -> bool {
+    table == crate::tick_persistence::TICKS_TABLE
+        || table == crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE
+        || crate::shadow_persistence::emitted_candle_table_names().contains(&table)
 }
 
 /// `true` when `day` is exactly `YYYY-MM-DD` in ASCII digits. Every SQL string
@@ -675,6 +703,30 @@ mod tests {
                 upsert_key: matches!(*s, "ts" | "feed" | "segment" | "security_id"),
             })
             .collect()
+    }
+
+    /// Recheck of PR AA finding 1: the tables the archiver locks for the
+    /// repair are exactly the ones the repair can rewrite: ticks, aux packets
+    /// and every emitted candle table, and nothing else.
+    #[test]
+    fn test_repair_may_rewrite_names_ticks_aux_and_every_candle_table() {
+        assert!(repair_may_rewrite("ticks"));
+        assert!(repair_may_rewrite("feed_aux_packets"));
+        let candles = crate::shadow_persistence::emitted_candle_table_names();
+        assert!(!candles.is_empty());
+        for table in &candles {
+            assert!(repair_may_rewrite(table), "{table}");
+        }
+        assert!(candles.contains(&"candles_1m"));
+        for table in [
+            "market_depth",
+            "market_depth_book",
+            "tick_quotes",
+            "order_audit",
+            "",
+        ] {
+            assert!(!repair_may_rewrite(table), "{table}");
+        }
     }
 
     #[test]

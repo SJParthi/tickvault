@@ -303,6 +303,20 @@ mod tests {
         assert!(!tables.iter().any(|t| t.contains("depth")));
     }
 
+    /// Recheck of PR AA finding 1: the archiver holds the quiesce lock across
+    /// the day path of exactly the tables the repair can rewrite. A table
+    /// added here and not there would be rewritten between an export and a
+    /// drop again.
+    #[test]
+    fn test_every_repaired_table_is_locked_by_the_archiver() {
+        for table in repair_tables() {
+            assert!(
+                tickvault_storage::contract_name_repair::repair_may_rewrite(table),
+                "{table} is repaired but the archiver would not hold the repair out"
+            );
+        }
+    }
+
     #[test]
     fn test_run_contract_name_repair_loop_is_spawned_once_from_main() {
         let main = include_str!("main.rs");
