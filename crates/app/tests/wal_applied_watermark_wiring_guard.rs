@@ -465,19 +465,43 @@ fn test_regression_rd3_replay_confirm_maps_every_ack_outcome() {
             "{arm} must decide {verdict}: {arm_body}"
         );
     }
-    for source in [
-        r#"source = "replay_depth_deferred""#,
-        r#"source = "replay_rows_lost""#,
-        r#"source = "replay_ack_wait_timeout""#,
-    ] {
-        assert_eq!(body.matches(source).count(), 1, "{source} appears once");
-    }
-    let lost = body.find(r#"source = "replay_rows_lost""#).unwrap_or(0);
-    let lost_macro = body[..lost].rfind("error!(").unwrap_or(0);
-    assert!(
-        body[..lost].rfind("warn!(").is_none_or(|w| w < lost_macro),
-        "a lost row stays an ERROR (it pages, §2.17)"
+    // PR RD review finding 4 (2026-11-08): the deferred-depth arm is a row
+    // that landed in neither QuestDB nor a spill, so it logs `replay_rows_lost`
+    // at ERROR (it pages through `ws-spill-01`, §2.17), as the refused arm
+    // does; `confirmed` tells them apart. Bite: put back the `warn!` with
+    // `replay_depth_deferred` and every assertion below fails.
+    assert_eq!(
+        body.matches(r#"source = "replay_depth_deferred""#).count(),
+        0,
+        "no quiet source for a lost replayed row"
     );
+    assert_eq!(
+        body.matches(r#"source = "replay_ack_wait_timeout""#)
+            .count(),
+        1
+    );
+    let lost_sites: Vec<usize> = body
+        .match_indices(r#"source = "replay_rows_lost""#)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(lost_sites.len(), 2, "the deferred arm and the refused arm");
+    for lost in lost_sites {
+        let lost_macro = body[..lost].rfind("error!(").unwrap_or(0);
+        assert!(
+            lost_macro > 0 && body[..lost].rfind("warn!(").is_none_or(|w| w < lost_macro),
+            "a lost row stays an ERROR (it pages, §2.17)"
+        );
+    }
+    let deferred = body
+        .find("AckOutcome::LandedDepthDeferred =>")
+        .expect("deferred arm");
+    let deferred_arm = &body[deferred..];
+    let deferred_arm = &deferred_arm[..deferred_arm
+        .find("AckOutcome::TicksLost =>")
+        .unwrap_or(deferred_arm.len())];
+    assert!(deferred_arm.contains("error!("), "{deferred_arm}");
+    assert!(deferred_arm.contains(r#"source = "replay_rows_lost""#));
+    assert!(deferred_arm.contains("confirmed = true"));
 }
 
 /// RD-3: in a production build of the storage crate the table a failed depth

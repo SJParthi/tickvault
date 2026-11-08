@@ -15793,15 +15793,21 @@ fn wal_replay_acked(
     match outcome {
         tickvault_storage::wal_applied_watermark::AckOutcome::Landed => true,
         tickvault_storage::wal_applied_watermark::AckOutcome::LandedDepthDeferred => {
-            warn!(
+            // PR RD review (finding 4): a row that landed in neither QuestDB
+            // nor a spill pages as `replay_rows_lost` under §2.17 whether or
+            // not the batch is confirmed; `confirmed` tells the two apart.
+            error!(
                 code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-                source = "replay_depth_deferred",
+                source = "replay_rows_lost",
                 stage,
                 depth_batches,
+                confirmed = true,
                 "WAL replay: every tick row of the re-folded batch landed, but some order-book \
                  rows landed in neither QuestDB nor the depth spill. They are marked for the \
                  after-close pass, which writes them back from the WAL; the marks keep the \
-                 segments from being pruned until then. The segments are confirmed."
+                 segments from being pruned until then (below the 5% disk floor a pinned \
+                 segment with a verified S3 copy can still be deleted, counted as a loss). \
+                 The segments are confirmed."
             );
             true
         }
@@ -15820,6 +15826,7 @@ fn wal_replay_acked(
                 depth_batches_deferred = lost
                     .depth_deferred
                     .saturating_sub(unlanded_before.depth_deferred),
+                confirmed = false,
                 "WAL replay: re-folded rows landed in neither QuestDB nor the spill (tick rows, \
                  or order-book rows that could not be marked for the after-close pass), so the \
                  segments are NOT confirmed — they stay in `replaying/` and the next boot \

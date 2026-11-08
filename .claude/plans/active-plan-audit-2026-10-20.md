@@ -2476,3 +2476,35 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - [x] RD-3 depth losses deferred, not holding tick segments (storage, app): `wal_deferred_depth::DeferredDepth::defer_lost_range` (every bucket of a lost range, both kinds; `false` on no start, inverted, wider than the table, or a slot collision, which still records an overflow) and `persist_checked` (waits for an in-flight persist, writes, reports the result); `wal_applied_watermark`: the not-landed count split into ticks (`note_unlanded`), depth (`note_unlanded_depth(deferred)`) and deferred depth, `UnlandedSnapshot` / `unlanded_snapshot`, `AckOutcome { Landed, LandedDepthDeferred, TicksLost, TimedOut }` from `wait_for_replay_ack` (losses re-read after the completion is seen; `LandedDepthDeferred` only when every depth loss was deferred and the marks persisted); `unlanded_total` is the tick + depth sum for the pacing wait; `depth_persistence::note_rescue_outcome_depth` marks the range before counting it, in `wal_deferred_depth::lost_depth_marks()` (the process table in production; a separate table under storage's own unit tests so their deliberate rescue failures do not pollute other tests' prunes); `dhan_feed_stack::wal_replay_acked` confirms on `LandedDepthDeferred` with a coded `warn!` `replay_depth_deferred` (depth batches), and logs `replay_rows_lost` (ERROR, pages) apart from `replay_ack_wait_timeout` (the §2.17 source split; `tv_wal_replay_ack_wait_timeouts_total` still counts every refused confirm). Tests: `test_defer_lost_range_marks_every_bucket_both_kinds`, `test_defer_lost_range_refuses_what_it_cannot_hold`, `test_persist_checked_reports_whether_the_marks_reached_the_file`, `test_note_unlanded_depth_and_unlanded_snapshot_count_apart`, the six `test_wait_for_replay_ack_*`, `test_regression_rd3_a_lost_depth_range_keeps_its_archived_segment_and_reaches_the_pass` (bite: drop `defer_lost_range` and the prune deletes the segment), `test_rd3_note_rescue_outcome_depth_does_not_defer_a_sequence_less_loss`, `test_regression_rd3_pass_rewrites_a_lost_depth_range_from_an_archived_segment`, `test_regression_rd3_replay_confirm_maps_every_ack_outcome`, `test_lost_depth_marks_is_the_process_table_in_production`, `test_lost_depth_marks_is_not_the_process_table_under_unit_tests`.
 - [x] RD-4 log lines per §2.17 (storage): `wal_replay_frame_cap::cap_is_planned_evening_drain` (a cap above 3,000,000 exists only on the planned evening-drain boot; one process, fails closed) and `refuse_past_frame_cap` logs a coded `warn!` `source = "replay_frame_cap_planned"` on that boot, the coded `error!` `source = "replay_frame_cap"` on every other boot, counter on both. `ws-spill-01` alarm unchanged (its filter matches ERROR only; §2.17 keeps its description unchanged). Runbook rows in `docs/error-runbooks/ws-frame-spill-error-codes.md`. (The `replay_rows_lost` / `replay_ack_wait_timeout` split landed with RD-3.) Tests: `test_regression_rd4_planned_cap_refusal_warns_and_unplanned_errors` (JSON lines as the shipped layer writes them, checked against the deployed filter pattern; bite: always-error fails the planned case, always-warn fails the unplanned case), `test_cap_is_planned_evening_drain_only_above_the_standard_cap`.
 - [ ] RD-5 docs (Quote 41 note, CLAUDE.md rows).
+
+### PR RD review — 2026-11-08: four confirmed review findings on PR RD (app, docs)
+
+**Approved by:** the owner's 2026-11-08 decision card "Quiet on planned restarts (Recommended)" ("Any other start that hits the limit still pages you, and a real data problem always pages."), §2.17 of `dhan-rest-only-noise-lock-2026-07-14.md`, which this item now satisfies; no new quote is needed and no page, alarm, filter or EMF name is added.
+
+#### Design
+- RDR-1 (after-close pass): an uncertain bucket older than `UNCERTAIN_CARRY_MAX_DAYS` whose readable segments still hold it is written back from them first; only the unreadable neighbour's share is released (same `deferred_depth_uncertain_expired` line and counter, after the write). A bucket with no readable segment is released as before.
+- RDR-2 (disk floor): kept by design (item 45a, ticks over depth below the 5% floor); recorded honestly in §2.17's addendum and the runbook row; no behaviour change.
+- RDR-3 (planned mark): `evening_drain::claim_planned_boot` claims the mark in `main` before the WAL is locked and replayed and keeps the verdict in memory; `allowance_or` uses it (or claims itself when no early claim ran). A failed clearing write hands out nothing.
+- RDR-4 (paging): the `LandedDepthDeferred` arm logs `error!` `source = "replay_rows_lost"` with `confirmed = true` (pages through `ws-spill-01`, as §2.17 requires); the refused arm carries `confirmed = false`.
+
+#### Edge Cases
+A planned boot killed before the claim (seconds after start, before any replay): the mark survives up to 15 minutes, as before. A stale flag is cleared, never claimed. An expired uncertain bucket whose readable read fails or whose flush fails is carried, never released. Two `replay_rows_lost` lines on one boot (one per batch) page once per alarm episode.
+
+#### Failure Modes
+The early claim cannot write the state file: standard allowance, coded `DRAIN-HOLD-01` error (fail closed). The after-close sink cannot flush an expired bucket: carried to the next pass (keeps the mark). A deferred depth loss now pages: expected only when the depth spill is full, which is itself a real data problem.
+
+#### Test Plan
+`test_regression_expired_uncertain_bucket_is_written_back_from_its_readable_segment` (bite: the old first-visit release writes 0 rows and clears the mark); `test_regression_claim_applies_to_the_one_planned_boot_only`, `test_regression_claim_refuses_the_allowance_when_the_clear_fails` (bite: drop the `return None` on a failed clear); `the_lane_and_main_are_wired_to_the_evening_drain` (claim precedes `lock_wal_dir`); `test_regression_rd3_replay_confirm_maps_every_ack_outcome` (deferred arm is `error!` `replay_rows_lost`, no `replay_depth_deferred`).
+
+#### Rollback
+Revert the commit: the pass releases expired uncertain buckets unread again, the allowance is decided after the boot replay, and the deferred-depth line is a `warn!` again. No data format changes.
+
+#### Observability
+Unchanged counters (`tv_wal_deferred_depth_pass_total{outcome="uncertain_expired"}`, `tv_wal_replay_frame_cap_stops_total`); `replay_rows_lost` now carries `confirmed`. No new page, alarm, metric filter or EMF name.
+
+This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
+
+- [x] RDR-1 `crates/app/src/dhan_feed_stack/deferred_depth_pass.rs::run_after_close_pass` reads readable segments of an expired uncertain bucket before releasing it.
+- [x] RDR-2 §2.17 addendum + runbook row (disk-floor trade-off recorded).
+- [x] RDR-3 `crates/app/src/evening_drain.rs::{claim_planned_boot, claim_planned_boot_at, allowance_or}` + the `main.rs` call before `lock_wal_dir`.
+- [x] RDR-4 `crates/app/src/dhan_feed_stack.rs::wal_replay_acked` deferred arm pages as `replay_rows_lost` (`confirmed = true`); guard updated.

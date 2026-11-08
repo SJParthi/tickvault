@@ -990,7 +990,12 @@ pub fn run_after_close_pass(
         let expired_uncertain = bucket.uncertain
             && !bucket.touches_open
             && bucket_age_days(id) > UNCERTAIN_CARRY_MAX_DAYS;
-        if expired_uncertain {
+        // PR RD review (finding 1, 2026-11-08): an expired uncertain bucket
+        // whose READABLE segments still hold its rows is written back from
+        // them first; only the rows in the unreadable neighbour are released
+        // (reported after the write below). Releasing it unread would clear
+        // the only mark protecting a readable, possibly archived, segment.
+        if expired_uncertain && bucket.paths.is_empty() {
             summary.segments_damaged += 1;
             pass_counter("uncertain_expired");
             error!(
@@ -1004,7 +1009,7 @@ pub fn run_after_close_pass(
             done.push((id, kinds));
             continue;
         }
-        if bucket.touches_open || bucket.uncertain {
+        if bucket.touches_open || (bucket.uncertain && !expired_uncertain) {
             summary.buckets_carried += 1;
             if !bucket.touches_open {
                 summary.buckets_uncertain += 1;
@@ -1154,6 +1159,21 @@ pub fn run_after_close_pass(
                 frames = bucket_no_receipt,
                 "skipped order-book frames carry no receipt time and cannot be written back \
                  onto their original keys — they are lost"
+            );
+        }
+        if expired_uncertain {
+            // The readable segments were written back above; what remains
+            // unread is the unreadable neighbour's share, released as lost.
+            summary.segments_damaged += 1;
+            pass_counter("uncertain_expired");
+            error!(
+                code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                source = "deferred_depth_uncertain_expired",
+                bucket = id,
+                kinds,
+                "order-book rows skipped under load were written back from the readable WAL \
+                 segments; the rows in the unreadable neighbour could not be read for several \
+                 days — those are released as lost"
             );
         }
         done.push((id, kinds));
@@ -2006,6 +2026,82 @@ mod tests {
         );
         // `for_test` has no QuestDB: the bucket is carried, never cleared on a
         // write it could not prove, so the archived segment stays protected.
+        assert_eq!(summary.buckets_cleared, 0);
+        assert!(!marks.snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: PR RD review finding 1 (2026-11-08). A replayed backlog
+    // bucket is days old; an unreadable neighbour (an empty segment written
+    // after the archived one) makes it `uncertain`. Before the fix the pass
+    // released it as lost on its FIRST visit without reading the readable
+    // archived segment that holds the rows, and cleared the mark. It must
+    // write those rows back first.
+    #[test]
+    fn test_regression_expired_uncertain_bucket_is_written_back_from_its_readable_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-deferred-pass-rd-uncertain-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2026-05-28: far past UNCERTAIN_CARRY_MAX_DAYS.
+        let (seq, rx) = in_session();
+        assert!(bucket_age_days(seq >> DEFERRED_BUCKET_SHIFT) > UNCERTAIN_CARRY_MAX_DAYS);
+        {
+            let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                seq,
+                rx,
+                WalEndpoint::MainFeed,
+            );
+            wal.shutdown(Duration::from_secs(5));
+        }
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wal") {
+                std::fs::rename(&path, archive.join(entry.file_name())).unwrap();
+            }
+        }
+        // The unreadable neighbour, sorting after the archived segment.
+        std::fs::write(archive.join("zz-empty-neighbour.wal"), b"").unwrap();
+        let spans = deferred_segment_spans(&dir).unwrap();
+        let bucket = segments_for_bucket(&spans, seq >> DEFERRED_BUCKET_SHIFT);
+        assert!(
+            bucket.uncertain,
+            "the empty neighbour makes the bucket uncertain"
+        );
+        assert_eq!(bucket.paths.len(), 1, "the archived segment is readable");
+
+        let marks = DeferredDepth::new_for_tests();
+        assert!(marks.defer_lost_range(seq, seq));
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
+            sleep: &|_| {},
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(
+            summary.rows_written, 10,
+            "the readable archived segment is read before the bucket is released"
+        );
+        // `for_test` cannot flush, so the bucket is carried and its mark kept;
+        // the old code cleared it unread.
         assert_eq!(summary.buckets_cleared, 0);
         assert!(!marks.snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

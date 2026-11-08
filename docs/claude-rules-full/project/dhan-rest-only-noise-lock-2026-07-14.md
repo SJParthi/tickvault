@@ -5246,10 +5246,11 @@ the 8 Nov Muhurat boot), but the line says `replay_ack_wait_timeout`,
 | `WS-SPILL-01` `source = "replay_frame_cap"` on any other boot | `error!`, pages | unchanged: `error!`, pages |
 | A replayed row that landed in neither QuestDB nor a spill (the ack refuses at once) | `error!` `source = "replay_ack_wait_timeout"`, pages | `error!` `source = "replay_rows_lost"`, pages (same code, same filter) |
 | The ack wait really ran out of time | `error!` `source = "replay_ack_wait_timeout"`, pages | unchanged |
+| A replayed ORDER-BOOK row that landed nowhere, marked for the after-close pass (`LandedDepthDeferred`, PR RD review 2026-11-08) | (RD-3 draft: coded `warn!` `replay_depth_deferred`, not paged) | `error!` `source = "replay_rows_lost"`, `confirmed = true`, pages; the batch is confirmed and the marks keep its segments for the after-close pass |
 
 "Planned" means only the boot the evening drain itself recorded as its own
-restart in `data/state/evening-drain.state` (the one-boot pending flag read and
-cleared by `evening_drain::budget_or`); a deploy restart, a crash restart, a
+restart in `data/state/evening-drain.state` (the one-boot pending flag, read and
+cleared by `evening_drain::claim_planned_boot` before the boot replay starts, and handed out only when the clearing write succeeds); a deploy restart, a crash restart, a
 manual start, a Muhurat boot, or a boot whose state file cannot be read is NOT
 planned and keeps the ERROR.
 
@@ -5263,6 +5264,23 @@ in the app log (the `warn!` line), and in the evening drain's own progress
 check, which stops further restarts when the backlog does not shrink. A
 mistaken "planned" mark would hide a real capacity signal on that one boot, so
 the mark is one boot only and fails closed (unreadable state = not planned).
+
+**PR RD review addendum (2026-11-08, no new page, the owner card above).**
+(1) The planned mark is claimed in `main` before the WAL directory is locked
+and replayed, and the verdict is kept in memory, so a planned boot that dies
+in its replay (OOM, deploy, crash) leaves no mark for the next boot; a failed
+clearing write gives the standard allowance. Honest limit: a process killed
+between its start and the claim (before any replay) leaves the mark for the
+next boot within 15 minutes. (2) A replayed order-book row deferred to the
+after-close pass pages as `replay_rows_lost` (`confirmed = true`), per the
+card's "a real data problem always pages". Honest limit, unchanged from item
+45a: once confirmed, the segments sit in `archive/`, and below the 5% disk
+floor the archive prune may delete a marked segment that has a verified S3
+copy (counted, `deferred_depth_deleted_under_disk_floor_copy_in_s3`); before
+RD-3 they stayed in `replaying/` and were re-folded every boot. Ticks keep
+priority over depth at the floor; nothing re-reads the S3 copy yet (45e-2).
+(3) An uncertain bucket older than three days is written back from its
+readable segments before the unreadable neighbour's share is released.
 
 **What a PR that violates §2.17 looks like (REJECT):**
 - Logs `replay_frame_cap` below ERROR on any boot the evening drain did not
