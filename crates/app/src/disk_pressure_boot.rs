@@ -328,6 +328,9 @@ async fn run_disk_pressure_loop(
     let mut state = PressureState::default();
     // DA-13d: the last pass stood aside for the after-close depth pass.
     let mut last_stood_aside = false;
+    // PR AA review: the last pass stood aside ONLY for after-close depth
+    // marks (`stood_aside_only_for_depth_marks`).
+    let mut last_aside_for_depth_only = false;
     // PR DP review M7: the (re-arm window key, depth allowed) of the last
     // in-session pass that stood aside; the same conditions skip the rerun.
     // Depth is allowed at 90%+ used or, since PR AA step 4, while the disk is
@@ -697,7 +700,10 @@ async fn run_disk_pressure_loop(
                 // read is gone; it is now "marks are waiting, inside the
                 // after-close window" (`depth_marks_hold_busy`), so in session a
                 // stood-aside pass is retried at the next poll, as before.
-                let depth_gate_busy = last_stood_aside
+                // PR AA review: only a pass that stood aside SOLELY for depth
+                // marks waits for them; one that stood aside for a busy
+                // quiesce lock (a spill replay, a catch-up chunk) is retried.
+                let depth_gate_busy = last_aside_for_depth_only
                     && depth_marks_hold_busy(
                         u64::from(secs_of_day_ist()),
                         tickvault_storage::partition_archive::deferred_depth_marks_waiting(),
@@ -720,11 +726,10 @@ async fn run_disk_pressure_loop(
                 if let Some(reason) = gate {
                     metrics::counter!(PASS_GATED_COUNTER, "reason" => reason.as_str()).increment(1);
                 }
-                let pass = refund_off_session_progress(
-                    run_one_pass(&questdb, &cfg, limits).await,
-                    off_session,
-                );
+                let (pass, aside_for_depth_only) = run_one_pass(&questdb, &cfg, limits).await;
+                let pass = refund_off_session_progress(pass, off_session);
                 last_stood_aside = matches!(pass, PressurePass::StoodAside);
+                last_aside_for_depth_only = last_stood_aside && aside_for_depth_only;
                 last_in_session_aside = (in_session && matches!(pass, PressurePass::StoodAside))
                     .then_some((window_key, depth_allowed));
                 // PR DP review M1: a refunded pass (gated progress, or an
@@ -893,6 +898,24 @@ pub const fn classify_pressure_pass(
     PressurePass::Dropped(summary.dropped as u64)
 }
 
+/// Whether a pass stood aside ONLY because the after-close depth pass still
+/// has rows of some depth hours to write back (PR AA review): it dropped
+/// nothing, held depth hours for that reason, and nothing else held it (no
+/// busy quiesce lock, no session gate, no WAL-lagging gated table). Only then
+/// may the next polls wait for the marks to clear; a pass that stood aside
+/// because a spill replay or a catch-up chunk had the quiesce lock is retried
+/// at the next poll. Pure, O(1).
+#[must_use]
+pub const fn stood_aside_only_for_depth_marks(
+    summary: &tickvault_storage::partition_archive::ArchiveRunSummary,
+) -> bool {
+    matches!(classify_pressure_pass(summary), PressurePass::StoodAside)
+        && summary.held_deferred_depth > 0
+        && summary.held_quiesce_busy == 0
+        && summary.held_by_gate == 0
+        && summary.tables_wal_not_applied == 0
+}
+
 /// Whether a pressure poll wakes the raw-frame uploader (PR DP review M7):
 /// not inside the session below [`PRESSURE_EMERGENCY_USED_PCT`], where the
 /// upload's gzip and S3 copy of a 128 MiB WAL segment runs beside the hot
@@ -991,7 +1014,7 @@ async fn run_one_pass(
     questdb: &QuestDbConfig,
     cfg: &PartitionRetentionConfig,
     limits: ArchivePassLimits,
-) -> PressurePass {
+) -> (PressurePass, bool) {
     let pressure_cfg = pressure_config(cfg);
     match PartitionArchiver::new(questdb, &pressure_cfg).await {
         Ok(Some(archiver)) => {
@@ -1010,7 +1033,7 @@ async fn run_one_pass(
                      archive guard, or the WAL probe failed closed) — reporting as \
                      not-run rather than as nothing-reclaimable"
                 );
-                return PressurePass::NotRun;
+                return (PressurePass::NotRun, false);
             }
             info!(
                 verified = summary.verified,
@@ -1029,7 +1052,10 @@ async fn run_one_pass(
                 metrics::counter!(PASS_GATED_COUNTER, "reason" => PASS_GATED_DEADLINE_STOPPED)
                     .increment(1);
             }
-            classify_pressure_pass(&summary)
+            (
+                classify_pressure_pass(&summary),
+                stood_aside_only_for_depth_marks(&summary),
+            )
         }
         Ok(None) => {
             // No bucket resolvable. Archival is the ONLY way this loop frees
@@ -1041,7 +1067,7 @@ async fn run_one_pass(
                  [partition_retention] archive_bucket or TV_ENVIRONMENT) — no partition \
                  can be freed until this is fixed"
             );
-            PressurePass::NotRun
+            (PressurePass::NotRun, false)
         }
         Err(err) => {
             error!(
@@ -1049,7 +1075,7 @@ async fn run_one_pass(
                 code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
                 "disk-pressure pass could not build the archiver — no partition touched"
             );
-            PressurePass::NotRun
+            (PressurePass::NotRun, false)
         }
     }
 }
@@ -1383,6 +1409,43 @@ mod tests {
         assert!(depth_marks_hold_busy(before_dawn, true));
         assert!(!depth_marks_hold_busy(evening, false));
         assert!(!depth_marks_hold_busy(before_dawn, false));
+    }
+
+    /// PR AA review: only a pass that stood aside SOLELY for depth marks may
+    /// hold the next polls. One that stood aside because a spill replay or a
+    /// catch-up chunk had the quiesce lock (even with depth hours held too)
+    /// is retried at the next poll; before the fix it waited for the marks,
+    /// all night when the depth pass sat at its disk floor.
+    #[test]
+    fn test_regression_quiesce_busy_stand_aside_never_waits_for_depth_marks() {
+        use tickvault_storage::partition_archive::ArchiveRunSummary;
+        let summary = |deferred: u32, busy: u32, gate: u32| ArchiveRunSummary {
+            pass_ran: true,
+            held_deferred_depth: deferred,
+            held_quiesce_busy: busy,
+            held_by_gate: gate,
+            ..ArchiveRunSummary::default()
+        };
+        assert!(stood_aside_only_for_depth_marks(&summary(2, 0, 0)));
+        assert!(!stood_aside_only_for_depth_marks(&summary(0, 3, 0)));
+        assert!(!stood_aside_only_for_depth_marks(&summary(2, 3, 0)));
+        assert!(!stood_aside_only_for_depth_marks(&summary(2, 0, 1)));
+        let dropped = ArchiveRunSummary {
+            dropped: 1,
+            ..summary(2, 0, 0)
+        };
+        assert!(!stood_aside_only_for_depth_marks(&dropped));
+        // In the loop: a quiesce-busy stand-aside never holds the next poll,
+        // even with marks waiting after the close.
+        let evening = 18 * 3_600;
+        let busy_only = summary(0, 3, 0);
+        let depth_gate_busy =
+            stood_aside_only_for_depth_marks(&busy_only) && depth_marks_hold_busy(evening, true);
+        assert!(pressure_pass_due(
+            PressureAction::ContinuePass,
+            true,
+            depth_gate_busy
+        ));
     }
 
     // Regression: 2026-10-13 (DA-13d re-review) — a pass that held depth AND
@@ -1855,6 +1918,9 @@ mod probe_health_wiring_tests {
             "let probe = probe.with_projected_short(projection_short);",
             "projected_session_limits(",
             "in_session_rerun_skippable(last_in_session_aside, window_key, depth_allowed)",
+            // PR AA review: the depth-marks wait reads the depth-only flag.
+            "let depth_gate_busy = last_aside_for_depth_only",
+            "last_aside_for_depth_only = last_stood_aside && aside_for_depth_only;",
         ] {
             assert!(prod.contains(needle), "missing in the loop: {needle}");
         }

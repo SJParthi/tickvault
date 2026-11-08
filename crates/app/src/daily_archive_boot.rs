@@ -95,7 +95,9 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::ist_offset;
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
-use tickvault_storage::partition_archive::{ArchiveRunSummary, PartitionArchiver, VerifiedDayGate};
+use tickvault_storage::partition_archive::{
+    ArchivePassLimits, ArchiveRunSummary, PartitionArchiver, VerifiedDayGate,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::archive_free_target::{
@@ -118,7 +120,10 @@ const DAILY_ARCHIVE_POLL: Duration = Duration::from_secs(DAILY_ARCHIVE_POLL_INTE
 
 /// Attempts allowed per IST day before the loop stops retrying.
 ///
-/// Six, against a ~two-hour window at a five-minute poll. The cap exists so a
+/// Six attempts that fail WITHOUT progress (PR AA review: since step 5 the
+/// window runs from the close to 07:30 IST, and a pass that dropped
+/// something, was stood off by another job or only waited on QuestDB's WAL
+/// is given back, so only a real fault spends one). The cap exists so a
 /// persistently broken QuestDB is not hammered for the whole evening; it is
 /// deliberately larger than one so a single transient failure at 15:35 does
 /// not cost the day's archival, which is what latching on first attempt would
@@ -236,18 +241,21 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // before the day is out.
         return PassVerdict::Incomplete("wal_suspended");
     }
+    // PR AA review: the two real faults are named BEFORE a lagging WAL, so
+    // a pass that both waited on QuestDB and failed a partition spends its
+    // attempt (`wal_not_applied` alone is given back, `refunds_attempt`).
+    if summary.tables_list_failed > 0 {
+        return PassVerdict::Incomplete("table_list_failed");
+    }
+    if summary.failed > 0 {
+        return PassVerdict::Incomplete("partition_failed");
+    }
     if summary.tables_wal_not_applied > 0 {
         // A table's WAL could not be proven fully applied at the
         // per-partition gate (most often: it was merely behind), so its
         // partitions were kept. A later attempt the same day usually finds
         // it caught up.
         return PassVerdict::Incomplete("wal_not_applied");
-    }
-    if summary.tables_list_failed > 0 {
-        return PassVerdict::Incomplete("table_list_failed");
-    }
-    if summary.failed > 0 {
-        return PassVerdict::Incomplete("partition_failed");
     }
     // `>=` and not `>`: hitting the cap exactly means the worklist was
     // truncated at it, which is the same "there is more" as exceeding it.
@@ -301,13 +309,21 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
 /// write back) and `quiesce_busy` (PR AA step 2: a WAL replay, a spill
 /// replay or the after-close depth pass had the archive quiesce lock).
 /// Spending an attempt on any of them would exhaust the day's six attempts
-/// and page STORAGE-GAP-04 on a box that is working. Pure, O(1).
+/// and page STORAGE-GAP-04 on a box that is working.
+///
+/// PR AA review: also `wal_not_applied`, a pass that only waited on a WAL
+/// QuestDB had not applied yet (no listing failure, no failed partition:
+/// [`pass_verdict`] names those first). Since the window runs to 07:30 IST,
+/// six such passes (about an hour of evening apply lag at a 300 s snapshot
+/// wait each) used to end the leg for the whole night, and the hours that
+/// became old enough afterwards were never archived. The 07:30 window end
+/// bounds those passes now; apply lag has its own watchers. Pure, O(1).
 #[must_use]
 pub fn refunds_attempt(outcome: PassOutcome) -> bool {
     matches!(
         outcome,
         PassOutcome::Ran(PassVerdict::Incomplete(
-            "contended" | "deferred_depth_pass" | "quiesce_busy"
+            "contended" | "deferred_depth_pass" | "quiesce_busy" | "wal_not_applied"
         ))
     )
 }
@@ -474,6 +490,21 @@ pub fn archive_session_day(date_ist: NaiveDate, secs_of_day_ist: u32) -> (NaiveD
     }
 }
 
+/// The instant (Unix seconds) a daily pass of `session_day` must stop at:
+/// 07:30 IST the next calendar day, the end of its window (PR AA review).
+/// Without it a pass started at 07:29 ran its whole worklist (up to 200
+/// partitions, each holding the quiesce lock and a QuestDB export) into the
+/// 08:30 boot and the 09:00 session; the pressure leg already stops at its
+/// gate for the same reason. The pass stops at the next partition boundary
+/// once this passes. `None` only past chrono's last date. Pure, O(1).
+#[must_use]
+pub fn daily_pass_stop_unix_secs(session_day: NaiveDate) -> Option<i64> {
+    let end_day = session_day.succ_opt()?;
+    let end = end_day.and_hms_opt(0, 0, 0)?
+        + chrono::TimeDelta::seconds(i64::from(ARCHIVE_WINDOW_END_SECS_IST));
+    Some(end.and_utc().timestamp() - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
+}
+
 /// What one pass means for the day (PR AA step 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatchDecision {
@@ -610,6 +641,7 @@ async fn run_one_pass(
     cfg: &PartitionRetentionConfig,
     verified_day_gate: Option<&VerifiedDayGate>,
     measure_day: Option<NaiveDate>,
+    stop_at_unix_secs: Option<i64>,
 ) -> PassReport {
     match PartitionArchiver::new(questdb, cfg).await {
         Ok(Some(archiver)) => {
@@ -629,6 +661,12 @@ async fn run_one_pass(
             if cfg.drain_hold_counts_archive {
                 archiver = archiver.with_backlog_measure();
             }
+            // PR AA review: the pass stops at its window's end (07:30 IST),
+            // never running into the 08:30 boot and the 09:00 session.
+            archiver = archiver.with_pass_limits(ArchivePassLimits {
+                stop_at_unix_secs,
+                ..ArchivePassLimits::default()
+            });
             let summary = archiver.archive_and_drop_old_partitions().await;
             let verdict = pass_verdict(&summary, cfg.max_partitions_per_run);
             info!(
@@ -873,8 +911,14 @@ async fn run_daily_archive_loop(
             crate::archive_backlog::ARCHIVE_BACKLOG
                 .note_pass_started(chrono::Utc::now().timestamp());
         }
-        let report =
-            run_one_pass(&questdb, &pass_cfg, verified_day_gate.as_ref(), measure_day).await;
+        let report = run_one_pass(
+            &questdb,
+            &pass_cfg,
+            verified_day_gate.as_ref(),
+            measure_day,
+            daily_pass_stop_unix_secs(today_date),
+        )
+        .await;
         let outcome = report.outcome;
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome.as_str())
             .increment(1);
@@ -1396,6 +1440,9 @@ mod tests {
             body.contains("|| latched_day == Some(today);"),
             "completed_today must OR the in-process latch"
         );
+        // PR AA review: each pass stops at its window's end, 07:30 IST.
+        assert!(body.contains("daily_pass_stop_unix_secs(today_date),"));
+        assert!(prod.contains("archiver = archiver.with_pass_limits(ArchivePassLimits {"));
         let latch = body
             .find("latched_day = Some(today);")
             .unwrap_or(usize::MAX);
@@ -1603,6 +1650,76 @@ mod tests {
         let mut fresh = AttemptLedger::default();
         run(&mut fresh, failed, 1);
         assert_eq!(fresh.attempts_on(day), 0);
+    }
+
+    /// PR AA review: passes that drop nothing only because QuestDB had not
+    /// applied a WAL yet (evening apply backlog) are given back. Before the
+    /// fix six of them (about an hour) ended the leg for the night, and the
+    /// hours old enough from 18:00 to 20:00 were never archived. A pass that
+    /// also failed a partition reads `partition_failed` and still spends.
+    #[test]
+    fn test_regression_wal_lag_passes_never_exhaust_the_night() {
+        let day = 740_000;
+        let mut ledger = AttemptLedger::default();
+        let lagging = ArchiveRunSummary {
+            pass_ran: true,
+            tables_wal_not_applied: 1,
+            partitions_considered: 4,
+            ..ArchiveRunSummary::default()
+        };
+        // 18:00 to 07:30 at the five-minute poll.
+        for tick in 0..162_u32 {
+            let now = 18 * 3_600 + tick * 300;
+            assert_eq!(
+                archive_tick(
+                    now,
+                    56_400,
+                    false,
+                    ledger.attempts_on(day),
+                    MAX_DAILY_ARCHIVE_ATTEMPTS
+                ),
+                ArchiveTick::Run,
+                "tick {tick}"
+            );
+            ledger.record(day);
+            let outcome = PassOutcome::Ran(pass_verdict(&lagging, 200));
+            if let LatchDecision::KeepOpen { refund: true, .. } =
+                daily_latch_decision(outcome, 0, Some((0, 1)))
+            {
+                ledger.refund(day);
+            }
+        }
+        assert_eq!(ledger.attempts_on(day), 0);
+        let lagging_and_failed = ArchiveRunSummary {
+            failed: 1,
+            ..lagging
+        };
+        let verdict = pass_verdict(&lagging_and_failed, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("partition_failed"));
+        assert!(!refunds_attempt(PassOutcome::Ran(verdict)));
+    }
+
+    /// PR AA review: a daily pass stops at its window's end, 07:30 IST the
+    /// next calendar day, and the loop hands that stop to the archiver.
+    #[test]
+    fn test_daily_pass_stops_at_the_window_end() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).expect("date");
+        let stop = daily_pass_stop_unix_secs(day).expect("stop");
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 11, 10)
+            .and_then(|d| d.and_hms_opt(2, 0, 0))
+            .expect("02:00 UTC = 07:30 IST")
+            .and_utc()
+            .timestamp();
+        assert_eq!(stop, expected);
+        let started_0729 = expected - 60;
+        assert!(
+            !tickvault_storage::partition_archive::pass_deadline_reached(Some(stop), started_0729)
+        );
+        assert!(tickvault_storage::partition_archive::pass_deadline_reached(
+            Some(stop),
+            expected
+        ));
+        // The wiring is pinned in `test_latch_marker_failure_still_latches_in_process`.
     }
 
     /// A session is read once, after 15:40, the same calendar day, and only

@@ -173,6 +173,24 @@ mod tests {
             code.contains("catchup_early_stop = catchup_stop::STOP_ARCHIVE_QUIESCE;"),
             "a quiesce-held round must name its stop"
         );
+        // PR AA review: the chunk waits to the drain's own deadline (not a
+        // fixed 60 s), and the replay is registered before the boot refold,
+        // so the archiver starts no new partition while it runs.
+        assert!(
+            body[..lock].contains("aq::archive_quiesce_for_replay_until(")
+                && body[lock..refold].contains("catchup_deadline,"),
+            "each chunk waits until the drain's deadline"
+        );
+        let intent = code
+            .find("archive_quiesce::intend_old_hour_replay()")
+            .expect("the replay must be registered");
+        let boot_lock = code
+            .find("QuiesceWriter::BootRefold")
+            .expect("the boot refold lock");
+        assert!(
+            intent < boot_lock,
+            "registered before the boot refold waits"
+        );
     }
 
     /// PR AA step 1: the boot refold takes the lock (try-only in session)

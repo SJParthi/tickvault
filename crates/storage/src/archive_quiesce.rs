@@ -38,7 +38,13 @@
 //! work (nothing is lost; the frames or files are offered again later):
 //! - the boot refold and the catch-up drain only TRY inside the capture
 //!   window (09:00 to 15:40 IST), so the morning boot never waits on an
-//!   archive; outside it they wait at most [`WRITER_QUIESCE_WAIT`];
+//!   archive; outside it the boot refold waits at most
+//!   [`WRITER_QUIESCE_WAIT`] and each catch-up chunk waits until the drain's
+//!   own deadline (PR AA review: one partition can hold the lock longer
+//!   than 60 s, and a chunk miss stops the drain). Both register a
+//!   [`ReplayIntent`] for the whole replay first, so the archiver finishes
+//!   the partition it holds and starts no other until the replay is done;
+//!   the pass counts that as quiesce-busy and stands aside;
 //! - the spill replays wait at most [`WRITER_QUIESCE_WAIT`] per file, then
 //!   end the round with the files kept;
 //! - the after-close depth pass runs on its own OS thread and waits for the
@@ -50,6 +56,7 @@
 //! Cold path only (once per replay file, per replay chunk, per depth bucket,
 //! per archived partition); never per tick, never on the frame drain.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -111,6 +118,25 @@ impl QuiesceWriter {
 #[derive(Debug)]
 pub struct ArchiveQuiesce {
     lock: RwLock<()>,
+    /// Old-hour replays that have said they are about to write (PR AA
+    /// review): while any is registered the archiver does not START a new
+    /// partition ([`Self::hold_writers`] refuses at once), so a replay
+    /// waits behind at most the one partition already being copied.
+    replay_intents: AtomicUsize,
+}
+
+/// A registered old-hour replay ([`ArchiveQuiesce::intend_replay`]). While
+/// it lives the archiver starts no new partition; dropping it lets the
+/// archiver in again. O(1).
+#[derive(Debug)]
+pub struct ReplayIntent<'q> {
+    quiesce: &'q ArchiveQuiesce,
+}
+
+impl Drop for ReplayIntent<'_> {
+    fn drop(&mut self) {
+        self.quiesce.replay_intents.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Default for ArchiveQuiesce {
@@ -125,14 +151,35 @@ impl ArchiveQuiesce {
     pub const fn new() -> Self {
         Self {
             lock: RwLock::const_new(()),
+            replay_intents: AtomicUsize::new(0),
         }
     }
 
     /// The archiver's side: waits at most `wait` for every writer to finish
     /// and holds them out until the guard is dropped. `None` on timeout; the
     /// queued request is then withdrawn, so writers behind it go ahead.
+    ///
+    /// PR AA review: also `None` AT ONCE while an old-hour replay is
+    /// registered ([`Self::intend_replay`]). One archive partition can hold
+    /// the lock for many minutes (two snapshot waits and an export), longer
+    /// than a replay chunk can wait, so without this a replay that arrived
+    /// during one partition missed it and found the archiver queued again
+    /// for the next one. The pass counts it as quiesce-busy and stands aside.
     pub async fn hold_writers(&self, wait: Duration) -> Option<RwLockWriteGuard<'_, ()>> {
+        if self.replay_intents.load(Ordering::Acquire) > 0 {
+            return None;
+        }
         tokio::time::timeout(wait, self.lock.write()).await.ok()
+    }
+
+    /// Registers an old-hour replay that is about to write (PR AA review).
+    /// Hold the returned guard for the whole replay (the boot refold and the
+    /// WAL catch-up drain): the archiver finishes the partition it may
+    /// already hold and starts no other until the guard is dropped. O(1).
+    #[must_use]
+    pub fn intend_replay(&self) -> ReplayIntent<'_> {
+        self.replay_intents.fetch_add(1, Ordering::AcqRel);
+        ReplayIntent { quiesce: self }
     }
 
     /// A writer's side, waiting at most `wait`. `None` on timeout (an
@@ -175,6 +222,60 @@ impl ArchiveQuiesce {
         }
         guard
     }
+
+    /// [`Self::for_replay`] for a writer with its own deadline (the WAL
+    /// catch-up drain, PR AA review): inside the capture window TRY only, as
+    /// before; outside it wait until `deadline` instead of 60 s. One
+    /// archive partition can hold the lock for longer than 60 s, and a miss
+    /// stops the drain for the process, so the drain now waits out the
+    /// partition in progress, charged against its own clock. A miss is
+    /// counted as before.
+    pub async fn for_replay_until(
+        &self,
+        now_secs_of_day_ist: u64,
+        writer: QuiesceWriter,
+        deadline: tokio::time::Instant,
+    ) -> Option<RwLockReadGuard<'_, ()>> {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let guard = match replay_quiesce_wait_until(now_secs_of_day_ist, left) {
+            None => self.try_shared(),
+            Some(wait) => self.shared(wait).await,
+        };
+        if guard.is_none() {
+            note_quiesce_held(writer);
+        }
+        guard
+    }
+}
+
+/// How long a writer with `time_left` before its own deadline may wait at
+/// `now_secs_of_day_ist` (PR AA review): `None` (try only) inside the
+/// capture window, else all of `time_left`. Pure, O(1).
+#[must_use]
+pub fn replay_quiesce_wait_until(
+    now_secs_of_day_ist: u64,
+    time_left: Duration,
+) -> Option<Duration> {
+    replay_quiesce_wait(now_secs_of_day_ist).map(|_| time_left)
+}
+
+/// Registers an old-hour replay on the process lock. See
+/// [`ArchiveQuiesce::intend_replay`].
+#[must_use]
+pub fn intend_old_hour_replay() -> ReplayIntent<'static> {
+    ARCHIVE_QUIESCE.intend_replay()
+}
+
+/// The process lock under the catch-up drain's rule. See
+/// [`ArchiveQuiesce::for_replay_until`].
+pub async fn archive_quiesce_for_replay_until(
+    now_secs_of_day_ist: u64,
+    writer: QuiesceWriter,
+    deadline: tokio::time::Instant,
+) -> Option<RwLockReadGuard<'static, ()>> {
+    ARCHIVE_QUIESCE
+        .for_replay_until(now_secs_of_day_ist, writer, deadline)
+        .await
 }
 
 /// The process's one quiesce lock.
@@ -289,6 +390,71 @@ mod tests {
         assert_eq!(replay_quiesce_wait(86_399), Some(WRITER_QUIESCE_WAIT));
         // A bad clock reading past the end of the day still waits, bounded.
         assert_eq!(replay_quiesce_wait(u64::MAX), Some(WRITER_QUIESCE_WAIT));
+    }
+
+    /// PR AA review: while an old-hour replay is registered the archiver
+    /// starts no new partition, even on a free lock; once the replay drops
+    /// its intent the archiver gets in again.
+    #[tokio::test]
+    async fn test_regression_archiver_stands_aside_while_a_replay_is_registered() {
+        let q = ArchiveQuiesce::new();
+        let intent = q.intend_replay();
+        let started = tokio::time::Instant::now();
+        assert!(
+            q.hold_writers(Duration::from_secs(5)).await.is_none(),
+            "a registered replay keeps the archiver from starting a partition"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "it refuses at once, without queueing"
+        );
+        let second = q.intend_replay();
+        drop(intent);
+        assert!(q.hold_writers(Duration::from_millis(10)).await.is_none());
+        drop(second);
+        assert!(q.hold_writers(Duration::from_millis(10)).await.is_some());
+    }
+
+    /// PR AA review: a catch-up chunk outside the capture window waits until
+    /// its own deadline, longer than the old 60 s, so it outlasts one
+    /// archive partition; inside the window it still only tries.
+    #[test]
+    fn test_catchup_wait_runs_to_its_own_deadline_outside_the_window() {
+        let left = Duration::from_secs(900);
+        assert_eq!(replay_quiesce_wait_until(AFTER_CLOSE, left), Some(left));
+        assert!(replay_quiesce_wait_until(AFTER_CLOSE, left) > Some(WRITER_QUIESCE_WAIT));
+        assert_eq!(replay_quiesce_wait_until(IN_SESSION, left), None);
+        assert_eq!(
+            replay_quiesce_wait_until(AFTER_CLOSE, Duration::ZERO),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// PR AA review: a writer queued while the archiver holds one partition
+    /// gets in when it is released (it waits to its own deadline, not a
+    /// fixed 60 s; see the pure test above), and the registered replay keeps
+    /// the archiver from taking the next one.
+    #[tokio::test]
+    async fn test_catchup_chunk_outlasts_a_long_archive_partition() {
+        let q: &'static ArchiveQuiesce = Box::leak(Box::new(ArchiveQuiesce::new()));
+        let held = q.hold_writers(Duration::from_millis(10)).await;
+        assert!(held.is_some());
+        let intent = q.intend_replay();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let writer = tokio::spawn(async move {
+            q.for_replay_until(AFTER_CLOSE, QuiesceWriter::CatchUp, deadline)
+                .await
+                .is_some()
+        });
+        // The partition in progress finishes a while later.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        assert!(writer.await.expect("writer task"), "the chunk got in");
+        assert!(
+            q.hold_writers(Duration::from_millis(10)).await.is_none(),
+            "no next partition while the replay is registered"
+        );
+        drop(intent);
     }
 
     #[tokio::test]

@@ -41,6 +41,48 @@ const APPLY_DEADLINE: Duration = Duration::from_secs(90);
 /// partition because two later hours are written).
 const DROPPED_HOUR: &str = "2026-01-01T09";
 
+/// Whether the probe's outcome is one the archiver may live with (PR AA
+/// review). Safe: the late insert was REFUSED and the hour stays empty, or it
+/// was ACCEPTED and the hour holds exactly the late row in a re-created
+/// partition. Everything else fails: the dropped row came back, or QuestDB
+/// accepted the late row and it is not there (accepted and lost, the case a
+/// spill replay into a dropped hour would hit). Pure.
+fn probe_outcome_is_safe(late_accepted: bool, rows_after: &[i64], recreated: bool) -> bool {
+    let rows_ok = if late_accepted {
+        rows_after == [9]
+    } else {
+        rows_after.is_empty()
+    };
+    rows_ok && recreated != rows_after.is_empty()
+}
+
+/// The judge of the probe: the accepted-and-lost outcome must fail it (the
+/// first version of this probe passed on it). Runs without QuestDB.
+#[test]
+fn test_probe_outcome_judge_fails_accepted_and_lost() {
+    assert!(probe_outcome_is_safe(false, &[], false), "refused, empty");
+    assert!(
+        probe_outcome_is_safe(true, &[9], true),
+        "re-created with the late row"
+    );
+    assert!(
+        !probe_outcome_is_safe(true, &[], false),
+        "accepted and lost must fail"
+    );
+    assert!(
+        !probe_outcome_is_safe(true, &[1, 9], true),
+        "the dropped row came back"
+    );
+    assert!(
+        !probe_outcome_is_safe(false, &[1], true),
+        "the dropped row came back"
+    );
+    assert!(
+        !probe_outcome_is_safe(true, &[9], false),
+        "listing and rows disagree"
+    );
+}
+
 /// The QuestDB HTTP base URL, or `None` when no QuestDB is configured.
 fn base_url() -> Option<String> {
     let Some(addr) = std::env::var("TV_QDB_REAL_HTTP")
@@ -194,16 +236,14 @@ async fn dropped_wal_partition_recreated_on_insert() {
         if late.is_ok() { "accepted" } else { "refused" },
         if recreated { "RE-CREATED" } else { "absent" },
     );
-    // Either way: the dropped row never comes back, and the hour holds at
-    // most the late row.
+    // Either way: the dropped row never comes back, and an ACCEPTED late row
+    // is visible (accepted and then lost is the outcome this probe exists to
+    // catch). See `probe_outcome_is_safe`.
     assert!(
-        after.is_empty() || after == vec![9],
-        "the dropped hour came back with rows other than the late one: {after:?}"
-    );
-    assert_eq!(
-        recreated,
-        !after.is_empty(),
-        "partition listing and rows disagree"
+        probe_outcome_is_safe(late.is_ok(), &after, recreated),
+        "unsafe outcome: late insert {}, rows in the dropped hour {after:?}, re-created \
+         {recreated}",
+        if late.is_ok() { "accepted" } else { "refused" },
     );
 
     let _ = exec(&base, &format!("DROP TABLE IF EXISTS {table}")).await;

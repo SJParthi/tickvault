@@ -29,7 +29,11 @@
 //! 3. In-flight check ([`hour_in_flight_verdict`]): the hour is held when any
 //!    of its frames is still on its way to QuestDB (unapplied ranges,
 //!    after-close depth marks, a rescue batch, not yet acknowledged, or a
-//!    clock that stepped back).
+//!    clock that stepped back). For a table on the hour path that was not
+//!    forced past a pending spill file, the archiver also reads the table's
+//!    own spill folder again here, under the lock (PR AA review): a batch
+//!    rescued to a spill file counts as acknowledged, so only the folder
+//!    shows its rows are not in QuestDB yet.
 //! 4. Read S UNDER the lock and wait until `writerTxn >= S`, at most
 //!    `archive_wal_snapshot_wait_secs`. A timeout keeps the partition and
 //!    blocks the table for the rest of the run.
@@ -263,6 +267,11 @@ pub(crate) enum InFlightVerdict {
     /// The newest frame sequence is ahead of the wall clock, so frame
     /// sequences no longer map to hours.
     ClockAhead,
+    /// The table's own spill folder holds a file the spill replay has not
+    /// read yet (PR AA review). A rescued batch counts as acknowledged, so
+    /// none of the frame checks above sees its rows; the folder is read
+    /// again under the quiesce lock, where no replay can be posting.
+    SpillPending,
 }
 
 impl InFlightVerdict {
@@ -276,6 +285,7 @@ impl InFlightVerdict {
             Self::RescueFloor => "rescue_floor",
             Self::NotAcked => "not_acked",
             Self::ClockAhead => "clock_ahead",
+            Self::SpillPending => "spill_pending",
         }
     }
 }
@@ -801,7 +811,8 @@ fn note_in_flight(
         | InFlightVerdict::DeferredDepth
         | InFlightVerdict::Unapplied
         | InFlightVerdict::RescueFloor
-        | InFlightVerdict::NotAcked => {
+        | InFlightVerdict::NotAcked
+        | InFlightVerdict::SpillPending => {
             info!(
                 table,
                 partition,
@@ -1192,6 +1203,7 @@ mod tests {
             InFlightVerdict::RescueFloor,
             InFlightVerdict::NotAcked,
             InFlightVerdict::ClockAhead,
+            InFlightVerdict::SpillPending,
         ];
         let mut labels: Vec<&str> = all.iter().map(|v| v.as_str()).collect();
         labels.sort_unstable();

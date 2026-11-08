@@ -199,6 +199,18 @@ impl DayWork {
     /// not done, the direction that keeps the box up. O(1).
     #[must_use]
     pub fn is_done(&self) -> bool {
+        self.data_in_database() && self.archive_backlog_bytes.is_none()
+    }
+
+    /// [`Self::is_done`] without the archive copy work: the day's data is in
+    /// the database, whatever the archiver still has to copy to S3 (PR AA
+    /// review). The Quote 31 evening WAL restart reads this, not `is_done`:
+    /// the copy work holds the BOX (Quote 51), but it must never keep the
+    /// restart that drains the WAL backlog from running. Before, a partition
+    /// the archiver failed on every pass kept `is_done` false all night and
+    /// the evening restart gave up at 05:00 without running. O(1).
+    #[must_use]
+    pub fn data_in_database(&self) -> bool {
         let deferred_done = (self.deferred_marks == 0 && !self.deferred_overflowed)
             || self.deferred_retryable_left == Some(0)
             || self.deferred_floor_blocked();
@@ -209,7 +221,6 @@ impl DayWork {
             && self.suspended == Some(0)
             && !self.sink_suspect
             && !self.wal_holding
-            && self.archive_backlog_bytes.is_none()
     }
 
     /// Whether the skipped-depth buckets stop holding the box: every pass
@@ -614,7 +625,7 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 Some(evening) if on_aws => crate::evening_drain::evening_step(
                     &evening,
                     evening_day,
-                    work.is_done(),
+                    work.data_in_database(),
                     crate::evening_drain::crossverify_settled(xverify_marker, secs_ist),
                     work.wal_backlog,
                     now_unix,
@@ -1070,6 +1081,46 @@ mod tests {
         assert!(!tracker.observe(&holding(400), 0, t0 + DRAIN_HOLD_STALL_SECS + 10));
         // Stuck for an hour after the last fall: released anyway.
         assert!(tracker.observe(&holding(400), 0, t0 + 2 * DRAIN_HOLD_STALL_SECS - 1));
+    }
+
+    /// PR AA review: archive copy work holds the box but never the Quote 31
+    /// evening WAL restart. With a partition the archiver fails on every
+    /// pass, `is_done` stays false all night; the restart reads
+    /// `data_in_database`, so it still runs at 19:00.
+    #[test]
+    fn test_regression_archive_backlog_never_blocks_the_evening_restart() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(1 << 30),
+            ..done_work()
+        };
+        assert!(!work.is_done(), "the copy work holds the box");
+        assert!(work.data_in_database(), "the day's data is in the database");
+        let state = crate::evening_drain::EveningState::default();
+        let step = |other_done: bool| {
+            crate::evening_drain::evening_step(
+                &state,
+                739_000,
+                other_done,
+                true,
+                Some(12),
+                1_800_000_000,
+                19 * 3_600,
+            )
+        };
+        assert_eq!(
+            step(work.data_in_database()),
+            crate::evening_drain::EveningStep::Restart
+        );
+        assert_eq!(
+            step(work.is_done()),
+            crate::evening_drain::EveningStep::Wait
+        );
+        // Every other kind of unfinished work still keeps the restart waiting.
+        let spill = DayWork {
+            spill_files: 1,
+            ..done_work()
+        };
+        assert!(!spill.data_in_database());
     }
 
     /// A box held only for archive copy work is never held past 07:30 IST:

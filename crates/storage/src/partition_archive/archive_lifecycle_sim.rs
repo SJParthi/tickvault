@@ -34,11 +34,18 @@
 //!    acknowledged) at its drop.
 //! 5. `MARKED_DROP`: no after-close depth row of the hour is still waiting.
 //! 6. `FLOOR`: a dropped hour ended at least 4 h before the drop.
-//! 7. `EXEMPT_TABLE`: candles and audit tables are never dropped.
-//! 8. `DISK`: on a clean night every old hour is gone by 07:00, except the
-//!    stated cases (a row still in flight or waiting for the depth pass, an
-//!    hour whose last frame the sink has not acknowledged past, an upload
-//!    over the single-object limit).
+//! 7. `EXEMPT_TABLE`: candles and audit tables are never dropped (the model
+//!    reports every table's WAL, so a selection that let them onto the hour
+//!    path would reach the drop; bite-tested).
+//! 8. `DISK`: on a clean night every hour that started at least
+//!    `HOT_HOURS + 1 + DISK_CHECK_MARGIN_HOURS` (12) hours before the last
+//!    pass (about 06:xx) is gone by 07:00, i.e. every session hour up to
+//!    15:00 and a Muhurat 18:00 hour, except the stated cases (a row still in
+//!    flight or waiting for the depth pass, next to such an hour for a depth
+//!    table, an hour whose last frame the sink has not acknowledged past
+//!    (usually the session's last hour), the mark table overflowed, an upload
+//!    over the single-object limit). The horizon is fixed from the floor,
+//!    never from the hour offset under test.
 //!
 //! # Bite tests
 //!
@@ -46,7 +53,8 @@
 //! least one seed: the old exact-equality gate (DISK), no quiesce lock
 //! (LOSS), reading S before the lock (LOSS), no acknowledged-watermark check
 //! (INFLIGHT_DROP), the all-night depth hold (DISK), the start-based hour
-//! SQL (FLOOR).
+//! SQL (FLOOR), every table on the hour path (EXEMPT_TABLE), an hour SQL
+//! that lists hours 8 h late (DISK).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -83,8 +91,14 @@ const HOT_HOURS: u32 = 4;
 /// limit, stated case).
 const TOO_BIG_ROWS: u64 = 60_000;
 /// A clean night's DISK check covers hours eligible at least this long
-/// before the last pass (several passes to retry a random failure).
-const DISK_CHECK_MARGIN_HOURS: i64 = 11;
+/// before the last pass (several passes to retry a random failure). PR AA
+/// review: 7, not 11, so the session's last hour (15:00, eligible about
+/// 20:00) and a Muhurat 18:00 hour are checked the morning after; the limit
+/// is anchored to the floor (`HOT_HOURS + 1`), never to the hour offset the
+/// code under test produced.
+const DISK_CHECK_MARGIN_HOURS: i64 = 7;
+/// How many hours late [`Mutation::LateHourSql`] lists an hour.
+const LATE_SQL_EXTRA_HOURS: i64 = 8;
 
 /// The tables of the simulation: the two hour-path tables the plan moves
 /// first, and two tables the hour path must never touch.
@@ -105,6 +119,12 @@ enum Mutation {
     NoAckCheck,
     AllNightDepthHold,
     StartBasedSql,
+    /// The table selection lets every table onto the hour path (PR AA
+    /// review): candles and audit hours are dropped.
+    HourPathOnEveryTable,
+    /// The hour SQL lists an hour 8 h later than it should (PR AA review):
+    /// the day's afternoon hours stay on the box past the morning.
+    LateHourSql,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,10 +260,10 @@ impl World {
         };
         let floor = hot_hour_floor(HOT_HOURS).expect("hour floor on");
         let real_offset = sql_hour_offset(&build_closed_hour_list_sql("market_depth", floor));
-        let hour_offset = if mutation == Mutation::StartBasedSql {
-            i64::from(floor)
-        } else {
-            real_offset
+        let hour_offset = match mutation {
+            Mutation::StartBasedSql => i64::from(floor),
+            Mutation::LateHourSql => real_offset + LATE_SQL_EXTRA_HOURS,
+            _ => real_offset,
         };
         Self {
             rng: Rng(params.seed),
@@ -498,7 +518,6 @@ impl World {
         TABLES
             .iter()
             .zip(&self.walls)
-            .take(2)
             .map(|((name, _), wal)| WalTableRow {
                 name: (*name).to_string(),
                 suspended: false,
@@ -841,7 +860,10 @@ fn run_pass(world: &mut World, runtime: &tokio::runtime::Runtime, cap: Option<u3
         .live
         .iter()
         .take_while(|(h, _)| world.hour_start_ist(*h) < cutoff)
-        .filter(|(_, t)| hour_window_for(TABLES[*t].0, &world.cfg).is_some())
+        .filter(|(_, t)| {
+            world.mutation == Mutation::HourPathOnEveryTable
+                || hour_window_for(TABLES[*t].0, &world.cfg).is_some()
+        })
         .filter(|(h, t)| world.any_applied(*t, *h))
         .map(|&(h, t)| (t, h))
         .collect();
@@ -917,7 +939,9 @@ fn check_disk(world: &mut World, last_wall: i64, clean: bool) {
     if !clean {
         return;
     }
-    let limit = last_wall - (world.hour_offset.max(5) + DISK_CHECK_MARGIN_HOURS) * HOUR_SECS;
+    // Anchored to the configured floor, not to `world.hour_offset`: an hour
+    // SQL that lists hours late must not move its own check back with it.
+    let limit = last_wall - (i64::from(HOT_HOURS) + 1 + DISK_CHECK_MARGIN_HOURS) * HOUR_SECS;
     let mut found = Vec::new();
     for &(hour, table) in &world.live {
         let name = TABLES[table].0;
@@ -1213,4 +1237,20 @@ fn test_bite_all_night_depth_hold_fails_the_disk_invariant() {
 #[test]
 fn test_bite_start_based_hour_sql_breaks_the_floor() {
     assert!(bites(Mutation::StartBasedSql, "FLOOR"));
+}
+
+/// PR AA review: invariant 7 can fire. The model reports every table's WAL
+/// (it reported only the first two, so a candles or audit hour read "not
+/// reported" and was never dropped, whatever the selection said).
+#[test]
+fn test_bite_hour_path_on_every_table_drops_candles_or_audit() {
+    assert!(bites(Mutation::HourPathOnEveryTable, "EXEMPT_TABLE"));
+}
+
+/// PR AA review: the DISK check is anchored to the floor, so an hour SQL
+/// that lists hours a night late is caught (it moved its own check back
+/// with it before).
+#[test]
+fn test_bite_late_hour_sql_fails_the_disk_invariant() {
+    assert!(bites(Mutation::LateHourSql, "DISK"));
 }

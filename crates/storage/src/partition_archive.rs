@@ -1392,7 +1392,9 @@ pub struct ArchiveRunSummary {
     /// left on the box (PR AA step 6, AA-5): every partition of the worklist
     /// after the cross-verification hold, less the ones it dropped and the
     /// ones it held because rows of their hour were still on their way to
-    /// QuestDB (in-flight and after-close depth holds). `None` when the pass
+    /// QuestDB (in-flight and after-close depth holds), plus the hours of
+    /// each table listed by the hour that have ended but become old enough
+    /// only later tonight (PR AA review). `None` when the pass
     /// was not asked to measure it ([`PartitionArchiver::with_backlog_measure`]),
     /// did not run, or a size listing could not be read. The daily leg hands
     /// it to the drain hold.
@@ -1428,6 +1430,37 @@ pub(crate) fn add_worklist_sizes(
             && let Some(bytes) = listed.get(partition.as_str())
         {
             sizes.insert((*t, partition.clone()), *bytes);
+        }
+    }
+}
+
+/// Adds the bytes of `table`'s hour partitions (from its `(name, diskSize)`
+/// listing `rows`) that have ENDED by `now_ist` but are not yet old enough
+/// for an hour window of `hours` (PR AA review): an hour starting at S is
+/// listed once S is more than `hours + 1` hours before now
+/// (`build_closed_hour_list_sql`), so until then it is copy work a later pass
+/// tonight does. Without them the drain hold let the box stop at 16:30 with
+/// the afternoon's hours still waiting. The open hour, day partitions,
+/// partitions `counts` refuses (a cross-verification hold) and partitions
+/// already in `sizes` are skipped. Pure, O(rows).
+pub(crate) fn add_pending_hour_sizes(
+    table: &'static str,
+    hours: u32,
+    rows: &[(String, u64)],
+    now_ist: chrono::NaiveDateTime,
+    counts: impl Fn(&str) -> bool,
+    sizes: &mut std::collections::HashMap<(&'static str, String), u64>,
+) {
+    let listed_from = now_ist - chrono::TimeDelta::hours(i64::from(hours) + 1);
+    for (name, bytes) in rows {
+        let Some((start, end)) = partition_range_naive(name) else {
+            continue;
+        };
+        let is_hour = end - start == chrono::TimeDelta::hours(1);
+        let ended = end <= now_ist;
+        let not_listed_yet = start >= listed_from;
+        if is_hour && ended && not_listed_yet && counts(name) {
+            sizes.entry((table, name.clone())).or_insert(*bytes);
         }
     }
 }
@@ -1634,6 +1667,23 @@ pub struct PartitionArchiver {
     /// Measure the bytes this pass leaves on the box (PR AA step 6); set by
     /// [`Self::with_backlog_measure`] for the daily leg only.
     measure_backlog: bool,
+    /// Tables listed by the hour in this pass WITHOUT being forced past a
+    /// pending spill file (PR AA review). The snapshot gate reads each one's
+    /// own spill folder again under the quiesce lock ([`Self::in_flight_now`]).
+    spill_recheck_tables: Vec<&'static str>,
+    /// Whether a table's own spill folder holds a file the replay has not
+    /// read: [`process_spill_pending`] in production, scripted in tests.
+    spill_pending_reader: SpillPendingReader,
+}
+
+/// How the archiver reads a table's spill folder (PR AA review).
+pub(crate) type SpillPendingReader = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Whether `table`'s own spill folder holds a file the spill replay could
+/// still read, listed off the runtime worker. Cold: at most twice per
+/// hour-path partition, under the quiesce lock.
+fn process_spill_pending(table: &str) -> bool {
+    crate::off_worker::off_worker(|| PartitionArchiver::spill_dirs_have_pending_data(table))
 }
 
 /// Predicate the daily archive leg injects: `true` when day D is verified
@@ -1863,6 +1913,8 @@ impl PartitionArchiver {
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
             measure_backlog: false,
+            spill_recheck_tables: Vec::new(),
+            spill_pending_reader: std::sync::Arc::new(process_spill_pending),
         }))
     }
 
@@ -1905,6 +1957,8 @@ impl PartitionArchiver {
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
             measure_backlog: false,
+            spill_recheck_tables: Vec::new(),
+            spill_pending_reader: std::sync::Arc::new(process_spill_pending),
         })
     }
 
@@ -1953,6 +2007,16 @@ impl PartitionArchiver {
         self.quiesce = Some(quiesce);
         self.in_flight_reader = in_flight_reader;
         self.pause_override = Some(Duration::from_millis(10));
+        self
+    }
+
+    /// Test seam (PR AA review): a scripted spill-folder reader for the
+    /// re-check under the quiesce lock. The pass's own listing still reads
+    /// the real (empty) folder, so a stub test can make a spill file appear
+    /// after the listing.
+    #[cfg(test)]
+    pub(crate) fn with_test_spill_reader(mut self, reader: SpillPendingReader) -> Self {
+        self.spill_pending_reader = reader;
         self
     }
 
@@ -2067,19 +2131,49 @@ impl PartitionArchiver {
     }
 
     /// The bytes of each partition of `worklist` (PR AA step 6), one size
-    /// listing per distinct table. `None` when any listing fails: a partial
-    /// map would understate what is left. O(tables × partitions), cold.
+    /// listing per distinct table, plus (PR AA review) the hours of every
+    /// table in `hour_windows` that have ended but are not old enough yet:
+    /// a later pass tonight copies and drops them, so they are copy work
+    /// too. An hour the cross-verification hold would keep is not counted.
+    /// `None` when any listing fails: a partial map would understate what is
+    /// left. O(tables × partitions), cold.
     async fn worklist_sizes(
         &self,
         worklist: &[(&'static str, String)],
+        hour_windows: &[(&'static str, u32)],
     ) -> Option<std::collections::HashMap<(&'static str, String), u64>> {
-        let mut tables: Vec<&'static str> = worklist.iter().map(|(t, _)| *t).collect();
+        let mut tables: Vec<&'static str> = worklist
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(hour_windows.iter().map(|(t, _)| *t))
+            .collect();
         tables.sort_unstable();
         tables.dedup();
+        let now =
+            chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
+        let (now_ist, today_ist) = (now.naive_local(), now.date_naive());
+        let held_by_crossverify = |partition: &str| {
+            self.verified_day_gate.as_ref().is_some_and(|gate| {
+                crossverify_hold_decision(partition, today_ist, |d| gate(d))
+                    == CrossverifyHold::Hold
+            })
+        };
         let mut sizes = std::collections::HashMap::with_capacity(worklist.len());
         for table in tables {
             match self.partition_sizes(table).await {
-                Ok(rows) => add_worklist_sizes(worklist, table, &rows, &mut sizes),
+                Ok(rows) => {
+                    add_worklist_sizes(worklist, table, &rows, &mut sizes);
+                    if let Some((_, hours)) = hour_windows.iter().find(|(t, _)| *t == table) {
+                        add_pending_hour_sizes(
+                            table,
+                            *hours,
+                            &rows,
+                            now_ist,
+                            |p| !held_by_crossverify(p),
+                            &mut sizes,
+                        );
+                    }
+                }
                 Err(err) => {
                     info!(
                         table,
@@ -2287,6 +2381,11 @@ impl PartitionArchiver {
         // them goes through the WAL snapshot gate (`uses_snapshot_gate`) and
         // is never dropped from a gated pass for a WAL that is merely behind.
         let mut hour_path_tables: Vec<&'static str> = Vec::new();
+        // PR AA review: the hour window of each table listed by the hour, so
+        // the drain-hold backlog also counts hours that become old enough
+        // later tonight (`add_pending_hour_sizes`).
+        let mut hour_windows: Vec<(&'static str, u32)> = Vec::new();
+        self.spill_recheck_tables.clear();
         for table in swept_tables() {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
@@ -2299,6 +2398,18 @@ impl PartitionArchiver {
             let window = self.hour_window(table);
             if window.is_hour_granular() {
                 hour_path_tables.push(table);
+            }
+            match window {
+                // Listed by the hour with its spill folder empty: the folder
+                // is read again under the quiesce lock (PR AA review).
+                HourWindowDecision::Hours(hours) => {
+                    self.spill_recheck_tables.push(table);
+                    hour_windows.push((table, hours));
+                }
+                // Deliberately forced past a pending spill file
+                // (`market_depth` under pressure): no re-check.
+                HourWindowDecision::ForcedHours(hours) => hour_windows.push((table, hours)),
+                HourWindowDecision::DeferredToDays | HourWindowDecision::DaysByClass => {}
             }
             match self.list_eligible_partitions(table, window, hot_days).await {
                 Ok(PartitionListing::Eligible(names)) => {
@@ -2350,7 +2461,7 @@ impl PartitionArchiver {
         // is not work tonight) and before any cap, so a partition the pass
         // does not reach still counts.
         let backlog_sizes = if self.measure_backlog {
-            self.worklist_sizes(&worklist).await
+            self.worklist_sizes(&worklist, &hour_windows).await
         } else {
             None
         };
@@ -3645,7 +3756,19 @@ impl ArchiveIo for PartitionArchiver {
     }
 
     fn in_flight_now(&mut self, table: &str, span: HourFrameSpan) -> InFlightVerdict {
-        (self.in_flight_reader)(table, span)
+        let verdict = (self.in_flight_reader)(table, span);
+        if verdict != InFlightVerdict::Clear {
+            return verdict;
+        }
+        // PR AA review: the pass listed this table by the hour while its
+        // spill folder was empty, but a batch can be rescued to a spill file
+        // later in the same pass. A rescued batch counts as acknowledged, so
+        // the frame checks above cannot see it; the folder can. Read under
+        // the lock, where no spill replay is posting.
+        if self.spill_recheck_tables.contains(&table) && (self.spill_pending_reader)(table) {
+            return InFlightVerdict::SpillPending;
+        }
+        InFlightVerdict::Clear
     }
 
     async fn pause_for(&mut self, duration: Duration) {
@@ -6375,6 +6498,107 @@ mod stub_integration_tests {
             .filter(|r| r.target.contains("DROP PARTITION"))
             .count();
         assert_eq!(drops, 1);
+    }
+
+    /// PR AA review: the pass lists the table by the hour while its spill
+    /// folder is empty; later in the same pass a batch of that hour is
+    /// rescued to a spill file and counted as acknowledged, so every frame
+    /// check reads clear. The folder, read again under the quiesce lock,
+    /// holds the hour; once the replay has read the file the hour goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_spill_file_written_after_the_listing_holds_the_hour() {
+        use snapshot_gate::InFlightVerdict;
+        use std::sync::atomic::AtomicBool;
+
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let spill_pending = Arc::new(AtomicBool::new(true));
+        let reader_flag = Arc::clone(&spill_pending);
+        // `market_depth` on the hour path, as live (4 h).
+        let cfg = PartitionRetentionConfig {
+            depth_hot_hours: 4,
+            ..test_retention_cfg(200)
+        };
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear))
+            .with_test_spill_reader(Arc::new(move |table| {
+                table == crate::depth_persistence::MARKET_DEPTH_TABLE
+                    && reader_flag.load(Ordering::SeqCst)
+            }));
+
+        let held = archiver.run_archive_pass().await;
+        assert_eq!(
+            held.dropped, 0,
+            "a pending spill file holds the hour: {held:?}"
+        );
+        assert_eq!(held.held_in_flight, 1, "{held:?}");
+        assert_eq!(held.failed, 0, "{held:?}");
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "nothing is dropped while its rows wait in a spill file"
+        );
+
+        spill_pending.store(false, Ordering::SeqCst);
+        let freed = archiver.run_archive_pass().await;
+        assert_eq!(freed.dropped, 1, "once the replay read the file: {freed:?}");
+    }
+
+    /// PR AA review: hours that have ended but are not yet old enough for
+    /// the window are copy work for later tonight, so the drain hold counts
+    /// them. Before the fix the backlog counted only the worklist, read 0 at
+    /// 16:25 with the 12:00 to 15:00 hours still on the box, and the box
+    /// stopped at 16:30.
+    #[test]
+    fn test_add_pending_hour_sizes_counts_hours_eligible_later_tonight() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 9)
+            .and_then(|d| d.and_hms_opt(16, 25, 0))
+            .expect("now");
+        let rows: Vec<(String, u64)> = [
+            ("2026-11-09T10", 10_u64), // listed already (start < 11:25): worklist's job
+            ("2026-11-09T11", 11),     // starts 11:00 < 11:25: listed, not pending
+            ("2026-11-09T12", 12),     // pending: eligible at 17:00
+            ("2026-11-09T15", 15),     // pending: eligible at 20:00
+            ("2026-11-09T16", 16),     // still open at 16:25
+            ("2026-11-08", 99),        // a day partition is never an hour
+            ("2026-11-09T13", 13),     // held by the cross-verification hold
+        ]
+        .into_iter()
+        .map(|(n, b)| (n.to_string(), b))
+        .collect();
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert(("market_depth_book", "2026-11-09T12".to_string()), 12);
+        add_pending_hour_sizes(
+            "market_depth_book",
+            4,
+            &rows,
+            now,
+            |p| p != "2026-11-09T13",
+            &mut sizes,
+        );
+        let mut got: Vec<(&str, u64)> = sizes.iter().map(|((_, p), b)| (p.as_str(), *b)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![("2026-11-09T12", 12), ("2026-11-09T15", 15)]);
+        // The bytes left include them even with nothing on the worklist.
+        assert_eq!(
+            backlog_bytes_left(&sizes, &std::collections::HashSet::new()),
+            27
+        );
     }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;

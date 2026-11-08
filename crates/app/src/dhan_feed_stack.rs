@@ -17544,6 +17544,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // and catch-up round 0 reads the same frames again (review round 7).
     let mut boot_refold_confirmed = false;
     if !params.wal_replay_live_feed.is_empty() {
+        // PR AA review (owner Quote 51): register this replay with the
+        // archive quiesce lock for the boot refold AND the catch-up drain
+        // below. The archiver finishes the partition it may already hold and
+        // starts no other until this guard drops at the end of the block, so
+        // an evening restart's replay is not locked out all night by
+        // back-to-back archive partitions.
+        let _old_hour_replay = tickvault_storage::archive_quiesce::intend_old_hour_replay();
         // ORDERING PIN -- added 2026-08-28.
         //
         // Every candle this refold seals goes through the seal closure, which
@@ -18206,9 +18213,17 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     // PR AA (owner Quote 51): hold the old-hour writers' lock
                     // through this chunk's refold, flush and ack. A miss
                     // stops the drain here, before this segment settles; it
-                    // stays waiting for the next drain or boot.
+                    // stays waiting for the next drain or boot. PR AA
+                    // review: outside the capture window the chunk waits up
+                    // to the drain's own deadline (one archive partition can
+                    // hold the lock longer than 60 s), so the wait is charged
+                    // against that clock and never runs past it.
                     let now = now_ist_secs_of_day();
-                    let quiesce = aq::archive_quiesce_for_replay(now, aq::QuiesceWriter::CatchUp);
+                    let quiesce = aq::archive_quiesce_for_replay_until(
+                        now,
+                        aq::QuiesceWriter::CatchUp,
+                        catchup_deadline,
+                    );
                     let Some(_quiesce) = quiesce.await else {
                         round_quiesce_held = true;
                         break;
