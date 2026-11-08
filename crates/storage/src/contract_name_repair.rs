@@ -51,9 +51,11 @@
 //!   spill drain) can have its newer copy of a row replaced by the stored copy
 //!   the statement read. The quiet check makes this a window of one statement,
 //!   not a certainty; it is not closed.
-//! - The repair rewrites each touched partition (copy-on-write). If the
-//!   disk-pressure archive drops a partition while a statement runs, the
-//!   statement can leave only the repaired rows in it.
+//! - The repair rewrites each touched partition (copy-on-write). The
+//!   re-count and the statement run under the writer side of the archive
+//!   quiesce lock ([`crate::archive_quiesce`], PR AA), so the archiver never
+//!   copies or drops a partition while a statement runs; a table whose lock
+//!   wait runs out is left for the next attempt.
 //!
 //! Cold path: runs from the app's once-a-day after-close task, never on the
 //! frame drain.
@@ -550,7 +552,42 @@ async fn repair_table(
         tally.failures += 1;
         return;
     }
+    // PR AA (owner Quote 51): the repair rewrites rows of OLD hours, so it
+    // holds the writer side of the archive quiesce lock across the re-count
+    // and the INSERT. Without it the archiver could copy an hour, let this
+    // INSERT replace its rows in place (same count, same max(ts)) and then
+    // drop the hour, keeping only the blank-named copy in S3. The repair runs
+    // after 15:45, so it may wait; a miss leaves the table, and so the day,
+    // for the next attempt.
+    let quiesce =
+        crate::archive_quiesce::archive_quiesce_shared(crate::archive_quiesce::WRITER_QUIESCE_WAIT)
+            .await;
+    repair_quiet_table(client, exec_url, table, day, repair_sql, quiesce, tally).await;
+}
+
+/// The part of [`repair_table`] that writes: runs only while `quiesce` holds
+/// the writer side of the archive quiesce lock. `None` (an archiver held the
+/// lock past the wait) sends nothing, counts the miss on
+/// [`crate::archive_quiesce::QUIESCE_HELD_COUNTER`] and a failure, so the day
+/// is tried again.
+async fn repair_quiet_table(
+    client: &Client,
+    exec_url: &str,
+    table: &str,
+    day: &str,
+    repair_sql: &str,
+    quiesce: Option<tokio::sync::RwLockReadGuard<'_, ()>>,
+    tally: &mut RepairDayTally,
+) {
+    let Some(_quiesce) = quiesce else {
+        crate::archive_quiesce::note_quiesce_held(
+            crate::archive_quiesce::QuiesceWriter::ContractRepair,
+        );
+        tally.failures += 1;
+        return;
+    };
     // Count again on the quiet table, so the tally matches what is written.
+    let count_sql = blank_named_count_sql(table, day);
     let Some(named) = exec(client, exec_url, &count_sql)
         .await
         .and_then(|b| parse_single_long(&b))
@@ -903,6 +940,178 @@ mod tests {
         assert_eq!(tally, RepairDayTally::default());
         let tally = repair_contract_names_for_day(&client, url, "2026-10-09", &[], &["t"]).await;
         assert_eq!(tally, RepairDayTally::default());
+    }
+
+    /// A minimal keep-alive `/exec` stub on 127.0.0.1 that answers a count
+    /// with 3 and anything else with a DML OK, and logs every query target.
+    async fn spawn_exec_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub bind");
+        let addr = listener.local_addr().expect("stub addr");
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let accept_log = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&accept_log);
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        let end = loop {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                            match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                        buf.drain(..end);
+                        let target = head.split(' ').nth(1).unwrap_or_default().to_string();
+                        let body = if target.contains("INSERT") {
+                            r#"{"dml":"OK"}"#
+                        } else {
+                            r#"{"dataset":[[3]],"count":1}"#
+                        };
+                        log.lock().expect("stub log").push(target);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/exec"), log)
+    }
+
+    const STUB_REPAIR_COLUMNS: [&str; 5] = ["ts", "feed", "segment", "security_id", "contract"];
+
+    /// Regression (PR AA review, finding 1): the repair rewrites rows of old
+    /// hours and must not post while the archiver holds the quiesce lock, or
+    /// an hour copied before the INSERT and dropped after it keeps only its
+    /// blank-named copy in S3. With the archiver side held, nothing is sent
+    /// and the table counts a failure, so the day is not marked finished.
+    #[tokio::test]
+    async fn test_regression_repair_sends_no_insert_while_the_archiver_holds_the_lock() {
+        let (url, log) = spawn_exec_stub().await;
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
+        let repair_sql =
+            repair_insert_sql("ticks", "2026-10-09", &cols(&STUB_REPAIR_COLUMNS)).expect("builds");
+        let quiesce = crate::archive_quiesce::ArchiveQuiesce::new();
+        let _archiver = quiesce
+            .hold_writers(Duration::from_secs(1))
+            .await
+            .expect("a free lock lets the archiver in");
+        let guard = quiesce.shared(Duration::from_millis(50)).await;
+        assert!(guard.is_none(), "the archiver holds the lock");
+        let mut tally = RepairDayTally::default();
+        repair_quiet_table(
+            &client,
+            &url,
+            "ticks",
+            "2026-10-09",
+            &repair_sql,
+            guard,
+            &mut tally,
+        )
+        .await;
+        assert!(
+            log.lock().expect("stub log").is_empty(),
+            "nothing may be sent while the archiver holds the lock"
+        );
+        assert_eq!(tally.failures, 1, "a failure keeps the day unfinished");
+        assert_eq!(tally.tables_repaired, 0);
+        assert_eq!(tally.rows_restored, 0);
+    }
+
+    /// With the writer side held, the re-count and the INSERT go out, in
+    /// that order, and the table counts as repaired.
+    #[tokio::test]
+    async fn test_repair_counts_and_inserts_under_the_writer_side_of_the_lock() {
+        let (url, log) = spawn_exec_stub().await;
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
+        let repair_sql =
+            repair_insert_sql("ticks", "2026-10-09", &cols(&STUB_REPAIR_COLUMNS)).expect("builds");
+        let quiesce = crate::archive_quiesce::ArchiveQuiesce::new();
+        let guard = quiesce.shared(Duration::from_millis(50)).await;
+        assert!(guard.is_some(), "a free lock lets a writer in");
+        let mut tally = RepairDayTally::default();
+        repair_quiet_table(
+            &client,
+            &url,
+            "ticks",
+            "2026-10-09",
+            &repair_sql,
+            guard,
+            &mut tally,
+        )
+        .await;
+        let seen = log.lock().expect("stub log").clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(!seen[0].contains("INSERT"), "the re-count comes first");
+        assert!(seen[1].contains("INSERT"), "then the repair");
+        assert_eq!(tally.failures, 0);
+        assert_eq!(tally.tables_repaired, 1);
+        assert_eq!(tally.rows_restored, 3);
+    }
+
+    /// Source scan (PR AA review, finding 1): the production path takes the
+    /// writer side of the process quiesce lock before it calls the part that
+    /// writes, and the repair statement is sent only there, after the guard.
+    #[test]
+    fn test_the_repair_insert_is_sent_only_under_the_quiesce_guard() {
+        let src = include_str!("contract_name_repair.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production part");
+        let repair = prod
+            .split("async fn repair_table(")
+            .nth(1)
+            .and_then(|b| b.split("\nasync fn ").next())
+            .expect("repair_table exists");
+        let take = repair
+            .find("archive_quiesce_shared(")
+            .expect("repair_table takes the writer side of the process lock");
+        let call = repair
+            .find("repair_quiet_table(")
+            .expect("repair_table calls the writing part");
+        assert!(
+            take < call,
+            "the lock is taken before the writing part runs"
+        );
+        assert!(
+            repair[take..call].contains("WRITER_QUIESCE_WAIT"),
+            "the repair waits at most the writers' bounded wait"
+        );
+        assert!(
+            !repair.contains("repair_sql).await"),
+            "repair_table itself never sends the repair statement"
+        );
+        let quiet = prod
+            .split("async fn repair_quiet_table(")
+            .nth(1)
+            .and_then(|b| b.split("\n/// ").next())
+            .expect("repair_quiet_table exists");
+        let guard = quiet
+            .find("let Some(_quiesce) = quiesce else")
+            .expect("the writing part refuses without the guard");
+        let send = quiet
+            .find("exec(client, exec_url, repair_sql)")
+            .expect("the writing part sends the repair statement");
+        assert!(
+            guard < send,
+            "the statement is sent only after the guard check"
+        );
+        assert_eq!(
+            prod.matches("exec(client, exec_url, repair_sql)").count(),
+            1,
+            "the repair statement is sent from one place only"
+        );
     }
 
     #[tokio::test]

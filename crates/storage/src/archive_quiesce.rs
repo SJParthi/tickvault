@@ -6,7 +6,7 @@
 //! The partition archiver copies an old partition to S3, checks the copy and
 //! then drops the partition from the box. A row written into that partition
 //! after the copy and before the drop would be dropped with it and exist
-//! nowhere. The live drain only writes into the current hour, but four other
+//! nowhere. The live drain only writes into the current hour, but six other
 //! writers can post into an OLD hour:
 //!
 //! | Writer | Where | What it holds the lock around |
@@ -16,6 +16,7 @@
 //! | Text spill replay | `tick_spill_replay::replay_spill_dir` | one file, first POST to last ack |
 //! | Framed depth spill replay | `depth_spill_frame::replay_framed_spill_dir` | one file, first POST to last ack |
 //! | After-close depth pass | `deferred_depth_pass` (each bucket) | write, flush |
+//! | After-close contract name repair | `contract_name_repair` (each table of each day) | re-count, `INSERT … SELECT` |
 //!
 //! Each writer takes the SHARED (read) side. The archiver takes the EXCLUSIVE
 //! (write) side for one partition, from before its WAL snapshot to after its
@@ -48,7 +49,10 @@
 //! - the spill replays wait at most [`WRITER_QUIESCE_WAIT`] per file, then
 //!   end the round with the files kept;
 //! - the after-close depth pass runs on its own OS thread and waits for the
-//!   one partition an archive pass may have in flight.
+//!   one partition an archive pass may have in flight;
+//! - the after-close contract name repair (from 15:45 IST) waits at most
+//!   [`WRITER_QUIESCE_WAIT`] per table, then leaves that table, and so the
+//!   day, for its next attempt.
 //!
 //! # Complexity
 //!
@@ -89,15 +93,18 @@ pub enum QuiesceWriter {
     SpillReplay,
     /// One framed depth spill file (`*.dspl`).
     FramedSpillReplay,
+    /// The after-close contract name repair, one table of one day.
+    ContractRepair,
 }
 
 impl QuiesceWriter {
     /// Every writer that can be held, for the boot-time zero registration.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::BootRefold,
         Self::CatchUp,
         Self::SpillReplay,
         Self::FramedSpillReplay,
+        Self::ContractRepair,
     ];
 
     /// The stable `writer` label value.
@@ -108,6 +115,7 @@ impl QuiesceWriter {
             Self::CatchUp => "catch_up",
             Self::SpillReplay => "spill_replay",
             Self::FramedSpillReplay => "framed_spill_replay",
+            Self::ContractRepair => "contract_repair",
         }
     }
 }
@@ -377,7 +385,8 @@ mod tests {
                 "boot_refold",
                 "catch_up",
                 "spill_replay",
-                "framed_spill_replay"
+                "framed_spill_replay",
+                "contract_repair"
             ]
         );
         let mut sorted = labels.clone();

@@ -12,8 +12,9 @@
 //! For an OLD hour the question is narrower: has QuestDB applied every
 //! transaction that could hold a row of THAT hour? The live drain writes
 //! only into the current hour. Every writer that can post into an old hour
-//! (the boot WAL refold, the WAL catch-up drain, the spill replays and the
-//! after-close depth pass) takes the shared side of the archive quiesce lock
+//! (the boot WAL refold, the WAL catch-up drain, the spill replays, the
+//! after-close depth pass and the after-close contract name repair) takes
+//! the shared side of the archive quiesce lock
 //! ([`crate::archive_quiesce`]). So, with that lock held by the archiver,
 //! an old hour's rows are all in transactions that already exist, and
 //! waiting until `writerTxn >= S` (S = `sequencerTxn` read UNDER the lock)
