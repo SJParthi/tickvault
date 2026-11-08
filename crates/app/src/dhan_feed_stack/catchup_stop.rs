@@ -182,7 +182,7 @@ mod tests {
             "each chunk waits until the drain's deadline"
         );
         let intent = code
-            .find("archive_quiesce::intend_old_hour_replay()")
+            .find("unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay)")
             .expect("the replay must be registered");
         let boot_lock = code
             .find("QuiesceWriter::BootRefold")
@@ -191,6 +191,66 @@ mod tests {
             intent < boot_lock,
             "registered before the boot refold waits"
         );
+    }
+
+    /// Regression, PR AA finding 6: the replay used to be registered only
+    /// inside the lane, after the token wait, the seeding and the seal-writer
+    /// wait, while both archive loops were already running; on an evening
+    /// restart the archiver took the lock first and the drain could miss
+    /// its deadline. `main.rs` now registers it BEFORE either archive loop
+    /// spawns and hands it to the lane, which reuses it at the refold.
+    #[test]
+    fn test_regression_boot_replay_is_registered_before_the_archive_loops_spawn() {
+        let main_code: String = include_str!("../main.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let intent = main_code
+            .find("dhan_feed_stack::boot_replay_intent(&ws_wal_replay_live_feed)")
+            .expect("main.rs must register the boot replay");
+        for archive_loop in [
+            "spawn_supervised_disk_pressure_loop(",
+            "spawn_supervised_daily_archive_loop(",
+        ] {
+            let spawn = main_code
+                .find(archive_loop)
+                .expect("the archive loop spawn must exist");
+            assert!(
+                intent < spawn,
+                "the replay must be registered before {archive_loop}"
+            );
+        }
+        let handed = main_code
+            .find("boot_replay_intent,")
+            .expect("main.rs must hand the registration to the lane");
+        let lane_spawn = main_code
+            .find("dhan_feed_stack::spawn_dhan_feed_stack(")
+            .expect("the lane spawn must exist");
+        assert!(intent < handed && handed > lane_spawn);
+        // The lane reuses it at the refold, and keeps it through the dial
+        // wait only up to the authentication grace.
+        let lane = lane_code();
+        assert!(lane.contains(".boot_replay_intent\n            .take()"));
+        let dial = lane
+            .find("wait_for_dial_preconditions(&params.instance_lock_held")
+            .expect("the dial wait");
+        assert!(
+            lane[dial..].contains("if params.boot_replay_intent.is_some() =>"),
+            "the dial wait releases the registration at the grace"
+        );
+    }
+
+    /// PR AA finding 6: with nothing staged there is no registration, so the
+    /// archiver is never held back on a clean boot. (That a registration
+    /// holds the archiver out is pinned in `archive_quiesce`'s own tests.)
+    #[test]
+    fn test_boot_replay_intent_only_for_staged_frames() {
+        let none: [u8; 0] = [];
+        assert!(super::super::boot_replay_intent(&none).is_none());
+        let intent = super::super::boot_replay_intent(&[1u8]);
+        assert!(intent.is_some(), "staged frames register the replay");
+        drop(intent);
     }
 
     /// PR AA step 1: the boot refold takes the lock (try-only in session)

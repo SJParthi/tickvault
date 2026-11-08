@@ -11699,6 +11699,14 @@ pub struct DhanFeedStackParams {
     /// catch-up drain can flag a process boundary across the pass boundary
     /// (plan ITEM 47, `process_boundary_is_gap`).
     pub wal_replay_last_fold_receipt: Option<i64>,
+    /// The old-hour replay registration `main.rs` takes BEFORE it spawns the
+    /// archive loops when the boot read staged frames ([`boot_replay_intent`],
+    /// PR AA finding 6), so an evening restart's archiver cannot start a
+    /// partition while this lane waits for its token, seeds and finds the
+    /// seal writer. Held through the refold and the catch-up drain; released
+    /// early if the dial wait outlasts the authentication grace, when the
+    /// lane registers again at the refold. `None` with no staged frames.
+    pub boot_replay_intent: Option<tickvault_storage::archive_quiesce::ReplayIntent<'static>>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -17089,6 +17097,27 @@ pub fn refold_wal_frames(
     out
 }
 
+/// The old-hour replay registration for a boot that read staged WAL frames
+/// (PR AA finding 6). `main.rs` takes it BEFORE it spawns the archive loops
+/// and hands it to the lane in [`DhanFeedStackParams::boot_replay_intent`],
+/// so the archiver cannot start a partition in the minutes before the lane
+/// reaches its refold. `None` when nothing was staged. O(1).
+#[must_use]
+pub fn boot_replay_intent<T>(
+    staged_frames: &[T],
+) -> Option<tickvault_storage::archive_quiesce::ReplayIntent<'static>> {
+    (!staged_frames.is_empty()).then(tickvault_storage::archive_quiesce::intend_old_hour_replay)
+}
+
+/// How long the lane keeps the boot's early replay registration while it
+/// waits for its token and dual-instance lock: the authentication grace.
+/// Past it the registration is released (the dial wait has no end of its
+/// own, and a registration held all night would keep every archive pass,
+/// the disk-pressure leg's included, standing aside); the lane registers
+/// again at the refold.
+const BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS: u64 =
+    TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS;
+
 pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task::JoinHandle<()>> {
     let env_opt_in = std::env::var(DHAN_LIVE_FEED_ENV).ok();
     let gate = feed_stack_gate(params.dhan_enabled, env_opt_in.as_deref());
@@ -17161,7 +17190,7 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
 /// halts the process, never blocks boot.
 // Private bring-up body: every decision it makes (gate, universe, plan,
 // budget) is unit-tested below, and it performs no I/O of its own.
-async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
+async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     // Rule 11: the lane reads DOWN until it is provably carrying data, so a
     // half-wired stack is never presented as up.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
@@ -17294,16 +17323,35 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // dial would notice). Both now wait on a capped backoff for as long as
     // the process lives; see `wait_for_dial_preconditions`. Nothing dials
     // before both hold.
-    let client_id =
-        match wait_for_dial_preconditions(&params.instance_lock_held, &params.shutdown, plan.len())
-            .await
-        {
-            Ok(client_id) => client_id,
-            Err(waited_secs) => {
-                note_wal_frames_deferred_by_shutdown(&params.wal_replay_live_feed, waited_secs);
-                return;
+    // PR AA finding 6: the boot's early replay registration is kept through
+    // this wait only up to the authentication grace (see
+    // `BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS`).
+    let dial_wait =
+        wait_for_dial_preconditions(&params.instance_lock_held, &params.shutdown, plan.len());
+    tokio::pin!(dial_wait);
+    let dial_ready = loop {
+        tokio::select! {
+            ready = &mut dial_wait => break ready,
+            () = tokio::time::sleep(std::time::Duration::from_secs(
+                BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS,
+            )), if params.boot_replay_intent.is_some() => {
+                params.boot_replay_intent = None;
+                info!(
+                    waited_secs = BOOT_REPLAY_INTENT_MAX_DIAL_WAIT_SECS,
+                    "Dhan live feed: still waiting to dial, so the archiver is no longer \
+                     held back for the staged WAL refold; the lane registers again when \
+                     it refolds"
+                );
             }
-        };
+        }
+    };
+    let client_id = match dial_ready {
+        Ok(client_id) => client_id,
+        Err(waited_secs) => {
+            note_wal_frames_deferred_by_shutdown(&params.wal_replay_live_feed, waited_secs);
+            return;
+        }
+    };
 
     // ---- the fold ----------------------------------------------------------
     // DISTINCT slots across all three pools — not the sum of their lengths.
@@ -17549,8 +17597,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // below. The archiver finishes the partition it may already hold and
         // starts no other until this guard drops at the end of the block, so
         // an evening restart's replay is not locked out all night by
-        // back-to-back archive partitions.
-        let _old_hour_replay = tickvault_storage::archive_quiesce::intend_old_hour_replay();
+        // back-to-back archive partitions. Finding 6: the registration
+        // `main.rs` took before it spawned the archive loops is reused, so it
+        // has covered the whole bring-up; a fresh one only when it is gone.
+        let _old_hour_replay = params
+            .boot_replay_intent
+            .take()
+            .unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay);
         // ORDERING PIN -- added 2026-08-28.
         //
         // Every candle this refold seals goes through the seal closure, which
@@ -21774,6 +21827,7 @@ mod tests {
             wal_replay_gaps: Vec::new(),
             wal_replay_trailing_gap: None,
             wal_replay_last_fold_receipt: None,
+            boot_replay_intent: None,
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -26844,7 +26898,7 @@ mod tests {
             .expect("the lane function must exist")
             .1;
         let wait = lane
-            .find("match wait_for_dial_preconditions(")
+            .find("wait_for_dial_preconditions(&params.instance_lock_held")
             .expect("the lane must wait for the token manager and the lock before dialing");
         let dial = lane
             .find("dial_planned_connections(")

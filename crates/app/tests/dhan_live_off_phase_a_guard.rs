@@ -383,7 +383,7 @@ fn test_live_lane_refuses_to_dial_without_the_shared_instance_lock() {
     );
     // The wait must sit BEFORE the fold/dial.
     let gate = prod
-        .find("match wait_for_dial_preconditions(")
+        .find("wait_for_dial_preconditions(&params.instance_lock_held")
         .expect("the lane must call the precondition wait"); // APPROVED: test
     let fold = prod
         .find("let capacity = distinct_fold_slots(")

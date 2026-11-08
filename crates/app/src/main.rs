@@ -3080,10 +3080,9 @@ async fn async_main() -> Result<()> {
             require_raw_upload,
         );
 
-    // The third drain, for the top_volume board spill (2026-10-13), was
-    // removed on 2026-10-22 (plan item 62, operator Quote 34) with the
-    // top_volume writer. Files left in that folder are kept on disk; its
-    // quarantine is still copied cold by the raw upload loop.
+    // PR AA finding 6: the old-hour replay is registered BEFORE either archive loop.
+    let boot_replay_intent =
+        tickvault_app::dhan_feed_stack::boot_replay_intent(&ws_wal_replay_live_feed);
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
@@ -3874,6 +3873,7 @@ async fn async_main() -> Result<()> {
             wal_replay_gaps: std::mem::take(&mut ws_wal_replay_gaps),
             wal_replay_trailing_gap: ws_wal_replay_trailing_gap,
             wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,
+            boot_replay_intent, // PR AA finding 6: taken before the archive loops
             // The master-sourced set: `live_subscription_from_master` was built
             // default-off and the operator turned it on on 2026-08-12
             // (`config/base.toml` ships `true`). A missing list for today takes
