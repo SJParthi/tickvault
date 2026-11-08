@@ -2017,6 +2017,7 @@ pub async fn replay_spill_dir(
 /// [`replay_spill_dir`] under a given archive quiesce lock and wait: the
 /// process lock and [`WRITER_QUIESCE_WAIT`] in production, a private lock and
 /// a short wait in tests (PR AA).
+// TEST-EXEMPT: covered by test_spill_round_ends_when_quiesce_busy_files_kept
 pub(crate) async fn replay_spill_dir_quiesced(
     dir: &Path,
     url: &str,
@@ -5789,7 +5790,10 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     fn test_regression_da13b_every_unreadable_branch_is_counted() {
         let tick = include_str!("tick_spill_replay.rs");
         let tick_fn = tick
-            .split("pub(crate) async fn replay_spill_dir_quiesced(")
+            .split(concat!(
+                "pub(crate) async ",
+                "fn replay_spill_dir_quiesced("
+            ))
             .nth(1)
             .expect("replay_spill_dir_quiesced (the body of replay_spill_dir)");
         let tick_fn = &tick_fn[..tick_fn.find("\n\u{7d}\n").unwrap_or(tick_fn.len())];
@@ -5806,7 +5810,10 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         }
         let depth = include_str!("depth_spill_frame.rs");
         let depth_fn = depth
-            .split("pub(crate) async fn replay_framed_spill_dir_quiesced(")
+            .split(concat!(
+                "pub(crate) async ",
+                "fn replay_framed_spill_dir_quiesced("
+            ))
             .nth(1)
             .expect("replay_framed_spill_dir_quiesced (the body of replay_framed_spill_dir)");
         let depth_fn = &depth_fn[..depth_fn.find("\n\u{7d}\n").unwrap_or(depth_fn.len())];

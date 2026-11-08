@@ -426,6 +426,7 @@ pub async fn replay_framed_spill_dir(
 /// [`replay_framed_spill_dir`] under a given archive quiesce lock and wait:
 /// the process lock and `WRITER_QUIESCE_WAIT` in production, a private lock
 /// and a short wait in tests (PR AA).
+// TEST-EXEMPT: covered by test_framed_spill_round_ends_when_quiesce_busy_files_kept
 pub(crate) async fn replay_framed_spill_dir_quiesced(
     dir: &Path,
     url: &str,

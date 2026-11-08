@@ -114,6 +114,7 @@ pub(crate) fn snapshot_gate_table(table: &str) -> bool {
 /// The applied-watermark sink whose acknowledgements cover `table`'s rows.
 /// Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_snapshot_gate_tables_are_the_depth_tables_only
 pub(crate) fn sink_for_table(table: &str) -> AppliedSink {
     if DEPTH_TABLES.contains(&table) {
         AppliedSink::Depth
@@ -188,6 +189,7 @@ impl WalSnapshotVerdict {
 /// The snapshot target for `table`: its current `sequencerTxn`. Fail-closed:
 /// a missing, suspended or unreadable row is the refusal itself. Pure,
 /// O(rows).
+// TEST-EXEMPT: covered by test_wal_snapshot_verdict_truth_table
 pub(crate) fn snapshot_target(
     rows: &[WalTableRow],
     table: &str,
@@ -314,6 +316,7 @@ pub(crate) struct InFlightInputs<'a> {
 /// Checked in a fixed order; the first hit is the reason. Pure, O(1) plus
 /// the snapshot lookups (bounded tables).
 #[must_use]
+// TEST-EXEMPT: covered by test_in_flight_clear_when_nothing_is_on_its_way
 pub(crate) fn hour_in_flight_verdict(
     span: HourFrameSpan,
     inputs: &InFlightInputs<'_>,
@@ -479,6 +482,7 @@ impl SnapshotGate {
 /// it, at most `polls` pauses of [`SNAPSHOT_POLL`]. Returns the last verdict
 /// (`Reached` on success). The target is read once, at the call, so a
 /// caller holding the quiesce lock gets a target taken under the lock.
+// TEST-EXEMPT: covered by test_snapshot_timeout_keeps_and_blocks_the_table_with_bounded_polls
 pub(crate) async fn wait_for_snapshot<I: ArchiveIo>(
     io: &mut I,
     table: &str,
@@ -518,6 +522,7 @@ pub(crate) async fn wait_for_snapshot<I: ArchiveIo>(
 
 /// Archives one hour-path partition through the snapshot protocol (see the
 /// module docs). Every refusal keeps the partition.
+// TEST-EXEMPT: covered by test_happy_path_drops_once_with_the_writers_held_out
 pub(crate) async fn archive_with_snapshot_gate<I: ArchiveIo>(
     io: &mut I,
     table: &'static str,
@@ -615,6 +620,7 @@ const fn snapshot_polls_or_one(gate: SnapshotGate) -> u32 {
 /// the changed partition) is not refused as an S3 conflict forever; an object
 /// an earlier run wrote is left alone (it may be the only copy of data
 /// already dropped).
+// TEST-EXEMPT: covered by test_pre_drop_recount_mismatch_keeps_and_deletes_own_upload
 pub(crate) async fn recheck_and_drop<I: ArchiveIo>(
     io: &mut I,
     table: &str,
@@ -755,6 +761,7 @@ fn note_quiesce_busy(
 
 /// Adds `n` to `tv_partition_archive_skipped_total{reason="quiesce_busy"}`.
 /// The one place its labels are written. Local `/metrics` only. O(1).
+// TEST-EXEMPT: covered by test_quiesce_timeout_keeps_the_partition_and_exports_nothing
 pub(crate) fn count_quiesce_busy_held(n: u64) {
     metrics::counter!(
         "tv_partition_archive_skipped_total",

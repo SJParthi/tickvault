@@ -480,6 +480,7 @@ const SECS_PER_DAY: u32 = 86_400;
 /// previous day does not exist (the first date chrono knows), the clock is
 /// read as today. Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_loop_continues_past_midnight_until_0730
 pub fn archive_session_day(date_ist: NaiveDate, secs_of_day_ist: u32) -> (NaiveDate, u32) {
     if secs_of_day_ist >= ARCHIVE_WINDOW_END_SECS_IST {
         return (date_ist, secs_of_day_ist);
@@ -498,6 +499,7 @@ pub fn archive_session_day(date_ist: NaiveDate, secs_of_day_ist: u32) -> (NaiveD
 /// gate for the same reason. The pass stops at the next partition boundary
 /// once this passes. `None` only past chrono's last date. Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_daily_pass_stops_at_the_window_end
 pub fn daily_pass_stop_unix_secs(session_day: NaiveDate) -> Option<i64> {
     let end_day = session_day.succ_opt()?;
     let end = end_day.and_hms_opt(0, 0, 0)?
@@ -539,6 +541,7 @@ pub enum LatchDecision {
 /// So the attempt cap still bounds a pass that keeps failing without
 /// progress, and the 07:30 window end bounds the rest. Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_no_latch_while_eligible_or_below_target
 pub fn daily_latch_decision(
     outcome: PassOutcome,
     dropped: u32,

@@ -97,6 +97,7 @@ impl ArchiveBacklog {
 
     /// Records that a daily pass started at `now_unix`, keeping the last
     /// reading. O(1).
+    // TEST-EXEMPT: covered by test_publish_note_and_reading_round_trip
     pub fn note_pass_started(&self, now_unix: i64) {
         self.with(|reading| {
             if let Some(reading) = reading.as_mut() {
@@ -109,6 +110,7 @@ impl ArchiveBacklog {
     /// other archive leg held the pass lock, or the archiver could not be
     /// built): the last reading stays, ageing from when it was measured.
     /// O(1).
+    // TEST-EXEMPT: covered by test_publish_note_and_reading_round_trip
     pub fn note_pass_ended(&self) {
         self.with(|reading| {
             if let Some(reading) = reading.as_mut() {
@@ -148,6 +150,7 @@ pub static ARCHIVE_BACKLOG: ArchiveBacklog = ArchiveBacklog::new();
 
 /// Registers [`ARCHIVE_BACKLOG_GAUGE`] at 0, so the series exists before
 /// the first pass. O(1).
+// TEST-EXEMPT: covered by test_held_backlog_bytes_reads_the_process_cell
 pub fn register_archive_backlog_gauge() {
     metrics::gauge!(ARCHIVE_BACKLOG_GAUGE).set(0.0);
 }

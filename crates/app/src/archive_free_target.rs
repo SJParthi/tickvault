@@ -97,6 +97,7 @@ pub struct SessionBytesRing {
 impl SessionBytesRing {
     /// Whether `day` is already measured. O(n), n ≤ 20.
     #[must_use]
+    // TEST-EXEMPT: covered by test_record_replaces_the_same_day_and_keeps_the_newest_twenty
     pub fn has_day(&self, day: NaiveDate) -> bool {
         self.days.iter().any(|(d, _)| *d == day)
     }
@@ -126,6 +127,7 @@ impl SessionBytesRing {
     /// The 95th percentile of the measured days (nearest rank), or `None`
     /// with fewer than [`SESSION_BYTES_MIN_DAYS`] days.
     #[must_use]
+    // TEST-EXEMPT: covered by test_free_target_p95_and_empty_ring_fallback
     pub fn p95_bytes(&self) -> Option<u64> {
         if self.days.len() < SESSION_BYTES_MIN_DAYS {
             return None;
@@ -181,6 +183,7 @@ impl SessionBytesRing {
 
 /// `<data_dir>/state/archive_session_bytes.json`.
 #[must_use]
+// TEST-EXEMPT: covered by test_ring_file_atomic_write_and_corrupt_refused
 pub fn session_bytes_path(data_dir: &Path) -> PathBuf {
     data_dir.join("state").join(SESSION_BYTES_FILE)
 }
@@ -191,6 +194,7 @@ pub fn session_bytes_path(data_dir: &Path) -> PathBuf {
 ///
 /// # Errors
 /// The file could not be read, is over the size cap, or is refused.
+// TEST-EXEMPT: covered by test_ring_file_atomic_write_and_corrupt_refused
 pub fn load_session_bytes(path: &Path) -> Result<SessionBytesRing, String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -216,6 +220,7 @@ pub fn load_session_bytes(path: &Path) -> Result<SessionBytesRing, String> {
 /// Any failure up to and including the rename (the old file is then left
 /// as it was). A failed folder fsync after the rename is also returned, so
 /// the caller can say the save may not survive a power cut.
+// TEST-EXEMPT: covered by test_ring_file_atomic_write_and_corrupt_refused
 pub fn save_session_bytes(path: &Path, ring: &SessionBytesRing) -> std::io::Result<()> {
     let text = ring.to_json();
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -253,6 +258,7 @@ pub fn save_session_bytes(path: &Path, ring: &SessionBytesRing) -> std::io::Resu
 /// or, under five measured days, the configured fallback. Saturating, so no
 /// configuration can wrap it. Pure, O(n log n) on n ≤ 20.
 #[must_use]
+// TEST-EXEMPT: covered by test_free_target_p95_and_empty_ring_fallback
 pub fn free_target_bytes(
     ring: &SessionBytesRing,
     cfg: &PartitionRetentionConfig,

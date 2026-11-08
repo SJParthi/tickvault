@@ -177,6 +177,7 @@ impl ArchiveQuiesce {
     /// WAL catch-up drain): the archiver finishes the partition it may
     /// already hold and starts no other until the guard is dropped. O(1).
     #[must_use]
+    // TEST-EXEMPT: covered by test_regression_archiver_stands_aside_while_a_replay_is_registered
     pub fn intend_replay(&self) -> ReplayIntent<'_> {
         self.replay_intents.fetch_add(1, Ordering::AcqRel);
         ReplayIntent { quiesce: self }
@@ -191,6 +192,7 @@ impl ArchiveQuiesce {
     /// A writer's side without waiting. `None` while an archiver holds the
     /// lock or is queued for it.
     #[must_use]
+    // TEST-EXEMPT: covered by test_free_lock_lets_writers_share_and_the_archiver_in
     pub fn try_shared(&self) -> Option<RwLockReadGuard<'_, ()>> {
         self.lock.try_read().ok()
     }
@@ -230,6 +232,7 @@ impl ArchiveQuiesce {
     /// stops the drain for the process, so the drain now waits out the
     /// partition in progress, charged against its own clock. A miss is
     /// counted as before.
+    // TEST-EXEMPT: covered by test_catchup_chunk_outlasts_a_long_archive_partition
     pub async fn for_replay_until(
         &self,
         now_secs_of_day_ist: u64,
@@ -252,6 +255,7 @@ impl ArchiveQuiesce {
 /// `now_secs_of_day_ist` (PR AA review): `None` (try only) inside the
 /// capture window, else all of `time_left`. Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_catchup_wait_runs_to_its_own_deadline_outside_the_window
 pub fn replay_quiesce_wait_until(
     now_secs_of_day_ist: u64,
     time_left: Duration,
@@ -262,12 +266,14 @@ pub fn replay_quiesce_wait_until(
 /// Registers an old-hour replay on the process lock. See
 /// [`ArchiveQuiesce::intend_replay`].
 #[must_use]
+// TEST-EXEMPT: process-lock wrapper; intend_replay covered by test_regression_archiver_stands_aside_while_a_replay_is_registered
 pub fn intend_old_hour_replay() -> ReplayIntent<'static> {
     ARCHIVE_QUIESCE.intend_replay()
 }
 
 /// The process lock under the catch-up drain's rule. See
 /// [`ArchiveQuiesce::for_replay_until`].
+// TEST-EXEMPT: process-lock wrapper; for_replay_until covered by test_catchup_chunk_outlasts_a_long_archive_partition
 pub async fn archive_quiesce_for_replay_until(
     now_secs_of_day_ist: u64,
     writer: QuiesceWriter,
@@ -283,6 +289,7 @@ static ARCHIVE_QUIESCE: ArchiveQuiesce = ArchiveQuiesce::new();
 
 /// The archiver's side of the process lock: holds every writer that can post
 /// into an old hour out, waiting at most `wait`. `None` on timeout.
+// TEST-EXEMPT: covered by test_process_accessors_take_and_release_the_one_lock
 pub async fn hold_writers_for_archive(wait: Duration) -> Option<RwLockWriteGuard<'static, ()>> {
     ARCHIVE_QUIESCE.hold_writers(wait).await
 }
@@ -294,12 +301,14 @@ pub async fn archive_quiesce_shared(wait: Duration) -> Option<RwLockReadGuard<'s
 
 /// A writer's side of the process lock, without waiting.
 #[must_use]
+// TEST-EXEMPT: covered by test_process_accessors_take_and_release_the_one_lock
 pub fn try_archive_quiesce_shared() -> Option<RwLockReadGuard<'static, ()>> {
     ARCHIVE_QUIESCE.try_shared()
 }
 
 /// A writer's side of the process lock for a plain OS thread. See
 /// [`ArchiveQuiesce::shared_blocking`].
+// TEST-EXEMPT: covered by test_process_accessors_take_and_release_the_one_lock
 pub fn archive_quiesce_shared_blocking() -> RwLockReadGuard<'static, ()> {
     ARCHIVE_QUIESCE.shared_blocking()
 }
@@ -317,6 +326,7 @@ pub async fn archive_quiesce_for_replay(
 
 /// The process lock itself, for the spill replays (which take an
 /// `&ArchiveQuiesce` so their tests can pass a private one).
+// TEST-EXEMPT: covered by test_process_accessors_take_and_release_the_one_lock
 pub(crate) fn process_archive_quiesce() -> &'static ArchiveQuiesce {
     &ARCHIVE_QUIESCE
 }
@@ -337,12 +347,14 @@ pub fn replay_quiesce_wait(now_secs_of_day_ist: u64) -> Option<Duration> {
 
 /// Counts one deferral on [`QUIESCE_HELD_COUNTER`]. O(1); the label values
 /// are literals, so the counter stays on its non-allocating arm.
+// TEST-EXEMPT: covered by test_counters_register_and_count_without_a_recorder
 pub fn note_quiesce_held(writer: QuiesceWriter) {
     metrics::counter!(QUIESCE_HELD_COUNTER, "writer" => writer.label()).increment(1);
 }
 
 /// Registers every `writer` series of [`QUIESCE_HELD_COUNTER`] at 0, so the
 /// first real deferral is a visible change rather than a new series.
+// TEST-EXEMPT: covered by test_counters_register_and_count_without_a_recorder
 pub fn register_quiesce_counters() {
     for writer in QuiesceWriter::ALL {
         metrics::counter!(QUIESCE_HELD_COUNTER, "writer" => writer.label()).increment(0);

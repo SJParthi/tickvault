@@ -429,11 +429,10 @@ static PUBLISHED_HOURS_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn pack_hours_left(hours: Option<f64>, at_unix_secs: i64) -> u64 {
     let at = u64::from(u32::try_from(at_unix_secs.max(0)).unwrap_or(u32::MAX));
+    // APPROVED: u32 marker widened to f64 (exact), not an f32 price.
+    let cap = f64::from(HOURS_LEFT_NOT_FILLING - 1);
     let low = match hours {
-        Some(h) if h.is_finite() && h >= 0.0 => (h * 100.0)
-            .round()
-            .min(f64::from(HOURS_LEFT_NOT_FILLING - 1))
-            as u32,
+        Some(h) if h.is_finite() && h >= 0.0 => (h * 100.0).round().min(cap) as u32,
         _ => HOURS_LEFT_NOT_FILLING,
     };
     (at << 32) | u64::from(low)
@@ -453,6 +452,7 @@ fn fresh_hours_left(packed: u64, now_unix_secs: i64) -> Option<f64> {
         return None;
     }
     let low = u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(HOURS_LEFT_NOT_FILLING);
+    // APPROVED: u32 hundredths widened to f64 (exact), not an f32 price.
     (low != HOURS_LEFT_NOT_FILLING).then(|| f64::from(low) / 100.0)
 }
 

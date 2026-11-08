@@ -210,6 +210,7 @@ impl DayWork {
     /// the archiver failed on every pass kept `is_done` false all night and
     /// the evening restart gave up at 05:00 without running. O(1).
     #[must_use]
+    // TEST-EXEMPT: covered by test_regression_archive_backlog_never_blocks_the_evening_restart
     pub fn data_in_database(&self) -> bool {
         let deferred_done = (self.deferred_marks == 0 && !self.deferred_overflowed)
             || self.deferred_retryable_left == Some(0)

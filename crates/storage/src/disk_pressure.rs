@@ -152,6 +152,7 @@ pub const PROJECTED_FILL_MARGIN_HOURS: f64 = 1.0;
 /// * Otherwise (after the stop, or a day with no session): until the next
 ///   07:30 IST, the latest the drain hold can keep the box up.
 #[must_use]
+// TEST-EXEMPT: covered by test_projected_short_around_1630_and_0730
 pub fn hours_to_stop(
     now_unix_secs: i64,
     today_gate: Option<(u32, u32)>,
@@ -172,6 +173,7 @@ pub fn hours_to_stop(
             _ => 86_400 - secs_of_day + ceiling_secs_ist,
         }
     };
+    // APPROVED: u32 seconds widened to f64 (exact), not an f32 price.
     f64::from(secs) / 3_600.0
 }
 

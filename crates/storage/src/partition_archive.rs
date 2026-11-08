@@ -1999,6 +1999,7 @@ impl PartitionArchiver {
     /// and a scripted in-flight reader, so a stub test never contends with
     /// the process lock or depends on this process's WAL state.
     #[cfg(test)]
+    // TEST-EXEMPT: test-only builder; covered by test_regression_da13d_depth_hour_with_after_close_marks_is_held_until_cleared
     pub(crate) fn with_test_snapshot_gate(
         mut self,
         quiesce: &'static crate::archive_quiesce::ArchiveQuiesce,
@@ -2015,6 +2016,7 @@ impl PartitionArchiver {
     /// the real (empty) folder, so a stub test can make a spill file appear
     /// after the listing.
     #[cfg(test)]
+    // TEST-EXEMPT: test-only builder; covered by test_regression_spill_file_written_after_the_listing_holds_the_hour
     pub(crate) fn with_test_spill_reader(mut self, reader: SpillPendingReader) -> Self {
         self.spill_pending_reader = reader;
         self
@@ -8089,4 +8091,4 @@ mod archive_backlog_tests {
 // protocol. Declared last: source-scan guards treat everything after the
 // first `#[cfg(test)] mod` as test code.
 #[cfg(test)]
-mod archive_lifecycle_sim;
+mod archive_lifecycle_sim_tests;

@@ -693,6 +693,7 @@ pub(crate) struct PartitionRow {
 /// `candle_table_names()`) — never external input — so it is not
 /// injection-validated here; the untrusted `name` values are validated by
 /// [`is_valid_partition_name`] before they reach a DETACH statement.
+// TEST-EXEMPT: covered by test_eligibility_boundary_hot_days_minus_one_stays_hot
 pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     format!(
         "SELECT name, active FROM table_partitions('{}') \
@@ -720,6 +721,7 @@ pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
 ///
 /// `table` is the same trusted-constant class as the day builder: it comes
 /// from `partition_archive::HOUR_PATH_TABLES`, never from external input.
+// TEST-EXEMPT: covered by the_hour_query_differs_from_the_day_query_only_in_its_unit
 pub(crate) fn build_closed_hour_list_sql(table: &str, cutoff_hours: u32) -> String {
     // `now()` is UTC. `minTimestamp` on these tables is IST-SHIFTED — the
     // stamping sites add IST_UTC_OFFSET_NANOS, which `depth_persistence`'s own

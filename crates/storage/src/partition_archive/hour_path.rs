@@ -181,6 +181,7 @@ const _: () = assert!(
 /// The hour floor for a configured window: `0` is OFF (`None`), anything
 /// else is clamped up to [`MIN_HOT_HOURS`]. Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_hour_floor_end_based_at_least_4h
 pub(crate) fn hot_hour_floor(configured_hours: u32) -> Option<u32> {
     (configured_hours != 0).then(|| configured_hours.max(MIN_HOT_HOURS))
 }
@@ -193,6 +194,7 @@ pub(crate) fn hot_hour_floor(configured_hours: u32) -> Option<u32> {
 /// configured `depth_hot_hours = 0`, gets `None`. Spill files are judged
 /// separately ([`super::hour_window_decision`]). Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_hour_window_never_candles_sebi_audit
 pub(crate) fn hour_window_for(table: &str, cfg: &PartitionRetentionConfig) -> Option<u32> {
     if !HOUR_PATH_TABLES.contains(&table) {
         return None;
@@ -216,6 +218,7 @@ pub(crate) fn hour_window_for(table: &str, cfg: &PartitionRetentionConfig) -> Op
 /// file in its spill folder is still pending: `market_depth` only, behind
 /// `market_depth_force_with_spill_pending` (today's behaviour). Pure, O(1).
 #[must_use]
+// TEST-EXEMPT: covered by test_new_tables_not_forced_with_own_spill_pending
 pub(crate) fn may_force_with_spill_pending(table: &str, cfg: &PartitionRetentionConfig) -> bool {
     table == "market_depth" && cfg.market_depth_force_with_spill_pending
 }
@@ -225,6 +228,7 @@ pub(crate) fn may_force_with_spill_pending(table: &str, cfg: &PartitionRetention
 /// pass. Every other table keeps the exact `writerTxn == sequencerTxn` gate.
 /// Pure, O(tables on the hour path), at most five.
 #[must_use]
+// TEST-EXEMPT: covered by test_snapshot_gate_follows_the_hour_path
 pub(crate) fn uses_snapshot_gate(table: &str, hour_path_this_run: &[&str]) -> bool {
     DEPTH_TABLES.contains(&table) || hour_path_this_run.contains(&table)
 }

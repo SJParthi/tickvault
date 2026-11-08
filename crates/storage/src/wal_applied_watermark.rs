@@ -2954,6 +2954,7 @@ impl AppliedWatermark {
     /// hour while a rescue batch that can carry a frame of it is unsettled.
     /// O(`RESCUE_FLOOR_SLOTS`), cold.
     #[must_use]
+    // TEST-EXEMPT: covered by test_in_flight_holds_while_a_rescue_batch_can_carry_the_hour
     pub(crate) fn rescue_floor_lowest(&self, sink: AppliedSink) -> u64 {
         self.rescue_floor_min(sink)
     }
