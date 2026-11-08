@@ -69,6 +69,7 @@ fn done_work() -> DayWork {
         sink_suspect: false,
         wal_backlog: Some(0),
         wal_holding: false,
+        archive_backlog_bytes: None,
     }
 }
 

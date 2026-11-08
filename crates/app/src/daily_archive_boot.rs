@@ -624,6 +624,11 @@ async fn run_one_pass(
                 Some(gate) => archiver.with_verified_day_gate(std::sync::Arc::clone(gate)),
                 None => archiver,
             };
+            // PR AA step 6: the daily leg measures the copy work it leaves
+            // for the drain hold.
+            if cfg.drain_hold_counts_archive {
+                archiver = archiver.with_backlog_measure();
+            }
             let summary = archiver.archive_and_drop_old_partitions().await;
             let verdict = pass_verdict(&summary, cfg.max_partitions_per_run);
             info!(
@@ -757,6 +762,10 @@ async fn run_daily_archive_loop(
     }
     // PR AA (owner Quote 51): every `writer` of the archive quiesce counter.
     tickvault_storage::archive_quiesce::register_quiesce_counters();
+    // PR AA step 6 (AA-5, AA-6): the backlog the drain hold reads and the
+    // snapshot-wait gauge, both at 0 before the first pass.
+    crate::archive_backlog::register_archive_backlog_gauge();
+    tickvault_storage::partition_archive::register_archive_snapshot_wait_gauge();
     let completed_gauge = metrics::gauge!("tv_daily_archive_completed_today");
     // 2026-10-06 (plan item 51a): the day this process latched, held in RAM.
     // The marker can fail to save; without this latch every tick would
@@ -858,6 +867,12 @@ async fn run_daily_archive_loop(
             .then_some(today_date);
         let pass_cfg = daily_pass_config(&cfg, below_target);
 
+        // PR AA step 6: a running pass keeps the last backlog reading fresh
+        // for the drain hold.
+        if cfg.drain_hold_counts_archive {
+            crate::archive_backlog::ARCHIVE_BACKLOG
+                .note_pass_started(chrono::Utc::now().timestamp());
+        }
         let report =
             run_one_pass(&questdb, &pass_cfg, verified_day_gate.as_ref(), measure_day).await;
         let outcome = report.outcome;
@@ -905,11 +920,26 @@ async fn run_daily_archive_loop(
         let free_and_target =
             disk_after.map(|(free, total)| (free, free_target_bytes(&ring, &cfg, total)));
         let latch = daily_latch_decision(outcome, dropped, free_and_target);
+        // PR AA step 6 (AA-5): the copy work this pass left, for the drain
+        // hold. Off with `drain_hold_counts_archive = false`.
+        if cfg.drain_hold_counts_archive {
+            let cell = &crate::archive_backlog::ARCHIVE_BACKLOG;
+            if report.summary.pass_ran {
+                cell.publish(
+                    report.summary.archive_backlog_bytes,
+                    free_and_target.is_some_and(|(free, target)| free < target),
+                    chrono::Utc::now().timestamp(),
+                );
+            } else {
+                cell.note_pass_ended();
+            }
+        }
         info!(
             attempt,
             outcome = outcome.as_str(),
             dropped,
             hour_path_for_free_target = below_target,
+            archive_backlog_bytes = report.summary.archive_backlog_bytes,
             free_bytes = free_and_target.map(|(free, _)| free),
             target_free_bytes = free_and_target.map(|(_, target)| target),
             decision = ?latch,

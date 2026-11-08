@@ -487,7 +487,15 @@ pub(crate) async fn wait_for_snapshot<I: ArchiveIo>(
     loop {
         match verdict {
             WalSnapshotVerdict::Behind { .. } if used < polls => {}
-            other => return other,
+            other => {
+                // PR AA step 6 (AA-6): how long this wait took, local
+                // `/metrics` only.
+                #[allow(clippy::cast_precision_loss)]
+                // APPROVED: a poll count times 2 s, far below 2^53
+                let waited = (u64::from(used) * SNAPSHOT_POLL_SECS) as f64;
+                metrics::gauge!(super::WAL_SNAPSHOT_WAIT_GAUGE).set(waited);
+                return other;
+            }
         }
         io.pause_for(SNAPSHOT_POLL).await;
         used = used.saturating_add(1);

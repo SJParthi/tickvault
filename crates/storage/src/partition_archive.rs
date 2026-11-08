@@ -1388,6 +1388,61 @@ pub struct ArchiveRunSummary {
     /// (off-session or pre-open) is NOT capped: its WAL-lagging partitions
     /// still escalate and page, as before PR DP (combined review 2026-11-06).
     pub pass_gated: bool,
+    /// Bytes on disk of the partitions this pass could have acted on and
+    /// left on the box (PR AA step 6, AA-5): every partition of the worklist
+    /// after the cross-verification hold, less the ones it dropped and the
+    /// ones it held because rows of their hour were still on their way to
+    /// QuestDB (in-flight and after-close depth holds). `None` when the pass
+    /// was not asked to measure it ([`PartitionArchiver::with_backlog_measure`]),
+    /// did not run, or a size listing could not be read. The daily leg hands
+    /// it to the drain hold.
+    pub archive_backlog_bytes: Option<u64>,
+}
+
+/// Gauge: seconds the archiver's last WAL snapshot wait took (PR AA step 6,
+/// AA-6). Local `/metrics` only, registered at 0 by
+/// [`register_archive_snapshot_wait_gauge`]; no page, alarm or EMF name.
+pub const WAL_SNAPSHOT_WAIT_GAUGE: &str = "tv_partition_archive_wal_snapshot_wait_secs";
+
+/// Registers [`WAL_SNAPSHOT_WAIT_GAUGE`] at 0, so the series exists before
+/// the first wait. O(1).
+pub fn register_archive_snapshot_wait_gauge() {
+    metrics::gauge!(WAL_SNAPSHOT_WAIT_GAUGE).set(0.0);
+}
+
+/// The bytes of `worklist` partitions listed in `rows` (one table's
+/// `(name, diskSize)` listing), added to `sizes`. A worklist partition the
+/// listing does not name adds nothing. Pure, O(worklist + rows).
+pub(crate) fn add_worklist_sizes(
+    worklist: &[(&'static str, String)],
+    table: &str,
+    rows: &[(String, u64)],
+    sizes: &mut std::collections::HashMap<(&'static str, String), u64>,
+) {
+    let listed: std::collections::HashMap<&str, u64> = rows
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), *bytes))
+        .collect();
+    for (t, partition) in worklist {
+        if *t == table
+            && let Some(bytes) = listed.get(partition.as_str())
+        {
+            sizes.insert((*t, partition.clone()), *bytes);
+        }
+    }
+}
+
+/// The bytes of `sizes` not in `settled` (dropped, or held in flight).
+/// Saturating. Pure, O(sizes).
+#[must_use]
+pub(crate) fn backlog_bytes_left(
+    sizes: &std::collections::HashMap<(&'static str, String), u64>,
+    settled: &std::collections::HashSet<(&'static str, String)>,
+) -> u64 {
+    sizes
+        .iter()
+        .filter(|(key, _)| !settled.contains(*key))
+        .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
 }
 
 /// Limits the CALLER puts on one archive pass (PR DP-2, 2026-11-06).
@@ -1576,6 +1631,9 @@ pub struct PartitionArchiver {
     /// Replaces the snapshot gate's poll interval in tests (`None` in
     /// production: [`snapshot_gate::SNAPSHOT_POLL`]).
     pause_override: Option<Duration>,
+    /// Measure the bytes this pass leaves on the box (PR AA step 6); set by
+    /// [`Self::with_backlog_measure`] for the daily leg only.
+    measure_backlog: bool,
 }
 
 /// Predicate the daily archive leg injects: `true` when day D is verified
@@ -1804,6 +1862,7 @@ impl PartitionArchiver {
             quiesce: None,
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
+            measure_backlog: false,
         }))
     }
 
@@ -1845,6 +1904,7 @@ impl PartitionArchiver {
             quiesce: None,
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
+            measure_backlog: false,
         })
     }
 
@@ -1867,6 +1927,17 @@ impl PartitionArchiver {
     // TEST-EXEMPT: builder setter that stores the limits; what they do is tested through apply_pass_limits, pass_deadline_reached and the stub-server pass test test_stub_pass_limits_skip_depth_cap_and_deadline
     pub fn with_pass_limits(mut self, limits: ArchivePassLimits) -> Self {
         self.pass_limits = limits;
+        self
+    }
+
+    /// Asks this archiver's passes to measure the bytes they leave on the
+    /// box ([`ArchiveRunSummary::archive_backlog_bytes`], PR AA step 6). Only
+    /// the daily leg sets it, for the drain hold: it costs one size listing
+    /// per table that has a partition to archive, per pass.
+    #[must_use]
+    // TEST-EXEMPT: builder setter that stores the flag; what it measures is tested through add_worklist_sizes, backlog_bytes_left and the stub-server pass test test_stub_pass_measures_the_backlog_it_leaves
+    pub fn with_backlog_measure(mut self) -> Self {
+        self.measure_backlog = true;
         self
     }
 
@@ -1961,33 +2032,66 @@ impl PartitionArchiver {
     pub async fn session_bytes_on(&self, day: chrono::NaiveDate) -> Result<u64> {
         let mut total: u64 = 0;
         for table in HOUR_PATH_TABLES {
-            let sql = build_partition_size_sql(table);
-            let response = self
-                .ddl_client
-                .get(&self.exec_url)
-                .query(&[("query", &sql)])
-                .send()
-                .await
-                .context("partition size query failed")?;
-            let status = response.status();
-            let body = read_body_capped(response)
-                .await
-                .context("failed to read partition size response")?;
-            if is_table_absent_response(&body) {
-                continue;
-            }
-            if !status.is_success() {
-                anyhow::bail!(
-                    "partition size list for {table} returned {status}: {}",
-                    capture_rest_error_body(&body)
-                );
-            }
-            let rows = parse_partition_sizes(&body).with_context(|| {
-                format!("partition size list for {table} had no readable diskSize")
-            })?;
+            let rows = self.partition_sizes(table).await?;
             total = total.saturating_add(sum_partition_bytes_on_day(&rows, day));
         }
         Ok(total)
+    }
+
+    /// `(name, diskSize)` of every partition of `table`; empty when QuestDB
+    /// reports the table absent. One list query, O(partitions), cold.
+    async fn partition_sizes(&self, table: &str) -> Result<Vec<(String, u64)>> {
+        let sql = build_partition_size_sql(table);
+        let response = self
+            .ddl_client
+            .get(&self.exec_url)
+            .query(&[("query", &sql)])
+            .send()
+            .await
+            .context("partition size query failed")?;
+        let status = response.status();
+        let body = read_body_capped(response)
+            .await
+            .context("failed to read partition size response")?;
+        if is_table_absent_response(&body) {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            anyhow::bail!(
+                "partition size list for {table} returned {status}: {}",
+                capture_rest_error_body(&body)
+            );
+        }
+        parse_partition_sizes(&body)
+            .with_context(|| format!("partition size list for {table} had no readable diskSize"))
+    }
+
+    /// The bytes of each partition of `worklist` (PR AA step 6), one size
+    /// listing per distinct table. `None` when any listing fails: a partial
+    /// map would understate what is left. O(tables × partitions), cold.
+    async fn worklist_sizes(
+        &self,
+        worklist: &[(&'static str, String)],
+    ) -> Option<std::collections::HashMap<(&'static str, String), u64>> {
+        let mut tables: Vec<&'static str> = worklist.iter().map(|(t, _)| *t).collect();
+        tables.sort_unstable();
+        tables.dedup();
+        let mut sizes = std::collections::HashMap::with_capacity(worklist.len());
+        for table in tables {
+            match self.partition_sizes(table).await {
+                Ok(rows) => add_worklist_sizes(worklist, table, &rows, &mut sizes),
+                Err(err) => {
+                    info!(
+                        table,
+                        error = %format!("{err:#}"),
+                        "partition archive: size listing failed, so this pass reports no \
+                         archive backlog (the drain hold does not count it this time)"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(sizes)
     }
 
     /// Runs one archive→verify→drop cycle over every retention-swept table.
@@ -2241,6 +2345,17 @@ impl PartitionArchiver {
         // Cross-verification hold BEFORE the per-run cap, so a held partition
         // never consumes budget a verified one could have used.
         let worklist = self.apply_crossverify_hold(worklist, &mut summary);
+        // PR AA step 6: the sizes of what this pass could act on, for the
+        // drain hold. Measured after the cross-verification hold (a held day
+        // is not work tonight) and before any cap, so a partition the pass
+        // does not reach still counts.
+        let backlog_sizes = if self.measure_backlog {
+            self.worklist_sizes(&worklist).await
+        } else {
+            None
+        };
+        let mut settled: std::collections::HashSet<(&'static str, String)> =
+            std::collections::HashSet::new();
         // PR DP-2: the caller's depth skip BEFORE the per-run cap, so a held
         // depth partition never takes a slot another table could use.
         let (worklist, held_depth) = apply_pass_limits(
@@ -2343,6 +2458,11 @@ impl PartitionArchiver {
             // again: the writer that held it is still at work.
             // PR AA step 3: and so does every table on the hour path this
             // pass (`tick_quotes`, `feed_aux_packets` under pressure).
+            let before = (
+                summary.dropped,
+                summary.held_in_flight,
+                summary.held_deferred_depth,
+            );
             let step = if uses_snapshot_gate(table, &hour_path_tables) {
                 if quiesce_busy {
                     summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
@@ -2367,7 +2487,22 @@ impl PartitionArchiver {
                 wal_blocked.push(table);
                 summary.tables_wal_not_applied = summary.tables_wal_not_applied.saturating_add(1);
             }
+            // PR AA step 6: dropped, or held while rows of its hour are still
+            // on their way: either way not copy work left for tonight.
+            if backlog_sizes.is_some()
+                && before
+                    != (
+                        summary.dropped,
+                        summary.held_in_flight,
+                        summary.held_deferred_depth,
+                    )
+            {
+                settled.insert((table, partition));
+            }
         }
+        summary.archive_backlog_bytes = backlog_sizes
+            .as_ref()
+            .map(|sizes| backlog_bytes_left(sizes, &settled));
         if cap.is_some() {
             // A capped pass reports what it handed to the export steps.
             summary.partitions_considered = attempted;
@@ -2412,6 +2547,7 @@ impl PartitionArchiver {
             held_by_gate = summary.held_by_gate,
             stopped_at_deadline = summary.stopped_at_deadline,
             tables_wal_not_applied = summary.tables_wal_not_applied,
+            archive_backlog_bytes = summary.archive_backlog_bytes,
             gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
             csv_bytes_exported = summary.csv_bytes_exported,
             bucket = %self.cold.bucket(),
@@ -5790,6 +5926,26 @@ mod stub_integration_tests {
                 );
                 return (200, Vec::new(), body.into_bytes());
             }
+            // PR AA step 6: a size listing names each listed partition at
+            // `STUB_PARTITION_BYTES`.
+            if t.contains("diskSize") {
+                let rows: Vec<String> = listed
+                    .iter()
+                    .find(|(q, _)| t.contains(q.as_str()))
+                    .map(|(_, parts)| {
+                        parts
+                            .iter()
+                            .map(|p| format!("[\"{p}\",{STUB_PARTITION_BYTES}]"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let body = format!(
+                    "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"diskSize\"}}],\
+                     \"dataset\":[{}]}}",
+                    rows.join(",")
+                );
+                return (200, Vec::new(), body.into_bytes());
+            }
             if let Some((_, partitions)) = listed.iter().find(|(q, _)| t.contains(q.as_str())) {
                 let rows: Vec<String> = partitions
                     .iter()
@@ -5818,6 +5974,9 @@ mod stub_integration_tests {
     fn ilp_responder(status: u16) -> Responder {
         Arc::new(move |_req: &SeenRequest| (status, Vec::new(), Vec::new()))
     }
+
+    /// Bytes a stub size listing reports for each listed partition.
+    const STUB_PARTITION_BYTES: u64 = 1_000;
 
     fn test_retention_cfg(max_per_run: u32) -> PartitionRetentionConfig {
         PartitionRetentionConfig {
@@ -6096,6 +6255,62 @@ mod stub_integration_tests {
         let freed = archiver.run_archive_pass().await;
         assert_eq!(freed.held_deferred_depth, 0);
         assert_eq!(freed.dropped, 1, "once the marks clear the hour goes");
+    }
+
+    /// PR AA step 6 (AA-5): a pass asked to measure reports the bytes of the
+    /// partitions it could have acted on and left on the box: not the ones
+    /// it dropped, not the ones it held in flight. A pass not asked reports
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_pass_measures_the_backlog_it_leaves() {
+        use snapshot_gate::InFlightVerdict;
+
+        let responder = || {
+            qdb_responder_listing(
+                crate::depth_persistence::MARKET_DEPTH_TABLE,
+                vec!["2026-04-01T09", "2026-04-01T10", "2026-04-01T11"],
+                Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+                CSV,
+                Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+            )
+        };
+        // Hour 10 is held in flight; the cap of 2 leaves hour 11 unreached.
+        let held_hour = snapshot_gate::hour_frame_seq_span("2026-04-01T10").expect("span");
+        let reader: InFlightReader = Arc::new(move |_table, span| {
+            if span == held_hour {
+                InFlightVerdict::NotAcked
+            } else {
+                InFlightVerdict::Clear
+            }
+        });
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let (qdb_url, _qdb_log) = spawn_stub(responder()).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(2))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::clone(&reader))
+            .with_backlog_measure();
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 1, "{summary:?}");
+        assert_eq!(summary.held_in_flight, 1, "{summary:?}");
+        assert_eq!(
+            summary.archive_backlog_bytes,
+            Some(STUB_PARTITION_BYTES),
+            "only the unreached hour is copy work left: {summary:?}"
+        );
+
+        // Not asked: nothing is measured.
+        let (qdb_url, _qdb_log) = spawn_stub(responder()).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(2))
+            .await
+            .with_test_snapshot_gate(quiesce, reader);
+        assert_eq!(
+            archiver.run_archive_pass().await.archive_backlog_bytes,
+            None
+        );
     }
 
     /// PR AA step 2, the reason for the snapshot gate: the live writer keeps
@@ -7584,3 +7799,70 @@ mod archive_space_verdict_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod archive_backlog_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_add_worklist_sizes_keeps_only_worklist_partitions_of_the_table() {
+        let worklist: Vec<(&'static str, String)> = vec![
+            ("market_depth", "2026-11-06T10".to_string()),
+            ("market_depth", "2026-11-06T11".to_string()),
+            ("tick_quotes", "2026-11-06T10".to_string()),
+        ];
+        let rows = vec![
+            ("2026-11-06T10".to_string(), 70),
+            ("2026-11-06T12".to_string(), 9_999), // not in the worklist
+        ];
+        let mut sizes = HashMap::new();
+        add_worklist_sizes(&worklist, "market_depth", &rows, &mut sizes);
+        assert_eq!(sizes.len(), 1, "an unlisted partition adds nothing");
+        assert_eq!(
+            sizes.get(&("market_depth", "2026-11-06T10".to_string())),
+            Some(&70)
+        );
+        add_worklist_sizes(
+            &worklist,
+            "tick_quotes",
+            &[("2026-11-06T10".to_string(), 5)],
+            &mut sizes,
+        );
+        assert_eq!(
+            sizes.get(&("tick_quotes", "2026-11-06T10".to_string())),
+            Some(&5)
+        );
+    }
+
+    #[test]
+    fn test_backlog_bytes_left_skips_settled_and_saturates() {
+        let mut sizes = HashMap::new();
+        sizes.insert(("market_depth", "a".to_string()), u64::MAX);
+        sizes.insert(("market_depth", "b".to_string()), 10);
+        sizes.insert(("tick_quotes", "a".to_string()), 7);
+        let mut settled = HashSet::new();
+        assert_eq!(backlog_bytes_left(&sizes, &settled), u64::MAX);
+        settled.insert(("market_depth", "a".to_string()));
+        assert_eq!(backlog_bytes_left(&sizes, &settled), 17);
+        settled.insert(("market_depth", "b".to_string()));
+        settled.insert(("tick_quotes", "a".to_string()));
+        assert_eq!(backlog_bytes_left(&sizes, &settled), 0);
+        assert_eq!(backlog_bytes_left(&HashMap::new(), &settled), 0);
+    }
+
+    #[test]
+    fn test_register_archive_snapshot_wait_gauge_names_the_series() {
+        register_archive_snapshot_wait_gauge();
+        assert_eq!(
+            WAL_SNAPSHOT_WAIT_GAUGE,
+            "tv_partition_archive_wal_snapshot_wait_secs"
+        );
+    }
+}
+
+// PR AA step 6 (owner Quote 51): the randomized 30-day proof of the archive
+// protocol. Declared last: source-scan guards treat everything after the
+// first `#[cfg(test)] mod` as test code.
+#[cfg(test)]
+mod archive_lifecycle_sim;
