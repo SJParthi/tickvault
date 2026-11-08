@@ -331,6 +331,9 @@ async fn run_disk_pressure_loop(
     // PR AA review: the last pass stood aside ONLY for after-close depth
     // marks (`stood_aside_only_for_depth_marks`).
     let mut last_aside_for_depth_only = false;
+    // PR AA review finding 3: polls held in a row by that wait; at
+    // `DEPTH_ASIDE_MAX_SKIPPED_POLLS` one pass runs anyway. Reset by any pass.
+    let mut depth_aside_skipped_polls: u32 = 0;
     // PR DP review M7: the (re-arm window key, depth allowed) of the last
     // in-session pass that stood aside; the same conditions skip the rerun.
     // Depth is allowed at 90%+ used or, since PR AA step 4, while the disk is
@@ -703,19 +706,28 @@ async fn run_disk_pressure_loop(
                 // PR AA review: only a pass that stood aside SOLELY for depth
                 // marks waits for them; one that stood aside for a busy
                 // quiesce lock (a spill replay, a catch-up chunk) is retried.
-                let depth_gate_busy = last_aside_for_depth_only
-                    && depth_marks_hold_busy(
-                        u64::from(secs_of_day_ist()),
-                        tickvault_storage::partition_archive::deferred_depth_marks_waiting(),
-                    );
+                // PR AA review finding 3: marks the depth pass cannot clear
+                // (it stopped at its disk floor) do not hold the leg, and after
+                // `DEPTH_ASIDE_MAX_SKIPPED_POLLS` held polls one pass runs anyway.
+                let depth_gate_busy = depth_aside_holds_poll(
+                    last_aside_for_depth_only,
+                    u64::from(secs_of_day_ist()),
+                    tickvault_storage::partition_archive::deferred_depth_marks_waiting(),
+                    crate::dhan_feed_stack::deferred_depth_pass::floor_blocked_since_unix()
+                        .is_some(),
+                    depth_aside_skipped_polls,
+                );
                 if !pressure_pass_due(action, last_stood_aside, depth_gate_busy) {
+                    depth_aside_skipped_polls = depth_aside_skipped_polls.saturating_add(1);
                     tracing::debug!(
                         used_pct = used,
+                        skipped_polls = depth_aside_skipped_polls,
                         "disk-pressure pass held: the after-close depth pass still holds \
                          the depth partitions and the last pass found nothing else"
                     );
                     continue;
                 }
+                depth_aside_skipped_polls = 0;
 
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
                 // PR DP-2: the session gate (computed above). Measured
@@ -965,6 +977,33 @@ pub const fn pressure_pass_due(
 pub(crate) const fn depth_marks_hold_busy(now_secs_ist: u64, marks_waiting: bool) -> bool {
     marks_waiting
         && crate::dhan_feed_stack::deferred_depth_pass::in_after_close_window(now_secs_ist)
+}
+
+/// Held polls in a row after which a pass that stood aside only for depth
+/// marks runs once more anyway (PR AA review finding 3): 10 minutes at the
+/// 60 s poll, so a mark the depth pass can never clear (an uncertain bucket
+/// carried for days) does not hold the leg all night.
+const DEPTH_ASIDE_MAX_SKIPPED_POLLS: u32 = 10;
+
+/// Whether this poll waits for the after-close depth pass instead of running
+/// a pressure pass (PR AA review finding 3). Only after a pass that stood
+/// aside solely for depth marks, only while marks wait inside the after-close
+/// window, only while that pass is not stopped at its disk floor (it cannot
+/// clear the marks until space is freed, which is this leg's job), and only
+/// for fewer than [`DEPTH_ASIDE_MAX_SKIPPED_POLLS`] polls in a row. Before the
+/// fix the wait ended only when the marks cleared or at 07:15 IST. Pure, O(1).
+#[must_use]
+const fn depth_aside_holds_poll(
+    last_aside_for_depth_only: bool,
+    now_secs_ist: u64,
+    marks_waiting: bool,
+    depth_floor_blocked: bool,
+    skipped_polls: u32,
+) -> bool {
+    last_aside_for_depth_only
+        && depth_marks_hold_busy(now_secs_ist, marks_waiting)
+        && !depth_floor_blocked
+        && skipped_polls < DEPTH_ASIDE_MAX_SKIPPED_POLLS
 }
 
 /// Folds one pass's result into the episode state (DA-13d).
@@ -1409,6 +1448,41 @@ mod tests {
         assert!(depth_marks_hold_busy(before_dawn, true));
         assert!(!depth_marks_hold_busy(evening, false));
         assert!(!depth_marks_hold_busy(before_dawn, false));
+    }
+
+    /// Regression: PR AA review finding 3. After one depth-only stand-aside,
+    /// waiting marks held every later pressure pass until the marks cleared
+    /// or 07:15 IST, although the depth pass sat at its disk floor and could
+    /// clear nothing until this leg freed space. A floor-blocked depth pass no
+    /// longer holds the leg, and an unblocked wait ends after
+    /// `DEPTH_ASIDE_MAX_SKIPPED_POLLS` held polls.
+    #[test]
+    fn test_regression_depth_aside_wait_ends_at_floor_block_or_poll_cap() {
+        let at_16_41 = 16 * 3_600 + 41 * 60;
+        let due = |busy| pressure_pass_due(PressureAction::ContinuePass, true, busy);
+        // The depth pass stopped at its floor: the pass runs.
+        assert!(due(depth_aside_holds_poll(true, at_16_41, true, true, 0)));
+        // The depth pass can progress: the poll is held.
+        assert!(!due(depth_aside_holds_poll(true, at_16_41, true, false, 0)));
+        // Not a depth-only stand-aside, or no marks: never held.
+        assert!(due(depth_aside_holds_poll(false, at_16_41, true, false, 0)));
+        assert!(due(depth_aside_holds_poll(true, at_16_41, false, false, 0)));
+
+        // The loop's counter: held polls add one, a pass resets it. With the
+        // depth pass never finishing, a pass runs every 11th poll.
+        let mut skipped: u32 = 0;
+        let mut passes_at = Vec::new();
+        for poll in 0..23_u32 {
+            let busy = depth_aside_holds_poll(true, at_16_41, true, false, skipped);
+            if due(busy) {
+                passes_at.push(poll);
+                skipped = 0;
+            } else {
+                skipped = skipped.saturating_add(1);
+            }
+        }
+        assert_eq!(DEPTH_ASIDE_MAX_SKIPPED_POLLS, 10);
+        assert_eq!(passes_at, vec![10, 21]);
     }
 
     /// PR AA review: only a pass that stood aside SOLELY for depth marks may
@@ -1919,7 +1993,11 @@ mod probe_health_wiring_tests {
             "projected_session_limits(",
             "in_session_rerun_skippable(last_in_session_aside, window_key, depth_allowed)",
             // PR AA review: the depth-marks wait reads the depth-only flag.
-            "let depth_gate_busy = last_aside_for_depth_only",
+            "let depth_gate_busy = depth_aside_holds_poll(\n                    last_aside_for_depth_only,",
+            // PR AA review finding 3: the floor check and the held-poll cap.
+            "deferred_depth_pass::floor_blocked_since_unix()",
+            "depth_aside_skipped_polls = depth_aside_skipped_polls.saturating_add(1);",
+            "depth_aside_skipped_polls = 0;",
             "last_aside_for_depth_only = last_stood_aside && aside_for_depth_only;",
         ] {
             assert!(prod.contains(needle), "missing in the loop: {needle}");
