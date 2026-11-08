@@ -371,6 +371,9 @@ pub mod wal_idle_seal;
 pub mod wal_writer_wait;
 // PR W review round 7: count a WAL record written past the reorder slack.
 pub mod wal_reorder_guard;
+// PR RD-1 (2026-11-08, Quote 41): the per-boot replay frame cap in force,
+// raised once to 5x for a planned evening-drain boot.
+pub mod wal_replay_frame_cap;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
 // frames whose rows already reached the database. Sibling of `ws_frame_spill`.
 pub mod wal_applied_watermark;

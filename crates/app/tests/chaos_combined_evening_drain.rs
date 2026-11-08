@@ -29,13 +29,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tickvault_app::evening_drain::{
-    EVENING_DRAIN_CATCHUP_BUDGET_SECS, EVENING_DRAIN_FIRST_SECS_IST,
+    CatchupAllowance, EVENING_DRAIN_CATCHUP_BUDGET_SECS, EVENING_DRAIN_FIRST_SECS_IST,
     EVENING_DRAIN_LAST_RESTART_SECS_IST, EVENING_DRAIN_PENDING_MAX_AGE_SECS,
     EVENING_DRAIN_RESTARTS_MAX, EVENING_DRAIN_SPACING_SECS, EVENING_DRAIN_STATE_PATH,
-    EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST, EveningState, EveningStep, budget_or, catchup_budget_for,
-    crossverify_settled, evening_step, load_state, load_state_for_evening, state_for_give_up,
-    state_for_restart, store_state,
+    EVENING_DRAIN_XVERIFY_CLEAR_SECS_IST, EveningState, EveningStep, allowance_or,
+    catchup_allowance_for, crossverify_settled, evening_step, load_state, load_state_for_evening,
+    state_for_give_up, state_for_restart, store_state,
 };
+use tickvault_storage::wal_replay_frame_cap::EVENING_DRAIN_REPLAY_FRAME_CAP;
+use tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_FRAMES_PER_BOOT;
 
 const DAY: i32 = 739_910;
 const IST_OFFSET_SECS: i64 = 19_800;
@@ -49,7 +51,7 @@ const MINUTE: i64 = 60;
 // ---------------------------------------------------------------- helpers
 
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
-/// `budget_or` reads a cwd-relative path; the one test that moves the cwd
+/// `allowance_or` reads a cwd-relative path; the one test that moves the cwd
 /// holds this, and every other test here uses absolute paths only.
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -714,49 +716,75 @@ fn a_kill_at_every_point_of_the_restart_write_keeps_the_count_and_the_spacing() 
     );
 }
 
-/// The pending flag survives a kill between `budget_or`'s read and its
+/// The standard allowance: `secs` and the standard 3,000,000-frame cap.
+fn standard(secs: u64) -> CatchupAllowance {
+    CatchupAllowance {
+        budget_secs: secs,
+        frame_cap: WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+    }
+}
+
+/// The pending flag survives a kill between `allowance_or`'s read and its
 /// clearing write, but only for the 15 minutes it stays fresh.
 #[test]
 fn a_kill_before_the_pending_flag_is_cleared_ages_out_in_fifteen_minutes() {
     let at = evening_start_unix(0) + 120 * MINUTE;
     let s = state_for_restart(&EveningState::default(), DAY, 40, at);
     let secs = secs_ist_of(at);
-    let budget = EVENING_DRAIN_CATCHUP_BUDGET_SECS;
-    assert_eq!(catchup_budget_for(&s, 300, at + 5, secs), budget);
+    // PR RD-2 (Quote 41): the evening boot takes the 15-minute clock AND the
+    // 15,000,000-frame cap.
+    let evening = CatchupAllowance {
+        budget_secs: EVENING_DRAIN_CATCHUP_BUDGET_SECS,
+        frame_cap: EVENING_DRAIN_REPLAY_FRAME_CAP,
+    };
+    assert_eq!(catchup_allowance_for(&s, 300, at + 5, secs), evening);
     let edge = at + EVENING_DRAIN_PENDING_MAX_AGE_SECS;
-    assert_eq!(catchup_budget_for(&s, 300, edge, secs_ist_of(edge)), budget);
+    assert_eq!(
+        catchup_allowance_for(&s, 300, edge, secs_ist_of(edge)),
+        evening
+    );
     let stale = edge + 1;
-    assert_eq!(catchup_budget_for(&s, 300, stale, secs_ist_of(stale)), 300);
+    assert_eq!(
+        catchup_allowance_for(&s, 300, stale, secs_ist_of(stale)),
+        standard(300)
+    );
     // The standard budget never shrinks.
-    assert_eq!(catchup_budget_for(&s, 5_000, at + 5, secs), 5_000);
-    // A morning boot never takes the evening clock, even with a fresh flag.
+    assert_eq!(
+        catchup_allowance_for(&s, 5_000, at + 5, secs).budget_secs,
+        5_000
+    );
+    // A morning boot never takes the evening clock or cap, even with a fresh flag.
     let morning = 9 * 3_600;
-    assert_eq!(catchup_budget_for(&s, 300, at + 5, morning), 300);
+    assert_eq!(
+        catchup_allowance_for(&s, 300, at + 5, morning),
+        standard(300)
+    );
 }
 
-/// `budget_or` on the real cwd-relative path: one boot only, and a torn,
-/// missing or blocked file gives the standard budget without a write.
+/// `allowance_or` on the real cwd-relative path: one boot only (the second
+/// boot is back at 3,000,000 frames), and a torn, missing or blocked file
+/// gives the standard allowance without a write.
 #[test]
-fn budget_or_applies_to_one_boot_and_fails_closed_on_a_bad_file() {
+fn allowance_or_applies_to_one_boot_and_fails_closed_on_a_bad_file() {
     let _guard = CWD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new("budget-or");
+    let dir = TempDir::new("allowance-or");
     let old_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(&dir.0).expect("chdir");
     let result = std::panic::catch_unwind(|| {
         let path = Path::new(EVENING_DRAIN_STATE_PATH);
         // Missing: standard, and nothing is created.
-        assert_eq!(budget_or(300), 300);
+        assert_eq!(allowance_or(300), standard(300));
         assert!(!path.exists());
-        // Fresh pending flag: the budget the pure fn gives at this instant,
+        // Fresh pending flag: the allowance the pure fn gives at this instant,
         // and the flag is cleared so a second boot takes the standard one.
         let now = chrono::Utc::now().timestamp();
         let s = state_for_restart(&EveningState::default(), DAY, 12, now);
         store_state(path, &s).expect("store");
         let secs = tickvault_app::dhan_feed_stack::now_ist_secs_of_day();
-        let want = catchup_budget_for(&s, 300, now, secs);
-        assert_eq!(budget_or(300), want);
+        let want = catchup_allowance_for(&s, 300, now, secs);
+        assert_eq!(allowance_or(300), want);
         let cleared = load_state(path).expect("cleared");
         assert_eq!(
             cleared,
@@ -765,16 +793,21 @@ fn budget_or_applies_to_one_boot_and_fails_closed_on_a_bad_file() {
                 ..s
             }
         );
-        assert_eq!(budget_or(300), 300, "the flag applies to one boot only");
+        let second = allowance_or(300);
+        assert_eq!(second, standard(300), "the flag applies to one boot only");
+        assert_eq!(
+            second.frame_cap, WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+            "the second boot is back at the 3,000,000-frame cap"
+        );
         // Torn: standard, file untouched.
         let torn = &s.to_line().into_bytes()[..9];
         std::fs::write(path, torn).expect("tear");
-        assert_eq!(budget_or(300), 300);
+        assert_eq!(allowance_or(300), standard(300));
         assert_eq!(std::fs::read(path).expect("read"), torn);
         // A directory in the way: standard.
         std::fs::remove_file(path).expect("rm");
         std::fs::create_dir(path).expect("dir in the way");
-        assert_eq!(budget_or(300), 300);
+        assert_eq!(allowance_or(300), standard(300));
         assert!(path.is_dir());
     });
     std::env::set_current_dir(old_cwd).expect("restore cwd");

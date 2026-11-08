@@ -23,10 +23,14 @@
 //!   verdict is written down so it cannot flip back.
 //! - None after [`EVENING_DRAIN_LAST_RESTART_SECS_IST`] (05:00 IST), so the
 //!   last one is judged well before the 07:30 hold ceiling.
-//! - The restarted boot keeps every per-boot bound of the catch-up (the frame
-//!   cap, the round cap, the memory stop, the disk floor); only its clock is
-//!   [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] instead of five minutes, so lag
-//!   pauses do not end it early.
+//! - The restarted boot keeps the round cap, the memory stop and the disk
+//!   floor; its clock is [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] instead of five
+//!   minutes, so lag pauses do not end it early, and (PR RD-2, 2026-11-08,
+//!   owner Quote 41) its replay frame cap is
+//!   `EVENING_DRAIN_REPLAY_FRAME_CAP`, 5 x `WAL_REPLAY_MAX_FRAMES_PER_BOOT`
+//!   (15,000,000), raised once before the first catch-up round. Before, it
+//!   kept the 3,000,000 cap, which the boot pass alone (about 3.5 million
+//!   frames) already passed, so the longer clock bought nothing.
 //!
 //! # State
 //!
@@ -534,46 +538,70 @@ pub fn state_for_give_up(state: &EveningState, day: i32) -> EveningState {
     }
 }
 
-/// The catch-up clock for this boot: [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`]
-/// when this is the evening drain boot (a fresh pending flag, inside the
-/// restart window or the hour after it), else `standard`. Pure.
+/// What this boot's WAL catch-up may spend: its clock and its replay frame
+/// cap. Decided once per boot by [`catchup_allowance_for`] (PR RD-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchupAllowance {
+    /// The catch-up clock, in seconds.
+    pub budget_secs: u64,
+    /// Frames this boot may replay across STAGE-C and every catch-up round.
+    pub frame_cap: u64,
+}
+
+/// The catch-up allowance for this boot. On the evening drain boot (a fresh
+/// pending flag, inside the restart window or the hour after it): the clock
+/// is at least [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] and the frame cap is
+/// `EVENING_DRAIN_REPLAY_FRAME_CAP` (5 x `WAL_REPLAY_MAX_FRAMES_PER_BOOT`,
+/// 15,000,000, owner Quote 41). Any other boot: `standard` seconds and the
+/// standard 3,000,000 frames. Pure.
 #[must_use]
-pub fn catchup_budget_for(
+pub fn catchup_allowance_for(
     state: &EveningState,
     standard: u64,
     now_unix: i64,
     secs_ist: u64,
-) -> u64 {
+) -> CatchupAllowance {
     let age = now_unix.saturating_sub(state.pending_unix);
     let fresh = state.pending_unix != 0 && (0..=EVENING_DRAIN_PENDING_MAX_AGE_SECS).contains(&age);
     let evening = in_restart_window(secs_ist)
         || secs_ist
             < EVENING_DRAIN_LAST_RESTART_SECS_IST + EVENING_DRAIN_PENDING_MAX_AGE_SECS as u64;
     if fresh && evening {
-        standard.max(EVENING_DRAIN_CATCHUP_BUDGET_SECS)
+        CatchupAllowance {
+            budget_secs: standard.max(EVENING_DRAIN_CATCHUP_BUDGET_SECS),
+            frame_cap: tickvault_storage::wal_replay_frame_cap::EVENING_DRAIN_REPLAY_FRAME_CAP,
+        }
     } else {
-        standard
+        standard_allowance(standard)
     }
 }
 
-/// [`catchup_budget_for`] on the state file, clearing its pending flag so it
-/// applies to one boot only. Called once per lane start, cold.
+/// `standard` seconds and the standard per-boot frame cap. Pure.
+const fn standard_allowance(standard: u64) -> CatchupAllowance {
+    CatchupAllowance {
+        budget_secs: standard,
+        frame_cap: tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+    }
+}
+
+/// [`catchup_allowance_for`] on the state file, clearing its pending flag so
+/// it applies to one boot only. Called once per lane start, cold.
 #[must_use]
-// TEST-EXEMPT: file I/O around catchup_budget_for, which is unit-tested (test_catchup_budget_for_*) and on store_state/load_state.
-pub fn budget_or(standard: u64) -> u64 {
+// TEST-EXEMPT: file I/O around catchup_allowance_for, which is unit-tested (test_catchup_allowance_for_*) and on store_state/load_state; covered by allowance_or_applies_to_one_boot_and_fails_closed_on_a_bad_file.
+pub fn allowance_or(standard: u64) -> CatchupAllowance {
     let path = Path::new(EVENING_DRAIN_STATE_PATH);
     // Keep the read/clear transaction inside one lock: an old boot snapshot
     // must not overwrite a newer supervisor restart count when clearing pending.
     let Ok(_guard) = STATE_IO.lock() else {
-        return standard;
+        return standard_allowance(standard);
     };
     let Ok(StateRead::Valid(state)) = read_state(path) else {
-        return standard;
+        return standard_allowance(standard);
     };
     if state.pending_unix == 0 {
-        return standard;
+        return standard_allowance(standard);
     }
-    let budget = catchup_budget_for(
+    let allowance = catchup_allowance_for(
         &state,
         standard,
         chrono::Utc::now().timestamp(),
@@ -591,15 +619,17 @@ pub fn budget_or(standard: u64) -> u64 {
             "evening drain: the pending flag could not be cleared; it ages out in 15 minutes"
         );
     }
-    if budget > standard {
+    if allowance != standard_allowance(standard) {
         info!(
-            budget_secs = budget,
+            budget_secs = allowance.budget_secs,
+            frame_cap = allowance.frame_cap,
             restart = state.restarts,
             backlog_before = state.backlog_before,
-            "evening drain boot: the WAL catch-up takes the longer evening clock"
+            "evening drain boot: the WAL catch-up takes the longer evening clock and the \
+             evening frame cap"
         );
     }
-    budget
+    allowance
 }
 
 #[cfg(test)]
@@ -864,23 +894,51 @@ mod tests {
     }
 
     #[test]
-    fn test_catchup_budget_for_only_a_fresh_evening_pending_flag() {
+    fn test_catchup_allowance_for_only_a_fresh_evening_pending_flag() {
+        use tickvault_storage::wal_replay_frame_cap::EVENING_DRAIN_REPLAY_FRAME_CAP;
+        use tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_FRAMES_PER_BOOT;
         let pending = EveningState {
             pending_unix: NOW,
             ..EveningState::default()
         };
-        let budget = EVENING_DRAIN_CATCHUP_BUDGET_SECS;
-        assert_eq!(catchup_budget_for(&pending, 300, NOW + 30, EVENING), budget);
-        // Stale flag, no flag, or a morning boot: unchanged.
-        let stale = NOW + EVENING_DRAIN_PENDING_MAX_AGE_SECS + 1;
-        assert_eq!(catchup_budget_for(&pending, 300, stale, EVENING), 300);
+        let evening = CatchupAllowance {
+            budget_secs: EVENING_DRAIN_CATCHUP_BUDGET_SECS,
+            frame_cap: EVENING_DRAIN_REPLAY_FRAME_CAP,
+        };
+        // Quote 41: the evening drain boot replays up to 5 x 3,000,000.
+        assert_eq!(EVENING_DRAIN_REPLAY_FRAME_CAP, 15_000_000);
         assert_eq!(
-            catchup_budget_for(&EveningState::default(), 300, NOW, EVENING),
-            300
+            catchup_allowance_for(&pending, 300, NOW + 30, EVENING),
+            evening
         );
-        assert_eq!(catchup_budget_for(&pending, 20, NOW + 30, 10 * 3_600), 20);
+        let standard = |secs| CatchupAllowance {
+            budget_secs: secs,
+            frame_cap: WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+        };
+        // Stale flag, no flag, or a morning boot: the standard allowance.
+        let stale = NOW + EVENING_DRAIN_PENDING_MAX_AGE_SECS + 1;
+        assert_eq!(
+            catchup_allowance_for(&pending, 300, stale, EVENING),
+            standard(300)
+        );
+        assert_eq!(
+            catchup_allowance_for(&EveningState::default(), 300, NOW, EVENING),
+            standard(300)
+        );
+        assert_eq!(
+            catchup_allowance_for(&pending, 20, NOW + 30, 10 * 3_600),
+            standard(20)
+        );
         // A flag stamped in the future is not fresh.
-        assert_eq!(catchup_budget_for(&pending, 300, NOW - 5, EVENING), 300);
+        assert_eq!(
+            catchup_allowance_for(&pending, 300, NOW - 5, EVENING),
+            standard(300)
+        );
+        // The standard clock never shrinks on the evening boot.
+        assert_eq!(
+            catchup_allowance_for(&pending, 5_000, NOW + 30, EVENING).budget_secs,
+            5_000
+        );
     }
 
     #[test]
@@ -904,7 +962,7 @@ mod tests {
     fn the_lane_and_main_are_wired_to_the_evening_drain() {
         let lane = include_str!("dhan_feed_stack.rs");
         assert!(lane.contains(
-            "crate::evening_drain::budget_or(wal_catchup_budget_secs(now_ist_secs_of_day()))"
+            "crate::evening_drain::allowance_or(wal_catchup_budget_secs(now_ist_secs_of_day()))"
         ));
         let main = include_str!("main.rs");
         assert!(main.contains("tickvault_app::evening_drain::self_restart_requested()"));

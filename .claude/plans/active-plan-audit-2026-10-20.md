@@ -2471,8 +2471,8 @@ Revert the PR: the cap returns to the constant, the ack returns to all-or-nothin
 This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
 
 - [ ] RD-0 rule-file-first: §2.17 in `docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md` and its stub bullet; this plan item.
-- [ ] RD-1 per-boot frame cap (storage).
-- [ ] RD-2 evening allowance (app).
+- [x] RD-1 per-boot frame cap (storage): `crates/storage/src/wal_replay_frame_cap.rs` (`EVENING_DRAIN_REPLAY_FRAME_CAP`, `raise_replay_frame_cap_for_planned_drain`, `replay_frame_cap_this_boot`, `refuse_past_frame_cap`, the refusal line now names the cap used); `ws_frame_spill::replay_all_with_report_at` takes `frame_cap`, `replay_all_with_report_fenced` passes the atomic. Tests: `replay_refuses_past_the_per_boot_frame_cap` (3.5M: 3M refuses, 15M reads), `test_regression_fenced_replay_runs_under_the_raised_cap_not_the_constant`, `test_raise_cap_in_raises_once_never_lowers_never_passes_the_evening_cap`, `test_clamp_replay_frame_cap_holds_the_two_quote_41_bounds`, `test_refuse_past_frame_cap_uses_the_cap_it_is_given`, `test_raise_replay_frame_cap_for_planned_drain_keeps_replay_frame_cap_this_boot_in_bounds`.
+- [x] RD-2 evening allowance (app): `evening_drain::catchup_budget_for` / `budget_or` renamed `catchup_allowance_for` / `allowance_or`, returning `CatchupAllowance { budget_secs, frame_cap }` (one read-and-clear under `STATE_IO`); the lane raises the cap before its first catch-up round and logs `frame_cap` on the start and finish lines. Tests: `test_catchup_allowance_for_only_a_fresh_evening_pending_flag`, `a_kill_before_the_pending_flag_is_cleared_ages_out_in_fifteen_minutes`, `allowance_or_applies_to_one_boot_and_fails_closed_on_a_bad_file` (second boot back at 3,000,000).
 - [ ] RD-3 depth losses deferred, not holding tick segments (storage, app).
 - [ ] RD-4 log lines per §2.17 (storage, app).
 - [ ] RD-5 docs (Quote 41 note, CLAUDE.md rows).

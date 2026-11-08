@@ -17845,8 +17845,17 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
         // once, above, and every round folds against that same seeded state.
         // 44a (2026-09-22): the budget is clock-aware (short mid-session, so the
         // sockets dial sooner); an evening drain boot (Quote 31) takes 15 min.
-        let catchup_budget_secs =
-            crate::evening_drain::budget_or(wal_catchup_budget_secs(now_ist_secs_of_day()));
+        // PR RD-2 (2026-11-08, Quote 41): the same one read-and-clear of the
+        // evening-drain flag gives the frame cap too (15,000,000 on the
+        // planned restart, 3,000,000 otherwise), raised before the first
+        // catch-up round; the boot pass above reads one batch whatever the cap.
+        let catchup_allowance =
+            crate::evening_drain::allowance_or(wal_catchup_budget_secs(now_ist_secs_of_day()));
+        let catchup_budget_secs = catchup_allowance.budget_secs;
+        let catchup_frame_cap =
+            tickvault_storage::wal_replay_frame_cap::raise_replay_frame_cap_for_planned_drain(
+                catchup_allowance.frame_cap,
+            );
         let in_session_counter = metrics::counter!(WAL_CATCHUP_IN_SESSION_COUNTER);
         in_session_counter.increment(0);
         if catchup_budget_secs < WAL_CATCHUP_BUDGET_SECS {
@@ -17854,6 +17863,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             warn!(
                 budget_secs = catchup_budget_secs,
                 full_budget_secs = WAL_CATCHUP_BUDGET_SECS,
+                frame_cap = catchup_frame_cap,
                 counter = WAL_CATCHUP_IN_SESSION_COUNTER,
                 "WAL catch-up drain started INSIDE the capture window — taking the short \
                  in-session budget so the sockets dial sooner. Whatever it does not reach \
@@ -17862,6 +17872,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
         } else {
             info!(
                 budget_secs = catchup_budget_secs,
+                frame_cap = catchup_frame_cap,
                 "WAL catch-up drain started outside the capture window — full budget"
             );
         }
@@ -18433,6 +18444,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 budget_exhausted = exhausted,
                 memory_stopped = catchup_memory_stopped,
                 apply_lag_stopped = catchup_lag_stopped,
+                frame_cap = catchup_frame_cap,
                 stop_reason,
                 "WAL catch-up drain finished — recovered a backlog that a single \
                  512 MiB replay batch could never have reached"
