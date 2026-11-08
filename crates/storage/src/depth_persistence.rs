@@ -4197,7 +4197,18 @@ fn recycle_staged(
 /// captured frames genuinely need the next replay.
 /// See `note_rescue_outcome_ticks`: only the writer thread's own rescue is in
 /// order with the queue; a producer-side or rescue-thread landing acks nothing.
-fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
+///
+/// PR RD (RD-3, 2026-11-08): a batch that landed nowhere is also marked in
+/// the deferred-depth table (every bucket of its range, both kinds) BEFORE
+/// it is counted, so the after-close pass writes its rows back from the WAL
+/// and the prunes keep its segment until then. That is what lets a replay
+/// confirm archive a segment whose TICKS landed while its depth did not
+/// (measured 7 Nov and at the 8 Nov Muhurat boot: the same 5 segments
+/// re-offered on every boot because depth rows met a full spill). A range the
+/// table cannot hold counts as an undeferred loss and holds the segment as
+/// before. The unapplied mark is unchanged. O(buckets in the range), at most
+/// `DEFERRED_BUCKETS`, on a rescue failure only.
+pub(crate) fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
     let wm = crate::wal_applied_watermark::applied_watermark();
     if landed {
         if in_order {
@@ -4205,7 +4216,9 @@ fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
         }
     } else {
         wm.note_unapplied_range(range.0, range.1);
-        wm.note_unlanded();
+        let deferred =
+            crate::wal_deferred_depth::lost_depth_marks().defer_lost_range(range.0, range.1);
+        wm.note_unlanded_depth(deferred);
     }
 }
 

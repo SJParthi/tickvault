@@ -13246,6 +13246,7 @@ mod tests {
 
     mod frame_base_tests;
     mod k2_tests;
+    mod rd3_tests;
     // --- Z11a: resync past mid-segment damage (2026-10-02) -----------------
 
     /// A segment of v4 records, sequence `k + 1` and a payload of `fill(k)`;

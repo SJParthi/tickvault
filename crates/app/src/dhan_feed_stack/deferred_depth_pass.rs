@@ -1941,6 +1941,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Regression: 2026-11-08 (PR RD, RD-3). A replay batch whose depth rows
+    // landed nowhere is now confirmed (its segment moves to `archive/`) once
+    // the lost range is marked with `defer_lost_range`. The after-close pass
+    // must still find that segment in `archive/` and write the depth rows
+    // back from it, or the deferral would be a loss.
+    #[test]
+    fn test_regression_rd3_pass_rewrites_a_lost_depth_range_from_an_archived_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-deferred-pass-rd3-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (seq, rx) = in_session();
+        {
+            let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                seq,
+                rx,
+                WalEndpoint::MainFeed,
+            );
+            wal.shutdown(Duration::from_secs(5));
+        }
+        // What the replay confirm does once the ack says LandedDepthDeferred.
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let mut moved = 0;
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wal") {
+                std::fs::rename(&path, archive.join(entry.file_name())).unwrap();
+                moved += 1;
+            }
+        }
+        assert!(moved >= 1, "the segment is archived");
+
+        // What the depth writer does when the batch's write and rescue fail.
+        let marks = DeferredDepth::new_for_tests();
+        assert!(marks.defer_lost_range(seq, seq));
+
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
+            sleep: &|_| {},
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(
+            summary.rows_written, 10,
+            "the five inline levels a side of the archived frame are written back"
+        );
+        // `for_test` has no QuestDB: the bucket is carried, never cleared on a
+        // write it could not prove, so the archived segment stays protected.
+        assert_eq!(summary.buckets_cleared, 0);
+        assert!(!marks.snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Cancellation stops the pass before it touches a bucket.
     #[test]
     fn test_run_after_close_pass_cancelled_touches_nothing() {

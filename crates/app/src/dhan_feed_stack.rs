@@ -15736,7 +15736,10 @@ pub const WAL_REPLAY_ACK_WAIT_SECS: u64 = 30;
 /// counted and coded; the caller then leaves the segments in `replaying/`,
 /// where the next boot's applied-watermark skips exactly the frames that did
 /// ack and replays the rest.
-fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
+fn wal_replay_acked(
+    stage: &'static str,
+    unlanded_before: tickvault_storage::wal_applied_watermark::UnlandedSnapshot,
+) -> bool {
     let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
 
     // A SUSPECT sink's "ok" is not a landing — refuse to confirm on it.
@@ -15774,24 +15777,73 @@ fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
         return false;
     }
 
-    if wm.wait_for_offload_drained(
+    // PR RD (RD-3, 2026-11-08): a depth batch that landed nowhere no longer
+    // holds the batch when its range is marked for the after-close pass and
+    // the marks are on disk (`LandedDepthDeferred`); a tick loss, or a depth
+    // loss the table could not hold, still does (`TicksLost`). The two
+    // refusals log different sources (§2.17): before, a lost row was logged
+    // as a 30 s wait that never ran.
+    let outcome = wm.wait_for_replay_ack(
         std::time::Duration::from_secs(WAL_REPLAY_ACK_WAIT_SECS),
         unlanded_before,
-    ) {
-        return true;
-    }
-    metrics::counter!(tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER)
-        .increment(1);
-    error!(
-        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-        source = "replay_ack_wait_timeout",
-        stage,
-        wait_secs = WAL_REPLAY_ACK_WAIT_SECS,
-        "WAL replay: the writer threads did not ack the re-folded batch within the wait, so \
-         its segments are NOT confirmed — they stay in `replaying/` and the next boot \
-         re-offers whatever did not land. Nothing is archived unread."
+        || tickvault_storage::wal_deferred_depth::deferred_depth().persist_checked(),
     );
-    false
+    let lost = wm.unlanded_snapshot();
+    let depth_batches = lost.depth.saturating_sub(unlanded_before.depth);
+    match outcome {
+        tickvault_storage::wal_applied_watermark::AckOutcome::Landed => true,
+        tickvault_storage::wal_applied_watermark::AckOutcome::LandedDepthDeferred => {
+            warn!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "replay_depth_deferred",
+                stage,
+                depth_batches,
+                "WAL replay: every tick row of the re-folded batch landed, but some order-book \
+                 rows landed in neither QuestDB nor the depth spill. They are marked for the \
+                 after-close pass, which writes them back from the WAL; the marks keep the \
+                 segments from being pruned until then. The segments are confirmed."
+            );
+            true
+        }
+        tickvault_storage::wal_applied_watermark::AckOutcome::TicksLost => {
+            // The counter counts every refused confirm; `source` tells which.
+            metrics::counter!(
+                tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "replay_rows_lost",
+                stage,
+                tick_batches = lost.ticks.saturating_sub(unlanded_before.ticks),
+                depth_batches,
+                depth_batches_deferred = lost
+                    .depth_deferred
+                    .saturating_sub(unlanded_before.depth_deferred),
+                "WAL replay: re-folded rows landed in neither QuestDB nor the spill (tick rows, \
+                 or order-book rows that could not be marked for the after-close pass), so the \
+                 segments are NOT confirmed — they stay in `replaying/` and the next boot \
+                 re-offers them. Nothing is archived unread."
+            );
+            false
+        }
+        tickvault_storage::wal_applied_watermark::AckOutcome::TimedOut => {
+            metrics::counter!(
+                tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "replay_ack_wait_timeout",
+                stage,
+                wait_secs = WAL_REPLAY_ACK_WAIT_SECS,
+                "WAL replay: the writer threads did not ack the re-folded batch within the \
+                 wait, so its segments are NOT confirmed — they stay in `replaying/` and the \
+                 next boot re-offers whatever did not land. Nothing is archived unread."
+            );
+            false
+        }
+    }
 }
 
 /// The whole "did this replay batch land" question, in one place: the writer
@@ -15803,9 +15855,14 @@ fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
 /// One retry re-flushes those retained rows into a queue that has had a whole
 /// ack wait to drain.
 // TEST-EXEMPT: the three clauses are pinned separately — `wal_replay_acked` by the
-// storage tests on `wait_for_offload_drained`, the producer-empty clause by
+// storage tests on `wait_for_replay_ack` (and the outcome mapping by
+// `test_regression_rd3_replay_confirm_maps_every_ack_outcome`), the producer-empty clause by
 // `wal_applied_watermark_wiring_guard::both_lane_confirms_wait_for_the_writer_ack`.
-fn replay_rows_landed(ingest: &mut LiveIngest, stage: &'static str, unlanded_before: u64) -> bool {
+fn replay_rows_landed(
+    ingest: &mut LiveIngest,
+    stage: &'static str,
+    unlanded_before: tickvault_storage::wal_applied_watermark::UnlandedSnapshot,
+) -> bool {
     for attempt in 0..2u8 {
         if attempt > 0 {
             blocking_flush(|| ingest.flush());
@@ -17694,7 +17751,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             );
         } else {
             let unlanded_before =
-                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
+                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_snapshot();
             // DA-13c review: the suspicion count BEFORE the first row is acked.
             let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
             let (boot_frames, boot_gaps) = (&params.wal_replay_live_feed, &params.wal_replay_gaps);
@@ -18292,7 +18349,7 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                         round_quiesce_held = true;
                         break;
                     };
-                    let unlanded_before = applied_watermark().unlanded_total();
+                    let unlanded_before = applied_watermark().unlanded_snapshot();
                     let outcome =
                         refold_wal_frames(&mut ingest, chunk, &gaps_in_chunk, round_pace_until);
                     flushed = flushed.saturating_add(blocking_flush(|| ingest.flush()));
