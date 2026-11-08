@@ -276,7 +276,14 @@ impl DayWork {
             if self.wal_holding { "+replaying" } else { "" },
         ) + &self
             .archive_backlog_bytes
-            .map_or_else(String::new, |bytes| format!(" archive_bytes={bytes}"))
+            .map_or_else(String::new, |bytes| {
+                if bytes == crate::archive_backlog::PROVISIONAL_BACKLOG_BYTES {
+                    // The first pass of the process is running, unmeasured.
+                    " archive_bytes=pass_running".to_string()
+                } else {
+                    format!(" archive_bytes={bytes}")
+                }
+            })
             + &if self.spill_files_held_unensured > 0 {
                 format!(
                     " spill_files_held_for_table={}",
@@ -1082,6 +1089,29 @@ mod tests {
         assert!(!tracker.observe(&holding(400), 0, t0 + DRAIN_HOLD_STALL_SECS + 10));
         // Stuck for an hour after the last fall: released anyway.
         assert!(tracker.observe(&holding(400), 0, t0 + 2 * DRAIN_HOLD_STALL_SECS - 1));
+    }
+
+    /// PR AA finding 5: the first daily pass of a process starts on an empty
+    /// backlog cell. With every other part done, the day still reads not done
+    /// while that pass runs below the free-space target.
+    #[test]
+    fn test_regression_first_archive_pass_on_an_empty_cell_keeps_the_day_open() {
+        let cell = crate::archive_backlog::ArchiveBacklog::new();
+        let t0 = 1_800_000_000;
+        cell.note_pass_started(t0, true);
+        let work = DayWork {
+            archive_backlog_bytes: crate::archive_backlog::backlog_holds(cell.reading(), t0 + 600),
+            ..done_work()
+        };
+        assert!(
+            !work.is_done(),
+            "the first pass holds the box while it runs"
+        );
+        assert!(
+            work.data_in_database(),
+            "it never holds the evening restart"
+        );
+        assert!(work.left_text().contains("archive_bytes=pass_running"));
     }
 
     /// PR AA review: archive copy work holds the box but never the Quote 31

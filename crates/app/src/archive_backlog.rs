@@ -20,6 +20,14 @@
 //! - the bytes are above 0;
 //! - free space was below the target when it was measured.
 //!
+//! The first pass of a process has no reading yet. Its start writes a
+//! provisional one ([`PROVISIONAL_BACKLOG_BYTES`], free space from the
+//! probe taken just before the pass), so the box stays up while that first
+//! pass runs, for at most [`ARCHIVE_BACKLOG_RUNNING_MAX_SECS`]. Before, the
+//! first evening pass ran with nothing holding the box, and the 16:30 stop
+//! could cut it off. The pass's own result replaces it; a pass that did not
+//! run its sweep removes it.
+//!
 //! A cross-verification hold or an hour whose rows are still in flight is
 //! not counted (the pass leaves them out), so they never keep the box up.
 //! `[partition_retention] drain_hold_counts_archive = false` means the daily
@@ -52,6 +60,11 @@ pub const ARCHIVE_BACKLOG_FRESH_SECS: i64 = 900;
 /// most this long, so a pass that never returns cannot hold the box all
 /// night through this alone.
 pub const ARCHIVE_BACKLOG_RUNNING_MAX_SECS: i64 = 7_200;
+
+/// The bytes of a provisional reading: the first pass of a process is
+/// running and has not measured anything yet. No measured backlog reaches
+/// this value.
+pub const PROVISIONAL_BACKLOG_BYTES: u64 = u64::MAX;
 
 /// How far a reading may sit ahead of the clock and still count (a small
 /// step of the wall clock between the write and the read).
@@ -96,24 +109,35 @@ impl ArchiveBacklog {
     }
 
     /// Records that a daily pass started at `now_unix`, keeping the last
-    /// reading. O(1).
-    // TEST-EXEMPT: covered by test_publish_note_and_reading_round_trip
-    pub fn note_pass_started(&self, now_unix: i64) {
-        self.with(|reading| {
-            if let Some(reading) = reading.as_mut() {
-                reading.pass_running_since = Some(now_unix);
+    /// reading. With no reading yet (the first pass of the process), it
+    /// writes a provisional one: [`PROVISIONAL_BACKLOG_BYTES`], measured now,
+    /// with `below_target` from the free-space probe taken before the pass.
+    /// O(1).
+    // TEST-EXEMPT: covered by test_regression_first_pass_on_an_empty_cell_holds_the_box
+    pub fn note_pass_started(&self, now_unix: i64, below_target: bool) {
+        self.with(|reading| match reading.as_mut() {
+            Some(reading) => reading.pass_running_since = Some(now_unix),
+            None => {
+                *reading = Some(BacklogReading {
+                    bytes: PROVISIONAL_BACKLOG_BYTES,
+                    below_target,
+                    at_unix: now_unix,
+                    pass_running_since: Some(now_unix),
+                });
             }
         });
     }
 
     /// Records the end of a daily pass that did not run its sweep (the
     /// other archive leg held the pass lock, or the archiver could not be
-    /// built): the last reading stays, ageing from when it was measured.
-    /// O(1).
+    /// built): the last reading stays, ageing from when it was measured. A
+    /// provisional reading is removed: nothing was measured. O(1).
     // TEST-EXEMPT: covered by test_publish_note_and_reading_round_trip
     pub fn note_pass_ended(&self) {
-        self.with(|reading| {
-            if let Some(reading) = reading.as_mut() {
+        self.with(|slot| {
+            if slot.is_some_and(|r| r.bytes == PROVISIONAL_BACKLOG_BYTES) {
+                *slot = None;
+            } else if let Some(reading) = slot.as_mut() {
                 reading.pass_running_since = None;
             }
         });
@@ -248,12 +272,18 @@ mod tests {
     fn test_publish_note_and_reading_round_trip() {
         let cell = ArchiveBacklog::new();
         assert_eq!(cell.reading(), None);
-        // A start with nothing published keeps nothing.
-        cell.note_pass_started(NOW);
+        // A start with nothing published writes a provisional reading; a
+        // pass that then did not run its sweep removes it.
+        cell.note_pass_started(NOW, true);
+        assert_eq!(
+            cell.reading().map(|r| r.bytes),
+            Some(PROVISIONAL_BACKLOG_BYTES)
+        );
+        cell.note_pass_ended();
         assert_eq!(cell.reading(), None);
         cell.publish(Some(42), true, NOW);
         assert_eq!(cell.reading(), Some(reading(42, true, NOW)));
-        cell.note_pass_started(NOW + 300);
+        cell.note_pass_started(NOW + 300, false);
         assert_eq!(
             cell.reading().and_then(|r| r.pass_running_since),
             Some(NOW + 300)
@@ -265,6 +295,33 @@ mod tests {
         // A pass that measured nothing clears the reading.
         cell.publish(None, true, NOW + 900);
         assert_eq!(cell.reading(), None);
+    }
+
+    /// PR AA finding 5: every process starts with the cell empty, so the
+    /// first evening pass ran with nothing holding the box, and the 16:30
+    /// stop could cut it off. The start now writes a provisional reading.
+    #[test]
+    fn test_regression_first_pass_on_an_empty_cell_holds_the_box() {
+        let cell = ArchiveBacklog::new();
+        cell.note_pass_started(NOW, true);
+        assert_eq!(
+            backlog_holds(cell.reading(), NOW + 600),
+            Some(PROVISIONAL_BACKLOG_BYTES),
+            "the first pass, below the target, holds the box while it runs"
+        );
+        assert_eq!(
+            backlog_holds(cell.reading(), NOW + ARCHIVE_BACKLOG_RUNNING_MAX_SECS),
+            None,
+            "bounded like any running pass"
+        );
+        // The pass's result replaces the provisional reading.
+        cell.publish(Some(3), true, NOW + 900);
+        assert_eq!(backlog_holds(cell.reading(), NOW + 900), Some(3));
+
+        // Free space at or above the target before the pass: nothing holds.
+        let above = ArchiveBacklog::new();
+        above.note_pass_started(NOW, false);
+        assert_eq!(backlog_holds(above.reading(), NOW + 600), None);
     }
 
     #[test]

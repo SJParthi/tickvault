@@ -913,10 +913,12 @@ async fn run_daily_archive_loop(
         let pass_cfg = daily_pass_config(&cfg, below_target);
 
         // PR AA step 6: a running pass keeps the last backlog reading fresh
-        // for the drain hold.
+        // for the drain hold. The process's first pass has no reading yet,
+        // so it writes a provisional one from the probe above (PR AA
+        // finding 5): the box stays up while that first pass runs.
         if cfg.drain_hold_counts_archive {
             crate::archive_backlog::ARCHIVE_BACKLOG
-                .note_pass_started(chrono::Utc::now().timestamp());
+                .note_pass_started(chrono::Utc::now().timestamp(), below_target);
         }
         let report = run_one_pass(
             &questdb,
