@@ -107,7 +107,7 @@ tower = { version = "=0.5.3", features = ["full"] }
 tower-http = { version = "=0.7.1", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "=1.1.8"
+toml = "=1.2.0"
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
@@ -190,7 +190,7 @@ aws-sdk-ssm = { version = "=1.133.0", default-features = false, features = ["beh
 aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # EC2 and CloudWatch share the same reviewed SDK/Smithy generation.
 # They remain Rust Lambda/control-plane dependencies, with modern HTTPS.
-aws-sdk-ec2 = { version = "=1.274.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "=1.275.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatch = { version = "=1.140.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-10-22 (plan item 63, operator Quote 37; owner approved the new
 # dependency on the decision card "Approve (Recommended)"): the free AWS
