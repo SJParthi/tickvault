@@ -92,14 +92,27 @@
 //!   needs a torn write or a rollback across a version change.
 //! - The frame counter can run ahead of the wall without a step under a
 //!   burst above about 7,600 frames a second (one 131 µs frame base each).
-//!   A rotation then records a small spurious window; it holds only while
-//!   its own frames are on their way.
+//!   A rotation then records a small spurious window; it is retired with
+//!   the rest of the union, so it holds while any frame of the union is on
+//!   its way.
+//! - After a backward step the frame counter stays ahead of the wall for
+//!   S/(1 - r) seconds (r: frame bases spent per second) and climbs past the
+//!   top the step recorded. While a window is recorded, each tick-writer
+//!   batch raises the top over the counter
+//!   ([`ClockStepLog::follow_counter_lead`]), so the window covers every
+//!   sequence the counter reached by the last batch that saw it ahead. A
+//!   tick writer stalled for longer than one margin of counter advance
+//!   while the counter is ahead (30 s of sequence, about 200 s of wall at
+//!   r = 0.15) leaves the sequences of that stretch above the top until its
+//!   next batch, unless a segment rotation records them first.
 //!
 //! # Complexity
 //!
 //! O(1): one uncontended lock per recorded step (rare: a refresh every 30 s
 //! or a segment rotation that finds the clock ahead), one lock per archive
-//! verdict, one atomic load per tick-writer batch while nothing changed.
+//! verdict, two atomic loads per tick-writer batch while no window is
+//! recorded (one more load and one clock read while one is, and the lock
+//! only when the counter passes the top less one margin).
 //! Never on the frame path. An unreadable file adds one header walk of the
 //! newest WAL segments at boot (`wal_last_receipt`), cold.
 
@@ -265,6 +278,9 @@ pub(crate) struct ClockStepLog {
     paths: OnceLock<(PathBuf, PathBuf)>,
     /// A write is failing (one warning per episode).
     persist_failing: AtomicBool,
+    /// A window is recorded (kept with `window` under its lock), so the tick
+    /// writer reads the clock and the frame counter only while one exists.
+    active: AtomicBool,
 }
 
 impl ClockStepLog {
@@ -276,6 +292,7 @@ impl ClockStepLog {
             dirty: AtomicBool::new(false),
             paths: OnceLock::new(),
             persist_failing: AtomicBool::new(false),
+            active: AtomicBool::new(false),
         }
     }
 
@@ -293,7 +310,39 @@ impl ClockStepLog {
             *window = widened;
             self.dirty.store(true, Ordering::Release);
         }
+        self.active.store(widened.is_some(), Ordering::Release);
         widened
+    }
+
+    /// Extends the window's top over the frame counter while the counter runs
+    /// ahead of the wall (recheck 3 of PR AA finding 2). After a backward
+    /// step of S the counter adds one frame base per frame, so at a frame
+    /// rate below one base per base it stays ahead for S/(1 - r) seconds and
+    /// climbs past the `at_wall + S + margin` the step recorded; rows received
+    /// then carry sequences above the window's top. With a window recorded
+    /// and the counter more than 1 s ahead, the top is raised to the counter
+    /// plus two margins whenever the counter comes within one margin of it,
+    /// so a row's sequence is inside the window whenever the counter was
+    /// seen ahead at most one margin of counter advance after it. The low end
+    /// is kept (lowered to `now_nanos` at most). No window or the counter
+    /// not ahead: nothing. O(1); the lock only when the top moves, about once
+    /// per 30 s of counter advance, so the file is rewritten as rarely.
+    pub(crate) fn follow_counter_lead(&self, now_nanos: u64, frame_seq: u64) {
+        if !self.active.load(Ordering::Acquire)
+            || frame_seq.saturating_sub(now_nanos) <= CLOCK_STEP_MIN_NANOS
+        {
+            return;
+        }
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((lo, hi)) = *window else {
+            return;
+        };
+        if frame_seq.saturating_add(CLOCK_STEP_MARGIN_NANOS) <= hi {
+            return;
+        }
+        let top = frame_seq.saturating_add(CLOCK_STEP_MARGIN_NANOS.saturating_mul(2));
+        *window = Some((lo.min(now_nanos), top));
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// Records a step (see [`step_window`]); a move of 1 s or less is
@@ -325,6 +374,7 @@ impl ClockStepLog {
         }
         *window = None;
         self.dirty.store(true, Ordering::Release);
+        self.active.store(false, Ordering::Release);
         drop(window);
         info!(
             window_lo_nanos = seen.0,
@@ -443,8 +493,17 @@ pub(crate) fn bind_clock_step_log(wal_dir: &Path) {
 }
 
 /// Writes the process window when it changed (tick writer thread, at most
-/// once a batch). One atomic load when nothing changed.
+/// once a batch). First, while a window is recorded, raises its top over a
+/// frame counter still ahead of the wall ([`ClockStepLog::follow_counter_lead`]:
+/// one clock read and one atomic load). No window and nothing changed: two
+/// atomic loads.
 pub(crate) fn persist_clock_step_log_if_dirty() {
+    if LOG.active.load(Ordering::Acquire) {
+        LOG.follow_counter_lead(
+            crate::wal_applied_watermark::wall_nanos(),
+            crate::ws_frame_spill::current_frame_seq(),
+        );
+    }
     LOG.persist_if_dirty();
 }
 
@@ -565,6 +624,54 @@ mod tests {
         let log = ClockStepLog::new();
         note_rotation_on(&log, u128::from(now), u128::from(now), now + 600 * SEC);
         assert_eq!(log.window(), Some((now - 630 * SEC, now + 630 * SEC)));
+    }
+
+    /// Recheck 3 of finding 2: after a 600 s step back the frame counter can
+    /// stay ahead of the wall for minutes and climb past the top the step
+    /// recorded (`at_wall + S + margin`), so rows received before the
+    /// counter meets the wall carry sequences above that top. Each batch that
+    /// sees the counter ahead raises the top over it. Bites: with the follow
+    /// a no-op, `row_seq` stays outside the window.
+    #[test]
+    fn test_regression_follow_counter_lead_keeps_the_window_top_over_a_counter_still_ahead() {
+        let hms = |h: u64, m: u64, s: u64| ((h * 60 + m) * 60 + s) * SEC;
+        let log = ClockStepLog::new();
+        // No window: the counter far ahead records nothing.
+        log.follow_counter_lead(hms(11, 50, 0), hms(12, 0, 0));
+        assert_eq!(log.window(), None);
+        log.note(hms(11, 58, 54), hms(11, 59, 34), 600 * SEC);
+        let (lo, top) = log.window().expect("the step");
+        assert_eq!(top, hms(11, 59, 34) + 630 * SEC);
+        let row_seq = top + SEC;
+        assert!(!window_overlaps(log.window(), row_seq, row_seq));
+        // Counter not ahead (within 1 s of the wall), or ahead but well under
+        // the top: unchanged and not rewritten.
+        log.dirty.store(false, Ordering::Release);
+        log.follow_counter_lead(hms(11, 59, 50), hms(11, 59, 50) + SEC);
+        log.follow_counter_lead(hms(11, 59, 50), top - 2 * CLOCK_STEP_MARGIN_NANOS);
+        assert_eq!(log.window(), Some((lo, top)));
+        assert!(!log.dirty.load(Ordering::Acquire));
+        // The counter comes within one margin of the top: raised over it.
+        let seen = top - CLOCK_STEP_MARGIN_NANOS + SEC;
+        log.follow_counter_lead(hms(11, 59, 55), seen);
+        assert_eq!(log.window(), Some((lo, seen + 2 * CLOCK_STEP_MARGIN_NANOS)));
+        assert!(
+            log.dirty.load(Ordering::Acquire),
+            "the new top is persisted"
+        );
+        // Every sequence the counter reached by that batch, plus one margin
+        // of later advance, is inside.
+        assert!(window_overlaps(
+            log.window(),
+            seen + CLOCK_STEP_MARGIN_NANOS,
+            seen + CLOCK_STEP_MARGIN_NANOS
+        ));
+        assert!(window_overlaps(log.window(), row_seq, row_seq));
+        // A retired window stops the follow.
+        let now = log.window().expect("kept");
+        assert!(log.retire_if_settled(now, true));
+        log.follow_counter_lead(hms(12, 1, 0), hms(12, 30, 0));
+        assert_eq!(log.window(), None);
     }
 
     #[test]
