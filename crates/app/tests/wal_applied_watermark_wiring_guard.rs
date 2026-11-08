@@ -219,13 +219,15 @@ fn both_lane_confirms_require_empty_producers_and_no_unlanded_batch() {
         lane.contains("ingest.writer.pending() == 0 && ingest.depth_pending_rows() == 0"),
         "rows retained in a producer after a full queue are RAM-only and must block the confirm"
     );
-    // `applied_watermark().unlanded_total()` and not the bare method: the
-    // replay pacing (audit R1) also reads it, once per wait, to end a wait
-    // early on a rescue, and that read is not a confirm snapshot.
+    // `applied_watermark().unlanded_snapshot()` (PR RD, RD-3, 2026-11-08:
+    // the tick, depth and deferred-depth counts at once). The replay pacing
+    // (audit R1) reads the bare `unlanded_total()` to end a wait early on a
+    // rescue, and that read is not a confirm snapshot.
     assert_eq!(
-        lane.matches("applied_watermark().unlanded_total()").count(),
+        lane.matches("applied_watermark().unlanded_snapshot()")
+            .count(),
         2,
-        "each refold snapshots the unlanded count before it folds"
+        "each refold snapshots the unlanded counts before it folds"
     );
 }
 
@@ -346,7 +348,10 @@ fn the_replay_confirm_refuses_a_suspect_sinks_ack() {
              `confirm_replayed` archives segments whose rows were never \
              applied — into `archive/`, which is never re-globbed.",
     );
-    let drained = body.find("wait_for_offload_drained").expect(
+    // PR RD (RD-3, 2026-11-08): the confirm waits through
+    // `wait_for_replay_ack`, which also tells a deferred depth loss from a
+    // real one.
+    let drained = body.find("wait_for_replay_ack").expect(
         "wal_replay_acked must still wait for the offload drain — the suspect \
          check replaces nothing, it is an ADDITIONAL refusal",
     );
@@ -419,4 +424,94 @@ fn an_unfinished_catchup_guards_its_leftover_backlog_before_the_live_drain() {
         guard + persist < live,
         "persisted before the live ring exists"
     );
+}
+
+/// PR RD (RD-3, 2026-11-08): the replay confirm maps each ack outcome to its
+/// own decision and its own log source. A deferred depth loss confirms (the
+/// marks keep the segment for the after-close pass, and the marks are
+/// persisted inside the wait); a lost row and a real timeout refuse with
+/// different sources, so a lost row is no longer logged as a 30 s wait that
+/// never ran (noise-lock §2.17).
+#[test]
+fn test_regression_rd3_replay_confirm_maps_every_ack_outcome() {
+    let lane = production("src/dhan_feed_stack.rs");
+    let start = lane
+        .find("fn wal_replay_acked(")
+        .expect("wal_replay_acked exists");
+    let body = &lane[start..];
+    let body = &body[..body.find("\nfn ").map_or(body.len(), |i| i + 1)];
+    assert!(
+        body.contains("deferred_depth().persist_checked()"),
+        "LandedDepthDeferred must be decided on persisted marks"
+    );
+    for (arm, verdict) in [
+        ("AckOutcome::Landed =>", "true"),
+        ("AckOutcome::LandedDepthDeferred =>", "true"),
+        ("AckOutcome::TicksLost =>", "false"),
+        ("AckOutcome::TimedOut =>", "false"),
+    ] {
+        let at = body
+            .find(arm)
+            .unwrap_or_else(|| panic!("{arm} is matched explicitly"));
+        let rest = &body[at + arm.len()..];
+        let next_arm = rest
+            .find("tickvault_storage::wal_applied_watermark::AckOutcome::")
+            .unwrap_or(rest.len());
+        let arm_body = &rest[..next_arm];
+        let ends_with =
+            arm_body.trim_end_matches(|c: char| c.is_whitespace() || c == ',' || c == '}');
+        assert!(
+            ends_with.ends_with(verdict),
+            "{arm} must decide {verdict}: {arm_body}"
+        );
+    }
+    // PR RD review finding 4 (2026-11-08): the deferred-depth arm is a row
+    // that landed in neither QuestDB nor a spill, so it logs `replay_rows_lost`
+    // at ERROR (it pages through `ws-spill-01`, §2.17), as the refused arm
+    // does; `confirmed` tells them apart. Bite: put back the `warn!` with
+    // `replay_depth_deferred` and every assertion below fails.
+    assert_eq!(
+        body.matches(r#"source = "replay_depth_deferred""#).count(),
+        0,
+        "no quiet source for a lost replayed row"
+    );
+    assert_eq!(
+        body.matches(r#"source = "replay_ack_wait_timeout""#)
+            .count(),
+        1
+    );
+    let lost_sites: Vec<usize> = body
+        .match_indices(r#"source = "replay_rows_lost""#)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(lost_sites.len(), 2, "the deferred arm and the refused arm");
+    for lost in lost_sites {
+        let lost_macro = body[..lost].rfind("error!(").unwrap_or(0);
+        assert!(
+            lost_macro > 0 && body[..lost].rfind("warn!(").is_none_or(|w| w < lost_macro),
+            "a lost row stays an ERROR (it pages, §2.17)"
+        );
+    }
+    let deferred = body
+        .find("AckOutcome::LandedDepthDeferred =>")
+        .expect("deferred arm");
+    let deferred_arm = &body[deferred..];
+    let deferred_arm = &deferred_arm[..deferred_arm
+        .find("AckOutcome::TicksLost =>")
+        .unwrap_or(deferred_arm.len())];
+    assert!(deferred_arm.contains("error!("), "{deferred_arm}");
+    assert!(deferred_arm.contains(r#"source = "replay_rows_lost""#));
+    assert!(deferred_arm.contains("confirmed = true"));
+}
+
+/// RD-3: in a production build of the storage crate the table a failed depth
+/// rescue marks IS the process table the prunes and the after-close pass read.
+/// (Under storage's own unit tests it is a separate table, so those tests do
+/// not pollute each other's prunes.)
+#[test]
+fn test_lost_depth_marks_is_the_process_table_in_production() {
+    assert!(std::ptr::eq(
+        tickvault_storage::wal_deferred_depth::lost_depth_marks(),
+        tickvault_storage::wal_deferred_depth::deferred_depth(),
+    ));
 }

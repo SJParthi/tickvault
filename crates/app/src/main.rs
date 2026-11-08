@@ -1260,9 +1260,9 @@ async fn async_main() -> Result<()> {
     // remain in `ws_frame_spill::WsType` as orphan; any replayed records
     // of those types are silently dropped here.
     // -----------------------------------------------------------------------
-    // Single source of truth for the WAL dir (hostile-review H1: shared
-    // with the 15:40 conservation audit so the two sites can never drift).
-    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
+    // PR RD finding 3: take the evening drain's restart mark before replaying.
+    let _planned_evening_boot = tickvault_app::evening_drain::claim_planned_boot();
+    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir(); // shared with the 15:40 audit (H1)
     let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
     // CLAIM THE WAL DIRECTORY BEFORE ANYTHING TOUCHES IT (2026-08-28).
     //

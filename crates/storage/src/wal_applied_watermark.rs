@@ -1129,6 +1129,34 @@ fn encode_range_buckets(table: &mut [(u64, u64); UNAPPLIED_BUCKETS], lo: u64, hi
     }
 }
 
+/// The not-landed counters at one instant (RD-3, 2026-11-08), taken before a
+/// replay batch is folded and compared after it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnlandedSnapshot {
+    /// Tick batches (and any loss not known to be depth) that landed nowhere.
+    pub ticks: u64,
+    /// Depth batches that landed nowhere.
+    pub depth: u64,
+    /// Of those depth batches, the ones whose range was deferred.
+    pub depth_deferred: u64,
+}
+
+/// What [`AppliedWatermark::wait_for_replay_ack`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// Every batch completed and nothing landed nowhere: confirm.
+    Landed,
+    /// Every batch completed, no tick row was lost, and every lost depth
+    /// batch is marked (and the marks persisted) for the after-close pass:
+    /// confirm; the depth rows are written back from the WAL later.
+    LandedDepthDeferred,
+    /// Tick rows landed nowhere, or depth rows that could not be deferred
+    /// (or whose marks could not be persisted): hold the segments.
+    TicksLost,
+    /// The writers did not finish inside the wait: hold the segments.
+    TimedOut,
+}
+
 /// The process-wide watermark. One per process, like `WAL_FRAME_SEQ`.
 pub struct AppliedWatermark {
     hwm_ticks: AtomicU64,
@@ -1246,7 +1274,20 @@ pub struct AppliedWatermark {
     /// rescue to the spill tier failed. Monotone. The replay confirm compares
     /// it before and after a batch: a batch that lost rows must never have its
     /// WAL segment archived, because the segment is now the ONLY copy.
+    ///
+    /// PR RD (RD-3, 2026-11-08): this one counts TICK batches (and any loss
+    /// not known to be depth). Depth losses are counted apart below, because
+    /// a depth range the after-close pass will write back does not need its
+    /// segment held.
     unlanded: AtomicU64,
+    /// Depth batches that landed nowhere (RD-3). Monotone.
+    unlanded_depth: AtomicU64,
+    /// Of [`Self::unlanded_depth`], the batches whose whole range was marked
+    /// in the deferred-depth table (`DeferredDepth::defer_lost_range`), so
+    /// the after-close pass writes them back. Incremented BEFORE
+    /// `unlanded_depth` for the same batch, so a reader that sees the depth
+    /// loss also sees its deferral. Monotone.
+    unlanded_depth_deferred: AtomicU64,
     /// Lowest `capture_seq` of each rescue batch queued for (or being written
     /// by) a rescue thread, per sink; `0` is a free slot (Z7, 2026-10-02).
     ///
@@ -1558,6 +1599,8 @@ impl AppliedWatermark {
             episode_start_secs: AtomicU64::new(0),
             probe_expected: AtomicBool::new(false),
             unlanded: AtomicU64::new(0),
+            unlanded_depth: AtomicU64::new(0),
+            unlanded_depth_deferred: AtomicU64::new(0),
             rescue_floors_ticks: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
             rescue_floors_depth: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
             ranges: Mutex::new(RangesState::new()),
@@ -2742,17 +2785,45 @@ impl AppliedWatermark {
     /// A batch's rows landed NOWHERE: the ILP write failed and the rescue to
     /// the spill tier failed. The bucket mark (made by the caller through
     /// [`Self::note_unapplied_range`]) keeps the next boot from skipping it;
-    /// this counter keeps THIS boot from archiving it.
+    /// this counter keeps THIS boot from archiving it. Tick batches (RD-3:
+    /// depth batches use [`Self::note_unlanded_depth`]).
     pub fn note_unlanded(&self) {
         self.unlanded.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Monotone count of batches that landed nowhere. Snapshot it before a
-    /// replay batch is folded; hand the snapshot to
-    /// [`Self::wait_for_offload_drained`].
+    /// A DEPTH batch's rows landed nowhere (RD-3, 2026-11-08). `deferred`:
+    /// the caller marked the batch's whole range in the deferred-depth table
+    /// first, so the after-close pass writes the rows back from the WAL and
+    /// the replay confirm may archive the segment for its ticks (the mark
+    /// keeps it from being pruned). An undeferred depth loss holds the
+    /// segment exactly as a tick loss does. O(1), failure path only.
+    pub fn note_unlanded_depth(&self, deferred: bool) {
+        if deferred {
+            self.unlanded_depth_deferred.fetch_add(1, Ordering::AcqRel);
+        }
+        self.unlanded_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Monotone count of batches (tick and depth) that landed nowhere. The
+    /// replay PACING reads it to end a wait early on a rescue; the replay
+    /// confirm takes [`Self::unlanded_snapshot`] instead.
     #[must_use]
     pub fn unlanded_total(&self) -> u64 {
-        self.unlanded.load(Ordering::Acquire)
+        self.unlanded
+            .load(Ordering::Acquire)
+            .saturating_add(self.unlanded_depth.load(Ordering::Acquire))
+    }
+
+    /// The three not-landed counters, read in the order the writers move
+    /// them backwards (depth before its deferral). Snapshot it before a
+    /// replay batch is folded; hand it to [`Self::wait_for_replay_ack`].
+    #[must_use]
+    pub fn unlanded_snapshot(&self) -> UnlandedSnapshot {
+        UnlandedSnapshot {
+            ticks: self.unlanded.load(Ordering::Acquire),
+            depth: self.unlanded_depth.load(Ordering::Acquire),
+            depth_deferred: self.unlanded_depth_deferred.load(Ordering::Acquire),
+        }
     }
 
     /// A batch left the producer for the tick writer thread.
@@ -2778,6 +2849,12 @@ impl AppliedWatermark {
     /// This is what makes "durably re-captured" TRUE before a replay confirm:
     /// `flush()` on the offloaded path returns rows HANDED OFF, not rows
     /// landed, and `confirm_replayed` archived on the strength of it.
+    ///
+    /// RD-3 (2026-11-08): `unlanded_before` is [`Self::unlanded_total`], and
+    /// ANY loss (tick or depth, deferred or not) ends the wait with `false`.
+    /// The replay pacing uses it to stop waiting on a rescue; the replay
+    /// CONFIRM uses [`Self::wait_for_replay_ack`], which tells a deferred
+    /// depth loss from a real one.
     #[must_use]
     pub fn wait_for_offload_drained(&self, timeout: Duration, unlanded_before: u64) -> bool {
         let target_ticks = self.ticks_handed_off.load(Ordering::Acquire);
@@ -2788,7 +2865,7 @@ impl AppliedWatermark {
             // AND whose rescue failed still completes — and its rows exist
             // only in the WAL segment the caller is about to archive. So the
             // wait is also "nothing was lost since the caller's snapshot".
-            if self.unlanded.load(Ordering::Acquire) != unlanded_before {
+            if self.unlanded_total() != unlanded_before {
                 return false;
             }
             if self.ticks_completed.load(Ordering::Acquire) >= target_ticks
@@ -2801,6 +2878,84 @@ impl AppliedWatermark {
             }
             std::thread::sleep(Duration::from_millis(OFFLOAD_DRAIN_POLL_MILLIS));
         }
+    }
+
+    /// The replay confirm's wait (RD-3, 2026-11-08): blocks (polling,
+    /// bounded by `timeout`) until every batch handed off so far has been
+    /// processed by its writer thread, and says what landed.
+    ///
+    /// * [`AckOutcome::TicksLost`] at once when a tick batch landed nowhere
+    ///   since `before`, or a depth batch did whose range could not be
+    ///   deferred; also when every loss was deferred but `persist_marks`
+    ///   (production: `DeferredDepth::persist_checked`) could not write the
+    ///   marks. Hold the segment.
+    /// * [`AckOutcome::LandedDepthDeferred`] when everything completed, no
+    ///   tick batch was lost, every lost depth batch was deferred AND the
+    ///   marks were persisted. The segment may be archived; the marks keep it
+    ///   from being pruned until the after-close pass writes the depth back.
+    /// * [`AckOutcome::Landed`] when everything completed and nothing was
+    ///   lost.
+    /// * [`AckOutcome::TimedOut`] when the deadline passed first.
+    ///
+    /// The not-landed counters are read again AFTER the completed counters
+    /// show the batch done: a writer counts a loss before it counts the
+    /// batch completed, so a loss in the last batch is never missed.
+    pub fn wait_for_replay_ack(
+        &self,
+        timeout: Duration,
+        before: UnlandedSnapshot,
+        persist_marks: impl FnOnce() -> bool,
+    ) -> AckOutcome {
+        let target_ticks = self.ticks_handed_off.load(Ordering::Acquire);
+        let target_depth = self.depth_handed_off.load(Ordering::Acquire);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(lost) = self.unlanded_since(before) {
+                return lost;
+            }
+            if self.ticks_completed.load(Ordering::Acquire) >= target_ticks
+                && self.depth_completed.load(Ordering::Acquire) >= target_depth
+            {
+                if let Some(lost) = self.unlanded_since(before) {
+                    return lost;
+                }
+                let depth_lost = self
+                    .unlanded_depth
+                    .load(Ordering::Acquire)
+                    .saturating_sub(before.depth);
+                if depth_lost == 0 {
+                    return AckOutcome::Landed;
+                }
+                return if persist_marks() {
+                    AckOutcome::LandedDepthDeferred
+                } else {
+                    AckOutcome::TicksLost
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                return AckOutcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_millis(OFFLOAD_DRAIN_POLL_MILLIS));
+        }
+    }
+
+    /// `Some(TicksLost)` when a tick batch, or a depth batch that was not
+    /// deferred, landed nowhere since `before`. Depth is read before its
+    /// deferral count (the writer bumps them the other way round), so a
+    /// deferred loss is never misread as undeferred. O(1).
+    fn unlanded_since(&self, before: UnlandedSnapshot) -> Option<AckOutcome> {
+        if self.unlanded.load(Ordering::Acquire) != before.ticks {
+            return Some(AckOutcome::TicksLost);
+        }
+        let depth_lost = self
+            .unlanded_depth
+            .load(Ordering::Acquire)
+            .saturating_sub(before.depth);
+        let deferred = self
+            .unlanded_depth_deferred
+            .load(Ordering::Acquire)
+            .saturating_sub(before.depth_deferred);
+        (depth_lost > deferred).then_some(AckOutcome::TicksLost)
     }
 
     /// Current RAM state.
@@ -3833,6 +3988,162 @@ mod tests {
         );
         // A caller that snapshots AFTER the loss is not blocked by it.
         assert!(wm.wait_for_offload_drained(Duration::from_millis(1), wm.unlanded_total()));
+        // RD-3: the total counts depth losses too, deferred or not, so the
+        // pacing wait still ends on any of them.
+        let before = wm.unlanded_total();
+        wm.note_unlanded_depth(true);
+        assert_eq!(wm.unlanded_total(), before + 1);
+        assert!(!wm.wait_for_offload_drained(Duration::from_millis(1), before));
+    }
+
+    // ---- PR RD (RD-3, 2026-11-08): the replay confirm's ack outcome -------
+
+    /// The three not-landed counts move apart, and the pacing total is the
+    /// sum of the tick and depth counts.
+    #[test]
+    fn test_note_unlanded_depth_and_unlanded_snapshot_count_apart() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.unlanded_snapshot(), UnlandedSnapshot::default());
+        wm.note_unlanded();
+        wm.note_unlanded_depth(true);
+        wm.note_unlanded_depth(false);
+        assert_eq!(
+            wm.unlanded_snapshot(),
+            UnlandedSnapshot {
+                ticks: 1,
+                depth: 2,
+                depth_deferred: 1,
+            }
+        );
+        assert_eq!(wm.unlanded_total(), 3);
+    }
+
+    /// A tick batch that landed nowhere holds the segment at once.
+    #[test]
+    fn test_wait_for_replay_ack_tick_loss_is_ticks_lost() {
+        let wm = AppliedWatermark::new_for_tests();
+        let before = wm.unlanded_snapshot();
+        wm.note_ticks_handed_off();
+        wm.note_unlanded();
+        wm.note_ticks_completed();
+        assert_eq!(
+            wm.wait_for_replay_ack(Duration::from_millis(1), before, || true),
+            AckOutcome::TicksLost
+        );
+    }
+
+    /// A depth loss whose range was deferred, with the marks persisted, lets
+    /// the segment be archived for its ticks.
+    #[test]
+    fn test_wait_for_replay_ack_deferred_depth_loss_is_landed_depth_deferred() {
+        let wm = AppliedWatermark::new_for_tests();
+        let before = wm.unlanded_snapshot();
+        wm.note_ticks_handed_off();
+        wm.note_ticks_completed();
+        wm.note_depth_handed_off();
+        wm.note_unlanded_depth(true);
+        wm.note_depth_completed();
+        let persisted = std::cell::Cell::new(0u32);
+        let outcome = wm.wait_for_replay_ack(Duration::from_millis(1), before, || {
+            persisted.set(persisted.get() + 1);
+            true
+        });
+        assert_eq!(outcome, AckOutcome::LandedDepthDeferred);
+        assert_eq!(
+            persisted.get(),
+            1,
+            "the marks are persisted before the confirm"
+        );
+        let snap = wm.unlanded_snapshot();
+        assert_eq!((snap.ticks, snap.depth, snap.depth_deferred), (0, 1, 1));
+    }
+
+    /// A depth loss that could not be deferred (overflowed table, refused
+    /// bucket, no sequence) holds exactly like a tick loss, without even
+    /// trying to persist.
+    #[test]
+    fn test_wait_for_replay_ack_undeferred_depth_loss_is_ticks_lost() {
+        let wm = AppliedWatermark::new_for_tests();
+        let before = wm.unlanded_snapshot();
+        wm.note_depth_handed_off();
+        wm.note_unlanded_depth(true);
+        wm.note_unlanded_depth(false);
+        wm.note_depth_completed();
+        let outcome = wm.wait_for_replay_ack(Duration::from_millis(1), before, || {
+            panic!("an undeferred loss must not reach the persist")
+        });
+        assert_eq!(outcome, AckOutcome::TicksLost);
+    }
+
+    /// Every depth loss deferred but the marks could not be written: hold.
+    #[test]
+    fn test_wait_for_replay_ack_failed_marks_persist_is_ticks_lost() {
+        let wm = AppliedWatermark::new_for_tests();
+        let before = wm.unlanded_snapshot();
+        wm.note_depth_handed_off();
+        wm.note_unlanded_depth(true);
+        wm.note_depth_completed();
+        assert_eq!(
+            wm.wait_for_replay_ack(Duration::from_millis(1), before, || false),
+            AckOutcome::TicksLost
+        );
+    }
+
+    /// Nothing lost: `Landed` without touching the marks; a batch still in
+    /// flight at the deadline: `TimedOut`, never a confirm.
+    #[test]
+    fn test_wait_for_replay_ack_landed_and_timed_out() {
+        let wm = AppliedWatermark::new_for_tests();
+        let before = wm.unlanded_snapshot();
+        assert_eq!(
+            wm.wait_for_replay_ack(Duration::from_millis(1), before, || {
+                panic!("nothing deferred: no persist")
+            }),
+            AckOutcome::Landed
+        );
+        wm.note_ticks_handed_off();
+        assert_eq!(
+            wm.wait_for_replay_ack(Duration::from_millis(60), before, || true),
+            AckOutcome::TimedOut
+        );
+        // A deferred depth loss does not end the wait early: it still waits
+        // for the tick batch, then times out.
+        wm.note_unlanded_depth(true);
+        assert_eq!(
+            wm.wait_for_replay_ack(Duration::from_millis(60), before, || true),
+            AckOutcome::TimedOut
+        );
+        wm.note_ticks_completed();
+        assert_eq!(
+            wm.wait_for_replay_ack(Duration::from_millis(1), before, || true),
+            AckOutcome::LandedDepthDeferred
+        );
+    }
+
+    /// A loss counted by the LAST batch, just before it completes, racing
+    /// the wait on another thread. The guarantee is the read order: a writer
+    /// counts the loss before the completion, and the wait reads the losses
+    /// again after it sees the completion. This stress run is a smoke check,
+    /// not a proof: the window between the wait's two reads is a few
+    /// instructions, and with the re-read removed 200 rounds still passed on
+    /// the dev container (2026-11-08), so it does not bite.
+    #[test]
+    fn test_wait_for_replay_ack_counts_a_loss_racing_the_last_completion() {
+        for _ in 0..200 {
+            let wm = std::sync::Arc::new(AppliedWatermark::new_for_tests());
+            let before = wm.unlanded_snapshot();
+            wm.note_ticks_handed_off();
+            let writer = {
+                let wm = std::sync::Arc::clone(&wm);
+                std::thread::spawn(move || {
+                    wm.note_unlanded();
+                    wm.note_ticks_completed();
+                })
+            };
+            let outcome = wm.wait_for_replay_ack(Duration::from_secs(5), before, || true);
+            writer.join().expect("writer thread");
+            assert_eq!(outcome, AckOutcome::TicksLost);
+        }
     }
 
     #[test]

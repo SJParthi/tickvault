@@ -23,10 +23,14 @@
 //!   verdict is written down so it cannot flip back.
 //! - None after [`EVENING_DRAIN_LAST_RESTART_SECS_IST`] (05:00 IST), so the
 //!   last one is judged well before the 07:30 hold ceiling.
-//! - The restarted boot keeps every per-boot bound of the catch-up (the frame
-//!   cap, the round cap, the memory stop, the disk floor); only its clock is
-//!   [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] instead of five minutes, so lag
-//!   pauses do not end it early.
+//! - The restarted boot keeps the round cap, the memory stop and the disk
+//!   floor; its clock is [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] instead of five
+//!   minutes, so lag pauses do not end it early, and (PR RD-2, 2026-11-08,
+//!   owner Quote 41) its replay frame cap is
+//!   `EVENING_DRAIN_REPLAY_FRAME_CAP`, 5 x `WAL_REPLAY_MAX_FRAMES_PER_BOOT`
+//!   (15,000,000), raised once before the first catch-up round. Before, it
+//!   kept the 3,000,000 cap, which the boot pass alone (about 3.5 million
+//!   frames) already passed, so the longer clock bought nothing.
 //!
 //! # State
 //!
@@ -534,72 +538,157 @@ pub fn state_for_give_up(state: &EveningState, day: i32) -> EveningState {
     }
 }
 
-/// The catch-up clock for this boot: [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`]
-/// when this is the evening drain boot (a fresh pending flag, inside the
-/// restart window or the hour after it), else `standard`. Pure.
+/// What this boot's WAL catch-up may spend: its clock and its replay frame
+/// cap. Decided once per boot by [`catchup_allowance_for`] (PR RD-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchupAllowance {
+    /// The catch-up clock, in seconds.
+    pub budget_secs: u64,
+    /// Frames this boot may replay across STAGE-C and every catch-up round.
+    pub frame_cap: u64,
+}
+
+/// The catch-up allowance for this boot. On the evening drain boot (a fresh
+/// pending flag, inside the restart window or the hour after it): the clock
+/// is at least [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] and the frame cap is
+/// `EVENING_DRAIN_REPLAY_FRAME_CAP` (5 x `WAL_REPLAY_MAX_FRAMES_PER_BOOT`,
+/// 15,000,000, owner Quote 41). Any other boot: `standard` seconds and the
+/// standard 3,000,000 frames. Pure.
 #[must_use]
-pub fn catchup_budget_for(
+pub fn catchup_allowance_for(
     state: &EveningState,
     standard: u64,
     now_unix: i64,
     secs_ist: u64,
-) -> u64 {
+) -> CatchupAllowance {
     let age = now_unix.saturating_sub(state.pending_unix);
     let fresh = state.pending_unix != 0 && (0..=EVENING_DRAIN_PENDING_MAX_AGE_SECS).contains(&age);
     let evening = in_restart_window(secs_ist)
         || secs_ist
             < EVENING_DRAIN_LAST_RESTART_SECS_IST + EVENING_DRAIN_PENDING_MAX_AGE_SECS as u64;
     if fresh && evening {
-        standard.max(EVENING_DRAIN_CATCHUP_BUDGET_SECS)
+        evening_allowance(standard)
     } else {
-        standard
+        standard_allowance(standard)
     }
 }
 
-/// [`catchup_budget_for`] on the state file, clearing its pending flag so it
-/// applies to one boot only. Called once per lane start, cold.
-#[must_use]
-// TEST-EXEMPT: file I/O around catchup_budget_for, which is unit-tested (test_catchup_budget_for_*) and on store_state/load_state.
-pub fn budget_or(standard: u64) -> u64 {
-    let path = Path::new(EVENING_DRAIN_STATE_PATH);
+/// `standard` seconds and the standard per-boot frame cap. Pure.
+const fn standard_allowance(standard: u64) -> CatchupAllowance {
+    CatchupAllowance {
+        budget_secs: standard,
+        frame_cap: tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+    }
+}
+
+/// The evening allowance: at least [`EVENING_DRAIN_CATCHUP_BUDGET_SECS`] on
+/// the clock and the evening frame cap. Pure.
+fn evening_allowance(standard: u64) -> CatchupAllowance {
+    CatchupAllowance {
+        budget_secs: standard.max(EVENING_DRAIN_CATCHUP_BUDGET_SECS),
+        frame_cap: tickvault_storage::wal_replay_frame_cap::EVENING_DRAIN_REPLAY_FRAME_CAP,
+    }
+}
+
+/// This process's claim of the planned-restart mark, decided once by
+/// [`claim_planned_boot`] (PR RD review, finding 3). `Some(state)` only on
+/// the boot the evening drain started, and only when its mark was cleared.
+static BOOT_CLAIM: std::sync::OnceLock<Option<EveningState>> = std::sync::OnceLock::new();
+
+/// Reads the state file, clears any pending flag in the same lock, and
+/// returns the state when this boot is the planned evening one: a fresh flag,
+/// in the evening, AND the clearing write succeeded. A flag that could not be
+/// cleared hands out nothing (fail closed): it could otherwise reach a later
+/// boot the evening drain did not start. `store` is the clearing write
+/// (injected so the failure arm is testable). Cold, once per boot.
+fn claim_planned_boot_at<S>(
+    path: &Path,
+    now_unix: i64,
+    secs_ist: u64,
+    store: S,
+) -> Option<EveningState>
+where
+    S: FnOnce(&Path, &EveningState) -> std::io::Result<()>,
+{
     // Keep the read/clear transaction inside one lock: an old boot snapshot
     // must not overwrite a newer supervisor restart count when clearing pending.
     let Ok(_guard) = STATE_IO.lock() else {
-        return standard;
+        return None;
     };
     let Ok(StateRead::Valid(state)) = read_state(path) else {
-        return standard;
+        return None;
     };
     if state.pending_unix == 0 {
-        return standard;
+        return None;
     }
-    let budget = catchup_budget_for(
-        &state,
-        standard,
-        chrono::Utc::now().timestamp(),
-        crate::dhan_feed_stack::now_ist_secs_of_day(),
-    );
+    // Probe with a zero standard: any planned verdict raises the frame cap.
+    let planned = catchup_allowance_for(&state, 0, now_unix, secs_ist) != standard_allowance(0);
     let cleared = EveningState {
         pending_unix: 0,
         ..state
     };
-    if let Err(err) = store_state_locked(path, &cleared) {
+    if let Err(err) = store(path, &cleared) {
         error!(
             code = ErrorCode::DrainHold01NotWritten.code_str(),
             source = "evening_drain_state",
             error = %err,
-            "evening drain: the pending flag could not be cleared; it ages out in 15 minutes"
+            "evening drain: the pending flag could not be cleared, so this boot takes the \
+             standard replay allowance; the flag ages out in 15 minutes"
         );
+        return None;
     }
-    if budget > standard {
-        info!(
-            budget_secs = budget,
-            restart = state.restarts,
-            backlog_before = state.backlog_before,
-            "evening drain boot: the WAL catch-up takes the longer evening clock"
-        );
-    }
-    budget
+    planned.then_some(state)
+}
+
+/// Claims the planned-restart mark for THIS process, before the boot replay
+/// (STAGE-C) starts, and remembers the verdict in memory. Called from `main`
+/// right before the WAL directory is claimed, so a planned boot that dies in
+/// its replay (OOM, deploy, crash) cannot leave the mark for the next boot:
+/// the mark is already gone from the file. Idempotent: the first call decides.
+#[must_use]
+// TEST-EXEMPT: a OnceLock around claim_planned_boot_at (unit-tested: test_regression_claim_*); its placement before the boot replay is pinned by the_lane_and_main_are_wired_to_the_evening_drain.
+pub fn claim_planned_boot() -> bool {
+    BOOT_CLAIM
+        .get_or_init(|| {
+            claim_planned_boot_at(
+                Path::new(EVENING_DRAIN_STATE_PATH),
+                chrono::Utc::now().timestamp(),
+                crate::dhan_feed_stack::now_ist_secs_of_day(),
+                store_state_locked,
+            )
+        })
+        .is_some()
+}
+
+/// The catch-up allowance for this boot: the verdict [`claim_planned_boot`]
+/// took at process start when it ran, otherwise a claim made now (a lane
+/// started without that early claim, e.g. a test harness). Either way the
+/// pending flag applies to one boot only. Called once per lane start, cold.
+#[must_use]
+// TEST-EXEMPT: file I/O around claim_planned_boot_at and catchup_allowance_for, both unit-tested; covered by allowance_or_applies_to_one_boot_and_fails_closed_on_a_bad_file.
+pub fn allowance_or(standard: u64) -> CatchupAllowance {
+    let claimed = match BOOT_CLAIM.get() {
+        Some(claimed) => *claimed,
+        None => claim_planned_boot_at(
+            Path::new(EVENING_DRAIN_STATE_PATH),
+            chrono::Utc::now().timestamp(),
+            crate::dhan_feed_stack::now_ist_secs_of_day(),
+            store_state_locked,
+        ),
+    };
+    let Some(state) = claimed else {
+        return standard_allowance(standard);
+    };
+    let allowance = evening_allowance(standard);
+    info!(
+        budget_secs = allowance.budget_secs,
+        frame_cap = allowance.frame_cap,
+        restart = state.restarts,
+        backlog_before = state.backlog_before,
+        "evening drain boot: the WAL catch-up takes the longer evening clock and the \
+         evening frame cap"
+    );
+    allowance
 }
 
 #[cfg(test)]
@@ -864,23 +953,51 @@ mod tests {
     }
 
     #[test]
-    fn test_catchup_budget_for_only_a_fresh_evening_pending_flag() {
+    fn test_catchup_allowance_for_only_a_fresh_evening_pending_flag() {
+        use tickvault_storage::wal_replay_frame_cap::EVENING_DRAIN_REPLAY_FRAME_CAP;
+        use tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_FRAMES_PER_BOOT;
         let pending = EveningState {
             pending_unix: NOW,
             ..EveningState::default()
         };
-        let budget = EVENING_DRAIN_CATCHUP_BUDGET_SECS;
-        assert_eq!(catchup_budget_for(&pending, 300, NOW + 30, EVENING), budget);
-        // Stale flag, no flag, or a morning boot: unchanged.
-        let stale = NOW + EVENING_DRAIN_PENDING_MAX_AGE_SECS + 1;
-        assert_eq!(catchup_budget_for(&pending, 300, stale, EVENING), 300);
+        let evening = CatchupAllowance {
+            budget_secs: EVENING_DRAIN_CATCHUP_BUDGET_SECS,
+            frame_cap: EVENING_DRAIN_REPLAY_FRAME_CAP,
+        };
+        // Quote 41: the evening drain boot replays up to 5 x 3,000,000.
+        assert_eq!(EVENING_DRAIN_REPLAY_FRAME_CAP, 15_000_000);
         assert_eq!(
-            catchup_budget_for(&EveningState::default(), 300, NOW, EVENING),
-            300
+            catchup_allowance_for(&pending, 300, NOW + 30, EVENING),
+            evening
         );
-        assert_eq!(catchup_budget_for(&pending, 20, NOW + 30, 10 * 3_600), 20);
+        let standard = |secs| CatchupAllowance {
+            budget_secs: secs,
+            frame_cap: WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+        };
+        // Stale flag, no flag, or a morning boot: the standard allowance.
+        let stale = NOW + EVENING_DRAIN_PENDING_MAX_AGE_SECS + 1;
+        assert_eq!(
+            catchup_allowance_for(&pending, 300, stale, EVENING),
+            standard(300)
+        );
+        assert_eq!(
+            catchup_allowance_for(&EveningState::default(), 300, NOW, EVENING),
+            standard(300)
+        );
+        assert_eq!(
+            catchup_allowance_for(&pending, 20, NOW + 30, 10 * 3_600),
+            standard(20)
+        );
         // A flag stamped in the future is not fresh.
-        assert_eq!(catchup_budget_for(&pending, 300, NOW - 5, EVENING), 300);
+        assert_eq!(
+            catchup_allowance_for(&pending, 300, NOW - 5, EVENING),
+            standard(300)
+        );
+        // The standard clock never shrinks on the evening boot.
+        assert_eq!(
+            catchup_allowance_for(&pending, 5_000, NOW + 30, EVENING).budget_secs,
+            5_000
+        );
     }
 
     #[test]
@@ -900,14 +1017,82 @@ mod tests {
             .expect("the stored permit resolves the wait");
     }
 
+    /// A fresh evening state file in its own temp directory.
+    fn planned_state_file(tag: &str) -> (PathBuf, PathBuf, EveningState) {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-evening-claim-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let path = dir.join("state");
+        let s = state_for_restart(&EveningState::default(), DAY, 40, NOW);
+        store_state(&path, &s).expect("store");
+        (dir, path, s)
+    }
+
+    // Regression: PR RD review finding 3 (2026-11-08). The claim clears the
+    // mark from the file, so a second boot (the crash restart after a planned
+    // boot died) finds nothing and takes the standard allowance. Bite: skip
+    // the clearing write and the second claim returns the planned state.
+    #[test]
+    fn test_regression_claim_applies_to_the_one_planned_boot_only() {
+        let (dir, path, s) = planned_state_file("one-boot");
+        let first = claim_planned_boot_at(&path, NOW + 5, EVENING, store_state_locked);
+        assert_eq!(first, Some(s), "the planned boot claims the mark");
+        assert_eq!(load_state(&path).map(|l| l.pending_unix), Some(0));
+        let second = claim_planned_boot_at(&path, NOW + 130, EVENING, store_state_locked);
+        assert_eq!(
+            second, None,
+            "the crash restart two minutes later is standard"
+        );
+        // A stale flag is cleared but never claimed.
+        let (dir2, path2, _) = planned_state_file("stale");
+        let stale = NOW + EVENING_DRAIN_PENDING_MAX_AGE_SECS + 1;
+        assert_eq!(
+            claim_planned_boot_at(&path2, stale, EVENING, store_state_locked),
+            None
+        );
+        assert_eq!(load_state(&path2).map(|l| l.pending_unix), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // Regression: PR RD review finding 3 (2026-11-08). When the clearing
+    // write fails the flag survives on disk, so handing out the allowance
+    // could give it to a later, unplanned boot. Fail closed. Bite: drop the
+    // `return None` in the store-error arm and this returns the state.
+    #[test]
+    fn test_regression_claim_refuses_the_allowance_when_the_clear_fails() {
+        let (dir, path, _) = planned_state_file("clear-fails");
+        let claimed = claim_planned_boot_at(&path, NOW + 5, EVENING, |_, _| {
+            Err(std::io::Error::other("injected clear failure"))
+        });
+        assert_eq!(claimed, None);
+        assert_eq!(
+            load_state(&path).map(|l| l.pending_unix),
+            Some(NOW),
+            "the flag is still on disk, which is why nothing is handed out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn the_lane_and_main_are_wired_to_the_evening_drain() {
         let lane = include_str!("dhan_feed_stack.rs");
         assert!(lane.contains(
-            "crate::evening_drain::budget_or(wal_catchup_budget_secs(now_ist_secs_of_day()))"
+            "crate::evening_drain::allowance_or(wal_catchup_budget_secs(now_ist_secs_of_day()))"
         ));
         let main = include_str!("main.rs");
         assert!(main.contains("tickvault_app::evening_drain::self_restart_requested()"));
+        // PR RD review finding 3: main claims the planned-restart mark BEFORE
+        // it locks and replays the WAL, so a planned boot that dies in its
+        // replay leaves no mark for the next boot. Bite: move or drop the call.
+        let claim = main.find("tickvault_app::evening_drain::claim_planned_boot()");
+        let wal_lock = main.find("tickvault_storage::ws_frame_spill::lock_wal_dir(");
+        assert!(
+            matches!((claim, wal_lock), (Some(c), Some(w)) if c < w),
+            "claim at {claim:?} must precede the WAL lock at {wal_lock:?}"
+        );
         let hold = include_str!("drain_hold.rs");
         assert!(hold.contains("crate::evening_drain::request_self_restart()"));
         assert!(hold.contains("crate::evening_drain::state_for_give_up("));

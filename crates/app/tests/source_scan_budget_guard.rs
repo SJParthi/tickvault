@@ -134,7 +134,7 @@ const BUDGET: &[(&str, usize)] = &[
     ("ensure_questdb.rs", 1),
     // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
     // hold supervisor); paired behaviour tests `evening_step_*`,
-    // `test_catchup_budget_for_only_a_fresh_evening_pending_flag`,
+    // `test_catchup_allowance_for_only_a_fresh_evening_pending_flag`,
     // `test_request_self_restart_resolves_a_later_self_restart_requested`.
     ("evening_drain.rs", 3),
     // 2026-10-28 (daily expiry check): 5 wiring scans (main spawns the 15:50
