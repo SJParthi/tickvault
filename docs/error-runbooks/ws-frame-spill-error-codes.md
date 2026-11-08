@@ -191,6 +191,18 @@ or let the catch-up drain retry; nothing is lost while the segments stay put.
 The boot-time `WS-SPILL-02 source="boot_replay_failed"` line still pages as
 before; its text now says nothing staged was archived.
 
+### 2026-11-08 — the replay frame cap and the replay ack (PR RD, noise lock §2.17)
+
+These `WS-SPILL-01` lines are not a writer or disk fault; the alarm text's
+"disk I/O error" does not apply to them.
+
+| `source` | Level | Pages | Meaning, and what to do |
+|---|---|---|---|
+| `replay_frame_cap` | ERROR | yes | A boot replayed its 3,000,000-frame allowance and stopped; the rest stays as `*.wal` files for the next boot. Read `tv_wal_unapplied_pinned_bytes` over several boots: if it does not fall, the backlog is not draining. |
+| `replay_frame_cap_planned` | WARN | no | The same stop on the evening drain's own planned restart (cap 15,000,000, Quote 41). Expected; counted on `tv_wal_replay_frame_cap_stops_total`. |
+| `replay_rows_lost` | ERROR | yes | A replayed row landed in neither QuestDB nor a spill; the batch is held for the next boot. Check the depth and tick spill folders' size and the QuestDB logs. |
+| `replay_ack_wait_timeout` | ERROR | yes | The replay ack really waited its full time; the batch is held for the next boot. Check QuestDB health. |
+
 ---
 
 ## §3. Trigger / auto-load

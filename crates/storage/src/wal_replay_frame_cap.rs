@@ -28,7 +28,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tickvault_common::error_code::ErrorCode;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::ws_frame_spill::{WAL_REPLAY_FRAME_CAP_STOPS_COUNTER, WAL_REPLAY_MAX_FRAMES_PER_BOOT};
 
@@ -81,15 +81,49 @@ pub fn replay_frame_cap_this_boot() -> u64 {
     REPLAY_FRAME_CAP_THIS_BOOT.load(Ordering::Acquire)
 }
 
+/// `true` when `cap` is the allowance of a boot the evening drain marked as
+/// its own planned restart (PR RD-4, noise lock §2.17). Exact, not a guess:
+/// the cap starts at [`WAL_REPLAY_MAX_FRAMES_PER_BOOT`] in every process and
+/// only [`raise_replay_frame_cap_for_planned_drain`] moves it, with the
+/// allowance `evening_drain::allowance_or` decided from one read-and-clear of
+/// the pending flag (unreadable state, a stale flag, a deploy, crash, manual
+/// or Muhurat start all give 3,000,000). So a cap above the standard one
+/// exists only on that one planned boot, and dies with the process. Pure,
+/// O(1).
+#[must_use]
+pub(crate) const fn cap_is_planned_evening_drain(cap: u64) -> bool {
+    cap > WAL_REPLAY_MAX_FRAMES_PER_BOOT
+}
+
 /// `true` (and counted, and logged with the cap actually used) when a replay
 /// pass must be refused because `frames_so_far` reached `cap`. Checked before
 /// a pass, never during one, so a single pass can end past the cap; the next
 /// pass is then refused. O(1).
+///
+/// PR RD-4 (noise lock §2.17, owner card "Quiet on planned restarts
+/// (Recommended)", 2026-11-08): on the planned evening-drain boot reaching
+/// the cap is the expected end of that boot's slice, so the line is a coded
+/// `warn!` with `source = "replay_frame_cap_planned"` (the `ws-spill-01`
+/// filter matches `ERROR` only, so it does not page). Every other boot keeps
+/// the `error!` and the page. The counter moves on both paths.
 pub(crate) fn refuse_past_frame_cap(frames_so_far: u64, cap: u64) -> bool {
     if frames_so_far < cap {
         return false;
     }
     metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(1);
+    if cap_is_planned_evening_drain(cap) {
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_frame_cap_planned",
+            frames_so_far,
+            cap,
+            "WAL replay paused for this boot: the planned evening restart has replayed its \
+             whole frame allowance. Nothing is stranded — every unread segment stays a \
+             `*.wal` file for the next boot, and the evening check decides whether to \
+             restart again."
+        );
+        return true;
+    }
     error!(
         code = ErrorCode::WsSpill01WriterRespawn.code_str(),
         source = "replay_frame_cap",
@@ -171,6 +205,136 @@ mod tests {
             EVENING_DRAIN_REPLAY_FRAME_CAP
         ));
         assert!(!refuse_past_frame_cap(0, WAL_REPLAY_MAX_FRAMES_PER_BOOT));
+    }
+
+    /// A `std::io::Write` sink the JSON subscriber writes into.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `refuse_past_frame_cap` under a JSON subscriber shaped like the
+    /// production `errors.jsonl` layer (`flatten_event(true)`: `level`,
+    /// `code` and `source` at the top level, which is what the CloudWatch
+    /// filter reads) and returns `(refused, every line as JSON)`.
+    fn refuse_and_capture(frames_so_far: u64, cap: u64) -> (bool, Vec<serde_json::Value>) {
+        let out = Captured::default();
+        let sink = out.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let refused = tracing::subscriber::with_default(subscriber, || {
+            refuse_past_frame_cap(frames_so_far, cap)
+        });
+        let text = String::from_utf8_lossy(
+            &out.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned();
+        let lines = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each captured line is JSON"))
+            .collect();
+        (refused, lines)
+    }
+
+    /// The `ws-spill-01` CloudWatch metric filter, read from the Terraform
+    /// that ships it, evaluated on one log line: `$.code = "WS-SPILL-01" &&
+    /// $.level = "ERROR"`. The test first pins that the deployed pattern is
+    /// exactly that, so a wider filter fails here instead of paging quietly.
+    fn ws_spill_01_filter_matches(line: &serde_json::Value) -> bool {
+        let tf = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/aws/terraform/error-code-alarms.tf"
+        ))
+        .expect("error-code-alarms.tf is in the repository");
+        let start = tf
+            .find("\"ws-spill-01\" = {")
+            .expect("the ws-spill-01 alarm is defined");
+        let pattern_line = tf[start..]
+            .lines()
+            .find(|l| l.trim_start().starts_with("pattern"))
+            .expect("the ws-spill-01 alarm has a pattern");
+        assert_eq!(
+            pattern_line.trim(),
+            r#"pattern     = "{ $.code = \"WS-SPILL-01\" && $.level = \"ERROR\" }""#,
+            "the ws-spill-01 filter changed; re-check noise lock §2.17 before editing this test"
+        );
+        line["code"] == "WS-SPILL-01" && line["level"] == "ERROR"
+    }
+
+    #[test]
+    fn test_cap_is_planned_evening_drain_only_above_the_standard_cap() {
+        assert!(!cap_is_planned_evening_drain(0));
+        assert!(!cap_is_planned_evening_drain(
+            WAL_REPLAY_MAX_FRAMES_PER_BOOT
+        ));
+        assert!(cap_is_planned_evening_drain(
+            WAL_REPLAY_MAX_FRAMES_PER_BOOT + 1
+        ));
+        assert!(cap_is_planned_evening_drain(EVENING_DRAIN_REPLAY_FRAME_CAP));
+        // Every cap the process can hold that is not the planned one.
+        assert!(!cap_is_planned_evening_drain(clamp_replay_frame_cap(0)));
+    }
+
+    /// PR RD-4 (noise lock §2.17): the planned evening-drain boot logs the
+    /// cap refusal as a coded WARN with `source = "replay_frame_cap_planned"`,
+    /// which the `ws-spill-01` filter does not match (no page); every other
+    /// boot keeps the coded ERROR with `source = "replay_frame_cap"`, which it
+    /// does match (pages). Both still refuse the pass.
+    #[test]
+    fn test_regression_rd4_planned_cap_refusal_warns_and_unplanned_errors() {
+        // Planned evening-drain boot: 15M replayed under the 15M cap.
+        let (refused, lines) = refuse_and_capture(
+            EVENING_DRAIN_REPLAY_FRAME_CAP,
+            EVENING_DRAIN_REPLAY_FRAME_CAP,
+        );
+        assert!(refused, "the planned boot still stops at its cap");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let planned = &lines[0];
+        assert_eq!(planned["level"], "WARN", "{planned}");
+        assert_eq!(planned["code"], "WS-SPILL-01", "{planned}");
+        assert_eq!(planned["source"], "replay_frame_cap_planned", "{planned}");
+        assert_eq!(planned["cap"], EVENING_DRAIN_REPLAY_FRAME_CAP, "{planned}");
+        assert!(
+            !ws_spill_01_filter_matches(planned),
+            "the planned-restart line must not page: {planned}"
+        );
+
+        // Any other boot (deploy, crash, manual, Muhurat, unreadable state):
+        // the 8 Nov 2026 shape, 3.5M frames after the boot pass, 3M cap.
+        let (refused, lines) = refuse_and_capture(3_497_726, WAL_REPLAY_MAX_FRAMES_PER_BOOT);
+        assert!(refused);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let unplanned = &lines[0];
+        assert_eq!(unplanned["level"], "ERROR", "{unplanned}");
+        assert_eq!(unplanned["code"], "WS-SPILL-01", "{unplanned}");
+        assert_eq!(unplanned["source"], "replay_frame_cap", "{unplanned}");
+        assert!(
+            ws_spill_01_filter_matches(unplanned),
+            "an unplanned boot at the cap must still page: {unplanned}"
+        );
+
+        // Under the cap: no refusal, no line at all.
+        let (refused, lines) = refuse_and_capture(0, EVENING_DRAIN_REPLAY_FRAME_CAP);
+        assert!(!refused);
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     /// The PRODUCTION wrapper runs under the cap in force, not the constant:
