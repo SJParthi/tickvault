@@ -3121,14 +3121,10 @@ async fn async_main() -> Result<()> {
     // how the 17:30 box stop always arrives. Neither case reported anything,
     // because a sweep that never runs leaves every failure counter flat.
     //
-    // Spawned HERE, beside the disk-pressure loop, because the two are the
-    // same class of job and are now mutually excluded inside
-    // `partition_archive` itself rather than by luck of timing.
+    // Spawned HERE, beside the disk-pressure loop: the same class of job, now
+    // mutually excluded inside `partition_archive` rather than by timing luck.
     let _daily_archive_supervisor =
         tickvault_app::daily_archive_boot::spawn_supervised_daily_archive_loop(
-            // The data volume the free-space target is measured on, and the
-            // home of `state/archive_session_bytes.json` (PR AA step 5); the
-            // same path the disk-pressure loop probes.
             std::path::PathBuf::from("data"),
             config.questdb.clone(),
             config.partition_retention.clone(),

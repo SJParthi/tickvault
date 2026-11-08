@@ -347,14 +347,14 @@ pub fn replay_quiesce_wait(now_secs_of_day_ist: u64) -> Option<Duration> {
 
 /// Counts one deferral on [`QUIESCE_HELD_COUNTER`]. O(1); the label values
 /// are literals, so the counter stays on its non-allocating arm.
-// TEST-EXEMPT: covered by test_counters_register_and_count_without_a_recorder
+// TEST-EXEMPT: covered by test_counters_register_and_count_without_a_recorder_no_panic
 pub fn note_quiesce_held(writer: QuiesceWriter) {
     metrics::counter!(QUIESCE_HELD_COUNTER, "writer" => writer.label()).increment(1);
 }
 
 /// Registers every `writer` series of [`QUIESCE_HELD_COUNTER`] at 0, so the
 /// first real deferral is a visible change rather than a new series.
-// TEST-EXEMPT: covered by test_counters_register_and_count_without_a_recorder
+// TEST-EXEMPT: covered by test_counters_register_and_count_without_a_recorder_no_panic
 pub fn register_quiesce_counters() {
     for writer in QuiesceWriter::ALL {
         metrics::counter!(QUIESCE_HELD_COUNTER, "writer" => writer.label()).increment(0);
@@ -649,7 +649,7 @@ mod tests {
     /// `daily_archive_boot::test_archive_quiesce_counters_seed_at_zero_and_count`
     /// (storage has no exporter dev-dependency).
     #[test]
-    fn test_counters_register_and_count_without_a_recorder() {
+    fn test_counters_register_and_count_without_a_recorder_no_panic() {
         register_quiesce_counters();
         for writer in QuiesceWriter::ALL {
             note_quiesce_held(writer);

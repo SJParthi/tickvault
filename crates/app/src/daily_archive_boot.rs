@@ -721,6 +721,10 @@ async fn run_one_pass(
 ///
 /// Returning `None` is always a deliberate refusal with a log line naming the
 /// reason — never a silent no-op.
+///
+/// `data_dir` is the data volume the free-space target is measured on, and the
+/// home of `state/archive_session_bytes.json` (PR AA step 5); `main.rs` passes
+/// the same path the disk-pressure loop probes.
 pub fn spawn_supervised_daily_archive_loop(
     data_dir: PathBuf,
     questdb: QuestDbConfig,
