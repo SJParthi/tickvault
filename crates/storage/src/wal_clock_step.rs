@@ -50,9 +50,17 @@
 //! a second, only when it changed, and read back when the WAL directory is
 //! bound at boot, before any sink or socket exists. The unapplied ranges and
 //! the deferred-depth marks it guards survive a restart, so it must too. An
-//! unreadable file is replaced by the window `[0, now]` (keeps more; it
-//! clears once every frame up to the boot is acknowledged and unmarked), with
-//! one coded warning.
+//! unreadable file is replaced by the window `[boot - 6 h, boot]`
+//! ([`REJECTED_FILE_LOOKBACK_NANOS`]), with one coded warning.
+//!
+//! # Expiry
+//!
+//! Every window, carried over from the file or recorded in this process,
+//! expires [`CLOCK_STEP_WINDOW_TTL_NANOS`] (24 h) after its `hi` (the end of
+//! the latest step it records, so at least 24 h after that step). After that
+//! the hours it reached are judged by their own spans only: the unapplied
+//! ranges, the deferred-depth marks in the hour's own span and the
+//! acknowledged watermarks still decide.
 //!
 //! # Honest limits
 //!
@@ -63,6 +71,17 @@
 //!   never less), so every hour between them is judged against all of it.
 //! - A step smaller than 1 s is not recorded; the span's own 2 s receipt
 //!   slop covers it.
+//! - The trade-off of the bounded fallback and the expiry (recheck of PR AA
+//!   finding 2, 2026-11-08): the earlier fallback `[0, boot]` never expired
+//!   and could not retire while any old mark or unapplied range was left,
+//!   which on this box held every depth hour from before the boot, so the
+//!   pressure leg freed nothing and the disk filled. Now an unreadable file
+//!   covers a step only in the 6 h before the boot, and a row displaced by a
+//!   step and still unapplied (or still marked) more than 24 h after it is
+//!   protected only when its mark or range falls in its own hour's span. An
+//!   unreadable file needs a torn write or a rollback across a version
+//!   change; a row 24 h on its way needs a backlog that has not drained in a
+//!   day, which the drain hold and the evening restarts exist to prevent.
 //! - The frame counter can run ahead of the wall without a step under a
 //!   burst above about 7,600 frames a second (one 131 µs frame base each).
 //!   A rotation then records a small spurious window; it holds only while
@@ -96,6 +115,28 @@ pub(crate) const CLOCK_STEP_MARGIN_NANOS: u64 = 30_000_000_000;
 /// receipt slop already covers it, and NTP slew over one 30 s refresh is
 /// about 15 ms.
 pub(crate) const CLOCK_STEP_MIN_NANOS: u64 = 1_000_000_000;
+
+/// How long a window lives after its `hi`: 24 h. A row a step displaced
+/// that is still on its way after that is judged by its own hour's span.
+pub(crate) const CLOCK_STEP_WINDOW_TTL_NANOS: u64 = 24 * 3_600 * 1_000_000_000;
+
+/// How far before the boot the window of an unreadable file reaches: 6 h.
+/// A chosen bound (Assumed, not measured): it covers a step seen earlier in
+/// the same session by a process that restarted within it. A step more than
+/// 6 h before the boot whose file is now unreadable is not covered.
+pub(crate) const REJECTED_FILE_LOOKBACK_NANOS: u64 = 6 * 3_600 * 1_000_000_000;
+
+/// `window` unless it has expired at `now_nanos` (see
+/// [`CLOCK_STEP_WINDOW_TTL_NANOS`]). Pure, O(1).
+#[must_use]
+pub(crate) const fn live_window(window: Option<(u64, u64)>, now_nanos: u64) -> Option<(u64, u64)> {
+    match window {
+        Some((lo, hi)) if now_nanos < hi.saturating_add(CLOCK_STEP_WINDOW_TTL_NANOS) => {
+            Some((lo, hi))
+        }
+        _ => None,
+    }
+}
 
 /// File layout: magic, version, `lo`, `hi`, CRC-32 of the first 24 bytes.
 const FILE_MAGIC: [u8; 4] = *b"TVCS";
@@ -228,14 +269,35 @@ impl ClockStepLog {
         }
     }
 
-    /// The recorded window, or `None`. O(1).
+    /// The recorded window as stored, expired or not, or `None`. O(1).
     pub(crate) fn window(&self) -> Option<(u64, u64)> {
         *self.window.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn widen(&self, add: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    /// The recorded window at `now_nanos`: an expired one is dropped (and the
+    /// drop persisted) and reads `None`. O(1).
+    pub(crate) fn window_at(&self, now_nanos: u64) -> Option<(u64, u64)> {
         let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
-        let widened = union(*window, add);
+        let stored = *window;
+        let live = live_window(stored, now_nanos);
+        if live != stored {
+            *window = None;
+            self.dirty.store(true, Ordering::Release);
+            drop(window);
+            info!(
+                window = ?stored,
+                ttl_hours = CLOCK_STEP_WINDOW_TTL_NANOS / 3_600_000_000_000,
+                "wall clock step window expired: archive hours are judged by their own spans again"
+            );
+        }
+        live
+    }
+
+    /// Adds `add` to the window; one that expired by `now_nanos` is replaced,
+    /// not widened.
+    fn widen(&self, add: Option<(u64, u64)>, now_nanos: u64) -> Option<(u64, u64)> {
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        let widened = union(live_window(*window, now_nanos), add);
         if widened != *window {
             *window = widened;
             self.dirty.store(true, Ordering::Release);
@@ -249,7 +311,7 @@ impl ClockStepLog {
         let Some((lo, hi)) = step_window(start_nanos, at_wall_nanos, magnitude_nanos) else {
             return;
         };
-        let window = self.widen(Some((lo, hi)));
+        let window = self.widen(Some((lo, hi)), at_wall_nanos);
         info!(
             step_ms = magnitude_nanos / 1_000_000,
             window_lo_nanos = lo,
@@ -281,9 +343,10 @@ impl ClockStepLog {
         true
     }
 
-    /// Binds the log to `wal_dir` and adds the window the file there holds.
-    /// First caller wins. An unreadable file adds `[0, now_nanos]` and is
-    /// rewritten at the next persist. Cold, once per process.
+    /// Binds the log to `wal_dir` and adds the window the file there holds,
+    /// unless it expired by `now_nanos`. First caller wins. An unreadable file
+    /// adds `[now_nanos - 6 h, now_nanos]` and is rewritten at the next
+    /// persist. Cold, once per process.
     pub(crate) fn bind(&self, wal_dir: &Path, now_nanos: u64) {
         let set = self
             .paths
@@ -295,21 +358,30 @@ impl ClockStepLog {
         match read_file(wal_dir) {
             StepFile::Absent => {}
             StepFile::Loaded(window) => {
-                let window = self.widen(window);
+                if live_window(window, now_nanos).is_none() && window.is_some() {
+                    // Expired while the box was down: rewrite the file empty.
+                    self.dirty.store(true, Ordering::Release);
+                    info!(window = ?window, "wall clock step window from the last process expired");
+                    return;
+                }
+                let window = self.widen(window, now_nanos);
                 if window.is_some() {
                     info!(window = ?window, "wall clock step window carried over from the last process");
                 }
             }
             StepFile::Rejected => {
-                self.widen(Some((0, now_nanos)));
+                let lo = now_nanos.saturating_sub(REJECTED_FILE_LOOKBACK_NANOS);
+                self.widen(Some((lo, now_nanos)), now_nanos);
                 self.dirty.store(true, Ordering::Release);
                 warn!(
                     code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn
                         .code_str(),
                     source = "clock_step_window_file_rejected",
                     path = %wal_dir.join(CLOCK_STEP_FILE).display(),
-                    "wall clock step file cannot be read: every archive hour up to now is \
-                     judged as stepped until all of it is acknowledged (keeps more, never less)"
+                    lookback_hours = REJECTED_FILE_LOOKBACK_NANOS / 3_600_000_000_000,
+                    "wall clock step file cannot be read: archive hours of the last 6 hours \
+                     before the boot are judged as stepped until all of them are acknowledged \
+                     or 24 hours pass"
                 );
             }
         }
@@ -360,10 +432,11 @@ pub(crate) fn note_clock_step(start_nanos: u64, at_wall_nanos: u64, magnitude_na
     LOG.note(start_nanos, at_wall_nanos, magnitude_nanos);
 }
 
-/// The process window `[lo, hi]`, or `None` when no step is recorded. O(1).
+/// The process window `[lo, hi]`, or `None` when no step is recorded or the
+/// window expired (see [`CLOCK_STEP_WINDOW_TTL_NANOS`]). O(1).
 #[must_use]
 pub(crate) fn clock_step_window() -> Option<(u64, u64)> {
-    LOG.window()
+    LOG.window_at(crate::wal_applied_watermark::wall_nanos())
 }
 
 /// Drops the process window when it reads settled. See
@@ -599,18 +672,106 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    /// Regression: recheck of PR AA finding 2 (2026-11-08). An unreadable
+    /// file became the window `[0, boot]`, which never expired and could not
+    /// retire while any old mark or unapplied range was left, so every depth
+    /// hour before the boot was held and the pressure leg freed nothing. It
+    /// is now the 6 h before the boot, and it expires 24 h after the boot.
     #[test]
-    fn test_unreadable_file_holds_every_hour_up_to_the_boot_and_is_rewritten() {
+    fn test_regression_unreadable_file_holds_only_the_six_hours_before_the_boot() {
         let dir = temp_dir("rejected");
         std::fs::write(dir.join(CLOCK_STEP_FILE), b"torn").expect("write");
+        let boot = 1_000_000 * SEC;
         let log = ClockStepLog::new();
-        log.bind(&dir, 4_000 * SEC);
-        assert_eq!(log.window(), Some((0, 4_000 * SEC)));
+        log.bind(&dir, boot);
+        let expected = (boot - REJECTED_FILE_LOOKBACK_NANOS, boot);
+        assert_eq!(log.window(), Some(expected));
+        assert_eq!(REJECTED_FILE_LOOKBACK_NANOS, 6 * 3_600 * SEC);
+        assert!(
+            !window_overlaps(log.window(), 0, boot - REJECTED_FILE_LOOKBACK_NANOS - 1),
+            "an hour more than 6 h before the boot is not judged as stepped"
+        );
         log.persist_if_dirty();
         let again = ClockStepLog::new();
-        again.bind(&dir, 9_000 * SEC);
-        assert_eq!(again.window(), Some((0, 4_000 * SEC)), "rewritten whole");
+        again.bind(&dir, boot + 3_600 * SEC);
+        assert_eq!(again.window(), Some(expected), "rewritten whole");
+        // A day after the boot the window is gone, at a restart and in RAM.
+        assert_eq!(again.window_at(boot + CLOCK_STEP_WINDOW_TTL_NANOS), None);
+        let later = ClockStepLog::new();
+        later.bind(&dir, boot + CLOCK_STEP_WINDOW_TTL_NANOS);
+        assert_eq!(later.window(), None);
+        // A boot close to the epoch saturates instead of wrapping.
+        let dir2 = temp_dir("rejected-early");
+        std::fs::write(dir2.join(CLOCK_STEP_FILE), b"torn").expect("write");
+        let early = ClockStepLog::new();
+        early.bind(&dir2, 4_000 * SEC);
+        assert_eq!(early.window(), Some((0, 4_000 * SEC)));
         drop(std::fs::remove_dir_all(&dir));
+        drop(std::fs::remove_dir_all(&dir2));
+    }
+
+    /// Regression: recheck of PR AA finding 2 (2026-11-08). A carried window
+    /// never expired, so one old step kept judging hours against itself for
+    /// as long as anything in it was marked. It now lives 24 h after its
+    /// `hi`: kept a nanosecond before, dropped (and the drop persisted) at it,
+    /// whether read in RAM, at a restart or when a new step is recorded.
+    #[test]
+    fn test_regression_window_at_expires_a_carried_window_a_day_after_its_step() {
+        let dir = temp_dir("expiry");
+        let first = ClockStepLog::new();
+        first.bind(&dir, 0);
+        first.note(1_000 * SEC, 1_000 * SEC, 600 * SEC);
+        let recorded = first.window().expect("recorded");
+        first.persist_if_dirty();
+        let expires = recorded.1 + CLOCK_STEP_WINDOW_TTL_NANOS;
+
+        let restarted = ClockStepLog::new();
+        restarted.bind(&dir, expires - 1);
+        assert_eq!(restarted.window_at(expires - 1), Some(recorded));
+        restarted.persist_if_dirty();
+        assert_eq!(restarted.window_at(expires), None, "expired in RAM");
+        assert!(
+            restarted.dirty.load(Ordering::Acquire),
+            "the drop is persisted"
+        );
+        restarted.persist_if_dirty();
+        let third = ClockStepLog::new();
+        third.bind(&dir, expires - 1);
+        assert_eq!(third.window(), None, "the file was rewritten empty");
+
+        // Expired while the box was down: dropped at the boot.
+        let dir2 = temp_dir("expiry-down");
+        let old = ClockStepLog::new();
+        old.bind(&dir2, 0);
+        old.note(1_000 * SEC, 1_000 * SEC, 600 * SEC);
+        old.persist_if_dirty();
+        let booted = ClockStepLog::new();
+        booted.bind(&dir2, expires);
+        assert_eq!(booted.window(), None);
+        assert!(booted.dirty.load(Ordering::Acquire));
+
+        // A new step after expiry starts a new window, not a union with it.
+        let log = ClockStepLog::new();
+        log.note(1_000 * SEC, 1_000 * SEC, 600 * SEC);
+        let later = expires + 100 * SEC;
+        log.note(later, later, 10 * SEC);
+        assert_eq!(log.window(), Some((later - 40 * SEC, later + 40 * SEC)));
+        drop(std::fs::remove_dir_all(&dir));
+        drop(std::fs::remove_dir_all(&dir2));
+    }
+
+    #[test]
+    fn test_live_window_keeps_a_window_until_a_day_after_its_hi() {
+        assert_eq!(live_window(None, 0), None);
+        let w = Some((5, 10));
+        assert_eq!(live_window(w, 0), w);
+        assert_eq!(live_window(w, 10 + CLOCK_STEP_WINDOW_TTL_NANOS - 1), w);
+        assert_eq!(live_window(w, 10 + CLOCK_STEP_WINDOW_TTL_NANOS), None);
+        // A window ending near u64::MAX never wraps into an early expiry.
+        assert_eq!(
+            live_window(Some((1, u64::MAX)), u64::MAX - 1),
+            Some((1, u64::MAX))
+        );
     }
 
     #[test]

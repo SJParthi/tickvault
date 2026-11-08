@@ -44,8 +44,10 @@ pub const REPAIR_START_SECS_OF_DAY_IST: u32 =
 
 /// Days before today the repair also covers. Contract files are kept seven
 /// days (`ARTIFACT_RETENTION_DAYS`), so a day older than this has no names to
-/// give and is never tried.
-pub const REPAIR_LOOKBACK_DAYS: u32 = 7;
+/// give and is never tried. The partition archiver locks only partitions of
+/// these days for the repair, so it reads the same storage constant.
+pub const REPAIR_LOOKBACK_DAYS: u32 =
+    tickvault_storage::contract_name_repair::CONTRACT_NAME_REPAIR_LOOKBACK_DAYS;
 
 /// Wait after boot before the first check, so a boot's own frame-log replay
 /// and seal drain have finished before the repair reads the tables (the 9 Oct
@@ -315,6 +317,34 @@ mod tests {
                 "{table} is repaired but the archiver would not hold the repair out"
             );
         }
+    }
+
+    /// Recheck of PR AA finding 1 (narrowed): the archiver locks a partition
+    /// for the repair only when its day is one the repair visits. Every day
+    /// `repair_days` returns must be locked; a day well before them is not.
+    #[test]
+    fn test_every_repaired_day_is_locked_by_the_archiver() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).expect("date");
+        for day in repair_days("2026-11-08") {
+            for table in repair_tables() {
+                let hour = format!("{day}T10");
+                assert!(
+                    tickvault_storage::contract_name_repair::repair_may_rewrite_partition(
+                        table, &day, today
+                    ) && tickvault_storage::contract_name_repair::repair_may_rewrite_partition(
+                        table, &hour, today
+                    ),
+                    "{table} {day} is repaired but the archiver would not hold the repair out"
+                );
+            }
+        }
+        assert!(
+            !tickvault_storage::contract_name_repair::repair_may_rewrite_partition(
+                "ticks",
+                "2026-10-20T10",
+                today
+            )
+        );
     }
 
     #[test]

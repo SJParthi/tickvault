@@ -1664,6 +1664,9 @@ pub struct PartitionArchiver {
     /// Replaces the snapshot gate's poll interval in tests (`None` in
     /// production: [`snapshot_gate::SNAPSHOT_POLL`]).
     pause_override: Option<Duration>,
+    /// Replaces the IST day the pass reads for the contract name repair's
+    /// day range in tests (`None` in production: the wall clock).
+    repair_today_override: Option<chrono::NaiveDate>,
     /// Measure the bytes this pass leaves on the box (PR AA step 6); set by
     /// [`Self::with_backlog_measure`] for the daily leg only.
     measure_backlog: bool,
@@ -1912,6 +1915,7 @@ impl PartitionArchiver {
             quiesce: None,
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
+            repair_today_override: None,
             measure_backlog: false,
             spill_recheck_tables: Vec::new(),
             spill_pending_reader: std::sync::Arc::new(process_spill_pending),
@@ -1956,6 +1960,7 @@ impl PartitionArchiver {
             quiesce: None,
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
+            repair_today_override: None,
             measure_backlog: false,
             spill_recheck_tables: Vec::new(),
             spill_pending_reader: std::sync::Arc::new(process_spill_pending),
@@ -2019,6 +2024,14 @@ impl PartitionArchiver {
     // TEST-EXEMPT: test-only builder; covered by test_regression_spill_file_written_after_the_listing_holds_the_hour
     pub(crate) fn with_test_spill_reader(mut self, reader: SpillPendingReader) -> Self {
         self.spill_pending_reader = reader;
+        self
+    }
+
+    /// Test seam: the IST day the pass uses to decide which day-path
+    /// partitions the contract name repair can reach.
+    #[cfg(test)]
+    fn with_test_repair_today(mut self, today_ist: chrono::NaiveDate) -> Self {
+        self.repair_today_override = Some(today_ist);
         self
     }
 
@@ -2531,6 +2544,14 @@ impl PartitionArchiver {
         let mut attempted: u32 = 0;
         // PR AA step 2: set once the quiesce lock was busy for a full wait.
         let mut quiesce_busy = false;
+        // Recheck of PR AA finding 1 (narrowed): the repair rewrites only
+        // today and the days before it, so only those day-path partitions
+        // wait for it.
+        let repair_today = self.repair_today_override.unwrap_or_else(|| {
+            chrono::Utc::now()
+                .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+                .date_naive()
+        });
         for (index, (table, partition)) in worklist.into_iter().enumerate() {
             if let Some(cap) = cap
                 && exported >= cap
@@ -2584,12 +2605,17 @@ impl PartitionArchiver {
                 }
                 let gate = SnapshotGate::from_config(&self.cfg);
                 archive_with_snapshot_gate(self, table, &partition, gate, &mut summary).await
-            } else if crate::contract_name_repair::repair_may_rewrite(table) {
+            } else if crate::contract_name_repair::repair_may_rewrite_partition(
+                table,
+                &partition,
+                repair_today,
+            ) {
                 // Recheck of PR AA finding 1: the after-close contract name
-                // repair rewrites old partitions of this table in place (same
-                // count, same max(ts)), so its day path holds the old-hour
-                // writers out across the copy and the drop too. A busy lock
-                // holds this and every further locked partition, as above.
+                // repair rewrites partitions of its days in place (same
+                // count, same max(ts)), so the day path of such a partition
+                // holds the old-hour writers out across the copy and the drop
+                // too. A busy lock holds this and every further locked
+                // partition, as above; an older partition never waits.
                 if quiesce_busy {
                     summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
                     snapshot_gate::count_quiesce_busy_held(1);
@@ -2889,7 +2915,8 @@ impl PartitionArchiver {
     /// [`Self::process_one`] with the archiver side of the archive quiesce
     /// lock held from before the export to after the drop (recheck of PR AA
     /// finding 1), for a table the after-close contract name repair can
-    /// rewrite ([`crate::contract_name_repair::repair_may_rewrite`]). The
+    /// rewrite on one of its days
+    /// ([`crate::contract_name_repair::repair_may_rewrite_partition`]). The
     /// repair takes the writer side around its statement, so no repair
     /// statement runs between this export and this drop. A lock that cannot
     /// be taken within `archive_quiesce_wait_secs` keeps the partition
@@ -6323,9 +6350,13 @@ mod stub_integration_tests {
         assert!(!cfg.ticks_hour_path_enabled, "ticks takes the day path");
         assert!(!uses_snapshot_gate("ticks", &[]));
         assert!(crate::contract_name_repair::repair_may_rewrite("ticks"));
+        // 2026-04-01 is two days before this pass's IST day, a day the
+        // repair visits.
+        let repair_today = chrono::NaiveDate::from_ymd_opt(2026, 4, 3).expect("date");
         let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
             .await
-            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear));
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear))
+            .with_test_repair_today(repair_today);
 
         // The repair holds the writer side across its statement.
         let repair = quiesce
@@ -6354,6 +6385,54 @@ mod stub_integration_tests {
         let freed = archiver.run_archive_pass().await;
         assert_eq!(freed.dropped, 1, "{freed:?}");
         assert_eq!(freed.held_quiesce_busy, 0, "{freed:?}");
+    }
+
+    // Regression: recheck of the finding-1 fix (2026-11-08). The day-path
+    // lock covered every partition of a repaired table, so one 600 s repair
+    // statement kept the pressure leg from freeing partitions weeks older
+    // than anything the repair touches. Only a partition of a repair day
+    // waits now: with the repair holding the lock, an old hour is dropped
+    // and an hour of a repair day is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_day_path_locks_only_partitions_the_repair_can_reach() {
+        use snapshot_gate::InFlightVerdict;
+
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let repair = quiesce
+            .shared(Duration::from_secs(1))
+            .await
+            .expect("a free lock lets the repair in");
+        // (IST day of the pass, dropped, held busy): 2026-04-01 is 19 days
+        // old on 2026-04-20 (outside the repair days) and 1 day old on
+        // 2026-04-02 (inside).
+        for (today, dropped, busy) in [((2026, 4, 20), 1, 0), ((2026, 4, 2), 0, 1)] {
+            let (qdb_url, qdb_log) =
+                spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+            let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+            let objects = Arc::new(Mutex::new(HashMap::new()));
+            let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+            let cfg = PartitionRetentionConfig {
+                archive_quiesce_wait_secs: 1,
+                ..test_retention_cfg(200)
+            };
+            let day = chrono::NaiveDate::from_ymd_opt(today.0, today.1, today.2).expect("date");
+            let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+                .await
+                .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear))
+                .with_test_repair_today(day);
+            let summary = archiver.run_archive_pass().await;
+            assert_eq!(summary.dropped, dropped, "{day}: {summary:?}");
+            assert_eq!(summary.held_quiesce_busy, busy, "{day}: {summary:?}");
+            assert_eq!(summary.failed, 0, "{day}: {summary:?}");
+            let dropped_sent = qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION"));
+            assert_eq!(dropped_sent, dropped == 1, "{day}");
+        }
+        drop(repair);
     }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
