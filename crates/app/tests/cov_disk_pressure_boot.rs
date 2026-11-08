@@ -506,7 +506,7 @@ fn test_disk_pressure_boot_fold_pressure_pass_not_run_and_stood_aside_continue()
     assert!(!pressure_pass_due(PressureAction::ContinuePass, true, true));
     assert!(pressure_pass_due(PressureAction::Escalate, true, true));
     // pressure_config only ever shortens.
-    let p = pressure_config(&c);
+    let p = pressure_config(&c, false);
     assert!(p.under_disk_pressure);
     assert!(p.market_data_hot_days <= c.market_data_hot_days);
     assert!(p.depth_hot_days <= c.depth_hot_days);

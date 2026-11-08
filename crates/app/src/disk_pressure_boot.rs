@@ -191,8 +191,27 @@ pub const PRESSURE_PROBE_FAILING_POLLS: u32 = {
 /// candle tables — the heaviest class after depth — were structurally
 /// invisible to disk pressure. Benign only because the value happens to be 1
 /// today; at any larger value pressure could not touch them at all.
+///
+/// # A projected-only episode keeps the day windows (PR AA review finding 4)
+///
+/// `projected_only` is true for a pass of an episode the projected-fill
+/// trigger opened below high water (and that has not read high water since).
+/// Quote 51 lets the projection act on the hour partitions of the five hour
+/// tables only: "Candles, SEBI and audit tables keep their day windows". Such
+/// a pass therefore keeps every day window as configured and sets only the
+/// hour-path marker, as `daily_pass_config` does. Day-window compression is
+/// for used-space episodes (at or above high water).
 #[must_use]
-pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConfig {
+pub fn pressure_config(
+    cfg: &PartitionRetentionConfig,
+    projected_only: bool,
+) -> PartitionRetentionConfig {
+    if projected_only {
+        return PartitionRetentionConfig {
+            under_disk_pressure: true,
+            ..cfg.clone()
+        };
+    }
     let days = pressure_hot_days(cfg);
     PartitionRetentionConfig {
         // min(), never a bare assignment: pressure SHORTENS or does nothing.
@@ -210,6 +229,26 @@ pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConf
         under_disk_pressure: true,
         ..cfg.clone()
     }
+}
+
+/// Whether the pass about to run belongs to a projected-only episode (PR AA
+/// review finding 4), for [`pressure_config`].
+///
+/// The episode record is created only after its first pass, so a pass that
+/// STARTS an episode reads the volume directly: below high water, only the
+/// projection could have opened it. Every later pass reads the episode's
+/// `projected_only`, which `note_episode_level` clears once the volume reads
+/// high water. Pure, O(1).
+fn pass_is_projected_only(
+    state: &PressureState,
+    action: PressureAction,
+    used_pct: u8,
+    cfg: &PartitionRetentionConfig,
+) -> bool {
+    if matches!(action, PressureAction::StartEpisode) {
+        return used_pct < cfg.pressure_high_water_pct;
+    }
+    state.episode.is_some_and(|ep| ep.projected_only)
 }
 
 /// Free-space GAIN that invalidates the burn anchor.
@@ -738,7 +777,11 @@ async fn run_disk_pressure_loop(
                 if let Some(reason) = gate {
                     metrics::counter!(PASS_GATED_COUNTER, "reason" => reason.as_str()).increment(1);
                 }
-                let (pass, aside_for_depth_only) = run_one_pass(&questdb, &cfg, limits).await;
+                // PR AA review finding 4: a pass of a projected-only episode keeps
+                // the day windows (Quote 51: only the hour tables move).
+                let projected_only = pass_is_projected_only(&state, action, used, &cfg);
+                let (pass, aside_for_depth_only) =
+                    run_one_pass(&questdb, &cfg, limits, projected_only).await;
                 let pass = refund_off_session_progress(pass, off_session);
                 last_stood_aside = matches!(pass, PressurePass::StoodAside);
                 last_aside_for_depth_only = last_stood_aside && aside_for_depth_only;
@@ -1053,8 +1096,9 @@ async fn run_one_pass(
     questdb: &QuestDbConfig,
     cfg: &PartitionRetentionConfig,
     limits: ArchivePassLimits,
+    projected_only: bool,
 ) -> (PressurePass, bool) {
-    let pressure_cfg = pressure_config(cfg);
+    let pressure_cfg = pressure_config(cfg, projected_only);
     match PartitionArchiver::new(questdb, &pressure_cfg).await {
         Ok(Some(archiver)) => {
             let mut archiver = archiver.with_pass_limits(limits);
@@ -1606,7 +1650,7 @@ mod tests {
 
     #[test]
     fn pressure_config_compresses_market_data_not_audit() {
-        let p = pressure_config(&cfg());
+        let p = pressure_config(&cfg(), false);
         assert_eq!(
             p.market_data_hot_days, 2,
             "minute history compresses 35 -> 2"
@@ -1640,7 +1684,7 @@ mod tests {
             c.market_data_hot_days = configured;
             c.depth_hot_days = configured;
             c.intraday_hot_days = configured;
-            let p = pressure_config(&c);
+            let p = pressure_config(&c, false);
             assert!(
                 p.market_data_hot_days <= configured,
                 "market_data widened {configured} -> {}",
@@ -1666,7 +1710,7 @@ mod tests {
         for configured in [0_u32, 1, 35, u32::MAX] {
             let mut c = cfg();
             c.depth_hot_days = configured;
-            assert_eq!(pressure_config(&c).retention_days, 90);
+            assert_eq!(pressure_config(&c, false).retention_days, 90);
         }
     }
 
@@ -1674,7 +1718,7 @@ mod tests {
     fn pressure_config_cannot_reach_below_the_floor() {
         let mut c = cfg();
         c.pressure_hot_days = 0;
-        let p = pressure_config(&c);
+        let p = pressure_config(&c, false);
         assert_eq!(
             p.market_data_hot_days, 2,
             "today and yesterday stay untouchable even when the config asks for 0"
@@ -1684,12 +1728,98 @@ mod tests {
         assert_eq!(p.depth_hot_days, 1);
     }
 
+    // Regression: PR AA review finding 4 (2026-11-08). An episode the
+    // projected-fill trigger opened at 58% used went through this config and
+    // cut the candle and other market-data day windows 15 -> 2, so candle day
+    // partitions 3 to 15 days old were copied and dropped. Quote 51 lets the
+    // projection move only the hour tables; the day windows must stay.
+    #[test]
+    fn test_regression_projected_only_pass_keeps_the_day_windows() {
+        let mut c = cfg();
+        c.market_data_hot_days = 15;
+        c.depth_hot_days = 3;
+        c.intraday_hot_days = 4;
+        let p = pressure_config(&c, true);
+        assert_eq!(p.market_data_hot_days, 15, "candle day window kept");
+        assert_eq!(p.depth_hot_days, 3);
+        assert_eq!(p.intraday_hot_days, 4);
+        assert_eq!(p.retention_days, 90);
+        assert!(p.under_disk_pressure, "the hour path still runs");
+        assert_eq!(
+            p.market_depth_force_with_spill_pending, c.market_depth_force_with_spill_pending,
+            "nothing else changes"
+        );
+        let used_space = pressure_config(&c, false);
+        assert_eq!(used_space.market_data_hot_days, 2, "used-space compresses");
+        assert!(used_space.under_disk_pressure);
+    }
+
+    #[test]
+    fn test_pass_is_projected_only_reads_the_volume_then_the_episode() {
+        let c = cfg();
+        let high = c.pressure_high_water_pct;
+        let none = PressureState::default();
+        // A pass that opens the episode: below high water only the projection
+        // could have opened it.
+        assert!(pass_is_projected_only(
+            &none,
+            PressureAction::StartEpisode,
+            high - 17,
+            &c
+        ));
+        assert!(!pass_is_projected_only(
+            &none,
+            PressureAction::StartEpisode,
+            high,
+            &c
+        ));
+        // Later passes follow the episode's own flag.
+        let mut st = PressureState::default();
+        apply_action(&mut st, PressureAction::StartEpisode, 0, Some(1));
+        assert!(!pass_is_projected_only(
+            &st,
+            PressureAction::ContinuePass,
+            high - 17,
+            &c
+        ));
+        if let Some(ep) = st.episode.as_mut() {
+            ep.projected_only = true;
+        }
+        assert!(pass_is_projected_only(
+            &st,
+            PressureAction::ContinuePass,
+            high - 17,
+            &c
+        ));
+        assert!(!pass_is_projected_only(
+            &none,
+            PressureAction::ContinuePass,
+            high - 17,
+            &c
+        ));
+    }
+
+    #[test]
+    fn test_projected_only_reaches_the_pass_config() {
+        // Source scan: the loop computes the flag and the pass builds its
+        // config from it, so a projected episode can never take the
+        // compressing config.
+        let src = include_str!("disk_pressure_boot.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("pass_is_projected_only(&state, action, used, &cfg)")
+                && prod.contains("run_one_pass(&questdb, &cfg, limits, projected_only)")
+                && prod.contains("pressure_config(cfg, projected_only)"),
+            "the projected-only flag must reach pressure_config"
+        );
+    }
+
     #[test]
     fn pressure_config_preserves_everything_else() {
         let mut c = cfg();
         c.archive_bucket = "tv-prod-cold".to_string();
         c.max_partitions_per_run = 200;
-        let p = pressure_config(&c);
+        let p = pressure_config(&c, false);
         assert_eq!(p.archive_bucket, "tv-prod-cold");
         assert_eq!(p.max_partitions_per_run, 200);
         assert!(p.archive_enabled, "the pass still needs the archive leg on");
