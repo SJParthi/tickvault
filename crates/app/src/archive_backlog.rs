@@ -28,8 +28,20 @@
 //! could cut it off. The pass's own result replaces it; a pass that did not
 //! run its sweep removes it.
 //!
-//! A cross-verification hold or an hour whose rows are still in flight is
-//! not counted (the pass leaves them out), so they never keep the box up.
+//! A cross-verification hold is not counted. An hour whose rows are still in
+//! flight is left out only when a pass REACHED it; an hour no pass reached
+//! (not listed yet, or the pass was quiesce-busy, WAL-blocked or capped) is
+//! counted. ⚠ CORRECTED 2026-11-09 (PR AA review finding 12): this line said
+//! every in-flight hour was left out, which held for reached hours only. Since
+//! then a depth hour no acknowledgement can clear before the next session
+//! (depth rows stop at the graced end of the day's arrival window) is left out
+//! whether or not a pass reached it
+//! (`snapshot_gate::depth_hour_cannot_clear_tonight`), so the 15:00 depth hour
+//! no longer holds the box until about 20:00. After midnight the previous
+//! IST day's Muhurat status comes from the installed trading calendar, so the
+//! hour stays out on an ordinary night (review of finding 12, same day: it
+//! came back at 00:00 before); with no calendar installed the Muhurat end is
+//! assumed and it is counted again (keeps more). Tick-sink hours still count.
 //! `[partition_retention] drain_hold_counts_archive = false` means the daily
 //! leg never publishes, so nothing here holds.
 //!

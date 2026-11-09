@@ -78,9 +78,15 @@
 //! - Unknown (not verified against QuestDB 9.3.5): whether QuestDB cancels
 //!   an `/exec` `INSERT … SELECT` when the client gives up at that timeout.
 //!   So a statement that got no answer keeps the lock while QuestDB lists a
-//!   query starting `INSERT INTO <table> (` in `query_activity()` (the 9.3.5
-//!   console reads that function; its `query` column is Assumed, not checked
-//!   on a live 9.3.5), sends it `CANCEL QUERY` once at half the settle
+//!   query starting `INSERT INTO <table> (` in `query_activity()` (its
+//!   `query_id` LONG and `query` STRING columns, the stored text being the
+//!   statement as sent, and the `CANCEL QUERY <id>` syntax were checked
+//!   2026-11-09 against the QuestDB 9.3.5 source:
+//!   `core/src/main/java/io/questdb/griffin/engine/functions/activity/QueryActivityFunctionFactory.java`,
+//!   `griffin/QueryRegistry.java`, `griffin/SqlCompilerImpl.java::compileCancel`
+//!   and the HTTP `INSERT … SELECT` case in `cutlass/http/QueryRegistryTest.java`,
+//!   at <https://github.com/questdb/questdb/tree/9.3.5>; not yet run against
+//!   the live box), sends it `CANCEL QUERY` once at half the settle
 //!   budget, and then needs two polls [`TABLE_QUIET_POLL_SECS`] apart with no
 //!   such query and the same committed, applied transaction. An unreadable
 //!   query list counts as "still running". Past the budget the lock is
