@@ -112,7 +112,7 @@ use crate::partition_manager::{
     DAY_PARTITIONED_TABLES, HOUR_PARTITIONED_TABLES, RETENTION_EXEMPT_TABLES,
     build_closed_hour_list_sql, build_detach_list_sql, build_partition_size_sql,
     is_valid_partition_name, parse_partition_rows, parse_partition_sizes,
-    select_partitions_to_detach, sum_partition_bytes_on_day,
+    select_partitions_to_detach,
 };
 use crate::s3_cold::{
     S3Cold, S3ObjectMeta, Sha256Writer, base64_encode, hex_encode, resolve_archive_bucket,
@@ -124,6 +124,8 @@ use crate::wal_suspension_watcher::WalTableRow;
 mod snapshot_gate;
 // PR AA step 3 (owner Quote 51): which tables take the hour path in a pass.
 mod hour_path;
+// PR AA review finding 11: bytes of hour-path partitions dropped per IST day.
+mod drop_tally;
 
 use hour_path::{
     HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
@@ -279,6 +281,46 @@ pub const fn archive_space_verdict(free_bytes: Option<u64>, floor: u64) -> Archi
 
 /// HTTP timeout for DDL / count / drop statements (mirrors the detach path).
 const ARCHIVE_DDL_TIMEOUT_SECS: u64 = 30;
+
+/// HTTP timeout for the drop tally's size listing just before a drop's
+/// last-moment recount (review of PR AA finding 11, 2026-11-09). On a
+/// snapshot-gate table it runs under the exclusive quiesce lock, so it is
+/// kept well under [`ARCHIVE_DDL_TIMEOUT_SECS`]; a listing that does not
+/// answer in time records the pass-start size instead (a sizing estimate,
+/// never a drop decision).
+const PRE_DROP_SIZE_LISTING_TIMEOUT_SECS: u64 = 5;
+
+/// Why [`PartitionArchiver::session_bytes_on`] gave no reading (review of PR
+/// AA finding 11, 2026-11-09).
+#[derive(Debug)]
+pub enum SessionBytesError {
+    /// A size listing failed; a later reading may succeed.
+    Unread(anyhow::Error),
+    /// The drop tally cannot complete the day in this process (a dropped
+    /// partition of unknown size is gone, or the day overflowed the tally).
+    /// Reading again never succeeds; the caller leaves the day out.
+    Refused(&'static str),
+}
+
+impl SessionBytesError {
+    /// Whether reading the same day again in this process can succeed.
+    /// Pure, O(1).
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        matches!(self, Self::Unread(_))
+    }
+}
+
+impl std::fmt::Display for SessionBytesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unread(err) => write!(f, "session size listing failed: {err:#}"),
+            Self::Refused(reason) => write!(f, "session size refused: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionBytesError {}
 
 /// HTTP timeout for a single partition `/exp` CSV export. Generous — an
 /// hourly `ticks` partition can be hundreds of MB of CSV; the stream is
@@ -1465,6 +1507,32 @@ pub(crate) fn add_pending_hour_sizes(
     }
 }
 
+/// Removes from `sizes` every depth-table hour no acknowledgement can clear
+/// before the next session opens (PR AA review finding 12,
+/// [`snapshot_gate::depth_hour_cannot_clear_tonight`]): such an hour reads
+/// `NotAcked` in every pass tonight, so counting it kept the drain hold up
+/// for work no pass could do (about an hour, until it was listed and a pass
+/// reached it, and again after any pass that did not reach it). Every other
+/// entry stays. Pure, O(sizes).
+pub(crate) fn retain_copyable_tonight(
+    sizes: &mut std::collections::HashMap<(&'static str, String), u64>,
+    now_ist: chrono::NaiveDateTime,
+    muhurat_active: bool,
+    muhurat_yesterday: Option<bool>,
+    clock_trusted: bool,
+) {
+    sizes.retain(|(table, partition), _| {
+        !snapshot_gate::depth_hour_cannot_clear_tonight(
+            table,
+            partition,
+            now_ist,
+            muhurat_active,
+            muhurat_yesterday,
+            clock_trusted,
+        )
+    });
+}
+
 /// The bytes of `sizes` not in `settled` (dropped, or held in flight).
 /// Saturating. Pure, O(sizes).
 #[must_use]
@@ -1667,6 +1735,9 @@ pub struct PartitionArchiver {
     /// Replaces the IST day the pass reads for the contract name repair's
     /// day range in tests (`None` in production: the wall clock).
     repair_today_override: Option<chrono::NaiveDate>,
+    /// Replaces the IST instant the drain-hold backlog measure reads in
+    /// tests (`None` in production: the wall clock, read once per measure).
+    backlog_now_override: Option<chrono::NaiveDateTime>,
     /// Measure the bytes this pass leaves on the box (PR AA step 6); set by
     /// [`Self::with_backlog_measure`] for the daily leg only.
     measure_backlog: bool,
@@ -1677,6 +1748,16 @@ pub struct PartitionArchiver {
     /// Whether a table's own spill folder holds a file the replay has not
     /// read: [`process_spill_pending`] in production, scripted in tests.
     spill_pending_reader: SpillPendingReader,
+    /// Where drops of hour-path-table partitions are recorded per IST day
+    /// (PR AA review finding 11): the process tally in production.
+    dropped_tally: &'static drop_tally::HourPathDropTally,
+    /// `diskSize` of each hour-path-table partition this pass may drop,
+    /// listed at the pass start before any quiesce lock (finding 11).
+    drop_sizes: std::collections::HashMap<(String, String), u64>,
+    /// Whether the arrival-to-sequence mapping the drain-hold backlog's
+    /// depth-hour exclusion relies on holds (PR AA review finding 12):
+    /// [`snapshot_gate::process_depth_ack_bound_trusted`] in production.
+    depth_ack_bound_trusted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// How the archiver reads a table's spill folder (PR AA review).
@@ -1916,9 +1997,15 @@ impl PartitionArchiver {
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
             repair_today_override: None,
+            backlog_now_override: None,
             measure_backlog: false,
             spill_recheck_tables: Vec::new(),
             spill_pending_reader: std::sync::Arc::new(process_spill_pending),
+            dropped_tally: drop_tally::process_drop_tally(),
+            drop_sizes: std::collections::HashMap::new(),
+            depth_ack_bound_trusted: std::sync::Arc::new(
+                snapshot_gate::process_depth_ack_bound_trusted,
+            ),
         }))
     }
 
@@ -1961,9 +2048,15 @@ impl PartitionArchiver {
             in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
             pause_override: None,
             repair_today_override: None,
+            backlog_now_override: None,
             measure_backlog: false,
             spill_recheck_tables: Vec::new(),
             spill_pending_reader: std::sync::Arc::new(process_spill_pending),
+            dropped_tally: drop_tally::process_drop_tally(),
+            drop_sizes: std::collections::HashMap::new(),
+            depth_ack_bound_trusted: std::sync::Arc::new(
+                snapshot_gate::process_depth_ack_bound_trusted,
+            ),
         })
     }
 
@@ -2106,25 +2199,126 @@ impl PartitionArchiver {
     /// any row, is an error, so a partial sum is never recorded as a whole
     /// session. Five list queries, O(partitions), cold path.
     ///
+    /// PR AA review finding 11: partitions of the day that either archive leg
+    /// already dropped are added back from the process drop tally
+    /// ([`drop_tally`]), so a day the disk-pressure leg drained does not read
+    /// low. A dropped partition the listing still shows (DROP refused,
+    /// unanswered, or not applied yet) is counted once, from the listing; a
+    /// gone one of unknown size makes the reading an error. Limit: the tally
+    /// is RAM only, so drops before a restart that day are not counted.
+    ///
     /// # Errors
-    /// The list query failed, answered non-2xx, or could not be parsed.
-    pub async fn session_bytes_on(&self, day: chrono::NaiveDate) -> Result<u64> {
-        let mut total: u64 = 0;
+    /// [`SessionBytesError::Unread`]: a list query failed, answered non-2xx,
+    /// or could not be parsed (a later reading may succeed).
+    /// [`SessionBytesError::Refused`]: a partition of the day is gone from
+    /// the listing with no known size, or the day recorded more drops than
+    /// the tally keeps; neither clears in this process, so reading again
+    /// never succeeds.
+    pub async fn session_bytes_on(
+        &self,
+        day: chrono::NaiveDate,
+    ) -> std::result::Result<u64, SessionBytesError> {
+        let mut listings: Vec<(&str, Vec<(String, u64)>)> =
+            Vec::with_capacity(HOUR_PATH_TABLES.len());
         for table in HOUR_PATH_TABLES {
-            let rows = self.partition_sizes(table).await?;
-            total = total.saturating_add(sum_partition_bytes_on_day(&rows, day));
+            let rows = self
+                .partition_sizes(table)
+                .await
+                .map_err(SessionBytesError::Unread)?;
+            listings.push((table, rows));
         }
-        Ok(total)
+        // Read AFTER every listing: a DROP is recorded before it is sent, so
+        // any partition a listing no longer shows is in this read
+        // ([`drop_tally::session_bytes_with_drops`]).
+        let drops = self.dropped_tally.read(day);
+        let views: Vec<(&str, &[(String, u64)])> = listings
+            .iter()
+            .map(|(table, rows)| (*table, rows.as_slice()))
+            .collect();
+        drop_tally::session_bytes_with_drops(&views, day, &drops)
+            .map_err(SessionBytesError::Refused)
+    }
+
+    /// Records `table`'s `partition` in the drop tally for its IST day, with
+    /// its size, when it is an hour-path-table partition (PR AA review
+    /// finding 11). Called by `recheck_and_drop` BEFORE the last-moment
+    /// recount, whatever the recount and the DROP then answer: a lost DROP
+    /// answer may hide a DROP that ran, and a partition still listed is
+    /// counted from the listing. Any other table: nothing. Cold.
+    async fn record_drop_in_tally(&self, table: &str, partition: &str) {
+        let Some(hour_table) = HOUR_PATH_TABLES.iter().copied().find(|t| *t == table) else {
+            return;
+        };
+        let Some(day) = drop_tally::partition_day(partition) else {
+            return;
+        };
+        let size = self.size_just_before_drop(hour_table, partition).await;
+        self.dropped_tally.record(day, hour_table, partition, size);
+    }
+
+    /// `diskSize` of `table`'s `partition` read just before its last-moment
+    /// recount (review of PR AA finding 11): for a snapshot-gate table under
+    /// the quiesce lock and after the WAL wait; on the exact
+    /// `writerTxn == sequencerTxn` gate after that gate, with no lock. Rows
+    /// applied since the pass-start listing are counted. Runs BEFORE the
+    /// recount (never between it and the DROP) and is bounded by
+    /// [`PRE_DROP_SIZE_LISTING_TIMEOUT_SECS`], so on a gated table it adds at
+    /// most that to the exclusive lock hold. Falls back to the pass-start
+    /// size when this listing fails or does not show the partition; `None`
+    /// when neither is known. One list query, O(partitions), cold, once per
+    /// hour-path drop attempt.
+    async fn size_just_before_drop(&self, table: &str, partition: &str) -> Option<u64> {
+        let fresh = match self
+            .partition_sizes_within(
+                table,
+                Some(Duration::from_secs(PRE_DROP_SIZE_LISTING_TIMEOUT_SECS)),
+            )
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .find(|(name, _)| name == partition)
+                .map(|(_, bytes)| bytes),
+            Err(err) => {
+                info!(
+                    table,
+                    partition,
+                    error = %format!("{err:#}"),
+                    "partition archive: size listing just before the drop failed; the \
+                     pass-start size is recorded for it"
+                );
+                None
+            }
+        };
+        fresh.or_else(|| {
+            self.drop_sizes
+                .get(&(table.to_string(), partition.to_string()))
+                .copied()
+        })
     }
 
     /// `(name, diskSize)` of every partition of `table`; empty when QuestDB
     /// reports the table absent. One list query, O(partitions), cold.
     async fn partition_sizes(&self, table: &str) -> Result<Vec<(String, u64)>> {
+        self.partition_sizes_within(table, None).await
+    }
+
+    /// [`Self::partition_sizes`] with an optional per-request timeout shorter
+    /// than the client's ([`ARCHIVE_DDL_TIMEOUT_SECS`]).
+    async fn partition_sizes_within(
+        &self,
+        table: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<(String, u64)>> {
         let sql = build_partition_size_sql(table);
-        let response = self
+        let mut request = self
             .ddl_client
             .get(&self.exec_url)
-            .query(&[("query", &sql)])
+            .query(&[("query", &sql)]);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request
             .send()
             .await
             .context("partition size query failed")?;
@@ -2143,6 +2337,57 @@ impl PartitionArchiver {
         }
         parse_partition_sizes(&body)
             .with_context(|| format!("partition size list for {table} had no readable diskSize"))
+    }
+
+    /// `diskSize` of each partition of `worklist` on an hour-path table (PR AA
+    /// review finding 11), taken from `measured` when the pass already listed
+    /// it, else from one size listing per such table. It is the FALLBACK for
+    /// [`Self::size_just_before_drop`], which lists again under the lock; a
+    /// partition neither listing sizes is recorded with no known size (the
+    /// day's session reading refuses only once it is gone). O(worklist ×
+    /// partitions), at most five queries, cold, before any quiesce lock.
+    async fn hour_path_drop_sizes(
+        &self,
+        worklist: &[(&'static str, String)],
+        measured: Option<&std::collections::HashMap<(&'static str, String), u64>>,
+    ) -> std::collections::HashMap<(String, String), u64> {
+        let mut sizes = std::collections::HashMap::new();
+        for table in HOUR_PATH_TABLES {
+            let wanted: Vec<&(&'static str, String)> =
+                worklist.iter().filter(|(t, _)| t == table).collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            if let Some(measured) = measured
+                && wanted.iter().all(|key| measured.contains_key(*key))
+            {
+                for key in wanted {
+                    if let Some(bytes) = measured.get(key) {
+                        sizes.insert((key.0.to_string(), key.1.clone()), *bytes);
+                    }
+                }
+                continue;
+            }
+            match self.partition_sizes(table).await {
+                Ok(rows) => {
+                    for (name, bytes) in rows {
+                        if wanted.iter().any(|(_, p)| *p == name) {
+                            sizes.insert((table.to_string(), name), bytes);
+                        }
+                    }
+                }
+                Err(err) => {
+                    info!(
+                        table,
+                        error = %format!("{err:#}"),
+                        "partition archive: pass-start size listing failed; a drop in this \
+                         pass records the size listed just before it, or no known size \
+                         when that listing fails too"
+                    );
+                }
+            }
+        }
+        sizes
     }
 
     /// The bytes of each partition of `worklist` (PR AA step 6), one size
@@ -2164,9 +2409,14 @@ impl PartitionArchiver {
             .collect();
         tables.sort_unstable();
         tables.dedup();
-        let now =
-            chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
-        let (now_ist, today_ist) = (now.naive_local(), now.date_naive());
+        // One clock reading for the whole measure (review of finding 12: a
+        // test that read the clock again could straddle 09:00 or midnight).
+        let now_ist = self.backlog_now_override.unwrap_or_else(|| {
+            chrono::Utc::now()
+                .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+                .naive_local()
+        });
+        let today_ist = now_ist.date();
         let held_by_crossverify = |partition: &str| {
             self.verified_day_gate.as_ref().is_some_and(|gate| {
                 crossverify_hold_decision(partition, today_ist, |d| gate(d))
@@ -2200,6 +2450,16 @@ impl PartitionArchiver {
                 }
             }
         }
+        // PR AA review finding 12: a depth hour no ack can clear before the
+        // next session is not copy work tonight, reached by this pass or not.
+        let yesterday = today_ist - chrono::TimeDelta::days(1);
+        retain_copyable_tonight(
+            &mut sizes,
+            now_ist,
+            tickvault_common::muhurat::current(),
+            tickvault_common::market_hours::installed_calendar_says_muhurat(yesterday),
+            (self.depth_ack_bound_trusted)(),
+        );
         Some(sizes)
     }
 
@@ -2527,6 +2787,15 @@ impl PartitionArchiver {
             worklist
         };
         let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
+        // PR AA review finding 11: the pass-start size of every hour-path
+        // partition this pass may drop (the fallback for the listing taken
+        // just before each drop's recount), read before any quiesce lock.
+        // Review of the fix (2026-11-09): read AFTER the depth skip, the
+        // WAL-lag removal and the per-run cap, so a table the pass cannot
+        // drop from is never listed for it.
+        self.drop_sizes = self
+            .hour_path_drop_sizes(&worklist, backlog_sizes.as_ref())
+            .await;
         summary.held_by_gate = held_depth;
         summary.partitions_considered = worklist.len() as u32;
 
@@ -3148,7 +3417,12 @@ impl PartitionArchiver {
         let CopiedPartition { proof, s3_key, .. } = copied;
         let table = proof.table().to_string();
         let partition = proof.partition().to_string();
-        match self.drop_partition(&proof).await {
+        // PR AA review finding 11: the drop-tally record of this partition
+        // was made by `ArchiveIo::note_drop_intent`, BEFORE the last-moment
+        // recount (review of the fix, 2026-11-09): no query runs between
+        // that recount and this DROP.
+        let dropped = self.drop_partition(&proof).await;
+        match dropped {
             Ok(()) => {
                 summary.dropped = summary.dropped.saturating_add(1);
                 summary.rows_archived = summary.rows_archived.saturating_add(proof.rows);
@@ -3188,8 +3462,9 @@ impl PartitionArchiver {
                     code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
                     table,
                     partition,
-                    "partition DROP failed AFTER verified S3 archive — partition kept, \
-                     retried next run (S3 copy is durable)"
+                    "partition DROP failed AFTER verified S3 archive — partition kept and \
+                     retried next run (S3 copy is durable); if only the answer was lost, \
+                     QuestDB may already have dropped it"
                 );
             }
         }
@@ -3859,6 +4134,10 @@ impl ArchiveIo for PartitionArchiver {
     ) -> Option<CopiedPartition> {
         self.copy_and_verify_partition(table, partition, start, end, summary)
             .await
+    }
+
+    async fn note_drop_intent(&mut self, table: &str, partition: &str) {
+        self.record_drop_in_tally(table, partition).await;
     }
 
     async fn recount_range(&mut self, table: &str, start: &str, end: &str) -> Option<RangeTally> {
@@ -6233,7 +6512,7 @@ mod stub_integration_tests {
         let audit = PartitionArchiveAuditWriter::with_conf(&format!(
             "http::addr={ilp_addr};protocol_version=1;retry_timeout=0;request_timeout=5000;"
         ));
-        PartitionArchiver::from_parts(
+        let mut archiver = PartitionArchiver::from_parts(
             format!("{qdb_url}/exec"),
             format!("{qdb_url}/exp"),
             s3,
@@ -6242,7 +6521,11 @@ mod stub_integration_tests {
             cfg,
             audit,
         )
-        .expect("test archiver")
+        .expect("test archiver");
+        // Each test archiver records drops in its own tally (finding 11),
+        // so parallel tests never read each other's drops.
+        archiver.dropped_tally = Box::leak(Box::new(drop_tally::HourPathDropTally::new()));
+        archiver
     }
 
     const CSV: &str = "ts,security_id\n1,13\n2,25\n3,51\n"; // header + 3 rows
@@ -6564,6 +6847,271 @@ mod stub_integration_tests {
         assert_eq!(freed.dropped, 1, "once the marks clear the hour goes");
     }
 
+    /// How [`forgetting_responder`] answers (PR AA review finding 11 and its
+    /// review).
+    #[derive(Debug, Clone, Copy)]
+    struct ForgetStub {
+        /// Size listings of the table answer 500 until a DROP arrives.
+        fail_sizes_until_drop: bool,
+        /// Status of the DROP answer. A non-2xx status here still APPLIES the
+        /// drop (when `apply_drops`): the DROP ran and only its answer was
+        /// lost or wrong.
+        drop_status: u16,
+        /// A DROP removes the partition from later size listings. `false`:
+        /// QuestDB accepted it but has not applied it yet.
+        apply_drops: bool,
+        /// Bytes every partition gains on each size listing after the first
+        /// (rows applied after the pass-start listing).
+        grow_after_first_listing: u64,
+    }
+
+    impl ForgetStub {
+        const PLAIN: Self = Self {
+            fail_sizes_until_drop: false,
+            drop_status: 200,
+            apply_drops: true,
+            grow_after_first_listing: 0,
+        };
+    }
+
+    /// A QuestDB stub over `inner` that forgets each partition once a DROP
+    /// names it (size listings for `table` then omit it), shaped by `stub`.
+    fn forgetting_responder(
+        inner: Responder,
+        table: &'static str,
+        partitions: Vec<&'static str>,
+        stub: ForgetStub,
+    ) -> Responder {
+        let dropped: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listings = Arc::new(AtomicU64::new(0));
+        Arc::new(move |req: &SeenRequest| {
+            let t = &req.target;
+            if let Some(at) = t.find("DROP PARTITION LIST '") {
+                let rest = &t[at + "DROP PARTITION LIST '".len()..];
+                if let Some(end) = rest.find('\'') {
+                    dropped
+                        .lock()
+                        .expect("dropped")
+                        .push(rest[..end].to_string());
+                }
+                if stub.drop_status != 200 {
+                    return (
+                        stub.drop_status,
+                        Vec::new(),
+                        b"{\"error\":\"answer lost\"}".to_vec(),
+                    );
+                }
+            }
+            if t.contains("diskSize") && t.contains(&format!("table_partitions('{table}')")) {
+                let gone = dropped.lock().expect("dropped").clone();
+                if stub.fail_sizes_until_drop && gone.is_empty() {
+                    return (500, Vec::new(), b"{\"error\":\"boom\"}".to_vec());
+                }
+                let earlier = listings.fetch_add(1, Ordering::SeqCst);
+                let bytes = STUB_PARTITION_BYTES
+                    + if earlier == 0 {
+                        0
+                    } else {
+                        stub.grow_after_first_listing
+                    };
+                let rows: Vec<String> = partitions
+                    .iter()
+                    .filter(|p| !stub.apply_drops || !gone.iter().any(|g| g == *p))
+                    .map(|p| format!("[\"{p}\",{bytes}]"))
+                    .collect();
+                let body = format!(
+                    "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"diskSize\"}}],\
+                     \"dataset\":[{}]}}",
+                    rows.join(",")
+                );
+                return (200, Vec::new(), body.into_bytes());
+            }
+            inner(req)
+        })
+    }
+
+    /// One pass that copies and sends a DROP for the oldest of two
+    /// `market_depth` hours of 2026-11-07 (cap 1), then the archiver it ran
+    /// on. `dropped` is the count the pass must report.
+    async fn archiver_after_one_drop(stub: ForgetStub, dropped: u32) -> PartitionArchiver {
+        archiver_and_log_after_one_drop(stub, dropped).await.0
+    }
+
+    /// [`archiver_after_one_drop`], also returning the QuestDB request log.
+    async fn archiver_and_log_after_one_drop(
+        stub: ForgetStub,
+        dropped: u32,
+    ) -> (PartitionArchiver, Arc<Mutex<Vec<SeenRequest>>>) {
+        use snapshot_gate::InFlightVerdict;
+        let table = crate::depth_persistence::MARKET_DEPTH_TABLE;
+        let partitions = vec!["2026-11-07T09", "2026-11-07T14"];
+        let inner = qdb_responder_listing(
+            table,
+            partitions.clone(),
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        );
+        let (qdb_url, qdb_log) =
+            spawn_stub(forgetting_responder(inner, table, partitions, stub)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(1))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_t, _s| InFlightVerdict::Clear));
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, dropped, "{summary:?}");
+        (archiver, qdb_log)
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. The drop-tally
+    // size listing ran AFTER the last-moment recount, so a slow listing (up
+    // to 30 s) opened a gap between the proof the partition is unchanged and
+    // the DROP. The recount is now the last query before the DROP.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_recount_is_the_last_query_before_the_drop() {
+        let (_archiver, log) = archiver_and_log_after_one_drop(ForgetStub::PLAIN, 1).await;
+        let targets: Vec<String> = log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .map(|r| r.target.clone())
+            .collect();
+        let drop_at = targets
+            .iter()
+            .position(|t| t.contains("DROP PARTITION LIST"))
+            .expect("a DROP was sent");
+        assert!(drop_at > 0, "{targets:?}");
+        assert!(
+            targets[drop_at - 1].contains("SELECT count(), max(ts)"),
+            "the request before the DROP must be the recount: {:?}",
+            &targets[..=drop_at]
+        );
+        // The size listing for the tally still ran, before the recount.
+        let size_listings = targets[..drop_at]
+            .iter()
+            .filter(|t| t.contains("diskSize FROM table_partitions('market_depth')"))
+            .count();
+        assert!(size_listings >= 2, "pass-start + pre-recount: {targets:?}");
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. A dropped
+    // partition gone with no known size refuses the reading PERMANENTLY
+    // (`Refused`, not retryable): no later tick of this process can read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_unknown_dropped_size_is_a_permanent_refusal() {
+        let stub = ForgetStub {
+            fail_sizes_until_drop: true,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        let err = archiver
+            .session_bytes_on(day_2026_11_07())
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, SessionBytesError::Refused(_)), "{err}");
+        assert!(!err.retryable());
+        assert!(SessionBytesError::Unread(anyhow::anyhow!("boom")).retryable());
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    fn day_2026_11_07() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("date")
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 11. A partition another
+    // archive pass (the disk-pressure leg) already dropped that day is added
+    // back to the day's session bytes; the listing alone read 1,000, not 2,000.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_counts_partitions_a_pressure_pass_dropped() {
+        let archiver = archiver_after_one_drop(ForgetStub::PLAIN, 1).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * STUB_PARTITION_BYTES
+        );
+        let other = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+        assert_eq!(archiver.session_bytes_on(other).await.expect("reads"), 0);
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 11. A drop whose size no
+    // listing could read, once its partition is gone, makes the day's reading
+    // an error, never a short sum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_session_bytes_on_refuses_a_day_with_an_unknown_dropped_size() {
+        let stub = ForgetStub {
+            fail_sizes_until_drop: true,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        assert!(archiver.session_bytes_on(day_2026_11_07()).await.is_err());
+    }
+
+    // Regression: 2026-11-09 — review of PR AA finding 11. QuestDB ran the
+    // DROP but its answer came back as an error (a lost or late answer reads
+    // the same). The tally recorded "not dropped" and the day read 1,000 with
+    // no error; it now reads 2,000.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_counts_a_drop_whose_answer_was_lost() {
+        let stub = ForgetStub {
+            drop_status: 500,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 0).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * STUB_PARTITION_BYTES
+        );
+    }
+
+    // Regression: 2026-11-09 — review of PR AA finding 11. QuestDB accepted
+    // the DROP but has not applied it, so the partition is still listed. The
+    // listing plus the tally read it twice (3,000); it is counted once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_counts_an_unapplied_drop_once() {
+        let stub = ForgetStub {
+            apply_drops: false,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * STUB_PARTITION_BYTES
+        );
+    }
+
+    // Regression: 2026-11-09 — review of PR AA finding 11. Rows applied after
+    // the pass-start listing are in the dropped partition; its size is read
+    // again just before the DROP, so the day reads both hours at their
+    // applied size, not the dropped one at its pass-start size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_drop_records_the_size_listed_just_before_it() {
+        let grow = 700;
+        let stub = ForgetStub {
+            grow_after_first_listing: grow,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * (STUB_PARTITION_BYTES + grow)
+        );
+    }
+
     /// PR AA step 6 (AA-5): a pass asked to measure reports the bytes of the
     /// partitions it could have acted on and left on the box: not the ones
     /// it dropped, not the ones it held in flight. A pass not asked reports
@@ -6782,6 +7330,127 @@ mod stub_integration_tests {
         assert_eq!(
             backlog_bytes_left(&sizes, &std::collections::HashSet::new()),
             27
+        );
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 12. At 18:30 the 15:00
+    // depth hours (and any 15:00 hour on the worklist) were counted as copy
+    // work although depth rows stop at 15:44 and no ack can pass 16:00 before
+    // tomorrow's session; the tick-sink hour and every earlier hour stay.
+    #[test]
+    fn test_retain_copyable_tonight_and_add_pending_hour_sizes_leave_out_a_depth_hour_that_cannot_clear_tonight()
+     {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 9)
+            .and_then(|d| d.and_hms_opt(18, 30, 0))
+            .expect("now");
+        let rows: Vec<(String, u64)> = [("2026-11-09T14", 14_u64), ("2026-11-09T15", 15)]
+            .into_iter()
+            .map(|(n, b)| (n.to_string(), b))
+            .collect();
+        let mut sizes = std::collections::HashMap::new();
+        for table in ["market_depth", "market_depth_book", "tick_quotes"] {
+            add_pending_hour_sizes(table, 4, &rows, now, |_| true, &mut sizes);
+        }
+        // A worklist entry of the same hour (listed, not yet reached).
+        sizes.insert(("market_depth", "2026-11-08T15".to_string()), 7);
+        let before = sizes.clone();
+        retain_copyable_tonight(&mut sizes, now, false, None, true);
+        let mut got: Vec<(&str, &str)> = sizes.keys().map(|(t, p)| (*t, p.as_str())).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                ("market_depth", "2026-11-08T15"),
+                ("market_depth", "2026-11-09T14"),
+                ("market_depth_book", "2026-11-09T14"),
+                ("tick_quotes", "2026-11-09T14"),
+                ("tick_quotes", "2026-11-09T15"),
+            ]
+        );
+        // An untrusted clock or a Muhurat evening keeps everything.
+        let mut untrusted = before.clone();
+        retain_copyable_tonight(&mut untrusted, now, false, None, false);
+        assert_eq!(untrusted, before);
+        let mut muhurat = before.clone();
+        retain_copyable_tonight(&mut muhurat, now, true, None, true);
+        assert_eq!(muhurat, before);
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 12, through a whole
+    // pass. The quiesce lock is busy (a replay intent), so the pass reaches
+    // no partition; the depth hour no ack can clear before the next session
+    // is not reported as copy work, the earlier one still is.
+    //
+    // Review of finding 12 (2026-11-09): the test named its partitions from
+    // the wall clock and the pass read the clock again, so it could fail at
+    // 09:00 or midnight IST, and between 09:00 and 16:00 its "stuck" hour had
+    // not ended and passed with the fix removed. The pass now takes one
+    // injected instant (18:30 IST), so the outcome is the same at any hour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_busy_pass_leaves_out_a_depth_hour_that_cannot_clear_tonight() {
+        use snapshot_gate::InFlightVerdict;
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 9)
+            .and_then(|d| d.and_hms_opt(18, 30, 0))
+            .expect("now");
+        let (stuck, earlier) = ("2026-11-09T15", "2026-11-08T15");
+        let backlog = |muhurat_active: bool| {
+            let stuck_excluded = snapshot_gate::depth_hour_cannot_clear_tonight(
+                crate::depth_persistence::MARKET_DEPTH_TABLE,
+                stuck,
+                now,
+                muhurat_active,
+                None,
+                true,
+            );
+            if stuck_excluded {
+                STUB_PARTITION_BYTES
+            } else {
+                2 * STUB_PARTITION_BYTES
+            }
+        };
+        assert_eq!(
+            backlog(false),
+            STUB_PARTITION_BYTES,
+            "the 15:00 hour is stuck"
+        );
+        let responder = qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec![earlier, stuck],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        );
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let _replay = quiesce.intend_replay();
+        let (qdb_url, _qdb_log) = spawn_stub(responder).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(10))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_t, _s| InFlightVerdict::NotAcked))
+            .with_backlog_measure();
+        archiver.depth_ack_bound_trusted = Arc::new(|| true);
+        archiver.backlog_now_override = Some(now);
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 0, "{summary:?}");
+        assert!(summary.held_quiesce_busy > 0, "{summary:?}");
+        // The process Muhurat flag is read by the pass; on its usual `false`
+        // only the earlier hour is copy work tonight.
+        assert_eq!(
+            summary.archive_backlog_bytes,
+            Some(backlog(tickvault_common::muhurat::current())),
+            "{summary:?}"
+        );
+        // An untrusted clock keeps the stuck hour counted (the production
+        // guard's own truth table is in snapshot_gate's tests).
+        archiver.depth_ack_bound_trusted = Arc::new(|| false);
+        let untrusted = archiver.run_archive_pass().await;
+        assert_eq!(
+            untrusted.archive_backlog_bytes,
+            Some(2 * STUB_PARTITION_BYTES),
+            "{untrusted:?}"
         );
     }
 
@@ -7515,6 +8184,49 @@ mod stub_integration_tests {
                 .expect("objects")
                 .contains_key("tv-test-cold/questdb-partitions/ticks/2026-04-01T09.csv.gz"),
             "the OLDEST partition goes first (monotonic progress)"
+        );
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. The pass-start
+    // drop-size listing ran before the depth skip, so a pressure pass that
+    // could not drop a depth hour still listed both depth tables for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_pass_start_size_listing_skips_tables_the_pass_cannot_drop() {
+        // Only `market_depth` has partitions to archive.
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09", "2026-04-01T10"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let _summary = archiver.run_archive_pass().await;
+        let depth_listings: Vec<String> = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| {
+                r.target
+                    .contains("diskSize FROM table_partitions('market_depth')")
+                    || r.target
+                        .contains("diskSize FROM table_partitions('market_depth_book')")
+            })
+            .map(|r| r.target.clone())
+            .collect();
+        assert!(
+            depth_listings.is_empty(),
+            "a depth-skipping pass lists no depth sizes: {depth_listings:?}"
         );
     }
 

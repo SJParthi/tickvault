@@ -245,6 +245,11 @@ struct World {
     max_seq: u64,
     too_big: HashSet<(usize, i64)>,
     violations: Vec<String>,
+    /// In-flight verdicts that read `ClockAhead` with no clock step this
+    /// night: always a model fault (PR AA review finding 8).
+    clock_ahead_unstepped: u64,
+    /// Hours dropped by a pass inside the session (13:00 to 15:59 IST).
+    in_session_drops: u64,
     cfg: PartitionRetentionConfig,
     /// Hours back from now that the hour SQL selects by its START.
     hour_offset: i64,
@@ -295,6 +300,8 @@ impl World {
             max_seq: 0,
             too_big: HashSet::new(),
             violations: Vec::new(),
+            clock_ahead_unstepped: 0,
+            in_session_drops: 0,
             cfg,
             hour_offset,
             marks_version: 0,
@@ -329,6 +336,13 @@ impl World {
     }
 
     fn push_batch(&mut self, table: usize, ist_secs: i64, rows: u64, state: BatchState) {
+        // PR AA review finding 8: nothing is received after the clock.
+        if ist_secs > self.now_ist {
+            self.violations.push(format!(
+                "SIM future_stamp table {table} at {ist_secs} now {}",
+                self.now_ist
+            ));
+        }
         let hour = self.hour_index(ist_secs);
         let seq = Self::seq_at(ist_secs);
         let id = self.batches.len();
@@ -541,6 +555,9 @@ impl World {
     /// The drop, with invariants 1, 3, 4, 5, 6 and 7.
     fn drop_hour(&mut self, table: usize, hour: i64, key: &str) {
         let name = TABLES[table].0;
+        if (13..=15).contains(&self.hour_index(self.now_ist).rem_euclid(24)) {
+            self.in_session_drops += 1;
+        }
         if !super::hour_path::HOUR_PATH_TABLES.contains(&name) {
             self.violations.push(format!("EXEMPT_TABLE {name}"));
         }
@@ -675,7 +692,11 @@ impl ArchiveIo for SimIo<'_> {
         if !self.tick() {
             return InFlightVerdict::WalNotBound;
         }
-        self.world.in_flight(self.table, span)
+        let verdict = self.world.in_flight(self.table, span);
+        if verdict == InFlightVerdict::ClockAhead && self.world.night.clock_step_secs == 0 {
+            self.world.clock_ahead_unstepped += 1;
+        }
+        verdict
     }
 
     async fn pause_for(&mut self, _duration: Duration) {
@@ -752,6 +773,8 @@ impl ArchiveIo for SimIo<'_> {
             verified_tally: Some(tally),
         })
     }
+
+    async fn note_drop_intent(&mut self, _table: &str, _partition: &str) {}
 
     async fn recount_range(&mut self, _t: &str, _s: &str, _e: &str) -> Option<RangeTally> {
         if !self.tick() {
@@ -1052,7 +1075,20 @@ fn simulate_world(params: Params, mutation: Mutation, days: i64) -> (Vec<String>
                 .day
                 .stall
                 .is_some_and(|(s, e)| (s..e).contains(&hour_of_day));
-            ingest_hour(&mut world, hour_of_day);
+            // PR AA review finding 8: the pass instant is drawn first, so the
+            // hour's rows land on either side of it and none is stamped after
+            // the clock that observes it (a future stamp read as ClockAhead
+            // and hid the in-session drop path).
+            let in_session_pass = world.day.session && (13..=15).contains(&hour_of_day);
+            let night_pass = !(7..16).contains(&hour_of_day);
+            let hour_start = world.now_ist;
+            let hour_last = hour_start + HOUR_SECS - 1;
+            let pass_at = (in_session_pass || night_pass)
+                .then(|| hour_start + (1 + i64::try_from(world.rng.below(58)).unwrap_or(0)) * 60);
+            let mut arrivals = draw_hour(&mut world, hour_of_day);
+            let landed_until = pass_at.unwrap_or(hour_last);
+            world.now_ist = landed_until;
+            land(&mut world, &mut arrivals, landed_until);
             world.background();
             for _ in 0..4 {
                 world.old_hour_writer();
@@ -1063,14 +1099,13 @@ fn simulate_world(params: Params, mutation: Mutation, days: i64) -> (Vec<String>
                 wal.writer = wal.writer.max(behind.min(wal.sequencer));
                 wal.previous_step = wal.sequencer;
             }
-            let in_session_pass = world.day.session && (13..=15).contains(&hour_of_day);
-            let night_pass = !(7..16).contains(&hour_of_day);
-            if in_session_pass || night_pass {
-                let minute = 1 + i64::try_from(world.rng.below(58)).unwrap_or(0);
-                world.now_ist += minute * 60;
+            if pass_at.is_some() {
                 run_pass(&mut world, &runtime, in_session_pass.then_some(1));
                 last_wall = world.wall_ist();
             }
+            world.now_ist = hour_last;
+            land(&mut world, &mut arrivals, hour_last);
+            assert!(arrivals.is_empty(), "every row of the hour has landed");
         }
     }
     // Invariant 2: every received row is in S3 or still on the box.
@@ -1093,15 +1128,27 @@ fn simulate_world(params: Params, mutation: Mutation, days: i64) -> (Vec<String>
     (std::mem::take(&mut world.violations), world)
 }
 
+/// One row batch of the hour, drawn before it lands.
+struct Arrival {
+    table: usize,
+    at: i64,
+    rows: u64,
+    state: BatchState,
+}
+
 /// The session's rows for one hour: ticks and depth, shed and stalled.
-fn ingest_hour(world: &mut World, hour_of_day: i64) {
+/// Drawn at the hour's start and landed by [`land`] once the clock reaches
+/// each stamp (PR AA review finding 8: they were pushed at once, up to an
+/// hour ahead of the pass that read them).
+fn draw_hour(world: &mut World, hour_of_day: i64) -> Vec<Arrival> {
     let session_hour = (world.day.session && (9..=15).contains(&hour_of_day))
         || (world.day.muhurat && hour_of_day == 18);
     if !session_hour {
-        return;
+        return Vec::new();
     }
     let batches = 1 + world.day.volume_pct / 100;
     let mut hour_rows = [0_u64; 2];
+    let mut arrivals = Vec::new();
     for _ in 0..batches {
         for table in 0..TABLES.len() {
             let at = world.now_ist + i64::try_from(world.rng.below(3_600)).unwrap_or(0);
@@ -1118,18 +1165,15 @@ fn ingest_hour(world: &mut World, hour_of_day: i64) {
             } else {
                 BatchState::Committed(0)
             };
-            world.push_batch(table, at, rows, state);
-            let id = world.batches.len() - 1;
-            if matches!(state, BatchState::Committed(_)) {
-                world.commit(id);
-            }
             if table < 2 {
                 hour_rows[table] += rows;
-                if !matches!(state, BatchState::InFlight | BatchState::Spilled) {
-                    let sink = World::sink(table);
-                    world.acked_max[sink] = world.acked_max[sink].max(World::seq_at(at));
-                }
             }
+            arrivals.push(Arrival {
+                table,
+                at,
+                rows,
+                state,
+            });
         }
     }
     let hour = world.hour_index(world.now_ist);
@@ -1138,6 +1182,24 @@ fn ingest_hour(world: &mut World, hour_of_day: i64) {
             world.too_big.insert((table, hour));
         }
     }
+    arrivals
+}
+
+/// Lands every drawn batch stamped at or before `upto`, in draw order.
+fn land(world: &mut World, arrivals: &mut Vec<Arrival>, upto: i64) {
+    for arrival in arrivals.iter().filter(|a| a.at <= upto) {
+        world.push_batch(arrival.table, arrival.at, arrival.rows, arrival.state);
+        let id = world.batches.len() - 1;
+        if matches!(arrival.state, BatchState::Committed(_)) {
+            world.commit(id);
+        }
+        if arrival.table < 2 && !matches!(arrival.state, BatchState::InFlight | BatchState::Spilled)
+        {
+            let sink = World::sink(arrival.table);
+            world.acked_max[sink] = world.acked_max[sink].max(World::seq_at(arrival.at));
+        }
+    }
+    arrivals.retain(|a| a.at > upto);
 }
 
 fn kinds(violations: &[String]) -> BTreeSet<String> {
@@ -1207,6 +1269,24 @@ fn test_sim_exercises_drops_sidecars_and_holds() {
         sidecars > 0,
         "an hour re-created by a late spill row goes to a sidecar key"
     );
+}
+
+/// PR AA review finding 8: the model never reads its own future rows as a
+/// clock running ahead, and the in-session pressure path really drops
+/// hours under the real protocol (it was masked by that false ClockAhead).
+#[test]
+fn test_sim_drops_in_session_without_a_false_clock_ahead() {
+    let mut in_session_drops = 0_u64;
+    for seed in 0..16_u64 {
+        let (violations, world) = simulate_world(params_for(seed), Mutation::None, 30);
+        assert!(violations.is_empty(), "seed {seed}: {violations:?}");
+        assert_eq!(
+            world.clock_ahead_unstepped, 0,
+            "seed {seed}: ClockAhead with no clock step"
+        );
+        in_session_drops += world.in_session_drops;
+    }
+    assert!(in_session_drops > 0, "an in-session pass must drop an hour");
 }
 
 #[test]

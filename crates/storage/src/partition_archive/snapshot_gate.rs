@@ -157,6 +157,114 @@ pub(crate) fn hour_frame_seq_span(partition: &str) -> Option<HourFrameSpan> {
     })
 }
 
+/// The latest IST instant a depth row can be received before the next
+/// regular session opens at 09:00 IST (PR AA review finding 12): the end of
+/// the graced arrival window of the session day of `now_ist` (15:40 IST plus
+/// `ARRIVAL_GRACE_TAIL_SECS`, or the Muhurat evening window's graced end when
+/// `muhurat_active`). Before 09:00 the session day is yesterday, judged by
+/// `muhurat_yesterday` (the installed trading calendar's answer for the
+/// previous IST date); `None`, no calendar, uses the Muhurat end (keeps
+/// more). Corrected 2026-11-09 (review of finding 12): this said a process
+/// booted after midnight "cannot know" yesterday's status, so after
+/// midnight every ordinary night counted the 15:00 depth hour as copy work
+/// again; the calendar knows. Pure, O(1).
+#[must_use]
+pub(crate) fn last_depth_arrival_ist(
+    now_ist: chrono::NaiveDateTime,
+    muhurat_active: bool,
+    muhurat_yesterday: Option<bool>,
+) -> chrono::NaiveDateTime {
+    use tickvault_common::constants::{
+        ARRIVAL_GRACE_TAIL_SECS, MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+        TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    };
+    let midnight = now_ist.date().and_time(chrono::NaiveTime::MIN);
+    let since_midnight = now_ist - midnight;
+    let before_open =
+        since_midnight < chrono::TimeDelta::seconds(i64::from(TICK_PERSIST_START_SECS_OF_DAY_IST));
+    let (day_start, end_secs) = if before_open {
+        let end = if muhurat_yesterday == Some(false) {
+            TICK_PERSIST_END_SECS_OF_DAY_IST
+        } else {
+            MUHURAT_PERSIST_END_SECS_OF_DAY_IST
+        };
+        (midnight - chrono::TimeDelta::days(1), end)
+    } else if muhurat_active {
+        (midnight, MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+    } else {
+        (midnight, TICK_PERSIST_END_SECS_OF_DAY_IST)
+    };
+    day_start + chrono::TimeDelta::seconds(i64::from(end_secs) + i64::from(ARRIVAL_GRACE_TAIL_SECS))
+}
+
+/// Whether no depth acknowledgement can pass `partition`'s NotAcked line
+/// before the next session opens (PR AA review finding 12), so no pass
+/// tonight can copy it and the drain hold must not wait for it.
+///
+/// A depth row is refused once its arrival is past
+/// [`last_depth_arrival_ist`], so every depth ack until 09:00 carries a frame
+/// sequence of at most that instant plus [`RECEIPT_SLOP_NANOS`]. When that is
+/// at or below the gate's own line (`span.hi + REPLAY_REORDER_SLACK_SEQ`,
+/// [`hour_in_flight_verdict`]), the hour reads `NotAcked` all night. Depth
+/// tables only: the tick sink can still acknowledge while the main feed
+/// delivers. `false` for a malformed name or when `clock_trusted` is false (a
+/// recorded wall-clock step or a frame counter ahead of the wall breaks the
+/// arrival-to-sequence mapping): the hour then stays counted. Pure, O(1).
+#[must_use]
+pub(crate) fn depth_hour_cannot_clear_tonight(
+    table: &str,
+    partition: &str,
+    now_ist: chrono::NaiveDateTime,
+    muhurat_active: bool,
+    muhurat_yesterday: Option<bool>,
+    clock_trusted: bool,
+) -> bool {
+    if !clock_trusted || !DEPTH_TABLES.contains(&table) {
+        return false;
+    }
+    let Some(span) = hour_frame_seq_span(partition) else {
+        return false;
+    };
+    let last = last_depth_arrival_ist(now_ist, muhurat_active, muhurat_yesterday);
+    let Some(last_utc) = last
+        .and_utc()
+        .timestamp()
+        .checked_sub(i64::from(IST_UTC_OFFSET_SECONDS))
+        .and_then(|s| u64::try_from(s).ok())
+        .and_then(|s| s.checked_mul(NANOS_PER_SEC))
+    else {
+        return false;
+    };
+    let max_future_ack = last_utc.saturating_add(RECEIPT_SLOP_NANOS);
+    max_future_ack <= span.hi.saturating_add(REPLAY_REORDER_SLACK_SEQ)
+}
+
+/// Whether this process's clock maps arrivals to frame sequences (finding
+/// 12): no wall-clock step window recorded and the frame counter not ahead of
+/// the wall. Cold, O(1).
+#[must_use]
+pub(crate) fn process_depth_ack_bound_trusted() -> bool {
+    depth_ack_bound_trusted(
+        crate::wal_clock_step::clock_step_window().is_some(),
+        crate::ws_frame_spill::current_frame_seq(),
+        crate::wal_applied_watermark::wall_nanos(),
+    )
+}
+
+/// [`process_depth_ack_bound_trusted`] over its three readings (review of
+/// finding 12: the wrapper had no test). Trusted only with no step window
+/// recorded and `last_frame_seq` at most [`CLOCK_AHEAD_LIMIT_NANOS`] ahead
+/// of `wall_nanos`, the same lead [`hour_in_flight_verdict`] reads as
+/// `ClockAhead` past. Pure, O(1).
+#[must_use]
+pub(crate) fn depth_ack_bound_trusted(
+    step_window_recorded: bool,
+    last_frame_seq: u64,
+    wall_nanos: u64,
+) -> bool {
+    !step_window_recorded && last_frame_seq <= wall_nanos.saturating_add(CLOCK_AHEAD_LIMIT_NANOS)
+}
+
 /// One reading of a table's WAL against a snapshot target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalSnapshotVerdict {
@@ -412,28 +520,70 @@ pub(crate) fn clock_step_window_settled(
     ticks.wal_bound && frame_hold(span, ticks).is_none() && frame_hold(span, depth).is_none()
 }
 
+/// The process state [`process_in_flight_verdict`] reads, borrowed so a test
+/// can pass instances it owns (PR AA review finding 9): the global
+/// watermark, mark table and step log are shared by every test in the
+/// binary, so a test over them could assert only what any answer satisfies.
+/// The two counters are read through closures at the point the verdict
+/// reads them, after the step-window retire, as before. Cold.
+pub(crate) struct ProcessInFlightState<'a> {
+    /// The applied watermark (the process one: `applied_watermark()`).
+    pub(crate) watermark: &'a crate::wal_applied_watermark::AppliedWatermark,
+    /// The after-close depth marks (the process one: `deferred_depth()`).
+    pub(crate) deferred: &'a crate::wal_deferred_depth::DeferredDepth,
+    /// The recorded wall-clock step window.
+    pub(crate) clock_window: &'a dyn Fn() -> Option<(u64, u64)>,
+    /// Drops the step window when settled; whether it was dropped.
+    pub(crate) retire_clock_window: &'a dyn Fn((u64, u64), bool) -> bool,
+    /// The newest frame sequence minted in this process.
+    pub(crate) last_frame_seq: &'a dyn Fn() -> u64,
+    /// The wall clock now, UTC nanoseconds.
+    pub(crate) wall_nanos: &'a dyn Fn() -> u64,
+}
+
 /// [`hour_in_flight_verdict`] over this process's live state: the applied
 /// watermark, the after-close depth marks (depth tables only), the rescue
 /// floors, the newest frame sequence and the wall clock. Cold, O(bounded
 /// tables).
 #[must_use]
 pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InFlightVerdict {
-    let watermark = crate::wal_applied_watermark::applied_watermark();
+    process_in_flight_verdict_on(
+        &ProcessInFlightState {
+            watermark: crate::wal_applied_watermark::applied_watermark(),
+            deferred: crate::wal_deferred_depth::deferred_depth(),
+            clock_window: &crate::wal_clock_step::clock_step_window,
+            retire_clock_window: &crate::wal_clock_step::retire_clock_step_window_if_settled,
+            last_frame_seq: &crate::ws_frame_spill::current_frame_seq,
+            wall_nanos: &crate::wal_applied_watermark::wall_nanos,
+        },
+        table,
+        span,
+    )
+}
+
+/// [`process_in_flight_verdict`] over `state`. Cold, O(bounded tables).
+#[must_use]
+pub(crate) fn process_in_flight_verdict_on(
+    state: &ProcessInFlightState<'_>,
+    table: &str,
+    span: HourFrameSpan,
+) -> InFlightVerdict {
+    let watermark = state.watermark;
     let applied = watermark.snapshot();
     let sink = sink_for_table(table);
     let deferred = DEPTH_TABLES
         .contains(&table)
-        .then(|| crate::wal_deferred_depth::deferred_depth().snapshot());
+        .then(|| state.deferred.snapshot());
     let acked_high = match sink {
         AppliedSink::Depth => applied.hwm_depth,
         AppliedSink::Ticks => applied.hwm_ticks,
     };
-    let mut clock_step = crate::wal_clock_step::clock_step_window();
+    let mut clock_step = (state.clock_window)();
     // PR AA finding 2 recheck: a step window that holds nothing on its way
     // for either sink is dropped (and the drop persisted), so a window from
     // a step long ago does not keep judging later hours against all of it.
     if let Some(window) = clock_step {
-        let depth_marks = crate::wal_deferred_depth::deferred_depth().snapshot();
+        let depth_marks = state.deferred.snapshot();
         let sink_inputs = |sink: AppliedSink, deferred| InFlightInputs {
             wal_bound: watermark.is_bound(),
             applied: &applied,
@@ -452,8 +602,8 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
             &sink_inputs(AppliedSink::Ticks, None),
             &sink_inputs(AppliedSink::Depth, Some(&depth_marks)),
         );
-        if crate::wal_clock_step::retire_clock_step_window_if_settled(window, settled) {
-            clock_step = crate::wal_clock_step::clock_step_window();
+        if (state.retire_clock_window)(window, settled) {
+            clock_step = (state.clock_window)();
         }
     }
     let inputs = InFlightInputs {
@@ -462,8 +612,8 @@ pub(crate) fn process_in_flight_verdict(table: &str, span: HourFrameSpan) -> InF
         deferred: deferred.as_ref(),
         rescue_floor_lowest: watermark.rescue_floor_lowest(sink),
         acked_high,
-        last_frame_seq: crate::ws_frame_spill::current_frame_seq(),
-        wall_nanos: crate::wal_applied_watermark::wall_nanos(),
+        last_frame_seq: (state.last_frame_seq)(),
+        wall_nanos: (state.wall_nanos)(),
         clock_step,
     };
     hour_in_flight_verdict(span, &inputs)
@@ -519,6 +669,14 @@ pub(crate) trait ArchiveIo {
         end: &str,
         summary: &mut ArchiveRunSummary,
     ) -> impl Future<Output = Option<CopiedPartition>> + Send;
+
+    /// Records that a DROP of `table`'s `partition` may follow, with its size
+    /// (PR AA review finding 11). Called BEFORE the last-moment recount,
+    /// never between the recount and the DROP: the recount is the proof the
+    /// partition still matches its S3 copy, and nothing slow may run after
+    /// it (review of the finding-11 fix, 2026-11-09).
+    fn note_drop_intent(&mut self, table: &str, partition: &str)
+    -> impl Future<Output = ()> + Send;
 
     /// `count()` and `max(ts)` over the partition range now.
     fn recount_range(
@@ -722,6 +880,12 @@ pub(crate) async fn recheck_and_drop<I: ArchiveIo>(
     copied: CopiedPartition,
     summary: &mut ArchiveRunSummary,
 ) -> PartitionStep {
+    // Review of the finding-11 fix (2026-11-09): the drop-tally size listing
+    // runs HERE, before the recount, so the recount stays the last query
+    // before the DROP. Recording a partition the recount then keeps is
+    // harmless: it is still listed, so the session reading counts it from
+    // the listing.
+    io.note_drop_intent(table, partition).await;
     let recheck = io.recount_range(table, start, end).await;
     match recheck {
         Some(ref now)
@@ -1508,19 +1672,452 @@ mod tests {
         assert_eq!(labels.len(), all.len());
     }
 
-    /// The process reader runs end to end on this process's live state.
-    /// Other tests in this binary may bind or ack the global watermark, so
-    /// only the shape is asserted: it answers, and an hour far in the future
-    /// is never clear (no ack can be past it).
+    fn ist(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .and_then(|date| date.and_hms_opt(h, min, s))
+            .expect("valid IST instant")
+    }
+
+    /// PR AA review finding 12: the depth hours no ack can clear before the
+    /// next session, on a normal day, a Muhurat day, after midnight, and at
+    /// the 09:00 switch; never a tick-sink table, a malformed name, or with
+    /// an untrusted clock.
     #[test]
-    fn test_process_in_flight_verdict_reads_the_process_state() {
-        let verdict = process_in_flight_verdict(DEPTH, the_span());
-        assert!(!verdict.as_str().is_empty());
-        let far = hour_frame_seq_span("2099-01-01T10").expect("span");
-        assert_ne!(
-            process_in_flight_verdict(DEPTH, far),
+    fn test_last_depth_arrival_ist_and_depth_hour_cannot_clear_tonight_boundaries() {
+        let evening = ist(2026, 11, 9, 18, 30, 0);
+        assert_eq!(
+            last_depth_arrival_ist(evening, false, None),
+            ist(2026, 11, 9, 15, 44, 0)
+        );
+        let cannot = |table: &str, p: &str, now, muhurat, trusted| {
+            depth_hour_cannot_clear_tonight(table, p, now, muhurat, None, trusted)
+        };
+        // Normal day: the 15:00 hour (ends 16:00) waits for tomorrow's acks.
+        assert!(cannot(DEPTH, "2026-11-09T15", evening, false, true));
+        assert!(cannot(
+            "market_depth_book",
+            "2026-11-09T15",
+            evening,
+            false,
+            true
+        ));
+        assert!(!cannot(DEPTH, "2026-11-09T14", evening, false, true));
+        assert!(!cannot(DEPTH, "2026-11-08T15", evening, false, true));
+        // Tick-sink tables keep counting (their sink can still ack).
+        assert!(!cannot(
+            "tick_quotes",
+            "2026-11-09T15",
+            evening,
+            false,
+            true
+        ));
+        assert!(!cannot("ticks", "2026-11-09T15", evening, false, true));
+        // Untrusted clock or a malformed name: counted.
+        assert!(!cannot(DEPTH, "2026-11-09T15", evening, false, false));
+        assert!(!cannot(DEPTH, "2026-11-09X15", evening, false, true));
+        // Muhurat day: depth rows arrive until 19:34, so 15:00 to 18:00 can
+        // still clear tonight; 19:00 cannot.
+        let late = ist(2026, 11, 9, 21, 0, 0);
+        assert!(!cannot(DEPTH, "2026-11-09T15", late, true, true));
+        assert!(!cannot(DEPTH, "2026-11-09T18", late, true, true));
+        assert!(cannot(DEPTH, "2026-11-09T19", late, true, true));
+        // After midnight with no calendar the previous day's Muhurat status
+        // is unknown, so its graced end is used whatever the flag says.
+        let night = ist(2026, 11, 10, 2, 0, 0);
+        assert_eq!(
+            last_depth_arrival_ist(night, false, None),
+            ist(2026, 11, 9, 19, 34, 0)
+        );
+        assert!(!cannot(DEPTH, "2026-11-09T15", night, false, true));
+        assert!(cannot(DEPTH, "2026-11-09T19", night, false, true));
+        // Regression: 2026-11-09 — review of finding 12. With the calendar
+        // saying yesterday was an ordinary day, the 15:00 hour stays out of
+        // the backlog after midnight too (it came back at 00:00 before);
+        // yesterday a Muhurat day keeps it counted.
+        assert_eq!(
+            last_depth_arrival_ist(night, false, Some(false)),
+            ist(2026, 11, 9, 15, 44, 0)
+        );
+        assert_eq!(
+            last_depth_arrival_ist(night, true, Some(true)),
+            ist(2026, 11, 9, 19, 34, 0)
+        );
+        let ordinary_yesterday =
+            |p: &str| depth_hour_cannot_clear_tonight(DEPTH, p, night, false, Some(false), true);
+        assert!(ordinary_yesterday("2026-11-09T15"));
+        assert!(!ordinary_yesterday("2026-11-09T14"));
+        assert!(!depth_hour_cannot_clear_tonight(
+            DEPTH,
+            "2026-11-09T15",
+            night,
+            false,
+            Some(true),
+            true
+        ));
+        // The flag about TODAY never decides a before-09:00 reading.
+        assert_eq!(
+            last_depth_arrival_ist(night, true, Some(false)),
+            ist(2026, 11, 9, 15, 44, 0)
+        );
+        // At 09:00 the session day moves to today.
+        let before_open = ist(2026, 11, 10, 8, 59, 59);
+        let at_open = ist(2026, 11, 10, 9, 0, 0);
+        assert!(cannot(DEPTH, "2026-11-09T19", before_open, false, true));
+        assert!(!cannot(DEPTH, "2026-11-09T19", at_open, false, true));
+        assert_eq!(
+            last_depth_arrival_ist(at_open, false, None),
+            ist(2026, 11, 10, 15, 44, 0)
+        );
+    }
+
+    proptest::proptest! {
+        /// PR AA review finding 12: the exclusion is exactly "the highest ack
+        /// any depth row can still carry reads NotAcked at the gate", so it
+        /// can never leave out an hour the gate could clear tonight.
+        #[test]
+        fn proptest_cannot_clear_tonight_agrees_with_the_gate(
+            day in 1_u32..=28,
+            hour in 0_u32..=23,
+            now_day_offset in 0_i64..=1,
+            now_secs in 0_i64..86_400,
+            muhurat in proptest::bool::ANY,
+            yesterday in proptest::option::of(proptest::bool::ANY),
+        ) {
+            let partition = format!("2026-02-{day:02}T{hour:02}");
+            let now = ist(2026, 2, day, 0, 0, 0)
+                + chrono::TimeDelta::days(now_day_offset)
+                + chrono::TimeDelta::seconds(now_secs);
+            let span = hour_frame_seq_span(&partition).expect("span");
+            let last = last_depth_arrival_ist(now, muhurat, yesterday);
+            let last_utc = u64::try_from(
+                last.and_utc().timestamp() - i64::from(IST_UTC_OFFSET_SECONDS),
+            )
+            .expect("after epoch")
+                * NANOS_PER_SEC;
+            let highest_ack = last_utc + RECEIPT_SLOP_NANOS;
+            let applied = AppliedSnapshot::default();
+            let inputs = InFlightInputs {
+                acked_high: highest_ack,
+                last_frame_seq: highest_ack.max(span.hi) + 3_600 * SEC,
+                wall_nanos: highest_ack.max(span.hi) + 3_600 * SEC,
+                ..clear_inputs(&applied, span)
+            };
+            let gate_holds = hour_in_flight_verdict(span, &inputs) == InFlightVerdict::NotAcked;
+            proptest::prop_assert_eq!(
+                depth_hour_cannot_clear_tonight(DEPTH, &partition, now, muhurat, yesterday, true),
+                gate_holds
+            );
+        }
+    }
+
+    /// A fresh temp directory for a test-owned watermark (never the global).
+    fn reader_test_dir(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tv-pifv-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The process reader over test-owned state reads each input it is
+    /// given (PR AA review finding 9): unbound, unacked, the right sink's
+    /// ack and rescue floor, the after-close marks on depth tables only,
+    /// the clock lead, and the step window with its retire.
+    #[test]
+    fn test_process_in_flight_verdict_on_reads_each_process_input() {
+        use crate::wal_clock_step::ClockStepLog;
+        const TICKS: &str = "ticks";
+        const BOOK: &str = "market_depth_book";
+        let span = the_span();
+        let past_span = span.hi + REPLAY_REORDER_SLACK_SEQ + 1;
+        let wall = span.hi + 3_600 * SEC;
+        let no_window = || None;
+        let no_retire = |_w: (u64, u64), _s: bool| false;
+        let at_wall = || wall;
+        let verdict_with =
+            |wm: &AppliedWatermark, marks: &DeferredDepth, last: &dyn Fn() -> u64, table: &str| {
+                process_in_flight_verdict_on(
+                    &ProcessInFlightState {
+                        watermark: wm,
+                        deferred: marks,
+                        clock_window: &no_window,
+                        retire_clock_window: &no_retire,
+                        last_frame_seq: last,
+                        wall_nanos: &at_wall,
+                    },
+                    table,
+                    span,
+                )
+            };
+        let marks = DeferredDepth::new_for_tests();
+
+        // 1. Unbound: nothing can be proven, for either sink.
+        let unbound = AppliedWatermark::new_for_tests();
+        assert_eq!(
+            verdict_with(&unbound, &marks, &at_wall, DEPTH),
+            InFlightVerdict::WalNotBound
+        );
+        assert_eq!(
+            verdict_with(&unbound, &marks, &at_wall, TICKS),
+            InFlightVerdict::WalNotBound
+        );
+
+        // 2. Bound, nothing acked.
+        let dir = reader_test_dir("acks");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, DEPTH),
+            InFlightVerdict::NotAcked
+        );
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, TICKS),
+            InFlightVerdict::NotAcked
+        );
+
+        // 3. Each table reads its own sink's acknowledgement.
+        wm.note_depth_acked(past_span);
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, DEPTH),
             InFlightVerdict::Clear
         );
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, TICKS),
+            InFlightVerdict::NotAcked
+        );
+        wm.note_ticks_acked(past_span);
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, TICKS),
+            InFlightVerdict::Clear
+        );
+
+        // 4. A depth rescue floor holds depth tables only.
+        let floor = wm
+            .hold_rescue_floor(AppliedSink::Depth, span.lo, span.hi)
+            .expect("free slot");
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, DEPTH),
+            InFlightVerdict::RescueFloor
+        );
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, TICKS),
+            InFlightVerdict::Clear
+        );
+        wm.release_rescue_floor(floor);
+        assert_eq!(
+            verdict_with(&wm, &marks, &at_wall, DEPTH),
+            InFlightVerdict::Clear
+        );
+
+        // 5. After-close marks hold the depth tables, never a tick table.
+        let shed = DeferredDepth::new_for_tests();
+        shed.note_shed(span.lo + SEC, ShedDepth::Inline);
+        assert_eq!(
+            verdict_with(&wm, &shed, &at_wall, DEPTH),
+            InFlightVerdict::DeferredDepth
+        );
+        assert_eq!(
+            verdict_with(&wm, &shed, &at_wall, BOOK),
+            InFlightVerdict::DeferredDepth
+        );
+        assert_eq!(
+            verdict_with(&wm, &shed, &at_wall, TICKS),
+            InFlightVerdict::Clear
+        );
+
+        // 6. The frame counter ahead of the wall clock.
+        let ahead = || wall + CLOCK_AHEAD_LIMIT_NANOS + 1;
+        assert_eq!(
+            verdict_with(&wm, &marks, &ahead, DEPTH),
+            InFlightVerdict::ClockAhead
+        );
+        assert_eq!(
+            verdict_with(&wm, &marks, &ahead, TICKS),
+            InFlightVerdict::ClockAhead
+        );
+
+        // 7. A step window reaching the hour: held while its frames are not
+        //    acked (and kept), then retired once both sinks pass it.
+        let log = ClockStepLog::new();
+        log.note(span.hi, span.hi, 10 * SEC);
+        let window = log.window().expect("window recorded");
+        assert!(window.1 > past_span + REPLAY_REORDER_SLACK_SEQ);
+        let log_window = || log.window();
+        let log_retire = |w: (u64, u64), s: bool| log.retire_if_settled(w, s);
+        let stepped = |wm: &AppliedWatermark| {
+            process_in_flight_verdict_on(
+                &ProcessInFlightState {
+                    watermark: wm,
+                    deferred: &marks,
+                    clock_window: &log_window,
+                    retire_clock_window: &log_retire,
+                    last_frame_seq: &at_wall,
+                    wall_nanos: &at_wall,
+                },
+                DEPTH,
+                span,
+            )
+        };
+        assert_eq!(stepped(&wm), InFlightVerdict::ClockStepped);
+        assert_eq!(log.window(), Some(window), "not settled, so not retired");
+        let past_window = window.1 + REPLAY_REORDER_SLACK_SEQ + 1;
+        wm.note_depth_acked(past_window);
+        wm.note_ticks_acked(past_window);
+        assert_eq!(stepped(&wm), InFlightVerdict::Clear);
+        assert_eq!(log.window(), None, "settled, so retired and re-read");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The production reader passes the process globals, never a fresh
+    /// instance (PR AA review finding 9; source scan, bite-tested below).
+    #[test]
+    fn test_process_in_flight_verdict_wrapper_passes_the_process_globals() {
+        let source = include_str!("snapshot_gate.rs");
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production part");
+        let wrapper = wrapper_body(production).expect("wrapper found");
+        assert!(wrapper_reads_the_globals(wrapper), "{wrapper}");
+        // Bite: the same scan refuses a wrapper that builds its own state.
+        let doctored = wrapper.replace(
+            "crate::wal_applied_watermark::applied_watermark()",
+            "&crate::wal_applied_watermark::AppliedWatermark::new()",
+        );
+        assert_ne!(doctored, wrapper);
+        assert!(!wrapper_reads_the_globals(&doctored));
+        // Regression: 2026-11-09 — review of finding 9. Bite: a wrapper that
+        // swaps the two `fn() -> u64` closures still compiles and names each
+        // path once; the field scan refuses it.
+        let swapped = wrapper
+            .replace(
+                "last_frame_seq: &crate::ws_frame_spill::current_frame_seq,",
+                "last_frame_seq: &crate::wal_applied_watermark::wall_nanos,@",
+            )
+            .replace(
+                "wall_nanos: &crate::wal_applied_watermark::wall_nanos,",
+                "wall_nanos: &crate::ws_frame_spill::current_frame_seq,",
+            )
+            .replace('@', "");
+        assert_ne!(swapped, wrapper);
+        assert!(!wrapper_reads_the_globals(&swapped), "{swapped}");
+    }
+
+    // Regression: 2026-11-09 — review of finding 12. The only guard that
+    // turns the depth-hour exclusion off had no test: a recorded step window
+    // or a frame counter more than `CLOCK_AHEAD_LIMIT_NANOS` ahead of the
+    // wall makes it false, and the boundary is the gate's own `ClockAhead`
+    // line.
+    #[test]
+    fn test_depth_ack_bound_trusted_truth_table() {
+        let wall = 1_000 * SEC;
+        assert!(depth_ack_bound_trusted(false, wall, wall));
+        assert!(depth_ack_bound_trusted(false, 0, wall));
+        assert!(depth_ack_bound_trusted(
+            false,
+            wall + CLOCK_AHEAD_LIMIT_NANOS,
+            wall
+        ));
+        assert!(!depth_ack_bound_trusted(
+            false,
+            wall + CLOCK_AHEAD_LIMIT_NANOS + 1,
+            wall
+        ));
+        assert!(!depth_ack_bound_trusted(true, wall, wall));
+        assert!(!depth_ack_bound_trusted(true, 0, wall));
+        // Saturating at the top of the range.
+        assert!(depth_ack_bound_trusted(false, u64::MAX, u64::MAX));
+        // Agrees with the gate: trusted exactly when the gate does not read
+        // ClockAhead for the same lead.
+        let span = hour_frame_seq_span("2026-02-10T09").expect("span");
+        let applied = AppliedSnapshot::default();
+        for lead in [0, CLOCK_AHEAD_LIMIT_NANOS, CLOCK_AHEAD_LIMIT_NANOS + 1] {
+            let wall_nanos = span.hi + 3_600 * SEC;
+            let inputs = InFlightInputs {
+                acked_high: wall_nanos,
+                last_frame_seq: wall_nanos + lead,
+                wall_nanos,
+                ..clear_inputs(&applied, span)
+            };
+            let ahead = hour_in_flight_verdict(span, &inputs) == InFlightVerdict::ClockAhead;
+            assert_eq!(
+                depth_ack_bound_trusted(false, wall_nanos + lead, wall_nanos),
+                !ahead,
+                "lead {lead}"
+            );
+        }
+    }
+
+    // Regression: 2026-11-09 — review of finding 12. The production wrapper
+    // reads the three process globals into the right arguments, and both
+    // archiver constructors wire it (source scan, bite-tested).
+    #[test]
+    fn test_process_depth_ack_bound_trusted_reads_the_globals_and_is_wired() {
+        let source = include_str!("snapshot_gate.rs");
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production part");
+        let start = production
+            .find("pub(crate) fn process_depth_ack_bound_trusted()")
+            .expect("wrapper");
+        let body = &production[start..];
+        // The escape is a closing brace: a bare one inside a string unbalances
+        // the banned-pattern scanner's test-block tracking (it counts braces).
+        let body = &body[..body.find("\n\u{7d}\n").expect("end")];
+        let reads_in_order = |body: &str| {
+            let step = body.find("crate::wal_clock_step::clock_step_window().is_some(),");
+            let seq = body.find("crate::ws_frame_spill::current_frame_seq(),");
+            let wall = body.find("crate::wal_applied_watermark::wall_nanos(),");
+            body.contains("depth_ack_bound_trusted(")
+                && matches!((step, seq, wall), (Some(a), Some(b), Some(c)) if a < b && b < c)
+        };
+        assert!(reads_in_order(body), "{body}");
+        let swapped = body
+            .replace("current_frame_seq(),", "@")
+            .replace("wall_nanos(),", "current_frame_seq(),")
+            .replace('@', "wall_nanos(),");
+        assert!(!reads_in_order(&swapped), "{swapped}");
+
+        let archive = include_str!("../partition_archive.rs");
+        let archive_production = archive
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production part");
+        let wiring = "depth_ack_bound_trusted: std::sync::Arc::new(\n                \
+                      snapshot_gate::process_depth_ack_bound_trusted,";
+        assert_eq!(
+            archive_production.matches(wiring).count(),
+            2,
+            "PartitionArchiver::new and from_parts both wire the process guard"
+        );
+    }
+
+    fn wrapper_body(source: &str) -> Option<&str> {
+        let start = source.find("pub(crate) fn process_in_flight_verdict(")?;
+        let rest = &source[start..];
+        let end = rest.find("\n\u{7d}\n")?;
+        Some(&rest[..end])
+    }
+
+    fn wrapper_reads_the_globals(wrapper: &str) -> bool {
+        // Each global on its own FIELD (review of finding 9: matching the
+        // path alone passed a wrapper that swapped two closures of one type).
+        let once = [
+            "watermark: crate::wal_applied_watermark::applied_watermark(),",
+            "deferred: crate::wal_deferred_depth::deferred_depth(),",
+            "clock_window: &crate::wal_clock_step::clock_step_window,",
+            "retire_clock_window: &crate::wal_clock_step::retire_clock_step_window_if_settled,",
+            "last_frame_seq: &crate::ws_frame_spill::current_frame_seq,",
+            "wall_nanos: &crate::wal_applied_watermark::wall_nanos,",
+            "process_in_flight_verdict_on(",
+        ];
+        let banned = ["new_for_tests", "::new()", "ClockStepLog"];
+        once.iter()
+            .all(|needle| wrapper.matches(needle).count() == 1)
+            && banned.iter().all(|needle| !wrapper.contains(needle))
     }
 
     // ---- the protocol, through a scripted ArchiveIo ---------------------
@@ -1672,6 +2269,8 @@ mod tests {
                 verified_tally: Some(tally(3)),
             })
         }
+
+        async fn note_drop_intent(&mut self, _table: &str, _partition: &str) {}
 
         async fn recount_range(&mut self, _t: &str, _s: &str, _e: &str) -> Option<RangeTally> {
             self.events.push(Event::Recount);
