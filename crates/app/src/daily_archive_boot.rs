@@ -81,8 +81,10 @@
 //!   hours past its end, with every gate of the snapshot path. Day windows of
 //!   every other table are unchanged.
 //!
-//! The session size is read once a day after 15:40, before this process
-//! drops any partition of that day ([`should_measure_session`]).
+//! The session size is read once a day after 15:40, by a process that saw
+//! the whole session; the drop tally adds back every hour-path partition
+//! this process dropped ([`should_measure_session`],
+//! [`process_saw_whole_session`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -96,7 +98,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::ist_offset;
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::partition_archive::{
-    ArchivePassLimits, ArchiveRunSummary, PartitionArchiver, VerifiedDayGate,
+    ArchivePassLimits, ArchiveRunSummary, PartitionArchiver, SessionBytesError, VerifiedDayGate,
 };
 use tracing::{debug, error, info, warn};
 
@@ -573,19 +575,78 @@ pub fn daily_latch_decision(
 }
 
 /// Whether this tick should read the session day's size (PR AA step 5): not
-/// yet measured, the session's writes have ended (15:40 IST,
-/// `TICK_PERSIST_END_SECS_OF_DAY_IST`), still the same calendar day (an
-/// after-midnight reading would come after the night's drops), and this
-/// process has not dropped any partition of that day yet. Pure, O(1).
+/// yet measured (or refused for good), the session's writes have ended
+/// (15:40 IST, `TICK_PERSIST_END_SECS_OF_DAY_IST`), still the same calendar
+/// day, and this process saw the whole session
+/// ([`process_saw_whole_session`]).
+///
+/// Review of the finding-11 fix (2026-11-09): there is no longer a "before
+/// this process dropped a partition of the day" condition. The drop tally
+/// adds every hour-path drop of this process back into the reading, so a
+/// reading after a drop is whole, and the old condition stopped every retry
+/// once any pass of the day dropped anything (of any day or table). Drops by
+/// an EARLIER process are not in the tally, which is why a process started
+/// after the session opened does not measure it at all. Pure, O(1).
 #[must_use]
 pub fn should_measure_session(
-    already_measured: bool,
+    measured_or_refused: bool,
     secs_into_session_day: u32,
-    dropped_this_session_day: u64,
+    process_saw_whole_session: bool,
 ) -> bool {
-    !already_measured
+    !measured_or_refused
         && (TICK_PERSIST_END_SECS_OF_DAY_IST..SECS_PER_DAY).contains(&secs_into_session_day)
-        && dropped_this_session_day == 0
+        && process_saw_whole_session
+}
+
+/// Whether a process whose archive loop was armed at `armed_at_unix_secs`
+/// saw all of `session_day` (review of the finding-11 fix, 2026-11-09):
+/// armed at or before that day's 09:00 IST session open
+/// (`TICK_PERSIST_START_SECS_OF_DAY_IST`). The drop tally is RAM only, so a
+/// process started after the open (an evening-drain restart, a crash) cannot
+/// know what an earlier process dropped that day, and its reading could read
+/// low. Such a day is left out of the ring: a missing day, never a low one.
+/// An unrepresentable instant reads `false`. Pure, O(1).
+#[must_use]
+pub fn process_saw_whole_session(armed_at_unix_secs: i64, session_day: NaiveDate) -> bool {
+    let Some(open) = NaiveTime::from_num_seconds_from_midnight_opt(
+        tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST,
+        0,
+    ) else {
+        return false;
+    };
+    session_day
+        .and_time(open)
+        .and_local_timezone(ist_offset())
+        .single()
+        .is_some_and(|open_at| armed_at_unix_secs <= open_at.timestamp())
+}
+
+/// What the daily loop does with one session reading (review of the
+/// finding-11 fix, 2026-11-09).
+#[derive(Debug)]
+enum SessionReadingAction<'a> {
+    /// No reading this tick, or a day that wrote nothing (a holiday): never
+    /// recorded, so it never pulls the p95 down.
+    Nothing,
+    /// A whole reading: recorded in the ring and saved.
+    Record(u64),
+    /// A listing failed: the next tick before midnight reads again.
+    Retry(&'a SessionBytesError),
+    /// The tally can never complete the day in this process: the day is left
+    /// out of the ring and not read again (a missing day, never a low one).
+    LeaveOut(&'a SessionBytesError),
+}
+
+/// Pure, O(1). See [`SessionReadingAction`].
+fn session_reading_action(
+    reading: Option<&Result<u64, SessionBytesError>>,
+) -> SessionReadingAction<'_> {
+    match reading {
+        None | Some(Ok(0)) => SessionReadingAction::Nothing,
+        Some(Ok(bytes)) => SessionReadingAction::Record(*bytes),
+        Some(Err(err)) if err.retryable() => SessionReadingAction::Retry(err),
+        Some(Err(err)) => SessionReadingAction::LeaveOut(err),
+    }
 }
 
 /// The config a daily pass runs with (PR AA step 5, owner decision 3:
@@ -632,7 +693,7 @@ async fn probe_data_volume(data_dir: &Path) -> Option<(u64, u64)> {
 struct PassReport {
     outcome: PassOutcome,
     summary: ArchiveRunSummary,
-    session_bytes: Option<anyhow::Result<u64>>,
+    session_bytes: Option<Result<u64, SessionBytesError>>,
 }
 
 /// Runs ONE sweep and classifies it. Never panics; never returns `Err`.
@@ -758,14 +819,20 @@ pub fn spawn_supervised_daily_archive_loop(
          market close, which the retired inline block did not)"
     );
 
+    // Review of the finding-11 fix (2026-11-09): when this process armed the
+    // loop, read ONCE here (a respawn after a panic keeps it, since the drop
+    // tally it guards is process-wide), so a session that opened before it
+    // is never measured from a tally that missed an earlier process's drops.
+    let armed_at_unix_secs = chrono::Utc::now().timestamp();
     Some(tokio::spawn(async move {
         loop {
             let d = data_dir.clone();
             let q = questdb.clone();
             let c = cfg.clone();
             let g = verified_day_gate.clone();
-            let handle =
-                tokio::spawn(async move { run_daily_archive_loop(d, q, c, window_open, g).await });
+            let handle = tokio::spawn(async move {
+                run_daily_archive_loop(d, q, c, window_open, g, armed_at_unix_secs).await
+            });
             match handle.await {
                 Ok(()) => {
                     info!("daily archive loop returned cleanly — not respawning");
@@ -794,6 +861,7 @@ async fn run_daily_archive_loop(
     cfg: PartitionRetentionConfig,
     window_open: u32,
     verified_day_gate: Option<VerifiedDayGate>,
+    armed_at_unix_secs: i64,
 ) {
     let mut ledger = AttemptLedger::default();
     let mut ticker = tokio::time::interval(DAILY_ARCHIVE_POLL);
@@ -835,9 +903,13 @@ async fn run_daily_archive_loop(
             SessionBytesRing::default()
         }
     };
-    // Partitions this process dropped per session day: a session is measured
-    // only before the first of them.
-    let mut dropped_on: (i32, u64) = (0, 0);
+    // Review of the finding-11 fix (2026-11-09): a session day whose reading
+    // the drop tally refused for good in this process (a dropped partition of
+    // unknown size, or an overflowed day): left out of the ring, never read
+    // again by this process.
+    let mut refused_day: Option<i32> = None;
+    // A session day this process started too late to measure, logged once.
+    let mut unseen_day_noted: Option<i32> = None;
 
     loop {
         ticker.tick().await;
@@ -903,13 +975,23 @@ async fn run_daily_archive_loop(
         let disk_before = probe_data_volume(&data_dir).await;
         let below_target =
             disk_before.is_some_and(|(free, total)| free < free_target_bytes(&ring, &cfg, total));
-        let dropped_today = if dropped_on.0 == today {
-            dropped_on.1
-        } else {
-            0
-        };
-        let measure_day = should_measure_session(ring.has_day(today_date), now_secs, dropped_today)
+        let measured_or_refused = ring.has_day(today_date) || refused_day == Some(today);
+        let saw_whole_session = process_saw_whole_session(armed_at_unix_secs, today_date);
+        let measure_day = should_measure_session(measured_or_refused, now_secs, saw_whole_session)
             .then_some(today_date);
+        if !saw_whole_session
+            && !measured_or_refused
+            && unseen_day_noted != Some(today)
+            && should_measure_session(false, now_secs, true)
+        {
+            unseen_day_noted = Some(today);
+            info!(
+                session_day = %today_date,
+                "daily archive: this process started after the session opened, so the \
+                 day's size is not measured (an earlier process's drops are not known); \
+                 the free-space target uses the other measured days"
+            );
+        }
         let pass_cfg = daily_pass_config(&cfg, below_target);
 
         // PR AA step 6: a running pass keeps the last backlog reading fresh
@@ -932,12 +1014,9 @@ async fn run_daily_archive_loop(
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome.as_str())
             .increment(1);
 
-        match report.session_bytes {
-            // A day that wrote nothing (a holiday) is not recorded, so it
-            // never pulls the p95 down; it is not read again either way once
-            // the next session day starts.
-            Some(Ok(0)) | None => {}
-            Some(Ok(bytes)) => {
+        match session_reading_action(report.session_bytes.as_ref()) {
+            SessionReadingAction::Nothing => {}
+            SessionReadingAction::Record(bytes) => {
                 ring.record(today_date, bytes);
                 info!(
                     session_day = %today_date,
@@ -957,18 +1036,29 @@ async fn run_daily_archive_loop(
                     );
                 }
             }
-            Some(Err(err)) => warn!(
+            SessionReadingAction::Retry(err) => warn!(
                 code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
                 source = "archive_session_bytes_unread",
                 session_day = %today_date,
-                ?err,
+                error = %err,
                 "daily archive: the session size could not be read; the next tick tries \
-                 again until a partition of the day is dropped"
+                 again before midnight"
             ),
+            SessionReadingAction::LeaveOut(err) => {
+                refused_day = Some(today);
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    source = "archive_session_bytes_unread",
+                    session_day = %today_date,
+                    error = %err,
+                    "daily archive: the session size cannot be completed in this process; \
+                     the day is left out of the free-space target (a missing day, never a \
+                     low one) and not read again"
+                );
+            }
         }
 
         let dropped = report.summary.dropped;
-        dropped_on = (today, dropped_today.saturating_add(u64::from(dropped)));
         let disk_after = probe_data_volume(&data_dir).await;
         let free_and_target =
             disk_after.map(|(free, total)| (free, free_target_bytes(&ring, &cfg, total)));
@@ -1731,18 +1821,94 @@ mod tests {
         // The wiring is pinned in `test_latch_marker_failure_still_latches_in_process`.
     }
 
-    /// A session is read once, after 15:40, the same calendar day, and only
-    /// before this process dropped any of its partitions.
+    /// A session is read after 15:40, the same calendar day, until measured
+    /// or refused for good, and only by a process that saw the whole session.
     #[test]
-    fn test_should_measure_session_once_after_1540_before_any_drop() {
+    fn test_should_measure_session_once_after_1540_by_a_process_that_saw_it() {
         let end = TICK_PERSIST_END_SECS_OF_DAY_IST;
-        assert!(should_measure_session(false, end, 0));
-        assert!(should_measure_session(false, 86_399, 0));
-        assert!(!should_measure_session(false, end - 1, 0), "before 15:40");
-        assert!(!should_measure_session(false, 86_400, 0), "after midnight");
-        assert!(!should_measure_session(false, 86_700, 0), "after midnight");
-        assert!(!should_measure_session(true, end, 0), "already measured");
-        assert!(!should_measure_session(false, end, 1), "after a drop");
+        assert!(should_measure_session(false, end, true));
+        assert!(should_measure_session(false, 86_399, true));
+        assert!(
+            !should_measure_session(false, end - 1, true),
+            "before 15:40"
+        );
+        assert!(
+            !should_measure_session(false, 86_400, true),
+            "after midnight"
+        );
+        assert!(
+            !should_measure_session(false, 86_700, true),
+            "after midnight"
+        );
+        assert!(
+            !should_measure_session(true, end, true),
+            "measured or refused"
+        );
+        assert!(
+            !should_measure_session(false, end, false),
+            "started after the session opened"
+        );
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. A process
+    // started after 09:00 IST (an evening-drain restart) has an empty drop
+    // tally, so its reading of a day the pressure leg drained read low and
+    // was saved as a full day.
+    #[test]
+    fn test_regression_process_saw_whole_session_only_when_armed_before_the_open() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).expect("date");
+        let at = |hh: u32, mm: u32| -> i64 {
+            day.and_hms_opt(hh, mm, 0)
+                .expect("time")
+                .and_local_timezone(ist_offset())
+                .single()
+                .expect("ist")
+                .timestamp()
+        };
+        assert!(process_saw_whole_session(at(8, 30), day), "08:30 boot");
+        assert!(process_saw_whole_session(at(9, 0), day), "at the open");
+        assert!(
+            !process_saw_whole_session(at(9, 0) + 1, day),
+            "after the open"
+        );
+        assert!(
+            !process_saw_whole_session(at(17, 30), day),
+            "evening restart"
+        );
+        let next = NaiveDate::from_ymd_opt(2026, 11, 10).expect("date");
+        assert!(process_saw_whole_session(at(17, 30), next), "next session");
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. A refused
+    // reading (a dropped partition of unknown size, an overflowed day) can
+    // never succeed in this process, yet the loop logged "the next tick tries
+    // again" and read again every tick; a failed listing is the only reading
+    // worth retrying. A holiday's 0 is never recorded.
+    #[test]
+    fn test_regression_refused_session_reading_is_left_out_and_unread_is_retried() {
+        let refused: Result<u64, SessionBytesError> = Err(SessionBytesError::Refused("gone"));
+        let unread: Result<u64, SessionBytesError> =
+            Err(SessionBytesError::Unread(anyhow::anyhow!("listing failed")));
+        assert!(matches!(
+            session_reading_action(Some(&refused)),
+            SessionReadingAction::LeaveOut(_)
+        ));
+        assert!(matches!(
+            session_reading_action(Some(&unread)),
+            SessionReadingAction::Retry(_)
+        ));
+        assert!(matches!(
+            session_reading_action(Some(&Ok(7))),
+            SessionReadingAction::Record(7)
+        ));
+        assert!(matches!(
+            session_reading_action(Some(&Ok(0))),
+            SessionReadingAction::Nothing
+        ));
+        assert!(matches!(
+            session_reading_action(None),
+            SessionReadingAction::Nothing
+        ));
     }
 
     /// Below the target the daily pass gets the hour-path marker and nothing

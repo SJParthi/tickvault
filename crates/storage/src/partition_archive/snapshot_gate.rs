@@ -670,6 +670,14 @@ pub(crate) trait ArchiveIo {
         summary: &mut ArchiveRunSummary,
     ) -> impl Future<Output = Option<CopiedPartition>> + Send;
 
+    /// Records that a DROP of `table`'s `partition` may follow, with its size
+    /// (PR AA review finding 11). Called BEFORE the last-moment recount,
+    /// never between the recount and the DROP: the recount is the proof the
+    /// partition still matches its S3 copy, and nothing slow may run after
+    /// it (review of the finding-11 fix, 2026-11-09).
+    fn note_drop_intent(&mut self, table: &str, partition: &str)
+    -> impl Future<Output = ()> + Send;
+
     /// `count()` and `max(ts)` over the partition range now.
     fn recount_range(
         &mut self,
@@ -872,6 +880,12 @@ pub(crate) async fn recheck_and_drop<I: ArchiveIo>(
     copied: CopiedPartition,
     summary: &mut ArchiveRunSummary,
 ) -> PartitionStep {
+    // Review of the finding-11 fix (2026-11-09): the drop-tally size listing
+    // runs HERE, before the recount, so the recount stays the last query
+    // before the DROP. Recording a partition the recount then keeps is
+    // harmless: it is still listed, so the session reading counts it from
+    // the listing.
+    io.note_drop_intent(table, partition).await;
     let recheck = io.recount_range(table, start, end).await;
     match recheck {
         Some(ref now)
@@ -2255,6 +2269,8 @@ mod tests {
                 verified_tally: Some(tally(3)),
             })
         }
+
+        async fn note_drop_intent(&mut self, _table: &str, _partition: &str) {}
 
         async fn recount_range(&mut self, _t: &str, _s: &str, _e: &str) -> Option<RangeTally> {
             self.events.push(Event::Recount);

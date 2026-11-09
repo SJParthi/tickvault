@@ -27,12 +27,27 @@
 //!
 //! Fail-closed: a partition gone from the listing whose size was never
 //! known, or a day with more records than [`HOUR_PATH_DROP_NAMES_PER_DAY`],
-//! makes the reading an error (the caller retries on its next tick). Never a
-//! partial sum, never a double count.
+//! makes the reading an error. Both are PERMANENT for this process (a gone
+//! partition's size never becomes known, and an overflowed day stays
+//! overflowed), so the caller leaves the day out of its ring instead of
+//! retrying. Never a partial sum, never a double count.
 //!
-//! RAM only. HONEST LIMIT: a restart forgets the drops before it, so a day
-//! first measured after a restart that day can still read low (the 30%-of-disk
-//! floor of the target still bounds it).
+//! Review of the finding-11 fix (2026-11-09): a recorded partition the
+//! listing still shows is counted at the LARGER of its listed and recorded
+//! size. A late row (a spill replay) can re-create an hour after its DROP was
+//! applied; that re-created partition is small, and counting only the listing
+//! dropped the hour's real bytes. The larger of the two never loses the
+//! dropped bytes and never counts one partition twice.
+//!
+//! RAM only. A restart forgets the drops before it, so the CALLER must not
+//! read a day this process did not see whole (the daily leg skips a session
+//! day whose 09:00 IST open came before the process started).
+//!
+//! HONEST LIMITS: a re-created partition's own bytes are not added to the
+//! dropped bytes (the larger of the two is counted, never the sum, because a
+//! refused or unapplied DROP looks the same); a partition re-created and
+//! dropped again keeps the larger record; a partition of unknown size that
+//! is re-created reads at its listed size.
 //!
 //! Cost: one uncontended lock, a scan of [`HOUR_PATH_DROP_DAYS`] slots and a
 //! scan of at most [`HOUR_PATH_DROP_NAMES_PER_DAY`] names per drop; one copy
@@ -194,9 +209,10 @@ pub(crate) fn partition_day(name: &str) -> Option<chrono::NaiveDate> {
 /// The bytes IST `day` holds on the hour-path tables: the day's partitions
 /// in `listings` (one `(table, rows)` per table, rows as `(name, diskSize)`),
 /// plus every partition in `drops` (read AFTER the listings) that its
-/// table's listing no longer shows. A recorded partition still listed is
-/// counted once, from the listing (its DROP was refused, unanswered, or not
-/// applied yet). A table missing from `listings` lists nothing.
+/// table's listing no longer shows. A recorded partition still listed (its
+/// DROP was refused, unanswered, or not applied yet, or a late row
+/// re-created it after the DROP) is counted once, at the larger of its
+/// listed and recorded size. A table missing from `listings` lists nothing.
 ///
 /// Why one read of the tally after the listings is enough: a DROP is
 /// recorded before it is sent, so a partition gone from a listing was
@@ -227,14 +243,21 @@ pub(crate) fn session_bytes_with_drops(
         let listed = listings
             .iter()
             .filter(|(table, _)| *table == dropped.table)
-            .any(|(_, rows)| rows.iter().any(|(name, _)| *name == dropped.partition));
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|(name, _)| *name == dropped.partition)
+            .map(|(_, bytes)| *bytes)
+            .max();
         // O(1) EXEMPT: end
-        if listed {
-            continue;
-        }
-        match dropped.bytes {
-            Some(bytes) => total = total.saturating_add(bytes),
-            None => {
+        match (listed, dropped.bytes) {
+            // Still listed: the listing already counted `listed`; the larger
+            // of the two stands for the partition (a re-created hour lists
+            // small while its dropped bytes are in the record).
+            (Some(listed), Some(recorded)) => {
+                total = total.saturating_add(recorded.saturating_sub(listed));
+            }
+            (Some(_), None) => {}
+            (None, Some(recorded)) => total = total.saturating_add(recorded),
+            (None, None) => {
                 return Err("an hour-path partition of the day was dropped with no known size");
             }
         }
@@ -367,6 +390,29 @@ mod tests {
         );
     }
 
+    // Regression: 2026-11-09 — review of the finding-11 fix. A late spill
+    // row re-created a dropped 18,000-byte hour at 5 bytes; the reading
+    // skipped the record because the name was listed, and read the day at
+    // 5 + 7 instead of 18,000 + 7.
+    #[test]
+    fn test_session_bytes_with_drops_keeps_the_dropped_bytes_of_a_recreated_hour() {
+        let tally = HourPathDropTally::new();
+        tally.record(day(7), DEPTH, "2026-11-07T10", Some(18_000));
+        let recreated = rows(&[("2026-11-07T10", 5), ("2026-11-07T11", 7)]);
+        let read = tally.read(day(7));
+        assert_eq!(
+            session_bytes_with_drops(&[(DEPTH, &recreated)], day(7), &read),
+            Ok(18_007)
+        );
+        // A partition that grew after its record (a refused DROP) counts at
+        // its listed size, once.
+        let grown = rows(&[("2026-11-07T10", 20_000)]);
+        assert_eq!(
+            session_bytes_with_drops(&[(DEPTH, &grown)], day(7), &read),
+            Ok(20_000)
+        );
+    }
+
     #[test]
     fn test_session_bytes_with_drops_saturates() {
         let tally = HourPathDropTally::new();
@@ -392,15 +438,24 @@ mod tests {
         fn proptest_listing_plus_tally_is_the_day(
             sizes in proptest::collection::vec(0_u64..1_000_000, 0..30),
             // 0 = not dropped, 1 = dropped and applied, 2 = DROP sent but
-            // still listed (refused, unanswered or not applied yet).
-            fate in proptest::collection::vec(0_u8..3, 30),
+            // still listed (refused, unanswered or not applied yet),
+            // 3 = dropped, then re-created by a late row at a smaller size.
+            fate in proptest::collection::vec(0_u8..4, 30),
             size_known in proptest::collection::vec(any::<bool>(), 30),
             retried in proptest::collection::vec(any::<bool>(), 30),
+            recreated_size in proptest::collection::vec(0_u64..1_000, 30),
         ) {
             let tally = HourPathDropTally::new();
             let before: u64 = sizes.iter().sum();
-            let mut listed: Vec<(String, u64)> = Vec::new();
+            let mut depth: Vec<(String, u64)> = Vec::new();
+            let mut quotes: Vec<(String, u64)> = Vec::new();
             let mut gone_unknown = false;
+            // A re-created hour of unknown recorded size reads at its listed
+            // size (honest limit): the lower bound is not checked then.
+            let mut ambiguous = false;
+            // The re-created hours' own bytes, which the reading may leave
+            // out (it counts the larger of listed and recorded, never both).
+            let mut recreated_total: u64 = 0;
             for (i, size) in sizes.iter().enumerate() {
                 let name = format!("2026-11-07T{:02}", i % 24);
                 // Distinct names: the hour plus a table pick per index.
@@ -412,26 +467,40 @@ mod tests {
                         tally.record(day(7), table, &name, known);
                     }
                 }
-                if fate[i] == 1 {
-                    gone_unknown |= known.is_none();
-                } else if table == DEPTH {
-                    // A `tick_quotes` partition is listed under its own
-                    // table below.
-                    listed.push((name, *size));
+                let listed_size = match fate[i] {
+                    1 => {
+                        gone_unknown |= known.is_none();
+                        None
+                    }
+                    3 => {
+                        let small = recreated_size[i].min(*size);
+                        recreated_total += small;
+                        ambiguous |= known.is_none();
+                        Some(small)
+                    }
+                    _ => Some(*size),
+                };
+                if let Some(listed_size) = listed_size {
+                    let list = if table == DEPTH { &mut depth } else { &mut quotes };
+                    list.push((name, listed_size));
                 }
             }
-            let quotes: Vec<(String, u64)> = sizes
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i >= 24 && fate[*i] != 1)
-                .map(|(i, s)| (format!("2026-11-07T{:02}", i % 24), *s))
-                .collect();
-            let listings: [(&str, &[(String, u64)]); 2] = [(DEPTH, &listed), (QUOTES, &quotes)];
+            let listings: [(&str, &[(String, u64)]); 2] = [(DEPTH, &depth), (QUOTES, &quotes)];
             let got = session_bytes_with_drops(&listings, day(7), &tally.read(day(7)));
             if gone_unknown {
                 prop_assert!(got.is_err());
             } else {
-                prop_assert_eq!(got, Ok(before));
+                let got = got.expect("no gone partition of unknown size");
+                // Never a double count: at most the day plus the re-created
+                // hours.
+                prop_assert!(got <= before + recreated_total, "{got} > {before} + {recreated_total}");
+                if !ambiguous {
+                    // Never a dropped byte lost.
+                    prop_assert!(got >= before, "{got} < {before}");
+                }
+                if recreated_total == 0 && !ambiguous {
+                    prop_assert_eq!(got, before);
+                }
             }
         }
     }

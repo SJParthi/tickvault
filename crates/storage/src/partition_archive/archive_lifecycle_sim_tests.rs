@@ -774,6 +774,8 @@ impl ArchiveIo for SimIo<'_> {
         })
     }
 
+    async fn note_drop_intent(&mut self, _table: &str, _partition: &str) {}
+
     async fn recount_range(&mut self, _t: &str, _s: &str, _e: &str) -> Option<RangeTally> {
         if !self.tick() {
             return None;
