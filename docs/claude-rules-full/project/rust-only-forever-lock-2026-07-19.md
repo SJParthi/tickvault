@@ -1433,3 +1433,5 @@ This exception then ends.
 **REJECT:** reusing this exception for any other workflow or payload; raising
 the row's ceiling; adding a schedule or push trigger; any delete beyond the
 four Quote 56 ids; keeping the workflow after the run.
+
+**ENDED 2026-11-11.** The workflow ran twice that evening: `dry` (run 43068890684) and `apply` (run 43069827741), both OK; all four ids were deleted and verified gone. The workflow, its budget row, the Rust tool and the role are deleted in the follow-up PR, so this exception authorizes nothing further.

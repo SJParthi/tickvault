@@ -3577,3 +3577,15 @@ The session's own login (`claude-code-agent`) was refused `ec2:DeleteVolume` and
 - Any other identity gaining `ec2:DeleteVolume` or `ec2:DeleteSnapshot`; a schedule or push trigger on the workflow; keeping the role, workflow or tool after the run.
 - Deleting a volume that is attached, `in-use`, or not `available`.
 - Changing instance, disk, IOPS, throughput, budget lines or anything else under Quote 56.
+
+##### Quote 56 run record (2026-11-11) — ENDED
+
+| Step | GitHub run | Result |
+|---|---|---|
+| Cloud update creating the role (first try) | 43046930995 | Failed at `CreateRole`: the role's `Purpose` tag held brackets, which IAM refuses. Nothing else applied. Fixed by PR #2232, which also added `crates/common/tests/terraform_tag_value_guard.rs` so a bad tag fails CI instead of the apply |
+| Cloud update creating the role | 43062788421 | Success |
+| `dry` | 43068890684 | Live root `vol-07a6586a56466ea83` seen attached; all four "would be deleted (permission confirmed)"; result OK |
+| `apply` | 43069827741 | All four deleted; the tool's own verify read every one gone; result OK |
+| Independent read-only describe (session login) | — | Volumes: only `vol-07a6586a56466ea83` (150 GB, in-use, attached). Owned snapshots: none |
+
+The role, the workflow, the Rust tool and its budget row are deleted in the PR that adds this record; the role leaves AWS at the next terraform apply. **Quote 56 is ENDED** and Quote 52's REJECT on delete permissions binds again unchanged.
