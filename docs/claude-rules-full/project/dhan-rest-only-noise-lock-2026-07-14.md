@@ -5292,3 +5292,82 @@ readable segments before the unreadable neighbour's share is released.
 - Drops the `tv_wal_replay_frame_cap_stops_total` increment on the planned path.
 - Adds a page, alarm, `ok_actions`, metric filter or EMF name under cover of
   this section, or edits the `ws-spill-01` alarm to exclude these sources.
+
+**§2.17 note — 2026-11-11: the two replay DEFERRAL lines are quiet on the
+same planned boot (no new page; same owner card).** Recorded BEFORE the code,
+per the rule-file-first law, under the owner's 2026-11-08 card
+**"Quiet on planned restarts (Recommended)"** quoted above ("Only the planned
+evening restart logs it quietly (still counted and visible in logs). Any other
+start that hits the limit still pages you, and a real data problem always
+pages.").
+
+**Why (Verified on the production box, 2026-11-09):** every PLANNED
+evening-drain restart (3:54, 4:34 and 5:14 PM IST) sent two false pages,
+because the catch-up replay reports the segments it leaves for the next boot
+at ERROR: the once-per-boot `WS-SPILL-01` `source = "replay_deferred"` line
+("WAL replay DEFERRED segments past its RAM budget", `dhan_feed_stack`) and
+the `WS-SPILL-02` line "WAL replay DEFERRED the remaining segments to the next
+boot" (`ws_frame_spill::replay_all_with_report_at`). The `ws-spill-01` and
+`ws-spill-02` filters match `level = "ERROR"` only. Nothing is lost on these
+lines: a deferred segment stays a `*.wal` file and is replayed by a later boot.
+On a planned restart the per-boot slice ending with segments left is the
+expected end of that boot, the same case as `replay_frame_cap_planned`.
+
+| Line | Before | After (2026-11-11) |
+|---|---|---|
+| `WS-SPILL-01` `source = "replay_deferred"` on a planned evening-drain boot | `error!`, pages | coded `warn!`, `source = "replay_deferred_planned"`, same code, every counter kept |
+| `WS-SPILL-02` replay budget deferral on a planned evening-drain boot, BYTE-budget stop | `error!`, pages | coded `warn!`, `source = "replay_budget_deferred_planned"`, same code, every counter kept |
+| `WS-SPILL-02` replay deferral on ANY boot, MEMORY-guard stop (`stopped_for_memory = true`) | `error!`, pages | unchanged (review 2, 2026-11-11: a different remedy, the host cannot hold the frames; it keeps paging on the planned boot too) |
+| Either line on any other boot | `error!`, pages | same fields and text; only the log `target` moved to `tickvault_storage::wal_replay_frame_cap` (no alarm filter keys on it) |
+
+"Planned" is exactly the §2.17 test, read by
+`wal_replay_frame_cap::planned_evening_drain_boot`: the boot's replay frame cap
+is the evening-drain allowance (`cap_is_planned_evening_drain(
+replay_frame_cap_this_boot())`), or `claim_planned_boot` recorded this
+process's claim as planned (`note_planned_evening_drain_claim`). The second arm
+exists because the boot's STAGE-C replay runs before the catch-up drain raises
+the cap; both arms come from the same one read-and-clear of the planned mark,
+so a deploy, crash, manual, Muhurat or unreadable-state boot is never
+planned. Cost: zero (no alarm, filter, EMF name, `ok_actions` or Telegram
+family).
+
+**Honest limit (Rule 11):** a planned boot that defers because the backlog is
+large is silent on the phone; it stays on the counters, in the app log, and in
+the evening drain's progress check, which stops the restarts when the backlog
+does not shrink. A memory-guard stop is NOT quieted (row above).
+
+**Authority, CONFIRMED by the owner 2026-11-11:** review 2 flagged that the
+card text above names the frame-cap line only. Asked directly on the card
+"Should these two lines also be quiet on planned evening restarts only?", the
+owner chose **"Yes, quiet them too (Recommended)"** ("On the planned evening
+restart only, they become quiet log lines (still counted). Any other start
+still pages, a memory-limit stop always pages, and real data loss always
+pages."). This note covers exactly these two deferral lines; it is not a
+precedent for quieting any other line.
+
+**REJECT (2026-11-11 note):** quieting either deferral line on a boot that is
+not the planned evening-drain boot; quieting `replay_rows_lost`; dropping any
+counter on the planned path; any new page, alarm, metric filter or EMF name, or
+editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
+
+## §2.18 — 2026-11-11: one daily AWS WASTE page (a new page family, owner-approved)
+
+**Owner, 2026-11-11 (verbatim, typos preserved):** "see ypou never told me whu this fuckign billing issue arised dude why?" and "is this always already fully 24/7 monitored automated dude thats my main question". On the card "Should I add a daily automatic \"waste check\" that sends one Telegram message naming what is wasting money and what to delete?" the owner chose **"Yes, daily waste check (Recommended)"** ("Once a day, read-only: lists disks attached to nothing for over 2 days, snapshots older than 30 days, unused IPs, and the top 5 costs this month. One message per new finding, never repeated. Results also saved to S3 as an audit file. ... It can only look, never delete.").
+
+**Why (Verified 2026-11-11):** the hourly guard reads month-to-date spend only while the box runs; the native budget pages only at 80% forecast and acts at 100% actual; the 17:30 IST cost card shows totals. Nothing in the repository listed unattached volumes, snapshots or idle addresses (`grep DescribeVolumes` hits only `downsize-instance.yml`), so a 600 GB and a 30 GB volume attached to nothing billed about $21 (1–11 Nov) with no message naming them.
+
+| Item | What §2.18 authorizes |
+|---|---|
+| Family | ONE new Telegram page family, "AWS waste", from a Rust Lambda run once a day (all days, outside 09:00–15:40 IST) |
+| Inputs | Read-only: `ec2:DescribeVolumes`, `ec2:DescribeSnapshots` (owner self), `ec2:DescribeAddresses`, and ONE Cost Explorer `GetCostAndUsage` grouped by service per run ($0.01 each, ~$0.30 a month; the owner's card said "top 5 costs"; corrected cost told to the owner the same day) |
+| Findings | A volume `available` for over 48 h; an owned snapshot older than 30 days; an Elastic IP with no association; the top 5 services by month-to-date cost (context, not a finding) |
+| Delivery | Edge-triggered: a message only when the set of findings gains an item not in the previous run's set (kept in one SSM parameter or S3 object); a resolved finding sends nothing; at most one message a day; plain English, names each item, its size and its estimated monthly cost, and the console action to delete it |
+| Audit | Each run writes one JSON file to `s3://tv-<env>-cold/cost-audit/<date>.json` (kept, never expired) |
+| Power | Read-only: no Delete, Release, Modify or Stop action in its role; no `ok_actions`, no CloudWatch alarm beyond its own not-invoked check |
+
+**What a PR that violates §2.18 looks like (REJECT):**
+- Gives the waste Lambda (or any role) a delete, release, modify or stop permission, or makes it act on a finding.
+- Sends more than one waste message a day, or repeats an unchanged finding set, or pages on a resolved finding.
+- Runs more than one Cost Explorer query per run, or runs it more than once a day.
+- Adds per-resource CloudWatch metrics or alarms for the findings.
+- Uses any language but Rust for the Lambda.

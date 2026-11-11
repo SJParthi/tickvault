@@ -187,3 +187,30 @@ fn test_drain_hold_progress_tracker_unknown_parts_never_count_as_progress() {
     assert!(!tracker.observe(&unknown, 0, DRAIN_HOLD_STALL_SECS * 2 + 10));
     assert!(tracker.observe(&unknown, 0, DRAIN_HOLD_STALL_SECS * 3));
 }
+
+/// PR AA-G (finding 10): the supervisor feeds the process archive drop count
+/// to the tracker, and the drain hold's backlog reading passes the latest
+/// drop instant. Read with `read_to_string` (the inline-scan budget is for
+/// `src`); the behaviour is pinned by the `drain_hold` and `archive_backlog`
+/// unit tests.
+#[test]
+fn test_observe_with_archive_is_wired_to_archive_drops_total() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let drain = std::fs::read_to_string(src_dir.join("drain_hold.rs")).expect("drain_hold.rs");
+    let prod = drain
+        .split("\n#[cfg(test)]\nmod ")
+        .next()
+        .expect("production part");
+    let call = prod
+        .find("progress.observe_with_archive(")
+        .expect("the supervisor calls observe_with_archive");
+    let end = (call + 300).min(prod.len());
+    assert!(
+        prod[call..end].contains("partition_archive::archive_drops_total()"),
+        "it passes the process drop count"
+    );
+    assert!(!prod.contains("progress.observe(&work"));
+    let held =
+        std::fs::read_to_string(src_dir.join("archive_backlog.rs")).expect("archive_backlog.rs");
+    assert!(held.contains("partition_archive::last_archive_drop_unix(),"));
+}

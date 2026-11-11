@@ -463,6 +463,9 @@ pub struct ProgressTracker {
     anchor: [u64; 6],
     /// Pass rows written as of the last reading.
     pass_rows: u64,
+    /// Archive partitions dropped (after a verified copy) as of the last
+    /// reading (PR AA-G, finding 10).
+    archive_drops: u64,
     /// When progress was last seen; `None` before the first reading.
     last_progress_unix: Option<i64>,
 }
@@ -475,6 +478,29 @@ impl ProgressTracker {
     /// falling counts (3,000 → 600 after a pass), while one that only swings
     /// up and down around a level does not. Unknown parts never count.
     pub fn observe(&mut self, work: &DayWork, pass_rows: u64, now_unix: i64) -> bool {
+        let archive_drops = self.archive_drops;
+        self.observe_with_archive(work, pass_rows, archive_drops, now_unix)
+    }
+
+    /// [`Self::observe`] that also counts an archive partition DROPPED since
+    /// the last reading (`archive_drops` is
+    /// `partition_archive::archive_drops_total`) as progress, only while the
+    /// archive backlog holds the box (`work.archive_backlog_bytes` is
+    /// `Some`), and never re-anchors on it (PR AA-G, finding 10; both limits
+    /// added 2026-11-11 after review). The archive backlog reading moves only at
+    /// the END of a pass, so a pass longer than an hour that kept freeing
+    /// disk was judged stalled; and a reading that rose (new hours past the
+    /// floor) and then fell, still above its old level, never counted. Only
+    /// an accepted DROP counts: an upload or a verify can repeat every pass
+    /// with nothing freed, so a truly stuck backlog still releases after
+    /// [`DRAIN_HOLD_STALL_SECS`]. O(1).
+    pub fn observe_with_archive(
+        &mut self,
+        work: &DayWork,
+        pass_rows: u64,
+        archive_drops: u64,
+        now_unix: i64,
+    ) -> bool {
         let parts = [
             u64::try_from(work.deferred_marks).unwrap_or(u64::MAX),
             u64::try_from(work.spill_files).unwrap_or(u64::MAX),
@@ -487,11 +513,20 @@ impl ProgressTracker {
         let Some(last) = self.last_progress_unix else {
             self.anchor = parts;
             self.pass_rows = pass_rows;
+            self.archive_drops = archive_drops;
             self.last_progress_unix = Some(now_unix);
             return false;
         };
         let wrote = pass_rows > self.pass_rows;
+        // ⚠ CHANGED 2026-11-11 (PR AA-G review): a drop counts only while
+        // the archive backlog is part of the hold. Every leg's drops raise
+        // the counter (routine retention included), so before, an unrelated
+        // drop kept a stuck spill or deferred-mark hold alive, and re-held a
+        // box the stall rule had released. The count is still taken, so a
+        // later drop is measured from here.
+        let dropped = work.archive_backlog_bytes.is_some() && archive_drops > self.archive_drops;
         self.pass_rows = pass_rows;
+        self.archive_drops = archive_drops;
         let fell = self
             .anchor
             .iter()
@@ -499,6 +534,12 @@ impl ProgressTracker {
             .any(|(anchor, part)| part < *anchor);
         if wrote || fell {
             self.anchor = parts;
+        }
+        if wrote || fell || dropped {
+            // ⚠ CHANGED 2026-11-11 (PR AA-G review): a drop alone moves the
+            // clock but not the anchor; re-anchoring on it set a swinging
+            // part's level at its high point, so its next ordinary dip read
+            // as progress and restarted the hour.
             self.last_progress_unix = Some(now_unix);
             return false;
         }
@@ -665,7 +706,12 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             let floor_blocked = work.floor_blocked_buckets() as f64;
             metrics::gauge!(FLOOR_BLOCKED_BUCKETS_GAUGE).set(floor_blocked);
             let pass_rows = crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total();
-            let stalled = progress.observe(&work, pass_rows, now_unix);
+            let stalled = progress.observe_with_archive(
+                &work,
+                pass_rows,
+                tickvault_storage::partition_archive::archive_drops_total(),
+                now_unix,
+            );
             let done = work.is_done();
             let restart_now =
                 evening_step == crate::evening_drain::EveningStep::Restart && !stalled;
@@ -1091,6 +1137,165 @@ mod tests {
         assert!(tracker.observe(&holding(400), 0, t0 + 2 * DRAIN_HOLD_STALL_SECS - 1));
     }
 
+    // Regression: 2026-11-09 — PR AA-G (finding 10). The backlog reading
+    // moves only at the end of a pass, so a pass that kept dropping
+    // partitions for over an hour was judged stalled and the box released
+    // with copy work left.
+    #[test]
+    fn test_regression_archive_drop_mid_pass_is_progress() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(900),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&work, 0, 0, t0));
+        let t1 = t0 + 3_500;
+        assert!(!tracker.observe_with_archive(&work, 0, 1, t1), "a drop");
+        assert!(
+            !tracker.observe_with_archive(&work, 0, 1, t0 + DRAIN_HOLD_STALL_SECS),
+            "an hour after the first reading, but a drop since"
+        );
+        assert!(!tracker.observe_with_archive(&work, 0, 1, t1 + DRAIN_HOLD_STALL_SECS - 1));
+        assert!(
+            tracker.observe_with_archive(&work, 0, 1, t1 + DRAIN_HOLD_STALL_SECS),
+            "an hour with no drop and nothing else moving"
+        );
+    }
+
+    // Regression: 2026-11-09 — PR AA-G (finding 10). A reading that rose
+    // (new hours past the floor) and then fell, still above its old level,
+    // never counted, while the archiver was dropping partitions.
+    #[test]
+    fn test_regression_backlog_rise_then_drops_is_progress() {
+        let holding = |bytes: u64| DayWork {
+            archive_backlog_bytes: Some(bytes),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&holding(400), 0, 10, t0));
+        assert!(!tracker.observe_with_archive(&holding(900), 0, 12, t0 + 1_800));
+        assert!(!tracker.observe_with_archive(&holding(600), 0, 15, t0 + DRAIN_HOLD_STALL_SECS));
+        // The old rule (no drop count) stalls on the same readings.
+        let mut old = ProgressTracker::default();
+        assert!(!old.observe(&holding(400), 0, t0));
+        assert!(!old.observe(&holding(900), 0, t0 + 1_800));
+        assert!(old.observe(&holding(600), 0, t0 + DRAIN_HOLD_STALL_SECS));
+    }
+
+    /// PR AA-G (finding 10): a backlog with no drop and no part falling
+    /// (every pass re-verifies a partition it cannot drop) still releases
+    /// after exactly an hour.
+    #[test]
+    fn test_observe_with_archive_stuck_backlog_without_drops_still_releases_after_an_hour() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(900),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&work, 0, 7, t0));
+        for step in 1..DRAIN_HOLD_STALL_SECS / 60 {
+            assert!(!tracker.observe_with_archive(&work, 0, 7, t0 + step * 60));
+        }
+        assert!(tracker.observe_with_archive(&work, 0, 7, t0 + DRAIN_HOLD_STALL_SECS));
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. Every leg's drops raise the
+    // counter (routine retention too), so an unrelated drop kept a stuck
+    // spill hold alive while the archive backlog was not holding at all.
+    #[test]
+    fn test_regression_drop_counts_only_while_the_archive_backlog_holds() {
+        let stuck = DayWork {
+            spill_files: 3,
+            archive_backlog_bytes: None,
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&stuck, 0, 0, t0));
+        let mut drops = 0;
+        for minute in 1..DRAIN_HOLD_STALL_SECS / 60 {
+            drops += 1;
+            assert!(!tracker.observe_with_archive(&stuck, 0, drops, t0 + minute * 60));
+        }
+        assert!(
+            tracker.observe_with_archive(&stuck, 0, drops + 1, t0 + DRAIN_HOLD_STALL_SECS),
+            "an hour with nothing that holds moving: stalled, whatever other tables dropped"
+        );
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. A drop re-anchored every part
+    // at its current level, so a drop taken while the apply lag swung high
+    // made its next ordinary dip read as progress and restarted the hour.
+    #[test]
+    fn test_regression_drop_does_not_reanchor_a_swinging_part() {
+        let at = |lag: u64| DayWork {
+            archive_backlog_bytes: Some(900),
+            apply_lag: Some(lag),
+            ..done_work()
+        };
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe_with_archive(&at(40), 0, 0, t0));
+        assert!(
+            !tracker.observe_with_archive(&at(600), 0, 1, t0 + 60),
+            "a drop"
+        );
+        let mut now = t0 + 60;
+        let mut high = false;
+        while now + 60 < t0 + 60 + DRAIN_HOLD_STALL_SECS {
+            now += 60;
+            high = !high;
+            assert!(!tracker.observe_with_archive(&at(if high { 600 } else { 40 }), 0, 1, now));
+        }
+        assert!(
+            tracker.observe_with_archive(&at(40), 0, 1, t0 + 60 + DRAIN_HOLD_STALL_SECS),
+            "exactly an hour after the last drop, the swings never counted"
+        );
+    }
+
+    proptest::proptest! {
+        /// PR AA-G (finding 10): never stalled within an hour of a drop (or of
+        /// the first reading); always stalled an hour after the last drop when
+        /// nothing else moved.
+        #[test]
+        fn proptest_observe_with_archive_stalls_exactly_an_hour_after_the_last_drop(
+            steps in proptest::collection::vec(
+                (1i64..1_200, proptest::bool::ANY, proptest::bool::ANY),
+                1..80,
+            ),
+        ) {
+            // 2026-11-11 review: the apply lag swings around its first level
+            // (never below it), which must never count as progress, drops or
+            // not; before, a drop at a high point re-anchored it there.
+            let work_at = |high: bool| DayWork {
+                archive_backlog_bytes: Some(900),
+                apply_lag: Some(if high { 600 } else { 40 }),
+                ..done_work()
+            };
+            let mut tracker = ProgressTracker::default();
+            let mut now = 1_000_000_i64;
+            let mut drops = 0_u64;
+            let mut last_progress = now;
+            proptest::prop_assert!(!tracker.observe_with_archive(&work_at(false), 0, drops, now));
+            for (gap, dropped, high) in steps {
+                now += gap;
+                if dropped {
+                    drops += 1;
+                }
+                let stalled = tracker.observe_with_archive(&work_at(high), 0, drops, now);
+                if dropped {
+                    last_progress = now;
+                    proptest::prop_assert!(!stalled);
+                } else {
+                    proptest::prop_assert_eq!(stalled, now - last_progress >= DRAIN_HOLD_STALL_SECS);
+                }
+            }
+        }
+    }
+
     /// PR AA finding 5: the first daily pass of a process starts on an empty
     /// backlog cell. With every other part done, the day still reads not done
     /// while that pass runs below the free-space target.
@@ -1100,7 +1305,11 @@ mod tests {
         let t0 = 1_800_000_000;
         cell.note_pass_started(t0, true);
         let work = DayWork {
-            archive_backlog_bytes: crate::archive_backlog::backlog_holds(cell.reading(), t0 + 600),
+            archive_backlog_bytes: crate::archive_backlog::backlog_holds(
+                cell.reading(),
+                None,
+                t0 + 600,
+            ),
             ..done_work()
         };
         assert!(

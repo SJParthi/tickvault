@@ -9317,8 +9317,13 @@ impl DepthIngest {
     // TEST-EXEMPT: thin constructor; the routing is exercised through
     // `rewrite_inline_depth` via `for_test_book_only`.
     fn new_book_only(questdb: &tickvault_common::config::QuestDbConfig, since: i64) -> Self {
+        // PR AA-G (finding 17 review, 2026-11-11): a pin cut on this
+        // synchronous writer commits from inside an append; it holds the
+        // archive quiesce lock like the pass's own flushes do.
+        let mut writer = DepthWriter::new_book(questdb, Feed::Dhan);
+        writer.hold_archive_quiesce_on_pin_cut();
         Self {
-            writer: DepthWriter::new_book(questdb, Feed::Dhan),
+            writer,
             buf: DepthLevelBuffer::new(),
             book: Some(BookMode::boxed_book_only(since)),
             writer_thread: None,
@@ -18153,19 +18158,14 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 REPLAY_DEFERRED_PAGED.load(std::sync::atomic::Ordering::Relaxed),
             ) {
                 REPLAY_DEFERRED_PAGED.store(true, std::sync::atomic::Ordering::Relaxed);
-                error!(
-                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-                    source = "replay_deferred",
-                    deferred_segments = batch.deferred_segments,
-                    bytes_replayed = batch.bytes_replayed,
-                    budget_bytes = batch.budget_bytes,
+                // 2026-11-11 (noise lock §2.17 note): a coded WARN on the
+                // planned evening-drain boot, the same ERROR everywhere else.
+                tickvault_storage::wal_replay_frame_cap::report_catchup_replay_deferred(
+                    tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot(),
+                    batch.deferred_segments,
+                    batch.bytes_replayed,
+                    batch.budget_bytes,
                     rounds,
-                    "WAL replay DEFERRED segments past its RAM budget — nothing is stranded \
-                     (a deferred segment stays a `*.wal` file and is re-globbed next round or \
-                     next boot), but those frames are on disk rather than in the database \
-                     until then. A deferral on every boot means the WAL is growing faster \
-                     than replay drains it: a capacity problem, not a recovery one. Reported \
-                     once per boot."
                 );
             }
             if batch.frames.is_empty() {
@@ -22879,7 +22879,7 @@ mod tests {
     fn the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not() {
         let pass = include_str!("dhan_feed_stack/deferred_depth_pass.rs");
         let pass_prod = pass.split("#[cfg(test)]").next().unwrap_or(pass);
-        assert!(pass_prod.contains("sink.late_flush_due() && sink.flush()"));
+        assert!(pass_prod.contains("if sink.late_flush_due() {"));
         assert!(
             !pass_prod.contains("sink.flush_due()"),
             "the after-close pass writes late rows only"

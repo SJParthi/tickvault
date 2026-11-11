@@ -2120,6 +2120,12 @@ pub struct DepthWriter {
     /// PF-4b: the return lane's sender, kept so the rescue split can hand a
     /// clone to the rescue thread.
     spare_staged_tx: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    /// PR AA-G (finding 17 review, 2026-11-11): the archive quiesce lock the
+    /// SYNCHRONOUS arm of [`Self::stage_pin_after_cut`] holds around its
+    /// commit. `None` everywhere but the after-close depth pass, whose
+    /// commits land in old depth hours an archiver may be copying and
+    /// dropping; set by [`Self::hold_archive_quiesce_on_pin_cut`].
+    pin_cut_quiesce: Option<&'static crate::archive_quiesce::ArchiveQuiesce>,
 }
 
 /// A unique temp spill directory, so a test writer never touches
@@ -2324,6 +2330,7 @@ impl DepthWriter {
                     book_label: None,
                     spare_staged: None,
                     spare_staged_tx: None,
+                    pin_cut_quiesce: None,
                 }
             }
             Err(err) => {
@@ -2360,6 +2367,7 @@ impl DepthWriter {
                     book_label: None,
                     spare_staged: None,
                     spare_staged_tx: None,
+                    pin_cut_quiesce: None,
                 }
             }
         }
@@ -2402,6 +2410,7 @@ impl DepthWriter {
             book_label: None,
             spare_staged: None,
             spare_staged_tx: None,
+            pin_cut_quiesce: None,
         }
     }
 
@@ -2456,6 +2465,27 @@ impl DepthWriter {
     fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
         self.wal_defer_check = check;
         self
+    }
+
+    /// PR AA-G (finding 17 review, 2026-11-11): makes the synchronous commit
+    /// a pin cut makes inside [`Self::append_book_row`] hold the shared side
+    /// of the PROCESS archive quiesce lock, the same lock the after-close
+    /// depth pass holds around each of its flushes. Only that pass calls this
+    /// (its writer is synchronous and its rows go into old depth hours); a
+    /// live or offloaded writer never does. The lock is taken with
+    /// `blocking_read`, so the writer must run on a plain OS thread. O(1).
+    pub fn hold_archive_quiesce_on_pin_cut(&mut self) {
+        self.pin_cut_quiesce = Some(crate::archive_quiesce::process_archive_quiesce());
+    }
+
+    /// [`Self::hold_archive_quiesce_on_pin_cut`] with a private lock, so a
+    /// test can hold its exclusive side without stalling every other test.
+    #[cfg(test)]
+    fn hold_archive_quiesce_on_pin_cut_with(
+        &mut self,
+        quiesce: &'static crate::archive_quiesce::ArchiveQuiesce,
+    ) {
+        self.pin_cut_quiesce = Some(quiesce);
     }
 
     /// Rows appended but not yet flushed.
@@ -2765,6 +2795,16 @@ impl DepthWriter {
             }
         } else {
             // The synchronous arm: sends, or rescues the rows on failure.
+            // PR AA-G (finding 17 review, 2026-11-11): this commit is made
+            // INSIDE an append, so the after-close pass's per-flush lock does
+            // not cover it; the pass's writer holds the archive quiesce lock
+            // here itself, so no commit of the pass lands while an archiver
+            // copies and drops an old depth hour. The guard borrows a
+            // `'static` lock, not `self`. Never nested: the pass appends
+            // outside its own flush lock.
+            let _quiesce = self
+                .pin_cut_quiesce
+                .map(crate::archive_quiesce::ArchiveQuiesce::shared_blocking);
             let _sent_or_rescued = self.flush().is_ok();
         }
         self.pending_unbacked |= unbacked;

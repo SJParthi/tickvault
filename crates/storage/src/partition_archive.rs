@@ -174,7 +174,9 @@ static ARCHIVE_PASS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 // can select. Until PR AA it held a process-wide gate (`DEPTH_REWRITE_GATE`)
 // from its first write until its marks were cleared, which on a long night
 // kept every depth partition on the box for hours. It now takes the shared
-// side of the archive quiesce lock per bucket (`archive_quiesce`), and the
+// side of the archive quiesce lock per bucket (`archive_quiesce`; ⚠ CHANGED
+// 2026-11-09, PR AA-G finding 17: per committing FLUSH, plus the book
+// writer's in-append pin-cut commit, never a whole bucket), and the
 // snapshot gate holds any hour whose frames still carry an after-close mark
 // (`snapshot_gate::InFlightVerdict::DeferredDepth`), so an hour is never
 // copied while rows of it are still to be written back, and the pass never
@@ -221,6 +223,71 @@ pub fn deferred_depth_marks_waiting() -> bool {
     !crate::wal_deferred_depth::deferred_depth()
         .snapshot()
         .is_empty()
+}
+
+/// Partitions dropped after a verified copy, and when the latest was (PR
+/// AA-G, finding 10). Raised only on a DROP QuestDB accepted, never on a
+/// failed drop, a verify, an upload or a reused copy: those can repeat every
+/// pass with nothing freed. One per process ([`ARCHIVE_DROPS`]); a test
+/// archiver gets its own, so parallel tests never read each other's drops
+/// (2026-11-11 review: the stub test's assertions read the process statics
+/// and could pass on another test's drop).
+pub(crate) struct ArchiveDropLedger {
+    total: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the latest drop; 0 before the first.
+    last_unix: std::sync::atomic::AtomicI64,
+}
+
+impl ArchiveDropLedger {
+    pub(crate) const fn new() -> Self {
+        Self {
+            total: std::sync::atomic::AtomicU64::new(0),
+            last_unix: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// Records one accepted DROP at `now_unix`. Two relaxed atomics, O(1).
+    /// ⚠ CHANGED 2026-11-11 (PR AA-G review): the instant is STORED, not
+    /// `fetch_max`ed: after a wall-clock step back, a max kept a future
+    /// instant and swallowed every later drop until the clock passed it
+    /// (freshness switched off for up to the step). Now the next drop
+    /// replaces it; a future instant still held is clamped to the clock by
+    /// the reader (`archive_backlog::backlog_holds`).
+    fn note(&self, now_unix: i64) {
+        self.total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_unix
+            .store(now_unix, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn last_unix(&self) -> Option<i64> {
+        let at = self.last_unix.load(std::sync::atomic::Ordering::Relaxed);
+        (at > 0).then_some(at)
+    }
+}
+
+/// The process's drop ledger, read by the drain hold.
+static ARCHIVE_DROPS: ArchiveDropLedger = ArchiveDropLedger::new();
+
+/// Partitions dropped (after a verified copy) by either archive leg of this
+/// process. The drain hold counts a rise as progress while the archive
+/// backlog holds the box, so a long pass that is still freeing disk is never
+/// judged stalled (PR AA-G, finding 10). One relaxed load, O(1).
+#[must_use]
+pub fn archive_drops_total() -> u64 {
+    ARCHIVE_DROPS.total()
+}
+
+/// When this process last dropped a partition after a verified copy (Unix
+/// seconds), `None` before its first. Can be ahead of the clock after a
+/// wall-clock step back; the reader clamps it. One relaxed load, O(1).
+#[must_use]
+pub fn last_archive_drop_unix() -> Option<i64> {
+    ARCHIVE_DROPS.last_unix()
 }
 
 /// Free-space level below which an archive pass is reported as WEDGED.
@@ -1751,6 +1818,9 @@ pub struct PartitionArchiver {
     /// Where drops of hour-path-table partitions are recorded per IST day
     /// (PR AA review finding 11): the process tally in production.
     dropped_tally: &'static drop_tally::HourPathDropTally,
+    /// Where accepted DROPs are counted for the drain hold (PR AA-G, finding
+    /// 10): [`ARCHIVE_DROPS`] in production, a private ledger in tests.
+    drop_ledger: &'static ArchiveDropLedger,
     /// `diskSize` of each hour-path-table partition this pass may drop,
     /// listed at the pass start before any quiesce lock (finding 11).
     drop_sizes: std::collections::HashMap<(String, String), u64>,
@@ -2002,6 +2072,7 @@ impl PartitionArchiver {
             spill_recheck_tables: Vec::new(),
             spill_pending_reader: std::sync::Arc::new(process_spill_pending),
             dropped_tally: drop_tally::process_drop_tally(),
+            drop_ledger: &ARCHIVE_DROPS,
             drop_sizes: std::collections::HashMap::new(),
             depth_ack_bound_trusted: std::sync::Arc::new(
                 snapshot_gate::process_depth_ack_bound_trusted,
@@ -2053,6 +2124,7 @@ impl PartitionArchiver {
             spill_recheck_tables: Vec::new(),
             spill_pending_reader: std::sync::Arc::new(process_spill_pending),
             dropped_tally: drop_tally::process_drop_tally(),
+            drop_ledger: &ARCHIVE_DROPS,
             drop_sizes: std::collections::HashMap::new(),
             depth_ack_bound_trusted: std::sync::Arc::new(
                 snapshot_gate::process_depth_ack_bound_trusted,
@@ -3427,6 +3499,7 @@ impl PartitionArchiver {
                 summary.dropped = summary.dropped.saturating_add(1);
                 summary.rows_archived = summary.rows_archived.saturating_add(proof.rows);
                 metrics::counter!("tv_partition_dropped_total").increment(1);
+                self.drop_ledger.note(chrono::Utc::now().timestamp());
                 self.append_audit(
                     &table,
                     &partition,
@@ -6525,6 +6598,8 @@ mod stub_integration_tests {
         // Each test archiver records drops in its own tally (finding 11),
         // so parallel tests never read each other's drops.
         archiver.dropped_tally = Box::leak(Box::new(drop_tally::HourPathDropTally::new()));
+        // ... and counts its accepted DROPs in its own ledger (PR AA-G review).
+        archiver.drop_ledger = Box::leak(Box::new(super::ArchiveDropLedger::new()));
         archiver
     }
 
@@ -6718,6 +6793,47 @@ mod stub_integration_tests {
         drop(repair);
     }
 
+    // Regression: 2026-11-11 — PR AA-G review 2. "Raised only on an
+    // accepted DROP" was pinned by a source scan alone. A DROP QuestDB
+    // refuses (HTTP 500) must leave this archiver's ledger untouched, or a
+    // refused drop counts as drain-hold progress and keeps the box up on a
+    // backlog that frees nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_stub_refused_drop_is_not_counted_as_progress() {
+        let inner = qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200);
+        let refusing: Responder = Arc::new(move |req: &SeenRequest| {
+            if req.target.contains("DROP PARTITION") {
+                return (500, Vec::new(), b"{\"error\":\"refused\"}".to_vec());
+            }
+            inner(req)
+        });
+        let (qdb_url, qdb_log) = spawn_stub(refusing).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert!(
+            qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the DROP was sent (and refused): {summary:?}"
+        );
+        assert_eq!(summary.dropped, 0, "{summary:?}");
+        assert!(summary.failed >= 1, "{summary:?}");
+        assert_eq!(
+            archiver.drop_ledger.total(),
+            0,
+            "a refused DROP is never drain-hold progress"
+        );
+        assert_eq!(archiver.drop_ledger.last_unix(), None);
+    }
+
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
     // a current_thread runtime would starve the stub server tasks while
     // the flush blocks (deadlock until the request timeout).
@@ -6738,6 +6854,11 @@ mod stub_integration_tests {
         assert_eq!(summary.dropped, 1);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.rows_archived, 3);
+        // PR AA-G (finding 10): an accepted DROP is drain-hold progress,
+        // counted exactly once in this archiver's own ledger (2026-11-11
+        // review: the process statics let another test's drop pass this).
+        assert_eq!(archiver.drop_ledger.total(), 1);
+        assert!(archiver.drop_ledger.last_unix().is_some());
         assert!(summary.gzip_bytes_uploaded > 0);
 
         // F1: HeadObject preceded a CONDITIONAL PutObject.
@@ -8977,6 +9098,98 @@ mod archive_backlog_tests {
         assert_eq!(
             WAL_SNAPSHOT_WAIT_GAUGE,
             "tv_partition_archive_wal_snapshot_wait_secs"
+        );
+    }
+
+    /// PR AA-G (finding 10): the drop counter the drain hold reads as
+    /// progress, on a private ledger so the values are exact.
+    #[test]
+    fn test_archive_drops_total_and_last_archive_drop_unix_count_a_drop() {
+        let ledger = ArchiveDropLedger::new();
+        assert_eq!(ledger.total(), 0);
+        assert_eq!(ledger.last_unix(), None, "None before the first drop");
+        ledger.note(1_900_000_000);
+        assert_eq!(ledger.total(), 1, "a drop raises the count by one");
+        assert_eq!(ledger.last_unix(), Some(1_900_000_000));
+        // The process accessors (`archive_drops_total`,
+        // `last_archive_drop_unix`) only read `ARCHIVE_DROPS`; the equality
+        // that stood here repeated their bodies (2026-11-11 review 2). The
+        // accepted-only rule is pinned by the stub tests
+        // `test_stub_full_flow_verifies_audits_then_drops` (one drop, one
+        // count) and `test_regression_stub_refused_drop_is_not_counted_as_progress`.
+        // What the process accessors CAN be checked for: once the process
+        // ledger has counted a drop it always has a drop instant (read in
+        // that order, so a racing drop cannot fail it).
+        let total = archive_drops_total();
+        let last = last_archive_drop_unix();
+        if total > 0 {
+            assert!(last.is_some(), "a counted drop always has an instant");
+        }
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. `fetch_max` kept a drop
+    // instant stamped during a forward clock step after the clock stepped
+    // back, and swallowed every later drop until the clock passed it.
+    #[test]
+    fn test_regression_drop_ledger_keeps_the_latest_drop_not_the_largest_stamp() {
+        let ledger = ArchiveDropLedger::new();
+        ledger.note(1_900_000_600); // during a +10 min step
+        ledger.note(1_900_000_060); // the clock is back
+        assert_eq!(ledger.total(), 2);
+        assert_eq!(
+            ledger.last_unix(),
+            Some(1_900_000_060),
+            "the latest drop replaces a future stamp"
+        );
+    }
+
+    /// The counter is raised only in the accepted-DROP arm, never on a failed
+    /// drop, a verify or an upload (source scan of the production part).
+    /// ⚠ CHANGED 2026-11-11 (review): the scan matched one exact spelling, so
+    /// a second call written another way passed it; it now counts every
+    /// write of the ledger and every call of `note`, however written, and
+    /// places the one call inside `drop_copied_partition`'s accepted arm.
+    #[test]
+    fn test_archive_drops_total_is_raised_only_on_an_accepted_drop() {
+        let src = include_str!("partition_archive.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production part");
+        // The two atomics are written only inside `ArchiveDropLedger::note`
+        // (whitespace removed, so formatting cannot hide a second write).
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(compact.matches("self.total.fetch_add(").count(), 1);
+        assert_eq!(compact.matches("self.last_unix.store(").count(), 1);
+        assert_eq!(compact.matches(".last_unix.fetch_").count(), 0);
+        // Exactly one call of `.note(` on any ledger, however written.
+        assert_eq!(
+            compact.matches(".note(").count(),
+            compact.matches("drop_ledger.note(").count(),
+            "no other `.note(` call in this file"
+        );
+        let calls: Vec<usize> = prod
+            .match_indices("drop_ledger.note(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one drop-ledger call site");
+        assert_eq!(
+            prod.matches("ARCHIVE_DROPS.note(").count(),
+            0,
+            "the process ledger is reached only through the archiver's field"
+        );
+        let site = calls[0];
+        let fn_at = prod[..site].rfind("fn ").expect("inside a function");
+        assert!(
+            prod[fn_at..].starts_with("fn drop_copied_partition("),
+            "the call sits in drop_copied_partition"
+        );
+        let ok_arm = prod[..site].rfind("Ok(()) => {").expect("inside an Ok arm");
+        assert!(ok_arm > fn_at, "the Ok arm is drop_copied_partition's own");
+        let between = &prod[ok_arm..site];
+        assert!(
+            between.contains("tv_partition_dropped_total") && !between.contains("Err("),
+            "the call sits in the accepted-DROP arm"
         );
     }
 }
