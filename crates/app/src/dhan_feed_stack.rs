@@ -6952,6 +6952,33 @@ fn silence_scan_pending(silent: u64, never: u64, never_reported: bool) -> bool {
     went_quiet > 0 || (never > 0 && !never_reported)
 }
 
+/// Percent of tracked instruments that must be quiet together before the
+/// silent-instrument check PAGES (noise lock §2.19, owner card "Only real
+/// feed trouble (Recommended)", 2026-11-11). Below it the episode is one
+/// coded `warn!`: on 2026-11-11 every page named 1 to 3 of 19,868 slow
+/// stocks with nothing never-ticked.
+const SILENCE_PAGE_FLOOR_PERCENT: u64 = 1;
+
+/// The quiet count at which an episode pages: `ceil(tracked × 1%)`, at
+/// least 1 (so a four-index fallback universe still pages on one). O(1).
+fn silence_page_floor(tracked: u64) -> u64 {
+    tracked
+        .saturating_mul(SILENCE_PAGE_FLOOR_PERCENT)
+        .div_ceil(100)
+        .max(1)
+}
+
+/// Whether a confirmed silence episode PAGES (§2.19): a never-ticked
+/// instrument new this session, or at least `silence_page_floor(tracked)`
+/// instruments that TICKED and then went quiet together. `silent` includes the
+/// never-ticked set (`counts_toward_alarm` is `Exceeded | NeverTicked`), so the
+/// floor is judged on `silent - never`: a never-ticked set already paged must
+/// not lift one slow stock over the floor for the rest of the session (review
+/// 2026-11-11). Otherwise the episode is logged at `warn!`. O(1), pure.
+fn silence_warrants_page(silent: u64, never: u64, never_reported: bool, tracked: u64) -> bool {
+    (never > 0 && !never_reported) || silent.saturating_sub(never) >= silence_page_floor(tracked)
+}
+
 fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown: u64) -> bool {
     // saturating_sub, because a clock that steps backwards (NTP correction)
     // must not wrap into a gigantic elapsed value and silently clear the
@@ -7079,6 +7106,9 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    // §2.19: an episode below the paging floor is logged once at `warn!`.
+    // A separate latch, so an episode that grows past the floor still pages.
+    let mut silence_logged = false;
     // Never-ticked instruments are paged once per session; see
     // `silence_scan_pending` for why this is a separate latch.
     let mut never_reported = false;
@@ -8056,6 +8086,7 @@ async fn run_frame_drain(
                 {
                     silent_scans = 0;
                     silence_reported = false;
+                    silence_logged = false;
                     never_reported = false;
                     continue;
                 }
@@ -8081,6 +8112,7 @@ async fn run_frame_drain(
                     // the cooldown at the emit below, and the measured numbers
                     // recorded there.
                     silence_reported = false;
+                    silence_logged = false;
                     continue;
                 }
                 silent_scans = silent_scans.saturating_add(1);
@@ -8121,7 +8153,38 @@ async fn run_frame_drain(
                 let now_secs = now_millis / 1_000;
                 let cooling =
                     silence_page_is_cooling(last_silence_page, now_secs, SILENCE_PAGE_COOLDOWN_SECS);
-                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling {
+                // §2.19 (2026-11-11): below the floor the episode is logged, not paged.
+                let tracked_now = ingest.tracked_instruments() as u64;
+                let pages = silence_warrants_page(silent, never, never_reported, tracked_now);
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT
+                    && !silence_reported
+                    && !silence_logged
+                    && !pages
+                {
+                    silence_logged = true;
+                    warn!(
+                        code = ErrorCode::RiskGapTickGap.code_str(),
+                        silent,
+                        never_ticked = never,
+                        tracked = tracked_now,
+                        page_floor = silence_page_floor(tracked_now),
+                        consecutive_scans = silent_scans,
+                        "Dhan live feed: {silent} subscribed instrument(s) are quiet beyond their \
+                         own learned cadence, below the paging floor (1% of tracked); logged and \
+                         counted, not paged"
+                    );
+                    for entry in worst_silent.iter().take(named) {
+                        warn!(
+                            code = ErrorCode::RiskGapTickGap.code_str(),
+                            security_id = entry.security_id,
+                            segment = entry.segment.as_str(),
+                            silent_millis = entry.silent_millis,
+                            expected_millis = entry.expected_millis,
+                            "quiet instrument named (below the paging floor)"
+                        );
+                    }
+                }
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling && pages {
                     silence_reported = true;
                     if never > 0 {
                         never_reported = true;
@@ -29246,7 +29309,9 @@ mod host_sizing_tests {
 
 #[cfg(test)]
 mod silence_latch_tests {
-    use super::{silence_page_is_cooling, silence_scan_pending};
+    use super::{
+        silence_page_floor, silence_page_is_cooling, silence_scan_pending, silence_warrants_page,
+    };
 
     /// Audit 2026-10-06 F1: never-ticked far strikes must not hold the latch.
     ///
@@ -29295,6 +29360,49 @@ mod silence_latch_tests {
             "one page for the never-ticked strikes at the open, one for the \
              11:00 episode; the old latch gave only the first"
         );
+    }
+
+    #[test]
+    fn test_silence_page_floor_is_one_percent_rounded_up_and_at_least_one() {
+        // §2.19 (2026-11-11): 1% of tracked, rounded up, never below 1.
+        assert_eq!(silence_page_floor(19_868), 199);
+        assert_eq!(silence_page_floor(100), 1);
+        assert_eq!(silence_page_floor(101), 2);
+        assert_eq!(silence_page_floor(4), 1);
+        assert_eq!(silence_page_floor(0), 1);
+        assert_eq!(silence_page_floor(u64::MAX), u64::MAX.div_ceil(100));
+    }
+
+    #[test]
+    fn test_regression_silence_warrants_page_ignores_a_few_slow_stocks() {
+        // Regression: 2026-11-11 — seven SOS pages, each naming 1 to 3 of
+        // 19,868 slow NSE_EQ stocks with never_ticked = 0.
+        for silent in 1..=3 {
+            assert!(!silence_warrants_page(silent, 0, false, 19_868));
+        }
+        assert!(!silence_warrants_page(198, 0, false, 19_868));
+        // Real feed trouble: 1% or more quiet together.
+        assert!(silence_warrants_page(199, 0, false, 19_868));
+        assert!(silence_warrants_page(19_868, 0, true, 19_868));
+        // A never-ticked instrument new this session always pages.
+        assert!(silence_warrants_page(1, 1, false, 19_868));
+        // Once reported, the same never-ticked set does not page again.
+        assert!(!silence_warrants_page(3, 1, true, 19_868));
+        // The four-index fallback universe still pages on one quiet index.
+        assert!(silence_warrants_page(1, 0, true, 4));
+    }
+
+    #[test]
+    fn test_regression_a_reported_never_ticked_set_does_not_lift_a_slow_stock_over_the_floor() {
+        // Regression: 2026-11-11 review — `silent` includes never-ticked
+        // instruments. After 5,000 never-ticked contracts paged once, one slow
+        // stock (silent 5,001, never 5,000) must not page again.
+        assert!(!silence_warrants_page(5_001, 5_000, true, 19_868));
+        assert!(!silence_warrants_page(5_198, 5_000, true, 19_868));
+        // 199 instruments that ticked and then went quiet still page.
+        assert!(silence_warrants_page(5_199, 5_000, true, 19_868));
+        // A count inconsistency (never > silent) never underflows into a page.
+        assert!(!silence_warrants_page(2, 5, true, 19_868));
     }
 
     #[test]

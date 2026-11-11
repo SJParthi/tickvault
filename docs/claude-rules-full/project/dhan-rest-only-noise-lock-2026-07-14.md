@@ -5371,3 +5371,17 @@ editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
 - Runs more than one Cost Explorer query per run, or runs it more than once a day.
 - Adds per-resource CloudWatch metrics or alarms for the findings.
 - Uses any language but Rust for the Lambda.
+
+## §2.19 — 2026-11-11: the silent-instrument page (`RISK-GAP-03`) pages only real feed trouble (no new page)
+
+**Owner, 2026-11-11 (screenshot of seven SOS pages "DHAN: some instruments have gone quiet or never sent a price today", 09:42 to 12:16 IST, one every 30 minutes):** on the card "When should it page you instead?" the owner chose **"Only real feed trouble (Recommended)"** ("Page when at least 1% of subscribed instruments (about 200) go quiet together, or any instrument never sent a single price since subscribing. A few slow stocks are only logged and counted, never paged.").
+
+**Why (Verified 2026-11-11 from the live app log):** every page that day named 1 to 3 of 19,868 tracked instruments, all `NSE_EQ` stocks, quiet 31 to 68 s against a learned cadence of 30 to 66 s, with `never_ticked = 0` throughout; slow stocks between trades, not a feed fault. The 30-minute cooldown (§2.16) only spaced them out.
+
+| Item | What §2.19 changes |
+|---|---|
+| Page (coded `error!`, the `errcode-risk-gap-03` filter) | Only when the instruments that TICKED and then went quiet (`silent - never`; the never-ticked set is judged on its own) reach 1% of the tracked instruments (`ceil(tracked / 100)`, at least 1), or an instrument that never ticked is new this session (`never > 0` and not yet reported) |
+| Below that | One coded `warn!` per episode with the same fields plus the floor, and the named instruments at `warn!`; the alarm filter matches `level = ERROR` only, so it never pages |
+| Unchanged | The scan, both gauges (`tv_dhan_feed_instruments_silent`, `..._never_ticked`), the 2-scan confirmation, the 30-minute page cooldown, the session gate, the dead-class and detector-blind reports, the alarm itself |
+
+**REJECT (§2.19):** a page for fewer quiet instruments than the 1% floor; dropping the never-ticked page; removing or narrowing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated owner quote.
