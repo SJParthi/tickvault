@@ -87,7 +87,7 @@ tracing-appender = "=0.2.5"
 # jsonwebtoken removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
-arc-swap = "=1.9.3"
+arc-swap = "=1.9.4"
 totp-rs = { version = "=6.0.0", features = ["otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
@@ -107,7 +107,7 @@ tower = { version = "=0.5.3", features = ["full"] }
 tower-http = { version = "=0.7.1", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "=1.1.8"
+toml = "=1.2.0"
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
@@ -179,7 +179,7 @@ aws-lc-rs = "=1.19.0"
 # RUSTSEC advisories on the AWS chain without an upstream SDK release.
 aws-config = { version = "=1.13.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-sns = { version = "=1.121.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-ssm = { version = "=1.133.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "=1.134.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-10-31: coordinated AWS family repair for RUSTSEC-2026-0253.
 # S3 1.157.0 requires patched lru ^0.18.2. All nine config/service pins
 # move together because older pre-1.0 Smithy requirements cannot share
@@ -190,7 +190,7 @@ aws-sdk-ssm = { version = "=1.133.0", default-features = false, features = ["beh
 aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # EC2 and CloudWatch share the same reviewed SDK/Smithy generation.
 # They remain Rust Lambda/control-plane dependencies, with modern HTTPS.
-aws-sdk-ec2 = { version = "=1.274.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "=1.275.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatch = { version = "=1.140.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-10-22 (plan item 63, operator Quote 37; owner approved the new
 # dependency on the decision card "Approve (Recommended)"): the free AWS
@@ -216,7 +216,7 @@ lambda_runtime = "=1.5.0"
 # S3 upload. NOT a new supply-chain root — flate2 1.1.9 was ALREADY resolved
 # in Cargo.lock (transitive via tower-http compression-gzip); this promotes
 # it to a direct pin — the aws-lc-rs promotion precedent above.
-flate2 = "=1.1.10"
+flate2 = "=1.1.11"
 
 # ---- Section 11c: Regex (tickvault-logs-mcp grep_codebase) ----
 # 2026-07-18 (rust-only phase 2c): the Rust port of the tickvault-logs MCP
@@ -244,14 +244,14 @@ form_urlencoded = "=1.2.2"
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.29.0", features = ["v4", "serde"] }
+uuid = { version = "=1.29.1", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 
 # ---- Section 13: Dev/Test Dependencies ----
 criterion = { version = "=0.8.2", features = ["html_reports"] }
 proptest = "=1.12.0"
-loom = "=0.7.2"
+loom = "=0.7.3"
 dhat = "=0.3.3"
 
 # Build Profiles
