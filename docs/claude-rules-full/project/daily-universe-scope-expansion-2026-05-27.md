@@ -3429,6 +3429,19 @@ After the run Quote 50 is SPENT for deletion; its "Keep, always" row stays bindi
 - Changing versioning, lifecycle, object lock or bucket policy under Quote 50.
 - A second deletion run under Quote 50.
 
+##### Quote 50 run record (2026-11-11) — SPENT
+
+Ran on 2026-11-11 after the 2 Nov S3 copy was verified and PR #2187 was live, outside 09:00–15:45 IST (owner: "go ahead delete everything before nov 2 tonight dude", 2026-11-11).
+
+| Step | Result (Verified) |
+|---|---|
+| `tv-prod-cold` (`raw-frames/`, `questdb-partitions/`, `instrument-snapshots/`, `logs/`, `tick-quarantine/`), ~16:22 IST | Dry listing, then delete by version id: 786 versions deleted, 0 failed; verify listing 0 left before the cutoff; every kept count unchanged (questdb-partitions 352, raw-frames 1,008, logs 823, instrument-snapshots 42). `deploys/` untouched. |
+| Box, market-data partitions | Already none before 2 Nov (oldest `ticks` 2026-11-11, `tick_quotes` and `feed_aux_packets` 2026-11-09). |
+| Box, SEBI/audit partitions (16 tables, about 90 MB, 32 partitions dated 2026-10-29 to 2026-11-01) | Dropped by `ALTER TABLE … DROP PARTITION LIST` on the evening of 2026-11-11; listing after: 0 partitions dated before 2026-11-02. |
+| Box files (8 empty tick spill files, one below-floor quarantine file and its marker, 4 stale `ws_wal/uploaded/` markers) | Removed; listing after: none dated before 2026-11-02. |
+
+**Exception, owner-approved:** the box steps ran with the app RUNNING, against the "box step with the app running" REJECT row above. The owner chose this on the 2026-11-11 card "Delete now, app running (Recommended)" ("Drop only the October partitions of those 16 tables and remove the empty files and old markers now. The app never writes to October partitions, so it is safe; no restart, no SOS."). Quote 50 is now SPENT for deletion; its "Keep, always" row stays binding and Quote 27 binds again.
+
 #### Quote 51 (2026-11-07, ~21:30–00:30 IST) — THE BOX COPIES TO S3 AND DELETES BY ITSELF; NO MANUAL MOVE, NO BIGGER DISK (preserve EXACTLY)
 
 Owner messages (2026-11-07), verbatim: "dude always our plan is to move the data to s3 and then dleete right dude then whyt he fuck eevrytime disk issue and why again and again manually evrytime why the fuck we need to move this fuckign data usign claude cod emtoherfucker or increasing the disk to 200 g by inreasign the rpcie mtoehrfucker why?" and "Bro but ensure to cover al these cases before copying and deleting it dude okY?Especially cover all kinds of extreme permuations combiantions of excpeitons errors situations conditions bugs scenarios ideas etc etc etc inclduign out of box also dude okay? do you understand what in askign dude?". Decision cards, verbatim labels: on the disk card the owner tapped "Copy 6 Nov to S3, then delete" (card text: "Frees about 51 GB on the server. The copy is checked first, then the 6 Nov order-book data is deleted from the server only and kept in S3. Permanent on the server; needs your dated approval naming that data."); on the automation card the owner tapped "Approve both (Recommended)" (card text: "(1) When the disk is filling fast, delete data from the server hour by hour once it is over 4 hours old, not only after 1 to 2 days, and always only after its S3 copy is checked. Today only one table may do this. (2) After the close, keep the server on until the day's data is copied and deleted, at most until 7:30 AM, at about $0.19 per extra hour. With both, no manual moves and no bigger disk are needed.").
