@@ -1293,8 +1293,8 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    // K4 (2026-10-26): the previous process's last receipt, read after the
-    // claim and before this process can append (boot crash-gap row).
+    // §2.20 + K4: backlog vs the last start, then the last receipt, before any append.
+    let _backlog_trend = tickvault_storage::wal_backlog_trend::judge_at_boot(&ws_wal_path);
     let previous_process_last_receipt =
         tickvault_storage::wal_last_receipt::newest_receipt_nanos_on_disk(&ws_wal_path);
 

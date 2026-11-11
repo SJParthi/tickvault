@@ -18221,10 +18221,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 REPLAY_DEFERRED_PAGED.load(std::sync::atomic::Ordering::Relaxed),
             ) {
                 REPLAY_DEFERRED_PAGED.store(true, std::sync::atomic::Ordering::Relaxed);
-                // 2026-11-11 (noise lock §2.17 note): a coded WARN on the
-                // planned evening-drain boot, the same ERROR everywhere else.
+                // 2026-11-11 (noise lock §2.17 note, §2.20): a coded WARN on the
+                // planned evening-drain boot or a shrinking backlog, else the ERROR.
                 tickvault_storage::wal_replay_frame_cap::report_catchup_replay_deferred(
-                    tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot(),
+                    tickvault_storage::wal_replay_frame_cap::replay_limit_verdict_this_boot(),
                     batch.deferred_segments,
                     batch.bytes_replayed,
                     batch.budget_bytes,

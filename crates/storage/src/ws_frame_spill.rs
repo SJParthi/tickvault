@@ -4879,10 +4879,10 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {
         metrics::counter!(WAL_REPLAY_DEFERRED_COUNTER).increment(deferred as u64);
-        // 2026-11-11 (noise lock §2.17 note): a coded WARN on the planned
-        // evening-drain boot, the same ERROR everywhere else.
+        // 2026-11-11 (noise lock §2.17 note, §2.20): a coded WARN on the planned
+        // evening-drain boot or a shrinking backlog, the ERROR everywhere else.
         crate::wal_replay_frame_cap::report_replay_budget_deferred(
-            crate::wal_replay_frame_cap::planned_evening_drain_boot(),
+            crate::wal_replay_frame_cap::replay_limit_verdict_this_boot(),
             crate::wal_replay_frame_cap::ReplayBudgetDeferral {
                 deferred_segments: deferred,
                 consumed_segments: consumed,

@@ -5385,3 +5385,101 @@ editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
 | Unchanged | The scan, both gauges (`tv_dhan_feed_instruments_silent`, `..._never_ticked`), the 2-scan confirmation, the 30-minute page cooldown, the session gate, the dead-class and detector-blind reports, the alarm itself |
 
 **REJECT (§2.19):** a page for fewer quiet instruments than the 1% floor; dropping the never-ticked page; removing or narrowing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated owner quote.
+
+## §2.20 — 2026-11-11: the WAL replay limit and deferral lines page only when the backlog is stuck (no new page)
+
+**The owner's decision (2026-11-11 decision card, after the 8:33 AM IST SOS "safety capture hit a limit"; option label verbatim):**
+
+> **"Page only if stuck (Recommended)"**
+
+The card read: the replay-limit line is quiet on EVERY boot (not only the
+planned evening restart); it pages only if the waiting backlog of WAL segments
+does not shrink between two starts; real data loss (`replay_rows_lost`,
+memory-guard stops) always pages. Recorded here BEFORE the code, per the
+rule-file-first law. Plan: `active-plan-audit-2026-10-20.md`, item PR RS.
+
+**Why:** the per-boot frame cap and the byte budget end almost every boot's
+replay with segments left while a large backlog drains a slice per start
+(§2.17). Nothing is lost on these lines (a deferred segment stays a `*.wal`
+file and is replayed by a later start). §2.17 quieted them on the planned
+evening restart only, so the 8:33 AM morning start paged although the backlog
+had shrunk overnight. The question the owner wants paged is "is the backlog
+stuck", not "did this start leave some for the next one".
+
+| Line | Before (§2.17) | After (2026-11-11, §2.20) |
+|---|---|---|
+| `WS-SPILL-01` `replay_frame_cap`, `WS-SPILL-01` `replay_deferred`, `WS-SPILL-02` byte-budget deferral, on a start whose waiting backlog is STRICTLY lower than the previous start's | `error!`, pages (unless the planned evening restart) | coded `warn!`, same code, `source` with the suffix `_shrinking` (`replay_frame_cap_shrinking`, `replay_deferred_shrinking`, `replay_budget_deferred_shrinking`); every counter kept; not paged (the filters match `ERROR` only) |
+| The same lines on the planned evening restart | coded `warn!` `*_planned` | unchanged (planned wins over shrinking) |
+| The same lines on a start with no previous record, an unreadable record, a record dated after today, an unknown count now or then, or an equal or higher count | `error!`, pages | unchanged: `error!`, pages |
+| `WS-SPILL-02` MEMORY-guard stop (`stopped_for_memory = true`) | `error!`, pages | unchanged on every start |
+| `replay_rows_lost`, `replay_ack_wait_timeout` | `error!`, pages | unchanged |
+
+**How "shrinking" is measured:** once per start, after the WAL folder is
+claimed and before the boot replay reads anything, the app counts the waiting
+segments the replay would still read (every segment in the live folder,
+`replaying/` and `settling/` that the applied watermark saved on disk does not
+cover; every waiting segment when no watermark loads) and compares it with the
+count the previous start saved in `data/state/wal-backlog-trend.state` (one
+line: version, IST date, count or `unknown`; written with a temp file, sync,
+rename and a folder sync). Every start overwrites the record with its own
+count (or `unknown`), so the next start compares against the start just
+before it. A record that cannot be written is removed, so the next start
+pages. The verdict is decided once per process and never changes inside it.
+
+**⚠ CHANGED 2026-11-11 (same-day review fix, within the owner's card: it only
+narrows when a line is quiet).** Three points of the paragraph above were
+wrong:
+- *"Every start overwrites the record ... the start just before it."* The
+  planned evening-drain restart no longer saves its count. It is quiet anyway
+  (§2.17 wins), and its count is taken after the trading day's growth and
+  before its own replay; saving it let the next morning compare only against
+  the evening's progress, so a backlog growing a few segments every day read
+  "shrinking" every morning and never paged. Every other start now compares
+  with the previous start that was NOT a planned evening restart (normally the
+  previous morning, so the comparison covers one whole day: the session's
+  growth and the evening's drain together).
+- *"A record that cannot be written is removed, so the next start pages."*
+  When `data/state` itself cannot be written (permissions, a read-only
+  remount), the old record cannot be removed either, and every later start
+  compared against that frozen count. Now a start that cannot save its record
+  pages its own lines (verdict `state_not_saved`) whatever it compared, so a
+  folder that stays unwritable pages on every start. The old record is still
+  removed when it can be.
+- The record now carries a CRC-32 (version `v2`); a line whose checksum does
+  not match is unreadable and pages, so a corrupted digit cannot read as a
+  higher previous count.
+Honest limit kept: when the folder becomes writable again, the first start
+after it can still compare once against a record left by an earlier failed
+start (one quiet start at most, then it saves its own count).
+
+*Second review note (2026-11-11, same owner card, a narrowing toward MORE
+paging, no new page).* A start whose applied watermark (`applied.tvaw`) was
+absent, rejected, or loaded as an overflow of unknown height counted every
+waiting segment, applied ones waiting only for the S3 copy included, and
+saved that inflated number as a known count; the next start with a clean
+watermark then read `Shrinking` and stayed quiet on a stuck backlog. Such a
+start now counts `unknown` while segments wait (it pages, `current_unknown`,
+and saves `unknown`, so the next start pages, `previous_unknown`). A failed
+save now logs which record it removed (`removed_record`: the previous
+start's, or this start's when only the folder sync after the rename failed)
+and whether that removal was synced (`removal_synced`), replacing
+`old_record_removed`.
+
+**Cost:** zero. No alarm, metric filter, EMF name, `ok_actions` or Telegram
+family added; `ws-spill-01` and `ws-spill-02` are unchanged.
+
+**Honest limits (Rule 11):** a backlog that shrinks by one segment per start
+is quiet on the phone even if it would take weeks to drain; it stays on the
+counters (`tv_wal_replay_frame_cap_stops_total`, `tv_wal_replay_deferred_segments_total`),
+in the app log, on `tv_wal_unapplied_pinned_segments` and in the evening
+drain's progress check. The count is the replay's view from the saved
+watermark (an approximation of what the replay reads, the same each start, so
+a trend is fair); it excludes segments this start's own boot fold will pin.
+
+**REJECT (§2.20):**
+- Quieting `replay_rows_lost`, `replay_ack_wait_timeout` or a MEMORY-guard stop on any start.
+- Quieting a line on a start whose count is equal to or higher than the previous start's, or when either count is unknown, the record is missing, unreadable or dated after today.
+- (2026-11-11 review fix) Saving the planned evening restart's count as the comparison point; quieting a start whose own record save failed; reading a record without checking its checksum.
+- (2026-11-11 second review fix) Saving a known count taken while segments wait without a trusted, bounded applied watermark.
+- Dropping any counter on the quiet path.
+- Any new page, alarm, metric filter or EMF name, or editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
