@@ -49,6 +49,17 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-11-07 with plan item PR AA step 3 (owner Quote 51): a probe
+    // of whether QuestDB re-creates a dropped WAL hour partition when a late
+    // row for that hour is inserted. It needs a scratch QuestDB, so it cannot
+    // gate a PR; its answer gates PR AA owner decision 2 (may a table other
+    // than market_depth be dropped while its spill files wait). Run it with:
+    //
+    //   TV_QDB_REAL_HTTP=127.0.0.1:9000 cargo test -p tickvault-storage --test questdb_dropped_partition_probe -- --ignored --nocapture
+    (
+        "crates/storage/tests/questdb_dropped_partition_probe.rs",
+        "dropped_wal_partition_recreated_on_insert",
+    ),
     // 2026-11-02: the two evening-state defect tests now run unignored.
     // Added 2026-11-07 with plan item TG-4 (2026-11-06 archiver incident):
     // the archiver's /exp export against a REAL QuestDB while ILP writes and

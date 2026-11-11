@@ -13,6 +13,10 @@
 //!   * `tv_disk_hours_left_at_fill_rate` — gauge, hours until full at the
 //!     last hour's fill rate, -1 when not filling (DA-12, local `/metrics` only)
 //!
+//! It also publishes that projection for the disk-pressure loop
+//! ([`published_hours_left`], PR AA step 4), which starts archiving early when
+//! the disk is projected to fill before the box stops.
+//!
 //! Prometheus alert rule (added separately): fires CRITICAL Telegram when
 //! `tv_spill_dir_free_bytes < SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD`.
 //! Operator gets ~hours of warning instead of seconds.
@@ -390,6 +394,88 @@ fn ist_day_number(unix_secs: u64) -> u64 {
         / u64::from(tickvault_common::constants::SECONDS_PER_DAY)
 }
 
+// ---------------------------------------------------------------------------
+// The published projection (PR AA step 4, Quote 51, 2026-11-07)
+// ---------------------------------------------------------------------------
+//
+// The disk-pressure loop starts archiving early when the disk is projected
+// to fill before the box stops. It reads the watcher's projection here
+// instead of keeping a second fill window of its own.
+//
+// One `AtomicU64` holds both the figure and when it was taken, so a reader
+// can never pair a new figure with an old time (or the other way round):
+// the high 32 bits are the Unix second of the reading, the low 32 bits are
+// the hours left in hundredths, or `HOURS_LEFT_NOT_FILLING` when the disk
+// was not filling. `0` means nothing was published yet. A reading older
+// than `PROJECTION_MAX_AGE_SECS`, or stamped ahead of the reader's clock
+// (the clock stepped back), reads as unknown, and unknown never starts an
+// episode: archiving early is a choice made only on a fresh reading.
+
+/// A projection older than this reads as unknown: five probe cadences, so
+/// one slow probe never drops it, and a stopped watcher stops it within five
+/// minutes.
+pub const PROJECTION_MAX_AGE_SECS: i64 = 300;
+
+/// Low-word value for "the disk was not filling" (no projection).
+const HOURS_LEFT_NOT_FILLING: u32 = u32::MAX;
+
+/// The packed projection. See the section comment above.
+static PUBLISHED_HOURS_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Packs a projection taken at `at_unix_secs`. Hours are kept in hundredths
+/// and capped just below the "not filling" marker; a negative, NaN or
+/// infinite figure is stored as "not filling". Pure and O(1).
+// APPROVED: cast — a finite, non-negative value clamped to 0..=u32::MAX-1 first.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn pack_hours_left(hours: Option<f64>, at_unix_secs: i64) -> u64 {
+    let at = u64::from(u32::try_from(at_unix_secs.max(0)).unwrap_or(u32::MAX));
+    // APPROVED: u32 marker widened to f64 (exact), not an f32 price.
+    let cap = f64::from(HOURS_LEFT_NOT_FILLING - 1);
+    let low = match hours {
+        Some(h) if h.is_finite() && h >= 0.0 => (h * 100.0).round().min(cap) as u32,
+        _ => HOURS_LEFT_NOT_FILLING,
+    };
+    (at << 32) | u64::from(low)
+}
+
+/// Reads a packed projection at `now_unix_secs`: the hours left when the
+/// reading is fresh and the disk was filling, `None` otherwise (never
+/// published, older than [`PROJECTION_MAX_AGE_SECS`], stamped in the
+/// future, or not filling). Pure and O(1).
+fn fresh_hours_left(packed: u64, now_unix_secs: i64) -> Option<f64> {
+    if packed == 0 {
+        return None;
+    }
+    let at = i64::from(u32::try_from(packed >> 32).unwrap_or(u32::MAX));
+    let age = now_unix_secs.checked_sub(at)?;
+    if !(0..=PROJECTION_MAX_AGE_SECS).contains(&age) {
+        return None;
+    }
+    let low = u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(HOURS_LEFT_NOT_FILLING);
+    // APPROVED: u32 hundredths widened to f64 (exact), not an f32 price.
+    (low != HOURS_LEFT_NOT_FILLING).then(|| f64::from(low) / 100.0)
+}
+
+/// Records the watcher's latest projection. Called once a minute by the
+/// watcher, after each successful probe. O(1), one atomic store.
+fn publish_hours_left(hours: Option<f64>, at_unix_secs: i64) {
+    PUBLISHED_HOURS_LEFT.store(
+        pack_hours_left(hours, at_unix_secs),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The watcher's hours-to-full at the last hour's fill rate, if the reading
+/// is fresh at `now_unix_secs` and the disk was filling. Read once a minute
+/// by the disk-pressure loop (PR AA step 4). O(1), one atomic load.
+#[must_use]
+pub fn published_hours_left(now_unix_secs: i64) -> Option<f64> {
+    fresh_hours_left(
+        PUBLISHED_HOURS_LEFT.load(std::sync::atomic::Ordering::Acquire),
+        now_unix_secs,
+    )
+}
+
 /// The edge-triggered decision for the hours-left warning: `(fire, latched)`.
 /// Fires once when the projection is shorter than `session_hours_left` (the
 /// disk fills before the capture window ends). Re-arms only once the
@@ -496,6 +582,9 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                     let now_unix = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
+                    // PR AA step 4: the disk-pressure loop reads this to start
+                    // archiving early when the disk fills before the stop.
+                    publish_hours_left(projected, i64::try_from(now_unix).unwrap_or(i64::MAX));
                     let today = ist_day_number(now_unix);
                     if today != hours_left_day {
                         hours_left_day = today;
@@ -748,6 +837,72 @@ mod tests {
     /// DA-12 (S3-1): no projection when the disk is flat or gaining space,
     /// when the window is shorter than the minimum span, when empty, or when
     /// the clock did not move forward.
+    /// PR AA step 4: a projection reads back only while it is fresh. Older
+    /// than five minutes, stamped ahead of the clock (a backward clock step),
+    /// never published, or "not filling" all read as unknown, and unknown
+    /// never starts an archive episode.
+    #[test]
+    fn test_stale_projection_is_unknown() {
+        let at = 1_762_500_000_i64;
+        let packed = pack_hours_left(Some(3.25), at);
+        assert_eq!(fresh_hours_left(packed, at), Some(3.25));
+        assert_eq!(
+            fresh_hours_left(packed, at + PROJECTION_MAX_AGE_SECS),
+            Some(3.25),
+            "exactly five minutes old is still fresh"
+        );
+        assert_eq!(
+            fresh_hours_left(packed, at + PROJECTION_MAX_AGE_SECS + 1),
+            None,
+            "older than five minutes is unknown"
+        );
+        assert_eq!(
+            fresh_hours_left(packed, at - 1),
+            None,
+            "a reading stamped ahead of the clock is unknown"
+        );
+        assert_eq!(fresh_hours_left(0, at), None, "never published");
+        assert_eq!(
+            fresh_hours_left(pack_hours_left(None, at), at),
+            None,
+            "not filling"
+        );
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(
+                fresh_hours_left(pack_hours_left(Some(bad), at), at),
+                None,
+                "{bad} is stored as not filling"
+            );
+        }
+        // A huge figure is capped, never wrapped into "not filling" or zero.
+        let huge = fresh_hours_left(pack_hours_left(Some(1e12), at), at);
+        assert!(
+            huge.is_some_and(|h| h > 1e6),
+            "capped, still a figure: {huge:?}"
+        );
+        // Hundredths survive the round trip.
+        assert_eq!(
+            fresh_hours_left(pack_hours_left(Some(0.004), at), at),
+            Some(0.0)
+        );
+        assert_eq!(
+            fresh_hours_left(pack_hours_left(Some(0.016), at), at),
+            Some(0.02)
+        );
+    }
+
+    /// PR AA step 4: what the watcher publishes is what the pressure loop
+    /// reads, through the one shared atomic.
+    #[test]
+    fn test_published_hours_left_round_trips_through_the_atomic() {
+        let at = 1_762_600_000_i64;
+        publish_hours_left(Some(7.5), at);
+        assert_eq!(published_hours_left(at + 60), Some(7.5));
+        assert_eq!(published_hours_left(at + PROJECTION_MAX_AGE_SECS + 1), None);
+        publish_hours_left(None, at);
+        assert_eq!(published_hours_left(at + 60), None);
+    }
+
     #[test]
     fn hours_left_none_when_disk_not_filling() {
         assert_eq!(hours_left(&DiskFillWindow::new()), None);

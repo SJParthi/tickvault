@@ -53,3 +53,16 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 [[profile.ci.overrides]]
 filter = "binary_id(tickvault-storage::wal_unapplied_ranges_properties) & test(=proptest_wal_lifetimes_never_skip_or_prune_an_unapplied_frame)"
 slow-timeout = { period = "300s", terminate-after = 2 }
+
+# Same reason, second test (2026-11-08): the archive lifecycle property test
+# (30 simulated days x 256 cases, PR #2213) took 150.8 s on a CI retry after
+# its first try passed the 90 s x 2 = 180 s kill on a slower runner (PR #2214
+# run 42502831792). It is the test that proves nothing is dropped without a
+# verified S3 copy; its cases are not cut. Only the time limit changes.
+[[profile.default.overrides]]
+filter = "binary_id(tickvault-storage) & test(=partition_archive::archive_lifecycle_sim_tests::proptest_archive_lifecycle_keeps_every_invariant)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "binary_id(tickvault-storage) & test(=partition_archive::archive_lifecycle_sim_tests::proptest_archive_lifecycle_keeps_every_invariant)"
+slow-timeout = { period = "300s", terminate-after = 2 }

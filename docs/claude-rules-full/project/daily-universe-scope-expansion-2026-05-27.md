@@ -3172,6 +3172,8 @@ Measured before the fourth card (Verified, 2026-10-26 11:00 IST scrape): every d
 | Evening drain restarts (Quote 31, plan ITEM 60) | A boot that `evening_drain` marked as its own planned restart may replay up to **5×** `WAL_REPLAY_MAX_FRAMES_PER_BOOT` (15,000,000 frames). The morning boot and every other boot keep the 3,000,000 cap. The 40 GiB replay disk floor, the 15-minute catch-up clock, the at-most-3-restarts and 40-minute spacing, and "none before the day's cross-verification marker or 17:25 IST" are unchanged. |
 | Repeat quotes | Recorded in `websocket-connection-scope-lock.md` §"2026-10-27 — REPEAT QUOTES GET THEIR OWN TABLE" (the `ticks` schema lock lives there). |
 
+**Dated note, 2026-11-08 (PR RD) — the 5× slice was not in the code until this date.** Measured 7 and 8 Nov 2026: `evening_drain` lengthened only the catch-up clock, and the 3,000,000 cap is checked only before a replay pass, so every boot (planned restarts included) retired one 512 MiB batch of about 3.5 million frames and every catch-up round was refused at round 0. It is now built as `EVENING_DRAIN_REPLAY_FRAME_CAP` (`crates/storage/src/wal_replay_frame_cap.rs`): a process-wide cap, default 3,000,000, raised once to 15,000,000 only on the boot whose planned-restart mark `evening_drain::claim_planned_boot` claimed (one read-and-clear of the pending flag; a deploy, crash, manual, Muhurat boot or an unreadable state file gets 3,000,000). Nothing else in this section changes: the disk floor, the 15-minute clock, the restart count and spacing, and the REJECT rows below all stand. Honest limit: the cap is still checked before a pass, so a planned boot can read past 15,000,000 by up to one batch.
+
 ##### What violates Quote 41 (REJECT)
 - Any throughput, IOPS or size change under cover of this quote.
 - The 15,000,000-frame slice on any boot that is not an evening drain restart, or removing the replay disk floor or the restart spacing.
@@ -3426,3 +3428,67 @@ After the run Quote 50 is SPENT for deletion; its "Keep, always" row stays bindi
 - Deleting without the listing before and the listing after, or a cloud delete without the dry listing.
 - Changing versioning, lifecycle, object lock or bucket policy under Quote 50.
 - A second deletion run under Quote 50.
+
+#### Quote 51 (2026-11-07, ~21:30–00:30 IST) — THE BOX COPIES TO S3 AND DELETES BY ITSELF; NO MANUAL MOVE, NO BIGGER DISK (preserve EXACTLY)
+
+Owner messages (2026-11-07), verbatim: "dude always our plan is to move the data to s3 and then dleete right dude then whyt he fuck eevrytime disk issue and why again and again manually evrytime why the fuck we need to move this fuckign data usign claude cod emtoherfucker or increasing the disk to 200 g by inreasign the rpcie mtoehrfucker why?" and "Bro but ensure to cover al these cases before copying and deleting it dude okY?Especially cover all kinds of extreme permuations combiantions of excpeitons errors situations conditions bugs scenarios ideas etc etc etc inclduign out of box also dude okay? do you understand what in askign dude?". Decision cards, verbatim labels: on the disk card the owner tapped "Copy 6 Nov to S3, then delete" (card text: "Frees about 51 GB on the server. The copy is checked first, then the 6 Nov order-book data is deleted from the server only and kept in S3. Permanent on the server; needs your dated approval naming that data."); on the automation card the owner tapped "Approve both (Recommended)" (card text: "(1) When the disk is filling fast, delete data from the server hour by hour once it is over 4 hours old, not only after 1 to 2 days, and always only after its S3 copy is checked. Today only one table may do this. (2) After the close, keep the server on until the day's data is copied and deleted, at most until 7:30 AM, at about $0.19 per extra hour. With both, no manual moves and no bigger disk are needed.").
+
+Measured the same evening (CloudWatch, S3 listing, code read): the archiver dropped 201 partitions 3–7 Nov, each after a verified copy, but deletes by age (about 24.5 hours), skips a whole table when its WAL is even one transaction behind (233 skips, 15 pressure episodes that freed 0 bytes at 75–93% used), latches the daily run done at about 15:47, and runs only about 50 minutes before the 16:30 stop. The 6 Nov `market_depth` volume (about 51 GB) came from the `market_depth_book` designated-timestamp bug fixed by #2212.
+
+| Item | What Quote 51 authorizes |
+|---|---|
+| Automatic copy-then-delete, hour by hour | The app's own archiver (`partition_archive`, `disk_pressure`) may copy, verify and drop hour partitions of `ticks`, `tick_quotes`, `market_depth`, `market_depth_book` and `feed_aux_packets` once they are more than 4 hours old, when the disk is under pressure or projected to fill before the stop. Always the existing order: export, upload with checksum, verify (recount and size), audit row acked, WAL and recount re-checked, then `DROP PARTITION LIST`. Candles, SEBI and audit tables keep their day windows and are not touched by the hour path |
+| The applied-WAL check | The archiver may treat a table as applied for an OLD partition when QuestDB has applied every transaction that existed when the check started (a snapshot), instead of requiring the whole table to be fully caught up, provided every writer that can post into an old hour (WAL replay, spill replay, the after-close depth pass) is held for the copy and the drop |
+| Daily run until done | The after-close run does not mark the day done while partitions old enough to drop remain, and keeps running after the close until free space reaches its target |
+| Keep the box on | The drain hold (Quote 31) also counts data still waiting to be copied to S3 and deleted; never past 07:30 IST, only while that work remains |
+| The 6 Nov data | `market_depth` hour partitions dated 2026-11-06 leave the box through this same automatic path, after a verified S3 copy. No manual delete, no SSM delete, no new tool |
+| Proof first | Before it ships: randomized tests over many days with extreme day volumes, S3 failures, WAL lag, restarts, replays and crashes between copy and delete, checking that nothing is dropped without a verified copy, nothing is dropped while its rows are unapplied, SEBI and audit tables are never touched, and the disk stays below the line unless S3 is down or one session writes more than the free space |
+
+Quote 50's "Keep, always" row and Quote 27 are unchanged: every copy stays in `tv-prod-cold`, and the box keeps only its hot window.
+
+##### What violates Quote 51 (REJECT)
+- Any drop without a verified S3 copy (export, checksummed upload, recount, size check, acked audit row), or deleting or overwriting any S3 copy.
+- An hour floor under 4 hours, or the hour path on candles, SEBI, audit or any table not named above.
+- Dropping a partition while one of its rows is unapplied, or while a writer that can post into that hour is running; dropping an hour with deferred-depth marks still waiting.
+- A drain hold past 07:30 IST, or one held when no copy work remains.
+- Any manual or SSM delete of market data under Quote 51.
+- A new page, alarm, metric filter or EMF name for this work.
+- Growing the disk, raising IOPS or throughput, or changing the instance under Quote 51.
+- Shipping before the randomized proof above passes.
+
+#### Quote 52 (2026-11-11, ~09:30 IST) — NOVEMBER 2026 ONLY: STOP AT $90; THE LEFTOVER DISKS ARE DELETED BY THE OWNER (preserve EXACTLY)
+
+Owner asked (2026-11-11), verbatim: "see still is it possible to erdcue the per month maximsied amount to still 5000 inr alone only poer month is that psosible dude?" and "see can you check and tell me prrecisleyw here this monthly bill stands dude okay? ... im aksign yo uto totally fix itself less than 5k inr per month then hwo the fuck for these days itsefl its 5k inr dude". After one approved Cost Explorer query (card "Yes, one query (Recommended)", $0.01), the owner tapped "Delete all (Recommended)" and "Raise Nov to $90 only (Recommended)".
+
+Measured (Cost Explorer, 1–11 Nov 2026, unblended USD): total $46.11 with tax; gp3 volume storage $22.23 + $4.00 tax, of which about $17.95 + tax is two volumes attached to nothing: `vol-0c6ab6e593e39d8c8` (600 GB, tag `tv-rebuild-old-root=2026-10-22`, the old root Quote 47 authorized the owner to delete on 28 Oct, never deleted) and `vol-073ccaa417a0f344b` (30 GB, May 2026 root), plus snapshots `snap-090ed9c4f3df0ca61` and `snap-0573ab07252f67bf3` (pre-downsize rollbacks of the 30 GB volume, July and August). Compute (r8g.large) $6.97 + tax; CloudWatch $6.23 + tax; S3 storage $0.54. Projection with the leftovers gone: about $66 a month with tax; November about $88 (it had already spent $46).
+
+| Item | What Quote 52 authorizes |
+|---|---|
+| November 2026 line | `NOVEMBER_2026_KILL_USD` = $90 in the hourly guard's clamp and the native budget `limit_amount` = 90, November 2026 (UTC month) only |
+| From 1 December 2026 | The standing $75 line (Quote 37) applies again: the code clamp does it by itself; the native `limit_amount` returns to 75 in a follow-up change on or after 1 December |
+| The leftover disks | The OWNER deletes `vol-0c6ab6e593e39d8c8`, `vol-073ccaa417a0f344b` and the two snapshots above in the AWS console (no repository role may delete volumes or snapshots, Quote 47 unchanged); a session confirms with a read-only describe afterwards |
+
+##### What violates Quote 52 (REJECT)
+- Any month other than November 2026 above $75 without a fresh dated quote; leaving the native `limit_amount` at 90 into December.
+- Adding `ec2:DeleteVolume` or `ec2:DeleteSnapshot` to any standing role, or deleting any volume or snapshot other than the four named above.
+- Changing instance, disk size, IOPS, throughput or depth under Quote 52.
+
+#### Quote 53 (2026-11-11, ~10:00 IST) — FROM DECEMBER: FEWER ALARMS, FEWER SHIPPED METRICS, NO CLOUDWATCH DASHBOARD, OLD RAW FRAMES TO A CHEAPER S3 CLASS; THE $75 STOP STAYS (preserve EXACTLY)
+
+Owner asked (2026-11-11), verbatim: "so now hwpw and what si your plan to shorten it to 5k inr per motnh that to othe max worst case shsoudl be only 5.5 k inr per month ddude okay?". On the card "which of these may I do from December?" the owner ticked all four: "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard". On "Should the box also stop for good if a month's bill reaches ₹5,500?" the owner chose "No, keep $75 stop for now (Recommended)".
+
+Estimate (Assumed, extrapolated from Cost Explorer 1–11 Nov 2026 with the Quote 52 leftover disks gone, before tax): server ~$22, 150 GB disk ~$12, alarms ~$9.4, shipped metrics ~$4.9, dashboard $3, public IP ~$3.6, cross-zone traffic ~$2.6, S3 ~$1.5 and rising about 165 GB a month, keys and secrets ~$1.2; total ~$60, ~$70 with tax. The four levers save about $12–13 before tax, leaving about $47 (~$56 with tax): about ₹4,900 at ₹88/$, about ₹5,600 at the ₹100/$ rate the budget card prints. The cross-zone traffic is the next lever to investigate if December reads above ₹5,500.
+
+| Item | What Quote 53 authorizes |
+|---|---|
+| Alarms | Remove CloudWatch alarms from about 93 to about 30, each removal with its own row in a dated alarm review (why it goes, what still covers the failure). KEPT whatever else goes: every data-loss and loss-group page, the lane-down / socket-parked / ticks-dropped live-lane pages, the token pages, the budget pages, the disk-full and QuestDB-down pages, the cross-verification pages. A removed alarm in a noise-lock family needs that file's dated edit in the same change |
+| Shipped metrics | CloudWatch receives only the metrics an alarm reads; every metric stays on the box's local `/metrics` |
+| Dashboard | The CloudWatch dashboard is deleted (reverses Quote 37's "dashboard KEPT"); the operator portal and Telegram stay |
+| Raw frames in S3 | A lifecycle TRANSITION moves `raw-frames/` objects older than 30 days to S3 Glacier Instant Retrieval (readable at once, nothing deleted); `questdb-partitions/` (ticks and candles brutex reads) stays STANDARD |
+| Stop line | Unchanged: $75 from 1 December 2026 (Quote 37); no $55 stop |
+
+##### What violates Quote 53 (REJECT)
+- Removing an alarm without its review row, or removing any alarm in the KEPT list above.
+- Removing a metric from the box's local `/metrics`, or shipping fewer metrics than the alarms read.
+- Any S3 `expiration`, `noncurrent_version_expiration`, delete or versioning change; a transition of `questdb-partitions/`, `deploys/`, `instrument-snapshots/` or `logs/`; Glacier Flexible or Deep Archive for anything brutex reads.
+- A stop line below $75 or a change to instance, disk, IOPS, throughput or depth under Quote 53.

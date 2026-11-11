@@ -733,4 +733,47 @@ mod tests {
     fn remove_dir_is_quiet_on_a_missing_dir() {
         assert!(remove_dir(Path::new("/nonexistent/tv-bench-ab-test")).is_ok());
     }
+
+    /// The file helpers' refusal arms, each on a real path: an unreadable
+    /// folder is skipped, a record with no ids is refused, two saved binaries
+    /// for one target pick none, a sub-folder is not copied, and removing a
+    /// plain file as a folder is an error, never a silent success.
+    #[test]
+    fn file_helpers_refuse_the_odd_shapes() {
+        let root = std::env::temp_dir().join(format!("tv-bench-ab-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("crit/new")).unwrap();
+
+        // An unreadable starting folder yields no roots.
+        assert!(change_roots(&root.join("missing")).is_empty());
+
+        // benchmark.json without full_id/title is refused.
+        std::fs::write(root.join("crit/new/benchmark.json"), "{\"group_id\":\"g\"}").unwrap();
+        let err = bench_ids(&root.join("crit")).unwrap_err();
+        assert!(err.contains("no full_id/title"), "{err}");
+
+        // Two saved binaries for the same target: ambiguous, so none.
+        let saved = root.join("saved");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join("pipeline-0123456789abcdef"), b"a").unwrap();
+        std::fs::write(saved.join("pipeline-fedcba9876543210"), b"b").unwrap();
+        assert_eq!(saved_bin_for(&saved, "pipeline"), None);
+        assert_eq!(saved_bin_for(&root.join("missing"), "pipeline"), None);
+
+        // A sub-folder in the source is skipped; files are copied.
+        std::fs::create_dir_all(saved.join("nested")).unwrap();
+        let copy = root.join("copy");
+        copy_dir_files(&saved, &copy).unwrap();
+        assert!(copy.join("pipeline-0123456789abcdef").is_file());
+        assert!(!copy.join("nested").exists());
+        assert!(copy_dir_files(&root.join("missing"), &root.join("copy2")).is_err());
+
+        // A plain file is not a folder: the removal reports it.
+        let plain = root.join("plain.txt");
+        std::fs::write(&plain, b"x").unwrap();
+        let err = remove_dir(&plain).unwrap_err();
+        assert!(err.contains("plain.txt"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

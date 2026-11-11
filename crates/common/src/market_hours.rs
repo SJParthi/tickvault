@@ -113,6 +113,25 @@ pub fn is_trading_session_at(utc_secs: i64) -> bool {
     combine_trading_session(in_trading_session_at(utc_secs), calendar_trading_day)
 }
 
+/// Whether IST `date` had (or has) a Muhurat session, by the calendar
+/// installed with [`set_market_calendar_for_session`]; `None` when no
+/// calendar is installed (the caller must then assume whichever answer keeps
+/// more). Added 2026-11-09 for the archive drain hold (PR AA review finding
+/// 12): a process booted after midnight can ask about yesterday. O(1).
+#[must_use]
+pub fn installed_calendar_says_muhurat(date: chrono::NaiveDate) -> Option<bool> {
+    calendar_says_muhurat(SESSION_CALENDAR.get().map(Arc::as_ref), date)
+}
+
+/// [`installed_calendar_says_muhurat`] over an explicit calendar. Pure, O(1).
+#[must_use]
+fn calendar_says_muhurat(
+    calendar: Option<&TradingCalendar>,
+    date: chrono::NaiveDate,
+) -> Option<bool> {
+    calendar.map(|c| c.is_muhurat_trading_day(date))
+}
+
 /// Pure combiner for [`is_trading_session_now`] — unit-testable without a clock.
 ///
 /// `in_weekday_session` is the time-of-day + weekday gate
@@ -659,6 +678,43 @@ mod tests {
             is_trading_session_now(),
             expected,
             "with a calendar installed, the session gate must follow is_trading_day_today"
+        );
+    }
+
+    /// `calendar_says_muhurat` reads the calendar's Muhurat dates, and no
+    /// calendar is `None`, never a guessed `false` (PR AA review finding 12).
+    #[test]
+    fn test_installed_calendar_says_muhurat_reads_the_calendar_and_none_without_one() {
+        use crate::config::{MuhuratTradingEntry, TradingConfig};
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![MuhuratTradingEntry {
+                date: "2026-11-08".to_string(),
+                name: "Diwali 2026".to_string(),
+                ..Default::default()
+            }],
+            nse_mock_trading_dates: vec![],
+        };
+        let cal = TradingCalendar::from_config(&cfg).unwrap();
+        let muhurat = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        let ordinary = chrono::NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        assert_eq!(calendar_says_muhurat(Some(&cal), muhurat), Some(true));
+        assert_eq!(calendar_says_muhurat(Some(&cal), ordinary), Some(false));
+        assert_eq!(calendar_says_muhurat(None, muhurat), None);
+        // The wrapper reads the installed calendar, whichever test installed
+        // it first in this binary.
+        assert_eq!(
+            installed_calendar_says_muhurat(ordinary),
+            SESSION_CALENDAR
+                .get()
+                .map(|c| c.is_muhurat_trading_day(ordinary))
         );
     }
 

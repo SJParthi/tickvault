@@ -5212,3 +5212,83 @@ must never wait 30 minutes behind an unrelated silence page.
 - Raises the `RISK-GAP-03` period above 300 s, adds an OK page to it, or removes
   the emit side's 30-minute cooldown (which is what keeps a 300 s window from
   bringing back the 2026-08-14 burst).
+
+## §2.17 — 2026-11-08: the replay frame-cap line is quiet only on a planned evening restart; a lost replay row gets its own page source (no new page)
+
+**The owner's decision (2026-11-08 decision card, option label verbatim):**
+
+> **"Quiet on planned restarts (Recommended)"**
+
+The card read, verbatim: *"Only the planned evening restart logs it quietly
+(still counted and visible in logs). Any other start that hits the limit still
+pages you, and a real data problem always pages."* Recorded here BEFORE the
+code, per the rule-file-first law. Plan: `active-plan-audit-2026-10-20.md`,
+item PR RD.
+
+**Why (Verified from the CloudWatch log group `/tickvault/prod/app`, 7–8 Nov
+2026, and the code at `origin/main` 7205ad002):** every boot replays ONE
+512 MiB batch (about 3.5 million frames, 5 segments) and the per-boot frame cap
+(`WAL_REPLAY_MAX_FRAMES_PER_BOOT`, 3,000,000) is checked only before a pass,
+so every catch-up round after the boot pass is refused at round 0 with an
+ERROR `WS-SPILL-01` `source = "replay_frame_cap"`. That ERROR matches the
+`ws-spill-01` filter (`$.code = "WS-SPILL-01" && $.level = "ERROR"`, one line
+pages), whose description says "disk I/O error", which is wrong for this case.
+On a restart the evening drain planned on purpose (Quote 41's longer catch-up
+clock, and the 5x frame cap PR RD builds), reaching the cap is the expected
+end of that boot's slice, not a fault. Separately, the ack check refuses at
+once when any replayed row landed nowhere (a full depth spill on 7 Nov and at
+the 8 Nov Muhurat boot), but the line says `replay_ack_wait_timeout`,
+`wait_secs 30`, although no wait ran.
+
+| Line | Before | After (2026-11-08) |
+|---|---|---|
+| `WS-SPILL-01` `source = "replay_frame_cap"` on a boot the evening drain marked as planned | `error!`, pages through `ws-spill-01` | coded `warn!`, `source = "replay_frame_cap_planned"`; `tv_wal_replay_frame_cap_stops_total` still counted; not paged (the filter matches `ERROR` only) |
+| `WS-SPILL-01` `source = "replay_frame_cap"` on any other boot | `error!`, pages | unchanged: `error!`, pages |
+| A replayed row that landed in neither QuestDB nor a spill (the ack refuses at once) | `error!` `source = "replay_ack_wait_timeout"`, pages | `error!` `source = "replay_rows_lost"`, pages (same code, same filter) |
+| The ack wait really ran out of time | `error!` `source = "replay_ack_wait_timeout"`, pages | unchanged |
+| A replayed ORDER-BOOK row that landed nowhere, marked for the after-close pass (`LandedDepthDeferred`, PR RD review 2026-11-08) | (RD-3 draft: coded `warn!` `replay_depth_deferred`, not paged) | `error!` `source = "replay_rows_lost"`, `confirmed = true`, pages; the batch is confirmed and the marks keep its segments for the after-close pass |
+
+"Planned" means only the boot the evening drain itself recorded as its own
+restart in `data/state/evening-drain.state` (the one-boot pending flag, read and
+cleared by `evening_drain::claim_planned_boot` before the boot replay starts, and handed out only when the clearing write succeeds); a deploy restart, a crash restart, a
+manual start, a Muhurat boot, or a boot whose state file cannot be read is NOT
+planned and keeps the ERROR.
+
+**Cost:** zero. No alarm, metric filter, EMF name, `ok_actions` or Telegram
+family added; the `ws-spill-01` alarm definition and description are
+unchanged.
+
+**Honest limits (Rule 11).** A planned restart that hits the cap because the
+backlog is still large is silent on the phone; it stays visible on the counter,
+in the app log (the `warn!` line), and in the evening drain's own progress
+check, which stops further restarts when the backlog does not shrink. A
+mistaken "planned" mark would hide a real capacity signal on that one boot, so
+the mark is one boot only and fails closed (unreadable state = not planned).
+
+**PR RD review addendum (2026-11-08, no new page, the owner card above).**
+(1) The planned mark is claimed in `main` before the WAL directory is locked
+and replayed, and the verdict is kept in memory, so a planned boot that dies
+in its replay (OOM, deploy, crash) leaves no mark for the next boot; a failed
+clearing write gives the standard allowance. Honest limit: a process killed
+between its start and the claim (before any replay) leaves the mark for the
+next boot within 15 minutes. (2) A replayed order-book row deferred to the
+after-close pass pages as `replay_rows_lost` (`confirmed = true`), per the
+card's "a real data problem always pages". Honest limit, unchanged from item
+45a: once confirmed, the segments sit in `archive/`, and below the 5% disk
+floor the archive prune may delete a marked segment that has a verified S3
+copy (counted, `deferred_depth_deleted_under_disk_floor_copy_in_s3`); before
+RD-3 they stayed in `replaying/` and were re-folded every boot. Ticks keep
+priority over depth at the floor; nothing re-reads the S3 copy yet (45e-2).
+(3) An uncertain bucket older than three days is written back from its
+readable segments before the unreadable neighbour's share is released.
+
+**What a PR that violates §2.17 looks like (REJECT):**
+- Logs `replay_frame_cap` below ERROR on any boot the evening drain did not
+  mark as its own planned restart (deploy, crash, manual, Muhurat, or an
+  unreadable state file), or keeps the planned mark for more than one boot.
+- Quiets `replay_rows_lost` (lower than ERROR, a different code, or a source the
+  `ws-spill-01` filter does not match), or folds it back into
+  `replay_ack_wait_timeout`.
+- Drops the `tv_wal_replay_frame_cap_stops_total` increment on the planned path.
+- Adds a page, alarm, `ok_actions`, metric filter or EMF name under cover of
+  this section, or edits the `ws-spill-01` alarm to exclude these sources.

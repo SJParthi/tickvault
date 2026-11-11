@@ -36,7 +36,7 @@
 //!   [`after_close_floor_bytes`] (the 5% pinned-delete line plus one partition
 //!   rewrite plus 2 GiB, at least [`AFTER_CLOSE_DISK_FLOOR_MIN_FREE_BYTES`]),
 //!   after first asking for a reclaim (only above the pinned line) and
-//!   waiting, BEFORE it takes the depth-partition hold, up to
+//!   waiting, before its first bucket, up to
 //!   [`AFTER_CLOSE_FLOOR_RECLAIM_WAIT_POLLS`] pauses for it (PR DP-4/DP-7).
 //!
 //! # Why the ingest shed does not pause it (fixed 2026-10-13)
@@ -214,7 +214,7 @@ const _: () = assert!(
 /// `max(5% line + one hour-partition rewrite + 2 GiB, 10 GiB)`: about
 /// 16 GiB (11%) on the 150 GB root, below the inline shed threshold (15%).
 /// Honest consequence: 12.9 GB free on that box is BELOW this floor; the
-/// pass asks for a reclaim and waits before it takes the depth partitions,
+/// pass asks for a reclaim and waits before its first bucket,
 /// and the pressure loop reclaims back to back after 15:40 (review M3).
 #[must_use]
 pub fn after_close_floor_bytes(total_bytes: u64) -> u64 {
@@ -411,10 +411,11 @@ fn request_space_if_safe(signals: &PassSignals<'_>, wal_dir: &Path) -> bool {
 /// 2026-11-05 it stopped ~700 times overnight at the same 12.9 GB. Returns
 /// early on cancellation. Cold path, the pass's own thread.
 ///
-/// PR DP review M4: called only BEFORE the pass takes the depth-partition
-/// hold, and only inside the window; under the hold the pass checks the
-/// floor without waiting ([`disk_low`]), so a 3-minute wait never blocks the
-/// archiver.
+/// PR DP review M4: called only before the pass's first bucket, and only
+/// inside the window; between buckets the pass checks the floor without
+/// waiting ([`disk_low`]). (PR AA step 2, 2026-11-07: the all-night
+/// depth-partition hold this protected the archiver from is gone; each
+/// bucket takes the archive quiesce lock only for its own writes.)
 fn disk_stays_low(signals: &PassSignals<'_>, wal_dir: &Path, cancel: &AtomicBool) -> bool {
     if !disk_low(signals, wal_dir) {
         return false;
@@ -784,8 +785,8 @@ const fn endpoint_matches(endpoint: WalEndpoint, kinds: u8) -> bool {
 
 /// Waits until the pacing rule says run. `Err` carries the stop reason.
 ///
-/// PR DP review M4: runs under the depth-partition hold, so the disk floor
-/// is read WITHOUT the reclaim wait ([`disk_low`]), and only inside the
+/// PR DP review M4: runs between buckets (before each bucket takes the
+/// archive quiesce lock), so the disk floor is read WITHOUT the reclaim wait ([`disk_low`]), and only inside the
 /// window (outside it the step stops on the clock and no `statvfs` is read).
 fn wait_for_run(
     signals: &PassSignals<'_>,
@@ -929,9 +930,9 @@ pub fn run_after_close_pass(
         return summary;
     }
     // PR DP review M4: the disk floor's reclaim wait (up to 3 minutes) runs
-    // HERE, before the depth-partition hold, and only inside the window, so
-    // it never blocks the archiver that could be freeing that space. Under
-    // the hold the floor is read without waiting.
+    // HERE, before the first bucket, and only inside the window, so it never
+    // holds the archive quiesce lock the archiver needs to free that space.
+    // Between buckets the floor is read without waiting.
     if in_after_close_window((signals.now_secs_ist)()) && disk_stays_low(signals, wal_dir, cancel) {
         let first = work.first().map_or(0, |&(id, _)| id);
         report_disk_floor_stop(signals, wal_dir, first);
@@ -939,25 +940,22 @@ pub fn run_after_close_pass(
         summary.stop = Some(PassStop::DiskFloor);
         return summary;
     }
-    // DA-13d: no depth partition is archived (exported, recounted, dropped)
-    // from the first rewrite until the marks are cleared below, so a row
-    // written back here cannot land between an archive's recount and its
-    // DROP and vanish with the partition. Waits for at most the one depth
-    // partition an archive pass may have in flight. Held to the end of this
-    // function; this runs on the pass's own OS thread, never an async one.
-    //
-    // Held through the lag pauses and the settle too, though nothing is
-    // written then, and deliberately: from here until the marks are cleared
-    // the pass still has rows to write into these partitions, so an export
-    // and DROP in a pause would leave those rows out of the S3 copy and the
-    // later rewrite would recreate a partition holding only them. The
-    // archivers read a hold as "stand aside", never as a failure: the daily
-    // leg refunds the attempt and retries, the disk-pressure leg neither
-    // counts the pass nor escalates (DA-13d review). The hold ends by the
-    // pass's own deadline (07:15 IST plus the settle), or earlier at its disk
-    // floor or a cancel.
-    let _depth_partitions =
-        tickvault_storage::partition_archive::hold_depth_partitions_for_rewrite();
+    // DA-13d, reworked by PR AA step 2 (owner Quote 51, 2026-11-07): a row
+    // written back here must never land between an archive's recount and
+    // its DROP and vanish with the partition, and an hour must never be
+    // copied while rows of it are still to be written back. Until PR AA the
+    // pass held a process-wide depth-partition gate from here until its marks
+    // were cleared, which kept EVERY depth partition on the box all night.
+    // Now:
+    // - each bucket takes the shared side of the archive quiesce lock for
+    //   its own writes and its bucket-edge flush (in the loop below), so the
+    //   archiver, which holds the lock from its WAL snapshot to its DROP,
+    //   never runs a copy or a drop while this pass writes;
+    // - the archiver holds every hour whose frames still carry an after-close
+    //   mark (the marks are cleared only at the end of this pass, after the
+    //   settle), so an hour is copied only once its rows are all written back.
+    // A hold for marks is read by the archivers as "stand aside", never as a
+    // failure, exactly as the old gate was.
     info!(
         buckets = work.len(),
         overflowed = snap.overflowed,
@@ -992,7 +990,12 @@ pub fn run_after_close_pass(
         let expired_uncertain = bucket.uncertain
             && !bucket.touches_open
             && bucket_age_days(id) > UNCERTAIN_CARRY_MAX_DAYS;
-        if expired_uncertain {
+        // PR RD review (finding 1, 2026-11-08): an expired uncertain bucket
+        // whose READABLE segments still hold its rows is written back from
+        // them first; only the rows in the unreadable neighbour are released
+        // (reported after the write below). Releasing it unread would clear
+        // the only mark protecting a readable, possibly archived, segment.
+        if expired_uncertain && bucket.paths.is_empty() {
             summary.segments_damaged += 1;
             pass_counter("uncertain_expired");
             error!(
@@ -1006,7 +1009,7 @@ pub fn run_after_close_pass(
             done.push((id, kinds));
             continue;
         }
-        if bucket.touches_open || bucket.uncertain {
+        if bucket.touches_open || (bucket.uncertain && !expired_uncertain) {
             summary.buckets_carried += 1;
             if !bucket.touches_open {
                 summary.buckets_uncertain += 1;
@@ -1037,6 +1040,13 @@ pub fn run_after_close_pass(
         let mut disk_stop = false;
         let mut damaged = false;
         let mut bucket_no_receipt = 0u64;
+        // PR AA (owner Quote 51): this bucket's rows go into OLD depth
+        // hours, so the bucket is written and flushed only while no archiver
+        // is copying and dropping one of them. Waits behind at most the one
+        // partition an archive pass has in flight (this is the pass's own OS
+        // thread, never an async one); released at the end of this
+        // iteration, after the bucket-edge flush below.
+        let _quiesce = tickvault_storage::archive_quiesce::archive_quiesce_shared_blocking();
         'segments: for path in &bucket.paths {
             let read = match read_segment_frames_matching(path, &keep) {
                 Ok(read) => read,
@@ -1149,6 +1159,21 @@ pub fn run_after_close_pass(
                 frames = bucket_no_receipt,
                 "skipped order-book frames carry no receipt time and cannot be written back \
                  onto their original keys — they are lost"
+            );
+        }
+        if expired_uncertain {
+            // The readable segments were written back above; what remains
+            // unread is the unreadable neighbour's share, released as lost.
+            summary.segments_damaged += 1;
+            pass_counter("uncertain_expired");
+            error!(
+                code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                source = "deferred_depth_uncertain_expired",
+                bucket = id,
+                kinds,
+                "order-book rows skipped under load were written back from the readable WAL \
+                 segments; the rows in the unreadable neighbour could not be read for several \
+                 days — those are released as lost"
             );
         }
         done.push((id, kinds));
@@ -1356,6 +1381,44 @@ mod tests {
 
     /// A free fraction well clear of every shed and floor threshold.
     const HEALTHY_FREE: f64 = 0.5;
+
+    /// PR AA step 1: each bucket takes the archive quiesce lock before its
+    /// first write and keeps it through the bucket-edge flush, inside the
+    /// per-bucket loop (so it is released between buckets, never held all
+    /// night). A source scan, because the lock is process-wide and a
+    /// behavioural test holding it would stall every other pass test.
+    #[test]
+    fn test_each_bucket_holds_the_archive_quiesce_lock_through_its_flush() {
+        let src = include_str!("deferred_depth_pass.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let loop_at = production
+            .find("for &(id, kinds) in &work {")
+            .expect("the per-bucket loop must exist");
+        let body = &production[loop_at..];
+        let lock_at = body
+            .find("archive_quiesce_shared_blocking()")
+            .expect("each bucket must take the archive quiesce lock");
+        let write_at = body
+            .find("'segments: for path in &bucket.paths")
+            .expect("the bucket's write loop must exist");
+        let flush_at = body
+            .find("if !failed && sink.flush().is_err()")
+            .expect("the bucket-edge flush must exist");
+        assert!(
+            lock_at < write_at,
+            "the lock is taken before the first write"
+        );
+        assert!(write_at < flush_at);
+        let guard_line = body[..write_at]
+            .lines()
+            .rev()
+            .find(|l| l.contains("archive_quiesce_shared_blocking()"))
+            .unwrap_or_default();
+        assert!(
+            guard_line.trim_start().starts_with("let _quiesce ="),
+            "the guard must be bound for the iteration, not dropped at once: {guard_line}"
+        );
+    }
 
     #[test]
     fn after_close_step_over_the_full_grid() {
@@ -1607,27 +1670,18 @@ mod tests {
     }
 
     // Regression: PR DP review M4 — the 3-minute reclaim wait ran while the
-    // pass held the depth partitions, blocking the archiver. It now runs
-    // before the hold: with the hold already taken (as an archive pass in
-    // flight would), a pass at its floor still returns instead of waiting
-    // for it.
+    // pass held the depth partitions, blocking the archiver. It runs before
+    // the first bucket, so a pass at its floor returns without writing
+    // anything. (PR AA step 2, 2026-11-07: the all-night depth-partition hold
+    // is gone; each bucket takes the archive quiesce lock only after this
+    // wait, which the source order below pins.)
     #[test]
-    fn test_regression_m4_floor_wait_runs_before_the_depth_partition_hold() {
+    fn test_regression_m4_floor_wait_runs_before_the_first_bucket() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicU32;
         let (dir, seq) = wal_with_refused_frames("m4-floor-before-hold", 1);
         let marks = Arc::new(DeferredDepth::new_for_tests());
         marks.note_shed(seq, ShedDepth::Inline);
-        // Take the hold the way an archive pass would (another test may hold
-        // it briefly; wait for it).
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let guard = loop {
-            if let Some(g) = tickvault_storage::partition_archive::try_hold_depth_partitions() {
-                break g;
-            }
-            assert!(std::time::Instant::now() < deadline, "the hold never freed");
-            std::thread::sleep(Duration::from_millis(20));
-        };
         let sleeps = Arc::new(AtomicU32::new(0));
         let requests = Arc::new(AtomicU32::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1661,8 +1715,19 @@ mod tests {
         });
         let summary = rx
             .recv_timeout(Duration::from_secs(30))
-            .expect("the pass must not wait for the depth-partition hold at its floor");
-        drop(guard);
+            .expect("the pass must return at its floor");
+        let src = include_str!("deferred_depth_pass.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let floor_at = production
+            .find("disk_stays_low(signals, wal_dir, cancel)")
+            .expect("the floor wait must exist");
+        let lock_at = production
+            .find("archive_quiesce_shared_blocking()")
+            .expect("each bucket must take the quiesce lock");
+        assert!(
+            floor_at < lock_at,
+            "the floor wait runs before any bucket lock"
+        );
         assert_eq!(summary.stop, Some(PassStop::DiskFloor));
         assert_eq!(summary.rows_written, 0);
         assert_eq!(
@@ -1896,6 +1961,152 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Regression: 2026-11-08 (PR RD, RD-3). A replay batch whose depth rows
+    // landed nowhere is now confirmed (its segment moves to `archive/`) once
+    // the lost range is marked with `defer_lost_range`. The after-close pass
+    // must still find that segment in `archive/` and write the depth rows
+    // back from it, or the deferral would be a loss.
+    #[test]
+    fn test_regression_rd3_pass_rewrites_a_lost_depth_range_from_an_archived_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-deferred-pass-rd3-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (seq, rx) = in_session();
+        {
+            let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                seq,
+                rx,
+                WalEndpoint::MainFeed,
+            );
+            wal.shutdown(Duration::from_secs(5));
+        }
+        // What the replay confirm does once the ack says LandedDepthDeferred.
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let mut moved = 0;
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wal") {
+                std::fs::rename(&path, archive.join(entry.file_name())).unwrap();
+                moved += 1;
+            }
+        }
+        assert!(moved >= 1, "the segment is archived");
+
+        // What the depth writer does when the batch's write and rescue fail.
+        let marks = DeferredDepth::new_for_tests();
+        assert!(marks.defer_lost_range(seq, seq));
+
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
+            sleep: &|_| {},
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(
+            summary.rows_written, 10,
+            "the five inline levels a side of the archived frame are written back"
+        );
+        // `for_test` has no QuestDB: the bucket is carried, never cleared on a
+        // write it could not prove, so the archived segment stays protected.
+        assert_eq!(summary.buckets_cleared, 0);
+        assert!(!marks.snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: PR RD review finding 1 (2026-11-08). A replayed backlog
+    // bucket is days old; an unreadable neighbour (an empty segment written
+    // after the archived one) makes it `uncertain`. Before the fix the pass
+    // released it as lost on its FIRST visit without reading the readable
+    // archived segment that holds the rows, and cleared the mark. It must
+    // write those rows back first.
+    #[test]
+    fn test_regression_expired_uncertain_bucket_is_written_back_from_its_readable_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-deferred-pass-rd-uncertain-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2026-05-28: far past UNCERTAIN_CARRY_MAX_DAYS.
+        let (seq, rx) = in_session();
+        assert!(bucket_age_days(seq >> DEFERRED_BUCKET_SHIFT) > UNCERTAIN_CARRY_MAX_DAYS);
+        {
+            let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                seq,
+                rx,
+                WalEndpoint::MainFeed,
+            );
+            wal.shutdown(Duration::from_secs(5));
+        }
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wal") {
+                std::fs::rename(&path, archive.join(entry.file_name())).unwrap();
+            }
+        }
+        // The unreadable neighbour, sorting after the archived segment.
+        std::fs::write(archive.join("zz-empty-neighbour.wal"), b"").unwrap();
+        let spans = deferred_segment_spans(&dir).unwrap();
+        let bucket = segments_for_bucket(&spans, seq >> DEFERRED_BUCKET_SHIFT);
+        assert!(
+            bucket.uncertain,
+            "the empty neighbour makes the bucket uncertain"
+        );
+        assert_eq!(bucket.paths.len(), 1, "the archived segment is readable");
+
+        let marks = DeferredDepth::new_for_tests();
+        assert!(marks.defer_lost_range(seq, seq));
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
+            sleep: &|_| {},
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(
+            summary.rows_written, 10,
+            "the readable archived segment is read before the bucket is released"
+        );
+        // `for_test` cannot flush, so the bucket is carried and its mark kept;
+        // the old code cleared it unread.
+        assert_eq!(summary.buckets_cleared, 0);
+        assert!(!marks.snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Cancellation stops the pass before it touches a bucket.
     #[test]
     fn test_run_after_close_pass_cancelled_touches_nothing() {
@@ -2083,22 +2294,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Regression: 2026-10-13 (DA-13d) — the pass wrote depth rows back while
-    // the partition archiver could be between a recount and a DROP of the
-    // same partition. It must hold the depth-partition gate through its
-    // writes and its settle, until the marks are cleared.
+    // Regression: 2026-10-13 (DA-13d), reworked for PR AA step 2 — the pass
+    // wrote depth rows back while the partition archiver could be between a
+    // recount and a DROP of the same partition. The archiver now holds every
+    // hour whose frames still carry a mark, so the marks must stay set
+    // through the writes AND the settle and be cleared only at the end; and
+    // the pass must no longer take an all-night hold on every depth
+    // partition.
     #[test]
-    fn test_regression_da13d_pass_holds_the_depth_partition_gate_until_cleared() {
+    fn test_regression_da13d_marks_stay_set_through_the_settle_and_no_all_night_hold() {
+        let src = include_str!("deferred_depth_pass.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !production.contains("hold_depth_partitions_for_rewrite"),
+            "the all-night depth-partition hold must not come back"
+        );
         let (dir, seq) = wal_with_one_refused_frame("gate");
         let marks = DeferredDepth::new_for_tests();
         marks.note_shed(seq, ShedDepth::Inline);
         let clock = Cell::new(IN_WINDOW);
-        let gate_free_during_settle = Cell::new(None);
+        let marked_during_settle = Cell::new(None);
         let sleep = |d: Duration| {
             if d == AFTER_CLOSE_SETTLE {
-                let free =
-                    tickvault_storage::partition_archive::try_hold_depth_partitions().is_some();
-                gate_free_during_settle.set(Some(free));
+                let marked = !marks.snapshot().marked_buckets().is_empty();
+                marked_during_settle.set(Some(marked));
             }
             clock.set(clock.get() + d.as_secs());
         };
@@ -2121,9 +2340,13 @@ mod tests {
         );
         assert_eq!(summary.buckets_cleared, 1);
         assert_eq!(
-            gate_free_during_settle.get(),
-            Some(false),
-            "an archive pass could take a depth partition while the pass settles"
+            marked_during_settle.get(),
+            Some(true),
+            "the archiver could copy the hour while the pass settles"
+        );
+        assert!(
+            marks.snapshot().marked_buckets().is_empty(),
+            "the marks are cleared at the end of the pass"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -476,6 +476,28 @@ pub fn deferred_depth() -> &'static DeferredDepth {
     &DEFERRED
 }
 
+/// The table a failed depth rescue marks (plan item PR RD, RD-3,
+/// 2026-11-08). In production it IS [`deferred_depth`], the table the prunes
+/// and the after-close pass read (pinned by the app's
+/// `test_lost_depth_marks_is_the_process_table_in_production`). Under this
+/// crate's own unit tests it is a separate static: many of them fail depth
+/// rescues on purpose, and their marks in the process table would make every
+/// test that prunes through [`prune_view`] keep segments it expects deleted.
+#[cfg(not(test))]
+#[must_use]
+pub fn lost_depth_marks() -> &'static DeferredDepth {
+    &DEFERRED
+}
+
+/// See the production [`lost_depth_marks`]: this crate's unit tests mark a
+/// table of their own.
+#[cfg(test)]
+#[must_use]
+pub fn lost_depth_marks() -> &'static DeferredDepth {
+    static LOST_FOR_UNIT_TESTS: DeferredDepth = DeferredDepth::new();
+    &LOST_FOR_UNIT_TESTS
+}
+
 impl DeferredDepth {
     /// A fresh, unbound instance for tests that must not share the global.
     #[must_use]
@@ -592,6 +614,44 @@ impl DeferredDepth {
         if !self.mark(id, bit) {
             self.note_overflow(id);
         }
+    }
+
+    /// Records that the depth rows of a whole capture range `[lo, hi]` landed
+    /// nowhere (the ILP write failed AND the spill rescue failed), so the
+    /// after-close pass must write them back from the WAL (plan item PR RD,
+    /// RD-3, 2026-11-08). Every bucket the range touches is marked for BOTH
+    /// depth kinds: a failed batch does not say which kind it held, and
+    /// keeping more is the safe side.
+    ///
+    /// `true` only when every bucket is now held by its own slot. `false`,
+    /// and the caller must hold the WAL segment as a loss, when the range has
+    /// no usable start (`lo == 0`, a sequence-less batch, or a bucket id of
+    /// 0), is inverted, spans more buckets than the table holds (nothing is
+    /// marked then), or any bucket collided with another in its slot (that
+    /// bucket is recorded as an overflow, which still keeps every segment at
+    /// or below it: keep more).
+    ///
+    /// O(buckets in the range), at most [`DEFERRED_BUCKETS`]; a rescue
+    /// FAILURE path only, never per tick.
+    #[must_use]
+    pub fn defer_lost_range(&self, lo: u64, hi: u64) -> bool {
+        if lo == 0 || hi < lo {
+            return false;
+        }
+        let lo_id = lo >> DEFERRED_BUCKET_SHIFT;
+        let hi_id = hi >> DEFERRED_BUCKET_SHIFT;
+        if lo_id == 0 || hi_id - lo_id >= DEFERRED_BUCKETS as u64 {
+            return false;
+        }
+        let mut every_bucket_held = true;
+        // O(1) EXEMPT: at most DEFERRED_BUCKETS iterations, rescue-failure path
+        for id in lo_id..=hi_id {
+            if !self.mark(id, SHED_DEPTH_ALL) {
+                self.note_overflow(id);
+                every_bucket_held = false;
+            }
+        }
+        every_bucket_held
     }
 
     /// Records that bucket `id` could not be held: every range now reads as
@@ -729,15 +789,41 @@ impl DeferredDepth {
     /// Writes the current state to the bound file (tmp + rename). Unbound →
     /// nothing. A failure is counted and warned, never propagated.
     pub fn persist_now(&self) {
+        let _written = self.persist_locked(false);
+    }
+
+    /// [`Self::persist_now`] that WAITS for a persist already in flight
+    /// instead of skipping, writes even when nothing changed, and says
+    /// whether the file now holds every mark made before the call. A replay
+    /// confirm that leaves depth rows to the after-close pass (plan item
+    /// PR RD, RD-3) archives the WAL segment only after this returns `true`:
+    /// marks that died with the process would leave the archived segment
+    /// unprotected. `false` when unbound or when the write failed (counted
+    /// and warned as in [`Self::persist_now`]). Cold path: once per replay
+    /// confirm that deferred depth.
+    #[must_use]
+    pub fn persist_checked(&self) -> bool {
+        self.persist_locked(true)
+    }
+
+    /// The shared persist. `wait` takes the lock blocking (the confirm path)
+    /// instead of skipping when another thread is writing.
+    fn persist_locked(&self, wait: bool) -> bool {
         let Some((path, tmp)) = self.paths.get() else {
-            return;
+            return false;
         };
-        let _guard = match self.persist_lock.try_lock() {
-            Ok(guard) => guard,
+        let _guard = if wait {
             // A panic mid-persist poisons the lock; the file it guards is
             // still written tmp + rename, so carry on rather than go silent.
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+            self.persist_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            match self.persist_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            }
         };
         // Cleared BEFORE the snapshot: a change racing the write re-sets it
         // and is written next time.
@@ -750,7 +836,7 @@ impl DeferredDepth {
             self.dirty.store(true, Ordering::Release);
             metrics::counter!(DEFERRED_PERSIST_FAILED_COUNTER).increment(1);
             if self.persist_failing.swap(true, Ordering::AcqRel) {
-                return; // already reported this episode
+                return false; // already reported this episode
             }
             warn!(
                 code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
@@ -760,12 +846,15 @@ impl DeferredDepth {
                 "WAL deferred-depth marks could not be persisted — the RAM marks are kept; \
                  a crash before the next successful persist would lose the newest marks"
             );
-        } else if self.persist_failing.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        if self.persist_failing.swap(false, Ordering::AcqRel) {
             tracing::info!(
                 path = %path.display(),
                 "WAL deferred-depth marks are persisting again"
             );
         }
+        true
     }
 }
 
@@ -1394,5 +1483,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- PR RD (RD-3, 2026-11-08): a lost depth range is deferred --------
+
+    /// A lost range marks EVERY bucket it touches, for both kinds, and says
+    /// so; the segment then reads as deferred.
+    #[test]
+    fn test_defer_lost_range_marks_every_bucket_both_kinds() {
+        let d = DeferredDepth::new_for_tests();
+        let lo = seq(100);
+        let hi = lo + (2u64 << DEFERRED_BUCKET_SHIFT);
+        assert!(d.defer_lost_range(lo, hi));
+        let snap = d.snapshot();
+        let marked = snap.marked_buckets();
+        assert_eq!(marked.len(), 3, "lo, middle and hi buckets: {marked:?}");
+        assert!(marked.iter().all(|&(_, k)| k == SHED_DEPTH_ALL));
+        assert!(snap.segment_is_deferred(lo, Some(hi)));
+        assert!(!snap.overflowed);
+    }
+
+    /// A range that cannot be held is refused, so the caller holds the
+    /// segment: no start, inverted, too wide (nothing marked), or a bucket
+    /// another bucket owns (overflow recorded: keep more).
+    #[test]
+    fn test_defer_lost_range_refuses_what_it_cannot_hold() {
+        let d = DeferredDepth::new_for_tests();
+        assert!(!d.defer_lost_range(0, seq(10)), "sequence-less batch");
+        assert!(!d.defer_lost_range(5, 9), "bucket id 0");
+        assert!(!d.defer_lost_range(seq(10), seq(5)), "inverted");
+        let wide = seq(10) + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        assert!(!d.defer_lost_range(seq(10), wide), "wider than the table");
+        assert!(d.snapshot().is_empty(), "none of those marked anything");
+
+        // Two buckets DEFERRED_BUCKETS apart share a slot.
+        let first = seq(10);
+        let twin = first + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        assert!(d.defer_lost_range(first, first));
+        assert!(!d.defer_lost_range(twin, twin), "slot collision");
+        let snap = d.snapshot();
+        assert!(snap.overflowed, "the collision keeps more, never less");
+        assert!(snap.segment_is_deferred(twin, Some(twin)));
+    }
+
+    /// Under this crate's unit tests a failed rescue marks its own table, never
+    /// the process table the prunes read.
+    #[test]
+    fn test_lost_depth_marks_is_not_the_process_table_under_unit_tests() {
+        assert!(!std::ptr::eq(lost_depth_marks(), deferred_depth()));
+        assert!(std::ptr::eq(lost_depth_marks(), lost_depth_marks()));
+    }
+
+    /// `persist_checked` writes the marks and reports it; unbound or a failed
+    /// write reports `false`.
+    #[test]
+    fn test_persist_checked_reports_whether_the_marks_reached_the_file() {
+        let unbound = DeferredDepth::new_for_tests();
+        assert!(unbound.defer_lost_range(seq(100), seq(100)));
+        assert!(!unbound.persist_checked(), "unbound: nothing persisted");
+
+        let dir = scratch("persist-checked");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        assert!(d.defer_lost_range(seq(200), seq(200)));
+        assert!(d.persist_checked());
+        let disk = DeferredDepthSnapshot::load(&dir).expect("the marks file loads");
+        assert!(disk.segment_is_deferred(seq(200), Some(seq(201))));
+        // Clean and still `true`: the confirm path writes regardless of dirty.
+        assert!(d.persist_checked());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !d.persist_checked(),
+            "the directory is gone: the write fails"
+        );
     }
 }

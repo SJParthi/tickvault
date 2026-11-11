@@ -41,6 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::archive_quiesce::{ArchiveQuiesce, QuiesceWriter, WRITER_QUIESCE_WAIT};
 use reqwest::Client;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_trading::candles::multi_tf_aggregator::{
@@ -137,6 +138,10 @@ pub struct SpillReplayOutcome {
     /// because they hold a row for a table this process has not yet ensured
     /// (2026-11-07, `ilp_table_gate`).
     pub files_held_table_not_ensured: usize,
+    /// Files left as they are because the partition archiver held the old-hour
+    /// writers out for longer than the bounded wait (PR AA, owner Quote 51).
+    /// The round ended there; the file is offered again next round.
+    pub files_held_archive_quiesce: usize,
 }
 
 impl SpillReplayOutcome {
@@ -165,6 +170,9 @@ impl SpillReplayOutcome {
         self.files_held_table_not_ensured = self
             .files_held_table_not_ensured
             .saturating_add(other.files_held_table_not_ensured);
+        self.files_held_archive_quiesce = self
+            .files_held_archive_quiesce
+            .saturating_add(other.files_held_archive_quiesce);
     }
 }
 
@@ -1995,6 +2003,29 @@ pub async fn replay_spill_dir(
     client: &Client,
     view: &SpillSinkView,
 ) -> SpillReplayOutcome {
+    replay_spill_dir_quiesced(
+        dir,
+        url,
+        client,
+        view,
+        crate::archive_quiesce::process_archive_quiesce(),
+        WRITER_QUIESCE_WAIT,
+    )
+    .await
+}
+
+/// [`replay_spill_dir`] under a given archive quiesce lock and wait: the
+/// process lock and [`WRITER_QUIESCE_WAIT`] in production, a private lock and
+/// a short wait in tests (PR AA).
+// TEST-EXEMPT: covered by test_spill_round_ends_when_quiesce_busy_files_kept
+pub(crate) async fn replay_spill_dir_quiesced(
+    dir: &Path,
+    url: &str,
+    client: &Client,
+    view: &SpillSinkView,
+    quiesce: &ArchiveQuiesce,
+    quiesce_wait: std::time::Duration,
+) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     // FIRST-SAMPLE BASELINE. The CloudWatch agent computes a counter as the
     // delta between consecutive samples and DROPS the first sample of a series
@@ -2104,6 +2135,18 @@ pub async fn replay_spill_dir(
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        // PR AA (owner Quote 51): a spill file holds rows of OLD hours, so
+        // it is posted only while no archiver is copying and dropping one of
+        // them. Held from this file's first POST to its last acknowledgement
+        // (the end of this iteration). An archiver that does not finish
+        // within the bounded wait ends the round; the file is kept as it is
+        // and offered again next round.
+        let Some(_quiesce) = quiesce.shared(quiesce_wait).await else {
+            crate::archive_quiesce::note_quiesce_held(QuiesceWriter::SpillReplay);
+            outcome.files_held_archive_quiesce =
+                outcome.files_held_archive_quiesce.saturating_add(1);
+            return outcome;
+        };
         let mut handle = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(err) => {
@@ -3201,8 +3244,13 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool, policy
                 // The depth directory also holds length-framed `.dspl` files
                 // (plan item 49e, 2026-10-09). Older `.ilp` files drain first;
                 // a failed text round leaves the framed files for the next
-                // round, as any failure stops the round.
-                if framed_depth && outcome.files_failed == 0 {
+                // round, as any failure stops the round. So does a round the
+                // archive quiesce lock held (PR AA): the archiver is still
+                // copying, so the framed files would only wait again.
+                if framed_depth
+                    && outcome.files_failed == 0
+                    && outcome.files_held_archive_quiesce == 0
+                {
                     outcome.absorb(runtime.block_on(
                         crate::depth_spill_frame::replay_framed_spill_dir(
                             &round_dir,
@@ -3239,10 +3287,14 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool, policy
         let Ok((outcome, pruned)) = round else {
             return;
         };
-        if outcome.files_replayed > 0 || outcome.files_failed > 0 {
+        if outcome.files_replayed > 0
+            || outcome.files_failed > 0
+            || outcome.files_held_archive_quiesce > 0
+        {
             info!(
                 files_replayed = outcome.files_replayed,
                 files_failed = outcome.files_failed,
+                files_held_archive_quiesce = outcome.files_held_archive_quiesce,
                 bytes_replayed = outcome.bytes_replayed,
                 "tick spill drain round complete"
             );
@@ -4479,6 +4531,90 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PR AA step 1: while the partition archiver holds the old-hour writers
+    /// out, a spill round posts NOTHING, keeps the file byte for byte and
+    /// ends (counted, not failed). Once the archiver lets go, the same file
+    /// is posted. The URL of the held round points at a port nothing listens
+    /// on, so a POST there would have read as a failed file.
+    #[tokio::test]
+    async fn test_spill_round_ends_when_quiesce_busy_files_kept() {
+        let dir = temp_dir("quiesce-held");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let payload = b"ticks value=1i 1\n";
+        std::fs::write(&path, payload).expect("write");
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let quiesce = ArchiveQuiesce::new();
+        let wait = std::time::Duration::from_millis(50);
+
+        let archiver = quiesce.hold_writers(wait).await;
+        assert!(archiver.is_some(), "the private lock starts free");
+        let held = replay_spill_dir_quiesced(
+            &dir,
+            "http://127.0.0.1:9/write",
+            &client,
+            &test_spill_view(),
+            &quiesce,
+            wait,
+        )
+        .await;
+        assert_eq!(held.files_held_archive_quiesce, 1);
+        assert_eq!(held.files_failed, 0, "a held file is deferred, not failed");
+        assert_eq!(held.files_replayed, 0);
+        assert_eq!(held.bytes_replayed, 0, "nothing is posted while held");
+        assert_eq!(std::fs::read(&path).expect("read"), payload);
+        assert_eq!(super::resume_offset_for(&path), 0, "no progress recorded");
+
+        drop(archiver);
+        let (url, server) = tiny_server(
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            1,
+        );
+        let released =
+            replay_spill_dir_quiesced(&dir, &url, &client, &test_spill_view(), &quiesce, wait)
+                .await;
+        let _ = server.join();
+        assert_eq!(released.files_held_archive_quiesce, 0);
+        assert_eq!(
+            released.files_replayed, 1,
+            "the file is posted once released"
+        );
+        assert_eq!(released.bytes_replayed, payload.len() as u64);
+        super::forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The spill drain loop does not start the framed depth replay in a
+    /// round the quiesce lock held: the archiver is still copying.
+    #[test]
+    fn test_framed_replay_is_skipped_after_a_quiesce_held_text_round() {
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("async fn run_replay_loop")
+            .nth(1)
+            .expect("the drain loop must exist");
+        let framed = body
+            .find("replay_framed_spill_dir(")
+            .expect("the framed replay must still run");
+        let gate = body[..framed]
+            .rfind("outcome.files_held_archive_quiesce == 0")
+            .expect("the framed replay must be gated on a quiesce-free text round");
+        assert!(gate < framed);
+    }
+
+    /// `absorb` adds the quiesce-held count like every other count.
+    #[test]
+    fn test_absorb_adds_files_held_archive_quiesce() {
+        let mut a = SpillReplayOutcome {
+            files_held_archive_quiesce: 1,
+            ..SpillReplayOutcome::default()
+        };
+        a.absorb(SpillReplayOutcome {
+            files_held_archive_quiesce: 2,
+            ..SpillReplayOutcome::default()
+        });
+        assert_eq!(a.files_held_archive_quiesce, 3);
+    }
+
     /// Audit K1: the streak counts only the SAME status, and resets.
     #[test]
     fn test_quarantine_streak_stops_at_three_of_the_same_status() {
@@ -5654,9 +5790,12 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     fn test_regression_da13b_every_unreadable_branch_is_counted() {
         let tick = include_str!("tick_spill_replay.rs");
         let tick_fn = tick
-            .split("pub async fn replay_spill_dir(")
+            .split(concat!(
+                "pub(crate) async ",
+                "fn replay_spill_dir_quiesced("
+            ))
             .nth(1)
-            .expect("replay_spill_dir");
+            .expect("replay_spill_dir_quiesced (the body of replay_spill_dir)");
         let tick_fn = &tick_fn[..tick_fn.find("\n\u{7d}\n").unwrap_or(tick_fn.len())];
         for source in [
             "spill_stat_failed",
@@ -5671,9 +5810,12 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         }
         let depth = include_str!("depth_spill_frame.rs");
         let depth_fn = depth
-            .split("pub async fn replay_framed_spill_dir(")
+            .split(concat!(
+                "pub(crate) async ",
+                "fn replay_framed_spill_dir_quiesced("
+            ))
             .nth(1)
-            .expect("replay_framed_spill_dir");
+            .expect("replay_framed_spill_dir_quiesced (the body of replay_framed_spill_dir)");
         let depth_fn = &depth_fn[..depth_fn.find("\n\u{7d}\n").unwrap_or(depth_fn.len())];
         for source in [
             "spill_stat_failed",

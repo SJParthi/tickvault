@@ -85,6 +85,11 @@ pub mod day_ohlc_orchestrator;
 // PR #6a (2026-05-19): bhavcopy_pipeline DELETED — 16:30 IST NSE bhavcopy
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
+/// The archive copy work the drain hold counts (PR AA step 6, Quote 51).
+pub mod archive_backlog;
+/// The daily archive leg's free-space target and its session-size file
+/// (PR AA step 5, owner Quote 51).
+pub mod archive_free_target;
 pub mod boot_helpers;
 /// STAGE-C: which boot replay outcomes may archive `replaying/` (2026-11-07).
 pub mod boot_wal_confirm;

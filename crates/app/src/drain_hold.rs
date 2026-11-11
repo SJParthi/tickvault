@@ -186,6 +186,12 @@ pub struct DayWork {
     /// The backlog keeps the hold: an evening restart will replay it
     /// (`evening_drain::EveningStep::holds`). Set by the supervisor.
     pub wal_holding: bool,
+    /// Bytes of old partitions the daily archive leg still has to copy to
+    /// S3 and drop, while free space is below its target (PR AA step 6,
+    /// owner Quote 51); `None` when that copy work does not hold the box
+    /// (nothing left, target met, a stale reading, or the switch off). See
+    /// `archive_backlog::backlog_holds`.
+    pub archive_backlog_bytes: Option<u64>,
 }
 
 impl DayWork {
@@ -193,6 +199,19 @@ impl DayWork {
     /// not done, the direction that keeps the box up. O(1).
     #[must_use]
     pub fn is_done(&self) -> bool {
+        self.data_in_database() && self.archive_backlog_bytes.is_none()
+    }
+
+    /// [`Self::is_done`] without the archive copy work: the day's data is in
+    /// the database, whatever the archiver still has to copy to S3 (PR AA
+    /// review). The Quote 31 evening WAL restart reads this, not `is_done`:
+    /// the copy work holds the BOX (Quote 51), but it must never keep the
+    /// restart that drains the WAL backlog from running. Before, a partition
+    /// the archiver failed on every pass kept `is_done` false all night and
+    /// the evening restart gave up at 05:00 without running. O(1).
+    #[must_use]
+    // TEST-EXEMPT: covered by test_regression_archive_backlog_never_blocks_the_evening_restart
+    pub fn data_in_database(&self) -> bool {
         let deferred_done = (self.deferred_marks == 0 && !self.deferred_overflowed)
             || self.deferred_retryable_left == Some(0)
             || self.deferred_floor_blocked();
@@ -255,14 +274,24 @@ impl DayWork {
             },
             show(self.wal_backlog),
             if self.wal_holding { "+replaying" } else { "" },
-        ) + &if self.spill_files_held_unensured > 0 {
-            format!(
-                " spill_files_held_for_table={}",
-                self.spill_files_held_unensured
-            )
-        } else {
-            String::new()
-        }
+        ) + &self
+            .archive_backlog_bytes
+            .map_or_else(String::new, |bytes| {
+                if bytes == crate::archive_backlog::PROVISIONAL_BACKLOG_BYTES {
+                    // The first pass of the process is running, unmeasured.
+                    " archive_bytes=pass_running".to_string()
+                } else {
+                    format!(" archive_bytes={bytes}")
+                }
+            })
+            + &if self.spill_files_held_unensured > 0 {
+                format!(
+                    " spill_files_held_for_table={}",
+                    self.spill_files_held_unensured
+                )
+            } else {
+                String::new()
+            }
     }
 }
 
@@ -399,6 +428,9 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
         ),
         // Decided by the supervisor (`evening_drain::evening_step`).
         wal_holding: false,
+        archive_backlog_bytes: crate::archive_backlog::held_backlog_bytes(
+            chrono::Utc::now().timestamp(),
+        ),
     }
 }
 
@@ -425,9 +457,10 @@ pub const DRAIN_HOLD_STALL_SECS: i64 = 3_600;
 /// Tracks whether the day's work is still moving. Pure, O(1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProgressTracker {
-    /// Marks, spill files, seal files, backlog and WAL segments at the last
-    /// progress; `u64::MAX` for a part that was unknown then.
-    anchor: [u64; 5],
+    /// Marks, spill files, seal files, backlog, WAL segments and archive
+    /// bytes left at the last progress; `u64::MAX` for a part that was
+    /// unknown (or, for the archive bytes, not holding) then.
+    anchor: [u64; 6],
     /// Pass rows written as of the last reading.
     pass_rows: u64,
     /// When progress was last seen; `None` before the first reading.
@@ -449,6 +482,7 @@ impl ProgressTracker {
                 .map_or(u64::MAX, |v| u64::try_from(v).unwrap_or(u64::MAX)),
             work.apply_lag.unwrap_or(u64::MAX),
             work.wal_backlog.unwrap_or(u64::MAX),
+            work.archive_backlog_bytes.unwrap_or(u64::MAX),
         ];
         let Some(last) = self.last_progress_unix else {
             self.anchor = parts;
@@ -599,7 +633,7 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 Some(evening) if on_aws => crate::evening_drain::evening_step(
                     &evening,
                     evening_day,
-                    work.is_done(),
+                    work.data_in_database(),
                     crate::evening_drain::crossverify_settled(xverify_marker, secs_ist),
                     work.wal_backlog,
                     now_unix,
@@ -1032,6 +1066,121 @@ mod tests {
             proptest::prop_assert!(until - now <= i64::try_from(to_ceiling).unwrap());
         }
     }
+
+    // PR AA step 6 (AA-5, owner Quote 51): copy work the daily archive leg
+    // still has to do holds the box, shows in the parameter, and its fall
+    // counts as progress; a stuck backlog still releases after an hour.
+    #[test]
+    fn test_archive_backlog_holds_and_its_fall_is_progress() {
+        let holding = |bytes: u64| DayWork {
+            archive_backlog_bytes: Some(bytes),
+            ..done_work()
+        };
+        assert!(!holding(5).is_done(), "copy work left holds the box");
+        assert!(done_work().is_done(), "no copy work (None) does not hold");
+        assert!(holding(5).left_text().contains("archive_bytes=5"));
+        assert!(!done_work().left_text().contains("archive_bytes"));
+
+        let mut tracker = ProgressTracker::default();
+        let t0 = 1_000_000;
+        assert!(!tracker.observe(&holding(900), 0, t0));
+        // Bytes fall: progress, the stall clock restarts.
+        assert!(!tracker.observe(&holding(400), 0, t0 + DRAIN_HOLD_STALL_SECS - 1));
+        assert!(!tracker.observe(&holding(400), 0, t0 + DRAIN_HOLD_STALL_SECS + 10));
+        // Stuck for an hour after the last fall: released anyway.
+        assert!(tracker.observe(&holding(400), 0, t0 + 2 * DRAIN_HOLD_STALL_SECS - 1));
+    }
+
+    /// PR AA finding 5: the first daily pass of a process starts on an empty
+    /// backlog cell. With every other part done, the day still reads not done
+    /// while that pass runs below the free-space target.
+    #[test]
+    fn test_regression_first_archive_pass_on_an_empty_cell_keeps_the_day_open() {
+        let cell = crate::archive_backlog::ArchiveBacklog::new();
+        let t0 = 1_800_000_000;
+        cell.note_pass_started(t0, true);
+        let work = DayWork {
+            archive_backlog_bytes: crate::archive_backlog::backlog_holds(cell.reading(), t0 + 600),
+            ..done_work()
+        };
+        assert!(
+            !work.is_done(),
+            "the first pass holds the box while it runs"
+        );
+        assert!(
+            work.data_in_database(),
+            "it never holds the evening restart"
+        );
+        assert!(work.left_text().contains("archive_bytes=pass_running"));
+    }
+
+    /// PR AA review: archive copy work holds the box but never the Quote 31
+    /// evening WAL restart. With a partition the archiver fails on every
+    /// pass, `is_done` stays false all night; the restart reads
+    /// `data_in_database`, so it still runs at 19:00.
+    #[test]
+    fn test_regression_archive_backlog_never_blocks_the_evening_restart() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(1 << 30),
+            ..done_work()
+        };
+        assert!(!work.is_done(), "the copy work holds the box");
+        assert!(work.data_in_database(), "the day's data is in the database");
+        let state = crate::evening_drain::EveningState::default();
+        let step = |other_done: bool| {
+            crate::evening_drain::evening_step(
+                &state,
+                739_000,
+                other_done,
+                true,
+                Some(12),
+                1_800_000_000,
+                19 * 3_600,
+            )
+        };
+        assert_eq!(
+            step(work.data_in_database()),
+            crate::evening_drain::EveningStep::Restart
+        );
+        assert_eq!(
+            step(work.is_done()),
+            crate::evening_drain::EveningStep::Wait
+        );
+        // Every other kind of unfinished work still keeps the restart waiting.
+        let spill = DayWork {
+            spill_files: 1,
+            ..done_work()
+        };
+        assert!(!spill.data_in_database());
+    }
+
+    /// A box held only for archive copy work is never held past 07:30 IST:
+    /// the written expiry stops there and no hold is judged from 07:30.
+    #[test]
+    fn test_never_past_0730() {
+        let work = DayWork {
+            archive_backlog_bytes: Some(1 << 40),
+            ..done_work()
+        };
+        assert!(!work.is_done());
+        assert!(!in_hold_window(DRAIN_HOLD_CEILING_SECS_IST));
+        assert!(in_hold_window(DRAIN_HOLD_CEILING_SECS_IST - 1));
+        // One minute before 07:30 the expiry is 07:30, never later.
+        let now_secs = DRAIN_HOLD_CEILING_SECS_IST - 60;
+        let now_unix = 1_762_500_000;
+        assert_eq!(hold_until_unix(now_unix, now_secs), now_unix + 60);
+        let mut state = HoldState::default();
+        assert_eq!(state.step(work.is_done(), now_unix), HoldAction::Hold);
+        assert_eq!(
+            ARCHIVE_WINDOW_END_IS_THE_CEILING,
+            DRAIN_HOLD_CEILING_SECS_IST
+        );
+    }
+
+    /// The daily archive leg's own window ends at the same 07:30 (it is
+    /// derived from the hold's ceiling), so its readings go stale then.
+    const ARCHIVE_WINDOW_END_IS_THE_CEILING: u64 =
+        crate::daily_archive_boot::ARCHIVE_WINDOW_END_SECS_IST as u64;
 
     #[test]
     fn is_done_needs_every_part_and_unknown_is_not_done() {

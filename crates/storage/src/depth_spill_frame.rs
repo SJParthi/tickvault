@@ -412,6 +412,29 @@ pub async fn replay_framed_spill_dir(
     client: &Client,
     view: &SpillSinkView,
 ) -> SpillReplayOutcome {
+    replay_framed_spill_dir_quiesced(
+        dir,
+        url,
+        client,
+        view,
+        crate::archive_quiesce::process_archive_quiesce(),
+        crate::archive_quiesce::WRITER_QUIESCE_WAIT,
+    )
+    .await
+}
+
+/// [`replay_framed_spill_dir`] under a given archive quiesce lock and wait:
+/// the process lock and `WRITER_QUIESCE_WAIT` in production, a private lock
+/// and a short wait in tests (PR AA).
+// TEST-EXEMPT: covered by test_framed_spill_round_ends_when_quiesce_busy_files_kept
+pub(crate) async fn replay_framed_spill_dir_quiesced(
+    dir: &Path,
+    url: &str,
+    client: &Client,
+    view: &SpillSinkView,
+    quiesce: &crate::archive_quiesce::ArchiveQuiesce,
+    quiesce_wait: std::time::Duration,
+) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     for reason in ["refused", "corrupt", "torn_tail"] {
         metrics::counter!(FRAMED_SET_ASIDE_COUNTER, "reason" => reason).increment(0);
@@ -503,6 +526,19 @@ pub async fn replay_framed_spill_dir(
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        // PR AA (owner Quote 51): the same per-file hold as the text spill
+        // replay. A framed file holds depth rows of OLD hours, so it is
+        // posted only while no archiver is copying and dropping one of them;
+        // held to the end of this iteration (its last acknowledgement). A
+        // bounded-wait miss ends the round with the file kept as it is.
+        let Some(_quiesce) = quiesce.shared(quiesce_wait).await else {
+            crate::archive_quiesce::note_quiesce_held(
+                crate::archive_quiesce::QuiesceWriter::FramedSpillReplay,
+            );
+            outcome.files_held_archive_quiesce =
+                outcome.files_held_archive_quiesce.saturating_add(1);
+            return outcome;
+        };
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(err) => {
@@ -1176,6 +1212,50 @@ mod tests {
             "closed file emptied"
         );
         forget_resume_offset(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR AA step 1: while the partition archiver holds the old-hour writers
+    /// out, a framed round posts nothing, keeps the file byte for byte and
+    /// ends (counted, not failed); once released, the same record is posted.
+    #[tokio::test]
+    async fn test_framed_spill_round_ends_when_quiesce_busy_files_kept() {
+        let dir = temp_dir("quiesce-held");
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let closed = dir.join("depth-dhan-1.dspl");
+        write_records(&closed, &[(b"market_depth,a=1 b=1i 1\n", 1)]);
+        let before = std::fs::read(&closed).expect("read"); // APPROVED: test
+        let quiesce = crate::archive_quiesce::ArchiveQuiesce::new();
+        let wait = std::time::Duration::from_millis(50);
+
+        let (url, bodies, server) = spawn_recording_server().await;
+        let archiver = quiesce.hold_writers(wait).await;
+        assert!(archiver.is_some(), "the private lock starts free");
+        let held =
+            replay_framed_spill_dir_quiesced(&dir, &url, &client(), &view, &quiesce, wait).await;
+        assert_eq!(held.files_held_archive_quiesce, 1);
+        assert_eq!(held.files_failed, 0, "a held file is deferred, not failed");
+        assert_eq!(held.bytes_replayed, 0);
+        assert!(
+            bodies.lock().expect("lock").is_empty(),
+            "nothing is posted while the archiver holds the writers out"
+        );
+        assert_eq!(std::fs::read(&closed).expect("read"), before);
+
+        drop(archiver);
+        let released =
+            replay_framed_spill_dir_quiesced(&dir, &url, &client(), &view, &quiesce, wait).await;
+        server.abort();
+        assert_eq!(released.files_held_archive_quiesce, 0);
+        assert_eq!(
+            released.files_replayed, 1,
+            "the file is posted once released"
+        );
+        assert_eq!(
+            bodies.lock().expect("lock").clone(),
+            vec![b"market_depth,a=1 b=1i 1\n".to_vec()]
+        );
+        forget_resume_offset(&closed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

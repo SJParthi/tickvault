@@ -1260,9 +1260,9 @@ async fn async_main() -> Result<()> {
     // remain in `ws_frame_spill::WsType` as orphan; any replayed records
     // of those types are silently dropped here.
     // -----------------------------------------------------------------------
-    // Single source of truth for the WAL dir (hostile-review H1: shared
-    // with the 15:40 conservation audit so the two sites can never drift).
-    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
+    // PR RD finding 3: take the evening drain's restart mark before replaying.
+    let _planned_evening_boot = tickvault_app::evening_drain::claim_planned_boot();
+    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir(); // shared with the 15:40 audit (H1)
     let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
     // CLAIM THE WAL DIRECTORY BEFORE ANYTHING TOUCHES IT (2026-08-28).
     //
@@ -3080,10 +3080,9 @@ async fn async_main() -> Result<()> {
             require_raw_upload,
         );
 
-    // The third drain, for the top_volume board spill (2026-10-13), was
-    // removed on 2026-10-22 (plan item 62, operator Quote 34) with the
-    // top_volume writer. Files left in that folder are kept on disk; its
-    // quarantine is still copied cold by the raw upload loop.
+    // PR AA finding 6: the old-hour replay is registered BEFORE either archive loop.
+    let boot_replay_intent =
+        tickvault_app::dhan_feed_stack::boot_replay_intent(&ws_wal_replay_live_feed);
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
@@ -3121,11 +3120,11 @@ async fn async_main() -> Result<()> {
     // how the 17:30 box stop always arrives. Neither case reported anything,
     // because a sweep that never runs leaves every failure counter flat.
     //
-    // Spawned HERE, beside the disk-pressure loop, because the two are the
-    // same class of job and are now mutually excluded inside
-    // `partition_archive` itself rather than by luck of timing.
+    // Spawned HERE, beside the disk-pressure loop: the same class of job, now
+    // mutually excluded inside `partition_archive` rather than by timing luck.
     let _daily_archive_supervisor =
         tickvault_app::daily_archive_boot::spawn_supervised_daily_archive_loop(
+            std::path::PathBuf::from("data"),
             config.questdb.clone(),
             config.partition_retention.clone(),
             config.trading.market_close_time.clone(),
@@ -3874,6 +3873,7 @@ async fn async_main() -> Result<()> {
             wal_replay_gaps: std::mem::take(&mut ws_wal_replay_gaps),
             wal_replay_trailing_gap: ws_wal_replay_trailing_gap,
             wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,
+            boot_replay_intent, // PR AA finding 6: taken before the archive loops
             // The master-sourced set: `live_subscription_from_master` was built
             // default-off and the operator turned it on on 2026-08-12
             // (`config/base.toml` ships `true`). A missing list for today takes

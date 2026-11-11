@@ -241,7 +241,13 @@ resource "aws_budgets_budget" "tv_monthly" {
   # October-only allowance has expired. Apply the already-authorized $75
   # standing native line; the historical Lambda/digest settings remain $185
   # and their unchanged UTC-month clamp already enforces $75 from November.
-  limit_amount      = "75"
+  # 2026-11-11 (operator Quote 52, daily-universe §0): $75 -> $90 for
+  #   NOVEMBER 2026 only (about $21 of the month was two disks attached to
+  #   nothing; the owner deletes them in the console). The Lambda clamps
+  #   November 2026 to $90 and December onward to $75 in code; this native
+  #   stop goes back to "75" on or after 1 December (the lockstep guard
+  #   fails the build from December while it still reads 90).
+  limit_amount      = "90"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

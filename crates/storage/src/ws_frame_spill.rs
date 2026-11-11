@@ -1138,6 +1138,7 @@ impl WsFrameSpill {
         // The deferred-depth marks (item 45a) sit beside it for the same reason:
         // a shed frame's segment must stay protected across a restart.
         crate::wal_deferred_depth::deferred_depth().bind(&wal_dir);
+        crate::wal_clock_step::bind_clock_step_log(&wal_dir); // PR AA finding 2 recheck
         // 2026-10-20 (plan item PR W): fold earlier processes' unapplied marks
         // into bounded ranges and register the boot tail, BEFORE the writer
         // thread spawns and before any sink or socket exists.
@@ -3283,7 +3284,7 @@ pub fn refresh_receipt_anchor() {
     // It is counted (`outcome = "adopted_backward_step"`) and logged. A small
     // rewind (slew) is still refused, and repeated refusals now end too: once
     // the accumulated slew passes the threshold it is adopted as a step.
-    match cell.refresh_with(take_anchor) {
+    match cell.refresh_noting_step(take_anchor, crate::wal_clock_step::note_clock_step) {
         AnchorRefresh::Adopt => {
             metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
         }
@@ -4001,6 +4002,7 @@ fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let (nanos, clamped) = next_segment_name_nanos(wal_dir, now_nanos);
+    crate::wal_clock_step::note_segment_rotation(now_nanos, nanos);
     if clamped {
         metrics::counter!(WAL_SEGMENT_NAME_CLAMPED_COUNTER).increment(1);
         warn!(
@@ -4388,7 +4390,7 @@ pub const WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER: &str =
     "tv_wal_replay_sink_suspect_refusals_total";
 
 /// Frames returned by every replay pass of this process, for the per-boot cap.
-static WAL_REPLAY_FRAMES_THIS_BOOT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WAL_REPLAY_FRAMES_THIS_BOOT: AtomicU64 = AtomicU64::new(0);
 
 /// Kill switch: `TV_WAL_APPLIED_SKIP=0` makes replay ignore the watermark
 /// file (it is still written). Deleting `applied.tvaw` has the same effect.
@@ -5173,6 +5175,7 @@ pub fn replay_all_with_report_at<P: AsRef<Path>>(
     budget_bytes: usize,
     disk: crate::disk_health_watcher::DiskHealthOutcome,
     frames_so_far: u64,
+    frame_cap: u64,
 ) -> anyhow::Result<WalReplayBatch> {
     let wal_dir = wal_dir.as_ref();
     let refused = |stopped_for_disk: bool| WalReplayBatch {
@@ -5181,17 +5184,9 @@ pub fn replay_all_with_report_at<P: AsRef<Path>>(
         stopped_for_frame_cap: !stopped_for_disk,
         ..WalReplayBatch::default()
     };
-    if frames_so_far >= WAL_REPLAY_MAX_FRAMES_PER_BOOT {
-        metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(1);
-        error!(
-            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-            source = "replay_frame_cap",
-            frames_so_far,
-            cap = WAL_REPLAY_MAX_FRAMES_PER_BOOT,
-            "WAL replay REFUSED: this boot has already replayed the per-boot frame cap. \
-             Nothing is stranded — every unread segment stays a `*.wal` file for the next \
-             boot — but a backlog this size is a capacity problem, not a recovery one."
-        );
+    // PR RD-1: the cap this boot runs under (3,000,000, or 15,000,000 on a
+    // planned evening-drain boot, Quote 41); counted and logged with it.
+    if crate::wal_replay_frame_cap::refuse_past_frame_cap(frames_so_far, frame_cap) {
         return Ok(refused(false));
     }
     match disk {
@@ -5312,6 +5307,7 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
         budget_bytes,
         disk,
         WAL_REPLAY_FRAMES_THIS_BOOT.load(Ordering::Acquire),
+        crate::wal_replay_frame_cap::replay_frame_cap_this_boot(),
     )
 }
 
@@ -13386,6 +13382,7 @@ mod tests {
                 total_bytes: 600 * 1024 * 1024 * 1024, // floor = the 40 GiB constant here
             },
             0,
+            WAL_REPLAY_MAX_FRAMES_PER_BOOT,
         )
         .expect("refusal is Ok, not Err");
         assert!(refused.stopped_for_disk);
@@ -13397,6 +13394,7 @@ mod tests {
             usize::MAX,
             DiskHealthOutcome::ProbeFailed { reason: "test" },
             0,
+            WAL_REPLAY_MAX_FRAMES_PER_BOOT,
         )
         .expect("replay");
         assert_eq!(
@@ -13408,25 +13406,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PR RD-1 (Quote 41): a pass refuses at the cap it is GIVEN. After a
+    /// 3.5M-frame boot pass the standard cap refuses, the evening cap reads.
     #[test]
     fn replay_refuses_past_the_per_boot_frame_cap() {
         use crate::disk_health_watcher::DiskHealthOutcome;
+        use crate::wal_replay_frame_cap::EVENING_DRAIN_REPLAY_FRAME_CAP as EVENING;
         let dir = tmp_dir("wm-frame-cap");
         write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
-        let refused = replay_all_with_report_at(
-            &dir,
-            usize::MAX,
-            DiskHealthOutcome::Ok {
-                free_bytes: u64::MAX,
-                total_bytes: u64::MAX,
-            },
-            WAL_REPLAY_MAX_FRAMES_PER_BOOT,
-        )
-        .expect("refusal is Ok");
-        assert!(refused.stopped_for_frame_cap);
-        assert!(!refused.stopped_for_disk);
+        let (free_bytes, total_bytes) = (u64::MAX, u64::MAX);
+        let disk = DiskHealthOutcome::Ok {
+            free_bytes,
+            total_bytes,
+        };
+        let pass = |so_far, cap| replay_all_with_report_at(&dir, usize::MAX, disk, so_far, cap);
+        let refused = pass(3_500_000, WAL_REPLAY_MAX_FRAMES_PER_BOOT).expect("refusal is Ok");
+        assert!(refused.stopped_for_frame_cap && !refused.stopped_for_disk);
         assert!(refused.frames.is_empty());
         assert_eq!(wal_segments_in(&dir).len(), 1, "nothing moved");
+        let read = pass(3_500_000, EVENING).expect("the evening cap reads");
+        assert!(!read.stopped_for_frame_cap, "15M is above 3.5M");
+        assert_eq!(read.frames.len(), 3);
+        assert!(pass(EVENING, EVENING).expect("Ok").stopped_for_frame_cap);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13519,6 +13520,7 @@ mod tests {
 
     mod frame_base_tests;
     mod k2_tests;
+    mod rd3_tests;
     // --- Z11a: resync past mid-segment damage (2026-10-02) -----------------
 
     /// A segment of v4 records, sequence `k + 1` and a payload of `fill(k)`;

@@ -322,7 +322,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
         with:
           tool: cargo-nextest@0.9.148
 
@@ -407,7 +407,7 @@ jobs:
       - name: Install cargo-audit + cargo-deny (prebuilt, pinned)
         id: install-audit-tools
         continue-on-error: true
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.82.7 SHA-pinned
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.82.7 SHA-pinned
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.19.9
 
