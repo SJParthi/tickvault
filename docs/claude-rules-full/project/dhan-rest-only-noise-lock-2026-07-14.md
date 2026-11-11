@@ -5174,7 +5174,7 @@ reached nobody.
 - Opens earlier than session start + 20 minutes, or types the session times in
   terraform without the same change in `config/base.toml`.
 
-**Note (2026-11-11, operator Quote 53 alarm review, §2.20):** two of the three did-it-run alarms named above (`deploy-watchdog-not-invoked`, `market-open-readiness-not-invoked`) were removed, so they are no longer in `ALARM_NAMES` and the Muhurat open skips only `boot-heartbeat-gate-not-invoked`, which the review KEPT (it watches the gate that arms the kept `boot-heartbeat-missing`). The rows above still bind: every did-it-run alarm in `ALARM_NAMES` must be in the open's `skip_alarms`, and a skip list naming a removed alarm is a terraform error, not a fix.
+**Note (2026-11-11, operator Quote 53 alarm review, §2.21):** two of the three did-it-run alarms named above (`deploy-watchdog-not-invoked`, `market-open-readiness-not-invoked`) were removed, so they are no longer in `ALARM_NAMES` and the Muhurat open skips only `boot-heartbeat-gate-not-invoked`, which the review KEPT (it watches the gate that arms the kept `boot-heartbeat-missing`). The rows above still bind: every did-it-run alarm in `ALARM_NAMES` must be in the open's `skip_alarms`, and a skip list naming a removed alarm is a terraform error, not a fix.
 
 ## §2.16 — 2026-11-06: two pages made quieter (`questdb-disconnected`, `RISK-GAP-03`; no new page)
 
@@ -5388,7 +5388,7 @@ editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
 
 **REJECT (§2.19):** a page for fewer quiet instruments than the 1% floor; dropping the never-ticked page; removing or narrowing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated owner quote.
 
-## §2.20 — 2026-11-11: the Quote 53 alarm review removes pages from these families (no new page)
+## §2.21 — 2026-11-11: the Quote 53 alarm review removes pages from these families (no new page)
 
 **Owner, 2026-11-11 (operator Quote 53, recorded in `daily-universe-scope-expansion-2026-05-27.md`):** on the card "which of these may I do from December?" the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard". Quote 53 requires a removed alarm in a family recorded here to have this file's dated edit in the same change; this section is that edit. Every removal has its row (what it watched, what still covers it) in `docs/audits/2026-11-alarm-review.md`.
 
@@ -5405,7 +5405,7 @@ editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
 
 The coded log lines, counters and local `/metrics` of every removed alarm are unchanged; only the CloudWatch filter and alarm go. The §2.6, §2.9 and §2.13 rows that constrain these alarms stay in force for any future alarm of the same name.
 
-**REJECT (§2.20):** re-adding any alarm named above without a fresh dated owner quote recorded here first; removing any page this table names as the remaining cover; removing any of the seven alarms listed under "Not removed"; narrowing the `errcode-ws-spill-02` filter (for example by `source`) while `wal-replay-restore-failed` stays removed; using §2.20 to remove any other alarm.
+**REJECT (§2.21):** re-adding any alarm named above without a fresh dated owner quote recorded here first; removing any page this table names as the remaining cover; removing any of the seven alarms listed under "Not removed"; narrowing the `errcode-ws-spill-02` filter (for example by `source`) while `wal-replay-restore-failed` stays removed; using §2.20 to remove any other alarm.
 
 ## §2.20 — 2026-11-11: the WAL replay limit and deferral lines page only when the backlog is stuck (no new page)
 

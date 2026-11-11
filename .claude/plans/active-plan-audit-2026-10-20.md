@@ -2543,7 +2543,7 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 
 ### PR Q53 — 2026-11-11: fewer alarms, fewer shipped metrics, no CloudWatch dashboard, raw frames to Glacier Instant Retrieval (terraform, aws-lambdas, common, app, storage tests, docs)
 
-**Approved by:** operator Quote 53 (2026-11-11), recorded first in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` and its summary stub: the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard", and kept the $75 stop. Noise-lock §2.20 records the removed pages per family before the code.
+**Approved by:** operator Quote 53 (2026-11-11), recorded first in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` and its summary stub: the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard", and kept the $75 stop. Noise-lock §2.21 records the removed pages per family before the code.
 
 #### Design
 - Q53-1 alarm review: one row per alarm in `docs/audits/2026-11-alarm-review.md` (what it watches, KEEP/REMOVE, what still covers it). REMOVE only alarms outside the KEPT list (data loss, loss groups, lane-down / socket-parked / ticks-dropped, tokens, budget, disk-full / QuestDB-down, cross-verification); also kept: the two EC2 status checks (self-heal actions), every Severity::Critical coded page, the money-path order pages, the page-delivery and gate watchers. Result: 39 removed, 80 kept in prod (the first draft removed 44; its review put back `errcode-stream-silent` with its two schema filters, `live-universe-fallback`, `tick-spill-quarantined`, `wal-suspension-probe-blind` and `deploy-provenance-blind`, each the only page for a KEPT failure). Removed resources are replaced by a dated tombstone comment; references (outputs, the market-hours `ALARM_NAMES` list, the Muhurat skip list) go with them.
@@ -2572,7 +2572,7 @@ Second review (2026-11-11, same day), added to this item: Q53-7 the metric trim 
 
 This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
 
-- [x] Q53-0 rule-file-first: Quote 53 (owner) in the daily-universe file; noise-lock §2.20 (full + summary); dated Quote 37 dashboard notes; aws-budget COST NOTE 2026-11-11.
+- [x] Q53-0 rule-file-first: Quote 53 (owner) in the daily-universe file; noise-lock §2.21 (full + summary); dated Quote 37 dashboard notes; aws-budget COST NOTE 2026-11-11.
 - [x] Q53-1 alarm review doc + terraform removals.
 - [x] Q53-2 EMF selector / host metrics / filters trimmed.
 - [x] Q53-3 dashboard and its output deleted.
