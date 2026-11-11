@@ -3455,3 +3455,40 @@ Quote 50's "Keep, always" row and Quote 27 are unchanged: every copy stays in `t
 - A new page, alarm, metric filter or EMF name for this work.
 - Growing the disk, raising IOPS or throughput, or changing the instance under Quote 51.
 - Shipping before the randomized proof above passes.
+
+#### Quote 52 (2026-11-11, ~09:30 IST) — NOVEMBER 2026 ONLY: STOP AT $90; THE LEFTOVER DISKS ARE DELETED BY THE OWNER (preserve EXACTLY)
+
+Owner asked (2026-11-11), verbatim: "see still is it possible to erdcue the per month maximsied amount to still 5000 inr alone only poer month is that psosible dude?" and "see can you check and tell me prrecisleyw here this monthly bill stands dude okay? ... im aksign yo uto totally fix itself less than 5k inr per month then hwo the fuck for these days itsefl its 5k inr dude". After one approved Cost Explorer query (card "Yes, one query (Recommended)", $0.01), the owner tapped "Delete all (Recommended)" and "Raise Nov to $90 only (Recommended)".
+
+Measured (Cost Explorer, 1–11 Nov 2026, unblended USD): total $46.11 with tax; gp3 volume storage $22.23 + $4.00 tax, of which about $17.95 + tax is two volumes attached to nothing: `vol-0c6ab6e593e39d8c8` (600 GB, tag `tv-rebuild-old-root=2026-10-22`, the old root Quote 47 authorized the owner to delete on 28 Oct, never deleted) and `vol-073ccaa417a0f344b` (30 GB, May 2026 root), plus snapshots `snap-090ed9c4f3df0ca61` and `snap-0573ab07252f67bf3` (pre-downsize rollbacks of the 30 GB volume, July and August). Compute (r8g.large) $6.97 + tax; CloudWatch $6.23 + tax; S3 storage $0.54. Projection with the leftovers gone: about $66 a month with tax; November about $88 (it had already spent $46).
+
+| Item | What Quote 52 authorizes |
+|---|---|
+| November 2026 line | `NOVEMBER_2026_KILL_USD` = $90 in the hourly guard's clamp and the native budget `limit_amount` = 90, November 2026 (UTC month) only |
+| From 1 December 2026 | The standing $75 line (Quote 37) applies again: the code clamp does it by itself; the native `limit_amount` returns to 75 in a follow-up change on or after 1 December |
+| The leftover disks | The OWNER deletes `vol-0c6ab6e593e39d8c8`, `vol-073ccaa417a0f344b` and the two snapshots above in the AWS console (no repository role may delete volumes or snapshots, Quote 47 unchanged); a session confirms with a read-only describe afterwards |
+
+##### What violates Quote 52 (REJECT)
+- Any month other than November 2026 above $75 without a fresh dated quote; leaving the native `limit_amount` at 90 into December.
+- Adding `ec2:DeleteVolume` or `ec2:DeleteSnapshot` to any standing role, or deleting any volume or snapshot other than the four named above.
+- Changing instance, disk size, IOPS, throughput or depth under Quote 52.
+
+#### Quote 53 (2026-11-11, ~10:00 IST) — FROM DECEMBER: FEWER ALARMS, FEWER SHIPPED METRICS, NO CLOUDWATCH DASHBOARD, OLD RAW FRAMES TO A CHEAPER S3 CLASS; THE $75 STOP STAYS (preserve EXACTLY)
+
+Owner asked (2026-11-11), verbatim: "so now hwpw and what si your plan to shorten it to 5k inr per motnh that to othe max worst case shsoudl be only 5.5 k inr per month ddude okay?". On the card "which of these may I do from December?" the owner ticked all four: "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard". On "Should the box also stop for good if a month's bill reaches ₹5,500?" the owner chose "No, keep $75 stop for now (Recommended)".
+
+Estimate (Assumed, extrapolated from Cost Explorer 1–11 Nov 2026 with the Quote 52 leftover disks gone, before tax): server ~$22, 150 GB disk ~$12, alarms ~$9.4, shipped metrics ~$4.9, dashboard $3, public IP ~$3.6, cross-zone traffic ~$2.6, S3 ~$1.5 and rising about 165 GB a month, keys and secrets ~$1.2; total ~$60, ~$70 with tax. The four levers save about $12–13 before tax, leaving about $47 (~$56 with tax): about ₹4,900 at ₹88/$, about ₹5,600 at the ₹100/$ rate the budget card prints. The cross-zone traffic is the next lever to investigate if December reads above ₹5,500.
+
+| Item | What Quote 53 authorizes |
+|---|---|
+| Alarms | Remove CloudWatch alarms from about 93 to about 30, each removal with its own row in a dated alarm review (why it goes, what still covers the failure). KEPT whatever else goes: every data-loss and loss-group page, the lane-down / socket-parked / ticks-dropped live-lane pages, the token pages, the budget pages, the disk-full and QuestDB-down pages, the cross-verification pages. A removed alarm in a noise-lock family needs that file's dated edit in the same change |
+| Shipped metrics | CloudWatch receives only the metrics an alarm reads; every metric stays on the box's local `/metrics` |
+| Dashboard | The CloudWatch dashboard is deleted (reverses Quote 37's "dashboard KEPT"); the operator portal and Telegram stay |
+| Raw frames in S3 | A lifecycle TRANSITION moves `raw-frames/` objects older than 30 days to S3 Glacier Instant Retrieval (readable at once, nothing deleted); `questdb-partitions/` (ticks and candles brutex reads) stays STANDARD |
+| Stop line | Unchanged: $75 from 1 December 2026 (Quote 37); no $55 stop |
+
+##### What violates Quote 53 (REJECT)
+- Removing an alarm without its review row, or removing any alarm in the KEPT list above.
+- Removing a metric from the box's local `/metrics`, or shipping fewer metrics than the alarms read.
+- Any S3 `expiration`, `noncurrent_version_expiration`, delete or versioning change; a transition of `questdb-partitions/`, `deploys/`, `instrument-snapshots/` or `logs/`; Glacier Flexible or Deep Archive for anything brutex reads.
+- A stop line below $75 or a change to instance, disk, IOPS, throughput or depth under Quote 53.
