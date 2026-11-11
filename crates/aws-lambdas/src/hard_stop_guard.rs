@@ -79,7 +79,9 @@ pub const DEFAULT_BUDGET_KILL_USD: f64 = 185.0;
 /// raised to $170 (≈₹15,000) by operator Quote 30 on 2026-10-13, and lowered
 /// to $100 from November 2026 by operator Quote 33 (2026-10-21), then to **$85 from
 /// November 2026** by operator Quote 36 (the same evening), and to **$75
-/// from November 2026, GST included,** by operator Quote 37. October
+/// from November 2026, GST included,** by operator Quote 37. November 2026 alone is $90
+/// (`NOVEMBER_2026_KILL_USD`, operator Quote 52, 2026-11-11); this standing
+/// line applies again from December 2026. October
 /// 2026 keeps the configured $170 (`OCTOBER_2026_ALLOWANCE`): its spend was
 /// already $119.20 on 1–20 Oct, so a $100 line would have stopped the box at once.
 ///
@@ -450,7 +452,8 @@ pub fn classify_ping_decision(
     month: &str,
 ) -> (&'static str, Value) {
     let bucket = spend_bucket(mtd, budget_kill_usd);
-    let mut new_state = json!({"month": month, "bucket": bucket, "outcome": action});
+    let mut new_state =
+        json!({"month": month, "bucket": bucket, "outcome": action, "line": budget_kill_usd});
     // cost_unknown first: it has no trustworthy spend figure, so no other
     // reason may render one; edge-latched so repeats stay silent.
     if action == "cost_unknown" {
@@ -476,6 +479,20 @@ pub fn classify_ping_decision(
     }
     if prev_outcome == "cost_unknown" {
         return ("ping_cost_recovered", new_state);
+    }
+    // Quote 52 (2026-11-11): the line can move inside a month ($75 -> $90 for
+    // November 2026). A bucket saved against the old line is not comparable,
+    // so any bucket change after a line change pings once (and saves the new
+    // line). A state saved before the line was recorded is read as the
+    // standing line from November 2026 on (the only line the old code used
+    // then) and as unchanged before it.
+    let prev_line = prev
+        .and_then(|p| p.get("line"))
+        .and_then(Value::as_f64)
+        .or_else(|| (month >= "2026-11").then_some(STANDING_BUDGET_KILL_USD));
+    let line_changed = prev_line.is_some_and(|l| (l - budget_kill_usd).abs() > f64::EPSILON);
+    if line_changed && bucket != prev_bucket {
+        return ("ping_bucket_changed", new_state);
     }
     if bucket > prev_bucket {
         return ("ping_bucket_changed", new_state);
@@ -2440,6 +2457,32 @@ aws events enable-rule --name tv-prod-daily-start\n"
         // standing line ($75 since Quote 37) starts in November, never in October.
         assert_eq!(effective_budget_kill_usd(170.0, 2026, 10), 170.0);
         assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 75.0);
+    }
+
+    #[test]
+    fn test_regression_classify_ping_decision_pings_once_when_the_line_moves_mid_month() {
+        // Regression: 2026-11-11 (PR 2221 review) — spend $46 was bucket 6
+        // against $75; against $90 it is bucket 5. A 1-step dip used to be
+        // silent and keep bucket 6, hiding the 60%-of-$90 message at $54.
+        let old = json!({"month": "2026-11", "bucket": 6, "outcome": "below_budget"});
+        let (reason, state) =
+            classify_ping_decision(Some(&old), "below_budget", Some(46.0), 90.0, "2026-11");
+        assert_eq!(reason, "ping_bucket_changed");
+        assert_eq!(state["bucket"], json!(5));
+        assert_eq!(state["line"], json!(90.0));
+        // Once the new line is saved, the usual hysteresis applies again.
+        let (reason, _) =
+            classify_ping_decision(Some(&state), "below_budget", Some(44.0), 90.0, "2026-11");
+        assert_eq!(reason, "silent");
+        let (reason, _) =
+            classify_ping_decision(Some(&state), "below_budget", Some(54.0), 90.0, "2026-11");
+        assert_eq!(reason, "ping_bucket_changed");
+        // Same line, same bucket: silent, as before.
+        let same =
+            json!({"month": "2026-11", "bucket": 5, "outcome": "below_budget", "line": 90.0});
+        let (reason, _) =
+            classify_ping_decision(Some(&same), "below_budget", Some(46.0), 90.0, "2026-11");
+        assert_eq!(reason, "silent");
     }
 
     #[test]
