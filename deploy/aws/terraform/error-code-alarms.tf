@@ -112,9 +112,14 @@
 #   MEASURED 2026-09-17 — the running-total chain above is the AUDIT TRAIL of
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
-#   rather than carried forward: 5 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 22 live
-#   `error_code_alerts` map entries (was 18 on 2026-09-17; +3 on 2026-09-24,
+#   rather than carried forward: 4 standalone `aws_cloudwatch_log_metric_filter`
+#   resources, 3 standalone `aws_cloudwatch_metric_alarm` resources, and 18 live
+#   `error_code_alerts` map entries (5 filters, 4 alarms and 22 entries until
+#   2026-11-11, when the operator Quote 53 alarm review,
+#   docs/audits/2026-11-alarm-review.md, removed the preopen-ready pair and
+#   four map entries; stream-silent and its two schema filters were removed in
+#   its first draft and put back after review, noise-lock §2.3s;
+#   was 18 on 2026-09-17; +3 on 2026-09-24,
 #   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
 #   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
 #   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
@@ -246,15 +251,8 @@ locals {
     # dormant while dry_run=true. Flagged follow-up (NOT this PR): a 3-line
     # error!(code = ErrorCode::Dh906OrderError.code_str(), ...) at the
     # OmsError classification site converts this to a coded filter.
-    "dh-906" = {
-      pattern     = "\"DH-906\""
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # round-4: discrete per-order reject - auto-OK ~15 min later means the episode aged out, never "orders working again" (Rule-11 false-recovery)
-      desc        = "DH-906: Dhan order error - NEVER auto-retry; fix the order. NO recovered/OK page: a reject is a discrete event, so the auto-OK ~15 min later only means the episode aged out of the lookback. NOTE: pre-armed tripwire - no coded emit site exists and dry_run=true means no live orders today; the literal arrives inside Dhan's response text via OmsError. Runbook: .claude/rules/dhan/annexure-enums.md rule 11"
-    }
+    # "dh-906" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
     "auth-gap-04" = {
       pattern     = "{ $.code = \"AUTH-GAP-04\" && $.level = \"ERROR\" }"
       period      = 300
@@ -313,15 +311,8 @@ locals {
     # while RSS stays over the line, so an OK genuinely means the RSS fell
     # back under it (or the operator restarted the app) — the DH-901 shape,
     # not the discrete-event proc-01 shape.
-    "resource-02" = {
-      pattern     = "{ $.code = \"RESOURCE-02\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = true
-      desc        = "RESOURCE-02: the trading app's resident memory is at or above 80% of its ceiling (MemoryHigh=20G on the systemd unit, so the line is 16 GB). Past the ceiling the kernel THROTTLES this process - it is not killed (no MemoryMax by design) - but a throttled tick decoder falls behind the socket and the vendor drops ticks upstream. Triage NOW: tv_process_rss_bytes + the tv_subsystem_memory_bytes components (which one is growing?); tv_spill_dir_free_bytes + tv_questdb_wal_suspended_tables (a stalled DB backs up the writers). If a queue grows without bound, restart the app in the next quiet window; under host exhaustion QuestDB (-500) is killed before this process (-900) and the spill tier absorbs that. OK = RSS fell back under the line. Runbook: docs/error-runbooks/wave-4-error-codes.md + dhan-rest-only-noise-lock-2026-07-14.md section 2.3p"
-    }
+    # "resource-02" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
     # AGGREGATOR-DROP-01 (added 2026-07-09 — audit finding): the ONLY
     # silent-data-loss path for a sealed candle (ring + spill + DLQ all
     # failed), Severity::Critical, previously paged NOBODY. Emit site:
@@ -415,15 +406,8 @@ locals {
     # out would be a Rule-11 false recovery while the table is still
     # suspended; the real recovery signals are the falling-edge info!
     # line + tv_questdb_wal_suspended_tables returning to 0.
-    "wal-suspend-01" = {
-      pattern     = "{ $.code = \"WAL-SUSPEND-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
-      desc        = "WAL-SUSPEND-01: a QuestDB table is not applying its WAL - rows are ACKed but not yet visible. Read the source field. apply_lag_growing: NOT suspended, falling behind under load, nothing lost, catches up by itself. probe_blind: the wal_tables() probe failed, so suspension state is unknown. No source: the table is SUSPENDED (disk-full or WAL apply error) - fix the cause first; the box tries one bounded RESUME WAL when the disk is healthy, else run ALTER TABLE <table> RESUME WAL. No OK page. Runbook: docs/error-runbooks/wal-suspension-error-codes.md"
-    }
+    # "wal-suspend-01" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
     # TICK-CONSERVE-01 (added 2026-07-14 — automation-gaps PR-3; RETIRED
     # 2026-07-18 — tick-conservation retirement, dead-WS sweep follow-up):
     # its ONLY emit site (crates/app/src/tick_conservation_boot.rs, the
@@ -865,15 +849,8 @@ locals {
     # an hour later is the datapoint ageing out, never the summary arriving.
     # The underlying ws_event_audit and feed_episode_audit rows are unaffected
     # and the day can be re-rolled by hand.
-    "scoreboard-01" = {
-      pattern     = "{ $.code = \"SCOREBOARD-01\" && $.level = \"ERROR\" }"
-      period      = 86400
-      threshold   = 1
-      eval        = 1
-      dta         = 1
-      ok_recovery = false
-      desc        = "SCOREBOARD-01: a daily rollup failed to write. The per-connection or per-feed summary for that day is MISSING - this is the table you read to answer 'which connection misbehaved yesterday'. The raw ws_event_audit and feed_episode_audit rows it is folded FROM are unaffected, so nothing is lost and the day can be re-rolled by hand; what you lose until then is the summary view. Check QuestDB reachability at the 15:45 IST rollup window, then the stage field on the log line - it names which rollup and whether it failed on append or on flush. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
-    }
+    # "scoreboard-01" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
   }
 }
 
@@ -978,61 +955,11 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
 # alarmable, but it could never answer "how early were we today?", which is the
 # question that re-tunes STOCK_OPTION_PRICING_QUORUM_PERCENT from evidence
 # instead of defending it.
-resource "aws_cloudwatch_log_metric_filter" "preopen_ready" {
-  name           = "tv-${var.environment}-preopen-ready-secs"
-  log_group_name = aws_cloudwatch_log_group.tv_app.name
-  # Anchored on the FIELD, not on the message text: the message is prose and
-  # will be reworded, the field name is a contract the alarm depends on.
-  pattern = "{ $.fields.ready_at_ist_secs = * }"
-  metric_transformation {
-    name      = "tv_dhan_preopen_ready_secs"
-    namespace = "Tickvault/Prod"
-    value     = "$.fields.ready_at_ist_secs"
-    # NOT "Seconds": this is an absolute second-of-day, not an elapsed
-    # duration, and labelling it a duration would make every chart read as a
-    # nine-hour latency.
-    unit = "None"
-    # Sparse by design — one datapoint per session. No default_value, so the
-    # metric is billed only in hours where an attach actually completed.
-  }
-}
+# metric filter "preopen_ready" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
-resource "aws_cloudwatch_metric_alarm" "preopen_ready_late" {
-  alarm_name        = "tv-${var.environment}-preopen-ready-late"
-  alarm_description = "The DHAN live lane finished its contract and depth attach AFTER 09:12:00 IST (32120 = 9*3600+12*60 seconds of day). The session opened without its full ~23,000-instrument set on the wire: everything dialed, just late, so the first minutes after 09:15 carry spot only. Usual cause is the 60% stock-option pricing quorum arriving late on a thin pre-open - read underlyings_without_spot on the same 'late-attach complete' line, and re-tune STOCK_OPTION_PRICING_QUORUM_PERCENT from that rather than defending it. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
-  # GreaterThan, not GreaterThanOrEqual: 09:12:00 exactly is MET, matching the
-  # code's `ready_at <= PREOPEN_READY_DEADLINE_IST_SECS`. An off-by-one here
-  # would page on the one morning that hit the deadline precisely.
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  datapoints_to_alarm = 1
-  metric_name         = "tv_dhan_preopen_ready_secs"
-  namespace           = local.app_namespace
-  period              = 3600
-  # Maximum, not Average: one datapoint per session, and on a restart day the
-  # LATEST attach is the one that matters. An average would let a good 09:08
-  # hide a 10:30 re-attach.
-  statistic = "Maximum"
-  threshold = 33120
-  # notBreaching: the box is stopped overnight and does not attach at weekends,
-  # so absent data is the normal off-hours state. A lane that never attaches at
-  # all is a DIFFERENT alarm (dhan-no-ticks-flowing, breaching + gated).
-  treat_missing_data = "notBreaching"
-  # `local.app_alarm_actions`, the same indirection every alarm in this repo
-  # uses — NOT a direct topic reference. The first draft wrote
-  # `aws_sns_topic.alerts.arn`, a resource that does not exist (the topic is
-  # `tv_alerts`, and nothing outside app-alarms.tf references it directly).
-  # Terraform plan caught it; `terraform validate` could not run locally
-  # because the provider registry is 403-blocked from the dev sandbox.
-  alarm_actions = local.app_alarm_actions
-  # NO ok_actions, deliberately — the discrete-emitter precedent set by the
-  # ok_recovery = false codes above. This metric is SPARSE: one datapoint per
-  # session. With treat_missing_data = notBreaching the alarm would flip back
-  # to OK about an hour after that datapoint ages out, which is not a
-  # recovery — nothing has been re-measured, and the next attach is a day
-  # away. A "recovered" page on that transition is the Rule-11 false-OK the
-  # locals comment above describes.
-}
+# alarm "preopen_ready_late" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # HOT-PATH-02 — the persistence layer's own loss code (2026-08-25)

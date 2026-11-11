@@ -71,6 +71,20 @@ Owner, 2026-10-28: tapped "Raise Oct to $185 (Recommended)" after the Budgets AP
 | October 2026 line (`OCTOBER_2026_KILL_USD`, four lockstep sites) | $170 | **$185**, October 2026 only |
 | `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
 
+## COST NOTE 2026-11-11 — Quote 53: fewer alarms, fewer shipped metrics, no CloudWatch dashboard, raw frames to Glacier Instant Retrieval ($75 stop unchanged)
+
+Owner, 2026-11-11: ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard"; kept the $75 stop. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 53. Per-alarm rows and the estimate: `docs/audits/2026-11-alarm-review.md`.
+
+| | Before | After |
+|---|---|---|
+| CloudWatch alarms (prod) | 119 | 82 (the KEPT list in Quote 53 does not allow ~30) |
+| EMF names shipped | 109 + 1 class series | 46 |
+| CWAgent host metrics | disk, memory, CPU | disk |
+| CloudWatch dashboard | 1 (the "dashboard kept" of Quote 37) | 0 |
+| `raw-frames/` after 30 days | Deep Archive | Glacier Instant Retrieval |
+
+Estimate (Assumed, never measured): about $11–14 a month less before tax. **Risk:** Glacier Instant Retrieval costs more per GB than the Deep Archive class it replaces for `raw-frames/` (about $0.50 a month more per month of raw frames kept, Assumed); it buys reads at once instead of a 12-hour restore. Read the December bill.
+
 ## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
 
 Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 37 (also: free Budgets API lookups, alarm squeeze, dashboard kept, 16:30 IST stop).

@@ -141,17 +141,15 @@ PROMCFG
 # environment variable, one more line of boot script.
 #
 # What stays here is a MINIMAL host-only fallback, so a box whose clone fails
-# still reports disk, memory and CPU -- the signals the budget guard and the
-# disk alarms read. App metrics are absent in that case, but they would be
+# still reports disk -- the signal the disk alarm reads (memory and CPU left
+# 2026-11-11, operator Quote 53: no kept alarm reads them). App metrics are absent in that case, but they would be
 # anyway: the app binary comes from the same repo the clone failed to fetch.
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
 {
   "agent": { "metrics_collection_interval": 60 },
   "metrics": {
     "metrics_collected": {
-      "disk": { "measurement": ["used_percent"], "resources": ["/"] },
-      "mem":  { "measurement": ["mem_used_percent"] },
-      "cpu":  { "measurement": ["cpu_usage_active"] }
+      "disk": { "measurement": ["used_percent"], "resources": ["/"] }
     },
     "append_dimensions": { "InstanceId": "\$${!aws:InstanceId}" }
   },

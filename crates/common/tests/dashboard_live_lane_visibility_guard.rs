@@ -1,36 +1,30 @@
-//! Pins that every metric we PAY to publish is actually LOOKED AT.
+//! Pins that every metric we PAY to ship to CloudWatch is READ by an alarm.
 //!
-//! # The defect this guard exists to prevent recurring
+//! # History
 //!
-//! Between 2026-08-11 and 2026-08-15 the Dhan live lane — the only live tick
-//! source in the system — had **twenty-one** metric series added to the
-//! CloudWatch agent's EMF allowlist across three separate dated cost notes,
-//! each one deliberate, each one justified, each one billed at ~$0.30/month.
+//! Between 2026-08-11 and 2026-08-15 the Dhan live lane had twenty-one metric
+//! series added to the CloudWatch agent's EMF allowlist, each billed at about
+//! $0.30 a month, and not one of them was charted or alarmed. This guard was
+//! written then and required every shipped name to be either charted on the
+//! CloudWatch operator dashboard or read by an alarm.
 //!
-//! Not one of them was charted anywhere, and none of them has an alarm.
+//! # Since 2026-11-11 (operator Quote 53)
 //!
-//! So the money bought the series and nothing bought the *sight* of it. Every
-//! way the live feed can lose ticks was counted, shipped to CloudWatch, and
-//! then read by nobody — which is indistinguishable, from the operator's
-//! chair, from not having instrumented it at all. The dashboard's own Row-7
-//! comment had already described exactly this failure one subsystem earlier
-//! ("the operator could look at an all-green page while the whole runtime was
-//! dead"); it recurred anyway, because nothing mechanical connected the act of
-//! publishing a metric to the act of displaying it.
+//! The owner ticked "Trim CloudWatch metrics" and "Delete the CloudWatch
+//! dashboard" (recorded in
+//! `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`,
+//! Quote 53). The dashboard is gone, so a chart no longer counts as a reader:
+//! CloudWatch receives ONLY the metrics an alarm reads. Every metric stays on
+//! the box's local `/metrics`, and the metrics log group still receives every
+//! scrape, so the log metric filters (the loss groups) are unaffected.
 //!
-//! # Why a guard rather than a habit
+//! What is pinned:
+//! 1. every EMF-selected name is read by an alarm (`metric_name = "..."`);
+//! 2. the CloudWatch dashboard does not come back;
+//! 3. the selector still carries the kept pages' metrics (non-vacuity).
 //!
-//! The two halves live in different files, are edited in different PRs, and
-//! neither one fails when the other is missing. An allowlist entry with no
-//! widget is invisible; a widget with no allowlist entry renders "no data",
-//! which an operator reads as "fine" — strictly worse than an absent panel.
-//! Only a check that reads BOTH files can see the mismatch.
-//!
-//! # What is pinned
-//!
-//! Every EMF-selected `tv_dhan_*` name is either charted on the operator
-//! dashboard, or listed in [`DELIBERATELY_NOT_CHARTED`] with a written reason.
-//! Adding a lane metric without doing one of those two things fails the build.
+//! The file keeps its old name so the test-count ratchet and the history in
+//! other files that cite it stay valid.
 
 use std::path::{Path, PathBuf};
 
@@ -38,66 +32,28 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
-        .expect("dashboard visibility guard: cannot canonicalize repo root")
+        .expect("metric visibility guard: cannot canonicalize repo root")
 }
 
 fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel))
-        .unwrap_or_else(|e| panic!("dashboard visibility guard: {rel} must be readable: {e}"))
+        .unwrap_or_else(|e| panic!("metric visibility guard: {rel} must be readable: {e}"))
 }
 
 /// The CloudWatch agent config the box actually loads.
-///
-/// Was `deploy/aws/terraform/user-data.sh.tftpl` until 2026-08-25, when the
-/// ~1.6 KB duplicate of this file was removed from that template (it pinned
-/// user-data at exactly its 15,872-byte budget with zero bytes free). The
-/// template now copies this file into place after the Step 5 clone.
-const USER_DATA: &str = "deploy/aws/cloudwatch-agent.json";
-const DASHBOARD: &str = "deploy/aws/terraform/dashboard.tf";
+const AGENT_CONFIG: &str = "deploy/aws/cloudwatch-agent.json";
 
-/// Lane metrics that are EMF-published but intentionally not on the dashboard.
-///
-/// Each entry must carry a reason. "We forgot" is not one of them — that is
-/// the case this guard exists to catch, and it looks identical to a deliberate
-/// omission until somebody writes down which it is.
-const DELIBERATELY_NOT_CHARTED: &[(&str, &str)] = &[
-    (
-        "tv_dhan_feed_depth_total",
-        "SHIPPED but neither charted nor alarmed, and that is #1751's own \
-         recorded decision rather than an oversight: paging on it is a new \
-         Dhan-scoped alert, which dhan-rest-only-noise-lock-2026-07-14.md §3 \
-         REJECTs without a dated row in THAT file first. Charting it here \
-         would be the better half of the fix and is a one-widget follow-up; \
-         listing it keeps the gap WRITTEN DOWN in the meantime, which is the \
-         entire point of this list. SHARPENED 2026-08-26: charting it is NOT \
-         a one-widget follow-up. EMF folds its labels by summing, and its \
-         arms are `rows` (the success path, large) plus `refused`, `dropped`, \
-         `shed_inline`, `shed_dedicated`, `disconnects`, `length_mismatch` \
-         and `truncated` (failures, expected zero). A folded line is therefore \
-         dominated by successes and could not show a failure spike at all, so \
-         a plain chart would close this entry while creating the exact false \
-         comfort the entry exists to prevent. Splitting it needs per-outcome \
-         metric NAMES, which is its own change.",
-    ),
-    (
-        "tv_dhan_ws_lag_excluded_total",
-        "counts lag SAMPLES excluded from the p99 (stale/negative exchange \
-     timestamps), not ticks lost. It is a quality qualifier for a histogram \
-     that is deliberately NOT EMF-shipped, so charting it alone would show a \
-     correction with nothing to correct. It belongs beside the lag histogram \
-     on the /metrics endpoint, where the histogram actually lives.",
-    ),
-];
+/// Shipped metrics excused from the "read by an alarm" rule. EMPTY since
+/// Quote 53: a shipped metric nobody alarms on is money for nothing, and the
+/// metric is still on the box's local `/metrics`. Adding an entry needs a
+/// fresh dated owner quote first.
+const SHIPPED_WITHOUT_AN_ALARM: &[(&str, &str)] = &[];
 
 /// Extract the EMF `metric_selectors` names from the deployed agent config.
-fn emf_selected_names(user_data: &str) -> Vec<String> {
+fn emf_selected_names(config: &str) -> Vec<String> {
     // The UNION across EVERY `metric_selectors` entry, not just the first.
-    // The agent config carries more than one declaration block (the host-only
-    // list plus per-dimension ones), and reading only the first silently
-    // under-reports what is published — which in this guard would produce
-    // false "charted but never publishes" failures on names that publish fine.
     let mut names: Vec<String> = Vec::new();
-    let mut rest = user_data;
+    let mut rest = config;
     while let Some(idx) = rest.find("metric_selectors") {
         rest = &rest[idx + "metric_selectors".len()..];
         let Some(open) = rest.find("[\"") else { break };
@@ -120,7 +76,7 @@ fn emf_selected_names(user_data: &str) -> Vec<String> {
     }
     assert!(
         !names.is_empty(),
-        "no tv_* names parsed out of {USER_DATA} — the extractor is broken, \
+        "no tv_* names parsed out of {AGENT_CONFIG} — the extractor is broken, \
          and every check in this file would pass or fail for the wrong reason"
     );
     names.sort();
@@ -128,205 +84,115 @@ fn emf_selected_names(user_data: &str) -> Vec<String> {
     names
 }
 
+/// Every `.tf` file under deploy/aws/terraform, comments stripped, joined.
+fn terraform_without_comments() -> String {
+    let dir = repo_root().join("deploy/aws/terraform");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "tf"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|body| {
+            body.lines()
+                .map(|l| l.split('#').next().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `metric_name = "<name>"`, whitespace-insensitive (HCL aligns `=` to the
+/// longest key of its own block, so the spacing varies).
+fn alarm_reads(terraform: &str, name: &str) -> bool {
+    let wanted = format!("metric_name = \"{name}\"");
+    terraform
+        .lines()
+        .any(|line| line.split_whitespace().collect::<Vec<_>>().join(" ") == wanted)
+}
+
 #[test]
 fn every_published_metric_is_visible_somewhere() {
-    let selected = emf_selected_names(&read(USER_DATA));
-    let dashboard = read(DASHBOARD);
-
-    // ALARMS COUNT AS VISIBLE, and until 2026-08-15 this guard did not look at
-    // them — while its own failure message said "and are in no alarm".
-    //
-    // That is a false claim inside a guard whose entire purpose is catching
-    // false claims, and it is not harmless: it sends the reader hunting for a
-    // missing alarm that already exists. It surfaced on the merge with #1751,
-    // which added `tv_dhan_live_universe_fallback_total` and
-    // `tv_dhan_ws_alive_connections` WITH alarms and no chart — correctly
-    // visible, wrongly reported.
-    //
-    // The test is named `..._is_visible_somewhere`. An alarm IS somewhere: a
-    // metric that pages an operator is not money spent on a number nobody
-    // sees. Charted-or-alarmed is the property; charted-only was a bug.
-    let alarms: String = std::fs::read_dir(repo_root().join("deploy/aws/terraform"))
-        .map(|dir| {
-            dir.filter_map(Result::ok)
-                .filter(|e| e.path().extension().is_some_and(|x| x == "tf"))
-                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+    let selected = emf_selected_names(&read(AGENT_CONFIG));
+    let terraform = terraform_without_comments();
     assert!(
-        alarms.contains("aws_cloudwatch_metric_alarm"),
-        "the terraform scan found no alarm definitions at all — the alarm half \
-         of this check would pass vacuously and re-create the exact blind spot \
-         it was added to close"
+        terraform.contains("aws_cloudwatch_metric_alarm"),
+        "the terraform scan found no alarm definitions at all — this check \
+         would pass or fail for the wrong reason"
     );
-
-    // SCOPE WIDENED 2026-08-26 — was `.filter(|n| n.starts_with("tv_dhan_"))`.
-    //
-    // The rule this guard enforces ("a metric we PAY to ship must reach a
-    // human somewhere") was never specific to the lane, but the filter was.
-    // So the gate held for one prefix and drifted silently for the other
-    // eight: a sweep on 2026-08-26 found TEN shipped metrics that were on no
-    // dashboard and in no alarm — cadence fallbacks, a refused option mark, a
-    // degraded identity check, two candle-recovery counters, and two resource
-    // gauges. None of them could have failed this test, because none of them
-    // began with `tv_dhan_`.
-    //
-    // Two of the ten had a further sting: `dhan-rest-only-noise-lock` §2.3h
-    // records the candle-recovery pair as "charted so the mechanism is
-    // observable". They were not charted. A reader checking that claim by
-    // reading would have found it satisfied.
-    //
-    // Every selected name is now in scope. That is the whole change; the
-    // charted / alarmed / excused logic below is untouched.
-    let mut invisible: Vec<String> = Vec::new();
-    for name in &selected {
-        // A `"name"` occurrence in a `metrics = [...]` position is what puts a
-        // line on a chart. A bare mention inside a `#` comment is not, so the
-        // quoted form is the right thing to look for: comments in this file
-        // never quote the metric.
-        let charted = dashboard.contains(&format!("\"{name}\""));
-        // `metric_name = "..."` is the alarm form; a bare comment mention is
-        // not, so the quoted form is again what distinguishes them.
-        // Whitespace-INSENSITIVE since 2026-08-21. This used to match two
-        // hardcoded spacings — one space, or exactly nine. HCL aligns `=` to
-        // the longest key in its own block, so the correct spacing depends on
-        // what other attributes that particular alarm happens to declare. A
-        // new alarm whose longest key was `comparison_operator` aligned to
-        // EIGHT spaces, matched neither pattern, and the metric was reported
-        // as unalarmed while its alarm sat in the file being scanned.
-        //
-        // That is the failure mode this guard exists to prevent, arriving
-        // through the guard itself: it would have sent someone to add a
-        // duplicate alarm for a metric that already had one.
-        let alarmed = alarms.lines().any(|line| {
-            let squeezed: String = {
-                let mut out = String::with_capacity(line.len());
-                let mut prev_space = false;
-                for ch in line.trim().chars() {
-                    let is_space = ch == ' ' || ch == '\t';
-                    if !(is_space && prev_space) {
-                        out.push(if is_space { ' ' } else { ch });
-                    }
-                    prev_space = is_space;
-                }
-                out
-            };
-            squeezed == format!("metric_name = \"{name}\"")
-        });
-        let excused = DELIBERATELY_NOT_CHARTED
-            .iter()
-            .any(|(m, _)| *m == name.as_str());
-
-        if !charted && !alarmed && !excused {
-            invisible.push(name.clone());
-        }
-    }
-
+    let unread: Vec<&String> = selected
+        .iter()
+        .filter(|n| !alarm_reads(&terraform, n))
+        .filter(|n| !SHIPPED_WITHOUT_AN_ALARM.iter().any(|(m, _)| m == n))
+        .collect();
     assert!(
-        invisible.is_empty(),
-        "these metrics are PUBLISHED to CloudWatch (~$0.30/mo each) \
-         but appear on no dashboard and are in no alarm — money spent on \
-         numbers nobody can see:\n  {}\n\nEither add a widget in {DASHBOARD}, \
-         or add the name to DELIBERATELY_NOT_CHARTED in this file with a \
-         written reason. An unexplained gap here is exactly the state that \
-         left the entire failure surface of the only live tick source \
-         invisible for four days.",
-        invisible.join("\n  ")
+        unread.is_empty(),
+        "these metrics are SHIPPED to CloudWatch (about $0.30 a month each) but \
+         no alarm reads them. Operator Quote 53 (2026-11-11): CloudWatch receives \
+         only the metrics an alarm reads; the box's local /metrics keeps them all. \
+         Remove them from {AGENT_CONFIG}:\n  {unread:?}"
     );
 }
 
 #[test]
 fn nothing_is_charted_that_can_never_publish() {
-    // The inverse error, and the more dangerous one. A widget whose metric is
-    // not EMF-selected renders as "no data" — visually identical to a healthy
-    // flat-zero loss counter. An operator glancing at it concludes nothing is
-    // being lost, when in fact nothing is being measured.
-    let selected = emf_selected_names(&read(USER_DATA));
-    let dashboard = read(DASHBOARD);
-
-    // SCOPE WIDENED 2026-08-26 — was three prefixes: `tv_dhan_`, `tv_tick`,
-    // `tv_ws_`. Same defect as the sibling check above, in the direction this
-    // test's own comment calls "the more dangerous one": a phantom widget on
-    // `tv_cadence_*`, `tv_chain_*`, `tv_partition_*`, `tv_ilp_*`, `tv_boot_*`
-    // or any other prefix rendered "no data" and NOTHING would have said so.
-    //
-    // Any `tv_`-prefixed string on the dashboard is in scope now. The filter
-    // reads string literals, and the dashboard's comments never quote a metric
-    // name, so a prose mention cannot produce a false positive.
-    let mut phantom: Vec<String> = Vec::new();
-    for name in dashboard.split('"').filter(|s| s.starts_with("tv_")) {
-        // Derived metrics-log-filter series (order-side) are published by a
-        // log metric filter rather than the EMF path, so they legitimately
-        // never appear in the selector list.
-        if name.ends_with("_delta_total") {
-            continue;
-        }
-        if !selected.iter().any(|s| s == name) {
-            phantom.push(name.to_string());
-        }
-    }
-    phantom.sort();
-    phantom.dedup();
-
+    // Quote 53 deleted the CloudWatch dashboard (reversing Quote 37's
+    // "dashboard KEPT"). A dashboard that comes back without a fresh dated
+    // quote is a REJECT.
     assert!(
-        phantom.is_empty(),
-        "these metrics are CHARTED on the operator dashboard but are not in \
-         the CloudWatch agent's EMF allowlist, so they can never carry a \
-         datapoint:\n  {}\n\nThe widget will render 'no data', which on a loss \
-         counter is indistinguishable from 'nothing is being lost'. Either add \
-         the name to metric_selectors in {USER_DATA} (with a dated cost note, \
-         ~$0.30/mo) or remove the widget.",
-        phantom.join("\n  ")
+        !repo_root()
+            .join("deploy/aws/terraform/dashboard.tf")
+            .exists(),
+        "deploy/aws/terraform/dashboard.tf is back; Quote 53 deleted the \
+         CloudWatch dashboard"
+    );
+    assert!(
+        !terraform_without_comments().contains("aws_cloudwatch_dashboard"),
+        "a CloudWatch dashboard resource is declared again; Quote 53 deleted it"
     );
 }
 
 #[test]
 fn the_lane_row_actually_exists_and_is_substantial() {
-    // Non-vacuity. Both checks above pass trivially against a dashboard file
-    // that charts nothing at all, which is precisely the state this guard was
-    // written to end.
-    let dashboard = read(DASHBOARD);
-    let selected = emf_selected_names(&read(USER_DATA));
-
-    let lane_count = selected
-        .iter()
-        .filter(|n| n.starts_with("tv_dhan_"))
-        .count();
+    // Non-vacuity: the first check passes trivially against an empty selector,
+    // which would also silence every kept page that reads an EMF metric.
+    let selected = emf_selected_names(&read(AGENT_CONFIG));
+    for required in [
+        "tv_dhan_feed_stack_up",
+        "tv_dhan_ws_park_total",
+        "tv_ticks_dropped_total",
+        "tv_ticks_spilled_total",
+        "tv_dhan_feed_last_tick_age_secs",
+        "tv_token_remaining_seconds",
+        "tv_questdb_disconnected_seconds",
+        "tv_spill_dir_free_bytes",
+    ] {
+        assert!(
+            selected.iter().any(|s| s == required),
+            "{required} must stay EMF-selected: a page Quote 53 keeps reads it"
+        );
+    }
     assert!(
-        lane_count >= 15,
-        "found only {lane_count} tv_dhan_* names in the EMF allowlist — the \
-         scanner is not matching, so both checks above would pass vacuously"
-    );
-
-    let charted = selected
-        .iter()
-        .filter(|n| n.starts_with("tv_dhan_"))
-        .filter(|n| dashboard.contains(&format!("\"{n}\"")))
-        .count();
-    assert!(
-        charted >= 15,
-        "only {charted} of {lane_count} live-lane metrics are charted. The \
-         live feed is the only tick source in the system; a dashboard that \
-         does not show it is not an operator dashboard"
+        selected.len() >= 30,
+        "only {} names parsed from the selector — the extractor is not matching",
+        selected.len()
     );
 }
 
 #[test]
 fn every_excuse_carries_a_real_reason() {
-    // An allowlist whose entries can be blank is a rubber stamp: the next
-    // person adds a name, leaves the reason empty, and the guard passes while
-    // the metric goes dark. Require the reason to be long enough that it had
-    // to be written by someone who thought about it.
-    for (metric, reason) in DELIBERATELY_NOT_CHARTED {
-        assert!(
-            reason.len() > 80,
-            "{metric} is excused from the dashboard with a {}-char reason. \
-             Write down WHY it is safe for this metric to be invisible, or \
-             chart it",
-            reason.len()
-        );
+    // Quote 53: no shipped metric goes unalarmed, so the excuse list is empty.
+    // If an owner quote ever re-opens it, each entry still needs a reason.
+    for (metric, reason) in SHIPPED_WITHOUT_AN_ALARM {
+        assert!(reason.len() > 80, "{metric} is excused without a reason");
         assert!(metric.starts_with("tv_"), "{metric} is not a metric name");
     }
+    assert!(
+        SHIPPED_WITHOUT_AN_ALARM.is_empty(),
+        "Quote 53 allows no shipped metric without an alarm"
+    );
 }

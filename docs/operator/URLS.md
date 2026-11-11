@@ -9,7 +9,7 @@
 
 | # | What | URL |
 |---|---|---|
-| 1 | **Live App Dashboard** (all metrics, real-time) | [CloudWatch Dashboard `tv-prod-operator`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator) |
+| 1 | **Live App Dashboard** (all metrics, real-time) | [CloudWatch Dashboard `tv-prod-operator`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator) ⚠ From December 2026 (operator Quote 53) this CloudWatch dashboard is deleted; use the operator portal (`terraform output operator_portal_url`) and Telegram. |
 | 2 | **Live App Logs** (stream every line) | [Log group `/tickvault/prod/app` → click "Start tailing"](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#logsV2:log-groups/log-group/$252Ftickvault$252Fprod$252Fapp) |
 | 3 | **Active Alarms** (red = action needed) | [CloudWatch Alarms](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarmFilter=ALARM) |
 | 4 | **Deploy History** | [GitHub Actions → `deploy-aws`](https://github.com/SJParthi/tickvault/actions/workflows/deploy-aws.yml) |
@@ -21,7 +21,7 @@
 
 | What | URL |
 |---|---|
-| Dashboard `tv-prod-operator` | https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator |
+| Dashboard `tv-prod-operator` | https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator ⚠ From December 2026 (operator Quote 53) this CloudWatch dashboard is deleted; use the operator portal (`terraform output operator_portal_url`) and Telegram. |
 | ALL CloudWatch Alarms | https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2: |
 | Firing Alarms ONLY | https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarmFilter=ALARM |
 
@@ -133,7 +133,7 @@ bookmark any `…ts.net:9000` URL; use the SSM port-forward in Option A.
 
 ## 🎯 Daily 30-Second Health Check
 
-1. Open **Dashboard** (URL #1 above) — all widgets green? ✅
+1. Open **Dashboard** (URL #1 above) — all widgets green? ✅ (⚠ From December 2026 (operator Quote 53) this CloudWatch dashboard is deleted; use the operator portal (`terraform output operator_portal_url`) and Telegram.)
 2. Glance at **Alarms** (URL #3) — any red? 🔴 → click → diagnose
 3. Open **Telegram** → scroll recent messages — anything 🆘 or ⚠️?
 4. Done. Coffee.

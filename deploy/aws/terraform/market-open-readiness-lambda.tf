@@ -166,30 +166,8 @@ resource "aws_lambda_permission" "market_open_readiness" {
 # Watch the watchman — the readiness pager itself failing must page.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "market_open_readiness_lambda_errors" {
-  alarm_name          = "tv-${var.environment}-market-open-readiness-errors"
-  alarm_description   = "The 08:45 IST readiness pager itself FAILED - the watchman must be watched (the pager exists because silent failure is the incident class). Its SNS-publish path deliberately RAISES on failure so a broken page lands here instead of dying silently."
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  dimensions = {
-    FunctionName = aws_lambda_function.market_open_readiness.function_name
-  }
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  # NO ok_actions (round-14): this Lambda runs 1-2x/day (the 08:45 cron +
-  # occasional drills), so the post-ALARM auto-OK only means the single
-  # Errors datapoint AGED OUT of the lookback — never that anything was
-  # fixed. The telegram-webhook Lambda forwards every OK as a green
-  # "recovered" page, so a symmetric ok_actions here produced a recurring
-  # Rule-11 false-recovery green per failure episode. Recovery signal = the
-  # NEXT scheduled run succeeding (verdict visible in the Lambda log group).
-  ok_actions = []
-}
+# alarm "market_open_readiness_lambda_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 
 # ---------------------------------------------------------------------------
@@ -208,29 +186,5 @@ resource "aws_cloudwatch_metric_alarm" "market_open_readiness_lambda_errors" {
 # worth seeing in the console and is not worth a second page.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "market_open_readiness_not_invoked" {
-  alarm_name          = "tv-${var.environment}-market-open-readiness-not-invoked"
-  alarm_description   = "The pre-open readiness check did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). While it is not running nothing verifies the system is ready before the market opens, and the absence of a readiness page is indistinguishable from a clean readiness result. Its Errors alarm cannot see this (no invocation = no error)."
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Invocations"
-  namespace           = "AWS/Lambda"
-  period              = 86400
-  statistic           = "Sum"
-  threshold           = 1
-  # breaching: a missing Invocations datapoint IS the condition being detected.
-  treat_missing_data = "breaching"
-  dimensions = {
-    FunctionName = aws_lambda_function.market_open_readiness.function_name
-  }
-  # GATED (2026-09-01): ships DISARMED. The market-hours gate Lambda
-  # (market-hours-liveness-alarm.tf ALARM_NAMES) enables actions at 09:20 IST
-  # Mon-Fri and disables them at 15:35 IST. Without this the alarm pages every
-  # Saturday and Sunday: the watched Lambda is on a MON-FRI cron, so its
-  # Invocations datapoint is legitimately ABSENT at the weekend and
-  # treat_missing_data = breaching turns that absence into an ALARM. The gate
-  # cannot disarm an alarm that ships armed, so this line is half of the fix.
-  actions_enabled = false
-  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
-  ok_actions      = []
-}
+# alarm "market_open_readiness_not_invoked" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.

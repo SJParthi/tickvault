@@ -328,3 +328,15 @@ variable "muhurat_sessions" {
     error_message = "muhurat_sessions: times must sit inside 06:00-23:00 IST so every dated rule stays on its UTC date."
   }
 }
+
+# Operator Quote 53 (2026-11-11) authorizes the alarm, metric and dashboard
+# cuts "FROM DECEMBER". The gate `terraform_data.quote53_not_before_december`
+# in main.tf refuses any plan made before 1 December 2026 IST. Set this to true
+# (change the default below, in the same change) ONLY after the owner has given a
+# dated go-ahead to apply earlier, recorded in
+# daily-universe-scope-expansion-2026-05-27.md under Quote 53.
+variable "quote53_early_apply_approved" {
+  description = "Owner go-ahead to apply the Quote 53 alarm cuts before 1 December 2026 IST. True since the owner's 2026-11-11 go-ahead; false refuses the plan until then."
+  type        = bool
+  default     = true # owner go-ahead 2026-11-11 (Quote 53 note, card "Apply now (Recommended)")
+}

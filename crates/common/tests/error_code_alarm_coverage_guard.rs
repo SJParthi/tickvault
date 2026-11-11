@@ -357,6 +357,12 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // VOLUME-MONO-01 left this list on 2026-10-22: its variant is retired
     // with the volume leaderboard (plan item 62).
     "WS-GAP-10",
+    // 2026-11-11, operator Quote 53 alarm review (docs/audits/2026-11-alarm-review.md):
+    // these three lost their CloudWatch filter and alarm, each with a review
+    // row naming what still covers it. Their coded log lines are unchanged.
+    "DH-906",
+    "RESOURCE-02",
+    "WAL-SUSPEND-01",
     // WS-SPILL-01 left this list on 2026-08-12 — it is now ALARMED
     // (`deploy/aws/terraform/error-code-alarms.tf`, entry "ws-spill-01").
     // Its sibling WS-SPILL-02 had been alarmed since 2026-08-11 while the

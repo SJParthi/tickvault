@@ -303,7 +303,7 @@ jobs:
             echo "**Partial** — see the sections above; re-run status after a minute." >> "$S"
           fi
           echo "" >> "$S"
-          echo "_Dashboards: CloudWatch → Dashboards → tv-prod-operator · Logs: CloudWatch → Log groups → /tickvault/prod/app_" >> "$S"
+          echo "_Logs: CloudWatch → Log groups → /tickvault/prod/app_" >> "$S"
 
           # Also echo to the run log for quick glance.
           echo "$OUT"

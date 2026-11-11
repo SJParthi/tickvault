@@ -1151,10 +1151,24 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // two tv_depth_first_packet_*_total twins each had ONE reader, a depth
     // alarm deleted in the same change (depth is switched off since
     // 2026-10-21). -$1.20/mo. They stay in the app's local /metrics.
+    //
+    // 2026-11-11: 109 -> 44, a REMOVAL (operator Quote 53, card "Trim
+    // CloudWatch metrics": CloudWatch receives only the metrics an alarm
+    // reads). 65 names that no kept alarm reads after the Quote 53 alarm
+    // review (docs/audits/2026-11-alarm-review.md) left the selector; every
+    // one stays on the app's local /metrics, and the metrics log group still
+    // receives every scrape. dashboard_live_lane_visibility_guard.rs now pins
+    // that every selected name is read by an alarm. Its own review then put
+    // two back (44 -> 46): tv_dhan_live_universe_fallback_total and
+    // tv_tick_spill_replay_quarantined_total, read by the restored
+    // live-universe-fallback and tick-spill-quarantined data-loss pages.
     assert_eq!(
         names.len(),
-        109,
-        "Z+ L2 VERIFY ratchet: expected exactly 109 names in the MAIN EMF \
+        46,
+        "Z+ L2 VERIFY ratchet: expected exactly 46 names in the MAIN EMF \
+         (2026-11-11: 109 -> 46, the names no kept alarm reads after the Quote 53 \
+         alarm review, docs/audits/2026-11-alarm-review.md, with the two names its \
+         review put back for the restored fallback and quarantine pages.) \
          (2026-10-22: 113 -> 109, the four depth names whose only reader was a \
          depth alarm removed by the Quote 37 alarm review, noise-lock §2.14.) \
          (2026-10-04: 103 -> 113, the ten §2.9 data-at-risk counters, see aws-budget.md \
@@ -1367,7 +1381,15 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         names.len()
     );
     for required in [
-        "tv_process_rss_bytes",
+        // ⚠ 2026-11-11 (operator Quote 53, "Trim CloudWatch metrics"):
+        // tv_process_rss_bytes, tv_oom_kills_total and tv_ram_store_dropped_total
+        // left this list and the selector (tv_daily_pnl stays: the kept
+        // daily-loss page reads it). No kept
+        // alarm reads them (docs/audits/2026-11-alarm-review.md), and CloudWatch
+        // now receives only what an alarm reads; all three stay on the app's
+        // local /metrics. The anchors below are the kept pages' inputs.
+        "tv_ticks_dropped_total",
+        "tv_dhan_feed_stack_up",
         // tv_subsystem_memory_estimated_bytes REMOVED from this required list
         // 2026-08-29. It was required here since the 2K-universe memory
         // measurement, and a live `cloudwatch list-metrics` returns [] for it:
@@ -1452,8 +1474,9 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         // still fails loudly on any of them.
         "tv_questdb_wal_suspended_tables", // QuestDB silently stops accepting writes
         "tv_order_audit_rows_discarded_total", // SEBI 5-yr audit row loss
-        "tv_oom_kills_total",              // host memory saturation
-        "tv_ram_store_dropped_total",      // RAM decision surface dropping rows
+                                           // tv_oom_kills_total and tv_ram_store_dropped_total left 2026-11-11
+                                           // (Quote 53, no kept alarm reads them; the OOM kill still pages through
+                                           // the PROC-01 log filter).
     ] {
         assert!(
             names.iter().any(|n| n == required),
@@ -2022,10 +2045,17 @@ fn test_app_alarms_count_is_seven() {
     // arithmetic crosses the automatic action line and this widens it. The
     // levers remain the already-approved Quote 10 EIP release (-$3.60/mo) or an
     // operator decision on limit_amount. Neither is taken here.
+    //
+    // 2026-11-11: 9 -> 4, a REMOVAL (operator Quote 53 alarm review,
+    // docs/audits/2026-11-alarm-review.md): orders_rejected, clock_skew_high,
+    // disk_watcher_respawn, questdb_wal_apply_lag and questdb_wal_probe_failed
+    // left app-alarms.tf (mem_used_high and disk_fill_rate_high also left; they
+    // read host metrics, not a metric_name). Kept: questdb_disconnected,
+    // token_remaining_low, spill_dir_free_low, questdb_wal_suspended.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 9,
-        "Z+ L2 VERIFY ratchet: expected exactly 9 app-level CloudWatch alarm \
+        count, 4,
+        "Z+ L2 VERIFY ratchet: expected exactly 4 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \
@@ -2443,20 +2473,39 @@ const LAMBDA_ERRORS_ALARM_EXEMPT: &[(&str, &str)] = &[
     // `questdb_console_proxy` was added on 2026-08-25 mirroring its front
     // sibling exactly. Giving one half of a two-Lambda surface a pager while
     // the other stays silent is a worse inconsistency than either state.
+    //
+    // 2026-11-11 (operator Quote 53, docs/audits/2026-11-alarm-review.md):
+    // the three action-less alarms above were REMOVED outright (they paged
+    // nobody and still cost $0.10 a month each), and three scheduled helpers
+    // lost their Errors alarm. Each entry below names what still covers it.
     (
         "questdb_console_front",
-        "dashboard-only by design: operator console surface, alarm exists without \
-         alarm_actions. Pre-dates 2026-08-25.",
+        "operator convenience surface; its action-less Errors alarm was removed \
+         2026-11-11 under operator Quote 53. A failing console shows itself to the \
+         operator who is using it.",
     ),
     (
         "questdb_console_proxy",
-        "dashboard-only by design: mirrors questdb_console_front, including its \
-         lack of alarm_actions. Added 2026-08-25.",
+        "mirrors questdb_console_front; its action-less Errors alarm was removed \
+         2026-11-11 under operator Quote 53.",
     ),
     (
         "operator_control",
-        "dashboard-only by design: operator control surface, alarm exists without \
-         alarm_actions. Pre-dates 2026-08-25.",
+        "operator control surface; its action-less Errors alarm was removed \
+         2026-11-11 under operator Quote 53. A failing button shows itself to the \
+         operator who pressed it.",
+    ),
+    (
+        "deploy_watchdog",
+        "Errors alarm removed 2026-11-11 under operator Quote 53. The stale-binary \
+         page it feeds (tv-<env>-binary-sha-stale) is kept; a dead watchdog leaves it \
+         quiet, accepted in the alarm review.",
+    ),
+    (
+        "market_open_readiness",
+        "Errors alarm removed 2026-11-11 under operator Quote 53. A box that is not \
+         ready is still paged by tv-<env>-boot-heartbeat-missing and, from 09:20 IST, \
+         by tv-<env>-market-hours-liveness-missing.",
     ),
     // 2026-11-11 (noise lock §2.18, owner card "Yes, daily waste check
     // (Recommended)"): the waste check may have NO alarm beyond its
@@ -2784,11 +2833,26 @@ fn schedule_driven_lambdas(bodies: &[(String, String)]) -> Vec<String> {
 
 /// Scheduled Lambdas deliberately left without a "did it run" alarm.
 ///
-/// Empty, and that is the intended steady state. An entry here is a decision
-/// that a given clock-driven Lambda may silently stop running — which is a
-/// real choice for something purely cosmetic, and never one for anything on a
-/// safety or money path.
-const LAMBDA_INVOCATIONS_ALARM_EXEMPT: &[(&str, &str)] = &[];
+/// An entry here is a decision that a given clock-driven Lambda may silently
+/// stop running — a real choice for something that is not on a safety or
+/// money path, and never one for anything that is. The two entries are the
+/// owner's 2026-11-11 Quote 53 alarm review (docs/audits/2026-11-alarm-review.md);
+/// the budget guards, the token minters, the start watchdog and the
+/// market-hours gate all keep theirs.
+const LAMBDA_INVOCATIONS_ALARM_EXEMPT: &[(&str, &str)] = &[
+    (
+        "deploy_watchdog",
+        "did-it-run alarm removed 2026-11-11 under operator Quote 53: the deploy \
+         watchdog is not on the trading or money path; a stale binary is a deploy \
+         problem the next deploy fixes.",
+    ),
+    (
+        "market_open_readiness",
+        "did-it-run alarm removed 2026-11-11 under operator Quote 53: the 08:45 \
+         readiness check is an early warning; tv-<env>-boot-heartbeat-missing and \
+         tv-<env>-market-hours-liveness-missing still page an app that is not up.",
+    ),
+];
 
 #[test]
 fn every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption() {
@@ -3404,8 +3468,10 @@ fn the_app_alarms_output_names_every_alarm_in_the_file() {
             declared.push(name.to_owned());
         }
     }
+    // Floor 10 -> 5 on 2026-11-11: the operator Quote 53 alarm review left
+    // five alarm resources in app-alarms.tf (measured).
     assert!(
-        declared.len() >= 10,
+        declared.len() >= 5,
         "ratchet self-check: parsed {} alarm resources from app-alarms.tf — \
          the resource-header parser is broken, not the file",
         declared.len()
