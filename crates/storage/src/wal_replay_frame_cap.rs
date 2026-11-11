@@ -137,6 +137,64 @@ pub fn planned_evening_drain_boot() -> bool {
     )
 }
 
+/// Whether a replay-limit line (the frame cap, the catch-up deferral, a
+/// byte-budget deferral) pages on this boot (noise lock §2.17 and §2.20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayLimitVerdict {
+    /// Pages: an `error!` the `ws-spill-01` / `ws-spill-02` filters match.
+    Page,
+    /// The evening drain's planned restart (§2.17): a coded `warn!`,
+    /// `source` suffix `_planned`.
+    PlannedRestart,
+    /// The waiting backlog is strictly lower than the previous start's
+    /// (§2.20, owner card "Page only if stuck (Recommended)"): a coded
+    /// `warn!`, `source` suffix `_shrinking`.
+    BacklogShrinking { previous: u64, current: u64 },
+}
+
+/// The §2.17 / §2.20 decision: the planned restart wins, then a shrinking
+/// backlog; anything else (no judgement, first start, unknown or unchanged
+/// or grown count) pages. Pure, O(1).
+#[must_use]
+pub const fn replay_limit_verdict(
+    planned: bool,
+    trend: Option<crate::wal_backlog_trend::BacklogTrend>,
+) -> ReplayLimitVerdict {
+    if planned {
+        return ReplayLimitVerdict::PlannedRestart;
+    }
+    match trend {
+        Some(crate::wal_backlog_trend::BacklogTrend::Shrinking { previous, current }) => {
+            ReplayLimitVerdict::BacklogShrinking { previous, current }
+        }
+        _ => ReplayLimitVerdict::Page,
+    }
+}
+
+/// This boot's verdict: [`planned_evening_drain_boot`] and the backlog trend
+/// `main` judged before the boot replay
+/// (`wal_backlog_trend::boot_backlog_trend`). Two atomic loads and one
+/// `OnceLock` read, O(1).
+#[must_use]
+pub fn replay_limit_verdict_this_boot() -> ReplayLimitVerdict {
+    replay_limit_verdict(
+        planned_evening_drain_boot(),
+        crate::wal_backlog_trend::boot_backlog_trend(),
+    )
+}
+
+/// `(previous, current)` backlog counts for a log line; `(-1, -1)` when the
+/// verdict carries none. O(1).
+const fn backlog_fields(verdict: ReplayLimitVerdict) -> (i64, i64) {
+    match verdict {
+        ReplayLimitVerdict::BacklogShrinking { previous, current } => {
+            // APPROVED: cast -- a segment count is far below i64::MAX.
+            (previous as i64, current as i64)
+        }
+        _ => (-1, -1),
+    }
+}
+
 /// Reports the catch-up drain's once-per-boot `WS-SPILL-01` deferral line
 /// (`source = "replay_deferred"`). On the planned evening-drain boot the
 /// line is a coded `warn!` with `source = "replay_deferred_planned"`, which
@@ -148,14 +206,35 @@ pub fn planned_evening_drain_boot() -> bool {
 /// alarm filter keys on it (2026-11-11, noise lock §2.17 note; Verified live
 /// 2026-11-09: every planned restart paged on this line). Cold, at most once
 /// per boot.
+///
+/// 2026-11-11 (noise lock §2.20): on any boot whose waiting backlog is
+/// strictly lower than the previous start's, a coded `warn!` with `source =
+/// "replay_deferred_shrinking"` (no page).
 pub fn report_catchup_replay_deferred(
-    planned: bool,
+    verdict: ReplayLimitVerdict,
     deferred_segments: u64,
     bytes_replayed: u64,
     budget_bytes: u64,
     rounds: u32,
 ) {
-    if planned {
+    if let ReplayLimitVerdict::BacklogShrinking { .. } = verdict {
+        let (previous_backlog_segments, backlog_segments) = backlog_fields(verdict);
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_deferred_shrinking",
+            deferred_segments,
+            bytes_replayed,
+            budget_bytes,
+            rounds,
+            previous_backlog_segments,
+            backlog_segments,
+            "WAL replay left segments for the next boot, and the waiting backlog is \
+             smaller than at the previous start, so it is draining. Nothing is stranded \
+             (a deferred segment stays a `*.wal` file). Reported once per boot."
+        );
+        return;
+    }
+    if verdict == ReplayLimitVerdict::PlannedRestart {
         warn!(
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
             source = "replay_deferred_planned",
@@ -209,7 +288,11 @@ pub(crate) struct ReplayBudgetDeferral {
 /// text as before (no `source` field; the log `target` is now this module).
 /// The counter is moved by the caller on both paths. Cold, once per replay
 /// pass that defers.
-pub(crate) fn report_replay_budget_deferred(planned: bool, d: ReplayBudgetDeferral) {
+///
+/// 2026-11-11 (noise lock §2.20): a BYTE-budget stop on a boot whose waiting
+/// backlog is shrinking is a coded `warn!` with `source =
+/// "replay_budget_deferred_shrinking"`; a memory-guard stop still pages.
+pub(crate) fn report_replay_budget_deferred(verdict: ReplayLimitVerdict, d: ReplayBudgetDeferral) {
     let ReplayBudgetDeferral {
         deferred_segments,
         consumed_segments,
@@ -218,7 +301,26 @@ pub(crate) fn report_replay_budget_deferred(planned: bool, d: ReplayBudgetDeferr
         stopped_for_memory,
         stop_pct,
     } = d;
-    if planned && !stopped_for_memory {
+    if !stopped_for_memory && let ReplayLimitVerdict::BacklogShrinking { .. } = verdict {
+        let (previous_backlog_segments, backlog_segments) = backlog_fields(verdict);
+        warn!(
+            code = ErrorCode::WsSpill02FrameDropped.code_str(),
+            source = "replay_budget_deferred_shrinking",
+            deferred_segments,
+            consumed_segments,
+            bytes_held,
+            budget_bytes,
+            stopped_for_memory,
+            stop_pct,
+            previous_backlog_segments,
+            backlog_segments,
+            "WAL replay left the remaining segments for the next boot (byte budget), and \
+             the waiting backlog is smaller than at the previous start, so it is draining. \
+             Nothing is stranded: each one stays a `*.wal` file."
+        );
+        return;
+    }
+    if verdict == ReplayLimitVerdict::PlannedRestart && !stopped_for_memory {
         warn!(
             code = ErrorCode::WsSpill02FrameDropped.code_str(),
             source = "replay_budget_deferred_planned",
@@ -265,12 +367,44 @@ pub(crate) fn report_replay_budget_deferred(planned: bool, d: ReplayBudgetDeferr
 /// `warn!` with `source = "replay_frame_cap_planned"` (the `ws-spill-01`
 /// filter matches `ERROR` only, so it does not page). Every other boot keeps
 /// the `error!` and the page. The counter moves on both paths.
+///
+/// 2026-11-11 (noise lock §2.20): on any other boot whose waiting backlog is
+/// strictly lower than the previous start's, a coded `warn!` with `source =
+/// "replay_frame_cap_shrinking"` (no page).
 pub(crate) fn refuse_past_frame_cap(frames_so_far: u64, cap: u64) -> bool {
+    refuse_past_frame_cap_as(
+        frames_so_far,
+        cap,
+        replay_limit_verdict(
+            cap_is_planned_evening_drain(cap),
+            crate::wal_backlog_trend::boot_backlog_trend(),
+        ),
+    )
+}
+
+/// [`refuse_past_frame_cap`] with the verdict given (tests drive every arm
+/// without the process judgement). O(1).
+fn refuse_past_frame_cap_as(frames_so_far: u64, cap: u64, verdict: ReplayLimitVerdict) -> bool {
     if frames_so_far < cap {
         return false;
     }
     metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(1);
-    if cap_is_planned_evening_drain(cap) {
+    if let ReplayLimitVerdict::BacklogShrinking { .. } = verdict {
+        let (previous_backlog_segments, backlog_segments) = backlog_fields(verdict);
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_frame_cap_shrinking",
+            frames_so_far,
+            cap,
+            previous_backlog_segments,
+            backlog_segments,
+            "WAL replay paused for this boot at the per-boot frame cap, and the waiting \
+             backlog is smaller than at the previous start, so it is draining. Nothing is \
+             stranded — every unread segment stays a `*.wal` file for the next boot."
+        );
+        return true;
+    }
+    if verdict == ReplayLimitVerdict::PlannedRestart {
         warn!(
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
             source = "replay_frame_cap_planned",
@@ -595,8 +729,15 @@ mod tests {
     // `replay_deferred_planned` (no page); any other boot → the same ERROR.
     #[test]
     fn test_regression_report_catchup_replay_deferred_warns_only_on_the_planned_boot() {
-        let planned =
-            capture(|| report_catchup_replay_deferred(true, 3, 536_870_912, 536_870_912, 2));
+        let planned = capture(|| {
+            report_catchup_replay_deferred(
+                ReplayLimitVerdict::PlannedRestart,
+                3,
+                536_870_912,
+                536_870_912,
+                2,
+            )
+        });
         assert_eq!(planned.len(), 1, "{planned:?}");
         assert_eq!(planned[0]["level"], "WARN", "{}", planned[0]);
         assert_eq!(planned[0]["code"], "WS-SPILL-01", "{}", planned[0]);
@@ -611,8 +752,9 @@ mod tests {
             "a planned boot does not page"
         );
 
-        let unplanned =
-            capture(|| report_catchup_replay_deferred(false, 3, 536_870_912, 536_870_912, 2));
+        let unplanned = capture(|| {
+            report_catchup_replay_deferred(ReplayLimitVerdict::Page, 3, 536_870_912, 536_870_912, 2)
+        });
         assert_eq!(unplanned.len(), 1, "{unplanned:?}");
         assert_eq!(unplanned[0]["level"], "ERROR", "{}", unplanned[0]);
         assert_eq!(unplanned[0]["code"], "WS-SPILL-01", "{}", unplanned[0]);
@@ -639,7 +781,8 @@ mod tests {
             stopped_for_memory: false,
             stop_pct: 60,
         };
-        let planned = capture(|| report_replay_budget_deferred(true, deferral));
+        let planned =
+            capture(|| report_replay_budget_deferred(ReplayLimitVerdict::PlannedRestart, deferral));
         assert_eq!(planned.len(), 1, "{planned:?}");
         assert_eq!(planned[0]["level"], "WARN", "{}", planned[0]);
         assert_eq!(planned[0]["code"], "WS-SPILL-02", "{}", planned[0]);
@@ -654,7 +797,8 @@ mod tests {
             "a planned boot does not page"
         );
 
-        let unplanned = capture(|| report_replay_budget_deferred(false, deferral));
+        let unplanned =
+            capture(|| report_replay_budget_deferred(ReplayLimitVerdict::Page, deferral));
         assert_eq!(unplanned.len(), 1, "{unplanned:?}");
         assert_eq!(unplanned[0]["level"], "ERROR", "{}", unplanned[0]);
         assert_eq!(unplanned[0]["code"], "WS-SPILL-02", "{}", unplanned[0]);
@@ -683,7 +827,8 @@ mod tests {
             stopped_for_memory: true,
             stop_pct: 80,
         };
-        let planned = capture(|| report_replay_budget_deferred(true, deferral));
+        let planned =
+            capture(|| report_replay_budget_deferred(ReplayLimitVerdict::PlannedRestart, deferral));
         assert_eq!(planned.len(), 1, "{planned:?}");
         assert_eq!(planned[0]["level"], "ERROR", "{}", planned[0]);
         assert_eq!(planned[0]["code"], "WS-SPILL-02", "{}", planned[0]);
@@ -754,12 +899,238 @@ mod tests {
             .expect("the call");
         assert!(
             prod[at..at + 200]
-                .contains("crate::wal_replay_frame_cap::planned_evening_drain_boot()"),
-            "it passes the process planned verdict"
+                .contains("crate::wal_replay_frame_cap::replay_limit_verdict_this_boot()"),
+            "it passes the process verdict (planned restart or shrinking backlog, §2.20)"
         );
         assert!(
             !prod.contains("WAL replay DEFERRED the remaining segments"),
             "the line lives only in the reporter now"
         );
+    }
+
+    // ---- noise lock §2.20 (2026-11-11, "Page only if stuck (Recommended)") ----
+
+    use crate::wal_backlog_trend::BacklogTrend;
+
+    const SHRINKING: ReplayLimitVerdict = ReplayLimitVerdict::BacklogShrinking {
+        previous: 290,
+        current: 285,
+    };
+
+    /// Every trend × planned: the planned restart wins, then only a strict
+    /// shrink is quiet; no judgement at all pages.
+    #[test]
+    fn test_replay_limit_verdict_planned_wins_then_shrinking_else_page() {
+        let trends = [
+            None,
+            Some(BacklogTrend::FirstStart),
+            Some(BacklogTrend::Unreadable),
+            Some(BacklogTrend::FutureDated),
+            Some(BacklogTrend::PreviousUnknown),
+            Some(BacklogTrend::CurrentUnknown),
+            Some(BacklogTrend::Unchanged {
+                previous: 7,
+                current: 7,
+            }),
+            Some(BacklogTrend::Grew {
+                previous: 7,
+                current: 8,
+            }),
+            Some(BacklogTrend::Shrinking {
+                previous: 8,
+                current: 7,
+            }),
+        ];
+        for trend in trends {
+            assert_eq!(
+                replay_limit_verdict(true, trend),
+                ReplayLimitVerdict::PlannedRestart,
+                "{trend:?}"
+            );
+            let expected = match trend {
+                Some(BacklogTrend::Shrinking { previous, current }) => {
+                    ReplayLimitVerdict::BacklogShrinking { previous, current }
+                }
+                _ => ReplayLimitVerdict::Page,
+            };
+            assert_eq!(replay_limit_verdict(false, trend), expected, "{trend:?}");
+        }
+    }
+
+    /// No test in this binary judges the backlog, so the process verdict is
+    /// never `BacklogShrinking` here: a lane started without the boot
+    /// judgement pages (the planned arm may be set by the fenced-replay test).
+    #[test]
+    fn test_replay_limit_verdict_this_boot_without_a_judgement_is_never_shrinking() {
+        assert_eq!(crate::wal_backlog_trend::boot_backlog_trend(), None);
+        let v = replay_limit_verdict_this_boot();
+        assert!(
+            matches!(
+                v,
+                ReplayLimitVerdict::Page | ReplayLimitVerdict::PlannedRestart
+            ),
+            "{v:?}"
+        );
+    }
+
+    /// The frame-cap refusal under each verdict: shrinking and planned are
+    /// coded WARNs the `ws-spill-01` filter does not match; `Page` is the
+    /// unchanged ERROR. Every arm still refuses.
+    #[test]
+    fn test_refuse_past_frame_cap_as_every_verdict() {
+        let lines = capture(|| {
+            assert!(refuse_past_frame_cap_as(
+                3_497_726,
+                WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+                SHRINKING
+            ));
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["level"], "WARN", "{}", lines[0]);
+        assert_eq!(lines[0]["code"], "WS-SPILL-01", "{}", lines[0]);
+        assert_eq!(
+            lines[0]["source"], "replay_frame_cap_shrinking",
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[0]["previous_backlog_segments"], 290, "{}", lines[0]);
+        assert_eq!(lines[0]["backlog_segments"], 285, "{}", lines[0]);
+        assert!(!ws_spill_01_filter_matches(&lines[0]));
+
+        let lines = capture(|| {
+            assert!(refuse_past_frame_cap_as(
+                3_497_726,
+                WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+                ReplayLimitVerdict::Page
+            ));
+        });
+        assert_eq!(lines[0]["level"], "ERROR", "{}", lines[0]);
+        assert_eq!(lines[0]["source"], "replay_frame_cap", "{}", lines[0]);
+        assert!(ws_spill_01_filter_matches(&lines[0]));
+
+        let lines = capture(|| {
+            assert!(refuse_past_frame_cap_as(
+                EVENING_DRAIN_REPLAY_FRAME_CAP,
+                EVENING_DRAIN_REPLAY_FRAME_CAP,
+                ReplayLimitVerdict::PlannedRestart
+            ));
+        });
+        assert_eq!(
+            lines[0]["source"], "replay_frame_cap_planned",
+            "{}",
+            lines[0]
+        );
+        assert!(!ws_spill_01_filter_matches(&lines[0]));
+
+        // Under the cap: nothing, whatever the verdict.
+        let lines = capture(|| assert!(!refuse_past_frame_cap_as(0, 1, SHRINKING)));
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The catch-up deferral and the byte-budget deferral are quiet on a
+    /// shrinking backlog; the memory-guard stop pages on every verdict.
+    #[test]
+    fn test_regression_rs_deferral_lines_quiet_only_when_shrinking_memory_always_pages() {
+        let lines = capture(|| report_catchup_replay_deferred(SHRINKING, 3, 1, 2, 4));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["level"], "WARN", "{}", lines[0]);
+        assert_eq!(
+            lines[0]["source"], "replay_deferred_shrinking",
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[0]["backlog_segments"], 285, "{}", lines[0]);
+        assert!(!ws_spill_01_filter_matches(&lines[0]));
+
+        let byte_stop = ReplayBudgetDeferral {
+            deferred_segments: 7,
+            consumed_segments: 5,
+            bytes_held: 536_870_912,
+            budget_bytes: 536_870_912,
+            stopped_for_memory: false,
+            stop_pct: 60,
+        };
+        let lines = capture(|| report_replay_budget_deferred(SHRINKING, byte_stop));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["level"], "WARN", "{}", lines[0]);
+        assert_eq!(lines[0]["code"], "WS-SPILL-02", "{}", lines[0]);
+        assert_eq!(
+            lines[0]["source"], "replay_budget_deferred_shrinking",
+            "{}",
+            lines[0]
+        );
+        assert!(!ws_spill_02_filter_matches(&lines[0]));
+
+        let memory_stop = ReplayBudgetDeferral {
+            stopped_for_memory: true,
+            ..byte_stop
+        };
+        for verdict in [
+            SHRINKING,
+            ReplayLimitVerdict::PlannedRestart,
+            ReplayLimitVerdict::Page,
+        ] {
+            let lines = capture(|| report_replay_budget_deferred(verdict, memory_stop));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["level"], "ERROR", "{verdict:?}: {}", lines[0]);
+            assert!(
+                ws_spill_02_filter_matches(&lines[0]),
+                "{verdict:?}: a memory-guard stop always pages"
+            );
+        }
+    }
+
+    // Regression: 2026-11-11 08:33 IST SOS "safety capture hit a limit". The
+    // morning start reached the per-boot frame cap (the 8 Nov shape, 3.5M
+    // frames after the boot pass) while its waiting backlog was below the
+    // previous evening start's. It paged. Under §2.20 a smaller backlog is
+    // quiet; the same backlog, or no record, still pages. The counts are the
+    // shape of that morning (Assumed: the exact counts were not captured).
+    // (2026-11-11 review fix: the comparison point is now the previous start
+    // that was not a planned evening restart, since the planned restart saves
+    // no count; the verdict below is the same for any recorded previous count.)
+    #[test]
+    fn test_regression_rs_0833_morning_start_with_a_shrinking_backlog_does_not_page() {
+        use crate::wal_backlog_trend::{BacklogRecord, PreviousRecord, backlog_trend_verdict};
+        let today = 20_768; // 2026-11-11 IST
+        let last_evening = PreviousRecord::Valid(BacklogRecord {
+            ist_day: today - 1,
+            segments: Some(290),
+        });
+        let morning = |current: Option<u64>, previous: PreviousRecord| {
+            let trend = backlog_trend_verdict(previous, today, current);
+            let verdict = replay_limit_verdict(false, Some(trend));
+            capture(|| {
+                assert!(refuse_past_frame_cap_as(
+                    3_497_726,
+                    WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+                    verdict
+                ));
+            })
+        };
+        let quiet = morning(Some(285), last_evening);
+        assert_eq!(quiet[0]["level"], "WARN", "{}", quiet[0]);
+        assert_eq!(
+            quiet[0]["source"], "replay_frame_cap_shrinking",
+            "{}",
+            quiet[0]
+        );
+        assert!(!ws_spill_01_filter_matches(&quiet[0]), "shrinking: no page");
+
+        for (current, previous) in [
+            (Some(290), last_evening),           // stuck
+            (Some(291), last_evening),           // growing
+            (None, last_evening),                // cannot count
+            (Some(285), PreviousRecord::Absent), // first start
+            (Some(285), PreviousRecord::Unreadable),
+        ] {
+            let lines = morning(current, previous);
+            assert_eq!(lines[0]["level"], "ERROR", "{current:?} {previous:?}");
+            assert_eq!(lines[0]["source"], "replay_frame_cap");
+            assert!(
+                ws_spill_01_filter_matches(&lines[0]),
+                "stuck or unknown: pages"
+            );
+        }
     }
 }

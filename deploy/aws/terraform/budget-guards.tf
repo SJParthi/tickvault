@@ -324,6 +324,8 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # 2026-10-13 (operator Quote 30): $150 -> $170 (≈₹15,000 a month).
       # 2026-10-28 (operator Quote 45): $170 -> $185, October 2026 only; the
       # code clamps November onward to $75.
+      # 2026-11-11 (operator Quotes 52 and 54): the code clamps November 2026
+      # to $90 and December onward to $62; this configured value is unchanged.
       BUDGET_KILL_USD = "185"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).

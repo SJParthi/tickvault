@@ -274,6 +274,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "2026-10-20 (plan item PR W): coded WS-SPILL-01, latched once per episode, counted on the same persist-failed counter durability-sync-failing pages on; the watermark file then names no sidecar generation, so the next boot reads the ranges as whole buckets or, when they do not fit, as an unbounded overflow (replay more, never less)",
     ),
     (
+        "crates/storage/src/wal_backlog_trend.rs",
+        "wal backlog record could not be saved",
+        "2026-11-11 (noise lock 2.20): coded WS-SPILL-01; a failed save makes this start (and every later start that cannot save) page its replay-limit lines as ERROR, so the failure is already paged there and error! here would page twice; no market data is lost, the record only decides whether those lines are quiet",
+    ),
+    (
         "crates/storage/src/wal_clock_step.rs",
         "wall clock step window could not be persisted",
         "2026-11-08 (PR AA finding 2 recheck): coded WS-SPILL-01, latched once per episode and retried on every tick-writer batch; the window stays in RAM, so only a restart while the write fails forgets the step; the file sits beside applied.tvaw, whose persist failing on the same folder pages durability-sync-failing",
