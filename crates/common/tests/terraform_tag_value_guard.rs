@@ -82,10 +82,10 @@ fn tag_values(src: &str) -> Vec<(usize, String)> {
         match depth_in_tags {
             None => {
                 let head = line.split('=').next().unwrap_or("").trim();
-                if matches!(head, "tags" | "tags_all") || line.starts_with("default_tags") {
-                    if line.contains('{') && !line.contains('}') {
-                        depth_in_tags = Some(1);
-                    }
+                let opens_tags =
+                    matches!(head, "tags" | "tags_all") || line.starts_with("default_tags");
+                if opens_tags && line.contains('{') && !line.contains('}') {
+                    depth_in_tags = Some(1);
                 }
             }
             Some(depth) => {
@@ -93,10 +93,10 @@ fn tag_values(src: &str) -> Vec<(usize, String)> {
                 let closes = line.matches('}').count() as i32;
                 let interp = line.matches("${").count() as i32;
                 let next = depth + (opens - interp) - (closes - interp);
-                if depth == 1 {
-                    if let Some(v) = literal_value(line) {
-                        out.push((i + 1, v.to_string()));
-                    }
+                if depth == 1
+                    && let Some(v) = literal_value(line)
+                {
+                    out.push((i + 1, v.to_string()));
                 }
                 depth_in_tags = if next <= 0 { None } else { Some(next) };
             }
