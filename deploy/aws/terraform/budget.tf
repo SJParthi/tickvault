@@ -240,7 +240,8 @@ resource "aws_budgets_budget" "tv_monthly" {
   # 2026-11-02 (operator Quotes 37 and 45, daily-universe §0): the
   # October-only allowance has expired. Apply the already-authorized $75
   # standing native line; the historical Lambda/digest settings remain $185
-  # and their unchanged UTC-month clamp already enforces $75 from November.
+  # and their unchanged UTC-month clamp already enforces $75 from November
+  # (superseded for November 2026 only by the 2026-11-11 entry below).
   # 2026-11-11 (operator Quote 52, daily-universe §0): $75 -> $90 for
   #   NOVEMBER 2026 only (about $21 of the month was two disks attached to
   #   nothing; the owner deletes them in the console). The Lambda clamps
