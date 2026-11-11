@@ -98,7 +98,22 @@ const BUDGET: &[(&str, usize)] = &[
     // `test_regression_da13d_marks_stay_set_through_the_settle_and_no_all_night_hold`
     // (the marks stay set through the settle), plus `archive_quiesce`'s
     // `test_shared_blocking_waits_for_the_archiver_on_a_plain_thread`.
-    ("dhan_feed_stack/deferred_depth_pass.rs", 3),
+    // ⚠ CORRECTED 2026-11-11 (PR AA-G review 2): since AA-G (finding 17)
+    // there is no bucket lock. The scans now pin that the lock is taken per
+    // committing flush (`flush_quiesced`, the item-17 scan, which also pins
+    // that the production wrapper skips it only when the sink has nothing
+    // pending), that the late-commit floor is re-read UNDER that lock, and
+    // that the m4 floor wait comes before the first `flush_quiesced` call;
+    // the all-night hold scan is unchanged. Paired behaviour tests for the
+    // per-flush lock: `test_flush_quiesced_with_holds_the_lock_only_for_the_flush`,
+    // `test_flush_quiesced_with_reads_the_floor_under_the_lock`,
+    // `test_flush_quiesced_with_skips_the_lock_when_nothing_is_pending`.
+    // 3 -> 4 (2026-11-11, PR AA-G review): the item-17 scan also pins that
+    // the pass's book writer holds the archive quiesce lock for its in-append
+    // pin-cut commit (`DepthIngest::new_book_only` lives in the lane). Paired
+    // behaviour test in storage:
+    // `test_hold_archive_quiesce_on_pin_cut_holds_the_in_append_commit`.
+    ("dhan_feed_stack/deferred_depth_pass.rs", 4),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     // 2026-10-26 (audit PR M / M4): 1 wiring scan, every dial batch republishes
     // the reserved-connections gauge (the widen dials long after bring-up and
@@ -136,7 +151,17 @@ const BUDGET: &[(&str, usize)] = &[
     // hold supervisor); paired behaviour tests `evening_step_*`,
     // `test_catchup_allowance_for_only_a_fresh_evening_pending_flag`,
     // `test_request_self_restart_resolves_a_later_self_restart_requested`.
-    ("evening_drain.rs", 3),
+    // 3 -> 4 (2026-11-11, noise lock §2.17 note): pins that
+    // `claim_planned_boot` records its verdict for the replay deferral lines
+    // (the claim is a process OnceLock over a real file, so it cannot be
+    // driven from a unit test). Paired behaviour test in storage, in its own
+    // test process so the process flag can be set:
+    // `tests/planned_evening_drain_claim_process.rs`
+    // (`test_the_claim_alone_makes_the_process_a_planned_boot`). ⚠ CORRECTED
+    // 2026-11-11 (review 2): this named
+    // `test_note_planned_evening_drain_claim_and_planned_evening_drain_boot`,
+    // which drives only a private slot and never the process flag.
+    ("evening_drain.rs", 4),
     // 2026-10-28 (daily expiry check): 5 wiring scans (main spawns the 15:50
     // check, it runs on its own task never the frame drain, the attach refuses
     // before it names or dials, every error carries its code). Paired behaviour

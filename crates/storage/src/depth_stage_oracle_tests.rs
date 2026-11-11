@@ -879,3 +879,85 @@ fn test_writer_sink_scratch_shrinks_back_after_a_batch_above_the_presize() {
     assert!(sink.scratch.capacity() <= DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES * 2);
     let _ = std::fs::remove_dir_all(&spill);
 }
+
+// Regression: 2026-11-11 — PR AA-G review (finding 17). On the after-close
+// pass's SYNCHRONOUS writer a ninth name table inside one batch commits the
+// batch from inside `append_book_row` (`stage_pin_after_cut`), outside the
+// pass's per-flush archive quiesce lock. With
+// `hold_archive_quiesce_on_pin_cut` set, that commit waits while an archiver
+// holds the exclusive side, and runs as soon as it lets go.
+#[test]
+fn test_hold_archive_quiesce_on_pin_cut_holds_the_in_append_commit() {
+    let _g = TEST_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+        Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let archiver = runtime
+        .block_on(quiesce.hold_writers(std::time::Duration::from_secs(5)))
+        .expect("the archiver takes the exclusive side");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<i64>();
+    let writer = std::thread::spawn(move || {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        w.hold_archive_quiesce_on_pin_cut_with(quiesce);
+        let prices = [100.0];
+        for t in 0..crate::depth_stage::DEPTH_STAGE_LABEL_PINS as i64 + 1 {
+            let mut labels = CandleContractLabels::default();
+            labels.insert((ID_BASE + t, "NSE_FNO"), Arc::from("N"));
+            publish_candle_contract_labels(labels);
+            let row = DepthBookRow {
+                security_id: ID_BASE + t,
+                segment: "NSE_FNO",
+                depth_kind: DEPTH_KIND_5,
+                side: DEPTH_SIDE_ASK,
+                prices: &prices,
+                quantities: &prices,
+                orders: &prices,
+                capture_seq: 100 + t,
+                ts_nanos: SESSION_TS_NANOS,
+            };
+            let _ = w.append_book_row(&row);
+            let _ = done_tx.send(t);
+        }
+    });
+    let pins = crate::depth_stage::DEPTH_STAGE_LABEL_PINS as i64;
+    for t in 0..pins {
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Ok(t),
+            "appends that stage only never wait for the archiver"
+        );
+    }
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the ninth table's in-append commit waits while the archiver holds the lock"
+    );
+    drop(archiver);
+    assert_eq!(
+        done_rx.recv_timeout(std::time::Duration::from_secs(30)),
+        Ok(pins),
+        "it commits as soon as the archiver lets go"
+    );
+    writer.join().expect("writer thread");
+    publish_candle_contract_labels(CandleContractLabels::default());
+}
+
+/// The production setter points the pin cut at the PROCESS lock (the one the
+/// archiver and the after-close pass's flushes use).
+#[test]
+fn test_hold_archive_quiesce_on_pin_cut_uses_the_process_lock() {
+    let mut w = DepthWriter::for_test_book(Feed::Dhan);
+    assert!(w.pin_cut_quiesce.is_none(), "off by default");
+    w.hold_archive_quiesce_on_pin_cut();
+    assert!(
+        w.pin_cut_quiesce
+            .is_some_and(|q| std::ptr::eq(q, crate::archive_quiesce::process_archive_quiesce())),
+        "the process lock"
+    );
+}

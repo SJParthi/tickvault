@@ -415,7 +415,7 @@ fn request_space_if_safe(signals: &PassSignals<'_>, wal_dir: &Path) -> bool {
 /// inside the window; between buckets the pass checks the floor without
 /// waiting ([`disk_low`]). (PR AA step 2, 2026-11-07: the all-night
 /// depth-partition hold this protected the archiver from is gone; each
-/// bucket takes the archive quiesce lock only for its own writes.)
+/// flush takes the archive quiesce lock, [`flush_quiesced`].)
 fn disk_stays_low(signals: &PassSignals<'_>, wal_dir: &Path, cancel: &AtomicBool) -> bool {
     if !disk_low(signals, wal_dir) {
         return false;
@@ -785,8 +785,8 @@ const fn endpoint_matches(endpoint: WalEndpoint, kinds: u8) -> bool {
 
 /// Waits until the pacing rule says run. `Err` carries the stop reason.
 ///
-/// PR DP review M4: runs between buckets (before each bucket takes the
-/// archive quiesce lock), so the disk floor is read WITHOUT the reclaim wait ([`disk_low`]), and only inside the
+/// PR DP review M4: runs between buckets (outside every flush's hold of
+/// the archive quiesce lock), so the disk floor is read WITHOUT the reclaim wait ([`disk_low`]), and only inside the
 /// window (outside it the step stops on the clock and no `statvfs` is read).
 fn wait_for_run(
     signals: &PassSignals<'_>,
@@ -851,6 +851,9 @@ pub fn run_after_close_pass(
     signals: &PassSignals<'_>,
 ) -> PassSummary {
     let mut summary = PassSummary::default();
+    // PR AA-G review (2026-11-11): time this pass spent waiting for the
+    // archive quiesce lock, logged with the pass summary (no metric).
+    let mut quiesce_wait = Duration::ZERO;
     let snap = marks.snapshot();
     // O(1) EXEMPT: cold after-close work list, at most DEFERRED_BUCKETS entries
     let mut work = snap.marked_buckets();
@@ -947,10 +950,11 @@ pub fn run_after_close_pass(
     // pass held a process-wide depth-partition gate from here until its marks
     // were cleared, which kept EVERY depth partition on the box all night.
     // Now:
-    // - each bucket takes the shared side of the archive quiesce lock for
-    //   its own writes and its bucket-edge flush (in the loop below), so the
-    //   archiver, which holds the lock from its WAL snapshot to its DROP,
-    //   never runs a copy or a drop while this pass writes;
+    // - each flush takes the shared side of the archive quiesce lock
+    //   ([`flush_quiesced`], PR AA-G finding 17: per flush, not per
+    //   bucket), so the archiver, which holds the lock from its WAL snapshot
+    //   to its DROP, never runs a copy or a drop while this pass commits
+    //   rows, and waits for at most one flush;
     // - the archiver holds every hour whose frames still carry an after-close
     //   mark (the marks are cleared only at the end of this pass, after the
     //   settle), so an hour is copied only once its rows are all written back.
@@ -1041,12 +1045,13 @@ pub fn run_after_close_pass(
         let mut damaged = false;
         let mut bucket_no_receipt = 0u64;
         // PR AA (owner Quote 51): this bucket's rows go into OLD depth
-        // hours, so the bucket is written and flushed only while no archiver
-        // is copying and dropping one of them. Waits behind at most the one
-        // partition an archive pass has in flight (this is the pass's own OS
-        // thread, never an async one); released at the end of this
-        // iteration, after the bucket-edge flush below.
-        let _quiesce = tickvault_storage::archive_quiesce::archive_quiesce_shared_blocking();
+        // hours, so each FLUSH (the only step that commits rows to QuestDB)
+        // runs only while no archiver is copying and dropping one of them
+        // ([`flush_quiesced`]). ⚠ CHANGED 2026-11-09 (PR AA-G, finding 17):
+        // the lock was held for the whole bucket (segment reads, staging and
+        // every flush), so a queued archiver could wait longer than its 120 s
+        // and hold every hour-path partition of its run; now it waits for at
+        // most one flush.
         'segments: for path in &bucket.paths {
             let read = match read_segment_frames_matching(path, &keep) {
                 Ok(read) => read,
@@ -1095,24 +1100,33 @@ pub fn run_after_close_pass(
                 }
                 summary.rows_written = summary.rows_written.saturating_add(rows);
                 PASS_ROWS_WRITTEN.fetch_add(rows, Ordering::Relaxed);
-                // Re-check the disk floor before every late commit (one
-                // `statvfs` per 16 MiB batch): a bucket can hold many
-                // batches, and each commit rewrites an hour partition.
-                if sink.late_flush_due() && disk_low(signals, wal_dir) {
-                    disk_stop = true;
-                    failed = true;
-                    break 'segments;
-                }
                 // The LATE-row trigger (plan item 55): every commit here
                 // rewrites a whole hour partition, so fewer, larger ones.
-                if sink.late_flush_due() && sink.flush().is_err() {
-                    failed = true;
-                    break 'segments;
+                // The disk floor is re-checked before every late commit (one
+                // `statvfs` per 16 MiB batch): a bucket can hold many
+                // batches, and each commit rewrites an hour partition.
+                // ⚠ CHANGED 2026-11-11 (PR AA-G review): the check runs
+                // INSIDE the lock, after any archiver turn this flush waited
+                // behind ([`flush_quiesced`]), so it is never stale by the
+                // time the commit lands.
+                if sink.late_flush_due() {
+                    match flush_quiesced(sink, Some((signals, wal_dir)), &mut quiesce_wait) {
+                        Ok(QuiescedFlush::Flushed) => {}
+                        Ok(QuiescedFlush::DiskLow) => {
+                            disk_stop = true;
+                            failed = true;
+                            break 'segments;
+                        }
+                        Err(_) => {
+                            failed = true;
+                            break 'segments;
+                        }
+                    }
                 }
             }
         }
         // Flush at every bucket edge so no ILP batch spans two buckets.
-        if !failed && sink.flush().is_err() {
+        if !failed && flush_quiesced(sink, None, &mut quiesce_wait).is_err() {
             failed = true;
         }
         if disk_stop {
@@ -1232,9 +1246,92 @@ pub fn run_after_close_pass(
         damaged = summary.segments_damaged,
         missing = summary.buckets_missing,
         stop = ?summary.stop,
+        quiesce_wait_ms = u64::try_from(quiesce_wait.as_millis()).unwrap_or(u64::MAX),
         "after-close deferred-depth pass finished"
     );
     summary
+}
+
+/// What [`flush_quiesced`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuiescedFlush {
+    /// The flush ran (or there was nothing to commit).
+    Flushed,
+    /// The disk floor, re-read under the lock, was low: nothing committed.
+    DiskLow,
+}
+
+/// PR AA-G (finding 17, 2026-11-09): one flush of the pass's writer under the
+/// shared side of the process archive quiesce lock, so no commit of this
+/// pass lands while an archiver copies and drops an old depth hour.
+///
+/// The pass commits rows to QuestDB in exactly two places: here, and the
+/// in-append commit a pin cut makes on the book writer (a ninth contract-name
+/// table inside one batch, `DepthWriter::stage_pin_after_cut`), which holds
+/// the same lock itself (`DepthWriter::hold_archive_quiesce_on_pin_cut`,
+/// set by `DepthIngest::new_book_only`). A segment read touches only local
+/// files and an append only stages rows in RAM. ⚠ CORRECTED 2026-11-11 (PR
+/// AA-G review): this doc said the flush was the ONLY committing step; the
+/// pin cut was missed.
+///
+/// With nothing pending the flush only hands parked rescue batches to their
+/// thread (no commit), so it runs WITHOUT the lock and never queues behind
+/// an archiver turn for a no-op (PR AA-G review). `floor`: for a late flush,
+/// the disk floor is re-read once the lock is held, after any archiver turn
+/// this flush waited behind; low → nothing is committed ([`QuiescedFlush::DiskLow`]).
+///
+/// The wait, honestly (Risk, unmeasured on the box): the ARCHIVER now waits
+/// for at most one flush, which is the writer's 5 s request timeout plus the
+/// batch at the library's minimum throughput (about 100 KiB/s): about 87 s
+/// for an 8 MiB book batch, about 169 s for a 16 MiB level batch
+/// (`DEPTH_LATE_FLUSH_BYTES`, array rows off), plus a failed flush's inline
+/// rescue spill. So the archiver's 120 s `archive_quiesce_wait_secs` CAN
+/// still run out on a slow QuestDB (always possible for a level batch).
+/// The PASS, in turn, waits once per committing flush behind at most one
+/// archived partition (export, upload, verify, drop; the upload has no
+/// bound), where it used to wait once per bucket; the wait is added to
+/// `quiesce_wait` and logged with the pass summary. Pass's own OS thread,
+/// never an async one. Cold, once per flush.
+fn flush_quiesced(
+    sink: &mut DepthIngest,
+    floor: Option<(&PassSignals<'_>, &Path)>,
+    quiesce_wait: &mut Duration,
+) -> anyhow::Result<QuiescedFlush> {
+    let pending = sink.pending_rows() > 0;
+    flush_quiesced_with(
+        pending,
+        || {
+            let started = std::time::Instant::now();
+            let guard = tickvault_storage::archive_quiesce::archive_quiesce_shared_blocking();
+            *quiesce_wait = quiesce_wait.saturating_add(started.elapsed());
+            guard
+        },
+        || floor.is_some_and(|(signals, wal_dir)| disk_low(signals, wal_dir)),
+        || sink.flush(),
+    )
+}
+
+/// [`flush_quiesced`] with the lock, the floor check and the flush passed
+/// in, so a test can drive a local lock instead of the process one. With
+/// nothing `pending` the flush runs without the lock and the floor is not
+/// read. Otherwise the guard lives exactly as long as the floor check and
+/// the flush. O(1) plus the flush.
+fn flush_quiesced_with<G>(
+    pending: bool,
+    hold: impl FnOnce() -> G,
+    floor_low: impl FnOnce() -> bool,
+    flush: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<QuiescedFlush> {
+    if !pending {
+        flush()?;
+        return Ok(QuiescedFlush::Flushed);
+    }
+    let _quiesce = hold();
+    if floor_low() {
+        return Ok(QuiescedFlush::DiskLow);
+    }
+    flush()?;
+    Ok(QuiescedFlush::Flushed)
 }
 
 /// The pass's depth writer (ITEM 57a, 2026-10-13): book-only when the lane
@@ -1382,41 +1479,281 @@ mod tests {
     /// A free fraction well clear of every shed and floor threshold.
     const HEALTHY_FREE: f64 = 0.5;
 
-    /// PR AA step 1: each bucket takes the archive quiesce lock before its
-    /// first write and keeps it through the bucket-edge flush, inside the
-    /// per-bucket loop (so it is released between buckets, never held all
-    /// night). A source scan, because the lock is process-wide and a
-    /// behavioural test holding it would stall every other pass test.
+    // Regression: 2026-11-09 — PR AA-G (finding 17). Each bucket held the
+    // shared side of the archive quiesce lock through every segment read,
+    // staged append and flush, so a queued archiver could wait longer than
+    // its 120 s and then hold every hour-path partition of its run. Only a
+    // commit may hold it now: a flush ([`flush_quiesced`]) or the book
+    // writer's in-append pin-cut commit (2026-11-11 review). A source scan,
+    // because the lock is process-wide and a behavioural test holding it
+    // would stall every other pass test (the local-lock behaviour is pinned
+    // by `test_flush_quiesced_with_holds_the_lock_only_for_the_flush`).
     #[test]
-    fn test_each_bucket_holds_the_archive_quiesce_lock_through_its_flush() {
+    fn test_regression_item17_only_flushes_hold_the_archive_quiesce_lock() {
         let src = include_str!("deferred_depth_pass.rs");
         let production = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let loop_at = production
-            .find("for &(id, kinds) in &work {")
-            .expect("the per-bucket loop must exist");
-        let body = &production[loop_at..];
-        let lock_at = body
-            .find("archive_quiesce_shared_blocking()")
-            .expect("each bucket must take the archive quiesce lock");
-        let write_at = body
-            .find("'segments: for path in &bucket.paths")
-            .expect("the bucket's write loop must exist");
-        let flush_at = body
-            .find("if !failed && sink.flush().is_err()")
-            .expect("the bucket-edge flush must exist");
-        assert!(
-            lock_at < write_at,
-            "the lock is taken before the first write"
+        let pass_at = production
+            .find("pub fn run_after_close_pass(")
+            .expect("the pass must exist");
+        let pass_end = production[pass_at..]
+            .find("\n\u{7d}\n")
+            .map_or(production.len(), |i| pass_at + i);
+        let pass = &production[pass_at..pass_end];
+        // Other ways of taking the lock in the pass body (2026-11-11
+        // review: the scan only knew one spelling). A list of substrings,
+        // not proof: a lock taken inside a helper the pass calls is not
+        // seen. `shared_blocking` carries no `(` so the point-free
+        // `.map(ArchiveQuiesce::shared_blocking)` spelling (the one the
+        // book writer's pin cut uses) is caught too (2026-11-11 review 2).
+        for taker in [
+            "archive_quiesce_shared_blocking",
+            "shared_blocking",
+            "blocking_read",
+            "archive_quiesce(",
+            "archive_quiesce_for_replay",
+            "ArchiveQuiesce",
+            "hold_writers",
+            "try_shared",
+            "archive_quiesce_shared(",
+        ] {
+            assert!(
+                !pass.contains(taker),
+                "the pass body takes the lock only through flush_quiesced: {taker}"
+            );
+        }
+        assert_eq!(
+            pass.matches("flush_quiesced(sink, Some((signals, wal_dir)), &mut quiesce_wait)")
+                .count(),
+            1,
+            "the late flush holds the lock and re-reads the floor under it"
         );
-        assert!(write_at < flush_at);
-        let guard_line = body[..write_at]
-            .lines()
-            .rev()
-            .find(|l| l.contains("archive_quiesce_shared_blocking()"))
-            .unwrap_or_default();
+        assert_eq!(
+            pass.matches("flush_quiesced(sink, None, &mut quiesce_wait)")
+                .count(),
+            1,
+            "the bucket-edge flush holds the lock"
+        );
         assert!(
-            guard_line.trim_start().starts_with("let _quiesce ="),
-            "the guard must be bound for the iteration, not dropped at once: {guard_line}"
+            !pass.contains("sink.flush()"),
+            "no flush commits rows outside the lock"
+        );
+        assert!(
+            !pass.contains("&& disk_low(signals, wal_dir)"),
+            "the late-commit floor check runs under the lock, not before it"
+        );
+        assert_eq!(
+            production
+                .matches("tickvault_storage::archive_quiesce::archive_quiesce_shared_blocking")
+                .count(),
+            1,
+            "the lock is taken in exactly one place"
+        );
+        // 2026-11-11 review 2: the production wrapper skips the lock only
+        // when the sink really has nothing pending (helper-level test:
+        // `test_flush_quiesced_with_skips_the_lock_when_nothing_is_pending`).
+        let wrapper_at = production
+            .find("fn flush_quiesced(")
+            .expect("the production wrapper exists");
+        let wrapper_end = production[wrapper_at..]
+            .find("\n\u{7d}\n")
+            .map_or(production.len(), |i| wrapper_at + i);
+        let wrapper = &production[wrapper_at..wrapper_end];
+        assert_eq!(
+            wrapper
+                .matches("let pending = sink.pending_rows() > 0;")
+                .count(),
+            1,
+            "`pending` is the sink's pending row count, nothing else"
+        );
+        assert!(
+            wrapper.contains("flush_quiesced_with(\n        pending,"),
+            "the wrapper passes that `pending` to the helper"
+        );
+        let helper_at = production
+            .find("fn flush_quiesced_with<G>(")
+            .expect("the guard seam exists");
+        assert!(
+            production[helper_at..helper_at + 600].contains("let _quiesce = hold();"),
+            "the guard is bound for the flush, not dropped at once"
+        );
+        // The book writer's in-append pin-cut commit holds the same lock.
+        let stack = include_str!("../dhan_feed_stack.rs");
+        let book_only_at = stack
+            .find("fn new_book_only(")
+            .expect("the pass's ingest constructor exists");
+        assert!(
+            stack[book_only_at..book_only_at + 700]
+                .contains("writer.hold_archive_quiesce_on_pin_cut();"),
+            "the pass's book writer holds the lock for its pin-cut commit"
+        );
+        let pass_writer_at = production
+            .find("fn pass_depth_ingest(")
+            .expect("the pass writer constructor exists");
+        assert!(
+            production[pass_writer_at..pass_writer_at + 400]
+                .contains("DepthIngest::new_book_only(questdb, since)"),
+            "the book pass writer is built through new_book_only"
+        );
+    }
+
+    /// PR AA-G (finding 17): with a local lock, a queued archiver is held
+    /// out while one flush is in flight, gets in as soon as that flush
+    /// returns, and is never held out by the work between flushes. ⚠ RENAMED
+    /// 2026-11-11 (review): this was `..._archiver_waits_at_most_one_flush`,
+    /// which the helper alone cannot prove for the whole pass; that rests on
+    /// the source scan above.
+    #[test]
+    fn test_flush_quiesced_with_holds_the_lock_only_for_the_flush() {
+        use tickvault_storage::archive_quiesce::ArchiveQuiesce;
+        let quiesce = ArchiveQuiesce::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let (in_flight_tx, in_flight_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (between_tx, between_rx) = std::sync::mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let quiesce = &quiesce;
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let flushed = flush_quiesced_with(
+                    true,
+                    || quiesce.shared_blocking(),
+                    || false,
+                    || {
+                        let _ = in_flight_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                        Ok(())
+                    },
+                );
+                // The next segment read and staging: no lock held.
+                let _ = between_tx.send(());
+                let _ = finish_rx.recv_timeout(Duration::from_secs(30));
+                flushed
+            });
+            in_flight_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the flush starts");
+            assert!(
+                runtime
+                    .block_on(quiesce.hold_writers(Duration::from_millis(50)))
+                    .is_none(),
+                "an archiver waits while a flush is in flight"
+            );
+            release_tx.send(()).expect("release the flush");
+            between_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the flush returned");
+            assert!(
+                runtime
+                    .block_on(quiesce.hold_writers(Duration::from_secs(1)))
+                    .is_some(),
+                "between flushes the archiver gets in at once"
+            );
+            finish_tx.send(()).expect("finish");
+            assert_eq!(
+                writer.join().expect("writer thread").ok(),
+                Some(QuiescedFlush::Flushed)
+            );
+        });
+    }
+
+    /// PR AA-G (finding 17): a failed flush is reported as a failure, so the
+    /// bucket stays marked.
+    #[test]
+    fn test_flush_quiesced_with_returns_the_flush_error() {
+        let quiesce = tickvault_storage::archive_quiesce::ArchiveQuiesce::new();
+        let failed = flush_quiesced_with(
+            true,
+            || quiesce.shared_blocking(),
+            || false,
+            || Err(anyhow::anyhow!("questdb refused")),
+        );
+        assert!(failed.is_err());
+        // Only an EXCLUSIVE take proves the shared guard was dropped: a
+        // shared `try_shared` succeeds beside a leaked shared guard
+        // (2026-11-11 review 2: that assertion was vacuous).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        assert!(
+            runtime
+                .block_on(quiesce.hold_writers(Duration::from_millis(200)))
+                .is_some(),
+            "the guard is released on the error return"
+        );
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. A flush with nothing pending
+    // (right after a late flush, or a bucket that produced no rows) commits
+    // nothing, but queued for the lock behind a whole archiver turn.
+    #[test]
+    fn test_flush_quiesced_with_skips_the_lock_when_nothing_is_pending() {
+        let held = std::cell::Cell::new(false);
+        let floor_read = std::cell::Cell::new(false);
+        let flushed = std::cell::Cell::new(false);
+        let outcome = flush_quiesced_with(
+            false,
+            || held.set(true),
+            || {
+                floor_read.set(true);
+                true
+            },
+            || {
+                flushed.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(outcome.ok(), Some(QuiescedFlush::Flushed));
+        assert!(!held.get(), "no lock for a flush that commits nothing");
+        assert!(!floor_read.get(), "no floor read either");
+        assert!(flushed.get(), "parked rescue batches are still handed on");
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. The disk floor was read
+    // BEFORE the lock, so an archiver turn the flush then waited behind (a
+    // local export into the temp folder) could leave it stale by the commit.
+    // It is read under the lock now; low → nothing is committed.
+    #[test]
+    fn test_flush_quiesced_with_reads_the_floor_under_the_lock() {
+        let quiesce = tickvault_storage::archive_quiesce::ArchiveQuiesce::new();
+        let flushed = std::cell::Cell::new(false);
+        let outcome = flush_quiesced_with(
+            true,
+            || quiesce.shared_blocking(),
+            || {
+                assert!(
+                    quiesce.try_shared().is_some() && {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_time()
+                            .build()
+                            .expect("runtime");
+                        runtime
+                            .block_on(quiesce.hold_writers(Duration::from_millis(20)))
+                            .is_none()
+                    },
+                    "the floor is read while the shared side is held"
+                );
+                true
+            },
+            || {
+                flushed.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(outcome.ok(), Some(QuiescedFlush::DiskLow));
+        assert!(!flushed.get(), "a low floor commits nothing");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        assert!(
+            runtime
+                .block_on(quiesce.hold_writers(Duration::from_secs(1)))
+                .is_some(),
+            "the guard is released on the low-floor return"
         );
     }
 
@@ -1673,7 +2010,7 @@ mod tests {
     // pass held the depth partitions, blocking the archiver. It runs before
     // the first bucket, so a pass at its floor returns without writing
     // anything. (PR AA step 2, 2026-11-07: the all-night depth-partition hold
-    // is gone; each bucket takes the archive quiesce lock only after this
+    // is gone; each flush takes the archive quiesce lock only after this
     // wait, which the source order below pins.)
     #[test]
     fn test_regression_m4_floor_wait_runs_before_the_first_bucket() {
@@ -1722,11 +2059,11 @@ mod tests {
             .find("disk_stays_low(signals, wal_dir, cancel)")
             .expect("the floor wait must exist");
         let lock_at = production
-            .find("archive_quiesce_shared_blocking()")
-            .expect("each bucket must take the quiesce lock");
+            .find("flush_quiesced(sink,")
+            .expect("each flush must take the quiesce lock");
         assert!(
             floor_at < lock_at,
-            "the floor wait runs before any bucket lock"
+            "the floor wait runs before the first flush_quiesced lock (per flush since PR AA-G)"
         );
         assert_eq!(summary.stop, Some(PassStop::DiskFloor));
         assert_eq!(summary.rows_written, 0);

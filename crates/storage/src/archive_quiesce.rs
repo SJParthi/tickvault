@@ -15,7 +15,7 @@
 //! | WAL catch-up drain | `dhan_feed_stack` (each chunk) | refold, flush, ack |
 //! | Text spill replay | `tick_spill_replay::replay_spill_dir` | one file, first POST to last ack |
 //! | Framed depth spill replay | `depth_spill_frame::replay_framed_spill_dir` | one file, first POST to last ack |
-//! | After-close depth pass | `deferred_depth_pass` (each bucket) | write, flush |
+//! | After-close depth pass | `deferred_depth_pass` (each flush since PR AA-G 2026-11-09, was each bucket; only a flush with rows pending, plus its book writer's pin-cut commit, since the 2026-11-11 review) | flush |
 //! | After-close contract name repair | `contract_name_repair` (each table of each day) | re-count, `INSERT … SELECT` |
 //!
 //! Each writer takes the SHARED (read) side. The archiver takes the EXCLUSIVE
@@ -66,6 +66,11 @@
 //! Every call is O(1): one semaphore operation, plus a timer when it waits.
 //! Cold path only (once per replay file, per replay chunk, per depth bucket,
 //! per archived partition); never per tick, never on the frame drain.
+//! ⚠ CHANGED 2026-11-09 (PR AA-G, finding 17): the after-close depth pass
+//! takes it once per flush, not once per depth bucket.
+//! ⚠ CHANGED 2026-11-11 (PR AA-G review): only a flush with rows pending
+//! takes it (an empty flush commits nothing), and the pass's book writer
+//! also takes it around its in-append pin-cut commit.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -215,7 +220,8 @@ impl ArchiveQuiesce {
     /// A writer's side for a plain OS thread (the after-close depth pass):
     /// waits in the queue, behind at most the one partition an archive pass
     /// has in flight. Must NOT be called inside an async context (tokio
-    /// panics there). Cold path, once per after-close bucket.
+    /// panics there). Cold path, once per after-close flush (PR AA-G
+    /// finding 17, 2026-11-09; was once per bucket).
     pub fn shared_blocking(&self) -> RwLockReadGuard<'_, ()> {
         self.lock.blocking_read()
     }

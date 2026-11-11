@@ -4879,23 +4879,18 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {
         metrics::counter!(WAL_REPLAY_DEFERRED_COUNTER).increment(deferred as u64);
-        error!(
-            code = ErrorCode::WsSpill02FrameDropped.code_str(),
-            deferred_segments = deferred,
-            consumed_segments = consumed,
-            bytes_held,
-            budget_bytes,
-            stopped_for_memory,
-            stop_pct,
-            "WAL replay DEFERRED the remaining segments to the next boot — on \
-             the MEMORY guard when stopped_for_memory=true, otherwise on the \
-             byte budget. Nothing is stranded: an unconsumed segment stays a \
-             `*.wal` file and is re-globbed next boot, but those frames are on \
-             disk rather than in the database until then. The two have DIFFERENT \
-             remedies, which is why the flag is here: a byte-budget stop means \
-             raise the budget or drain more often; a memory stop means the \
-             frames materialize into more rows than this host can hold at once, \
-             and raising the budget would make it worse, not better."
+        // 2026-11-11 (noise lock §2.17 note): a coded WARN on the planned
+        // evening-drain boot, the same ERROR everywhere else.
+        crate::wal_replay_frame_cap::report_replay_budget_deferred(
+            crate::wal_replay_frame_cap::planned_evening_drain_boot(),
+            crate::wal_replay_frame_cap::ReplayBudgetDeferral {
+                deferred_segments: deferred,
+                consumed_segments: consumed,
+                bytes_held,
+                budget_bytes,
+                stopped_for_memory,
+                stop_pct,
+            },
         );
     }
 
