@@ -69,7 +69,7 @@ Owner, 2026-10-28: tapped "Raise Oct to $185 (Recommended)" after the Budgets AP
 | | Before (Quote 37) | After (Quote 45) |
 |---|---|---|
 | October 2026 line (`OCTOBER_2026_KILL_USD`, four lockstep sites) | $170 | **$185**, October 2026 only |
-| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
 
 ## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
 
@@ -77,7 +77,7 @@ Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 pe
 
 | | Before (Quote 36) | After (Quote 37) |
 |---|---|---|
-| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 |
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
 | Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $85 | $170 until 1 November, then **$75** (a follow-up change on or after that date) |
 
 ## OPERATOR RULING 2026-10-21 (later) — stop at $85 from 1 November (supersedes the $100 line below)

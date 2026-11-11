@@ -163,10 +163,13 @@ pub fn effective_budget_kill_usd(configured: f64, billing_year: i32, billing_mon
     }
 }
 /// The line a ping state with no `line` field was saved against, from
-/// November 2026 on: every build before PR 2222 (which started recording the
-/// line) used the then-standing $75 for November 2026 and every later month.
-/// Fixed history, deliberately NOT `STANDING_BUDGET_KILL_USD`, which moved to
-/// $62 under operator Quote 54 (2026-11-11).
+/// November 2026 on. Builds before PR 2221 used the then-standing $75 for
+/// November 2026 and every later month. PR 2221's own build (merged 32
+/// minutes before PR 2222, which started recording the line) used $90 for
+/// November without recording it; such a state reads as saved against $75,
+/// so at most one extra ping fires (loud, never silent). Fixed history,
+/// deliberately NOT `STANDING_BUDGET_KILL_USD`, which moved to $62 under
+/// operator Quote 54 (2026-11-11).
 const UNRECORDED_PING_LINE_USD: f64 = 75.0;
 
 /// Legacy parity default for the change-only ping-state SSM param
@@ -493,11 +496,13 @@ pub fn classify_ping_decision(
     // Quote 52 (2026-11-11): the line can move inside a month ($75 -> $90 for
     // November 2026). A bucket saved against the old line is not comparable,
     // so any bucket change after a line change pings once (and saves the new
-    // line). A state saved before the line was recorded (every build before
-    // PR 2222) was saved against $75 from November 2026 on, the only line
-    // those builds used then, and is read as unchanged before it. That is a
-    // fixed historical value, never the current standing line: since Quote
-    // 54 the standing line is $62, which no such state was saved against.
+    // line). A state saved before the line was recorded (builds before PR
+    // 2222) is read as saved against $75 from November 2026 on, the line
+    // builds before PR 2221 used; PR 2221's build used $90 for November, so
+    // its state can cost at most one extra ping (loud, never silent). That
+    // is a fixed historical value, never the current standing line: since
+    // Quote 54 the standing line is $62, which no such state was saved
+    // against.
     let prev_line = prev
         .and_then(|p| p.get("line"))
         .and_then(Value::as_f64)

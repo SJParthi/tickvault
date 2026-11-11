@@ -3078,7 +3078,7 @@ After the squeeze table (plan as decided ~$70–75; free spend lookups, dead ala
 
 | Item | Disposition |
 |---|---|
-| `STANDING_BUDGET_KILL_USD` | **$75 from 1 November 2026** (was $85 under Quote 36). The live budget counts tax (`IncludeTax = true`), so $75 is the bill paid, 18% GST included. October stays $170. The native `limit_amount` moves to $75 on or after 1 November, never before. |
+| `STANDING_BUDGET_KILL_USD` | **$75 from 1 November 2026** (was $85 under Quote 36). The live budget counts tax (`IncludeTax = true`), so $75 is the bill paid, 18% GST included. October stays $170. The native `limit_amount` moves to $75 on or after 1 November, never before. *(⚠ Superseded: November 2026 is $90 (Quote 52) and the standing line is $62 from 1 December 2026 (Quote 54).)* |
 | Spend lookups | The guard, digest and console read month-to-date spend from the free AWS Budgets API instead of paid Cost Explorer calls. |
 | Alarms and metrics for switched-off or removed features (depth, top_volume, 3 s/5 s candles) | Removed, each in the same change as its feature, with the noise-lock row that names it. |
 | Alarm count 127 → about 60 | Allowed after a written per-alarm review; each removal names the alarm, what it watched, and which remaining alarm covers that failure. The paging families in `dhan-rest-only-noise-lock-2026-07-14.md` are kept unless that file records the removal first. |
@@ -3291,7 +3291,7 @@ Then, the same morning: "see ic elalry told yo uto from tonoght itself the enitr
 | Item | Change |
 |---|---|
 | October 2026 kill line | $170 → **$185** in all four lockstep sites (`budget.tf` `limit_amount`, `budget-guards.tf` `BUDGET_KILL_USD`, `budget_digest.rs` `BUDGET_USD`, `hard_stop_guard.rs` `DEFAULT_BUDGET_KILL_USD`) and `OCTOBER_2026_KILL_USD`. |
-| November 2026 onward | **Unchanged: $75**, GST included (Quote 37). `STANDING_BUDGET_KILL_USD` stays $75; the guard clamps every month after October to it; the native `limit_amount` moves to $75 on or after 1 November (unchanged follow-up). |
+| November 2026 onward | **Unchanged: $75**, GST included (Quote 37). `STANDING_BUDGET_KILL_USD` stays $75; the guard clamps every month after October to it; the native `limit_amount` moves to $75 on or after 1 November (unchanged follow-up). *(⚠ Superseded: November 2026 is $90 (Quote 52) and the standing line is $62 from 1 December 2026 (Quote 54).)* |
 | One native stop at 100% | Unchanged (Quote 30). |
 
 ##### What violates Quote 45 (REJECT)
