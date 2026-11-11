@@ -2042,6 +2042,10 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     // then 642 → 640: the holiday-stop skip before the self-start added 4 lines,
     // paid by merging the two 4-line instance-state branches into one line each.
     (".github/workflows/deploy-aws.yml", 640),
+    // 2026-11-11 (rust-only lock §0.19, owner Quote 56): ONE-OFF, two lines
+    // building and calling the Rust tool `tv-disk-delete-2026-11-11`. Deleted with the
+    // workflow in the first PR after the run.
+    (".github/workflows/disk-delete-2026-11-11.yml", 2),
     (".github/workflows/downsize-instance.yml", 425),
     (".github/workflows/emergency-fs-recover.yml", 126),
     // 2026-11-06 (PR CI, CI-1/CI-2): 83 → 60. The duplicate `cargo check`

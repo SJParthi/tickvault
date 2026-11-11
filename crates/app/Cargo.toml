@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "tv-movers"
 path = "src/bin/tickvault_operator_read.rs"
 
+# Quote 56 (2026-11-11): one-off delete of the four Quote 52 leftovers; removed after the run.
+[[bin]]
+name = "tv-disk-delete-2026-11-11"
+path = "src/bin/tv_disk_delete_2026_11_11.rs"
+
 [dependencies]
 tickvault-common = { path = "../common" }
 tickvault-core = { path = "../core" }

@@ -2643,3 +2643,32 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - [x] RS-3 `crates/storage/src/wal_replay_frame_cap.rs` verdict and reporters; `crates/storage/src/ws_frame_spill.rs` call site.
 - [x] RS-4 `crates/app/src/main.rs` boot call; `crates/app/src/dhan_feed_stack.rs` catch-up call site; `crates/app/src/evening_drain.rs` wiring test.
 - [x] RS-5 runbook and CLAUDE.md notes.
+
+### DD — 2026-11-11: one-off delete of the four Quote 52 leftovers (app, terraform, one workflow)
+
+**Approved by:** the owner's 2026-11-11 card "One-off, these 4 only (Recommended)", recorded as Quote 56 in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` and §0.19 in `docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md` (rule files first). Crate changed: `tickvault-app` (crates/app) src; `tickvault-common` tests only (the workflow budget row).
+
+#### Design
+`crates/app/src/disk_delete_2026_11_11.rs` holds the four ids as constants (`VOLUME_IDS`, `SNAPSHOT_IDS`) and `run(aws, mode, now)`: first reads the live root `vol-07a6586a56466ea83` and refuses unless it is visible and attached (a wrong account or region would read every leftover as gone); per volume, read it; delete only when `available` with no attachment; per snapshot, delete when this account still owns it; `dry` sends `DryRun` (proves the permission, deletes nothing); `apply` deletes then reads every deleted id again up to 10 times, 3 s apart, and fails unless each is gone (`deleting` counts as gone). Refused at and after 2026-11-14 00:00 UTC. The AWS surface is a trait (`DiskAws`) with the EC2 client behind `SdkDiskAws`. Thin bin `tv-disk-delete-2026-11-11`. `deploy/aws/terraform/disk-delete-2026-11-11.tf`: role `tv-prod-disk-delete-2026-11-11`, trusted only by the GitHub environment `disk-delete-2026-11-11`, delete actions on the four exact ARNs, describe on `*`, every statement and the trust expire at 2026-11-14 00:00 UTC. `.github/workflows/disk-delete-2026-11-11.yml`: dispatch-only, `dry` or `apply`, two `run:` lines (build before credentials, then run).
+
+#### Edge Cases
+Already deleted (the owner may still delete in the console): reported "already gone", success. A volume found attached or `in-use`: not deleted, run fails. Past the deadline: refused before any AWS call. A second `apply`: every id already gone, success. AWS returns `deleting` after the delete: counts as gone.
+
+#### Failure Modes
+Role not applied yet: the credentials step fails, nothing runs. Permission refused: the run fails naming AWS's code. A read fails: that id fails, nothing deleted for it. A snapshot that still exists after 10 reads: verify fails. The live root is never in the lists (test). The role cannot delete anything else (exact ARNs).
+
+#### Test Plan
+In the module: ids exactly the four and never the live root; deadline instant; mode parsing; deletable and gone predicates; full runs against a fake: wrong account or region refused (live root not visible), live root not attached refused, a re-run finding `deleting`/`deleted` succeeds with no call, a volume that never disappears fails verify, dry deletes nothing, apply deletes all four and never touches the live root, second apply, attached volume refused in three shapes, past-deadline refusal with no call, permission refusal in both modes, unreadable volume, `deleting` read, a snapshot that never disappears, mode mismatch, `SdkDiskAws::new`. Guards: `shell_budget_guard` (the two-line row), workflow guards (pinned actions, no dispatch input in `run:`).
+
+#### Rollback
+Revert the commit before the run: the role leaves terraform on the next apply. After the run the deletes cannot be undone (owner-approved, Quote 56).
+
+#### Observability
+The workflow log prints one line per id and `result: OK` or `FAILED`; a read-only describe afterwards confirms; the daily waste check reports any leftover at 6:07 PM.
+
+This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
+
+- [x] DD-0 rule-file-first: Quote 56 (full + summary), rust-only §0.19 (full + summary).
+- [x] DD-1 `crates/app/src/disk_delete_2026_11_11.rs` + bin `tv-disk-delete-2026-11-11`.
+- [x] DD-2 `deploy/aws/terraform/disk-delete-2026-11-11.tf` + `.github/workflows/disk-delete-2026-11-11.yml` + budget row.
+- [ ] DD-3 after merge: terraform apply, dispatch `dry` then `apply`, confirm with a read-only describe; then a PR deletes the role, workflow, tool and row and records Quote 56 ENDED.

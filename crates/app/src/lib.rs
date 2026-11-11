@@ -219,6 +219,8 @@ pub mod volume_semantics_probe;
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
 /// The depth-20 / depth-200 on-off switch (owner, 2026-10-21).
 pub mod depth_switch;
+/// Quote 56 (2026-11-11): one-off delete of the four Quote 52 leftovers; removed after the run.
+pub mod disk_delete_2026_11_11;
 /// The after-close drain hold (operator Quote 31, 2026-10-21): keeps the box
 /// up after the close until the day's data is in the database.
 pub mod drain_hold;

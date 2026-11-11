@@ -31,6 +31,8 @@
 
 **§0.18 (2026-11-03, owner: "why the fucvkign exisitng data is not available dude with available dates and times for slection dude okay? in top movers dude okay?", after approving the "Approve, build it" design card):** the operator portal's Stocks view gets a date and an IST time input; the chosen minute travels as the movers filter's optional `as_of`, and the read stays in Rust. The portal's JS_BYTE_BUDGET row may grow from 34,530 to at most 34,714 bytes; lines (308 of 350), script tags and inline handlers unchanged. REJECT: going above that, a new script tag, page or handler, or using it for anything else.
 
+**§0.19 (2026-11-11, owner Quote 56, card "One-off, these 4 only (Recommended)"):** `.github/workflows/disk-delete-2026-11-11.yml` (dispatch-only, two `run:` lines: build before any AWS credentials, then run) runs the Rust tool `tv-disk-delete-2026-11-11`, which deletes only the four Quote 52 leftovers (two unattached volumes, two old snapshots) with a one-off role, `dry` then `apply` then verify, refused after 2026-11-14 00:00 UTC; workflow, budget row, tool and role deleted by the next PR. REJECT: reusing it, raising its ceiling, a schedule or push trigger, any other delete, keeping it after the run.
+
 The dated §0.x SCOPE FIX sections each add further REJECT rows for specific guard holes (interpreter invocations, build systems in the dependency graph, etc.) — read them before touching the guard.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update THIS file FIRST with a fresh dated quote, only then can the PR land."

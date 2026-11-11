@@ -1407,3 +1407,29 @@ first compacted the script to 34,627 bytes; the follow-up fix that stops a
 reply for an older filter from rendering under a newer one (a generation stamp
 on each reply) brings it to **34,696**, still under the 34,714 this section
 approved. No line, tag or handler change.
+
+## §0.19. 2026-11-11 — ONE-OFF workflow for the Quote 56 disk delete (owner-approved)
+
+**Operator words (verbatim, typos included):** "swhat i cnat or i wont do
+anythign dude i aske dyou makle it evrythign as entirleya utomated full
+yauotmed dude okay? is aid ful lauiyamtio ndude okay?" and "i aske dyou to
+dleete it dude okay? doe veyrhtign from your side dude okay?", then the
+decision card "One-off, these 4 only (Recommended)" (recorded as Quote 56 in
+`daily-universe-scope-expansion-2026-05-27.md`).
+
+**What is authorized:** one workflow, `.github/workflows/disk-delete-2026-11-11.yml`,
+dispatch-only, with TWO `run:` lines (build, then run; budget row in
+`crates/common/tests/shell_budget_guard.rs`), the build before any AWS credentials exist, then the Rust tool
+`tv-disk-delete-2026-11-11` (`crates/app/src/disk_delete_2026_11_11.rs`). All
+logic is in Rust: the four ids are constants, a volume is deleted only when it
+is `available` and unattached, `dry` proves the permission and deletes nothing,
+`apply` deletes then verifies, and the tool refuses after 2026-11-14 00:00 UTC.
+No SSM shell, no shell on the box.
+
+**Removal:** the workflow, its budget row, the tool and the role are deleted
+in the first PR after the run (or after 2026-11-14 IST, whichever comes first).
+This exception then ends.
+
+**REJECT:** reusing this exception for any other workflow or payload; raising
+the row's ceiling; adding a schedule or push trigger; any delete beyond the
+four Quote 56 ids; keeping the workflow after the run.

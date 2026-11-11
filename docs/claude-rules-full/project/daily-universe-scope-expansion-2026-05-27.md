@@ -3479,7 +3479,7 @@ Measured (Cost Explorer, 1–11 Nov 2026, unblended USD): total $46.11 with tax;
 |---|---|
 | November 2026 line | `NOVEMBER_2026_KILL_USD` = $90 in the hourly guard's clamp and the native budget `limit_amount` = 90, November 2026 (UTC month) only |
 | From 1 December 2026 | The standing $75 line (Quote 37) applies again: the code clamp does it by itself; the native `limit_amount` returns to 75 in a follow-up change on or after 1 December *(⚠ SUPERSEDED the same day by Quote 54: $62 from 1 December, native `limit_amount` to 62)* |
-| The leftover disks | The OWNER deletes `vol-0c6ab6e593e39d8c8`, `vol-073ccaa417a0f344b` and the two snapshots above in the AWS console (no repository role may delete volumes or snapshots, Quote 47 unchanged); a session confirms with a read-only describe afterwards |
+| The leftover disks | The OWNER deletes `vol-0c6ab6e593e39d8c8`, `vol-073ccaa417a0f344b` and the two snapshots above in the AWS console (no repository role may delete volumes or snapshots, Quote 47 unchanged); a session confirms with a read-only describe afterwards *(⚠ SUPERSEDED 2026-11-11 by Quote 56 for these four only: a one-off role scoped to these four IDs deletes them, then is removed)* |
 
 ##### What violates Quote 52 (REJECT)
 - Any month other than November 2026 above $75 without a fresh dated quote; leaving the native `limit_amount` at 90 into December.
@@ -3554,3 +3554,26 @@ The Security & Audit check on PR #2225 (heads `223227e` and `c10b51f`) failed `c
 - Any `Cargo.toml` change, a new dependency, or a version move other than `rustix` (if the update moves another package, it is reverted and the owner asked again).
 
 **How it was applied (2026-11-11):** the session's permission system refused `cargo update` even with the deny rule lifted, so the rule was restored at once and the same move was made by editing the two `Cargo.lock` lines (`version` and the crates.io index `checksum` e5e76742…58aa for 1.1.6). Every dependency of 1.1.6 is already satisfied by the lock (bitflags 2.11.0, errno 0.3.14, libc 0.2.191, linux-raw-sys 0.12.1). Verified: `cargo metadata --locked` accepts the lock, and a locked build compiled `rustix v1.1.6` with `tickvault-common` lib tests at 1,100 passed, 0 failed. No other package moved.
+
+#### Quote 56 (2026-11-11, ~19:58 IST) — A ONE-OFF ROBOT DELETES THE FOUR QUOTE 52 LEFTOVERS; SUPERSEDES QUOTE 52'S "THE OWNER DELETES IN THE CONSOLE" ROW FOR THOSE FOUR ONLY (preserve EXACTLY)
+
+Owner wrote (2026-11-11), verbatim, typos kept: "wgat the fuck si this bro why cnat you solv ehtis bro jsut do ot nro okay?Two empty disks and two old snapshots	❌ Your step in the AWS console", then "done deleted the disks and snapshots dude" (a read-only describe at 19:55–19:57 IST showed all four still present in ap-south-1), then "swhat i cnat or i wont do anythign dude i aske dyou makle it evrythign as entirleya utomated full yauotmed dude okay? is aid ful lauiyamtio ndude okay?" and "i aske dyou to dleete it dude okay? doe veyrhtign from your side dude okay?".
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "The 2 empty disks (600 GB + 30 GB) and 2 old snapshots still exist in AWS. My login cannot delete them, and our rules forbid any robot delete key without your dated approval. How should I automate this?" | **"One-off, these 4 only (Recommended)"** | "I build a one-time robot whose key can delete ONLY these 4 exact IDs (it cannot touch the live 150 GB disk). It runs once tonight, verifies they are gone, then the key and robot are deleted. You do nothing more." |
+
+The session's own login (`claude-code-agent`) was refused `ec2:DeleteVolume` and `ec2:DeleteSnapshot` by AWS at 19:47 IST (dry run), so a new permission is needed.
+
+| Item | What Quote 56 authorizes |
+|---|---|
+| Identity | One NEW IAM role, `tv-prod-disk-delete-2026-11-11`, trusted ONLY for the GitHub Actions environment `disk-delete-2026-11-11` of this repository through the existing OIDC provider. No existing role or user gains a permission. |
+| Permission | `ec2:DeleteVolume` on exactly `vol-0c6ab6e593e39d8c8` and `vol-073ccaa417a0f344b`; `ec2:DeleteSnapshot` on exactly `snap-090ed9c4f3df0ca61` and `snap-0573ab07252f67bf3`; `ec2:DescribeVolumes` / `ec2:DescribeSnapshots` (read). Every statement expires at 2026-11-14 00:00 UTC (`aws:CurrentTime`). |
+| Tool | A Rust tool, `tv-disk-delete-2026-11-11` (app crate), run by a dispatch-only workflow: `dry` first (reports, deletes nothing), then `apply`; it first checks the live root is visible and attached (else refuses: wrong account or region); a volume is deleted only when it is one of the two named, `available` and attached to nothing; after deleting it describes again and fails unless all four are gone (a volume still `deleting` counts as gone). It refuses after 2026-11-14 00:00 UTC. |
+| Removal | The role, the workflow, the tool and its budget row are deleted in the first PR after the run (or after 2026-11-14 IST, whichever comes first). Quote 56 then ENDS and Quote 52's REJECT on delete permissions binds again unchanged. |
+
+##### What violates Quote 56 (REJECT)
+- Any other volume or snapshot in the role, the tool or the workflow; any wildcard resource on a delete action; `vol-07a6586a56466ea83` (the live 150 GB root) named anywhere a delete can reach.
+- Any other identity gaining `ec2:DeleteVolume` or `ec2:DeleteSnapshot`; a schedule or push trigger on the workflow; keeping the role, workflow or tool after the run.
+- Deleting a volume that is attached, `in-use`, or not `available`.
+- Changing instance, disk, IOPS, throughput, budget lines or anything else under Quote 56.
