@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 121] = [
+pub const ALARM_PHRASES: [(&str, &str); 122] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -518,6 +518,10 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
     (
         "boot-heartbeat-gate-not-invoked",
         "The morning start-up alarm switch did not run — its schedule was dropped",
+    ),
+    (
+        "aws-waste-check-not-invoked",
+        "The daily AWS waste check did not run — its schedule was dropped",
     ),
     (
         "dhan-token-minter-not-invoked",
