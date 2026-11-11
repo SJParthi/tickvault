@@ -2507,6 +2507,17 @@ const LAMBDA_ERRORS_ALARM_EXEMPT: &[(&str, &str)] = &[
          ready is still paged by tv-<env>-boot-heartbeat-missing and, from 09:20 IST, \
          by tv-<env>-market-hours-liveness-missing.",
     ),
+    // 2026-11-11 (noise lock §2.18, owner card "Yes, daily waste check
+    // (Recommended)"): the waste check may have NO alarm beyond its
+    // did-it-run (not-invoked) alarm, so it has no Errors alarm at all.
+    // A failed run shows only in its log group and as a missing
+    // cost-audit/<date>.json file (both recorded in §2.18's note).
+    (
+        "aws_waste_check",
+        "no Errors alarm by owner decision (noise lock §2.18, 2026-11-11): its \
+         only alarm is the not-invoked check; a failed run shows in its log group \
+         and as a missing cost-audit file.",
+    ),
 ];
 
 /// Every `resource "aws_lambda_function" "<name>"` in the terraform directory.
