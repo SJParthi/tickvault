@@ -994,7 +994,7 @@ impl AppliedSnapshot {
 
     /// [`Self::load`] without the report. `Ok(None)` when absent, `Err(len)`
     /// when present but rejected.
-    fn load_quiet(wal_dir: &Path) -> Result<Option<Self>, usize> {
+    pub(crate) fn load_quiet(wal_dir: &Path) -> Result<Option<Self>, usize> {
         let path = wal_dir.join(APPLIED_WATERMARK_FILE);
         // APPROVED: boot-time load, cold path
         let Ok(bytes) = std::fs::read(&path) else {
