@@ -40,6 +40,18 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-11-11 (later) — from 1 December 2026 the stop line is $62, GST included (Quote 54)
+
+Owner, 2026-11-11, asked on a decision card "From December, should the AWS bill be hard-capped at ₹5,000 a month?", chose "Cap ₹5,500": "Stop line $62 (about ₹5,500 with GST). A bit of headroom above the expected bill, still close to ₹5,000." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 54. It supersedes Quote 53's "keep the $75 stop" row only; Quote 53's other rows (alarms, shipped metrics, dashboard, raw-frame storage class) stand.
+
+| | Before (Quotes 37 and 52) | After (Quote 54) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (code clamp) | $75 from 1 December | **$62 from 1 December 2026**, GST included (the live budget counts tax, Quote 36) |
+| November 2026 (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $90 | **$90** (unchanged) |
+| October 2026 | $185 | $185 (unchanged, history) |
+| Native `limit_amount` (budget.tf) | "90" now, "75" on or after 1 December | "90" now, **"62"** in a follow-up on or after 1 December, never before; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December unless it reads exactly 62 |
+| Expected bill | ~$56 a month with tax (Quote 53 estimate, Assumed) | unchanged; ₹5,000 is that estimate, not a guarantee. The hard maximum is the $62 stop |
+
 ## OPERATOR RULING 2026-11-11 — November 2026 only: stop at $90; the owner deletes the leftover disks
 
 Owner, 2026-11-11: tapped "Raise Nov to $90 only (Recommended)" and "Delete all (Recommended)" after a one-off Cost Explorer read showed 1–11 Nov at $46.11, of which about $21 (tax included) was two volumes attached to nothing (the 600 GB old root left from Quote 47 and a 30 GB May root) plus two old snapshots. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 52.
@@ -47,7 +59,7 @@ Owner, 2026-11-11: tapped "Raise Nov to $90 only (Recommended)" and "Delete all 
 | | Before (Quote 37) | After (Quote 52) |
 |---|---|---|
 | November 2026 line (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $75 | **$90**, November 2026 (UTC month) only |
-| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 December 2026** onward (code clamp by itself; native `limit_amount` back to "75" in a follow-up on or after 1 December; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December while it still reads 90) |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 December 2026** onward (code clamp by itself; native `limit_amount` back to "75" in a follow-up on or after 1 December; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December while it still reads 90) *(⚠ SUPERSEDED the same day by Quote 54 above: the standing line is $62 from 1 December, and the native `limit_amount` moves to "62", not "75".)* |
 | Leftover volumes and snapshots | billed | deleted by the owner in the console; no repository role gets a volume or snapshot delete permission |
 
 ## OPERATOR RULING 2026-10-28 — October 2026 only: stop at $185 (supersedes "October 2026 stays capped at $170" below)
@@ -57,7 +69,7 @@ Owner, 2026-10-28: tapped "Raise Oct to $185 (Recommended)" after the Budgets AP
 | | Before (Quote 37) | After (Quote 45) |
 |---|---|---|
 | October 2026 line (`OCTOBER_2026_KILL_USD`, four lockstep sites) | $170 | **$185**, October 2026 only |
-| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
 
 ## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
 
@@ -65,7 +77,7 @@ Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 pe
 
 | | Before (Quote 36) | After (Quote 37) |
 |---|---|---|
-| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 |
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
 | Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $85 | $170 until 1 November, then **$75** (a follow-up change on or after that date) |
 
 ## OPERATOR RULING 2026-10-21 (later) — stop at $85 from 1 November (supersedes the $100 line below)

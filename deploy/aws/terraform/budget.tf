@@ -248,6 +248,12 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   November 2026 to $90 and December onward to $75 in code; this native
   #   stop goes back to "75" on or after 1 December (the lockstep guard
   #   fails the build from December while it still reads 90).
+  # 2026-11-11 (operator Quote 54, daily-universe §0, owner card "Cap ₹5,500"):
+  #   from 1 December 2026 the standing line is $62 a month, GST included
+  #   (about ₹5,500), replacing $75. The Lambda clamps December onward to $62
+  #   in code now; this native stop stays "90" until the end of November and
+  #   moves to "62" (not "75") in a follow-up change on or after 1 December,
+  #   never before (the lockstep guard requires exactly "62" from December).
   limit_amount      = "90"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
