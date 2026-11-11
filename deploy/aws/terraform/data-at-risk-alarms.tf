@@ -110,61 +110,8 @@ resource "aws_cloudwatch_metric_alarm" "cold_backup_failing" {
 # no verified copy. The WAL leg counts only the BYTE-ceiling pass (the age
 # pass keeping an unuploaded segment is normal and logged at info), so a
 # non-zero value means the disk is already over its ceiling. One period.
-resource "aws_cloudwatch_metric_alarm" "disk_kept_not_backed_up" {
-  alarm_name        = "tv-${var.environment}-disk-kept-not-backed-up"
-  alarm_description = "OLD MARKET DATA FILES ARE DUE TO BE CLEARED BUT HAVE NO CLOUD COPY, SO THEY ARE KEPT. Sums three counters: WAL segments the byte-ceiling prune refused, seal-spill files the age prune refused, and quarantined files the quarantine budget refused - each because no verified S3 copy is recorded. The data is safe; the disk is not. DO: (1) check whether tv-<env>-cold-backup-failing is also in ALARM - that is the usual cause. (2) grep /tickvault/<env>/app for STORAGE-GAP-04 and WS-SPILL-01 lines; they name the directory and the byte count. (3) df -h /data. Fix the upload, never delete an unuploaded file by hand. Runbook: docs/error-runbooks/wave-2-error-codes.md"
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  datapoints_to_alarm = 1
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = []
-
-  metric_query {
-    id          = "prune_refused_not_uploaded"
-    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)"
-    label       = "files kept because no cloud copy exists"
-    return_data = true
-  }
-
-  metric_query {
-    id          = "m1"
-    return_data = false
-    metric {
-      metric_name = "tv_wal_prune_refused_not_uploaded_total"
-      namespace   = local.app_namespace
-      period      = 900
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  metric_query {
-    id          = "m2"
-    return_data = false
-    metric {
-      metric_name = "tv_seal_spill_prune_refused_not_uploaded_total"
-      namespace   = local.app_namespace
-      period      = 900
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  metric_query {
-    id          = "m3"
-    return_data = false
-    metric {
-      metric_name = "tv_quarantine_prune_refused_not_uploaded_total"
-      namespace   = local.app_namespace
-      period      = 900
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-}
+# alarm "disk_kept_not_backed_up" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 3. AN ORDER UPDATE REACHED NOTHING
@@ -254,46 +201,5 @@ resource "aws_cloudwatch_metric_alarm" "log_lines_dropped" {
 # park (park full, 8 batches / 128 MiB) is written inline on the drain. Nothing
 # is dropped, but the drain is the only thing emptying the socket while it
 # waits, and Dhan skips a slow consumer forward with no sequence number.
-resource "aws_cloudwatch_metric_alarm" "feed_thread_wrote_to_disk" {
-  alarm_name        = "tv-${var.environment}-feed-thread-wrote-to-disk"
-  alarm_description = "THE LIVE PRICE THREAD HAD TO WRITE TO DISK ITSELF. A tick or depth rescue batch could not be handed to the rescue thread (queue full or thread gone) or parked, so the frame drain wrote it inline. Nothing in the batch is dropped, but the drain is the only thing emptying the socket while it waits, and Dhan skips a slow reader forward without telling us. DO: (1) check disk write latency and df -h /data. (2) grep /tickvault/<env>/app for the rescue fallback lines; reason=thread_gone means the rescue thread died and needs a restart. (3) check whether tv-<env>-errcode-hot-path-stall-01 fired in the same window."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  datapoints_to_alarm = 1
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = []
-
-  metric_query {
-    id          = "inline_fallbacks"
-    expression  = "FILL(m1,0)+FILL(m2,0)"
-    label       = "rescue batches written inline on the frame drain"
-    return_data = true
-  }
-
-  metric_query {
-    id          = "m1"
-    return_data = false
-    metric {
-      metric_name = "tv_tick_rescue_inline_fallback_total"
-      namespace   = local.app_namespace
-      period      = 300
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-
-  metric_query {
-    id          = "m2"
-    return_data = false
-    metric {
-      metric_name = "tv_depth_rescue_inline_fallback_total"
-      namespace   = local.app_namespace
-      period      = 300
-      stat        = "Sum"
-      dimensions  = local.app_dimensions
-    }
-  }
-}
+# alarm "feed_thread_wrote_to_disk" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.

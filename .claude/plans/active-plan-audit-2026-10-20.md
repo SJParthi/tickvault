@@ -2540,3 +2540,41 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - [x] RDR-2 §2.17 addendum + runbook row (disk-floor trade-off recorded).
 - [x] RDR-3 `crates/app/src/evening_drain.rs::{claim_planned_boot, claim_planned_boot_at, allowance_or}` + the `main.rs` call before `lock_wal_dir`.
 - [x] RDR-4 `crates/app/src/dhan_feed_stack.rs::wal_replay_acked` deferred arm pages as `replay_rows_lost` (`confirmed = true`); guard updated.
+
+### PR Q53 — 2026-11-11: fewer alarms, fewer shipped metrics, no CloudWatch dashboard, raw frames to Glacier Instant Retrieval (terraform, aws-lambdas, common, app, storage tests, docs)
+
+**Approved by:** operator Quote 53 (2026-11-11), recorded first in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` and its summary stub: the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard", and kept the $75 stop. Noise-lock §2.20 records the removed pages per family before the code.
+
+#### Design
+- Q53-1 alarm review: one row per alarm in `docs/audits/2026-11-alarm-review.md` (what it watches, KEEP/REMOVE, what still covers it). REMOVE only alarms outside the KEPT list (data loss, loss groups, lane-down / socket-parked / ticks-dropped, tokens, budget, disk-full / QuestDB-down, cross-verification); also kept: the two EC2 status checks (self-heal actions), every Severity::Critical coded page, the money-path order pages, the page-delivery and gate watchers. Result: 39 removed, 80 kept in prod (the first draft removed 44; its review put back `errcode-stream-silent` with its two schema filters, `live-universe-fallback`, `tick-spill-quarantined`, `wal-suspension-probe-blind` and `deploy-provenance-blind`, each the only page for a KEPT failure). Removed resources are replaced by a dated tombstone comment; references (outputs, the market-hours `ALARM_NAMES` list, the Muhurat skip list) go with them.
+- Q53-2 shipped metrics: the EMF selector keeps only names a kept alarm reads (109 → 46); the `class` declaration and the memory/CPU host metrics go; filters whose only reader is removed go. Local `/metrics` unchanged.
+- Q53-3 dashboard: `dashboard.tf` and the `dashboard_url` output deleted; dated notes reverse Quote 37's "dashboard KEPT".
+- Q53-4 S3: the `raw-frames/` rule moves current and noncurrent versions to `GLACIER_IR` after 30 days (was `DEEP_ARCHIVE`); no expiration; no new rule for `questdb-partitions/`, `deploys/`, `instrument-snapshots/`, `logs/`.
+- Q53-5 aws-lambdas (src): `telegram_webhook::ALARM_PHRASES` loses the rows of removed alarms (the phrase guard requires both directions); the two `DEGRADE_NOT_EMERGENCY` entries stay with a dated note.
+- Q53-6 date gate: `terraform_data.quote53_not_before_december` (main.tf) with a `plantimestamp()` precondition refuses any plan before 2026-12-01 00:00 IST unless `var.quote53_early_apply_approved` (default false) is set true with a dated owner go-ahead; deleted in the first change after 2026-12-01.
+
+#### Edge Cases
+A removed alarm referenced from another file (ALARM_NAMES, outputs, Muhurat skip list): every reference removed, checked by grep. A did-it-run alarm removed while the Muhurat open skipped it: its skip entry goes with it; the kept `boot-heartbeat-gate-not-invoked` stays skipped, and a guard requires every `_not_invoked` alarm in `ALARM_NAMES` to be in the skip list (second review). A shipped metric read by a metric-math alarm: kept (the selector is derived from every `metric_name =` in terraform). Count-gated depth-minter alarms: kept (count 0, no cost). An object already in Deep Archive: stays there (lifecycle cannot move it up).
+
+#### Failure Modes
+A removed alarm whose failure is not in fact covered: each REMOVE row names the cover; the owner reviews the table. Found in review and fixed: five removals had no real cover (see the review's "Corrections" section); `quote53_alarm_review_cover_guard.rs` now fails the build if any of the five, or the date gate, goes. While the date gate holds, every terraform apply fails, not only this change (Risk; merge on or after 1 December). `plantimestamp()` in a precondition is Assumed to evaluate at plan time on Terraform 1.9.8 (documented since 1.5; not run here). Terraform not installed here, so no `terraform validate` ran (Risk); a dangling reference would fail the plan at apply. Glacier Instant Retrieval costs more per GB than Deep Archive (Risk, recorded for the owner).
+
+#### Test Plan
+`cargo test -p tickvault-aws-lambdas` (lib + all guards), `cargo test -p tickvault-common --tests`, the storage guards that read `deploy/aws` (`--test` each), the app guards that read `deploy/aws` or the phrase table (`--test` each), `tickvault-core --test telegram_lambda_house_style_guard`, `tickvault-trading --test daily_pnl_emit_wiring_guard`, `cargo fmt --all -- --check`. Plus `cargo test -p tickvault-common --test quote53_alarm_review_cover_guard`. Guards changed only as Quote 53 requires (each change dated in the file).
+
+#### Rollback
+Revert the PR: terraform recreates the alarms, filters and dashboard, the selector and host metrics come back, and the lifecycle rule returns to Deep Archive. Objects already moved to Glacier Instant Retrieval stay there (readable at once).
+
+#### Observability
+No new page, alarm, filter or EMF name. Every removed alarm's coded log lines, counters and local `/metrics` are unchanged. Read after apply: the alarm count (82 in prod), the December bill.
+
+Second review (2026-11-11, same day), added to this item: Q53-7 the metric trim has no terraform in its path (`deploy-aws.yml` and the morning boot copy `cloudwatch-agent.json`), so test 9 of `crates/common/tests/quote53_alarm_review_cover_guard.rs` fails the build while the trimmed config is in the tree before 2026-12-01 00:00 IST (same `quote53_early_apply_approved` switch); the change merges on or after 1 December. Q53-8 `boot-heartbeat-gate-errors` and `-not-invoked` are KEPT (they watch the gate that arms the kept `boot-heartbeat-missing`): back in terraform, the gate `ALARM_NAMES`, the Muhurat `skip_alarms`, `telegram_webhook::ALARM_PHRASES` (82 to 84 rows, aws-lambdas src), and the two Lambda exemptions removed. Q53-9 the `wal-replay-restore-failed` review row names its real cover (`errcode-ws-spill-02`), pinned by test 10. Crates: aws-lambdas (src and tests), common (tests). Rollback, failure modes and observability as above; test plan adds `cargo test -p tickvault-common --test quote53_alarm_review_cover_guard` (test 9 fails until 1 December by design).
+
+This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
+
+- [x] Q53-0 rule-file-first: Quote 53 (owner) in the daily-universe file; noise-lock §2.20 (full + summary); dated Quote 37 dashboard notes; aws-budget COST NOTE 2026-11-11.
+- [x] Q53-1 alarm review doc + terraform removals.
+- [x] Q53-2 EMF selector / host metrics / filters trimmed.
+- [x] Q53-3 dashboard and its output deleted.
+- [x] Q53-4 raw-frames lifecycle to GLACIER_IR.
+- [x] Q53-5 `crates/aws-lambdas/src/telegram_webhook.rs` phrase table and its tests.

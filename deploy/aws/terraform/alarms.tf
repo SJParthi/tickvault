@@ -89,25 +89,8 @@ resource "aws_cloudwatch_metric_alarm" "system_status_check" {
 # high-vol minutes, but sustained = investigate)
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "high_cpu" {
-  alarm_name          = "tv-${var.environment}-cpu-high-5min"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 5
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 60
-  statistic           = "Average"
-  threshold           = 90
-  alarm_description   = "CPU > 90% for 5 consecutive minutes. Investigate hot path allocation or trace a CPU flamegraph."
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    InstanceId = aws_instance.tv_app.id
-  }
-
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = [aws_sns_topic.tv_alerts.arn]
-}
+# alarm "high_cpu" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 4. EBS per-operation write latency > 50ms — disk slowness can break tick
@@ -120,89 +103,25 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
 # is metric math: Sum(write time) / Sum(write ops) × 1000 = avg ms per write.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "ebs_write_latency" {
-  alarm_name          = "tv-${var.environment}-ebs-write-latency-high"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 3
-  threshold           = 50 # milliseconds per write operation (metric-math e1)
-  alarm_description   = "EBS avg per-op write latency > 50ms for 15 minutes (metric math: Sum VolumeTotalWriteTime / Sum VolumeWriteOps × 1000). Tick spill + QuestDB ILP use this volume. See DR runbook §8 (Spill disk)."
-  treat_missing_data  = "notBreaching"
-
-  metric_query {
-    id          = "e1"
-    expression  = "IF(ops > 0, (wt / ops) * 1000, 0)"
-    label       = "Avg ms per EBS write op"
-    return_data = true
-  }
-
-  metric_query {
-    id = "wt"
-
-    metric {
-      metric_name = "VolumeTotalWriteTime"
-      namespace   = "AWS/EBS"
-      period      = 300
-      stat        = "Sum"
-
-      dimensions = {
-        VolumeId = aws_instance.tv_app.root_block_device[0].volume_id
-      }
-    }
-  }
-
-  metric_query {
-    id = "ops"
-
-    metric {
-      metric_name = "VolumeWriteOps"
-      namespace   = "AWS/EBS"
-      period      = 300
-      stat        = "Sum"
-
-      dimensions = {
-        VolumeId = aws_instance.tv_app.root_block_device[0].volume_id
-      }
-    }
-  }
-
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-}
+# alarm "ebs_write_latency" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 5. Average NetworkOut > 50 MiB per 60-second period for 5 periods
 # NetworkOut is a byte count; with one sample per period, this is 50 MiB/min.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_metric_alarm" "network_out_high" {
-  alarm_name          = "tv-${var.environment}-network-out-runaway"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 5
-  metric_name         = "NetworkOut"
-  namespace           = "AWS/EC2"
-  period              = 60
-  statistic           = "Average"
-  threshold           = 52428800 # 50 MiB byte-count sample, not bytes/second
-  alarm_description   = "Average NetworkOut exceeds 50 MiB in each of five 60-second periods. This metric is a byte count, not bytes/second. Investigate transfer cost and the responsible job. See DR runbook §9."
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    InstanceId = aws_instance.tv_app.id
-  }
-
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-}
+# alarm "network_out_high" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # Outputs for operator visibility
 # ---------------------------------------------------------------------------
 
 output "cloudwatch_alarms" {
-  description = "Names of the 5 CloudWatch alarms. All publish to tv-alerts SNS."
+  description = "Names of the CloudWatch alarms declared in this file (2 since 2026-11-11: the operator Quote 53 alarm review removed the CPU, EBS-latency and network-out alarms; the two status checks stay because each carries an EC2 self-heal action). All publish to tv-alerts SNS."
   value = [
     aws_cloudwatch_metric_alarm.instance_status_check.alarm_name,
     aws_cloudwatch_metric_alarm.system_status_check.alarm_name,
-    aws_cloudwatch_metric_alarm.high_cpu.alarm_name,
-    aws_cloudwatch_metric_alarm.ebs_write_latency.alarm_name,
-    aws_cloudwatch_metric_alarm.network_out_high.alarm_name,
   ]
 }

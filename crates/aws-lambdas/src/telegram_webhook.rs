@@ -153,12 +153,8 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 121] = [
+pub const ALARM_PHRASES: [(&str, &str); 84] = [
     // ---- capacity + candle building ----
-    (
-        "aggregator-refusal-rate-high",
-        "🔷 DHAN: more than a QUARTER of prices arrive with a bad time stamp — the prices ARE saved, only the per-minute summary skips them. Recent sessions ran 2-7%",
-    ),
     (
         "aggregator-slots-exhausted",
         "🔷 DHAN: ran out of candle slots — some instruments are no longer getting candles",
@@ -167,36 +163,26 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "seal-writer-dropped",
         "Finished candles were thrown away instead of being saved",
     ),
-    (
-        "seal-writer-rescued",
-        "Finished candles had to be written to a rescue file instead of the database",
-    ),
     // ---- app + host health ----
-    (
-        "api-auth-failed",
-        "Someone is repeatedly failing the password check on the operator web pages",
-    ),
     (
         "app-log-ingestion-silent",
         "🖥️ HOST: the app has stopped writing any log lines",
+    ),
+    (
+        "errcode-stream-silent",
+        "The error feed the alarms read has stopped arriving — the app is still reporting errors, so the other alarms are now blind until this is fixed",
     ),
     (
         "binary-sha-stale",
         "The running app is more than a day behind the latest approved code",
     ),
     (
+        "deploy-provenance-blind",
+        "the check that tells you the box is running the latest code cannot run — it is not saying the code is fine, it is saying it does not know",
+    ),
+    (
         "boot-heartbeat-missing",
         "The app did not start on time this morning",
-    ),
-    ("clock-skew-high", "The server clock has drifted too far"),
-    (
-        "cpu-high-5min",
-        "Server CPU has been very high for 5 minutes",
-    ),
-    ("mem-used-high", "Server memory is almost full"),
-    (
-        "instance-status-failed",
-        "The cloud server is failing its health checks",
     ),
     (
         "system-status-failed",
@@ -206,36 +192,11 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "market-hours-liveness-missing",
         "🖥️ HOST: the app has gone silent during market hours",
     ),
-    (
-        "network-out-runaway",
-        "Outbound network traffic is abnormally high",
-    ),
-    (
-        "logs-ingestion-runaway",
-        "Log volume is growing abnormally fast",
-    ),
-    (
-        "eventbridge-dlq-depth",
-        "Scheduled cloud tasks are failing and piling up",
-    ),
     // ---- disk ----
     ("disk-used-high", "Server disk is almost full"),
     (
-        "disk-fill-rate-high",
-        "Disk space is being used up unusually fast",
-    ),
-    (
         "spill-dir-free-low",
         "Disk space is nearly gone — rescued prices will stop fitting soon",
-    ),
-    ("disk-watcher-respawn", "The disk monitor keeps restarting"),
-    (
-        "ebs-write-latency-high",
-        "Disk writes have become very slow",
-    ),
-    (
-        "partition-archive-failed",
-        "Old data could not be moved to cold storage",
     ),
     // ---- database ----
     (
@@ -247,28 +208,8 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "A database table has stopped storing rows while still accepting them",
     ),
     (
-        "questdb-wal-apply-lag",
-        "The database is falling behind on writing what it has already accepted",
-    ),
-    (
-        "questdb-wal-probe-failed",
-        "The check that watches for stuck database tables is itself failing",
-    ),
-    (
         "wal-suspension-probe-blind",
-        "The check that watches for stuck database tables cannot see anything",
-    ),
-    (
-        "wal-catchup-budget-exhausted",
-        "The database ran out of time catching up on rows it had accepted",
-    ),
-    (
-        "questdb-console-front-errors",
-        "The database console page is failing",
-    ),
-    (
-        "questdb-console-proxy-errors",
-        "The database console link is failing",
+        "The check that watches for stuck database tables cannot see anything — a stuck table would not page right now",
     ),
     // ---- market data capture + loss ----
     (
@@ -283,18 +224,10 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "ticks-dropped",
         "Live prices were dropped before they could be saved",
     ),
-    (
-        "ticks-spilling",
-        "Prices are being saved to disk instead of the database because the database is behind — nothing is lost, they are replayed",
-    ),
     ("ticks-lost-spill", "Rescued prices were lost for good"),
     (
-        "tick-spill-replay-failing",
-        "Rescued prices could not be put back into the database",
-    ),
-    (
         "tick-spill-quarantined",
-        "A rescue file of prices was set aside as unreadable",
+        "A rescue file of prices was set aside because the database refused it — those prices are not in the database until someone re-sends them",
     ),
     (
         "wal-frames-not-recovered",
@@ -309,10 +242,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "The app was cut off while still writing captured market data — those frames were never saved and cannot be recovered",
     ),
     (
-        "wal-replay-restore-failed",
-        "A saved market data file could not be put back for the next start-up — it is still on disk but no start-up will find it",
-    ),
-    (
         "wal-replay-unknown-magic",
         "A saved market data file is in a format this app cannot read — that data is gone",
     ),
@@ -325,16 +254,8 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "Copies of captured market data are not reaching cloud storage — the files are kept on the server, but the disk will fill",
     ),
     (
-        "disk-kept-not-backed-up",
-        "Old market data files are due to be cleared but have no cloud copy, so they are kept — the disk will fill",
-    ),
-    (
         "log-lines-dropped",
         "Log lines were dropped because the log writer fell behind — part of the record is missing",
-    ),
-    (
-        "feed-thread-wrote-to-disk",
-        "🔷 DHAN: the live price thread had to save to disk itself because the save helper was full or gone — prices may have been skipped while it waited",
     ),
     // ---- loss groups (noise lock §2.10, 2026-10-05) ----
     (
@@ -375,22 +296,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "🔷 DHAN: a market data connection has given up and will not try again",
     ),
     (
-        "dhan-worst-socket-deaf",
-        "🔷 DHAN: one market data connection looks alive but has stopped delivering prices",
-    ),
-    (
-        "dhan-ring-dwell-high",
-        "🔷 DHAN: prices are waiting too long in the incoming buffer — this is the early warning that comes BEFORE prices start being refused",
-    ),
-    (
-        "dhan-feed-delay-high",
-        "🔷 DHAN: repeated checks found index and cash-stock price updates with trade times at least a minute old — investigate feed timing",
-    ),
-    (
-        "dhan-main-reconnect-slow",
-        "🔷 DHAN: the main price connection dropped and took more than 15 seconds to start delivering prices again",
-    ),
-    (
         "dhan-wal-dropped",
         "🔷 DHAN: live prices arrived but were never safely stored — that data is gone",
     ),
@@ -399,16 +304,12 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "🔷 DHAN: could not work out today's contract list — most instruments are unsubscribed",
     ),
     (
-        "live-universe-fallback",
-        "🔷 DHAN: fell back to a tiny instrument list — almost nothing is being watched",
-    ),
-    (
-        "preopen-ready-late",
-        "🔷 DHAN: the feed was not fully connected and subscribed by 9:12 AM",
-    ),
-    (
         "ws-no-alive-connections",
         "🔷 DHAN: no live market data connections are up",
+    ),
+    (
+        "live-universe-fallback",
+        "🔷 DHAN: the live feed is not using today's full instrument list — some instruments are not being watched",
     ),
     (
         "ws-ring-full",
@@ -423,19 +324,10 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "🔷 DHAN: access token expires soon — the live price feed stops if it is not renewed",
     ),
     // ---- orders + risk ----
-    ("orders-rejected", "Orders are being rejected"),
-    (
-        "orders-placed-storm",
-        "Far more orders are being placed than expected",
-    ),
     ("order-audit-chain-loss", "Order history rows were lost"),
     (
         "order-update-dropped",
         "🔷 DHAN: an order update from the broker reached nothing in the app — that update is missing",
-    ),
-    (
-        "daily-loss-breach",
-        "Today's trading loss has crossed the limit you set",
     ),
     // ---- helper Lambdas: is it erroring? ----
     (
@@ -451,20 +343,48 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "The daily cost summary helper is failing",
     ),
     (
+        "market-hours-gate-errors",
+        "The market-hours alarm switch is failing",
+    ),
+    (
+        "market-hours-gate-not-invoked",
+        "The market-hours alarm switch did not run — its schedule was dropped",
+    ),
+    (
         "start-watchdog-errors",
         "The morning start helper is failing",
     ),
     (
-        "deploy-watchdog-errors",
-        "The stale-code checker is failing",
+        "start-watchdog-not-invoked",
+        "The morning start helper did not run — its schedule was dropped",
     ),
     (
-        "market-open-readiness-errors",
-        "The pre-open readiness check is failing",
+        "instance-status-failed",
+        "The cloud server is failing its health checks",
     ),
     (
-        "market-hours-gate-errors",
-        "The market-hours alarm switch is failing",
+        "errcode-aggregator-stall-01",
+        "The live price feed paused for over a second while a slow disk saved a candle — check the disk",
+    ),
+    (
+        "errcode-boot-03",
+        "The server clock has drifted too far for the app to start",
+    ),
+    (
+        "errcode-oms-gap-06",
+        "The paper order runtime stopped and had to be restarted",
+    ),
+    (
+        "api-auth-failed",
+        "Someone is repeatedly failing the password check on the operator web pages",
+    ),
+    (
+        "orders-placed-storm",
+        "Far more orders are being placed than expected",
+    ),
+    (
+        "daily-loss-breach",
+        "Today's trading loss has crossed the limit you set",
     ),
     (
         "boot-heartbeat-gate-errors",
@@ -477,10 +397,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
     (
         "dhan-depth-token-minter-errors",
         "🔷 DHAN: the second (depth-only) account's daily access-key helper is failing — only its extra depth sockets are affected",
-    ),
-    (
-        "operator-control-errors",
-        "The operator control page is failing",
     ),
     (
         "telegram-webhook-errors",
@@ -500,22 +416,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "The daily cost summary did not run — its schedule was dropped",
     ),
     (
-        "start-watchdog-not-invoked",
-        "The morning start helper did not run — its schedule was dropped",
-    ),
-    (
-        "deploy-watchdog-not-invoked",
-        "The stale-code checker did not run — its schedule was dropped",
-    ),
-    (
-        "market-open-readiness-not-invoked",
-        "The pre-open readiness check did not run — its schedule was dropped",
-    ),
-    (
-        "market-hours-gate-not-invoked",
-        "The market-hours alarm switch did not run — its schedule was dropped",
-    ),
-    (
         "boot-heartbeat-gate-not-invoked",
         "The morning start-up alarm switch did not run — its schedule was dropped",
     ),
@@ -533,10 +433,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "🔷 DHAN: the broker sign-in check is failing — usually THEIR server, not our key. Read the status first: 401/403 means the key, 5xx means Dhan is down. Do not replace the key on a 5xx",
     ),
     (
-        "errcode-dh-906",
-        "🔷 DHAN: the broker refused an order — do not retry it, fix the order",
-    ),
-    (
         "errcode-auth-gap-04",
         "🔷 DHAN: the login code no longer matches — sign-in stays dead until it is fixed by hand",
     ),
@@ -547,10 +443,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
     (
         "errcode-boot-02",
         "The app could not reach its database at start-up, so it did not start",
-    ),
-    (
-        "errcode-boot-03",
-        "The server clock has drifted too far for the app to start",
     ),
     // ---- Four REST-leg phrases RETIRED 2026-09-17 ----
     //
@@ -571,10 +463,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "Finished candles were dropped, or prices were refused by the candle builder",
     ),
     (
-        "errcode-aggregator-stall-01",
-        "The live price feed paused for over a second while a slow disk saved a candle — check the disk",
-    ),
-    (
         "errcode-hot-path-stall-01",
         "🔷 DHAN: the live market data path stalled for 2 seconds or more — some prices may have been skipped; check the server",
     ),
@@ -583,36 +471,16 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
         "The database is behind, so prices are being held on disk and replayed — nothing is lost",
     ),
     (
-        "errcode-oms-gap-06",
-        "The paper order runtime stopped and had to be restarted",
-    ),
-    (
         "errcode-proc-01",
         "The app was killed by the server for using too much memory",
-    ),
-    (
-        "errcode-resource-02",
-        "The trading app's memory is close to its ceiling — it will be slowed, not killed, but check what is growing",
     ),
     (
         "errcode-risk-gap-03",
         "🔷 DHAN: some instruments have gone quiet or never sent a price today",
     ),
     (
-        "errcode-stream-silent",
-        "The error feed the alarms read has stopped arriving — the app is still reporting errors, so the other alarms are now blind until this is fixed",
-    ),
-    (
         "errcode-storage-gap-05",
         "Disk is above its high-water mark and nothing is left that may be archived away",
-    ),
-    (
-        "errcode-wal-suspend-01",
-        // 2026-09-23: this ONE filter also matches the `apply_lag_growing`
-        // and `probe_blind` sources, where the table is NOT suspended. The
-        // old text said "STOPPED" for all three and paged a falling-behind
-        // table as a dead one. Worded to cover every source it can match.
-        "A database table is not keeping up with writes, so new rows are saved but do not show in queries yet. The server log line says which case: \"apply_lag_growing\" means the table is still working but falling further behind at every check, nothing is lost, and it catches up when the load drops; no case named means the table has STOPPED and will NOT catch up by itself (the box tries a bounded auto-resume first, and if that fails someone must resume it by hand; the runbook has the exact command). If the disk is full, fix that first",
     ),
     (
         "errcode-ws-spill-01",
@@ -621,14 +489,6 @@ pub const ALARM_PHRASES: [(&str, &str); 121] = [
     (
         "errcode-ws-spill-02",
         "Incoming market data hit a capture limit — EITHER a frame was genuinely dropped, OR replay deferred segments to the next start, which loses nothing. The server log line names which — check it before assuming loss",
-    ),
-    (
-        "deploy-provenance-blind",
-        "the check that tells you the box is running the latest code cannot run — it is not saying the code is fine, it is saying it does not know",
-    ),
-    (
-        "errcode-scoreboard-01",
-        "yesterday's per-connection summary could not be saved — the raw records are safe and it can be rebuilt, but the summary view is missing",
     ),
     (
         "errcode-ws-gap-03-universe-collapse",
@@ -709,6 +569,14 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
 /// only conditions whose own text says nothing is lost, and adding to it is a
 /// deliberate act with a reason attached — never a way to quieten something
 /// inconvenient.
+//
+// ⚠ 2026-11-11 (operator Quote 53, docs/audits/2026-11-alarm-review.md): BOTH
+// alarms named below were REMOVED from terraform, so in production this list
+// matches nothing today and every page renders 🆘 (fail-loud, the default).
+// The two entries are kept so the downgrade mechanism and its tests stay
+// exercised; an alarm restored under a fresh dated quote gets its downgrade
+// back without a code change. Kept stale on purpose and stated here, rather
+// than read as live coverage.
 const DEGRADE_NOT_EMERGENCY: &[&str] = &[
     // The tick spill tier engaging. `dropped == spilled` is the proof the
     // rescue worked, and this alarm fires on exactly that path.
@@ -1767,20 +1635,20 @@ mod tests {
     #[test]
     fn test_alarm_state_two_lines_emoji_first() {
         let out = house_line(&json!({
-            "AlarmName": "tv-prod-cpu-high-5min",
+            "AlarmName": "tv-prod-disk-used-high",
             "NewStateValue": "ALARM",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         }));
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "🆘 Server CPU has been very high for 5 minutes");
+        assert_eq!(lines[0], "🆘 Server disk is almost full");
         assert_eq!(lines[1], "10:01 AM IST");
     }
 
     #[test]
     fn test_ok_state_single_recovered_line() {
         let out = house_line(&json!({
-            "AlarmName": "tv-prod-cpu-high-5min",
+            "AlarmName": "tv-prod-disk-used-high",
             "NewStateValue": "OK",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         }));
@@ -1812,7 +1680,7 @@ mod tests {
     #[test]
     fn test_insufficient_data_is_warning_emoji() {
         let out = house_line(&json!({
-            "AlarmName": "tv-prod-mem-used-high",
+            "AlarmName": "tv-prod-spill-dir-free-low",
             "NewStateValue": "INSUFFICIENT_DATA",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         }));
@@ -1874,12 +1742,14 @@ mod tests {
     }
 
     #[test]
-    fn feed_delay_pages_describe_timestamp_age_without_claiming_continuous_delay() {
-        // The seven observed 2026-11-02 OK->ALARM transitions. OK actions
-        // are disabled for this alarm, so the Lambda sees no intervening OK.
-        // Every re-armed incident must still reach the rendered output.
+    fn rearmed_alarm_pages_are_each_delivered_without_an_ok_between() {
+        // The seven observed 2026-11-02 OK->ALARM transitions (they were on
+        // the feed-delay alarm, removed 2026-11-11 by operator Quote 53; the
+        // socket-parked page has OK actions disabled the same way). The Lambda
+        // sees no intervening OK, and every re-armed incident must still reach
+        // the rendered output.
         let mut cache = AlertCache::new();
-        let name = "tv-prod-dhan-feed-delay-high";
+        let name = "tv-prod-dhan-socket-parked";
         for (now, when) in [
             (0.0, "2026-11-02T03:57:15.297+0000"),
             (6_060.0, "2026-11-02T05:38:15.297+0000"),
@@ -1895,11 +1765,9 @@ mod tests {
             let texts = fold_records(&[alarm_record(name, "ALARM", when)], now, &mut cache);
             assert_eq!(texts.len(), 1, "an ALARM must still be delivered at {when}");
             let text = &texts[0];
-            assert!(text.contains("DHAN") && text.contains("trade times"));
-            assert!(text.contains("at least a minute"), "equality breaches too");
             assert!(
-                !text.contains("10 minutes straight") && !text.contains("after the trade happened"),
-                "sampled trade-age peaks cannot prove continuous transport delay: {text}"
+                text.contains("DHAN") && text.contains("given up"),
+                "the kept phrase must reach every re-armed page: {text}"
             );
         }
     }
@@ -1907,8 +1775,8 @@ mod tests {
     #[test]
     fn test_env_prefix_is_stripped_for_any_environment() {
         assert_eq!(
-            alarm_phrase("tv-staging-cpu-high-5min"),
-            alarm_phrase("tv-prod-cpu-high-5min")
+            alarm_phrase("tv-staging-disk-used-high"),
+            alarm_phrase("tv-prod-disk-used-high")
         );
     }
 
@@ -1923,14 +1791,14 @@ mod tests {
     fn test_ok_flip_single_line_recovered() {
         let mut cache = HashMap::new();
         let texts = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(texts.len(), 1);
         assert!(!texts[0].contains('\n'));
         assert!(texts[0].starts_with("✅ Recovered: "));
-        assert!(texts[0].contains("Server CPU has been very high for 5 minutes"));
+        assert!(texts[0].contains("Server disk is almost full"));
         assert!(ist_12h_re().is_match(&texts[0]));
     }
 
@@ -1939,8 +1807,8 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
-                alarm("tv-prod-cpu-high-5min", "OK"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
+                alarm("tv-prod-disk-used-high", "OK"),
             ],
             1_000_000.0,
             &mut cache,
@@ -1956,8 +1824,8 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "OK"),
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-disk-used-high", "OK"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
             ],
             1_000_000.0,
             &mut cache,
@@ -1971,16 +1839,16 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "OK"),
-                alarm("tv-prod-mem-used-high", "OK"),
+                alarm("tv-prod-disk-used-high", "OK"),
+                alarm("tv-prod-spill-dir-free-low", "OK"),
             ],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(texts.len(), 1);
         assert!(texts[0].starts_with("✅ Recovered: "));
-        assert!(texts[0].contains("Server CPU has been very high for 5 minutes"));
-        assert!(texts[0].contains("Server memory is almost full"));
+        assert!(texts[0].contains("Server disk is almost full"));
+        assert!(texts[0].contains("Disk space is nearly gone"));
     }
 
     #[test]
@@ -1988,7 +1856,7 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
                 alarm("tv-prod-questdb-disconnected", "ALARM"),
             ],
             1_000_000.0,
@@ -2004,7 +1872,7 @@ mod tests {
     fn test_alarm_never_suppressed_by_warm_cache() {
         let mut cache = HashMap::from([
             (
-                "tv-prod-cpu-high-5min".to_string(),
+                "tv-prod-disk-used-high".to_string(),
                 ("ALARM".to_string(), 999_999.0, 1),
             ),
             (
@@ -2014,7 +1882,7 @@ mod tests {
         ]);
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
                 alarm("tv-prod-questdb-disconnected", "ALARM"),
             ],
             1_000_000.0,
@@ -2030,20 +1898,20 @@ mod tests {
     fn test_repeat_ok_within_window_is_suppressed() {
         let mut cache = HashMap::new();
         let first = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(first.len(), 1);
         let repeat = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0 + 30.0,
             &mut cache,
         );
         assert!(repeat.is_empty());
         // Past the window the OK flows again.
         let later = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0 + OK_REPEAT_SUPPRESS_SECS + 1.0,
             &mut cache,
         );
@@ -2074,8 +1942,8 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
-                alarm("tv-prod-mem-used-high", "OK"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
+                alarm("tv-prod-spill-dir-free-low", "OK"),
                 json!({"Sns": {"Subject": "DLT deploy OK", "Message": "commit=abc ref=main"}}),
             ],
             1_000_000.0,
@@ -2312,7 +2180,7 @@ mod tests {
         let (result, posted) = invoke(vec![
             alarm("tv-prod-ws-no-alive-connections", "ALARM"),
             alarm_record(
-                "tv-prod-cpu-high-5min",
+                "tv-prod-disk-used-high",
                 "ALARM",
                 "9999-12-31T23:59:59+00:00",
             ),
@@ -2329,7 +2197,7 @@ mod tests {
         // The edge-dated alarm still pages (degraded timestamp, not dropped).
         let poisoned: Vec<&String> = posted
             .iter()
-            .filter(|t| t.contains("Server CPU has been very high for 5 minutes"))
+            .filter(|t| t.contains("Server disk is almost full"))
             .collect();
         assert_eq!(poisoned.len(), 1);
         assert!(poisoned[0].starts_with("🆘"));
@@ -2491,16 +2359,20 @@ mod tests {
         // 2nd and later pages of ONE ongoing episode get the short render.
         let mut cache = HashMap::new();
         let first = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(first.len(), 1);
-        assert!(first[0].starts_with("🆘 Server CPU"), "got: {:?}", first[0]);
+        assert!(
+            first[0].starts_with("🆘 Server disk"),
+            "got: {:?}",
+            first[0]
+        );
         assert!(!first[0].contains("Still down"));
 
         let second = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0 + 60.0,
             &mut cache,
         );
@@ -2514,7 +2386,7 @@ mod tests {
         assert!(!second[0].contains('\n'), "the repeat render is ONE line");
 
         let third = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0 + 120.0,
             &mut cache,
         );
@@ -2536,7 +2408,7 @@ mod tests {
         let mut cache = HashMap::new();
         for tick in 0..4 {
             let out = fold_records(
-                &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+                &[alarm("tv-prod-disk-used-high", "ALARM")],
                 1_000_000.0 + f64::from(tick) * 30.0,
                 &mut cache,
             );
@@ -2568,12 +2440,12 @@ mod tests {
     fn test_alarm_outside_the_coalesce_window_starts_a_fresh_full_page() {
         let mut cache = HashMap::new();
         fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0,
             &mut cache,
         );
         let later = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0 + ALARM_REPEAT_COALESCE_SECS + 1.0,
             &mut cache,
         );
@@ -2591,22 +2463,22 @@ mod tests {
         // operator experiences as a new failure.
         let mut cache = HashMap::new();
         fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0,
             &mut cache,
         );
         fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0 + 30.0,
             &mut cache,
         );
         fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0 + 60.0,
             &mut cache,
         );
         let re_alarm = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0 + 90.0,
             &mut cache,
         );
@@ -2624,12 +2496,12 @@ mod tests {
         // unknown mid-episode would be labelled as more of the same.
         let mut cache = HashMap::new();
         fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "ALARM")],
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
             1_000_000.0,
             &mut cache,
         );
         let unknown = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "INSUFFICIENT_DATA")],
+            &[alarm("tv-prod-disk-used-high", "INSUFFICIENT_DATA")],
             1_000_000.0 + 30.0,
             &mut cache,
         );
@@ -2683,7 +2555,7 @@ mod tests {
     #[test]
     fn test_repeat_alarm_line_is_one_line_and_names_the_page_number() {
         let inner = json!({
-            "AlarmName": "tv-prod-cpu-high-5min",
+            "AlarmName": "tv-prod-disk-used-high",
             "NewStateValue": "ALARM",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         });
@@ -2714,7 +2586,7 @@ mod tests {
 
         // It carries the same plain-English phrase the full page used, so the
         // repeat is recognisable as the SAME incident.
-        assert!(line.contains("CPU"), "got: {line:?}");
+        assert!(line.contains("disk"), "got: {line:?}");
     }
 
     #[test]

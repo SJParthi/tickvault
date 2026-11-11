@@ -119,13 +119,21 @@ fn user_data_carries_no_second_copy_of_the_selector() {
          otherwise the file is written and the running agent never reads it"
     );
 
-    // The fallback must keep the signals the budget and disk alarms read — a
-    // fallback that reports nothing is the same as no fallback.
-    for measurement in ["used_percent", "mem_used_percent", "cpu_usage_active"] {
+    // The fallback must keep the signal the disk alarm reads — a fallback
+    // that reports nothing is the same as no fallback. Memory and CPU left on
+    // 2026-11-11 (operator Quote 53, "Trim CloudWatch metrics"): no kept alarm
+    // reads them (docs/audits/2026-11-alarm-review.md), and nothing here may
+    // bring them back without an alarm that reads them.
+    assert!(
+        boot.contains("used_percent"),
+        "the host-only fallback must still collect `used_percent` — it is what the \
+         disk alarm reads when the clone has failed"
+    );
+    for gone in ["mem_used_percent", "cpu_usage_active"] {
         assert!(
-            boot.contains(measurement),
-            "the host-only fallback must still collect `{measurement}` — it is what the \
-             budget guard and the disk alarms read when the clone has failed"
+            !boot.contains(&format!("\"{gone}\"")),
+            "the host-only fallback ships `{gone}` again, which no kept alarm reads \
+             (Quote 53: CloudWatch receives only what an alarm reads)"
         );
     }
 }
@@ -199,7 +207,9 @@ fn resource_block_extractor_is_bounded_at_own_closing_brace() {
     // after the alarm's own lines were deleted.
     let root = repo_root();
     let tf = read(&root.join("deploy/aws/terraform/app-alarms.tf"));
-    for block_name in ["questdb_disconnected", "disk_watcher_respawn"] {
+    // disk_watcher_respawn was the second sample until 2026-11-11, when the
+    // operator Quote 53 alarm review removed it; spill_dir_free_low replaces it.
+    for block_name in ["questdb_disconnected", "spill_dir_free_low"] {
         let block = resource_block(&tf, block_name);
         assert_eq!(
             block

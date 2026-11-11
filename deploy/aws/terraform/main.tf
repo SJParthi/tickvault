@@ -765,13 +765,20 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
   }
 
   # Raw capture-at-receipt WAL segments (ITEM 45e uploads them here). They are
-  # read back only to rebuild a day, so they go straight to Deep Archive after
-  # 30 days. This rule overlaps the one above on the same day; when two
-  # transitions to different classes fall due together, S3 takes the one with
-  # the lower storage cost, i.e. Deep Archive (Assumed from the AWS lifecycle
-  # documentation; not observed on this bucket yet).
+  # read back only to rebuild a day. Operator Quote 53 (2026-11-11, card
+  # "Cheaper S3 class for old raw frames (Recommended)"): after 30 days they
+  # move to S3 Glacier Instant Retrieval, readable at once, current and
+  # noncurrent versions alike; nothing is deleted or expired. Until Quote 53
+  # this rule sent them to Deep Archive (cheaper per GB, but a 12-hour restore
+  # before a read). An object already in Deep Archive stays there: lifecycle
+  # cannot move an object back up to Glacier IR. This rule overlaps the
+  # catch-all rule above on day 30; when two transitions to different classes
+  # fall due together, S3 takes the lower-cost class, which here is Glacier IR
+  # (Assumed from the AWS lifecycle documentation; not observed on this bucket
+  # yet). `questdb-partitions/` (the ticks and candles brutex reads) gets no
+  # rule of its own under Quote 53.
   rule {
-    id     = "raw-frames-deep-archive"
+    id     = "raw-frames-glacier-ir"
     status = "Enabled"
 
     filter {
@@ -780,12 +787,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
 
     transition {
       days          = 30
-      storage_class = "DEEP_ARCHIVE"
+      storage_class = "GLACIER_IR"
     }
 
     noncurrent_version_transition {
       noncurrent_days = 30
-      storage_class   = "DEEP_ARCHIVE"
+      storage_class   = "GLACIER_IR"
     }
   }
 }
@@ -796,4 +803,35 @@ resource "aws_s3_bucket_public_access_block" "tv_cold" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+# ---------------------------------------------------------------------------
+# Quote 53 date gate (2026-11-11). The owner authorized the alarm review
+# (docs/audits/2026-11-alarm-review.md), the metric trim and the dashboard
+# delete "FROM DECEMBER". terraform-apply.yml applies on every push to main
+# that touches this directory and again on its weekday retries, so merging
+# this change in November would apply it in November. This precondition
+# refuses any plan made before 2026-12-01 00:00 IST (2026-11-30 18:30 UTC):
+# the apply job fails with the message below and nothing changes in AWS.
+#
+# plantimestamp() is the time the plan was made (known at plan time, Terraform
+# 1.5+); `terraform validate` sees it as unknown, so validation still passes.
+# Honest cost: while the gate holds, EVERY terraform apply fails, not only the
+# Quote 53 part, and each failed run reports itself. Merge on or after
+# 1 December to avoid that. Delete this block in the first change after
+# 2026-12-01. Pinned by crates/common/tests/quote53_alarm_review_cover_guard.rs.
+#
+# This gate covers ONLY the terraform half. The metric trim in
+# deploy/aws/cloudwatch-agent.json reaches the box through deploy-aws.yml and
+# the morning boot copy, with no terraform in the path; test 9 of the same
+# guard fails the build while that trimmed file is in the tree before
+# 2026-12-01 00:00 IST (same quote53_early_apply_approved switch).
+# ---------------------------------------------------------------------------
+resource "terraform_data" "quote53_not_before_december" {
+  lifecycle {
+    precondition {
+      condition     = var.quote53_early_apply_approved || timecmp(plantimestamp(), "2026-11-30T18:30:00Z") >= 0
+      error_message = "Quote 53 (alarm cuts, metric trim, dashboard delete) may be applied only on or after 1 December 2026 IST. Wait until then, or record the owner's dated go-ahead under Quote 53 and set the quote53_early_apply_approved default to true in the same change."
+    }
+  }
 }

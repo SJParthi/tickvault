@@ -95,7 +95,10 @@ const LOG_LOOKAHEAD_LINES: usize = 12;
 const LOG_LOOKBEHIND_LINES: usize = 24;
 
 /// Counters that are neither shipped nor logged, each with the reason it is
-/// tolerated. **This list may only SHRINK.**
+/// tolerated. **This list may only SHRINK** — with ONE dated exception:
+/// on 2026-11-11 operator Quote 53 ("Trim CloudWatch metrics") took eight loss
+/// counters off CloudWatch because no kept alarm reads them; their rows say
+/// "operator Quote 53" and they stay on the box's local /metrics.
 ///
 /// Adding a row is a deliberate act that needs a reason a reviewer can check.
 /// Removing one means the counter became reachable — the direction of travel.
@@ -120,6 +123,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     // no longer applies. The exemption was written when the counter was
     // unreachable from CloudWatch; it stayed while the counter recorded a
     // 2.4%-of-every-tick hard refusal that nobody could see. It ships now.
+    (
+        "tv_aggregator_tick_refused_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. The rows are still written; only the candle bucket is refused.",
+    ),
     (
         "tv_candle_rows_out_of_window_refused_total",
         "logged, and the guard cannot see it — same const -> struct field -> method chain as the two rows below and as tv_dhan_feed_ingest_seq_refused_total. The emit is `counter.increment(1)` on a pre-resolved handle held in a CandleOutOfWindowCounters field; the throttled `warn!` (code=STORAGE-GAP-01, powers of two) sits on the next lines of the same `note()` body. VERIFIED 2026-09-05 by running this guard, not by reading the code. Carries NO `feed` label, unlike its tick and depth siblings: ShadowCandleWriter is feed-agnostic and `row.feed` varies per row, so a per-row labelled handle would drop `metrics::counter!` to its allocating arm on the seal path — the record_ws_lag class of defect, which cost 36M allocations/hour the last time it shipped. NOT EMF-shipped, deliberately: this counter measures the gate WORKING, so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note. This change carries no lever.",
@@ -147,6 +154,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "NOT A LOSS COUNTER (added 2026-10-02 with the main-feed backup copies, scope lock 2026-10-02). It counts the SECOND copy of a packet the drain already folded from the contract's other socket (reason=identical). Since audit M2 (2026-10-04) a copy older than one already folded is no longer dropped: it is kept and counted on tv_dhan_feed_backup_late_accepted_total. The data it measures is held, not lost: the first copy is folded and stored, and the WAL keeps both copies as raw frames. Shipping it would bill a healthy duplicate rate as if it were loss; the matching signal for a socket that stops is tv_dhan_feed_backup_only_arrivals_total.",
     ),
     (
+        "tv_dhan_feed_ingest_refused_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. It was charted only on the deleted CloudWatch dashboard.",
+    ),
+    (
         "tv_dhan_feed_ingest_seq_refused_total",
         "logged — the emit is counters().ingest_seq_refused, three levels of indirection from the literal (const -> struct field -> method), and the error! sits directly beside it; the scanner cannot follow that chain (verified 2026-08-12)",
     ),
@@ -165,6 +176,18 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     // `option_chain_1m_persistence.rs` in the same deletion. (The Groww FEED
     // itself was retired 2026-08-21; this row outlived it because the writer
     // was feed-generic and survived until now.)
+    (
+        "tv_dhan_feed_seals_dropped_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A candle that is truly lost is still paged by the seal-writer-dropped and AGGREGATOR-DROP-01 pages.",
+    ),
+    (
+        "tv_dhan_feed_seq_refused",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A gauge of refused sequence numbers; it was charted on the deleted dashboard only.",
+    ),
+    (
+        "tv_dhan_ws_dial_failed_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A socket that never comes back is paged by the socket-parked and no-live-sockets pages.",
+    ),
     (
         "tv_groww_contract1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
@@ -196,6 +219,14 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     // REMOVED 2026-10-05: `tv_tf_verify_audit_rows_discarded_total` is forwarded whole by a loss-group log
     // metric filter (noise lock §2.10), so it now reaches an operator.
     (
+        "tv_seal_escalation_lost_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A candle that is truly lost is still paged by the seal-writer-dropped and AGGREGATOR-DROP-01 pages.",
+    ),
+    (
+        "tv_seal_spill_write_errors_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. The API speed/health handler also reads it from local /metrics.",
+    ),
+    (
         "tv_ticks_out_of_window_refused_total",
         "logged, and the guard cannot see it — VERIFIED 2026-09-05 by running this guard, not by reading the code. The emit is `counter.increment(1)` on a pre-resolved `metrics::Counter` held in an `OutOfWindowCounters` struct field, and the throttled `warn!` (code=STORAGE-GAP-01) sits on the next lines of the same `note()` body. That is the const -> struct field -> method chain already allowlisted above for tv_dhan_feed_ingest_seq_refused_total: the scanner follows a const NAME alias and a local `let h = metrics::counter!(..)` handle, but not this one, so it judges proximity at `tick_out_of_window_counters` — where no log sits — instead of at `note()`. That function exists so the const is named exactly ONCE outside its declaration: spelled at the three struct-literal sites it sat nine lines above the `error!` in the ILP-connect failure arm, and this guard passed the counter on the strength of a log about a completely different event. An accidental pass retires the question without answering it, which is worse than a recorded exemption. The handles are pre-resolved because the macro form allocated ONCE PER TICK on the drain task (DHAT measured 10,010 blocks over 10,000 ticks against a ceiling of 500, CI-caught 2026-09-05); the all-literal macro form is allocation-free and passes this guard, and was rejected because it cannot carry the `feed` label that every sibling loss counter carries and that the pluggable-feed contract needs. NOT EMF-shipped, deliberately: this counter measures the gate WORKING (outside 09:00-15:39:59 IST every tick increments it), so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note.",
     ),
@@ -206,6 +237,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     (
         "tv_wal_shed_frames_lost_total",
         "double-billed, and logged — added 2026-10-04 (audit M1). The emit is a pre-resolved handle in wal_frame_fate::FateCounters (const -> struct field -> cold fn), which this scanner cannot follow; the coded `error!` (code=WS-SPILL-02, throttled by refusal_line_due) sits in the same `record_shed_loss` body, and WS-SPILL-02 has a CloudWatch log-filter alarm at threshold 1 (error-code-alarms.tf). For shed=ring the same increment also moves tv_ticks_lost_total{source=wal_lost_after_shed}, which IS in the EMF selector and alarmed (live-lane-alarms.tf), so shipping this name too would bill one loss twice for ~0.30 USD/mo. shed=drain_depth (depth rows, not ticks) reaches the operator through the WS-SPILL-02 line only.",
+    ),
+    (
+        "tv_wal_suspension_probe_failed_total",
+        "local /metrics only since 2026-11-11: operator Quote 53 (card \"Trim CloudWatch metrics\") ships to CloudWatch only the metrics an alarm reads, and no kept alarm reads this one (docs/audits/2026-11-alarm-review.md). It was EMF-shipped before that and is still registered on the box's local /metrics. A QuestDB that is down is still paged by questdb-disconnected.",
     ),
 ];
 

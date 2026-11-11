@@ -197,6 +197,26 @@ fn the_deaf_socket_alarm_is_gated_even_though_it_is_not_breaching() {
     let block_end = tail.find("])").expect("ALARM_NAMES must be a join() list");
     let list = &tail[..block_end];
 
+    // 2026-11-11: operator Quote 53 removed this alarm (row in
+    // docs/audits/2026-11-alarm-review.md; the 1% silent-instrument page,
+    // RISK-GAP-03, still covers a deaf socket). If it comes back, every check
+    // below applies to it again unchanged.
+    let lane_now = code_only(LIVE_LANE);
+    if !lane_now.contains(r#"resource "aws_cloudwatch_metric_alarm" "dhan_worst_socket_deaf""#) {
+        let review = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/audits/2026-11-alarm-review.md"),
+        )
+        .expect("the Quote 53 alarm review must be readable"); // APPROVED: test
+        assert!(
+            review.contains("`tv-<env>-dhan-worst-socket-deaf`")
+                && !list.contains("dhan_worst_socket_deaf"),
+            "the deaf-socket alarm is gone: it needs its REMOVE row in the alarm \
+             review and no leftover gate reference"
+        );
+        return;
+    }
+
     assert!(
         list.contains("dhan_worst_socket_deaf"),
         "`dhan_worst_socket_deaf` must appear INSIDE the gate's ALARM_NAMES \
@@ -317,9 +337,11 @@ fn all_terraform_sources() -> Vec<String> {
 #[test]
 fn every_gate_listed_alarm_ships_disarmed() {
     let members = gate_members(GATE);
+    // Floor 10 -> 5 on 2026-11-11: the operator Quote 53 alarm review left five
+    // members (liveness, app log shipping, lane down, no ticks, no sockets).
     assert!(
-        members.len() >= 10,
-        "expected at least ten gate members, parsed {} ({members:?}). A broken parser \
+        members.len() >= 5,
+        "expected at least five gate members, parsed {} ({members:?}). A broken parser \
          reporting zero members would make this guard pass vacuously.",
         members.len()
     );

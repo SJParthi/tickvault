@@ -62,6 +62,8 @@ const LOG_ONLY_CODES: &[&str] = &[
     "DH-909",
     "DH-910",
     "DHAN-LIVE-XVERIFY-01",
+    // DISK-WATCHER-01: its alarm left 2026-11-11 (operator Quote 53 alarm review).
+    "DISK-WATCHER-01",
     "DRAIN-HOLD-01",
     "EXIT-ORDER-01",
     "EXIT-VERIFY-01",
@@ -122,6 +124,8 @@ const LOG_ONLY_CODES: &[&str] = &[
     "TELEGRAM-03",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
+    // TICK-FLUSH-01: its alarm left 2026-11-11 (operator Quote 53 alarm review).
+    "TICK-FLUSH-01",
     "TICK-GAP-01",
     "WS-GAP-01",
     "WS-GAP-04",

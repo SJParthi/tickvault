@@ -73,28 +73,8 @@
 # only caller — export / upload / verify / drop / s3_conflict), so nothing
 # successful is folded in. That is NOT true of every counter — see the two
 # EXCLUDED counters documented at the bottom of this file.
-resource "aws_cloudwatch_metric_alarm" "partition_archive_failed" {
-  alarm_name        = "tv-${var.environment}-partition-archive-failed"
-  alarm_description = "RETENTION IS NOT FREEING DISK. The archive->verify->drop pass failed - the partition stayed on disk and nothing else reclaims space. Live state 2026-08-25: partition_archive_audit held 1,000 rows, ALL outcome='s3_conflict', zero successes ever; oldest ticks 2026-06-02 on a 1-day hot window; root volume 86%. DO: (1) SELECT outcome, count() FROM partition_archive_audit WHERE ts > dateadd('d',-1,now()) - the outcome names the stage. (2) s3_conflict means the object already exists with different content: check the cold bucket key and whether a prior half-run left a partial object. (3) export/upload/verify failures point at S3 creds, bucket policy or the ILP client. (4) Nothing is dropped without a verified S3 copy, so a failure is safe-but-stuck, never data loss. Runbook: docs/runbooks/may31-inplace-upgrade-and-access.md"
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  datapoints_to_alarm = 1
-  metric_name         = "tv_partition_archive_failed_total"
-  namespace           = local.app_namespace
-  period              = 900
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = local.app_alarm_actions
-  # NO ok_actions. Deltas returning to zero means the pass ENDED, never that it
-  # succeeded - the partitions it failed to archive are still on the disk. An OK
-  # page here would read as "retention is working again" (Rule 11, no false
-  # recovery). The real recovery signal is a success row in
-  # partition_archive_audit and disk_used_percent falling.
-  ok_actions = []
-}
+# alarm "partition_archive_failed" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 # ---------------------------------------------------------------------------
 # 2. MARKET-DATA ROWS DID NOT REACH QUESTDB — one composite over FIVE counters
@@ -410,7 +390,7 @@ resource "aws_cloudwatch_metric_alarm" "durable_floor_breach" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "wal_suspension_probe_blind" {
   alarm_name          = "tv-${var.environment}-wal-suspension-probe-blind"
-  alarm_description   = "WAL-SUSPENSION MONITORING IS BLIND. The per-table wal_tables() probe has failed for several consecutive polls, so the suspended-tables gauge is reporting UNKNOWN (-1) rather than a stale reading. Tables may be WAL-suspended right now with nothing able to say so - ILP keeps ACKing rows while they stop becoming visible. DO: (1) df -h /data first, a full volume causes both this and real suspensions; (2) check QuestDB answers http://127.0.0.1:9000/exec; (3) once it answers, the gauge returns to a live count on the next poll and the WAL-SUSPEND-01 filter resumes paging on real suspensions. Runbook: docs/error-runbooks/wal-suspension-error-codes.md"
+  alarm_description   = "WAL-SUSPENSION MONITORING IS BLIND. The per-table wal_tables() probe has failed for several consecutive polls, so the suspended-tables gauge is reporting UNKNOWN (-1) rather than a stale reading. Tables may be WAL-suspended right now with nothing able to say so - ILP keeps ACKing rows while they stop becoming visible. DO: (1) df -h /data first, a full volume causes both this and real suspensions; (2) check QuestDB answers http://127.0.0.1:9000/exec; (3) once it answers, the gauge returns to a live count on the next poll and tv-${var.environment}-questdb-wal-suspended resumes paging on real suspensions. This is the only page for a blind probe since the 2026-11-11 Quote 53 review removed questdb-wal-probe-failed and the WAL-SUSPEND-01 filter. Runbook: docs/error-runbooks/wal-suspension-error-codes.md"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 1
   metric_name         = "tv_questdb_wal_suspended_tables"

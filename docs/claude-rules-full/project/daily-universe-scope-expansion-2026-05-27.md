@@ -3082,14 +3082,14 @@ After the squeeze table (plan as decided ~$70–75; free spend lookups, dead ala
 | Spend lookups | The guard, digest and console read month-to-date spend from the free AWS Budgets API instead of paid Cost Explorer calls. |
 | Alarms and metrics for switched-off or removed features (depth, top_volume, 3 s/5 s candles) | Removed, each in the same change as its feature, with the noise-lock row that names it. |
 | Alarm count 127 → about 60 | Allowed after a written per-alarm review; each removal names the alarm, what it watched, and which remaining alarm covers that failure. The paging families in `dhan-rest-only-noise-lock-2026-07-14.md` are kept unless that file records the removal first. |
-| CloudWatch dashboard | **Kept** (the owner excluded it). |
+| CloudWatch dashboard | **Kept** (the owner excluded it). *(⚠ REVERSED 2026-11-11 by Quote 53, card "Delete the CloudWatch dashboard": the dashboard is deleted; see Quote 53 below.)* |
 | Daily stop | 17:30 → **16:30 IST** (the owner allowed 16:00 or 16:30; 16:30 keeps the 15:44 cross-verification inside the run). The Quote 31 same-day drain hold still keeps the box up past the stop while the day's data is not saved; the cross-verification end bound and the stop-check move with the stop. Start stays 08:30 IST. |
 
 **Honest limits, stated to the owner:** the estimate under $75 assumes the squeeze rows above land before 1 November. If they do not, a normal November is about $70–75, so a $75 line could stop the server in the last days of the month. A month that reaches $75 switches the server off for the rest of that month.
 
 ##### What violates Quote 37 (REJECT)
 - A November-or-later line above $75 without a fresh dated quote, or a native stop below $170 before 1 November 2026.
-- Deleting the CloudWatch dashboard under this quote.
+- Deleting the CloudWatch dashboard under this quote. *(Quote 53, 2026-11-11, authorizes the deletion; this row binds Quote 37 only.)*
 - Removing an alarm without the per-alarm review row, or a noise-lock paging family without that file's dated edit first.
 - A daily stop earlier than 16:30 IST, or one that ignores the same-day drain hold.
 
@@ -3492,3 +3492,15 @@ Estimate (Assumed, extrapolated from Cost Explorer 1–11 Nov 2026 with the Quot
 - Removing a metric from the box's local `/metrics`, or shipping fewer metrics than the alarms read.
 - Any S3 `expiration`, `noncurrent_version_expiration`, delete or versioning change; a transition of `questdb-partitions/`, `deploys/`, `instrument-snapshots/` or `logs/`; Glacier Flexible or Deep Archive for anything brutex reads.
 - A stop line below $75 or a change to instance, disk, IOPS, throughput or depth under Quote 53.
+
+##### Quote 53 build note (2026-11-11)
+
+Built per `docs/audits/2026-11-alarm-review.md`: 37 alarms removed, 82 kept in prod (the first draft removed 44; its reviews put back seven that were the only page for, or the only watcher of, a KEPT failure, see the review's "Corrections" section) (the KEPT list above holds more than 30 pages; the review lists which kept alarms only a broad reading keeps, for the owner to decide); 63 EMF names, the class series and two host metrics left CloudWatch (every one stays on local `/metrics`); the dashboard and its output are deleted; the `raw-frames/` rule now moves current and noncurrent versions to Glacier Instant Retrieval after 30 days. "FROM DECEMBER" is enforced in two places, because the change has two delivery paths. Terraform: `terraform_data.quote53_not_before_december` (main.tf) refuses any plan made before 2026-12-01 00:00 IST. The metric trim: `deploy-aws.yml` and every morning boot copy `deploy/aws/cloudwatch-agent.json` to the box with no terraform in the path, so the terraform gate cannot hold it (corrected 2026-11-11 by the second review: the first build note said "a November merge cannot apply it", which was false for the metric half); instead test 9 of `crates/common/tests/quote53_alarm_review_cover_guard.rs` fails the build while the trimmed agent config is in the tree before that instant, so this change cannot merge before 1 December. The only early path for either half is the owner's dated go-ahead recorded here with the `quote53_early_apply_approved` default set true in the same change. **Risk:** while the gate holds every terraform apply fails, not only this change, so merge on or after 1 December. **Risk recorded for the owner:** that rule sent `raw-frames/` to Deep Archive before, which is cheaper per GB (but needs a 12-hour restore), so this lever makes raw frames readable at once and costs a little more, not less. And the bucket-wide tiering rule (since 2026-09-29) already moves `questdb-partitions/` to Intelligent-Tiering at 30 days and Glacier Instant Retrieval at 365 days, so it is not STANDARD today; Quote 53 authorizes no change to that rule, so it is unchanged.
+
+##### Quote 53 early go-ahead (2026-11-11, ~16:55 IST, decision card, preserve EXACTLY)
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "The December cost cuts (alarms 93 → about 30, only alarm-read numbers sent to CloudWatch, CloudWatch dashboard deleted, old raw frames to a cheaper S3 shelf) are built, reviewed and tested. They are locked until 1 December because you said 'from December'. Apply them now in November instead?" | **"Apply now (Recommended)"** | "Merge after the replay-alarm fix and the waste check; goes live after tomorrow's close. Saves money in November too. All data-loss, feed-down, token, budget and disk/database pages are kept." |
+
+**What this changes, and nothing else:** `quote53_early_apply_approved` defaults to `true` in `deploy/aws/terraform/variables.tf`, so the terraform date gate and test 9 of `quote53_alarm_review_cover_guard.rs` let the Quote 53 change merge and apply in November. Every other Quote 53 row and REJECT stands; the $90 November line (Quote 52) and the $62 December line (Quote 54) are unchanged. Honest note: the build removed 37 alarms and kept 82, not "about 30"; the review lists which kept alarms only a broad reading of the KEPT list holds, for the owner to decide later.

@@ -11,7 +11,7 @@
 |---|---|---|---|---|
 | 1 | Telegram `BootReadyConfirmation` arrived | Telegram chat | Single Severity::Info message dated today's IST date | Section A below |
 | 2 | All 4 boot gates green | Same Telegram thread | `static_ip ✓ instance_lock ✓ clock_skew ✓ questdb_ready ✓` | Section B below |
-| 3 | CloudWatch operator-health dashboard | CloudWatch console → Dashboards → operator-health | All 7 health widgets green; no firing alarms | Section C below |
+| 3 | CloudWatch operator-health dashboard | CloudWatch console → Dashboards → operator-health | All 7 health widgets green; no firing alarms (⚠ from December 2026, operator Quote 53, the dashboard is deleted: open the operator portal, `terraform output operator_portal_url`, and CloudWatch → Alarms; pass = no firing alarms) | Section C below |
 | 4 | Main feed SIDs subscribed | CloudWatch "Main feed subscription count" widget | `tv_main_feed_subscribed_total` matches the expected universe size | Section D below |
 | 5 | `previous_close` table populated for today | QuestDB | `SELECT count(*) FROM previous_close WHERE trading_date_ist = today()` returns ≥ 200 rows | Section E below |
 
@@ -69,6 +69,8 @@ present in the same Telegram thread.
     boot will auto-pass.
 
 ## Section C — CloudWatch dashboard widget red
+
+> ⚠ From December 2026 (operator Quote 53, `docs/audits/2026-11-alarm-review.md`) the CloudWatch dashboard is deleted. Use the operator portal and CloudWatch → Alarms; the text below applies only while it still exists.
 
 > The local Grafana operator-health dashboard was retired in the
 > CloudWatch-only migration (#O1, 2026-05-19). Operator visualization now

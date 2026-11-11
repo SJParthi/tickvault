@@ -5174,6 +5174,8 @@ reached nobody.
 - Opens earlier than session start + 20 minutes, or types the session times in
   terraform without the same change in `config/base.toml`.
 
+**Note (2026-11-11, operator Quote 53 alarm review, §2.20):** two of the three did-it-run alarms named above (`deploy-watchdog-not-invoked`, `market-open-readiness-not-invoked`) were removed, so they are no longer in `ALARM_NAMES` and the Muhurat open skips only `boot-heartbeat-gate-not-invoked`, which the review KEPT (it watches the gate that arms the kept `boot-heartbeat-missing`). The rows above still bind: every did-it-run alarm in `ALARM_NAMES` must be in the open's `skip_alarms`, and a skip list naming a removed alarm is a terraform error, not a fix.
+
 ## §2.16 — 2026-11-06: two pages made quieter (`questdb-disconnected`, `RISK-GAP-03`; no new page)
 
 **The owner's decision (2026-11-06 decision card, option label verbatim):**
@@ -5385,3 +5387,22 @@ editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
 | Unchanged | The scan, both gauges (`tv_dhan_feed_instruments_silent`, `..._never_ticked`), the 2-scan confirmation, the 30-minute page cooldown, the session gate, the dead-class and detector-blind reports, the alarm itself |
 
 **REJECT (§2.19):** a page for fewer quiet instruments than the 1% floor; dropping the never-ticked page; removing or narrowing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated owner quote.
+
+## §2.20 — 2026-11-11: the Quote 53 alarm review removes pages from these families (no new page)
+
+**Owner, 2026-11-11 (operator Quote 53, recorded in `daily-universe-scope-expansion-2026-05-27.md`):** on the card "which of these may I do from December?" the owner ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard". Quote 53 requires a removed alarm in a family recorded here to have this file's dated edit in the same change; this section is that edit. Every removal has its row (what it watched, what still covers it) in `docs/audits/2026-11-alarm-review.md`.
+
+| Family (this file) | Alarms removed | Still covered by |
+|---|---|---|
+| §2.3 live-lane integrity | `dhan-ring-dwell-high`, `tick-spill-replay-failing`, `ticks-spilling`, `seal-writer-rescued`, `wal-catchup-budget-exhausted`, `wal-replay-restore-failed`, `aggregator-refusal-rate-high`, `preopen-ready-late` | The lane-down, socket-parked, ticks-dropped, ring-full and other data-loss pages, all kept |
+| §2.3f / §2.3g / §2.3h watchers and QuestDB | `deploy-watchdog-errors`, `deploy-watchdog-not-invoked`, `market-open-readiness-errors`, `market-open-readiness-not-invoked`, `questdb-wal-apply-lag`, `questdb-wal-probe-failed`, `disk-fill-rate-high`, `disk-watcher-respawn` | `boot-heartbeat-missing` (its gate keeps both its alarms: `boot-heartbeat-gate-errors` and `boot-heartbeat-gate-not-invoked`, not removed), `market-hours-liveness-missing` (its gate keeps both its alarms), `questdb-disconnected`, `questdb-wal-suspended` with its blind detector `wal-suspension-probe-blind` (kept), `disk-used-high`, `spill-dir-free-low` |
+| §2.3p / §2.3q | `errcode-resource-02`, `errcode-scoreboard-01` | `errcode-proc-01` (the kill itself); `audit-rows-lost` for the raw audit rows |
+| §2.6 | `dhan-feed-delay-high`, `dhan-main-reconnect-slow` | Delay is not loss; a socket that does not come back is paged by `dhan-socket-parked` and `ws-no-alive-connections` |
+| §2.9 | `disk-kept-not-backed-up`, `feed-thread-wrote-to-disk` | `cold-backup-failing` and the disk-full pages; `errcode-hot-path-stall-01` |
+| §2.13 | `dhan-worst-socket-deaf` | `errcode-risk-gap-03` (1% floor, §2.19) |
+
+**Not removed (2026-11-11, review of the first draft):** the first draft also removed five alarms that are the only page for a failure on the Quote 53 KEPT list; they stay: `errcode-stream-silent` with its two schema filters (§2.3s: `app-log-ingestion-silent` cannot see errors.jsonl alone stop, so every KEPT `$.code` page would go dark), `live-universe-fallback` (it also counts `truncated_to_capacity`, `artifact_unreadable`, `artifact_unparseable` and `no_usable_widening`, which the universe-collapse filter does not match), `tick-spill-quarantined` (a whole quarantined tick file is missing from QuestDB), `wal-suspension-probe-blind` (the only blind detector left for `questdb-wal-suspended`) and `deploy-provenance-blind` (without it `binary-sha-stale` reads OK when it does not know, §2.3q). Each has its KEEP row in the review. A second review the same day put back two more: `boot-heartbeat-gate-errors` and `boot-heartbeat-gate-not-invoked` (the kept `boot-heartbeat-missing` ships disarmed and only that gate arms it, so without them a failing or dropped gate leaves it off unseen until the liveness page after 09:20 IST), and corrected one cover: `wal-replay-restore-failed` stays removed, but its failure is a data-loss path (the segment is archived unread) whose page is the coded `WS-SPILL-02` ERROR at the same site and the kept `errcode-ws-spill-02`, so that filter must not be narrowed by `source`.
+
+The coded log lines, counters and local `/metrics` of every removed alarm are unchanged; only the CloudWatch filter and alarm go. The §2.6, §2.9 and §2.13 rows that constrain these alarms stay in force for any future alarm of the same name.
+
+**REJECT (§2.20):** re-adding any alarm named above without a fresh dated owner quote recorded here first; removing any page this table names as the remaining cover; removing any of the seven alarms listed under "Not removed"; narrowing the `errcode-ws-spill-02` filter (for example by `source`) while `wal-replay-restore-failed` stays removed; using §2.20 to remove any other alarm.

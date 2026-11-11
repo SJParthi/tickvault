@@ -63,9 +63,27 @@ fn tf_resource_block(body: &str, resource_type: &str, resource_name: &str) -> St
     panic!("unbalanced braces in resource block {header}"); // APPROVED: test
 }
 
+/// Operator Quote 53 (2026-11-11) removed some alarms whose SHAPE this file
+/// pins. A removed alarm must carry its row in the dated alarm review; if it
+/// ever comes back, the shape checks below apply to it again unchanged.
+fn removed_under_quote_53(alarm_slug: &str) -> bool {
+    let review = read("docs/audits/2026-11-alarm-review.md");
+    review
+        .lines()
+        .any(|l| l.contains(&format!("`tv-<env>-{alarm_slug}`")) && l.contains("| REMOVE |"))
+}
+
 #[test]
 fn test_ebs_write_latency_alarm_uses_metric_math_per_op_latency() {
     let tf = read("deploy/aws/terraform/alarms.tf");
+    if !tf.contains("resource \"aws_cloudwatch_metric_alarm\" \"ebs_write_latency\"") {
+        assert!(
+            removed_under_quote_53("ebs-write-latency-high"),
+            "ebs_write_latency is gone from alarms.tf without a REMOVE row in \
+             docs/audits/2026-11-alarm-review.md"
+        );
+        return;
+    }
     let block = tf_resource_block(&tf, "aws_cloudwatch_metric_alarm", "ebs_write_latency");
 
     assert!(
@@ -100,6 +118,14 @@ fn test_ebs_write_latency_alarm_uses_metric_math_per_op_latency() {
 #[test]
 fn test_eventbridge_dlq_alarm_is_edge_triggered_on_new_arrivals() {
     let tf = read("deploy/aws/terraform/eventbridge-dlq.tf");
+    if !tf.contains("resource \"aws_cloudwatch_metric_alarm\" \"eventbridge_dlq_depth\"") {
+        assert!(
+            removed_under_quote_53("eventbridge-dlq-depth"),
+            "eventbridge_dlq_depth is gone without a REMOVE row in \
+             docs/audits/2026-11-alarm-review.md"
+        );
+        return;
+    }
     let block = tf_resource_block(&tf, "aws_cloudwatch_metric_alarm", "eventbridge_dlq_depth");
 
     assert!(

@@ -7,7 +7,7 @@
 
 ## ⭐ THE 5 LINKS YOU OPEN EVERY DAY
 
-1. 📊 **[LIVE DASHBOARD →](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator)** — every metric in one view
+1. 📊 **[LIVE DASHBOARD →](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator)** — every metric in one view (⚠ From December 2026 (operator Quote 53) this CloudWatch dashboard is deleted; use the operator portal (`terraform output operator_portal_url`) and Telegram.)
 2. 📜 **[LIVE LOGS →](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#logsV2:log-groups/log-group/$252Ftickvault$252Fprod$252Fapp/log-events)** — streaming, click "Start tailing"
 3. 🚨 **[ALARMS →](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarmFilter=ALARM)** — red = action needed
 4. 🚀 **[DEPLOYS →](https://github.com/SJParthi/tickvault/actions/workflows/deploy-aws.yml)** — every deploy run
@@ -19,7 +19,7 @@
 
 | Dashboard | URL |
 |---|---|
-| **Operator Overview** (custom, all metrics) | [open](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator) |
+| **Operator Overview** (custom, all metrics) | [open](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator) ⚠ From December 2026 (operator Quote 53) this CloudWatch dashboard is deleted; use the operator portal (`terraform output operator_portal_url`) and Telegram. |
 | **All Dashboards** | [open](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards:) |
 | **CloudWatch Overview** | [open](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#home:) |
 | **EC2 Instance Detail** | [open](https://ap-south-1.console.aws.amazon.com/ec2/home?region=ap-south-1#InstanceDetails:instanceId=i-0b956d0209231a48b) |
@@ -284,7 +284,7 @@ mcp__tickvault-logs__questdb_sql "SELECT count(*) FROM ticks WHERE ts > dateadd(
 # 🎯 DAILY 30-SECOND ROUTINE
 
 1. **Morning (08:30 IST):** Telegram should show "tickvault started Mode: LIVE" — if not, [check deploys](https://github.com/SJParthi/tickvault/actions/workflows/deploy-aws.yml)
-2. **Mid-day:** Glance at [Dashboard](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator) — all green?
+2. **Mid-day:** Glance at [Dashboard](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards/dashboard/tv-prod-operator) — all green? (⚠ From December 2026 (operator Quote 53) this CloudWatch dashboard is deleted; use the operator portal (`terraform output operator_portal_url`) and Telegram.)
 3. **Anytime red alarm:** Click [FIRING ALARMS](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarmFilter=ALARM) → see graph → diagnose
 4. **17:30 IST:** Telegram shows daily budget digest (after PR #934 merges)
 5. **End of week:** [Costs](https://ap-south-1.console.aws.amazon.com/billing/home?region=ap-south-1#!/costexplorer) — on track for ₹2000/mo?

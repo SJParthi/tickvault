@@ -40,10 +40,9 @@ output "ssm_session_command" {
   value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.tv_app.id}"
 }
 
-output "dashboard_url" {
-  description = "Direct URL to the CloudWatch operator dashboard (open in any browser)"
-  value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards/dashboard/${aws_cloudwatch_dashboard.operator.dashboard_name}"
-}
+# output "dashboard_url" REMOVED 2026-11-11 with the CloudWatch operator
+# dashboard (operator Quote 53, card "Delete the CloudWatch dashboard";
+# reverses Quote 37's "dashboard KEPT"). The operator portal and Telegram stay.
 
 output "portal_git_sha" {
   description = "B9 deploy provenance: git SHA of the repo tree this terraform state was last applied from (CI-set; \"unknown\" for local applies)"
