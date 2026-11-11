@@ -445,6 +445,21 @@ emit). Ratchet:
 - `reset()` clears all tracking state
 - Test: integration `risk_tick_gap::*`
 
+### 2026-11-11 note — the live silent-instrument page pages only real feed trouble
+
+Owner card "Only real feed trouble (Recommended)" (noise lock §2.19). The live
+lane's 30 s silence scan (`dhan_feed_stack.rs`, `silence_warrants_page`) now
+pages `RISK-GAP-03` only when at least 1% of tracked instruments are quiet
+together (`silence_page_floor`, `ceil(tracked / 100)`, at least 1) or a
+never-ticked instrument is new this session. Below that, the episode is one
+coded `warn!` (named instruments at `warn!` too), which the
+`errcode-risk-gap-03` filter (level ERROR only) never pages. Gauges, the
+2-scan confirmation and the 30-minute cooldown are unchanged. Evidence: on
+2026-11-11 seven pages each named 1 to 3 of 19,868 slow `NSE_EQ` stocks,
+`never_ticked = 0`. Tests: `test_silence_page_floor_is_one_percent_rounded_up_and_at_least_one`,
+`test_regression_silence_warrants_page_ignores_a_few_slow_stocks`,
+`test_regression_a_reported_never_ticked_set_does_not_lift_a_slow_stock_over_the_floor`.
+
 ---
 
 # Auth Gap Enforcement
