@@ -2671,4 +2671,5 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - [x] DD-0 rule-file-first: Quote 56 (full + summary), rust-only §0.19 (full + summary).
 - [x] DD-1 `crates/app/src/disk_delete_2026_11_11.rs` + bin `tv-disk-delete-2026-11-11`.
 - [x] DD-2 `deploy/aws/terraform/disk-delete-2026-11-11.tf` + `.github/workflows/disk-delete-2026-11-11.yml` + budget row.
+- [x] DD-2b fix (2026-11-11): the role tag `Purpose` held brackets, which IAM refuses at apply (run 43046930995, nothing else applied); now `... leftovers - Quote 56`. New guard `crates/common/tests/terraform_tag_value_guard.rs` checks every literal tag value in `deploy/aws/terraform/*.tf` against the AWS tag character set, with a fixture that bites on the old value.
 - [ ] DD-3 after merge: terraform apply, dispatch `dry` then `apply`, confirm with a read-only describe; then a PR deletes the role, workflow, tool and row and records Quote 56 ENDED.
