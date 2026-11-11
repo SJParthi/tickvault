@@ -1600,6 +1600,8 @@ static BOOT_FOLD_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// fold ran in this process or the report was already written. O(1), cold,
 /// once per process.
 pub fn log_boot_fold_summary() -> bool {
+    // Noise lock §2.20: the backlog-trend verdict, judged before the subscriber.
+    let _trend_logged = crate::wal_backlog_trend::log_boot_backlog_trend();
     let Some(report) = BOOT_FOLD_REPORT.get() else {
         return false;
     };
@@ -1857,6 +1859,60 @@ fn backlog_segments_with(wm: &AppliedWatermark, wal_dir: &Path) -> Option<u64> {
         SpanScan::Refused(NOTHING_WAITING) => Some(0),
         SpanScan::Refused(_) => None,
     }
+}
+
+/// The waiting segments a boot replay would still read, judged against the
+/// applied watermark SAVED ON DISK beside `wal_dir` (noise lock §2.20,
+/// 2026-11-11): every waiting segment (live folder, `replaying/`,
+/// `settling/`) that [`AppliedSnapshot::segment_is_applied`] does not cover.
+/// `Some(0)` when nothing waits. `None` when the waiting set cannot be read,
+/// AND (2026-11-11 review fix) when segments wait but the saved watermark is
+/// not a trusted, bounded one: absent, rejected (a clock step back past the
+/// future limit, a changed folder tag, a corrupt file), or loaded with an
+/// overflow of unknown height (a crash between the sidecar write and the
+/// `applied.tvaw` write). Each of those makes every waiting segment read
+/// unapplied, applied live segments that only wait for the S3 copy
+/// included, so the number would not be comparable with a start whose
+/// watermark loads cleanly; saving it let the next normal start read
+/// `Shrinking` against an inflated count and stay quiet on a stuck backlog.
+/// Read once per boot, after the WAL folder is claimed and before the boot
+/// replay. Quiet: a rejected watermark is reported once, by the bind.
+///
+/// Cost: one header read per waiting segment, plus a tail read (64 KiB,
+/// at most 4 MiB) of every segment followed by a sequence gap larger than
+/// one bucket (`scan_spans`), once per boot, cold.
+///
+/// [`AppliedSnapshot::segment_is_applied`]: crate::wal_applied_watermark::AppliedSnapshot::segment_is_applied
+#[must_use]
+pub fn waiting_unreplayed_segments(wal_dir: &Path) -> Option<u64> {
+    let saved = crate::wal_applied_watermark::AppliedSnapshot::load_quiet(wal_dir)
+        .ok()
+        .flatten();
+    let spans = match scan_spans(wal_dir) {
+        SpanScan::Full(spans) | SpanScan::ReadableOnly(spans) => spans,
+        SpanScan::Refused(NOTHING_WAITING) => return Some(0),
+        SpanScan::Refused(_) => return None,
+    };
+    if spans.segments.is_empty() {
+        return Some(0);
+    }
+    let snap = saved.filter(watermark_bounds_the_count)?;
+    // O(1) EXEMPT: bounded by the waiting segments, once per boot, cold
+    let unread = spans
+        .segments
+        .iter()
+        .filter(|(lo, hi, _)| !snap.segment_is_applied(*lo, *hi))
+        .count();
+    // APPROVED: cast -- a segment count always fits u64.
+    Some(unread as u64)
+}
+
+/// `true` when `snap` can judge segments one by one: not overflowed, or
+/// overflowed below a KNOWN height. An overflow of unknown height (`0` or
+/// `u64::MAX`, the load of a bit with no trusted sidecar) taints every
+/// segment, so a count under it says nothing about the backlog. Pure, O(1).
+fn watermark_bounds_the_count(snap: &crate::wal_applied_watermark::AppliedSnapshot) -> bool {
+    !snap.overflowed || !matches!(snap.overflow_high_seq, 0 | u64::MAX)
 }
 
 #[cfg(test)]
@@ -4120,6 +4176,115 @@ mod tests {
         )
         .expect("a file where a folder belongs");
         assert_eq!(backlog_segments_with(&wm, &unlistable), None, "unknown");
+    }
+
+    /// Noise lock §2.20 (2026-11-11): the boot count of segments a replay
+    /// would still read, judged against the watermark SAVED ON DISK. With no
+    /// file every waiting segment counts (the replay reads them all); with a
+    /// file whose acks cover the older segment only the newer counts; an
+    /// empty folder is 0; an unlistable one is unknown.
+    #[test]
+    fn test_waiting_unreplayed_segments_judges_against_the_saved_watermark() {
+        let empty = scratch("unreplayed-empty");
+        assert_eq!(
+            waiting_unreplayed_segments(&empty),
+            Some(0),
+            "nothing waiting"
+        );
+
+        let dir = scratch("unreplayed-count");
+        let _a = segment(&dir, 0, 3);
+        let _b = segment(&dir, 10_000, 3);
+        assert_eq!(
+            waiting_unreplayed_segments(&dir),
+            None,
+            "no saved watermark while segments wait: not a comparable count"
+        );
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        ack_both(&wm, seq(5_000));
+        persist_durably(&wm, 1);
+        assert!(dir.join(APPLIED_WATERMARK_FILE).exists(), "saved");
+        assert_eq!(
+            waiting_unreplayed_segments(&dir),
+            Some(1),
+            "the acked older segment is covered; the newer one is still waiting"
+        );
+        // A range over the older one makes it waiting again.
+        assert!(wm.add_unapplied_range(seq(0), seq(2)));
+        persist_durably(&wm, 2 * LAG_NANOS + 10);
+        assert_eq!(waiting_unreplayed_segments(&dir), Some(2), "pinned again");
+
+        let unlistable = scratch("unreplayed-unlistable");
+        std::fs::write(
+            unlistable.join(crate::ws_frame_spill::REPLAYING_SUBDIR),
+            b"x",
+        )
+        .expect("a file where a folder belongs");
+        assert_eq!(waiting_unreplayed_segments(&unlistable), None, "unknown");
+        for d in [&empty, &dir, &unlistable] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Regression (LOW, 2026-11-11 review): with a watermark that is not a
+    /// trusted, bounded one, every waiting segment counted, applied ones
+    /// included, and the inflated number was saved as a known count. The
+    /// next start with a clean watermark then read `Shrinking` against it
+    /// and stayed quiet on a stuck backlog. A rejected file, and an overflow
+    /// of unknown height, now give an unknown count while segments wait; a
+    /// folder with nothing waiting is still 0.
+    #[test]
+    fn test_regression_untrusted_watermark_gives_an_unknown_backlog_count() {
+        let dir = scratch("unreplayed-untrusted");
+        let _a = segment(&dir, 0, 3);
+        let _b = segment(&dir, 10_000, 3);
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        ack_both(&wm, seq(5_000));
+        persist_durably(&wm, 1);
+        assert_eq!(waiting_unreplayed_segments(&dir), Some(1), "trusted: 1");
+
+        // A rejected file (wrong magic and length).
+        std::fs::write(dir.join(APPLIED_WATERMARK_FILE), b"not a watermark").expect("write");
+        assert_eq!(waiting_unreplayed_segments(&dir), None, "rejected file");
+
+        // An overflow of unknown height: every segment reads unapplied.
+        crate::wal_applied_watermark::write_v1_overflow_file_for_test(
+            &dir,
+            seq(5_000),
+            [(0, 0); UNAPPLIED_BUCKETS],
+        );
+        assert!(
+            AppliedSnapshot::load_quiet(&dir)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.overflowed),
+            "the file loads, overflowed"
+        );
+        assert_eq!(waiting_unreplayed_segments(&dir), None, "unknown height");
+
+        // Nothing waiting is 0 whatever the watermark says.
+        let empty = scratch("unreplayed-untrusted-empty");
+        std::fs::write(empty.join(APPLIED_WATERMARK_FILE), b"garbage").expect("write");
+        assert_eq!(waiting_unreplayed_segments(&empty), Some(0));
+        for d in [&dir, &empty] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn test_watermark_bounds_the_count_only_for_a_known_height() {
+        let clean = AppliedSnapshot::default();
+        assert!(watermark_bounds_the_count(&clean));
+        for (height, bounded) in [(0, false), (u64::MAX, false), (seq(5), true)] {
+            let snap = AppliedSnapshot {
+                overflowed: true,
+                overflow_high_seq: height,
+                ..AppliedSnapshot::default()
+            };
+            assert_eq!(watermark_bounds_the_count(&snap), bounded, "{height}");
+        }
     }
 
     #[test]

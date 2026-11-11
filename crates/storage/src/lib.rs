@@ -374,6 +374,9 @@ pub mod wal_reorder_guard;
 // PR RD-1 (2026-11-08, Quote 41): the per-boot replay frame cap in force,
 // raised once to 5x for a planned evening-drain boot.
 pub mod wal_replay_frame_cap;
+// Noise lock §2.20 (2026-11-11): is the WAL replay backlog shrinking between
+// two starts? A replay-limit line pages only when it is not.
+pub mod wal_backlog_trend;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
 // frames whose rows already reached the database. Sibling of `ws_frame_spill`.
 pub mod wal_applied_watermark;

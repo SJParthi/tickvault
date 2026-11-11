@@ -1098,17 +1098,30 @@ mod tests {
             matches!((claim, wal_lock), (Some(c), Some(w)) if c < w),
             "claim at {claim:?} must precede the WAL lock at {wal_lock:?}"
         );
-        // 2026-11-11 (noise lock §2.17 note): the catch-up's once-per-boot
-        // deferral line reports through the planned-aware reporter (paired
-        // behaviour test in storage:
-        // `test_regression_report_catchup_replay_deferred_warns_only_on_the_planned_boot`).
+        // 2026-11-11 (noise lock §2.20): the backlog trend is judged after the
+        // WAL lock and before the boot replay reads anything, so the count is
+        // taken at the same point on every start. Paired behaviour tests in
+        // storage: `test_judge_at_boot_in_first_start_then_shrink_then_unchanged`.
+        let judge = main.find("tickvault_storage::wal_backlog_trend::judge_at_boot(&ws_wal_path)");
+        let replay =
+            main.find("tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path)");
+        assert!(
+            matches!((wal_lock, judge, replay), (Some(w), Some(j), Some(r)) if w < j && j < r),
+            "lock {wal_lock:?} < judge {judge:?} < replay {replay:?}"
+        );
+        // 2026-11-11 (noise lock §2.17 note, §2.20): the catch-up's once-per-boot
+        // deferral line reports through the verdict-aware reporter (paired
+        // behaviour tests in storage:
+        // `test_regression_report_catchup_replay_deferred_warns_only_on_the_planned_boot`,
+        // `test_regression_rs_0833_morning_start_with_a_shrinking_backlog_does_not_page`).
         let call = lane
             .find("tickvault_storage::wal_replay_frame_cap::report_catchup_replay_deferred(")
             .expect("the catch-up deferral goes through the reporter");
         assert!(
-            lane[call..call + 200]
-                .contains("tickvault_storage::wal_replay_frame_cap::planned_evening_drain_boot()"),
-            "with the process planned verdict"
+            lane[call..call + 200].contains(
+                "tickvault_storage::wal_replay_frame_cap::replay_limit_verdict_this_boot()"
+            ),
+            "with the process verdict (planned restart or shrinking backlog)"
         );
         assert!(
             !lane.contains("source = \"replay_deferred\""),
