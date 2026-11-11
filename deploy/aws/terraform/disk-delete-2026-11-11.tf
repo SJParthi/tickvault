@@ -37,7 +37,7 @@ resource "aws_iam_role" "disk_delete_2026_11_11" {
 
   tags = {
     Name    = "tv-${var.environment}-disk-delete-2026-11-11"
-    Purpose = "one-off delete of the four Quote 52 leftovers (Quote 56)"
+    Purpose = "one-off delete of the four Quote 52 leftovers - Quote 56"
   }
 }
 
