@@ -66,7 +66,8 @@ use tracing::{error, info, warn};
 ///
 /// 2026-10-21 (operator Quote 33): stays 170.0, the configured line for
 /// October 2026. From November the month clamp brings it down to
-/// `STANDING_BUDGET_KILL_USD` ($75 since operator Quote 37) in code; the terraform `limit_amount`
+/// `STANDING_BUDGET_KILL_USD` ($75 since operator Quote 37, $62 from December
+/// 2026 since operator Quote 54) in code; the terraform `limit_amount`
 /// (the native 100% stop) can follow on or after 1 November.
 ///
 /// 2026-10-28 (operator Quote 45): 170.0 → 185.0 for October 2026 only
@@ -80,8 +81,9 @@ pub const DEFAULT_BUDGET_KILL_USD: f64 = 185.0;
 /// to $100 from November 2026 by operator Quote 33 (2026-10-21), then to **$85 from
 /// November 2026** by operator Quote 36 (the same evening), and to **$75
 /// from November 2026, GST included,** by operator Quote 37. November 2026 alone is $90
-/// (`NOVEMBER_2026_KILL_USD`, operator Quote 52, 2026-11-11); this standing
-/// line applies again from December 2026. October
+/// (`NOVEMBER_2026_KILL_USD`, operator Quote 52, 2026-11-11). From December
+/// 2026 the standing line is **$62, GST included** (about ₹5,500), operator
+/// Quote 54 (2026-11-11, owner card "Cap ₹5,500"). October
 /// 2026 keeps the configured $170 (`OCTOBER_2026_ALLOWANCE`): its spend was
 /// already $119.20 on 1–20 Oct, so a $100 line would have stopped the box at once.
 ///
@@ -89,7 +91,7 @@ pub const DEFAULT_BUDGET_KILL_USD: f64 = 185.0;
 /// $225 as a September-2026-only allowance, and is $150 again since 2026-10-01. `effective_budget_kill_usd` clamps
 /// every other month back to this value IN CODE, so October is protected even
 /// if the scheduled 1-Oct revert of the terraform value is late or never lands.
-pub const STANDING_BUDGET_KILL_USD: f64 = 75.0;
+pub const STANDING_BUDGET_KILL_USD: f64 = 62.0;
 
 // A clamp must never RAISE the line: the standing ceiling may not sit above
 // the configured (September-allowance) fallback.
@@ -99,8 +101,8 @@ const _: () = assert!(STANDING_BUDGET_KILL_USD <= DEFAULT_BUDGET_KILL_USD);
 /// `STANDING_BUDGET_KILL_USD`.
 pub const SEPTEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 9);
 
-/// October 2026 keeps its own line (`OCTOBER_2026_KILL_USD`, $185 since Quote 45) while the $75 standing line
-/// starts in November (operator Quotes 33, 36 and 37, 2026-10-21). One month, like September.
+/// October 2026 keeps its own line (`OCTOBER_2026_KILL_USD`, $185 since Quote 45); the standing
+/// line (then $75, operator Quotes 33, 36 and 37, 2026-10-21) started after it. One month, like September.
 pub const OCTOBER_2026_ALLOWANCE: (i32, u32) = (2026, 10);
 
 /// The line October 2026 is capped at, whatever is configured (Quote 30, $170;
@@ -110,8 +112,9 @@ pub const OCTOBER_2026_KILL_USD: f64 = 185.0;
 
 /// November 2026 only (operator Quote 52, 2026-11-11, owner card "Raise Nov
 /// to $90 only (Recommended)"): about $21 of the month's bill was two disks
-/// attached to nothing, so the $75 standing line would have stopped the box
-/// around 18 to 24 November. December onward is back on the standing $75.
+/// attached to nothing, so the then-standing $75 line would have stopped the box
+/// around 18 to 24 November. December onward is on the standing line, $62
+/// since operator Quote 54 (2026-11-11).
 pub const NOVEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 11);
 
 /// The line November 2026 is capped at, whatever is configured (Quote 52).
@@ -159,6 +162,13 @@ pub fn effective_budget_kill_usd(configured: f64, billing_year: i32, billing_mon
         configured.min(STANDING_BUDGET_KILL_USD)
     }
 }
+/// The line a ping state with no `line` field was saved against, from
+/// November 2026 on: every build before PR 2222 (which started recording the
+/// line) used the then-standing $75 for November 2026 and every later month.
+/// Fixed history, deliberately NOT `STANDING_BUDGET_KILL_USD`, which moved to
+/// $62 under operator Quote 54 (2026-11-11).
+const UNRECORDED_PING_LINE_USD: f64 = 75.0;
+
 /// Legacy parity default for the change-only ping-state SSM param
 /// (NOT under the banned groww/* namespace).
 pub const DEFAULT_PING_STATE_PARAM: &str = "/tickvault/prod/budget-guard/ping-state";
@@ -483,13 +493,15 @@ pub fn classify_ping_decision(
     // Quote 52 (2026-11-11): the line can move inside a month ($75 -> $90 for
     // November 2026). A bucket saved against the old line is not comparable,
     // so any bucket change after a line change pings once (and saves the new
-    // line). A state saved before the line was recorded is read as the
-    // standing line from November 2026 on (the only line the old code used
-    // then) and as unchanged before it.
+    // line). A state saved before the line was recorded (every build before
+    // PR 2222) was saved against $75 from November 2026 on, the only line
+    // those builds used then, and is read as unchanged before it. That is a
+    // fixed historical value, never the current standing line: since Quote
+    // 54 the standing line is $62, which no such state was saved against.
     let prev_line = prev
         .and_then(|p| p.get("line"))
         .and_then(Value::as_f64)
-        .or_else(|| (month >= "2026-11").then_some(STANDING_BUDGET_KILL_USD));
+        .or_else(|| (month >= "2026-11").then_some(UNRECORDED_PING_LINE_USD));
     let line_changed = prev_line.is_some_and(|l| (l - budget_kill_usd).abs() > f64::EPSILON);
     if line_changed && bucket != prev_bucket {
         return ("ping_bucket_changed", new_state);
@@ -2454,9 +2466,9 @@ aws events enable-rule --name tv-prod-daily-start\n"
     #[test]
     fn effective_ceiling_october_2026_keeps_the_configured_line() {
         // Quote 33 (2026-10-21): October had spent $119.20 by the 20th, so the
-        // standing line ($75 since Quote 37) starts in November, never in October.
+        // standing line ($62 since Quote 54) never applies to October.
         assert_eq!(effective_budget_kill_usd(170.0, 2026, 10), 170.0);
-        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 75.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 62.0);
     }
 
     #[test]
@@ -2486,24 +2498,78 @@ aws events enable-rule --name tv-prod-daily-start\n"
     }
 
     #[test]
+    fn test_regression_classify_ping_decision_unrecorded_line_is_75_not_the_standing_line() {
+        // Regression: 2026-11-11 (Quote 54) — a state saved with no `line`
+        // field was saved against $75 by every build before PR 2222. The
+        // fallback used to read STANDING_BUDGET_KILL_USD, which became $62:
+        // a November state would then read as "line changed" against $90
+        // (still pings, by luck) and a December state saved against $75
+        // would read as unchanged against $62, so a 1-bucket dip after the
+        // line moved stayed silent and kept the stale bucket.
+        assert!((UNRECORDED_PING_LINE_USD - 75.0).abs() < f64::EPSILON);
+        assert!((UNRECORDED_PING_LINE_USD - STANDING_BUDGET_KILL_USD).abs() > f64::EPSILON);
+        // December 2026, legacy state at bucket 7 against $75 ($55 = 73%);
+        // against $62, $43 is bucket 6 (69%). The line moved, so it pings once.
+        let old = json!({"month": "2026-12", "bucket": 7, "outcome": "below_budget"});
+        let (reason, state) =
+            classify_ping_decision(Some(&old), "below_budget", Some(43.0), 62.0, "2026-12");
+        assert_eq!(reason, "ping_bucket_changed");
+        assert_eq!(state["bucket"], json!(6));
+        assert_eq!(state["line"], json!(62.0));
+        // A legacy state in a month the guard really ran at $75 and still
+        // runs at $75 (an explicit $75 configured value) keeps the hysteresis.
+        let (reason, _) =
+            classify_ping_decision(Some(&old), "below_budget", Some(48.0), 75.0, "2026-12");
+        assert_eq!(reason, "silent");
+        // Before November 2026 a legacy state is read as unchanged.
+        let oct = json!({"month": "2026-10", "bucket": 7, "outcome": "below_budget"});
+        let (reason, _) =
+            classify_ping_decision(Some(&oct), "below_budget", Some(120.0), 185.0, "2026-10");
+        assert_eq!(reason, "silent");
+    }
+
+    #[test]
     fn test_regression_effective_ceiling_november_2026_is_the_90_dollar_line() {
         // Regression: 2026-11-11 — November 2026 only is $90 (Quote 52); the
-        // standing line is $75 from December again (Quote 37).
+        // standing line is $62 from December (Quote 54).
         assert_eq!(effective_budget_kill_usd(170.0, 2026, 11), 90.0);
         assert_eq!(
             effective_budget_kill_usd(185.0, 2026, 11),
             NOVEMBER_2026_KILL_USD
         );
-        assert_eq!(effective_budget_kill_usd(170.0, 2027, 11), 75.0);
-        assert_eq!(effective_budget_kill_usd(170.0, 2026, 12), 75.0);
-        assert_eq!(effective_budget_kill_usd(170.0, 2027, 10), 75.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2027, 11), 62.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 12), 62.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2027, 10), 62.0);
+    }
+
+    #[test]
+    fn test_quote54_standing_line_is_62_from_december_2026() {
+        // Operator Quote 54 (2026-11-11, owner card "Cap ₹5,500"): $62 a
+        // month, GST included, from 1 December 2026. November stays $90.
+        assert!((STANDING_BUDGET_KILL_USD - 62.0).abs() < f64::EPSILON);
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 12),
+            62.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2027, 1),
+            62.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
+            90.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 10),
+            185.0
+        );
     }
 
     #[test]
     fn effective_ceiling_other_years_september_is_still_clamped() {
         // The allowance is one billing month, never "every September".
-        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 75.0);
-        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 75.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 62.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 62.0);
     }
 
     #[test]
@@ -2590,7 +2656,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     #[tokio::test]
     async fn test_regression_quote52_november_line_is_90_dollars() {
         // Operator Quote 52 (2026-11-11): November 2026 only, the line is $90.
-        // $85 month-to-date (a breach at the standing $75) must not stop the
+        // $85 month-to-date (a breach at the old standing $75) must not stop the
         // box; $91 must.
         let env = GuardEnv {
             budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
@@ -2622,6 +2688,58 @@ aws events enable-rule --name tv-prod-daily-start\n"
                 "November spend ${spend}"
             );
             assert_eq!(ec2.stopped.borrow().is_empty(), !should_stop);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quote54_december_line_is_62_dollars() {
+        // Operator Quote 54 (2026-11-11): from December 2026 the line is $62,
+        // GST included. $61 month-to-date must not stop the box; $63 must.
+        // January 2027 is on the same line. Thursday 10 Dec 2026 and Thursday
+        // 14 Jan 2027, 04:30 UTC = 10:00 IST, past the distrusted first 48 h.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        for (now, spend, should_stop) in [
+            (utc(2026, 12, 10, 4, 30), 61.0, false),
+            (utc(2026, 12, 10, 4, 30), 63.0, true),
+            (utc(2027, 1, 14, 4, 30), 61.0, false),
+            (utc(2027, 1, 14, 4, 30), 63.0, true),
+        ] {
+            let (ec2, sns, events) = (
+                FakeEc2::new("running"),
+                FakeSns::default(),
+                FakeEvents::new(),
+            );
+            let ssm = FakeSsm::empty();
+            let out = run_guard(
+                &env,
+                &ec2,
+                &sns,
+                &events,
+                &FakeBudgets {
+                    amount: Some(spend),
+                },
+                &ssm,
+                now,
+            )
+            .await
+            .expect("run_guard ok");
+            assert_eq!(
+                out["breach"] == json!(true),
+                should_stop,
+                "{now} spend ${spend}"
+            );
+            assert_eq!(ec2.stopped.borrow().is_empty(), !should_stop);
+            if should_stop {
+                let published = sns.published.borrow();
+                assert!(
+                    published[0].message.contains(">= $62 stop-budget"),
+                    "the breach page must name the $62 line: {}",
+                    published[0].message
+                );
+            }
         }
     }
 
@@ -2690,14 +2808,14 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
         // November 2026: the same configured $185 is clamped to $90 (Quote 52);
-        // December onward to the standing $75.
+        // December onward to the standing $62 (Quote 54).
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
             90.0
         );
         assert_eq!(
             effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 12),
-            75.0
+            62.0
         );
     }
 

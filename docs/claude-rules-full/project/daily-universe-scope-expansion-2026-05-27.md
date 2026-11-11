@@ -3465,7 +3465,7 @@ Measured (Cost Explorer, 1–11 Nov 2026, unblended USD): total $46.11 with tax;
 | Item | What Quote 52 authorizes |
 |---|---|
 | November 2026 line | `NOVEMBER_2026_KILL_USD` = $90 in the hourly guard's clamp and the native budget `limit_amount` = 90, November 2026 (UTC month) only |
-| From 1 December 2026 | The standing $75 line (Quote 37) applies again: the code clamp does it by itself; the native `limit_amount` returns to 75 in a follow-up change on or after 1 December |
+| From 1 December 2026 | The standing $75 line (Quote 37) applies again: the code clamp does it by itself; the native `limit_amount` returns to 75 in a follow-up change on or after 1 December *(⚠ SUPERSEDED the same day by Quote 54: $62 from 1 December, native `limit_amount` to 62)* |
 | The leftover disks | The OWNER deletes `vol-0c6ab6e593e39d8c8`, `vol-073ccaa417a0f344b` and the two snapshots above in the AWS console (no repository role may delete volumes or snapshots, Quote 47 unchanged); a session confirms with a read-only describe afterwards |
 
 ##### What violates Quote 52 (REJECT)
@@ -3485,10 +3485,30 @@ Estimate (Assumed, extrapolated from Cost Explorer 1–11 Nov 2026 with the Quot
 | Shipped metrics | CloudWatch receives only the metrics an alarm reads; every metric stays on the box's local `/metrics` |
 | Dashboard | The CloudWatch dashboard is deleted (reverses Quote 37's "dashboard KEPT"); the operator portal and Telegram stay |
 | Raw frames in S3 | A lifecycle TRANSITION moves `raw-frames/` objects older than 30 days to S3 Glacier Instant Retrieval (readable at once, nothing deleted); `questdb-partitions/` (ticks and candles brutex reads) stays STANDARD |
-| Stop line | Unchanged: $75 from 1 December 2026 (Quote 37); no $55 stop |
+| Stop line | Unchanged: $75 from 1 December 2026 (Quote 37); no $55 stop *(⚠ SUPERSEDED the same day by Quote 54: $62 from 1 December 2026; this row only)* |
 
 ##### What violates Quote 53 (REJECT)
 - Removing an alarm without its review row, or removing any alarm in the KEPT list above.
 - Removing a metric from the box's local `/metrics`, or shipping fewer metrics than the alarms read.
 - Any S3 `expiration`, `noncurrent_version_expiration`, delete or versioning change; a transition of `questdb-partitions/`, `deploys/`, `instrument-snapshots/` or `logs/`; Glacier Flexible or Deep Archive for anything brutex reads.
 - A stop line below $75 or a change to instance, disk, IOPS, throughput or depth under Quote 53.
+
+#### Quote 54 (2026-11-11) — FROM DECEMBER 2026 THE STOP LINE IS $62 A MONTH, GST INCLUDED (about ₹5,500); SUPERSEDES QUOTE 53'S "KEEP THE $75 STOP" ROW ONLY (preserve EXACTLY)
+
+Owner was asked (2026-11-11, decision card): "From December, should the AWS bill be hard-capped at ₹5,000 a month?". The owner chose, verbatim, the option labelled "Cap ₹5,500", described "Stop line $62 (about ₹5,500 with GST). A bit of headroom above the expected bill, still close to ₹5,000."
+
+| Item | What Quote 54 authorizes |
+|---|---|
+| Standing line | `STANDING_BUDGET_KILL_USD` = **$62 from 1 December 2026**, GST included (the live budget counts tax, Quote 36), replacing the $75 of Quote 37. The hourly guard's code clamp enforces it from the first December UTC billing month by itself |
+| November 2026 | Unchanged: $90 (Quote 52), code clamp and native `limit_amount` = 90 until the end of November (UTC month) |
+| October 2026 | Unchanged: $185 (Quote 45) |
+| Native `limit_amount` | Stays "90" now; moves to "62" (not "75") in a follow-up change on or after 1 December 2026, then a terraform apply. The lockstep guard requires exactly "62" from December |
+| Quote 53 | Its "Stop line: Unchanged: $75 from 1 December 2026" row and its "A stop line below $75" REJECT clause are superseded by Quote 54 for the stop line only; every other Quote 53 row (alarms, shipped metrics, dashboard, raw-frame storage class, its REJECT rows on those) stands |
+| The ₹5,000 figure | An estimate (Quote 53's ~$56 with tax), not a guarantee; the hard bound is the $62 stop, which stops the box for the rest of the month when reached |
+
+##### What violates Quote 54 (REJECT)
+- A December-2026-or-later stop line above $62 (code clamp or native `limit_amount`) without a fresh dated quote.
+- Moving November 2026 off $90 (code clamp or native `limit_amount`) under Quote 54.
+- Setting the native `limit_amount` to 62 before 1 December 2026 (it would stop the box below November's $90 line).
+- Changing instance, disk size, IOPS, throughput or depth under Quote 54.
+- Calling the ₹5,000 estimate a guarantee or a maximum; the maximum is the $62 stop.
