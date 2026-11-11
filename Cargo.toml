@@ -200,6 +200,16 @@ aws-sdk-cloudwatch = { version = "=1.140.0", default-features = false, features 
 # same change. The current pin participates in the coordinated 2026-10-31
 # SDK family repair; the approved DescribeBudget scope is unchanged.
 aws-sdk-budgets = { version = "=1.130.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 2026-11-11 (noise lock §2.18, owner card "Yes, daily waste check
+# (Recommended)"): the daily AWS waste check makes ONE Cost Explorer
+# `GetCostAndUsage` per run (month-to-date, grouped by service) for the
+# "top 5 costs this month" context line the owner asked for ($0.01 a call,
+# about $0.30 a month). Re-adds the crate removed 2026-10-22 (plan item 63)
+# for that single call only; the guard, digest and console keep reading the
+# free Budgets API. 1.138.0 is the release whose Smithy/runtime requirements
+# equal aws-sdk-budgets 1.130.0's exactly, so the lock gains this one crate
+# and moves nothing else. Same feature shape as every other AWS SDK pin.
+aws-sdk-costexplorer = { version = "=1.138.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # The console front Lambda invokes the back relay through Lambda Invoke.
 # Preserve its existing features while upgrading the shared SDK family.
 aws-sdk-lambda = { version = "=1.156.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }

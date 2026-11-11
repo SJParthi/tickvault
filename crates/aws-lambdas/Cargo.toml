@@ -29,6 +29,9 @@ aws-sdk-ssm = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-budgets = { workspace = true }
+# 2026-11-11 (noise lock §2.18): the daily AWS waste check's ONE
+# month-to-date Cost Explorer `GetCostAndUsage` grouped by service.
+aws-sdk-costexplorer = { workspace = true }
 # Plan PR MV (2026-11-06): the operator-control Lambda reads the published
 # movers universe (one GetObject). Existing workspace pin, already used by
 # the storage and app crates.
@@ -118,3 +121,9 @@ path = "src/bin/qdb_console_front.rs"
 [[bin]]
 name = "dhan-token-minter"
 path = "src/bin/dhan_token_minter.rs"
+
+# 2026-11-11 (noise lock §2.18, owner card "Yes, daily waste check
+# (Recommended)"): the read-only daily AWS waste check.
+[[bin]]
+name = "aws-waste-check"
+path = "src/bin/aws_waste_check.rs"

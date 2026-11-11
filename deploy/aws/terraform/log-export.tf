@@ -11,7 +11,7 @@
 #
 #   log group --subscription filter--> Kinesis Firehose --> s3://tv-<env>-cold/
 #     /tickvault/<env>/app          -> tv-<env>-app-logs-to-s3    -> logs/app/
-#     the 12 Lambda log groups      -> tv-<env>-lambda-logs-to-s3 -> logs/lambda/
+#     the 13 Lambda log groups      -> tv-<env>-lambda-logs-to-s3 -> logs/lambda/
 #
 # It is a DATA COPY, not a page: no alarm, no metric, no Telegram line.
 #
@@ -54,9 +54,10 @@
 # =============================================================================
 
 locals {
-  # The 12 terraform-managed Lambda log groups. Every one is a resource in
+  # The 13 terraform-managed Lambda log groups. Every one is a resource in
   # this module, so a renamed or deleted group fails the plan here.
   lambda_log_export_groups = {
+    "aws-waste-check"            = aws_cloudwatch_log_group.aws_waste_check.name
     "boot-heartbeat-gate"        = aws_cloudwatch_log_group.tv_boot_heartbeat_gate.name
     "daily-budget-digest"        = aws_cloudwatch_log_group.tv_daily_budget_digest.name
     "hard-stop-guard"            = aws_cloudwatch_log_group.tv_hard_stop_guard.name
