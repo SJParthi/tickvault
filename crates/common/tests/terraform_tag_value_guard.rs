@@ -145,9 +145,8 @@ fn every_terraform_tag_value_uses_only_aws_allowed_characters() {
     );
 }
 
-#[test]
-fn the_scan_bites_on_the_2026_11_11_tag() {
-    let src = r#"
+/// The 2026-11-11 role, as it was when IAM refused it.
+const BAD_TAG_FIXTURE: &str = r#"
 resource "aws_iam_role" "x" {
   name = "x"
   tags = {
@@ -156,7 +155,23 @@ resource "aws_iam_role" "x" {
   }
 }
 "#;
-    let bad = bad_values(src);
+
+/// Punctuation outside a tags block is allowed and must not be scanned.
+const NON_TAG_FIXTURE: &str = r#"
+resource "aws_cloudwatch_metric_alarm" "a" {
+  alarm_description = "has (brackets), commas; fine here"
+  tags = {
+    Name = "ok"
+  }
+  dimensions = {
+    X = "(not a tag)"
+  }
+}
+"#;
+
+#[test]
+fn the_scan_bites_on_the_2026_11_11_tag() {
+    let bad = bad_values(BAD_TAG_FIXTURE);
     assert_eq!(bad.len(), 1, "{bad:?}");
     assert!(bad[0].1.contains("(Quote 56)"));
 }
@@ -188,17 +203,6 @@ fn interpolations_are_removed_before_the_check() {
 
 #[test]
 fn values_outside_tags_blocks_are_not_scanned() {
-    let src = r#"
-resource "aws_cloudwatch_metric_alarm" "a" {
-  alarm_description = "has (brackets), commas; fine here"
-  tags = {
-    Name = "ok"
-  }
-  dimensions = {
-    X = "(not a tag)"
-  }
-}
-"#;
-    assert_eq!(tag_values(src).len(), 1);
-    assert!(bad_values(src).is_empty());
+    assert_eq!(tag_values(NON_TAG_FIXTURE).len(), 1);
+    assert!(bad_values(NON_TAG_FIXTURE).is_empty());
 }
