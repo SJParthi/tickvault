@@ -40,7 +40,8 @@
 //!     order_id STRING, exchange_order_ts TIMESTAMP, exchange_trade_ts TIMESTAMP,
 //!     fill_qty LONG, fill_price_paise LONG, avg_price_paise LONG, remainder_qty LONG,
 //!     model_price_paise LONG, worse_than_model SYMBOL,
-//!     reason STRING, charges_paise LONG
+//!     reason STRING, charges_paise LONG,
+//!     tick_paise LONG, lot_size LONG, participation_bps INT, max_fill_seconds INT
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, signal_id, event, seq, feed);
 //! ```
@@ -176,6 +177,10 @@ pub const LIVE_ORDER_EVENTS_COLUMNS: &[(&str, &str)] = &[
     ("worse_than_model", "SYMBOL"),
     ("reason", "STRING"),
     ("charges_paise", "LONG"),
+    ("tick_paise", "LONG"),
+    ("lot_size", "LONG"),
+    ("participation_bps", "INT"),
+    ("max_fill_seconds", "INT"),
 ];
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -426,6 +431,15 @@ pub struct LiveOrderEvent {
     pub reason: Option<String>,
     /// Charges, paise.
     pub charges_paise: Option<i64>,
+    /// The contract's tick size, paise. Decision row only (LF-7: the
+    /// daily report re-prices each order from the stored seconds).
+    pub tick_paise: Option<i64>,
+    /// The contract's lot size, shares. Decision row only (LF-7).
+    pub lot_size: Option<i64>,
+    /// Our share of a second's volume, basis points. Decision row only (LF-7).
+    pub participation_bps: Option<i32>,
+    /// The fill window, seconds. Decision row only (LF-7).
+    pub max_fill_seconds: Option<i32>,
 }
 
 /// Why a row was refused before it reached the ILP buffer. Names the column.
@@ -499,7 +513,7 @@ pub fn validate_live_order_event(e: &LiveOrderEvent) -> Result<(), LiveOrderEven
             return refuse(column);
         }
     }
-    let non_negative: [(&'static str, Option<i64>); 20] = [
+    let non_negative: [(&'static str, Option<i64>); 24] = [
         ("candle_start", e.candle_start_ist_nanos),
         ("candle_end", e.candle_end_ist_nanos),
         ("last_tick_exchange_ts", e.last_tick_exchange_ist_nanos),
@@ -520,6 +534,10 @@ pub fn validate_live_order_event(e: &LiveOrderEvent) -> Result<(), LiveOrderEven
         ("remainder_qty", e.remainder_qty),
         ("model_price_paise", e.model_price_paise),
         ("charges_paise", e.charges_paise),
+        ("tick_paise", e.tick_paise),
+        ("lot_size", e.lot_size),
+        ("participation_bps", e.participation_bps.map(i64::from)),
+        ("max_fill_seconds", e.max_fill_seconds.map(i64::from)),
     ];
     for (column, value) in non_negative {
         if value.is_some_and(|v| v < 0) {
@@ -576,7 +594,11 @@ pub fn live_order_events_create_ddl() -> String {
             model_price_paise     LONG, \
             worse_than_model      SYMBOL, \
             reason                STRING, \
-            charges_paise         LONG\
+            charges_paise         LONG, \
+            tick_paise            LONG, \
+            lot_size              LONG, \
+            participation_bps     INT, \
+            max_fill_seconds      INT\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_LIVE_ORDER_EVENTS});"
     )
@@ -903,7 +925,7 @@ impl LiveOrderEventsWriter {
                     .context(name)?;
             }
         }
-        let longs: [(&'static str, Option<i64>); 16] = [
+        let longs: [(&'static str, Option<i64>); 20] = [
             ("best_bid_paise", e.best_bid_paise),
             ("best_bid_qty", e.best_bid_qty),
             ("best_ask_paise", e.best_ask_paise),
@@ -920,6 +942,10 @@ impl LiveOrderEventsWriter {
             ("remainder_qty", e.remainder_qty),
             ("model_price_paise", e.model_price_paise),
             ("charges_paise", e.charges_paise),
+            ("tick_paise", e.tick_paise),
+            ("lot_size", e.lot_size),
+            ("participation_bps", e.participation_bps.map(i64::from)),
+            ("max_fill_seconds", e.max_fill_seconds.map(i64::from)),
         ];
         for (name, value) in longs {
             if let Some(v) = value {
@@ -1083,6 +1109,10 @@ mod tests {
             worse_than_model: Some(false),
             reason: Some("filled at second +1".to_string()),
             charges_paise: Some(2_150),
+            tick_paise: Some(5),
+            lot_size: Some(250),
+            participation_bps: Some(2_500),
+            max_fill_seconds: Some(60),
         }
     }
 
@@ -1119,6 +1149,10 @@ mod tests {
             worse_than_model: None,
             reason: None,
             charges_paise: None,
+            tick_paise: None,
+            lot_size: None,
+            participation_bps: None,
+            max_fill_seconds: None,
             ..full_event()
         }
     }
@@ -1322,6 +1356,10 @@ mod tests {
             ",worse_than_model=not_worse",
             "reason=\"filled at second +1\"",
             "charges_paise=2150i",
+            "tick_paise=5i",
+            "lot_size=250i",
+            "participation_bps=2500i",
+            "max_fill_seconds=60i",
         ] {
             assert!(line.contains(part), "missing {part:?} in {line}");
         }
@@ -1498,6 +1536,10 @@ mod tests {
             "remainder_qty",
             "model_price_paise",
             "charges_paise",
+            "tick_paise",
+            "lot_size",
+            "participation_bps",
+            "max_fill_seconds",
         ]
         .into_iter()
         .collect();

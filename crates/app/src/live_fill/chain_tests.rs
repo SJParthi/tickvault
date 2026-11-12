@@ -1218,3 +1218,40 @@ fn test_push_mark_folds_an_instruments_marks_within_a_pass() {
     });
     assert_eq!(prices, vec![101.5, 102.0]);
 }
+
+/// LF-7: the Decision row carries the four pricing inputs the daily report
+/// re-prices with (tick, lot, participation, window); the Built row and the
+/// execution's later rows keep them NULL.
+#[test]
+fn test_decision_row_carries_pricing_inputs() {
+    let mut c = chain(emitting(), true);
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 120, 0), rising, 1_000);
+    f.drive(&mut c, (OPEN + 120, OPEN + 125, 2), |_| 102.0, 1_000);
+    let rows: Vec<&LiveOrderEvent> = f
+        .out
+        .iter()
+        .filter_map(|o| match o {
+            ChainOutput::Event(e) => Some(e.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let decision = rows
+        .iter()
+        .find(|e| e.event == LiveOrderEventKind::Decision)
+        .expect("a decision row");
+    assert_eq!(decision.tick_paise, Some(5));
+    assert_eq!(decision.lot_size, Some(1));
+    assert_eq!(decision.participation_bps, Some(2_500));
+    assert_eq!(decision.max_fill_seconds, Some(60));
+    let built = rows
+        .iter()
+        .find(|e| e.event == LiveOrderEventKind::Built)
+        .expect("a built row");
+    assert_eq!(built.tick_paise, None);
+    assert_eq!(built.max_fill_seconds, None);
+    let x = executions(&f.out);
+    assert_eq!(x.len(), 1);
+    assert_eq!(x[0].base.tick_paise, None);
+    assert_eq!(x[0].base.participation_bps, None);
+}

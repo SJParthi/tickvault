@@ -271,6 +271,10 @@ pub mod leg_identity;
 /// approved brutex engine → held order with its worst-case fill → paper OMS.
 /// Off by default; idles until an approved strategy crate exists.
 pub mod live_fill;
+/// The daily live paper fill calibration report (plan item LF-7): re-prices
+/// each paper order from the stored 1 s candles, writes five files per day and
+/// copies them to the cold bucket. Paper only, log-only codes.
+pub mod live_fill_report;
 /// The `live_order_events` writer task (ensure, disk-tier drain, ILP writer).
 pub mod live_order_events_boot;
 pub mod log_coalescer;

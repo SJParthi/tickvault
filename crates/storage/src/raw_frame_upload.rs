@@ -855,6 +855,81 @@ pub async fn upload_file<S: ColdObjectStore>(
     upload_file_with(store, markers_dir, path, key, None).await
 }
 
+/// The S3 half of [`upload_file`] and NOTHING else: gzip, conditional
+/// create (or the content-addressed sidecar), HeadObject verify, under the
+/// same per-file budget. It writes no marker, bumps no counter, logs no
+/// coded line and records nothing in the in-memory verified-unmarked set
+/// (the WAL and spill prunes read that set). For a caller that keeps its
+/// own record of the copy, such as the daily live fill report (plan item
+/// LF-7 review findings 4 and 6), whose marker failure must never feed the
+/// raw-frame `cold-backup-failing` page. Never panics. Cold, O(file bytes).
+pub async fn copy_file_verified<S: ColdObjectStore>(
+    store: &S,
+    path: &Path,
+    key: &str,
+) -> SegmentOutcome {
+    match copy_verified(store, path, key).await {
+        Ok((outcome, _)) | Err(outcome) => outcome,
+    }
+}
+
+/// Prepares `segment` and runs [`store_and_verify`] under the store's budget.
+/// `Ok` carries a verified outcome (uploaded, sidecar or reused) and the
+/// prepared bytes' digests; `Err` carries a failed or timed-out outcome.
+async fn copy_verified<S: ColdObjectStore>(
+    store: &S,
+    segment: &Path,
+    key: &str,
+) -> std::result::Result<(SegmentOutcome, PreparedSegment), SegmentOutcome> {
+    let path = segment.to_path_buf();
+    let prepared = match tokio::task::spawn_blocking(move || prepare_segment(&path)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(err)) => {
+            return Err(SegmentOutcome::Failed {
+                reason: format!("{err:#}"),
+            });
+        }
+        Err(err) => {
+            return Err(SegmentOutcome::Failed {
+                reason: format!("prepare task failed: {err}"),
+            });
+        }
+    };
+    let gzip_len = prepared.gzip.len() as u64;
+    let canonical = key.to_string();
+
+    // Audit SUP-5: every S3 call for this file runs under one budget, so a
+    // hung connection ends as a counted failure instead of a pass that never
+    // returns. The marker write stays outside it.
+    let budget = store.call_budget(gzip_len);
+    let mut in_flight = S3InFlight::default();
+    // A separate statement, so the timed-out future (which borrows
+    // `in_flight`) is dropped before the match reads it.
+    let timed = tokio::time::timeout(
+        budget,
+        store_and_verify(store, canonical, gzip_len, &prepared, &mut in_flight),
+    )
+    .await;
+    let outcome = match timed {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            // Review of SUP-5: name the call and the key that hung, which can
+            // be the content-addressed sidecar rather than `key`.
+            return Err(SegmentOutcome::TimedOut {
+                reason: format!(
+                    "{} {} did not finish; the file's S3 calls ran past {budget:?} \
+                     (canonical key {key}); retried on the next pass",
+                    in_flight.call, in_flight.key
+                ),
+            });
+        }
+    };
+    match outcome {
+        SegmentOutcome::Failed { .. } | SegmentOutcome::TimedOut { .. } => Err(outcome),
+        verified => Ok((verified, prepared)),
+    }
+}
+
 /// [`upload_file`] with the marker's first frame sequence.
 async fn upload_file_with<S: ColdObjectStore>(
     store: &S,
@@ -872,49 +947,11 @@ async fn upload_file_with<S: ColdObjectStore>(
             reason: "file path has no file name".to_string(),
         };
     };
-    let path = segment.to_path_buf();
-    let prepared = match tokio::task::spawn_blocking(move || prepare_segment(&path)).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(err)) => {
-            return SegmentOutcome::Failed {
-                reason: format!("{err:#}"),
-            };
-        }
-        Err(err) => {
-            return SegmentOutcome::Failed {
-                reason: format!("prepare task failed: {err}"),
-            };
-        }
+    let (outcome, prepared) = match copy_verified(store, segment, key).await {
+        Ok(v) => v,
+        Err(failed) => return failed,
     };
     let gzip_len = prepared.gzip.len() as u64;
-    let canonical = key.to_string();
-
-    // Audit SUP-5: every S3 call for this file runs under one budget, so a
-    // hung connection ends as a counted failure instead of a pass that never
-    // returns. The marker write below stays outside it.
-    let budget = store.call_budget(gzip_len);
-    let mut in_flight = S3InFlight::default();
-    // A separate statement, so the timed-out future (which borrows
-    // `in_flight`) is dropped before the match reads it.
-    let timed = tokio::time::timeout(
-        budget,
-        store_and_verify(store, canonical, gzip_len, &prepared, &mut in_flight),
-    )
-    .await;
-    let outcome = match timed {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => {
-            // Review of SUP-5: name the call and the key that hung, which can
-            // be the content-addressed sidecar rather than `key`.
-            return SegmentOutcome::TimedOut {
-                reason: format!(
-                    "{} {} did not finish; the file's S3 calls ran past {budget:?} \
-                     (canonical key {key}); retried on the next pass",
-                    in_flight.call, in_flight.key
-                ),
-            };
-        }
-    };
     let key = match &outcome {
         SegmentOutcome::Uploaded { key }
         | SegmentOutcome::UploadedSidecar { key }
@@ -2848,6 +2885,47 @@ mod tests {
             !marker_matches(&markers, &seg, 10),
             "a pruned file's record is dropped with it"
         );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// LF-7 review findings 4 and 6: the marker-free copy step verifies the
+    /// object and writes NOTHING locally — no marker, no entry in the
+    /// in-memory verified-unmarked set the prunes read — even with the marker
+    /// folder blocked, the shape a full disk gives. A second copy of the same
+    /// bytes is reused, never put again.
+    #[tokio::test]
+    async fn test_copy_file_verified_writes_no_marker_and_holds_nothing_in_memory() {
+        let dir = temp_wal_dir("lf7-copy-only");
+        let file = plant(&dir, "report-2026-11-12.json", b"report body");
+        let markers = dir.join("uploaded");
+        std::fs::write(&markers, b"blocker").expect("blocker"); // APPROVED: test-only
+        let store = FakeStore::default();
+        let key = "live-fill-logs/2026-11-12/report-2026-11-12.json.gz";
+        let first = copy_file_verified(&store, &file, key).await;
+        assert!(
+            matches!(first, SegmentOutcome::Uploaded { ref key } if key.starts_with("live-fill-logs/")),
+            "{first:?}"
+        );
+        assert_eq!(store.put_count(), 1);
+        assert!(
+            !marker_matches(&markers, &file, 11),
+            "nothing may enter the shared verified-unmarked set"
+        );
+        assert!(
+            markers.is_file(),
+            "the marker folder was never touched (still the blocker file)"
+        );
+        let again = copy_file_verified(&store, &file, key).await;
+        assert!(matches!(again, SegmentOutcome::Reused { .. }), "{again:?}");
+        assert_eq!(store.put_count(), 1);
+        let down = FakeStore {
+            fail_heads: true,
+            ..FakeStore::default()
+        };
+        assert!(matches!(
+            copy_file_verified(&down, &file, key).await,
+            SegmentOutcome::Failed { .. }
+        ));
         drop(std::fs::remove_dir_all(&dir));
     }
 }

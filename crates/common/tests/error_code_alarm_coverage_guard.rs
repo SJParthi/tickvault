@@ -351,6 +351,13 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // only; a page needs a dated quote there first. The refusal itself already
     // keeps the wrong contract off the wire.
     "EXPIRY-SCOPE-01",
+    // ADDED 2026-11-12 (plan item LF-7), an addition to a shrink-only list, so
+    // the reason: LIVE-FILL-02 is the daily paper fill calibration verdict (a
+    // paper fill outside the worst case re-priced from the stored 1 s candles).
+    // PAPER ONLY, written once a day after 15:40 IST; the noise lock §2.22 and
+    // its 2026-11-12 note allow no new page without a dated row first. The
+    // order lines are in the day's report files and the cold-bucket copy.
+    "LIVE-FILL-02",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",

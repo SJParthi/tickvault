@@ -296,6 +296,11 @@ const fn default_live_fill_band_bps() -> u32 {
 const fn default_live_fill_participation_bps() -> u32 {
     2_500
 }
+/// The highest `[live_fill] max_fill_seconds` the config accepts. The daily
+/// report (`live_fill_report`) bounds a stored value by the same figure, so a
+/// hand-edited row cannot size an allocation past it.
+pub const LIVE_FILL_MAX_FILL_SECONDS_CEILING: u32 = 600;
+
 const fn default_live_fill_max_fill_seconds() -> u32 {
     60
 }
@@ -358,9 +363,9 @@ impl LiveFillConfig {
                 self.participation_bps
             );
         }
-        if !(1..=600).contains(&self.max_fill_seconds) {
+        if !(1..=LIVE_FILL_MAX_FILL_SECONDS_CEILING).contains(&self.max_fill_seconds) {
             bail!(
-                "live_fill.max_fill_seconds ({}) must be in [1, 600]",
+                "live_fill.max_fill_seconds ({}) must be in [1, {LIVE_FILL_MAX_FILL_SECONDS_CEILING}]",
                 self.max_fill_seconds
             );
         }
