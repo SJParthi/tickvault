@@ -3,8 +3,11 @@
 //! The measured basis: a second's final price arrives by the end of the next
 //! second, and the very first second of the session (09:15:00) arrives later.
 //! So the chain waits `wait` (1 s) after a candle's end before deciding on
-//! it, and `open_wait` (2.5 s) for the first candle of each size that opens
-//! at 09:15:00.
+//! it, and `open_wait` for the first candle of each size that opens at
+//! 09:15:00. The owner set `open_wait` = 1 s (= `wait`) on 2026-11-12 (Quote
+//! 57 addendum: only 0-4 of ~165 stocks per opening second came later; those
+//! are skipped as late prices), so by default the clamp below does nothing; it
+//! stays for a configured `open_wait` above `wait` (the tests use 2.5 s).
 //!
 //! The candle book has ONE clock for all its frames, and closes every bar at
 //! the clock reading. If the chain simply ran that clock `open_wait` behind
@@ -43,10 +46,21 @@ use tickvault_trading::brutex_host::live_candles::ClosedBar;
 
 /// 09:15:00 IST, seconds of day.
 pub const SESSION_OPEN_SOD: i64 = 33_300;
-/// 15:30:00 IST, seconds of day.
+/// 15:30:00 IST, seconds of day: the STRATEGY session close. Only bars ending
+/// at or before it reach the engine ([`bar_in_session`]).
 pub const SESSION_CLOSE_SOD: i64 = 55_800;
+/// 15:40:00 IST, seconds of day: the end of F&O continuous trading (NSE,
+/// 2026-08-03), from the one source `MARKET_CLOSE_IST_NANOS`. The fold folds
+/// and taps ticks until then, and a held order decided on a bar ending by
+/// 15:30 fills on live seconds up to `15:30 + max_fill_seconds`, so the
+/// feed-gap watch stays armed until this close, not the strategy one (LF-6b
+/// review round 2, finding 4).
+pub const FEED_WATCH_CLOSE_SOD: i64 =
+    tickvault_common::constants::MARKET_CLOSE_IST_NANOS / NANOS_PER_SEC;
 const SECS_PER_DAY: i64 = 86_400;
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+const _: () = assert!(FEED_WATCH_CLOSE_SOD > SESSION_CLOSE_SOD);
 
 /// The end (seconds of day) of a frame's bar that opens at 09:15:00, or `None`
 /// when the frame's grid has no boundary at 09:15:00 (for example 7 s). The

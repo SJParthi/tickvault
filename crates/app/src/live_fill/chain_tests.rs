@@ -69,6 +69,7 @@ fn tap(secs: i64, receipt_ns: i64, ltp: f32, cum: u32, drop_seq: u32) -> TapTick
         drop_seq,
         segment: 1,
         new_trade: true,
+        older_trade: false,
     }
 }
 
@@ -682,4 +683,538 @@ proptest::proptest! {
         }
         proptest::prop_assert_eq!(c.counters().late_ticks, 0);
     }
+}
+
+/// An engine that buys on its second bar and closes on its fourth, with a
+/// fixed exit size. TEST DOUBLE (toy rule, no strategy of tickvault's own).
+#[derive(Debug, Default)]
+struct EntryThenExit {
+    bars: usize,
+    entry_lots: u32,
+    exit_lots: u32,
+    cols: Vec<String>,
+}
+
+impl StrategyEngine for EntryThenExit {
+    fn configure(
+        &mut self,
+        _recipe: &Recipe,
+        _params: Option<&ParamSnapshot>,
+        _universe: &[InstrumentKey],
+    ) -> Result<(), Refusal> {
+        self.bars = 0;
+        Ok(())
+    }
+    fn on_tick(&mut self, _tick: &TickInput, _out: &mut IntentSink) {}
+    fn on_bar(&mut self, bar: &BarInput, out: &mut IntentSink) {
+        self.bars += 1;
+        let mut i = intent(bar.key, Side::Buy);
+        if self.bars == 2 && self.entry_lots > 0 {
+            i.qty_lots = self.entry_lots;
+            out.push(i);
+        }
+        if self.bars == 4 {
+            i.kind = IntentKind::Exit;
+            i.side = Side::Sell;
+            i.qty_lots = self.exit_lots;
+            out.push(i);
+        }
+    }
+    fn value_columns(&self) -> &[String] {
+        &self.cols
+    }
+    fn bar_values(&self, _key: InstrumentKey, _tf: u8, _out: &mut [f64]) -> bool {
+        false
+    }
+}
+
+fn marks(out: &[ChainOutput]) -> usize {
+    out.iter()
+        .filter(|o| matches!(o, ChainOutput::Cmd(PaperCmd::Mark { .. })))
+        .count()
+}
+
+/// LF-6b review finding 6: the entry filled only 2 of its 10 lots; the
+/// strategy's full-size exit is cut to the 2 lots held, never a reversal. An
+/// exit with nothing held is refused.
+#[test]
+fn test_exit_after_a_partial_entry_is_cut_to_the_position_held() {
+    let mut s = setup(true);
+    s.contracts.get_mut(&key()).expect("spec").lot_size = 50;
+    let engine = EntryThenExit {
+        entry_lots: 10,
+        exit_lots: 10,
+        ..EntryThenExit::default()
+    };
+    let mut c = LiveFillChain::new(engine, s, params(), (OPEN - 600) * NS).expect("chain");
+    let mut f = Feed::new();
+    // 8 shares a second, 2 of them ours: the entry fills 100 of 500 shares.
+    f.drive(&mut c, (OPEN, OPEN + 300, 4), rising, 8);
+    let x = executions(&f.out);
+    assert_eq!(x.len(), 2, "{x:?}");
+    assert!(!x[0].exit);
+    assert_eq!(x[0].filled_qty, 100);
+    assert!(x[1].exit);
+    assert_eq!(x[1].side, Side::Sell);
+    assert_eq!(x[1].qty, 100, "the exit is cut to the 2 lots held");
+    assert!(x[1].filled_qty <= 100);
+    // No entry at all: the exit is refused before any order exists.
+    let engine = EntryThenExit {
+        entry_lots: 0,
+        exit_lots: 10,
+        ..EntryThenExit::default()
+    };
+    let mut c =
+        LiveFillChain::new(engine, setup(true), params(), (OPEN - 600) * NS).expect("chain");
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 250, 4), rising, 1_000);
+    assert!(executions(&f.out).is_empty());
+    assert!(
+        events(&f.out)
+            .iter()
+            .any(|e| e.2.as_deref() == Some("exit_without_position")),
+        "{:?}",
+        events(&f.out)
+    );
+}
+
+/// LF-6b review finding 7: once a paper order filled, the instrument's 1 s
+/// closes keep going to the runtime even after the chain's own count reads
+/// flat, because the runtime may have refused the closing order and still
+/// hold the position (it ignores a mark for a flat one).
+#[test]
+fn test_marks_continue_after_the_chain_count_reads_flat() {
+    let engine = EntryThenExit {
+        entry_lots: 10,
+        exit_lots: 10,
+        ..EntryThenExit::default()
+    };
+    let mut c =
+        LiveFillChain::new(engine, setup(true), params(), (OPEN - 600) * NS).expect("chain");
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 250, 4), rising, 1_000);
+    let x = executions(&f.out);
+    assert_eq!(x.len(), 2, "entry and exit both executed: {x:?}");
+    assert_eq!(c.net_shares[0], 0, "the chain's own count reads flat");
+    f.out.clear();
+    f.drive(&mut c, (OPEN + 250, OPEN + 260, 2), |_| 101.0, 1_000);
+    assert!(
+        marks(&f.out) >= 5,
+        "the 1 s closes are still marked: {}",
+        marks(&f.out)
+    );
+}
+
+/// LF-6b review finding 3: a pass whose drain stopped at the per-pass cap
+/// runs the book clock on the newest receipt read, not the wall, so a bar
+/// whose ticks may still be queued is neither closed nor decided.
+#[test]
+fn test_backlogged_pass_never_runs_the_clock_past_the_stream_on_pass_bounded() {
+    let mut c = chain(Recorder::default(), true);
+    let mut f = Feed::new();
+    // Ticks through 09:16:59 (received at 09:16:59.3), passes to 09:17:00.
+    f.drive(&mut c, (OPEN, OPEN + 120, 0), |_| 100.0, 10);
+    let before = c.engine().bars.len();
+    // The wall is at 09:17:05, but the thread is 6 s behind its ring.
+    let wall = (OPEN + 125) * NS;
+    c.on_pass_bounded(wall, wall - DAY * NS, true)
+        .expect("pass");
+    assert_eq!(
+        c.engine().bars.len(),
+        before,
+        "the 09:16 bar is not released on seconds still queued"
+    );
+    // Caught up: the same wall releases it.
+    c.on_pass_bounded(wall, wall - DAY * NS, false)
+        .expect("pass");
+    assert_eq!(c.engine().bars.len(), before + 1);
+}
+
+/// LF-6b review finding 3: a loss the tap counted behind ticks still queued
+/// is read out of band and refuses the candle before it is decided.
+#[test]
+fn test_tap_loss_read_out_of_band_refuses_the_next_decision_note_tap_loss() {
+    let mut c = chain(emitting(), true);
+    let mut f = Feed::new();
+    // Up to 09:17:00.9: the 09:16 bar (the one the engine orders on) is
+    // released at 09:17:01.
+    f.drive(&mut c, (OPEN, OPEN + 120, 0), rising, 1_000);
+    f.passes(
+        &mut c,
+        (OPEN + 120) * NS + 100_000_000,
+        (OPEN + 121) * NS - 1,
+    );
+    assert!(events(&f.out).is_empty());
+    c.note_tap_loss(1);
+    f.passes(&mut c, (OPEN + 121) * NS, (OPEN + 121) * NS + 200_000_000);
+    let ev = events(&f.out);
+    assert!(
+        ev.contains(&(
+            LiveOrderEventKind::Reject,
+            1,
+            Some("tick_dropped".to_owned())
+        )),
+        "{ev:?}"
+    );
+    assert_eq!(c.held_orders(), 0);
+    // The queued tick that carries the same count taints nothing more.
+    let added = c.taints_added();
+    c.on_tap(&tap(
+        OPEN + 121,
+        (OPEN + 121) * NS + 100_000_000,
+        101.0,
+        f.cum + 1,
+        1,
+    ));
+    assert_eq!(c.taints_added(), added);
+}
+
+/// LF-6b review finding 4: a real but OLDER trade (a backup copy accepted
+/// late, a stale cumulative regression) whose price belongs to the decision
+/// candle, arriving after that candle closed, skips the order as a late
+/// price; one inside a still-open bar widens it without moving its close.
+#[test]
+fn test_older_real_trade_on_a_closed_candle_is_a_late_price() {
+    let mut c = chain(emitting(), true);
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 120, 0), rising, 100);
+    // 09:17:00.3: the 09:17:00 tick closes the 09:16 bar; a backup copy of a
+    // 09:16:59 trade the primary skipped arrives at 09:17:00.5 with a lower
+    // cumulative: the fold marks it an older trade.
+    f.cum += 100;
+    c.on_tap(&tap(
+        OPEN + 120,
+        (OPEN + 120) * NS + 300_000_000,
+        101.0,
+        f.cum,
+        0,
+    ));
+    let mut older = tap(
+        OPEN + 119,
+        (OPEN + 120) * NS + 500_000_000,
+        101.5,
+        f.cum - 50,
+        0,
+    );
+    older.new_trade = false;
+    older.older_trade = true;
+    c.on_tap(&older);
+    f.passes(&mut c, (OPEN + 120) * NS + 600_000_000, (OPEN + 122) * NS);
+    assert_eq!(c.counters().late_ticks, 1);
+    assert!(
+        events(&f.out).contains(&(
+            LiveOrderEventKind::Reject,
+            1,
+            Some(REASON_LATE_PRICE.to_owned())
+        )),
+        "{:?}",
+        events(&f.out)
+    );
+    assert!(executions(&f.out).is_empty());
+    // Inside the open 09:17 bar: the high widens, the close stays.
+    let mut c = chain(Recorder::default(), true);
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 70, 0), |_| 100.0, 10);
+    let mut inside = tap(OPEN + 65, (OPEN + 70) * NS, 104.0, f.cum - 5, 0);
+    inside.new_trade = false;
+    inside.older_trade = true;
+    c.on_tap(&inside);
+    f.drive(&mut c, (OPEN + 70, OPEN + 121, 1), |_| 100.0, 10);
+    let bar = c
+        .engine()
+        .bars
+        .iter()
+        .find(|b| b.open_ist_secs == OPEN + 60)
+        .copied()
+        .expect("09:16 bar");
+    assert!(
+        (bar.high - 104.0).abs() < 1e-9,
+        "the older price widens the bar"
+    );
+    assert!(
+        (bar.close - 100.0).abs() < 1e-9,
+        "the close is the newest price"
+    );
+}
+
+/// LF-6b review round 2, finding 2: an instrument whose first packet of the
+/// day arrives at 09:44:30 (a late subscribe, a widen or a resubscribe) has
+/// a 09:30-09:45 bar built from 30 s of trades. Orders on it are refused
+/// `first_bar_partial`; the next full bar decides normally.
+#[test]
+fn test_regression_first_bar_after_a_late_first_packet_is_refused_first_bar_partial() {
+    let mut s = setup(true);
+    s.engine_frames_secs = vec![900];
+    let engine = Recorder {
+        emit_all: true,
+        ..Recorder::default()
+    };
+    let mut c = LiveFillChain::new(engine, s, params(), (OPEN - 600) * NS).expect("chain");
+    let mut f = Feed::new();
+    // First packet 09:44:30.3; the 09:30 bar closes at 09:45:00.
+    f.drive(&mut c, (OPEN + 1_770, OPEN + 1_802, 0), |_| 100.0, 1_000);
+    let ev = events(&f.out);
+    assert!(
+        ev.contains(&(
+            LiveOrderEventKind::Reject,
+            1,
+            Some(REASON_FIRST_BAR_PARTIAL.to_owned())
+        )),
+        "{ev:?}"
+    );
+    assert!(
+        ev.iter().all(|e| e.0 != LiveOrderEventKind::Built),
+        "{ev:?}"
+    );
+    // The 09:45-10:00 bar starts after the first packet: decided normally.
+    f.drive(&mut c, (OPEN + 1_802, OPEN + 2_702, 0), |_| 100.0, 1_000);
+    assert!(
+        events(&f.out)
+            .iter()
+            .any(|e| e.0 == LiveOrderEventKind::Built),
+        "the first full bar decides"
+    );
+}
+
+/// LF-6b review round 2, finding 3: the stream is silent from 09:16:00.05 to
+/// 09:16:02.2. The feed gap `[09:16:00, 09:16:02]` is recorded and handed out
+/// before the opening candle is decided (09:16:02.5) and does not touch the
+/// candle itself, only its fill seconds. The decision must still refuse it.
+#[test]
+fn test_regression_taint_over_the_fill_window_before_the_decision_refuses_the_order() {
+    let engine = Recorder {
+        emit_all: true,
+        ..Recorder::default()
+    };
+    let mut c = chain(engine, true);
+    let mut f = Feed::new();
+    f.drive(&mut c, (OPEN, OPEN + 60, 0), |_| 100.0, 1_000);
+    // The 09:16:00 trade received at 09:16:00.05 closes the opening bar.
+    f.cum += 1_000;
+    c.on_tap(&tap(
+        OPEN + 60,
+        (OPEN + 60) * NS + 50_000_000,
+        100.0,
+        f.cum,
+        0,
+    ));
+    // Silence; the pass at 09:16:02.1 records the gap.
+    f.passes(
+        &mut c,
+        (OPEN + 60) * NS + 100_000_000,
+        (OPEN + 62) * NS + 200_000_000,
+    );
+    assert!(c.taints_added()[1] >= 1, "a feed gap was recorded");
+    assert_eq!(c.held_orders(), 0, "nothing decided yet");
+    f.cum += 1_000;
+    c.on_tap(&tap(
+        OPEN + 62,
+        (OPEN + 62) * NS + 200_000_000,
+        100.0,
+        f.cum,
+        0,
+    ));
+    f.drive(&mut c, (OPEN + 63, OPEN + 125, 2), |_| 100.0, 1_000);
+    let opening: Vec<_> = f
+        .out
+        .iter()
+        .filter_map(|o| match o {
+            ChainOutput::Event(e) if e.candle_start_ist_nanos == Some(OPEN * NS) => {
+                Some((e.event, e.reason.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        opening.contains(&(LiveOrderEventKind::Reject, Some("feed_gap".to_owned()))),
+        "{opening:?}"
+    );
+    assert!(
+        executions(&f.out)
+            .iter()
+            .all(|x| x.base.candle_start_ist_nanos != Some(OPEN * NS)),
+        "no paper order fills on the silent seconds"
+    );
+}
+
+/// LF-6b review round 2, finding 4: an order decided on the 15:29 bar fills
+/// on seconds up to 15:31:00, while F&O still trades. A stall from 15:30:10
+/// must refuse it: the feed-gap watch stays armed past the 15:30 strategy
+/// close, to 15:40.
+#[test]
+fn test_regression_feed_gap_after_the_strategy_close_refuses_the_held_order() {
+    let mut c = chain(emitting(), true);
+    let mut f = Feed::new();
+    let t0 = DAY + 55_620; // 15:27:00
+    let t1 = DAY + 55_810; // 15:30:10
+    f.drive(&mut c, (t0, t1, 0), |_| 100.0, 1);
+    assert_eq!(c.held_orders(), 1, "the 15:29 bar's order is held");
+    f.passes(&mut c, (t1 + 1) * NS, (DAY + 55_830) * NS);
+    assert_eq!(c.held_orders(), 0);
+    let ev = events(&f.out);
+    assert!(
+        ev.contains(&(LiveOrderEventKind::Reject, 2, Some("feed_gap".to_owned()))),
+        "{ev:?}"
+    );
+    assert!(
+        executions(&f.out)
+            .iter()
+            .all(|x| x.base.candle_start_ist_nanos != Some((DAY + 55_740) * NS)),
+        "the 15:29 order never fills over the stall"
+    );
+}
+
+/// LF-6b review round 2, finding 5: the FRAME DRAIN runs 1.5 s behind (the
+/// tap ring itself is empty, so no pass is backlogged). Each second's last
+/// ticks reach the chain after the wall-clock reading would have closed the
+/// second. With the drain's lag seen on the ticks, the clock follows the
+/// newest receipt, so no tick of a closed second arrives late.
+#[test]
+fn test_regression_frame_drain_lag_holds_the_clock_to_the_stream() {
+    let mut c = chain(Recorder::default(), true);
+    let start = OPEN + 100;
+    let end = OPEN + 130;
+    let lag = 1_500_000_000;
+    let ticks = (end - start) * 10;
+    let mut k = 0i64;
+    let mut cum = 0u32;
+    let mut now = start * NS;
+    while now <= (end + 5) * NS {
+        while k < ticks && start * NS + k * 100_000_000 + 50_000_000 + lag <= now {
+            cum += 1;
+            c.on_tap(&tap(
+                start + k / 10,
+                start * NS + k * 100_000_000 + 50_000_000,
+                100.0,
+                cum,
+                0,
+            ));
+            k += 1;
+        }
+        pass(&mut c, now);
+        now += 100_000_000;
+    }
+    assert!(c.counters().bars_released > 0);
+    assert_eq!(
+        c.counters().late_ticks,
+        0,
+        "a second is never closed while its ticks are still in the drain"
+    );
+}
+
+/// Asks for 10 shares of `key()` on its second 1 m bar and of nothing else.
+/// TEST DOUBLE.
+#[derive(Debug, Default)]
+struct OneKeyOnce {
+    key_bars: usize,
+}
+
+impl StrategyEngine for OneKeyOnce {
+    fn configure(
+        &mut self,
+        _recipe: &Recipe,
+        _params: Option<&ParamSnapshot>,
+        _universe: &[InstrumentKey],
+    ) -> Result<(), Refusal> {
+        self.key_bars = 0;
+        Ok(())
+    }
+    fn on_tick(&mut self, _tick: &TickInput, _out: &mut IntentSink) {}
+    fn on_bar(&mut self, bar: &BarInput, out: &mut IntentSink) {
+        if bar.key != key() {
+            return;
+        }
+        self.key_bars += 1;
+        if self.key_bars == 2 {
+            out.push(intent(bar.key, Side::Buy));
+        }
+    }
+    fn value_columns(&self) -> &[String] {
+        &[]
+    }
+    fn bar_values(&self, _key: InstrumentKey, _tf: u8, _out: &mut [f64]) -> bool {
+        false
+    }
+}
+
+/// LF-6b review round 3, finding 1: 800 instruments with a paper position
+/// release their 1 s bars in the same pass as an order finishes. Their marks
+/// (more than the 768 slots the outbox used to have) must not crowd out the
+/// Execute, and each instrument gets at most one mark per pass.
+#[test]
+fn test_regression_marks_of_many_traded_instruments_never_crowd_out_the_execute() {
+    const OTHERS: u64 = 800;
+    let mut s = setup(true);
+    for i in 0..OTHERS {
+        s.universe.push(InstrumentKey {
+            security_id: 50_000 + i,
+            exchange_segment: 1,
+        });
+    }
+    let mut c =
+        LiveFillChain::new(OneKeyOnce::default(), s, params(), (OPEN - 600) * NS).expect("chain");
+    for t in c.traded_today.iter_mut().skip(1) {
+        *t = true;
+    }
+    let mut cum = vec![0u32; usize::try_from(OTHERS).expect("fits") + 1];
+    let mut out: Vec<ChainOutput> = Vec::new();
+    let mut most_marks_in_a_pass = 0usize;
+    let (from, to) = (OPEN, OPEN + 125);
+    let mut sec = from;
+    let mut now = from * NS;
+    while now <= (to + 3) * NS {
+        while sec < to && sec * NS + 300_000_000 <= now {
+            for (i, cv) in cum.iter_mut().enumerate() {
+                *cv += 1_000;
+                let mut t = tap(sec, sec * NS + 300_000_000, rising(sec), *cv, 0);
+                t.security_id = if i == 0 { 2885 } else { 50_000 + i as u64 - 1 };
+                c.on_tap(&t);
+            }
+            sec += 1;
+        }
+        pass(&mut c, now);
+        let mut pass_out = Vec::new();
+        c.drain_outputs(|o| pass_out.push(o));
+        most_marks_in_a_pass = most_marks_in_a_pass.max(marks(&pass_out));
+        out.extend(pass_out);
+        now += 100_000_000;
+    }
+    let x = executions(&out);
+    assert_eq!(x.len(), 1, "the Execute must come out: {:?}", c.counters());
+    assert_eq!(x[0].filled_qty, 10);
+    assert_eq!(c.counters().executions_lost, 0);
+    assert_eq!(c.counters().outbox_overflow, 0, "{:?}", c.counters());
+    assert!(
+        most_marks_in_a_pass > 768,
+        "the pass carried more marks than the old outbox: {most_marks_in_a_pass}"
+    );
+    assert!(most_marks_in_a_pass <= usize::try_from(OTHERS).expect("fits") + 1);
+}
+
+/// LF-6b review round 3, finding 1: two seconds of the same instrument
+/// released in one pass give ONE mark carrying the newer close.
+#[test]
+fn test_push_mark_folds_an_instruments_marks_within_a_pass() {
+    let mut s = setup(true);
+    s.universe.push(InstrumentKey {
+        security_id: 9,
+        exchange_segment: 1,
+    });
+    let mut c =
+        LiveFillChain::new(Recorder::default(), s, params(), (OPEN - 600) * NS).expect("chain");
+    c.pass_floor = 0;
+    c.push_mark(0, 2885, ExchangeSegment::NseEquity, 100.0);
+    c.push_mark(0, 2885, ExchangeSegment::NseEquity, 101.5);
+    assert_eq!(c.outputs_waiting(), 1);
+    assert_eq!(c.counters().marks_coalesced, 1);
+    // A new pass never folds into an earlier pass's mark still queued.
+    c.pass_floor = c.outbox.len();
+    c.push_mark(0, 2885, ExchangeSegment::NseEquity, 102.0);
+    let mut prices = Vec::new();
+    c.drain_outputs(|o| {
+        if let ChainOutput::Cmd(PaperCmd::Mark { price, .. }) = o {
+            prices.push(price);
+        }
+    });
+    assert_eq!(prices, vec![101.5, 102.0]);
 }

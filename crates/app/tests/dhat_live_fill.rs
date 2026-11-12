@@ -132,6 +132,7 @@ fn tap_at(secs: i64, cum: u32) -> TapTick {
         drop_seq: 0,
         segment: 1,
         new_trade: true,
+        older_trade: false,
     }
 }
 
@@ -152,10 +153,10 @@ fn dhat_live_fill_tap_drain_and_chain_per_tick_paths_allocate_nothing() {
         ..ParsedTick::default()
     };
     // Warm: first send on each ring, the counter registration.
-    assert!(accept_tap.offer(&parsed, None, true));
+    assert!(accept_tap.offer(&parsed, None, true, false));
     let _ = accept_rx.try_recv();
-    let _ = full_tap.offer(&parsed, None, true);
-    let _ = full_tap.offer(&parsed, None, true);
+    let _ = full_tap.offer(&parsed, None, true, false);
+    let _ = full_tap.offer(&parsed, None, true, false);
 
     const WARMUP_FRAMES: u64 = 4;
     const FRAMES: u64 = 2_500;
@@ -215,8 +216,8 @@ fn dhat_live_fill_tap_drain_and_chain_per_tick_paths_allocate_nothing() {
         || {},
         || {
             for _ in 0..10_000 {
-                std::hint::black_box(accept_tap.offer(&parsed, None, true));
-                std::hint::black_box(full_tap.offer(&parsed, None, true));
+                std::hint::black_box(accept_tap.offer(&parsed, None, true, false));
+                std::hint::black_box(full_tap.offer(&parsed, None, true, false));
             }
             while accept_rx.try_recv().is_some() {}
         },

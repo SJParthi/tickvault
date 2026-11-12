@@ -1420,6 +1420,13 @@ pub enum IngestOutcome {
         /// cumulative regression, a backup copy accepted late, or an illiquid
         /// contract's first packet all carry an old trade time that is not lag.
         advanced: bool,
+        /// The first packet folded live for the instrument traded while this
+        /// process listened (`ConsumeStats::fresh_first`, LF-6b): a fresh
+        /// trade the live paper fill chain must price, often the 09:15:00 open.
+        fresh_first: bool,
+        /// A real trade older than the newest one seen
+        /// (`ConsumeStats::older_trade`, LF-6b).
+        older_trade: bool,
     },
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
@@ -1889,8 +1896,18 @@ impl LiveIngest {
     /// give-up arms only.
     #[inline]
     pub(crate) fn note_live_fill_abandoned(&mut self, connection_index: u8, abandoned_bytes: u64) {
-        if abandoned_bytes > 0
-            && live_fill_tap::tap_gate(connection_index, self.replaying_wal)
+        if abandoned_bytes > 0 {
+            self.note_live_fill_loss(connection_index);
+        }
+    }
+
+    /// A live tick the chain will not see although it may have traded (an
+    /// abandoned frame tail, or a folded tick whose row append failed, LF-6b):
+    /// moves the live fill tap's loss count. O(1), no allocation; loss arms
+    /// only.
+    #[inline]
+    pub(crate) fn note_live_fill_loss(&mut self, connection_index: u8) {
+        if live_fill_tap::tap_gate(connection_index, self.replaying_wal)
             && let Some(tap) = self.live_fill_tap.as_mut()
         {
             tap.note_upstream_loss();
@@ -3501,6 +3518,8 @@ impl LiveIngest {
             amended: stats.amended_count,
             repeat_quote: stats.repeat_quote,
             advanced: stats.advanced,
+            fresh_first: stats.fresh_first,
+            older_trade: stats.older_trade,
         }
     }
 
@@ -9019,9 +9038,11 @@ pub fn drain_main_feed_frame(
                         // replayed WAL frame, never while the backlog is
                         // re-folded). One branch while off; O(1), no
                         // allocation, never a wait while on. `new_trade`: a
-                        // repeat quote or first-sight packet carries an old
-                        // trade time and price, which the chain must never
-                        // treat as a candle price.
+                        // new trade, or a first packet that traded while we
+                        // listened (the 09:15:00 open); a repeat quote or a
+                        // connect snapshot carries an old trade time and
+                        // price, which the chain must never treat as a candle
+                        // price. `older_trade`: a real older trade (late path).
                         let tap_open =
                             live_fill_tap::tap_gate(frame.connection_index, ingest.replaying_wal);
                         if tap_open && let Some(tap) = ingest.live_fill_tap.as_mut() {
@@ -9029,9 +9050,16 @@ pub fn drain_main_feed_frame(
                                 ParsedFrame::TickWithDepth(_, levels) => levels.first(),
                                 _ => None,
                             };
-                            let new_trade =
-                                matches!(outcome, IngestOutcome::Folded { advanced: true, .. });
-                            let _queued = tap.offer(tick, best, new_trade);
+                            let (new_trade, older_trade) = match outcome {
+                                IngestOutcome::Folded {
+                                    advanced,
+                                    fresh_first,
+                                    older_trade,
+                                    ..
+                                } => (advanced || fresh_first, older_trade),
+                                _ => (false, false),
+                            };
+                            let _queued = tap.offer(tick, best, new_trade, older_trade);
                         }
                     }
                     IngestOutcome::WrittenOutOfSession => {
@@ -9051,7 +9079,13 @@ pub fn drain_main_feed_frame(
                     IngestOutcome::AggregatorRefused | IngestOutcome::RefusedWrongDay => {
                         c.aggregator_refused.increment(1)
                     }
-                    IngestOutcome::WriteFailed => c.write_failed.increment(1),
+                    IngestOutcome::WriteFailed => {
+                        c.write_failed.increment(1);
+                        // LF-6b: the tick WAS folded, but its row did not
+                        // stage; the live paper fill chain's candles must not
+                        // trust the stretch it touched.
+                        ingest.note_live_fill_loss(frame.connection_index);
+                    }
                 }
             }
             // A disconnect the drain DECODED. It is split out of the untyped
@@ -17681,8 +17715,9 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     ingest.subscribe_reconcile = Some(Arc::clone(&subscribe_reconcile));
     // LF-6b: the live paper fill chain's tap, only when the boot built the
     // chain (an approved strategy engine exists); never today.
-    if let Some(tap_tx) = crate::live_fill::take_tap_sender() {
-        ingest = ingest.with_live_fill_tap(live_fill_tap::LiveFillTap::new(tap_tx));
+    if let Some(link) = crate::live_fill::take_tap_sender() {
+        ingest = ingest
+            .with_live_fill_tap(live_fill_tap::LiveFillTap::new(link.tx).with_loss_out(link.loss));
         info!("live paper fill chain: tap armed on the frame drain");
     }
     info!(

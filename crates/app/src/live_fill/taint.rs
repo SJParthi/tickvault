@@ -39,7 +39,7 @@
 
 use tickvault_trading::brutex_host::live_candles::FUTURE_TICK_SKEW_SECS;
 
-use super::timing::{SESSION_CLOSE_SOD, SESSION_OPEN_SOD};
+use super::timing::{FEED_WATCH_CLOSE_SOD, SESSION_CLOSE_SOD, SESSION_OPEN_SOD};
 
 /// Receipt-time gap between two ticks, inside the session, that taints.
 pub const FEED_GAP_NS: i64 = 2_000_000_000;
@@ -231,6 +231,16 @@ pub fn in_session_ns(ist_ns: i64) -> bool {
     (SESSION_OPEN_SOD..SESSION_CLOSE_SOD).contains(&sod)
 }
 
+/// Whether `ist_ns` lies in 09:15:00-15:40:00 of its day: the stretch the
+/// feed-gap watch is armed, up to the end of F&O trading, so a held order
+/// filling on seconds after the 15:30 strategy close still sees a stall
+/// (LF-6b review round 2, finding 4). O(1).
+#[must_use]
+pub fn in_feed_watch_ns(ist_ns: i64) -> bool {
+    let sod = ist_ns.div_euclid(NANOS_PER_SEC).rem_euclid(SECS_PER_DAY);
+    (SESSION_OPEN_SOD..FEED_WATCH_CLOSE_SOD).contains(&sod)
+}
+
 /// The stretch a chain started at `now_ist_ns` cannot trust: from 09:15:00 of
 /// the day to the end of the longest bucket open at the start, when the start
 /// lies inside the session (strictly after 09:15:00); else `None`. O(1).
@@ -245,6 +255,15 @@ pub fn chain_start_taint(now_ist_ns: i64, longest_frame_secs: u32) -> Option<(i6
         open_ns.div_euclid(NANOS_PER_SEC),
         now_secs.saturating_add(i64::from(longest_frame_secs.max(1))),
     ))
+}
+
+/// Whether loss count `seq` is ahead of `last` (wrapping, 32 bits). O(1).
+#[inline]
+fn seq_ahead(seq: u32, last: u32) -> bool {
+    // APPROVED: wrapping distance read as signed; a count never moves 2^31.
+    #[allow(clippy::cast_possible_wrap)]
+    let d = seq.wrapping_sub(last) as i32;
+    d > 0
 }
 
 /// Watches the tap's stream for drops and feed gaps, and the clocks for steps.
@@ -298,7 +317,8 @@ impl StreamWatch {
     }
 
     /// One received tick: taints the stretch a drop or a feed gap could have
-    /// touched. `in_session` gates the feed-gap check (09:15-15:30). O(1).
+    /// touched. `in_session` gates the feed-gap check (09:15-15:40, see
+    /// [`in_feed_watch_ns`]). O(1).
     pub fn on_tick(
         &mut self,
         drop_seq: u32,
@@ -308,32 +328,10 @@ impl StreamWatch {
         taints: &mut TaintRanges,
     ) {
         let receipt_secs = receipt_ist_ns.div_euclid(NANOS_PER_SEC);
-        if self.last_drop_seq != drop_seq {
-            // With nothing received yet today the drop has no lower bound:
-            // every candle up to this tick is suspect.
-            let lo = match self.last_receipt_ns {
-                Some(prev) => {
-                    let by_lag = prev
-                        .div_euclid(NANOS_PER_SEC)
-                        .saturating_sub(MAX_DROP_LAG_SECS);
-                    if self.max_exchange_secs > 0 {
-                        by_lag.min(self.max_exchange_secs)
-                    } else {
-                        by_lag
-                    }
-                }
-                None => 0,
-            };
-            let hi = exchange_secs
-                .max(receipt_secs)
-                .saturating_add(FUTURE_TICK_SKEW_SECS)
-                .max(lo);
-            taints.add(lo, hi, TaintReason::TickDropped);
-            // A frame shed before the drain may be newer than this tick: the
-            // next pass bounds the stretch by its wall clock.
-            self.drop_pending_lo = Some(self.drop_pending_lo.map_or(lo, |p| p.min(lo)));
+        if seq_ahead(drop_seq, self.last_drop_seq) {
+            self.note_drop(exchange_secs.max(receipt_secs), taints);
+            self.last_drop_seq = drop_seq;
         }
-        self.last_drop_seq = drop_seq;
         if let Some(prev) = self.last_receipt_ns
             && in_session
         {
@@ -360,6 +358,54 @@ impl StreamWatch {
         }
     }
 
+    /// A loss the tap counted: taints from the newest receipt seen minus
+    /// [`MAX_DROP_LAG_SECS`] (or from 0 with nothing received yet) to
+    /// `newest_secs` plus [`FUTURE_TICK_SKEW_SECS`], and leaves the lower
+    /// bound for the next pass to extend to its wall clock. O(1).
+    fn note_drop(&mut self, newest_secs: i64, taints: &mut TaintRanges) {
+        let lo = match self.last_receipt_ns {
+            Some(prev) => {
+                let by_lag = prev
+                    .div_euclid(NANOS_PER_SEC)
+                    .saturating_sub(MAX_DROP_LAG_SECS);
+                if self.max_exchange_secs > 0 {
+                    by_lag.min(self.max_exchange_secs)
+                } else {
+                    by_lag
+                }
+            }
+            None => 0,
+        };
+        let hi = newest_secs.saturating_add(FUTURE_TICK_SKEW_SECS).max(lo);
+        taints.add(lo, hi, TaintReason::TickDropped);
+        // A frame shed before the drain may be newer than the tick that
+        // reports it: the next pass bounds the stretch by its wall clock.
+        self.drop_pending_lo = Some(self.drop_pending_lo.map_or(lo, |p| p.min(lo)));
+    }
+
+    /// The tap's loss total read OUT OF BAND (its low 32 bits, the same count
+    /// the next queued tick's `drop_seq` will carry), before ticks still
+    /// queued behind the loss are read: a loss ahead of the last one seen
+    /// taints now, so no release can run on the seconds it touched. The
+    /// queued ticks that later carry the same count, or an older one, taint
+    /// nothing more. O(1).
+    pub fn on_loss_total(&mut self, seq: u32, taints: &mut TaintRanges) {
+        if seq_ahead(seq, self.last_drop_seq) {
+            let newest = self
+                .last_receipt_ns
+                .map_or(0, |r| r.div_euclid(NANOS_PER_SEC))
+                .max(self.max_exchange_secs);
+            self.note_drop(newest, taints);
+            self.last_drop_seq = seq;
+        }
+    }
+
+    /// The newest receipt (IST ns) of a tick received today, if any. O(1).
+    #[must_use]
+    pub fn newest_receipt_ns(&self) -> Option<i64> {
+        self.last_receipt_ns
+    }
+
     /// One pass: bounds a pending drop by the wall clock, taints an ongoing
     /// feed gap, and compares the wall step with the monotonic step since the
     /// last pass, tainting the wall-clock stretch when they disagree by more
@@ -374,7 +420,7 @@ impl StreamWatch {
             );
         }
         if let Some(prev) = self.last_receipt_ns
-            && in_session_ns(wall_ist_ns)
+            && in_feed_watch_ns(wall_ist_ns)
         {
             let prev_eff = prev.max(session_open_ns(wall_ist_ns));
             if wall_ist_ns.saturating_sub(prev_eff) >= FEED_GAP_NS {
@@ -490,6 +536,27 @@ mod tests {
         assert_eq!(t.taint_of(top, top + 1), Some(TaintReason::ClockStep));
     }
 
+    /// LF-6b review round 2, finding 4: the feed-gap watch is armed from
+    /// 09:15:00 to 15:40:00 (the end of F&O trading), past the 15:30 strategy
+    /// close, and a stall at 15:30:20 is tainted by a pass.
+    #[test]
+    fn test_in_feed_watch_ns_runs_to_the_end_of_fo_trading() {
+        assert!(!in_feed_watch_ns((DAY + 33_299) * NS));
+        assert!(in_feed_watch_ns((DAY + 33_300) * NS));
+        assert!(in_feed_watch_ns((DAY + 55_820) * NS));
+        assert!(in_feed_watch_ns((DAY + 56_399) * NS));
+        assert!(!in_feed_watch_ns((DAY + 56_400) * NS));
+        let mut w = StreamWatch::new();
+        let mut t = TaintRanges::new();
+        w.on_tick(0, DAY + 55_810, (DAY + 55_810) * NS, true, &mut t);
+        let wall = (DAY + 55_820) * NS;
+        w.on_pass(wall, wall, &mut t);
+        assert_eq!(
+            t.taint_of(DAY + 55_815, DAY + 55_816),
+            Some(TaintReason::FeedGap)
+        );
+    }
+
     #[test]
     fn test_session_open_ns_in_session_ns_and_chain_start_taint() {
         assert_eq!(session_open_ns(T10 * NS), (DAY + 33_300) * NS);
@@ -505,6 +572,44 @@ mod tests {
             chain_start_taint(T10 * NS + 500_000_000, 300),
             Some((DAY + 33_300, T10 + 300))
         );
+    }
+
+    /// LF-6b review finding 3: a loss read out of band taints once, from the
+    /// newest receipt seen minus the lag bound, before the queued ticks that
+    /// carry it (or an older count) arrive; those taint nothing more.
+    #[test]
+    fn test_stream_watch_on_loss_total_taints_once_and_newest_receipt_ns() {
+        let mut w = StreamWatch::new();
+        let mut t = TaintRanges::new();
+        assert_eq!(w.newest_receipt_ns(), None);
+        w.on_tick(0, T10, T10 * NS, false, &mut t);
+        assert_eq!(w.newest_receipt_ns(), Some(T10 * NS));
+        w.on_loss_total(0, &mut t);
+        assert_eq!(
+            t.added()[TaintReason::TickDropped as usize],
+            0,
+            "no new loss"
+        );
+        w.on_loss_total(2, &mut t);
+        assert_eq!(t.added()[TaintReason::TickDropped as usize], 1);
+        assert_eq!(
+            t.taint_of(T10 - MAX_DROP_LAG_SECS, T10 - MAX_DROP_LAG_SECS + 1),
+            Some(TaintReason::TickDropped)
+        );
+        assert_eq!(t.taint_of(T10 + 5, T10 + 6), Some(TaintReason::TickDropped));
+        // Queued ticks carrying an older or the same count change nothing.
+        w.on_tick(1, T10 + 1, (T10 + 1) * NS, false, &mut t);
+        w.on_tick(2, T10 + 1, (T10 + 1) * NS, false, &mut t);
+        assert_eq!(t.added()[TaintReason::TickDropped as usize], 1);
+        // The pass extends the stretch to its wall clock.
+        w.on_pass((T10 + 200) * NS, 0, &mut t);
+        assert_eq!(
+            t.taint_of(T10 + 200, T10 + 201),
+            Some(TaintReason::TickDropped)
+        );
+        // A later count still taints.
+        w.on_tick(3, T10 + 2, (T10 + 2) * NS, false, &mut t);
+        assert_eq!(t.added()[TaintReason::TickDropped as usize], 2);
     }
 
     #[test]

@@ -23,9 +23,17 @@
 //! queue push per bar the tick closed (O(opening ends) for its release
 //! instant). A repeat quote or a first-sight packet (`new_trade` false) only
 //! refreshes the best bid/ask and the volume baseline (two hash probes): its
-//! trade time and price are old and never reach a candle or the engine. No
-//! allocation unless the engine asks for an order on a tick (refused with a
-//! row; rows allocate). DHAT-gated by `crates/app/tests/dhat_live_fill.rs`.
+//! trade time and price are old and never reach a candle or the engine. A
+//! real but OLDER trade (`older_trade`) goes through the candle book only:
+//! its price joins the bar it belongs to without moving a close, or counts
+//! late on a closed bar; it never reaches the engine. No allocation unless
+//! the engine asks for an order on a tick (refused with a row; rows
+//! allocate). DHAT-gated by `crates/app/tests/dhat_live_fill.rs`.
+//!
+//! An exit intent is reduce-only against the paper position the chain sent
+//! (refused `exit_without_position` when none), and the runtime clamps it
+//! again against the position it booked. Once an order filled something, the
+//! instrument's 1 s closes are marked for the rest of the day.
 //!
 //! # Per pass
 //!
@@ -46,7 +54,7 @@ use tickvault_storage::live_order_events_persistence::{
 };
 use tickvault_trading::brutex_host::InstrumentKey;
 use tickvault_trading::brutex_host::engine::{
-    IntentSink, OrderIntent, Side, StrategyEngine, TickInput,
+    IntentKind, IntentSink, OrderIntent, Side, StrategyEngine, TickInput,
 };
 use tickvault_trading::brutex_host::live_candles::{
     CloseBy, ClosedBar, ClosedBars, LiveCandleBook, TickVerdict,
@@ -56,16 +64,27 @@ use tickvault_trading::brutex_host::recipe::{ParamSnapshot, Recipe};
 use tickvault_trading::brutex_host::worst_fill::{SecondBar, rupees_to_paise};
 
 use super::fill_window::{Finished, HeldOrder, MAX_PENDING_ORDERS, PendingBook};
-use super::taint::{StreamWatch, TaintRanges, TaintReason, chain_start_taint};
-use super::timing::{BookClock, ReleaseQueue, SESSION_CLOSE_SOD, SESSION_OPEN_SOD, bar_in_session};
+use super::taint::{
+    FEED_GAP_NS, StreamWatch, TaintRanges, TaintReason, chain_start_taint, session_open_ns,
+};
+use super::timing::{
+    BookClock, FEED_WATCH_CLOSE_SOD, ReleaseQueue, SESSION_OPEN_SOD, bar_in_session,
+};
 use crate::dhan_feed_stack::live_fill_tap::TapTick;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const SECS_PER_DAY: i64 = 86_400;
 /// Intents one engine call may return.
 pub const INTENT_SINK_CAPACITY: usize = 64;
+/// Outbox slots kept for decision rows and finished orders (every intent of
+/// the released bars plus every finished order, with room to spare). Marks
+/// never take these slots (LF-6b review round 3, finding 1).
+const OUTBOX_ORDER_ROOM: usize = INTENT_SINK_CAPACITY * 8 + MAX_PENDING_ORDERS * 4;
 /// Reason on a refusal row when a late price reached the decision candle.
 pub const REASON_LATE_PRICE: &str = "skip:late_price";
+/// Reason on a refusal row when the instrument's first packet of the day came
+/// after the decision candle opened, so the candle is partial.
+pub const REASON_FIRST_BAR_PARTIAL: &str = "first_bar_partial";
 
 /// Tick size, lot size and label of one tradable contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +153,9 @@ pub struct PaperExecution {
     pub avg_price: f64,
     /// The same, paise (the model price on the Fill row).
     pub avg_price_paise: Option<i64>,
+    /// The strategy asked to EXIT: the runtime makes it reduce-only against
+    /// the paper position it actually holds (never a reversal).
+    pub exit: bool,
 }
 
 /// What the chain sends to the order runtime.
@@ -195,7 +217,13 @@ pub struct ChainCounters {
     pub late_price_skipped: u64,
     pub clock_steps: u64,
     pub marks: u64,
+    /// Marks folded into the same instrument's earlier mark of this pass
+    /// (only the newest second's close is sent).
+    pub marks_coalesced: u64,
     pub outbox_overflow: u64,
+    /// Filled paper orders that could not be queued (the outbox was full):
+    /// the chain's own position count was left unchanged.
+    pub executions_lost: u64,
 }
 
 /// Context carried with a held order, for its rows.
@@ -204,6 +232,7 @@ struct OrderMeta {
     base: LiveOrderEvent,
     lot_size: u32,
     limit_paise: i64,
+    exit: bool,
 }
 
 /// Last best quote per instrument (from the tap's Full packets).
@@ -242,8 +271,24 @@ pub struct LiveFillChain<E: StrategyEngine> {
     late_bucket: Vec<i64>,
     quotes: Vec<Quote>,
     last_second: Vec<Option<LastSecond>>,
-    /// Signed shares this chain's paper fills hold, per instrument.
+    /// Signed shares this chain's paper fills hold, per instrument, as sent:
+    /// the runtime may book less (a refusal), so this only sizes an exit
+    /// early; the runtime's own clamp is the authority.
     net_shares: Vec<i64>,
+    /// Per instrument: an Execute that filled something was sent today. Its
+    /// 1 s closes are marked from then on (the runtime ignores a mark for a
+    /// flat position), so a refused closing order cannot stop the marks.
+    traded_today: Vec<bool>,
+    /// Per instrument: the IST second its first tapped packet (of any kind)
+    /// was received, `i64::MIN` when that was inside the session's opening
+    /// release window (listening from the open), `i64::MAX` before any packet.
+    /// A bar opening before it was built from part of its bucket only
+    /// (`first_bar_partial`; LF-6b review round 2, finding 2).
+    first_seen_secs: Vec<i64>,
+    /// The newest tapped tick's receipt trailed the last pass's wall clock by
+    /// more than the wait: the frame drain is behind, so passes run on the
+    /// newest receipt, not the wall (round 2, finding 5).
+    stream_lagging: bool,
     taints: TaintRanges,
     watch: StreamWatch,
     pending: PendingBook<OrderMeta>,
@@ -251,6 +296,14 @@ pub struct LiveFillChain<E: StrategyEngine> {
     ready: Vec<usize>,
     outbox: Vec<ChainOutput>,
     outbox_cap: usize,
+    /// Per instrument: the outbox position of its newest mark, `u32::MAX` for
+    /// none. Valid only at or above `pass_floor` and while that slot still
+    /// holds a mark for the same instrument.
+    mark_slot: Vec<u32>,
+    /// The outbox length when this pass began: a mark is folded only into one
+    /// queued by the same pass, so it never moves ahead of an earlier pass's
+    /// Execute.
+    pass_floor: usize,
     day: i64,
     signal_base: i64,
     signal_next: i64,
@@ -303,9 +356,9 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         for (i, k) in setup.universe.iter().enumerate() {
             index.insert(*k, u32::try_from(i).unwrap_or(u32::MAX));
         }
-        // Outbox: the rows one pass can produce at most (every intent of a
-        // released bar plus every finished order), with room to spare.
-        let outbox_cap = INTENT_SINK_CAPACITY * 8 + MAX_PENDING_ORDERS * 4;
+        // Outbox: one mark per instrument (a pass folds an instrument's marks
+        // into one), plus the room kept for decision rows and finished orders.
+        let outbox_cap = keys.saturating_add(OUTBOX_ORDER_ROOM);
         let mut chain = Self {
             clock: BookClock::new(&frames_secs, params.wait_ms, params.open_wait_ms),
             queue: ReleaseQueue::with_capacity(bar_cap),
@@ -315,6 +368,9 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             quotes: vec![Quote::default(); keys],
             last_second: vec![None; keys],
             net_shares: vec![0; keys],
+            traded_today: vec![false; keys],
+            first_seen_secs: vec![i64::MAX; keys],
+            stream_lagging: false,
             taints: TaintRanges::new(),
             watch: StreamWatch::new(),
             pending: PendingBook::new(params.max_fill_seconds, keys),
@@ -322,6 +378,8 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             ready: Vec::with_capacity(MAX_PENDING_ORDERS),
             outbox: Vec::with_capacity(outbox_cap),
             outbox_cap,
+            mark_slot: vec![u32::MAX; keys],
+            pass_floor: 0,
             day: now_ist_ns
                 .div_euclid(NANOS_PER_SEC)
                 .div_euclid(SECS_PER_DAY),
@@ -378,6 +436,9 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         self.quotes.iter_mut().for_each(|q| *q = Quote::default());
         self.last_second.iter_mut().for_each(|s| *s = None);
         self.net_shares.iter_mut().for_each(|n| *n = 0);
+        self.traded_today.iter_mut().for_each(|t| *t = false);
+        self.first_seen_secs.iter_mut().for_each(|s| *s = i64::MAX);
+        self.stream_lagging = false;
         self.taints.clear();
         self.watch.reset();
         self.day = now_ist_ns
@@ -434,17 +495,31 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         let secs = i64::from(t.exchange_secs);
         let receipt = t.receipt_ist_ns;
         let sod = receipt.div_euclid(NANOS_PER_SEC).rem_euclid(SECS_PER_DAY);
-        let in_session = (SESSION_OPEN_SOD..SESSION_CLOSE_SOD).contains(&sod);
+        // The feed-gap watch runs to the end of F&O trading (15:40), past the
+        // 15:30 strategy close, while held orders still fill (finding 4).
+        let in_session = (SESSION_OPEN_SOD..FEED_WATCH_CLOSE_SOD).contains(&sod);
         self.watch
             .on_tick(t.drop_seq, secs, receipt, in_session, &mut self.taints);
         self.apply_fresh_taints();
+        // The frame drain's lag behind this thread's last pass (finding 5).
+        // O(1): one subtraction and one compare.
+        self.stream_lagging = self.now_ns.saturating_sub(receipt) > self.wait_ns();
+        // One hash probe, reused below.
+        let ki = self.key_index(&key);
+        if let Some(ki) = ki {
+            self.note_first_seen(ki, receipt);
+        }
+        if t.older_trade && !t.new_trade {
+            self.on_older_trade(key, ki, t);
+            return;
+        }
         if !t.new_trade {
             // A repeat quote (the book moved, no trade) or a first packet
             // after a subscribe: its trade time, price and cumulative are OLD.
             // Folding it would count it late on a closed bucket and skip an
             // order on a candle no new price reached. Only its best bid/ask
             // and its volume baseline are used. O(1): two hash probes.
-            if let Some(ki) = self.key_index(&key) {
+            if let Some(ki) = ki {
                 self.refresh_quote(ki, t);
             }
             let _known = self.book.note_baseline_volume(key, u64::from(t.cum_volume));
@@ -467,10 +542,10 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 return;
             }
         };
-        if let Some(ki) = self.key_index(&key) {
+        if let Some(ki) = ki {
             self.refresh_quote(ki, t);
             if late {
-                self.on_late(ki, secs);
+                self.on_late(ki, secs, ltp);
             }
         }
         self.queue_closed();
@@ -494,6 +569,82 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             }
             self.sink.clear();
         }
+    }
+
+    /// A real trade older than the newest one the fold has seen (a stale
+    /// cumulative regression, a backup copy accepted late; LF-6b review
+    /// finding 4). The candle book folds its price into the bar it belongs to
+    /// without moving a close, or counts it late on a closed bar, which skips
+    /// an order on that candle (owner rule). Never handed to the engine: its
+    /// trade time is not the newest. O(1) hash probes plus O(frames).
+    fn on_older_trade(&mut self, key: InstrumentKey, ki: Option<u32>, t: &TapTick) {
+        let ltp = f32_to_f64_clean(t.ltp);
+        self.closed.clear();
+        let verdict = self.book.on_tick(
+            key,
+            t.exchange_secs,
+            t.receipt_ist_ns,
+            ltp,
+            u64::from(t.cum_volume),
+            &mut self.closed,
+        );
+        let TickVerdict::Accepted { late_frames } = verdict else {
+            self.counters.ticks_refused = self.counters.ticks_refused.saturating_add(1);
+            return;
+        };
+        if let Some(ki) = ki {
+            self.refresh_quote(ki, t);
+            if late_frames > 0 {
+                self.on_late(ki, i64::from(t.exchange_secs), ltp);
+            }
+        }
+        self.queue_closed();
+        self.apply_fresh_taints();
+    }
+
+    /// The tap's loss total, read out of band by the thread before each pass
+    /// (LF-6b review finding 3): a loss behind ticks still queued taints the
+    /// stretch it touched before anything is released. O(1).
+    pub fn note_tap_loss(&mut self, total: u64) {
+        // APPROVED: the low 32 bits are the `drop_seq` the ticks carry.
+        #[allow(clippy::cast_possible_truncation)]
+        let seq = total as u32;
+        self.watch.on_loss_total(seq, &mut self.taints);
+        self.apply_fresh_taints();
+    }
+
+    /// The configured wait after a candle's end, nanoseconds. O(1).
+    #[inline]
+    fn wait_ns(&self) -> i64 {
+        i64::try_from(self.params.wait_ms)
+            .unwrap_or(i64::MAX / 2)
+            .saturating_mul(1_000_000)
+    }
+
+    /// Records instrument `ki`'s first tapped packet of the day (LF-6b review
+    /// round 2, finding 2): one array read, plus one write on the first
+    /// packet. A packet received inside the opening release window (09:15:00
+    /// plus one second plus `open_wait`) means the instrument was subscribed
+    /// before the open, so nothing it traded was missed. O(1).
+    #[inline]
+    fn note_first_seen(&mut self, ki: u32, receipt_ns: i64) {
+        let Some(slot) = self.first_seen_secs.get_mut(ki as usize) else {
+            return;
+        };
+        if *slot != i64::MAX {
+            return;
+        }
+        let open_wait_ns = i64::try_from(self.params.open_wait_ms)
+            .unwrap_or(i64::MAX / 2)
+            .saturating_mul(1_000_000);
+        let from_open = session_open_ns(receipt_ns)
+            .saturating_add(NANOS_PER_SEC)
+            .saturating_add(open_wait_ns);
+        *slot = if receipt_ns <= from_open {
+            i64::MIN
+        } else {
+            receipt_ns.div_euclid(NANOS_PER_SEC)
+        };
     }
 
     /// The tick's best bid/ask, when its packet carried depth. O(1).
@@ -524,8 +675,9 @@ impl<E: StrategyEngine> LiveFillChain<E> {
 
     /// A late tick of instrument `ki` at exchange second `secs`: records the
     /// bucket it belonged to on each frame that counted it late. Rare.
-    fn on_late(&mut self, ki: u32, secs: i64) {
+    fn on_late(&mut self, ki: u32, secs: i64, ltp: f64) {
         self.counters.late_ticks = self.counters.late_ticks.saturating_add(1);
+        let price_paise = rupees_to_paise(ltp).ok();
         let nf = self.frames_secs.len();
         for fi in 0..nf {
             if !self.book.last_tick_late(fi) {
@@ -537,7 +689,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 *slot = open;
             }
             self.pending
-                .on_late_tick(ki, u8::try_from(fi).unwrap_or(u8::MAX), secs);
+                .on_late_tick(ki, u8::try_from(fi).unwrap_or(u8::MAX), secs, price_paise);
         }
     }
 
@@ -569,31 +721,71 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     /// # Errors
     /// A day roll whose reconfiguration was refused (the chain then stops).
     pub fn on_pass(&mut self, wall_ist_ns: i64, mono_ns: i64) -> Result<(), ChainError> {
+        self.on_pass_bounded(wall_ist_ns, mono_ns, false)
+    }
+
+    /// [`Self::on_pass`] for a thread that may have left ticks queued
+    /// (`backlogged`: its last drain stopped at the per-pass cap). The book
+    /// clock, the releases and the held orders' final seconds then run on the
+    /// newest receipt read (never past the wall), not on the wall: the
+    /// measured wait covers receipt to final price, not this thread's own
+    /// backlog, so a second whose ticks are still queued is never closed,
+    /// decided or filled (LF-6b review finding 3). O(1) more.
+    ///
+    /// The same holds when the FRAME DRAIN upstream is behind (round 2,
+    /// finding 5): the tap ring is then empty, but the newest tick read
+    /// trailed the last pass's wall by more than the wait, so its seconds may
+    /// still be on their way. Until a tick arrives on time again, the pass
+    /// runs on the newest receipt too, unless the stream has been silent for
+    /// a feed gap: the gap watch has tainted that stretch, and the clock may
+    /// move on the wall again.
+    ///
+    /// # Errors
+    /// As [`Self::on_pass`].
+    pub fn on_pass_bounded(
+        &mut self,
+        wall_ist_ns: i64,
+        mono_ns: i64,
+        backlogged: bool,
+    ) -> Result<(), ChainError> {
         let day = wall_ist_ns
             .div_euclid(NANOS_PER_SEC)
             .div_euclid(SECS_PER_DAY);
         if day != self.day {
             self.new_day(wall_ist_ns)?;
         }
+        self.pass_floor = self.outbox.len();
         self.now_ns = wall_ist_ns;
         if self.watch.on_pass(wall_ist_ns, mono_ns, &mut self.taints) {
             self.counters.clock_steps = self.counters.clock_steps.saturating_add(1);
         }
-        let c = self.clock.reading(wall_ist_ns);
+        let drain_behind = self.stream_lagging
+            && self
+                .watch
+                .newest_receipt_ns()
+                .is_some_and(|r| wall_ist_ns.saturating_sub(r) < FEED_GAP_NS);
+        let stream_ns = if backlogged || drain_behind {
+            self.watch
+                .newest_receipt_ns()
+                .map_or(wall_ist_ns, |r| r.min(wall_ist_ns))
+        } else {
+            wall_ist_ns
+        };
+        let c = self.clock.reading(stream_ns);
         self.closed.clear();
         self.book.on_clock(c, &mut self.closed);
         self.queue_closed();
         // Before any candle is decided: orders already held learn of this
         // pass's drops, gaps and steps; new decisions read them via `taint_of`.
         self.apply_fresh_taints();
-        self.queue.release_due(wall_ist_ns, &mut self.released);
+        self.queue.release_due(stream_ns, &mut self.released);
         for i in 0..self.released.len() {
             let bar = self.released[i];
             self.on_released(&bar);
         }
         self.released.clear();
         self.pending
-            .collect_ready(wall_ist_ns, &self.clock, &mut self.ready);
+            .collect_ready(stream_ns, &self.clock, &mut self.ready);
         for r in 0..self.ready.len() {
             let slot = self.ready[r];
             if let Some(done) = self.pending.finish(slot) {
@@ -645,24 +837,68 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         };
         self.last_second[ki as usize] = Some(LastSecond { bar: sb });
         self.pending.on_second(ki, sb);
-        if self.net_shares[ki as usize] != 0
+        if self.traded_today[ki as usize]
             && let Some(segment) = ExchangeSegment::from_byte(bar.key.exchange_segment)
         {
             self.counters.marks = self.counters.marks.saturating_add(1);
-            self.push_out(ChainOutput::Cmd(PaperCmd::Mark {
-                security_id: bar.key.security_id,
-                segment,
-                price: bar.close,
-            }));
+            self.push_mark(ki, bar.key.security_id, segment, bar.close);
         }
     }
 
+    /// Queues a mark (LF-6b review round 3, finding 1). An instrument's
+    /// earlier mark of this pass is overwritten with the newer close, so a
+    /// pass queues at most one mark per instrument, and a mark never takes the
+    /// slots kept for decision rows and finished orders: a pass that releases
+    /// several seconds of many traded instruments cannot crowd out an
+    /// Execute. O(1): one array read and one compare.
+    fn push_mark(&mut self, ki: u32, security_id: u64, segment: ExchangeSegment, price: f64) {
+        let pos = self.mark_slot[ki as usize] as usize;
+        if pos >= self.pass_floor
+            && let Some(ChainOutput::Cmd(PaperCmd::Mark {
+                security_id: s,
+                segment: g,
+                price: p,
+            })) = self.outbox.get_mut(pos)
+            && *s == security_id
+            && *g == segment
+        {
+            *p = price;
+            self.counters.marks_coalesced = self.counters.marks_coalesced.saturating_add(1);
+            return;
+        }
+        if self.outbox.len().saturating_add(OUTBOX_ORDER_ROOM) >= self.outbox_cap {
+            // Only reachable when the outbox was not drained between passes;
+            // the next second's mark supersedes this one.
+            self.counters.outbox_overflow = self.counters.outbox_overflow.saturating_add(1);
+            return;
+        }
+        self.mark_slot[ki as usize] = u32::try_from(self.outbox.len()).unwrap_or(u32::MAX);
+        self.outbox.push(ChainOutput::Cmd(PaperCmd::Mark {
+            security_id,
+            segment,
+            price,
+        }));
+    }
+
+    /// Queues a decision row, keeping [`MAX_PENDING_ORDERS`] slots for the
+    /// finished orders of the same pass. O(1).
     fn push_out(&mut self, o: ChainOutput) {
-        if self.outbox.len() >= self.outbox_cap {
+        if self.outbox.len().saturating_add(MAX_PENDING_ORDERS) >= self.outbox_cap {
             self.counters.outbox_overflow = self.counters.outbox_overflow.saturating_add(1);
             return;
         }
         self.outbox.push(o);
+    }
+
+    /// Queues a finished order's output (an Execute or its Reject row); it may
+    /// use every slot. `false` when the outbox is full. O(1).
+    fn push_finished(&mut self, o: ChainOutput) -> bool {
+        if self.outbox.len() >= self.outbox_cap {
+            self.counters.outbox_overflow = self.counters.outbox_overflow.saturating_add(1);
+            return false;
+        }
+        self.outbox.push(o);
+        true
     }
 
     fn next_signal_id(&mut self) -> i64 {
@@ -774,9 +1010,18 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             self.refuse_unplaced(intent, Some(bar), "intent_for_other_instrument");
             return;
         }
+        // The candle AND its whole fill window `[end, end + max_fill_seconds]`
+        // (LF-6b review round 2, finding 3): a stretch tainted and handed out
+        // to the held orders BEFORE this order existed (a feed gap starting
+        // exactly at the candle's end, a lost 1 s bar of the first fill
+        // second) is never re-offered to it, so it is checked here, the same
+        // span `PendingBook::on_taint` checks later. O(256), once per order.
+        let horizon_end = bar
+            .bucket_end_secs
+            .saturating_add(i64::from(self.params.max_fill_seconds.max(1)));
         if let Some(t) = self
             .taints
-            .taint_of(bar.bucket_open_secs, bar.bucket_end_secs)
+            .taint_of(bar.bucket_open_secs, horizon_end.saturating_add(1))
         {
             self.refuse_unplaced(intent, Some(bar), t.as_str());
             return;
@@ -785,6 +1030,13 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             self.refuse_unplaced(intent, Some(bar), "instrument_not_in_universe");
             return;
         };
+        // The instrument's first packet came after this bar opened (a late
+        // subscribe, a widen or a resubscribe after the open): the bar holds
+        // only the trades from then on (round 2, finding 2). One array read.
+        if bar.bucket_open_secs < self.first_seen_secs[ki as usize] {
+            self.refuse_unplaced(intent, Some(bar), REASON_FIRST_BAR_PARTIAL);
+            return;
+        }
         let nf = self.frames_secs.len();
         let fi = bar.frame_index as usize;
         if self.late_bucket[ki as usize * nf + fi] == bar.bucket_open_secs {
@@ -797,10 +1049,27 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             return;
         };
         let (tick_paise, lot_size) = (spec.tick_paise, spec.lot_size);
-        let qty = u64::from(intent.qty_lots).saturating_mul(u64::from(lot_size));
+        let mut qty = u64::from(intent.qty_lots).saturating_mul(u64::from(lot_size));
         if qty == 0 {
             self.refuse_unplaced(intent, Some(bar), "zero_quantity");
             return;
+        }
+        // An exit is reduce-only against the paper position this chain sent
+        // (LF-6b review finding 6); the runtime clamps again against what it
+        // actually booked.
+        let exit = intent.kind == IntentKind::Exit;
+        if exit {
+            let held = self.net_shares[ki as usize];
+            let can = match intent.side {
+                Side::Sell if held > 0 => held.unsigned_abs(),
+                Side::Buy if held < 0 => held.unsigned_abs(),
+                _ => 0,
+            };
+            if can == 0 {
+                self.refuse_unplaced(intent, Some(bar), "exit_without_position");
+                return;
+            }
+            qty = qty.min(can);
         }
         let Ok(ltp_paise) = rupees_to_paise(bar.close) else {
             self.refuse_unplaced(intent, Some(bar), "bad_last_price");
@@ -879,6 +1148,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 base: base.clone(),
                 lot_size,
                 limit_paise: limit.price_paise,
+                exit,
             },
         };
         match self.pending.insert(order) {
@@ -911,7 +1181,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 reject.event = LiveOrderEventKind::Reject;
                 reject.seq = 2;
                 reject.reason = Some(REASON_LATE_PRICE.to_owned());
-                self.push_out(ChainOutput::Event(Box::new(reject)));
+                let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
             }
             Finished::Tainted { order, reason } => {
                 self.counters.refused = self.counters.refused.saturating_add(1);
@@ -921,7 +1191,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 reject.seq = 2;
                 reject.remainder_qty = i64::try_from(order.qty).ok();
                 reject.reason = Some(reason.as_str().to_owned());
-                self.push_out(ChainOutput::Event(Box::new(reject)));
+                let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
             }
             Finished::Refused { order, refusal } => {
                 self.counters.refused = self.counters.refused.saturating_add(1);
@@ -931,7 +1201,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 reject.seq = 2;
                 reject.remainder_qty = i64::try_from(order.qty).ok();
                 reject.reason = Some(format!("fill_model_refused:{refusal}"));
-                self.push_out(ChainOutput::Event(Box::new(reject)));
+                let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
             }
             Finished::Filled {
                 order,
@@ -942,6 +1212,15 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 let Some(segment) = ExchangeSegment::from_byte(order.key.exchange_segment) else {
                     return;
                 };
+                // No room for the Execute (only when the outbox was not drained
+                // between passes): nothing is counted as held, so a later exit
+                // is never sized against a position the runtime never booked
+                // (LF-6b review round 3, finding 1).
+                if self.outbox.len() >= self.outbox_cap {
+                    self.counters.outbox_overflow = self.counters.outbox_overflow.saturating_add(1);
+                    self.counters.executions_lost = self.counters.executions_lost.saturating_add(1);
+                    return;
+                }
                 let lot = u64::from(order.meta.lot_size.max(1));
                 // The OMS books whole lots; the model's odd shares are part of
                 // the cancelled remainder.
@@ -965,9 +1244,14 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 if let Some(n) = self.net_shares.get_mut(ki) {
                     *n = n.saturating_add(signed);
                 }
+                if filled_i != 0
+                    && let Some(t) = self.traded_today.get_mut(ki)
+                {
+                    *t = true;
+                }
                 self.counters.sent = self.counters.sent.saturating_add(1);
                 let limit_price = paise_to_rupees(order.meta.limit_paise);
-                self.push_out(ChainOutput::Cmd(PaperCmd::Execute(Box::new(
+                let _queued = self.push_finished(ChainOutput::Cmd(PaperCmd::Execute(Box::new(
                     PaperExecution {
                         base,
                         next_seq: 2,
@@ -980,6 +1264,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                         filled_qty: filled_i,
                         avg_price: avg_paise.map_or(0.0, paise_to_rupees),
                         avg_price_paise: avg_paise,
+                        exit: order.meta.exit,
                     },
                 ))));
             }

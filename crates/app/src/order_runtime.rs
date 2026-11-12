@@ -76,7 +76,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -258,6 +258,27 @@ impl MarkForwarder {
 // Alert sink — the FIRST production implementer of both alert traits
 // ---------------------------------------------------------------------------
 
+/// Seconds without an order rate-limit refusal that end an episode: the
+/// Telegram page fires once per episode, the coded log line on every refusal
+/// (LF-6b review round 3, finding 3: a burst of paper exits refused by the
+/// 10-a-second limiter paged once per refusal, at the Immediate lane).
+const RATE_LIMIT_PAGE_EPISODE_GAP_SECS: i64 = 60;
+
+/// Wall second (UTC epoch) of the newest order rate-limit refusal the sink
+/// saw, `i64::MIN` for none. One per process: there is one order runtime.
+static RATE_LIMIT_LAST_REFUSAL_SECS: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Records a rate-limit refusal at `now_secs` in `last` and says whether it
+/// starts a new episode (no refusal in the previous
+/// [`RATE_LIMIT_PAGE_EPISODE_GAP_SECS`], or the clock stepped back), the only
+/// refusal that pages. O(1): one atomic swap.
+fn rate_limit_refusal_starts_episode(last: &AtomicI64, now_secs: i64) -> bool {
+    let prev = last.swap(now_secs, Ordering::Relaxed);
+    prev == i64::MIN
+        || now_secs < prev
+        || now_secs.saturating_sub(prev) >= RATE_LIMIT_PAGE_EPISODE_GAP_SECS
+}
+
 /// Bridges OMS + Risk alerts to `NotificationService` (Telegram). `notify()`
 /// is sync fire-and-forget (service.rs — F19: never blocks this task).
 pub struct NotifierAlertSink(pub Arc<NotificationService>);
@@ -297,13 +318,21 @@ impl OmsAlertSink for NotifierAlertSink {
                 self.0.notify(NotificationEvent::CircuitBreakerClosed);
             }
             OmsAlert::RateLimitExhausted { limit_type } => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                let page =
+                    rate_limit_refusal_starts_episode(&RATE_LIMIT_LAST_REFUSAL_SECS, now_secs);
                 error!(
                     code = ErrorCode::OmsGapRateLimit.code_str(),
                     limit_type = %limit_type,
+                    paged = page,
                     "OMS-GAP-04: order rate limit exhausted — order rejected"
                 );
-                self.0
-                    .notify(NotificationEvent::RateLimitExhausted { limit_type });
+                if page {
+                    self.0
+                        .notify(NotificationEvent::RateLimitExhausted { limit_type });
+                }
             }
             // Cluster-F alert classes (#1558: readiness refusal / OMS halt /
             // DH-904 ladder exhaustion / DATA-805 stop-all) are
@@ -876,6 +905,11 @@ struct BookState {
     pending_paper: HashMap<(u64, ExchangeSegment), Vec<String>>,
     /// The local reconcile's working sets, kept between heartbeats (PR18).
     reconcile_scratch: ReconcileScratch,
+    /// LF-6b: live paper fill exits a time-rolling OMS gate refused, resent
+    /// on the 1 s housekeeping tick (bounded by
+    /// `live_fill_arm::LIVE_FILL_EXIT_RETRY_CAPACITY`; emptied at the daily
+    /// reset).
+    live_fill_exit_retry: Vec<live_fill_arm::ExitRetry>,
 }
 
 impl BookState {
@@ -955,6 +989,7 @@ impl BookState {
             tripwire_reported: HashSet::with_capacity(8),
             pending_paper: HashMap::with_capacity(8),
             reconcile_scratch: ReconcileScratch::default(),
+            live_fill_exit_retry: Vec::new(),
         }
     }
 
@@ -964,6 +999,7 @@ impl BookState {
         self.tripwire_reported.clear();
         self.pending_paper.clear();
         self.reconcile_scratch.clear();
+        self.live_fill_exit_retry.clear();
     }
 
     /// Rebuilds the sid → pending-PAPER-order index from the OMS book.
@@ -1543,6 +1579,10 @@ async fn run_order_runtime(
 
                 // Mark-to-market halt backstop (marks may be idle).
                 risk.evaluate_daily_loss_halt();
+
+                // LF-6b: paper exits a rate or budget gate refused, sent
+                // again (O(1) when none wait).
+                live_fill_arm::retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
 
                 // Placement-duration buckets to `/metrics` (cold, O(14) loads, a
                 // no-op when nothing was placed this second).
@@ -3320,6 +3360,36 @@ mod tests {
         assert_eq!(risk.position_security_ids().count(), 0, "no position");
         assert!(book.mirror.is_empty(), "mirror untouched");
         assert!(oms.all_orders().is_empty(), "orphan never tracked");
+    }
+
+    /// LF-6b review round 3, finding 3: order rate-limit refusals page once
+    /// per episode. A refusal every second for a minute is one episode (one
+    /// page); a refusal after 60 s of quiet, or after the clock stepped back,
+    /// starts a new one.
+    #[test]
+    fn test_regression_rate_limit_refusal_starts_episode_pages_once_per_episode() {
+        let last = AtomicI64::new(i64::MIN);
+        let t0 = 1_800_000_000;
+        assert!(
+            rate_limit_refusal_starts_episode(&last, t0),
+            "first refusal pages"
+        );
+        let pages = (1..=300)
+            .filter(|s| rate_limit_refusal_starts_episode(&last, t0 + s))
+            .count();
+        assert_eq!(
+            pages, 0,
+            "a refusal every second for 5 minutes is one episode"
+        );
+        assert!(!rate_limit_refusal_starts_episode(&last, t0 + 359));
+        assert!(
+            rate_limit_refusal_starts_episode(&last, t0 + 359 + RATE_LIMIT_PAGE_EPISODE_GAP_SECS),
+            "60 s of quiet ends the episode"
+        );
+        assert!(
+            rate_limit_refusal_starts_episode(&last, t0),
+            "a clock step back pages"
+        );
     }
 
     /// M4 (partial — honest scope): exercises every NotifierAlertSink arm

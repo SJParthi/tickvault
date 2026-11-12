@@ -47,15 +47,15 @@ fn bench_tap(c: &mut Criterion) {
     let mut tap = LiveFillTap::new(tx);
     c.bench_function("live_fill/tap_accept", |b| {
         b.iter(|| {
-            black_box(tap.offer(black_box(&parsed), None, true));
+            black_box(tap.offer(black_box(&parsed), None, true, false));
             black_box(rx.try_recv());
         });
     });
     let (full_tx, _full_rx) = live_fill_tap_ring(1);
     let mut full = LiveFillTap::new(full_tx);
-    let _ = full.offer(&parsed, None, true);
+    let _ = full.offer(&parsed, None, true, false);
     c.bench_function("live_fill/tap_full", |b| {
-        b.iter(|| black_box(full.offer(black_box(&parsed), None, true)));
+        b.iter(|| black_box(full.offer(black_box(&parsed), None, true, false)));
     });
 }
 
@@ -121,6 +121,7 @@ fn bench_chain(c: &mut Criterion) {
                     drop_seq: 0,
                     segment: 2,
                     new_trade: true,
+                    older_trade: false,
                 }));
             }
             let t = sec * NS + 500_000_000;

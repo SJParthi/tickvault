@@ -107,8 +107,18 @@ struct Slot<M> {
     trigger_sec: Option<i64>,
     late_price: bool,
     late_fill_ticks: u32,
+    /// Late 1 s prices for fill seconds not yet appended (a second closed by
+    /// the next second's tick and still waiting for its release): `(sec,
+    /// low, high)` paise, folded into the second when it is appended.
+    late_widen: [(i64, i64, i64); LATE_WIDEN_SLOTS],
+    late_widen_len: u8,
     tainted: Option<TaintReason>,
 }
+
+/// Fill seconds per held order that can carry a late price while they wait
+/// for their release (the longest release wait is a few seconds). A late
+/// price past these is still counted on the order.
+const LATE_WIDEN_SLOTS: usize = 4;
 
 /// The held orders (see the module docs).
 #[derive(Debug)]
@@ -134,6 +144,8 @@ impl<M> PendingBook<M> {
                 trigger_sec: None,
                 late_price: false,
                 late_fill_ticks: 0,
+                late_widen: [(0, 0, 0); LATE_WIDEN_SLOTS],
+                late_widen_len: 0,
                 tainted: None,
             })
             .collect();
@@ -179,6 +191,7 @@ impl<M> PendingBook<M> {
         slot.trigger_sec = None;
         slot.late_price = false;
         slot.late_fill_ticks = 0;
+        slot.late_widen_len = 0;
         slot.tainted = None;
         slot.order = Some(order);
         self.per_key[ki] = self.per_key[ki].saturating_add(1);
@@ -212,6 +225,8 @@ impl<M> PendingBook<M> {
             if slot.seconds.len() >= slot.seconds.capacity() {
                 continue;
             }
+            let mut bar = bar;
+            take_late_widen(&mut slot.late_widen, &mut slot.late_widen_len, &mut bar);
             slot.seconds.push(bar);
             if bar.sec < horizon_end && slot.trigger_sec.is_none() {
                 let cap = u128::from(bar.volume) * u128::from(o.participation_bps)
@@ -227,14 +242,24 @@ impl<M> PendingBook<M> {
     }
 
     /// A tick of instrument `ki` the candle book counted late on book frame
-    /// `frame_index`, at exchange second `tick_secs`. A late price inside a
-    /// held order's decision candle marks it to be skipped; one on the 1 s
-    /// frame (frame 0) inside its fill seconds is counted on the order. See
-    /// the module docs for the cost.
-    pub fn on_late_tick(&mut self, ki: u32, frame_index: u8, tick_secs: i64) {
+    /// `frame_index`, at exchange second `tick_secs`, price `price_paise`. A
+    /// late price inside a held order's decision candle marks it to be
+    /// skipped. One on the 1 s frame (frame 0) inside the order's fill window
+    /// is counted on the order whether or not that second was appended yet
+    /// (a second closed by the next second's tick waits for its release; LF-6b
+    /// review round 3, finding 2), and widens that second's high/low, now if
+    /// it is appended, else when it is. See the module docs for the cost.
+    pub fn on_late_tick(
+        &mut self,
+        ki: u32,
+        frame_index: u8,
+        tick_secs: i64,
+        price_paise: Option<i64>,
+    ) {
         if !self.has_held(ki) {
             return;
         }
+        let window = i64::from(self.max_fill_seconds);
         for slot in &mut self.slots {
             let Some(o) = slot.order.as_ref() else {
                 continue;
@@ -248,8 +273,13 @@ impl<M> PendingBook<M> {
             {
                 slot.late_price = true;
             }
-            if frame_index == 0 && slot.seconds.last().is_some_and(|l| tick_secs <= l.sec) {
+            let first = o.decision_bar.sec.saturating_add(1);
+            let horizon_end = first.saturating_add(window);
+            if frame_index == 0 && tick_secs >= first && tick_secs <= horizon_end {
                 slot.late_fill_ticks = slot.late_fill_ticks.saturating_add(1);
+                if let Some(p) = price_paise.filter(|p| *p > 0) {
+                    widen_late(slot, tick_secs, p);
+                }
             }
         }
     }
@@ -388,6 +418,55 @@ impl<M> PendingBook<M> {
         self.per_key.iter_mut().for_each(|c| *c = 0);
         self.held = 0;
         n
+    }
+}
+
+/// Folds a late price into fill second `sec` of `slot`: in place when the
+/// second is appended (a binary search over at most `max_fill_seconds + 1`
+/// entries), else kept until it is. Past [`LATE_WIDEN_SLOTS`] waiting seconds
+/// the price is not kept (the order still counts it). O(log seconds).
+fn widen_late<M>(slot: &mut Slot<M>, sec: i64, price: i64) {
+    if let Ok(i) = slot.seconds.binary_search_by_key(&sec, |b| b.sec) {
+        let b = &mut slot.seconds[i];
+        b.high_paise = b.high_paise.max(price);
+        b.low_paise = b.low_paise.min(price);
+        return;
+    }
+    if slot.seconds.last().is_some_and(|l| l.sec > sec) {
+        // A second with no trade before the newest appended one: it holds
+        // no volume to fill against, so there is nothing to price.
+        return;
+    }
+    let n = usize::from(slot.late_widen_len);
+    for w in &mut slot.late_widen[..n] {
+        if w.0 == sec {
+            w.1 = w.1.min(price);
+            w.2 = w.2.max(price);
+            return;
+        }
+    }
+    if n < LATE_WIDEN_SLOTS {
+        slot.late_widen[n] = (sec, price, price);
+        slot.late_widen_len = slot.late_widen_len.saturating_add(1);
+    }
+}
+
+/// Applies (and drops) a late price kept for `bar`'s second. O(slots).
+fn take_late_widen(
+    widen: &mut [(i64, i64, i64); LATE_WIDEN_SLOTS],
+    len: &mut u8,
+    bar: &mut SecondBar,
+) {
+    let n = usize::from(*len).min(LATE_WIDEN_SLOTS);
+    for i in 0..n {
+        let (sec, lo, hi) = widen[i];
+        if sec == bar.sec {
+            bar.low_paise = bar.low_paise.min(lo);
+            bar.high_paise = bar.high_paise.max(hi);
+            widen[i] = widen[n - 1];
+            *len = len.saturating_sub(1);
+            return;
+        }
     }
 }
 
@@ -614,16 +693,76 @@ mod tests {
         let mut p = PendingBook::<u32>::new(60, 1);
         p.insert(order(0, 10)).expect("room");
         // Late on another frame, or outside the candle: nothing.
-        p.on_late_tick(0, 2, DEC);
-        p.on_late_tick(0, 1, DEC + 1);
+        p.on_late_tick(0, 2, DEC, None);
+        p.on_late_tick(0, 1, DEC + 1, None);
         let c = clock();
         let mut ready = Vec::with_capacity(MAX_PENDING_ORDERS);
         p.collect_ready(DEC * NS, &c, &mut ready);
         assert!(ready.is_empty());
-        p.on_late_tick(0, 1, DEC - 3);
+        p.on_late_tick(0, 1, DEC - 3, None);
         p.collect_ready(DEC * NS, &c, &mut ready);
         assert_eq!(ready, vec![0]);
         assert!(matches!(p.finish(0), Some(Finished::LatePrice { .. })));
+    }
+
+    /// LF-6b review round 3, finding 2: a late price for a fill second that
+    /// is closed (by the next second's tick) but not yet released, or for the
+    /// first fill second before anything was appended, is counted on the
+    /// order and widens that second when it is appended, so the worst-case
+    /// price reflects it.
+    #[test]
+    fn test_regression_late_price_on_a_second_still_waiting_for_release_is_counted_and_priced() {
+        let c = clock();
+        let mut ready = Vec::with_capacity(MAX_PENDING_ORDERS);
+        // The first fill second (nothing appended yet) takes a late print at
+        // 105.00 before its release; its bar tops out at 100.20.
+        let mut p = PendingBook::<u32>::new(60, 1);
+        p.insert(order(0, 10)).expect("room");
+        p.on_late_tick(0, 0, DEC + 1, Some(10_500));
+        p.on_second(0, sec(DEC + 1, 1_000));
+        p.on_second(0, sec(DEC + 2, 1_000));
+        p.collect_ready((DEC + 4) * NS, &c, &mut ready);
+        assert_eq!(ready, vec![0]);
+        match p.finish(0) {
+            Some(Finished::Filled {
+                summary,
+                late_fill_ticks,
+                ..
+            }) => {
+                assert_eq!(late_fill_ticks, 1, "the late print is counted");
+                assert_eq!(summary.filled_qty, 10);
+                assert!(
+                    summary.vwap_paise.is_some_and(|v| v >= 10_500),
+                    "the fill is priced no better than the late print: {summary:?}"
+                );
+            }
+            other => panic!("expected a fill, got {other:?}"),
+        }
+        // A later second (DEC + 2) waits for release while DEC + 1 is
+        // appended: the late print for DEC + 2 is counted and folded in.
+        let mut p = PendingBook::<u32>::new(60, 1);
+        p.insert(order(0, 400)).expect("room");
+        p.on_second(0, sec(DEC + 1, 1_000));
+        p.on_late_tick(0, 0, DEC + 2, Some(10_600));
+        p.on_second(0, sec(DEC + 2, 1_000));
+        p.on_second(0, sec(DEC + 3, 1_000));
+        ready.clear();
+        p.collect_ready((DEC + 5) * NS, &c, &mut ready);
+        assert_eq!(ready, vec![0]);
+        match p.finish(0) {
+            Some(Finished::Filled {
+                summary,
+                late_fill_ticks,
+                ..
+            }) => {
+                assert_eq!(late_fill_ticks, 1);
+                assert!(
+                    summary.vwap_paise.is_some_and(|v| v > 10_025),
+                    "the waiting second carries the late print: {summary:?}"
+                );
+            }
+            other => panic!("expected a fill, got {other:?}"),
+        }
     }
 
     #[test]
@@ -631,8 +770,8 @@ mod tests {
         let mut p = PendingBook::<u32>::new(5, 1);
         p.insert(order(0, 10)).expect("room");
         p.on_second(0, sec(DEC + 2, 0));
-        p.on_late_tick(0, 0, DEC + 1);
-        p.on_late_tick(0, 0, DEC + 9);
+        p.on_late_tick(0, 0, DEC + 1, None);
+        p.on_late_tick(0, 0, DEC + 9, None);
         p.on_second(0, sec(DEC + 2, 1_000)); // a repeat second is ignored
         let c = clock();
         let mut ready = Vec::with_capacity(MAX_PENDING_ORDERS);

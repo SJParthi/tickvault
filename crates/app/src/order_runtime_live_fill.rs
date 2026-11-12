@@ -27,7 +27,7 @@ use tickvault_common::order_types::{
 };
 use tickvault_storage::live_order_events_persistence::{LiveOrderEvent, LiveOrderEventKind};
 use tickvault_trading::brutex_host::engine::Side;
-use tickvault_trading::oms::{ManagedOrder, OrderManagementSystem, PlaceOrderRequest};
+use tickvault_trading::oms::{ManagedOrder, OmsError, OrderManagementSystem, PlaceOrderRequest};
 use tickvault_trading::risk::engine::RiskEngine;
 use tickvault_trading::risk::types::RiskCheck;
 use tokio::sync::{MutexGuard, mpsc};
@@ -165,8 +165,177 @@ pub(super) async fn handle_live_fill_cmd(
                 risk.evaluate_daily_loss_halt();
             }
         }
-        PaperCmd::Execute(x) => execute(oms, risk, book, ctx, &x).await,
+        PaperCmd::Execute(x) => {
+            // An exit arriving while earlier exits wait for the order gates
+            // goes to the back of their queue without a place attempt: the
+            // gates that refused them are still closed, and every refused
+            // attempt costs an order-budget unit and an alert (LF-6b review
+            // round 3, findings 3 and 4). Exits keep their order.
+            if x.exit && !book.live_fill_exit_retry.is_empty() {
+                queue_exit_retry(book, ctx, ExitRetry::waiting(x));
+                return;
+            }
+            if let Placed::RetryExit(err) = execute(oms, risk, book, ctx, &x).await {
+                queue_exit_retry(book, ctx, ExitRetry::new(x, err));
+            }
+        }
     }
+}
+
+/// Exits a time-rolling OMS gate refused, kept for a resend: four times the
+/// orders the chain can hold at once, so a burst of finishing windows plus a
+/// minute of refusals fits.
+pub(super) const LIVE_FILL_EXIT_RETRY_CAPACITY: usize =
+    crate::live_fill::fill_window::MAX_PENDING_ORDERS * 4;
+/// Resends (one per 1 s housekeeping tick) before an exit is given up with a
+/// Reject row: one hour, the per-hour order budget's window.
+pub(super) const LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS: u32 = 3_600;
+/// Counter of exit resends (local `/metrics` only).
+pub(super) const LIVE_FILL_EXIT_RETRIES_COUNTER: &str = "tv_live_fill_exit_retries_total";
+
+/// What one place attempt came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Placed {
+    /// Placed, or refused for good with a row.
+    Done,
+    /// An exit a rate, budget, order-book or circuit gate refused: no row
+    /// yet, to be sent again (the reason text).
+    RetryExit(String),
+}
+
+/// One exit waiting for a resend.
+#[derive(Debug)]
+pub(super) struct ExitRetry {
+    x: Box<PaperExecution>,
+    attempts: u32,
+    last_err: String,
+}
+
+impl ExitRetry {
+    fn new(x: Box<PaperExecution>, err: String) -> Self {
+        Self {
+            x,
+            attempts: 1,
+            last_err: err,
+        }
+    }
+
+    /// An exit queued behind earlier ones without a place attempt.
+    fn waiting(x: Box<PaperExecution>) -> Self {
+        Self {
+            x,
+            attempts: 0,
+            last_err: "queued_behind_earlier_exits".to_owned(),
+        }
+    }
+}
+
+/// A refusal that clears as time passes: the per-second rate limit, the
+/// per-minute/hour/day budget, the order-book ceiling (reset daily) and the
+/// circuit breaker. A field-validation refusal never clears. O(1).
+fn place_refusal_rolls_over(err: &OmsError) -> bool {
+    matches!(
+        err,
+        OmsError::RateLimited
+            | OmsError::OrderBudgetExhausted { .. }
+            | OmsError::OrderBookFull { .. }
+            | OmsError::CircuitBreakerOpen
+    )
+}
+
+/// Keeps `r` for the next housekeeping tick, or gives it up with one Reject
+/// row when the queue is full or its attempts are spent. Cold.
+fn queue_exit_retry(book: &mut BookState, ctx: &RuntimeCtx, r: ExitRetry) {
+    if r.attempts < LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS
+        && book.live_fill_exit_retry.len() < LIVE_FILL_EXIT_RETRY_CAPACITY
+    {
+        book.live_fill_exit_retry.push(r);
+        return;
+    }
+    let why = if r.attempts >= LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS {
+        "retries_exhausted"
+    } else {
+        "retry_queue_full"
+    };
+    error!(
+        code = ErrorCode::OrderReady01GateRefused.code_str(),
+        source = "live_fill_exit_not_sent",
+        security_id = r.x.security_id,
+        attempts = r.attempts,
+        why,
+        "live paper fill: a paper exit the order gates kept refusing was given up; the \
+         paper position stays open until the daily reset (paper only, no broker order)"
+    );
+    let mut seq = r.x.next_seq;
+    emit(
+        ctx,
+        &r.x.base,
+        LiveOrderEventKind::Reject,
+        &mut seq,
+        |row| {
+            row.remainder_qty = Some(r.x.qty.max(0));
+            row.reason = Some(format!("{};{why}", r.last_err));
+        },
+    );
+}
+
+/// Sends every waiting exit again (the 1 s housekeeping tick). Each one is
+/// clamped afresh against the position held now, so an exit whose position
+/// another order already closed is refused `exit_without_position`. O(1) when
+/// nothing waits; else O(waiting), at most
+/// [`LIVE_FILL_EXIT_RETRY_CAPACITY`]. Cold.
+pub(super) async fn retry_live_fill_exits(
+    oms: &mut OrderManagementSystem,
+    risk: &mut RiskEngine,
+    book: &mut BookState,
+    ctx: &RuntimeCtx,
+) {
+    if book.live_fill_exit_retry.is_empty() {
+        return;
+    }
+    let waiting = std::mem::take(&mut book.live_fill_exit_retry);
+    // The first refusal ends the round (LF-6b review round 3, findings 3 and
+    // 4): every refusal that rolls over is a gate shared by all orders (rate,
+    // budget, order book, circuit), so the exits after it would only be
+    // refused too, each costing an order-budget unit (the OMS takes it before
+    // the rate check) and a High alert. They go back in order, untouched.
+    let mut gate_closed = false;
+    let mut sent: u64 = 0;
+    for mut r in waiting {
+        if gate_closed {
+            book.live_fill_exit_retry.push(r);
+            continue;
+        }
+        sent = sent.saturating_add(1);
+        if let Placed::RetryExit(err) = execute(oms, risk, book, ctx, &r.x).await {
+            r.attempts = r.attempts.saturating_add(1);
+            r.last_err = err;
+            gate_closed = true;
+            queue_exit_retry(book, ctx, r);
+        }
+    }
+    metrics::counter!(LIVE_FILL_EXIT_RETRIES_COUNTER).increment(sent);
+}
+
+/// An exit sized to the opposite-signed paper position held (`held_lots`,
+/// signed): `None` when nothing is held on the side it would close, else the
+/// execution with its order, fill and row quantities cut to the position.
+/// Cold, one clone per exit.
+fn clamp_exit(held_lots: i32, x: &PaperExecution) -> Option<PaperExecution> {
+    let can_lots = match x.side {
+        Side::Sell if held_lots > 0 => i64::from(held_lots),
+        Side::Buy if held_lots < 0 => i64::from(held_lots).saturating_neg(),
+        _ => 0,
+    };
+    if can_lots == 0 {
+        return None;
+    }
+    let can = can_lots.saturating_mul(i64::from(x.lot_size.max(1)));
+    let mut c = x.clone();
+    c.qty = c.qty.min(can);
+    c.filled_qty = c.filled_qty.min(c.qty);
+    c.base.qty = c.qty;
+    Some(c)
 }
 
 async fn execute(
@@ -175,8 +344,25 @@ async fn execute(
     book: &mut BookState,
     ctx: &RuntimeCtx,
     x: &PaperExecution,
-) {
+) -> Placed {
     let mut seq = x.next_seq;
+    // An exit is reduce-only against the paper position the risk engine
+    // actually holds (LF-6b review finding 6): the chain cannot see a
+    // refused or part-booked entry, so it may ask for more than is held.
+    let clamped;
+    let x = if x.exit {
+        let Some(c) = clamp_exit(risk.net_lots_for_in_segment(x.security_id, x.segment), x) else {
+            emit(ctx, &x.base, LiveOrderEventKind::Reject, &mut seq, |r| {
+                r.remainder_qty = Some(x.qty.max(0));
+                r.reason = Some("exit_without_position".to_owned());
+            });
+            return Placed::Done;
+        };
+        clamped = c;
+        &clamped
+    } else {
+        x
+    };
     let reject = |seq: &mut i32, reason: String| {
         emit(ctx, &x.base, LiveOrderEventKind::Reject, seq, |r| {
             r.remainder_qty = Some(x.qty.max(0));
@@ -192,7 +378,7 @@ async fn execute(
              refused; the chain only ever places paper orders"
         );
         reject(&mut seq, "refused:not_dry_run".to_owned());
-        return;
+        return Placed::Done;
     }
     let lot = i64::from(x.lot_size.max(1));
     let lots = i32::try_from(x.qty / lot).unwrap_or(i32::MAX);
@@ -200,11 +386,17 @@ async fn execute(
         Side::Buy => lots,
         Side::Sell => lots.saturating_neg(),
     };
-    if let RiskCheck::Rejected { breach, .. } =
-        risk.check_order_in_segment(x.security_id, x.segment, signed)
+    // A clamped exit can only bring the position toward flat, so the halt and
+    // the pre-trade limits do not apply to it (LF-6b review round 2, findings
+    // 6 and 8): a daily-loss halt stops NEW risk, and refusing the order that
+    // removes risk left a losing paper position open and marked until the
+    // 16:00 reset. The OMS treats a cancel the same way (no halt gate).
+    if !x.exit
+        && let RiskCheck::Rejected { breach, .. } =
+            risk.check_order_in_segment(x.security_id, x.segment, signed)
     {
         reject(&mut seq, format!("risk:{breach:?}"));
-        return;
+        return Placed::Done;
     }
     let request = PlaceOrderRequest {
         security_id: x.security_id,
@@ -226,8 +418,15 @@ async fn execute(
     let order_id = match oms.place_order(request).await {
         Ok(id) => id,
         Err(err) => {
+            // An exit a gate that rolls over time refused is kept and sent
+            // again on the 1 s housekeeping tick (finding 7): the chain has
+            // already counted it, so dropping it would leave the paper
+            // position open with nothing to close it.
+            if x.exit && place_refusal_rolls_over(&err) {
+                return Placed::RetryExit(format!("place_refused:{err}"));
+            }
             reject(&mut seq, format!("place_refused:{err}"));
-            return;
+            return Placed::Done;
         }
     };
     let rtt_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
@@ -239,7 +438,7 @@ async fn execute(
              no fill is applied"
         );
         reject(&mut seq, "refused:non_paper_id".to_owned());
-        return;
+        return Placed::Done;
     }
     emit(ctx, &x.base, LiveOrderEventKind::Sent, &mut seq, |r| {
         r.order_id = Some(order_id.clone());
@@ -319,6 +518,7 @@ async fn execute(
         filled,
         "live paper fill: paper order placed, filled and closed (no broker call)"
     );
+    Placed::Done
 }
 
 #[cfg(test)]
@@ -333,7 +533,7 @@ mod tests {
     use tickvault_common::types::ExchangeSegment;
     use tickvault_core::notification::NotificationService;
     use tickvault_storage::live_order_events_persistence::{LiveOrderMode, LiveOrderSide};
-    use tickvault_trading::oms::{OmsError, OrderApiClient, OrderRateLimiter, TokenProvider};
+    use tickvault_trading::oms::{OrderApiClient, OrderRateLimiter, TokenProvider};
     use tokio::sync::Notify;
 
     struct NoToken;
@@ -404,6 +604,7 @@ mod tests {
             filled_qty: filled,
             avg_price: 100.25,
             avg_price_paise: Some(10_025),
+            exit: false,
         }
     }
 
@@ -529,6 +730,68 @@ mod tests {
         );
     }
 
+    /// LF-6b review finding 6: an entry of 10 lots that filled only 4, then
+    /// the strategy's full-size exit. The exit is cut to the 4 lots actually
+    /// held, leaving the paper book flat, never short 6; an exit with nothing
+    /// held is refused.
+    #[tokio::test]
+    async fn test_exit_is_reduce_only_against_the_booked_paper_position_clamp_exit() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        let mut book = BookState::new();
+        let seg = ExchangeSegment::NseEquity;
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution(10, 4))),
+        )
+        .await;
+        assert_eq!(risk.net_lots_for_in_segment(2885, seg), 4);
+        let mut exit = execution(10, 10);
+        exit.side = Side::Sell;
+        exit.exit = true;
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(exit.clone())),
+        )
+        .await;
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, seg),
+            0,
+            "the exit closes the 4 lots held, never opens a short"
+        );
+        // Flat now: a further exit is refused before anything is placed.
+        let orders = oms.active_order_count();
+        while rx.try_recv().is_ok() {}
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(exit.clone())),
+        )
+        .await;
+        let last = rx.try_recv().expect("a reject row");
+        assert_eq!(last.event, LiveOrderEventKind::Reject);
+        assert_eq!(last.reason.as_deref(), Some("exit_without_position"));
+        assert_eq!(risk.net_lots_for_in_segment(2885, seg), 0);
+        assert_eq!(oms.active_order_count(), orders);
+        // The pure clamp: a Buy exit covers a short only.
+        let mut cover = execution(10, 10);
+        cover.exit = true;
+        assert!(clamp_exit(3, &cover).is_none(), "a buy exit on a long");
+        let c = clamp_exit(-3, &cover).expect("covers the short");
+        assert_eq!((c.qty, c.filled_qty, c.base.qty), (3, 3, 3));
+        assert!(clamp_exit(0, &exit).is_none());
+    }
+
     #[tokio::test]
     async fn test_handle_live_fill_cmd_risk_refusal_writes_a_reject_and_places_nothing() {
         let (tx, mut rx) = mpsc::channel(64);
@@ -622,6 +885,285 @@ mod tests {
         assert!(oms.all_orders().len() >= 5);
         assert_eq!(oms.active_order_count(), 0, "no open paper remainder");
         assert!(!book.has_pending_paper(2885, ExchangeSegment::NseEquity));
+    }
+
+    /// LF-6b review round 2, findings 6 and 8: the paper position's own marks
+    /// trip the daily-loss halt; the strategy's exit for that position still
+    /// goes through (a halt stops new risk, never the order that removes it),
+    /// and a NEW entry is still refused while halted.
+    #[tokio::test]
+    async fn test_regression_exit_closes_the_position_after_the_daily_loss_halt() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        // 2% of 10,000 rupees: a 200-rupee loss halts.
+        let mut risk = RiskEngine::new(2.0, 100, 10_000.0);
+        let mut book = BookState::new();
+        let seg = ExchangeSegment::NseEquity;
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution(10, 10))),
+        )
+        .await;
+        assert_eq!(risk.net_lots_for_in_segment(2885, seg), 10);
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Mark {
+                security_id: 2885,
+                segment: seg,
+                price: 50.0,
+            },
+        )
+        .await;
+        assert!(risk.is_halted(), "a 500-rupee paper loss halts the book");
+        while rx.try_recv().is_ok() {}
+        let mut exit = execution(10, 10);
+        exit.side = Side::Sell;
+        exit.exit = true;
+        exit.avg_price = 50.0;
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(exit)),
+        )
+        .await;
+        assert_eq!(
+            risk.net_lots_for_in_segment(2885, seg),
+            0,
+            "the exit closes the losing position although the book is halted"
+        );
+        let rows = drain(&mut rx);
+        assert!(
+            rows.iter().all(|r| r.0 != LiveOrderEventKind::Reject),
+            "{rows:?}"
+        );
+        // A new entry is still refused by the halt.
+        handle_live_fill_cmd(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &ctx,
+            PaperCmd::Execute(Box::new(execution(10, 10))),
+        )
+        .await;
+        let rows = drain(&mut rx);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].2.as_deref().is_some_and(|r| r.starts_with("risk:")),
+            "{rows:?}"
+        );
+        assert_eq!(risk.net_lots_for_in_segment(2885, seg), 0);
+    }
+
+    fn execution_for(security_id: u64, side: Side, exit: bool) -> PaperExecution {
+        let mut x = execution(1, 1);
+        x.security_id = security_id;
+        x.side = side;
+        x.exit = exit;
+        x
+    }
+
+    /// LF-6b review round 2, finding 7: twenty paper exits finishing in the
+    /// same second against the 10-a-second order limiter. The refused ones
+    /// are kept (no row yet) and sent again on the housekeeping tick until
+    /// every position is flat; none is lost.
+    #[tokio::test]
+    async fn test_regression_exits_refused_by_the_rate_limit_are_resent_retry_live_fill_exits() {
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let mut risk = RiskEngine::new(2.0, 1_000, 1_000_000.0);
+        let mut book = BookState::new();
+        let seg = ExchangeSegment::NseEquity;
+        let sids: Vec<u64> = (5_000..5_020).collect();
+        for batch in sids.chunks(10) {
+            for &sid in batch {
+                handle_live_fill_cmd(
+                    &mut oms,
+                    &mut risk,
+                    &mut book,
+                    &ctx,
+                    PaperCmd::Execute(Box::new(execution_for(sid, Side::Buy, false))),
+                )
+                .await;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+        }
+        for &sid in &sids {
+            assert_eq!(risk.net_lots_for_in_segment(sid, seg), 1, "sid {sid} open");
+        }
+        while rx.try_recv().is_ok() {}
+        for &sid in &sids {
+            handle_live_fill_cmd(
+                &mut oms,
+                &mut risk,
+                &mut book,
+                &ctx,
+                PaperCmd::Execute(Box::new(execution_for(sid, Side::Sell, true))),
+            )
+            .await;
+        }
+        assert!(
+            !book.live_fill_exit_retry.is_empty(),
+            "the burst outran the limiter, so some exits wait"
+        );
+        let mut rounds = 0;
+        while !book.live_fill_exit_retry.is_empty() && rounds < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+            retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
+            rounds += 1;
+        }
+        for &sid in &sids {
+            assert_eq!(risk.net_lots_for_in_segment(sid, seg), 0, "sid {sid} flat");
+        }
+        let rows = drain_any(&mut rx);
+        assert!(
+            rows.iter().all(|r| r.0 != LiveOrderEventKind::Reject),
+            "{rows:?}"
+        );
+        // An exit whose position closed meanwhile is refused when resent.
+        let mut gone = ExitRetry::new(
+            Box::new(execution_for(sids[0], Side::Sell, true)),
+            "place_refused:x".to_owned(),
+        );
+        gone.attempts = 2;
+        book.live_fill_exit_retry.push(gone);
+        retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
+        assert!(book.live_fill_exit_retry.is_empty());
+        let last = rx.try_recv().expect("a reject row");
+        assert_eq!(last.reason.as_deref(), Some("exit_without_position"));
+        // Spent attempts or a full queue: one Reject row, nothing kept.
+        let mut spent = ExitRetry::new(
+            Box::new(execution_for(1, Side::Sell, true)),
+            "place_refused:rate".to_owned(),
+        );
+        spent.attempts = LIVE_FILL_EXIT_RETRY_MAX_ATTEMPTS;
+        queue_exit_retry(&mut book, &ctx, spent);
+        assert!(book.live_fill_exit_retry.is_empty());
+        let last = rx.try_recv().expect("a reject row");
+        assert_eq!(
+            last.reason.as_deref(),
+            Some("place_refused:rate;retries_exhausted")
+        );
+        assert!(place_refusal_rolls_over(&OmsError::RateLimited));
+        assert!(!place_refusal_rolls_over(&OmsError::OrderNotFound {
+            order_id: "x".to_owned()
+        }));
+        assert_eq!(
+            Placed::RetryExit("a".to_owned()),
+            Placed::RetryExit("a".to_owned())
+        );
+    }
+
+    /// Counts the OMS's rate-limit and budget alerts. TEST DOUBLE.
+    #[derive(Clone, Default)]
+    struct CountingSink(Arc<AtomicU64>);
+    impl tickvault_trading::oms::engine::OmsAlertSink for CountingSink {
+        fn fire(&self, alert: tickvault_trading::oms::engine::OmsAlert) {
+            if matches!(
+                alert,
+                tickvault_trading::oms::engine::OmsAlert::RateLimitExhausted { .. }
+            ) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// LF-6b review round 3, findings 3 and 4: thirty paper exits finishing
+    /// together against the 10-a-second limiter. An exit arriving while
+    /// others wait joins the back of the queue with no place attempt, and a
+    /// retry round stops at its first refusal, so the refused attempts (each
+    /// one a High alert and an order-budget unit) are one per round, not one
+    /// per waiting exit; every position still ends flat and in order.
+    #[tokio::test]
+    async fn test_regression_exit_burst_makes_one_refused_attempt_per_round() {
+        let (tx, mut rx) = mpsc::channel(4_096);
+        let ctx = ctx(tx);
+        let mut oms = oms();
+        let alerts = CountingSink::default();
+        let mut risk = RiskEngine::new(2.0, 1_000, 1_000_000.0);
+        let mut book = BookState::new();
+        let seg = ExchangeSegment::NseEquity;
+        let sids: Vec<u64> = (7_000..7_030).collect();
+        for batch in sids.chunks(10) {
+            for &sid in batch {
+                handle_live_fill_cmd(
+                    &mut oms,
+                    &mut risk,
+                    &mut book,
+                    &ctx,
+                    PaperCmd::Execute(Box::new(execution_for(sid, Side::Buy, false))),
+                )
+                .await;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+        }
+        while rx.try_recv().is_ok() {}
+        oms.set_alert_sink(Box::new(alerts.clone()));
+        for &sid in &sids {
+            let mut x = execution_for(sid, Side::Sell, true);
+            x.base.security_id = i64::try_from(sid).expect("fits");
+            handle_live_fill_cmd(
+                &mut oms,
+                &mut risk,
+                &mut book,
+                &ctx,
+                PaperCmd::Execute(Box::new(x)),
+            )
+            .await;
+        }
+        assert_eq!(
+            alerts.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one refused attempt for the burst, the rest wait untouched"
+        );
+        assert_eq!(book.live_fill_exit_retry.len(), 20);
+        assert_eq!(book.live_fill_exit_retry[1].attempts, 0);
+        let mut rounds = 0u64;
+        while !book.live_fill_exit_retry.is_empty() && rounds < 6 {
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+            retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
+            rounds += 1;
+        }
+        for &sid in &sids {
+            assert_eq!(risk.net_lots_for_in_segment(sid, seg), 0, "sid {sid} flat");
+        }
+        assert!(
+            alerts.0.load(std::sync::atomic::Ordering::Relaxed) <= 1 + rounds,
+            "at most one refused attempt per round: {} alerts in {rounds} rounds",
+            alerts.0.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // Exits close in the order they finished.
+        let mut order = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            if r.event == LiveOrderEventKind::Fill {
+                order.push(r.security_id);
+            }
+            assert_ne!(r.event, LiveOrderEventKind::Reject, "{r:?}");
+        }
+        let want: Vec<i64> = sids
+            .iter()
+            .map(|s| i64::try_from(*s).expect("fits"))
+            .collect();
+        assert_eq!(order, want);
+    }
+
+    fn drain_any(
+        rx: &mut mpsc::Receiver<LiveOrderEvent>,
+    ) -> Vec<(LiveOrderEventKind, i32, Option<String>)> {
+        let mut v = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            v.push((r.event, r.seq, r.reason));
+        }
+        v
     }
 
     #[test]

@@ -130,7 +130,11 @@ const BUDGET: &[(&str, usize)] = &[
     // not replaying the WAL). Paired behaviour tests:
     // `test_with_live_fill_tap_hands_a_folded_live_tick_to_the_chain`,
     // `test_tap_skips_replayed_frames_wal_refold_and_unfolded_ticks`.
-    ("dhan_feed_stack/live_fill_tap_drain_tests.rs", 1),
+    // 2026-11-12 (LF-6b review finding 5): a second wiring scan pinning that
+    // the drain's `WriteFailed` arm counts a live fill loss (the staging
+    // append cannot be made to fail from a unit test). Paired behaviour test:
+    // `test_write_failed_tick_moves_drop_seq_note_live_fill_loss`.
+    ("dhan_feed_stack/live_fill_tap_drain_tests.rs", 2),
     ("dhan_feed_stack/reserved_connections_tests.rs", 1),
     // 2026-10-28 (DT-small seed queue): 1 wiring scan, the drain's idle arm is
     // gated on `idle_work_pending()` alone, never the seed latch (the select!

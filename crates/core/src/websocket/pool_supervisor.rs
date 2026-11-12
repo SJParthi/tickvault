@@ -473,6 +473,7 @@ const _: () = {
 /// What the evidence-based fast paths do: off, count only (the default), or
 /// act. Owned by the config crate, re-exported here.
 pub use tickvault_common::config::FrameSilenceFastPath;
+pub mod live_shed;
 
 /// Why a frame-silence redial fired. Audit and counter label only; every
 /// basis schedules the same `ReconnectReason::IdleSilence` redial.
@@ -5059,7 +5060,7 @@ impl ConnectionSupervisor {
 
     /// Feeds one event through the state machine and returns the action the
     /// shell must take. Total, allocation-free, O(1).
-    pub fn on_event(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
+    fn on_event_inner(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
         // Parking is terminal and absorbs everything — with ONE exception:
         // the overflow probe (D7 for the main feed, scope lock 2026-10-02 for
         // depth) may release a market-data socket parked for 805. Every other
@@ -8451,45 +8452,13 @@ impl WalRingSink {
     #[inline]
     fn note_ring_shed(&self, seq: u64) {
         note_ring_refused(self.endpoint == DhanEndpointType::MainFeed);
-        note_main_feed_live_shed(self.endpoint == DhanEndpointType::MainFeed);
+        live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
         let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
             seq,
             tickvault_storage::wal_frame_fate::ShedKind::Ring,
             self.ws_type,
         );
     }
-
-    /// A frame both the WAL and the ring refused: counted for the live paper
-    /// fill chain (plan item LF-6b) just before the total-loss outcome is
-    /// returned. O(1), shed arm only.
-    #[inline]
-    fn note_wal_dropped(&self) {
-        note_main_feed_live_shed(self.endpoint == DhanEndpointType::MainFeed);
-    }
-}
-
-/// Main-feed frames the live drain never folded live: shed at the ring (WAL
-/// copy re-folded later by replay) or refused by both the ring and the WAL.
-/// Read by the live paper fill tap (plan item LF-6b), whose chain must know
-/// that ticks went missing from the live stream it builds candles from.
-static MAIN_FEED_LIVE_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Counts one main-feed frame that will not reach the live drain. O(1): one
-/// branch and at most one relaxed add, on the shed arms only.
-#[inline]
-fn note_main_feed_live_shed(main_feed: bool) {
-    if main_feed {
-        MAIN_FEED_LIVE_SHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Main-feed frames shed before the live drain over this process's life
-/// (ring sheds and WAL-and-ring refusals). One relaxed load, O(1), no
-/// allocation; read once per tick by the live paper fill tap.
-#[must_use]
-#[inline]
-pub fn main_feed_live_shed_total() -> u64 {
-    MAIN_FEED_LIVE_SHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl FrameSink for WalRingSink {
@@ -8609,7 +8578,7 @@ impl FrameSink for WalRingSink {
                 // so marking it would protect nothing and the honest outcome
                 // is the total-loss one.
                 if wal_refused {
-                    self.note_wal_dropped();
+                    live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
@@ -8625,7 +8594,7 @@ impl FrameSink for WalRingSink {
             RingReserve::SlotsFull => {
                 self.ring_full.increment(1);
                 if wal_refused {
-                    self.note_wal_dropped();
+                    live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
@@ -8665,7 +8634,7 @@ impl FrameSink for WalRingSink {
                 self.ring_full.increment(1);
             }
             if wal_refused {
-                self.note_wal_dropped();
+                live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
                 return FrameSinkOutcome::WalDropped;
             }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
@@ -12113,27 +12082,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// LF-6b: only MAIN-FEED sheds move the live-fill shed total, and each
-    /// shed arm (ring shed and WAL-and-ring refusal) counts through it.
-    #[test]
-    fn test_main_feed_live_shed_total_counts_main_feed_sheds_only() {
-        let before = main_feed_live_shed_total();
-        note_main_feed_live_shed(false);
-        note_main_feed_live_shed(true);
-        note_main_feed_live_shed(true);
-        assert!(main_feed_live_shed_total() >= before + 2);
-        let src = include_str!("pool_supervisor.rs");
-        let production = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
-        assert_eq!(
-            production.matches("self.note_wal_dropped();\n").count(),
-            production
-                .matches("return FrameSinkOutcome::WalDropped;")
-                .count(),
-            "every WAL-and-ring refusal must count for the live fill tap"
-        );
-    }
-
     /// Test-only: clears every slot so tests do not see each other's requests.
     fn reset_ghost_redials_for_tests() {
         for (((p, l), c), r) in GHOST_REGISTER

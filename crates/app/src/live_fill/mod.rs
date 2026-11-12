@@ -27,7 +27,9 @@
 //! # Threads and complexity
 //!
 //! One OS thread, `tv-live-fill`, owns the chain. It busy-polls the tap's ring
-//! with `try_recv` (at most 4,096 ticks per pass), then runs one pass, then
+//! with `try_recv` (at most 4,096 ticks per pass), reads the tap's loss total
+//! out of band (one relaxed load), then runs one pass (bounded by the newest
+//! receipt read when the cap left ticks queued), then
 //! sends what the pass produced with `try_send` (a full channel is counted and
 //! logged, never waited on), and sleeps 1 ms (5 ms after 50 idle passes) when
 //! no tick came. Per-tick and per-pass costs are in [`chain`].
@@ -37,13 +39,13 @@ pub mod fill_window;
 pub mod taint;
 pub mod timing;
 
-use std::sync::Mutex;
-use std::sync::PoisonError;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tickvault_common::config::{ApplicationConfig, LiveFillConfig};
 use tickvault_common::error_code::ErrorCode;
-use tickvault_core::websocket::frame_ring::{FrameRingReceiver, FrameRingSender};
+use tickvault_core::websocket::frame_ring::FrameRingReceiver;
 use tickvault_storage::live_order_events_persistence::{LiveOrderEvent, LiveOrderEventKind};
 use tickvault_trading::brutex_host::InstrumentKey;
 use tickvault_trading::brutex_host::Refusal;
@@ -53,7 +55,7 @@ use tickvault_trading::brutex_host::recipe::{ParamSnapshot, Recipe};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::dhan_feed_stack::live_fill_tap::{TapTick, live_fill_tap_ring};
+use crate::dhan_feed_stack::live_fill_tap::{TapLink, TapTick, live_fill_tap_ring};
 use chain::{ChainOutput, ChainParams, ChainSetup, LiveFillChain, PaperCmd};
 use taint::TaintReason;
 
@@ -89,13 +91,13 @@ pub struct PaperLink {
     pub events: mpsc::Sender<LiveOrderEvent>,
 }
 
-static TAP_SLOT: Mutex<Option<FrameRingSender<TapTick>>> = Mutex::new(None);
+static TAP_SLOT: Mutex<Option<TapLink>> = Mutex::new(None);
 static PAPER_SLOT: Mutex<Option<PaperLink>> = Mutex::new(None);
 
-/// The tap's sender, once, for the frame drain. `None` unless the boot built
-/// the chain (never today). O(1), cold.
+/// The tap's sender and shared loss total, once, for the frame drain. `None`
+/// unless the boot built the chain (never today). O(1), cold.
 #[must_use]
-pub fn take_tap_sender() -> Option<FrameRingSender<TapTick>> {
+pub fn take_tap_sender() -> Option<TapLink> {
     TAP_SLOT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -268,15 +270,19 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     let params = ChainParams::from(config);
     let chain = LiveFillChain::new(engine, setup, params, now_ist_ns)?;
     let (tap_tx, tap_rx) = live_fill_tap_ring(config.tap_capacity);
+    let tap_loss = Arc::new(AtomicU64::new(0));
     let (cmd_tx, cmd_rx) = mpsc::channel::<PaperCmd>(config.event_channel_capacity);
-    *TAP_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(tap_tx);
+    *TAP_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(TapLink {
+        tx: tap_tx,
+        loss: Arc::clone(&tap_loss),
+    });
     *PAPER_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(PaperLink {
         cmds: cmd_rx,
         events: events_tx.clone(),
     });
     std::thread::Builder::new()
         .name("tv-live-fill".to_owned())
-        .spawn(move || run_live_fill_thread(chain, tap_rx, cmd_tx, events_tx))?;
+        .spawn(move || run_live_fill_thread(chain, tap_rx, &tap_loss, cmd_tx, events_tx))?;
     Ok(())
 }
 
@@ -360,6 +366,7 @@ pub struct SendDrops {
 fn run_live_fill_thread<E: StrategyEngine>(
     mut chain: LiveFillChain<E>,
     mut tap_rx: FrameRingReceiver<TapTick>,
+    tap_loss: &AtomicU64,
     cmd_tx: mpsc::Sender<PaperCmd>,
     events_tx: mpsc::Sender<LiveOrderEvent>,
 ) {
@@ -384,7 +391,13 @@ fn run_live_fill_thread<E: StrategyEngine>(
             }
         }
         let mono = i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX);
-        if let Err(e) = chain.on_pass(wall_ist_ns(), mono) {
+        // Losses the tap counted, read out of band: a tick dropped behind the
+        // ones still queued taints before this pass releases anything.
+        chain.note_tap_loss(tap_loss.load(Ordering::Relaxed));
+        // A pass that stopped at the per-pass cap left ticks queued: the book
+        // clock must not run past the stream it has read.
+        let backlogged = n >= MAX_TICKS_PER_PASS;
+        if let Err(e) = chain.on_pass_bounded(wall_ist_ns(), mono, backlogged) {
             error!(
                 code = ErrorCode::OrderReady01GateRefused.code_str(),
                 source = "live_fill_day_roll_refused",
@@ -412,6 +425,15 @@ fn run_live_fill_thread<E: StrategyEngine>(
                 warn!(
                     lost = c.outbox_overflow - published.outbox_overflow,
                     "live paper fill chain: outputs over the per-pass outbox were lost"
+                );
+            }
+            if c.executions_lost > published.executions_lost {
+                error!(
+                    code = ErrorCode::OrderReady01GateRefused.code_str(),
+                    source = "live_fill_execution_not_queued",
+                    lost = c.executions_lost - published.executions_lost,
+                    "live paper fill chain: a filled paper order could not be queued (the \
+                     outbox was full); the chain did not count it as held (paper only)"
                 );
             }
             published = c;

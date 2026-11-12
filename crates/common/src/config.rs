@@ -288,7 +288,7 @@ const fn default_live_fill_wait_ms() -> u64 {
     1_000
 }
 const fn default_live_fill_open_wait_ms() -> u64 {
-    2_500
+    1_000
 }
 const fn default_live_fill_band_bps() -> u32 {
     1_000
@@ -5867,7 +5867,7 @@ mod tests {
         assert!(!d.enabled, "live_fill must default OFF");
         assert_eq!(d.tap_capacity, 65_536);
         assert_eq!(d.wait_ms, 1_000);
-        assert_eq!(d.open_wait_ms, 2_500);
+        assert_eq!(d.open_wait_ms, 1_000);
         assert_eq!(d.max_fill_seconds, 60);
         assert!(d.validate().is_ok());
 
