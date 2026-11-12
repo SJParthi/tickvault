@@ -11,23 +11,46 @@
 //! Everything here is pure (no network, no clock): the folder reader takes a
 //! local directory, the clock comes in as arguments, and the strategy crate sits
 //! behind [`engine::StrategyEngine`]. The S3 download lives in the storage crate
-//! (`strategy_recipe_fetch`, List + Get only). Nothing in this module is on the
-//! live trading path yet: no strategy is approved and brutex's crate does not
-//! exist. Cold path throughout except the trait's `on_tick`/`on_bar`, which the
-//! crate must make O(1) and allocation-free (contract R4–R6).
+//! (`strategy_recipe_fetch`, List + Get only). Nothing in this module is wired
+//! into the live trading path yet: no strategy is approved and brutex's crate
+//! does not exist.
+//!
+//! # What is cold and what is per call
+//!
+//! * Cold (once before the market opens, or in the dry-run CLI): `loader`,
+//!   `manifest`, `recipe`, `check_files`, `gates`, `replay`, `select`, `swap`,
+//!   `audit`, `fixture`, and `live_candles::LiveCandleBook::configure` (the
+//!   only allocation the candle book makes).
+//! * Per tick: `live_candles::LiveCandleBook::on_tick`, one composite-key hash
+//!   probe plus O(frames), no allocation. It does not drop a duplicate
+//!   packet: a repeat adds to the bar's tick count and no volume. Per clock
+//!   reading: `LiveCandleBook::on_clock`, O(frames), plus one O(open bars of
+//!   a frame) scan when that frame's due bound passes (see `live_candles`).
+//! * Per order (a hot call, not per tick): `worst_fill::worst_fill`,
+//!   O(fill seconds used + book levels); `order_price::marketable_limit`, O(1);
+//!   `send_queue::SendQueue` push and pop, O(log N) heap sifts with the
+//!   capacity N at most 64 (6 levels) on a fixed array. All of them allocate
+//!   nothing per call.
+//! * The strategy crate behind `engine::StrategyEngine` carries its own
+//!   per-tick contract: `on_tick`/`on_bar` O(1) and allocation-free (contract
+//!   R4–R6).
 
-// O(1) EXEMPT: begin — cold path: runs once before the market opens (or in the dry-run CLI), never per tick. The strategy crate behind `engine::StrategyEngine` carries the hot-path contract (R4–R6).
+// O(1) EXEMPT: begin — module declarations, the key type and the cold `hex_lower` helper only (no per-tick code in this file). The per-tick and per-order functions live in `live_candles`, `worst_fill`, `order_price` and `send_queue`; their complexity is stated in the module docs above and in each module.
 pub mod audit;
 pub mod check_files;
 pub mod engine;
 pub mod fixture;
 pub mod gates;
+pub mod live_candles;
 pub mod loader;
 pub mod manifest;
+pub mod order_price;
 pub mod recipe;
 pub mod replay;
 pub mod select;
+pub mod send_queue;
 pub mod swap;
+pub mod worst_fill;
 
 /// The only unique instrument key (I-P1-11): id and segment together.
 #[derive(

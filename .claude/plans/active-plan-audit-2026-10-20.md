@@ -2708,10 +2708,10 @@ Each LF PR reverts on its own; the tap is behind `[live_fill] enabled` (default 
 This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`.
 
 - [x] LF-0 rule-file-first: Quote 57 (full + summary), noise lock §2.22 (full + summary), this item.
-- [ ] LF-1 `brutex_host::live_candles` + tests + DHAT + bench.
-- [ ] LF-2 `brutex_host::worst_fill` + tests + DHAT + bench.
-- [ ] LF-3 `brutex_host::order_price` + tests + bench.
-- [ ] LF-4 `brutex_host::send_queue` + tests + bench.
+- [x] LF-1 `brutex_host::live_candles` + tests + DHAT + bench.
+- [x] LF-2 `brutex_host::worst_fill` + tests + DHAT + bench.
+- [x] LF-3 `brutex_host::order_price` + tests + bench.
+- [x] LF-4 `brutex_host::send_queue` + tests + bench.
 - [ ] LF-5 storage `live_order_events` table and writer.
 - [ ] LF-6 app paper wiring, clock offset column and page, handshake RTT table.
 - [ ] LF-7 daily calibration report to S3 + IAM grant.

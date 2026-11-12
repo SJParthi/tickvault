@@ -172,6 +172,10 @@ spot_price_store         = 250          # <250ns per call (measured: median 27 n
 backup_dedup             = 400          # <400ns per packet (measured: median 55 ns accept, p99 153 ns with the clock pair) — matches backup_dedup/admit_* (set full at 5,000) and its p99 gate (plan ITEM DT, 2026-10-30)
 tick_conservation_ledger = 100          # <100ns per row (measured: median 8 ns, p99 58 ns with the clock pair) — matches tick_conservation_ledger/note_row_appended_* and its p99 gate (plan ITEM DT, 2026-10-30)
 depth_row_append         = 1000         # <1us per row — matches depth_row_append/level_row (market_depth, one row per level) and depth_row_append/book_row_5 (market_depth_book, the inline five-level Full-packet book), and its p99 gate (plan ITEM DT, 2026-10-30). Measured on the x86 dev container: median 393 ns per level row, 378 ns per book row; per-call p99 671-866 ns over three runs (one Instant pair inside each sample).
+live_candles             = 1000         # <1us per tick — matches live_candles/on_tick_500x3 (500 ticks + one clock call per iter; see [elements]). In-memory strategy candles, plan item LF-1 (2026-11-12). Measured on the x86 dev container: ~51-63 ns per tick median, per-call p99 117-173 ns with the clock pair.
+worst_fill               = 1000         # <1us per order — matches worst_fill/buy_5s_depth (the backtest worst-case fill model over 5 seconds with book depth, plan item LF-2, 2026-11-12). Measured: median 109-111 ns, per-call p99 215-256 ns.
+order_price              = 200          # <200ns per order — matches order_price/marketable_limit (plan item LF-3, 2026-11-12). Measured: median 19 ns, per-call p99 60-84 ns with the clock pair.
+send_queue               = 500          # <500ns per push+pop — matches send_queue/push_pop_64 (64-deep rate-limit priority queue, O(log 64), plan item LF-4, 2026-11-12). Measured: median 64 ns, per-call p99 135-201 ns.
 
 # =============================================================================
 # Per-element counts for BATCH benchmarks (2026-06-02)
@@ -199,3 +203,4 @@ candles_consume_tick_hit            = 500  # 500 ticks per hit batch (candle_fol
 tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
 depth_row_append                    = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
 order_path_risk_record_fill_held    = 2    # 2 fills per iter (add then reduce: net lots return each iter; avg price and realized P&L drift, bounded)
+live_candles_on_tick_500x3          = 500  # 500 ticks per iter (one on_clock call included), plan item LF-1
