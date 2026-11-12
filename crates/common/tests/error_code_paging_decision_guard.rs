@@ -99,6 +99,10 @@ const LOG_ONLY_CODES: &[&str] = &[
     "LAMBDA-PROV-01",
     "LAMBDA-START-01",
     "LAMBDA-START-02",
+    // 2026-11-12 (plan item LF-6a): the once-per-session handshake timing
+    // check failed an attempt or a write. A measurement, log only; the failed
+    // attempt is itself a row in `network_rtt_session`.
+    "NET-RTT-01",
     "OMS-GAP-01",
     "OMS-GAP-02",
     "OMS-GAP-04",

@@ -183,6 +183,21 @@ pub enum ErrorCode {
     /// ticks. Edge-triggered, at most one line a minute; pages (noise-lock
     /// §2.8, owner-approved 2026-10-02).
     HotPathStall01,
+    /// CLOCK-SKEW-01: chrony's clock offset was over 1 ms for 5 consecutive
+    /// minute samples inside 09:00–15:40 IST. Signal and order times taken
+    /// from this clock may be off by that much. Edge-triggered once per
+    /// episode, no recovery line; pages (noise-lock §2.22, Quote 57,
+    /// owner-approved 2026-11-12). A failed sample is a `warn!` with this code
+    /// and never pages.
+    ClockSkew01OffsetOverOneMs,
+    /// NET-RTT-01: the once-per-session TCP + TLS handshake check to the Dhan
+    /// hosts could not resolve, connect or finish a handshake, or its rows
+    /// could not be written. Log-only, never pages: a failed handshake
+    /// attempt is a `warn!` (and a row in `network_rtt_session` with
+    /// `ok = false`); a failed row write, or a table that could not be
+    /// ensured after one retry (`stage = "ensure_failed"`), is an `error!`
+    /// with no CloudWatch filter.
+    NetRtt01HandshakeCheckFailed,
     /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
     /// QuestDB and has been quarantined so the rest of the backlog can drain.
     ///
@@ -1169,6 +1184,8 @@ impl ErrorCode {
             Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
             Self::HotPath04TelemetryNotStarted => "HOT-PATH-04",
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
+            Self::ClockSkew01OffsetOverOneMs => "CLOCK-SKEW-01",
+            Self::NetRtt01HandshakeCheckFailed => "NET-RTT-01",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             Self::DrainHold01NotWritten => "DRAIN-HOLD-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
@@ -1459,6 +1476,11 @@ impl ErrorCode {
             // this process; this failure alone does not establish capture loss.
             Self::HotPath04TelemetryNotStarted => Severity::Medium,
             Self::HotPathStall01 => Severity::High,
+            // CLOCK-SKEW-01 pages (noise-lock §2.22): signal and order times
+            // read from a clock off by more than 1 ms for five minutes.
+            Self::ClockSkew01OffsetOverOneMs => Severity::High,
+            // NET-RTT-01: a measurement row is missing or failed; log-only.
+            Self::NetRtt01HandshakeCheckFailed => Severity::Low,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1646,6 +1668,9 @@ impl ErrorCode {
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot => "docs/error-runbooks/wave-1-error-codes.md",
             Self::HotPathStall01 => "docs/error-runbooks/hot-path-stall-error-codes.md",
+            Self::ClockSkew01OffsetOverOneMs | Self::NetRtt01HandshakeCheckFailed => {
+                "docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
+            }
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 "docs/error-runbooks/ws-frame-spill-error-codes.md"
             }
@@ -1951,6 +1976,8 @@ impl ErrorCode {
             Self::HotPath03ReaderPinNotApplied,
             Self::HotPath04TelemetryNotStarted,
             Self::HotPathStall01,
+            Self::ClockSkew01OffsetOverOneMs,
+            Self::NetRtt01HandshakeCheckFailed,
             Self::TickSpill01FileQuarantined,
             Self::DrainHold01NotWritten,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
@@ -2504,7 +2531,11 @@ mod tests {
                 // trading pipeline's broadcast lag.
                 || s.starts_with("API-SERVER-")
                 || s.starts_with("TICK-GAP-")
-                || s.starts_with("PIPELINE-LAG-");
+                || s.starts_with("PIPELINE-LAG-")
+                // Plan item LF-6a (2026-11-12): the clock-offset page and
+                // the session handshake timing check.
+                || s.starts_with("CLOCK-SKEW-")
+                || s.starts_with("NET-RTT-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

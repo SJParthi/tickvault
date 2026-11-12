@@ -2714,6 +2714,8 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - [x] LF-3 `brutex_host::order_price` + tests + bench.
 - [x] LF-4 `brutex_host::send_queue` + tests + bench.
 - [x] LF-5 storage `live_order_events` table and writer.
+- Owner decisions for LF-6b (2026-11-12, recorded in the Quote 57 addendum): skip and log an order from a candle that took a late price; cancel a partial remainder; 60 s fill limit; forward 1 s closes for instruments with an open paper position to the paper risk engine. Synthesized design: scratchpad lf6b-plan.md (judge of three designs).
 - [ ] LF-6 app paper wiring, clock offset column and page, handshake RTT table.
+  - 2026-11-12: LF-6a built, not merged (clock offset column, §2.22 page, handshake table; the paper wiring is LF-6b): `host_capacity_minute.clock_offset_ns` (`crates/storage/src/host_capacity_minute.rs`, fed by `crates/app/src/infra.rs`), `ClockOffsetEpisode` + `CLOCK-SKEW-01` (`crates/app/src/clock_offset_page.rs`, `crates/common/src/error_code.rs`, `deploy/aws/terraform/error-code-alarms.tf` `clock-skew-01`, runbook `docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md`), `network_rtt_session` (`crates/storage/src/network_rtt_session_persistence.rs`, `crates/app/src/network_rtt.rs`, `NET-RTT-01` log-only, `tls::shared_http11_client_config` in `crates/core/src/websocket/tls.rs`).
 - [ ] LF-7 daily calibration report to S3 + IAM grant.
 - [ ] LF-8 replay CLI, sample log and report.

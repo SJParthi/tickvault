@@ -175,7 +175,12 @@ authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.8: in session, a tokio
 runtime or the frame drain made no progress for 2 s, or one hot-path step
 took 2 s; written by the telemetry thread, edge-triggered per signal, at most
 one line a minute. `ok_recovery = false`: a stall that ended is not a
-repair**)**.
+repair**)**, and **CLOCK-SKEW-01 (added 2026-11-12** — owner-approved,
+authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.22, Quote 57: chrony's
+clock offset over 1 ms for 5 consecutive minute samples inside 09:00–15:40 IST;
+written by the clock-skew poller, once per episode; a failed sample is a `warn!`
+with this code and does not match the filter. `ok_recovery = false`: the rule
+forbids a recovery page**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added

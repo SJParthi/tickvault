@@ -37,7 +37,8 @@
 //!     ticks_accepted                 LONG,       -- `ticks` rows appended this minute
 //!     ticks_not_landed               LONG,       -- rows spilled, failed or deferred to replay
 //!     ticks_lost                     LONG,       -- `tv_ticks_lost_total` growth
-//!     ring_refused_frames            LONG        -- main-feed frames missing downstream live-path timing
+//!     ring_refused_frames            LONG,       -- main-feed frames missing downstream live-path timing
+//!     clock_offset_ns                LONG        -- chrony's signed offset at the minute close (+ = clock ahead)
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, feed);
 //!
@@ -114,9 +115,16 @@
 //! * `ticks_lost` sums the `tv_ticks_lost_total` series read from this
 //!   process's own `/metrics` once a minute by a separate thread; NULL until
 //!   the first read.
+//! * `clock_offset_ns` (plan item LF-6a, Quote 57, 2026-11-12) is the clock
+//!   poller's latest `chronyc tracking` reading (every 30 s) at the minute
+//!   close, so it is at most about 30 s old. NULL when the last probe failed,
+//!   when no probe ran yet, or when the latest reading is older than
+//!   [`CLOCK_OFFSET_FRESH_SECS`] (the poller stopped). Read with two atomic
+//!   loads; the publisher writes them with no lock, so a reading and its
+//!   time can come from two adjacent probes (both real readings).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, TimestampNanos};
@@ -170,6 +178,9 @@ pub const HOST_CAPACITY_MINUTE_COLUMNS: &[(&str, &str)] = &[
     ("ticks_not_landed", "LONG"),
     ("ticks_lost", "LONG"),
     ("ring_refused_frames", "LONG"),
+    // 2026-11-12 (plan item LF-6a): nullable, self-healed by the per-column
+    // `ADD COLUMN IF NOT EXISTS` the ensure already runs.
+    ("clock_offset_ns", "LONG"),
 ];
 
 /// `(column, type)` for the verdict table, in DDL order.
@@ -274,6 +285,64 @@ pub fn publish_ticks_lost_total(total: u64) {
 pub fn ticks_lost_total() -> Option<u64> {
     let v = TICKS_LOST_TOTAL.load(Ordering::Relaxed);
     (v != UNKNOWN).then_some(v)
+}
+
+/// A clock-offset reading older than this at the minute close is written as
+/// NULL: the poller samples every 30 s, so three missed polls mean it stopped.
+pub const CLOCK_OFFSET_FRESH_SECS: i64 = 90;
+
+/// Largest offset magnitude stored, in ns (one hour). A larger reading is
+/// not a slewing clock but a broken probe, and is stored as unknown.
+pub const CLOCK_OFFSET_MAX_ABS_NS: i64 = 3_600 * NANOS_PER_SECOND;
+
+/// `i64::MIN` = no reading (also QuestDB's LONG NULL, so it is never written).
+const CLOCK_OFFSET_NONE: i64 = i64::MIN;
+static CLOCK_OFFSET_NS: AtomicI64 = AtomicI64::new(CLOCK_OFFSET_NONE);
+static CLOCK_OFFSET_AT_UNIX_SECS: AtomicI64 = AtomicI64::new(0);
+
+/// chrony's offset in seconds as whole nanoseconds; `None` when it is not
+/// finite or over [`CLOCK_OFFSET_MAX_ABS_NS`]. Pure.
+#[must_use]
+pub fn clock_offset_ns_from_secs(offset_secs: f64) -> Option<i64> {
+    if !offset_secs.is_finite() {
+        return None;
+    }
+    let ns = (offset_secs * NANOS_PER_SECOND as f64).round();
+    // The bound check is on the float, before the cast, so the cast is exact.
+    (ns.abs() <= CLOCK_OFFSET_MAX_ABS_NS as f64).then_some(ns as i64)
+}
+
+/// Records the clock poller's latest probe: `Some(offset_secs)` for a
+/// `chronyc` reading, `None` for a failed probe (the column then reads
+/// NULL until the next good one). `at_unix_secs` is when it was taken.
+/// O(1): two relaxed stores, no allocation. Called by the clock poller only.
+pub fn publish_clock_offset(offset_secs: Option<f64>, at_unix_secs: i64) {
+    let ns = offset_secs
+        .and_then(clock_offset_ns_from_secs)
+        .unwrap_or(CLOCK_OFFSET_NONE);
+    CLOCK_OFFSET_NS.store(ns, Ordering::Relaxed);
+    CLOCK_OFFSET_AT_UNIX_SECS.store(at_unix_secs, Ordering::Release);
+}
+
+/// The reading to store for a minute closed at `now_unix_secs`, from a raw
+/// stored offset and its time: `None` for no reading, a failed probe, or a
+/// reading more than [`CLOCK_OFFSET_FRESH_SECS`] old (or from the future by
+/// more than that: a clock step). Pure.
+#[must_use]
+pub fn fresh_clock_offset_ns(raw_ns: i64, at_unix_secs: i64, now_unix_secs: i64) -> Option<i64> {
+    if raw_ns == CLOCK_OFFSET_NONE || at_unix_secs <= 0 {
+        return None;
+    }
+    (now_unix_secs.saturating_sub(at_unix_secs).abs() <= CLOCK_OFFSET_FRESH_SECS).then_some(raw_ns)
+}
+
+/// The latest published clock offset if fresh at `now_unix_secs`. O(1):
+/// two atomic loads.
+#[must_use]
+pub fn latest_clock_offset_ns(now_unix_secs: i64) -> Option<i64> {
+    let at = CLOCK_OFFSET_AT_UNIX_SECS.load(Ordering::Acquire);
+    let raw = CLOCK_OFFSET_NS.load(Ordering::Relaxed);
+    fresh_clock_offset_ns(raw, at, now_unix_secs)
 }
 
 /// The sum of every sample of counter `name` in a Prometheus text exposition
@@ -465,6 +534,9 @@ pub struct HostMinuteRow {
     pub ticks_lost: Option<u64>,
     /// Main-feed frames the ring refused this minute.
     pub ring_refused_frames: u64,
+    /// chrony's signed clock offset at the minute close, in ns (positive =
+    /// this clock ahead); `None` when no fresh reading.
+    pub clock_offset_ns: Option<i64>,
 }
 
 impl HostMinuteRow {
@@ -680,6 +752,11 @@ impl HostSampler {
                 tickvault_common::ingest_shed::wal_apply_lag_max()
                     .map(|_| u64::from(tickvault_common::ingest_shed::wal_apply_lag_growing())),
             ),
+        );
+        let mut row = row;
+        row.clock_offset_ns = latest_clock_offset_ns(
+            now_ist_nanos.div_euclid(NANOS_PER_SECOND)
+                - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
         );
         self.seconds = 0;
         self.prev = Some(now);
@@ -1541,6 +1618,11 @@ pub fn append_host_row(buffer: &mut Buffer, r: &HostMinuteRow) -> Result<()> {
             row = row.column_i64(name, to_i64(v)).context(name)?;
         }
     }
+    if let Some(v) = r.clock_offset_ns {
+        row = row
+            .column_i64("clock_offset_ns", v)
+            .context("clock_offset_ns")?;
+    }
     row.at(TimestampNanos::new(r.minute_ist_nanos))
         .context("designated timestamp")?;
     Ok(())
@@ -2388,6 +2470,80 @@ mod tests {
             append_host_row(&mut buf, &bad).is_err(),
             "negative ts refused"
         );
+    }
+
+    #[test]
+    fn test_append_host_row_writes_clock_offset_ns_only_when_known() {
+        let mut row = host(at(0, 10, 0), 5_000, 2_000, 40.0);
+        let mut buf = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+        append_host_row(&mut buf, &row).expect("append");
+        let text = String::from_utf8_lossy(buf.as_bytes()).into_owned();
+        assert!(!text.contains("clock_offset_ns"), "NULL is omitted: {text}");
+
+        row.clock_offset_ns = Some(-1_500_000);
+        let mut buf = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+        append_host_row(&mut buf, &row).expect("append");
+        let text = String::from_utf8_lossy(buf.as_bytes()).into_owned();
+        assert!(text.contains("clock_offset_ns=-1500000i"), "{text}");
+    }
+
+    #[test]
+    fn test_clock_offset_column_is_in_the_ddl_and_self_heals() {
+        assert!(
+            HOST_CAPACITY_MINUTE_COLUMNS.contains(&("clock_offset_ns", "LONG")),
+            "the column list carries clock_offset_ns LONG"
+        );
+        let stmts = host_capacity_minute_ddl_statements();
+        assert!(stmts[0].contains("clock_offset_ns LONG"));
+        assert!(stmts.iter().any(|s| s
+            == "ALTER TABLE host_capacity_minute ADD COLUMN IF NOT EXISTS clock_offset_ns LONG;"));
+    }
+
+    #[test]
+    fn test_clock_offset_ns_from_secs_rounds_and_refuses_bad_readings() {
+        assert_eq!(clock_offset_ns_from_secs(0.0), Some(0));
+        assert_eq!(clock_offset_ns_from_secs(-0.000_007_441), Some(-7_441));
+        assert_eq!(clock_offset_ns_from_secs(0.001_000_000_4), Some(1_000_000));
+        assert_eq!(
+            clock_offset_ns_from_secs(3_600.0),
+            Some(CLOCK_OFFSET_MAX_ABS_NS)
+        );
+        assert_eq!(clock_offset_ns_from_secs(3_600.5), None, "over one hour");
+        assert_eq!(clock_offset_ns_from_secs(-3_600.5), None);
+        assert_eq!(clock_offset_ns_from_secs(f64::NAN), None);
+        assert_eq!(clock_offset_ns_from_secs(f64::INFINITY), None);
+        assert_eq!(clock_offset_ns_from_secs(f64::MAX), None);
+    }
+
+    #[test]
+    fn test_fresh_clock_offset_ns_needs_a_recent_real_reading() {
+        let now = 1_800_000_000;
+        assert_eq!(fresh_clock_offset_ns(42, now - 30, now), Some(42));
+        assert_eq!(fresh_clock_offset_ns(42, now - 90, now), Some(42));
+        assert_eq!(fresh_clock_offset_ns(42, now - 91, now), None, "stale");
+        assert_eq!(fresh_clock_offset_ns(42, now + 91, now), None, "future");
+        assert_eq!(
+            fresh_clock_offset_ns(i64::MIN, now, now),
+            None,
+            "failed probe"
+        );
+        assert_eq!(fresh_clock_offset_ns(42, 0, now), None, "never published");
+    }
+
+    #[test]
+    fn test_publish_clock_offset_and_latest_clock_offset_ns() {
+        // The only test that touches the process-wide reading. Times far in
+        // the future keep other tests' minute closes (which pass real or
+        // synthetic clocks) from seeing it as fresh.
+        let at = 4_000_000_000;
+        publish_clock_offset(Some(-0.002), at);
+        assert_eq!(latest_clock_offset_ns(at + 10), Some(-2_000_000));
+        assert_eq!(latest_clock_offset_ns(at + 91), None);
+        publish_clock_offset(None, at + 30);
+        assert_eq!(latest_clock_offset_ns(at + 31), None, "failed probe");
+        publish_clock_offset(Some(f64::NAN), at + 60);
+        assert_eq!(latest_clock_offset_ns(at + 61), None, "bad reading");
+        publish_clock_offset(None, 0);
     }
 
     #[test]

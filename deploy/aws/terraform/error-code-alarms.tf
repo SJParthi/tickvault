@@ -113,7 +113,7 @@
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
 #   rather than carried forward: 4 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 3 standalone `aws_cloudwatch_metric_alarm` resources, and 18 live
+#   resources, 3 standalone `aws_cloudwatch_metric_alarm` resources, and 19 live
 #   `error_code_alerts` map entries (5 filters, 4 alarms and 22 entries until
 #   2026-11-11, when the operator Quote 53 alarm review,
 #   docs/audits/2026-11-alarm-review.md, removed the preopen-ready pair and
@@ -124,7 +124,8 @@
 #   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
 #   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
 #   `hot-path-stall-01`, noise-lock §2.8; -1 on 2026-10-22, the depth
-#   swap-emptied entry, Quote 37 alarm review — noise-lock §2.14). Re-count with:
+#   swap-emptied entry, Quote 37 alarm review — noise-lock §2.14; +1 on
+#   2026-11-12, `clock-skew-01`, Quote 57 — noise-lock §2.22). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has
@@ -391,6 +392,23 @@ locals {
       dta         = 1
       ok_recovery = false # 2026-10-02: the stall already ended or is latched; an auto-OK would read as a repair nobody made
       desc        = "HOT-PATH-STALL-01 = in session, a step on the Dhan live path stalled for at least 2 s: a tokio runtime or the frame drain made no progress (kind=heartbeat), or one socket hand-off, ring wait or runtime wake took that long (kind=stage). Socket reads may have waited and Dhan may have skipped ticks. Fields: signal, kind, stalled_secs, signals, missed_episodes (one line a minute at most). Check host CPU, disk, QuestDB, and the tv_task_heartbeat_age_seconds / tv_hot_path_stage_max_ns gauges. NO recovered/OK page. Runbook: docs/error-runbooks/hot-path-stall-error-codes.md"
+    }
+    # CLOCK-SKEW-01 (added 2026-11-12, noise-lock §2.22, Quote 57 — owner
+    # tapped "Page if 5 min in a row (Recommended)"). Emit site:
+    # crates/app/src/infra.rs::run_clock_skew_loop via
+    # crates/app/src/clock_offset_page.rs::ClockOffsetEpisode: chrony's
+    # offset over 1 ms for 5 consecutive minute samples inside 09:00-15:40
+    # IST, once per episode. A failed sample is a warn! with this code and is
+    # excluded by the level clause. ok_recovery = false: the rule forbids a
+    # recovery page.
+    "clock-skew-01" = {
+      pattern     = "{ $.code = \"CLOCK-SKEW-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-11-12: §2.22 forbids a recovery page; the episode ends silently
+      desc        = "CLOCK-SKEW-01 = chrony's clock offset was over 1 ms for 5 consecutive minute samples inside 09:00-15:40 IST. Signal, order and fill times read from this clock are off by about offset_ns (positive = clock ahead). Fields: offset_ns, consecutive_minutes, threshold_ns. Check chronyc tracking and chronyc sources on the box; host_capacity_minute.clock_offset_ns has the minute series. Once per episode. NO recovered/OK page. Runbook: docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply
