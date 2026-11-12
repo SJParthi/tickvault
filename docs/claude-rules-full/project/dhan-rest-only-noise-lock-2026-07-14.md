@@ -5510,3 +5510,15 @@ a trend is fair); it excludes segments this start's own boot fold will pin.
 - (2026-11-11 second review fix) Saving a known count taken while segments wait without a trusted, bounded applied watermark.
 - Dropping any counter on the quiet path.
 - Any new page, alarm, metric filter or EMF name, or editing `ws-spill-01` / `ws-spill-02` to exclude these sources.
+
+## §2.22 — 2026-11-12: clock offset page, five minutes in a row over 1 ms (ONE new page)
+
+**Owner, 2026-11-12 (Quote 57, daily-universe file):** on the card "Your task asks to alert if the clock is off by more than 1 ms. A Telegram page for that needs your OK under the alert-noise rule. What should happen?" the owner tapped **"Page if 5 min in a row (Recommended)"**: "Log the offset every minute (database + dashboard). Page you once only if it stays over 1 ms for 5 minutes in a row during market hours, and once when it recovers is NOT sent. Avoids pages for a single blip."
+
+| Item | Contract |
+|---|---|
+| Sample | chrony's offset from the Amazon Time Sync Service, once a minute, written to the database |
+| Page | one coded ERROR when the absolute offset is over 1 ms for 5 consecutive minute samples inside 09:00–15:40 IST; edge-triggered once per episode, no recovery page, no `ok_actions` |
+| Not a page | a single reading over 1 ms, a failed sample (coded warn only), anything outside 09:00–15:40 IST |
+
+**REJECT (§2.22):** paging on fewer than 5 consecutive readings or outside 09:00–15:40 IST; a recovery page or `ok_actions`; paging more than once per episode; a per-instrument or per-connection dimension; using §2.22 for any other page.
