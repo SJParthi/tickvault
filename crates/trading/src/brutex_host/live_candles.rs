@@ -343,6 +343,10 @@ pub struct LiveCandleBook {
     last_cum: Vec<Option<u64>>,
     last_clock_ns: i64,
     counters: Counters,
+    /// Bit `fi` set when the most recent [`Self::on_tick`] counted that tick
+    /// late on frame `fi` ([`MAX_FRAMES`] bits). Reset at the start of every
+    /// tick: 4 stores, no allocation.
+    last_tick_late: [u64; MAX_FRAMES / 64],
 }
 
 impl LiveCandleBook {
@@ -401,6 +405,7 @@ impl LiveCandleBook {
                 late,
                 ..Counters::default()
             },
+            last_tick_late: [0; MAX_FRAMES / 64],
         })
     }
     // O(1) EXEMPT: end
@@ -408,6 +413,18 @@ impl LiveCandleBook {
     #[must_use]
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// Whether the most recent [`Self::on_tick`] counted its tick late on
+    /// frame `fi` (false for a refused tick, and for `fi` out of range). The
+    /// caller learns WHICH bars the late price belonged to: the bucket of the
+    /// tick's exchange second in each frame where this is true. O(1).
+    #[must_use]
+    pub fn last_tick_late(&self, fi: usize) -> bool {
+        if fi >= MAX_FRAMES {
+            return false;
+        }
+        self.last_tick_late[fi / 64] & (1u64 << (fi % 64)) != 0
     }
 
     #[must_use]
@@ -433,6 +450,29 @@ impl LiveCandleBook {
         )
     }
 
+    /// A packet that carried NO new trade (a repeat quote, the first packet
+    /// after a subscribe, a packet ending a replay gap): its trade time and
+    /// price are old, so it touches no bar, but its cumulative volume is a
+    /// valid baseline. Raises the instrument's baseline to `cum_volume` (seeds
+    /// it when unset; never lowers it), so the next new trade's delta counts
+    /// only volume traded after this packet. `false` for an unknown key.
+    /// O(1) hash probe, no allocation.
+    pub fn note_baseline_volume(&mut self, key: InstrumentKey, cum_volume: u64) -> bool {
+        let Some(&ki) = self.index.get(&key) else {
+            return false;
+        };
+        let slot = &mut self.last_cum[ki as usize];
+        match *slot {
+            None => {
+                self.counters.baseline = self.counters.baseline.saturating_add(1);
+                *slot = Some(cum_volume);
+            }
+            Some(prev) if cum_volume > prev => *slot = Some(cum_volume),
+            Some(_) => {}
+        }
+        true
+    }
+
     /// One live tick. O(1) hash probe plus O(frames); no allocation.
     pub fn on_tick(
         &mut self,
@@ -443,6 +483,7 @@ impl LiveCandleBook {
         cum_volume: u64,
         out: &mut ClosedBars,
     ) -> TickVerdict {
+        self.last_tick_late = [0; MAX_FRAMES / 64];
         let Some(&ki) = self.index.get(&key) else {
             self.counters.refused_unknown = self.counters.refused_unknown.saturating_add(1);
             return TickVerdict::RefusedUnknownKey;
@@ -497,6 +538,7 @@ impl LiveCandleBook {
             {
                 self.counters.late[fi] = self.counters.late[fi].saturating_add(1);
                 late_frames = late_frames.saturating_add(1);
+                self.last_tick_late[fi / 64] |= 1u64 << (fi % 64);
                 continue;
             }
             if bucket == slot.bucket {

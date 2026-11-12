@@ -389,10 +389,18 @@ fn run_stream(class: Class, seed: u64, d: &mut Digest) {
         // sealed bar, amendment and every pre-existing verdict bit for bit
         // (a changed candle still fails here). `advanced` itself is pinned by
         // the unit tests in `multi_tf_aggregator::advanced_tests`.
+        // 2026-11-12 (LF-6b): `fresh_first` and `older_trade` were added the same
+        // way (informational verdicts the live paper fill tap reads; neither
+        // feeds a bar), so they are left out of the digest text for the same
+        // reason. They are pinned by `multi_tf_aggregator_advanced_tests`.
         let stats_text = format!("{stats:?}");
         let stats_text = stats_text
             .replace(", advanced: false", "")
-            .replace(", advanced: true", "");
+            .replace(", advanced: true", "")
+            .replace(", fresh_first: false", "")
+            .replace(", fresh_first: true", "")
+            .replace(", older_trade: false", "")
+            .replace(", older_trade: true", "");
         d.text(&stats_text);
     }
 

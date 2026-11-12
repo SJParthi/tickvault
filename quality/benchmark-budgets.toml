@@ -176,6 +176,8 @@ live_candles             = 1000         # <1us per tick — matches live_candles
 worst_fill               = 1000         # <1us per order — matches worst_fill/buy_5s_depth (the backtest worst-case fill model over 5 seconds with book depth, plan item LF-2, 2026-11-12). Measured: median 109-111 ns, per-call p99 215-256 ns.
 order_price              = 200          # <200ns per order — matches order_price/marketable_limit (plan item LF-3, 2026-11-12). Measured: median 19 ns, per-call p99 60-84 ns with the clock pair.
 send_queue               = 500          # <500ns per push+pop — matches send_queue/push_pop_64 (64-deep rate-limit priority queue, O(log 64), plan item LF-4, 2026-11-12). Measured: median 64 ns, per-call p99 135-201 ns.
+live_fill_tap            = 100          # <100ns per tick — matches live_fill/tap_accept and live_fill/tap_full: the frame drain's tap into the live paper fill chain (plan item LF-6b, 2026-11-12), one try_send into a pre-allocated busy-polled ring (accept, plus the consumer's try_recv) or a counted drop. DHAT 0 blocks (tests/dhat_live_fill.rs).
+live_fill_chain          = 1000         # <1us per tick — matches live_fill/chain_on_tap (500 ticks + one pass per iter; see [elements]): one tick through the tv-live-fill thread's on_tap (stream watch, candle book on_tick, instrument probe, engine on_tick), plan item LF-6b. DHAT 0 blocks.
 
 # =============================================================================
 # Per-element counts for BATCH benchmarks (2026-06-02)
@@ -204,3 +206,4 @@ tick_row_append                     = 1000 # 1,000 rows per iteration (one fresh
 depth_row_append                    = 1000 # 1,000 rows per iteration (one fresh writer per 5 iterations, outside the timed region)
 order_path_risk_record_fill_held    = 2    # 2 fills per iter (add then reduce: net lots return each iter; avg price and realized P&L drift, bounded)
 live_candles_on_tick_500x3          = 500  # 500 ticks per iter (one on_clock call included), plan item LF-1
+live_fill_chain_on_tap              = 500  # 500 ticks per iter (one pass included), plan item LF-6b

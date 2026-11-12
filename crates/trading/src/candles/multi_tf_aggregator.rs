@@ -150,6 +150,10 @@ pub const UNTRADED_PROOF_MAX_SKEW_SECS: u32 = 5;
 /// most one M1 bucket ahead, where the unbounded fold let it run hours ahead.
 pub const FOLD_FUTURE_TRADE_TIME_SKEW_SECS: i64 = 60;
 
+/// The most a first live packet's receipt may trail its trade second for the
+/// packet to count as a fresh trade ([`ConsumeStats::fresh_first`]).
+pub const FRESH_FIRST_MAX_LAG_SECS: u32 = 60;
+
 /// IST second-of-day after which the equity pre-open call auction has matched
 /// (09:12:00; the match runs ~09:08-09:12). An equity proof taken at or after
 /// it may be extended to the 09:15 open, because nothing trades in between;
@@ -733,6 +737,19 @@ pub struct ConsumeStats {
     /// 2026-11-06: 4,038,655 ms read on the F&O class while the index/spot
     /// class read 1,923 ms).
     pub advanced: bool,
+    /// LF-6b: the FIRST packet folded live for an instrument (the seeding one,
+    /// or the one ending a replay hand-over gap) whose trade happened while
+    /// this process listened: trade second at or after the live capture start
+    /// and at most [`FRESH_FIRST_MAX_LAG_SECS`] before its receipt. Typically
+    /// the 09:15:00 opening trade, which `advanced` cannot see (pre-open
+    /// packets are refused before they seed); a connect snapshot of an earlier
+    /// trade reads `false`. Informational only, like `advanced`.
+    pub fresh_first: bool,
+    /// LF-6b: a REAL trade older than the newest one seen for the instrument:
+    /// seeded slot, no gap ending, not a repeat, not `advanced` (a stale
+    /// cumulative regression, a backup copy accepted late, an index tick at
+    /// an older or the same second with another price). Informational only.
+    pub older_trade: bool,
     /// Timeframes whose seal or late amendment was NOT emitted because a WAL
     /// replay could only partly see that bar (plan ITEM 47). The complete bar
     /// the live process stored survives. `0..=TF_COUNT`.
@@ -2279,6 +2296,14 @@ impl MultiTfAggregator {
         // `true` when THIS tick seeds the baseline: the bucket it opens misses
         // this tick's own delta, so it is partial (plan ITEM 47).
         let seeded_now = !slot.volume_baseline_seeded;
+        // LF-6b (O(1), a few compares): see the two `ConsumeStats` fields.
+        let older_trade = !seeded_now && !gap_now && !repeat_candidate && !advanced;
+        let fresh_first = (seeded_now || gap_now)
+            && !replay_mode
+            && live_from != 0
+            && fold_secs >= live_from
+            && receipt_ist_secs(tick.received_at_nanos)
+                .is_some_and(|r| r <= fold_secs.saturating_add(FRESH_FIRST_MAX_LAG_SECS));
         // An instrument first seen LIVE after a mid-session boot (review
         // round 19): it may have traded while nobody listened, and its socket
         // may have listened later than the others, so its own first receipt
@@ -2948,6 +2973,8 @@ impl MultiTfAggregator {
                 .increment(1);
         }
         stats.advanced = advanced;
+        stats.fresh_first = fresh_first;
+        stats.older_trade = older_trade;
         stats
     }
 
@@ -10723,6 +10750,9 @@ mod tests {
             repeat_quote: _,
             // Informational, not a refusal: a new trade or not (plan PR AL-1).
             advanced: _,
+            // Informational (LF-6b): fresh first packet, older real trade.
+            fresh_first: _,
+            older_trade: _,
             // Not a refusal either: the tick WAS folded; only the output of a
             // bar a replay could partly see was held back (plan ITEM 47).
             replay_partial_suppressed: _,

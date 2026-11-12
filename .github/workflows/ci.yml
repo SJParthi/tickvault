@@ -836,9 +836,9 @@ jobs:
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
           app_expected=$(cat .github/dhat-app-targets.txt)
-          if [ "$(printf '%s\n' "$app_expected" | wc -l)" -ne 11 ] || \
+          if [ "$(printf '%s\n' "$app_expected" | wc -l)" -ne 12 ] || \
             printf '%s\n' "$app_expected" | grep -qvE '^crates/app/tests/dhat_[a-z0-9_]+\.rs$'; then
-            echo "::error::app DHAT inventory must contain exactly 11 explicit app test paths."
+            echo "::error::app DHAT inventory must contain exactly 12 explicit app test paths."
             exit 1
           fi
           expected=$(LC_ALL=C sort <<EOF
@@ -1084,7 +1084,7 @@ jobs:
           cargo test -p tickvault-app \
             --test dhat_depth_drain --test dhat_idle_seed_step \
             --test dhat_depth_book_row_presize --test dhat_depth_level_row_presize \
-            --test dhat_live_ingest_seam \
+            --test dhat_live_ingest_seam --test dhat_live_fill \
             --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
             --test dhat_order_path_recorder --test dhat_wal_ring_sink_accept \
             --test dhat_ws_lag --test dhat_ws_lag_recorder \
@@ -1120,10 +1120,10 @@ jobs:
           # 9 since 2026-10-30 (order path under 1 us): dhat_order_path_recorder
           # gates the order path with the production recorder installed.
           # 11 since 2026-10-31: isolate level/book heap cases in their own
-          # binaries, retaining all three cases and their exact 0/0 budgets.
+          # binaries, retaining all three cases and their exact 0/0 budgets. 12 since 2026-11-12: dhat_live_fill (LF-6b).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 11 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step."; exit 1
+          if [ "$ran" -ne 12 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 12 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------

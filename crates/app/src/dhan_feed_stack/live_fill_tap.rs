@@ -1,0 +1,638 @@
+//! The live paper fill chain's tap on the frame drain (plan item LF-6b).
+//!
+//! The drain hands each live tick the candle fold accepted
+//! (`IngestOutcome::Folded`) to the `tv-live-fill` thread through a bounded,
+//! pre-allocated ring. The drain never waits: a full ring drops the tick and
+//! counts it, and every tick that does go out carries the loss count so far
+//! (`drop_seq`), so the chain thread can tell where in the stream ticks went
+//! missing and keep orders off the candles they could have touched.
+//!
+//! `drop_seq` counts three kinds of loss, not only the tap's own ring:
+//!
+//! * a tick this tap's ring had no room for;
+//! * a main-feed frame shed BEFORE the drain (the socket-to-drain ring was
+//!   full, or the ring and the WAL both refused it): read from
+//!   `pool_supervisor::live_shed::main_feed_live_shed_total` with one relaxed load per
+//!   offer. A ring-shed frame is re-folded later from the WAL, but as a
+//!   replayed frame, which never taps, so the live stream the chain builds
+//!   candles from lacks it;
+//! * a frame whose tail the drain abandoned (unknown code, partial packet),
+//!   or a folded tick whose row append failed, noted by the drain through
+//!   [`LiveFillTap::note_upstream_loss`];
+//! * a main-feed socket that was delivering and is now down (closed, waiting
+//!   out a redial, re-subscribing, parked): read from
+//!   `pool_supervisor::live_shed::main_feed_socket_loss_state` with one relaxed load per
+//!   offer. Its instruments get no ticks while the other sockets keep the
+//!   stream busy, so no feed gap shows. The tap counts one loss on every
+//!   change of the down-slot mask and, while any slot is down, one per second
+//!   of receipt time, so the chain's untrusted stretch has no hole from the
+//!   close to the redial.
+//!
+//! The running loss total is also stored in a shared atomic
+//! ([`LiveFillTap::with_loss_out`]) whenever it changes, so the chain thread
+//! can taint BEFORE it releases anything even while ticks are still queued in
+//! this ring (the in-band `drop_seq` arrives only behind them).
+//!
+//! Gates, both at the call site: only frames from a live socket
+//! (`connection_index != u8::MAX`, a replayed WAL frame carries `u8::MAX`) and
+//! never while the WAL backlog is being re-folded (`replaying_wal`). A
+//! replayed tick is history the strategy already passed.
+//!
+//! # Complexity and allocation
+//!
+//! [`LiveFillTap::offer`]: O(1), two relaxed atomic loads (one more relaxed
+//! store when the loss total moved), one `Copy` struct
+//! built on the stack and one `try_send` into a crossbeam array slot; no
+//! allocation, no lock, no log, no metric macro. The receiver busy-polls
+//! ([`FrameRingReceiver::set_busy_polling`] is set before the sender is handed
+//! out), so `try_send` never calls `notify_one`. DHAT-gated by
+//! `crates/app/tests/dhat_live_fill.rs`. [`LiveFillTap::publish_dropped`] runs
+//! on the drain's 30 s silence arm: one counter add.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tickvault_common::error_code::ErrorCode;
+use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
+use tickvault_core::websocket::frame_ring::{
+    FrameRingReceiver, FrameRingSender, FrameRingTrySendError, frame_ring,
+};
+use tickvault_core::websocket::pool_supervisor::live_shed::{
+    main_feed_live_shed_total, main_feed_socket_loss_state,
+};
+use tickvault_trading::brutex_host::live_candles::IST_OFFSET_NS;
+
+/// The counter the drain publishes tap drops on (local `/metrics` only).
+pub const LIVE_FILL_TAP_DROPPED_COUNTER: &str = "tv_live_fill_tap_dropped_total";
+
+/// One tick for the chain thread. `Copy`, 56 bytes, no heap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TapTick {
+    pub security_id: u64,
+    /// Receipt, IST epoch nanoseconds (UTC receipt + 5:30).
+    pub receipt_ist_ns: i64,
+    pub ltp: f32,
+    /// Exchange trade time, IST epoch seconds.
+    pub exchange_secs: u32,
+    /// Vendor cumulative day volume.
+    pub cum_volume: u32,
+    /// Best bid / ask of the Full packet; 0.0 when the packet had no depth.
+    pub best_bid: f32,
+    pub best_ask: f32,
+    pub best_bid_qty: u32,
+    pub best_ask_qty: u32,
+    /// Ticks lost before this one (wrapping): tap drops, frames shed before
+    /// the drain, abandoned frame tails, failed row appends and main-feed
+    /// socket downtime (see the module docs).
+    pub drop_seq: u32,
+    pub segment: u8,
+    /// The packet carried a NEW trade (the fold's `advanced`). A repeat quote
+    /// (the book moved, no trade) or the first packet after a subscribe
+    /// carries an OLD trade time, price and cumulative volume: the chain only
+    /// takes its best bid/ask (and the volume baseline), never a candle price.
+    /// Also true for the first in-session packet of an instrument when its
+    /// trade happened while this process listened (the fold's `fresh_first`):
+    /// often the 09:15:00 opening trade.
+    pub new_trade: bool,
+    /// The packet carried a REAL trade older than the newest one the fold has
+    /// seen for the instrument (a stale cumulative regression, a backup copy
+    /// accepted late, an index tick at an older or the same second with a
+    /// different price; the fold's `older_trade`). The chain folds its price
+    /// into the bar it belongs to (or counts it late on a closed one) and
+    /// never lets it move a close or reach the engine. Never true together
+    /// with `new_trade`.
+    pub older_trade: bool,
+}
+
+impl TapTick {
+    /// Builds the chain's tick from the drain's decoded packet and, for a Full
+    /// packet, its best depth level. O(1), no allocation.
+    #[must_use]
+    #[inline]
+    pub fn from_parsed(
+        tick: &ParsedTick,
+        best: Option<&MarketDepthLevel>,
+        drop_seq: u32,
+        new_trade: bool,
+        older_trade: bool,
+    ) -> Self {
+        let (best_bid, best_ask, best_bid_qty, best_ask_qty) = match best {
+            Some(l) => (l.bid_price, l.ask_price, l.bid_quantity, l.ask_quantity),
+            None => (0.0, 0.0, 0, 0),
+        };
+        Self {
+            security_id: tick.security_id,
+            receipt_ist_ns: tick.received_at_nanos.saturating_add(IST_OFFSET_NS),
+            ltp: tick.last_traded_price,
+            exchange_secs: tick.exchange_timestamp,
+            cum_volume: tick.volume,
+            best_bid,
+            best_ask,
+            best_bid_qty,
+            best_ask_qty,
+            drop_seq,
+            segment: tick.exchange_segment_code,
+            new_trade,
+            older_trade: older_trade && !new_trade,
+        }
+    }
+}
+
+/// Whether a folded tick may go to the chain: a live socket's frame, and not
+/// while the WAL backlog is re-folded. O(1).
+#[must_use]
+#[inline]
+pub const fn tap_gate(connection_index: u8, replaying_wal: bool) -> bool {
+    connection_index != u8::MAX && !replaying_wal
+}
+
+/// The drain-side half. Owned by `LiveIngest` (single owner, `&mut`), so the
+/// counts are plain fields.
+#[derive(Debug)]
+pub struct LiveFillTap {
+    tx: FrameRingSender<TapTick>,
+    /// Ticks this tap's ring refused.
+    dropped: u64,
+    published: u64,
+    /// Main-feed frames lost before the drain, plus abandoned frame tails.
+    upstream_lost: u64,
+    /// The shed total's source: `main_feed_live_shed_total` in production.
+    shed_total: fn() -> u64,
+    /// The shed total as last read.
+    shed_seen: u64,
+    /// The socket loss word's source: `main_feed_socket_loss_state` in
+    /// production.
+    socket_state: fn() -> u64,
+    /// The socket loss word as last read.
+    socket_seen: u64,
+    /// Receipt second of the last socket-down loss counted.
+    socket_bump_sec: i64,
+    /// Where the running loss total is published for the chain thread.
+    loss_out: Option<Arc<AtomicU64>>,
+    /// The loss total last published.
+    loss_published: u64,
+    /// The chain thread is gone (its receiver dropped, e.g. a refused day
+    /// roll): every later offer returns at once, doing no work.
+    closed: bool,
+}
+
+/// The tap's link from the boot to the frame drain: the ring's sender and the
+/// shared loss total the chain thread reads out of band.
+#[derive(Debug)]
+pub struct TapLink {
+    pub tx: FrameRingSender<TapTick>,
+    pub loss: Arc<AtomicU64>,
+}
+
+/// No socket loss (tests that do not exercise it). O(1).
+fn no_socket_loss() -> u64 {
+    0
+}
+
+impl LiveFillTap {
+    /// Cold: registers the drop counter at 0 and takes the shed total so far
+    /// as the baseline (sheds before the tap existed touched no chain candle).
+    #[must_use]
+    pub fn new(tx: FrameRingSender<TapTick>) -> Self {
+        Self::with_sources(tx, main_feed_live_shed_total, main_feed_socket_loss_state)
+    }
+
+    /// [`Self::new`] with the shed total read from `shed_total` and no socket
+    /// loss (tests use a private counter: the production one is
+    /// process-wide). Cold.
+    #[must_use]
+    pub fn with_shed_source(tx: FrameRingSender<TapTick>, shed_total: fn() -> u64) -> Self {
+        Self::with_sources(tx, shed_total, no_socket_loss)
+    }
+
+    /// [`Self::new`] with both upstream sources injected. The socket word
+    /// read now is the baseline; a slot already down keeps counting. Cold.
+    #[must_use]
+    pub fn with_sources(
+        tx: FrameRingSender<TapTick>,
+        shed_total: fn() -> u64,
+        socket_state: fn() -> u64,
+    ) -> Self {
+        metrics::counter!(LIVE_FILL_TAP_DROPPED_COUNTER).increment(0);
+        Self {
+            tx,
+            dropped: 0,
+            published: 0,
+            upstream_lost: 0,
+            shed_total,
+            shed_seen: shed_total(),
+            socket_state,
+            socket_seen: socket_state(),
+            socket_bump_sec: i64::MIN,
+            loss_out: None,
+            loss_published: 0,
+            closed: false,
+        }
+    }
+
+    /// Publishes the running loss total to `loss` for the chain thread
+    /// (builder). Cold.
+    #[must_use]
+    pub fn with_loss_out(mut self, loss: Arc<AtomicU64>) -> Self {
+        loss.store(self.loss_total(), Ordering::Relaxed);
+        self.loss_published = self.loss_total();
+        self.loss_out = Some(loss);
+        self
+    }
+
+    /// Offers one folded tick. `true` when queued; `false` when the ring was
+    /// full or closed (counted). Frames shed before the drain and main-feed
+    /// socket downtime since the last offer are folded into this tick's
+    /// `drop_seq` first. O(1), no allocation.
+    #[inline]
+    pub fn offer(
+        &mut self,
+        tick: &ParsedTick,
+        best: Option<&MarketDepthLevel>,
+        new_trade: bool,
+        older_trade: bool,
+    ) -> bool {
+        if self.closed {
+            return false;
+        }
+        let shed = (self.shed_total)();
+        if shed != self.shed_seen {
+            self.upstream_lost = self
+                .upstream_lost
+                .saturating_add(shed.wrapping_sub(self.shed_seen));
+            self.shed_seen = shed;
+        }
+        let sock = (self.socket_state)();
+        let sec = tick.received_at_nanos.div_euclid(1_000_000_000);
+        // APPROVED: the low 32 bits of the packed word are the down-slot mask.
+        #[allow(clippy::cast_possible_truncation)]
+        let any_down = sock as u32 != 0;
+        if sock != self.socket_seen || (any_down && sec != self.socket_bump_sec) {
+            self.socket_seen = sock;
+            self.socket_bump_sec = sec;
+            self.upstream_lost = self.upstream_lost.saturating_add(1);
+        }
+        let t = TapTick::from_parsed(tick, best, self.drop_seq(), new_trade, older_trade);
+        match self.tx.try_send(t) {
+            Ok(()) => {
+                self.publish_loss();
+                true
+            }
+            Err(FrameRingTrySendError::Full(_)) => {
+                self.dropped = self.dropped.saturating_add(1);
+                self.publish_loss();
+                false
+            }
+            Err(FrameRingTrySendError::Closed(_)) => {
+                self.on_closed();
+                false
+            }
+        }
+    }
+
+    /// The chain thread dropped its receiver: stop tapping for the rest of the
+    /// process and say so once. Cold (once per process).
+    #[cold]
+    #[inline(never)]
+    fn on_closed(&mut self) {
+        self.closed = true;
+        tracing::error!(
+            code = ErrorCode::OrderReady01GateRefused.code_str(),
+            source = "live_fill_tap_closed",
+            "live paper fill tap: the chain thread has stopped, so the drain stops \
+             handing it ticks for the rest of this process (paper chain only, no tick \
+             is lost from storage)"
+        );
+    }
+
+    /// Every loss so far (tap drops plus upstream losses). O(1).
+    #[inline]
+    fn loss_total(&self) -> u64 {
+        self.dropped.wrapping_add(self.upstream_lost)
+    }
+
+    /// Stores the loss total for the chain thread when it moved. O(1): one
+    /// compare, and one relaxed store on a loss.
+    #[inline]
+    fn publish_loss(&mut self) {
+        let total = self.loss_total();
+        if total != self.loss_published {
+            self.loss_published = total;
+            if let Some(out) = self.loss_out.as_ref() {
+                out.store(total, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The loss count the next tick carries: the low 32 bits of every loss
+    /// so far. The chain only compares two consecutive values, so wrapping is
+    /// harmless. O(1).
+    #[inline]
+    fn drop_seq(&self) -> u32 {
+        // APPROVED: deliberate truncation to the low 32 bits (wrapping compare).
+        #[allow(clippy::cast_possible_truncation)]
+        let seq = self.loss_total() as u32;
+        seq
+    }
+
+    /// The drain abandoned the tail of a live main-feed frame (an unknown
+    /// packet code or a partial packet), or folded a live tick whose row
+    /// append failed: ticks may be missing from the stream. O(1).
+    #[inline]
+    pub fn note_upstream_loss(&mut self) {
+        self.upstream_lost = self.upstream_lost.saturating_add(1);
+        self.publish_loss();
+    }
+
+    /// Ticks this tap's ring dropped so far.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Losses before the drain (shed frames, abandoned tails) seen so far.
+    #[must_use]
+    pub fn upstream_lost(&self) -> u64 {
+        self.upstream_lost
+    }
+
+    /// Adds the drops since the last call to the counter, with one `warn!` when
+    /// there were any. Cold (30 s arm).
+    pub fn publish_dropped(&mut self) {
+        let delta = self.dropped.saturating_sub(self.published);
+        if delta > 0 {
+            metrics::counter!(LIVE_FILL_TAP_DROPPED_COUNTER).increment(delta);
+            self.published = self.dropped;
+            tracing::warn!(
+                dropped = delta,
+                total = self.dropped,
+                "live paper fill tap: the chain thread fell behind and ticks were dropped; \
+                 the candles they touched refuse orders (paper chain only, no tick is lost \
+                 from storage)"
+            );
+        }
+    }
+}
+
+/// Builds the ring with the receiver in busy-poll mode BEFORE any sender
+/// exists, so no `try_send` ever takes the wake path. Cold.
+#[must_use]
+pub fn live_fill_tap_ring(
+    capacity: usize,
+) -> (FrameRingSender<TapTick>, FrameRingReceiver<TapTick>) {
+    let (tx, rx) = frame_ring::<TapTick>(capacity);
+    rx.set_busy_polling(true);
+    (tx, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(sid: u64, ltp: f32, exch: u32, vol: u32) -> ParsedTick {
+        ParsedTick {
+            security_id: sid,
+            exchange_segment_code: 2,
+            last_traded_price: ltp,
+            exchange_timestamp: exch,
+            received_at_nanos: 1_000_000_000,
+            volume: vol,
+            ..ParsedTick::default()
+        }
+    }
+
+    #[test]
+    fn test_tap_gate_refuses_replayed_frames_and_wal_refold() {
+        assert!(tap_gate(0, false));
+        assert!(tap_gate(15, false));
+        assert!(!tap_gate(u8::MAX, false), "a replayed WAL frame never taps");
+        assert!(!tap_gate(0, true), "nothing taps while the WAL re-folds");
+        assert!(!tap_gate(u8::MAX, true));
+    }
+
+    #[test]
+    fn test_tap_tick_from_parsed_carries_best_level_and_ist_receipt() {
+        let p = parsed(42, 101.5, 1_779_355_000, 900);
+        let level = MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 101.45,
+            ask_price: 101.55,
+        };
+        let t = TapTick::from_parsed(&p, Some(&level), 7, true, true);
+        assert_eq!(t.security_id, 42);
+        assert_eq!(t.segment, 2);
+        assert_eq!(t.receipt_ist_ns, 1_000_000_000 + IST_OFFSET_NS);
+        assert_eq!(t.cum_volume, 900);
+        assert_eq!(t.best_bid_qty, 10);
+        assert_eq!(t.best_ask_qty, 20);
+        assert!((t.best_ask - 101.55).abs() < 1e-6);
+        assert_eq!(t.drop_seq, 7);
+        assert!(
+            t.new_trade && !t.older_trade,
+            "a new trade is never also older"
+        );
+        let no_depth = TapTick::from_parsed(&p, None, 0, false, true);
+        assert!(no_depth.older_trade);
+        assert_eq!(no_depth.best_bid, 0.0);
+        assert_eq!(no_depth.best_ask_qty, 0);
+        assert!(std::mem::size_of::<TapTick>() <= 56);
+    }
+
+    #[test]
+    fn test_live_fill_tap_offer_publish_dropped_and_live_fill_tap_ring() {
+        let (tx, mut rx) = live_fill_tap_ring(2);
+        assert!(rx.is_busy_polling());
+        let mut tap = LiveFillTap::with_shed_source(tx, || 0);
+        assert_eq!(tap.upstream_lost(), 0);
+        let p = parsed(1, 10.0, 100, 1);
+        assert!(tap.offer(&p, None, true, false));
+        assert!(tap.offer(&p, None, true, false));
+        assert!(!tap.offer(&p, None, true, false), "full ring drops");
+        assert!(!tap.offer(&p, None, true, false));
+        assert_eq!(tap.dropped(), 2);
+        assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
+        assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
+        assert!(tap.offer(&p, None, true, false));
+        assert_eq!(
+            rx.try_recv().map(|t| t.drop_seq),
+            Some(2),
+            "the next tick names the drops before it"
+        );
+        tap.publish_dropped();
+        tap.publish_dropped();
+        assert_eq!(tap.published, 2);
+        drop(rx);
+        assert!(
+            !tap.offer(&p, None, true, false),
+            "a closed ring queues nothing"
+        );
+        assert_eq!(tap.dropped(), 2, "a closed ring is not a fell-behind drop");
+    }
+
+    static CLOSED_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CLOSED_SHED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn closed_shed_now() -> u64 {
+        CLOSED_SHED_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CLOSED_SHED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// LF-6b review round 2, finding 1: once the chain thread is gone (its
+    /// receiver dropped after a refused day roll), the tap stops for good: a
+    /// later offer reads no source, stores no loss total and counts no drop,
+    /// so the 30 s arm never reports a fell-behind that did not happen.
+    #[test]
+    fn test_regression_closed_ring_stops_the_tap_without_dead_work_or_fell_behind_warn() {
+        let (tx, rx) = live_fill_tap_ring(4);
+        let loss = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut tap = LiveFillTap::with_shed_source(tx, closed_shed_now)
+            .with_loss_out(std::sync::Arc::clone(&loss));
+        let p = parsed(1, 10.0, 100, 1);
+        drop(rx);
+        assert!(!tap.offer(&p, None, true, false));
+        assert!(tap.closed, "the first closed send stops the tap");
+        let reads = CLOSED_SHED_READS.load(std::sync::atomic::Ordering::Relaxed);
+        let stored = loss.load(std::sync::atomic::Ordering::Relaxed);
+        CLOSED_SHED.store(9, std::sync::atomic::Ordering::Relaxed);
+        assert!(!tap.offer(&p, None, true, false));
+        assert!(!tap.offer(&p, None, true, false));
+        assert_eq!(
+            CLOSED_SHED_READS.load(std::sync::atomic::Ordering::Relaxed),
+            reads,
+            "a stopped tap reads no upstream source"
+        );
+        assert_eq!(
+            loss.load(std::sync::atomic::Ordering::Relaxed),
+            stored,
+            "a stopped tap stores no loss total"
+        );
+        assert_eq!(tap.dropped(), 0, "a gone thread is not a fell-behind drop");
+        tap.publish_dropped();
+        assert_eq!(tap.published, 0, "nothing to report as fell behind");
+    }
+
+    static SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shed_now() -> u64 {
+        SHED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A frame shed before the drain (or an abandoned frame tail) between two
+    /// tapped ticks moves the next tick's `drop_seq`, so the chain taints the
+    /// candles in between; `new` starts from the production total.
+    #[test]
+    fn test_upstream_sheds_and_note_upstream_loss_move_drop_seq_with_shed_source_upstream_lost() {
+        let (tx, mut rx) = live_fill_tap_ring(8);
+        SHED.store(5, std::sync::atomic::Ordering::Relaxed);
+        let mut tap = LiveFillTap::with_shed_source(tx, shed_now);
+        let p = parsed(1, 10.0, 100, 1);
+        assert!(tap.offer(&p, None, true, false));
+        assert_eq!(
+            rx.try_recv().map(|t| t.drop_seq),
+            Some(0),
+            "sheds before the tap do not count"
+        );
+        SHED.store(8, std::sync::atomic::Ordering::Relaxed);
+        assert!(tap.offer(&p, None, true, false));
+        assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(3));
+        assert_eq!(tap.upstream_lost(), 3);
+        assert_eq!(tap.dropped(), 0, "the tap's own drop metric is unchanged");
+        tap.note_upstream_loss();
+        assert!(tap.offer(&p, None, false, false));
+        let t = rx.try_recv().expect("queued");
+        assert_eq!(t.drop_seq, 4);
+        assert!(!t.new_trade);
+        let (tx2, _rx2) = live_fill_tap_ring(1);
+        let prod = LiveFillTap::new(tx2);
+        assert_eq!(prod.upstream_lost(), 0);
+    }
+
+    static SOCKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn sockets_now() -> u64 {
+        SOCKETS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// LF-6b review finding 1: one of two main-feed sockets closes and redials
+    /// while the other keeps delivering. No global silence ever shows, yet
+    /// every second the closed socket was down must read untrusted, and the
+    /// loss total reaches the chain thread out of band.
+    #[test]
+    fn test_one_main_feed_socket_down_taints_the_stretch_with_sources_with_loss_out() {
+        use crate::live_fill::taint::{StreamWatch, TaintRanges, TaintReason};
+        const NS: i64 = 1_000_000_000;
+        // 10:00:00 IST of an arbitrary day; receipt in UTC nanos.
+        let t0_ist: i64 = 20_000 * 86_400 + 36_000;
+        let utc = |ist_secs: i64, frac_ns: i64| (ist_secs - IST_OFFSET_NS / NS) * NS + frac_ns;
+        let (tx, mut rx) = live_fill_tap_ring(4_096);
+        let loss = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut tap = LiveFillTap::with_sources(tx, || 0, sockets_now)
+            .with_loss_out(std::sync::Arc::clone(&loss));
+        let mut watch = StreamWatch::new();
+        let mut taints = TaintRanges::new();
+        let mut cum = 0u32;
+        // The sibling socket ticks every 100 ms from 10:00:00 to 10:10:00;
+        // socket 0 is down from 10:00:20 to 10:08:00 (a long 805-style park).
+        for step in 0..6_000i64 {
+            let ist = t0_ist + step / 10;
+            let frac = (step % 10) * 100_000_000;
+            if ist == t0_ist + 20 && frac == 0 {
+                SOCKETS.store((1u64 << 32) | 1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if ist == t0_ist + 480 && frac == 0 {
+                SOCKETS.store(2u64 << 32, std::sync::atomic::Ordering::Relaxed);
+            }
+            cum += 1;
+            let mut p = parsed(7, 100.0, u32::try_from(ist).expect("fits"), cum);
+            p.received_at_nanos = utc(ist, frac);
+            assert!(tap.offer(&p, None, true, false));
+            let t = rx.try_recv().expect("queued");
+            watch.on_tick(
+                t.drop_seq,
+                i64::from(t.exchange_secs),
+                t.receipt_ist_ns,
+                true,
+                &mut taints,
+            );
+            let wall = t.receipt_ist_ns + 1_000_000;
+            watch.on_pass(wall, wall, &mut taints);
+        }
+        for s in [
+            t0_ist + 20,
+            t0_ist + 100,
+            t0_ist + 300,
+            t0_ist + 479,
+            t0_ist + 480,
+        ] {
+            assert_eq!(
+                taints.taint_of(s, s + 1),
+                Some(TaintReason::TickDropped),
+                "second {} of the downtime must read untrusted",
+                s - t0_ist
+            );
+        }
+        assert_eq!(
+            taints.taint_of(t0_ist + 590, t0_ist + 600),
+            None,
+            "after the socket is back and the lag bound passes, candles are trusted"
+        );
+        assert_eq!(
+            loss.load(std::sync::atomic::Ordering::Relaxed),
+            tap.upstream_lost(),
+            "the chain thread sees the same loss total out of band"
+        );
+        assert!(
+            tap.upstream_lost() >= 460,
+            "one loss per second down, plus the edges"
+        );
+        // No socket ever down: nothing is tainted.
+        let (tx, mut rx) = live_fill_tap_ring(16);
+        let mut quiet = LiveFillTap::with_sources(tx, || 0, || 0);
+        let mut p = parsed(7, 100.0, u32::try_from(t0_ist).expect("fits"), 1);
+        for k in 0..5 {
+            p.received_at_nanos = utc(t0_ist + k, 0);
+            assert!(quiet.offer(&p, None, true, false));
+            assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
+        }
+    }
+}

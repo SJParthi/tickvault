@@ -267,6 +267,12 @@ pub mod infra;
 /// quiet where `/proc` is absent.
 pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
+/// The live PAPER fill chain (plan item LF-6b): tap → strategy candles →
+/// approved brutex engine → held order with its worst-case fill → paper OMS.
+/// Off by default; idles until an approved strategy crate exists.
+pub mod live_fill;
+/// The `live_order_events` writer task (ensure, disk-tier drain, ILP writer).
+pub mod live_order_events_boot;
 pub mod log_coalescer;
 /// `tickvault strategy-dry-run`: load, verify and replay published brutex strategy folders (no order, no live change).
 pub mod strategy_dry_run;

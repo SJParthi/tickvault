@@ -112,6 +112,10 @@ name = "order_gate"
 harness = false
 
 [[bench]]
+name = "live_fill"
+harness = false
+
+[[bench]]
 name = "feed_drain"
 harness = false
 
