@@ -264,6 +264,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "order_leg_pnl",
     "order_update_events",
     "position_update_events",
+    // LF-5 (2026-11-12, owner Quote 57): one row per PAPER order event of the
+    // live signal-timing work (decision, sent, ack, fill, ...). The same
+    // order-audit class as order_audit above: 90d hot, then copied to S3 and
+    // verified before the partition leaves the box; the S3 copy is never
+    // deleted. A few dozen rows per signal, paper only today; `feed` is in
+    // the DEDUP key.
+    "live_order_events",
     // CADENCE-04 (2026-07-20, cross-fill visibility, operator directive):
     // one row per cadence cross-fill firing / Groww fallback launch — a
     // handful of rows/day by construction (one per degraded lane per

@@ -248,8 +248,13 @@ pub mod raw_frame_upload;
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
-// Audit PR42b (2026-10-01): disk tier for the three order-side audit writers
-// (order_audit, pnl_audit, order_leg_pnl) — a failed flush is written to
+// Plan item LF-5 (2026-11-12, owner Quote 57): the paper order event log of
+// the live signal-timing work. One row per event; treated like order_audit
+// (never deleted, audit disk tier on a failed flush).
+pub mod live_order_events_persistence;
+// Audit PR42b (2026-10-01): disk tier for the four order-side audit writers
+// (order_audit, pnl_audit, order_leg_pnl, and live_order_events since
+// 2026-11-12, plan item LF-5) — a failed flush is written to
 // data/spill/audit/<table>/ and replayed by one drain task per table.
 pub mod audit_spill;
 // Full-fidelity order/position push-event capture (design 2026-07-18;

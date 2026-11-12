@@ -274,6 +274,27 @@ uncoded `warn!` until 2026-10-01.
   book is REST outside the allowed classes. That reconcile is plan item
   PR42c and needs an owner decision.
 
+### 2026-11-12 note — the paper order event log (plan item LF-5)
+
+`crates/storage/src/live_order_events_persistence.rs` also logs AUDIT-06,
+always with `table = "live_order_events"`. Stages: `ensure_client_build` /
+`ensure_ddl` (the table's boot DDL), `append` (a row refused before the
+buffer because a price, quantity, charge, identity or timestamp column is
+negative, or an ILP append error) and `flush` (rows discarded after a failed
+flush AND a refused disk-tier write). A failed flush normally goes to
+`data/spill/audit/live_order_events/` and is replayed, like `order_audit`.
+
+- **Counters (local `/metrics` only):** `tv_live_order_events_rows_total{event}`,
+  `tv_live_order_events_rows_refused_total{column}`,
+  `tv_live_order_events_rows_discarded_total`,
+  `tv_live_order_events_persist_errors_total{stage}`. The disk tier's
+  generic `tv_audit_spill_*{table="live_order_events"}` counters and the
+  chain counter source `live_order_events_spill_lost` are shared with the
+  other audit tables.
+- **DO:** a `column` refusal is a bug in the paper chain that built the row
+  (a negative money or quantity value); the row is not written. A discard
+  means the rows are gone; record the window.
+
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
 **Trigger:** any audit-table writer hit an unrecoverable error after the
