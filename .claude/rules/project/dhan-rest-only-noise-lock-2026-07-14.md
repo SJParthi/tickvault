@@ -38,6 +38,8 @@
 
 - (§2.22, 2026-11-12, owner card "Page if 5 min in a row (Recommended)", Quote 57) ONE new page: the clock offset from Amazon Time Sync, sampled once a minute into the database, pages once (coded ERROR, edge-triggered, no recovery page) when it stays over 1 ms for 5 consecutive minutes inside 09:00–15:40 IST. REJECT: fewer than 5 readings, outside the session, a recovery page or `ok_actions`, more than one page per episode, any other page under §2.22.
 
+- (§2.22-a, 2026-11-12, owner: "Monitor log track capture db save audit log visualised dashboard alrm ring do everything") NO new page: the paper-order log `live_order_events` joins the audit disk tier. Its spill-refused, quarantined and replay-failed rows page through the existing §2.10 `audit-rows-lost` group (generic `tv_audit_spill_{refused_rows,quarantined_rows,replay_failed}_total`); its chain-lost rows (`tv_order_audit_chain_lost_total{source="live_order_events_spill_lost"}`) and a 30-minute stuck backlog (`tv_order_audit_persist_errors_total{stage="spill_backlog"}`) page through the existing `order-audit-chain-loss` alarm. No new alarm. REJECT: a separate page, alarm, filter or EMF name for it; paging a refused row.
+
 **REJECT (§3, verbatim headlines):**
 - Adds ANY new Dhan-scoped Telegram page outside the allowed set without a fresh dated operator quote HERE first.
 - Re-introduces the mid-session profile / forced-re-mint Telegram pages, the REST canary, the no-tick watchdog, the fast-boot validation call, or the order-update spawn.

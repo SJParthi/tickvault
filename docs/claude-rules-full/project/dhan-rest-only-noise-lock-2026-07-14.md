@@ -5522,3 +5522,16 @@ a trend is fair); it excludes segments this start's own boot fold will pin.
 | Not a page | a single reading over 1 ms, a failed sample (coded warn only), anything outside 09:00–15:40 IST |
 
 **REJECT (§2.22):** paging on fewer than 5 consecutive readings or outside 09:00–15:40 IST; a recovery page or `ok_actions`; paging more than once per episode; a per-instrument or per-connection dimension; using §2.22 for any other page.
+
+### §2.22-a — 2026-11-12: the paper-order log rides the existing audit-rows-lost and order-audit-chain-loss pages (NO new page)
+
+**Owner, 2026-11-12**, asked "If rows ever get stuck on disk or have to be set aside [in the new paper-order log table `live_order_events`], should that page you on Telegram, using the existing 'audit rows lost' page (no new alarm)?" (Recommended: "Yes, use existing page"), answered: "Monitor log track capture db save audit log visualised dashboard alrm ring do everything sud eokay?".
+
+`live_order_events` joins the audit disk tier as `AuditSpillTable::LiveOrderEvents`. What pages, as the code does it (checked against `crates/storage/src/audit_spill.rs` and `deploy/aws/terraform/{loss-group-alarms,order-side-alarms}.tf`, 2026-11-12):
+
+- a batch the disk tier refuses, a file QuestDB permanently refuses (quarantined) and a failed replay move the generic `tv_audit_spill_refused_rows_total`, `tv_audit_spill_quarantined_rows_total` and `tv_audit_spill_replay_failed_total` (label `table=live_order_events`), which are legs of the §2.10 `audit-rows-lost` group;
+- rows lost from the chain (a quarantined file's rows, or a crashed half-written spill file) move `tv_order_audit_chain_lost_total{source="live_order_events_spill_lost"}`, and a backlog whose oldest file has waited 30 minutes counts `tv_order_audit_persist_errors_total{stage="spill_backlog"}` once per episode; both are legs of the existing `order-audit-chain-loss` alarm (`order-side-alarms.tf`, m6 and m2).
+
+No new alarm, page, metric filter, EMF name or `ok_actions`. The writer's own counters (`tv_live_order_events_*`) stay on the box's local `/metrics`.
+
+**REJECT (§2.22-a):** a separate page, alarm, filter or EMF name for this table; paging a refused (validated-out) row; moving this table out of the audit spill tier without a fresh dated quote.

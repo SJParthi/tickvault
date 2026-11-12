@@ -221,6 +221,8 @@ pub const SEBI_NEVER_RESET: &[&str] = &[
     "instrument_lifecycle_audit",
     "index_constituency",
     "order_audit",
+    // LF-5 (2026-11-12): the paper order event log, kept like order_audit.
+    "live_order_events",
     "order_update_events",
     "position_update_events",
     "ws_event_audit",

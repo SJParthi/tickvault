@@ -1,22 +1,27 @@
-//! Disk tier for the three order-side audit writers (audit PR42b).
+//! Disk tier for the order-side audit writers (audit PR42b; `live_order_events`
+//! joined 2026-11-12, plan item LF-5).
 //!
 //! # Why this exists
 //!
-//! `order_audit`, `pnl_audit` and `order_leg_pnl` each flush one ILP batch
-//! per order event. Until 2026-10-01 a failed flush DISCARDED the batch
-//! (the poisoned-buffer defense), counted and coded, so a QuestDB outage
-//! during the session cost every order-side audit row written in it. The
-//! rows are SEBI forensics, and a counted loss is still a loss.
+//! `order_audit`, `pnl_audit`, `order_leg_pnl` and `live_order_events` each
+//! flush one ILP batch per order event. Until 2026-10-01 a failed flush
+//! DISCARDED the batch (the poisoned-buffer defense), counted and coded, so a
+//! QuestDB outage during the session cost every order-side audit row written
+//! in it. The rows are SEBI forensics, and a counted loss is still a loss.
 //!
 //! Now a failed flush writes the batch's exact ILP bytes to a file under
 //! `data/spill/audit/<table>/`, and one drain task per table POSTs them back
 //! to QuestDB's `/write` once it answers. A row is lost only when the disk
 //! tier itself refuses it (cap reached, write failed) or QuestDB permanently
-//! refuses the payload. Both are counted and reach the order-audit
-//! chain-loss alarm: a refused spill on the writer's own discard counter
-//! (`tv_order_audit_rows_discarded_total` for `order_audit`,
-//! `tv_order_audit_chain_lost_total` for the two P&L tables), a permanent
-//! refusal on `tv_order_audit_chain_lost_total`.
+//! refuses the payload. Both are counted. For the three order-side tables a
+//! refused spill reaches the order-audit chain-loss alarm on the writer's own
+//! discard counter (`tv_order_audit_rows_discarded_total` for `order_audit`,
+//! `tv_order_audit_chain_lost_total` for the two P&L tables). For
+//! `live_order_events` it is counted on its local
+//! `tv_live_order_events_rows_discarded_total` and pages through
+//! `audit-rows-lost` (`tv_audit_spill_refused_rows_total`), not chain-loss
+//! (noise lock §2.22-a). A permanent refusal is counted on
+//! `tv_order_audit_chain_lost_total`.
 //!
 //! # How an outage still pages
 //!
@@ -108,7 +113,7 @@ const TMP_EXTENSION: &str = "tmp";
 /// Process-wide sequence so two spills in the same nanosecond get distinct names.
 static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The three order-side audit tables that spill.
+/// The order-side audit tables that spill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditSpillTable {
     /// `order_audit` (order consumer and Dhan push consumer both write it).
@@ -117,11 +122,19 @@ pub enum AuditSpillTable {
     PnlAudit,
     /// `order_leg_pnl`.
     OrderLegPnl,
+    /// `live_order_events` (plan item LF-5, 2026-11-12): the paper order event
+    /// log of the live signal-timing work.
+    LiveOrderEvents,
 }
 
 impl AuditSpillTable {
     /// Every table, for metric seeding.
-    pub const ALL: [Self; 3] = [Self::OrderAudit, Self::PnlAudit, Self::OrderLegPnl];
+    pub const ALL: [Self; 4] = [
+        Self::OrderAudit,
+        Self::PnlAudit,
+        Self::OrderLegPnl,
+        Self::LiveOrderEvents,
+    ];
 
     /// The QuestDB table name, also the spill sub-directory name.
     #[must_use]
@@ -130,6 +143,7 @@ impl AuditSpillTable {
             Self::OrderAudit => crate::order_audit_persistence::ORDER_AUDIT_TABLE,
             Self::PnlAudit => crate::pnl_audit_persistence::PNL_AUDIT_TABLE,
             Self::OrderLegPnl => crate::order_leg_pnl_persistence::ORDER_LEG_PNL_TABLE,
+            Self::LiveOrderEvents => crate::live_order_events_persistence::LIVE_ORDER_EVENTS_TABLE,
         }
     }
 
@@ -140,6 +154,7 @@ impl AuditSpillTable {
             Self::OrderAudit => "order_audit_spill_lost",
             Self::PnlAudit => "pnl_audit_spill_lost",
             Self::OrderLegPnl => "order_leg_pnl_spill_lost",
+            Self::LiveOrderEvents => "live_order_events_spill_lost",
         }
     }
 
@@ -155,6 +170,7 @@ impl AuditSpillTable {
             Self::OrderAudit => 0,
             Self::PnlAudit => 1,
             Self::OrderLegPnl => 2,
+            Self::LiveOrderEvents => 3,
         }
     }
 }
@@ -192,7 +208,7 @@ pub struct AuditSpill {
 impl AuditSpill {
     /// The production spill target for `table`.
     #[must_use]
-    // TEST-EXEMPT: one-line constructor; the spill tests in this file build the same struct and the three audit writers call it
+    // TEST-EXEMPT: one-line constructor; the spill tests in this file build the same struct and the four audit writers call it
     pub fn for_table(table: AuditSpillTable) -> Self {
         Self {
             dir: table.default_dir(),
@@ -600,7 +616,8 @@ fn quarantine_stale_tmp_files(dir: &Path, table: AuditSpillTable) {
 
 /// One flag per table, so the drain is spawned once however many writers
 /// share the table.
-static DRAIN_SPAWNED: [AtomicBool; 3] = [
+static DRAIN_SPAWNED: [AtomicBool; AuditSpillTable::ALL.len()] = [
+    AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
@@ -645,6 +662,9 @@ async fn ensure_table(table: AuditSpillTable, questdb: &QuestDbConfig) -> bool {
         }
         AuditSpillTable::OrderLegPnl => {
             crate::order_leg_pnl_persistence::ensure_order_leg_pnl_table(questdb).await
+        }
+        AuditSpillTable::LiveOrderEvents => {
+            crate::live_order_events_persistence::ensure_live_order_events_table(questdb).await
         }
     }
 }
@@ -1014,14 +1034,17 @@ mod tests {
         assert_eq!(dirs[0], Path::new("data/spill/audit/order_audit"));
         assert_eq!(dirs[1], Path::new("data/spill/audit/pnl_audit"));
         assert_eq!(dirs[2], Path::new("data/spill/audit/order_leg_pnl"));
+        assert_eq!(dirs[3], Path::new("data/spill/audit/live_order_events"));
         let mut sources: Vec<&str> = AuditSpillTable::ALL
             .iter()
             .map(|t| t.lost_source())
             .collect();
+        sources.sort_unstable();
         sources.dedup();
-        assert_eq!(sources.len(), 3);
+        assert_eq!(sources.len(), 4);
         let indexes: Vec<usize> = AuditSpillTable::ALL.iter().map(|t| t.index()).collect();
-        assert_eq!(indexes, vec![0, 1, 2]);
+        assert_eq!(indexes, vec![0, 1, 2, 3]);
+        assert_eq!(DRAIN_SPAWNED.len(), AuditSpillTable::ALL.len());
     }
 
     #[tokio::test]

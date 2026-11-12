@@ -2687,6 +2687,7 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - **LF-4 `brutex_host::send_queue`** (pure): a fixed-capacity priority queue for intents waiting on the order rate limits, ordered by the strategy's rank then arrival; records the wait. O(log n), n ≤ capacity (64), flagged.
 - **LF-5 storage `live_order_events`**: one row per event (decision, built, sent, ack, exchange order time, fill, reject, modify, cancel, exit, stop, square-off) with millisecond IST and exchange times, recipe, version, signal id, instrument, side, qty, slot, candle start/end, last tick in candle, close trigger, book at decision, feed lag, API round trip, limit price, queue wait, fill qty/price, remainder, reason, charges; DEDUP `(ts, signal_id, event, seq, feed)`. Off the hot path through a bounded channel; ILP like `order_audit`.
 - **LF-6 app paper wiring**: an O(1) `try_send` tap beside `consume_tick` in `LiveIngest` into a bounded pre-allocated channel; a strategy task owns the configured `StrategyEngine` (none configured today: the task idles and says so), the strategy candles, the per-second state and the send queue; intents become paper orders on the existing `order_runtime` OMS (no second `spawn_order_runtime`); the would-be fill comes from LF-2 on live per-second data; every step writes LF-5 rows. Clock offset (chronyc) every minute into `host_capacity_minute` (new column) and the page in §2.22; a TCP+TLS handshake to the feed, order and order-update hosts 5 times per session into a new `network_rtt_session` table.
+  - **Recorded 2026-11-12 (LF-5 review):** nothing starts the `live_order_events` boot ensure or its disk-tier drain yet. Where the paper chain builds `LiveOrderEventsWriter::new`, first await `ensure_live_order_events_table` and call `spawn_audit_spill_drain_once(AuditSpillTable::LiveOrderEvents, ..)`, as `crates/app/src/order_observability.rs` does for `order_audit`, with a source-scan ratchet that fails the build if either call is missing beside the writer's construction.
 - **LF-7 daily calibration report**: after 15:40 IST, from LF-5 rows plus `ticks`/`tick_quotes`/`market_depth_book`: fill-second distribution from the decision, live or paper price vs the LF-2 worst case per order, every worse-than-worst fill flagged loudly (coded ERROR, full row), step latency p50/p95/p99/max, feed lag, rejects, partials. JSON + CSV to `s3://tv-prod-cold/live-fill-logs/YYYY-MM-DD/` (PutObject on that prefix only).
 - **LF-8 replay**: a CLI replays one recorded day from the archived `ticks` CSV through LF-1/LF-2 with a TEST FIXTURE intent source (never a strategy, never on the live path) and prints every decision time against its candle boundary, plus a sample log and report.
 
@@ -2712,7 +2713,7 @@ This item carries the 15-row + 7-row guarantee matrix by reference to `.claude/r
 - [x] LF-2 `brutex_host::worst_fill` + tests + DHAT + bench.
 - [x] LF-3 `brutex_host::order_price` + tests + bench.
 - [x] LF-4 `brutex_host::send_queue` + tests + bench.
-- [ ] LF-5 storage `live_order_events` table and writer.
+- [x] LF-5 storage `live_order_events` table and writer.
 - [ ] LF-6 app paper wiring, clock offset column and page, handshake RTT table.
 - [ ] LF-7 daily calibration report to S3 + IAM grant.
 - [ ] LF-8 replay CLI, sample log and report.
