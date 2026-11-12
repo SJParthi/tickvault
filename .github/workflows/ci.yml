@@ -1066,8 +1066,8 @@ jobs:
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 3 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 5 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 5 — a --test flag was dropped from this step."
             exit 1
           fi
 
