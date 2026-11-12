@@ -984,6 +984,24 @@ reconcile_interval_secs = 300
 mark_channel_capacity = 8192
 
 # ===========================================================================
+# Live PAPER fill chain (plan item LF-6b, owner rules 2026-11-12). OFF.
+# Live ticks -> strategy candles -> the approved brutex strategy -> a paper
+# order on the dry-run OMS above, filled by the worst-case model over a
+# 60-second window (the rest is cancelled; a candle whose final price came
+# late skips its order). Needs [order_runtime] enabled. Even when on it idles
+# until an approved brutex strategy crate exists. Never sends to a broker.
+# ===========================================================================
+[live_fill]
+enabled = false
+tap_capacity = 65536
+wait_ms = 1000
+open_wait_ms = 2500
+band_bps = 1000
+participation_bps = 2500
+max_fill_seconds = 60
+event_channel_capacity = 4096
+
+# ===========================================================================
 # 🔷 DHAN order-update WS paper-mode push channel (operator directive
 # 2026-07-16; governance on PR #1597 —
 # .claude/plans/active-plan-dhan-order-update-rewire.md). RECEIVE-ONLY:

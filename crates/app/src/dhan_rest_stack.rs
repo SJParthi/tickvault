@@ -522,6 +522,12 @@ pub fn spawn_dhan_rest_stack(params: DhanRestStackParams) -> Option<tokio::task:
         );
         return None;
     }
+    // LF-6b: the live PAPER fill chain boots here, once, synchronously and
+    // BEFORE main spawns the feed stack, because both stacks take their half
+    // of the chain from slots this fills (the order runtime's link below,
+    // the drain's tap at the lane setup). Off by default; idle until an
+    // approved brutex strategy engine exists.
+    let _live_fill = crate::live_fill::boot(&params.config);
     let inner = tokio::spawn(run_dhan_rest_stack(params));
     Some(tokio::spawn(async move {
         // Exit monitor: the bring-up task normally COMPLETES after spawning
@@ -1276,6 +1282,10 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 client_id: client_id.clone(),
                 auth_notify: auth_signal,
                 leg_pnl_tx: params.leg_pnl_tx.clone(),
+                // LF-6b: the live paper fill chain's link; `None` unless the
+                // boot built the chain (an approved strategy engine; never
+                // today).
+                live_fill: crate::live_fill::take_paper_link(),
             });
         info!(
             "Dhan REST-only stack: DRY-RUN order runtime spawned (socket-free — \

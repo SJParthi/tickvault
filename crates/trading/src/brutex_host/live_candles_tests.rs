@@ -745,3 +745,55 @@ fn test_no_clock_and_no_receipt_accepts_the_tick() {
     assert_eq!(b.counters().refused_future, 0);
     assert_eq!(b.open_bars(), 1);
 }
+
+#[test]
+fn test_last_tick_late_names_the_frames_that_counted_the_tick_late() {
+    // Frames 1 s and 5 s: a tick that lands in an already-closed 1 s bucket
+    // but in the still-open 5 s bucket is late on frame 0 only.
+    let mut b = book(1, &[1, 5]);
+    let mut out = ClosedBars::with_capacity(8);
+    tick(&mut b, OPEN, 10.0, 100, &mut out);
+    assert!(!b.last_tick_late(0));
+    assert!(!b.last_tick_late(1));
+    // A tick of second OPEN+1 closes the 1 s bar of OPEN (by tick).
+    tick(&mut b, OPEN + 1, 10.5, 101, &mut out);
+    // A straggler for OPEN: late in the 1 s frame, on time in the 5 s frame.
+    let v = tick(&mut b, OPEN, 10.2, 102, &mut out);
+    assert_eq!(v, TickVerdict::Accepted { late_frames: 1 });
+    assert!(b.last_tick_late(0));
+    assert!(!b.last_tick_late(1));
+    // The next on-time tick clears the mask.
+    tick(&mut b, OPEN + 2, 10.6, 103, &mut out);
+    assert!(!b.last_tick_late(0));
+    // A refused tick clears it too, and out-of-range frames read false.
+    tick(&mut b, OPEN, 10.2, 104, &mut out);
+    assert!(b.last_tick_late(0));
+    assert_eq!(
+        b.on_tick(key(99), OPEN + 2, ns(OPEN + 2), 1.0, 1, &mut out),
+        TickVerdict::RefusedUnknownKey
+    );
+    assert!(!b.last_tick_late(0));
+    assert!(!b.last_tick_late(MAX_FRAMES));
+    assert!(!b.last_tick_late(usize::MAX));
+}
+
+/// LF-6b finding 2: a packet with no new trade seeds or raises the volume
+/// baseline and touches no bar, so the next trade's delta is only its own.
+#[test]
+fn test_note_baseline_volume_seeds_raises_never_lowers_and_opens_no_bar() {
+    let mut b = book(1, &[60]);
+    let mut out = ClosedBars::with_capacity(8);
+    assert!(!b.note_baseline_volume(key(9), 10), "unknown key");
+    assert!(b.note_baseline_volume(key(1), 1_000));
+    assert_eq!(b.counters().baseline, 1);
+    assert_eq!(b.open_bars(), 0, "no bar opened");
+    // A lower (stale) cumulative never lowers it; a higher one raises it.
+    assert!(b.note_baseline_volume(key(1), 900));
+    assert!(b.note_baseline_volume(key(1), 1_100));
+    assert_eq!(b.counters().baseline, 1);
+    // The first trade's delta counts from 1,100.
+    tick(&mut b, OPEN, 100.0, 1_150, &mut out);
+    b.on_clock(ns(OPEN + 60), &mut out);
+    assert_eq!(out.bars().len(), 1);
+    assert_eq!(out.bars()[0].volume, 50);
+}

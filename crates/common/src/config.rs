@@ -235,6 +235,143 @@ pub struct ApplicationConfig {
     /// the portal fall back to the slower box path.
     #[serde(default)]
     pub operator_movers: OperatorMoversConfig,
+    /// `[live_fill]` — the live PAPER fill chain (plan item LF-6b): live ticks
+    /// → strategy candles → the approved brutex strategy engine → a paper
+    /// order on the dry-run OMS with the worst-case fill. Absent section ⇒
+    /// OFF. Even when on, the chain idles until an approved brutex strategy
+    /// crate exists (`live_fill::select_engine` returns `None` today).
+    #[serde(default)]
+    pub live_fill: LiveFillConfig,
+}
+
+/// `[live_fill]` — the live paper fill chain (plan item LF-6b, owner rules of
+/// 2026-11-12: a late price skips the order, a partial fill's remainder is
+/// cancelled, 60 s fill window, worst-case fill priced per second). PAPER
+/// ONLY: the chain sends to the dry-run OMS and never to a broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct LiveFillConfig {
+    /// Master switch. Default OFF. Needs `[order_runtime] enabled`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ticks the drain may queue for the chain thread before the tap drops
+    /// (counted). Range 1,024..=1,048,576.
+    #[serde(default = "default_live_fill_tap_capacity")]
+    pub tap_capacity: usize,
+    /// How long after a candle's end the chain waits for its final price
+    /// before deciding, ms. Range 100..=10,000.
+    #[serde(default = "default_live_fill_wait_ms")]
+    pub wait_ms: u64,
+    /// The same wait for the first candle of each size that opens at 09:15:00,
+    /// ms. Range `wait_ms..=30,000`.
+    #[serde(default = "default_live_fill_open_wait_ms")]
+    pub open_wait_ms: u64,
+    /// Marketable-limit band, basis points. Range 1..=9,999.
+    #[serde(default = "default_live_fill_band_bps")]
+    pub band_bps: u32,
+    /// Our share of a second's traded volume in the worst-case fill, basis
+    /// points. Range 1..=10,000.
+    #[serde(default = "default_live_fill_participation_bps")]
+    pub participation_bps: u32,
+    /// The fill window, seconds after the decision (owner rule: 60). The rest
+    /// is cancelled. Range 1..=600.
+    #[serde(default = "default_live_fill_max_fill_seconds")]
+    pub max_fill_seconds: u32,
+    /// Bounded event and paper-command channel capacity. Range 64..=65,536.
+    #[serde(default = "default_live_fill_event_channel_capacity")]
+    pub event_channel_capacity: usize,
+}
+
+const fn default_live_fill_tap_capacity() -> usize {
+    65_536
+}
+const fn default_live_fill_wait_ms() -> u64 {
+    1_000
+}
+const fn default_live_fill_open_wait_ms() -> u64 {
+    2_500
+}
+const fn default_live_fill_band_bps() -> u32 {
+    1_000
+}
+const fn default_live_fill_participation_bps() -> u32 {
+    2_500
+}
+const fn default_live_fill_max_fill_seconds() -> u32 {
+    60
+}
+const fn default_live_fill_event_channel_capacity() -> usize {
+    4_096
+}
+
+impl Default for LiveFillConfig {
+    /// Matches the serde field defaults: an empty `[live_fill]` section and an
+    /// absent one read the same.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tap_capacity: default_live_fill_tap_capacity(),
+            wait_ms: default_live_fill_wait_ms(),
+            open_wait_ms: default_live_fill_open_wait_ms(),
+            band_bps: default_live_fill_band_bps(),
+            participation_bps: default_live_fill_participation_bps(),
+            max_fill_seconds: default_live_fill_max_fill_seconds(),
+            event_channel_capacity: default_live_fill_event_channel_capacity(),
+        }
+    }
+}
+
+impl LiveFillConfig {
+    /// Bounds check, run at boot whether or not the chain is enabled (a bad
+    /// value is refused before anyone turns it on). O(1).
+    ///
+    /// # Errors
+    /// The first field out of range, named.
+    pub fn validate(&self) -> Result<()> {
+        if !(1_024..=1_048_576).contains(&self.tap_capacity) {
+            bail!(
+                "live_fill.tap_capacity ({}) must be in [1024, 1048576]",
+                self.tap_capacity
+            );
+        }
+        if !(100..=10_000).contains(&self.wait_ms) {
+            bail!(
+                "live_fill.wait_ms ({}) must be in [100, 10000]",
+                self.wait_ms
+            );
+        }
+        if self.open_wait_ms < self.wait_ms || self.open_wait_ms > 30_000 {
+            bail!(
+                "live_fill.open_wait_ms ({}) must be in [wait_ms ({}), 30000]",
+                self.open_wait_ms,
+                self.wait_ms
+            );
+        }
+        if !(1..=9_999).contains(&self.band_bps) {
+            bail!(
+                "live_fill.band_bps ({}) must be in [1, 9999]",
+                self.band_bps
+            );
+        }
+        if !(1..=10_000).contains(&self.participation_bps) {
+            bail!(
+                "live_fill.participation_bps ({}) must be in [1, 10000]",
+                self.participation_bps
+            );
+        }
+        if !(1..=600).contains(&self.max_fill_seconds) {
+            bail!(
+                "live_fill.max_fill_seconds ({}) must be in [1, 600]",
+                self.max_fill_seconds
+            );
+        }
+        if !(64..=65_536).contains(&self.event_channel_capacity) {
+            bail!(
+                "live_fill.event_channel_capacity ({}) must be in [64, 65536]",
+                self.event_channel_capacity
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[operator_movers]` — the movers universe publisher (plan PR MV).
@@ -3381,6 +3518,7 @@ impl ApplicationConfig {
         // bounds always; freeze-limit + review-date sanity when enabled —
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
+        self.live_fill.validate()?;
 
         // 2026-07-16 REST-era candle derivation: the boot catch-up window
         // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
@@ -4177,6 +4315,7 @@ mod tests {
             memory_watchdog: MemoryWatchdogConfig::default(),
             task_heartbeat: TaskHeartbeatConfig::default(),
             operator_movers: OperatorMoversConfig::default(),
+            live_fill: LiveFillConfig::default(),
         }
     }
 
@@ -5714,6 +5853,118 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// LF-6b: `[live_fill]` defaults OFF; an absent and an empty section read
+    /// the same; `validate` refuses every out-of-range field and accepts the
+    /// defaults.
+    #[test]
+    fn test_live_fill_config_defaults_off_and_validate_bounds() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = LiveFillConfig::default();
+        assert!(!d.enabled, "live_fill must default OFF");
+        assert_eq!(d.tap_capacity, 65_536);
+        assert_eq!(d.wait_ms, 1_000);
+        assert_eq!(d.open_wait_ms, 2_500);
+        assert_eq!(d.max_fill_seconds, 60);
+        assert!(d.validate().is_ok());
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            live_fill: LiveFillConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing section defaults");
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[live_fill]\n"))
+            .extract()
+            .expect("empty section defaults");
+        assert_eq!(missing.live_fill, d);
+        assert_eq!(empty.live_fill, d);
+
+        let bad = [
+            LiveFillConfig {
+                tap_capacity: 1_023,
+                ..d
+            },
+            LiveFillConfig {
+                tap_capacity: 1_048_577,
+                ..d
+            },
+            LiveFillConfig { wait_ms: 99, ..d },
+            LiveFillConfig {
+                wait_ms: 10_001,
+                open_wait_ms: 10_001,
+                ..d
+            },
+            LiveFillConfig {
+                open_wait_ms: 999,
+                ..d
+            },
+            LiveFillConfig {
+                open_wait_ms: 30_001,
+                ..d
+            },
+            LiveFillConfig { band_bps: 0, ..d },
+            LiveFillConfig {
+                band_bps: 10_000,
+                ..d
+            },
+            LiveFillConfig {
+                participation_bps: 0,
+                ..d
+            },
+            LiveFillConfig {
+                participation_bps: 10_001,
+                ..d
+            },
+            LiveFillConfig {
+                max_fill_seconds: 0,
+                ..d
+            },
+            LiveFillConfig {
+                max_fill_seconds: 601,
+                ..d
+            },
+            LiveFillConfig {
+                event_channel_capacity: 63,
+                ..d
+            },
+            LiveFillConfig {
+                event_channel_capacity: 65_537,
+                ..d
+            },
+        ];
+        for b in bad {
+            assert!(b.validate().is_err(), "{b:?} must be refused");
+        }
+        let edges = [
+            LiveFillConfig {
+                tap_capacity: 1_024,
+                wait_ms: 100,
+                open_wait_ms: 100,
+                ..d
+            },
+            LiveFillConfig {
+                band_bps: 9_999,
+                participation_bps: 10_000,
+                max_fill_seconds: 600,
+                ..d
+            },
+            LiveFillConfig {
+                event_channel_capacity: 64,
+                open_wait_ms: 30_000,
+                ..d
+            },
+        ];
+        for e in edges {
+            assert!(e.validate().is_ok(), "{e:?} is inside the bounds");
+        }
     }
 
     /// Order runtime (2026-07-14, cluster A): the `[order_runtime]` section

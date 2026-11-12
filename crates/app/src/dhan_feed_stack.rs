@@ -97,6 +97,8 @@ mod shutdown_residue;
 // Live audit LH-05 (2026-10-29): the worst delivery delay split by segment
 // class (index/cash vs contracts), local /metrics only.
 mod ws_lag_class;
+// Plan item LF-6b (2026-11-12): the live paper fill chain's tap on this drain.
+pub mod live_fill_tap;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -1513,6 +1515,10 @@ pub struct LiveIngest {
     /// that part was always true, and it is what keeps every test and every
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
+    /// The live paper fill chain's tap (plan item LF-6b). `None` unless
+    /// `[live_fill] enabled` AND an approved strategy engine exists, which is
+    /// never today; see `live_fill::select_engine`.
+    live_fill_tap: Option<live_fill_tap::LiveFillTap>,
     detector: TickGapDetector,
     subscribe_reconcile: Option<Arc<crate::subscribe_reconcile::SubscribeReconcile>>,
     /// Per slot, the depth-200 baseline the cross-feed check last acted on
@@ -1860,6 +1866,37 @@ impl LiveIngest {
         self
     }
 
+    /// Arms the live paper fill chain's tap (plan item LF-6b). Builder, so
+    /// every caller that does not ask for it keeps the tap off by
+    /// construction.
+    #[must_use]
+    pub fn with_live_fill_tap(mut self, tap: live_fill_tap::LiveFillTap) -> Self {
+        self.live_fill_tap = Some(tap);
+        self
+    }
+
+    /// Ticks the live fill tap dropped so far; `None` while the tap is off.
+    #[must_use]
+    pub fn live_fill_tap_dropped(&self) -> Option<u64> {
+        self.live_fill_tap
+            .as_ref()
+            .map(live_fill_tap::LiveFillTap::dropped)
+    }
+
+    /// The drain abandoned `abandoned_bytes` of a main-feed frame (LF-6b):
+    /// a live frame's lost tail moves the live fill tap's loss count, so the
+    /// chain taints the candles it may have touched. O(1), no allocation; the
+    /// give-up arms only.
+    #[inline]
+    pub(crate) fn note_live_fill_abandoned(&mut self, connection_index: u8, abandoned_bytes: u64) {
+        if abandoned_bytes > 0
+            && live_fill_tap::tap_gate(connection_index, self.replaying_wal)
+            && let Some(tap) = self.live_fill_tap.as_mut()
+        {
+            tap.note_upstream_loss();
+        }
+    }
+
     /// Stores a wall-clock reading, whole IST seconds, for the catch-up seal
     /// cutoff cap ([`Self::catch_up_cutoff`]). A reading that does not fit
     /// (before the epoch, or past 2106) is ignored and the previous one kept.
@@ -2015,6 +2052,7 @@ impl LiveIngest {
         Self {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
+            live_fill_tap: None,
             // Plan PR AL-5 (2026-11-06): the live lane's detector gives each
             // seeded NSE_FNO contract a 10-minute warmup and floors its judged
             // cadence at 60 s (`DetectorConfig::live_lane`); indices and cash
@@ -8017,6 +8055,10 @@ async fn run_frame_drain(
                 // week's measurement, and the depth-200 cross-feed check.
                 // Both cold: O(slots) every 30 s.
                 tickvault_core::websocket::pool_supervisor::publish_frame_gap_peaks();
+                // LF-6b: the live fill tap's drops since the last publish.
+                if let Some(tap) = ingest.live_fill_tap.as_mut() {
+                    tap.publish_dropped();
+                }
                 let _ = ingest.check_depth200_cross_feed(
                     now_millis,
                     configured_frame_silence_fast_path(),
@@ -8704,6 +8746,7 @@ pub fn drain_main_feed_frame(
                     c.truncated.increment(1);
                     let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
                     c.abandoned_bytes.increment(abandoned);
+                    ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
                     out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
                     return out;
                 }
@@ -8719,6 +8762,7 @@ pub fn drain_main_feed_frame(
             // message.
             let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
             c.abandoned_bytes.increment(abandoned);
+            ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         };
@@ -8727,6 +8771,7 @@ pub fn drain_main_feed_frame(
             c.truncated.increment(1);
             let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
             c.abandoned_bytes.increment(abandoned);
+            ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
@@ -8969,6 +9014,25 @@ pub fn drain_main_feed_frame(
                     IngestOutcome::Folded { .. } => {
                         tally.folded = tally.folded.saturating_add(1);
                         out.folded = out.folded.saturating_add(1);
+                        // LF-6b: the live paper fill chain sees every tick the
+                        // fold accepted, from a live socket only (never a
+                        // replayed WAL frame, never while the backlog is
+                        // re-folded). One branch while off; O(1), no
+                        // allocation, never a wait while on. `new_trade`: a
+                        // repeat quote or first-sight packet carries an old
+                        // trade time and price, which the chain must never
+                        // treat as a candle price.
+                        let tap_open =
+                            live_fill_tap::tap_gate(frame.connection_index, ingest.replaying_wal);
+                        if tap_open && let Some(tap) = ingest.live_fill_tap.as_mut() {
+                            let best = match parsed {
+                                ParsedFrame::TickWithDepth(_, levels) => levels.first(),
+                                _ => None,
+                            };
+                            let new_trade =
+                                matches!(outcome, IngestOutcome::Folded { advanced: true, .. });
+                            let _queued = tap.offer(tick, best, new_trade);
+                        }
                     }
                     IngestOutcome::WrittenOutOfSession => {
                         // A ROW was written, so it counts as folded for the
@@ -9162,6 +9226,7 @@ pub fn drain_main_feed_frame(
             // integer 1.
             let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
             c.abandoned_bytes.increment(abandoned);
+            ingest.note_live_fill_abandoned(frame.connection_index, abandoned);
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
@@ -17614,6 +17679,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
     .with_fold_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since));
     ingest.subscribe_reconcile = Some(Arc::clone(&subscribe_reconcile));
+    // LF-6b: the live paper fill chain's tap, only when the boot built the
+    // chain (an approved strategy engine exists); never today.
+    if let Some(tap_tx) = crate::live_fill::take_tap_sender() {
+        ingest = ingest.with_live_fill_tap(live_fill_tap::LiveFillTap::new(tap_tx));
+        info!("live paper fill chain: tap armed on the frame drain");
+    }
     info!(
         boot_instruments = capacity,
         fold_slots = ingest.fold_slot_capacity(),
@@ -32924,6 +32995,8 @@ mod feed_aux_tests;
 
 #[cfg(test)]
 mod l3_audit_tests;
+#[cfg(test)]
+mod live_fill_tap_drain_tests;
 #[cfg(test)]
 mod reserved_connections_tests;
 

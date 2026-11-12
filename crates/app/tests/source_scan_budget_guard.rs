@@ -125,6 +125,12 @@ const BUDGET: &[(&str, usize)] = &[
     // the reserved-connections gauge (the widen dials long after bring-up and
     // cannot be staged in a unit test). Paired behaviour test:
     // `test_regression_reserved_connections_gauge_follows_the_widen`.
+    // 2026-11-12 (plan item LF-6b): one wiring scan pinning that the live
+    // fill tap call sits in the `Folded` arm behind both gates (live socket,
+    // not replaying the WAL). Paired behaviour tests:
+    // `test_with_live_fill_tap_hands_a_folded_live_tick_to_the_chain`,
+    // `test_tap_skips_replayed_frames_wal_refold_and_unfolded_ticks`.
+    ("dhan_feed_stack/live_fill_tap_drain_tests.rs", 1),
     ("dhan_feed_stack/reserved_connections_tests.rs", 1),
     // 2026-10-28 (DT-small seed queue): 1 wiring scan, the drain's idle arm is
     // gated on `idle_work_pending()` alone, never the seed latch (the select!
@@ -199,6 +205,13 @@ const BUDGET: &[(&str, usize)] = &[
     // `test_run_bounded_snapshot_pass_bounds_the_gap_between_proof_and_sweep`:
     // a pass past the bound returns no summary and sweeps nothing.
     ("instrument_snapshot_upload.rs", 1),
+    // 2026-11-12 (plan item LF-6b): one ordering scan pinning that the
+    // `live_order_events` writer awaits the table's ensure and starts the
+    // disk-tier drain BEFORE it builds the ILP writer (the LF-5 review's
+    // requirement; the order cannot be staged without QuestDB). Paired
+    // behaviour tests: `test_ensure_retry_secs_doubles_to_the_cap`,
+    // `test_flush_on_a_current_thread_runtime_does_not_panic`.
+    ("live_order_events_boot.rs", 1),
     ("log_coalescer.rs", 1),
     ("main.rs", 3),
     ("observability.rs", 3),

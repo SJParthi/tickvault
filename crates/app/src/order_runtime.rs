@@ -378,6 +378,10 @@ pub struct OrderRuntimeParams {
     pub auth_notify: Arc<Notify>,
     /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
     pub leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
+    /// The live paper fill chain's commands and event channel (plan item
+    /// LF-6b). `None` unless the chain runs, which needs an approved strategy
+    /// engine: never today.
+    pub live_fill: Option<crate::live_fill::PaperLink>,
 }
 
 /// Spawn the supervised order runtime. Returns the SUPERVISOR handle.
@@ -397,7 +401,17 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             client_id,
             auth_notify,
             leg_pnl_tx,
+            live_fill,
         } = params;
+        // LF-6b: like the mark receiver, the paper-command receiver survives
+        // inner respawns behind a tokio Mutex.
+        let (live_fill_rx, live_fill_events) = match live_fill {
+            Some(link) => (
+                Some(Arc::new(tokio::sync::Mutex::new(link.cmds))),
+                Some(link.events),
+            ),
+            None => (None, None),
+        };
         // The mark receiver survives inner respawns behind a tokio Mutex —
         // the inner run holds the guard for its lifetime; an (unwind-build)
         // death releases it for the respawn.
@@ -423,11 +437,14 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 client_id: client_id.clone(),
                 auth_notify: Arc::clone(&auth_notify),
                 leg_pnl_tx: leg_pnl_tx.clone(),
+                live_fill_events: live_fill_events.clone(),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
+            let live_fill_shared = live_fill_rx.clone();
             let run_started = std::time::Instant::now();
-            let inner =
-                tokio::spawn(async move { run_order_runtime(ctx, order_rx, mark_rx_shared).await });
+            let inner = tokio::spawn(async move {
+                run_order_runtime(ctx, order_rx, mark_rx_shared, live_fill_shared).await
+            });
             let reason = match inner.await {
                 // The inner loop is infinite; a clean return means the
                 // order-update broadcast CLOSED — structurally impossible
@@ -495,7 +512,14 @@ struct RuntimeCtx {
     auth_notify: Arc<Notify>,
     /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
     leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
+    /// LF-6b: where the live paper fill arm writes its order event rows.
+    live_fill_events:
+        Option<mpsc::Sender<tickvault_storage::live_order_events_persistence::LiveOrderEvent>>,
 }
+
+// LF-6b: the live paper fill chain's arm (paper commands → dry-run OMS).
+#[path = "order_runtime_live_fill.rs"]
+mod live_fill_arm;
 
 // ---------------------------------------------------------------------------
 // Time helpers (pure)
@@ -1257,6 +1281,9 @@ async fn run_order_runtime(
     ctx: RuntimeCtx,
     mut order_rx: broadcast::Receiver<OrderUpdate>,
     mark_rx_shared: Arc<tokio::sync::Mutex<mpsc::Receiver<MarkUpdate>>>,
+    live_fill_shared: Option<
+        Arc<tokio::sync::Mutex<mpsc::Receiver<crate::live_fill::chain::PaperCmd>>>,
+    >,
 ) {
     let config = &ctx.config;
     // ---- Construction (the proven trading_pipeline template) ----
@@ -1298,6 +1325,12 @@ async fn run_order_runtime(
     let mut book = BookState::new();
     let mut self_test = SelfTestState::new();
     let mut mark_rx = mark_rx_shared.lock().await;
+    // LF-6b: held for this run's lifetime, released on a respawn.
+    let mut live_fill_rx = match live_fill_shared.as_ref() {
+        Some(m) => Some(m.lock().await),
+        None => None,
+    };
+    let mut live_fill_open = live_fill_rx.is_some();
 
     let reconcile_interval = config.order_runtime.reconcile_interval_secs.max(60);
     let mut next_reconcile =
@@ -1459,6 +1492,23 @@ async fn run_order_runtime(
                 // the batching + the housekeeping tick backstop).
                 risk.evaluate_daily_loss_halt();
                 republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+            }
+
+            // ---- Arm 2b (LF-6b): live paper fill commands (dry-run only) ----
+            cmd = live_fill_arm::recv_live_fill(&mut live_fill_rx), if live_fill_open => {
+                match cmd {
+                    Some(cmd) => {
+                        live_fill_arm::handle_live_fill_cmd(
+                            &mut oms, &mut risk, &mut book, &ctx, cmd,
+                        )
+                        .await;
+                        republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+                    }
+                    None => {
+                        warn!("order runtime: live paper fill channel closed — arm disarmed");
+                        live_fill_open = false;
+                    }
+                }
             }
 
             // ---- Arm 3: one-shot reconcile on first WS auth ----
@@ -2216,6 +2266,7 @@ mod tests {
             client_id: "100".to_string(),
             auth_notify: Arc::new(Notify::new()),
             leg_pnl_tx: None,
+            live_fill_events: None,
         }
     }
 
