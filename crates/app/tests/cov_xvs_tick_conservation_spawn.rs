@@ -168,15 +168,19 @@ async fn test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_ca
             assert!(line.contains("verdict=partial"), "{line}");
             assert!(line.contains("reason=process_started_mid_day"), "{line}");
             assert!(line.contains("db_tick_rows=10i"), "{line}");
-            // The count settles the verdict on the first read that answers.
-            // Under the paused clock that read can time out: `drive_paused`
-            // steps virtual time once the fake server has been quiet for a
-            // moment of real time, and if the task has woken but not yet
-            // connected, the step passes the 30 s query timeout. The task then
-            // reads again 120 s later, as it should. Reproduced locally about
-            // once in 30 runs (count_reads=2i, db_tick_rows=10i). So one or two
-            // reads are both correct here; `db_tick_rows=10i` above proves a
-            // read answered, and a third read would mean neither did.
+            // The count settles the verdict on the first read that answers,
+            // and the task makes up to three reads 120 s apart, so a third
+            // read is correct task behaviour, not a sign that no read answered
+            // (`db_tick_rows=10i` above shows which happened). This test
+            // expects one read: `drive_paused` takes waiting connections on
+            // the runtime thread and waits for the woken task before moving
+            // the paused clock, so a clock step should no longer time out a
+            // read that is in flight. One extra read is still allowed: before
+            // that fix, a step could pass the read's 30 s timeout on a loaded
+            // runner (the request not yet seen by the fake server, or its
+            // answer not yet read by the task), and the task read again.
+            // A third read here would mean the driver still lets the clock
+            // move under a live request, which is the bug to look for.
             assert!(
                 line.contains("count_reads=1i") || line.contains("count_reads=2i"),
                 "{line}"
