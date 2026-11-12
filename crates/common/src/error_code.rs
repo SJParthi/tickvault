@@ -198,7 +198,20 @@ pub enum ErrorCode {
     /// ensured after one retry (`stage = "ensure_failed"`), is an `error!`
     /// with no CloudWatch filter.
     NetRtt01HandshakeCheckFailed,
-    /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
+    /// LIVE-FILL-01: the daily live paper fill calibration report (plan item
+    /// LF-7) could not read its rows, re-price an order, write its files,
+    /// copy them to the cold bucket, write its daily marker or its database
+    /// row, or read a day truncated at its row cap. Field `stage` names the
+    /// step. Log-only, never pages: the local files are kept and the next
+    /// run retries the copy.
+    LiveFill01ReportFailed,
+    /// LIVE-FILL-02: the daily calibration report re-priced a paper fill from
+    /// the stored 1 s candles and the chain's price differs (worse or better
+    /// than the worst case), or a stored row says the fill was worse than the
+    /// model. One line per order, at most 50 a report, then one total.
+    /// Log-only, never pages (noise lock: no new page without a dated row).
+    LiveFill02FillOutsideWorstCase,
+    /// TICK-SPILL-01) — a rescued tick-spill file was PERMANENTLY refused by
     /// QuestDB and has been quarantined so the rest of the backlog can drain.
     ///
     /// The spill tier exists so a failed ILP flush costs disk instead of data.
@@ -1186,6 +1199,8 @@ impl ErrorCode {
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
             Self::ClockSkew01OffsetOverOneMs => "CLOCK-SKEW-01",
             Self::NetRtt01HandshakeCheckFailed => "NET-RTT-01",
+            Self::LiveFill01ReportFailed => "LIVE-FILL-01",
+            Self::LiveFill02FillOutsideWorstCase => "LIVE-FILL-02",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             Self::DrainHold01NotWritten => "DRAIN-HOLD-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
@@ -1481,6 +1496,10 @@ impl ErrorCode {
             Self::ClockSkew01OffsetOverOneMs => Severity::High,
             // NET-RTT-01: a measurement row is missing or failed; log-only.
             Self::NetRtt01HandshakeCheckFailed => Severity::Low,
+            // LIVE-FILL-01: a step of the daily report failed; files kept, log-only.
+            Self::LiveFill01ReportFailed => Severity::Medium,
+            // LIVE-FILL-02: a paper fill outside the re-priced worst case; log-only.
+            Self::LiveFill02FillOutsideWorstCase => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1670,6 +1689,9 @@ impl ErrorCode {
             Self::HotPathStall01 => "docs/error-runbooks/hot-path-stall-error-codes.md",
             Self::ClockSkew01OffsetOverOneMs | Self::NetRtt01HandshakeCheckFailed => {
                 "docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
+            }
+            Self::LiveFill01ReportFailed | Self::LiveFill02FillOutsideWorstCase => {
+                "docs/error-runbooks/live-fill-report-error-codes.md"
             }
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 "docs/error-runbooks/ws-frame-spill-error-codes.md"
@@ -1978,6 +2000,8 @@ impl ErrorCode {
             Self::HotPathStall01,
             Self::ClockSkew01OffsetOverOneMs,
             Self::NetRtt01HandshakeCheckFailed,
+            Self::LiveFill01ReportFailed,
+            Self::LiveFill02FillOutsideWorstCase,
             Self::TickSpill01FileQuarantined,
             Self::DrainHold01NotWritten,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
@@ -2535,7 +2559,10 @@ mod tests {
                 // Plan item LF-6a (2026-11-12): the clock-offset page and
                 // the session handshake timing check.
                 || s.starts_with("CLOCK-SKEW-")
-                || s.starts_with("NET-RTT-");
+                || s.starts_with("NET-RTT-")
+                // Plan item LF-7 (2026-11-12): the daily live paper fill
+                // calibration report.
+                || s.starts_with("LIVE-FILL-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

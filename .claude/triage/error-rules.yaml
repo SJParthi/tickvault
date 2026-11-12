@@ -780,6 +780,35 @@ rules:
       The failed attempt is itself a row (ok = false). Nothing to fix on
       the trading path; the live-feed alarms cover a real outage.
 
+  - name: live-fill-01-report-failed-silence
+    match:
+      code: LIVE-FILL-01
+    action: silence
+    runbook_path: docs/error-runbooks/live-fill-report-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      LIVE-FILL-01 is a log-only line from the daily live paper fill
+      calibration report (plan item LF-7): one step (query, re-price, file
+      write, cold-bucket copy, marker or database row) failed. The local
+      report files are kept and the next run (or the next boot) retries the
+      copy. No trade path is touched; paper only.
+
+  - name: live-fill-02-fill-outside-worst-case-silence
+    match:
+      code: LIVE-FILL-02
+    action: silence
+    runbook_path: docs/error-runbooks/live-fill-report-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      LIVE-FILL-02 means the daily report re-priced a paper fill from the
+      stored 1 s candles and the chain priced it differently, or a stored row
+      says a fill was worse than the model. It may be a late tick the chain
+      never saw (a difference, not proof of a defect). Log-only by the noise
+      lock (no new page): read it in the day's report files and the runbook
+      before trusting the fill model; never auto-fixed.
+
   - name: prev-close-01-ilp-failed-escalate
     match:
       code: PREVCLOSE-01

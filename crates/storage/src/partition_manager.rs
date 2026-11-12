@@ -274,7 +274,11 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // deleted. A few dozen rows per signal, paper only today; `feed` is in
     // the DEDUP key.
     "live_order_events",
-    // CADENCE-04 (2026-07-20, cross-fill visibility, operator directive):
+    // LF-7 (2026-11-12): one row per trading day, the daily live paper fill
+    // calibration report's summary. Same order-audit class and DAY sweep as
+    // live_order_events above; `feed` is in the DEDUP key.
+    "live_fill_report_daily",
+    // CADENCE-04) (2026-07-20, cross-fill visibility, operator directive):
     // one row per cadence cross-fill firing / Groww fallback launch — a
     // handful of rows/day by construction (one per degraded lane per
     // cycle); same DAY partitioning + SEBI audit retention class as the

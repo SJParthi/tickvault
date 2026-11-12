@@ -314,6 +314,20 @@ resource "aws_iam_role_policy" "tv_instance" {
         ]
       },
       {
+        # Plan item LF-7 (2026-11-12, owner Quote 57): the daily live paper fill
+        # report copies its files to live-fill-logs/<date>/. The whole-bucket
+        # grant above already covers that PutObject, so no new Allow is added
+        # (it would narrow nothing). This explicit Deny is the real control: the
+        # box can never delete a report copy, any version of it, whatever any
+        # other statement allows. No lifecycle change (tv_cold only transitions).
+        Effect = "Deny"
+        Action = [
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+        ]
+        Resource = "arn:aws:s3:::tv-${var.environment}-cold/live-fill-logs/*"
+      },
+      {
         # Plan PR MV (2026-11-06): the movers universe publisher writes ONE
         # object (live-view-bucket.tf). PutObject on that key only.
         Effect   = "Allow"

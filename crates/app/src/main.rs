@@ -3983,7 +3983,7 @@ async fn async_main() -> Result<()> {
             previous_process_last_receipt,
         )
     });
-    // LF-6a handshake timing (09:25 IST); 2026-10-28 expiry-scope check (15:50 IST). Own tasks.
+    // LF-6a handshake timing (09:25 IST); expiry-scope check (15:50); LF-7 fill report. Own tasks.
     let _network_rtt = tickvault_app::network_rtt::spawn_network_rtt_session(&config);
     let _expiry_scope = config.feeds.dhan_enabled.then(|| {
         tickvault_app::expiry_scope_check::spawn_expiry_scope_check(
@@ -3991,7 +3991,7 @@ async fn async_main() -> Result<()> {
             std::sync::Arc::clone(&trading_calendar),
         )
     });
-
+    tickvault_app::live_fill_report::start(&config, &trading_calendar, process_start_ist_nanos);
     // =======================================================================
     // Boot completion signals (deploy-hang fix 2026-07-13; unconditional +
     // non-blocking since PR-C2).

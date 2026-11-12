@@ -986,6 +986,10 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             worse_than_model: None,
             reason: None,
             charges_paise: None,
+            tick_paise: None,
+            lot_size: None,
+            participation_bps: None,
+            max_fill_seconds: None,
         })
     }
 
@@ -1131,6 +1135,16 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         let mut built = base.clone();
         built.event = LiveOrderEventKind::Built;
         built.seq = 1;
+        let template = base.clone();
+        // The pricing inputs go on the Decision row only (plan item LF-7): the
+        // daily report re-prices the order from the stored seconds with them.
+        // The Built row and every later row of the order keep them NULL (the
+        // template is cloned before they are set, so no extra clone). O(1).
+        let mut decision = base;
+        decision.tick_paise = Some(tick_paise);
+        decision.lot_size = Some(i64::from(lot_size));
+        decision.participation_bps = i32::try_from(self.params.participation_bps).ok();
+        decision.max_fill_seconds = i32::try_from(self.params.max_fill_seconds.max(1)).ok();
         let order = HeldOrder {
             key_index: ki,
             key: bar.key,
@@ -1145,7 +1159,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             book,
             limit_paise: limit.price_paise,
             meta: OrderMeta {
-                base: base.clone(),
+                base: template,
                 lot_size,
                 limit_paise: limit.price_paise,
                 exit,
@@ -1154,16 +1168,16 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         match self.pending.insert(order) {
             Ok(()) => {
                 self.counters.held = self.counters.held.saturating_add(1);
-                self.push_out(ChainOutput::Event(Box::new(base)));
+                self.push_out(ChainOutput::Event(Box::new(decision)));
                 self.push_out(ChainOutput::Event(Box::new(built)));
             }
-            Err(_) => {
+            Err(held) => {
                 self.counters.refused = self.counters.refused.saturating_add(1);
-                let mut reject = base.clone();
+                let mut reject = held.meta.base;
                 reject.event = LiveOrderEventKind::Reject;
                 reject.seq = 1;
                 reject.reason = Some("held_orders_full".to_owned());
-                self.push_out(ChainOutput::Event(Box::new(base)));
+                self.push_out(ChainOutput::Event(Box::new(decision)));
                 self.push_out(ChainOutput::Event(Box::new(reject)));
             }
         }

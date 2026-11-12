@@ -252,7 +252,50 @@ pub fn boot(config: &ApplicationConfig) -> BootOutcome {
             }
         }
     }
+    record_boot_outcome(outcome);
     outcome
+}
+
+/// The boot outcome of this process, for the daily calibration report (plan
+/// item LF-7): 0 = not booted yet, else `1 + BootOutcome as u8`. One store,
+/// once per process.
+static LIVE_FILL_BOOT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Records `outcome` for [`last_boot_outcome`]. One relaxed store.
+fn record_boot_outcome(outcome: BootOutcome) {
+    LIVE_FILL_BOOT.store(
+        boot_outcome_code(outcome),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The stored code of an outcome (never 0). O(1).
+const fn boot_outcome_code(outcome: BootOutcome) -> u8 {
+    match outcome {
+        BootOutcome::Off => 1,
+        BootOutcome::RefusedNoOrderRuntime => 2,
+        BootOutcome::IdleNoEngine => 3,
+        BootOutcome::Running => 4,
+    }
+}
+
+/// The outcome of a stored code; `None` for 0 (not booted) or an unknown code. O(1).
+const fn boot_outcome_of_code(code: u8) -> Option<BootOutcome> {
+    match code {
+        1 => Some(BootOutcome::Off),
+        2 => Some(BootOutcome::RefusedNoOrderRuntime),
+        3 => Some(BootOutcome::IdleNoEngine),
+        4 => Some(BootOutcome::Running),
+        _ => None,
+    }
+}
+
+/// What [`boot`] decided in this process, or `None` before it ran. Read by
+/// the daily calibration report to say why a day had no orders. One relaxed
+/// load.
+#[must_use]
+pub fn last_boot_outcome() -> Option<BootOutcome> {
+    boot_outcome_of_code(LIVE_FILL_BOOT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Builds the chain, puts the tap sender and the runtime link in their slots,
@@ -474,6 +517,25 @@ mod tests {
         assert_eq!(boot_decision(true, true, true), BootOutcome::Running);
     }
 
+    /// LF-7: the boot outcome round-trips through its stored code; 0 and an
+    /// unknown code read as not booted.
+    #[test]
+    fn test_last_boot_outcome_round_trips_every_outcome() {
+        for o in [
+            BootOutcome::Off,
+            BootOutcome::RefusedNoOrderRuntime,
+            BootOutcome::IdleNoEngine,
+            BootOutcome::Running,
+        ] {
+            assert_ne!(boot_outcome_code(o), 0);
+            assert_eq!(boot_outcome_of_code(boot_outcome_code(o)), Some(o));
+        }
+        assert_eq!(boot_outcome_of_code(0), None);
+        assert_eq!(boot_outcome_of_code(9), None);
+        record_boot_outcome(BootOutcome::IdleNoEngine);
+        assert_eq!(last_boot_outcome(), Some(BootOutcome::IdleNoEngine));
+    }
+
     #[test]
     fn test_register_metrics_and_wall_ist_ns() {
         register_metrics();
@@ -614,6 +676,10 @@ pub(crate) mod test_support {
             worse_than_model: None,
             reason: None,
             charges_paise: None,
+            tick_paise: None,
+            lot_size: None,
+            participation_bps: None,
+            max_fill_seconds: None,
         }
     }
 }

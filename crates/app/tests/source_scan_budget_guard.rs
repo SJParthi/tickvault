@@ -215,6 +215,12 @@ const BUDGET: &[(&str, usize)] = &[
     // requirement; the order cannot be staged without QuestDB). Paired
     // behaviour tests: `test_ensure_retry_secs_doubles_to_the_cap`,
     // `test_flush_on_a_current_thread_runtime_does_not_panic`.
+    // 2026-11-12 (plan item LF-7): 6 scans of the report module's own files
+    // (`test_report_module_places_no_order`: no order call, no broker host, no
+    // object delete, which no behaviour test can prove absent) and 1 of
+    // `main.rs` (the one-line start; paired behaviour test
+    // `test_start_is_none_when_live_fill_is_off`).
+    ("live_fill_report/mod.rs", 7),
     ("live_order_events_boot.rs", 1),
     ("log_coalescer.rs", 1),
     ("main.rs", 3),

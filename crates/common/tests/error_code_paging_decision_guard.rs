@@ -99,6 +99,12 @@ const LOG_ONLY_CODES: &[&str] = &[
     "LAMBDA-PROV-01",
     "LAMBDA-START-01",
     "LAMBDA-START-02",
+    // 2026-11-12 (plan item LF-7): the daily live paper fill calibration
+    // report. A report step failed (files kept, retried) or a paper fill sits
+    // outside the re-priced worst case. Log only: noise lock §2.22 and its
+    // 2026-11-12 note allow no new page without a dated row.
+    "LIVE-FILL-01",
+    "LIVE-FILL-02",
     // 2026-11-12 (plan item LF-6a): the once-per-session handshake timing
     // check failed an attempt or a write. A measurement, log only; the failed
     // attempt is itself a row in `network_rtt_session`.

@@ -151,6 +151,8 @@ pub mod delay_render;
 // table. `tick_conservation_ledger` is the process-side count it reads.
 /// The daily expiry-scope check's audit table (owner 2026-10-28).
 pub mod expiry_scope_audit_persistence;
+/// The daily live paper fill calibration report's summary row (plan item LF-7).
+pub mod live_fill_report_persistence;
 /// The once-per-session TCP + TLS handshake timing table (plan item LF-6a).
 pub mod network_rtt_session_persistence;
 pub mod table_storage_probe;

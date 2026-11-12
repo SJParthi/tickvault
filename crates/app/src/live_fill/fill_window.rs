@@ -346,64 +346,29 @@ impl<M> PendingBook<M> {
         if let Some(reason) = slot.tainted {
             return Some(Finished::Tainted { order, reason });
         }
-        // A second whose worst price (one tick against us included) is beyond
-        // the LIMIT cannot fill a LIMIT order: its volume is not ours.
-        if order.limit_paise > 0 {
-            let mut base = extreme(order.side, &order.decision_bar);
-            if let Some((best, _)) = order.book {
-                base = worse(order.side, base, best);
-            }
-            for j in 0..slot.seconds.len() {
-                let s = slot.seconds[j];
-                let mut p = worse(order.side, base, extreme(order.side, &s));
-                if let Some(n) = slot.seconds.get(j + 1)
-                    && n.sec == s.sec.saturating_add(1)
-                {
-                    p = worse(order.side, p, extreme(order.side, n));
-                }
-                if beyond_limit(
-                    order.side,
-                    against(order.side, p, order.tick_paise),
-                    order.limit_paise,
-                ) {
-                    slot.seconds[j].volume = 0;
-                }
-            }
-        }
-        let params = FillParams {
-            side: order.side,
-            qty: order.qty,
-            tick_paise: order.tick_paise,
-            participation_bps: order.participation_bps,
-            decision_sec: order.decision_bar.sec,
-            first_fill_sec: order.decision_bar.sec.saturating_add(1),
-            max_seconds: self.max_fill_seconds,
-        };
-        let book = order.book.map(|(best_paise, best_qty)| BookAtDecision {
-            best_paise,
-            best_qty,
-            levels: &[],
-        });
-        let result = worst_fill(
-            &params,
-            &order.decision_bar,
-            &slot.seconds,
-            book.as_ref(),
+        let result = price_held_window(
+            &HeldPricing {
+                side: order.side,
+                qty: order.qty,
+                tick_paise: order.tick_paise,
+                participation_bps: order.participation_bps,
+                max_fill_seconds: self.max_fill_seconds,
+                limit_paise: order.limit_paise,
+                decision_bar: order.decision_bar,
+                book: order.book,
+            },
+            &mut slot.seconds,
             &mut self.schedule,
         );
         let late_fill_ticks = slot.late_fill_ticks;
         slot.seconds.clear();
         Some(match result {
-            Ok(summary) => {
-                let (summary, beyond_limit_qty) =
-                    within_limit(&order, summary, self.schedule.slices());
-                Finished::Filled {
-                    order,
-                    summary,
-                    late_fill_ticks,
-                    beyond_limit_qty,
-                }
-            }
+            Ok((summary, beyond_limit_qty)) => Finished::Filled {
+                order,
+                summary,
+                late_fill_ticks,
+                beyond_limit_qty,
+            },
             Err(refusal) => Finished::Refused { order, refusal },
         })
     }
@@ -419,6 +384,93 @@ impl<M> PendingBook<M> {
         self.held = 0;
         n
     }
+}
+
+/// The inputs that price one held order (everything but its seconds). The
+/// chain builds it from its held order; the daily calibration report (plan
+/// item LF-7) builds it from the stored Decision row, so both price the same
+/// order the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldPricing {
+    pub side: Side,
+    /// Shares.
+    pub qty: u64,
+    pub tick_paise: i64,
+    pub participation_bps: u32,
+    /// The fill window, seconds (at least 1).
+    pub max_fill_seconds: u32,
+    /// The order's LIMIT, paise; 0 or below means no limit.
+    pub limit_paise: i64,
+    /// The decision second (the candle's last second) with its high/low.
+    pub decision_bar: SecondBar,
+    /// Best price and quantity on our side of the book at the decision.
+    pub book: Option<(i64, u64)>,
+}
+
+/// Prices one held order over its fill seconds, exactly as
+/// [`PendingBook::finish`] does (plan item LF-7 moved the body here so the
+/// daily report re-prices with the same code):
+///
+/// 1. a second whose worst price (one tick against us, and the next
+///    second's price as a candidate, included) is beyond the LIMIT has its
+///    volume set to 0 in `seconds` (it cannot fill a LIMIT order);
+/// 2. `worst_fill` over the best quote only (no depth levels);
+/// 3. [`within_limit`]: any share still priced beyond the LIMIT is left
+///    unfilled.
+///
+/// Returns the summary and the shares left beyond the LIMIT. `out` holds the
+/// slices before the LIMIT cut. O(seconds used), no allocation.
+///
+/// # Errors
+/// The model's refusal (for example no traded second at all).
+pub fn price_held_window(
+    p: &HeldPricing,
+    seconds: &mut [SecondBar],
+    out: &mut FillSchedule,
+) -> Result<(FillSummary, u64), FillRefusal> {
+    // A second whose worst price (one tick against us included) is beyond
+    // the LIMIT cannot fill a LIMIT order: its volume is not ours.
+    if p.limit_paise > 0 {
+        let mut base = extreme(p.side, &p.decision_bar);
+        if let Some((best, _)) = p.book {
+            base = worse(p.side, base, best);
+        }
+        for j in 0..seconds.len() {
+            let s = seconds[j];
+            let mut price = worse(p.side, base, extreme(p.side, &s));
+            if let Some(n) = seconds.get(j + 1)
+                && n.sec == s.sec.saturating_add(1)
+            {
+                price = worse(p.side, price, extreme(p.side, n));
+            }
+            if beyond_limit(p.side, against(p.side, price, p.tick_paise), p.limit_paise) {
+                seconds[j].volume = 0;
+            }
+        }
+    }
+    let max_seconds = p.max_fill_seconds.max(1);
+    let params = FillParams {
+        side: p.side,
+        qty: p.qty,
+        tick_paise: p.tick_paise,
+        participation_bps: p.participation_bps,
+        decision_sec: p.decision_bar.sec,
+        first_fill_sec: p.decision_bar.sec.saturating_add(1),
+        max_seconds,
+    };
+    let book = p.book.map(|(best_paise, best_qty)| BookAtDecision {
+        best_paise,
+        best_qty,
+        levels: &[],
+    });
+    let summary = worst_fill(&params, &p.decision_bar, seconds, book.as_ref(), out)?;
+    Ok(limit_cut(
+        p.side,
+        p.qty,
+        p.limit_paise,
+        summary,
+        out.slices(),
+    ))
 }
 
 /// Folds a late price into fill second `sec` of `slot`: in place when the
@@ -525,14 +577,25 @@ pub fn within_limit<M>(
     summary: FillSummary,
     slices: &[FillSlice],
 ) -> (FillSummary, u64) {
-    if order.limit_paise <= 0 {
+    limit_cut(order.side, order.qty, order.limit_paise, summary, slices)
+}
+
+/// [`within_limit`] on the bare inputs. O(slices), no allocation.
+fn limit_cut(
+    side: Side,
+    qty: u64,
+    limit_paise: i64,
+    summary: FillSummary,
+    slices: &[FillSlice],
+) -> (FillSummary, u64) {
+    if limit_paise <= 0 {
         return (summary, 0);
     }
     let mut filled: u64 = 0;
     let mut cost: i128 = 0;
     let mut beyond: u64 = 0;
     for s in slices {
-        if beyond_limit(order.side, s.price_paise, order.limit_paise) {
+        if beyond_limit(side, s.price_paise, limit_paise) {
             beyond = beyond.saturating_add(s.qty);
         } else {
             filled = filled.saturating_add(s.qty);
@@ -546,7 +609,7 @@ pub fn within_limit<M>(
         None
     } else {
         let f = i128::from(filled);
-        let avg = match order.side {
+        let avg = match side {
             Side::Buy => (cost + f - 1) / f,
             Side::Sell => cost / f,
         };
@@ -556,7 +619,7 @@ pub fn within_limit<M>(
         FillSummary {
             filled_qty: filled,
             vwap_paise,
-            unfilled_qty: order.qty.saturating_sub(filled),
+            unfilled_qty: qty.saturating_sub(filled),
             seconds_used: summary.seconds_used,
             depth_exhausted: summary.depth_exhausted,
         },
@@ -966,6 +1029,114 @@ mod tests {
             }
             proptest::prop_assert_eq!(finished, 1);
             proptest::prop_assert_eq!(p.held(), 0);
+        }
+    }
+
+    /// The pre-LF-7 body of `PendingBook::finish` after its early returns,
+    /// kept verbatim as the oracle for the moved [`price_held_window`].
+    fn oracle_finish_pricing(
+        order: &HeldOrder<u32>,
+        max_fill_seconds: u32,
+        seconds: &mut [SecondBar],
+        schedule: &mut FillSchedule,
+    ) -> Result<(FillSummary, u64), FillRefusal> {
+        if order.limit_paise > 0 {
+            let mut base = extreme(order.side, &order.decision_bar);
+            if let Some((best, _)) = order.book {
+                base = worse(order.side, base, best);
+            }
+            for j in 0..seconds.len() {
+                let s = seconds[j];
+                let mut p = worse(order.side, base, extreme(order.side, &s));
+                if let Some(n) = seconds.get(j + 1)
+                    && n.sec == s.sec.saturating_add(1)
+                {
+                    p = worse(order.side, p, extreme(order.side, n));
+                }
+                if beyond_limit(
+                    order.side,
+                    against(order.side, p, order.tick_paise),
+                    order.limit_paise,
+                ) {
+                    seconds[j].volume = 0;
+                }
+            }
+        }
+        let params = FillParams {
+            side: order.side,
+            qty: order.qty,
+            tick_paise: order.tick_paise,
+            participation_bps: order.participation_bps,
+            decision_sec: order.decision_bar.sec,
+            first_fill_sec: order.decision_bar.sec.saturating_add(1),
+            max_seconds: max_fill_seconds.max(1),
+        };
+        let book = order.book.map(|(best_paise, best_qty)| BookAtDecision {
+            best_paise,
+            best_qty,
+            levels: &[],
+        });
+        let summary = worst_fill(
+            &params,
+            &order.decision_bar,
+            seconds,
+            book.as_ref(),
+            schedule,
+        )?;
+        Ok(within_limit(order, summary, schedule.slices()))
+    }
+
+    proptest::proptest! {
+        /// LF-7: the moved pricing gives byte-for-byte the same result as the
+        /// old `finish` body, on random sides, quantities, limits, books,
+        /// windows and seconds (gaps included).
+        #[test]
+        fn test_price_held_window_equals_finish_on_random_orders(
+            buy in proptest::bool::ANY,
+            qty in 0u64..2_000,
+            tick in 1i64..20,
+            part in 1u32..=10_000,
+            window in 1u32..70,
+            limit_off in -400i64..400,
+            no_limit in proptest::bool::ANY,
+            book in proptest::option::of((9_800i64..10_200, 0u64..500)),
+            bars in proptest::collection::vec((1i64..3, 9_700i64..10_300, 0i64..200, 0u64..600), 0..75),
+        ) {
+            let mut o = order(0, qty);
+            o.side = if buy { Side::Buy } else { Side::Sell };
+            o.tick_paise = tick;
+            o.participation_bps = part;
+            o.book = book;
+            o.limit_paise = if no_limit { 0 } else { 10_000 + limit_off };
+            let mut secs = Vec::with_capacity(bars.len());
+            let mut s = DEC;
+            for (gap, low, span, vol) in &bars {
+                s += gap;
+                secs.push(SecondBar { sec: s, high_paise: low + span, low_paise: *low, volume: *vol });
+            }
+            let mut a = secs.clone();
+            let mut b = secs;
+            let cap = FillSchedule::required_capacity(window, 0);
+            let mut sa = FillSchedule::with_capacity(cap);
+            let mut sb = FillSchedule::with_capacity(cap);
+            let old = oracle_finish_pricing(&o, window, &mut a, &mut sa);
+            let new = price_held_window(
+                &HeldPricing {
+                    side: o.side,
+                    qty: o.qty,
+                    tick_paise: o.tick_paise,
+                    participation_bps: o.participation_bps,
+                    max_fill_seconds: window,
+                    limit_paise: o.limit_paise,
+                    decision_bar: o.decision_bar,
+                    book: o.book,
+                },
+                &mut b,
+                &mut sb,
+            );
+            proptest::prop_assert_eq!(old, new);
+            proptest::prop_assert_eq!(a, b);
+            proptest::prop_assert_eq!(sa.slices(), sb.slices());
         }
     }
 }
