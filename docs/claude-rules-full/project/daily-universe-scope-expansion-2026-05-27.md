@@ -3614,3 +3614,18 @@ The owner asked (2026-11-12) for exact live signal timing, millisecond order sen
 - Changing what any strategy decides; adding strategy logic of tickvault's own.
 - Sending an HTTP request to a Dhan API to measure latency.
 - Deleting, overwriting or putting a lifecycle expiration on anything under `live-fill-logs/`; writing outside that prefix with its role grant.
+
+##### Quote 57 addendum (2026-11-12, ~16:45 IST) — paper chain rules, four owner cards
+
+Owner, on four cards for the LF-6b paper chain, chose every recommended option:
+
+| Card | Owner's answer | Rule |
+|---|---|---|
+| "If a candle's data turns out incomplete when the strategy decides, what should happen to its order?" | "Skip the order, log why (Recommended)" | No paper order from a candle that took a price after its decision; the skipped signal and its reason are written to `live_order_events`. |
+| "If only part of an order would fill (the 25%-of-volume cap), what happens to the rest?" | "Cancel the rest (Recommended)" | The filled part stands; the remainder is cancelled and logged. |
+| "How long may an order keep filling second by second before the rest is cancelled?" | "60 seconds (Recommended)" | `max_fill_seconds` = 60; past it the remainder is cancelled and logged. |
+| "Should open paper positions get live prices every second so the paper profit/loss and risk limits work?" | "Yes, every second (Recommended)" | One 1 s close per instrument with an open paper position goes to the paper risk engine; nothing for instruments without a position. |
+
+Also settled by earlier owner decisions, not re-asked: the wait W is 1.0 s after each candle's end and 2.5 s for every frame's bar that opens at 09:15:00 (the brutex timing prompt the owner accepted), and the best bid/ask at the decision travels with each tapped tick (the owner's worst-case fill rule uses the best quote).
+
+**REJECT (addendum):** placing a paper order from a candle that took a late price; keeping a partial remainder working past 60 s or after a partial; forwarding marks for instruments with no open paper position; any of this on a real order path.

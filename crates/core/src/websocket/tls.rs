@@ -114,6 +114,21 @@ fn cached_client_config(
     Ok(built)
 }
 
+/// The process-wide HTTP/1.1-ALPN client config the main-feed and
+/// order-update sockets use (cached; a refcount bump after the first build).
+///
+/// Exposed for the once-per-session TCP + TLS handshake timing check (plan
+/// item LF-6a), which needs the same roots and ALPN as the live sockets
+/// without depending on `tokio-tungstenite`. That caller CLONES the config and
+/// turns session resumption off on its copy, so it never touches the live
+/// sockets' resumption store and every sample is a full handshake.
+///
+/// # Errors
+/// Returns `TlsConfigurationFailed` when no native root certificate loads.
+pub fn shared_http11_client_config() -> Result<Arc<rustls::ClientConfig>, WebSocketError> {
+    cached_client_config(true)
+}
+
 fn build_tls_connector_inner(force_http11_alpn: bool) -> Result<Connector, WebSocketError> {
     // `Connector` is `Clone` and its rustls arm holds an `Arc`, so wrapping the
     // cached config is a refcount bump — no TLS work happens here after the
@@ -191,6 +206,18 @@ mod tests {
              dial carries an empty resumption store, so every reconnect pays a full \
              2-RTT handshake and re-parses the system CA bundle from disk"
         );
+    }
+
+    /// The handshake timing check gets the SAME cached ALPN config the live
+    /// sockets use (same roots, same `http/1.1` ALPN), not a third one.
+    #[test]
+    fn test_shared_http11_client_config_is_the_cached_alpn_config() {
+        install_crypto_provider();
+        let shared = shared_http11_client_config().expect("ALPN config builds");
+        let connector =
+            unwrap_rustls_config(build_websocket_tls_connector().expect("ALPN connector builds"));
+        assert!(Arc::ptr_eq(&shared, &connector));
+        assert_eq!(shared.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
     /// Same guarantee for the depth-200 (no-ALPN) profile.

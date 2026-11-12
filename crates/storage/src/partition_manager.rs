@@ -166,6 +166,9 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // 4-core box needed" verdict, same writer thread and window.
     "host_capacity_minute",
     "capacity_verdict_daily",
+    // (2026-11-12, plan item LF-6a, Quote 57) TCP + TLS handshake times to the
+    // Dhan hosts, 15 rows once per session. Measurement; same DAY window.
+    "network_rtt_session",
     // (2026-08-29, per-table disk-footprint measurement): one row per
     // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
     // class + DAY partitioning as the scoreboard tables above. Swept with

@@ -39,6 +39,12 @@ const BUDGET: &[(&str, usize)] = &[
     // behaviour tests: `market_depth_book_ensure_reads_not_keyed_when_unreachable`,
     // `ensure_until_keyed_returns_once_every_statement_is_accepted`.
     ("candle_ddl_boot.rs", 7),
+    // 2026-11-12 (plan item LF-6a): one wiring scan pinning that the live
+    // clock poll loop feeds the 1 ms page episode and the probe publishes the
+    // minute column (a 30 s chrony loop cannot be staged in a unit test).
+    // Paired behaviour tests: the `test_observe_*` episode tests and
+    // `test_feed_clock_offset_episode_uses_the_ist_minute_and_window`.
+    ("clock_offset_page.rs", 1),
     ("contract_name_repair_boot.rs", 1),
     // 1 -> 2 (2026-11-07, PR AA step 1, owner Quote 51): pins that the daily
     // loop seeds the quiesce counters before its first pass (the loop cannot

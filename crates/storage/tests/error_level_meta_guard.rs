@@ -63,6 +63,11 @@ const FAILURE_WORDS: &[&str] = &["fail", "could not", "cannot", "couldn't", "not
 const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     // ---- app ----
     (
+        "crates/app/src/clock_offset_page.rs",
+        "the saved episode latch could not be read or written",
+        "a small state file that only stops a second page for the same clock-offset episode after a restart; the poller and the offset row carry on, at worst one extra page, no market data is lost",
+    ),
+    (
         "crates/app/src/depth_book_since.rs",
         "the start instant could not be saved",
         "the instant still applies to this process; a later boot records a later one, so replayed frames go to market_depth (plan item 49e step 3 honest limit); no market data is lost",

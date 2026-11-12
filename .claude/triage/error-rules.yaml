@@ -752,6 +752,34 @@ rules:
       database, a blocking step) needs an operator to read the stage and
       heartbeat gauges.
 
+  - name: clock-skew-01-offset-over-1ms-escalate
+    match:
+      code: CLOCK-SKEW-01
+    action: escalate
+    runbook_path: docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CLOCK-SKEW-01 = chrony's clock offset was over 1 ms for 5 consecutive
+      minute samples inside 09:00-15:40 IST (noise lock 2.22). Signal and
+      order times read from this clock are off by about that much. Edge
+      triggered once per episode, no recovery line. Never auto-fixed: the
+      time source needs an operator (chronyc tracking, chronyc sources).
+
+  - name: net-rtt-01-handshake-check-failed-silence
+    match:
+      code: NET-RTT-01
+    action: silence
+    runbook_path: docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      NET-RTT-01 is a log-only line from the once-per-session TCP + TLS
+      handshake measurement: one attempt could not resolve, connect or
+      finish its handshake, or the session's rows could not be written.
+      The failed attempt is itself a row (ok = false). Nothing to fix on
+      the trading path; the live-feed alarms cover a real outage.
+
   - name: prev-close-01-ilp-failed-escalate
     match:
       code: PREVCLOSE-01

@@ -3974,8 +3974,7 @@ async fn async_main() -> Result<()> {
             &main_feed_instruments,
         )
     });
-    // K4 (2026-10-26): daily ticks conservation check (15:45 IST) and the
-    // boot downtime row. Own task; only with the Dhan lane, the one writer.
+    // K4 (2026-10-26): 15:45 IST ticks conservation check + boot downtime row; Dhan lane only.
     let _tick_conservation = config.feeds.dhan_enabled.then(|| {
         tickvault_app::tick_conservation::spawn_tick_conservation(
             config.questdb.clone(),
@@ -3984,7 +3983,8 @@ async fn async_main() -> Result<()> {
             previous_process_last_receipt,
         )
     });
-    // 2026-10-28: the daily expiry-scope check (15:50 IST), own task.
+    // LF-6a handshake timing (09:25 IST); 2026-10-28 expiry-scope check (15:50 IST). Own tasks.
+    let _network_rtt = tickvault_app::network_rtt::spawn_network_rtt_session(&config);
     let _expiry_scope = config.feeds.dhan_enabled.then(|| {
         tickvault_app::expiry_scope_check::spawn_expiry_scope_check(
             config.questdb.clone(),
