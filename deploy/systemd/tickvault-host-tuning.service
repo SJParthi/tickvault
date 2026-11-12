@@ -124,6 +124,19 @@ ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning verify
 #    which every latency number the system reports is untrustworthy.
 ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning apply
 
+# 5. Keep the CloudWatch agent off the hot core (owner card Thu 12 Nov 2026
+#    ~16:15 IST: "Yes, both, measure 1 day (Recommended)" — "...and keep the
+#    monitoring agent on core 0"). Measured 12 Nov: the agent was seen running
+#    on core 1, where only the socket reader and the frame drain belong (every
+#    other app thread and QuestDB are on core 0). `set-property --runtime`
+#    writes a runtime cgroup setting, applied at once if the agent runs and at
+#    its start if it does not; it is gone at reboot, and this unit re-applies it
+#    every boot. Not a shell (no `sh -c`). Leading `-`: a box without the agent
+#    must not fail this unit. Undo: delete this line (the next boot restores
+#    the default) or `systemctl set-property --runtime
+#    amazon-cloudwatch-agent.service AllowedCPUs=` now.
+ExecStart=-/usr/bin/systemctl set-property --runtime amazon-cloudwatch-agent.service AllowedCPUs=0
+
 # A tuning failure must NEVER keep the trading app down. A host with default
 # buffers is slower; a host with no app is blind. The `-` prefixes above and
 # this line encode that ordering of harms deliberately — the failures are loud
