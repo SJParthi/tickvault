@@ -3589,3 +3589,28 @@ The session's own login (`claude-code-agent`) was refused `ec2:DeleteVolume` and
 | Independent read-only describe (session login) | — | Volumes: only `vol-07a6586a56466ea83` (150 GB, in-use, attached). Owned snapshots: none |
 
 The role, the workflow, the Rust tool and its budget row are deleted in the PR that adds this record; the role leaves AWS at the next terraform apply. **Quote 56 is ENDED** and Quote 52's REJECT on delete permissions binds again unchanged.
+
+#### Quote 57 (2026-11-12) — STRATEGY CANDLES OF ANY SIZE, IN MEMORY ONLY; LIVE SIGNAL TIMING, PAPER FILL LOG AND DAILY CALIBRATION REPORT (preserve EXACTLY)
+
+The owner asked (2026-11-12) for exact live signal timing, millisecond order sending and a full fill log, so live trading can be checked against Brutex's worst-case backtest. Paper mode first; no real order (including a latency probe) without the owner's explicit OK for that action; no change to any strategy's signal logic. Four decision cards, answered verbatim:
+
+| Card | Owner's tap |
+|---|---|
+| "How should strategy candles be built?" (Quote 34 removed 3s/5s) | **"In memory, any size (Recommended)"** — "Build whatever candle size the strategy recipe asks for (5s, 1m, ...) in memory, from live ticks, for the strategy only. Not stored as new database tables, so disk cost doesn't change. The stored 1s/1m tables stay as they are." |
+| Clock offset over 1 ms | **"Page if 5 min in a row (Recommended)"** (recorded in the noise lock, §2.22) |
+| Session round trip to Dhan's order API | **"Handshake only (Recommended)"** — TCP + TLS connection timing only, no request sent, no REST-rule change |
+| Where the daily fill log and report go | **"tv-prod-cold/live-fill-logs (Recommended)"** — `s3://tv-prod-cold/live-fill-logs/YYYY-MM-DD/`, versioned, never deleted |
+
+| Item | What Quote 57 authorizes |
+|---|---|
+| Strategy candles | Any candle size a recipe asks for, built in memory from live ticks for strategy use only. Supersedes Quote 34's "re-adding them without a fresh dated quote" REJECT for this in-memory use only; `candles_3s` / `candles_5s` tables stay removed and `TF_COUNT` of the stored fold is unchanged |
+| Paper chain | Live ticks and quotes → strategy candles → decision → would-be order → worst-case would-be fills, logged per event, in paper mode only |
+| Report | One dated report per trading day in `s3://tv-prod-cold/live-fill-logs/YYYY-MM-DD/` (PutObject only on that prefix) |
+| Latency probe | TCP + TLS handshake timing to the order and feed hosts, a few times per session; no HTTP request |
+
+##### What violates Quote 57 (REJECT)
+- Storing a strategy-candle table (`candles_3s`, `candles_5s` or any new size) or changing the stored fold's `TF_COUNT` under Quote 57.
+- Placing, modifying or cancelling any real order (including a probe order), or flipping any `dry_run` / `[exit_orders]` / live-order switch, under Quote 57.
+- Changing what any strategy decides; adding strategy logic of tickvault's own.
+- Sending an HTTP request to a Dhan API to measure latency.
+- Deleting, overwriting or putting a lifecycle expiration on anything under `live-fill-logs/`; writing outside that prefix with its role grant.

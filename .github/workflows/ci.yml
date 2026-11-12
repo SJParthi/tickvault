@@ -866,9 +866,11 @@ jobs:
           crates/storage/tests/dhat_task_watch.rs
           crates/storage/tests/dhat_tick_rescue_spare.rs
           crates/storage/tests/dhat_tick_row_append.rs
+          crates/trading/tests/dhat_live_candles.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
           crates/trading/tests/dhat_risk_engine.rs
           crates/trading/tests/dhat_tick_ram_arena.rs
+          crates/trading/tests/dhat_worst_fill.rs
           EOF
           )
           # Defensive de-indent: YAML block scalars normally de-dent the
@@ -1056,17 +1058,16 @@ jobs:
           # collections. The drift check above caught this target too, on the
           # first push, exactly as it caught dhat_multi_tf_fold.
           cargo test -p tickvault-trading \
-            --test dhat_multi_tf_fold \
-            --test dhat_risk_engine \
-            --test dhat_tick_ram_arena \
+            --test dhat_live_candles --test dhat_multi_tf_fold \
+            --test dhat_risk_engine --test dhat_tick_ram_arena --test dhat_worst_fill \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
             echo "::error::a trading dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 3 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 5 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 5 — a --test flag was dropped from this step."
             exit 1
           fi
 
