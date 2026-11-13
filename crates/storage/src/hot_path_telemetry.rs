@@ -64,7 +64,7 @@
 //! | [`record_stage_nanos`] | O(1): fixed threshold classification, one bin increment, sum/max and optional stall atomics |
 //! | [`beat_at`] / [`busy_begin_at`] / [`busy_end_at`] | O(1): one `Instant` subtraction, one or two relaxed stores |
 //! | [`record_receipt_to_fold_nanos`] | O(1): the stage record plus one more relaxed add into the fine histogram |
-//! | [`publish_once`] | O(stages × buckets + tasks): 7 × 29 raw bins projected to 28 historical bins, plus 6 tasks and 58 fine bins; fixed arrays on the publisher thread, no allocation |
+//! | [`publish_once`] | O(stages × buckets + tasks): 9 × 29 raw bins projected to 28 historical bins, plus 6 tasks and 58 fine bins; fixed arrays on the publisher thread, no allocation |
 //! | [`stage_quantiles`] / [`fine_quantiles`] | O(buckets) = O(28) / O(58), on the publisher thread only, never on the frame path |
 //! | [`RollingMax::push`] | O(window) = O(75) per stage, once a second, on the publisher thread only; a fixed array, no allocation |
 //!
@@ -193,10 +193,39 @@ pub enum Stage {
     /// so a green "under 1 µs" tile means the p99 sits in the bucket ending
     /// at 1,024 ns, not at or under 1,000 ns.
     DrainMainTick = 7,
+    /// The frame arm's synchronous work AFTER a frame's own decode and
+    /// fold (B3, 2026-11-13, audit finding: `drain_main_frame`,
+    /// `drain_main_tick` and `receipt_to_fold` all stop their clock when the
+    /// fold returns, so the work the same arm then does before it can take
+    /// the next frame was in none of them). It covers, for every frame the
+    /// drain takes from the ring (main feed, depth and order update):
+    /// the socket delivery stamp and silence bookkeeping after the fold, the
+    /// tick size-trigger hand-off (`flush_ticks_and_record`, including the
+    /// reserve and page touch of a fresh staged batch when no spare came
+    /// back), the depth size-trigger or unbacked hand-off (`flush_depth`),
+    /// and the fold-depth gauges published every 1,024 frames. For a
+    /// main-feed frame it starts at the instant `drain_main_frame` ended, so
+    /// `drain_main_frame + drain_frame_post` is the frame's time on the
+    /// drain from the frame timer's start (the ring-dwell bookkeeping just
+    /// before that start is untimed: a few atomics and one clock read,
+    /// Assumed well under a microsecond). A depth or
+    /// order-update frame has no stage of its own, so its sample starts at
+    /// the frame timer's start and also holds that frame's own handling
+    /// (depth decode and staging, O(levels); B3 review round 3). Depth and
+    /// main-feed samples share this one histogram and cannot be told apart
+    /// here. The time a slow post step holds the drain is ALSO inside the
+    /// `ring_dwell` (and, for main-feed frames, `receipt_to_fold`) of every
+    /// frame queued behind it, so do not add those stages to this one.
+    /// Most frames trip no trigger and record only the stamping; the tail is
+    /// the hand-offs. Recorded once per frame, one clock read
+    /// and four relaxed atomics, no allocation. Never paged. The timer
+    /// arm's hand-offs (every 500 ms) are NOT in it; a stall there shows
+    /// as the next frames' `ring_dwell`.
+    DrainFramePost = 8,
 }
 
 /// Every stage, in index order.
-pub const ALL_STAGES: [Stage; 8] = [
+pub const ALL_STAGES: [Stage; 9] = [
     Stage::SocketToWal,
     Stage::RingDwell,
     Stage::MainRuntimeLag,
@@ -205,6 +234,7 @@ pub const ALL_STAGES: [Stage; 8] = [
     Stage::ReceiptToFold,
     Stage::MetricsUpkeep,
     Stage::DrainMainTick,
+    Stage::DrainFramePost,
 ];
 
 const STAGE_COUNT: usize = ALL_STAGES.len();
@@ -220,6 +250,7 @@ const _: () = assert!(PAGED_STAGE_COUNT <= STAGE_COUNT);
 const _: () = assert!(Stage::ReceiptToFold as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::MetricsUpkeep as usize >= PAGED_STAGE_COUNT);
 const _: () = assert!(Stage::DrainMainTick as usize >= PAGED_STAGE_COUNT);
+const _: () = assert!(Stage::DrainFramePost as usize >= PAGED_STAGE_COUNT);
 
 impl Stage {
     /// The `stage` label value.
@@ -234,6 +265,7 @@ impl Stage {
             Self::ReceiptToFold => "receipt_to_fold",
             Self::MetricsUpkeep => "metrics_upkeep",
             Self::DrainMainTick => "drain_main_tick",
+            Self::DrainFramePost => "drain_frame_post",
         }
     }
 
@@ -263,6 +295,9 @@ impl Stage {
             // PR DP-6: one tick's share; never paged, the over-budget count
             // and the per-episode p99 warn use 1 ms like the frame stage.
             Self::DrainMainTick => 1_000_000,
+            // B3: the post-frame work holds the next frame like the frame's
+            // own work does, so the same 1 ms budget; never paged.
+            Self::DrainFramePost => 1_000_000,
         }
     }
 }
@@ -1621,7 +1656,7 @@ mod tests {
     #[test]
     fn test_regression_dp6_record_stage_nanos_weighted_records_a_per_tick_sample() {
         assert_eq!(Stage::DrainMainTick.as_str(), "drain_main_tick");
-        assert_eq!(*ALL_STAGES.last().expect("stages"), Stage::DrainMainTick);
+        assert!(ALL_STAGES.contains(&Stage::DrainMainTick));
         assert!(
             Stage::DrainMainTick as usize >= PAGED_STAGE_COUNT,
             "never paged"
@@ -1641,6 +1676,30 @@ mod tests {
             "the 700 ns ticks sit in the <= 1,024 ns bucket"
         );
         assert_eq!(after.buckets[1] - before.buckets[1], 1);
+    }
+
+    // Regression: 2026-11-13 (B3): the frame arm's hand-offs after the fold
+    // were in no stage. `drain_frame_post` is the last stage, never paged,
+    // labelled for the minute table, and a 1 ms sample is not a stall while
+    // one nanosecond more is. Only this test records it in this binary.
+    #[test]
+    fn test_regression_b3_drain_frame_post_is_a_recorded_never_paged_stage() {
+        assert_eq!(Stage::DrainFramePost.as_str(), "drain_frame_post");
+        assert_eq!(*ALL_STAGES.last().expect("stages"), Stage::DrainFramePost);
+        assert_eq!(ALL_STAGES.len(), 9);
+        assert!(
+            Stage::DrainFramePost as usize >= PAGED_STAGE_COUNT,
+            "never paged"
+        );
+        assert_eq!(Stage::DrainFramePost.stall_budget_nanos(), 1_000_000);
+        let before = stage_snapshot(Stage::DrainFramePost);
+        record_stage(Stage::DrainFramePost, Duration::from_nanos(300));
+        record_stage_nanos(Stage::DrainFramePost, 1_000_000);
+        record_stage_nanos(Stage::DrainFramePost, 1_000_001);
+        let after = stage_snapshot(Stage::DrainFramePost);
+        assert_eq!(after.count - before.count, 3);
+        assert_eq!(after.over_budget - before.over_budget, 1);
+        assert_eq!(after.buckets[0] - before.buckets[0], 1);
     }
 
     #[test]
@@ -1858,6 +1917,80 @@ mod tests {
             read() < nanos_to_f64(SPIKE),
             "window + 1 ago: gone, read {}",
             read()
+        );
+    }
+
+    /// B3 review round 4 (2026-11-13). The HOT-PATH-STALL-01 runbook says
+    /// that while a step is blocked the per-second
+    /// `tv_hot_path_stage_max_ns` reads 0 (the maximum is reset every
+    /// publish), and the 75 s gauge keeps the largest finished step. It
+    /// first said the gauge "still shows the last step that finished", which
+    /// is false. This pins the code side of the corrected sentence: a publish
+    /// after a second with no sample sets the per-second gauge to 0 while the
+    /// rolling gauge still holds the earlier step.
+    #[test]
+    fn test_publish_once_reads_0_for_a_second_with_no_sample() {
+        // MetricsUpkeep: recorded by no test in this crate, so no other test
+        // can add a sample between the two publishes below.
+        const STEP: u64 = 2_500_000;
+        let per_second = std::sync::Arc::new(AtomicU64::new(f64::NAN.to_bits()));
+        let rolling = std::sync::Arc::new(AtomicU64::new(f64::NAN.to_bits()));
+        let stage = Stage::MetricsUpkeep.as_str();
+        let per_second_rec = OneGaugeRecorder {
+            name: "tv_hot_path_stage_max_ns",
+            stage,
+            bits: std::sync::Arc::clone(&per_second),
+        };
+        let rolling_rec = OneGaugeRecorder {
+            name: "tv_hot_path_stage_max_ns_75s",
+            stage,
+            bits: std::sync::Arc::clone(&rolling),
+        };
+        let read = |bits: &AtomicU64| f64::from_bits(bits.load(Ordering::Relaxed));
+        // Two handle sets, one per gauge, publishing the same stage's
+        // windows; each resolves only its own gauge to a live value.
+        let mut a = metrics::with_local_recorder(&per_second_rec, TelemetryHandles::resolve);
+        let mut b = metrics::with_local_recorder(&rolling_rec, TelemetryHandles::resolve);
+        // The process-wide publisher started by
+        // `spawn_publisher_starts_a_named_thread` can take the window max
+        // first; retry until our publish read it (bounded).
+        let mut seen = false;
+        for _ in 0..1_000 {
+            record_stage_nanos(Stage::MetricsUpkeep, STEP);
+            publish_once(&mut a, Instant::now());
+            if read(&per_second) >= nanos_to_f64(STEP) {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "the finished step never reached this publish");
+        // The rolling handles need the same step in their own window.
+        let mut seen_rolling = false;
+        for _ in 0..1_000 {
+            record_stage_nanos(Stage::MetricsUpkeep, STEP);
+            publish_once(&mut b, Instant::now());
+            if read(&rolling) >= nanos_to_f64(STEP) {
+                seen_rolling = true;
+                break;
+            }
+        }
+        assert!(
+            seen_rolling,
+            "the finished step never reached the rolling window"
+        );
+        // A second with no sample (the step is "blocked"): the per-second
+        // gauge reads 0, never the last finished step.
+        publish_once(&mut a, Instant::now());
+        assert!(
+            read(&per_second).abs() < f64::EPSILON,
+            "a second with no sample must read 0, read {}",
+            read(&per_second)
+        );
+        publish_once(&mut b, Instant::now());
+        assert!(
+            read(&rolling) >= nanos_to_f64(STEP),
+            "the 75 s gauge keeps the finished step, read {}",
+            read(&rolling)
         );
     }
 

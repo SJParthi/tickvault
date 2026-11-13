@@ -65,7 +65,7 @@ allowed where genuinely inapplicable.
 
 | Dimension | Proof artefact (real, no hallucination) |
 |---|---|
-| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up), `scripts/coverage-gate.sh` ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green, and again after merge |
+| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up), `scripts/coverage-gate.sh` ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green, and again after merge |
 | Audit coverage | `<event>_audit` QuestDB table with DEDUP UPSERT KEYS |
 | Testing coverage | the 22 test categories in `testing.md`, scoped to changed crate(s) |
 | Security coverage | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent |

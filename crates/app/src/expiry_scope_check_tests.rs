@@ -2264,9 +2264,11 @@ fn test_build_expiry_index_nearest_by_name_agreeing_and_disagreeing_buckets() {
 // ----------------------------------------- the daily loop with a calendar
 
 /// Weekends plus two weekday holidays: Tue 10 Nov 2026 and Mon 16 Nov 2026
-/// (a Monday holiday right after a weekend).
+/// (a Monday holiday right after a weekend), and one Muhurat Sunday, 8 Nov
+/// 2026 at 14:05 to 15:40 (B3 review, 2026-11-13: a Muhurat session is a
+/// session day, operator Quote 49, so the loop checks it).
 fn sweep_calendar() -> TradingCalendar {
-    use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+    use tickvault_common::config::{MuhuratTradingEntry, NseHolidayEntry, TradingConfig};
     let holiday = |date: &str| NseHolidayEntry {
         date: date.to_owned(),
         name: "Synthetic Holiday".to_owned(),
@@ -2280,7 +2282,12 @@ fn sweep_calendar() -> TradingCalendar {
         timezone: "Asia/Kolkata".to_owned(),
         max_orders_per_second: 10,
         nse_holidays: vec![holiday("2026-11-10"), holiday("2026-11-16")],
-        muhurat_trading_dates: vec![],
+        muhurat_trading_dates: vec![MuhuratTradingEntry {
+            date: "2026-11-08".to_owned(),
+            name: "Synthetic Muhurat".to_owned(),
+            session_start_ist: "14:05".to_owned(),
+            session_end_ist: "15:40".to_owned(),
+        }],
         nse_mock_trading_dates: vec![],
     })
     .expect("test calendar")
@@ -2311,8 +2318,8 @@ fn simulate_daily_loop(
         assert!(iterations < 1_000, "the loop must advance");
         let now_ist = clock;
         let today = ist_date_of(now_ist);
-        let trading = today.is_some_and(|d| calendar.is_trading_day(d));
-        if let (true, Some(day)) = (trading, today) {
+        let session_day = today.is_some_and(|d| calendar.is_session_day(d));
+        if let (true, Some(day)) = (session_day, today) {
             let wait = secs_until_expiry_scope_check(secs_of_day(now_ist));
             clock += i64::try_from(wait).expect("secs") * NANOS_PER_SEC;
             let begin = clock;
@@ -2327,14 +2334,14 @@ fn simulate_daily_loop(
 
 /// The production loop's statements, in the order `simulate_daily_loop`
 /// copies them. A source scan, not an execution: it fails when the real loop
-/// drops the trading-day gate, the 15:50 wait, or the run, reads the clock
+/// drops the session-day gate (a trading day or a Muhurat date), the 15:50 wait, or the run, reads the clock
 /// for the after-run sleep before the run, or measures that sleep from the
 /// instant after the run instead of the instant read before it.
 #[test]
 fn test_spawn_expiry_scope_check_loop_body_matches_the_simulated_steps() {
     let me = production(include_str!("expiry_scope_check.rs"));
     let spawn = me
-        .find("pub fn spawn_expiry_scope_check(")
+        .find("pub fn spawn_expiry_scope_check_with_clock<")
         .expect("spawn fn");
     let body_start = spawn + me[spawn..].find("loop {").expect("loop");
     let body_end = body_start
@@ -2345,11 +2352,12 @@ fn test_spawn_expiry_scope_check_loop_body_matches_the_simulated_steps() {
     let steps = [
         "let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);",
         "let today = ist_date_of(now_ist);",
-        "let trading = today.is_some_and(|d| calendar.is_trading_day(d));",
-        "if let (true, Some(day)) = (trading, today) {",
+        // B3 review (2026-11-13): a session day, Muhurat included (Quote 49).
+        "let session_day = today.is_some_and(|d| calendar.is_session_day(d));",
+        "if let (true, Some(day)) = (session_day, today) {",
         "let wait = secs_until_expiry_scope_check(secs_of_day(now_ist));",
         "tokio::time::sleep(Duration::from_secs(wait)).await;",
-        "run_one_check(&questdb, day, now_ist).await;",
+        "run_one_check(&questdb, day, now_ist, &now_utc_nanos).await;",
         "let after = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);",
         "let secs = secs_until_after_checked_day(now_ist, after);",
         "tokio::time::sleep(Duration::from_secs(secs)).await;",
@@ -2360,7 +2368,7 @@ fn test_spawn_expiry_scope_check_loop_body_matches_the_simulated_steps() {
         assert!(found.is_some(), "loop step missing or out of order: {step}");
         at += found.unwrap_or_default() + step.len();
     }
-    // The run sits inside the trading-day block: the block closes after the
+    // The run sits inside the session-day block: the block closes after the
     // run and before the after-run clock read.
     let run = body.find("run_one_check(").expect("run");
     let after = body.find("let after =").expect("after");
@@ -2403,8 +2411,8 @@ fn test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_tra
                 for &(day, begin, _) in &checks {
                     *per_day.entry(day).or_insert(0) += 1;
                     assert!(
-                        calendar.is_trading_day(day),
-                        "{label}: {day} is not a trading day"
+                        calendar.is_session_day(day),
+                        "{label}: {day} is not a session day"
                     );
                     assert_eq!(ist_date_of(begin), Some(day), "{label}");
                     assert!(
@@ -2414,7 +2422,7 @@ fn test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_tra
                 }
                 assert!(per_day.values().all(|&n| n == 1), "{label}: {per_day:?}");
                 for &day in &window {
-                    if !calendar.is_trading_day(day) || per_day.contains_key(&day) {
+                    if !calendar.is_session_day(day) || per_day.contains_key(&day) {
                         continue;
                     }
                     // A missed trading day must lie wholly inside one run
@@ -2428,12 +2436,18 @@ fn test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_tra
                 }
                 // The process started on a trading day after 15:50 checks
                 // that day at once.
-                if calendar.is_trading_day(start_day) && start_secs >= 57_000 {
+                if calendar.is_session_day(start_day) && start_secs >= 57_000 {
                     assert_eq!(
                         checks.first().map(|c| c.1),
                         Some(ist_at(start_day, start_secs)),
                         "{label}"
                     );
+                }
+                // The Muhurat Sunday is checked whenever the window covers
+                // it and no run longer than a day swallowed it.
+                let muhurat = NaiveDate::from_ymd_opt(2026, 11, 8).expect("date");
+                if run_secs <= 86_400 {
+                    assert_eq!(per_day.get(&muhurat), Some(&1), "{label}: Muhurat");
                 }
                 // The holidays and the weekend after a Friday run that
                 // crosses midnight are never checked.
@@ -2942,4 +2956,50 @@ fn test_classify_candle_contracts_sample_is_the_lowest_segment_code_then_id_in_a
         assert_eq!(counts.off_expiry, 2);
         assert_eq!(sample.as_deref(), Some("SBIN-29Dec2026-1000-CE"));
     }
+}
+
+/// B3 review (2026-11-13): production must keep reading the WALL clock.
+/// `spawn_expiry_scope_check_with_clock` exists so the coverage test can pass
+/// a fixed weekday and weekend; the production spawn passes `wall_now_utc_nanos`
+/// (chrono's UTC now) and nothing else.
+#[test]
+fn test_spawn_expiry_scope_check_with_clock_gets_the_wall_clock_in_production() {
+    let me = production(include_str!("expiry_scope_check.rs"));
+    let outer = me
+        .find("pub fn spawn_expiry_scope_check(")
+        .expect("production spawn");
+    let inner = me
+        .find("pub fn spawn_expiry_scope_check_with_clock<")
+        .expect("clock spawn");
+    let body = &me[outer..inner];
+    assert!(
+        body.contains("spawn_expiry_scope_check_with_clock(questdb, calendar, wall_now_utc_nanos)")
+    );
+    assert!(me.contains("chrono::Utc::now().timestamp_nanos_opt()"));
+    // The wall-clock fn must not share the clock parameter's name, or a
+    // dropped parameter would still compile and read the wall clock.
+    assert!(
+        !me.contains("fn now_utc_nanos("),
+        "the wall-clock fn is named wall_now_utc_nanos, never now_utc_nanos"
+    );
+    // The row's `checked_at` reads the clock it was given, not the wall.
+    let run = me.find("async fn run_one_check(").expect("run fn");
+    let run_body = &me[run..];
+    let end = run_body.find("\nasync fn ").unwrap_or(run_body.len());
+    let run_body = &run_body[..end];
+    assert!(run_body.contains("now_utc_nanos: &(impl Fn() -> i64 + Sync)"));
+    // B3 review round 2 (2026-11-13): the readiness wait reads the same
+    // clock (its sleep to the live-final instant), never the wall clock.
+    assert!(
+        run_body.contains("let now_unix_secs = || now_utc_nanos().div_euclid(NANOS_PER_SEC);"),
+        "run_one_check must derive the readiness clock from its own clock"
+    );
+    assert!(
+        run_body.contains("live_side_readiness_with_clock("),
+        "run_one_check must hand its clock to the readiness wait"
+    );
+    assert!(
+        !run_body.contains("dhan_live_crossverify_boot::live_side_readiness("),
+        "the wall-clock readiness wait must not be called from the clocked task"
+    );
 }

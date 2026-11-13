@@ -7370,6 +7370,11 @@ async fn run_frame_drain(
                 // feeding one to the main-feed dispatcher makes byte 0 a length
                 // low-byte that matches no response code, so every depth frame
                 // would be counted "unparseable" and silently lost.
+                // B3 (2026-11-13): where the `drain_frame_post` stage starts.
+                // A main-feed frame sets it to the instant its own stages end;
+                // any other frame keeps it at the frame timer's start, so its
+                // own handling is inside the post stage (see below).
+                let mut post_start: Option<std::time::Instant> = None;
                 match frame.endpoint {
                     DhanEndpointType::MainFeed => {
                         let outcome = drain_main_feed_frame(
@@ -7380,6 +7385,7 @@ async fn run_frame_drain(
                         // own work. One clock read and four relaxed atomics,
                         // no allocation.
                         let frame_work_end = std::time::Instant::now();
+                        post_start = Some(frame_work_end);
                         // The frame's duration, computed once for both stages.
                         let frame_work =
                             frame_work_end.saturating_duration_since(frame_work_start);
@@ -7619,6 +7625,13 @@ async fn run_frame_drain(
                     }
                     DhanEndpointType::OrderUpdate => c.non_tick.increment(1),
                 }
+                // B3 review round 3: a depth or order-update frame has no stage
+                // of its own, so its post sample starts at the frame timer's
+                // start and covers its own handling too (depth decode and
+                // staging, O(levels), and the ghost resend). Before, it started
+                // here and that handling was timed by no stage. No extra clock
+                // read: the instant is the one the heartbeat already took.
+                let post_start = post_start.unwrap_or(frame_work_start);
 
                 // SIZE trigger. Rows sitting in the ILP buffer have NOT reached
                 // QuestDB — an unflushed buffer is not storage, it is a leak
@@ -7651,6 +7664,19 @@ async fn run_frame_drain(
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
                 }
+                // B3 (2026-11-13): the frame arm's work after the fold (the
+                // stamping above, the size-trigger and unbacked hand-offs, the
+                // 1,024-frame publish), which `drain_main_frame`,
+                // `drain_main_tick` and `receipt_to_fold` end before; for a
+                // depth or order-update frame it also holds that frame's own
+                // handling, from the frame timer's start. A
+                // hand-off with no spare batch reserves and touches a fresh
+                // one right here, so this is where that cost shows. One clock
+                // read and four relaxed atomics, no allocation.
+                tickvault_storage::hot_path_telemetry::record_stage(
+                    tickvault_storage::hot_path_telemetry::Stage::DrainFramePost,
+                    post_start.elapsed(),
+                );
             }
             // The ring tail is done once the frame arm finds the ring EMPTY.
             // `consume_budget` and not a ready future: when the task's
@@ -26433,6 +26459,10 @@ mod tests {
              {before} -> {after} for {FRAMES} frames"
         );
     }
+
+    // B3 (2026-11-13) drain_frame_post tests live in
+    // `dhan_feed_stack/tests/b3_post_frame_tests.rs` (size pin).
+    mod b3_post_frame_tests;
 
     /// The drain must exit on the shutdown signal **while the ring is still
     /// open** — the exit path that did not exist until 2026-08-14.
