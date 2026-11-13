@@ -146,6 +146,10 @@ const BUDGET: &[(&str, usize)] = &[
     // the same test, `test_idle_arm_keeps_seeding_queued_batches_after_the_seed_channel_closes`:
     // idle steps alone seed every queued batch after the sender is dropped.
     ("dhan_feed_stack/seed_step_tests.rs", 1),
+    // 3 (2026-11-13, audit B3 finding 12): pin that the drain records
+    // drain_frame_post after the hand-offs on every frame kind. Paired behaviour
+    // test (same file): `test_regression_b3_drain_records_the_post_frame_stage_after_the_hand_offs`.
+    ("dhan_feed_stack/tests/b3_post_frame_tests.rs", 3),
     ("dhan_live_crossverify.rs", 7),
     ("dhan_live_crossverify_boot.rs", 8),
     ("dhan_live_universe.rs", 18),
@@ -195,7 +199,10 @@ const BUDGET: &[(&str, usize)] = &[
     // +1 the real 15:50 loop keeps the simulated loop's step order (the loop
     // sleeps until 15:50 and cannot run in a test); paired behaviour test
     // `test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_trading_day_once`.
-    ("expiry_scope_check_tests.rs", 7),
+    // 7 -> 8 (2026-11-13, audit B3 finding 14): pins that production passes the
+    // wall clock to `spawn_expiry_scope_check_with_clock`. Paired behaviour test:
+    // `test_expiry_scope_check_spawn_runs_a_weekday_and_skips_a_weekend_whatever_the_wall_clock`.
+    ("expiry_scope_check_tests.rs", 8),
     // 2 -> 3 (2026-11-06, plan PR AL-2 review): pins that every QuestDB
     // failure site in the ~900-line scoreboard attempt logs through
     // `scoreboard_failure!` and returns Retry before the final attempt (a new
@@ -244,7 +251,10 @@ const BUDGET: &[(&str, usize)] = &[
     // conservation check and reads the last WAL receipt after claiming the WAL
     // and before its own writer starts. Paired behaviour tests: the
     // `test_classify_*` verdict tests and `test_process_down_gap_row_*`.
-    ("tick_conservation.rs", 1),
+    // 1 -> 3 (2026-11-13, audit B3 finding 14): pins that production passes the
+    // wall clock and the daily loop reads only the injected clock. Paired
+    // behaviour test: `test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_calls_for`.
+    ("tick_conservation.rs", 3),
     ("ws_audit_consumer.rs", 2),
     ("ws_connection_rollup.rs", 1),
 ];

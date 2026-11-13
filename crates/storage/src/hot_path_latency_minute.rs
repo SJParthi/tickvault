@@ -80,8 +80,9 @@
 //!
 //! ## Cost
 //!
-//! 8 rows a minute (one per stage, `ALL_STAGES`), ~3,900 rows a day at the
-//! box's ~8 hours. QuestDB only;
+//! 9 rows a minute (one per stage, `ALL_STAGES`; 8 until B3 added
+//! `drain_frame_post` on 2026-11-13), ~4,300 rows a day at the box's ~8
+//! hours. QuestDB only;
 //! nothing goes to `/metrics` except one drop counter.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -697,7 +698,7 @@ impl HotPathLatencyMinuteWriter {
     }
 
     /// Appends one row. Cold path: one per stage a minute (`ALL_STAGES`, eight
-    /// since PR DP-6), on the writer thread.
+    /// since PR DP-6, nine since B3 added `drain_frame_post`), on the writer thread.
     ///
     /// # Errors
     /// Propagates ILP buffer errors.
@@ -1302,6 +1303,27 @@ mod tests {
         assert!(!over_1024ns_is_meaningful(Stage::MainRuntimeLag));
         assert!(!over_1024ns_is_meaningful(Stage::ReaderRuntimeLag));
         assert!(!over_1024ns_is_meaningful(Stage::ReceiptToFold));
+    }
+
+    // Regression: 2026-11-13 (B3): the frame arm's post-fold hand-offs were
+    // in no stage, so no minute row could show them. Every minute now has a
+    // `drain_frame_post` row whose over-1,024 ns count is kept (most frames
+    // trip no hand-off, so the count separates the hand-off tail).
+    #[test]
+    fn test_regression_b3_every_minute_has_a_drain_frame_post_row() {
+        let mut acc = MinuteAccumulator::new();
+        let mut w = window_with(Stage::DrainFramePost, 200, 990);
+        w.stage_buckets[Stage::DrainFramePost as usize][bucket_index(600_000)] += 10;
+        w.stage_max_nanos[Stage::DrainFramePost as usize] = 600_000;
+        let _ = acc.absorb(minute(0), &w);
+        let rows = acc.rows().expect("rows");
+        assert_eq!(rows.len(), ALL_STAGES.len());
+        let post = row_of(&rows, Stage::DrainFramePost);
+        assert_eq!(post.stage.as_str(), "drain_frame_post");
+        assert_eq!(post.samples, 1_000);
+        assert_eq!(post.samples_over_1024ns, Some(10));
+        assert_eq!(post.max_ns, 600_000);
+        assert!(over_1024ns_is_meaningful(Stage::DrainFramePost));
     }
 
     /// The max is the largest per-second max, per stage.

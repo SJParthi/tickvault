@@ -105,7 +105,7 @@ How to read it:
 
 - `p99_ns = 1024` bounds the recorded population at 1,024 ns; it cannot distinguish 999, 1000 or 1001 ns. The strict result is UNKNOWN, not PASS. Historical later buckets demonstrate a miss. This correction closes false assurance; it does not achieve the latency target or alter existing histograms.
 - `samples_over_1024ns` retains its exact historical meaning: above 1,024 ns. It is not a strict 1,000 ns classifier. Zero samples provide no percentile, and zero appended tick rows do not independently prove zero eligible frames.
-- `socket_to_wal` and `ring_dwell` aggregate endpoints; `drain_main_frame` and `receipt_to_fold` cover main-feed frames. All use `feed='dhan'`, which does not separate endpoints. Counts are not comparable as one population. Decode/fold/append are combined in the frame timer; no individual depth/flush/maintenance p99 is established here.
+- `socket_to_wal` and `ring_dwell` aggregate endpoints; `drain_main_frame` and `receipt_to_fold` cover main-feed frames. All use `feed='dhan'`, which does not separate endpoints. Counts are not comparable as one population. Decode/fold/append are combined in the frame timer; no individual depth/flush/maintenance p99 is established here. (From 2026-11-13 the frame arm's size-trigger hand-offs and its 1,024-frame upkeep are measured together in `drain_frame_post`, below; the drain's other arms are not, see the list there.)
 - `ring_dwell` starts at the pre-WAL receipt instant and overlaps socket work; `receipt_to_fold` overlaps both. Do not sum these values or divide a frame percentile into a per-row percentile.
 - `i64::MAX` means the value was above every histogram bound; read `max_ns` for the real value.
 - `main_runtime_lag`, `reader_runtime_lag` and `metrics_upkeep` are not tick steps. They measure the lateness of a 100 ms sleep and the exporter upkeep.
@@ -117,6 +117,15 @@ How to read it:
 SELECT ts, samples AS ticks, p50_ns, p99_ns, p999_ns, max_ns, samples_over_1024ns
 FROM hot_path_latency_minute
 WHERE ts IN today() AND stage = 'drain_main_tick'
+ORDER BY ts;
+```
+
+- **Work after the fold: the `drain_frame_post` stage (from 2026-11-13, B3).** `drain_main_frame`, `drain_main_tick` and `receipt_to_fold` all stop their clock when a frame's fold returns. The frame arm then still runs, before it can take the next frame: the socket delivery stamp, the tick size-trigger hand-off (every 1,000 rows; with no recycled spare it reserves and touches a fresh staged batch of about 4.5 MiB on the drain), the depth size-trigger or unbacked hand-off, and the gauges every 1,024 frames. Until 2026-11-13 no stage timed it directly; it showed only as later frames' `ring_dwell`, so a minute could read `drain_main_tick p99_ns <= 1024` while hand-offs held the drain. `drain_frame_post` records it once per frame (every endpoint); for a main-feed frame it starts where `drain_main_frame` ends, so the two add up to the frame's time on the drain from the frame timer's start (the ring-dwell bookkeeping just before that start is untimed: a few atomics and one clock read, Assumed well under a microsecond). A depth or order-update frame has no stage of its own, so its `drain_frame_post` sample starts at the frame timer's start and also holds that frame's own handling (depth decode and staging, up to 200 levels a packet); depth and main-feed samples share the one row and cannot be told apart. Do not add `drain_frame_post` to `ring_dwell` or `receipt_to_fold`: the time a post step holds the drain is also inside the `ring_dwell` (and `receipt_to_fold`) of every frame queued behind it. Most frames trip no hand-off, so read its `p999_ns`, `max_ns` and `samples_over_1024ns`, not its p50. Still in no stage, all on the same drain task (B3 review, 2026-11-13: the first version of this line named only the first): the 500 ms flush timer arm (the tick and depth hand-offs and the gauge publish); the 30 s silence arm (the silence scan over every tracked instrument, O(tracked), about 70 µs at 25,000, the depth-200 cross-feed check and the gap gauges); the idle arm (one catch-up seal step of 256 slots times every timeframe plus the seals it emits, or one step of 512 seed inserts); the 5 s catch-up timer arm and the seed receive arm (both O(1)); the shutdown arm; and, inside the frame arm itself, the frame's drop after the record (a buffer reference released, which frees the socket buffer when the WAL writer has already released its copy). Each shows only as later frames' `ring_dwell`, so a large `ring_dwell` with small `drain_main_frame` and `drain_frame_post` points at one of these, not only the timer arm.
+
+```sql
+SELECT ts, samples AS frames, p50_ns, p99_ns, p999_ns, max_ns, samples_over_1024ns
+FROM hot_path_latency_minute
+WHERE ts IN today() AND stage = 'drain_frame_post'
 ORDER BY ts;
 ```
 

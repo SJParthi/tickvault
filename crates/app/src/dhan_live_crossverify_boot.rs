@@ -1145,6 +1145,16 @@ pub trait ReadinessSource {
 struct ProductionReadiness<'a> {
     client: reqwest::Client,
     exec_url: &'a str,
+    /// UTC unix seconds. [`wall_clock_unix_secs`] in production; the daily
+    /// expiry-scope check passes its own injected clock (B3 review,
+    /// 2026-11-13), so the readiness wait's sleep to the live-final instant
+    /// follows the same clock as the rest of that task.
+    now_unix_secs: &'a (dyn Fn() -> i64 + Sync),
+}
+
+/// The wall clock, UTC unix seconds. O(1).
+fn wall_clock_unix_secs() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 impl ReadinessSource for ProductionReadiness<'_> {
@@ -1174,7 +1184,7 @@ impl ReadinessSource for ProductionReadiness<'_> {
     }
 
     fn now_unix_secs(&self) -> i64 {
-        chrono::Utc::now().timestamp()
+        (self.now_unix_secs)()
     }
 }
 
@@ -1409,6 +1419,7 @@ async fn attempt_readiness(
     let src = ProductionReadiness {
         client,
         exec_url: &deps.questdb_exec_url,
+        now_unix_secs: &wall_clock_unix_secs,
     };
     let day_key = day_start_ist_nanos.div_euclid(1_000_000_000);
     let prior = FIRST_AFTER_LIVE_FINAL
@@ -1437,6 +1448,29 @@ pub async fn live_side_readiness(
     day_start_ist_nanos: i64,
     deadline: tokio::time::Instant,
 ) -> LiveReadiness {
+    live_side_readiness_with_clock(
+        exec_url,
+        today,
+        day_start_ist_nanos,
+        deadline,
+        &wall_clock_unix_secs,
+    )
+    .await
+}
+
+/// [`live_side_readiness`] with the clock passed in: `now_unix_secs` returns
+/// UTC unix seconds and is what the wait reads to decide how long to sleep
+/// before the live-final instant. The daily expiry-scope check passes its
+/// injected clock here (B3 review, 2026-11-13), so a test that fixes that
+/// task's date also fixes this wait. The sleeps are tokio sleeps either way.
+/// Same cost as [`live_side_readiness`].
+pub async fn live_side_readiness_with_clock(
+    exec_url: &str,
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+    deadline: tokio::time::Instant,
+    now_unix_secs: &(dyn Fn() -> i64 + Sync),
+) -> LiveReadiness {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
         .build()
@@ -1446,7 +1480,11 @@ pub async fn live_side_readiness(
             completeness: Completeness::Unknown,
         };
     };
-    let src = ProductionReadiness { client, exec_url };
+    let src = ProductionReadiness {
+        client,
+        exec_url,
+        now_unix_secs,
+    };
     wait_live_final(&src, today, day_start_ist_nanos, deadline, None)
         .await
         .0
@@ -8489,5 +8527,95 @@ mod tests {
             ],
             "actual alarm events occur once per date, with only a warning on same-day replay"
         );
+    }
+
+    /// B3 review (2026-11-13): the production readiness source used to read
+    /// the wall clock whatever its caller's clock said, so the daily
+    /// expiry-scope check's injected clock did not reach the readiness
+    /// wait's sleep to the live-final instant. The source now reads the
+    /// clock it is given; the cross-check passes the wall clock.
+    #[test]
+    fn production_readiness_reads_the_clock_it_was_given() {
+        let fixed = || 1_762_857_000_i64;
+        let src = ProductionReadiness {
+            client: reqwest::Client::new(),
+            exec_url: "http://tv-test-unreachable.invalid:9000/exec",
+            now_unix_secs: &fixed,
+        };
+        assert_eq!(src.now_unix_secs(), 1_762_857_000);
+        let wall = ProductionReadiness {
+            client: reqwest::Client::new(),
+            exec_url: "http://tv-test-unreachable.invalid:9000/exec",
+            now_unix_secs: &wall_clock_unix_secs,
+        };
+        let before = chrono::Utc::now().timestamp();
+        let read = wall.now_unix_secs();
+        let after = chrono::Utc::now().timestamp();
+        assert!(before <= read && read <= after, "{before} {read} {after}");
+    }
+
+    #[tokio::test]
+    async fn live_side_readiness_with_clock_is_not_ready_without_a_drained_seal_writer() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 11).expect("date");
+        let day_start = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("nanos");
+        let clock = || 1_762_857_000_i64;
+        let readiness = live_side_readiness_with_clock(
+            "http://tv-test-unreachable.invalid:9000/exec",
+            day,
+            day_start,
+            tokio::time::Instant::now(),
+            &clock,
+        )
+        .await;
+        assert_ne!(readiness.durability, Durability::Applied, "{readiness:?}");
+    }
+
+    /// B3 review round 3 (2026-11-13): the test above passes with any clock
+    /// (its deadline cuts the early sleep off at once, and no seal writer
+    /// means not ready whatever the time), so nothing at run time proved
+    /// that `live_side_readiness_with_clock` hands the readiness wait the
+    /// clock it was given. Here the clock reads 600 s before the day's
+    /// live-final instant and counts its reads: the wait must read it (a
+    /// wall clock passed inside would leave the count at 0), and with a 300 s
+    /// deadline it must sleep to that deadline before its first sample, so
+    /// the call returns no earlier than 300 s of virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn live_side_readiness_with_clock_sleeps_on_the_clock_it_was_given() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 11).expect("date");
+        let day_start = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("nanos");
+        let early_reading = ReadinessDay::new(day_start)
+            .live_final_unix_secs
+            .saturating_sub(600);
+        let reads = AtomicUsize::new(0);
+        let clock = || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            early_reading
+        };
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(300);
+        let readiness = live_side_readiness_with_clock(
+            "http://tv-test-unreachable.invalid:9000/exec",
+            day,
+            day_start,
+            deadline,
+            &clock,
+        )
+        .await;
+        assert!(
+            reads.load(Ordering::Relaxed) >= 1,
+            "the readiness wait must read the injected clock"
+        );
+        assert!(
+            tokio::time::Instant::now() >= deadline,
+            "the wait sleeps toward the live-final instant on the injected clock"
+        );
+        assert_ne!(readiness.durability, Durability::Applied, "{readiness:?}");
     }
 }

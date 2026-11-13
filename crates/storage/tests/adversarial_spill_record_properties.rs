@@ -262,18 +262,29 @@ proptest! {
     /// the range, and `None` exactly when there is none.
     #[test]
     fn prop_split_at_line_boundary_matches_reference(
-        bytes in prop::collection::vec(prop_oneof![Just(b'\n'), Just(b'a'), any::<u8>()], 0..96),
+        bytes in prop::collection::vec(
+            prop_oneof![Just(b'\n'), Just(b'\\'), Just(b'a'), any::<u8>()],
+            0..96,
+        ),
         start in 0usize..110,
         len in 0usize..110,
     ) {
         let range = start..start.saturating_add(len);
         let got = split_at_line_boundary(&bytes, range.clone());
         let end = range.end.min(bytes.len());
-        let reference_exists = (start.saturating_add(1)..end).any(|s| bytes[s - 1] == b'\n');
+        // B1 (2026-11-13): a newline after an ODD run of backslashes is
+        // escaped inside an ILP string field and does not end a row, so it is
+        // not a boundary. The reference counts the run itself rather than
+        // calling the code under test.
+        let row_end = |i: usize| {
+            bytes[i] == b'\n'
+                && bytes[..i].iter().rev().take_while(|b| **b == b'\\').count() % 2 == 0
+        };
+        let reference_exists = (start.saturating_add(1)..end).any(|s| row_end(s - 1));
         match got {
             Some(s) => {
                 prop_assert!(s > start && s < end, "split {} outside ({}, {})", s, start, end);
-                prop_assert_eq!(bytes[s - 1], b'\n');
+                prop_assert!(row_end(s - 1), "split {} is not after a row-ending newline", s);
             }
             None => prop_assert!(!reference_exists, "a boundary exists in {:?}", range),
         }

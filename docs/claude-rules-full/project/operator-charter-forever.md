@@ -69,7 +69,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 
 | Demand | Mechanical proof artefact | Real-time check tool |
 |---|---|---|
-| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up | `scripts/coverage-gate.sh` in CI |
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up | `scripts/coverage-gate.sh` in CI |
 | 100% audit coverage | `<event>_audit` table with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` |
 | 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green |
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory |
@@ -325,7 +325,7 @@ For every plan item / new feature / Telegram message / docs:
 | `resilience_sla_alert_guard.rs` | `cargo test` | every counter has an alert rule **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist failures use `error!` not `warn!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget on hot-path benches |
-| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (72.6–99.4, target 100%) per crate |
+| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%) per crate |
 | `block-bypass.sh` (wired via `pre-tool-dispatch.sh`) | pre-bash | `--no-verify`, `git stash push/pop/apply/save`, `--dangerously-skip-permissions`, `gh pr merge --admin`, force-push to main/master |
 | GitHub Actions CI | every PR | full 22-test battery + mutation + fuzz |
 

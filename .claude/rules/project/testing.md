@@ -30,8 +30,10 @@ fn test_<module>_<function>_<scenario>_<expected_outcome>()
 
 ## Coverage Thresholds
 - Single source of truth: `quality/crate-coverage-thresholds.toml` — ratcheted
-  per-crate LINE-coverage floors (app 72.6 · core 91.6 · storage 90.1 ·
-  trading 96.9 · api 98.6 · common 99.4 · default 63.0). Floors only move up
+  per-crate LINE-coverage floors (app 86.4 · core 94.5 · storage 93.7 ·
+  trading 97.1 · api 98.6 · common 99.4 · default 63.0; raised 2026-11-13, B3;
+  test code inside src counts as covered in these, so a second check floors
+  production-only coverage from the `[production]` table). Floors only move up
   (`coverage_threshold_lockdown.rs` ratchet); 100% remains the target.
   (storage 91.2 → 90.1 on 2026-07-17: truthful re-baseline after the stage-2
   dead-WS sweep deleted ~12K LoC of heavily-tested dead tick-chain code —

@@ -2,7 +2,7 @@
 //!
 //! `scripts/coverage-gate.sh` enforces per-CRATE floors only, and it is
 //! budget-pinned (shell may only shrink), so it cannot grow a per-file check.
-//! The `app` crate floor is 72.6%, and app holds the largest files in the
+//! The `app` crate floor is 86.4% (since 2026-11-13, test-inclusive), and app holds the largest files in the
 //! workspace (`main.rs`, `dhan_feed_stack.rs`), so one of them could lose most
 //! of its tests while the crate average still passes.
 //!

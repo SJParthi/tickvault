@@ -224,7 +224,7 @@ The operator's charter is non-negotiable. If a PR seems "too much work for a sma
 | `resilience_sla_alert_guard.rs` | `cargo test` | counter must have alert rule **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist uses `error!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget |
-| `scripts/coverage-gate.sh` | ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** every PR (inside All Green) and again after merge | ratcheted per-crate floors (72.6–99.4, target 100%) per crate |
+| `scripts/coverage-gate.sh` | ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** every PR (inside All Green) and again after merge | ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%) per crate |
 | **NEW:** `z-plus-checklist-guard.sh` | pre-PR | Z+ checklist filled in for every plan item **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): NOT BUILT; no such hook exists.** |
 | **NEW:** `auto-driver-test-guard.sh` | pre-PR | operator-facing text passes auto-driver test **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): NOT BUILT; no such hook exists.** |
 
