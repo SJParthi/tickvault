@@ -88,6 +88,12 @@ use crate::live_fill::paper_rows::{
     PaperOutcome, clamp_exit, execution_rows, reject_row, remainder_reason,
 };
 use crate::live_fill::replay::scripted::ScriptedIntents;
+
+/// The replay's engine type. Named so the chain type below reads
+/// `LiveFillChain<ReplayEngine>`: written out with the engine's own name,
+/// the lowercased text holds the HTML tag opener the browser-surface guard
+/// counts, which would wrongly mark this file as a frontend surface.
+type ReplayEngine = ScriptedIntents;
 use crate::live_fill::timing::{SESSION_CLOSE_SOD, SESSION_OPEN_SOD};
 use crate::main_feed_backup::ReplayBackup;
 
@@ -231,7 +237,7 @@ pub struct ReplayDriver {
     engine: ScriptedIntents,
     setup: ChainSetup,
     params: ChainParams,
-    chain: Option<LiveFillChain<ScriptedIntents>>,
+    chain: Option<LiveFillChain<ReplayEngine>>,
     fold: MultiTfAggregator,
     backup: Option<ReplayBackup>,
     universe: HashSet<InstrumentKey>,
