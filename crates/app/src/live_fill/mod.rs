@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use tickvault_common::config::{ApplicationConfig, LiveFillConfig};
 use tickvault_common::error_code::ErrorCode;
-use tickvault_core::websocket::frame_ring::FrameRingReceiver;
+use tickvault_core::websocket::frame_ring::{FrameRingReceiver, FrameRingSender, frame_ring};
 use tickvault_storage::live_order_events_persistence::{LiveOrderEvent, LiveOrderEventKind};
 use tickvault_trading::brutex_host::InstrumentKey;
 use tickvault_trading::brutex_host::Refusal;
@@ -61,7 +61,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::dhan_feed_stack::live_fill_tap::{TapLink, TapTick, live_fill_tap_ring};
-use chain::{ChainOutput, ChainParams, ChainSetup, LiveFillChain, PaperCmd};
+use chain::{ChainOutput, ChainParams, ChainSetup, LiveFillChain, PaperCmd, PositionReport};
 use taint::TaintReason;
 
 /// Gauge: 1 while a strategy engine runs the chain, 0 otherwise.
@@ -79,6 +79,19 @@ pub const LATE_TICKS_COUNTER: &str = "tv_live_fill_late_ticks_total";
 /// Counter: untrusted stretches, by reason.
 pub const TAINT_COUNTER: &str = "tv_live_fill_taint_total";
 
+/// The Reject reason when the order runtime's channel had no room for a
+/// priced order: the chain had worked its fill out (the daily re-pricing
+/// reads its share of the seconds as known, LF-9).
+pub const PAPER_QUEUE_FULL_REASON: &str = "paper_queue_full";
+
+/// The key of the count of late 1 s prints the chain saw inside a priced
+/// order's fill window, on that order's rows (`late_fill_ticks=N` in the
+/// reason). The daily re-pricing reads an order carrying it as one whose
+/// share of the seconds is not known (LF-9 review, third pass): the late
+/// print can have changed the stored volume of a second the chain had
+/// already settled.
+pub const LATE_FILL_TICKS_KEY: &str = "late_fill_ticks";
+
 /// Ticks one pass takes from the ring at most.
 pub const MAX_TICKS_PER_PASS: usize = 4_096;
 const IDLE_PASSES_BEFORE_SLOW_SLEEP: u32 = 50;
@@ -92,8 +105,14 @@ const COUNTER_PUBLISH_INTERVAL_SECS: u64 = 1;
 /// it writes Sent / Ack / Fill / Cancel / Reject rows on.
 #[derive(Debug)]
 pub struct PaperLink {
-    pub cmds: mpsc::Receiver<PaperCmd>,
+    /// A pre-allocated ring (LF-9 finding 5): a tokio channel grew 32-slot
+    /// blocks while the runtime lagged, an allocation per pass on this
+    /// thread.
+    pub cmds: FrameRingReceiver<PaperCmd>,
     pub events: mpsc::Sender<LiveOrderEvent>,
+    /// What the runtime booked for each Execute, back to the chain (LF-9
+    /// finding 2): a pre-allocated ring the chain thread busy-polls.
+    pub positions: FrameRingSender<PositionReport>,
 }
 
 static TAP_SLOT: Mutex<Option<TapLink>> = Mutex::new(None);
@@ -319,7 +338,12 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     let chain = LiveFillChain::new(engine, setup, params, now_ist_ns)?;
     let (tap_tx, tap_rx) = live_fill_tap_ring(config.tap_capacity);
     let tap_loss = Arc::new(AtomicU64::new(0));
-    let (cmd_tx, cmd_rx) = mpsc::channel::<PaperCmd>(config.event_channel_capacity);
+    let (cmd_tx, cmd_rx) = frame_ring::<PaperCmd>(config.event_channel_capacity.max(1));
+    // Every Execute in flight gets one report: the command channel, the
+    // runtime's exit retry queue and one pass of finished orders bound them.
+    let (pos_tx, pos_rx) =
+        frame_ring::<PositionReport>(position_ring_capacity(config.event_channel_capacity));
+    pos_rx.set_busy_polling(true);
     *TAP_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(TapLink {
         tx: tap_tx,
         loss: Arc::clone(&tap_loss),
@@ -327,11 +351,25 @@ pub fn start_chain<E: StrategyEngine + Send + 'static>(
     *PAPER_SLOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(PaperLink {
         cmds: cmd_rx,
         events: events_tx.clone(),
+        positions: pos_tx,
     });
     std::thread::Builder::new()
         .name("tv-live-fill".to_owned())
-        .spawn(move || run_live_fill_thread(chain, tap_rx, &tap_loss, cmd_tx, events_tx))?;
+        .spawn(move || {
+            run_live_fill_thread(chain, tap_rx, pos_rx, &tap_loss, cmd_tx, events_tx);
+        })?;
     Ok(())
+}
+
+/// Slots of the position-report ring (LF-9 finding 2): every Execute that can
+/// be in flight at once (the command channel, the runtime's exit retry queue,
+/// one pass of finished orders), so a report is never dropped while the chain
+/// thread keeps up. O(1).
+#[must_use]
+pub fn position_ring_capacity(cmd_capacity: usize) -> usize {
+    cmd_capacity
+        .saturating_add(fill_window::MAX_PENDING_ORDERS * 4)
+        .saturating_add(fill_window::MAX_PENDING_ORDERS)
 }
 
 /// The wall clock, IST epoch nanoseconds. O(1).
@@ -346,12 +384,15 @@ pub fn wall_ist_ns() -> i64 {
 /// Hands one chain output to its channel. Never waits: a full channel is
 /// counted and logged (at powers of two, so a stall cannot flood the log).
 /// O(1) apart from the row itself.
+/// Returns the report of an Execute the command channel refused (`expected`
+/// shares, nothing booked), so the chain can take its shares back (LF-9
+/// finding 2).
 pub fn send_output(
     o: ChainOutput,
-    cmd_tx: &mpsc::Sender<PaperCmd>,
+    cmd_tx: &FrameRingSender<PaperCmd>,
     events_tx: &mpsc::Sender<LiveOrderEvent>,
     drops: &mut SendDrops,
-) {
+) -> Option<PositionReport> {
     match o {
         ChainOutput::Event(e) => {
             if events_tx.try_send(*e).is_err() {
@@ -370,7 +411,7 @@ pub fn send_output(
         }
         ChainOutput::Cmd(cmd) => {
             let execution = match &cmd {
-                PaperCmd::Execute(x) => Some(x.base.clone()),
+                PaperCmd::Execute(x) => Some((x.base.clone(), paper_rows::position_report(x, 0))),
                 PaperCmd::Mark { .. } => None,
             };
             if cmd_tx.try_send(cmd).is_err() {
@@ -385,20 +426,112 @@ pub fn send_output(
                          runtime's channel was full or closed"
                     );
                 }
-                if let Some(mut row) = execution {
+                if let Some((mut row, unsent)) = execution {
                     row.event = LiveOrderEventKind::Reject;
                     row.seq = 2;
                     row.ts_ist_nanos = wall_ist_ns();
-                    row.reason = Some("paper_queue_full".to_owned());
+                    row.reason = Some(PAPER_QUEUE_FULL_REASON.to_owned());
                     if events_tx.try_send(row).is_err() {
                         drops.events = drops.events.saturating_add(1);
                         metrics::counter!(EVENTS_DROPPED_COUNTER).increment(1);
                     }
+                    return Some(unsent);
                 }
             } else if execution.is_some() {
                 metrics::counter!(ORDERS_SENT_COUNTER).increment(1);
             }
         }
+    }
+    None
+}
+
+/// The thread's once-a-second counter publish (LF-9 finding 5). Every metric
+/// handle is resolved once, at construction: a `counter!` with a non-literal
+/// label value builds its label list on the heap at EVERY call (the
+/// allocating arm of the `metrics` macro), so the taint counters used to
+/// allocate four times a second on this thread. A publish now allocates
+/// nothing unless it logs a loss line (rare). O(`TaintReason::COUNT`).
+pub struct CounterPublisher {
+    refused: metrics::Counter,
+    late: metrics::Counter,
+    taints: [metrics::Counter; TaintReason::COUNT],
+    published: chain::ChainCounters,
+    taints_published: [u64; TaintReason::COUNT],
+    /// `tv_live_fill_engine_configured`, resolved once (LF-9 review, finding
+    /// 5).
+    configured: metrics::Gauge,
+    /// Whether the chain was inert (`awaiting_day_setup`) at the last pass.
+    inert: bool,
+}
+
+impl CounterPublisher {
+    /// Resolves the handles and takes `c` and `t` as published. Cold.
+    #[must_use]
+    pub fn new(c: chain::ChainCounters, t: [u64; TaintReason::COUNT]) -> Self {
+        Self {
+            refused: metrics::counter!(ORDERS_REFUSED_COUNTER),
+            late: metrics::counter!(LATE_TICKS_COUNTER),
+            taints: std::array::from_fn(
+                |i| metrics::counter!(TAINT_COUNTER, "reason" => TaintReason::ALL[i].as_str()),
+            ),
+            published: c,
+            taints_published: t,
+            configured: metrics::gauge!(ENGINE_CONFIGURED_GAUGE),
+            inert: false,
+        }
+    }
+
+    /// The chain's inert state after a pass (LF-9 review, finding 5): when a
+    /// day roll leaves it on yesterday's setup it decides nothing, so the
+    /// engine-configured gauge goes to 0 at that edge (it read 1 all day
+    /// before, a false OK). Local `/metrics` only, no page or alarm. O(1):
+    /// one compare, one gauge store on the edge only.
+    pub fn note_inert(&mut self, inert: bool) {
+        if inert != self.inert {
+            self.inert = inert;
+            self.configured.set(if inert { 0.0 } else { 1.0 });
+        }
+    }
+
+    /// Adds what moved since the last publish, and logs once per moved loss
+    /// or stale-setup count. O(`TaintReason::COUNT`).
+    pub fn publish(&mut self, c: chain::ChainCounters, t: [u64; TaintReason::COUNT]) {
+        let published = self.published;
+        self.refused
+            .increment(c.refused.saturating_sub(published.refused));
+        self.late
+            .increment(c.late_ticks.saturating_sub(published.late_ticks));
+        for (i, counter) in self.taints.iter().enumerate() {
+            counter.increment(t[i].saturating_sub(self.taints_published[i]));
+        }
+        if c.outbox_overflow > published.outbox_overflow {
+            warn!(
+                lost = c.outbox_overflow - published.outbox_overflow,
+                "live paper fill chain: outputs over the per-pass outbox were lost"
+            );
+        }
+        if c.day_rolls_without_setup > published.day_rolls_without_setup {
+            // Once per day roll (LF-9 finding 12), never per bar.
+            warn!(
+                code = ErrorCode::OrderReady01GateRefused.code_str(),
+                source = "live_fill_setup_stale",
+                "live paper fill chain: a new trading day began while the loaded setup \
+                 is the previous day's; the chain decides nothing until the process \
+                 restarts and loads a setup checked for today (paper only, no order is \
+                 placed)"
+            );
+        }
+        if c.executions_lost > published.executions_lost {
+            error!(
+                code = ErrorCode::OrderReady01GateRefused.code_str(),
+                source = "live_fill_execution_not_queued",
+                lost = c.executions_lost - published.executions_lost,
+                "live paper fill chain: a filled paper order could not be queued (the \
+                 outbox was full); the chain did not count it as held (paper only)"
+            );
+        }
+        self.published = c;
+        self.taints_published = t;
     }
 }
 
@@ -409,22 +542,80 @@ pub struct SendDrops {
     pub events: u64,
 }
 
+/// Hands every position report the runtime sent since the last pass to the
+/// chain (LF-9 finding 2). The thread's own step, split out so a test drives
+/// the exact code the thread runs (LF-9 review). O(reports), no allocation.
+fn apply_position_reports<E: StrategyEngine>(
+    chain: &mut LiveFillChain<E>,
+    pos_rx: &mut FrameRingReceiver<PositionReport>,
+) {
+    while let Some(r) = pos_rx.try_recv() {
+        chain.on_position_report(&r);
+    }
+}
+
+/// Sends the chain's outputs and takes back the shares of every Execute the
+/// command channel refused (`forget_unsent`, LF-9 finding 2). `unsent` is the
+/// thread's pre-sized scratch, left empty. The thread's own step, split out
+/// for the same reason as [`apply_position_reports`]. O(outputs), no
+/// allocation within the scratch's capacity.
+fn forward_outputs<E: StrategyEngine>(
+    chain: &mut LiveFillChain<E>,
+    cmd_tx: &FrameRingSender<PaperCmd>,
+    events_tx: &mpsc::Sender<LiveOrderEvent>,
+    drops: &mut SendDrops,
+    unsent: &mut Vec<PositionReport>,
+) {
+    chain.drain_outputs(|o| {
+        if let Some(r) = send_output(o, cmd_tx, events_tx, drops)
+            && unsent.len() < unsent.capacity()
+        {
+            unsent.push(r);
+        }
+    });
+    for r in unsent.drain(..) {
+        chain.forget_unsent(r.security_id, r.segment, r.expected_shares);
+    }
+}
+
+/// One pass of the thread and its inert-state report (LF-9 review, finding
+/// 5): the thread's own step, split out so a test drives the exact code it
+/// runs. O(1) more than the pass.
+///
+/// # Errors
+/// As [`LiveFillChain::on_pass_bounded`].
+fn pass_step<E: StrategyEngine>(
+    chain: &mut LiveFillChain<E>,
+    publisher: &mut CounterPublisher,
+    wall_ist_ns: i64,
+    mono_ns: i64,
+    backlogged: bool,
+) -> Result<(), chain::ChainError> {
+    chain.on_pass_bounded(wall_ist_ns, mono_ns, backlogged)?;
+    publisher.note_inert(chain.awaiting_day_setup());
+    Ok(())
+}
+
 /// The `tv-live-fill` loop (see the module docs). Runs until the process
 /// exits or a day roll cannot reconfigure the chain.
 fn run_live_fill_thread<E: StrategyEngine>(
     mut chain: LiveFillChain<E>,
     mut tap_rx: FrameRingReceiver<TapTick>,
+    mut pos_rx: FrameRingReceiver<PositionReport>,
     tap_loss: &AtomicU64,
-    cmd_tx: mpsc::Sender<PaperCmd>,
+    cmd_tx: FrameRingSender<PaperCmd>,
     events_tx: mpsc::Sender<LiveOrderEvent>,
 ) {
     // Busy-polled: producers never take the wake path.
     tap_rx.set_busy_polling(true);
+    pos_rx.set_busy_polling(true);
+    // Executes the command channel refused in one pass: at most one pass of
+    // finished orders, sized once (LF-9 finding 2).
+    let mut unsent: Vec<PositionReport> = Vec::with_capacity(fill_window::MAX_PENDING_ORDERS * 4);
     let start = Instant::now();
     let mut idle: u32 = 0;
     let mut drops = SendDrops::default();
-    let mut published = chain.counters();
-    let mut taints_published = chain.taints_added();
+    let mut publisher = CounterPublisher::new(chain.counters(), chain.taints_added());
     let mut last_publish = Instant::now();
     info!("live paper fill chain: thread running (paper only)");
     loop {
@@ -438,6 +629,8 @@ fn run_live_fill_thread<E: StrategyEngine>(
                 None => break,
             }
         }
+        // What the runtime booked since the last pass (LF-9 finding 2).
+        apply_position_reports(&mut chain, &mut pos_rx);
         let mono = i64::try_from(start.elapsed().as_nanos()).unwrap_or(i64::MAX);
         // Losses the tap counted, read out of band: a tick dropped behind the
         // ones still queued taints before this pass releases anything.
@@ -445,7 +638,7 @@ fn run_live_fill_thread<E: StrategyEngine>(
         // A pass that stopped at the per-pass cap left ticks queued: the book
         // clock must not run past the stream it has read.
         let backlogged = n >= MAX_TICKS_PER_PASS;
-        if let Err(e) = chain.on_pass_bounded(wall_ist_ns(), mono, backlogged) {
+        if let Err(e) = pass_step(&mut chain, &mut publisher, wall_ist_ns(), mono, backlogged) {
             error!(
                 code = ErrorCode::OrderReady01GateRefused.code_str(),
                 source = "live_fill_day_roll_refused",
@@ -456,36 +649,10 @@ fn run_live_fill_thread<E: StrategyEngine>(
             metrics::gauge!(ENGINE_CONFIGURED_GAUGE).set(0.0);
             return;
         }
-        chain.drain_outputs(|o| send_output(o, &cmd_tx, &events_tx, &mut drops));
+        forward_outputs(&mut chain, &cmd_tx, &events_tx, &mut drops, &mut unsent);
         if last_publish.elapsed() >= Duration::from_secs(COUNTER_PUBLISH_INTERVAL_SECS) {
             last_publish = Instant::now();
-            let c = chain.counters();
-            metrics::counter!(ORDERS_REFUSED_COUNTER)
-                .increment(c.refused.saturating_sub(published.refused));
-            metrics::counter!(LATE_TICKS_COUNTER)
-                .increment(c.late_ticks.saturating_sub(published.late_ticks));
-            let t = chain.taints_added();
-            for (i, r) in TaintReason::ALL.iter().enumerate() {
-                metrics::counter!(TAINT_COUNTER, "reason" => r.as_str())
-                    .increment(t[i].saturating_sub(taints_published[i]));
-            }
-            if c.outbox_overflow > published.outbox_overflow {
-                warn!(
-                    lost = c.outbox_overflow - published.outbox_overflow,
-                    "live paper fill chain: outputs over the per-pass outbox were lost"
-                );
-            }
-            if c.executions_lost > published.executions_lost {
-                error!(
-                    code = ErrorCode::OrderReady01GateRefused.code_str(),
-                    source = "live_fill_execution_not_queued",
-                    lost = c.executions_lost - published.executions_lost,
-                    "live paper fill chain: a filled paper order could not be queued (the \
-                     outbox was full); the chain did not count it as held (paper only)"
-                );
-            }
-            published = c;
-            taints_published = t;
+            publisher.publish(chain.counters(), chain.taints_added());
         }
         if n == 0 {
             idle = idle.saturating_add(1);
@@ -549,8 +716,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_output_counts_full_channels_and_writes_a_reject_row() {
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<PaperCmd>(1);
+    async fn test_send_output_counts_full_channels_writes_a_reject_row_and_position_ring_capacity()
+    {
+        let (cmd_tx, mut cmd_rx) = frame_ring::<PaperCmd>(1);
         let (ev_tx, mut ev_rx) = mpsc::channel::<LiveOrderEvent>(4);
         let mut drops = SendDrops::default();
         let mark = || {
@@ -563,7 +731,7 @@ mod tests {
         send_output(mark(), &cmd_tx, &ev_tx, &mut drops);
         send_output(mark(), &cmd_tx, &ev_tx, &mut drops);
         assert_eq!(drops.cmds, 1);
-        assert!(cmd_rx.try_recv().is_ok());
+        assert!(cmd_rx.try_recv().is_some());
         assert!(ev_rx.try_recv().is_err(), "a dropped mark writes no row");
         drop(ev_rx);
         let ev = test_support::event();
@@ -574,6 +742,34 @@ mod tests {
             &mut drops,
         );
         assert_eq!(drops.events, 1);
+        // LF-9 finding 2: an Execute the command channel refuses comes back
+        // as the shares the chain must take off its position.
+        let (cmd_tx, _cmd_rx) = frame_ring::<PaperCmd>(1);
+        let (ev_tx, _ev_rx) = mpsc::channel::<LiveOrderEvent>(4);
+        assert!(send_output(mark(), &cmd_tx, &ev_tx, &mut drops).is_none());
+        let x = chain::PaperExecution {
+            base: test_support::event(),
+            next_seq: 2,
+            security_id: 9,
+            segment: tickvault_common::types::ExchangeSegment::NseEquity,
+            side: tickvault_trading::brutex_host::engine::Side::Sell,
+            qty: 20,
+            lot_size: 1,
+            limit_price: 10.0,
+            filled_qty: 20,
+            avg_price: 10.0,
+            avg_price_paise: Some(1_000),
+            exit: true,
+        };
+        let unsent = send_output(
+            ChainOutput::Cmd(PaperCmd::Execute(Box::new(x))),
+            &cmd_tx,
+            &ev_tx,
+            &mut drops,
+        )
+        .expect("refused");
+        assert_eq!((unsent.security_id, unsent.expected_shares), (9, -20));
+        assert!(position_ring_capacity(8) > fill_window::MAX_PENDING_ORDERS * 4);
     }
 
     /// One test owns the process-wide slots (tests run in parallel), so the
@@ -634,6 +830,9 @@ pub(crate) mod test_support {
             engine_frames_secs: vec![60],
             universe: vec![key],
             contracts,
+            trading_day: super::wall_ist_ns()
+                .div_euclid(1_000_000_000)
+                .div_euclid(86_400),
         }
     }
 

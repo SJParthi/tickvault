@@ -192,6 +192,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_groww_contract1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
+    (
+        "tv_live_fill_orders_refused_total",
+        "paper only, and every refusal is already a row: added 2026-11-13 (LF-9). Each order the live paper fill chain refuses is written as one Reject row (with its reason) to the live order events file and table, and counted in that day's live-fill calibration report, so the operator reads every refusal there. The counter is a running total published once a second from a pre-resolved handle (LF-9 finding 5), so the emit is the handle in CounterPublisher::new, far from any log line. The lane is off by default ([live_fill] enabled = false) and places no order.",
+    ),
     // REMOVED 2026-09-16: `tv_groww_spot1m_rows_discarded_total` — same
     // feed-generic writer story as the chain row above, in
     // `spot_1m_rest_persistence.rs`.

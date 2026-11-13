@@ -63,6 +63,22 @@
 //! book each trading day: a vendor counter that restarts reads as
 //! `volume_down` until it passes the old high.
 //!
+//! The live paper fill chain does not use that rule (LF-9 findings 8, 9 and
+//! 10): it hands each tick the candle fold's own volume through
+//! [`LiveCandleBook::on_trade`] ([`TradeVolume`]: the fold's per-tick delta on
+//! its unwrapped, re-anchored cumulative; on a day's first trade, the delta
+//! the fold credits to the first session bucket, the one holding 09:15:00;
+//! and after a counter restart, nothing for the opening tick of each frame's
+//! next bar, as the fold's next bucket starts on the live cumulative). So a
+//! chain bar carries the volume of the stored candle of the same bucket: the
+//! opening trade is no longer swallowed as a baseline, and a `u32`
+//! cumulative wrap no longer reads as a fall for the rest of the day.
+//! **Honest limit:** this holds where the chain's bucket grid is the fold's
+//! (every frame whose size divides the 09:15 open's offset from midnight,
+//! 1 s to 5 m and 15 m; a 10 m, 30 m or 60 m frame is midnight-aligned here
+//! and 09:15-aligned in the fold), and for ticks the fold folds in order; a
+//! late tick the fold carries into a later bucket is not mirrored.
+//!
 //! # Complexity (honest)
 //!
 //! * [`LiveCandleBook::configure`]: cold, allocates once, O(keys × frames).
@@ -102,6 +118,33 @@ const SECS_PER_DAY: i64 = 86_400;
 /// lags (review finding, 2026-11-12). Unlike the spot store, which keeps the
 /// tick and caps its stamp, this book refuses it and counts it.
 pub const FUTURE_TICK_SKEW_SECS: i64 = FOLD_FUTURE_TRADE_TIME_SKEW_SECS;
+
+/// The market open, seconds after IST midnight (09:15:00): the candle fold's
+/// session open (`tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST`, pinned equal
+/// by a test). The bucket holding it is a day's FIRST session bucket.
+pub const MARKET_OPEN_SECS_OF_DAY: i64 = 33_300;
+
+/// The volume one trade adds, as the live candle fold worked it out (LF-9):
+/// see [`LiveCandleBook::on_trade`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TradeVolume {
+    /// Added to every bar except a day's first session bucket.
+    pub delta: u64,
+    /// Added to the bar of a day's first session bucket (the one holding
+    /// 09:15:00). Equal to `delta` except on a day's first trade.
+    pub first_session_delta: u64,
+    /// A stale packet: its cumulative is below the high mark the fold already
+    /// holds (the fold's `is_stale_packet`). It widens the high and low but
+    /// never moves a close, exactly as the fold's bucket does. An older trade
+    /// that is NOT stale (an index tick at the same second with another
+    /// price) is not flagged: it moves the close when its second is at or
+    /// past the close's, as the fold's close does (LF-9 review).
+    pub stale: bool,
+    /// The fold re-anchored a vendor counter restart on this tick: in every
+    /// frame, the next bar opened (by this tick or a later one) adds nothing
+    /// for its opening tick, as the fold's next bucket does.
+    pub restart: bool,
+}
 
 /// Why [`LiveCandleBook::configure`] refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -266,6 +309,10 @@ struct Slot {
     tick_count: u32,
     last_exchange_secs: i64,
     last_receipt_ns: i64,
+    /// A counter restart was seen since this frame last opened a bar: the
+    /// next bar it opens starts at the live cumulative, so the tick that
+    /// opens it adds nothing (the candle fold's `chain_broken`, LF-9).
+    chain_broken: bool,
 }
 
 impl Slot {
@@ -281,6 +328,7 @@ impl Slot {
         tick_count: 0,
         last_exchange_secs: 0,
         last_receipt_ns: 0,
+        chain_broken: false,
     };
 }
 
@@ -308,6 +356,12 @@ impl Frame {
         let day = secs.div_euclid(SECS_PER_DAY);
         let idx = secs.rem_euclid(SECS_PER_DAY) / self.size;
         day.saturating_mul(self.per_day).saturating_add(idx)
+    }
+
+    /// Whether bucket key `bucket` holds IST second `sec`. O(1).
+    #[inline]
+    fn holds(&self, bucket: i64, sec: i64) -> bool {
+        self.bucket_of(sec) == bucket
     }
 
     /// `(open, end)` IST seconds of a bucket key; the end is cut at the next
@@ -473,7 +527,10 @@ impl LiveCandleBook {
         true
     }
 
-    /// One live tick. O(1) hash probe plus O(frames); no allocation.
+    /// One live tick. O(1) hash probe plus O(frames); no allocation. The
+    /// volume is worked out here from the vendor's raw cumulative (see the
+    /// module docs); the live paper fill chain uses [`Self::on_trade`]
+    /// instead, with the candle fold's own per-tick volume.
     pub fn on_tick(
         &mut self,
         key: InstrumentKey,
@@ -483,31 +540,10 @@ impl LiveCandleBook {
         cum_volume: u64,
         out: &mut ClosedBars,
     ) -> TickVerdict {
-        self.last_tick_late = [0; MAX_FRAMES / 64];
-        let Some(&ki) = self.index.get(&key) else {
-            self.counters.refused_unknown = self.counters.refused_unknown.saturating_add(1);
-            return TickVerdict::RefusedUnknownKey;
+        let ki = match self.admit(key, exchange_secs, receipt_ns, ltp) {
+            Ok(ki) => ki,
+            Err(v) => return v,
         };
-        if !ltp.is_finite() || ltp <= 0.0 {
-            self.counters.refused_price = self.counters.refused_price.saturating_add(1);
-            return TickVerdict::RefusedPrice;
-        }
-        let secs = i64::from(exchange_secs);
-        let reference_secs = self
-            .last_clock_ns
-            .div_euclid(NANOS_PER_SEC)
-            .max(receipt_ns.div_euclid(NANOS_PER_SEC));
-        // With no clock reading yet and no receipt (0 or less: a replayed frame
-        // with no stamp), there is no reference to judge by: accept, as the
-        // candle fold and the spot store do.
-        let has_reference = self.last_clock_ns != i64::MIN || receipt_ns > 0;
-        if has_reference && secs > reference_secs.saturating_add(FUTURE_TICK_SKEW_SECS) {
-            // Before any bar or the volume baseline is touched.
-            self.counters.refused_future = self.counters.refused_future.saturating_add(1);
-            return TickVerdict::RefusedFuture;
-        }
-        self.counters.accepted = self.counters.accepted.saturating_add(1);
-        let ki = ki as usize;
         let mut volume_down = false;
         let delta = match self.last_cum[ki] {
             None => {
@@ -525,11 +561,113 @@ impl LiveCandleBook {
                 cum_volume - prev
             }
         };
+        self.fold(
+            ki,
+            i64::from(exchange_secs),
+            receipt_ns,
+            ltp,
+            TradeVolume {
+                delta,
+                first_session_delta: delta,
+                stale: volume_down,
+                restart: false,
+            },
+            out,
+        )
+    }
+
+    /// One live tick whose volume the CALLER worked out (LF-9 findings 8, 9
+    /// and 10): the live candle fold's own per-tick delta, already unwrapped
+    /// past a `u32` cumulative wrap, re-anchored after a counter restart and,
+    /// on the day's first trade, credited to the first session bucket the way
+    /// the stored candle is. The book's own cumulative baseline is neither
+    /// read nor moved, so a bar here carries the volume the stored candle of
+    /// the same bucket carries. `stale`: a stale packet, which never moves a
+    /// close. O(1) hash probe plus O(frames); no allocation.
+    pub fn on_trade(
+        &mut self,
+        key: InstrumentKey,
+        exchange_secs: u32,
+        receipt_ns: i64,
+        ltp: f64,
+        volume: TradeVolume,
+        out: &mut ClosedBars,
+    ) -> TickVerdict {
+        let ki = match self.admit(key, exchange_secs, receipt_ns, ltp) {
+            Ok(ki) => ki,
+            Err(v) => return v,
+        };
+        self.fold(ki, i64::from(exchange_secs), receipt_ns, ltp, volume, out)
+    }
+
+    /// The key, price and future-stamp checks shared by [`Self::on_tick`] and
+    /// [`Self::on_trade`]: the key index, or the refusal (counted). O(1).
+    fn admit(
+        &mut self,
+        key: InstrumentKey,
+        exchange_secs: u32,
+        receipt_ns: i64,
+        ltp: f64,
+    ) -> Result<usize, TickVerdict> {
+        self.last_tick_late = [0; MAX_FRAMES / 64];
+        let Some(&ki) = self.index.get(&key) else {
+            self.counters.refused_unknown = self.counters.refused_unknown.saturating_add(1);
+            return Err(TickVerdict::RefusedUnknownKey);
+        };
+        if !ltp.is_finite() || ltp <= 0.0 {
+            self.counters.refused_price = self.counters.refused_price.saturating_add(1);
+            return Err(TickVerdict::RefusedPrice);
+        }
+        let secs = i64::from(exchange_secs);
+        let reference_secs = self
+            .last_clock_ns
+            .div_euclid(NANOS_PER_SEC)
+            .max(receipt_ns.div_euclid(NANOS_PER_SEC));
+        // With no clock reading yet and no receipt (0 or less: a replayed frame
+        // with no stamp), there is no reference to judge by: accept, as the
+        // candle fold and the spot store do.
+        let has_reference = self.last_clock_ns != i64::MIN || receipt_ns > 0;
+        if has_reference && secs > reference_secs.saturating_add(FUTURE_TICK_SKEW_SECS) {
+            // Before any bar or the volume baseline is touched.
+            self.counters.refused_future = self.counters.refused_future.saturating_add(1);
+            return Err(TickVerdict::RefusedFuture);
+        }
+        self.counters.accepted = self.counters.accepted.saturating_add(1);
+        Ok(ki as usize)
+    }
+
+    /// Folds one admitted tick into every frame. O(frames), no allocation.
+    fn fold(
+        &mut self,
+        ki: usize,
+        secs: i64,
+        receipt_ns: i64,
+        ltp: f64,
+        volume: TradeVolume,
+        out: &mut ClosedBars,
+    ) -> TickVerdict {
         let nf = self.frames.len();
         let mut late_frames: u16 = 0;
+        // The day's market open (09:15:00) as an IST epoch second, for the
+        // first session bucket's volume (one division per tick).
+        let market_open = secs
+            .div_euclid(SECS_PER_DAY)
+            .saturating_mul(SECS_PER_DAY)
+            .saturating_add(MARKET_OPEN_SECS_OF_DAY);
+        let first_differs = volume.first_session_delta != volume.delta;
+        if volume.restart {
+            for fi in 0..nf {
+                self.slots[ki * nf + fi].chain_broken = true;
+            }
+        }
         for fi in 0..nf {
             let frame = &self.frames[fi];
             let bucket = frame.bucket_of(secs);
+            let delta = if first_differs && frame.holds(bucket, market_open) {
+                volume.first_session_delta
+            } else {
+                volume.delta
+            };
             let si = ki * nf + fi;
             let slot = self.slots[si];
             if bucket < frame.min_live_bucket
@@ -553,7 +691,7 @@ impl LiveCandleBook {
                 s.tick_count = s.tick_count.saturating_add(1);
                 // An older packet (older exchange second, or a cumulative
                 // below the high mark) never overwrites the close.
-                if !volume_down && secs >= s.last_exchange_secs {
+                if !volume.stale && secs >= s.last_exchange_secs {
                     s.close = ltp;
                     s.last_exchange_secs = secs;
                     s.last_receipt_ns = receipt_ns;
@@ -587,10 +725,13 @@ impl LiveCandleBook {
                 high: ltp,
                 low: ltp,
                 close: ltp,
-                volume: delta,
+                // After a counter restart the fold opens this frame's next
+                // bucket on the live cumulative: its opening tick adds 0.
+                volume: if slot.chain_broken { 0 } else { delta },
                 tick_count: 1,
                 last_exchange_secs: secs,
                 last_receipt_ns: receipt_ns,
+                chain_broken: false,
             };
         }
         TickVerdict::Accepted { late_frames }

@@ -22,11 +22,13 @@
 //! late-price marks), the engine's `on_tick` (its own O(1) contract), and one
 //! queue push per bar the tick closed (O(opening ends) for its release
 //! instant). A repeat quote or a first-sight packet (`new_trade` false) only
-//! refreshes the best bid/ask and the volume baseline (two hash probes): its
-//! trade time and price are old and never reach a candle or the engine. A
-//! real but OLDER trade (`older_trade`) goes through the candle book only:
-//! its price joins the bar it belongs to without moving a close, or counts
-//! late on a closed bar; it never reaches the engine. No allocation unless
+//! refreshes the best bid/ask (one hash probe): its trade time and price are
+//! old and never reach a candle or the engine. A real but OLDER trade
+//! (`older_trade`) goes through the candle book only: its price joins the bar
+//! it belongs to, or counts late on a closed bar; it moves the close only
+//! when it is not a stale packet and its second is at or past the close's, as
+//! the fold's close does (LF-9 review); it never reaches the engine. No
+//! allocation unless
 //! the engine asks for an order on a tick (refused with a row; rows
 //! allocate). DHAT-gated by `crates/app/tests/dhat_live_fill.rs`.
 //!
@@ -57,12 +59,16 @@ use tickvault_trading::brutex_host::engine::{
     IntentKind, IntentSink, OrderIntent, Side, StrategyEngine, TickInput,
 };
 use tickvault_trading::brutex_host::live_candles::{
-    CloseBy, ClosedBar, ClosedBars, LiveCandleBook, TickVerdict,
+    CloseBy, ClosedBar, ClosedBars, LiveCandleBook, TickVerdict, TradeVolume,
 };
 use tickvault_trading::brutex_host::order_price::{LimitBound, marketable_limit};
 use tickvault_trading::brutex_host::recipe::{ParamSnapshot, Recipe};
 use tickvault_trading::brutex_host::worst_fill::{SecondBar, rupees_to_paise};
+use tickvault_trading::candles::multi_tf_aggregator::{
+    CUMULATIVE_WRAP_SPAN, CUMULATIVE_WRAP_WINDOW,
+};
 
+use super::LATE_FILL_TICKS_KEY;
 use super::fill_window::{Finished, HeldOrder, MAX_PENDING_ORDERS, PendingBook};
 use super::taint::{
     FEED_GAP_NS, StreamWatch, TaintRanges, TaintReason, chain_start_taint, session_open_ns,
@@ -82,6 +88,17 @@ pub const INTENT_SINK_CAPACITY: usize = 64;
 const OUTBOX_ORDER_ROOM: usize = INTENT_SINK_CAPACITY * 8 + MAX_PENDING_ORDERS * 4;
 /// Reason on a refusal row when a late price reached the decision candle.
 pub const REASON_LATE_PRICE: &str = "skip:late_price";
+
+/// Refusal reason: a late 1 s price moved a fill second whose share the held
+/// order had already counted past its LIMIT (LF-9 review), so the share no
+/// longer holds and no order is sent.
+pub const REASON_LATE_FILL_PRICE: &str = "skip:late_fill_price";
+/// Reason on a refusal row when the instrument's day volume is no longer the
+/// candle fold's (LF-9 review, findings 3 and 9): ticks of it the tap ring
+/// dropped could not be credited to the bars they belong to, so its candles
+/// are short for the rest of the day and no ENTRY is placed on them (an
+/// exit still goes out, LF-9 review second pass).
+pub const REASON_DAY_VOLUME_UNKNOWN: &str = "day_volume_unknown";
 /// Reason on a refusal row when the instrument's first packet of the day came
 /// after the decision candle opened, so the candle is partial.
 pub const REASON_FIRST_BAR_PARTIAL: &str = "first_bar_partial";
@@ -105,6 +122,12 @@ pub struct ChainSetup {
     /// Built from the day's contract artifact; a contract missing here has
     /// its orders refused.
     pub contracts: HashMap<InstrumentKey, ContractSpec>,
+    /// The IST day number (IST seconds / 86,400) this setup was loaded and
+    /// checked for: its universe, contracts, recipe and snapshot. Set where
+    /// the setup is built, never from the clock the chain is started on
+    /// (LF-9 hardening): a setup checked at 23:59:59.999 IST and a chain
+    /// started at 00:00:00.000 the next day must read as yesterday's.
+    pub trading_day: i64,
 }
 
 /// The chain's tuning, from `[live_fill]`.
@@ -202,6 +225,23 @@ impl std::fmt::Display for ChainError {
 
 impl std::error::Error for ChainError {}
 
+/// What the order runtime booked for one paper Execute (LF-9 finding 2),
+/// sent back to the chain so its position follows the runtime's paper book:
+/// a refused entry, an exit cut to what the runtime held, or an exit given up
+/// after its retries no longer leaves the chain sizing later exits against a
+/// position the runtime does not hold. `Copy`, no heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionReport {
+    pub security_id: u64,
+    pub segment: u8,
+    /// Signed shares the chain counted for this Execute when it sent it (its
+    /// model fill, whole lots).
+    pub expected_shares: i64,
+    /// Signed shares the runtime holds for the instrument once it has booked
+    /// (or refused) this Execute.
+    pub runtime_net_shares: i64,
+}
+
 /// Counters the thread publishes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChainCounters {
@@ -224,6 +264,28 @@ pub struct ChainCounters {
     /// Filled paper orders that could not be queued (the outbox was full):
     /// the chain's own position count was left unchanged.
     pub executions_lost: u64,
+    /// Day rolls with no setup loaded for the new trading day (LF-9 finding
+    /// 12): from each, the chain decides nothing until one is loaded.
+    pub day_rolls_without_setup: u64,
+    /// Strategy candles not handed to the engine because the setup is
+    /// yesterday's (LF-9 finding 12).
+    pub bars_unfed_stale_setup: u64,
+    /// Position reports applied from the order runtime (LF-9 finding 2).
+    pub position_reports: u64,
+    /// Reports that moved the chain's position (the runtime booked less than
+    /// the chain counted, or closed it).
+    pub position_resyncs: u64,
+    /// Executes the runtime's channel refused, taken back off the chain's
+    /// position.
+    pub executes_unsent: u64,
+    /// Shares of dropped tapped ticks NOT added to a later bar because that
+    /// bar lies outside every tainted stretch (LF-9 review, finding 3): added
+    /// there they would make an untrusted volume look trusted.
+    pub missed_volume_discarded: u64,
+    /// Instruments whose day volume became unknown (LF-9 review, findings 3
+    /// and 9): their entries are refused `day_volume_unknown` for the day
+    /// (exits still go out).
+    pub volume_unknown_marked: u64,
 }
 
 /// Context carried with a held order, for its rows.
@@ -275,6 +337,10 @@ pub struct LiveFillChain<E: StrategyEngine> {
     /// the runtime may book less (a refusal), so this only sizes an exit
     /// early; the runtime's own clamp is the authority.
     net_shares: Vec<i64>,
+    /// Per instrument: signed shares of the Executes sent whose position
+    /// report has not come back yet (LF-9 finding 2). `net_shares` is the
+    /// runtime's last reported position plus these.
+    inflight: Vec<i64>,
     /// Per instrument: an Execute that filled something was sent today. Its
     /// 1 s closes are marked from then on (the runtime ignores a mark for a
     /// flat position), so a refused closing order cannot stop the marks.
@@ -285,6 +351,28 @@ pub struct LiveFillChain<E: StrategyEngine> {
     /// A bar opening before it was built from part of its bucket only
     /// (`first_bar_partial`; LF-6b review round 2, finding 2).
     first_seen_secs: Vec<i64>,
+    /// Per instrument: the raw cumulative and `drop_seq` of its newest
+    /// non-stale tapped tick (LF-9 review), to find the volume of tapped
+    /// ticks the tap ring dropped after the fold had already counted them.
+    cum_seen: Vec<Option<(u32, u32)>>,
+    /// Per instrument: volume of such dropped ticks not yet added to a bar;
+    /// the instrument's next trade carries it, so the day's total stays the
+    /// fold's.
+    missed_volume: Vec<u64>,
+    /// Per instrument: its bars are short of the fold's by an amount the
+    /// chain cannot place (LF-9 review, findings 3 and 9), so its entries are
+    /// refused `day_volume_unknown` for the rest of the day (exits still go
+    /// out: the bars are only ever short, so their fills are capped low).
+    volume_unknown: Vec<bool>,
+    /// Per instrument: a counter restart the fold re-anchored on a tapped
+    /// tick the tap ring dropped (LF-9 review, second pass). The
+    /// instrument's next trade carries it as a restart, so each frame's next
+    /// bar adds nothing for its opening tick, as the fold's does.
+    restart_pending: Vec<bool>,
+    /// The tap's loss count when the day began: an instrument first tapped
+    /// after a loss of the same day, whose first tapped tick is not credited
+    /// with its whole cumulative, may have lost volume before it (finding 9).
+    day_drop_base: u32,
     /// The newest tapped tick's receipt trailed the last pass's wall clock by
     /// more than the wait: the frame drain is behind, so passes run on the
     /// newest receipt, not the wall (round 2, finding 5).
@@ -305,6 +393,11 @@ pub struct LiveFillChain<E: StrategyEngine> {
     /// Execute.
     pass_floor: usize,
     day: i64,
+    /// The IST day number the loaded setup (universe, contracts, recipe,
+    /// snapshot) was built for (`ChainSetup::trading_day`). While the
+    /// chain's own day differs from it the chain decides nothing, until
+    /// [`Self::reload_for_day`] (LF-9 finding 12).
+    setup_day: i64,
     signal_base: i64,
     signal_next: i64,
     now_ns: i64,
@@ -368,8 +461,14 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             quotes: vec![Quote::default(); keys],
             last_second: vec![None; keys],
             net_shares: vec![0; keys],
+            inflight: vec![0; keys],
             traded_today: vec![false; keys],
             first_seen_secs: vec![i64::MAX; keys],
+            cum_seen: vec![None; keys],
+            missed_volume: vec![0; keys],
+            volume_unknown: vec![false; keys],
+            restart_pending: vec![false; keys],
+            day_drop_base: 0,
             stream_lagging: false,
             taints: TaintRanges::new(),
             watch: StreamWatch::new(),
@@ -383,6 +482,10 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             day: now_ist_ns
                 .div_euclid(NANOS_PER_SEC)
                 .div_euclid(SECS_PER_DAY),
+            // The day the setup was checked for, not the start clock's (LF-9
+            // hardening): a start just past midnight on a setup checked the
+            // evening before stays inert until a setup for today is loaded.
+            setup_day: setup.trading_day,
             signal_base: now_ist_ns.max(0),
             signal_next: 0,
             now_ns: now_ist_ns,
@@ -410,19 +513,31 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     }
 
     /// A new trading day: a fresh candle book (the vendor's cumulative volume
-    /// restarts), the engine configured again, every held order and taint
-    /// dropped. Cold.
+    /// restarts), every held order and taint dropped. The engine is configured
+    /// again only when the loaded setup was built for this day; otherwise the
+    /// setup is yesterday's (its universe, lot and tick sizes, recipe and
+    /// parameter snapshot were checked for another day), so the chain stops
+    /// deciding until [`Self::reload_for_day`] loads one (LF-9 finding 12):
+    /// no candle reaches the engine and no order is held. Cold.
     ///
     /// # Errors
     /// The engine or the book refused.
     pub fn new_day(&mut self, now_ist_ns: i64) -> Result<usize, ChainError> {
-        self.engine
-            .configure(
-                &self.setup.recipe,
-                self.setup.snapshot.as_ref(),
-                &self.setup.universe,
-            )
-            .map_err(|e| ChainError::Engine(e.to_string()))?;
+        let day = now_ist_ns
+            .div_euclid(NANOS_PER_SEC)
+            .div_euclid(SECS_PER_DAY);
+        if day == self.setup_day {
+            self.engine
+                .configure(
+                    &self.setup.recipe,
+                    self.setup.snapshot.as_ref(),
+                    &self.setup.universe,
+                )
+                .map_err(|e| ChainError::Engine(e.to_string()))?;
+        } else if day != self.day {
+            self.counters.day_rolls_without_setup =
+                self.counters.day_rolls_without_setup.saturating_add(1);
+        }
         self.book = LiveCandleBook::configure(&self.setup.universe, &self.frames_secs)
             .map_err(|e| ChainError::Book(e.to_string()))?;
         self.clock = BookClock::new(
@@ -436,19 +551,86 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         self.quotes.iter_mut().for_each(|q| *q = Quote::default());
         self.last_second.iter_mut().for_each(|s| *s = None);
         self.net_shares.iter_mut().for_each(|n| *n = 0);
+        self.inflight.iter_mut().for_each(|n| *n = 0);
         self.traded_today.iter_mut().for_each(|t| *t = false);
         self.first_seen_secs.iter_mut().for_each(|s| *s = i64::MAX);
+        self.cum_seen.iter_mut().for_each(|c| *c = None);
+        self.missed_volume.iter_mut().for_each(|m| *m = 0);
+        self.volume_unknown.iter_mut().for_each(|v| *v = false);
+        self.restart_pending.iter_mut().for_each(|v| *v = false);
         self.stream_lagging = false;
         self.taints.clear();
         self.watch.reset();
-        self.day = now_ist_ns
-            .div_euclid(NANOS_PER_SEC)
-            .div_euclid(SECS_PER_DAY);
+        self.day_drop_base = self.watch.drop_seq();
+        self.day = day;
         let dropped = self.pending.clear();
         self.taint_chain_start(now_ist_ns);
         Ok(dropped)
     }
+
+    /// A fresh chain for the trading day of `now_ist_ns`, built from a setup
+    /// loaded and checked for that day (manifest, gates and replay as the rule
+    /// file requires), keeping the engine (LF-9 finding 12). Cold.
+    ///
+    /// NO PRODUCTION CALLER today (LF-9 review): `run_live_fill_thread` never
+    /// loads a new day's setup, so after an IST day roll the chain stays
+    /// inert (`awaiting_day_setup`) until the process restarts. The box stops
+    /// every evening, so in production this holds only while a drain hold
+    /// keeps the process up past midnight. Only tests call this today.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn reload_for_day(self, setup: ChainSetup, now_ist_ns: i64) -> Result<Self, ChainError> {
+        Self::new(self.engine, setup, self.params, now_ist_ns)
+    }
     // O(1) EXEMPT: end
+
+    /// What the order runtime booked for one Execute (LF-9 finding 2): the
+    /// Execute leaves the in-flight count and the chain's position becomes
+    /// the runtime's, plus the Executes still in flight. One hash probe,
+    /// O(1), no allocation.
+    pub fn on_position_report(&mut self, r: &PositionReport) {
+        let key = InstrumentKey {
+            security_id: r.security_id,
+            exchange_segment: r.segment,
+        };
+        let Some(ki) = self.key_index(&key) else {
+            return;
+        };
+        let ki = ki as usize;
+        let inflight = self.inflight[ki].saturating_sub(r.expected_shares);
+        self.inflight[ki] = inflight;
+        let synced = r.runtime_net_shares.saturating_add(inflight);
+        if synced != self.net_shares[ki] {
+            self.counters.position_resyncs = self.counters.position_resyncs.saturating_add(1);
+        }
+        self.net_shares[ki] = synced;
+        self.counters.position_reports = self.counters.position_reports.saturating_add(1);
+    }
+
+    /// An Execute the runtime's channel refused (`paper_queue_full`): its
+    /// shares never reach the runtime, so they leave the chain's position and
+    /// the in-flight count (LF-9 finding 2). One hash probe, O(1).
+    pub fn forget_unsent(&mut self, security_id: u64, segment: u8, expected_shares: i64) {
+        let key = InstrumentKey {
+            security_id,
+            exchange_segment: segment,
+        };
+        let Some(ki) = self.key_index(&key) else {
+            return;
+        };
+        let ki = ki as usize;
+        self.inflight[ki] = self.inflight[ki].saturating_sub(expected_shares);
+        self.net_shares[ki] = self.net_shares[ki].saturating_sub(expected_shares);
+        self.counters.executes_unsent = self.counters.executes_unsent.saturating_add(1);
+    }
+
+    /// Whether the loaded setup is for another day than the chain's own, so
+    /// nothing is decided (LF-9 finding 12). O(1).
+    #[must_use]
+    pub fn awaiting_day_setup(&self) -> bool {
+        self.day != self.setup_day
+    }
 
     /// The counters so far.
     #[must_use]
@@ -508,6 +690,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         let ki = self.key_index(&key);
         if let Some(ki) = ki {
             self.note_first_seen(ki, receipt);
+            self.note_cumulative(ki, t);
         }
         if t.older_trade && !t.new_trade {
             self.on_older_trade(key, ki, t);
@@ -517,24 +700,20 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             // A repeat quote (the book moved, no trade) or a first packet
             // after a subscribe: its trade time, price and cumulative are OLD.
             // Folding it would count it late on a closed bucket and skip an
-            // order on a candle no new price reached. Only its best bid/ask
-            // and its volume baseline are used. O(1): two hash probes.
+            // order on a candle no new price reached. Only its best bid/ask is
+            // used: the volume comes from the fold's own per-tick delta (LF-9),
+            // so no baseline is kept here. O(1): one hash probe.
             if let Some(ki) = ki {
                 self.refresh_quote(ki, t);
             }
-            let _known = self.book.note_baseline_volume(key, u64::from(t.cum_volume));
             return;
         }
         let ltp = f32_to_f64_clean(t.ltp);
+        let volume = self.take_trade_volume(ki, t);
         self.closed.clear();
-        let verdict = self.book.on_tick(
-            key,
-            t.exchange_secs,
-            receipt,
-            ltp,
-            u64::from(t.cum_volume),
-            &mut self.closed,
-        );
+        let verdict =
+            self.book
+                .on_trade(key, t.exchange_secs, receipt, ltp, volume, &mut self.closed);
         let late = match verdict {
             TickVerdict::Accepted { late_frames } => late_frames > 0,
             _ => {
@@ -550,6 +729,10 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         }
         self.queue_closed();
         self.apply_fresh_taints();
+        if self.awaiting_day_setup() {
+            // Yesterday's setup: the engine sees nothing (LF-9 finding 12).
+            return;
+        }
         self.sink.clear();
         let input = TickInput {
             key,
@@ -572,20 +755,23 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     }
 
     /// A real trade older than the newest one the fold has seen (a stale
-    /// cumulative regression, a backup copy accepted late; LF-6b review
-    /// finding 4). The candle book folds its price into the bar it belongs to
-    /// without moving a close, or counts it late on a closed bar, which skips
-    /// an order on that candle (owner rule). Never handed to the engine: its
+    /// cumulative regression, a backup copy accepted late, an index tick at
+    /// the same second with another price; LF-6b review finding 4). The candle
+    /// book folds its price into the bar it belongs to, or counts it late on a
+    /// closed bar, which skips an order on that candle (owner rule). Only a
+    /// stale packet is kept off the close (LF-9 review): the rest move it when
+    /// their second is at or past the close's, as the fold's close does. Never handed to the engine: its
     /// trade time is not the newest. O(1) hash probes plus O(frames).
     fn on_older_trade(&mut self, key: InstrumentKey, ki: Option<u32>, t: &TapTick) {
         let ltp = f32_to_f64_clean(t.ltp);
+        let volume = self.take_trade_volume(ki, t);
         self.closed.clear();
-        let verdict = self.book.on_tick(
+        let verdict = self.book.on_trade(
             key,
             t.exchange_secs,
             t.receipt_ist_ns,
             ltp,
-            u64::from(t.cum_volume),
+            volume,
             &mut self.closed,
         );
         let TickVerdict::Accepted { late_frames } = verdict else {
@@ -619,6 +805,146 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         i64::try_from(self.params.wait_ms)
             .unwrap_or(i64::MAX / 2)
             .saturating_mul(1_000_000)
+    }
+
+    /// Finds the volume of this instrument's tapped ticks the tap ring dropped
+    /// (LF-9 review): the fold had counted them, so the chain's bars would
+    /// stay short for the rest of the day. Only after a loss (`drop_seq`
+    /// moved since the instrument's last tapped tick): the raw cumulative
+    /// difference less what this tick's own delta credits is kept and added
+    /// to the instrument's next trade. A stale packet is skipped (the fold
+    /// keeps its high mark), a counter restart re-anchors, and a difference
+    /// across a `u32` wrap is not counted (one wrap per several billion
+    /// shares; the bars stay short there, a limit). O(1), two array reads.
+    ///
+    /// LF-9 review, finding 9: the instrument's FIRST tapped tick has no
+    /// earlier cumulative to difference against. When the tap counted a loss
+    /// earlier the same day and the fold did not credit this tick with the
+    /// whole cumulative (on a pre-market boot the fold's first trade carries
+    /// it all, so nothing before it can be missing), the volume of a dropped
+    /// earlier tick of this instrument cannot be found: its day volume is
+    /// marked unknown and its orders are refused for the day. The loss count
+    /// also moves for losses the fold never saw (a frame shed before the
+    /// drain), so this refuses more than strictly needed, never fewer.
+    ///
+    /// LF-9 review (second pass): a first tapped tick that is the fold's own
+    /// SEED (`fold_seed`) is never marked: the fold credited nothing before
+    /// it, so nothing can be missing, whatever its delta. That is the first
+    /// trade of an instrument the boot replay did not see (delta 0) and the
+    /// 09:15 first trade of a cash equity on a pre-market boot (its first
+    /// session bucket opens on the pre-open auction volume, so its delta is
+    /// below the cumulative). Before, both were refused for the day after
+    /// any loss.
+    ///
+    /// ⚠ CORRECTED, LF-9 review, third pass: the paragraph above said this
+    /// covered "every first trade of a mid-session boot". It did not. A
+    /// mid-session boot re-folds the WAL tail the applied watermark has not
+    /// passed (at least about 60 s), which seeds the slot of every instrument
+    /// that traded there; its first LIVE tick then ends the replay gap
+    /// instead (`fold_gap_reseed`, delta 0, `fold_seed` false), and was marked
+    /// unknown for the day after any tap loss. That tick is exempt too: the
+    /// fold credited no earlier live tick of the instrument, and the chain
+    /// never sees replayed ones.
+    ///
+    /// LF-9 review (second pass): a tick below the instrument's last tapped
+    /// cumulative after a loss, neither stale nor flagged as a restart, means
+    /// the fold re-anchored a counter restart (or a `u32` wrap) on a tick the
+    /// tap ring dropped. That tick's `cumulative_restarted` never reached the
+    /// chain, so the chain would add each frame's next opening tick where
+    /// the fold adds nothing. It is carried to the instrument's next trade as
+    /// a restart (`restart_pending`), which keeps the chain's bars at or
+    /// below the stored candles, and the day volume is marked unknown (the
+    /// dropped ticks' volume cannot be placed). O(1).
+    ///
+    /// LF-9 hardening: a step from the top of the `u32` range to the bottom
+    /// is a WRAP, read by the fold's own rule (`forward_cumulative`): the
+    /// fold counts it forward exactly, so the chain counts the forward
+    /// difference too. Before, a wrap on a tapped tick after any loss
+    /// anywhere (the loss count is global) read as a restart on a dropped
+    /// tick and marked the instrument's volume unknown for the day.
+    #[inline]
+    fn note_cumulative(&mut self, ki: u32, t: &TapTick) {
+        let k = ki as usize;
+        if k >= self.cum_seen.len() || t.stale_packet {
+            return;
+        }
+        if self.cum_seen[k].is_none()
+            && !t.fold_seed
+            && !t.fold_gap_reseed
+            && t.drop_seq != self.day_drop_base
+            && u64::from(t.volume_delta.max(t.first_bucket_volume_delta)) < u64::from(t.cum_volume)
+        {
+            self.mark_volume_unknown(k);
+        }
+        if !t.cumulative_restarted
+            && let Some((last, seq)) = self.cum_seen[k]
+            && seq != t.drop_seq
+        {
+            if let Some(raw) = forward_cumulative(last, t.cum_volume) {
+                let missed = raw.saturating_sub(u64::from(t.volume_delta));
+                self.missed_volume[k] = self.missed_volume[k].saturating_add(missed);
+            } else {
+                self.restart_pending[k] = true;
+                self.mark_volume_unknown(k);
+            }
+        }
+        self.cum_seen[k] = Some((t.cum_volume, t.drop_seq));
+    }
+
+    /// The volume a trade adds to the chain's bars: the fold's own
+    /// ([`trade_volume`]) plus any volume of dropped tapped ticks kept for
+    /// the instrument ([`Self::note_cumulative`]), which it takes.
+    ///
+    /// LF-9 review, finding 3: the kept volume belongs to the bars of the
+    /// dropped ticks, which the drop tainted. It is added only when this
+    /// trade's second lies in a tainted stretch too (its bars are refused for
+    /// orders anyway, and the day's total stays the fold's). Added to a bar
+    /// outside every tainted stretch it would make that bar's volume, and the
+    /// participation cap of a held order filling on it, larger than the
+    /// stored candle's while reading as trusted, so it is dropped instead,
+    /// counted (`missed_volume_discarded`), and the instrument's day volume
+    /// is marked unknown. O(1), plus one O(256) taint lookup on the one trade
+    /// that carries a kept volume (once per instrument per drop).
+    #[inline]
+    fn take_trade_volume(&mut self, ki: Option<u32>, t: &TapTick) -> TradeVolume {
+        let mut v = trade_volume(t);
+        let Some(k) = ki.map(|ki| ki as usize) else {
+            return v;
+        };
+        // A counter restart on a dropped tick (`note_cumulative`). One read.
+        if let Some(r) = self.restart_pending.get_mut(k)
+            && *r
+        {
+            *r = false;
+            v.restart = true;
+        }
+        let m = self.missed_volume.get(k).copied().unwrap_or(0);
+        if m == 0 {
+            return v;
+        }
+        self.missed_volume[k] = 0;
+        let sec = i64::from(t.exchange_secs);
+        if self.taints.taint_of(sec, sec.saturating_add(1)).is_some() {
+            v.delta = v.delta.saturating_add(m);
+            v.first_session_delta = v.first_session_delta.saturating_add(m);
+        } else {
+            self.counters.missed_volume_discarded =
+                self.counters.missed_volume_discarded.saturating_add(m);
+            self.mark_volume_unknown(k);
+        }
+        v
+    }
+
+    /// Marks instrument `k`'s day volume unknown (findings 3 and 9). O(1).
+    #[inline]
+    fn mark_volume_unknown(&mut self, k: usize) {
+        if let Some(u) = self.volume_unknown.get_mut(k)
+            && !*u
+        {
+            *u = true;
+            self.counters.volume_unknown_marked =
+                self.counters.volume_unknown_marked.saturating_add(1);
+        }
     }
 
     /// Records instrument `ki`'s first tapped packet of the day (LF-6b review
@@ -806,6 +1132,12 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             return;
         };
         if !bar_in_session(bar.bucket_open_secs, bar.bucket_end_secs) {
+            return;
+        }
+        if self.awaiting_day_setup() {
+            // Never decide a new day on yesterday's setup (LF-9 finding 12).
+            self.counters.bars_unfed_stale_setup =
+                self.counters.bars_unfed_stale_setup.saturating_add(1);
             return;
         }
         let mut input = bar.to_bar_input();
@@ -1041,6 +1373,19 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             self.refuse_unplaced(intent, Some(bar), REASON_FIRST_BAR_PARTIAL);
             return;
         }
+        // Its bars are short of the stored candles by volume the chain could
+        // not place (LF-9 review, findings 3 and 9). One array read. Only NEW
+        // risk is refused (LF-9 review, second pass): an exit still goes out.
+        // The mark lasts the whole day, so refusing exits too left a paper
+        // position opened before the mark open until the daily reset. Every
+        // way a bar can differ from the stored candle while marked keeps the
+        // chain's bar SHORT of it (dropped volume discarded, a dropped
+        // counter restart read as a restart), so the exit's fill is capped on
+        // less volume, never more.
+        if intent.kind != IntentKind::Exit && self.volume_unknown[ki as usize] {
+            self.refuse_unplaced(intent, Some(bar), REASON_DAY_VOLUME_UNKNOWN);
+            return;
+        }
         let nf = self.frames_secs.len();
         let fi = bar.frame_index as usize;
         if self.late_bucket[ki as usize * nf + fi] == bar.bucket_open_secs {
@@ -1063,7 +1408,17 @@ impl<E: StrategyEngine> LiveFillChain<E> {
         // actually booked.
         let exit = intent.kind == IntentKind::Exit;
         if exit {
-            let held = self.net_shares[ki as usize];
+            // The position counted from sent Executes, plus what entries still
+            // held will open (LF-9 review): an exit decided while its entry
+            // still waits for volume is sized against the position the entry
+            // makes, not refused. If the entry fills short, the runtime clamps
+            // the exit and reports its position back. O(64).
+            let entries = i64::try_from(self.pending.held_entry_qty(ki, Side::Buy))
+                .unwrap_or(i64::MAX)
+                .saturating_sub(
+                    i64::try_from(self.pending.held_entry_qty(ki, Side::Sell)).unwrap_or(i64::MAX),
+                );
+            let held = self.net_shares[ki as usize].saturating_add(entries);
             let can = match intent.side {
                 Side::Sell if held > 0 => held.unsigned_abs(),
                 Side::Buy if held < 0 => held.unsigned_abs(),
@@ -1073,6 +1428,15 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 self.refuse_unplaced(intent, Some(bar), "exit_without_position");
                 return;
             }
+            // An exit overlapping an exit still held is NOT cut by it (LF-9
+            // review, finding 7): the earlier one may fill short, fill nothing
+            // or be refused, and a cut or refused later exit then left the
+            // rest of the position open. Instead the held book finishes an
+            // exit only after every earlier held order of the instrument
+            // (`PendingBook::collect_ready`), so the runtime books those first
+            // and clamps this one against what they left (and reports the
+            // position back): two overlapping exits never both close the same
+            // shares, and a short first exit is completed by the second.
             qty = qty.min(can);
         }
         let Ok(ltp_paise) = rupees_to_paise(bar.close) else {
@@ -1158,6 +1522,7 @@ impl<E: StrategyEngine> LiveFillChain<E> {
             decision_bar,
             book,
             limit_paise: limit.price_paise,
+            reduce_only: exit,
             meta: OrderMeta {
                 base: template,
                 lot_size,
@@ -1195,6 +1560,16 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 reject.event = LiveOrderEventKind::Reject;
                 reject.seq = 2;
                 reject.reason = Some(REASON_LATE_PRICE.to_owned());
+                let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
+            }
+            Finished::LateFillPrice { order } => {
+                self.counters.refused = self.counters.refused.saturating_add(1);
+                let mut reject = order.meta.base;
+                reject.ts_ist_nanos = self.now_ns;
+                reject.event = LiveOrderEventKind::Reject;
+                reject.seq = 2;
+                reject.remainder_qty = i64::try_from(order.qty).ok();
+                reject.reason = Some(REASON_LATE_FILL_PRICE.to_owned());
                 let _queued = self.push_finished(ChainOutput::Event(Box::new(reject)));
             }
             Finished::Tainted { order, reason } => {
@@ -1246,9 +1621,9 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 base.model_price_paise = summary.vwap_paise;
                 base.reason = match (late_fill_ticks, beyond_limit_qty) {
                     (0, 0) => None,
-                    (l, 0) => Some(format!("late_fill_ticks={l}")),
+                    (l, 0) => Some(format!("{LATE_FILL_TICKS_KEY}={l}")),
                     (0, b) => Some(format!("beyond_limit_qty={b}")),
-                    (l, b) => Some(format!("late_fill_ticks={l};beyond_limit_qty={b}")),
+                    (l, b) => Some(format!("{LATE_FILL_TICKS_KEY}={l};beyond_limit_qty={b}")),
                 };
                 let signed = match order.side {
                     Side::Buy => filled_i,
@@ -1256,6 +1631,10 @@ impl<E: StrategyEngine> LiveFillChain<E> {
                 };
                 let ki = order.key_index as usize;
                 if let Some(n) = self.net_shares.get_mut(ki) {
+                    *n = n.saturating_add(signed);
+                }
+                // Until the runtime reports what it booked (LF-9 finding 2).
+                if let Some(n) = self.inflight.get_mut(ki) {
                     *n = n.saturating_add(signed);
                 }
                 if filled_i != 0
@@ -1296,6 +1675,42 @@ impl<E: StrategyEngine> LiveFillChain<E> {
     #[must_use]
     pub fn outputs_waiting(&self) -> usize {
         self.outbox.len()
+    }
+}
+
+/// The candle fold's volume for a tapped tick (LF-9 findings 8, 9, 10): the
+/// chain's bars add exactly what the stored candles add. Only a stale packet
+/// is kept off a close (LF-9 review): an older trade that is not stale (an
+/// index tick at the same second with another price) moves the close, as the
+/// fold's close does. O(1).
+#[inline]
+fn trade_volume(t: &TapTick) -> TradeVolume {
+    TradeVolume {
+        delta: u64::from(t.volume_delta),
+        first_session_delta: u64::from(t.first_bucket_volume_delta),
+        stale: t.stale_packet,
+        restart: t.cumulative_restarted,
+    }
+}
+
+/// The volume traded between two of an instrument's vendor `u32`
+/// day-cumulatives `last` then `cum`, when the step forward is readable: the
+/// plain difference when `cum` did not fall, or the wrapped difference when
+/// `last` is near the top of the `u32` range and `cum` near the bottom (the
+/// fold's own wrap rule, `CUMULATIVE_WRAP_WINDOW` at each end, so the chain
+/// and the fold read the same step the same way). `None` for any other fall
+/// (a counter restart). O(1).
+#[inline]
+#[must_use]
+fn forward_cumulative(last: u32, cum: u32) -> Option<u64> {
+    if cum >= last {
+        return Some(u64::from(cum - last));
+    }
+    let top = CUMULATIVE_WRAP_SPAN - CUMULATIVE_WRAP_WINDOW;
+    if u64::from(last) >= top && u64::from(cum) < CUMULATIVE_WRAP_WINDOW {
+        Some(u64::from(cum.wrapping_sub(last)))
+    } else {
+        None
     }
 }
 

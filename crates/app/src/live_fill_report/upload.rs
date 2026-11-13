@@ -39,6 +39,13 @@ pub const UPLOAD_SPACING_SECS: u64 = 60;
 /// The record written in `uploaded/` before the day's first copy starts.
 pub const COPY_STARTED_RECORD: &str = "copy-started";
 
+/// The record written in `uploaded/` once the day's summary row says its
+/// copy is verified (LF-9 review, second pass). The five copy records are
+/// written as each file is verified, BEFORE that row, so a day whose row
+/// write failed read as finished to the old-day scan and kept a missing or
+/// `s3_uploaded = false` row forever. A day is finished only with this too.
+pub const ROW_WRITTEN_RECORD: &str = "row-written";
+
 /// `live-fill-logs/<D>/<name>.gz`, or `None` when `day` is not a
 /// `YYYY-MM-DD` date or `name` is empty or holds `/`, `\` or `..`. Pure.
 #[must_use]
@@ -100,6 +107,24 @@ pub fn folder_copied(dir: &Path, day: &str) -> bool {
         .all(|n| markers.join(n).is_file())
 }
 
+/// Whether the day's summary row was written with the copy verified
+/// ([`ROW_WRITTEN_RECORD`] in `uploaded/`; LF-9 review, second pass). Never
+/// swept, like the copy records. O(1) stat.
+#[must_use]
+pub fn row_written(dir: &Path) -> bool {
+    markers_dir(dir).join(ROW_WRITTEN_RECORD).is_file()
+}
+
+/// Writes [`ROW_WRITTEN_RECORD`] for the day, durably (temp file, sync,
+/// rename, folder sync). Called only after the summary row that says the
+/// copy is verified was written. O(1) files.
+///
+/// # Errors
+/// The first failed step.
+pub fn write_row_written(dir: &Path, day: &str) -> std::io::Result<()> {
+    write_record(&markers_dir(dir), ROW_WRITTEN_RECORD, day.as_bytes())
+}
+
 /// A day folder under the local root that is not copied and that the
 /// boot's lookback no longer reaches (LF-7 review round 3, finding 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,13 +133,20 @@ pub struct UnreportedDay {
     pub day: chrono::NaiveDate,
     /// All five files are present (a copy-only catch-up can finish it).
     pub complete: bool,
+    /// Its copy is verified ([`folder_copied`]) and only the summary row is
+    /// missing. Listed after every never-copied folder (LF-9 hardening).
+    pub copied: bool,
 }
 
 /// The day folders under `root` dated before `today`, not reached by the
-/// lookback (`in_lookback` false) and not copied ([`folder_copied`] false),
-/// oldest first. A folder whose name is not a `YYYY-MM-DD` date is ignored; a
-/// missing root holds none. Once per boot, cold, O(folders) entries plus
-/// O(5) stats per day folder.
+/// lookback (`in_lookback` false) and not finished, never-copied ones first
+/// (LF-9 hardening), oldest first within each group: not copied
+/// ([`folder_copied`] false), or copied with no summary row written after the
+/// copy ([`row_written`] false; LF-9 review, second pass: such a day is
+/// copied again, idempotent, and its row is rebuilt from its report file).
+/// A folder whose name is not a `YYYY-MM-DD` date is ignored; a missing root
+/// holds none. Once per boot, cold, O(folders) entries plus O(6) stats per
+/// day folder.
 ///
 /// # Errors
 /// The root exists but cannot be listed.
@@ -145,15 +177,19 @@ pub fn unreported_day_folders(
             continue;
         }
         let dir = entry.path();
-        if folder_copied(&dir, name) {
+        let copied = folder_copied(&dir, name);
+        if copied && row_written(&dir) {
             continue;
         }
         out.push(UnreportedDay {
             day,
             complete: folder_complete(&dir, name),
+            copied,
         });
     }
-    out.sort_by_key(|u| u.day);
+    // Never-copied folders first (their report exists only on this disk),
+    // then copied ones missing only their row; oldest first within each.
+    out.sort_by_key(|u| (u.copied, u.day));
     Ok(out)
 }
 
@@ -299,6 +335,30 @@ pub async fn upload_day_with_retries<S: ColdObjectStore>(
     (last, ran)
 }
 
+/// How many of day `day`'s report files the bucket already holds (LF-9
+/// finding 7): one HeadObject per file, a read only. A catch-up of a day
+/// whose local folder is gone checks this before rebuilding, so a day already
+/// reported and copied is never built a second time beside its first build.
+/// O(5) calls.
+///
+/// # Errors
+/// A bad day, or a probe that failed (the day's state is then unknown).
+pub async fn day_files_in_bucket<S: ColdObjectStore>(
+    store: &S,
+    day: &str,
+) -> Result<usize, String> {
+    let mut found = 0usize;
+    for name in report_file_names(day) {
+        let key = live_fill_report_key(day, &name).ok_or_else(|| format!("bad key for {name}"))?;
+        match store.head_object(&key).await {
+            Ok(Some(_)) => found += 1,
+            Ok(None) => {}
+            Err(e) => return Err(format!("{name}: {e}")),
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +418,30 @@ mod tests {
             objects.insert(key.to_string(), (body.len() as u64, sha256_b64.to_string()));
             Ok(())
         }
+    }
+
+    /// LF-9 finding 7: the probe counts the day's files already in the
+    /// bucket (HeadObject only) and reports a failed probe as unknown.
+    #[tokio::test]
+    async fn test_day_files_in_bucket_counts_the_copied_files() {
+        let bucket = FakeBucket::default();
+        assert_eq!(day_files_in_bucket(&bucket, DAY).await, Ok(0));
+        let names = report_file_names(DAY);
+        for n in &names[..2] {
+            let key = live_fill_report_key(DAY, n).expect("key");
+            bucket
+                .objects
+                .lock()
+                .expect("lock")
+                .insert(key, (10, "x".to_owned()));
+        }
+        assert_eq!(day_files_in_bucket(&bucket, DAY).await, Ok(2));
+        assert!(day_files_in_bucket(&bucket, "nope").await.is_err());
+        assert_eq!(
+            bucket.puts.load(Ordering::SeqCst),
+            0,
+            "a probe never writes"
+        );
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -544,6 +628,8 @@ mod tests {
         let ok = FakeBucket::default();
         assert!(upload_day(&ok, &copied_dir, copied).await.all_verified());
         assert!(folder_copied(&copied_dir, copied));
+        write_row_written(&copied_dir, copied).expect("row record");
+        assert!(row_written(&copied_dir));
         for d in ["2026-11-13", "2026-11-16"] {
             write_report_files(&day_dir(&base, d), &five_files(d)).expect("write");
         }
@@ -557,10 +643,12 @@ mod tests {
                 UnreportedDay {
                     day: chrono::NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
                     complete: false,
+                    copied: false,
                 },
                 UnreportedDay {
                     day: chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap(),
                     complete: true,
+                    copied: false,
                 },
             ]
         );
@@ -569,6 +657,14 @@ mod tests {
             upload_day_with_retries(&ok, &old_dir, old, UPLOAD_TRIES, Duration::ZERO).await;
         assert!(done.all_verified());
         assert!(folder_copied(&old_dir, old));
+        // LF-9 review (second pass): copied, but its summary row was not
+        // written (the row write failed): still listed, so a later pass
+        // rewrites the row. Its row record finishes it.
+        let copied_no_row = unreported_day_folders(&base, today, lookback).expect("scan");
+        assert_eq!(copied_no_row.len(), 2, "{copied_no_row:?}");
+        assert!(copied_no_row[1].complete);
+        assert!(!row_written(&old_dir));
+        write_row_written(&old_dir, old).expect("row record");
         let after = unreported_day_folders(&base, today, lookback).expect("scan");
         assert_eq!(after.len(), 1);
         assert!(!after[0].complete);
@@ -661,5 +757,28 @@ mod tests {
                 .all(|(_, o)| o.starts_with("marker_failed:")),
             "{none:?}"
         );
+    }
+
+    /// LF-9 review round 3, finding 7: the summary row's own record is kept
+    /// per folder, apart from the five copy records. A folder with every file
+    /// copied but no row record is not finished; once `write_row_written`
+    /// lands, `row_written` reads it, and only for that folder.
+    #[test]
+    fn test_write_row_written_then_row_written_reads_it_for_that_folder_only() {
+        let base = scratch("row_record");
+        let day = "2026-11-12";
+        let dir = day_dir(&base, day);
+        let other = day_dir(&base, "2026-11-11");
+        assert!(!row_written(&dir), "no record before the row");
+        write_row_written(&dir, day).expect("row record");
+        assert!(row_written(&dir));
+        assert_eq!(
+            std::fs::read(markers_dir(&dir).join(ROW_WRITTEN_RECORD)).expect("read"),
+            day.as_bytes()
+        );
+        assert!(!row_written(&other), "another day's folder is untouched");
+        // A second write (a later attempt) is harmless.
+        write_row_written(&dir, day).expect("rewrite");
+        assert!(row_written(&dir));
     }
 }

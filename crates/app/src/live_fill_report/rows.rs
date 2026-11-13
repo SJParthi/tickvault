@@ -279,9 +279,104 @@ pub async fn read_day(exec_url: &str, day: NaiveDate) -> Result<(Vec<EventRow>, 
     tickvault_storage::off_worker::off_worker(move || parse_exec_body_owned(body))
 }
 
+/// The summary-row read of day `day` (`YYYY-MM-DD`, validated): whether a
+/// `live_fill_report_daily` row exists and says its copy was verified (LF-9
+/// finding 7). `None` for a day that is not a valid date. Pure.
+#[must_use]
+pub fn row_uploaded_sql(day: &str) -> Option<String> {
+    let d = NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "SELECT s3_uploaded FROM live_fill_report_daily WHERE ts IN '{}' AND feed = 'dhan' \
+         ORDER BY reported_at DESC LIMIT 1",
+        d.format("%Y-%m-%d")
+    ))
+}
+
+/// Parses a [`row_uploaded_sql`] reply: `Ok(Some(flag))` for a row (a NULL
+/// flag reads `false`, not verified), `Ok(None)` for no row, `Err` for an
+/// unreadable body (LF-9 review, findings 6 and 10: a failed read must never
+/// read as "no row"). Pure.
+///
+/// # Errors
+/// The body is not JSON or has no `dataset` array.
+pub fn parse_row_uploaded(body: &str) -> Result<Option<bool>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "summary row reply is not JSON".to_owned())?;
+    let dataset = v
+        .get("dataset")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "summary row reply has no dataset".to_owned())?;
+    Ok(dataset.first().map(|row| {
+        row.as_array()
+            .and_then(|c| c.first())
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }))
+}
+
+/// Whether day `day`'s summary row says its copy was verified: `Ok(None)`
+/// when there is no row, `Err` when the read failed (a timeout, a non-2xx
+/// status, an unreadable body; bounded by [`REPORT_QUERY_TIMEOUT_SECS`]).
+/// "No row" and "could not read" are kept apart (LF-9 review, findings 6
+/// and 10): a day whose row could not be read is never rebuilt over it.
+/// Never a write.
+///
+/// # Errors
+/// The read failed (the text says which step).
+// TEST-EXEMPT: one bounded QuestDB GET; the SQL (`row_uploaded_sql`) and the parse (`parse_row_uploaded`) are unit-tested, and the caller's decision on each outcome is `probe_failure_may_build`.
+pub async fn read_row_uploaded(exec_url: &str, day: &str) -> Result<Option<bool>, String> {
+    let sql = row_uploaded_sql(day).ok_or_else(|| "bad day".to_owned())?;
+    let client = tickvault_storage::http_client::shared_probe_client()
+        .map_err(|e| format!("client: {e}"))?;
+    let limit = Duration::from_secs(REPORT_QUERY_TIMEOUT_SECS);
+    let resp = tokio::time::timeout(
+        limit,
+        client
+            .get(exec_url)
+            .timeout(limit)
+            .query(&[("query", sql.as_str())])
+            .send(),
+    )
+    .await
+    .map_err(|_| "summary row read timed out".to_owned())?
+    .map_err(|e| format!("summary row read failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("summary row read status {}", resp.status()));
+    }
+    let body = tokio::time::timeout(limit, resp.text())
+        .await
+        .map_err(|_| "summary row body timed out".to_owned())?
+        .map_err(|e| format!("summary row body failed: {e}"))?;
+    parse_row_uploaded(&body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_row_uploaded_sql_and_parse_row_uploaded() {
+        let sql = row_uploaded_sql("2026-11-12").expect("valid day");
+        assert!(sql.contains("FROM live_fill_report_daily WHERE ts IN '2026-11-12'"));
+        assert!(row_uploaded_sql("2026-11-12'; DROP").is_none());
+        assert_eq!(
+            parse_row_uploaded(r#"{"dataset":[[true]]}"#),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            parse_row_uploaded(r#"{"dataset":[[false]]}"#),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            parse_row_uploaded(r#"{"dataset":[[null]]}"#),
+            Ok(Some(false))
+        );
+        assert_eq!(parse_row_uploaded(r#"{"dataset":[]}"#), Ok(None));
+        // LF-9 review, findings 6 and 10: an unreadable reply is a failed
+        // read, never "no row".
+        assert!(parse_row_uploaded("not json").is_err());
+        assert!(parse_row_uploaded(r#"{"error":"x"}"#).is_err());
+    }
 
     fn body(rows: &[serde_json::Value]) -> String {
         let cols: Vec<serde_json::Value> = EVENT_COLUMNS

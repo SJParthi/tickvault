@@ -24,9 +24,17 @@
 //!   `pool_supervisor::live_shed::main_feed_socket_loss_state` with one relaxed load per
 //!   offer. Its instruments get no ticks while the other sockets keep the
 //!   stream busy, so no feed gap shows. The tap counts one loss on every
-//!   change of the down-slot mask and, while any slot is down, one per second
-//!   of receipt time, so the chain's untrusted stretch has no hole from the
-//!   close to the redial.
+//!   change of the down-slot mask (the socket going down, and coming back),
+//!   never once per second while it stays down (LF-9 finding 11: a socket
+//!   parked for the rest of the day used to taint every instrument, on every
+//!   socket, every second until the close). Each loss taints the stretch
+//!   around that change (the chain's drop lag before it, its skew after), so
+//!   a bar of a down socket's instrument that holds the close or the redial
+//!   is refused, and a bar that lies wholly inside the downtime cannot exist
+//!   (no tick reached it). **Honest limit:** for a downtime longer than the
+//!   drop lag plus the skew, the stretch in between is not tainted for the
+//!   OTHER sockets' instruments, which is the point; an instrument with a
+//!   backup copy on a live socket keeps building bars from that copy there.
 //!
 //! The running loss total is also stored in a shared atomic
 //! ([`LiveFillTap::with_loss_out`]) whenever it changes, so the chain thread
@@ -65,7 +73,7 @@ use tickvault_trading::brutex_host::live_candles::IST_OFFSET_NS;
 /// The counter the drain publishes tap drops on (local `/metrics` only).
 pub const LIVE_FILL_TAP_DROPPED_COUNTER: &str = "tv_live_fill_tap_dropped_total";
 
-/// One tick for the chain thread. `Copy`, 56 bytes, no heap.
+/// One tick for the chain thread. `Copy`, 64 bytes, no heap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TapTick {
     pub security_id: u64,
@@ -99,9 +107,73 @@ pub struct TapTick {
     /// accepted late, an index tick at an older or the same second with a
     /// different price; the fold's `older_trade`). The chain folds its price
     /// into the bar it belongs to (or counts it late on a closed one) and
-    /// never lets it move a close or reach the engine. Never true together
-    /// with `new_trade`.
+    /// never lets it reach the engine; it moves a close only when it is not
+    /// `stale_packet`, as the fold's close does. Never true together with
+    /// `new_trade`.
     pub older_trade: bool,
+    /// The volume the candle fold credited this tick with (LF-9 findings 8,
+    /// 9, 10): `ConsumeStats::volume_delta`, saturated to `u32`. The chain
+    /// adds it to its bars instead of differencing `cum_volume`, so a chain
+    /// bar carries the volume of the stored candle of the same bucket (the
+    /// fold unwraps a `u32` wrap and re-anchors a counter restart).
+    pub volume_delta: u32,
+    /// The volume credited to a day's first session bucket (the one holding
+    /// 09:15:00): `ConsumeStats::first_bucket_volume_delta`. Equal to
+    /// `volume_delta` except on a pre-market boot's first trade.
+    pub first_bucket_volume_delta: u32,
+    /// The fold re-anchored a vendor counter restart on this tick
+    /// (`ConsumeStats::cumulative_restarted`): each frame's next bar adds
+    /// nothing for its opening tick, as the fold's does.
+    pub cumulative_restarted: bool,
+    /// The fold read this tick as a stale packet (`ConsumeStats::stale_packet`,
+    /// a cumulative below the slot's high mark; LF-9 review). Only a stale
+    /// packet is kept off a bar's close: an `older_trade` that is not stale
+    /// (an index tick at the same second with another price) moves the close
+    /// as the fold's does.
+    pub stale_packet: bool,
+    /// The fold SEEDED the instrument's volume baseline on this tick
+    /// (`ConsumeStats::seeded`; LF-9 review, second pass): it credited
+    /// nothing to an earlier tick of the instrument, so the chain cannot
+    /// have missed one.
+    pub fold_seed: bool,
+    /// The fold ended a replay gap on this LIVE tick and credited it nothing
+    /// (`ConsumeStats::gap_reseed`; LF-9 review, third pass): typically an
+    /// instrument's first live tick after a mid-session boot re-folded the
+    /// WAL tail. Like `fold_seed`, nothing earlier of this instrument can
+    /// have been missed by the chain.
+    pub fold_gap_reseed: bool,
+}
+
+/// The fold's per-tick volume for a [`TapTick`] (LF-9). O(1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TapVolume {
+    pub delta: u64,
+    pub first_bucket_delta: u64,
+    pub restart: bool,
+    /// `ConsumeStats::stale_packet` (LF-9 review).
+    pub stale: bool,
+    /// `ConsumeStats::seeded` (LF-9 review, second pass).
+    pub seed: bool,
+    /// `ConsumeStats::gap_reseed` (LF-9 review, third pass).
+    pub gap_reseed: bool,
+}
+
+impl TapVolume {
+    /// The fold's own per-tick volume, taken from its `ConsumeStats` (LF-9
+    /// review, finding 8): the ONE mapping the frame drain, the offline
+    /// replay and the tests share, so no copy can swap two fields. O(1).
+    #[must_use]
+    #[inline]
+    pub fn from_stats(stats: &tickvault_trading::candles::ConsumeStats) -> Self {
+        Self {
+            delta: stats.volume_delta,
+            first_bucket_delta: stats.first_bucket_volume_delta,
+            restart: stats.cumulative_restarted,
+            stale: stats.stale_packet,
+            seed: stats.seeded,
+            gap_reseed: stats.gap_reseed,
+        }
+    }
 }
 
 impl TapTick {
@@ -115,6 +187,7 @@ impl TapTick {
         drop_seq: u32,
         new_trade: bool,
         older_trade: bool,
+        volume: TapVolume,
     ) -> Self {
         let (best_bid, best_ask, best_bid_qty, best_ask_qty) = match best {
             Some(l) => (l.bid_price, l.ask_price, l.bid_quantity, l.ask_quantity),
@@ -134,6 +207,12 @@ impl TapTick {
             segment: tick.exchange_segment_code,
             new_trade,
             older_trade: older_trade && !new_trade,
+            volume_delta: u32::try_from(volume.delta).unwrap_or(u32::MAX),
+            first_bucket_volume_delta: u32::try_from(volume.first_bucket_delta).unwrap_or(u32::MAX),
+            cumulative_restarted: volume.restart,
+            stale_packet: volume.stale,
+            fold_seed: volume.seed,
+            fold_gap_reseed: volume.gap_reseed,
         }
     }
 }
@@ -165,8 +244,6 @@ pub struct LiveFillTap {
     socket_state: fn() -> u64,
     /// The socket loss word as last read.
     socket_seen: u64,
-    /// Receipt second of the last socket-down loss counted.
-    socket_bump_sec: i64,
     /// Where the running loss total is published for the chain thread.
     loss_out: Option<Arc<AtomicU64>>,
     /// The loss total last published.
@@ -223,7 +300,6 @@ impl LiveFillTap {
             shed_seen: shed_total(),
             socket_state,
             socket_seen: socket_state(),
-            socket_bump_sec: i64::MIN,
             loss_out: None,
             loss_published: 0,
             closed: false,
@@ -251,6 +327,7 @@ impl LiveFillTap {
         best: Option<&MarketDepthLevel>,
         new_trade: bool,
         older_trade: bool,
+        volume: TapVolume,
     ) -> bool {
         if self.closed {
             return false;
@@ -262,17 +339,14 @@ impl LiveFillTap {
                 .saturating_add(shed.wrapping_sub(self.shed_seen));
             self.shed_seen = shed;
         }
+        // One loss per change of the down-slot mask (a socket went down or
+        // came back), never per second while one stays down (LF-9 finding 11).
         let sock = (self.socket_state)();
-        let sec = tick.received_at_nanos.div_euclid(1_000_000_000);
-        // APPROVED: the low 32 bits of the packed word are the down-slot mask.
-        #[allow(clippy::cast_possible_truncation)]
-        let any_down = sock as u32 != 0;
-        if sock != self.socket_seen || (any_down && sec != self.socket_bump_sec) {
+        if sock != self.socket_seen {
             self.socket_seen = sock;
-            self.socket_bump_sec = sec;
             self.upstream_lost = self.upstream_lost.saturating_add(1);
         }
-        let t = TapTick::from_parsed(tick, best, self.drop_seq(), new_trade, older_trade);
+        let t = TapTick::from_parsed(tick, best, self.drop_seq(), new_trade, older_trade, volume);
         match self.tx.try_send(t) {
             Ok(()) => {
                 self.publish_loss();
@@ -421,7 +495,7 @@ mod tests {
             bid_price: 101.45,
             ask_price: 101.55,
         };
-        let t = TapTick::from_parsed(&p, Some(&level), 7, true, true);
+        let t = TapTick::from_parsed(&p, Some(&level), 7, true, true, TapVolume::default());
         assert_eq!(t.security_id, 42);
         assert_eq!(t.segment, 2);
         assert_eq!(t.receipt_ist_ns, 1_000_000_000 + IST_OFFSET_NS);
@@ -434,11 +508,11 @@ mod tests {
             t.new_trade && !t.older_trade,
             "a new trade is never also older"
         );
-        let no_depth = TapTick::from_parsed(&p, None, 0, false, true);
+        let no_depth = TapTick::from_parsed(&p, None, 0, false, true, TapVolume::default());
         assert!(no_depth.older_trade);
         assert_eq!(no_depth.best_bid, 0.0);
         assert_eq!(no_depth.best_ask_qty, 0);
-        assert!(std::mem::size_of::<TapTick>() <= 56);
+        assert!(std::mem::size_of::<TapTick>() <= 64);
     }
 
     #[test]
@@ -448,14 +522,17 @@ mod tests {
         let mut tap = LiveFillTap::with_shed_source(tx, || 0);
         assert_eq!(tap.upstream_lost(), 0);
         let p = parsed(1, 10.0, 100, 1);
-        assert!(tap.offer(&p, None, true, false));
-        assert!(tap.offer(&p, None, true, false));
-        assert!(!tap.offer(&p, None, true, false), "full ring drops");
-        assert!(!tap.offer(&p, None, true, false));
+        assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+        assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+        assert!(
+            !tap.offer(&p, None, true, false, TapVolume::default()),
+            "full ring drops"
+        );
+        assert!(!tap.offer(&p, None, true, false, TapVolume::default()));
         assert_eq!(tap.dropped(), 2);
         assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
         assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
-        assert!(tap.offer(&p, None, true, false));
+        assert!(tap.offer(&p, None, true, false, TapVolume::default()));
         assert_eq!(
             rx.try_recv().map(|t| t.drop_seq),
             Some(2),
@@ -466,7 +543,7 @@ mod tests {
         assert_eq!(tap.published, 2);
         drop(rx);
         assert!(
-            !tap.offer(&p, None, true, false),
+            !tap.offer(&p, None, true, false, TapVolume::default()),
             "a closed ring queues nothing"
         );
         assert_eq!(tap.dropped(), 2, "a closed ring is not a fell-behind drop");
@@ -491,13 +568,13 @@ mod tests {
             .with_loss_out(std::sync::Arc::clone(&loss));
         let p = parsed(1, 10.0, 100, 1);
         drop(rx);
-        assert!(!tap.offer(&p, None, true, false));
+        assert!(!tap.offer(&p, None, true, false, TapVolume::default()));
         assert!(tap.closed, "the first closed send stops the tap");
         let reads = CLOSED_SHED_READS.load(std::sync::atomic::Ordering::Relaxed);
         let stored = loss.load(std::sync::atomic::Ordering::Relaxed);
         CLOSED_SHED.store(9, std::sync::atomic::Ordering::Relaxed);
-        assert!(!tap.offer(&p, None, true, false));
-        assert!(!tap.offer(&p, None, true, false));
+        assert!(!tap.offer(&p, None, true, false, TapVolume::default()));
+        assert!(!tap.offer(&p, None, true, false, TapVolume::default()));
         assert_eq!(
             CLOSED_SHED_READS.load(std::sync::atomic::Ordering::Relaxed),
             reads,
@@ -527,19 +604,19 @@ mod tests {
         SHED.store(5, std::sync::atomic::Ordering::Relaxed);
         let mut tap = LiveFillTap::with_shed_source(tx, shed_now);
         let p = parsed(1, 10.0, 100, 1);
-        assert!(tap.offer(&p, None, true, false));
+        assert!(tap.offer(&p, None, true, false, TapVolume::default()));
         assert_eq!(
             rx.try_recv().map(|t| t.drop_seq),
             Some(0),
             "sheds before the tap do not count"
         );
         SHED.store(8, std::sync::atomic::Ordering::Relaxed);
-        assert!(tap.offer(&p, None, true, false));
+        assert!(tap.offer(&p, None, true, false, TapVolume::default()));
         assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(3));
         assert_eq!(tap.upstream_lost(), 3);
         assert_eq!(tap.dropped(), 0, "the tap's own drop metric is unchanged");
         tap.note_upstream_loss();
-        assert!(tap.offer(&p, None, false, false));
+        assert!(tap.offer(&p, None, false, false, TapVolume::default()));
         let t = rx.try_recv().expect("queued");
         assert_eq!(t.drop_seq, 4);
         assert!(!t.new_trade);
@@ -553,10 +630,15 @@ mod tests {
         SOCKETS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// LF-6b review finding 1: one of two main-feed sockets closes and redials
-    /// while the other keeps delivering. No global silence ever shows, yet
-    /// every second the closed socket was down must read untrusted, and the
-    /// loss total reaches the chain thread out of band.
+    /// LF-6b review finding 1, as LF-9 finding 11 bounds it: one of two
+    /// main-feed sockets closes and redials while the other keeps delivering.
+    /// No global silence ever shows, yet the stretch around the close and the
+    /// stretch around the redial read untrusted (a bar of the down socket's
+    /// instrument holding either is refused), and the loss total reaches the
+    /// chain thread out of band. The downtime counts ONE loss per change of
+    /// the down mask, never one per second: the middle of a long downtime is
+    /// not tainted for the healthy socket's instruments, and a socket parked
+    /// for the rest of the day taints only around the park.
     #[test]
     fn test_one_main_feed_socket_down_taints_the_stretch_with_sources_with_loss_out() {
         use crate::live_fill::taint::{StreamWatch, TaintRanges, TaintReason};
@@ -564,66 +646,80 @@ mod tests {
         // 10:00:00 IST of an arbitrary day; receipt in UTC nanos.
         let t0_ist: i64 = 20_000 * 86_400 + 36_000;
         let utc = |ist_secs: i64, frac_ns: i64| (ist_secs - IST_OFFSET_NS / NS) * NS + frac_ns;
-        let (tx, mut rx) = live_fill_tap_ring(4_096);
-        let loss = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut tap = LiveFillTap::with_sources(tx, || 0, sockets_now)
-            .with_loss_out(std::sync::Arc::clone(&loss));
-        let mut watch = StreamWatch::new();
-        let mut taints = TaintRanges::new();
-        let mut cum = 0u32;
-        // The sibling socket ticks every 100 ms from 10:00:00 to 10:10:00;
-        // socket 0 is down from 10:00:20 to 10:08:00 (a long 805-style park).
-        for step in 0..6_000i64 {
-            let ist = t0_ist + step / 10;
-            let frac = (step % 10) * 100_000_000;
-            if ist == t0_ist + 20 && frac == 0 {
-                SOCKETS.store((1u64 << 32) | 1, std::sync::atomic::Ordering::Relaxed);
+        let run = |down_at: i64, up_at: Option<i64>, secs: i64| {
+            let (tx, mut rx) = live_fill_tap_ring(4_096);
+            let loss = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            SOCKETS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let mut tap = LiveFillTap::with_sources(tx, || 0, sockets_now)
+                .with_loss_out(std::sync::Arc::clone(&loss));
+            let mut watch = StreamWatch::new();
+            let mut taints = TaintRanges::new();
+            let mut cum = 0u32;
+            // The sibling socket ticks every 100 ms from 10:00:00.
+            for step in 0..secs * 10 {
+                let ist = t0_ist + step / 10;
+                let frac = (step % 10) * 100_000_000;
+                if ist == t0_ist + down_at && frac == 0 {
+                    SOCKETS.store((1u64 << 32) | 1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if up_at.is_some_and(|u| ist == t0_ist + u) && frac == 0 {
+                    SOCKETS.store(2u64 << 32, std::sync::atomic::Ordering::Relaxed);
+                }
+                cum += 1;
+                let mut p = parsed(7, 100.0, u32::try_from(ist).expect("fits"), cum);
+                p.received_at_nanos = utc(ist, frac);
+                assert!(tap.offer(&p, None, true, false, TapVolume::default()));
+                let t = rx.try_recv().expect("queued");
+                watch.on_tick(
+                    t.drop_seq,
+                    i64::from(t.exchange_secs),
+                    t.receipt_ist_ns,
+                    true,
+                    &mut taints,
+                );
+                let wall = t.receipt_ist_ns + 1_000_000;
+                watch.on_pass(wall, wall, &mut taints);
             }
-            if ist == t0_ist + 480 && frac == 0 {
-                SOCKETS.store(2u64 << 32, std::sync::atomic::Ordering::Relaxed);
-            }
-            cum += 1;
-            let mut p = parsed(7, 100.0, u32::try_from(ist).expect("fits"), cum);
-            p.received_at_nanos = utc(ist, frac);
-            assert!(tap.offer(&p, None, true, false));
-            let t = rx.try_recv().expect("queued");
-            watch.on_tick(
-                t.drop_seq,
-                i64::from(t.exchange_secs),
-                t.receipt_ist_ns,
-                true,
-                &mut taints,
+            assert_eq!(
+                loss.load(std::sync::atomic::Ordering::Relaxed),
+                tap.upstream_lost(),
+                "the chain thread sees the same loss total out of band"
             );
-            let wall = t.receipt_ist_ns + 1_000_000;
-            watch.on_pass(wall, wall, &mut taints);
-        }
-        for s in [
-            t0_ist + 20,
-            t0_ist + 100,
-            t0_ist + 300,
-            t0_ist + 479,
-            t0_ist + 480,
-        ] {
+            (taints, tap.upstream_lost())
+        };
+        // Socket 0 down from 10:00:20 to 10:08:00 (a long 805-style park).
+        let (taints, lost) = run(20, Some(480), 600);
+        assert_eq!(lost, 2, "one loss when it went down, one when it came back");
+        for s in [t0_ist + 20, t0_ist + 60, t0_ist + 479, t0_ist + 480] {
             assert_eq!(
                 taints.taint_of(s, s + 1),
                 Some(TaintReason::TickDropped),
-                "second {} of the downtime must read untrusted",
+                "second {} next to the close or the redial must read untrusted",
                 s - t0_ist
             );
         }
+        assert_eq!(
+            taints.taint_of(t0_ist + 120, t0_ist + 150),
+            None,
+            "the middle of a long downtime does not taint the healthy socket's instruments"
+        );
         assert_eq!(
             taints.taint_of(t0_ist + 590, t0_ist + 600),
             None,
             "after the socket is back and the lag bound passes, candles are trusted"
         );
+        // Parked at 10:00:20 for the rest of the run (a terminal 808 / 806 /
+        // 810): one loss, and nothing after the stretch around the park.
+        let (taints, lost) = run(20, None, 1_200);
+        assert_eq!(lost, 1, "a parked socket counts once, not once a second");
         assert_eq!(
-            loss.load(std::sync::atomic::Ordering::Relaxed),
-            tap.upstream_lost(),
-            "the chain thread sees the same loss total out of band"
+            taints.taint_of(t0_ist + 20, t0_ist + 21),
+            Some(TaintReason::TickDropped)
         );
-        assert!(
-            tap.upstream_lost() >= 460,
-            "one loss per second down, plus the edges"
+        assert_eq!(
+            taints.taint_of(t0_ist + 300, t0_ist + 1_199),
+            None,
+            "a parked socket must not taint every instrument for the rest of the day"
         );
         // No socket ever down: nothing is tainted.
         let (tx, mut rx) = live_fill_tap_ring(16);
@@ -631,7 +727,7 @@ mod tests {
         let mut p = parsed(7, 100.0, u32::try_from(t0_ist).expect("fits"), 1);
         for k in 0..5 {
             p.received_at_nanos = utc(t0_ist + k, 0);
-            assert!(quiet.offer(&p, None, true, false));
+            assert!(quiet.offer(&p, None, true, false, TapVolume::default()));
             assert_eq!(rx.try_recv().map(|t| t.drop_seq), Some(0));
         }
     }
