@@ -258,9 +258,13 @@ fn the_lane_declares_whether_a_depth_sink_exists() {
 fn out_of_order_rescues_never_ack_the_watermark() {
     let ticks = production("../storage/src/tick_persistence.rs");
     let depth = production("../storage/src/depth_persistence.rs");
-    for (name, src, f) in [
-        ("ticks", &ticks, "note_rescue_outcome_ticks("),
-        ("depth", &depth, "note_rescue_outcome_depth("),
+    // B1 (2026-11-13): the tick writer thread has a third in-order site, the
+    // failed spill of rows set aside while their table is not keyed
+    // (`TickWriterSink::set_aside_rows`). It runs on the writer thread, in
+    // batch order, like the thread's own rescue.
+    for (name, src, f, expected_in_order) in [
+        ("ticks", &ticks, "note_rescue_outcome_ticks(", 3),
+        ("depth", &depth, "note_rescue_outcome_depth(", 2),
     ] {
         let in_order = src
             .matches(&format!("{f}true, (batch.min_seq, batch.max_seq), true)"))
@@ -269,8 +273,9 @@ fn out_of_order_rescues_never_ack_the_watermark() {
                 .matches(&format!("{f}false, (batch.min_seq, batch.max_seq), true)"))
                 .count();
         assert_eq!(
-            in_order, 2,
-            "{name}: only the writer thread's own rescue is in order"
+            in_order, expected_in_order,
+            "{name}: only the writer thread's own rescue (and, for ticks, its \
+             set-aside spill failure) is in order"
         );
         assert!(
             src.contains(&format!("{f}landed, range, false)")),

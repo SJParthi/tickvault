@@ -38,6 +38,10 @@ const BUDGET: &[(&str, usize)] = &[
     // ensure is refused (the same can-not-be-staged refusal as J3). Paired
     // behaviour tests: `market_depth_book_ensure_reads_not_keyed_when_unreachable`,
     // `ensure_until_keyed_returns_once_every_statement_is_accepted`.
+    // 2026-11-13 (B1): the arming order of the live write gate is a behaviour
+    // test in its own binary (`crates/app/tests/live_write_gate_boot.rs`,
+    // `test_boot_live_ddl_arms_the_write_gate_before_its_first_ensure`), not a
+    // source scan, so this row stays at 7.
     ("candle_ddl_boot.rs", 7),
     // 2026-11-12 (plan item LF-6a): one wiring scan pinning that the live
     // clock poll loop feeds the 1 ms page episode and the probe publishes the

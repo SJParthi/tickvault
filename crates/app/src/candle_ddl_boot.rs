@@ -259,6 +259,18 @@ pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 /// consequence — never a panic, and never a silent continue.
 // TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
 pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
+    // B1 (2026-11-13): from here on the live tick and depth writers post only
+    // into tables an ensure below (or its background re-run) has keyed. Armed
+    // BEFORE the first ensure so no live row can reach a table ILP would
+    // create without its key; a refusal keeps the rows in the spill / WAL.
+    tickvault_storage::ilp_table_gate::arm_live_write_gate();
+    live_table_ddl_loop(questdb).await
+}
+
+/// The bounded ensure loop behind [`run_live_table_ddl_at_boot`], without the
+/// gate arming, so its own test cannot arm the process-wide gate for the
+/// other tests in this binary.
+async fn live_table_ddl_loop(questdb: &QuestDbConfig) -> bool {
     for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
@@ -301,10 +313,10 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         attempts = LIVE_TABLE_DDL_ATTEMPTS,
         backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
         "live-table DDL boot EXHAUSTED — ticks, market_depth and/or feed_aux_packets could not be \
-         ensured. Consequence: the first ILP write may auto-create the table \
-         WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
-         pools overwrite each other's levels. The ensure keeps re-running in the \
-         background (the boot spawns it). \
+         ensured. Consequence: the live writers do NOT post into an un-keyed table (QuestDB \
+         would create it in a shape that can never take the DEDUP key); their batches go to \
+         the spill files or stay in the frame log until the ensure, which keeps re-running \
+         in the background (the boot spawns it), keys the table. \
          Check QuestDB's WAL state (`wal_tables()`) before the next session."
     );
     false
@@ -323,6 +335,64 @@ pub const DDL_BACKGROUND_RETRY_FIRST_SECS: u64 = 30;
 /// day against a database that keeps refusing; doubling to ten minutes keeps a
 /// long outage to a few dozen episodes while a short one still clears fast.
 pub const DDL_BACKGROUND_RETRY_MAX_SECS: u64 = 600;
+
+/// Ceiling on the live-table re-run's delay while the live writers' gate is
+/// still holding their batches (B1 review, 2026-11-13).
+///
+/// Every live tick and depth batch goes to the spill (or stays in the frame
+/// log) until the `Live` re-run keys `ticks`, `tick_quotes`,
+/// `feed_aux_packets` and `market_depth`. A boot whose bounded ensure gave up
+/// against a QuestDB that answered slowly then recovered would otherwise
+/// wait for the doubling delay (up to ten minutes) with the whole feed
+/// spilled. Once the gate is open the re-run returns to the doubling delay,
+/// so a database that keeps refusing only a column self-heal is not retried
+/// (and logged) every 30 s all day.
+pub const DDL_LIVE_UNKEYED_RETRY_MAX_SECS: u64 = 30;
+
+/// The delay before the next background re-run attempt: the doubling `delay`,
+/// capped at [`DDL_LIVE_UNKEYED_RETRY_MAX_SECS`] for the `Live` tables while
+/// the live writers' gate is still shut (`live_gate_open` false). Pure.
+#[must_use]
+pub fn background_retry_delay(
+    tables: DdlTables,
+    delay: std::time::Duration,
+    live_gate_open: bool,
+) -> std::time::Duration {
+    if tables == DdlTables::Live && !live_gate_open {
+        delay.min(std::time::Duration::from_secs(
+            DDL_LIVE_UNKEYED_RETRY_MAX_SECS,
+        ))
+    } else {
+        delay
+    }
+}
+
+/// Whether the live writers' gate is open for every live table (one Acquire
+/// load per table set). True in a process that never armed it.
+///
+/// B1 review 2: a table found un-keyable (QuestDB created it itself, see
+/// `ilp_table_gate::diagnose_refused_key`) counts as open here: no re-run can
+/// key it, so retrying every 30 s would only repeat the same refused
+/// statements and their error lines all session. The doubling delay applies.
+fn live_gate_open() -> bool {
+    use tickvault_storage::ilp_table_gate::{GatedTable, live_tables_writable, table_unkeyable};
+    live_rerun_settled(
+        [
+            GatedTable::Ticks,
+            GatedTable::TickQuotes,
+            GatedTable::FeedAuxPackets,
+            GatedTable::MarketDepth,
+        ]
+        .map(|t| (live_tables_writable(&[t]), table_unkeyable(t))),
+    )
+}
+
+/// Pure: `(keyed, unkeyable)` per live table; the re-run has nothing to
+/// hurry for once each table is keyed or known un-keyable. O(tables).
+#[must_use]
+fn live_rerun_settled(tables: [(bool, bool); 4]) -> bool {
+    tables.iter().all(|(keyed, unkeyable)| *keyed || *unkeyable)
+}
 
 /// Which ensure a background re-run repeats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,9 +522,11 @@ pub fn spawn_audit_ensure_until_keyed_once(questdb: &QuestDbConfig) -> bool {
 /// Never gives up: the tables it ensures are ones whose writers refuse to send
 /// until they are keyed, so giving up would park those writes for the session.
 /// Every statement is `IF NOT EXISTS` or an idempotent `DEDUP ENABLE`, so a
-/// re-run against a table the boot already created is free, and a
-/// `DEDUP ENABLE` re-run is what repairs a table ILP auto-created without its
-/// key.
+/// re-run against a table the boot already created is free. A `DEDUP ENABLE`
+/// re-run repairs a refused key on a table our CREATE made; it can NOT repair
+/// a table ILP auto-created (designated timestamp `timestamp`, no `ts`), which
+/// is why every writer it serves refuses to post until the ensure succeeds
+/// (B1, 2026-11-13: the live tick and depth writers joined that rule).
 pub async fn ensure_until_keyed(
     questdb: &QuestDbConfig,
     tables: DdlTables,
@@ -472,7 +544,7 @@ pub async fn ensure_until_keyed(
             );
             return attempt;
         }
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(background_retry_delay(tables, delay, live_gate_open())).await;
         delay = delay.saturating_mul(2).min(max_delay);
     }
 }
@@ -584,7 +656,50 @@ mod tests {
             pg_port: 1,
             ilp_port: 1,
         };
-        assert!(!run_live_table_ddl_at_boot(&questdb).await);
+        assert!(!live_table_ddl_loop(&questdb).await);
+    }
+
+    // B1 (2026-11-13): that the boot's live-table DDL step arms the live
+    // writers' gate BEFORE its first ensure is a behaviour test in its own
+    // binary (`crates/app/tests/live_write_gate_boot.rs`), because arming is
+    // process-wide and would close the gate for every other test here.
+
+    /// Regression, B1 review (2026-11-13): while the live gate is shut the
+    /// `Live` re-run retries every 30 s at most, instead of doubling to ten
+    /// minutes with the whole feed in the spill; once open, and for every
+    /// other table set, the doubling delay is untouched.
+    #[test]
+    fn test_background_retry_delay_regression_live_rerun_retries_fast_only_while_the_gate_is_shut()
+    {
+        let ten_min = std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_MAX_SECS);
+        let cap = std::time::Duration::from_secs(DDL_LIVE_UNKEYED_RETRY_MAX_SECS);
+        assert_eq!(background_retry_delay(DdlTables::Live, ten_min, false), cap);
+        assert_eq!(
+            background_retry_delay(DdlTables::Live, ten_min, true),
+            ten_min
+        );
+        assert_eq!(
+            background_retry_delay(DdlTables::Candles, ten_min, false),
+            ten_min
+        );
+        let short = std::time::Duration::from_secs(5);
+        assert_eq!(background_retry_delay(DdlTables::Live, short, false), short);
+        assert!(DDL_LIVE_UNKEYED_RETRY_MAX_SECS <= DDL_BACKGROUND_RETRY_FIRST_SECS);
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): a table QuestDB created itself can
+    /// never be keyed by a re-run, so it must not keep the Live re-run on its
+    /// 30 s cadence (one refused statement and its error line every 30 s, all
+    /// day). A table merely not keyed yet still does.
+    #[test]
+    fn test_live_rerun_settled_treats_an_unkeyable_table_as_settled() {
+        let keyed = (true, false);
+        let pending = (false, false);
+        let unkeyable = (false, true);
+        assert!(live_rerun_settled([keyed; 4]));
+        assert!(!live_rerun_settled([keyed, keyed, pending, keyed]));
+        assert!(live_rerun_settled([keyed, keyed, unkeyable, keyed]));
+        assert!(!live_rerun_settled([unkeyable, pending, keyed, keyed]));
     }
 
     fn unreachable_questdb() -> QuestDbConfig {

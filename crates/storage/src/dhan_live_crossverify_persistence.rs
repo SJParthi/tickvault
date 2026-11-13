@@ -745,11 +745,40 @@ pub fn dhan_live_xverify_ddl_statements() -> Vec<String> {
     statements
 }
 
-/// Create both audit tables if absent. Failures log at `error!` but NEVER
-/// block: a failed ensure leaves the first ILP write to auto-create the table
-/// WITHOUT dedup — a duplicate-row window until a later ensure succeeds.
-// TEST-EXEMPT: live-QuestDB DDL runner (the statement list is unit-tested via dhan_live_xverify_ddl_statements).
-pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig) {
+/// Set once [`ensure_dhan_live_crossverify_tables`] had every key-bearing
+/// statement (each CREATE and each `DEDUP ENABLE`) accepted in this process.
+/// Never cleared. Read by [`DhanLiveXverifyAuditWriter::flush`], which
+/// refuses to post until it is set (B1, 2026-11-13): a row reaching a table
+/// that does not exist makes QuestDB create it with the designated timestamp
+/// `timestamp` and no DEDUP key, a shape no later ensure can repair (every key
+/// here starts with `ts`). One Acquire load per flush.
+static XVERIFY_TABLES_KEYED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the cross-verify tables are keyed in this process. One Acquire load.
+#[must_use]
+pub fn xverify_tables_keyed() -> bool {
+    XVERIFY_TABLES_KEYED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `ddl` is one the keyed verdict depends on: a CREATE or a
+/// `DEDUP ENABLE`. The `ADD COLUMN IF NOT EXISTS` self-heals are best-effort
+/// (a missing back-filled column is a gap in old rows, not a table that dedups
+/// wrongly forever), as for the candle tables. Pure.
+#[must_use]
+pub fn xverify_ddl_is_key_bearing(ddl: &str) -> bool {
+    ddl.starts_with("CREATE") || ddl.contains("DEDUP ENABLE")
+}
+
+/// Create the three tables if absent, with their DEDUP keys. Failures log at
+/// `error!` and never block. Returns `true` when every key-bearing statement
+/// was accepted (and then sets [`xverify_tables_keyed`]); `false` otherwise,
+/// and the writer then refuses to post until a later call succeeds: the
+/// cross-verification run re-runs this before each persist while it is
+/// `false` (B1, 2026-11-13: before, the verdict was discarded, nothing re-ran
+/// it, and the first ILP row auto-created an un-keyable table).
+// TEST-EXEMPT: live-QuestDB DDL runner (the statement list is unit-tested via dhan_live_xverify_ddl_statements; the verdict via test_regression_xverify_ensure_returns_a_verdict_and_keys_the_writer).
+pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -771,12 +800,14 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
                 stage = "ensure_client_build",
                 ?err,
                 "dhan_live_crossverify: HTTP client build failed — audit tables \
-                 not ensured (first ILP write may auto-create them WITHOUT dedup)"
+                 not ensured (the writer refuses to post until they are)"
             );
-            return;
+            return false;
         }
     };
+    let mut keyed = true;
     for ddl in &dhan_live_xverify_ddl_statements() {
+        let key_bearing = xverify_ddl_is_key_bearing(ddl);
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -785,6 +816,7 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
+                keyed &= !key_bearing;
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 metrics::counter!(
@@ -800,10 +832,11 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
                     ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
                     "dhan_live_crossverify: DDL returned non-2xx (dedup may be \
-                     missing — duplicate-row window until a later ensure)"
+                     missing; the writer refuses to post until a later ensure succeeds)"
                 );
             }
             Err(err) => {
+                keyed &= !key_bearing;
                 metrics::counter!(
                     "tv_dhan_live_xverify_query_failures_total",
                     "stage" => "ensure_ddl"
@@ -820,6 +853,10 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
             }
         }
     }
+    if keyed {
+        XVERIFY_TABLES_KEYED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    keyed
 }
 
 /// The writer's ILP-over-HTTP request timeout, in milliseconds.
@@ -855,6 +892,9 @@ pub struct DhanLiveXverifyAuditWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Whether the tables are keyed (B1). Always [`xverify_tables_keyed`]
+    /// outside this module's tests.
+    keyed: fn() -> bool,
 }
 
 impl DhanLiveXverifyAuditWriter {
@@ -884,6 +924,7 @@ impl DhanLiveXverifyAuditWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    keyed: xverify_tables_keyed,
                 }
             }
             Err(err) => {
@@ -895,12 +936,16 @@ impl DhanLiveXverifyAuditWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    keyed: xverify_tables_keyed,
                 }
             }
         }
     }
 
-    /// Test constructor — disconnected writer, empty buffer.
+    /// Test constructor: disconnected writer, empty buffer, tables treated as
+    /// keyed (B1 review 4: a test process never runs the ensure, so reading
+    /// the process flag here would send every caller's test down the
+    /// not-keyed path). [`Self::for_test_unkeyed`] gives the other case.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
     pub fn for_test() -> Self {
@@ -908,7 +953,30 @@ impl DhanLiveXverifyAuditWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            keyed: || true,
         }
+    }
+
+    /// Test constructor: disconnected writer whose tables are NOT keyed
+    /// (B1 review 4), for callers that must prove they stop before a flush.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper, exercised by test_tables_keyed_and_for_test_unkeyed_follow_the_writer_flag and the app persist tests.
+    pub fn for_test_unkeyed() -> Self {
+        Self {
+            sender: None,
+            buffer: Buffer::new(ProtocolVersion::V1),
+            pending: 0,
+            keyed: || false,
+        }
+    }
+
+    /// Whether this writer's tables are keyed (B1 review 4). A caller checks
+    /// it before it appends: while it is `false` every [`Self::flush`] posts
+    /// nothing, so the caller skips the attempt as a deferral instead of
+    /// counting a refused flush as a persist failure. One Acquire load.
+    #[must_use]
+    pub fn tables_keyed(&self) -> bool {
+        (self.keyed)()
     }
 
     /// Rows appended but not yet flushed.
@@ -1178,6 +1246,20 @@ impl DhanLiveXverifyAuditWriter {
                  {dropped} pending row(s) discarded (recomputable, DEDUP-idempotent rerun)"
             );
         }
+        // B1 (2026-11-13): never post into a table this process has not keyed:
+        // QuestDB would create it in a shape that can never take the key. The
+        // run is degraded (no marker) and retried; the rows are recomputable.
+        // B1 review: the rows were never sent, so this is a deliberate stop,
+        // counted on the local abandoned counter and NOT on the paging
+        // discard counter (§12.15.8); the coded warn in the boot's ensure is
+        // the operator signal.
+        if !(self.keyed)() {
+            let dropped = self.abandon_pending();
+            anyhow::bail!(
+                "dhan_live_crossverify: tables not keyed yet (DDL refused); {dropped} \
+                 pending row(s) not posted; the attempt is retried"
+            );
+        }
         let flushed = self
             .sender
             .as_mut()
@@ -1266,6 +1348,193 @@ pub const DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local QuestDB stand-in: answers `/exec` with `exec_status` and every
+    /// other request (the ILP `/write`) with 204, counting the `/write`s.
+    fn b1_server(exec_status: u16) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&writes);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let reply = if head.starts_with("GET /exec") {
+                    format!(
+                        "HTTP/1.1 {exec_status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                } else {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (port, writes)
+    }
+
+    fn b1_cfg(port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// Regression, B1 (2026-11-13): the ensure returns a verdict (it returned
+    /// nothing, so nobody could retry it), a refused DDL reads `false`, and
+    /// the writer refuses to post while the tables are not keyed, so no row
+    /// can make QuestDB auto-create an un-keyable table.
+    #[tokio::test]
+    async fn test_ensure_dhan_live_crossverify_tables_regression_verdict_keys_the_writer() {
+        let (refusing, _) = b1_server(500);
+        assert!(!ensure_dhan_live_crossverify_tables(&b1_cfg(refusing)).await);
+        let (port, writes) = b1_server(200);
+        let cfg = b1_cfg(port);
+        // Not keyed: the flush posts nothing and reports a failure.
+        let mut shut = DhanLiveXverifyAuditWriter::new(&cfg);
+        shut.keyed = || false;
+        shut.append_daily(&sample_daily()).expect("append");
+        let refused = tokio::task::spawn_blocking(move || shut.flush())
+            .await
+            .expect("join");
+        assert!(
+            refused.is_err(),
+            "an un-keyed writer must not report success"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing posted"
+        );
+        // Accepted DDL keys the process; the production writer then posts.
+        assert!(ensure_dhan_live_crossverify_tables(&cfg).await);
+        assert!(xverify_tables_keyed());
+        let mut open = DhanLiveXverifyAuditWriter::new(&cfg);
+        open.append_daily(&sample_daily()).expect("append");
+        let sent = tokio::task::spawn_blocking(move || open.flush())
+            .await
+            .expect("join");
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one post"
+        );
+    }
+
+    /// The keyed flag follows an accepted ensure and is never cleared.
+    #[tokio::test]
+    async fn test_xverify_tables_keyed_after_an_accepted_ensure() {
+        let (port, _) = b1_server(200);
+        assert!(ensure_dhan_live_crossverify_tables(&b1_cfg(port)).await);
+        assert!(xverify_tables_keyed());
+        let (refusing, _) = b1_server(500);
+        assert!(!ensure_dhan_live_crossverify_tables(&b1_cfg(refusing)).await);
+        assert!(xverify_tables_keyed(), "a later refusal never clears it");
+    }
+
+    /// Counter names a scoped recorder saw registered (B1 review).
+    #[derive(Default)]
+    struct B1Names(std::sync::Mutex<Vec<String>>);
+
+    impl metrics::Recorder for B1Names {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if let Ok(mut names) = self.0.lock() {
+                names.push(key.name().to_string());
+            }
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// Regression, B1 review (2026-11-13): a flush held back because the
+    /// tables are not keyed sends nothing and is retried, so it is a
+    /// deliberate stop: it moves the local abandoned counter and NEVER the
+    /// paging `tv_dhan_live_xverify_audit_rows_discarded_total` (§2.10
+    /// audit_rows group).
+    #[test]
+    fn test_regression_unkeyed_flush_abandons_and_never_counts_as_discarded() {
+        let mut w = DhanLiveXverifyAuditWriter::new(&b1_cfg(1));
+        w.keyed = || false;
+        w.append_daily(&sample_daily()).expect("append");
+        let names = B1Names::default();
+        let out = metrics::with_local_recorder(&names, || w.flush());
+        assert!(out.is_err(), "the attempt must stay unpersisted");
+        assert_eq!(w.pending(), 0);
+        let seen = names.0.lock().map(|n| n.clone()).unwrap_or_default();
+        assert!(
+            !seen
+                .iter()
+                .any(|n| n == "tv_dhan_live_xverify_audit_rows_discarded_total"),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|n| n == DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER),
+            "{seen:?}"
+        );
+    }
+
+    /// B1 review 4: `tables_keyed` reports the writer's own flag, so a caller
+    /// can skip an attempt before any flush.
+    #[test]
+    fn test_tables_keyed_and_for_test_unkeyed_follow_the_writer_flag() {
+        assert!(DhanLiveXverifyAuditWriter::for_test().tables_keyed());
+        assert!(!DhanLiveXverifyAuditWriter::for_test_unkeyed().tables_keyed());
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.keyed = || false;
+        assert!(!w.tables_keyed());
+    }
+
+    #[test]
+    fn test_xverify_ddl_is_key_bearing_split() {
+        let all = dhan_live_xverify_ddl_statements();
+        let keyed = all.iter().filter(|d| xverify_ddl_is_key_bearing(d)).count();
+        assert_eq!(keyed, 6, "three CREATEs and three DEDUP ENABLEs");
+        assert!(!xverify_ddl_is_key_bearing(
+            "ALTER TABLE x ADD COLUMN IF NOT EXISTS y LONG;"
+        ));
+    }
 
     fn sample_cell() -> DhanLiveXverifyCellFinding {
         DhanLiveXverifyCellFinding {
