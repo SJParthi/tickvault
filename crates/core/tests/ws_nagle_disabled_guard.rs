@@ -92,10 +92,20 @@ fn every_production_dial_disables_nagle() {
 
         // The dial must exist at all — a guard that finds no call site and
         // reports success is the vacuous pass this file exists to prevent.
+        // Since 2026-11-13 (audit B2 finding 7) every site dials through
+        // `ws_dial::dial_ws_tls_with_keepalive`, which takes the same
+        // arguments as the library call it replaced and also sets
+        // SO_KEEPALIVE; `ws_dial_sets_keepalive_and_honours_disable_nagle`
+        // below pins what the helper does with them.
         assert!(
-            src.contains("connect_async_tls_with_config("),
-            "{rel}: no connect_async_tls_with_config call found — the dial moved \
+            src.contains("dial_ws_tls_with_keepalive("),
+            "{rel}: no dial_ws_tls_with_keepalive call found; the dial moved \
              and this guard is now vacuous"
+        );
+        assert!(
+            !src.contains("connect_async_tls_with_config("),
+            "{rel}: dials through the library helper, whose plain TCP connect \
+             never sets SO_KEEPALIVE. Use ws_dial::dial_ws_tls_with_keepalive."
         );
 
         // `disable_nagle` is the THIRD positional argument. Assert the two
@@ -103,19 +113,45 @@ fn every_production_dial_disables_nagle() {
         // (was `None` until audit J4, 2026-10-26; `None` is now refused by
         // `websocket_connect_config_guard.rs`) and a `config` binding (main feed).
         let ok = src.contains(
-            "connect_async_tls_with_config( request, Some(order_update_websocket_config()), true,",
-        ) || src.contains("connect_async_tls_with_config(request, config, true,");
+            "dial_ws_tls_with_keepalive( request, Some(order_update_websocket_config()), true,",
+        ) || src.contains("dial_ws_tls_with_keepalive(request, config, true,");
 
         assert!(
             ok,
             "{rel}: the dial does NOT pass disable_nagle = true.\n\
-             The third positional argument of connect_async_tls_with_config \
+             The third positional argument of dial_ws_tls_with_keepalive \
              controls Nagle. With it false, small control frames (auth, \
              subscribe batches, pongs) are held up to ~40ms, and a delayed \
              pong past Dhan's ping deadline is a self-inflicted disconnect \
              plus a full re-auth."
         );
     }
+}
+
+#[test]
+fn ws_dial_sets_keepalive_and_honours_disable_nagle() {
+    // The helper every site calls: SO_KEEPALIVE on unconditionally, TCP_NODELAY
+    // when the caller asked, both before the connect, and no plain
+    // `TcpStream::connect` (which sets neither).
+    let src = read_site("src/websocket/ws_dial.rs");
+    let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
+    assert!(production.contains("socket.set_keepalive(true)?;"));
+    assert!(production.contains("if disable_nagle { socket.set_nodelay(true)?; }"));
+    // The options are set before the connect, and the connect is the last
+    // step of the one per-address function (B2 review, 2026-11-13: each
+    // address is now tried under its own time limit).
+    let keepalive = production
+        .find("socket.set_keepalive(true)?;")
+        .expect("keepalive");
+    let connect = production
+        .find("socket.connect(addr).await")
+        .expect("connect");
+    assert!(
+        keepalive < connect,
+        "SO_KEEPALIVE must be set before the connect"
+    );
+    assert!(production.contains("connect_one_with_keepalive(addr, disable_nagle)"));
+    assert!(!production.contains("TcpStream::connect("));
 }
 
 #[test]
