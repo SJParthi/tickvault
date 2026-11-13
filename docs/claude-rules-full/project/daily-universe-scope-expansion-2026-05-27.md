@@ -3629,3 +3629,19 @@ Owner, on four cards for the LF-6b paper chain, chose every recommended option:
 Also settled by earlier owner decisions, not re-asked: the wait W is 1.0 s after each candle's end and 2.5 s for every frame's bar that opens at 09:15:00 (the brutex timing prompt the owner accepted) *(⚠ CHANGED 2026-11-12, owner card "1 s, same as all (Recommended)", after the measured 2-12 Nov opening count: only 36 of about 7,400 opening stock-seconds (0-4 of about 165 per second) had their final price more than 1 s after the candle end. The opening candles now wait 1 s like every other candle (`[live_fill] open_wait_ms = 1000`); a late opening price is skipped and logged under the addendum rule below. REJECT: an opening wait above 1 s without a fresh dated owner quote)*, and the best bid/ask at the decision travels with each tapped tick (the owner's worst-case fill rule uses the best quote).
 
 **REJECT (addendum):** placing a paper order from a candle that took a late price; keeping a partial remainder working past 60 s or after a partial; forwarding marks for instruments with no open paper position; any of this on a real order path.
+
+#### Quote 58 (2026-11-13, ~18:57 IST) — A SECURITY UPDATE: quinn-proto 0.11.18 → 0.11.19 and quinn-udp 0.5.14 → 0.5.16, Cargo.lock only (decision card, preserve EXACTLY)
+
+The Security & Audit check on PR #2246 (head `6af0654`) failed `cargo audit` on three advisories published to the advisory database that day: RUSTSEC-2026-0524 and RUSTSEC-2026-0523 in `quinn-proto` 0.11.18 (fixed from 0.11.19) and RUSTSEC-2026-0538 in `quinn-udp` 0.5.14 (fixed from 0.5.16). `cargo deny` passed: `quinn` is a phantom lock-file entry (reqwest's HTTP/3 feature is not enabled), and `cargo tree -i quinn --workspace --all-features --target all -e normal` prints nothing. `main` carries the same versions, so every PR fails until they move. The two earlier `quinn-proto` fixes (2026-07-09, 2026-10-13, recorded in `.cargo/audit.toml`) were made the same way.
+
+| Card | Owner's tap | What the card said |
+|---|---|---|
+| "Merges are blocked: today the public security list added 3 warnings for a network library (QUIC/HTTP-3, 'quinn') that sits in our lock file but is never built into the app (I checked: no build target uses it). Fixing it needs a one-time lock-file bump of quinn-proto 0.11.18 → 0.11.19 and quinn-udp 0.5.14 → 0.5.16, which your rules allow only with your OK. Which?" | **"Bump the lock (Recommended)"** | "One-time update of just those two packages in Cargo.lock, same as the last two quinn fixes (July, October). Nothing else moves; the app's built code doesn't change." |
+
+**What this changes, and nothing else:** the `Cargo.lock` entries of `quinn-proto` (0.11.18 → 0.11.19) and `quinn-udp` (0.5.14 → 0.5.16) move ONCE, on PR #2246's branch (`claude/compassionate-ritchie-rq0cyx`). Made by editing each entry's `version` and crates.io `checksum` line (the session's permission system refuses `cargo update`, as it did for Quote 55); the crates.io index shows both new versions with the same dependency names as the old ones (`quinn-udp` 0.5.16 widens `windows-sys` to `<=0.61`, still met by the locked 0.60.2), so no other entry moves.
+
+##### What violates Quote 58 (REJECT)
+- Moving any other package or version, or these two a second time, under this quote.
+- Any `Cargo.toml` change or new dependency, or enabling reqwest's HTTP/3 feature.
+- Committing `.claude/settings.json` with the `cargo update` deny rule removed.
+- Adding these advisories to an ignore list instead.
