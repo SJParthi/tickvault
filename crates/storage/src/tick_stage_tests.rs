@@ -427,3 +427,60 @@ fn test_clear_rows_keeps_pins_and_capacity_and_pin_count_tracks_them() {
     assert_eq!(b.pin_count(), 0, "pins dropped");
     assert_eq!(b.capacity(), cap);
 }
+
+/// B1 review 2 (2026-11-13), per table since B1 review 3: `encode_tables_into`
+/// and `has_rows_for` split a batch by table. The three parts together are
+/// the whole batch's text and each table's rows land only in its own part, so
+/// the writer thread can post the ticks while `tick_quotes` or
+/// `feed_aux_packets` alone is not keyed.
+#[test]
+fn test_encode_tables_into_and_has_rows_for_split_a_batch_by_table() {
+    let _g = lock();
+    publish_candle_contract_labels(CandleContractLabels::default());
+    let mut b = StagedBatch::presized();
+    let pin = b.try_pin(candle_contract_labels()).expect("pin");
+    b.push(StagedRow::Tick { row: row(1), pin });
+    assert!(b.has_rows_for(GatedTable::Ticks));
+    assert!(!b.has_rows_for(GatedTable::FeedAuxPackets), "ticks only");
+    assert!(!b.has_rows_for(GatedTable::TickQuotes), "ticks only");
+    let aux = AuxPacketRow::from_header(
+        AuxPacketKind::MarketStatus,
+        13,
+        0,
+        1_779_951_600_111_000_000,
+        2,
+    )
+    .expect("aux");
+    b.push(StagedRow::Aux { row: aux, pin });
+    b.push(StagedRow::Tick { row: row(3), pin });
+    b.push(StagedRow::Quote {
+        row: row(4),
+        exchange_ts: Some(1_793_268_000_000_000_000),
+        pin,
+    });
+    assert!(b.has_rows_for(GatedTable::FeedAuxPackets));
+    assert!(b.has_rows_for(GatedTable::TickQuotes));
+    let mut parts = 0;
+    let mut bytes = 0;
+    for (table, rows, prefix) in [
+        (GatedTable::Ticks, 2, "ticks,"),
+        (GatedTable::TickQuotes, 1, "tick_quotes,"),
+        (GatedTable::FeedAuxPackets, 1, "feed_aux_packets,"),
+    ] {
+        let mut out = TickRowBuffer::new(TickIlpEncoder::Library);
+        assert_eq!(
+            b.encode_tables_into(Feed::Dhan, &mut out, |t| t == table),
+            rows
+        );
+        let text = String::from_utf8_lossy(out.as_bytes()).to_string();
+        assert!(
+            text.lines().all(|l| l.starts_with(prefix)),
+            "{table:?}: {text}"
+        );
+        parts += rows;
+        bytes += out.as_bytes().len();
+    }
+    let mut whole = TickRowBuffer::new(TickIlpEncoder::Library);
+    assert_eq!(b.encode_into(Feed::Dhan, &mut whole), parts);
+    assert_eq!(whole.as_bytes().len(), bytes);
+}

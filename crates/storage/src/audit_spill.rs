@@ -65,8 +65,9 @@ use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info};
 
 use crate::tick_spill_replay::{
-    QUARANTINE_DIR, REPLAY_MAX_CHUNK_BYTES, SPILL_FILE_EXTENSION, describe_send_error,
-    ilp_chunk_ranges, is_permanent_refusal, list_spill_files, write_url,
+    LineIsolation, QUARANTINE_DIR, QuarantineStreak, REPLAY_MAX_CHUNK_BYTES, SPILL_FILE_EXTENSION,
+    describe_send_error, ilp_chunk_ranges, is_permanent_refusal, is_row_end, isolate_refused_lines,
+    list_spill_files, set_aside_rejected_lines, write_url,
 };
 
 /// Base directory of the audit disk tier. Relative, like the tick and depth
@@ -426,17 +427,36 @@ pub struct AuditDrainOutcome {
     pub rows_replayed: u64,
     /// Files QuestDB permanently refused, moved to quarantine.
     pub files_quarantined: u64,
-    /// A transient failure ended the round; the file stays for next round.
+    /// Rows QuestDB refused one by one (line isolation) and set aside in
+    /// `quarantine/<file>.rejected-lines`; the rest of their file landed.
+    pub rows_isolated: u64,
+    /// The round stopped after [`crate::tick_spill_replay::REPLAY_QUARANTINE_STREAK_STOP`]
+    /// files in a row were quarantined with the same status: the server is
+    /// refusing the table, not a file, so the rest wait for a fix (B1).
+    pub stopped_on_refusal_streak: bool,
+    /// The round ended early (a transient failure, or the refusal streak
+    /// above); the remaining files stay for the next round.
     pub failed: bool,
 }
 
 /// Replays every spill file in `dir` into QuestDB, oldest first.
 ///
-/// O(files) per round. A 2xx deletes the file. A permanent refusal (4xx other
-/// than 408/429) moves it to `quarantine/`, counts its rows as lost and logs
-/// AUDIT-06. Anything else ends the round with the file kept, so a struggling
-/// QuestDB is not pushed harder; the next round starts from the same file.
-/// No session-window filter is applied: every row is replayed as written.
+/// O(files) per round. A 2xx deletes the file. A permanent refusal (400, 413
+/// or 422) first isolates the refused rows by bisection, as the tick replay
+/// does (B1, 2026-11-13): every row QuestDB takes lands, only the rows it
+/// refuses one by one are set aside in `quarantine/<file>.rejected-lines`,
+/// and the file is then deleted. A refusal no row of the file survives (or
+/// past the isolation caps) moves the whole file to `quarantine/` and counts
+/// the rows that did not land as lost (AUDIT-06); after
+/// [`crate::tick_spill_replay::REPLAY_QUARANTINE_STREAK_STOP`] such files in
+/// a row with the same status the round stops, so a refusal of the whole
+/// table does not set the backlog aside. The drain loop carries that streak
+/// across rounds (B1 review): while the same status keeps coming back, later
+/// rounds keep the next file in place and stop, so at most that many files
+/// are ever set aside until a file lands again. Anything else ends the round with
+/// the file kept, so a struggling QuestDB is not pushed harder; the next
+/// round starts from the same file. No session-window filter is applied:
+/// every row is replayed as written.
 // TEST-EXEMPT: covered by the drain tests in this file (replay, refusal and quarantine outcomes)
 pub async fn drain_audit_spill_dir(
     dir: &Path,
@@ -444,8 +464,36 @@ pub async fn drain_audit_spill_dir(
     url: &str,
     client: &Client,
 ) -> AuditDrainOutcome {
+    drain_with_streak(dir, table, url, client, &mut QuarantineStreak::default()).await
+}
+
+/// Whether a whole-file refusal with `status` continues a refusal streak that
+/// ALREADY reached [`crate::tick_spill_replay::REPLAY_QUARANTINE_STREAK_STOP`]
+/// (B1 review, 2026-11-13). Such a file is kept in place, not set aside: the
+/// server is refusing the table, and the streak lives across rounds, so the
+/// backlog waits for a fix instead of draining into quarantine three files a
+/// round. Pure, O(1).
+fn streak_already_stopped_for(streak: QuarantineStreak, status: u16) -> bool {
+    let mut next = streak;
+    streak.count() >= crate::tick_spill_replay::REPLAY_QUARANTINE_STREAK_STOP
+        && next.record(status)
+        && next.count() > streak.count()
+}
+
+/// [`drain_audit_spill_dir`] with the refusal streak carried in from earlier
+/// rounds (the drain loop keeps one per table). A file that lands resets it.
+async fn drain_with_streak(
+    dir: &Path,
+    table: AuditSpillTable,
+    url: &str,
+    client: &Client,
+    streak: &mut QuarantineStreak,
+) -> AuditDrainOutcome {
     let name = table.table_name();
     let mut outcome = AuditDrainOutcome::default();
+    // B1 review 2: whether this round already kept a refused head file in
+    // place and went on to probe the next file once.
+    let mut probed_past_head = false;
     quarantine_stale_tmp_files(dir, table);
     for path in crate::off_worker::off_worker(|| list_spill_files(dir)) {
         let payload = match tokio::fs::read(&path).await {
@@ -470,10 +518,20 @@ pub async fn drain_audit_spill_dir(
             }
             continue;
         }
-        match post_file(&payload, url, client).await {
-            PostVerdict::Accepted => {
-                if let Err(err) = tokio::fs::remove_file(&path).await {
+        match post_file(&payload, url, client, dir, &path).await {
+            PostVerdict::Accepted { rejected_rows } => {
+                streak.reset();
+                if probed_past_head {
+                    // The probe landed: this round did not stop on the streak.
+                    outcome.stopped_on_refusal_streak = false;
+                    outcome.failed = false;
+                }
+                let rows = rows.saturating_sub(rejected_rows);
+                if let Err(err) = remove_replayed_file(&path).await {
                     // Re-POSTed next round; the DEDUP key makes that harmless.
+                    // B1 review: the isolated rows are NOT counted here; the
+                    // round that removes the file counts them, once. (The
+                    // `.rejected-lines` file can gain a second copy of them.)
                     error!(
                         code = ErrorCode::Audit06OrderWriteFailed.code_str(),
                         table = name,
@@ -485,13 +543,52 @@ pub async fn drain_audit_spill_dir(
                     outcome.failed = true;
                     break;
                 }
+                if rejected_rows > 0 {
+                    outcome.rows_isolated = outcome.rows_isolated.saturating_add(rejected_rows);
+                    metrics::counter!("tv_audit_spill_quarantined_rows_total", "table" => name)
+                        .increment(rejected_rows);
+                    metrics::counter!(CHAIN_LOST_COUNTER, "source" => table.lost_source())
+                        .increment(rejected_rows);
+                    error!(
+                        code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+                        table = name,
+                        rows = rejected_rows,
+                        path = %path.display(),
+                        "AUDIT-06: QuestDB refused {rejected_rows} row(s) of an audit spill \
+                         file one by one; they are kept in quarantine (.rejected-lines), the \
+                         rest of the file was replayed"
+                    );
+                }
                 outcome.files_replayed = outcome.files_replayed.saturating_add(1);
                 outcome.rows_replayed = outcome.rows_replayed.saturating_add(rows);
                 metrics::counter!("tv_audit_spill_replayed_rows_total", "table" => name)
                     .increment(rows);
             }
-            PostVerdict::Refused(status) => match quarantine(dir, &path) {
+            PostVerdict::Refused { status, .. } if streak_already_stopped_for(*streak, status) => {
+                // B1 review: the table is still refused the same way as when
+                // the streak stopped an earlier round; keep this file where
+                // it is (re-probed once a round) instead of setting it aside.
+                outcome.stopped_on_refusal_streak = true;
+                outcome.failed = true;
+                // B1 review 2: one file past it is probed once a round. If it
+                // lands, the refusals were per file, not the table: the streak
+                // resets (below), the good files behind drain now, and the
+                // kept file is judged anew (and set aside) next round. Before,
+                // four bad files in a row blocked every later file for good.
+                if !probed_past_head {
+                    probed_past_head = true;
+                    continue;
+                }
+                break;
+            }
+            PostVerdict::Refused {
+                status,
+                accepted_rows,
+            } => match quarantine(dir, &path) {
                 Ok(target) => {
+                    // Rows of earlier chunks of the same file already landed;
+                    // only the rest are out of the database (B1).
+                    let rows = rows.saturating_sub(accepted_rows);
                     outcome.files_quarantined = outcome.files_quarantined.saturating_add(1);
                     metrics::counter!("tv_audit_spill_quarantined_rows_total", "table" => name)
                         .increment(rows);
@@ -502,10 +599,24 @@ pub async fn drain_audit_spill_dir(
                         table = name,
                         status,
                         rows,
+                        accepted_rows,
                         path = %target.display(),
                         "AUDIT-06: QuestDB permanently refused an audit spill file — \
                          {rows} row(s) set aside in quarantine (kept, not deleted)"
                     );
+                    if streak.record(status) {
+                        outcome.stopped_on_refusal_streak = true;
+                        outcome.failed = true;
+                        error!(
+                            code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+                            table = name,
+                            status,
+                            "AUDIT-06: QuestDB refused several {name} spill files in a row the \
+                             same way; the round stops and the rest of the backlog waits on \
+                             disk for a fix instead of being set aside"
+                        );
+                        break;
+                    }
                 }
                 Err(err) => {
                     error!(
@@ -525,29 +636,98 @@ pub async fn drain_audit_spill_dir(
                 outcome.failed = true;
                 break;
             }
+            PostVerdict::SetAsideFailed(err) => {
+                error!(
+                    code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+                    table = name,
+                    path = %path.display(),
+                    %err,
+                    "AUDIT-06: QuestDB refused some rows of an audit spill file and they \
+                     could not be set aside; the file is kept and the round stops"
+                );
+                outcome.failed = true;
+                break;
+            }
         }
     }
     outcome
 }
 
 enum PostVerdict {
-    Accepted,
-    Refused(u16),
+    /// Every row landed except `rejected_rows`, which were set aside.
+    Accepted {
+        rejected_rows: u64,
+    },
+    /// Quarantine the whole file; `accepted_rows` of its rows already landed.
+    Refused {
+        status: u16,
+        accepted_rows: u64,
+    },
     Transient,
+    /// Isolated rows could not be written to quarantine; keep the file.
+    SetAsideFailed(std::io::Error),
 }
 
-async fn post_file(payload: &[u8], url: &str, client: &Client) -> PostVerdict {
+/// Rows in `bytes`: row-ending newlines, plus a final row with none. An
+/// escaped newline inside a string field does not count. O(bytes), cold.
+fn count_rows(bytes: &[u8]) -> u64 {
+    // O(1) EXEMPT: begin: cold replay path, one pass over a chunk.
+    let ends = (0..bytes.len()).filter(|&i| is_row_end(bytes, i)).count();
+    // O(1) EXEMPT: end
+    let torn_tail = bytes.last().is_some_and(|b| *b != b'\n');
+    u64::try_from(ends)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(torn_tail))
+}
+
+async fn post_file(
+    payload: &[u8],
+    url: &str,
+    client: &Client,
+    dir: &Path,
+    path: &Path,
+) -> PostVerdict {
+    let mut accepted_rows = 0_u64;
+    let mut rejected_rows = 0_u64;
     for range in ilp_chunk_ranges(payload, REPLAY_MAX_CHUNK_BYTES) {
-        let chunk = payload[range].to_vec();
-        match client.post(url).body(chunk).send().await {
-            Ok(response) if response.status().is_success() => {}
+        let chunk = bytes::Bytes::copy_from_slice(&payload[range]);
+        match client.post(url).body(chunk.clone()).send().await {
+            Ok(response) if response.status().is_success() => {
+                accepted_rows = accepted_rows.saturating_add(count_rows(&chunk));
+            }
             Ok(response) => {
                 let status = response.status().as_u16();
-                return if is_permanent_refusal(status) {
-                    PostVerdict::Refused(status)
-                } else {
-                    PostVerdict::Transient
-                };
+                if !is_permanent_refusal(status) {
+                    return PostVerdict::Transient;
+                }
+                // B1 (2026-11-13): find the refused rows instead of setting
+                // the whole file aside for one bad row.
+                match isolate_refused_lines(client, url, &chunk, accepted_rows > 0).await {
+                    LineIsolation::Isolated(ranges) => {
+                        if !ranges.is_empty()
+                            && let Err(err) = crate::off_worker::off_worker(|| {
+                                set_aside_rejected_lines(dir, path, &chunk, &ranges)
+                            })
+                        {
+                            return PostVerdict::SetAsideFailed(err);
+                        }
+                        // O(1) EXEMPT: cold, at most the isolation's line cap.
+                        let lost: u64 = ranges
+                            .iter()
+                            .map(|r| count_rows(chunk.get(r.clone()).unwrap_or_default()))
+                            .sum();
+                        rejected_rows = rejected_rows.saturating_add(lost);
+                        accepted_rows =
+                            accepted_rows.saturating_add(count_rows(&chunk).saturating_sub(lost));
+                    }
+                    LineIsolation::WholeFile => {
+                        return PostVerdict::Refused {
+                            status,
+                            accepted_rows,
+                        };
+                    }
+                    LineIsolation::Transient => return PostVerdict::Transient,
+                }
             }
             Err(err) => {
                 tracing::debug!(
@@ -558,7 +738,7 @@ async fn post_file(payload: &[u8], url: &str, client: &Client) -> PostVerdict {
             }
         }
     }
-    PostVerdict::Accepted
+    PostVerdict::Accepted { rejected_rows }
 }
 
 fn quarantine(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
@@ -720,6 +900,10 @@ async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String, quest
     // the directory has emptied, never on every quiet round.
     let mut ensured = false;
     let mut pager = BacklogPager::default();
+    // B1 review: the refusal streak lives across rounds, so a table QuestDB
+    // keeps refusing sets aside at most REPLAY_QUARANTINE_STREAK_STOP files
+    // in all, not that many every round.
+    let mut streak = QuarantineStreak::default();
     loop {
         // Directory scans run off the shared worker (sweep S5): a slow disk
         // must not hold the worker the frame drain and the readers use.
@@ -738,7 +922,7 @@ async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String, quest
             // round counts as failed, so the ensure runs again next round and
             // the backlog page still fires if it never clears.
             let outcome = if ensured {
-                drain_audit_spill_dir(&dir, table, &url, &client).await
+                drain_with_streak(&dir, table, &url, &client, &mut streak).await
             } else {
                 AuditDrainOutcome {
                     failed: true,
@@ -1103,10 +1287,12 @@ mod tests {
         let tmp = TestDir::new();
         let spill = AuditSpill::in_dir(AuditSpillTable::OrderAudit, tmp.path().to_path_buf());
         let bad = spill.spill(ROWS, 2).expect("bad");
-        let (url, server) = status_server(BAD_400, 1);
+        // B1: the whole-file POST, then one POST per row while isolating;
+        // no row is taken, so the whole file is set aside as before.
+        let (url, server) = status_server(BAD_400, 3);
         let outcome =
             drain_audit_spill_dir(tmp.path(), AuditSpillTable::OrderAudit, &url, &client()).await;
-        assert_eq!(server.join().expect("join"), 1);
+        assert_eq!(server.join().expect("join"), 3);
         assert_eq!(outcome.files_quarantined, 1);
         assert!(!outcome.failed);
         assert!(list_spill_files(tmp.path()).is_empty());
@@ -1119,6 +1305,233 @@ mod tests {
             ROWS,
             "kept, not deleted"
         );
+    }
+
+    /// Answers 400 to a request whose body holds `BAD`, 204 otherwise, for
+    /// up to `n` requests; returns how many it served.
+    fn judging_server(n: usize) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let handle = std::thread::spawn(move || {
+            let give_up_at = std::time::Instant::now() + Duration::from_secs(5);
+            let mut served = 0usize;
+            while served < n && std::time::Instant::now() < give_up_at {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_nonblocking(false);
+                        let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
+                        let mut seen = Vec::new();
+                        let mut buf = [0u8; 65_536];
+                        // Read until the body arrives (the head may come alone).
+                        while let Ok(k) = sock.read(&mut buf) {
+                            if k == 0 {
+                                break;
+                            }
+                            seen.extend_from_slice(&buf[..k]);
+                            let head_end = seen.windows(4).position(|w| w == b"\r\n\r\n");
+                            if let Some(h) = head_end {
+                                let head = String::from_utf8_lossy(&seen[..h]).to_lowercase();
+                                let len = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                if seen.len() >= h + 4 + len {
+                                    break;
+                                }
+                            }
+                        }
+                        let bad = seen.windows(3).any(|w| w == b"BAD");
+                        let reply = if bad { BAD_400 } else { OK_204_CLOSE };
+                        let _ = sock.write_all(reply.as_bytes());
+                        let _ = sock.flush();
+                        served += 1;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            served
+        });
+        (format!("http://127.0.0.1:{port}/write"), handle)
+    }
+
+    const OK_204_CLOSE: &str =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Regression, B1 (2026-11-13): one refused row no longer sets its whole
+    /// file aside. The good rows (one with a newline escaped inside a string)
+    /// land, only the refused row is kept in `.rejected-lines`, and the file
+    /// is gone. Before, the whole file went to quarantine and every row in it
+    /// was counted lost.
+    #[tokio::test]
+    async fn test_regression_drain_isolates_one_refused_row_and_replays_the_rest() {
+        let tmp = TestDir::new();
+        let spill = AuditSpill::in_dir(AuditSpillTable::OrderAudit, tmp.path().to_path_buf());
+        let rows: &[u8] = b"order_audit,feed=dhan detail=\"a\\\nb\" 1\n\
+            order_audit,feed=dhan BAD=1i 2\norder_audit,feed=dhan x=1i 3\n";
+        let path = spill.spill(rows, 3).expect("spill");
+        let (url, server) = judging_server(64);
+        let outcome =
+            drain_audit_spill_dir(tmp.path(), AuditSpillTable::OrderAudit, &url, &client()).await;
+        drop(server);
+        assert!(!outcome.failed, "{outcome:?}");
+        assert_eq!(
+            outcome.files_quarantined, 0,
+            "the file is not set aside whole"
+        );
+        assert_eq!(outcome.files_replayed, 1);
+        assert_eq!(outcome.rows_replayed, 2);
+        assert_eq!(outcome.rows_isolated, 1);
+        assert!(list_spill_files(tmp.path()).is_empty());
+        let kept = tmp.path().join(QUARANTINE_DIR).join(format!(
+            "{}{}",
+            path.file_name().and_then(|n| n.to_str()).expect("name"),
+            crate::tick_spill_replay::REJECTED_LINES_SUFFIX
+        ));
+        assert_eq!(
+            std::fs::read(kept).expect("the refused row is kept"),
+            b"order_audit,feed=dhan BAD=1i 2\n"
+        );
+    }
+
+    /// Regression, B1 (2026-11-13): when QuestDB refuses every file the same
+    /// way (a column type changed), the round stops after three files in a
+    /// row instead of setting the whole backlog aside.
+    #[tokio::test]
+    async fn test_regression_drain_stops_after_three_files_refused_the_same_way() {
+        let tmp = TestDir::new();
+        let spill = AuditSpill::in_dir(AuditSpillTable::PnlAudit, tmp.path().to_path_buf());
+        for _ in 0..5 {
+            spill.spill(b"pnl_audit BAD=1i 1\n", 1).expect("spill");
+        }
+        let (url, server) = judging_server(64);
+        let outcome =
+            drain_audit_spill_dir(tmp.path(), AuditSpillTable::PnlAudit, &url, &client()).await;
+        drop(server);
+        assert_eq!(
+            outcome.files_quarantined,
+            u64::from(crate::tick_spill_replay::REPLAY_QUARANTINE_STREAK_STOP)
+        );
+        assert!(outcome.stopped_on_refusal_streak);
+        assert!(outcome.failed, "the round ends early");
+        assert_eq!(
+            list_spill_files(tmp.path()).len(),
+            2,
+            "the rest wait on disk"
+        );
+    }
+
+    /// Regression, B1 review (2026-11-13): the refusal streak lives across
+    /// rounds (the drain loop keeps it). Before, every 60 s round started a
+    /// fresh streak and set three more files aside, so a table QuestDB kept
+    /// refusing drained its whole backlog into quarantine within minutes.
+    #[tokio::test]
+    async fn test_regression_refusal_streak_holds_across_rounds() {
+        let tmp = TestDir::new();
+        let spill = AuditSpill::in_dir(AuditSpillTable::PnlAudit, tmp.path().to_path_buf());
+        for _ in 0..6 {
+            spill.spill(b"pnl_audit BAD=1i 1\n", 1).expect("spill");
+        }
+        let mut streak = QuarantineStreak::default();
+        let mut quarantined = 0_u64;
+        for _round in 0..3 {
+            let (url, server) = judging_server(64);
+            let outcome = drain_with_streak(
+                tmp.path(),
+                AuditSpillTable::PnlAudit,
+                &url,
+                &client(),
+                &mut streak,
+            )
+            .await;
+            drop(server);
+            assert!(outcome.failed && outcome.stopped_on_refusal_streak);
+            quarantined += outcome.files_quarantined;
+        }
+        assert_eq!(
+            quarantined,
+            u64::from(crate::tick_spill_replay::REPLAY_QUARANTINE_STREAK_STOP),
+            "at most one streak's worth is ever set aside"
+        );
+        assert_eq!(
+            list_spill_files(tmp.path()).len(),
+            3,
+            "the rest wait on disk"
+        );
+        // A file that lands breaks the streak; a later refusal is judged anew.
+        assert!(streak_already_stopped_for(streak, 400));
+        assert!(!streak_already_stopped_for(streak, 422), "another status");
+        let mut fresh = streak;
+        fresh.reset();
+        assert!(!streak_already_stopped_for(fresh, 400));
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): four single-row files QuestDB
+    /// refuses one by one, then good files. Round 1 sets three aside and stops
+    /// on the streak; before, every later round kept the fourth in place and
+    /// stopped, so the good files behind it never drained. Now each such round
+    /// probes one file past it: a probe that lands resets the streak, the good
+    /// files drain in that round, and the bad file is set aside the next.
+    #[tokio::test]
+    async fn test_regression_refused_head_file_does_not_block_the_good_files_behind_it() {
+        let tmp = TestDir::new();
+        let spill = AuditSpill::in_dir(AuditSpillTable::PnlAudit, tmp.path().to_path_buf());
+        for _ in 0..4 {
+            spill.spill(b"pnl_audit BAD=1i 1\n", 1).expect("spill bad");
+        }
+        for _ in 0..3 {
+            spill
+                .spill(b"pnl_audit,feed=dhan x=1i 1\n", 1)
+                .expect("spill good");
+        }
+        let mut streak = QuarantineStreak::default();
+        let mut replayed = 0_u64;
+        let mut quarantined = 0_u64;
+        for _round in 0..3 {
+            let (url, server) = judging_server(64);
+            let outcome = drain_with_streak(
+                tmp.path(),
+                AuditSpillTable::PnlAudit,
+                &url,
+                &client(),
+                &mut streak,
+            )
+            .await;
+            drop(server);
+            replayed += outcome.files_replayed;
+            quarantined += outcome.files_quarantined;
+        }
+        assert_eq!(replayed, 3, "every good file drained");
+        assert_eq!(quarantined, 4, "each bad file set aside once");
+        assert!(list_spill_files(tmp.path()).is_empty());
+    }
+
+    /// Regression, B1 review (2026-11-13): an isolated row is counted lost
+    /// ONCE, by the round that removes its file. Before, the count ran ahead
+    /// of the remove, so a file that could not be removed was re-sent,
+    /// re-isolated and counted lost again every round.
+    #[tokio::test]
+    async fn test_regression_isolated_row_is_counted_once_when_the_remove_fails() {
+        let tmp = TestDir::new();
+        let spill = AuditSpill::in_dir(AuditSpillTable::OrderAudit, tmp.path().to_path_buf());
+        let rows: &[u8] = b"order_audit,feed=dhan x=1i 1\norder_audit,feed=dhan BAD=1i 2\n";
+        spill.spill(rows, 2).expect("spill");
+        let mut isolated = 0_u64;
+        for fail in [true, false] {
+            FAIL_REMOVE_FOR_TEST.with(|f| f.set(fail));
+            let (url, server) = judging_server(64);
+            let outcome =
+                drain_audit_spill_dir(tmp.path(), AuditSpillTable::OrderAudit, &url, &client())
+                    .await;
+            drop(server);
+            assert_eq!(outcome.failed, fail, "{outcome:?}");
+            isolated += outcome.rows_isolated;
+        }
+        FAIL_REMOVE_FOR_TEST.with(|f| f.set(false));
+        assert_eq!(isolated, 1, "one refused row, counted once");
+        assert!(list_spill_files(tmp.path()).is_empty());
     }
 
     #[tokio::test]
@@ -1198,4 +1611,23 @@ mod tests {
             &cfg
         ));
     }
+}
+
+// Kept below the tests module: `the_drain_never_applies_the_tick_session_window`
+// reads the production code as the text before the first test-only attribute.
+
+/// Removes a replayed spill file. A test can make it fail (B1 review), to
+/// prove an isolated row is counted lost once even when its file must be
+/// re-sent.
+async fn remove_replayed_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_REMOVE_FOR_TEST.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("remove failure injected by a test"));
+    }
+    tokio::fs::remove_file(path).await
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_REMOVE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

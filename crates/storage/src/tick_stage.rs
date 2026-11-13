@@ -60,6 +60,7 @@ use tickvault_common::feed::Feed;
 
 use crate::candle_contract_labels::CandleContractLabels;
 use crate::feed_aux_persistence::AuxPacketRow;
+use crate::ilp_table_gate::GatedTable;
 use crate::tick_ilp::{TickIlpEncoder, TickRowBuffer};
 use crate::tick_persistence::{
     MAX_PRODUCER_BUFFER_BYTES, QUESTDB_MAX_BUF_SIZE_BYTES, TICKS_TABLE, TickRow,
@@ -111,6 +112,17 @@ impl StagedRow {
             Self::Tick { row, .. } | Self::Quote { row, .. } => row.capture_seq,
             Self::Aux { row, .. } => row.capture_seq,
             Self::Refused { capture_seq } => *capture_seq,
+        }
+    }
+
+    /// The table the row is written to; `None` for a refused row (B1 review
+    /// 3). O(1).
+    pub(crate) const fn table(&self) -> Option<GatedTable> {
+        match self {
+            Self::Tick { .. } => Some(GatedTable::Ticks),
+            Self::Quote { .. } => Some(GatedTable::TickQuotes),
+            Self::Aux { .. } => Some(GatedTable::FeedAuxPackets),
+            Self::Refused { .. } => None,
         }
     }
 }
@@ -322,11 +334,47 @@ impl StagedBatch {
     /// THIS thread (see the module docs) and marked `Refused`. O(row bytes)
     /// per row; allocation-free while `out` has room.
     pub(crate) fn encode_into(&mut self, feed: Feed, out: &mut TickRowBuffer) -> usize {
+        self.encode_matching(feed, out, |_| true)
+    }
+
+    /// [`Self::encode_into`] for the rows whose table `keep` accepts only
+    /// (B1 review 2; per table since B1 review 3): the writer thread posts the
+    /// `ticks` rows while `tick_quotes` or `feed_aux_packets` alone is not
+    /// keyed, and sets each held table's rows aside on their own. Same
+    /// counting and marking of a refused row; an already refused row belongs
+    /// to no table and is skipped. O(rows) to pass, O(row bytes) per row
+    /// written; allocation-free while `out` has room.
+    pub(crate) fn encode_tables_into(
+        &mut self,
+        feed: Feed,
+        out: &mut TickRowBuffer,
+        keep: impl Fn(GatedTable) -> bool,
+    ) -> usize {
+        self.encode_matching(feed, out, |row| row.table().is_some_and(&keep))
+    }
+
+    /// Whether the batch holds a row for `table`. O(rows); called only while
+    /// that table is not keyed (B1 review 2), never per row.
+    #[must_use]
+    pub(crate) fn has_rows_for(&self, table: GatedTable) -> bool {
+        // O(1) EXEMPT: cold, only while that table is not keyed.
+        self.rows.iter().any(|r| r.table() == Some(table))
+    }
+
+    fn encode_matching(
+        &mut self,
+        feed: Feed,
+        out: &mut TickRowBuffer,
+        keep: impl Fn(&StagedRow) -> bool,
+    ) -> usize {
         let mut encoded = 0;
         for i in 0..self.rows.len() {
             let Some(row) = self.rows.get(i).copied() else {
                 continue;
             };
+            if !keep(&row) {
+                continue;
+            }
             match encode_row(&row, self, feed.as_str(), out) {
                 Ok(true) => encoded += 1,
                 Ok(false) => {}

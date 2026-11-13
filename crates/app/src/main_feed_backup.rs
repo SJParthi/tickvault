@@ -45,9 +45,12 @@
 //! restarts each day.
 //!
 //! **Replay.** Each publication is also persisted ([`record_backup_set`]) into
-//! a bounded HISTORY of publications (the two most recent IST days that have
-//! one, at most [`BACKUP_HISTORY_MAX`] entries), so a later publication never
-//! erases the set an earlier, still-unreplayed frame was deduplicated with.
+//! a bounded HISTORY of publications (the [`BACKUP_HISTORY_DAYS`] most recent
+//! IST days that have one, at most [`BACKUP_HISTORY_MAX`] entries; two days
+//! until B1, 2026-11-13), so a later publication never erases the set an
+//! earlier, still-unreplayed frame was deduplicated with. A frame from a day
+//! the history trimmed is folded whole (both socket copies may land) and
+//! counted on [`BACKUP_REPLAY_UNJUDGED_COUNTER`], never silently.
 //! The WAL replay ([`ReplayBackup`]) applies to each frame the publication
 //! with the greatest instant at or before the frame's receipt on the same IST
 //! day, switching state exactly as the live drain does. A replayed frame
@@ -801,7 +804,25 @@ const BACKUP_SET_FILE: &str = "main-feed-backup-set.json";
 /// Most publications kept in the persisted history. A day normally has one
 /// or two (the publication and its narrowing share an instant, so they are
 /// one entry); a restart adds one. Bounds the file and the replay's table.
-pub const BACKUP_HISTORY_MAX: usize = 16;
+/// B1 (2026-11-13): 16 → 64, with [`BACKUP_HISTORY_DAYS`] 2 → 15, because
+/// the pinned WAL backlog replays frames older than two days as the normal
+/// case. File size at the default 1,000 contracts: about 20 bytes a contract,
+/// so about 1.3 MB at 64 entries (6.4 MB at the 5,000 ceiling), rewritten a
+/// few times a day and read once per lane start. Cold.
+pub const BACKUP_HISTORY_MAX: usize = 64;
+
+/// IST days with a publication the persisted history keeps (B1, 2026-11-13;
+/// was 2). A frame from an older day replays with no publication to judge it,
+/// and is counted on [`BACKUP_REPLAY_UNJUDGED_COUNTER`].
+pub const BACKUP_HISTORY_DAYS: usize = 15;
+
+/// Counter: replayed main-feed frames from a day whose backup publication
+/// the history no longer holds (B1, 2026-11-13). Such a frame is folded
+/// whole: both socket copies of a backed-up packet can land, where the live
+/// drain wrote one. Counted, never dropped (dropping could lose the only
+/// copy). Local `/metrics` only (no alarm, no filter, no EMF name),
+/// registered at 0 at lane start.
+pub const BACKUP_REPLAY_UNJUDGED_COUNTER: &str = "tv_dhan_feed_backup_replay_unjudged_frames_total";
 
 /// Counter: the WAL replay's backup set, by `outcome` (`loaded`, `missing`,
 /// `unreadable`). Once per lane start.
@@ -844,9 +865,16 @@ impl PersistedBackupSet {
 /// unreplayed earlier frame was deduplicated with).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedBackupHistory {
-    /// Ascending by instant, one entry per instant, only the two most recent
-    /// IST days that have one, at most [`BACKUP_HISTORY_MAX`].
+    /// Ascending by instant, one entry per instant, only the
+    /// [`BACKUP_HISTORY_DAYS`] most recent IST days that have one, at most
+    /// [`BACKUP_HISTORY_MAX`].
     pub publications: Vec<PersistedBackupSet>,
+    /// The newest IST day number whose publication was trimmed away (B1,
+    /// 2026-11-13). A replayed frame from that day or earlier cannot be
+    /// judged, and is counted. `None` when nothing was ever trimmed (a file an
+    /// earlier build wrote reads as `None`: what it trimmed is unknown).
+    #[serde(default)]
+    pub trimmed_through_day: Option<i64>,
 }
 
 impl PersistedBackupHistory {
@@ -866,32 +894,76 @@ impl PersistedBackupHistory {
 
     /// Restores the invariants: drops instant-less entries, orders by
     /// instant (stable, so of two entries with one instant the later
-    /// recorded wins), keeps the two most recent IST days that have a
-    /// publication — two days, not "today and yesterday", so Friday's set
-    /// still covers Friday's frames replayed on Monday — and at most
-    /// [`BACKUP_HISTORY_MAX`], the newest. Cold.
+    /// recorded wins), keeps the [`BACKUP_HISTORY_DAYS`] most recent IST days
+    /// that have a publication (days with one, not calendar days, so
+    /// Friday's set still covers Friday's frames replayed on Monday), and at
+    /// most [`BACKUP_HISTORY_MAX`], the newest. Every trimmed entry raises
+    /// [`Self::trimmed_through_day`] to its day. Cold: O(history).
     fn normalise(&mut self) {
         self.publications.retain(|p| p.published_at_nanos > 0);
         self.publications.sort_by_key(|p| p.published_at_nanos);
         self.publications.reverse();
         self.publications.dedup_by_key(|p| p.published_at_nanos);
         self.publications.reverse();
-        if let Some(latest_day) = self
-            .latest()
+        let mut days_seen = 0_usize;
+        let mut last_day = None;
+        // Newest first: the day at which the BACKUP_HISTORY_DAYS-th distinct
+        // day ends is the oldest kept.
+        let mut oldest_kept_day = None;
+        for day in self
+            .publications
+            .iter()
+            .rev()
             .map(|p| ist_day_of_nanos(p.published_at_nanos))
         {
-            let oldest_kept_day = self
-                .publications
-                .iter()
-                .rev()
-                .map(|p| ist_day_of_nanos(p.published_at_nanos))
-                .find(|&d| d < latest_day)
-                .unwrap_or(latest_day);
-            self.publications
-                .retain(|p| ist_day_of_nanos(p.published_at_nanos) >= oldest_kept_day);
+            if last_day != Some(day) {
+                days_seen += 1;
+                last_day = Some(day);
+                if days_seen > BACKUP_HISTORY_DAYS {
+                    break;
+                }
+                oldest_kept_day = Some(day);
+            }
         }
-        let excess = self.publications.len().saturating_sub(BACKUP_HISTORY_MAX);
-        self.publications.drain(..excess);
+        if let Some(oldest) = oldest_kept_day {
+            self.trim_while(|p| ist_day_of_nanos(p.published_at_nanos) < oldest);
+        }
+        // B1 review 4: the entry cap drops WHOLE oldest days. Trimming single
+        // entries could cut a day in two, and the replay then started that
+        // day's first surviving publication with an empty dedup ring where
+        // the live drain had carried the earlier publication's state over
+        // (same process and day), so the lagging second copies the live
+        // drain dropped were folded again, judged and uncounted. A day is
+        // now either kept whole or trimmed whole (and its frames counted).
+        // Honest limit: one day alone above the cap still trims its own
+        // oldest entries (about 64 publications in a day, never measured).
+        // Cold: O(days x history).
+        while self.publications.len() > BACKUP_HISTORY_MAX {
+            let day_of =
+                |p: Option<&PersistedBackupSet>| p.map(|p| ist_day_of_nanos(p.published_at_nanos));
+            let oldest = day_of(self.publications.first());
+            if oldest.is_none() || oldest == day_of(self.publications.last()) {
+                let excess = self.publications.len().saturating_sub(BACKUP_HISTORY_MAX);
+                let mut index = 0_usize;
+                self.trim_while(|_| {
+                    index += 1;
+                    index <= excess
+                });
+                break;
+            }
+            self.trim_while(|p| Some(ist_day_of_nanos(p.published_at_nanos)) == oldest);
+        }
+    }
+
+    /// Drops the OLDEST entries while `drop_it` holds, raising
+    /// [`Self::trimmed_through_day`] to each dropped entry's day. The list is
+    /// ascending, so the dropped entries are a prefix. Cold.
+    fn trim_while(&mut self, mut drop_it: impl FnMut(&PersistedBackupSet) -> bool) {
+        let cut = self.publications.iter().take_while(|p| drop_it(p)).count();
+        for gone in self.publications.drain(..cut) {
+            let day = ist_day_of_nanos(gone.published_at_nanos);
+            self.trimmed_through_day = Some(self.trimmed_through_day.map_or(day, |d| d.max(day)));
+        }
     }
 }
 
@@ -980,6 +1052,7 @@ pub fn read_backup_history(
                 Ok(OnDisk::History(history)) => history,
                 Ok(OnDisk::Single(set)) => PersistedBackupHistory {
                     publications: vec![set],
+                    trimmed_through_day: None,
                 },
                 Err(err) => return Err(err.to_string()),
             };
@@ -1040,6 +1113,10 @@ pub struct ReplayBackup {
     /// When a later process started: frames from then on are not this
     /// publication's (`i64::MAX` when none, or unknown).
     until_nanos: i64,
+    /// The history's [`PersistedBackupHistory::trimmed_through_day`] (B1).
+    trimmed_through_day: Option<i64>,
+    /// [`BACKUP_REPLAY_UNJUDGED_COUNTER`], resolved once (no per-frame label).
+    unjudged: metrics::Counter,
 }
 
 impl ReplayBackup {
@@ -1049,7 +1126,24 @@ impl ReplayBackup {
     pub fn new(history: &PersistedBackupHistory) -> Option<Self> {
         let mut history = history.clone();
         history.normalise();
-        if history.publications.iter().all(|p| p.contracts.is_empty()) {
+        // B1 review (2026-11-13): a history with no trim record (every file
+        // an earlier build wrote, which kept only two days) treats every day
+        // before its oldest kept publication as trimmed. Conservative: no
+        // publication is left to judge such a frame either way, so it is
+        // counted rather than folded whole in silence.
+        let trimmed_through_day = history.trimmed_through_day.or_else(|| {
+            history
+                .publications
+                .first()
+                .map(|p| ist_day_of_nanos(p.published_at_nanos).saturating_sub(1))
+        });
+        // B1: a history that RECORDED a trim is kept even with no contract, so
+        // frames from those days are still counted as unjudged. (The
+        // conservative reading above does not keep an all-empty history: it
+        // deduplicates nothing, as before.)
+        if history.publications.iter().all(|p| p.contracts.is_empty())
+            && history.trimmed_through_day.is_none()
+        {
             return None;
         }
         Some(Self {
@@ -1060,6 +1154,8 @@ impl ReplayBackup {
             day: NO_DAY,
             process: 0,
             until_nanos: i64::MAX,
+            trimmed_through_day,
+            unjudged: metrics::counter!(BACKUP_REPLAY_UNJUDGED_COUNTER),
         })
     }
 
@@ -1097,11 +1193,27 @@ impl ReplayBackup {
             self.next += 1;
             let _retired = self.dedup.swap_in(table, slots, day, carry);
         }
-        self.next > 0
+        let frame_day = ist_day_of_nanos(received_at_nanos);
+        let judged = self.next > 0
             && !self.dedup.is_empty()
             && received_at_nanos >= self.from_nanos
             && received_at_nanos < self.until_nanos
-            && ist_day_of_nanos(received_at_nanos) == self.day
+            && frame_day == self.day;
+        // B1 (2026-11-13): a frame from a day whose publication the history
+        // trimmed away is folded whole (both socket copies may land): counted,
+        // never silent. One compare per frame.
+        if !judged && self.trimmed_through_day.is_some_and(|d| frame_day <= d) {
+            self.unjudged.increment(1);
+        }
+        judged
+    }
+
+    /// Test-only: whether a frame received at `received_at_nanos` falls on a
+    /// day the history trimmed (B1).
+    #[cfg(test)]
+    fn day_was_trimmed(&self, received_at_nanos: i64) -> bool {
+        self.trimmed_through_day
+            .is_some_and(|d| ist_day_of_nanos(received_at_nanos) <= d)
     }
 
     /// The table, for the replayed packets [`Self::select`] said it covers.
@@ -1521,6 +1633,7 @@ mod tests {
 
     fn history_of(pubs: &[(i64, &[u64])]) -> PersistedBackupHistory {
         PersistedBackupHistory {
+            trimmed_through_day: None,
             publications: pubs
                 .iter()
                 .map(|(at, sids)| PersistedBackupSet {
@@ -1630,31 +1743,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
 
-        // Only the two most recent IST days that have a publication: a
-        // Friday set still covers Friday's frames replayed on Monday.
+        // Only the BACKUP_HISTORY_DAYS most recent IST days that have a
+        // publication (days with one, so a Friday set still covers Friday's
+        // frames replayed on Monday). B1 (2026-11-13): was two days.
         let mut h = PersistedBackupHistory::default();
-        let friday = TEN_AM - 3 * DAY;
-        h.record(PersistedBackupSet {
-            published_at_nanos: friday - DAY,
-            process_started_at_nanos: 0,
-            contracts: vec![(1, SEG)],
-        });
-        h.record(PersistedBackupSet {
-            published_at_nanos: friday,
-            process_started_at_nanos: 0,
-            contracts: vec![(2, SEG)],
-        });
-        h.record(PersistedBackupSet {
-            published_at_nanos: TEN_AM,
-            process_started_at_nanos: 0,
-            contracts: vec![(3, SEG)],
-        });
+        let days = BACKUP_HISTORY_DAYS as i64;
+        for back in (0..=days).rev() {
+            h.record(PersistedBackupSet {
+                published_at_nanos: TEN_AM - back * DAY,
+                process_started_at_nanos: 0,
+                contracts: vec![(1, SEG)],
+            });
+        }
         let kept: Vec<i64> = h
             .publications
             .iter()
             .map(|p| p.published_at_nanos)
             .collect();
-        assert_eq!(kept, vec![friday, TEN_AM], "Thursday is dropped");
+        let expect: Vec<i64> = (0..days).rev().map(|back| TEN_AM - back * DAY).collect();
+        assert_eq!(kept, expect, "the oldest of the 16 days is dropped");
+        assert_eq!(
+            h.trimmed_through_day,
+            Some(ist_day_of_nanos(TEN_AM - days * DAY)),
+            "the trim is recorded"
+        );
         // At most BACKUP_HISTORY_MAX, the newest; instant-less entries never.
         for i in 0..(BACKUP_HISTORY_MAX as i64 + 5) {
             h.record(PersistedBackupSet {
@@ -1850,6 +1962,152 @@ mod tests {
         assert!(!r.select(TEN_AM + 30 * MIN));
     }
 
+    /// Regression, B1 review 4: when the entry cap binds it drops the oldest
+    /// day WHOLE, never part of it. Before, it dropped the single oldest
+    /// entry, so a day with two publications of one process (09:20, then a
+    /// widen at 11:05) kept only the 11:05 one; the replay then started it
+    /// with an empty ring (no carry-over), folded the lagging second copies
+    /// the live drain had dropped, and counted nothing.
+    #[test]
+    fn test_regression_entry_cap_trims_whole_days_never_part_of_one() {
+        let mut h = PersistedBackupHistory::default();
+        let process = TEN_AM - 14 * DAY - 60 * MIN;
+        let oldest_day = TEN_AM - 14 * DAY;
+        for at in [oldest_day - 40 * MIN, oldest_day + 65 * MIN] {
+            h.record(PersistedBackupSet {
+                published_at_nanos: at,
+                process_started_at_nanos: process,
+                contracts: vec![(42, SEG)],
+            });
+        }
+        // Fill the 14 later days so the history is one entry over the cap.
+        let mut n = 2_usize;
+        let mut back = 13_i64;
+        while n <= BACKUP_HISTORY_MAX {
+            let per_day = 5_i64;
+            for k in 0..per_day {
+                if n > BACKUP_HISTORY_MAX {
+                    break;
+                }
+                h.record(PersistedBackupSet {
+                    published_at_nanos: TEN_AM - back * DAY + k * MIN,
+                    process_started_at_nanos: 0,
+                    contracts: vec![(42, SEG)],
+                });
+                n += 1;
+            }
+            back = (back - 1).max(0);
+        }
+        assert!(h.publications.len() <= BACKUP_HISTORY_MAX);
+        let oldest = ist_day_of_nanos(oldest_day);
+        assert!(
+            h.publications
+                .iter()
+                .all(|p| ist_day_of_nanos(p.published_at_nanos) != oldest),
+            "the cut day is gone whole, not split"
+        );
+        assert_eq!(h.trimmed_through_day, Some(oldest));
+        // So a frame after that day's surviving widen is counted, not judged
+        // by a fresh ring.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut replay =
+            metrics::with_local_recorder(&recorder, || ReplayBackup::new(&h).expect("contracts"));
+        assert!(
+            !replay.select(oldest_day + 66 * MIN),
+            "not judged by a fresh ring"
+        );
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|l| l == format!("{BACKUP_REPLAY_UNJUDGED_COUNTER} 1")),
+            "counted"
+        );
+    }
+
+    /// Regression, B1 (2026-11-13): the history kept only two publication
+    /// days, so a frame from three days back (the pinned WAL backlog replays
+    /// such frames as the normal case) had no publication: both socket copies
+    /// were folded with nothing counted. The history now keeps 15 days, and a
+    /// frame from a day the history trimmed is counted as unjudged.
+    #[test]
+    fn test_regression_old_frames_are_judged_or_counted_never_silent() {
+        let mut h = PersistedBackupHistory::default();
+        for back in (0..=3_i64).rev() {
+            h.record(PersistedBackupSet {
+                published_at_nanos: TEN_AM - back * DAY,
+                process_started_at_nanos: 0,
+                contracts: vec![(42, SEG)],
+            });
+        }
+        assert_eq!(h.publications.len(), 4, "three days back is still held");
+        let mut replay = ReplayBackup::new(&h).expect("contracts");
+        assert!(
+            replay.select(TEN_AM - 3 * DAY + MIN),
+            "a frame from three days back is judged by its own day's set"
+        );
+        // A history that has trimmed a day counts that day's frames.
+        let mut trimmed = PersistedBackupHistory::default();
+        for back in (0..=(BACKUP_HISTORY_DAYS as i64)).rev() {
+            trimmed.record(PersistedBackupSet {
+                published_at_nanos: TEN_AM - back * DAY,
+                process_started_at_nanos: 0,
+                contracts: vec![(42, SEG)],
+            });
+        }
+        let old = TEN_AM - (BACKUP_HISTORY_DAYS as i64) * DAY + MIN;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut replay = metrics::with_local_recorder(&recorder, || {
+            ReplayBackup::new(&trimmed).expect("contracts")
+        });
+        assert!(replay.day_was_trimmed(old));
+        assert!(!replay.select(old), "no publication left to judge it");
+        assert!(!replay.day_was_trimmed(TEN_AM + MIN));
+        assert!(replay.select(TEN_AM + MIN), "today's frame is judged");
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|l| l == format!("{BACKUP_REPLAY_UNJUDGED_COUNTER} 1")),
+            "the unjudged frame is counted once, the judged one not at all"
+        );
+    }
+
+    /// Regression, B1 review (2026-11-13): a history file an earlier build
+    /// wrote has no `trimmed_through_day` (it reads `None`), although that
+    /// build kept only two days. A frame from before its oldest publication
+    /// is counted as unjudged; before, the counter stayed at 0 for exactly
+    /// the backlog the counter was added for.
+    #[test]
+    fn test_regression_legacy_history_counts_frames_older_than_its_oldest_day() {
+        let legacy = history_of(&[(TEN_AM - DAY, &[42]), (TEN_AM, &[42])]);
+        let mut json = serde_json::to_value(&legacy).expect("to json");
+        let removed = json
+            .as_object_mut()
+            .and_then(|o| o.remove("trimmed_through_day"));
+        assert!(removed.is_some(), "the field existed and is now gone");
+        let read: PersistedBackupHistory = serde_json::from_value(json).expect("from json");
+        assert_eq!(read.trimmed_through_day, None, "a pre-B1 file reads None");
+        let old = TEN_AM - 5 * DAY + MIN;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut replay = metrics::with_local_recorder(&recorder, || {
+            ReplayBackup::new(&read).expect("contracts")
+        });
+        assert!(replay.day_was_trimmed(old));
+        assert!(!replay.select(old));
+        assert!(!replay.day_was_trimmed(TEN_AM - DAY + MIN), "a kept day");
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|l| l == format!("{BACKUP_REPLAY_UNJUDGED_COUNTER} 1")),
+            "the frame five days back is counted"
+        );
+    }
+
     /// Review 2026-10-02, F1: process 2 started at 11:00 and published at
     /// 11:05. Its frames from 11:00 to 11:05 were folded live with NO set (a
     /// fresh drain), so the replay must not judge them with process 1's 09:20
@@ -1862,6 +2120,7 @@ mod tests {
         let p2_start = TEN_AM + 60 * MIN;
         let at_1105 = TEN_AM + 65 * MIN;
         let history = PersistedBackupHistory {
+            trimmed_through_day: None,
             publications: vec![
                 PersistedBackupSet {
                     published_at_nanos: at_0920,

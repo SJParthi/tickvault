@@ -1511,6 +1511,9 @@ pub enum IngestOutcome {
 /// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
 /// allocation in steady state.
 pub struct LiveIngest {
+    /// B1 review: the live table gate [`Self::replay_tables_keyed`] reads.
+    /// Always `live_tables_writable` outside tests. One call per replay round.
+    replay_gate: fn(&[tickvault_storage::ilp_table_gate::GatedTable]) -> bool,
     /// Optional sink for the 5 depth levels that ride INLINE in every
     /// Full-mode tick packet (2026-08-19).
     ///
@@ -2074,6 +2077,7 @@ impl LiveIngest {
     #[must_use]
     pub fn new(writer: TickWriter, capacity: usize) -> Self {
         Self {
+            replay_gate: tickvault_storage::ilp_table_gate::live_tables_writable,
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
             live_fill_tap: None,
@@ -2850,6 +2854,30 @@ impl LiveIngest {
                 0
             }
         }
+    }
+
+    /// Whether a replay may post now: `ticks` and `tick_quotes` and, with
+    /// inline depth, its depth table are keyed in this process, or the live
+    /// gate was never armed (B1 review). The boot refold and each catch-up
+    /// round wait on it. `feed_aux_packets` is not required (B1 review 2),
+    /// nor a table other than `ticks` recorded un-keyable (B1 review 3,
+    /// `catchup_stop::replay_ready`). Cold, a few Acquire loads.
+    #[must_use]
+    pub fn replay_tables_keyed(&self) -> bool {
+        self.replay_keyed_check()()
+    }
+
+    /// [`Self::replay_tables_keyed`] as a `Send` closure over copies (the
+    /// gate and the static table lists), so the lane can re-read it across an
+    /// `.await` while it waits (B1 review 2) without borrowing the ingest.
+    pub fn replay_keyed_check(&self) -> impl Fn() -> bool + Send + Copy + 'static {
+        let gate = self.replay_gate;
+        let depth = self
+            .inline_depth
+            .as_ref()
+            .map(DepthIngest::gated_table_sets);
+        let unkeyable = tickvault_storage::ilp_table_gate::table_unkeyable;
+        move || catchup_stop::replay_ready(gate, unkeyable, depth)
     }
 
     /// Rows appended but not yet flushed.
@@ -4286,6 +4314,7 @@ impl LiveIngest {
         history: Option<&crate::main_feed_backup::PersistedBackupHistory>,
     ) {
         self.replay_backup_loaded = true;
+        metrics::counter!(crate::main_feed_backup::BACKUP_REPLAY_UNJUDGED_COUNTER).increment(0);
         self.replay_backup = history.and_then(crate::main_feed_backup::ReplayBackup::new);
     }
 
@@ -9973,6 +10002,38 @@ impl DepthIngest {
     pub const fn is_offloaded(&self) -> bool {
         self.writer.is_offloaded()
     }
+    /// Whether every writer this ingest routes rows to may post now: its
+    /// table is keyed, or the live gate was never armed (B1 review). Read by
+    /// the after-close pass once a round. Cold.
+    #[must_use]
+    pub fn table_keyed(&self) -> bool {
+        self.writer.table_keyed()
+            && self
+                .book
+                .as_ref()
+                .is_none_or(|b| b.book_only || b.levels.table_keyed())
+    }
+
+    /// The gated tables this ingest posts into: its writer's, and its level
+    /// writer's while a book mode still writes levels (B1 review 2: the
+    /// lane's replay check reads them through its own gate). O(1).
+    #[must_use]
+    // WIRING-EXEMPT: called as a path (`map(DepthIngest::gated_table_sets)`) in `LiveIngest::replay_keyed_check`, never by name with parentheses.
+    pub fn gated_table_sets(
+        &self,
+    ) -> (
+        &'static [tickvault_storage::ilp_table_gate::GatedTable],
+        Option<&'static [tickvault_storage::ilp_table_gate::GatedTable]>,
+    ) {
+        (
+            self.writer.gated_tables(),
+            self.book
+                .as_ref()
+                .filter(|b| !b.book_only)
+                .map(|b| b.levels.gated_tables()),
+        )
+    }
+
     /// Rows appended but not yet flushed.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
@@ -17846,10 +17907,8 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
         // back-to-back archive partitions. Finding 6: the registration
         // `main.rs` took before it spawned the archive loops is reused, so it
         // has covered the whole bring-up; a fresh one only when it is gone.
-        let _old_hour_replay = params
-            .boot_replay_intent
-            .take()
-            .unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay);
+        // B1 review 3: held here, released by a shut-gate wait below.
+        let mut old_hour_replay = params.boot_replay_intent.take();
         // ORDERING PIN -- added 2026-08-28.
         //
         // Every candle this refold seals goes through the seal closure, which
@@ -17888,12 +17947,43 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
             ))
             .await;
         }
+        // B1 review 2: wait for the background DDL re-run to key the tables
+        // (about 30 s after a boot DDL that gave up) instead of reading the
+        // gate once. B1 review 3: ONE deadline for this wait and the catch-up
+        // round's (zero in the capture window), a shut gate releases the
+        // archive registration for the wait, an un-keyable `ticks` ends it.
+        let replay_gate_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(catchup_stop::replay_gate_wait_secs(
+                now_ist_secs_of_day(),
+            ));
+        let replay_gate_stop = || shutdown_requested() || catchup_stop::replay_cannot_open();
+        // B1 review 5: how long the gate wait took bounds what follows it
+        // (the refold may start only before the cutoff, and the catch-up
+        // clock is the budget less the wait), so the dial, not only the
+        // wait, keeps its bound.
+        let replay_gate_started = tokio::time::Instant::now();
+        let replay_gate_shut = seal_writer_ready && !(ingest.replay_keyed_check())();
+        let boot_tables_keyed = !seal_writer_ready
+            || shutdown_requested()
+            || catchup_stop::wait_for_tables_keyed_releasing(
+                &mut old_hour_replay,
+                ingest.replay_keyed_check(),
+                replay_gate_stop,
+                replay_gate_deadline,
+            )
+            .await;
+        let gate_waited_secs =
+            catchup_stop::gate_wait_secs(replay_gate_shut, replay_gate_started.elapsed());
+        let boot_tables_keyed = boot_tables_keyed
+            && catchup_stop::refold_may_start_after_wait(now_ist_secs_of_day(), gate_waited_secs);
+        let _old_hour_replay = old_hour_replay
+            .unwrap_or_else(tickvault_storage::archive_quiesce::intend_old_hour_replay);
         // PR AA (owner Quote 51): the boot refold writes rows into OLD hours,
         // so it runs only while no archiver is copying and dropping one of
         // them. 09:00 to 15:40 IST it only tries (the morning boot never
         // waits on an archive); outside it waits at most 60 s. Released
         // right after the refold's flush and ack (`drop` below the chain).
-        let boot_quiesce = if seal_writer_ready && !shutdown_requested() {
+        let boot_quiesce = if seal_writer_ready && !shutdown_requested() && boot_tables_keyed {
             tickvault_storage::archive_quiesce::archive_quiesce_for_replay(
                 now_ist_secs_of_day(),
                 tickvault_storage::archive_quiesce::QuiesceWriter::BootRefold,
@@ -17924,6 +18014,20 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 "Dhan live feed: shutdown arrived before the WAL refold — the staged \
                  write-ahead log frames are not folded now and are re-offered on the \
                  next boot"
+            );
+        } else if !boot_tables_keyed {
+            // B1 review: the rows would only be rescued to a spill file that
+            // cannot drain either; the staged frames stay unconfirmed. Reached
+            // only after the bounded wait above (B1 review 2).
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_refold_table_not_keyed",
+                staged_frames = params.wal_replay_live_feed.len(),
+                gate_waited_secs,
+                "Dhan live feed: the boot WAL refold did not run, the tick or depth table is \
+                 not keyed yet (the boot DDL was refused), or it was keyed too close to the \
+                 session for a refold before the sockets dial. The staged frames are kept and \
+                 re-offered (deferred, not lost)."
             );
         } else if boot_quiesce.is_none() {
             // The partition archiver held the old-hour writers out: fold
@@ -18122,8 +18226,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 "WAL catch-up drain started outside the capture window — full budget"
             );
         }
+        // B1 review 5: the gate wait spent part of this budget already; the
+        // drain takes what is left, not a fresh budget.
+        let catchup_clock_secs =
+            catchup_stop::catchup_budget_after_gate_wait(catchup_budget_secs, gate_waited_secs);
         let catchup_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(catchup_budget_secs);
+            tokio::time::Instant::now() + std::time::Duration::from_secs(catchup_clock_secs);
         let mut rounds = 0u32;
         let mut catchup_frames = 0usize;
         let mut catchup_ticks = 0u64;
@@ -18302,6 +18410,26 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 );
                 break;
             }
+            // B1 review: never replay into a table this process has not keyed;
+            // B1 review 2: wait for it; B1 review 3: on the refold's deadline.
+            let round_keyed = catchup_stop::wait_for_tables_keyed(
+                ingest.replay_keyed_check(),
+                replay_gate_stop,
+                replay_gate_deadline.min(catchup_deadline),
+            )
+            .await;
+            if let Some(stop) = catchup_stop::round_start_stop(round_keyed) {
+                catchup_early_stop = stop;
+                warn!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    source = "wal_catchup_table_not_keyed",
+                    round = rounds,
+                    "WAL catch-up drain stopped: the tick or depth table is not keyed with its \
+                     DEDUP key yet (the boot DDL was refused). Nothing is lost; every segment \
+                     not reached stays a `*.wal` file for the next drain or boot."
+                );
+                break;
+            }
             let wal_dir = crate::boot_helpers::ws_wal_dir();
             let mut batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
                 &wal_dir,
@@ -18353,14 +18481,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                         || batch.trailing_gap
                         || batch.leading_gap,
                 );
-                catchup_drained = batch.deferred_segments == 0
-                    && !batch.stopped_for_disk
-                    && !batch.stopped_for_frame_cap
-                    && !batch.stopped_for_memory;
+                catchup_drained = catchup_stop::batch_stop_reason(&batch).is_none();
                 catchup_early_stop =
                     catchup_stop::batch_stop_reason(&batch).unwrap_or(catchup_early_stop);
                 break;
             }
+            let round_read_failed = batch.read_failed_segments;
             // Count what this lane does NOT fold before dropping it.
             //
             // The filter below is correct — the re-injection path expects
@@ -18480,6 +18606,10 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 // staged -- confirm so the loop cannot spin on them forever.
                 tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
                 rounds = rounds.saturating_add(1);
+                if let Some(stop) = catchup_stop::round_end_stop(round_read_failed) {
+                    catchup_early_stop = stop;
+                    break;
+                }
                 continue;
             }
             // Audit R1: paced like the boot pass, and never past this
@@ -18609,6 +18739,12 @@ async fn run_dhan_feed_stack(mut params: DhanFeedStackParams) {
                 pace_waits,
                 "WAL catch-up drain round complete"
             );
+            // B1 review: a segment this round's pass put back unread would be
+            // re-read (and its retries spent) by every later round.
+            if let Some(stop) = catchup_stop::round_end_stop(round_read_failed) {
+                catchup_early_stop = stop;
+                break;
+            }
         }
         replay_ended_on_gap = !catchup_drained || catchup_prev_trailing_gap.unwrap_or(true);
         if catchup_drained {
@@ -19205,6 +19341,14 @@ pub const fn ist_secs_of_day_from_millis(now_millis: u64) -> u64 {
 /// window, 09:00 to `TICK_PERSIST_END_SECS_OF_DAY_IST` (audit PR31b-2). Such
 /// an exit withholds the open bars instead of writing them truncated. Pure
 /// and total, so both boundaries are testable without a clock.
+///
+/// B1 review (2026-11-13): the window is NOT widened by the catch-up seal's
+/// late-delivery margin. An exit at 15:40 to 15:44 withholding open bars
+/// lost the day's last bar of every timeframe for every instrument (the
+/// 15:00 hourly bar, the 15:30 half-hour bar and the final minutes), for good,
+/// since a restart cannot rebuild a bucket that began before its capture
+/// start. Force-sealing them misses only a trade delivered after the exit,
+/// which the measured lag (at most 199 s) makes rare.
 #[must_use]
 pub const fn is_mid_session_exit(secs_of_day: u64) -> bool {
     secs_of_day >= tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64
@@ -24076,6 +24220,75 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_tables_keyed_reads_open_in_a_process_that_never_armed_the_gate() {
+        // B1 review: the gate is armed only by the boot DDL step, which no
+        // unit test here runs, so a replay posts as before. The shut side is
+        // proven by `test_regression_table_keyed_false_carries_every_bucket_without_writing`
+        // and the storage `live_write_gate_arm` binary.
+        let plain = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert!(plain.replay_tables_keyed());
+        let depth = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        assert!(depth.replay_tables_keyed());
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): nothing failed when
+    /// `replay_tables_keyed` read open regardless. Through the seam: a shut
+    /// tick table, or a shut inline-depth table, reads not keyed; an unkeyed
+    /// `feed_aux_packets` alone does not hold the replay (the writer thread
+    /// sets those rows aside).
+    /// B1 review 2: `replay_keyed_check` is a `Send` copy of the same verdict
+    /// (the lane re-reads it across an `.await`), and `gated_table_sets`
+    /// names one table per depth writer.
+    #[test]
+    fn test_replay_keyed_check_and_gated_table_sets_match_the_replay_verdict() {
+        fn is_send<T: Send + 'static>(_: &T) {}
+        let depth = DepthIngest::for_test();
+        let (writer, levels) = depth.gated_table_sets();
+        assert_eq!(writer.len(), 1);
+        assert!(levels.is_none(), "no book mode: no second level writer");
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8).with_inline_depth(depth);
+        let check = ingest.replay_keyed_check();
+        is_send(&check);
+        assert_eq!(check(), ingest.replay_tables_keyed());
+    }
+
+    #[test]
+    fn test_regression_replay_tables_keyed_reads_shut_through_its_seam() {
+        use tickvault_storage::ilp_table_gate::GatedTable;
+        // The seam is the private `replay_gate` field, set directly here (a
+        // `#[cfg(test)]` method in the impl would cut the file's production
+        // half short for the source scans that split at the first one).
+        let with_gate = |ingest: LiveIngest, gate: fn(&[GatedTable]) -> bool| {
+            let mut ingest = ingest;
+            ingest.replay_gate = gate;
+            ingest
+        };
+        let plain = with_gate(LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8), |_| {
+            false
+        });
+        assert!(!plain.replay_tables_keyed());
+        let depth = with_gate(
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+                .with_inline_depth(DepthIngest::for_test()),
+            |t| !t.contains(&GatedTable::MarketDepth),
+        );
+        assert!(
+            !depth.replay_tables_keyed(),
+            "the inline depth table is shut"
+        );
+        let aux = with_gate(
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+                .with_inline_depth(DepthIngest::for_test()),
+            |t| !t.contains(&GatedTable::FeedAuxPackets),
+        );
+        assert!(
+            aux.replay_tables_keyed(),
+            "an unkeyed aux table alone does not hold it"
+        );
+    }
+
+    #[test]
     fn test_is_mid_session_exit_covers_the_ingest_window_only() {
         let start = u64::from(tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST);
         let end = u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
@@ -24083,7 +24296,16 @@ mod tests {
         assert!(!is_mid_session_exit(start - 1));
         assert!(is_mid_session_exit(start));
         assert!(is_mid_session_exit(end - 1));
+        // Regression, B1 review (2026-11-13): an exit at 15:40 to 15:44 is
+        // NOT mid-session. Withholding there lost the day's final bar of
+        // every timeframe for every instrument; force-sealing writes them.
+        let margin = u64::from(CATCHUP_LATENESS_MARGIN_SECS);
         assert!(!is_mid_session_exit(end), "15:40 is after the session");
+        assert!(
+            !is_mid_session_exit(end + 90),
+            "15:41:30 force-seals the final bars"
+        );
+        assert!(!is_mid_session_exit(end + margin - 1));
         assert!(!is_mid_session_exit(17 * 3_600 + 30 * 60), "the 17:30 stop");
     }
 
@@ -30887,6 +31109,7 @@ mod frame_walk_accounting_tests {
         let history = |set: &crate::main_feed_backup::PersistedBackupSet| {
             crate::main_feed_backup::PersistedBackupHistory {
                 publications: vec![set.clone()],
+                trimmed_through_day: None,
             }
         };
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
@@ -32786,8 +33009,12 @@ mod item_44_tests {
             "the catch-up deadline must be sized by the clock-aware budget"
         );
         assert!(
-            prod.contains("from_secs(catchup_budget_secs)"),
-            "the deadline must use the resolved budget, not the raw 300 s const"
+            prod.contains("from_secs(catchup_clock_secs)")
+                && prod.contains(
+                    "catchup_budget_after_gate_wait(catchup_budget_secs, gate_waited_secs)"
+                ),
+            "the deadline must use the resolved budget less the gate wait (B1 review 5), \
+             not the raw 300 s const"
         );
         assert!(
             !prod.contains("from_secs(WAL_CATCHUP_BUDGET_SECS)"),

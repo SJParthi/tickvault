@@ -4270,9 +4270,11 @@ pub const WAL_REPLAY_ABANDONED_BYTES_COUNTER: &str = "tv_wal_replay_abandoned_by
 
 mod replay_retry;
 mod shutdown_outcome;
+#[cfg(test)]
+use replay_retry::forget_in_memory_for_test;
 pub use replay_retry::{
-    WAL_REPLAY_IO_RETRY_CAP, WAL_REPLAY_LISTING_REFUSED_COUNTER, WAL_REPLAY_READ_RETRIED_COUNTER,
-    WAL_REPLAY_STAGE_FAILED_COUNTER,
+    READ_FAILURE_BOOK_FILE, WAL_REPLAY_IO_RETRY_CAP, WAL_REPLAY_LISTING_REFUSED_COUNTER,
+    WAL_REPLAY_READ_RETRIED_COUNTER, WAL_REPLAY_STAGE_FAILED_COUNTER,
 };
 use replay_retry::{
     forget_segment_read_failures, note_listing_refused, note_segment_read_failure,
@@ -4493,6 +4495,10 @@ pub struct WalReplayBatch {
     pub trailing_gap: bool,
     /// M2: per segment READ, its file name and the `frames` index one past its last frame.
     pub segment_ends: Vec<(Option<std::ffi::OsString>, usize)>,
+    /// B1 (2026-11-13): segments whose read failed with an I/O error below the
+    /// retry cap. They are put back unread for the next pass, so a caller must
+    /// never treat a pass with any of them as a drained backlog.
+    pub read_failed_segments: u64,
 }
 
 /// Should THIS deferral page the operator?
@@ -4985,6 +4991,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         leading_gap: leading_gap.unwrap_or(real_gap),
         trailing_gap: real_gap,
         segment_ends,
+        read_failed_segments: read_retried,
     })
 }
 

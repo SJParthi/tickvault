@@ -943,6 +943,25 @@ pub fn run_after_close_pass(
         summary.stop = Some(PassStop::DiskFloor);
         return summary;
     }
+    // B1 review (2026-11-13): with the writer's table not keyed in this
+    // process (the boot DDL was refused and its re-run has not succeeded),
+    // every flush would rescue the bucket's rows to the depth spill and fail,
+    // the bucket would stay marked, and the next round would read the same
+    // segments and spill the same rows again, every minute through the night.
+    // Carry every bucket untouched instead; a round that wrote and cleared
+    // nothing waits the idle gap. The rows stay in the frame log.
+    if !pass_table_keyed(sink) {
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "deferred_depth_table_not_keyed",
+            buckets = work.len(),
+            "after-close depth pass skipped this round: its depth table is not keyed with \
+             its DEDUP key in this process yet (the boot DDL was refused); every mark stays \
+             and the frames stay in the frame log until the DDL re-run keys the table"
+        );
+        summary.buckets_carried = u64::try_from(work.len()).unwrap_or(u64::MAX);
+        return summary;
+    }
     // DA-13d, reworked by PR AA step 2 (owner Quote 51, 2026-11-07): a row
     // written back here must never land between an archive's recount and
     // its DROP and vanish with the partition, and an hour must never be
@@ -2234,6 +2253,71 @@ mod tests {
         assert!(!DepthIngest::for_test().writes_pre_switch_to_book(0));
     }
 
+    /// Regression, B1 review (2026-11-13): with the writer's table not keyed,
+    /// a round reads no segment and hands the writer no row (so nothing is
+    /// rescued to the depth spill), keeps every mark, and asks for the idle
+    /// gap; a second round does the same. Before, each 60 s round re-read the
+    /// bucket and spilled the same rows again, all night.
+    #[test]
+    fn test_regression_table_keyed_false_carries_every_bucket_without_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-deferred-pass-unkeyed-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (seq, rx) = in_session();
+        {
+            let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                seq,
+                rx,
+                WalEndpoint::MainFeed,
+            );
+            wal.shutdown(Duration::from_secs(5));
+        }
+        let marks = DeferredDepth::new_for_tests();
+        marks.note_shed(seq, ShedDepth::Inline);
+        let sleep = |_: Duration| {};
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            apply_lag: &|| Some(0),
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            disk_free_bytes: &|_| Some(u64::MAX),
+            request_space: &|| {},
+            sleep: &sleep,
+        };
+        let cancel = AtomicBool::new(false);
+        let mut sink = DepthIngest::for_test();
+        PASS_TABLE_KEYED_FOR_TEST.with(|k| k.set(Some(false)));
+        for round in 0..2 {
+            let summary = run_after_close_pass(&mut sink, &marks, &dir, &cancel, &signals);
+            assert_eq!(summary.rows_written, 0, "round {round}: nothing re-read");
+            assert_eq!(
+                sink.pending_rows(),
+                0,
+                "round {round}: no row reached the writer"
+            );
+            assert_eq!(summary.buckets_cleared, 0);
+            assert_eq!(summary.buckets_carried, 1);
+            assert_eq!(
+                next_round_gap_secs(&summary),
+                AFTER_CLOSE_IDLE_ROUND_GAP_SECS
+            );
+            assert!(
+                !marks.snapshot().is_empty(),
+                "round {round}: the mark stays"
+            );
+        }
+        PASS_TABLE_KEYED_FOR_TEST.with(|k| k.set(None));
+        assert!(sink.table_keyed(), "an unarmed gate reads keyed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A shed frame's depth is written back; a frame outside the bucket is
     /// not; the mark clears only after a healthy settle.
     #[test]
@@ -3028,4 +3112,23 @@ mod tests {
             .expect("a cancelled supervisor must exit promptly")
             .expect("the supervisor task must not panic");
     }
+}
+
+// Kept below the tests module: the source scans above read the production
+// code as the text before the first test-only attribute.
+
+/// Whether the pass's writer may post now ([`DepthIngest::table_keyed`]). A
+/// test can override it on its own thread (the live gate is process-wide).
+fn pass_table_keyed(sink: &DepthIngest) -> bool {
+    #[cfg(test)]
+    if let Some(keyed) = PASS_TABLE_KEYED_FOR_TEST.with(std::cell::Cell::get) {
+        return keyed;
+    }
+    sink.table_keyed()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PASS_TABLE_KEYED_FOR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }

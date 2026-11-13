@@ -4929,10 +4929,10 @@ async fn build_shared_infra(
     // loop (coded error on exhaustion); boot continues either way — a missing
     // key is a degraded session, a halted boot is a dark one.
     //
-    // Audit PR31a (2026-09-27): when the bounded loop gives up, keep
-    // re-running the ensure in the background for this session. A
-    // `DEDUP ENABLE` re-run is what repairs a ticks or depth table ILP
-    // auto-created without its key.
+    // PR31a: on give-up, re-run the ensure in the background. B1: the live
+    // writers post only into keyed tables (the loop arms that gate), since
+    // no re-run can key a table ILP auto-created; rows wait in spill/WAL
+    // until the re-run keys the table.
     if !tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await {
         drop(tickvault_app::candle_ddl_boot::spawn_ensure_until_keyed(
             config.questdb.clone(),
@@ -4946,9 +4946,9 @@ async fn build_shared_infra(
     // §12.15). The three tables — `dhan_rest_1m_tape` and its two audit
     // siblings — were retained with every row through the 2026-09-16 removal;
     // their writer is back, so their DDL is back. Awaited inline so the
-    // tables exist before the first 15:41 run can write to them. The helper
-    // logs its own failures; boot continues, and the run's flush error then
-    // reports a missing table.
+    // tables exist before the first 15:41 run can write to them. On refusal
+    // (logged) the writer refuses to post and each run re-runs this ensure
+    // first (B1), so ILP never auto-creates an un-keyable table.
     tickvault_storage::dhan_live_crossverify_persistence::ensure_dhan_live_crossverify_tables(
         &config.questdb,
     )
